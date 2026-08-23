@@ -234,6 +234,303 @@ def test_the_dry_run_shows_the_brokers_own_suppression_reason(nicegui_client):
         value=1.95, minimum=5.0) in texts
 
 
+# ---------------------------------------------------------------------------
+# W6: COST and VALUE per row, and the leverage flag.
+#
+# Everything here is located by MARKER, never by rendered text: the money figures
+# repeat across columns and "not marginable" already appears verbatim in the
+# free-text Reasons column of the very rows under test.
+# ---------------------------------------------------------------------------
+
+from ba2_trade_platform.core.portfolio_allocation import (  # noqa: E402
+    MARGIN_SOURCE_ASSET, MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
+)
+
+
+def _leverage_plan():
+    """One row of every shape the BP x column has to tell apart.
+
+    The four rows are the four live cases, with the numbers the adapters really
+    produce (see ``bp_leverage``): neutral, buying-power-penalised, no published
+    rate, and a sell.
+    """
+    return AllocationPlan(
+        rows=[
+            # Ordinary marginable stock, Reg-T 2:1 -> 0.5 x 2 = 1.0. NEUTRAL, and
+            # held: 10 shares, paid 1,200, now worth 1,600.
+            AllocationRow(symbol="AAPL", price=160.0, current_quantity=10.0,
+                          current_cost_basis=1_200.0, target_notional=3_200.0,
+                          target_quantity=20.0, delta_quantity=10.0,
+                          side=OrderDirection.BUY, estimated_value=1_600.0,
+                          bp_cost=1_600.0, bp_factor=1.0,
+                          initial_margin_rate=0.5,
+                          margin_source=MARGIN_SOURCE_ASSET),
+            # LAZR, verified live: initial margin 98.9% -> x1.978 of buying power.
+            AllocationRow(symbol="LAZR", price=10.0, current_quantity=0.0,
+                          current_cost_basis=0.0, target_notional=1_000.0,
+                          target_quantity=100.0, delta_quantity=100.0,
+                          side=OrderDirection.BUY, estimated_value=1_000.0,
+                          bp_cost=1_978.0, bp_factor=1.978, marginable=False,
+                          initial_margin_rate=0.989,
+                          margin_source=MARGIN_SOURCE_POSITION),
+            # A first-time TastyTrade buy. Unheld, so the adapter published no
+            # per-symbol rate and fell back to the account multiplier.
+            AllocationRow(symbol="NEWBIE", price=50.0, current_quantity=0.0,
+                          current_cost_basis=0.0, target_notional=500.0,
+                          target_quantity=10.0, delta_quantity=10.0,
+                          side=OrderDirection.BUY, estimated_value=500.0,
+                          bp_cost=1_000.0, bp_factor=2.0,
+                          initial_margin_rate=None,
+                          margin_source=MARGIN_SOURCE_DEFAULT),
+            AllocationRow(symbol="MSFT", price=400.0, current_quantity=10.0,
+                          current_cost_basis=3_000.0, target_notional=2_000.0,
+                          target_quantity=5.0, delta_quantity=-5.0,
+                          side=OrderDirection.SELL, estimated_value=2_000.0,
+                          bp_cost=0.0, bp_factor=1.0, initial_margin_rate=0.5,
+                          margin_source=MARGIN_SOURCE_ASSET),
+        ],
+        base_notional=20_000.0, available_buying_power=10_000.0,
+        required_buying_power=4_578.0, bp_usage_pct=45.78,
+        total_buy_value=3_100.0, total_sell_value=2_000.0,
+        valuation_mode=VALUATION_MODE_MARKET)
+
+
+def _open_leverage_wizard(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), _leverage_plan(), market=_open_market(),
+                             on_refresh=lambda f: None, on_submit=lambda p: None).open()
+    return wiz
+
+
+def test_the_dry_run_shows_what_is_held_what_it_cost_and_what_it_is_worth(
+        nicegui_client):
+    """The basis the user is trading against. Without it the only holding figure in
+    the table is the post-trade projection, so "am I topping up a winner or
+    averaging down?" is unanswerable from the dry run."""
+    wiz = _open_leverage_wizard(nicegui_client)
+
+    assert _marked_texts(nicegui_client.layout, wiz.MARKER_ROW_HELD) == [
+        "10", "0", "0", "10"]
+    assert _marked_texts(nicegui_client.layout, wiz.MARKER_ROW_COST) == [
+        "1,200.00", "0.00", "0.00", "3,000.00"]
+    assert _marked_texts(nicegui_client.layout, wiz.MARKER_ROW_VALUE) == [
+        "1,600.00", "0.00", "0.00", "4,000.00"]
+
+
+def test_an_unpriced_holding_shows_a_dash_and_is_left_out_of_the_value_total(
+        nicegui_client):
+    """A holding with no quote is NOT worth 0.00. The cell says ``-`` and the
+    footer total says how many it had to leave out, rather than quietly reporting a
+    smaller basis as a fact. Cost survives: it is a recorded figure, not a quote."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    plan = _leverage_plan()
+    plan.rows[0].price = None
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), plan, market=_open_market(),
+                             on_refresh=lambda f: None, on_submit=lambda p: None).open()
+        values = _marked_texts(nicegui_client.layout, wiz.MARKER_ROW_VALUE)
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert values[0] == "-"
+    # AAPL's 1,600 is gone from the total, and the footer says why rather than
+    # silently reporting 4,000.
+    assert "Held value: 4,000.00 (1 unpriced, excluded)" in texts
+    assert _marked_texts(nicegui_client.layout, wiz.MARKER_ROW_COST)[0] == "1,200.00"
+
+
+def test_the_dry_run_flags_a_buying_power_penalised_instrument(nicegui_client):
+    """LAZR charges x1.98 of buying power per dollar of stock. An ordinary
+    marginable name charges exactly x1.00, so 1.00 is NEUTRAL and must not be
+    dressed up as a finding."""
+    wiz = _open_leverage_wizard(nicegui_client)
+    cells = _marked_texts(nicegui_client.layout, wiz.MARKER_LEVERAGE)
+
+    # Plan order: AAPL, LAZR, NEWBIE, MSFT.
+    assert cells[0] == "×1.00"
+    assert cells[1] == "×1.98"
+
+
+def test_an_unheld_tastytrade_buy_is_not_painted_as_leveraged(nicegui_client):
+    """THE REGRESSION THIS FEATURE WOULD OTHERWISE SHIP. TastyTrade publishes no
+    per-symbol margin requirement for a symbol the account does not already hold,
+    so its adapter returns bp_factor = multiplier = 2.0 with no rate and
+    ``source = MARGIN_SOURCE_DEFAULT``. A first-time buy is unheld BY DEFINITION,
+    so an unguarded ``ratio > 1.0`` would flag every new position on that broker.
+
+    The cell says ``?``, not ``×2.00``, and it is not coloured as a finding."""
+    wiz = _open_leverage_wizard(nicegui_client)
+    cells = [d for d in nicegui_client.layout.descendants()
+             if wiz.MARKER_LEVERAGE in getattr(d, '_markers', [])]
+
+    newbie = cells[2]
+    assert newbie.text == wiz.LEVERAGE_UNKNOWN_MARK
+    assert "×2" not in newbie.text
+    assert "orange" not in " ".join(newbie._classes)
+    assert "red" not in " ".join(newbie._classes)
+    # And it says WHY, rather than leaving a bare question mark.
+    tips = [d.text for d in newbie.descendants() if getattr(d, 'text', None)]
+    assert any("no margin rate" in t for t in tips), tips
+
+
+def test_a_sell_states_no_leverage_in_the_table(nicegui_client):
+    """A sell FREES buying power; ``bp_cost`` is 0.0 for one by construction, so
+    any ratio computed for it is an artefact of that zero."""
+    wiz = _open_leverage_wizard(nicegui_client)
+    assert _marked_texts(nicegui_client.layout, wiz.MARKER_LEVERAGE)[3] == "-"
+
+
+def test_the_leverage_tooltip_separates_lending_from_buying_power(nicegui_client):
+    """"The broker lends against this" is ``initial margin < 100%``, which is a
+    DIFFERENT statement from ``x1.98 buying power`` and, on LAZR, the opposite
+    one: at a 98.9% initial margin it is nearly cash-collateralised. A bare red
+    x1.98 says the reverse, so the honest fact goes in the tooltip."""
+    wiz = _open_leverage_wizard(nicegui_client)
+    cells = [d for d in nicegui_client.layout.descendants()
+             if wiz.MARKER_LEVERAGE in getattr(d, '_markers', [])]
+    tips = [d.text for d in cells[1].descendants() if getattr(d, 'text', None)]
+
+    assert any("98.9%" in t for t in tips), tips
+    assert any(MARGIN_SOURCE_POSITION in t for t in tips), tips
+
+
+def test_the_dry_run_names_the_valuation_mode_on_the_projected_column(
+        nicegui_client):
+    """``Projected`` silently means post-trade COST BASIS in cost mode and
+    ``target quantity x price`` in market mode. An unlabelled column that changes
+    meaning with a toggle elsewhere on the page is worse than no column."""
+    wiz = _open_leverage_wizard(nicegui_client)
+    texts = _rendered_texts(nicegui_client.layout)
+    assert f"Projected ({VALUATION_MODE_MARKET})" in texts
+    assert "Projected" not in texts
+
+
+def test_the_dry_run_totals_add_up_the_cost_and_the_value_being_traded_against(
+        nicegui_client):
+    """Per-row cost and value with no total leaves the user adding a column of
+    figures by eye to answer "what basis am I moving?"."""
+    wiz = _open_leverage_wizard(nicegui_client)
+    texts = _rendered_texts(nicegui_client.layout)
+
+    # 1,200 + 0 + 0 + 3,000 held cost; 1,600 + 0 + 0 + 4,000 held value.
+    assert "Held cost: 4,200.00" in texts
+    assert "Held value: 5,600.00" in texts
+
+
+def test_the_dry_run_totals_say_that_buying_power_is_charged_not_bought(
+        nicegui_client):
+    """Requirement 1b, which is a LABELLING defect and not an arithmetic one. The
+    engine is already right -- ``bp_factor`` provably moves no target and no
+    quantity -- but a bare ``BP cost 4,578`` beside a ``Buy value 3,100`` reads as
+    if leverage had inflated the plan. The totals must name the two apart."""
+    wiz = _open_leverage_wizard(nicegui_client)
+    note = _marked_texts(nicegui_client.layout, wiz.MARKER_BP_NOTE)
+
+    assert len(note) == 1
+    assert "3,100.00" in note[0] and "4,578.00" in note[0]
+    assert "CHARGED" in note[0]
+    # And it says the thing the user actually got wrong: the ratio buys nothing.
+    assert "buys no extra share" in note[0]
+
+
+def test_the_buying_power_note_is_absent_when_the_plan_buys_nothing(
+        nicegui_client):
+    """A sell-only plan charges no buying power at all, and a sentence explaining a
+    charge that is not being made is noise."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    plan = _leverage_plan()
+    plan.rows = [r for r in plan.rows if r.symbol == "MSFT"]
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), plan, market=_open_market(),
+                             on_refresh=lambda f: None, on_submit=lambda p: None).open()
+        note = _marked_texts(nicegui_client.layout, wiz.MARKER_BP_NOTE)
+
+    assert note == []
+
+
+def test_the_dry_run_totals_show_the_prechecks_fee_estimate_when_there_is_one(
+        nicegui_client):
+    """Fees are literally cost, and the precheck's own figure was being captured
+    onto the row and then dropped at the display boundary."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    plan = _leverage_plan()
+    plan.rows[0].estimated_fees = 1.37
+    plan.rows[1].estimated_fees = 0.63
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), plan, market=_open_market(),
+                             on_refresh=lambda f: None, on_submit=lambda p: None).open()
+        texts = _rendered_texts(nicegui_client.layout)
+    assert "Est. fees: 2.00" in texts
+
+
+def test_an_unprechecked_plan_shows_no_fee_figure_at_all(nicegui_client):
+    """``estimated_fees is None`` means "not prechecked", NEVER "free". A 0.00 here
+    would be a broker figure nobody published."""
+    wiz = _open_leverage_wizard(nicegui_client)
+    texts = _rendered_texts(nicegui_client.layout)
+    assert not any(t.startswith("Est. fees") for t in texts)
+
+
+def test_the_leverage_cell_covers_every_verdict_the_engine_can_return():
+    """A verdict the cell does not know about would render as a blank column
+    rather than fail, so the mapping is pinned against the engine's own list. No
+    branch may return an empty text or an empty tooltip: a bare ``?`` or ``-`` in a
+    money column is a question the screen cannot answer."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.core.portfolio_allocation import LEVERAGE_VERDICTS
+
+    for verdict in LEVERAGE_VERDICTS:
+        text, _css, tooltip = wiz._leverage_cell(
+            {"symbol": "X", "leverage": verdict, "bp_ratio": 1.5,
+             "initial_margin_rate": 0.75, "margin_source": MARGIN_SOURCE_ASSET})
+        assert text, verdict
+        assert tooltip, verdict
+
+
+def _capture_errors(monkeypatch):
+    """Collect ``logger.error`` messages from the wizard module. NOT caplog."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    messages = []
+    monkeypatch.setattr(wiz.logger, 'error',
+                        lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+def test_a_broker_that_publishes_no_rate_is_a_normal_state_not_a_drift_error(
+        monkeypatch):
+    """LEVERAGE_UNKNOWN has its OWN branch, and it is not the last-resort
+    "the engine grew a verdict this table has never heard of" path -- which logs.
+
+    The two happen to render identically, so without this the guard could be
+    deleted and the fallback would silently cover for it. They are different
+    facts: one is the everyday case of a broker that says nothing about a symbol
+    you do not hold, the other is a code defect, and logging the first would put an
+    error in the log on every first-time buy."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.core.portfolio_allocation import LEVERAGE_UNKNOWN
+
+    errors = _capture_errors(monkeypatch)
+    text, _css, tooltip = wiz._leverage_cell(
+        {"symbol": "NEWBIE", "leverage": LEVERAGE_UNKNOWN, "bp_ratio": 2.0,
+         "initial_margin_rate": None, "margin_source": MARGIN_SOURCE_DEFAULT})
+
+    assert text == wiz.LEVERAGE_UNKNOWN_MARK
+    assert "no margin rate" in tooltip
+    assert errors == []
+
+    # ... whereas a verdict the table really does not know about does log.
+    wiz._leverage_cell({"symbol": "X", "leverage": "invented", "bp_ratio": 1.0,
+                        "initial_margin_rate": 0.5,
+                        "margin_source": MARGIN_SOURCE_ASSET})
+    assert len(errors) == 1
+    assert "invented" in errors[0]
+
+
 def test_submitting_hands_on_only_the_ticked_rows(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 

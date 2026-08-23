@@ -32,6 +32,13 @@ from nicegui import ui
 from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL,
     ALLOCATION_MODE_REBALANCE,
+    LEVERAGE_LEVERAGED,
+    LEVERAGE_NONE,
+    LEVERAGE_NOT_APPLICABLE,
+    LEVERAGE_PENALISED,
+    LEVERAGE_UNKNOWN,
+    MONEY_EPSILON,
+    VALUATION_MODE_MARKET,
     AllocationPlan,
     BaseSnapshot,
     LabelTarget,
@@ -91,6 +98,74 @@ MARKER_ORDER_KIND = 'dry-run-order-kind'
 #: NiceGUI marker on the dry-run table's per-row tick box. Rendered in plan order.
 MARKER_ROW_TICK = 'dry-run-row-tick'
 
+#: Markers on the dry-run table's CURRENT-HOLDING columns -- what is owned, what it
+#: cost, what it is worth now -- in plan order. By marker and never by text: every
+#: one of these is a bare money figure that repeats in three other columns of the
+#: same row, so a membership assertion could not tell which column it came from.
+MARKER_ROW_HELD = 'dry-run-row-held'
+MARKER_ROW_COST = 'dry-run-row-cost'
+MARKER_ROW_VALUE = 'dry-run-row-value'
+
+#: Marker on the dry-run table's leverage (``BP ×``) cell. Emphatically by marker:
+#: the engine's own ``REASON_NOT_MARGINABLE`` ("⚠ not marginable") already appears
+#: verbatim in the free-text Reasons column of exactly the rows a text search for a
+#: leverage signal would go looking in.
+MARKER_LEVERAGE = 'dry-run-leverage'
+
+#: Marker on the totals' buying-power sentence (see ``BP_IS_A_CHARGE_NOTE_FMT``).
+MARKER_BP_NOTE = 'dry-run-bp-note'
+
+#: Drawn in the ``BP ×`` column when the broker published no margin rate for the
+#: symbol. A ``?``, never the raw multiple: the number in that case is the
+#: account's own conservative fallback, and printing it as if it were measured is
+#: precisely the regression the ``MARGIN_SOURCE_DEFAULT`` guard exists to stop.
+LEVERAGE_UNKNOWN_MARK = '?'
+
+#: Tooltip under a ``BP ×`` cell the broker DID publish a rate for. It states the
+#: two facts apart, because they are routinely confused and on a hard-to-borrow
+#: name they point OPPOSITE ways: "the broker lends against this" is the initial
+#: margin being under 100%, whereas the × is how much BUYING POWER the buy charges.
+#: LAZR at a 98.9% initial margin is nearly cash-collateralised AND costs ×1.98 of
+#: buying power; a bare red ×1.98 on its own says the reverse.
+LEVERAGE_TOOLTIP_FMT = (
+    '{symbol} charges {ratio:.2f}x its trade value against buying power. '
+    'Initial margin {rate:.1%}, from the broker\'s {source} data. Above 1.00x '
+    'consumes MORE buying power than the position is worth; below 1.00x is '
+    'genuine leverage. "The broker lends against this" is the initial margin '
+    'being under 100%, which is a different fact and often the opposite one.')
+
+#: Tooltip when the rate is missing or came from the account-multiplier fallback.
+#: Names the fallback rather than hiding it: the ratio IS what the plan charges, so
+#: withholding the number would be its own lie -- what is withheld is the VERDICT.
+LEVERAGE_TOOLTIP_UNKNOWN_FMT = (
+    '{symbol}: the broker published no margin rate for this symbol, so buying '
+    'power is charged at the account multiplier ({ratio:.2f}x) as a conservative '
+    'fallback. That is not a measured figure, so this row is deliberately not '
+    'flagged either way. Brokers commonly publish nothing for a symbol you do not '
+    'already hold.')
+
+#: Tooltip on a sell's (empty) leverage cell.
+LEVERAGE_TOOLTIP_SELL = (
+    'A sell FREES buying power rather than charging it, so there is no ratio to '
+    'state.')
+
+#: Tooltip on a neutral ×1.00, so the column never reads as "nothing measured".
+LEVERAGE_TOOLTIP_NEUTRAL_FMT = (
+    '{symbol} charges 1.00x -- a dollar of stock costs a dollar of buying power, '
+    'which is the ordinary case for a marginable stock on a margin account '
+    '(initial margin {rate:.1%} x the account multiplier). Not a leverage story.')
+
+#: The totals' answer to requirement 1b. ``bp_factor`` is a notional-to-buying-power
+#: CONVERSION and provably moves no target and no quantity -- the engine is already
+#: right -- but a bare "BP cost 19,780" beside a "Buy value 10,000" reads as if
+#: leverage had inflated the plan. This names the two apart in one sentence. It is a
+#: LABELLING fix: nothing in the arithmetic changed to make it true.
+BP_IS_A_CHARGE_NOTE_FMT = (
+    'Buying power is CHARGED, not spent: this plan buys {buy_value:,.2f} of stock '
+    'and the broker reserves {required:,.2f} of buying power against it '
+    '({ratio:.2f}x). Only the {buy_value:,.2f} is invested - the ratio moves no '
+    'target and buys no extra share.')
+
 #: NiceGUI marker on the market-hours banner's sentence, and on each of the four
 #: plan notices. Located by marker, not by text: the gate's message is ALSO the
 #: Submit button's tooltip, and every notice quotes wording that recurs in the
@@ -117,6 +192,64 @@ INVEST_SCOPE_NOTE = ('Pre-filled with the unallocated income total. Buys only - 
 
 #: Shown on the fractional switch when the broker does not split shares at all.
 NO_FRACTIONAL_SUPPORT_NOTE = 'This broker does not support fractional shares.'
+
+
+def _shares(quantity: float) -> str:
+    """A share count for the table: full precision, no trailing-zero clutter.
+
+    5 decimals because that is TastyTrade's equity quantity precision -- the dry
+    run's job is to state what will be SENT, so it may not round tighter than the
+    broker's own grid. ``or '0'`` catches exactly 0.0, which strips to ''.
+    """
+    return f"{quantity:,.5f}".rstrip('0').rstrip('.') or '0'
+
+
+def _leverage_cell(row: Dict) -> Tuple[str, str, str]:
+    """The dry run's ``BP ×`` cell: ``(text, css, tooltip)``. Pure; no ``ui`` call.
+
+    Reads ``leverage`` -- the ENGINE's verdict, from ``bp_leverage``, which owns the
+    predicate and its ``MARGIN_SOURCE_DEFAULT`` guard -- and never re-derives it
+    from the ratio. Re-deriving is how the guard gets lost: the ratio for an unheld
+    TastyTrade buy really is 2.0, and it is only the SOURCE of that 2.0 that makes
+    it meaningless.
+
+    The colour is the message. Orange is reserved for the case that costs the user
+    something (a buying-power penalty); genuine leverage is green because it makes
+    the plan cheaper to hold; neutral and unpublished are grey, because neither is a
+    finding and painting the unpublished case would flag every first-time buy on a
+    broker that does not publish per-symbol rates.
+
+    Every branch returns a non-empty tooltip: a lone ``?`` or ``-`` in a numeric
+    column is a question the user cannot answer from the screen.
+    """
+    verdict = row['leverage']
+    ratio = row['bp_ratio']
+    symbol = row['symbol']
+    if verdict == LEVERAGE_NOT_APPLICABLE:
+        return '-', 'text-gray-400', LEVERAGE_TOOLTIP_SELL
+    if verdict == LEVERAGE_UNKNOWN:
+        return (LEVERAGE_UNKNOWN_MARK, 'text-gray-400',
+                LEVERAGE_TOOLTIP_UNKNOWN_FMT.format(symbol=symbol, ratio=ratio))
+    text = f'×{ratio:.2f}'
+    rate = row['initial_margin_rate']
+    if verdict == LEVERAGE_PENALISED:
+        return (text, 'text-orange-400 font-medium',
+                LEVERAGE_TOOLTIP_FMT.format(symbol=symbol, ratio=ratio, rate=rate,
+                                            source=row['margin_source']))
+    if verdict == LEVERAGE_LEVERAGED:
+        return (text, 'text-green-500 font-medium',
+                LEVERAGE_TOOLTIP_FMT.format(symbol=symbol, ratio=ratio, rate=rate,
+                                            source=row['margin_source']))
+    if verdict == LEVERAGE_NONE:
+        return (text, 'text-gray-400',
+                LEVERAGE_TOOLTIP_NEUTRAL_FMT.format(symbol=symbol, rate=rate))
+    # An engine verdict this cell has never heard of. Say so rather than draw a
+    # blank column: a silently empty cell in a money table is indistinguishable
+    # from "nothing to report".
+    logger.error(f"_leverage_cell: unknown leverage verdict {verdict!r} for "
+                 f"{symbol}; the engine and the table have drifted apart")
+    return (LEVERAGE_UNKNOWN_MARK, 'text-gray-400',
+            LEVERAGE_TOOLTIP_UNKNOWN_FMT.format(symbol=symbol, ratio=ratio or 0.0))
 
 
 class AllocationWizard:
@@ -373,7 +506,23 @@ class AllocationWizard:
             ui.label(warning).classes('text-xs text-orange-400')
 
     def _render_rows(self):
+        """The dry-run table, left to right: what you HOLD, what will be DONE,
+        where that LEAVES you, and what buying power it costs.
+
+        ``Projected`` is suffixed with the plan's own valuation mode because the
+        column silently means two different things -- post-trade COST BASIS in cost
+        mode, ``target quantity x price`` in market mode -- and the toggle that
+        decides which lives on another page. An unlabelled column that changes
+        meaning elsewhere is worse than no column.
+
+        Eighteen columns do not fit a laptop even maximised, so the container
+        scrolls SIDEWAYS and every row is ``min-w-max``: the alternative -- letting
+        the flex row squeeze -- silently truncates money figures, which is the one
+        failure mode a dry run may not have. ``classes()`` de-duplicates, so
+        re-applying it on every refresh is a no-op.
+        """
         self._rows_container.clear()
+        self._rows_container.classes('overflow-x-auto')
         rows = dry_run_rows(self.plan)
         with self._rows_container:
             if not rows:
@@ -382,14 +531,21 @@ class AllocationWizard:
                 return
             if any(r['fractional'] and not r['suppressed'] for r in rows):
                 ui.label(FRACTIONAL_IS_MARKET_ONLY_NOTE).classes('text-xs text-orange-400')
-            with ui.row().classes('w-full text-xs font-bold border-b py-1'):
-                for header, width in (('', 'w-10'), ('Symbol', 'w-24'), ('Side', 'w-16'),
-                                      ('Qty', 'w-28'), ('Order', 'w-28'),
-                                      ('Sizing', 'w-20'), ('Outcome', 'w-32'),
-                                      ('Est. value', 'w-28'), ('Target', 'w-28'),
-                                      ('Projected', 'w-28'), ('Weight', 'w-36'),
-                                      ('BP cost', 'w-28'), ('BP %', 'w-16'),
-                                      ('Reasons', 'flex-1')):
+            with ui.row().classes('w-full min-w-max text-xs font-bold border-b py-1'):
+                for header, width in (('', 'w-10'), ('Symbol', 'w-24'),
+                                      # WHERE THE ROW STARTS -- the basis being
+                                      # traded against, which the table never had.
+                                      ('Held', 'w-20'), ('Cost', 'w-24'),
+                                      ('Value', 'w-24'),
+                                      ('Side', 'w-16'),
+                                      ('Qty', 'w-24'), ('Order', 'w-24'),
+                                      ('Sizing', 'w-20'), ('Outcome', 'w-28'),
+                                      ('Est. value', 'w-24'), ('Target', 'w-24'),
+                                      (f'Projected ({self.plan.valuation_mode})', 'w-32'),
+                                      ('Weight', 'w-32'),
+                                      ('BP cost', 'w-24'), ('BP ×', 'w-20'),
+                                      ('BP %', 'w-16'),
+                                      ('Reasons', 'flex-1 min-w-64')):
                     ui.label(header).classes(width)
             for row in rows:
                 self._render_row(row)
@@ -403,9 +559,15 @@ class AllocationWizard:
         the ORDER (``fractional``), not the grid the row was sized on
         (``sized_fractional``) -- a row sized fractionally that landed on exactly
         5.0 shares sends an ordinary whole-share order.
+
+        ``Cost`` and ``Value`` are the CURRENT holding, not the trade: what was paid
+        and what it is worth now. They are the pair that answers "am I topping up a
+        winner or averaging down?", which the table could not answer before. A
+        ``Value`` of ``-`` means there is no price, never that the holding is
+        worthless.
         """
         blocked = row['suppressed'] or row['skipped']
-        with ui.row().classes('w-full text-sm items-center border-b py-1'
+        with ui.row().classes('w-full min-w-max text-sm items-center border-b py-1'
                               + (' opacity-60' if blocked else '')):
             checkbox = ui.checkbox(
                 value=row['symbol'] in self.selected,
@@ -415,18 +577,27 @@ class AllocationWizard:
             # -- greying it is not enough, the box would still be clickable.
             checkbox.set_enabled(not blocked)
             ui.label(row['symbol']).classes('w-24 font-medium')
+            # THE BASIS THIS ROW IS TRADING AGAINST.
+            ui.label(_shares(row['current_quantity'])).classes('w-20 text-gray-400') \
+                .mark(MARKER_ROW_HELD)
+            ui.label(f"{row['current_cost_basis']:,.2f}").classes('w-24 text-gray-400') \
+                .mark(MARKER_ROW_COST)
+            value = row['current_value']
+            # '-', never 0.00: no price is "not measurable", not "worthless".
+            ui.label('-' if value is None else f"{value:,.2f}") \
+                .classes('w-24 text-gray-400').mark(MARKER_ROW_VALUE)
             ui.label(row['side'] or '-').classes(
                 'w-16 ' + ('text-green-500' if row['side'] == 'BUY'
                            else 'text-red-500' if row['side'] == 'SELL'
                            else 'text-gray-400'))
-            ui.label(f"{row['quantity']:,.5f}".rstrip('0').rstrip('.') or '0').classes('w-28')
+            ui.label(_shares(row['quantity'])).classes('w-24')
             if row['suppressed']:
                 order_kind, order_class = 'no order', 'text-orange-400'
             elif row['fractional']:
                 order_kind, order_class = 'fractional', 'text-blue-400'
             else:
                 order_kind, order_class = 'whole shares', 'text-gray-400'
-            ui.label(order_kind).classes('w-28 text-xs ' + order_class) \
+            ui.label(order_kind).classes('w-24 text-xs ' + order_class) \
                 .mark(MARKER_ORDER_KIND)
             # The GRID the row was sized on, which is the column to scan when a
             # quarter of the book cannot trade fractionally at all.
@@ -436,25 +607,56 @@ class AllocationWizard:
             # WHICH RULE produced the quantity. A bumped row holds MORE than the
             # weights asked for, and that must never be silent.
             ui.label(row['outcome']).classes(
-                'w-32 text-xs ' + ('text-orange-400' if row['outcome'] != 'normal'
+                'w-28 text-xs ' + ('text-orange-400' if row['outcome'] != 'normal'
                                    else 'text-gray-400'))
-            ui.label(f"{row['estimated_value']:,.2f}").classes('w-28')
-            ui.label(f"{row['target_notional']:,.2f}").classes('w-28')
+            ui.label(f"{row['estimated_value']:,.2f}").classes('w-24')
+            ui.label(f"{row['target_notional']:,.2f}").classes('w-24')
             projected = row['projected_notional']
-            ui.label('-' if projected is None else f"{projected:,.2f}").classes('w-28')
+            # The header names the mode this figure is in; the tooltip carries the
+            # OTHER one, so cost and value are one hover apart instead of one
+            # page-level toggle and a re-solve apart.
+            projected_label = ui.label('-' if projected is None
+                                       else f"{projected:,.2f}").classes('w-32')
+            other = ('projected_cost' if self.plan.valuation_mode == VALUATION_MODE_MARKET
+                     else 'projected_market')
+            if row[other] is not None:
+                with projected_label:
+                    ui.tooltip(f"{other.replace('_', ' ')}: {row[other]:,.2f}")
             # ASKED -> ACTUAL. They differ whenever the grid, a bump or the label
             # redistribution moved this row, and hiding that would be rewriting the
             # user's weights behind their back.
             ui.label(f"{row['weight_pct']:.2f}% → {row['projected_weight_pct']:.2f}%") \
-                .classes('w-36 text-xs ' + ('text-orange-400' if row['redistributed']
+                .classes('w-32 text-xs ' + ('text-orange-400' if row['redistributed']
                                             else 'text-gray-400'))
-            ui.label(f"{row['bp_cost']:,.2f}").classes('w-28')
+            ui.label(f"{row['bp_cost']:,.2f}").classes('w-24')
+            # Immediately beside BP cost ON PURPOSE: the x IS the explanation of why
+            # that figure is not the Est. value, which is the misreading requirement
+            # 1b is about.
+            text, css, tip = _leverage_cell(row)
+            with ui.label(text).classes('w-20 text-xs ' + css).mark(MARKER_LEVERAGE):
+                ui.tooltip(tip)
             ui.label(f"{row['bp_usage_pct']:.1f}%").classes('w-16')
             ui.label(row['reasons']).classes(
-                'flex-1 text-xs ' + ('text-orange-400' if row['suppressed']
-                                     else 'text-gray-400'))
+                'flex-1 min-w-64 text-xs ' + ('text-orange-400' if row['suppressed']
+                                              else 'text-gray-400'))
 
     def _render_totals(self):
+        """The footer, over the TICKED rows only.
+
+        Two additions beyond the money that was already here. ``Held cost`` /
+        ``Held value`` total the basis the plan is trading against, so the new
+        per-row columns have a bottom line instead of a column of figures to add up
+        by eye; both are summed from ``dry_run_rows`` -- the same numbers the table
+        drew -- rather than recomputed, so the footer can never disagree with the
+        rows above it. ``Est. fees`` appears only when the precheck actually
+        returned one: ``None`` there means "not prechecked", never "free", and a
+        0.00 would be a fabricated broker figure.
+
+        And ``BP_IS_A_CHARGE_NOTE_FMT``, which is requirement 1b. Nothing in the
+        arithmetic moved to make it true -- ``bp_factor`` never touched a target or
+        a quantity -- but the pairing on screen was misleading, and a labelling
+        defect in a money table is still a defect.
+        """
         self._totals_container.clear()
         selected_plan = filter_plan_rows(self.plan, sorted(self.selected))
         try:
@@ -462,11 +664,19 @@ class AllocationWizard:
         except ValueError:
             totals = None
         summary = fractional_summary(selected_plan)
+        shown = dry_run_rows(selected_plan)
+        held_cost = sum(r['current_cost_basis'] for r in shown)
+        # None is EXCLUDED, not counted as zero: an unpriced holding is missing from
+        # this total, and summing it as 0.0 would report a smaller basis as a fact.
+        priced = [r['current_value'] for r in shown if r['current_value'] is not None]
+        fees = [r['estimated_fees'] for r in shown if r['estimated_fees'] is not None]
+        buy_value = selected_plan.total_buy_value
+        required = selected_plan.required_buying_power
         with self._totals_container:
             with ui.row().classes('w-full gap-6 mt-2 text-sm'):
                 ui.label(f"Sell value: {selected_plan.total_sell_value:,.2f}")
-                ui.label(f"Buy value: {selected_plan.total_buy_value:,.2f}")
-                ui.label(f"Required BP: {selected_plan.required_buying_power:,.2f} "
+                ui.label(f"Buy value: {buy_value:,.2f}")
+                ui.label(f"Required BP: {required:,.2f} "
                          f"/ {selected_plan.available_buying_power:,.2f} "
                          f"({selected_plan.bp_usage_pct:.1f}%)")
                 if totals is not None:
@@ -474,6 +684,21 @@ class AllocationWizard:
                 else:
                     ui.label('Est. cash after: unknown (broker published no cash balance)') \
                         .classes('text-orange-400')
+            with ui.row().classes('w-full gap-6 text-sm'):
+                ui.label(f"Held cost: {held_cost:,.2f}").classes('text-gray-400')
+                ui.label(f"Held value: {sum(priced):,.2f}"
+                         + ('' if len(priced) == len(shown)
+                            else f" ({len(shown) - len(priced)} unpriced, excluded)")) \
+                    .classes('text-gray-400')
+                if fees:
+                    ui.label(f"Est. fees: {sum(fees):,.2f}").classes('text-gray-400')
+            # Requirement 1b. Only when there is a charge to explain -- a sell-only
+            # plan reserves nothing and the sentence would be noise.
+            if buy_value > MONEY_EPSILON:
+                ui.label(BP_IS_A_CHARGE_NOTE_FMT.format(
+                    buy_value=buy_value, required=required,
+                    ratio=required / buy_value)).classes('text-xs text-gray-400') \
+                    .mark(MARKER_BP_NOTE)
             with ui.row().classes('w-full gap-6 text-sm'):
                 # SIGNED: a bump's over-allocation nets against a rounding shortfall,
                 # which is what "how far off target will I be" actually means.
