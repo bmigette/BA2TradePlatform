@@ -1534,3 +1534,49 @@ def test_dry_run_rows_keep_every_key_the_landed_table_already_drew_after_widenin
                 "estimated_fees", "bp_factor", "bp_ratio", "leverage",
                 "marginable", "initial_margin_rate", "margin_source"):
         assert key in row, key
+
+
+def _reserved_eligibility_plan():
+    """The same plan under a 25% reserve: base 262,800, investable 197,100.
+
+    A fixture where the two candidate denominators are far apart, because with no
+    reserve they are the SAME NUMBER -- which is why the Weight column's divisor
+    was never pinned in the first place.
+    """
+    plan = _mixed_eligibility_plan()
+    plan.reserved_pct = 25.0
+    plan.reserved_notional = 65_700.0
+    return plan
+
+
+def test_dry_run_weights_divide_the_GROSS_base_even_under_a_reserve():
+    """The Weight column is a share of ``base_notional``, not of the remainder.
+
+    Its neighbour ``projected_weight_pct`` is a realised post-trade HOLDING and has
+    no relative-weight reading at all, so the pair only means "asked -> actual" if
+    both divide the same thing; and the reserve chip, ``bp_usage_pct``,
+    ``residual_pct``, ``reserved_pct`` and ``unallocatable_pct`` on the same screen
+    all divide the base. Switching this to the investable remainder inflates every
+    weight by 1/(1-r) -- a third of the way again at a 25% reserve -- and left both
+    suites green because no test drove it with a reserve at all.
+    """
+    rows = {r["symbol"]: r for r in dry_run_rows(_reserved_eligibility_plan())}
+
+    assert rows["MSFT"]["weight_pct"] == pytest.approx(1_000.0 / 262_800.0 * 100.0,
+                                                       abs=5e-4)
+    assert rows["MSFT"]["projected_weight_pct"] == pytest.approx(
+        800.0 / 262_800.0 * 100.0, abs=5e-4)
+    # ...and emphatically NOT 1,000 / 197,100, which is where the remainder lands.
+    assert rows["MSFT"]["weight_pct"] != pytest.approx(1_000.0 / 197_100.0 * 100.0,
+                                                       abs=5e-4)
+
+
+def test_no_order_rows_weights_divide_the_same_base_as_the_main_table():
+    """The detail view sits under the same column heading and must not answer a
+    different question from the row it is explaining."""
+    dropped = {r["symbol"]: r for r in no_order_rows(_reserved_eligibility_plan())}
+
+    assert dropped["BRKA"]["weight_pct"] == pytest.approx(
+        260_000.0 / 262_800.0 * 100.0, abs=5e-4)
+    assert dropped["BRKA"]["weight_pct"] != pytest.approx(
+        260_000.0 / 197_100.0 * 100.0, abs=5e-4)

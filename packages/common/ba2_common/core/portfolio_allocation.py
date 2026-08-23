@@ -365,15 +365,31 @@ ERROR_LABEL_TOTAL_FMT = "label targets total {total:.2f}% - over 100% by {over:.
 #: box that does want a number, or the user has been told off without being told
 #: what to do.
 ERROR_LABEL_UNDER_FMT = ("label targets total {total:.2f}% - under 100% by "
-                         "{under:.2f}%. Use the Unallocated box to hold cash.")
+                         "{under:.2f}%. Use the Unallocated box to hold money "
+                         "back.")
 
 #: The reserve's own range check. Below 0 would INFLATE the investable base into
-#: money the account does not have; above 100 would make it negative, which
-#: ``compute_allocation`` refuses outright with a ValueError. Caught here instead,
-#: where the message can name the value and the user can see which box.
+#: money the account does not have; above 100 would make it negative.
+#:
+#: ``compute_allocation`` does NOT refuse either -- it CLAMPS, through
+#: ``clamp_unallocated_pct``, and that is exactly why this has to block. A clamped
+#: reserve solves a different plan from the one the user asked for and says nothing
+#: about having done so: a -20 silently becomes 0 and deploys the whole book. This
+#: is where it is caught, where the message can name the value and the user can see
+#: which box.
+#:
+#: ``{pct:g}``, never ``{pct:.2f}``. This validator has NO tolerance -- 100.005 is
+#: out of range -- and at two decimals the message read "unallocated 100.00% is
+#: outside 0-100%", a sentence that refutes itself by rounding the evidence into
+#: the legal range. ``g`` prints the digits that are there and no more: 140, -5,
+#: 100.005.
+#:
+#: "undeployed", not "held as cash": the reserve is a share of a base that INCLUDES
+#: buying power, so what it holds back is money the plan does not put to work --
+#: which on a margin account is not a cash balance.
 ERROR_UNALLOCATED_RANGE_FMT = (
-    "unallocated {pct:.2f}% is outside 0-100% - it is the share of the base to "
-    "hold as cash")
+    "unallocated {pct:g}% is outside 0-100% - it is the share of the base to leave "
+    "undeployed")
 ERROR_LABEL_NEGATIVE_FMT = "label '{label}' has a negative target ({pct:.2f}%)"
 ERROR_LABEL_DUPLICATE_FMT = "duplicate label '{label}'"
 ERROR_LABEL_NO_SYMBOLS_FMT = "label '{label}' has target {pct:.2f}% but no symbols"
@@ -1201,13 +1217,17 @@ def validate_unallocated_pct(unallocated_pct: float) -> List[str]:
 
     NO TOLERANCE, unlike the label totals: those are a SUM of several boxes and
     2dp rounding can legitimately land a hair off 100, while this is one number the
-    user typed. 100.005 here is simply out of range.
+    user typed. 100.005 here is simply out of range -- and the message says
+    "100.005", not a "100.00" rounded back into the range it is being refused for.
 
-    Both bounds BLOCK. Above 100 the investable base goes negative and
-    ``compute_allocation`` raises; below 0 it exceeds the base, which would size
-    every target against money the account does not have -- the buying-power
-    scaler would then quietly shrink the whole plan and nothing on screen would
-    say why.
+    Both bounds BLOCK, and the reason is NOT that the engine would raise --
+    ``compute_allocation`` clamps (``clamp_unallocated_pct``) and solves happily.
+    That is the problem. A -20 clamps to 0 and deploys the entire book; a 120
+    clamps to 100 and liquidates it. Either way the plan the user reviews is not
+    the plan they described, the number they typed is nowhere on screen, and
+    nothing says a substitution happened. The clamp is a floor under the
+    arithmetic; this is the thing that keeps the user's intent and the plan the
+    same object.
 
     Returns:
         List[str]: EMPTY means the reserve is usable.
@@ -2405,9 +2425,19 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
                                  else round(projected_market, 2)),
             "residual_notional": (None if projected is None
                                   else round(row.target_notional - projected, 2)),
-            # The weight the user TYPED and the weight the plan will really use. They
+            # The weight the plan ASKED for and the weight it will really use. They
             # differ whenever the grid, a bump or redistribution moved the row, and
             # showing both is what makes moving it acceptable.
+            #
+            # NOT "the weight the user typed", which it stopped being the moment the
+            # reserve became a stored number: what the user typed is a RELATIVE
+            # weight on the investable remainder, and both of these divide the GROSS
+            # ``base_notional``, so under a 10% reserve a symbol typed at 50% shows
+            # 45%. Deliberate, and the denominator is pinned. ``projected_weight_pct``
+            # beside it is a realised post-trade HOLDING with no relative reading at
+            # all, so the pair only means "asked -> actual" if both divide the same
+            # thing -- and the reserve chip, ``bp_usage_pct`` and ``residual_pct`` on
+            # the same screen are all shares of the base too.
             "weight_pct": round(row.target_notional / base * 100.0, 3) if base > 0 else 0.0,
             "projected_weight_pct": (round(projected / base * 100.0, 3)
                                      if base > 0 and projected is not None else 0.0),
@@ -3345,6 +3375,10 @@ def no_order_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
     Selected by ``unmet_notional``, so the reason strings never have to be
     pattern-matched: whatever zeroed the row -- the bump bound, the tradeable grid,
     the broker minimum, buying-power scaling, a precheck rejection -- set that field.
+
+    ``weight_pct`` divides the GROSS ``base_notional``, exactly as ``dry_run_rows``
+    does: this sits under the same column heading and must not answer a different
+    question from the row it is explaining.
     """
     mode = plan.valuation_mode
     basis = plan.allocation_basis

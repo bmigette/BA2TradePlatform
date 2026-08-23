@@ -2412,9 +2412,9 @@ def test_investable_notional_is_the_base_less_the_reserve():
 
 def test_investable_notional_clamps_a_nonsense_reserve_rather_than_inverting_the_base():
     """A negative reserve would INFLATE the base into money the account does not
-    have, and a reserve above 100 would make it negative -- which
-    ``compute_allocation`` refuses outright. The validator blocks both before a
-    plan is solved; this is the arithmetic refusing to produce a monster anyway."""
+    have, and a reserve above 100 would make it negative. The validator blocks both
+    before a plan is ever solved; this is the arithmetic refusing to produce a
+    monster anyway if one gets through."""
     assert pa.investable_notional(10_000.0, -25.0) == pytest.approx(10_000.0)
     assert pa.investable_notional(10_000.0, 175.0) == pytest.approx(0.0)
 
@@ -2734,7 +2734,7 @@ def test_a_label_total_below_one_hundred_is_a_hard_ERROR_again():
 
     assert messages == [pa.ERROR_LABEL_UNDER_FMT.format(total=60.0, under=40.0)]
     assert messages == ["label targets total 60.00% - under 100% by 40.00%. "
-                        "Use the Unallocated box to hold cash."]
+                        "Use the Unallocated box to hold money back."]
     assert pa.blocking_messages(messages) == messages
 
 
@@ -2772,11 +2772,41 @@ def test_a_negative_reserve_is_refused():
 
 
 def test_a_reserve_above_one_hundred_is_refused():
-    """Above 100 the investable base goes NEGATIVE, which ``compute_allocation``
-    refuses outright -- so it is caught here, where the user can see which box."""
+    """Above 100 the investable base would go NEGATIVE, so ``compute_allocation``
+    CLAMPS it to 100 and liquidates the book instead -- silently, and not the plan
+    the user described. Caught here, where the user can see which box."""
     messages = pa.validate_unallocated_pct(120.0)
     assert messages == [pa.ERROR_UNALLOCATED_RANGE_FMT.format(pct=120.0)]
     assert pa.blocking_messages(messages) == messages
+
+
+def test_the_range_error_does_not_ROUND_the_offending_value_into_range():
+    """It quotes the number back at the user, so it must quote the real one.
+
+    ``validate_unallocated_pct`` has no tolerance on purpose -- 100.005 is out of
+    range -- and at ``{pct:.2f}`` the message read "unallocated 100.00% is outside
+    0-100%", which is a sentence that refutes itself and leaves the user retyping
+    the value they already have. The rejection and the evidence for it have to be
+    the same number.
+    """
+    message = pa.validate_unallocated_pct(100.005)[0]
+
+    assert "100.005" in message, message
+    assert "100.00%" not in message, message
+
+
+def test_the_range_error_still_reads_naturally_for_the_ordinary_typo():
+    """The digits that ARE there, and no invented ones: 140, not 140.00 and not
+    140.000000000001."""
+    assert "140%" in pa.validate_unallocated_pct(140.0)[0]
+    assert "-5%" in pa.validate_unallocated_pct(-5.0)[0]
+
+
+def test_the_range_error_does_not_promise_cash_either():
+    """Same correction as the reserve captions: the reserve is a share of a base
+    that INCLUDES buying power, so what it holds back is undeployed money and not
+    necessarily a cash balance."""
+    assert "cash" not in pa.validate_unallocated_pct(120.0)[0].lower()
 
 
 def test_the_wizard_gate_checks_the_reserve_alongside_the_labels():

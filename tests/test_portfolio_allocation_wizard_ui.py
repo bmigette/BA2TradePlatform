@@ -800,7 +800,7 @@ def test_the_shortfall_message_points_at_the_box_that_does_want_a_number(
         _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(30.0)
         messages = _rendered_texts(steps._errors_container)
 
-    assert any("Use the Unallocated box to hold cash." in t for t in messages), messages
+    assert any("Use the Unallocated box to hold money back." in t for t in messages), messages
 
 
 def test_both_sides_of_the_label_total_rule_are_drawn_as_errors(nicegui_client):
