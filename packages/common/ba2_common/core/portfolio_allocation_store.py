@@ -273,14 +273,25 @@ def save_allocation_targets(account_id: int, labels, *,
     last chose, and the fractional switch has been persisted from exactly that
     point since it shipped (``remember_fractional_choice``).
 
-    **A SEPARATE WRITER, deliberately.** ``set_managed_label`` and
-    ``set_symbol_weight`` are untouched by this and must stay that way. The
-    comment-save path (``ui/pages/portfolio_allocation.py::_write_symbol_comment``)
-    re-writes ``weight_pct`` on EVERY debounced keystroke -- on purpose, because a
-    bare ``comment=`` write would create the row at the model default of 0.0 and the
-    engine reads 0 as "hold none of this". Anything this function grows later must
-    therefore live HERE and nowhere else; a flag threaded through the shared setters
-    would fire on every comment edit.
+    **A SEPARATE WRITER, deliberately, and this is where the shift lives.** The
+    previous generation -- ``previous_target_pct`` / ``previous_weight_pct``, what
+    the wizard's Load-last button reads -- is written HERE and by nothing else.
+    ``set_managed_label`` and ``set_symbol_weight`` are untouched by this and must
+    stay that way: the comment-save path
+    (``ui/pages/portfolio_allocation.py::_write_symbol_comment``) re-writes
+    ``weight_pct`` on EVERY debounced keystroke -- on purpose, because a bare
+    ``comment=`` write would create the row at the model default of 0.0 and the
+    engine reads 0 as "hold none of this" (the c63d34c bug). A shift threaded
+    through those setters would grind the real previous weight away one character
+    at a time; keeping it here makes that impossible by construction rather than by
+    a flag someone has to remember not to pass.
+
+    **The shift fires only on a CHANGE.** Pressing Continue twice with the same
+    numbers leaves the previous generation exactly where it was: one generation per
+    change, not per click. A row created BY this call keeps ``NULL`` -- there is no
+    value it held before. The first save of an existing row records the 0.0 the
+    label picker created it with, which is a real prior state (the engine reads 0 as
+    "hold none of this"), so NULL is reserved for "never saved through the wizard".
 
     **Never resurrects a label.** ``set_managed_label`` creates the row it cannot
     find, at ``target_pct=0``. A wizard opened before a label was unmanaged (in
@@ -356,15 +367,23 @@ def save_allocation_targets(account_id: int, labels, *,
                     f"future rebalance")
                 continue
             if save_label_targets:
+                if float(label_row.target_pct or 0.0) != target_pct:
+                    label_row.previous_target_pct = float(label_row.target_pct or 0.0)
                 label_row.target_pct = target_pct
                 session.add(label_row)
             written_labels += 1
             for symbol, weight_pct in weights:
                 row = symbol_rows.get((label, symbol))
                 if row is None:
+                    # Brand new row: there is no value it held before, so its
+                    # ``previous_weight_pct`` stays NULL. Recording the even-split
+                    # default it was notionally taking would put a number behind
+                    # Load last that the user never allocated with.
                     row = PortfolioAllocationSymbol(
                         account_id=account_id, label=label, symbol=symbol)
                     symbol_rows[(label, symbol)] = row
+                elif float(row.weight_pct or 0.0) != weight_pct:
+                    row.previous_weight_pct = float(row.weight_pct or 0.0)
                 row.weight_pct = weight_pct
                 session.add(row)
                 written_symbols += 1
@@ -376,6 +395,41 @@ def save_allocation_targets(account_id: int, labels, *,
                 + (f", {skipped} label(s) skipped as unmanaged" if skipped else ""))
     return {"labels": written_labels, "symbols": written_symbols,
             "skipped_labels": skipped}
+
+
+def get_previous_label_targets(account_id: int) -> Dict[str, Optional[float]]:
+    """``{label: previous_target_pct}`` for every managed label. NULL stays ``None``.
+
+    ``None`` means "there is no last" -- this label has never been through
+    ``save_allocation_targets``. It is NOT interchangeable with 0.0, which means the
+    last run allocated nothing to it, and the difference is exactly what the
+    wizard's Load-last button reads to decide whether it has anything to offer.
+
+    Every managed label is present in the result, so a missing key means the label
+    is not managed rather than that it has no history.
+    """
+    return {row.label: row.previous_target_pct
+            for row in get_managed_labels(account_id)}
+
+
+def get_previous_symbol_weights(account_id: int, label: str,
+                                symbols) -> Dict[str, Optional[float]]:
+    """``{symbol: previous_weight_pct}`` for the symbols you ask about.
+
+    The sharp difference from ``get_symbol_weights``: that one FILLS an absent row
+    with the even-split default, because a symbol always has an effective weight.
+    A symbol does not always have a PREVIOUS one, and there is no default for it --
+    computing a plausible number here would put a value behind Load last that the
+    user never allocated with. Absent, or stored with a NULL, both give ``None``.
+
+    Symbols are normalised (.strip().upper()) and de-duplicated, order preserved,
+    exactly as every other reader here does it.
+    """
+    syms = _normalise_symbols(symbols)
+    if not syms:
+        return {}
+    stored = get_symbol_rows(account_id, label)
+    return {s: (stored[s].previous_weight_pct if s in stored else None) for s in syms}
 
 
 def remove_symbol_weight(account_id: int, label: str, symbol: str) -> bool:

@@ -59,12 +59,13 @@ from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
-    compute_label_investment, unconsumed_income_notice,
+    compute_label_investment, current_value, unconsumed_income_notice,
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
-    get_symbol_rows, get_symbol_weights, remove_symbols_from_label, replace_managed_labels,
-    save_allocation_targets, set_allocation_config, set_managed_label, set_symbol_weight,
+    get_previous_symbol_weights, get_symbol_rows, get_symbol_weights,
+    remove_symbols_from_label, replace_managed_labels, save_allocation_targets,
+    set_allocation_config, set_managed_label, set_symbol_weight,
 )
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
@@ -179,9 +180,16 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
     """Everything the wizard needs to OPEN, in one thread hop. Blocking.
 
     Returns:
-        Tuple: ``(base, labels, allow_fractional)`` -- the frozen base snapshot, the
-        managed labels with their symbol weights, and the account's remembered
-        fractional choice.
+        Tuple: ``(base, labels, allow_fractional, symbol_values)`` -- the frozen base
+        snapshot, the managed labels with their symbol weights AND the previous
+        generation of both, the account's remembered fractional choice, and
+        ``{SYMBOL: current value}`` under ``valuation_mode`` for the wizard's
+        read-only "now" captions.
+
+        ``symbol_values`` goes through the engine's own ``current_value`` rather
+        than being re-derived, so the caption beside a target and the base that
+        target divides are measured the same way. It is DISPLAY only -- nothing in
+        it reaches a plan.
 
     Raises:
         PositionFetchFailed: the broker's position fetch failed. NOT a flat account,
@@ -202,16 +210,23 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
     for row in managed:
         members = symbols_by_label.get(row.label, [])
         weights = get_symbol_weights(account_id, row.label, members)
+        # NULL stays None all the way to the dialog: "there is no last" is what
+        # disables the Load-last button, and it is a different fact from 0.0.
+        previous_weights = get_previous_symbol_weights(account_id, row.label, members)
         labels.append(LabelTarget(
             label=row.label, target_pct=float(row.target_pct or 0.0),
-            symbols=[SymbolTarget(symbol=s, weight_pct=float(weights.get(s, 0.0)))
+            symbols=[SymbolTarget(symbol=s, weight_pct=float(weights.get(s, 0.0)),
+                                  previous_weight_pct=previous_weights.get(s))
                      for s in members],
-            comment=row.comment))
+            comment=row.comment,
+            previous_target_pct=row.previous_target_pct))
 
     current = svc.build_position_states(account, symbols)
     base = build_base_snapshot(account.get_account_snapshot(), current, symbols,
                                valuation_mode=valuation_mode)
-    return base, labels, bool(get_allocation_config(account_id).allow_fractional)
+    symbol_values = {s: current_value(current.get(s), valuation_mode) for s in symbols}
+    return (base, labels, bool(get_allocation_config(account_id).allow_fractional),
+            symbol_values)
 
 
 def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: float,
@@ -794,7 +809,7 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
     event loop freezes the app for every connected client.
     """
     try:
-        base, labels, allow_fractional = await asyncio.to_thread(
+        base, labels, allow_fractional, symbol_values = await asyncio.to_thread(
             _load_flow_inputs, account_id, valuation_mode)
     except PositionFetchFailed as e:
         logger.error(f"Portfolio allocation: position fetch failed: {e}")
@@ -938,7 +953,8 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
 
     open_allocation_steps(base, labels, on_dry_run=_on_dry_run,
                           allow_fractional=allow_fractional,
-                          mode=state['mode'], invest_amount=state['amount'])
+                          mode=state['mode'], invest_amount=state['amount'],
+                          symbol_values=symbol_values)
 
 
 async def _open_invest_flow(account_id: int, valuation_mode: str, amount: float,

@@ -6,6 +6,7 @@ by a bare `pytest`.
 """
 import pytest
 
+from ba2_common.core import portfolio_allocation as pa
 from ba2_common.core.account_types import AccountSnapshot, MarginInfo
 from ba2_common.core.portfolio_allocation import (
     ACTION_ADJUST,
@@ -519,6 +520,144 @@ def test_even_split_targets_passes_its_own_output_to_the_validator():
     labels = [LabelTarget(name, 0.0, [SymbolTarget(name * 3, 100.0)])
               for name in ("A", "B", "C")]
     assert steps_validation_messages(even_split_targets(labels)) == []
+
+
+# ---------------------------------------------------------------------------
+# W2: "Load last" -- one generation of what the user allocated with before.
+# Pure carriers on the two dataclasses; the solvers must ignore them.
+# ---------------------------------------------------------------------------
+
+
+def test_a_label_target_carries_no_previous_target_by_default():
+    """NULL, not 0.0: "there is no last" and "last time this got nothing" are
+    different answers, and only the first disables the button."""
+    assert LabelTarget("A", 10.0).previous_target_pct is None
+    assert SymbolTarget("AAA", 10.0).previous_weight_pct is None
+
+
+def test_the_solvers_ignore_the_previous_fields_entirely():
+    """Pure carriers. If a previous target could reach the arithmetic, a Load-last
+    button would change a plan just by being available."""
+    current = {"AAA": PositionState(symbol="AAA", quantity=0.0, cost_basis=0.0,
+                                    price=10.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+
+    def _plan(previous):
+        labels = [LabelTarget("A", 100.0,
+                              [SymbolTarget("AAA", 100.0, previous_weight_pct=previous)],
+                              )]
+        labels[0].previous_target_pct = previous
+        return compute_allocation(1_000.0, 1_000.0, labels, current, margin,
+                                  allow_fractional=False, default_bp_factor=1.0,
+                                  valuation_mode=VALUATION_MODE_MARKET)
+
+    assert _plan(None).to_dict() == _plan(3.0).to_dict()
+
+
+def test_load_previous_targets_restores_the_percentages_of_the_last_run():
+    labels = [LabelTarget("A", 70.0, previous_target_pct=60.0),
+              LabelTarget("B", 30.0, previous_target_pct=40.0)]
+
+    out = pa.load_previous_targets(labels)
+
+    assert [t.target_pct for t in out] == [60.0, 40.0]
+    # The originals are not mutated -- the dialog can still cancel.
+    assert [t.target_pct for t in labels] == [70.0, 30.0]
+
+
+def test_load_previous_targets_leaves_a_label_with_no_history_where_it_is():
+    """A partial history is the normal state -- a label added yesterday has none.
+    Zeroing it would silently unallocate a real basket."""
+    labels = [LabelTarget("A", 70.0, previous_target_pct=60.0),
+              LabelTarget("B", 30.0)]
+
+    out = pa.load_previous_targets(labels)
+
+    assert [t.target_pct for t in out] == [60.0, 30.0]
+
+
+def test_load_previous_targets_restores_a_previous_zero():
+    """0.0 is a real prior state, so it must survive the ``is not None`` test that
+    a truthiness check would swallow."""
+    out = pa.load_previous_targets([LabelTarget("A", 70.0, previous_target_pct=0.0)])
+    assert out[0].target_pct == 0.0
+
+
+def test_load_previous_targets_keeps_the_history_so_the_button_stays_usable():
+    out = pa.load_previous_targets([LabelTarget("A", 70.0, previous_target_pct=60.0)])
+    assert out[0].previous_target_pct == 60.0
+
+
+def test_load_previous_targets_gives_each_copy_its_own_symbol_list():
+    labels = [LabelTarget("A", 70.0, [SymbolTarget("AAA", 100.0)],
+                          previous_target_pct=60.0)]
+    out = pa.load_previous_targets(labels)
+    out[0].symbols.append(SymbolTarget("BBB", 0.0))
+    assert [st.symbol for st in labels[0].symbols] == ["AAA"]
+
+
+def test_load_previous_targets_of_nothing_is_empty():
+    assert pa.load_previous_targets([]) == []
+    assert pa.load_previous_targets(None) == []
+
+
+def test_has_previous_targets_is_the_buttons_enabled_state():
+    assert pa.has_previous_targets([LabelTarget("A", 10.0)]) is False
+    assert pa.has_previous_targets([LabelTarget("A", 10.0, previous_target_pct=0.0)]) is True
+    assert pa.has_previous_targets([]) is False
+    assert pa.has_previous_targets(None) is False
+
+
+def test_load_previous_symbol_weights_restores_one_labels_weights():
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("AAA", 80.0, previous_weight_pct=30.0),
+        SymbolTarget("BBB", 20.0, previous_weight_pct=70.0)])
+
+    out = pa.load_previous_symbol_weights(label)
+
+    assert [(st.symbol, st.weight_pct) for st in out.symbols] == [("AAA", 30.0),
+                                                                  ("BBB", 70.0)]
+    # The original label object the dialog is editing is untouched.
+    assert [st.weight_pct for st in label.symbols] == [80.0, 20.0]
+
+
+def test_load_previous_symbol_weights_leaves_a_symbol_with_no_history_alone():
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("AAA", 80.0, previous_weight_pct=30.0),
+        SymbolTarget("BBB", 20.0)])
+
+    out = pa.load_previous_symbol_weights(label)
+
+    assert [st.weight_pct for st in out.symbols] == [30.0, 20.0]
+
+
+def test_load_previous_symbol_weights_keeps_the_labels_own_target():
+    label = LabelTarget("A", 42.0, [SymbolTarget("AAA", 80.0, previous_weight_pct=30.0)],
+                        previous_target_pct=11.0)
+    out = pa.load_previous_symbol_weights(label)
+    assert out.target_pct == 42.0
+    assert out.previous_target_pct == 11.0
+
+
+def test_load_previous_symbol_weights_of_an_empty_label_is_an_empty_label():
+    out = pa.load_previous_symbol_weights(LabelTarget("A", 100.0))
+    assert out.symbols == []
+
+
+def test_has_previous_symbol_weights_is_the_per_label_buttons_enabled_state():
+    assert pa.has_previous_symbol_weights(LabelTarget("A", 100.0)) is False
+    assert pa.has_previous_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 80.0)])) is False
+    assert pa.has_previous_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 80.0, previous_weight_pct=0.0)])) is True
+
+
+def test_load_previous_targets_output_still_passes_the_validator():
+    """Whatever was last SAVED was last allocated with, so restoring it must not
+    produce a set the wizard then refuses."""
+    labels = [LabelTarget("A", 10.0, [SymbolTarget("AAA", 100.0)], previous_target_pct=60.0),
+              LabelTarget("B", 10.0, [SymbolTarget("BBB", 100.0)], previous_target_pct=40.0)]
+    assert steps_validation_messages(pa.load_previous_targets(labels)) == []
 
 
 def test_steps_validation_reports_the_label_total_and_the_symbol_totals():

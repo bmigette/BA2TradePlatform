@@ -47,6 +47,8 @@ __all__ = [
     "held_symbols_without_price", "held_no_price_block", "ERROR_HELD_NO_PRICE_FMT",
     "dry_run_rows", "filter_plan_rows", "summarise_plan", "DRY_RUN_QUANTITY_DECIMALS",
     "even_split_targets", "steps_validation_messages", "validate_invest_amount",
+    "load_previous_targets", "has_previous_targets",
+    "load_previous_symbol_weights", "has_previous_symbol_weights",
     "invest_validation_messages", "is_blocking_message", "blocking_messages",
     "ERROR_INVEST_AMOUNT_FMT", "ERROR_INVEST_NO_LABEL", "ERROR_INVEST_LABEL_EMPTY_FMT",
     "WARNING_INVEST_EXCEEDS_BP_FMT", "ADVISORY_MESSAGE_FRAGMENTS",
@@ -375,10 +377,18 @@ class PositionState:
 
 @dataclass
 class SymbolTarget:
-    """A symbol's weight WITHIN one label. ``weight_pct`` is 1-100, not 0-1."""
+    """A symbol's weight WITHIN one label. ``weight_pct`` is 1-100, not 0-1.
+
+    ``previous_weight_pct`` is a PURE CARRIER for the wizard's per-label "Load
+    last" button -- the weight this symbol ran with before the current one, from
+    ``portfolio_allocation_symbol.previous_weight_pct``. No solver reads it, and no
+    solver may: a button that changes a plan merely by being available is not a
+    button. ``None`` means there is no last, which is a different fact from 0.0.
+    """
     symbol: str
     weight_pct: float
     comment: Optional[str] = None
+    previous_weight_pct: Optional[float] = None
 
 
 @dataclass
@@ -386,14 +396,20 @@ class LabelTarget:
     """A managed label and its share of the base notional.
 
     ``target_pct`` is 1-100 of ``base_notional``. Across all managed labels of an
-    account it must total exactly 100 before a REBALANCE may be submitted. An
-    empty ``symbols`` list cannot absorb its percentage: the engine allocates it
-    nothing and adds ``target_pct`` to ``AllocationPlan.unallocatable_pct``.
+    account it must total no MORE than 100 before a REBALANCE may be submitted; the
+    remainder is deliberate free buying power. An empty ``symbols`` list cannot
+    absorb its percentage: the engine allocates it nothing and adds ``target_pct``
+    to ``AllocationPlan.unallocatable_pct``.
+
+    ``previous_target_pct`` is a PURE CARRIER for the wizard's "Load last" button,
+    on the same terms as ``SymbolTarget.previous_weight_pct``: read by the UI,
+    ignored by every solver, and ``None`` rather than 0.0 when there is no last.
     """
     label: str
     target_pct: float
     symbols: List[SymbolTarget] = field(default_factory=list)
     comment: Optional[str] = None
+    previous_target_pct: Optional[float] = None
 
 
 @dataclass
@@ -2224,8 +2240,74 @@ def even_split_targets(labels: List[LabelTarget]) -> List[LabelTarget]:
     if not items:
         return []
     return [LabelTarget(label=lt.label, target_pct=pct, symbols=list(lt.symbols),
-                        comment=lt.comment)
+                        comment=lt.comment,
+                        previous_target_pct=lt.previous_target_pct)
             for lt, pct in zip(items, even_split_pct(len(items)))]
+
+
+def has_previous_targets(labels: Optional[List[LabelTarget]]) -> bool:
+    """True when ANY label has a previous target -- the Load-last button's state.
+
+    Tested with ``is not None`` and never for truthiness: a previous target of 0.0
+    is a real prior state (the engine reads 0 as "hold none of this") and a button
+    that refuses to restore it would be refusing to undo the user's last change.
+    """
+    return any(lt.previous_target_pct is not None for lt in (labels or []))
+
+
+def load_previous_targets(labels: Optional[List[LabelTarget]]) -> List[LabelTarget]:
+    """The "Load last" button: restore the percentages the last run used. Pure.
+
+    The mirror of ``even_split_targets``, and it copies on exactly the same terms:
+    NEW ``LabelTarget`` objects with their own symbol LISTS (the ``SymbolTarget``
+    objects are shared), so the caller can still cancel out of the dialog without
+    having mutated its inputs.
+
+    A label with NO history keeps the target it already has. A partial history is
+    the ORDINARY state -- a label added yesterday has none -- and zeroing those
+    would silently unallocate a real basket the moment the button was pressed.
+
+    ``previous_target_pct`` is carried across unchanged, so the button stays usable
+    and pressing it twice is idempotent rather than self-erasing.
+    """
+    items = list(labels or [])
+    if not items:
+        return []
+    return [LabelTarget(
+        label=lt.label,
+        target_pct=(lt.target_pct if lt.previous_target_pct is None
+                    else float(lt.previous_target_pct)),
+        symbols=list(lt.symbols), comment=lt.comment,
+        previous_target_pct=lt.previous_target_pct) for lt in items]
+
+
+def has_previous_symbol_weights(label: Optional[LabelTarget]) -> bool:
+    """True when ANY symbol in this label has a previous weight. Per-label button."""
+    if label is None:
+        return False
+    return any(st.previous_weight_pct is not None for st in (label.symbols or []))
+
+
+def load_previous_symbol_weights(label: LabelTarget) -> LabelTarget:
+    """The per-label "Load last": restore ONE label's symbol weights. Pure.
+
+    Returns a NEW ``LabelTarget`` with NEW ``SymbolTarget`` objects -- unlike
+    ``load_previous_targets``, which shares them, because this is the function that
+    changes them. The label's own ``target_pct`` is untouched: step 2 is about
+    weights WITHIN a label and must not silently move the label itself.
+
+    A symbol with no history keeps the weight it already has, for the same reason a
+    label with no history does.
+    """
+    return LabelTarget(
+        label=label.label, target_pct=label.target_pct, comment=label.comment,
+        previous_target_pct=label.previous_target_pct,
+        symbols=[SymbolTarget(
+            symbol=st.symbol,
+            weight_pct=(st.weight_pct if st.previous_weight_pct is None
+                        else float(st.previous_weight_pct)),
+            comment=st.comment, previous_weight_pct=st.previous_weight_pct)
+            for st in (label.symbols or [])])
 
 
 def steps_validation_messages(labels: List[LabelTarget], *,

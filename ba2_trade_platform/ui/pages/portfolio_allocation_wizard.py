@@ -49,7 +49,11 @@ from ...core.portfolio_allocation import (
     even_split_targets,
     filter_plan_rows,
     fractional_summary,
+    has_previous_symbol_weights,
+    has_previous_targets,
     held_no_price_block,
+    load_previous_symbol_weights,
+    load_previous_targets,
     invest_validation_messages,
     is_blocking_message,
     no_order_notice,
@@ -179,6 +183,35 @@ MARKER_WORKING_ORDERS = 'income-working-orders'
 #: Markers on the step 1 / step 2 percentage boxes, in label then symbol order.
 MARKER_LABEL_PCT = 'steps-label-pct'
 MARKER_SYMBOL_PCT = 'steps-symbol-pct'
+
+#: Markers on the step 1 / step 2 "Load last" buttons. Buttons, not labels, so the
+#: tests locate them by marker AND by type -- 'Load last' is short enough to collide
+#: with free text, and the per-label copies are indistinguishable by caption.
+MARKER_LOAD_LAST = 'steps-load-last'
+MARKER_LOAD_LAST_SYMBOLS = 'steps-load-last-symbols'
+
+#: Markers on the read-only "now / last" captions beside each percentage box.
+#: ``ui.label``, deliberately NOT a second marked ``ui.number``: the landed suite
+#: indexes positionally into MARKER_LABEL_PCT / MARKER_SYMBOL_PCT, so an extra
+#: numeric widget under either would silently retarget those assertions instead of
+#: failing.
+MARKER_LABEL_CURRENT = 'steps-label-current'
+MARKER_SYMBOL_CURRENT = 'steps-symbol-current'
+
+#: Drawn where a percentage would be when there is no last. A dash, never 0.00%:
+#: "this has never run" and "last time this got nothing" are different facts, and
+#: 0.00% is a legitimate value of the second.
+NO_PREVIOUS_MARK = '-'
+
+#: Step 1's caption. The percentage is a share of BASE NOTIONAL -- the same
+#: denominator the target box divides -- and says so, because the page's own label
+#: header used to print "% of managed" immediately beside "target %" and the two
+#: are not comparable whenever buying power is non-zero.
+LABEL_CURRENT_FMT = 'now {value:,.2f} ({pct:.2f}% of base) · last {previous}'
+
+#: Step 2's caption. No "% of base" here: step 2's numbers are shares of the
+#: LABEL, and mixing the two denominators in one line is the defect above.
+SYMBOL_CURRENT_FMT = 'now {value:,.2f} · last {previous}'
 
 #: Marker on the steps dialog's "Continue saves your targets" note. By marker: the
 #: sentence names Cancel, and 'Cancel' is also the label of the button beside it.
@@ -879,16 +912,28 @@ class AllocationSteps:
                  on_dry_run: Callable[..., None],
                  allow_fractional: bool,
                  mode: str = ALLOCATION_MODE_REBALANCE,
-                 invest_amount: float = 0.0):
+                 invest_amount: float = 0.0,
+                 symbol_values: Optional[Dict[str, float]] = None):
         self.base = base
+        # The deep copy carries ``previous_*`` across UNCHANGED. They are what the
+        # Load-last buttons read, and a copy that dropped them would disable the
+        # feature silently on every open.
         self.labels = [LabelTarget(label=lt.label, target_pct=lt.target_pct,
-                                   symbols=[SymbolTarget(st.symbol, st.weight_pct, st.comment)
+                                   symbols=[SymbolTarget(st.symbol, st.weight_pct,
+                                                         st.comment,
+                                                         st.previous_weight_pct)
                                             for st in lt.symbols],
-                                   comment=lt.comment)
+                                   comment=lt.comment,
+                                   previous_target_pct=lt.previous_target_pct)
                        for lt in labels or []]
         self.on_dry_run = on_dry_run
         self.mode = mode
         self.invest_amount = float(invest_amount or 0.0)
+        #: ``{SYMBOL: current value}`` under the account's valuation mode, for the
+        #: read-only "now" captions. ``{}`` when the caller did not supply it, which
+        #: draws 0.00 rather than guessing -- these are display-only and touch no
+        #: target, so a missing map costs a caption and never a number that trades.
+        self.symbol_values = dict(symbol_values or {})
         # The account's REMEMBERED choice (defaults ON), still vetoed by a broker
         # that cannot do fractional at all. Per-symbol eligibility is the engine's
         # job -- MarginInfo.fractionable -- not this switch's.
@@ -899,6 +944,9 @@ class AllocationSteps:
         self._continue_button = None
         self._fractional_switch = None
         self._labels_container = None
+        #: ``{label: column}`` for step 2, so a per-label Load last can redraw just
+        #: that expansion's boxes.
+        self._symbol_containers = {}
 
     def open(self):
         title = ('Rebalance - set targets' if self.mode == ALLOCATION_MODE_REBALANCE
@@ -929,9 +977,32 @@ class AllocationSteps:
     def _render_step1_label_targets(self):
         ui.label('1. Label targets (% of the base notional, must total 100%)') \
             .classes('text-lg font-bold mt-2')
-        ui.button('Even split', icon='balance', on_click=self._even_split).props('outline dense')
+        with ui.row().classes('items-center gap-2'):
+            ui.button('Even split', icon='balance',
+                      on_click=self._even_split).props('outline dense')
+            # DISABLED, not hidden, when there is no last: the user has to be able
+            # to see the feature exists and learn that this account has never run.
+            last = ui.button('Load last', icon='history',
+                             on_click=self._load_last).props('outline dense') \
+                .mark(MARKER_LOAD_LAST)
+            last.set_enabled(has_previous_targets(self.labels))
         self._labels_container = ui.column().classes('w-full gap-1')
         self._draw_label_targets()
+
+    def _label_current_caption(self, lt: LabelTarget) -> str:
+        """The read-only "now X (Y% of base) · last Z%" beside a label's target box.
+
+        The percentage is a share of ``base_notional`` -- the SAME denominator the
+        target box divides -- so the two numbers on this line are comparable. Mixing
+        "% of managed" with "% of base" is exactly the defect the page's own label
+        header carried.
+        """
+        value = sum(self.symbol_values.get(st.symbol, 0.0) for st in lt.symbols)
+        base = float(self.base.base_notional or 0.0)
+        previous = (NO_PREVIOUS_MARK if lt.previous_target_pct is None
+                    else f'{float(lt.previous_target_pct):.2f}%')
+        return LABEL_CURRENT_FMT.format(
+            value=value, pct=(value / base * 100.0) if base else 0.0, previous=previous)
 
     def _draw_label_targets(self):
         self._labels_container.clear()
@@ -944,22 +1015,47 @@ class AllocationSteps:
                     ui.number(value=lt.target_pct, min=0, max=100, step=0.01, suffix='%',
                               on_change=lambda e, t=lt: self._set_label_pct(t, e.value)
                               ).props('dense outlined').classes('w-32').mark(MARKER_LABEL_PCT)
+                    ui.label(self._label_current_caption(lt)) \
+                        .classes('text-xs text-secondary-custom').mark(MARKER_LABEL_CURRENT)
+
+    def _symbol_current_caption(self, st: SymbolTarget) -> str:
+        previous = (NO_PREVIOUS_MARK if st.previous_weight_pct is None
+                    else f'{float(st.previous_weight_pct):.2f}%')
+        return SYMBOL_CURRENT_FMT.format(
+            value=self.symbol_values.get(st.symbol, 0.0), previous=previous)
 
     def _render_step2_symbol_weights(self):
         ui.label('2. Symbol weights within each label (each label must total 100%)') \
             .classes('text-lg font-bold mt-4')
+        self._symbol_containers = {}
         for lt in self.labels:
             with ui.expansion(f'{lt.label} - {len(lt.symbols)} symbol(s)').classes('w-full'):
+                last = ui.button('Load last', icon='history',
+                                 on_click=lambda _e=None, t=lt: self._load_last_symbols(t)
+                                 ).props('outline dense').mark(MARKER_LOAD_LAST_SYMBOLS)
+                last.set_enabled(has_previous_symbol_weights(lt))
                 if not lt.symbols:
                     ui.label('No symbols carry this label - it can absorb no allocation.') \
                         .classes('text-xs text-orange-400')
                     continue
-                for st in lt.symbols:
-                    with ui.row().classes('w-full items-center gap-3'):
-                        ui.label(st.symbol).classes('w-32')
-                        ui.number(value=st.weight_pct, min=0, max=100, step=0.01, suffix='%',
-                                  on_change=lambda e, t=st: self._set_symbol_pct(t, e.value)
-                                  ).props('dense outlined').classes('w-32').mark(MARKER_SYMBOL_PCT)
+                container = ui.column().classes('w-full gap-1')
+                self._symbol_containers[lt.label] = container
+                self._draw_symbol_weights(lt)
+
+    def _draw_symbol_weights(self, lt: LabelTarget):
+        container = self._symbol_containers.get(lt.label)
+        if container is None:
+            return
+        container.clear()
+        with container:
+            for st in lt.symbols:
+                with ui.row().classes('w-full items-center gap-3'):
+                    ui.label(st.symbol).classes('w-32')
+                    ui.number(value=st.weight_pct, min=0, max=100, step=0.01, suffix='%',
+                              on_change=lambda e, t=st: self._set_symbol_pct(t, e.value)
+                              ).props('dense outlined').classes('w-32').mark(MARKER_SYMBOL_PCT)
+                    ui.label(self._symbol_current_caption(st)) \
+                        .classes('text-xs text-secondary-custom').mark(MARKER_SYMBOL_CURRENT)
 
     def _render_invest_scope(self):
         ui.label('1. Which label, and how much').classes('text-lg font-bold mt-2')
@@ -995,6 +1091,30 @@ class AllocationSteps:
         for edited, fresh in zip(self.labels, even_split_targets(self.labels)):
             edited.target_pct = fresh.target_pct
         self._draw_label_targets()
+        self._revalidate()
+
+    def _load_last(self):
+        """Restore the label percentages the last run used.
+
+        Assigns onto the objects the dialog is already editing and then REDRAWS, for
+        the same reason ``_even_split`` does: a ``ui.number`` does not follow the
+        object it was built from, so a silent model change would leave the user
+        typing over numbers that are no longer what Continue will submit.
+
+        A label with no history keeps the target it has -- ``load_previous_targets``
+        owns that rule, so this and the button's enabled state cannot disagree.
+        """
+        for edited, fresh in zip(self.labels, load_previous_targets(self.labels)):
+            edited.target_pct = fresh.target_pct
+        self._draw_label_targets()
+        self._revalidate()
+
+    def _load_last_symbols(self, lt: LabelTarget):
+        """Restore ONE label's symbol weights. The label's own target does not move:
+        step 2 is about shares WITHIN a label."""
+        for edited, fresh in zip(lt.symbols, load_previous_symbol_weights(lt).symbols):
+            edited.weight_pct = fresh.weight_pct
+        self._draw_symbol_weights(lt)
         self._revalidate()
 
     def _set_label_pct(self, target: LabelTarget, value):
@@ -1060,7 +1180,9 @@ def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
                           on_dry_run: Callable[..., None],
                           allow_fractional: bool,
                           mode: str = ALLOCATION_MODE_REBALANCE,
-                          invest_amount: float = 0.0) -> AllocationSteps:
+                          invest_amount: float = 0.0,
+                          symbol_values: Optional[Dict[str, float]] = None
+                          ) -> AllocationSteps:
     """Open steps 1-3. ``on_dry_run`` is called with keyword arguments
     ``mode``, ``labels``, ``scope_label``, ``amount`` and ``allow_fractional``.
 
@@ -1071,7 +1193,7 @@ def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
     would silently re-answer a question the account has already answered."""
     steps = AllocationSteps(base, labels, on_dry_run=on_dry_run,
                             allow_fractional=allow_fractional, mode=mode,
-                            invest_amount=invest_amount)
+                            invest_amount=invest_amount, symbol_values=symbol_values)
     steps.open()
     return steps
 

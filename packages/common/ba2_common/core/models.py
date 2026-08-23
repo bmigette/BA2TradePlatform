@@ -871,8 +871,16 @@ class PortfolioAllocationLabel(SQLModel, table=True):
 
     The row's EXISTENCE is the "managed" flag, so label selection needs no
     separate table -- deleting the row unmanages the label. ``target_pct`` is
-    1-100 and, summed across all rows of one account, must equal exactly 100
-    before a REBALANCE run may be submitted.
+    1-100 and, summed across all rows of one account, must total no more than 100
+    before a REBALANCE run may be submitted; what is left over is deliberate free
+    buying power.
+
+    ``previous_target_pct`` is the target this label RAN WITH before the current
+    one -- one generation, shifted by ``save_allocation_targets`` and by nothing
+    else. It is NULLABLE and is never back-filled: NULL means "there is no last",
+    which is a different answer from a stored 0.0 ("the last run allocated nothing
+    to this"), and it is what makes the wizard's Load-last button's disabled state
+    a fact rather than a guess.
     """
     __tablename__ = "portfolio_allocation_label"
     __table_args__ = (
@@ -883,6 +891,7 @@ class PortfolioAllocationLabel(SQLModel, table=True):
     account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True)
     label: str = Field(index=True, description="Instrument label being managed (e.g. 'ARK26')")
     target_pct: float = Field(default=0.0, description="Target % of the base notional (1-100)")
+    previous_target_pct: float | None = Field(default=None, description="The target this label ran with before the current one; None means there is no last")
     sort_order: int = Field(default=0, description="Display order of the label expansion on the page")
     comment: str | None = Field(default=None, description="Free-text note shown on the label header")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
@@ -895,6 +904,14 @@ class PortfolioAllocationSymbol(SQLModel, table=True):
     absence is meaningful and must never be backfilled for every symbol. A symbol
     may legitimately appear under several labels (its targets then SUM; the page
     shows a warning icon).
+
+    ``previous_weight_pct`` is the weight this symbol RAN WITH before the current
+    one, shifted only by ``save_allocation_targets``. NULLABLE and never
+    back-filled, for the same reason as ``PortfolioAllocationLabel``: NULL is "there
+    is no last", 0.0 is "last time this got nothing". Emphatically NOT written by
+    ``set_symbol_weight`` -- the comment-save path re-writes ``weight_pct`` on every
+    debounced keystroke, so a shift there would destroy the real previous weight
+    one character at a time.
     """
     __tablename__ = "portfolio_allocation_symbol"
     __table_args__ = (
@@ -907,6 +924,7 @@ class PortfolioAllocationSymbol(SQLModel, table=True):
     label: str = Field(index=True)
     symbol: str = Field(index=True, description="Normalised (.strip().upper()) instrument symbol")
     weight_pct: float = Field(default=0.0, description="Weight % WITHIN the label (1-100)")
+    previous_weight_pct: float | None = Field(default=None, description="The weight this symbol ran with before the current one; None means there is no last")
     comment: str | None = Field(default=None, description="Free-text note shown on the symbol row")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 

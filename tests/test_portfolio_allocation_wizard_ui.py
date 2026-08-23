@@ -1845,3 +1845,160 @@ def test_the_steps_docstring_no_longer_promises_that_nothing_is_written():
     doc = wiz.AllocationSteps.__doc__
     assert 'Nothing is written here' not in doc
     assert 'Continue' in doc
+
+
+# ---------------------------------------------------------------------------
+# W2: "Load last", and CURRENT next to TARGET.
+#
+# Every new widget here is a ``ui.label``, never a second marked ``ui.number``.
+# The tests above index positionally into ``_numbers(..., MARKER_LABEL_PCT)`` and
+# ``MARKER_SYMBOL_PCT``, so an extra number under either marker would silently
+# retarget them rather than fail.
+# ---------------------------------------------------------------------------
+
+def _labels_with_history():
+    return [
+        LabelTarget("Growth", 70.0,
+                    [SymbolTarget("AAPL", 60.0, previous_weight_pct=50.0),
+                     SymbolTarget("MSFT", 40.0, previous_weight_pct=50.0)],
+                    previous_target_pct=60.0),
+        LabelTarget("Income", 30.0, [SymbolTarget("KO", 100.0)],
+                    previous_target_pct=40.0),
+    ]
+
+
+def _buttons(client, marker):
+    from nicegui import ui as nicegui_ui
+    return [d for d in client.layout.descendants()
+            if isinstance(d, nicegui_ui.button) and marker in getattr(d, '_markers', [])]
+
+
+def test_step_one_offers_load_last_when_there_is_a_last(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_labels_with_history())
+
+    found = _buttons(nicegui_client, wiz.MARKER_LOAD_LAST)
+    assert len(found) == 1
+    assert found[0].enabled is True
+
+
+def test_step_one_disables_load_last_when_no_label_has_a_history(nicegui_client):
+    """Disabled, not hidden: the user has to be able to see the feature exists and
+    learn that this account has never run an allocation."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz)          # _labels() carries no history
+
+    found = _buttons(nicegui_client, wiz.MARKER_LOAD_LAST)
+    assert len(found) == 1
+    assert found[0].enabled is False
+
+
+def test_pressing_load_last_restores_the_percentages_of_the_last_run(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_labels_with_history())
+    with nicegui_client:
+        steps._load_last()
+
+    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
+
+
+def test_load_last_redraws_the_boxes_rather_than_leaving_them_stale(nicegui_client):
+    """``_even_split`` re-draws for exactly this reason: a ``ui.number`` does not
+    follow the object it was built from, so a silent model change leaves the user
+    typing over numbers that are no longer what will be submitted."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_labels_with_history())
+    with nicegui_client:
+        steps._load_last()
+        drawn = [n.value for n in _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)]
+
+    assert drawn == [60.0, 40.0]
+
+
+def test_step_one_shows_the_last_percentage_beside_each_target(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_labels_with_history())
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
+
+    assert len(drawn) == 2
+    assert 'last 60.00%' in drawn[0]
+    assert 'last 40.00%' in drawn[1]
+
+
+def test_a_label_with_no_history_says_so_rather_than_showing_a_number(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz)
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
+
+    assert len(drawn) == 2
+    assert all('last -' in text for text in drawn), drawn
+
+
+def test_step_one_shows_each_labels_current_value_against_the_same_base(nicegui_client):
+    """The percentage beside a target has to be a share of ``base_notional``, the
+    SAME denominator the target itself divides. The page's own header used to put
+    "% of managed" next to "target %" -- two denominators, invited comparison."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    # base_notional is 10,000 (see ``_base``); Growth holds 2,500 of it.
+    _open_steps(nicegui_client, wiz, labels=_labels_with_history(),
+                symbol_values={'AAPL': 1_500.0, 'MSFT': 1_000.0, 'KO': 500.0})
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
+
+    assert 'now 2,500.00' in drawn[0]
+    assert '25.00% of base' in drawn[0]
+    assert 'now 500.00' in drawn[1]
+    assert '5.00% of base' in drawn[1]
+
+
+def test_step_two_offers_a_load_last_per_label(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_labels_with_history())
+
+    found = _buttons(nicegui_client, wiz.MARKER_LOAD_LAST_SYMBOLS)
+    assert len(found) == 2
+    assert [b.enabled for b in found] == [True, False]   # Income has no per-symbol history
+
+
+def test_pressing_a_labels_load_last_restores_only_that_labels_weights(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_labels_with_history())
+    with nicegui_client:
+        steps._load_last_symbols(steps.labels[0])
+
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [50.0, 50.0]
+    assert [st.weight_pct for st in steps.labels[1].symbols] == [100.0]
+    # The label's own target is step 1's business and must not move.
+    assert steps.labels[0].target_pct == 70.0
+
+
+def test_step_two_shows_the_last_weight_beside_each_symbol(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_labels_with_history(),
+                symbol_values={'AAPL': 1_500.0, 'MSFT': 1_000.0, 'KO': 500.0})
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_SYMBOL_CURRENT)
+
+    assert len(drawn) == 3
+    assert 'now 1,500.00' in drawn[0] and 'last 50.00%' in drawn[0]
+    assert 'last -' in drawn[2]              # KO has never run
+
+
+def test_the_percentage_boxes_are_still_the_only_marked_numbers(nicegui_client):
+    """The regression this whole section is written around: the landed suite indexes
+    positionally into these two marker sets, so any new numeric widget under either
+    would silently retarget six assertions instead of failing."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_labels_with_history())
+
+    assert len(_numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)) == 2
+    assert len(_numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)) == 3

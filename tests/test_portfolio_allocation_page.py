@@ -160,6 +160,19 @@ def _pos(symbol, qty, cost_basis, market_value=None, side='BUY'):
             'market_value': market_value, 'side': side}
 
 
+def _held(symbol, qty, cost_basis, market_value=None):
+    """The same position as an OBJECT.
+
+    ``portfolio_allocation_service.build_position_states`` reads attributes
+    (``getattr(position, 'qty')``), while the page's own view path goes through
+    ``positions_by_symbol``, which also accepts dicts. A dict handed to the service
+    path silently reads as a FLAT position, so the wizard flow needs this one.
+    """
+    from types import SimpleNamespace
+    return SimpleNamespace(symbol=symbol, qty=qty, cost_basis=cost_basis,
+                           market_value=market_value)
+
+
 @pytest.fixture
 def account_id():
     return create_account_definition(name='Manual', provider='MockAccount').id
@@ -1573,3 +1586,101 @@ def test_clearing_the_market_hours_cache_never_takes_a_dry_run_down(monkeypatch,
 
     assert [r.symbol for r in plan.rows] == ['AAPL']
     assert hours.is_open is True
+
+
+# ---------------------------------------------------------------------------
+# W2: the wizard opens knowing what the last run allocated with.
+# ---------------------------------------------------------------------------
+
+def test_the_wizard_opens_with_the_previous_targets_attached(monkeypatch, account_id):
+    """``_load_flow_inputs`` is the only place these reach the dialog. Without them
+    the Load-last button has nothing to load and no way to know it."""
+    from ba2_trade_platform.core.portfolio_allocation_store import save_allocation_targets
+    from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
+
+    set_managed_label(account_id, 'ARK26', target_pct=60.0)
+    add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=30.0)
+    set_symbol_weight(account_id, 'ARK26', 'MSFT', weight_pct=70.0)
+    save_allocation_targets(account_id, [LabelTarget(
+        'ARK26', 80.0, [SymbolTarget('AAPL', 55.0), SymbolTarget('MSFT', 45.0)])])
+
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0, 'MSFT': 100.0})
+    _use_account(monkeypatch, account)
+
+    base, labels, allow_fractional, _values = page._load_flow_inputs(
+        account_id, VALUATION_MODE_MARKET)
+
+    assert labels[0].target_pct == 80.0
+    assert labels[0].previous_target_pct == 60.0
+    by_symbol = {st.symbol: st for st in labels[0].symbols}
+    assert (by_symbol['AAPL'].weight_pct, by_symbol['AAPL'].previous_weight_pct) == (55.0, 30.0)
+    assert (by_symbol['MSFT'].weight_pct, by_symbol['MSFT'].previous_weight_pct) == (45.0, 70.0)
+
+
+def test_a_label_with_no_history_opens_with_no_previous_target(monkeypatch, account_id):
+    """NULL reaches the dialog as None, so the button can be disabled rather than
+    offering a number nobody chose."""
+    set_managed_label(account_id, 'ARK26', target_pct=60.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+
+    _base, labels, _frac, _values = page._load_flow_inputs(account_id,
+                                                            VALUATION_MODE_MARKET)
+
+    assert labels[0].previous_target_pct is None
+    assert labels[0].symbols[0].previous_weight_pct is None
+
+
+def test_the_flow_hands_the_wizard_each_symbols_current_value(monkeypatch, account_id):
+    """Step 1 and step 2 show "now $X" beside every target. Under the account's
+    valuation mode, which since W1 is MARKET -- 10 shares at 250 is 2,500, not the
+    1,000 they cost."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
+                            prices={'AAPL': 250.0})
+    _use_account(monkeypatch, account)
+
+    _base, _labels, _frac, symbol_values = page._load_flow_inputs(
+        account_id, VALUATION_MODE_MARKET)
+
+    assert symbol_values == {'AAPL': 2_500.0}
+
+
+def test_the_flow_values_the_same_book_at_cost_when_that_is_the_mode(monkeypatch,
+                                                                    account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
+                            prices={'AAPL': 250.0})
+    _use_account(monkeypatch, account)
+
+    _base, _labels, _frac, symbol_values = page._load_flow_inputs(
+        account_id, VALUATION_MODE_COST)
+
+    assert symbol_values == {'AAPL': 1_000.0}
+
+
+def test_the_flow_passes_the_current_values_into_the_steps_dialog(
+        monkeypatch, nicegui_client, account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
+                            prices={'AAPL': 250.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    steps = {}
+    monkeypatch.setattr(page, 'open_allocation_steps',
+                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
+
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_MARKET, _noop_refresh))
+
+    assert steps['symbol_values'] == {'AAPL': 2_500.0}

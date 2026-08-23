@@ -314,3 +314,82 @@ def test_the_rename_refuses_to_guess_at_a_schema_it_does_not_recognise(tmp_path)
 
     with pytest.raises(RuntimeError, match="refusing to guess"):
         _upgrade(engine)
+
+
+# --- W2: previous_target_pct / previous_weight_pct, amended in place --------
+#
+# Free only while this revision is UNAPPLIED. Verified read-only on the live DB
+# on 2026-08-23: alembic_version = d5e1b9a3c842, zero portfolio_% tables, and
+# f1c8a24b7e05 is the only head. A developer DB that init_db()'s create_all
+# already built is the case _add_column_if_absent exists for.
+
+_PREVIOUS_COLUMNS = [
+    ("portfolio_allocation_label", "previous_target_pct"),
+    ("portfolio_allocation_symbol", "previous_weight_pct"),
+]
+
+
+@pytest.mark.parametrize("table_name,column", _PREVIOUS_COLUMNS)
+def test_the_previous_target_columns_exist_and_are_nullable(migrated_engine, table_name,
+                                                            column):
+    """NULLABLE, not 0.0. NULL is how "there is no last" is spelled, and it is what
+    makes the Load-last button's disabled state a fact rather than a guess: a stored
+    0.0 would mean "the last run allocated nothing to this", which is a real and
+    different answer."""
+    columns = {c["name"]: c for c in inspect(migrated_engine).get_columns(table_name)}
+    assert column in columns
+    assert columns[column]["nullable"] is True
+
+
+@pytest.mark.parametrize("table_name,column", _PREVIOUS_COLUMNS)
+def test_a_create_all_database_gains_the_previous_columns_on_upgrade(tmp_path, table_name,
+                                                                     column):
+    """The developer case. ``_create_table_if_absent`` SKIPS a table create_all has
+    already built, so a column added to the CREATE alone would never reach it and
+    the model and the schema would disagree forever."""
+    from sqlalchemy import text
+    engine = create_engine(f"sqlite:///{tmp_path / 'older_create_all.sqlite'}")
+    _create_all_allocation_tables(engine)
+    # Reproduce the OLD shape by dropping the column create_all has just made.
+    with engine.begin() as connection:
+        connection.execute(text(f"ALTER TABLE {table_name} DROP COLUMN {column}"))
+    assert column not in {c["name"] for c in inspect(engine).get_columns(table_name)}
+
+    _upgrade(engine)
+
+    assert column in {c["name"] for c in inspect(engine).get_columns(table_name)}
+
+
+@pytest.mark.parametrize("table_name,column", _PREVIOUS_COLUMNS)
+def test_adding_the_previous_columns_is_idempotent(migrated_engine, table_name, column):
+    """Re-running is the documented recovery, and ``op.add_column`` of a column that
+    is already there is a hard error on SQLite."""
+    _upgrade(migrated_engine)
+
+    names = [c["name"] for c in inspect(migrated_engine).get_columns(table_name)]
+    assert names.count(column) == 1
+
+
+def test_adding_a_previous_column_preserves_the_rows_already_there(tmp_path):
+    """``op.add_column`` is not a table rebuild, but pin it anyway: these two rows
+    ARE the user's allocation configuration, and a migration that dropped them
+    would silently unmanage the account."""
+    from sqlalchemy import text
+    engine = create_engine(f"sqlite:///{tmp_path / 'with_rows.sqlite'}")
+    _create_all_allocation_tables(engine)
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE portfolio_allocation_label "
+                                "DROP COLUMN previous_target_pct"))
+        connection.execute(text(
+            "INSERT INTO portfolio_allocation_label "
+            "(id, account_id, label, target_pct, sort_order, created_at) "
+            "VALUES (1, 7, 'ARK26', 60.0, 0, '2026-08-01 00:00:00')"))
+
+    _upgrade(engine)
+
+    with engine.begin() as connection:
+        row = connection.execute(text(
+            "SELECT label, target_pct, previous_target_pct "
+            "FROM portfolio_allocation_label WHERE id = 1")).one()
+    assert (row[0], row[1]) == ('ARK26', 60.0)
+    assert row[2] is None       # no last: the column is new, not back-filled

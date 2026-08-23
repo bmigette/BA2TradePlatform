@@ -31,6 +31,18 @@ spent against them. A developer database that `init_db()` built with create_all
 on an older checkout has the OLD column names and would be skipped by
 _create_table_if_absent, so _rename_column_if_present fixes it up in place.
 
+Amended a THIRD time, on the same grounds, to add
+portfolio_allocation_label.previous_target_pct and
+portfolio_allocation_symbol.previous_weight_pct: one generation of "what did I
+allocate with last time", which is what the wizard's Load-last button reads.
+Re-verified read-only on the live DB on 2026-08-23 before amending --
+alembic_version = d5e1b9a3c842, zero portfolio_% tables, f1c8a24b7e05 still the
+only head -- so this is again free. BOTH ARE NULLABLE: NULL is how "there is no
+last" is spelled, and a 0.0 default would be indistinguishable from "the last run
+allocated nothing to this". _add_column_if_absent covers the developer database
+whose create_all built these tables before the columns existed; the CREATEs below
+cover everyone else.
+
 IDEMPOTENT ON PURPOSE
 =====================
 Every create is guarded by a `has_table` / `has_index` check, because THIS
@@ -152,6 +164,40 @@ def _create_index_if_absent(index_name: str, table_name: str, columns,
     op.create_index(index_name, table_name, columns, unique=unique)
 
 
+def _add_column_if_absent(table_name: str, column: sa.Column) -> None:
+    """``op.add_column`` unless the column is already there.
+
+    The sibling of _rename_column_if_present, for the other way an older create_all
+    leaves a table behind: right name, missing column. _create_table_if_absent SKIPS
+    a table that exists, so a column added to the CREATE above alone would never
+    reach a developer database that init_db() built before the column existed --
+    the model and the schema would then disagree forever and every read of it would
+    die on "no such column".
+
+    A FRESH inspector every call, for the same reason _create_table_if_absent takes
+    one: an Inspector memoises its reflection and this function changes the schema
+    between calls.
+
+    Nothing to do when the table is absent -- the CREATE above already included the
+    column. Nothing to do when the column is present -- which is what makes
+    re-running this revision safe, since ALTER TABLE ADD COLUMN of an existing
+    column is a hard error on SQLite.
+
+    Only ever adds NULLABLE columns here. ADD COLUMN with NOT NULL and no server
+    default is rejected outright by SQLite on a non-empty table, and back-filling a
+    "previous target" nobody ever set would invent history.
+    """
+    inspector = sa.inspect(op.get_bind())
+    if not inspector.has_table(table_name):
+        return
+    names = {existing["name"] for existing in inspector.get_columns(table_name)}
+    if column.name in names:
+        print(f"[pf-allocation] {table_name}.{column.name} already exists -- skipped")
+        return
+    op.add_column(table_name, column)
+    print(f"[pf-allocation] added {table_name}.{column.name}")
+
+
 def _rename_column_if_present(table_name: str, old_name: str, new_name: str) -> None:
     """Rename a column that an older create_all left behind under its old name.
 
@@ -203,6 +249,9 @@ def upgrade() -> None:
         sa.Column("account_id", sa.Integer(), nullable=False),
         sa.Column("label", sa.String(), nullable=False),
         sa.Column("target_pct", sa.Float(), nullable=False),
+        # NULLABLE and never back-filled: NULL is "there is no last", which is a
+        # different answer from 0.0 ("the last run allocated nothing to this").
+        sa.Column("previous_target_pct", sa.Float(), nullable=True),
         sa.Column("sort_order", sa.Integer(), nullable=False),
         sa.Column("comment", sa.String(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
@@ -221,6 +270,7 @@ def upgrade() -> None:
         sa.Column("label", sa.String(), nullable=False),
         sa.Column("symbol", sa.String(), nullable=False),
         sa.Column("weight_pct", sa.Float(), nullable=False),
+        sa.Column("previous_weight_pct", sa.Float(), nullable=True),
         sa.Column("comment", sa.String(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(["account_id"], ["accountdefinition.id"], ondelete="CASCADE"),
@@ -285,6 +335,13 @@ def upgrade() -> None:
                               "submitted_buy_value", "filled_buy_value")
     _rename_column_if_present("portfolio_allocation_run",
                               "submitted_sell_value", "filled_sell_value")
+
+    # For the developer database whose create_all built these two tables before
+    # the previous_* columns existed. A no-op everywhere else.
+    _add_column_if_absent("portfolio_allocation_label",
+                          sa.Column("previous_target_pct", sa.Float(), nullable=True))
+    _add_column_if_absent("portfolio_allocation_symbol",
+                          sa.Column("previous_weight_pct", sa.Float(), nullable=True))
 
 
 def downgrade() -> None:

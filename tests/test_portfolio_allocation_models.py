@@ -173,3 +173,44 @@ def test_a_second_config_row_for_one_account_is_rejected(mock_account_def):
     add_instance(PortfolioAllocationConfig(account_id=mock_account_def.id))
     with pytest.raises(IntegrityError):
         add_instance(PortfolioAllocationConfig(account_id=mock_account_def.id))
+
+
+# --- W2: one generation of "what did I allocate with last time" -------------
+
+def test_a_label_starts_with_no_previous_target(mock_account_def):
+    """NULL, not 0.0. "There is no last" and "last time this got nothing" are
+    different answers, and the Load-last button's disabled state is exactly the
+    first of them."""
+    add_instance(PortfolioAllocationLabel(account_id=mock_account_def.id, label='ARK26'))
+    with get_db() as session:
+        row = session.exec(select(PortfolioAllocationLabel)).one()
+        assert row.previous_target_pct is None
+
+
+def test_a_label_round_trips_a_previous_target_of_zero(mock_account_def):
+    """0.0 has to be storable and has to read back as 0.0 rather than as None --
+    the whole point of the column being nullable is that the two mean different
+    things."""
+    add_instance(PortfolioAllocationLabel(account_id=mock_account_def.id, label='ARK26',
+                                          target_pct=60.0, previous_target_pct=0.0))
+    with get_db() as session:
+        row = session.exec(select(PortfolioAllocationLabel)).one()
+        assert row.previous_target_pct == 0.0
+        assert row.previous_target_pct is not None
+
+
+def test_a_symbol_starts_with_no_previous_weight(mock_account_def):
+    add_instance(PortfolioAllocationSymbol(account_id=mock_account_def.id,
+                                           label='ARK26', symbol='AAPL'))
+    with get_db() as session:
+        row = session.exec(select(PortfolioAllocationSymbol)).one()
+        assert row.previous_weight_pct is None
+
+
+def test_a_symbol_round_trips_a_previous_weight(mock_account_def):
+    add_instance(PortfolioAllocationSymbol(account_id=mock_account_def.id, label='ARK26',
+                                           symbol='AAPL', weight_pct=70.0,
+                                           previous_weight_pct=30.0))
+    with get_db() as session:
+        row = session.exec(select(PortfolioAllocationSymbol)).one()
+        assert row.previous_weight_pct == 30.0
