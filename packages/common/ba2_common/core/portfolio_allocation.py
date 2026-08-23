@@ -62,6 +62,8 @@ __all__ = [
     # value objects and the fetch-failure sentinel
     "PositionState", "SymbolTarget", "LabelTarget", "AllocationRow", "AllocationPlan",
     "PositionFetchFailed", "AccountSnapshot", "MarginInfo", "OrderImpact",
+    # the ONE reconciliation of the two brokers' short conventions
+    "position_sign", "signed_position_values",
     # wizard
     "BaseSnapshot", "build_base_snapshot", "WARNING_NO_MULTIPLIER",
     "held_symbols_without_price", "held_no_price_block", "ERROR_HELD_NO_PRICE_FMT",
@@ -448,6 +450,76 @@ class PositionState:
     price: Optional[float] = None
     market_value: Optional[float] = None
     transaction_ids: List[int] = field(default_factory=list)
+
+
+#: ``Position.side`` spellings meaning "this is a SHORT". ``OrderDirection`` is a
+#: str enum, so its ``.value`` lands here; TastyTrade's own 'Short' does too.
+_SHORT_SIDES = frozenset({'sell', 'short'})
+_LONG_SIDES = frozenset({'buy', 'long'})
+
+
+def position_sign(side) -> Optional[int]:
+    """``-1`` for a short, ``+1`` for a long, ``None`` when the side is unknown.
+
+    ``None`` means "this row did not say", and the caller must then trust the
+    signs the broker already put on the numbers rather than invent a direction.
+    """
+    text = str(getattr(side, 'value', side) or "").strip().lower()
+    if text in _SHORT_SIDES:
+        return -1
+    if text in _LONG_SIDES:
+        return 1
+    return None
+
+
+def signed_position_values(side, *, quantity, cost_basis,
+                           market_value=None) -> Tuple[float, float, Optional[float]]:
+    """One broker position row's ``(quantity, cost_basis, market_value)``, SIGNED.
+
+    **Shorts have ONE canonical representation in this engine: signed negative.**
+    A short's quantity, cost basis and market value are all negative, so a label's
+    value is its NET exposure, ``compute_base_notional`` measures a hedge as
+    something that REDUCES the allocatable base, and every sum is a plain sum.
+
+    The two live brokers disagree at source and this is the single place that
+    reconciles them: Alpaca passes the broker's own negative signs straight
+    through (``AlpacaAccount.alpaca_position_to_position``) while TastyTrade
+    stores ``qty=abs_qty`` with positive money and puts the direction in ``side``
+    (``TastyTradeAccount.py:520-547``). It lives HERE, in the pure engine, because
+    it has two callers that must never drift apart -- the page's
+    ``ui/utils/portfolio_allocation_view.positions_by_symbol`` and the live
+    service's ``core/portfolio_allocation_service.build_position_states``. They
+    DID drift: only the first read ``side``, so on TastyTrade a short reached the
+    allocation base as a long and inflated every label target on the account.
+
+    Three properties, all deliberate and all tested:
+
+    * **Idempotent.** ``-abs(...)``, never a bare negation, so an already-negative
+      Alpaca short is left alone rather than flipped back into a long.
+    * **Longs are NOT rewritten.** Only a short forces a sign, so no broker's own
+      numbers are ever "corrected" on the strength of a metadata field.
+    * **Unknown or absent side trusts the given signs.** ``position_sign``
+      returning ``None`` means the row did not say; inventing a direction there
+      would rewrite real numbers on no evidence.
+
+    Args:
+        side: the row's ``Position.side`` -- an ``OrderDirection``, a plain
+            string, or ``None``. Read through ``position_sign``.
+        quantity: the row's quantity, in whatever sign the broker used.
+        cost_basis: likewise.
+        market_value: likewise, and ``None`` is preserved as ``None`` -- "the
+            broker stamped no market value" is a different fact from 0.0 and the
+            page renders it differently.
+
+    Returns:
+        Tuple[float, float, Optional[float]]: the three values as floats, with a
+        short's signs forced negative.
+    """
+    value = None if market_value is None else float(market_value)
+    if position_sign(side) != -1:
+        return float(quantity), float(cost_basis), value
+    return (-abs(float(quantity)), -abs(float(cost_basis)),
+            None if value is None else -abs(value))
 
 
 @dataclass

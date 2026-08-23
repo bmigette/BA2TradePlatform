@@ -27,7 +27,8 @@ from .portfolio_allocation import (
     AllocationPlan, BaseSnapshot, FilledTotals, MarginInfo, OrderFill,
     PositionFetchFailed, PositionState,
     apply_order_impacts, decide_symbol_action, held_no_price_block,
-    measure_filled_values, plan_quantity_attempts, split_delta_fifo,
+    measure_filled_values, plan_quantity_attempts, signed_position_values,
+    split_delta_fifo,
 )
 from .TransactionHelper import TransactionHelper
 from .types import (
@@ -64,6 +65,18 @@ def build_position_states(account, symbols: List[str]) -> Dict[str, PositionStat
     so the wizard can open a position in it. A symbol with no price keeps
     ``price=None`` and the engine will skip it with a reason.
 
+    **Shorts come back signed negative**, via the pure engine's
+    ``signed_position_values`` -- the SAME call the page's
+    ``ui/utils/portfolio_allocation_view.positions_by_symbol`` makes, deliberately
+    shared rather than copied. This path read ``qty`` RAW for two releases while
+    the page normalised, so on TastyTrade (``qty=abs_qty`` with the direction in
+    ``side``) a short arrived POSITIVE and was counted as a long by
+    ``compute_base_notional`` -- inflating ``BaseSnapshot.base_notional`` and with
+    it every label target on the account, and flipping the sign of the wizard's
+    unrealised P&L. Alpaca signs its own shorts, so the forcing must be (and is)
+    idempotent; latent rather than live only because the production DB holds
+    Alpaca accounts only.
+
     Raises:
         PositionFetchFailed: when ``get_positions()`` returned None. The class is
             defined in the pure engine, so the UI's view module raises the same one.
@@ -96,12 +109,18 @@ def build_position_states(account, symbols: List[str]) -> Dict[str, PositionStat
     states: Dict[str, PositionState] = {}
     for symbol in wanted:
         position = held.get(symbol)
-        states[symbol] = PositionState(
-            symbol=symbol,
+        quantity, cost_basis, market_value = signed_position_values(
+            getattr(position, 'side', None) if position else None,
             quantity=float(getattr(position, 'qty', 0.0) or 0.0) if position else 0.0,
             cost_basis=float(getattr(position, 'cost_basis', 0.0) or 0.0) if position else 0.0,
-            price=prices.get(symbol),
             market_value=float(getattr(position, 'market_value', 0.0) or 0.0) if position else 0.0,
+        )
+        states[symbol] = PositionState(
+            symbol=symbol,
+            quantity=quantity,
+            cost_basis=cost_basis,
+            price=prices.get(symbol),
+            market_value=market_value,
             transaction_ids=list(txn_ids.get(symbol, [])),
         )
     return states

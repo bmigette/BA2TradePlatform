@@ -718,6 +718,22 @@ def test_positions_by_symbol_leaves_a_long_exactly_as_the_broker_reported_it():
     assert out['AAPL'].cost_basis == 1500.0
 
 
+def test_positions_by_symbol_will_not_re_sign_a_long_from_its_side_field():
+    """The sign rule is one-way: a SHORT forces its numbers negative, a LONG
+    forces nothing.
+
+    Pinned with a CONTRADICTORY row -- ``side`` says long, the numbers say short --
+    because on an ordinary long "leave it alone" and "force it positive" agree, so
+    nothing else here can tell the two rules apart. Mutation-checked: making the
+    side authoritative in BOTH directions passed the whole allocation suite.
+    """
+    out = positions_by_symbol([{'symbol': 'AAPL', 'qty': -10, 'cost_basis': -1500.0,
+                                'market_value': -1800.0, 'side': 'BUY'}])
+    assert out['AAPL'].quantity == -10.0
+    assert out['AAPL'].cost_basis == -1500.0
+    assert out['AAPL'].market_value == -1800.0
+
+
 def test_positions_by_symbol_without_a_side_trusts_the_signs_it_was_given():
     """Not every source stamps a side; an unknown side must not silently rewrite
     the numbers."""

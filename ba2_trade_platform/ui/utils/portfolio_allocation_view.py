@@ -14,8 +14,16 @@ from typing import Any, Dict, List, Optional
 
 from ...core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed, PositionState,
-    current_value, investable_notional,
+    current_value, investable_notional, position_sign, signed_position_values,
 )
+
+# ``position_sign`` / ``signed_position_values`` are IMPORTED, not defined here,
+# and are re-exported under these names so existing callers keep working. They
+# moved into the pure engine the day ``build_position_states`` needed them too:
+# the sign rule had one implementation and one caller, the live service grew a
+# second caller WITHOUT it, and on TastyTrade a short then reached the allocation
+# base as a long. A live service module must not import from ``ui/``, so the
+# shared rule now lives where both sides already import from.
 
 # ---- gate reason codes (exact spellings; use these, never bare literals) ----
 
@@ -100,26 +108,6 @@ def _probe(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
-#: ``Position.side`` spellings meaning "this is a SHORT". ``OrderDirection`` is a
-#: str enum, so its ``.value`` lands here; TastyTrade's own 'Short' does too.
-_SHORT_SIDES = frozenset({'sell', 'short'})
-_LONG_SIDES = frozenset({'buy', 'long'})
-
-
-def position_sign(side) -> Optional[int]:
-    """``-1`` for a short, ``+1`` for a long, ``None`` when the side is unknown.
-
-    ``None`` means "this row did not say", and the caller must then trust the
-    signs the broker already put on the numbers rather than invent a direction.
-    """
-    text = str(getattr(side, 'value', side) or "").strip().lower()
-    if text in _SHORT_SIDES:
-        return -1
-    if text in _LONG_SIDES:
-        return 1
-    return None
-
-
 def positions_by_symbol(raw_positions) -> Dict[str, PositionState]:
     """Turn a broker position list into ``{SYMBOL: PositionState}``.
 
@@ -130,11 +118,13 @@ def positions_by_symbol(raw_positions) -> Dict[str, PositionState]:
     straight through (``alpaca_position_to_position``) while TastyTrade stores
     ``qty=abs_qty`` and puts the direction in ``side``
     (``TastyTradeAccount.py:520-547``) — so the same book used to render two
-    different pages. Reading ``side`` and forcing the sign is idempotent: an
-    already-negative Alpaca short is left alone rather than flipped back to a long.
+    different pages.
 
-    Long rows are NOT rewritten: only a short forces a sign, so a broker's own
-    numbers are never "corrected" on the strength of a metadata field.
+    The rule itself is ``signed_position_values`` in the pure engine, NOT a copy
+    here: the live service's ``build_position_states`` normalises the identical
+    rows for the allocation base and once did not, which read every TastyTrade
+    short as a long. See that function for the three properties it guarantees
+    (idempotent, longs untouched, unknown side trusted).
 
     Args:
         raw_positions: whatever ``account.get_positions()`` returned — a list of
@@ -183,12 +173,12 @@ def positions_by_symbol(raw_positions) -> Dict[str, PositionState]:
 
         market_value = _probe(row, 'market_value')
 
-        sign = position_sign(_probe(row, 'side'))
-        if sign == -1:
-            quantity = -abs(float(quantity))
-            cost_basis = -abs(float(cost_basis))
-            if market_value is not None:
-                market_value = -abs(float(market_value))
+        # The ONE sign rule, shared with the live service's
+        # ``build_position_states`` so the page and the plan can never disagree
+        # about which way a position points.
+        quantity, cost_basis, market_value = signed_position_values(
+            _probe(row, 'side'), quantity=quantity, cost_basis=cost_basis,
+            market_value=market_value)
 
         state = out.get(symbol)
         if state is None:

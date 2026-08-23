@@ -23,6 +23,7 @@ from ba2_trade_platform.core.portfolio_allocation import (
     REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     AllocationPlan, AllocationRow, BaseSnapshot, PositionFetchFailed, PositionState,
+    compute_base_notional,
 )
 from ba2_trade_platform.core.TransactionHelper import TransactionHelper
 from ba2_trade_platform.core.types import (
@@ -39,13 +40,21 @@ NOT_PASSED = "<not passed>"
 
 
 class FakePosition:
-    """Minimal stand-in for a broker Position row."""
+    """Minimal stand-in for a broker Position row.
 
-    def __init__(self, symbol, qty, cost_basis, market_value):
+    ``side`` defaults to None -- "this row did not say" -- because that is what a
+    hand-built row means and what the sign normalisation must TRUST. The two live
+    brokers do stamp it, and they disagree about the signs underneath it: Alpaca
+    passes its own negative numbers through while TastyTrade stores ``qty=abs_qty``
+    and puts the direction here.
+    """
+
+    def __init__(self, symbol, qty, cost_basis, market_value, side=None):
         self.symbol = symbol
         self.qty = qty
         self.cost_basis = cost_basis
         self.market_value = market_value
+        self.side = side
 
 
 class FakeAccount:
@@ -428,6 +437,176 @@ def test_build_position_states_on_a_genuinely_flat_account_is_not_a_failure():
 
     assert states["AAPL"].quantity == pytest.approx(0.0)
     assert states["AAPL"].price == pytest.approx(160.0)
+
+
+# ---------------------------------------------------------------------------
+# build_position_states: shorts carry ONE signed representation, whichever
+# broker reported them -- the same invariant ``positions_by_symbol`` already
+# holds. This path feeds ``compute_base_notional`` and therefore every label
+# target on the account, so a short read as a long inflates the whole base.
+# ---------------------------------------------------------------------------
+
+def test_build_position_states_signs_a_tastytrade_short_negative():
+    """TastyTrade stamps ``qty=abs_qty``, a POSITIVE cost basis and a POSITIVE
+    market value, and records the direction in ``side``
+    (``TastyTradeAccount.py:520-547``). Read raw, its short reads as a long."""
+    account = FakeAccount()
+    account.positions = [FakePosition("TSLA", 10.0, 1500.0, 1800.0,
+                                      side=OrderDirection.SELL)]
+    account.prices = {"TSLA": 180.0}
+
+    states = svc.build_position_states(account, ["TSLA"])
+
+    assert states["TSLA"].quantity == pytest.approx(-10.0)
+    assert states["TSLA"].cost_basis == pytest.approx(-1500.0)
+    assert states["TSLA"].market_value == pytest.approx(-1800.0)
+
+
+def test_build_position_states_does_not_flip_an_already_signed_alpaca_short():
+    """Alpaca passes the broker's own NEGATIVE signs straight through
+    (``alpaca_position_to_position``) and still stamps ``side=SELL``, so forcing
+    the sign has to be idempotent: ``-abs(...)``, never a bare negation."""
+    account = FakeAccount()
+    account.positions = [FakePosition("TSLA", -10.0, -1500.0, -1800.0,
+                                      side=OrderDirection.SELL)]
+    account.prices = {"TSLA": 180.0}
+
+    states = svc.build_position_states(account, ["TSLA"])
+
+    assert states["TSLA"].quantity == pytest.approx(-10.0)
+    assert states["TSLA"].cost_basis == pytest.approx(-1500.0)
+    assert states["TSLA"].market_value == pytest.approx(-1800.0)
+
+
+def test_build_position_states_leaves_a_long_exactly_as_the_broker_reported_it():
+    """Only a SHORT forces a sign. No broker's numbers are ever "corrected" on
+    the strength of a metadata field."""
+    account = FakeAccount()
+    account.positions = [FakePosition("AAPL", 10.0, 1500.0, 1800.0,
+                                      side=OrderDirection.BUY)]
+    account.prices = {"AAPL": 180.0}
+
+    states = svc.build_position_states(account, ["AAPL"])
+
+    assert states["AAPL"].quantity == pytest.approx(10.0)
+    assert states["AAPL"].cost_basis == pytest.approx(1500.0)
+    assert states["AAPL"].market_value == pytest.approx(1800.0)
+
+
+def test_build_position_states_will_not_re_sign_a_long_from_its_side_field():
+    """The sign rule is one-way: a SHORT forces its numbers negative, a LONG
+    forces nothing at all.
+
+    Pinned with a CONTRADICTORY row -- ``side`` says long, the numbers say short --
+    because that is the only shape that can tell the two rules apart: on an
+    ordinary long, "leave it alone" and "force it positive" agree. Trusting the
+    metadata field over the money would let one mislabelled row silently flip a
+    real short into a long in the allocation base, which is the very failure this
+    normalisation exists to prevent. Mutation-checked: making the side
+    authoritative for both directions passes every other test in this file.
+    """
+    account = FakeAccount()
+    account.positions = [FakePosition("AAPL", -10.0, -1500.0, -1800.0,
+                                      side=OrderDirection.BUY)]
+    account.prices = {"AAPL": 180.0}
+
+    states = svc.build_position_states(account, ["AAPL"])
+
+    assert states["AAPL"].quantity == pytest.approx(-10.0)
+    assert states["AAPL"].cost_basis == pytest.approx(-1500.0)
+    assert states["AAPL"].market_value == pytest.approx(-1800.0)
+
+
+def test_build_position_states_without_a_side_trusts_the_signs_it_was_given():
+    """An unknown/absent side means "this row did not say"; inventing a direction
+    from it would rewrite a broker's own numbers on no evidence."""
+    account = FakeAccount()
+    account.positions = [FakePosition("TSLA", -10.0, -1500.0, -1800.0)]
+    account.prices = {"TSLA": 180.0}
+
+    states = svc.build_position_states(account, ["TSLA"])
+
+    assert states["TSLA"].quantity == pytest.approx(-10.0)
+    assert states["TSLA"].cost_basis == pytest.approx(-1500.0)
+    assert states["TSLA"].market_value == pytest.approx(-1800.0)
+
+
+def test_a_tastytrade_short_REDUCES_the_base_notional_instead_of_inflating_it():
+    """THE money consequence. ``build_position_states`` feeds
+    ``compute_base_notional``, which feeds ``BaseSnapshot.base_notional`` and so
+    every label target on the account. Read raw, a 2,000 short ADDS 2,000 to the
+    base instead of removing it -- a 4,000 error on a 13,000 book, and every
+    target is then a share of the wrong number.
+    """
+    account = FakeAccount()
+    account.positions = [
+        FakePosition("AAPL", 10.0, 5000.0, 5000.0, side=OrderDirection.BUY),
+        # TastyTrade shape: magnitudes only, direction in `side`.
+        FakePosition("TSLA", 10.0, 2000.0, 2000.0, side=OrderDirection.SELL),
+    ]
+    account.prices = {"AAPL": 500.0, "TSLA": 200.0}
+
+    states = svc.build_position_states(account, ["AAPL", "TSLA"])
+
+    for mode in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        base = compute_base_notional(10_000.0, states, ["AAPL", "TSLA"],
+                                     valuation_mode=mode)
+        # 10,000 buying power + 5,000 long - 2,000 short. NOT 17,000.
+        assert base == pytest.approx(13_000.0), mode
+
+
+def test_the_base_notional_is_the_same_short_whichever_broker_reported_it():
+    """The two brokers' shapes must not produce two different bases."""
+    tastytrade = FakeAccount()
+    tastytrade.positions = [FakePosition("TSLA", 10.0, 2000.0, 2000.0,
+                                         side=OrderDirection.SELL)]
+    tastytrade.prices = {"TSLA": 200.0}
+    alpaca = FakeAccount()
+    alpaca.positions = [FakePosition("TSLA", -10.0, -2000.0, -2000.0,
+                                     side=OrderDirection.SELL)]
+    alpaca.prices = {"TSLA": 200.0}
+
+    bases = [compute_base_notional(10_000.0,
+                                   svc.build_position_states(account, ["TSLA"]),
+                                   ["TSLA"], valuation_mode=VALUATION_MODE_COST)
+             for account in (tastytrade, alpaca)]
+
+    assert bases == [pytest.approx(8_000.0), pytest.approx(8_000.0)]
+
+
+@pytest.mark.parametrize("qty, cost, value, side", [
+    # TastyTrade short: magnitudes, direction in `side`.
+    (10.0, 1500.0, 1800.0, OrderDirection.SELL),
+    # Alpaca short: already signed, and still stamped SELL.
+    (-10.0, -1500.0, -1800.0, OrderDirection.SELL),
+    # A long, from either broker.
+    (10.0, 1500.0, 1800.0, OrderDirection.BUY),
+    # No side at all: both paths must trust the signs they were given.
+    (-10.0, -1500.0, -1800.0, None),
+])
+def test_the_two_normalisation_paths_agree_on_the_same_broker_position(
+        qty, cost, value, side):
+    """THE invariant whose absence caused this bug, and the one that will catch
+    the next divergence.
+
+    ``ui/utils/portfolio_allocation_view.positions_by_symbol`` (the page) and
+    ``portfolio_allocation_service.build_position_states`` (the wizard, the base
+    notional, the solvers) normalise the SAME broker row. They disagreed for two
+    releases because only one of them read ``side``.
+    """
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
+
+    row = FakePosition("TSLA", qty, cost, value, side=side)
+    account = FakeAccount()
+    account.positions = [row]
+    account.prices = {"TSLA": 180.0}
+
+    page = positions_by_symbol([row])["TSLA"]
+    service = svc.build_position_states(account, ["TSLA"])["TSLA"]
+
+    assert service.quantity == pytest.approx(page.quantity)
+    assert service.cost_basis == pytest.approx(page.cost_basis)
+    assert service.market_value == pytest.approx(page.market_value)
 
 
 # ---------------------------------------------------------------------------
