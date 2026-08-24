@@ -48,6 +48,18 @@ from ba2_common.core.models import ExpertRecommendation, Transaction, TradingOrd
 from ba2_common.core.types import AssetClass, OrderStatus, TransactionStatus
 from ba2_common.core.utils import calculate_transaction_pnl
 
+# Why ``last_closed_transaction_with_reason`` found (or did not find) a close.
+#
+# "NEVER CLOSED" AND "COULD NOT DETERMINE" ARE DIFFERENT ANSWERS, and collapsing them
+# into a bare ``None`` is what let DaysSinceLastCloseCondition fabricate its 1e9
+# "infinitely long ago" sentinel for a close it simply could not classify — turning a
+# re-entry cooldown into a gate that never fires. The sentinel is defensible for
+# LAST_CLOSE_NONE (there is genuinely nothing to wait for) and is a made-up
+# measurement for LAST_CLOSE_UNCLASSIFIABLE.
+LAST_CLOSE_FOUND = "found"
+LAST_CLOSE_NONE = "no_qualifying_close"       # knowable: no close qualifies
+LAST_CLOSE_UNCLASSIFIABLE = "unclassifiable"  # NOT knowable: a close exists, unreadable
+
 
 class TradeRepository(ABC):
     """Read access to trade rows, independent of where they are stored."""
@@ -109,21 +121,60 @@ class TradeRepository(ABC):
                                 profit_sign: int = 0) -> Optional[Transaction]:
         """Most recent qualifying close, or None.
 
-        ``profit_sign``: 0 = any close, +1 = only profitable, -1 = only losing. A transaction
-        whose P&L cannot be computed is skipped when a sign is requested — it cannot be shown
-        to qualify.
+        ``profit_sign``: 0 = any close, +1 = only profitable, -1 = only losing.
+
+        A bare ``None`` cannot say WHY nothing was found. Callers that turn "nothing found"
+        into a decision (a cooldown, a sentinel) must use
+        ``last_closed_transaction_with_reason`` instead.
         """
-        for txn in self.closed_transactions(expert_id=expert_id, symbol=symbol):
+        return self.last_closed_transaction_with_reason(
+            expert_id=expert_id, symbol=symbol, profit_sign=profit_sign)[0]
+
+    def last_closed_transaction_with_reason(self, *, expert_id: int, symbol: str,
+                                            profit_sign: int = 0):
+        """``(transaction, reason)`` — the most recent qualifying close and WHY.
+
+        ``reason`` is one of ``LAST_CLOSE_FOUND`` / ``LAST_CLOSE_NONE`` /
+        ``LAST_CLOSE_UNCLASSIFIABLE``. The last one is the point of this method: it means
+        a close EXISTS but this repository cannot show whether it qualifies, so "nothing
+        found" must NOT be read as "never closed".
+
+        Two ways a close becomes unclassifiable:
+
+          * ``profit_sign != 0`` and ``calculate_transaction_pnl`` returns None (an
+            open/close price was never recorded), so its profit sign is unknown;
+          * the row carries no ``close_date``, so it cannot be DATED at all — which makes
+            every "days since" answer unknowable regardless of the sign.
+
+        Ordering matters. A close whose sign is unknown and that is NEWER than an otherwise
+        qualifying one HIDES it: "days since the last profitable close" is then either of
+        two numbers, and picking the older is a fabricated measurement. An unclassifiable
+        close OLDER than a match is irrelevant — the match already answers the question —
+        so the scan returns as soon as it matches with nothing unreadable above it.
+        """
+        rows = self.transactions(expert_id=expert_id,
+                                 statuses=[TransactionStatus.CLOSED], symbol=symbol)
+        # A CLOSED row with no close_date is dropped by _newest_close_first. Note it here
+        # rather than letting it vanish into "never closed".
+        undated = any(t.close_date is None for t in rows)
+
+        blind = False
+        for txn in self._newest_close_first(rows):
             if profit_sign != 0:
                 pnl = calculate_transaction_pnl(txn)
                 if pnl is None:
+                    blind = True
                     continue
                 if profit_sign > 0 and pnl <= 0:
                     continue
                 if profit_sign < 0 and pnl >= 0:
                     continue
-            return txn
-        return None
+            if blind or undated:
+                return None, LAST_CLOSE_UNCLASSIFIABLE
+            return txn, LAST_CLOSE_FOUND
+        if blind or undated:
+            return None, LAST_CLOSE_UNCLASSIFIABLE
+        return None, LAST_CLOSE_NONE
 
     def orders_for_transaction(self, transaction_id: Any, *, side: Optional[Any] = None,
                                statuses: Optional[Iterable[Any]] = None,

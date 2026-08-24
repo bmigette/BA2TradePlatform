@@ -1932,6 +1932,12 @@ class DaysSinceLastCloseCondition(CompareCondition):
     backtest, ≈ wall-clock in live) — NOT ``datetime.now()`` — so the value is correct under
     the backtest clock and never leaks wall time. When no qualifying close exists the value is
     a large sentinel (1e9) so a ">" cooldown passes (no prior trade -> entry allowed).
+
+    That sentinel is ONLY for a KNOWABLE "never closed". If a close exists but cannot be
+    classified — no P&L to read its profit sign from, or no ``close_date`` to age it — the
+    condition goes UNEVALUABLE (``calculated_value = None``, ``evaluate()`` False) instead.
+    Reusing 1e9 there answers "infinitely long ago" to a question nobody measured, and the
+    cooldown then never fires.
     """
 
     _profit_sign = 0  # 0=any, +1=profitable only, -1=losing only
@@ -1951,12 +1957,29 @@ class DaysSinceLastCloseCondition(CompareCondition):
             # every GA trial and the optimizer tuned a gene that did nothing. Live (SQLite) the
             # gate DID fire, so a deployed config behaved unlike its own backtest: the same
             # genome scored 103 trades / 17.55% annualised in-memory vs 169 / 0.20% on disk.
-            most_recent = get_trade_repository().last_closed_transaction(
+            from ba2_common.core.trade_repository import LAST_CLOSE_UNCLASSIFIABLE
+
+            most_recent, reason = get_trade_repository().last_closed_transaction_with_reason(
                 expert_id=expert_id, symbol=self.instrument_name,
                 profit_sign=self._profit_sign,
             )
 
             if most_recent is None:
+                if reason == LAST_CLOSE_UNCLASSIFIABLE:
+                    # "COULD NOT DETERMINE" IS NOT "NEVER CLOSED". The 1e9 sentinel says
+                    # "infinitely long ago", which makes a ">N day" cooldown pass — so a
+                    # close the repository could not classify (no close price recorded, so
+                    # no profit sign; or no close_date, so no age) silently DISABLED the
+                    # gate. The sentinel is only honest for a knowable "never". Go
+                    # unevaluable instead of inventing a measurement.
+                    logger.error(
+                        f"days-since-last-close for {self.instrument_name}: a close EXISTS "
+                        f"but cannot be classified (profit_sign={self._profit_sign}); the "
+                        f"cooldown is UNDETERMINABLE. Not using the 'never closed' sentinel "
+                        f"— that would silently pass the gate."
+                    )
+                    self.calculated_value = None
+                    return False
                 self.calculated_value = 1e9  # never closed (qualifying) -> "infinitely" long ago
                 return self.operator_func(self.calculated_value, self.value)
 
