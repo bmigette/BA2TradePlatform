@@ -233,6 +233,13 @@ SETTINGS_DEFINITIONS: Dict[str, Any] = {
                 "description": "Minimum confidence score (1-100) for deep triage finalists",
                 "tooltip": "Candidates below this confidence threshold are dropped after deep triage. Higher = more selective.",
             },
+            "exit_blind_max_ticks": {
+                "type": "int",
+                "required": True,
+                "default": 3,
+                "description": "Consecutive unmeasurable monitor ticks before a stop is forced",
+                "tooltip": "A protective stop that cannot be evaluated (no quote, no bars, a data-feed error) is NOT a stop that passed. After this many CONSECUTIVE unmeasurable ticks the position is closed anyway rather than held blind. At the default 60s monitor cadence, 3 ticks is about three minutes. Any tick that CAN be measured resets the counter, so a healthy position is never closed by this.",
+            },
             "exit_update_interval_ticks": {
                 "type": "int",
                 "required": True,
