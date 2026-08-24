@@ -19,6 +19,7 @@ from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..components.SmartRiskManagerDetailDialog import SmartRiskManagerDetailDialog
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from ..utils.perf_logger import PerfLogger
+from ..utils.protective_stop import resolve_protective_legs
 from sqlmodel import select, func, distinct
 
 
@@ -4097,12 +4098,17 @@ class OrderRecommendationsTab:
 
                     order_type_select.on_value_change(on_order_type_change)
 
-                    # Optional protective bracket (A4): if a Stop-Loss / Take-Profit price is given,
-                    # the order is submitted WITH it so the account creates the protective
-                    # WAITING_TRIGGER leg(s) — same mechanism the automated path uses. Left blank
-                    # (0) -> no bracket (unchanged legacy behavior). These do NOT re-size the order:
-                    # the user's quantity is preserved (we attach the bracket, we don't route through RM).
-                    sl_price_input = ui.number('Stop-Loss Price (optional)', value=0, min=0, step=0.01).classes('w-full mb-2')
+                    # Protective bracket (A4): the Stop-Loss / Take-Profit prices are passed
+                    # to submit_order so the account creates the protective WAITING_TRIGGER
+                    # leg(s) — same mechanism the automated path uses. They do NOT re-size the
+                    # order: the user's quantity is preserved (we attach the bracket, we don't
+                    # route through RM).
+                    #
+                    # The Stop-Loss is REQUIRED. It used to be optional, and a blank field
+                    # (which the number input reports as 0, not None) opened a position with no
+                    # stop at all. _place_order now refuses that before writing anything.
+                    sl_price_input = ui.number('Stop-Loss Price (required)', value=0, min=0, step=0.01).classes('w-full mb-2')
+                    sl_price_input.tooltip('Required — an order with no stop-loss will be refused.')
                     tp_price_input = ui.number('Take-Profit Price (optional)', value=0, min=0, step=0.01).classes('w-full mb-4')
 
                     with ui.row().classes('w-full justify-end gap-2'):
@@ -4147,19 +4153,30 @@ class OrderRecommendationsTab:
                 if pending_order:
                     # Submit the existing pending order
                     try:
+                        # Same gate as the Account Overview Submit button: this is a
+                        # hand-driven submit of an order the risk manager already sized,
+                        # so its safeguard SL must travel with it or nothing goes.
+                        decision = resolve_protective_legs(pending_order)
+                        if not decision.allow:
+                            logger.warning(f"Manual submit refused: {decision.reason}")
+                            ui.notify(decision.reason, type='negative', timeout=15000,
+                                      multi_line=True, close_button=True, classes='break-words')
+                            return
+
                         account = get_instance(AccountDefinition, pending_order.account_id)
                         if not account:
                             ui.notify('Account not found for existing order', type='negative')
                             return
-                        
+
                         # Submit the order through the account provider
                         provider_obj = get_account_instance_from_id(account.id)
                         if not provider_obj:
                             ui.notify(f'Failed to get account instance for {account.name}', type='negative')
                             return
-                        
-                        submitted_order = provider_obj.submit_order(pending_order)
-                        
+
+                        submitted_order = provider_obj.submit_order(
+                            pending_order, tp_price=decision.tp_price, sl_price=decision.sl_price)
+
                         if submitted_order:
                             ui.notify(f'Existing order {pending_order.id} submitted successfully to {account.provider}', type='positive')
                             self.refresh_data()
@@ -4314,12 +4331,16 @@ class OrderRecommendationsTab:
 
     def _place_order(self, symbol, side, quantity, order_type, limit_price, dialog, recommendation_id=None,
                      sl_price=None, tp_price=None):
-        """Place a manual order, optionally with a protective SL/TP bracket (A4).
+        """Place a manual order WITH a protective SL/TP bracket (A4).
 
-        When ``sl_price``/``tp_price`` are given they are passed to the account's
-        ``submit_order`` so the protective WAITING_TRIGGER leg(s) are created — the same
-        bracket mechanism the automated enter path uses. The user's ``quantity`` is used
-        verbatim (this path does NOT run the risk manager, so it never re-sizes the order)."""
+        ``sl_price``/``tp_price`` are passed to the account's ``submit_order`` so the
+        protective WAITING_TRIGGER leg(s) are created — the same bracket mechanism the
+        automated enter path uses. The user's ``quantity`` is used verbatim (this path
+        does NOT run the risk manager, so it never re-sizes the order).
+
+        The stop is no longer optional. A blank Stop-Loss field used to mean "no bracket",
+        which is a naked position dressed up as a default; the request is now refused
+        before anything is written, so a refusal leaves no orphan order row behind."""
         try:
             accounts = get_all_instances(AccountDefinition)
             if not accounts:
@@ -4355,22 +4376,31 @@ class OrderRecommendationsTab:
                 expert_recommendation_id=recommendation_id,
                 comment=f"Manual order from Trade Recommendations - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             )
-            
+
+            # GATE BEFORE PERSISTING. The order is still transient here, so a refusal
+            # leaves nothing behind — no PENDING row for someone to find later and submit
+            # bare, which is exactly how the WSC position was opened.
+            decision = resolve_protective_legs(order, explicit_sl_price=sl_price,
+                                               explicit_tp_price=tp_price)
+            if not decision.allow:
+                logger.warning(f"Manual place-order refused: {decision.reason}")
+                ui.notify(decision.reason, type='negative', timeout=15000,
+                          multi_line=True, close_button=True, classes='break-words')
+                return
+
             # Add to database first
             order_id = add_instance(order)
-            
+
             if order_id:
                 # Get the order back from database to get the complete object
-                from ...core.db import get_instance
                 order = get_instance(TradingOrder, order_id)
-                
+
                 # Submit the order through the account provider
                 try:
                     provider_obj = get_account_instance_from_id(account.id)
                     if provider_obj:
-                        # Attach the optional protective bracket (A4). None -> no bracket (legacy).
                         submitted_order = provider_obj.submit_order(
-                            order, tp_price=tp_price, sl_price=sl_price)
+                            order, tp_price=decision.tp_price, sl_price=decision.sl_price)
                         if submitted_order:
                             ui.notify(f'Order {order_id} submitted successfully to {account.provider}', type='positive')
                         else:

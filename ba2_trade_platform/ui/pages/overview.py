@@ -14,6 +14,7 @@ from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
 from ...logger import logger
 from ..utils.perf_logger import PerfLogger
+from ..utils.protective_stop import resolve_protective_legs
 from ..utils.growth_label_storage import (
     GROWTH_LABELS_STORAGE_KEY, MONTHLY_PROFIT_LABELS_STORAGE_KEY,
     read_growth_labels, resolve_growth_labels, write_growth_labels,
@@ -1161,22 +1162,8 @@ class OverviewTab:
                                         account_class = get_account_class(account_def.provider)
                                         if account_class:
                                             account = account_class(account_def.id)
-                                            
-                                            # Auto-submit orders with quantity > 0
-                                            submitted_count = 0
-                                            for order in updated_orders:
-                                                if order.quantity and order.quantity > 0:
-                                                    try:
-                                                        logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
-                                                        submitted_order = account.submit_order(order)
-                                                        if submitted_order:
-                                                            submitted_count += 1
-                                                            logger.info(f"Successfully submitted order {order.id} to broker")
-                                                        else:
-                                                            logger.warning(f"Failed to submit order {order.id} to broker")
-                                                    except Exception as submit_error:
-                                                        logger.error(f"Error submitting order {order.id}: {submit_error}", exc_info=True)
-                                            
+                                            submitted_count = self._auto_submit_after_risk_management(
+                                                account, updated_orders)
                                             if submitted_count > 0:
                                                 logger.info(f"Auto-submitted {submitted_count}/{len(updated_orders)} orders to broker")
                             except Exception as auto_submit_error:
@@ -1246,7 +1233,51 @@ class OverviewTab:
         except Exception as e:
             logger.error(f"Error in _handle_risk_management_from_overview: {e}", exc_info=True)
             ui.notify(f'Error: {str(e)}', type='negative')
-    
+
+    def _auto_submit_after_risk_management(self, account, updated_orders):
+        """Send the freshly sized orders to the broker, each with its protective stop.
+
+        Extracted from ``_handle_risk_management_from_overview`` so the protective-leg
+        decision is reachable on its own. Like every other hand-driven submit in this UI,
+        an order that cannot be protected is NOT sent: the risk manager stamps its
+        safeguard SL onto ``order.stop_price`` precisely so this call can pass it, and an
+        order that came back without one is a sizing that never produced a stop.
+
+        Notifying is done HERE rather than returned to the caller: a refusal the caller
+        forgets to render is the original defect with the volume turned down.
+
+        Returns:
+            int: how many orders actually reached the broker. Never raises for a single
+            bad order.
+        """
+        submitted_count = 0
+        for order in updated_orders:
+            if not order.quantity or order.quantity <= 0:
+                continue
+            decision = resolve_protective_legs(order)
+            if not decision.allow:
+                logger.warning(f"Auto-submit refused: {decision.reason}")
+                ui.notify(decision.reason, type='warning', timeout=15000,
+                          multi_line=True, close_button=True, classes='break-words')
+                continue
+            try:
+                logger.info(f"Auto-submitting order {order.id} for {order.symbol}: "
+                            f"{order.quantity} shares (sl={decision.sl_price}, "
+                            f"tp={decision.tp_price})")
+                submitted_order = account.submit_order(
+                    order, tp_price=decision.tp_price, sl_price=decision.sl_price)
+                if submitted_order:
+                    submitted_count += 1
+                    logger.info(f"Successfully submitted order {order.id} to broker")
+                else:
+                    logger.warning(f"Failed to submit order {order.id} to broker")
+            except Exception as submit_error:
+                logger.error(f"Error submitting order {order.id}: {submit_error}", exc_info=True)
+                ui.notify(f"Order {order.id} ({order.symbol}) was not submitted: {submit_error}",
+                          type='negative', timeout=15000, multi_line=True, close_button=True,
+                          classes='break-words')
+        return submitted_count
+
     def _handle_risk_management_from_overview_by_ids(self, order_ids):
         """Handle risk management execution from overview page using order IDs.
         
@@ -1976,20 +2007,40 @@ class AccountOverviewTab:
             ui.notify(f'Error: {str(e)}', type='negative')
     
     def _submit_order_to_broker(self, order: TradingOrder):
-        """Submit order to broker via account provider."""
+        """Submit order to broker via account provider, WITH its protective stop.
+
+        This used to be ``submit_order(order)`` — no ``sl_price``, no ``tp_price``. On
+        2026-08-24 that is how a hand-resubmitted WSC entry filled with a take-profit and
+        no stop: the risk manager's safeguard SL was sitting on ``order.stop_price`` and
+        the button dropped it. ``resolve_protective_legs`` now sources it the same way the
+        automated path does, and refuses the submit outright when no stop exists at all —
+        the rule ``AccountInterface.submit_order`` already applies to
+        ``supports_protective_legs``: either the stop exists, or nothing was opened.
+        """
         try:
+            # DECIDE BEFORE ANY WRITE. A refusal must leave the order exactly as it was —
+            # in particular it must not be re-stamped MANUAL, which would misattribute an
+            # order the user never managed to place.
+            decision = resolve_protective_legs(order)
+            if not decision.allow:
+                logger.warning(f"Manual submit refused: {decision.reason}")
+                ui.notify(decision.reason, type='negative', timeout=15000, multi_line=True, close_button=True,
+                          classes='break-words')
+                return
+            logger.info(f"Manual submit: {decision.reason}")
+
             # Mark this order as manually submitted
             if order.open_type != OrderOpenType.MANUAL:
                 from ...core.db import update_instance
                 order.open_type = OrderOpenType.MANUAL
                 update_instance(order)
-            
+
             # Get the account
             account = get_instance(AccountDefinition, order.account_id)
             if not account:
                 ui.notify('Account not found', type='negative')
                 return
-            
+
             # Submit the order through the account provider
             from ...modules.accounts import providers
             provider_cls = providers.get(account.provider)
@@ -2002,8 +2053,9 @@ class AccountOverviewTab:
                 if not provider_obj:
                     ui.notify(f'Failed to get account instance for {account.name}', type='negative')
                     return
-                submitted_order = provider_obj.submit_order(order)
-                
+                submitted_order = provider_obj.submit_order(
+                    order, tp_price=decision.tp_price, sl_price=decision.sl_price)
+
                 if submitted_order:
                     ui.notify(f'Order {order.id} submitted successfully to {account.provider}', type='positive')
                     # Refresh the table
@@ -2089,14 +2141,25 @@ class AccountOverviewTab:
                         errors.append(f"Account for order {order_id} not found")
                         continue
                     
+                    # Same gate as the single-order Submit button: a retry is still a
+                    # hand-driven submit, and an ERROR order is exactly the case where the
+                    # protective leg was never created — retrying it bare is how a naked
+                    # position gets opened on the second attempt instead of the first.
+                    decision = resolve_protective_legs(order)
+                    if not decision.allow:
+                        logger.warning(f"Retry refused: {decision.reason}")
+                        errors.append(decision.reason)
+                        continue
+
                     # Submit the order through the account provider
                     try:
                         provider_obj = get_account_instance_from_id(account.id)
                         if not provider_obj:
                             errors.append(f"Failed to get account instance for {account.name}")
                             continue
-                        submitted_order = provider_obj.submit_order(order)
-                        
+                        submitted_order = provider_obj.submit_order(
+                            order, tp_price=decision.tp_price, sl_price=decision.sl_price)
+
                         if submitted_order:
                             retried_count += 1
                             logger.info(f"Successfully retried order {order_id}: {order.symbol} {order.side} {order.quantity}")
@@ -2117,12 +2180,15 @@ class AccountOverviewTab:
             
             if zero_qty_orders:
                 ui.notify(f'{len(zero_qty_orders)} order(s) with quantity=0 skipped. Please update quantity manually and submit.', type='warning')
-            
+
             if errors:
-                error_msg = '; '.join(errors[:3])  # Show first 3 errors
+                error_msg = '\n'.join(errors[:3])  # Show first 3 errors
                 if len(errors) > 3:
-                    error_msg += f'... and {len(errors) - 3} more errors'
-                ui.notify(f'Errors: {error_msg}', type='warning')
+                    error_msg += f'\n... and {len(errors) - 3} more errors'
+                # multi_line + close_button because a protective-stop refusal is a full
+                # sentence the user has to be able to read, not a truncated toast.
+                ui.notify(f'Errors:\n{error_msg}', type='warning', timeout=15000,
+                          multi_line=True, close_button=True, classes='break-words')
             
             # Close dialog and refresh the table
             dialog.close()
