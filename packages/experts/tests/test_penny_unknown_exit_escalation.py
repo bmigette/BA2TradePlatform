@@ -476,8 +476,35 @@ def test_the_monitor_loop_escalates_the_stop_and_only_the_stop():
     -- unknown must not open a position."""
     import inspect
     src = inspect.getsource(MonitoringPhasesMixin)
-    assert "_evaluate_stop(" in src
-    # the take-profit and entry branches use the plain (unknown -> False) API
-    assert "evaluator.evaluate(\n" in src or "evaluator.evaluate(" in src
+    # BOTH protective-stop call sites (the grace-period hard stop and the normal
+    # signal stop) go through the escalating helper...
+    assert src.count("self._evaluate_stop(") == 2, \
+        "both stop-loss call sites must use the escalating helper"
+    assert "evaluator.evaluate(stop_loss" not in src
+    assert "evaluator.evaluate(grace_sl" not in src
+    # ... and the take-profit / entry branches keep the plain unknown->False API.
+    assert "evaluator.evaluate(\n                                tp_condition" in src
+    assert "evaluator.evaluate(entry_conds" in src
     assert "evaluate_exit(tp_condition" not in src
     assert "evaluate_exit(entry_conds" not in src
+
+
+def test_a_log_price_that_could_not_be_read_does_not_blow_up_the_exit():
+    """The escalated exit fires BECAUSE the price is unreadable, and the log line
+    it writes formats that price. A bare {None:.4f} raises TypeError inside the
+    monitor's per-symbol try/except -- swallowing the exit and reinstating the
+    exact defect. This one-liner is load-bearing."""
+    from ba2_experts.PennyMomentumTrader.monitoring import _fmt_px
+    assert _fmt_px(None) == "n/a"
+    assert _fmt_px(1.23456) == "1.2346"
+    assert _fmt_px(0.0) == "0.0000"        # a real zero price still prints
+
+
+def test_the_configured_escalation_window_defaults_to_three_ticks():
+    """0 would escalate on the first blind tick (clamped to 1) and flatten healthy
+    positions on ordinary API noise; a huge value is the silent hold again."""
+    from ba2_experts.PennyMomentumTrader.settings import SETTINGS_DEFINITIONS
+    spec = SETTINGS_DEFINITIONS["exit_blind_max_ticks"]
+    assert spec["type"] == "int"
+    assert spec["default"] == 3
+    assert spec["default"] >= 1

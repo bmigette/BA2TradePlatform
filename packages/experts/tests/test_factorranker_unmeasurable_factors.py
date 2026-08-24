@@ -154,11 +154,15 @@ def test_a_symbol_measured_on_nothing_is_always_excluded():
 
 
 def test_the_symbol_order_is_sorted_so_the_book_is_reproducible():
-    """A raw set union iterates in a PYTHONHASHSEED-dependent order."""
-    values = {"momentum": {"ZZZ": 0.1, "AAA": 0.2, "MMM": 0.3},
-              "value": {"ZZZ": 0.1, "AAA": 0.2, "MMM": 0.3}}
+    """A raw set union iterates in a PYTHONHASHSEED-dependent order, which becomes
+    the stored book's key order. Enough symbols that an unsorted set agreeing with
+    ``sorted`` by luck is a 1-in-12! event rather than a coin flip."""
+    names = ["ZZZ", "AAA", "MMM", "QQQ", "BBB", "YYY",
+             "CCC", "XXX", "DDD", "WWW", "EEE", "VVV"]
+    vals = {n: 0.1 * i for i, n in enumerate(names)}
+    values = {"momentum": dict(vals), "value": dict(vals)}
     assert list(composite_detail(values, {"momentum": 1.0, "value": 1.0})) == \
-        ["AAA", "MMM", "ZZZ"]
+        sorted(names)
 
 
 def test_K_is_clamped_to_the_number_of_weighted_factors():
