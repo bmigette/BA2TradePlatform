@@ -178,6 +178,85 @@ def test_a_precomputed_current_is_honoured(make_account):
     assert acct.get_iv_rank("AAPL", min_samples=5, current=0.40) == 100.0
 
 
+def test_market_holidays_are_not_sampled(make_account):
+    """A weekday filter is not a trading calendar.
+
+    The provider clamps to the latest snapshot on or before a date, so a CLOSED weekday
+    returns the previous session's number again — exactly the double-count the weekend
+    filter exists to prevent, just nine times a year instead of 104. 2024-02-19 is
+    Presidents' Day: a Monday, a weekday, and shut.
+    """
+    acct = make_account(_StubProvider(_flat_series(0.20)))
+    acct.get_iv_rank("AAPL", lookback_days=30, min_samples=5)
+
+    assert date(2024, 2, 19) not in acct._options.asked, "Presidents' Day is not a session"
+    assert date(2024, 2, 16) in acct._options.asked, "the Friday before it is"
+
+
+def test_the_grid_is_the_exchange_calendar_not_a_weekday_count(make_account):
+    """Pinned as a count so a regression to ``weekday() < 5`` is caught even if the one
+    holiday above moves: over a 30-day window ending 2024-03-04 there are 20 NYSE
+    sessions and 21 weekdays."""
+    acct = make_account(_StubProvider(_flat_series(0.20)))
+    acct.get_iv_rank("AAPL", lookback_days=30, min_samples=5)
+
+    trailing = [d for d in acct._options.asked if d != CLOCK]
+    assert len(trailing) == len(set(trailing)), "a date must not be sampled twice"
+    assert len(trailing) == 20
+
+
+def test_a_missing_exchange_calendar_degrades_to_weekdays_rather_than_killing_the_run(
+        monkeypatch, make_account):
+    """``pandas_market_calendars`` is a pinned dependency, but a GA worker that somehow
+    lacks it must produce a slightly coarser grid, not crash every trial."""
+    from ba2_common.core import market_calendar
+
+    monkeypatch.setattr(market_calendar, "nyse_regular_sessions",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            market_calendar.MarketCalendarUnavailable("no calendar")))
+    acct = make_account(_StubProvider(_flat_series(0.20)))
+
+    assert acct.get_iv_rank("AAPL", lookback_days=30, min_samples=5) == 0.0
+    assert date(2024, 2, 19) in acct._options.asked, "the fallback is the weekday grid"
+    assert [d for d in acct._options.asked if d.weekday() >= 5] == []
+
+
+def test_the_default_window_is_the_shared_one_year_constant(make_account):
+    """``lookback_days`` is CALENDAR days on both paths. 252 calendar days is ~173
+    sessions — about 8.5 months — while every rule name, docstring and threshold assumed
+    the textbook 1-year/252-SESSION rank. One shared constant, so live and backtest
+    cannot answer that differently."""
+    from datetime import timedelta
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+
+    assert OptionsAccountInterface.IV_RANK_LOOKBACK_DAYS == 365
+    acct = make_account(_StubProvider(_flat_series(0.20, days=500)), account_id=365)
+    acct.get_iv_rank("AAPL", min_samples=5)
+
+    trailing = [d for d in acct._options.asked if d != CLOCK]
+    assert min(trailing) >= CLOCK - timedelta(days=365)
+    assert 245 <= len(trailing) <= 255, \
+        f"a one-year window must hold ~252 sessions, got {len(trailing)}"
+
+
+def test_a_zero_or_nan_provider_iv_never_becomes_a_rank(make_account):
+    """The backtest never writes a row, so ``_iv_rank_from_series`` is this path's ONLY
+    plausibility boundary. A cache column that reads 0.0 rather than NULL must produce
+    "unknown", not "cheapest IV of the year"."""
+    from datetime import timedelta
+    hist = {CLOCK - timedelta(days=i): 0.10 for i in range(1, 20)}
+
+    acct = make_account(_StubProvider({**hist, CLOCK: 0.0}))
+    assert acct.get_iv_rank("AAPL", min_samples=5) is None
+
+    acct2 = make_account(_StubProvider({**hist, CLOCK: float("nan")}), account_id=2)
+    assert acct2.get_iv_rank("AAPL", min_samples=5) is None
+
+    acct3 = make_account(_StubProvider(_flat_series(0.0), default=0.0), account_id=3)
+    assert acct3.get_iv_rank("AAPL", min_samples=5) is None, \
+        "an all-zero series is a broken cache, not 252 days of calm"
+
+
 def test_percentile_math_is_the_shared_live_implementation(make_account):
     """Live and backtest must never disagree on what "IV rank 60" means. Only the
     sample GRID may differ; the arithmetic is one function."""

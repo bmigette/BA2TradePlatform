@@ -7,6 +7,7 @@ Capability detection elsewhere should use isinstance(account, OptionsAccountInte
 The concrete submit_option_order() owns TradingOrder/Transaction persistence and
 delegates the broker call to the abstract _submit_option_order_impl().
 """
+import math
 from abc import ABC, abstractmethod
 from datetime import date
 from typing import Any, List, Optional
@@ -168,15 +169,90 @@ class OptionsAccountInterface(ABC):
         ...
 
     # --- IV rank (self-computed from stored ATM-IV history) ----------------
-    @staticmethod
-    def _iv_rank_from_series(series, current, min_samples: int = 20):
+
+    #: Trailing window for the IV percentile, in CALENDAR days.
+    #:
+    #: 365, not 252. "IV rank" universally means the one-year percentile, and the live
+    #: rules are named for it ("Rich IV", "Cheap IV"). Both series are sampled on a
+    #: SESSION grid — the live recorder is a Mon-Fri cron, the backtest grid is the NYSE
+    #: calendar — so a window expressed in calendar days must be ~365 to hold the ~252
+    #: sessions the name promises. The previous 252 was 252 *calendar* days ≈ 173
+    #: sessions ≈ 8.5 months: a materially shorter, more reactive statistic than every
+    #: rule name, docstring and operator threshold assumed. One constant so live and
+    #: backtest cannot drift apart on it.
+    IV_RANK_LOOKBACK_DAYS = 365
+
+    #: Bounds on a value that can honestly be called an annualised ATM implied
+    #: volatility (as a FRACTION: 0.30 == 30%). Outside them the number is a data
+    #: error, and this codebase's rule is that a data error is UNKNOWN — never 0.0.
+    #:
+    #: Lower bound 1%. The quietest ATM IV ever printed on a listed US name is ~4-5%
+    #: (SPY, mid-2017); a single name has never traded near 1%. The floor is set at 1%
+    #: rather than "> 0" deliberately: the failure mode is an un-populated float field,
+    #: and those arrive as 0.0, 1e-9 and 0.0001 as readily as exact zero. A bare
+    #: ``iv > 0`` test lets every one of those through.
+    #:
+    #: Upper bound 500%. A biotech into a binary readout or a name in a squeeze prints
+    #: 200-400%; above 500% you are looking at a mis-scaled field (IV quoted in PERCENT,
+    #: so 30.0 means 3000%) or a one-tick-wide penny-option mid inverted into nonsense.
+    #:
+    #: Why this matters more than a usual sanity check: 0.0 ranks strictly below every
+    #: stored sample, so it scores rank 0.0 — and SIX of the nine iv_rank-gated rules on
+    #: the live book are ``iv_rank <= 35/40/50``. A zero-filled feed field would open
+    #: every one of them, submitting real option orders, precisely when the feed is
+    #: broken. NaN is worse still: ``v < nan`` is False for all v, so NaN also scores a
+    #: clean-looking 0.0 with no error anywhere.
+    MIN_PLAUSIBLE_ATM_IV = 0.01
+    MAX_PLAUSIBLE_ATM_IV = 5.0
+
+    @classmethod
+    def plausible_atm_iv(cls, iv) -> Optional[float]:
+        """``float(iv)`` when it can be a real annualised ATM IV, else None.
+
+        THE single definition, shared by the live recorder, the live rank, the backtest
+        rank and PremiumSeller's gate, so "what counts as a possible IV" cannot fork the
+        way the two IV-rank implementations did. Returning None (not a clamped value, not
+        0.0) is the whole point: every caller already treats None as "unknown" and fails
+        closed, and clamping would manufacture exactly the fabricated sample the recorder
+        refuses to write.
+
+        Coerces via ``float()`` rather than ``isinstance(iv, (int, float))`` so a numpy
+        scalar off a parquet/pandas path is a NUMBER, not silently "unknown"
+        (``np.float32`` is not a ``float`` subclass, though ``np.float64`` is — a trap
+        worth not stepping in). ``bool`` is excluded because it IS an int subclass and
+        ``True`` would otherwise become a perfectly plausible 100% IV; ``str``/``bytes``
+        because ``float("0.3")`` succeeds and a stringly-typed feed field is a bug to
+        surface, not to parse.
+        """
+        if iv is None or isinstance(iv, (bool, str, bytes)):
+            return None
+        try:
+            value = float(iv)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):          # NaN and ±inf
+            return None
+        if value < cls.MIN_PLAUSIBLE_ATM_IV or value > cls.MAX_PLAUSIBLE_ATM_IV:
+            return None
+        return value
+
+    @classmethod
+    def _iv_rank_from_series(cls, series, current, min_samples: int = 20):
         """Percentile (0-100) of `current` against `series`, or None.
 
-        None entries in `series` are ignored. Returns None when `current` is
-        None or fewer than `min_samples` valid samples exist. Counts strictly
-        below `current`.
+        Entries that are not a plausible ATM IV — None, NaN, 0.0, 800% — are DROPPED
+        from the series, and an implausible `current` returns None outright. Filtering
+        here as well as at ``record_atm_iv`` is not belt-and-braces: the backtest override
+        builds its series straight from the options provider and never writes a row, so
+        this is that path's ONLY boundary. Dropping rather than clamping keeps the
+        distinction the whole feature rests on — an unusable sample is absent, so it can
+        neither be counted as "below current" nor pad the denominator.
+
+        Returns None when `current` is unusable or fewer than `min_samples` USABLE
+        samples exist. Counts strictly below `current`.
         """
-        vals = [v for v in series if v is not None]
+        vals = [f for f in (cls.plausible_atm_iv(v) for v in series) if f is not None]
+        current = cls.plausible_atm_iv(current)
         if current is None or len(vals) < min_samples:
             return None
         below = sum(1 for v in vals if v < current)
@@ -240,18 +316,26 @@ class OptionsAccountInterface(ABC):
                 f"{self.id} (row {existing}); skipping")
             return existing
 
-        if iv is None:
-            iv = self.get_atm_implied_volatility(underlying)
+        raw = self.get_atm_implied_volatility(underlying) if iv is None else iv
+        iv = self.plausible_atm_iv(raw)
         if iv is None:
             logger.warning(
-                f"No ATM implied volatility available for {underlying} on account "
-                f"{self.id} — NO IV sample recorded. Any iv_rank-gated rule for this "
-                f"underlying stays inert (IVRankCondition fails closed).")
+                f"No usable ATM implied volatility for {underlying} on account "
+                f"{self.id} (feed returned {raw!r}; a sample must be a finite fraction "
+                f"in [{self.MIN_PLAUSIBLE_ATM_IV}, {self.MAX_PLAUSIBLE_ATM_IV}]) — NO IV "
+                f"sample recorded. Any iv_rank-gated rule for this underlying stays "
+                f"inert (IVRankCondition fails closed).")
             return None
         return add_instance(OptionIVSnapshot(account_id=self.id, underlying=underlying, atm_iv=iv))
 
-    def _iv_series(self, underlying: str, lookback_days: int):
+    def _iv_series(self, underlying: str, lookback_days: Optional[int] = None):
         """HISTORY: stored ATM-IV samples strictly BEFORE today (UTC), in window.
+
+        ``lookback_days`` is CALENDAR days (defaulting to ``IV_RANK_LOOKBACK_DAYS``),
+        because that is what the stored ``recorded_at`` supports; the recorder's Mon-Fri
+        cron is what turns it into ~252 SESSIONS. Spelling that out because "252" read
+        as trading days for as long as the default was 252 calendar days, and the two
+        differ by nearly three months.
 
         Today's own sample is excluded. ``_iv_rank_from_series`` counts strictly ``<``,
         so a sample equal to (or, after the daily recorder ran, nearly equal to)
@@ -270,6 +354,8 @@ class OptionsAccountInterface(ABC):
         from sqlmodel import select
         from ba2_common.core.db import get_db
         from ba2_common.core.models import OptionIVSnapshot
+        if lookback_days is None:
+            lookback_days = self.IV_RANK_LOOKBACK_DAYS
         cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
         with get_db() as session:
             rows = session.exec(
@@ -282,7 +368,7 @@ class OptionsAccountInterface(ABC):
             ).all()
             return [r.atm_iv for r in rows]   # read while session is open
 
-    def iv_sample_count(self, underlying: str, lookback_days: int = 252) -> int:
+    def iv_sample_count(self, underlying: str, lookback_days: Optional[int] = None) -> int:
         """How many trailing ATM-IV samples ``get_iv_rank`` would actually use.
 
         Exposed so readiness can be REPORTED rather than inferred: "no rank" and
@@ -290,10 +376,16 @@ class OptionsAccountInterface(ABC):
         underlyings are still short of ``min_samples`` before their rules wake up.
         Counts exactly what the rank counts (today's sample excluded), so the report
         cannot say "armed" a day before the gate can actually open.
+
+        ROWS, not usable samples: this deliberately does NOT apply the plausibility
+        filter. The readiness report answers "is the recorder keeping up?", and a row the
+        rank later discards is still evidence the recorder ran. Where the two numbers
+        disagree, the rank is the stricter one and the gate stays shut — the safe way
+        round.
         """
         return len(self._iv_series(underlying, lookback_days))
 
-    def get_iv_rank(self, underlying: str, lookback_days: int = 252,
+    def get_iv_rank(self, underlying: str, lookback_days: Optional[int] = None,
                     min_samples: int = 20,
                     current: Optional[float] = None) -> Optional[float]:
         """IV percentile (0-100) of the CURRENT ATM IV against the stored trailing

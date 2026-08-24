@@ -219,6 +219,23 @@ def test_iv_sample_count_reports_window_depth(mock_account):
     assert mock_account.iv_sample_count("AAPL", lookback_days=100000) == 3
 
 
+def test_the_live_window_is_the_shared_one_year_constant(mock_account):
+    """The DEFAULT window, not just an explicitly-passed one.
+
+    ``lookback_days`` is CALENDAR days here (that is what ``recorded_at`` supports) and
+    the recorder's weekday cron is what turns it into sessions. 252 calendar days — the
+    old default — is ~173 sessions, about 8.5 months, while the rule names ("Rich IV",
+    "Cheap IV") and every docstring said one year. Pinned against the shared constant so
+    the live and backtest windows cannot drift apart, and so a silent narrowing of the
+    default cannot quietly turn the gate into a short-term momentum filter.
+    """
+    assert OptionsAccountInterface.IV_RANK_LOOKBACK_DAYS == 365, "a true one-year window"
+
+    _seed_days_ago(mock_account, "AAPL", [(40, 0.1), (200, 0.2), (300, 0.3), (400, 0.9)])
+    assert mock_account.iv_sample_count("AAPL") == 3, \
+        "everything inside a year counts; the 400-day-old sample does not"
+
+
 # ---------------------------------------------------------------------------
 # 4. Fail-closed: an unknown rank never satisfies a gate
 # ---------------------------------------------------------------------------
@@ -267,3 +284,143 @@ def test_iv_rank_condition_can_finally_return_true_end_to_end(mock_account, samp
                             sample_recommendation, operator_str=">=", value=50.0)
     assert cond.evaluate() is True
     assert cond.calculated_value == 100.0
+
+
+# ---------------------------------------------------------------------------
+# 5. Plausibility: an impossible IV is UNKNOWN, never a number
+# ---------------------------------------------------------------------------
+#
+# ``record_atm_iv`` used to guard only ``if iv is None``. Everything else the broker
+# handed back became a real row. The two shapes a broken options feed actually returns
+# are 0.0 (an un-populated float field) and NaN (a failed Black-Scholes inversion), and
+# both are catastrophic HERE specifically:
+#
+#   * 0.0 ranks below every stored sample, so ``get_iv_rank`` returns 0.0 — and SIX of
+#     the nine live gated rules are ``iv_rank <= 35/40/50``. A zero-filled field would
+#     open every one of them, on real option orders, at the exact moment the feed is
+#     broken. "IV is unknown" and "IV is the cheapest of the year" are opposite trading
+#     instructions and the old guard could not tell them apart.
+#   * NaN propagates: ``v < nan`` is False for every v, so the rank silently becomes
+#     0.0 as well, and one NaN in the SERIES poisons nothing visibly while inflating
+#     the denominator.
+#
+# The bound therefore lives at the boundary where a raw IV enters the statistic, and a
+# rejected value produces NO ROW — never a substituted 0.0. Same distinction the rest of
+# this file pins for a missing IV.
+
+_IMPLAUSIBLE = [
+    pytest.param(0.0, id="zero-an-unpopulated-field-not-a-calm-market"),
+    pytest.param(-0.20, id="negative-volatility-does-not-exist"),
+    pytest.param(float("nan"), id="nan-a-failed-bs-inversion"),
+    pytest.param(float("inf"), id="inf"),
+    pytest.param(1e-9, id="epsilon-a-zero-fill-that-dodges-a-bare-gt-zero-test"),
+    pytest.param(8.0, id="800pct-a-mis-scaled-or-junk-mid"),
+    pytest.param(30.0, id="percent-scaled-30-meaning-3000pct"),
+]
+
+
+@pytest.mark.parametrize("iv", _IMPLAUSIBLE)
+def test_an_implausible_iv_writes_no_row_and_is_named(mock_account, monkeypatch, iv):
+    warnings = _capture_logs(monkeypatch)
+
+    assert mock_account.record_atm_iv("AAPL", iv) is None
+    assert _snapshots() == [], "a rejected sample must leave NO row, not a 0.0 row"
+    assert any("AAPL" in m for m in warnings)
+
+
+@pytest.mark.parametrize("iv", _IMPLAUSIBLE)
+def test_an_implausible_iv_from_the_broker_feed_is_rejected_too(mock_account, monkeypatch, iv):
+    """The bound must sit on the FETCHED value, not only on an explicitly passed one —
+    the daily recorder never passes ``iv``; it lets ``record_atm_iv`` fetch."""
+    monkeypatch.setattr(type(mock_account), "get_atm_implied_volatility",
+                        lambda self, u: iv, raising=True)
+
+    assert mock_account.record_atm_iv("AAPL") is None
+    assert _snapshots() == []
+
+
+@pytest.mark.parametrize("iv", [0.02, 0.05, 0.30, 1.50, 3.00, 4.99])
+def test_the_bound_admits_the_real_market(mock_account, iv):
+    """A bound that rejects real data is just a subtler fabrication. 5% is roughly the
+    quietest ATM IV ever printed on a listed US name; 300-400% is a biotech into a
+    binary readout. Both must survive."""
+    assert mock_account.record_atm_iv("AAPL", iv) is not None
+    assert [r.atm_iv for r in _snapshots()] == [iv]
+
+
+def test_an_implausible_current_leaves_the_gate_CLOSED_not_wide_open(
+        mock_account, monkeypatch, sample_recommendation):
+    """THE money test. Five honest history points, then the feed returns 0.0 today.
+
+    Old behaviour: 0 of 5 samples strictly below 0.0 -> rank 0.0 -> every "IV is low"
+    rule fires. Required behaviour: the rank is None and the rule stays shut.
+    """
+    _seed_days_ago(mock_account, "AAPL", [(1, 0.10), (2, 0.11), (3, 0.12), (4, 0.13), (5, 0.14)])
+    monkeypatch.setattr(type(mock_account), "get_atm_implied_volatility",
+                        lambda self, u: 0.0, raising=True)
+
+    assert mock_account.get_iv_rank("AAPL", min_samples=5) is None, \
+        "an impossible current IV must be UNKNOWN, not the cheapest tape of the year"
+
+    cond = create_condition(ExpertEventType.N_IV_RANK, mock_account, "AAPL",
+                            sample_recommendation, operator_str="<=", value=40.0)
+    assert cond.evaluate() is False
+    assert cond.calculated_value is None
+
+
+def test_a_nan_current_does_not_silently_score_zero(mock_account, monkeypatch):
+    """``v < nan`` is False for every v, so NaN scored a clean 0.0 with no error."""
+    _seed_days_ago(mock_account, "AAPL", [(1, 0.10), (2, 0.11), (3, 0.12), (4, 0.13), (5, 0.14)])
+    monkeypatch.setattr(type(mock_account), "get_atm_implied_volatility",
+                        lambda self, u: float("nan"), raising=True)
+    assert mock_account.get_iv_rank("AAPL", min_samples=5) is None
+
+
+def test_a_poisoned_stored_sample_is_dropped_from_the_series(mock_account):
+    """Rows predating the bound (or written by a script that bypassed it) must not
+    count. They are treated exactly like a None entry: dropped, never 0.0-valued."""
+    _seed_days_ago(mock_account, "AAPL", [(1, 0.10), (2, 0.11), (3, 0.12), (4, 0.13)])
+    _seed_days_ago(mock_account, "AAPL", [(5, 0.0), (6, float("inf")), (7, 12.0)])
+
+    assert mock_account.iv_sample_count("AAPL") == 7, \
+        "the raw row count is a separate fact from the usable one"
+    assert mock_account.get_iv_rank("AAPL", min_samples=5) is None, \
+        "4 usable samples is below the floor even though 7 rows exist"
+
+    _seed_days_ago(mock_account, "AAPL", [(8, 0.14)])
+    assert mock_account.get_iv_rank("AAPL", min_samples=5) == 100.0, \
+        "the 5th USABLE sample is what arms the gate"
+
+
+def test_the_bound_is_one_shared_definition(mock_account):
+    """Live, backtest and PremiumSeller must not each invent their own idea of
+    'a possible implied volatility'."""
+    assert OptionsAccountInterface.plausible_atm_iv(0.30) == 0.30
+    assert OptionsAccountInterface.plausible_atm_iv(0.0) is None
+    assert OptionsAccountInterface.plausible_atm_iv(None) is None
+    assert OptionsAccountInterface.plausible_atm_iv("0.3") is None, "a string is not an IV"
+    assert OptionsAccountInterface.plausible_atm_iv(object()) is None
+    assert OptionsAccountInterface.plausible_atm_iv(True) is None, \
+        "bool is an int subclass; True must not become an IV of 1.0"
+
+    # A numpy scalar off a parquet/pandas path IS a number. np.float32 is not a float
+    # subclass, so an isinstance-based guard would silently discard every backtest
+    # sample and leave the rank permanently None.
+    np = pytest.importorskip("numpy")
+    assert OptionsAccountInterface.plausible_atm_iv(np.float32(0.30)) == pytest.approx(0.30)
+    assert OptionsAccountInterface.plausible_atm_iv(np.float64(0.30)) == 0.30
+    assert OptionsAccountInterface.plausible_atm_iv(np.float64("nan")) is None
+    assert OptionsAccountInterface.MIN_PLAUSIBLE_ATM_IV < 0.05
+    assert OptionsAccountInterface.MAX_PLAUSIBLE_ATM_IV >= 4.0
+
+
+def test_the_bound_is_inclusive_at_both_ends():
+    """Pins WHICH side of each bound is open. An off-by-one here is invisible in normal
+    operation and silently changes what the recorder will accept."""
+    lo = OptionsAccountInterface.MIN_PLAUSIBLE_ATM_IV
+    hi = OptionsAccountInterface.MAX_PLAUSIBLE_ATM_IV
+
+    assert OptionsAccountInterface.plausible_atm_iv(lo) == lo
+    assert OptionsAccountInterface.plausible_atm_iv(hi) == hi
+    assert OptionsAccountInterface.plausible_atm_iv(lo * 0.99) is None
+    assert OptionsAccountInterface.plausible_atm_iv(hi * 1.01) is None

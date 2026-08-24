@@ -2386,37 +2386,67 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return None if self._options is None else self._options.get_atm_iv(
             underlying, self._as_of_date())
 
-    #: Spacing of the trailing ATM-IV grid, in calendar days. 1 == every weekday, which
-    #: MATCHES the live recorder (a Mon-Fri cron) so the two compute the same statistic
-    #: over the same sample density. Raise it to trade parity for speed on a very wide
+    #: Spacing of the trailing ATM-IV grid, in SESSIONS. 1 == every trading day, which
+    #: MATCHES the live recorder's daily cron so the two compute the same statistic over
+    #: the same sample density. Raise it to trade parity for speed on a very wide
     #: universe: cost is bounded by the number of DISTINCT (symbol, date) pairs a run
     #: touches — ~lookback + run length per symbol — because get_atm_iv is memoized
     #: per (db_path, underlying, as_of) for the life of the worker process, not
     #: recomputed per bar.
+    #:
+    #: Sessions, not calendar days: the old calendar-day step SKIPPED weekends rather
+    #: than stepping over them, so any value above 1 produced a grid that drifted through
+    #: the week and dropped a varying number of samples. Counting sessions makes "every
+    #: Nth sample" mean the same thing wherever the window starts.
     IV_RANK_SAMPLE_STEP_DAYS = 1
 
     def _iv_rank_sample_dates(self, as_of, lookback_days: int):
-        """Weekday grid over the trailing window, EXCLUDING ``as_of`` itself.
+        """Trading-session grid over the trailing window, EXCLUDING ``as_of`` itself.
 
-        Weekends are skipped because the provider clamps to the latest snapshot on or
-        before a date: a Saturday lookup silently returns Friday's number again, so
-        sampling them would triple-count every Friday. ``as_of`` is excluded because
-        ``_iv_rank_from_series`` counts strictly ``<`` and the memoized provider returns
-        a bit-identical value for the same date — including it would guarantee one
-        sample that can never be below ``current`` and bias every rank down by 100/N
-        (20 points at the production min_samples of 5). Live has the same shape: the
-        stored series is yesterday-and-earlier, ``current`` is a fresh read.
+        NON-SESSIONS ARE SKIPPED BECAUSE THE PROVIDER CLAMPS. ``get_atm_iv`` returns the
+        latest snapshot on or before a date, so any closed day silently returns the
+        previous session's number again and that session gets counted twice. The original
+        grid handled weekends (``weekday() < 5``) and missed market HOLIDAYS, which are
+        the same bug at 1/12th the volume: nine weekdays a year on which the exchange is
+        shut, each double-weighting the session before it — and clustered around
+        year-end and quarter turns, where IV is least typical. The NYSE calendar answers
+        both cases from one source, and half-days are real sessions with real closes so
+        they correctly stay in.
+
+        ``as_of`` is excluded because ``_iv_rank_from_series`` counts strictly ``<`` and
+        the memoized provider returns a bit-identical value for the same date — including
+        it would guarantee one sample that can never be below ``current`` and bias every
+        rank down by 100/N (20 points at the production min_samples of 5). Live has the
+        same shape: the stored series is yesterday-and-earlier, ``current`` is a fresh
+        read.
+
+        DEGRADES, NEVER DIES. ``pandas_market_calendars`` is a pinned dependency, but a
+        remote GA worker that somehow lacks it must produce a slightly coarser grid — the
+        old weekday fallback — rather than failing every trial in the job.
         """
         from datetime import timedelta
-        out, day = [], as_of - timedelta(days=lookback_days)
-        step = timedelta(days=max(1, int(self.IV_RANK_SAMPLE_STEP_DAYS)))
-        while day < as_of:
-            if day.weekday() < 5:
-                out.append(day)
-            day += step
-        return out
+        from ba2_common.core import market_calendar
 
-    def get_iv_rank(self, underlying, lookback_days: int = 252,
+        first = as_of - timedelta(days=lookback_days)
+        last = as_of - timedelta(days=1)
+        try:
+            days = [o.astimezone(market_calendar.NY_TZ).date()
+                    for o, _c in market_calendar.nyse_regular_sessions(first, last)]
+        except Exception as e:
+            logger.warning(
+                f"NYSE calendar unavailable ({e}); falling back to a weekday IV-rank grid. "
+                f"Market holidays will be sampled, double-counting the session before "
+                f"each one.")
+            days, day = [], first
+            while day <= last:
+                if day.weekday() < 5:
+                    days.append(day)
+                day += timedelta(days=1)
+
+        step = max(1, int(self.IV_RANK_SAMPLE_STEP_DAYS))
+        return days[::step]
+
+    def get_iv_rank(self, underlying, lookback_days: Optional[int] = None,
                     min_samples: int = 20, current=None):
         """OVERRIDE: percentile of today's ATM IV against a provider-derived series.
 
@@ -2435,13 +2465,27 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         same way.
 
         The PERCENTILE MATH is the shared ``_iv_rank_from_series``, so live and backtest
-        cannot drift on what "IV rank 60" means. Returns None (never 0.0) when the
-        provider yields fewer than ``min_samples`` usable points — which is the case on
-        every options cache built before the greeks columns existed, and is exactly what
-        keeps ``IVRankCondition`` failing closed there.
+        cannot drift on what "IV rank 60" means — including its plausibility bound, which
+        is this path's ONLY boundary since nothing here writes a row a recorder could
+        have vetted. Returns None (never 0.0) when the provider yields fewer than
+        ``min_samples`` usable points — which is the case on every options cache built
+        before the greeks columns existed, and is exactly what keeps ``IVRankCondition``
+        failing closed there.
+
+        WHAT IS NOT SHARED, and must not be claimed as such: the ATM CONTRACT. Live picks
+        the strike nearest spot across the whole 20-45 DTE chain; this provider has no
+        point-in-time spot, so it proxies with the CALL whose |delta| is nearest 0.50 (see
+        ``HistoricalOptionsProvider.get_atm_iv``). The two series are the same KIND of
+        number sampled on the same grid, but they are not the same statistic, and an
+        ``iv_rank`` threshold tuned here does not transfer to live at full precision.
+
+        ``lookback_days`` defaults to the shared ``IV_RANK_LOOKBACK_DAYS`` (calendar
+        days), so live and backtest cannot disagree on the window width either.
         """
         if self._options is None:
             return None
+        if lookback_days is None:
+            lookback_days = self.IV_RANK_LOOKBACK_DAYS
         as_of = self._as_of_date()
         if current is None:
             current = self._options.get_atm_iv(underlying, as_of)

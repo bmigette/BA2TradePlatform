@@ -12,13 +12,15 @@ from unittest.mock import patch
 
 import pytest
 
+from datetime import datetime, timedelta, timezone
+
 from ba2_common.core import iv_rank_audit as audit
 from ba2_trade_platform.core.db import get_all_instances
 from ba2_trade_platform.core.models import OptionIVSnapshot
-from ba2_trade_platform.core.types import ExpertEventRuleType
+from ba2_trade_platform.core.types import ExpertEventRuleType, MarketAnalysisStatus
 from tests.factories import (
     create_account_definition, create_expert_instance, create_event_action,
-    create_ruleset, link_rule_to_ruleset,
+    create_market_analysis, create_ruleset, link_rule_to_ruleset,
 )
 
 IV_TRIGGERS = {"trigger_0": {"event_type": "has_buy_position"},
@@ -59,6 +61,13 @@ def _capture(monkeypatch, module, level):
     messages = []
     monkeypatch.setattr(module.logger, level, lambda msg, *a, **k: messages.append(str(msg)))
     return messages
+
+
+def _analysed(expert_id, symbol, *, days_ago=1, status=MarketAnalysisStatus.COMPLETED):
+    """Record that `expert_id` ran an analysis on `symbol` `days_ago` days ago."""
+    return create_market_analysis(
+        symbol=symbol, expert_instance_id=expert_id, status=status,
+        created_at=datetime.now(timezone.utc) - timedelta(days=days_ago))
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +127,313 @@ def test_recording_targets_are_the_deduped_union_per_account():
     _gated_expert(a2.id, ["GOOG"], triggers=PLAIN_TRIGGERS)   # not gated -> excluded
 
     assert audit.recording_targets() == {a1.id: ["AAPL", "MSFT", "NVDA"], a2.id: ["TSLA"]}
+
+
+# ---------------------------------------------------------------------------
+# Deferred universes: the expert picks its symbols at ANALYSIS time
+# ---------------------------------------------------------------------------
+#
+# ``get_enabled_instruments()`` returns a SENTINEL — "SCREENER", "DYNAMIC", "EXPERT" —
+# for every selection method that resolves at analysis time. Filtering those out and
+# moving on (the original behaviour) meant a screener expert contributed ZERO recording
+# targets, so its gates could never arm. That is not a corner case: on the live book
+# FOUR of the seven iv_rank-gated experts (26, 29, 31, 33) select via screener and
+# between them carry SIX of the nine gated rules. Deleting the sentinel silently turned
+# the fix into a two-thirds fix.
+#
+# WHY RECENT ANALYSES, and not the alternatives:
+#
+#   * Re-running the screener at recorder time is the obvious idea and is wrong twice
+#     over. The screener is a live, deliberately UNCACHED FMP call
+#     (FMPScreenerProvider excludes itself from the uniform disk cache), so it doubles
+#     the daily bill; and the 16:30 universe is not the universe the 08:00 analysis pass
+#     used, so it would sample names the rules never ask about while missing names they
+#     do. Sampling has to follow what the expert actually looked at.
+#   * Declaring screener experts unsupported leaves six live rules permanently inert,
+#     which is the defect being fixed.
+#   * MarketAnalysis is ALREADY this codebase's answer to "is this symbol in a screener
+#     expert's universe?" — SmartRiskManagerToolkit gates order opening on exactly this
+#     query. A second, different definition is how two implementations of one statistic
+#     start diverging.
+#
+# WINDOW: 30 days, not SmartRiskManager's 24 hours. The live screener experts run
+# WEEKLY (verified: experts 26/29/31/33 each produce ~15 symbols every 7 days), so a
+# 24h window would see nothing on six days in seven and the recorder would sample in
+# bursts — the one cadence the whole feature exists to prevent. 30 days spans four
+# runs of the slowest configured cadence. Ageing a name out is cheap because rows are
+# never deleted: a symbol the screener re-selects still has its old series waiting.
+
+def _screener_expert(account_id, **kw):
+    """An iv_rank-gated expert whose universe is the SCREENER sentinel."""
+    return _gated_expert(account_id, ["SCREENER"], **kw)
+
+
+def test_a_screener_experts_universe_is_what_it_recently_analysed(mock_account_def):
+    """THE critical gap: a sentinel universe used to yield zero recording targets."""
+    inst = _screener_expert(mock_account_def.id)
+    _analysed(inst.id, "AAPL", days_ago=1)
+    _analysed(inst.id, "MSFT", days_ago=8)
+
+    assert audit.recording_targets() == {mock_account_def.id: ["AAPL", "MSFT"]}
+
+
+@pytest.mark.parametrize("sentinel", ["SCREENER", "DYNAMIC", "EXPERT"])
+def test_every_deferred_selection_mode_is_recovered_the_same_way(mock_account_def, sentinel):
+    """All three sentinels mean "resolved at analysis time". Handling only SCREENER
+    would leave the same hole one rename away."""
+    inst = _gated_expert(mock_account_def.id, [sentinel])
+    _analysed(inst.id, "AAPL")
+
+    assert audit.recording_targets() == {mock_account_def.id: ["AAPL"]}
+
+
+def test_a_deferred_universe_is_labelled_as_recovered_not_configured(mock_account_def):
+    """The report must be able to say WHERE a symbol list came from — a recovered list
+    is a best-effort trailing observation, a configured one is authoritative."""
+    inst = _screener_expert(mock_account_def.id)
+    _analysed(inst.id, "AAPL")
+
+    gate = audit.find_iv_rank_gates()[0]
+    assert gate.universe_source == audit.UNIVERSE_RECENT_ANALYSES
+    assert gate.universe_is_known is True
+    assert gate.deferred_modes == ("SCREENER",)
+
+
+def test_a_static_universe_is_labelled_configured(mock_account_def):
+    _gated_expert(mock_account_def.id, ["AAPL"])
+    gate = audit.find_iv_rank_gates()[0]
+    assert gate.universe_source == audit.UNIVERSE_CONFIGURED
+    assert gate.deferred_modes == ()
+
+
+def test_analyses_older_than_the_window_are_not_the_universe(mock_account_def):
+    inst = _screener_expert(mock_account_def.id)
+    _analysed(inst.id, "AAPL", days_ago=1)
+    _analysed(inst.id, "STALE", days_ago=audit.DEFERRED_UNIVERSE_LOOKBACK_DAYS + 1)
+
+    assert audit.recording_targets() == {mock_account_def.id: ["AAPL"]}
+
+
+def test_the_window_has_an_upper_bound_too(mock_account_def):
+    """Absolute dates, because the test above scales with the constant and so cannot
+    catch it being INFLATED.
+
+    An unbounded window would make the recording universe every symbol the expert has
+    ever screened, growing forever — one full option-chain request per name per day, for
+    names the screener stopped selecting months ago. The gate itself needs only
+    ``min_samples`` (5) trailing days, so a name genuinely back in the universe re-arms
+    within a week off its retained history.
+    """
+    assert audit.DEFERRED_UNIVERSE_LOOKBACK_DAYS <= 60, \
+        "the recording universe must not accumulate everything ever screened"
+
+    inst = _screener_expert(mock_account_def.id)
+    _analysed(inst.id, "AAPL", days_ago=1)
+    _analysed(inst.id, "LASTQUARTER", days_ago=90)
+    _analysed(inst.id, "LASTYEAR", days_ago=300)
+
+    assert audit.recording_targets() == {mock_account_def.id: ["AAPL"]}
+
+
+def test_the_window_spans_a_weekly_screener_cadence(mock_account_def):
+    """Live screener experts run every 7 days. A window that cannot hold several runs
+    makes the recorder sample in bursts and starve in between."""
+    assert audit.DEFERRED_UNIVERSE_LOOKBACK_DAYS >= 28
+
+    inst = _screener_expert(mock_account_def.id)
+    for week, sym in enumerate(["W1", "W2", "W3", "W4"], start=1):
+        _analysed(inst.id, sym, days_ago=7 * week)
+
+    assert audit.recording_targets() == {mock_account_def.id: ["W1", "W2", "W3", "W4"]}
+
+
+def test_one_experts_analyses_are_not_another_experts_universe(mock_account_def):
+    """Two screener experts on one account run different screens; borrowing symbols
+    would sample names neither rule will ever evaluate."""
+    mine = _screener_expert(mock_account_def.id)
+    theirs = create_expert_instance(account_id=mock_account_def.id, expert="MockExpert")
+    _analysed(mine.id, "MINE")
+    _analysed(theirs.id, "THEIRS")
+
+    assert audit.recording_targets() == {mock_account_def.id: ["MINE"]}
+
+
+def test_a_skipped_analysis_still_proves_the_screener_selected_the_symbol(mock_account_def):
+    """Deliberately wider than SmartRiskManager's COMPLETED-only filter. That check
+    AUTHORISES an order and wants proof of finished work; this one PRE-WARMS a series
+    and wants the widest honest superset — a symbol whose analysis was skipped today is
+    one the screener will hand back tomorrow, and a missing series is what makes a rule
+    permanently inert."""
+    inst = _screener_expert(mock_account_def.id)
+    _analysed(inst.id, "SKIP", status=MarketAnalysisStatus.SKIPPED)
+
+    assert audit.recording_targets() == {mock_account_def.id: ["SKIP"]}
+
+
+def test_a_sentinel_is_never_recorded_as_a_ticker(mock_account_def):
+    """Whatever else changes, asking a broker for the option chain of "SCREENER" must
+    stay impossible — including if a sentinel somehow lands in the analysis history."""
+    inst = _screener_expert(mock_account_def.id)
+    _analysed(inst.id, "SCREENER")
+    _analysed(inst.id, "AAPL")
+
+    assert audit.recording_targets() == {mock_account_def.id: ["AAPL"]}
+
+
+def test_a_screener_expert_that_has_analysed_nothing_is_UNKNOWN_not_empty(mock_account_def):
+    """"I cannot see this expert's universe" and "this expert has no symbols" are
+    different facts and must not collapse into the same silent zero."""
+    _screener_expert(mock_account_def.id)
+
+    gate = audit.find_iv_rank_gates()[0]
+    assert gate.symbols == ()
+    assert gate.universe_source == audit.UNIVERSE_UNKNOWN
+    assert gate.universe_is_known is False
+
+
+def test_a_universe_that_could_not_be_resolved_is_UNKNOWN(monkeypatch, mock_account_def):
+    """A raising resolver already logged an error, but the gate must carry the fact
+    forward so the report cannot present the expert as fine."""
+    _gated_expert(mock_account_def.id, ["AAPL"])
+    monkeypatch.setattr(audit, "_expert_symbols",
+                        lambda eid: (_ for _ in ()).throw(RuntimeError("registry down")))
+    _capture(monkeypatch, audit, "error")
+
+    gate = audit.find_iv_rank_gates()[0]
+    assert gate.universe_is_known is False
+    assert gate.universe_source == audit.UNIVERSE_UNKNOWN
+
+
+def test_a_recovered_universe_is_recorded_end_to_end(monkeypatch, mock_account, mock_account_def):
+    """The whole point: a screener expert's gated underlyings now get real samples."""
+    from ba2_trade_platform.core.TradeManager import TradeManager
+    inst = _screener_expert(mock_account_def.id)
+    _analysed(inst.id, "AAPL")
+    _analysed(inst.id, "MSFT")
+    _patch_account(monkeypatch, mock_account)
+
+    TradeManager().record_daily_iv_snapshots()
+
+    assert sorted(r.underlying for r in get_all_instances(OptionIVSnapshot)) == ["AAPL", "MSFT"]
+
+
+# ---------------------------------------------------------------------------
+# The report may never present an invisible universe as a healthy one
+# ---------------------------------------------------------------------------
+#
+# "0/0 ARMED" is the worst possible line: it is literally true, reads as success, and
+# is emitted exactly when the recorder has no idea what it is supposed to be recording.
+
+def _report_lines(monkeypatch):
+    import ba2_trade_platform.core.TradeManager as tm_mod
+    from ba2_trade_platform.core.TradeManager import TradeManager
+    infos = _capture(monkeypatch, tm_mod, "info")
+    warnings = _capture(monkeypatch, tm_mod, "warning")
+    TradeManager().report_iv_rank_readiness()
+    return infos, warnings
+
+
+def test_an_invisible_universe_is_a_WARNING_naming_the_dead_rules(
+        monkeypatch, mock_account, mock_account_def):
+    _screener_expert(mock_account_def.id, rule_name="Buy Call: Bullish Dip, Low IV")
+    _patch_account(monkeypatch, mock_account)
+
+    infos, warnings = _report_lines(monkeypatch)
+
+    blob = "\n".join(warnings)
+    assert "Buy Call: Bullish Dip, Low IV" in blob, "name the rule that stays dead"
+    assert "SCREENER" in blob, "name WHY the universe is invisible"
+    assert "0/0" not in "\n".join(infos + warnings), \
+        "an unknown universe must never be rendered as a count"
+
+
+@pytest.mark.parametrize("scenario", ["no-analyses", "resolver-raises", "empty-static-list"])
+def test_the_report_can_never_print_0_of_0_ARMED(monkeypatch, mock_account, mock_account_def,
+                                                 scenario):
+    """Swept across every path that produces a gate with no symbols."""
+    if scenario == "no-analyses":
+        _screener_expert(mock_account_def.id)
+    elif scenario == "resolver-raises":
+        _gated_expert(mock_account_def.id, ["AAPL"])
+        monkeypatch.setattr(audit, "_expert_symbols",
+                            lambda eid: (_ for _ in ()).throw(RuntimeError("boom")))
+        _capture(monkeypatch, audit, "error")
+    else:
+        _gated_expert(mock_account_def.id, [])
+    _patch_account(monkeypatch, mock_account)
+
+    infos, warnings = _report_lines(monkeypatch)
+
+    blob = "\n".join(infos + warnings)
+    assert "0/0" not in blob, f"{scenario} still renders an empty universe as a count"
+    assert any("ARMED" not in line for line in warnings)
+    assert warnings, f"{scenario} must produce a warning, not a clean info-only report"
+
+
+def test_a_gated_expert_with_no_configured_instruments_is_reported(
+        monkeypatch, mock_account, mock_account_def):
+    """A static expert whose instrument list is empty is misconfigured, not healthy."""
+    _gated_expert(mock_account_def.id, [])
+    _patch_account(monkeypatch, mock_account)
+
+    _, warnings = _report_lines(monkeypatch)
+    assert any("no" in m.lower() and "instrument" in m.lower() for m in warnings)
+
+
+def test_the_summary_line_counts_the_experts_it_cannot_see(
+        monkeypatch, mock_account, mock_account_def):
+    """The closing line is the one an operator actually reads. It must not be able to
+    say "0 armed" in a tone that means "all good"."""
+    _screener_expert(mock_account_def.id)
+    _gated_expert(mock_account_def.id, ["AAPL"])
+    _patch_account(monkeypatch, mock_account)
+
+    infos, _ = _report_lines(monkeypatch)
+    summary = [m for m in infos if m.startswith("IV-rank gate readiness:")][-1]
+    assert "1 expert(s) with an UNKNOWN universe" in summary
+
+
+def test_a_recovered_universe_is_reported_as_recovered(
+        monkeypatch, mock_account, mock_account_def):
+    """An operator must be able to tell a trailing observation from a configured list —
+    a recovered universe shrinks the moment the expert stops running."""
+    inst = _screener_expert(mock_account_def.id)
+    _analysed(inst.id, "AAPL")
+    _patch_account(monkeypatch, mock_account)
+
+    infos, _ = _report_lines(monkeypatch)
+    blob = "\n".join(infos)
+    assert "AAPL" in blob
+    assert audit.UNIVERSE_RECENT_ANALYSES in blob
+
+
+def test_the_recorder_warns_when_it_cannot_see_any_gated_universe(
+        monkeypatch, mock_account, mock_account_def):
+    """Not just the report: a recorder pass with gates but no resolvable targets used to
+    log "No iv_rank-gated rules configured" at DEBUG — the exact opposite of the truth."""
+    import ba2_trade_platform.core.TradeManager as tm_mod
+    from ba2_trade_platform.core.TradeManager import TradeManager
+    _screener_expert(mock_account_def.id)
+    _patch_account(monkeypatch, mock_account)
+    warnings = _capture(monkeypatch, tm_mod, "warning")
+
+    TradeManager().record_daily_iv_snapshots()
+
+    assert get_all_instances(OptionIVSnapshot) == []
+    assert any("universe" in m.lower() for m in warnings)
+
+
+def test_a_genuinely_unconfigured_platform_stays_quiet(monkeypatch, mock_account_def):
+    """No gated rules at all is not a problem and must not warn — a report that cries
+    wolf on every start is a report nobody reads."""
+    import ba2_trade_platform.core.TradeManager as tm_mod
+    from ba2_trade_platform.core.TradeManager import TradeManager
+    warnings = _capture(monkeypatch, tm_mod, "warning")
+
+    TradeManager().record_daily_iv_snapshots()
+    TradeManager().report_iv_rank_readiness()
+
+    assert warnings == []
 
 
 # ---------------------------------------------------------------------------

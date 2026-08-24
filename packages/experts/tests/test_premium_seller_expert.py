@@ -119,6 +119,43 @@ def test_iv_rank_gate_blocks(monkeypatch):
     assert rec.raw_outputs["targets"]["structures"] == []
 
 
+def test_the_iv_rank_series_is_the_trailing_history_not_including_today():
+    """Today's own IV is appended to ``_iv_history`` before the gate is evaluated, so
+    under the old ``<=`` arithmetic every symbol's rank counted itself and could never
+    read below 100/N. The live and backtest paths both define the series as
+    yesterday-and-earlier; this one must too, or "IV rank 50" means three things.
+    """
+    account = StubAccount(chain_for(), iv=0.30)
+    expert, ctx = make_expert(account)
+    expert._iv_history["XYZ"] = [0.30] * 24
+
+    trailing = expert._update_iv_history("XYZ", AS_OF, account, 0.30)
+
+    assert len(trailing) == 24, "the ranked series must not contain today's sample"
+    assert len(expert._iv_history["XYZ"]) == 25, "...but the rolling history still grows"
+
+    from ba2_experts.PremiumSeller import signals
+    assert signals.iv_rank(trailing, 0.30) == 0.0
+
+
+def test_the_gate_ranks_against_the_trailing_series(monkeypatch):
+    """Caller-level companion to the test above: 24 points all below today's IV is a
+    rank of 100, but only if today's own sample is kept out of the series. Ranking the
+    post-append list scores 96 and blocks a trade the rule says to take."""
+    # risk_per_structure_pct 10.0 so the spread actually sizes (see
+    # test_emits_put_credit_spread_target_with_budget); the IV gate is what is under test.
+    settings = dict(FULL_SETTINGS, iv_rank_enabled=True, iv_rank_min=99.0,
+                    risk_per_structure_pct=10.0)
+    expert, ctx = make_expert(StubAccount(chain_for(), iv=0.30), settings)
+    for sym in ("XYZ", "ABC"):
+        expert._iv_history[sym] = [0.10] * 24
+
+    rec = expert.analyze_as_of(AS_OF, ctx)
+    assert len(rec.raw_outputs["targets"]["structures"]) == 2, \
+        "rank is 100 against the trailing series; only self-inclusion drops it to 96"
+
+
+
 def test_trend_filter_blocks(monkeypatch):
     settings = dict(FULL_SETTINGS, trend_filter_enabled=True, trend_sma=3)
     account = StubAccount(chain_for())

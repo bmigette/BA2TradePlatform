@@ -422,11 +422,28 @@ class TradeManager:
         trading gate, and a fabricated sample would arm real option rules off invented
         data. A missing sample leaves ``IVRankCondition`` failing closed instead.
         """
-        from ba2_common.core.iv_rank_audit import recording_targets
+        from ba2_common.core.iv_rank_audit import find_iv_rank_gates, recording_targets
 
-        targets = recording_targets()
+        gates = find_iv_rank_gates()
+        targets = recording_targets(gates)
+        blind = [g for g in gates if not g.universe_is_known]
+        if blind:
+            # NOT a debug line. "No targets" and "I cannot see what the targets are" are
+            # opposite facts, and the second one means live rules stay permanently inert.
+            self.logger.warning(
+                f"ATM-IV recorder cannot see the instrument universe of {len(blind)} "
+                f"iv_rank-gated expert(s): "
+                + "; ".join(f"{g.expert_id} ({g.expert})"
+                            + (f" selects via {'/'.join(g.deferred_modes)} and has not "
+                               f"analysed anything recently" if g.deferred_modes
+                               else " could not be resolved")
+                            + f" — inert rule(s): {', '.join(g.rule_names)}"
+                            for g in blind)
+                + ". No ATM-IV series is being kept for them, so those rules cannot fire.")
         if not targets:
-            self.logger.debug("No iv_rank-gated rules configured; skipping ATM-IV recording")
+            if not gates:
+                self.logger.debug(
+                    "No iv_rank-gated rules configured; skipping ATM-IV recording")
             return
 
         total_recorded = 0
@@ -481,8 +498,17 @@ class TradeManager:
 
         Deliberately counts samples only — it does NOT compute the rank, because that
         would fetch a full option chain per symbol on every app start.
+
+        NO GATE MAY BE RENDERED AS A COUNT THE REPORT CANNOT STAND BEHIND. An expert
+        whose universe is UNKNOWN (a screener that has not run, a resolver that raised)
+        has no denominator, and printing one — ``0/0 underlying(s) ARMED`` — is the worst
+        available output: literally true, indistinguishable from a healthy start, and
+        emitted precisely when the recorder is blind and the rules are dead. Those gates
+        go to WARNING with the rules they are killing named, and the summary line carries
+        the count so it cannot read as an all-clear.
         """
-        from ba2_common.core.iv_rank_audit import find_iv_rank_gates
+        from ba2_common.core import iv_rank_audit as iv_audit
+        from ba2_common.core.iv_rank_audit import find_iv_rank_gates, UNIVERSE_CONFIGURED
         from ba2_common.core.TradeConditions import IVRankCondition
 
         gates = find_iv_rank_gates()
@@ -497,13 +523,36 @@ class TradeManager:
 
         accounts = {}
         armed_total = 0
+        blind_total = 0
         for gate in gates:
             if gate.account_id not in accounts:
                 accounts[gate.account_id] = self._resolve_options_account(gate.account_id)[1]
             account = accounts[gate.account_id]
+            rules = ', '.join(gate.rule_names)
             self.logger.info(
-                f"  expert {gate.expert_id} ({gate.expert}) — gated rule(s): "
-                f"{', '.join(gate.rule_names)}")
+                f"  expert {gate.expert_id} ({gate.expert}) — gated rule(s): {rules}")
+
+            if not gate.universe_is_known:
+                blind_total += 1
+                why = (f"selects instruments via {'/'.join(gate.deferred_modes)} and has "
+                       f"analysed nothing in the last "
+                       f"{iv_audit.DEFERRED_UNIVERSE_LOOKBACK_DAYS} days"
+                       if gate.deferred_modes else
+                       "its instrument universe could not be resolved (see the error above)")
+                self.logger.warning(
+                    f"    UNIVERSE UNKNOWN — expert {gate.expert_id} ({gate.expert}) {why}, "
+                    f"so no ATM-IV series is being recorded for it and its rule(s) "
+                    f"({rules}) CANNOT FIRE. This is not the same as having no "
+                    f"underlyings: the recorder does not know what to record.")
+                continue
+
+            if not gate.symbols:
+                self.logger.warning(
+                    f"    NO UNDERLYINGS — expert {gate.expert_id} ({gate.expert}) has an "
+                    f"iv_rank-gated rule ({rules}) but no enabled instruments configured, "
+                    f"so it has nothing to trade and nothing to sample.")
+                continue
+
             if account is None:
                 self.logger.info(
                     f"    {len(gate.symbols)} underlying(s) — UNKNOWN (account "
@@ -514,15 +563,21 @@ class TradeManager:
             armed = [s for s, c in counts.items() if c >= min_samples]
             inert = [s for s, c in counts.items() if c < min_samples]
             armed_total += len(armed)
+            origin = ("" if gate.universe_source == UNIVERSE_CONFIGURED else
+                      f" [{gate.universe_source}: recovered from the last "
+                      f"{iv_audit.DEFERRED_UNIVERSE_LOOKBACK_DAYS} days of analyses, not a "
+                      f"configured list — it moves with the {'/'.join(gate.deferred_modes)}]")
             self.logger.info(
-                f"    {len(armed)}/{len(gate.symbols)} underlying(s) ARMED"
+                f"    {len(armed)}/{len(gate.symbols)} underlying(s) ARMED{origin}"
                 + (f": {self._sample_list(armed, counts, min_samples)}" if armed else "")
                 + (f"; INERT (iv_rank is None, so the rule cannot fire): "
                    f"{self._sample_list(inert, counts, min_samples)}" if inert else ""))
 
         self.logger.info(
             f"IV-rank gate readiness: {armed_total} underlying(s) armed across "
-            f"{len(gates)} expert(s)")
+            f"{len(gates)} expert(s)"
+            + (f"; {blind_total} expert(s) with an UNKNOWN universe whose gated rules "
+               f"cannot fire at all" if blind_total else ""))
 
     @staticmethod
     def _sample_list(symbols, counts, min_samples, limit: int = 12) -> str:
