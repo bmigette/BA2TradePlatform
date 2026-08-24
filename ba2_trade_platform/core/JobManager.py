@@ -1429,23 +1429,50 @@ class JobManager:
     def _execute_open_positions_analysis(self, expert_instance_id: int, subtype: str, batch_id: Optional[str] = None):
         """
         Execute open positions analysis by expanding into individual jobs for each open position.
-        
+
         This method:
+        0. Runs the shared OPTION LIFECYCLE PASS (see below) — before anything else
         1. Queries all currently open transactions for the expert (WAITING or OPENED status)
         2. Extracts unique symbols from those transactions
         3. Creates individual analysis jobs for each symbol
-        
+
         This reuses the same logic as ENTER_MARKET's "no existing open positions" check,
         but inverted - we only analyze symbols that HAVE open positions.
-        
+
+        THE OPTION LIFECYCLE PASS RUNS FIRST, AND WITHOUT AN EXPERT.
+        Roll at 21 DTE, capture 50% of a credit, defend a tested short, trip a drawdown
+        breaker: none of those needs an opinion about the underlying, and paying for an FMP
+        call plus an LLM analysis to discover that a spread is at 21 DTE is exactly the cost
+        behind the "options must be as fast as stocks" requirement. Order matters both ways:
+        managing first stops the expert opining (at real cost) on a structure that is about
+        to be flattened, and stops an exit rule evaluating an entry thesis against a position
+        that no longer exists.
+
+        It also sits ABOVE the `not open_symbols` early return, deliberately: the pass
+        ratchets the sleeve's peak equity on EVERY evaluation, including a flat one. A sleeve
+        the breaker just flattened is flat, and skipping it there is precisely the bug
+        `option_book.update_breaker` documents — it would then measure its next drawdown from
+        the trough, i.e. from no drawdown at all.
+
+        Its failures are contained. Maintenance must not be able to take the analyses down,
+        and the analyses must not depend on it having run.
+
         Args:
             expert_instance_id: The expert instance ID
             subtype: The analysis subtype (should be OPEN_POSITIONS)
             batch_id: Optional batch identifier for grouping related jobs
         """
         try:
+            from .option_lifecycle_service import run_option_lifecycle_pass
+            run_option_lifecycle_pass(expert_instance_id)
+        except Exception as e:
+            logger.error(f"Option lifecycle pass failed for expert {expert_instance_id}: {e} "
+                         f"- its open option positions were NOT managed this cycle; "
+                         f"continuing with the analyses", exc_info=True)
+
+        try:
             logger.info(f"Executing open positions analysis for expert {expert_instance_id}, batch_id={batch_id}")
-            
+
             from sqlmodel import select, Session
             from .db import get_db
             from .models import Transaction
