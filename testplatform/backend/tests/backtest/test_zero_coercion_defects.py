@@ -431,6 +431,118 @@ def test_equity_round_trip_is_never_scaled_by_a_contract_multiplier():
 
 
 # ===========================================================================
+# Item 3 (siblings) — "capital deployed" reconstructed WITHOUT the multiplier
+# ===========================================================================
+# The round-trip row carried premium-per-share (``entry_price``) and CONTRACTS (``size``) but
+# NOT the contract multiplier, so every downstream consumer that rebuilds "the capital deployed
+# in this trade" as ``entry_price * size`` was 100x too small for an option. Two consumers:
+#   * results._compute_metrics' per-trade PROFIT CAP  -> cap 100x too TIGHT  -> PENALISES;
+#   * monte_carlo.apply_spread_cost's notional        -> cost 100x too SMALL -> FLATTERS.
+def _opt_trades(n, premium, exit_premium, contracts, mult=100.0):
+    return [{"symbol": "AAPL", "contract_symbol": f"X{i}", "underlying_symbol": "AAPL",
+             "entry_time": D1, "exit_time": D2, "direction": "buy",
+             "entry_price": premium, "exit_price": exit_premium, "size": contracts,
+             "multiplier": mult,
+             "pnl": (exit_premium - premium) * contracts * mult,
+             "pnl_pct": (exit_premium - premium) * contracts * mult / 100_000.0 * 100.0,
+             "bars_held": 5, "exit_reason": "exit"} for i in range(n)]
+
+
+def test_round_trip_row_carries_the_contract_multiplier(option_round_trip_account_comm):
+    """The row must publish the multiplier it used, so no consumer has to guess it."""
+    acct = option_round_trip_account_comm
+    rt = [t for t in acct.get_round_trip_trades() if t["exit_reason"] != "open_at_end"]
+    assert rt and rt[0]["multiplier"] == pytest.approx(100.0)
+
+
+def test_equity_round_trip_row_reports_multiplier_one():
+    from ba2_common.core.types import OrderDirection
+
+    acct, ctx, ps = _acct(account_id=211, cfg=CFG_COMM)
+    try:
+        buy, txn = _open_entry(acct, qty=10, side=OrderDirection.BUY)
+        _fill(acct, buy, 100.0, D2)
+        sell = _attach_order(acct, txn, OrderDirection.SELL, qty=10)
+        _fill(acct, sell, 120.0, D3)
+        assert acct.get_round_trip_trades()[0]["multiplier"] == pytest.approx(1.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_profit_cap_basis_is_capital_deployed_not_bare_premium():
+    """SYNTHETIC BOOK. 20 option round-trips: 2 contracts at a 2.00 premium (= $400 of capital
+    each) closed at 3.00 (= +$200, a 50% return on capital). At the launcher's DEFAULT
+    ``--profit-cap-pct 2000`` nothing should be capped — 50% is nowhere near 2000%.
+
+    Pre-fix the basis was ``2.00 * 2 = $4.00``, so the "2000%" cap was $80 against a $200 gain
+    and 60% of the book's profit was deducted: adjusted_total_return 4.0% -> 1.6%,
+    adjusted_calmar 3.99 -> 1.60. Every option trade returning more than 20% on capital was
+    silently truncated. This one PENALISES.
+    """
+    from app.services.backtest.results import build_results
+
+    trades = _opt_trades(20, 2.0, 3.0, 2.0)
+    snaps = [_snap(D1, 100_000.0), _snap(D2, 104_000.0), _snap(D3, 104_000.0)]
+    base = build_results(_PlainStub(snaps, trades), {"initial_capital": 100_000.0})
+    capped = build_results(_PlainStub(snaps, trades),
+                           {"initial_capital": 100_000.0, "profit_cap_pct": 2000.0})
+    assert base["total_return"] == pytest.approx(4.0)
+    assert capped["adjusted_total_return"] == pytest.approx(base["total_return"])
+    assert capped["adjusted_calmar_ratio"] == pytest.approx(base["adjusted_calmar_ratio"])
+
+
+def test_profit_cap_still_bites_when_the_gain_really_does_exceed_the_cap():
+    """REGRESSION guard for the mutation "multiplier applied in the wrong direction": the cap
+    must still fire on a genuine mega-winner. 1 contract, 1.00 premium ($100 deployed), closed
+    at 26.00 (+$2,500 = 2500% of capital) with a 2000% cap -> capped at $2,000."""
+    from app.services.backtest.results import build_results
+
+    trades = _opt_trades(1, 1.0, 26.0, 1.0)
+    snaps = [_snap(D1, 100_000.0), _snap(D2, 102_500.0), _snap(D3, 102_500.0)]
+    capped = build_results(_PlainStub(snaps, trades),
+                           {"initial_capital": 100_000.0, "profit_cap_pct": 2000.0})
+    # excess = 2500 - 2000 = 500 deducted from final equity -> 102_000 -> +2.0%
+    assert capped["adjusted_total_return"] == pytest.approx(2.0)
+
+
+def test_profit_cap_basis_for_equities_is_unchanged():
+    """LEGITIMATE: shares have no contract multiplier, so an equity row's basis stays
+    ``entry_price * size`` (a missing/1 multiplier must be an exact no-op)."""
+    from app.services.backtest.results import build_results
+
+    trades = [{"symbol": "AAA", "entry_time": D1, "exit_time": D2, "direction": "buy",
+               "entry_price": 10.0, "exit_price": 40.0, "size": 100.0, "pnl": 3_000.0,
+               "pnl_pct": 3.0, "bars_held": 5, "exit_reason": "exit"}]
+    snaps = [_snap(D1, 100_000.0), _snap(D2, 103_000.0), _snap(D3, 103_000.0)]
+    capped = build_results(_PlainStub(snaps, trades),
+                           {"initial_capital": 100_000.0, "profit_cap_pct": 100.0})
+    # basis 10*100 = $1,000; cap 100% = $1,000; gain $3,000 -> excess $2,000 deducted.
+    assert capped["adjusted_total_return"] == pytest.approx(1.0)
+
+
+def test_spread_stress_notional_uses_capital_deployed_for_options():
+    """The spread-stress robustness haircut charges ``notional * bps * 2``. With the notional
+    100x too small the modelled cost was 100x too small — a genome whose edge barely clears the
+    real spread sailed through the stress test. This one FLATTERS."""
+    from app.services.backtest.monte_carlo import apply_spread_cost
+
+    trade = _opt_trades(1, 2.0, 3.0, 2.0)[0]
+    out = apply_spread_cost([trade], initial=100_000.0, spread_bps=50.0)
+    # notional = 2.00 x 2 contracts x 100 = $400; round-trip cost = 400 * 0.005 * 2 = $4.00
+    # -> 4.00 / 100_000 * 100 = 0.004 pct points deducted.
+    assert out[0] == pytest.approx(trade["pnl_pct"] - 0.004)
+
+
+def test_spread_stress_notional_unchanged_for_equities():
+    from app.services.backtest.monte_carlo import apply_spread_cost
+
+    trade = {"entry_price": 10.0, "size": 100.0, "pnl_pct": 1.0}
+    out = apply_spread_cost([trade], initial=100_000.0, spread_bps=50.0)
+    # notional = $1,000; cost = 1000 * 0.005 * 2 = $10 -> 0.01 pct points.
+    assert out[0] == pytest.approx(1.0 - 0.01)
+
+
+# ===========================================================================
 # Item 4 — a NaN run must be rejected, not scored as flawless
 # ===========================================================================
 def test_snapshot_equity_rejects_non_finite_nlv():

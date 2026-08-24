@@ -76,7 +76,13 @@ def apply_spread_cost(trades: List[Dict[str, Any]], initial: float, spread_bps: 
     bps_frac = float(spread_bps) / 10_000.0
     out = []
     for i, t in enumerate(trades):
-        notional = float(t.get("entry_price") or 0.0) * float(t.get("size") or 0.0)
+        # Notional = capital DEPLOYED: premium x contracts x CONTRACT MULTIPLIER for an option,
+        # price x shares for equity. Without the multiplier the modelled spread cost was 100x
+        # too small on every option trade, so the spread-stress screen -- whose whole job is to
+        # reject genomes whose edge barely clears the cost -- charged effectively nothing and
+        # passed them. Rows with no multiplier (equities, legacy blobs) use 1: an exact no-op.
+        notional = (float(t.get("entry_price") or 0.0) * float(t.get("size") or 0.0)
+                    * float(t.get("multiplier") or 1.0))
         equity_at_entry = float(path[i])
         if notional <= 0 or equity_at_entry <= 0:
             out.append(pcts[i])

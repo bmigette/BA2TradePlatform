@@ -343,6 +343,10 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         "entry_price": _finite(entry_price, "trade.entry_price", default=0.0),
         "exit_price": _finite(trade.get("exit_price"), "trade.exit_price", default=0.0),
         "size": _finite(trade.get("size", trade.get("qty")), "trade.size", default=0.0),
+        # Contract multiplier (100 for an option, 1 for equity). ``default=1.0`` covers the
+        # per-FILL fallback rows, equities and trade blobs persisted before the round-trip
+        # recorder published it — 1 is the correct no-op for all three.
+        "multiplier": _finite(trade.get("multiplier"), "trade.multiplier", default=1.0),
         "pnl": _finite(trade.get("pnl"), "trade.pnl", default=0.0),
         "pnl_pct": _finite(trade.get("pnl_pct"), "trade.pnl_pct", default=0.0),
         "bars_held": int(trade.get("bars_held", 0) or 0),
@@ -496,7 +500,15 @@ def _compute_metrics(
         for t in trades:
             p = t.get("pnl") or 0.0
             if has_basis_cap:
-                cost = (t.get("entry_price") or 0.0) * (t.get("size") or 0.0)
+                # Capital DEPLOYED, not the bare premium: an option's basis is
+                # premium x contracts x CONTRACT MULTIPLIER. Without the multiplier the basis
+                # was 100x too small for every option trade, so a nominal "2000%" cap (the
+                # launcher default) actually truncated any option gain above 20% of the capital
+                # really at risk -- a large, invisible PENALTY on exactly the runs the option
+                # grid produces. Rows with no multiplier (equities, per-fill fallback rows,
+                # legacy persisted blobs) use 1, which is an exact no-op.
+                mult = t.get("multiplier") or 1.0
+                cost = (t.get("entry_price") or 0.0) * (t.get("size") or 0.0) * mult
                 cp1.append(min(p, cost * cap_frac) if (p > 0 and cost > 0) else p)
             else:
                 cp1.append(p)

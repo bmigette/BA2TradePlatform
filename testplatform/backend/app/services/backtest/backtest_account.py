@@ -2302,6 +2302,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     "entry_price": entry_px,
                     "exit_price": exit_px,
                     "size": size,
+                    # PUBLISH the contract multiplier the P&L above used (100 for an option,
+                    # 1 for equity). Without it every downstream consumer that rebuilds "the
+                    # capital deployed in this trade" from entry_price x size is 100x too small
+                    # for an option -- which is exactly what the results profit cap and the
+                    # monte-carlo spread-stress notional were doing. No consumer should have to
+                    # re-derive it from asset_class.
+                    "multiplier": float(mult),
                     "pnl": pnl,
                     "pnl_pct": pnl_pct,
                     "bars_held": bars_held,
