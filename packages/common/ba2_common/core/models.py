@@ -252,12 +252,32 @@ class Transaction(SQLModel, table=True):
         executed = OrderStatus.get_executed_statuses()
         for order in orders:
             # Only count filled orders
-            if order.status in executed and order.filled_qty:
-                # Add to total based on side (BUY is positive, SELL is negative)
-                if order.side == OrderDirection.BUY:
-                    total_qty += order.filled_qty
-                elif order.side == OrderDirection.SELL:
-                    total_qty -= order.filled_qty
+            if order.status not in executed:
+                continue
+            # ONE TRUTHINESS TEST USED TO DO TWO DIFFERENT JOBS. This was
+            # ``if order.status in executed and order.filled_qty:``, which collapsed
+            # "the broker said it filled but never said how much" (filled_qty NULL --
+            # UNMEASURABLE) into "nothing filled" (filled_qty 0.0 -- a MEASUREMENT).
+            # The total that came out looked like a number either way, and fed
+            # AccountInterface.submit_close_order_for_transaction and Smart-RM close
+            # sizing. The value cannot carry the tri-state (this returns a float and
+            # ~10 call sites add/compare it), so the gap is made LOUD instead of
+            # silent: skipped, and reported.
+            if order.filled_qty is None:
+                from ba2_common.logger import logger
+                logger.error(
+                    f"Transaction {self.id}.get_current_open_qty(): order {order.id} "
+                    f"({order.symbol} {order.side}) is {order.status} but has NO "
+                    f"filled_qty — the filled amount is UNMEASURABLE, not zero. "
+                    f"Excluding it; the returned net open quantity is therefore "
+                    f"incomplete and must not be treated as a measured position size."
+                )
+                continue
+            # Add to total based on side (BUY is positive, SELL is negative)
+            if order.side == OrderDirection.BUY:
+                total_qty += order.filled_qty
+            elif order.side == OrderDirection.SELL:
+                total_qty -= order.filled_qty
 
         return total_qty
 

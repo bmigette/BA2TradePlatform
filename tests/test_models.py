@@ -134,3 +134,103 @@ class TestMarketAnalysisStateDefault:
             status=MarketAnalysisStatus.PENDING,
         )
         assert ma.state == {}
+
+
+# ---------------------------------------------------------------------------
+# An UNMEASURABLE fill must not read as a measured zero.
+#
+# ``get_current_open_qty`` counted an order with ``if order.status in executed and
+# order.filled_qty:`` -- one truthiness test doing two different jobs. An EXECUTED
+# order whose ``filled_qty`` is NULL means "the broker told us it filled but never
+# told us how much": genuinely unknown. The old expression silently dropped it and
+# returned a total that looks exactly like a measured number, which then flowed into
+# ``AccountInterface.submit_close_order_for_transaction`` (net 0 -> fell back to the
+# stale ordered quantity) and into Smart-RM close sizing.
+#
+# A ``filled_qty`` of exactly 0.0, by contrast, IS a measurement ("nothing filled")
+# and must stay silent. Both directions are pinned below.
+# ---------------------------------------------------------------------------
+
+def _capture_model_errors(monkeypatch):
+    """Collect ``logger.error`` text from the shared ba2_common logger.
+
+    NOT caplog: ``logger.py`` sets ``propagate = False``, so caplog's root handler
+    sees nothing. ``models.get_current_open_qty`` imports the logger lazily from
+    ``ba2_common.logger``, so patching that object's ``.error`` catches it.
+    """
+    import ba2_common.logger as _log
+    messages = []
+    monkeypatch.setattr(_log.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+class TestGetCurrentOpenQtyUnmeasurableFill:
+    def test_executed_order_with_null_filled_qty_is_logged_loudly(self, monkeypatch):
+        """THE DEFECT: a FILLED order with no filled_qty was dropped in silence."""
+        acct_def = create_account_definition()
+        txn = create_transaction(symbol="AAPL", quantity=10.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=txn.id, filled_qty=None,
+        )
+        errors = _capture_model_errors(monkeypatch)
+
+        qty = txn.get_current_open_qty()
+
+        assert errors, (
+            "an EXECUTED order with no filled_qty is unmeasurable, not zero -- "
+            "it must not be dropped silently")
+        assert any("filled_qty" in m for m in errors), errors
+        # The value itself is unchanged (the tri-state does not fit the float return);
+        # the log is what makes the gap visible. See the report for that decision.
+        assert qty == 0.0
+
+    def test_a_measured_zero_fill_stays_silent(self, monkeypatch):
+        """THE INVERSE: ``filled_qty == 0.0`` on an executed order is a MEASUREMENT
+        ('nothing filled'), and must neither log nor change the total."""
+        acct_def = create_account_definition()
+        txn = create_transaction(symbol="AAPL", quantity=10.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=txn.id, filled_qty=0.0,
+        )
+        errors = _capture_model_errors(monkeypatch)
+
+        assert txn.get_current_open_qty() == 0.0
+        assert errors == [], ("a measured zero fill is an answer, not a gap", errors)
+
+    def test_a_non_executed_order_with_null_filled_qty_stays_silent(self, monkeypatch):
+        """THE INVERSE #2: a PENDING order has no fill yet BY DEFINITION. Splitting the
+        truthiness must not turn every resting order into an error."""
+        acct_def = create_account_definition()
+        txn = create_transaction(symbol="AAPL", quantity=10.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, status=OrderStatus.PENDING,
+            transaction_id=txn.id, filled_qty=None,
+        )
+        errors = _capture_model_errors(monkeypatch)
+
+        assert txn.get_current_open_qty() == 0.0
+        assert errors == [], errors
+
+    def test_measurable_siblings_are_still_counted(self, monkeypatch):
+        """A gap in one order must not discard the orders that DID report a fill."""
+        acct_def = create_account_definition()
+        txn = create_transaction(symbol="AAPL", quantity=10.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=txn.id, filled_qty=10.0,
+        )
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=4.0,
+            side=OrderDirection.SELL, status=OrderStatus.FILLED,
+            transaction_id=txn.id, filled_qty=None,
+        )
+        errors = _capture_model_errors(monkeypatch)
+
+        assert txn.get_current_open_qty() == 10.0
+        assert errors, "the unmeasurable SELL must still be reported"
