@@ -245,3 +245,77 @@ short-sign divergence happened.
   **does** publish `open_interest` (already read) and volume via the snapshot's `daily_bar` (not yet
   read), so live liquidity gates are an adapter fix, not a data purchase.
 - **Account-wide rails** across multiple option experts.
+
+---
+
+# Sub-project H — TastyTrade historical option data (NEW, follow-up)
+
+Added 2026-08-24 after probing the live DXLink feed. **This removes the need for ThetaData.**
+
+## What was measured
+
+`test_files/probe_tastytrade_option_history.py`, run against the real production account.
+`DXLinkStreamer.subscribe_candle(symbols, interval, start_time)` accepts an arbitrary
+`start_time`, and each `Candle` carries `open/high/low/close`, `volume`, `vwap`,
+`bid_volume`, `ask_volume`, **`imp_volatility`** and **`open_interest`**.
+
+**Contracts that have already EXPIRED are served.** This was the make-or-break question and the
+answer is yes — a 2024 expiry returns its full life and stops on its expiry date.
+
+Coverage, by expiry, measured on AAPL:
+
+| expiry | bars | IV | OI |
+|---|---|---|---|
+| 2019-01-18 | 101 | 0% | 0% |
+| 2021-01-15 | 334 | 0% | 35% |
+| 2022-01-21 | 507 | 0% | 79% |
+| 2023-01-20 | 591 | 13% | 100% |
+| 2024-01-19 | 587 | 55% | 100% |
+| 2024-09-20 | 236 | 99% | 99% |
+| 2026-02-20 | 173 | 94% | 99% |
+
+IV is not a per-contract cutoff but a **wall-clock floor**: counting IV-bearing bars back from each
+expiry lands on roughly **October 2022** every time. So ~8 years of bars, ~5 years of open
+interest, ~4 years of IV.
+
+**Limits found:**
+- **No intraday for expired contracts.** An hourly request on a dead contract returned one junk
+  sentinel bar. Daily only for history — a 0DTE arm can be backtested open-to-close but not
+  managed intraday.
+- **No bid/ask prices.** `Candle` carries `bid_volume`/`ask_volume` but not the quotes, so the
+  spread-cost calibration gap is NOT closed by this source. Needs its own probe.
+- **The WebSocket needs an explicit certifi SSL context.** REST works because `httpx` uses certifi
+  while `websockets` picks up a self-signed corporate root from the system store. Pass
+  `DXLinkStreamer(session, ssl_context=ssl.create_default_context(cafile=certifi.where()))`.
+
+## Scope
+
+**H1 — `TastyTradeOptionsProvider`.** A historical options provider alongside the existing
+`ThetaDataOptionsProvider`, which is already written, registered in `OPTIONS_PROVIDERS` and
+unit-tested but has **zero production callers**. That seam already exists; use it rather than
+inventing a second one. Streaming, not REST, so the shape is a paced crawl over contracts with
+backpressure — not a drop-in for `fetch_options.py`'s request loop.
+
+**H2 — cache schema migration.** `option_bar` predates the greeks feature and has **no
+`iv`/`delta`/`gamma`/`theta`/`vega` columns**, while `_BAR_COLS` names them in the INSERT. Because
+the DDL is `CREATE TABLE IF NOT EXISTS`, opening the existing file never adds them and **a rebuild
+crashes on the first bar write** (reproduced). Needs an explicit `ALTER TABLE ADD COLUMN`, or a
+fresh file. `open_interest` needs a column too.
+
+**H3 — the warm-up script.** Build the grid's cache over **2023-01-01 → today**. Chosen because it
+sits inside the IV floor, so every bar carries IV rather than starting ragged. It must be
+resumable (63M+ bars in the existing cache; a crawl that cannot resume is unusable), report
+coverage honestly per symbol, and never silently write a bar with a NULL IV where one was expected.
+
+## Why this matters beyond convenience
+
+IV and greeks are currently *computed* — `fetch_options.py` would derive IV by Black-Scholes
+inversion of each bar's close. That is a model output, adequate for strike selection and flagged as
+such. dxfeed's `imp_volatility` is exchange-derived, and **`open_interest` cannot be computed at
+all**. Today OI is NULL across all 6,757,055 chain rows, which is why `min_open_interest` rejects
+the entire chain in backtest and why delta-based selection yields zero trades.
+
+## Depends on
+
+Nothing in A+B. Can be specced and built in parallel. It **blocks D** (the grid runner), because a
+delta- or IV-gated arm cannot be optimised against a cache that has neither.
