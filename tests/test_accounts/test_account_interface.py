@@ -494,6 +494,58 @@ class TestUnreadableBalanceIsNotAPass:
         )
 
         assert errors, "the add-to-position branch must refuse an unreadable balance too"
+        # Specifically the GUARD's message. `assert errors` alone was satisfied by
+        # deleting the guard entirely: None then reached `additional_value > None`,
+        # the outer except caught the TypeError and appended its own error. A crash
+        # is not the check running.
+        assert any("before adding to" in e for e in errors), errors
+        assert not any("could not be completed" in e for e in errors), (
+            "the guard must refuse, not crash into the catch-all", errors)
+
+    def test_a_measured_zero_balance_blocks_adding_to_a_position(self, monkeypatch):
+        """THE INVERSE for the add-to-position branch: $0.00 available is measured, so
+        the top-up is rejected for exceeding it with the ordinary message."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=0.0)),
+        )
+        order, transaction = self._order_and_txn(acct_def, expert_instance)
+        create_trading_order(
+            account_id=acct_def.id, symbol="MSFT", quantity=1.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=transaction.id, filled_qty=1.0,
+        )
+
+        errors = account._validate_expert_available_balance(
+            order, transaction, expert_instance, current_price=400.0
+        )
+
+        assert any("Adding $400.00 exceeds expert's available balance $0.00" in e
+                   for e in errors), errors
+        assert not any("could not" in e.lower() for e in errors), errors
+
+    def test_a_readable_balance_permits_adding_to_a_position(self, monkeypatch):
+        """...and a top-up the sleeve can afford is still allowed."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=10_000.0)),
+        )
+        order, transaction = self._order_and_txn(acct_def, expert_instance)
+        create_trading_order(
+            account_id=acct_def.id, symbol="MSFT", quantity=1.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=transaction.id, filled_qty=1.0,
+        )
+
+        assert account._validate_expert_available_balance(
+            order, transaction, expert_instance, current_price=400.0
+        ) == []
 
     def test_a_measured_zero_balance_is_still_an_answer(self, monkeypatch):
         """THE INVERSE. $0.00 available is a MEASURED number, not an unknown: the order

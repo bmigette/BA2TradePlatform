@@ -280,3 +280,27 @@ def _orders_for(txn_id):
     from ba2_trade_platform.core.db import get_db
     with get_db() as session:
         return list(session.exec(select(TradingOrder).where(TradingOrder.transaction_id == txn_id)).all())
+
+
+class TestReconcileShortPositions:
+    """A SHORT position at the broker reports a NEGATIVE quantity."""
+
+    def test_a_short_broker_position_is_still_a_position(self):
+        """`abs()` is load-bearing: without it a short reads as <= 0 and reconcile
+        force-closes a live short, cancelling its stops."""
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "AMPX", "qty": -2.0}]
+        txn = _open_txn(acct.id, "AMPX")
+
+        assert account.reconcile_externally_closed_transactions() == 0
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
+
+    def test_a_short_reported_as_a_negative_string_is_also_a_position(self):
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "AMPX", "qty": "-2"}]
+        txn = _open_txn(acct.id, "AMPX")
+
+        assert account.reconcile_externally_closed_transactions() == 0
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED

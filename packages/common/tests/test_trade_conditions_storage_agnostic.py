@@ -554,3 +554,31 @@ def test_a_breakeven_close_is_knowable_not_unclassifiable(repo):
     any_close = _days_since_close()
     assert any_close.evaluate() is False
     assert any_close.calculated_value == 3.0
+
+
+def test_a_dateless_close_hides_an_otherwise_qualifying_one(repo):
+    """A CLOSED row with no close_date is invisible to the ordering, so it could be
+    NEWER than the close we matched -- "days since" is then unknowable even though a
+    perfectly good qualifying close exists. Without a datable close alongside it the
+    match path is never reached, so this needs both."""
+    _found, _none, _unclass = _reasons()
+    dateless = _closed_txn(days_ago=1)
+    dateless.close_date = None
+    repo.rows += [dateless, _closed_txn(days_ago=3)]
+
+    assert repo.last_closed_transaction_with_reason(
+        expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=0) == (None, _unclass)
+
+    cond = _days_since_close()
+    assert cond.evaluate() is False
+    assert cond.calculated_value is None
+
+
+def test_every_close_dated_is_still_an_ordinary_answer(repo):
+    """THE INVERSE: nothing about the dateless check may disturb dated closes."""
+    _found, _none, _unclass = _reasons()
+    repo.rows += [_closed_txn(days_ago=3), _closed_txn(days_ago=30)]
+    txn, reason = repo.last_closed_transaction_with_reason(
+        expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=0)
+    assert reason == _found
+    assert txn.close_date == NOW - timedelta(days=3)

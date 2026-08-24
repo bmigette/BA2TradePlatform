@@ -86,7 +86,7 @@ class TestVirtualBalanceHonoursAZeroPercentSleeve:
 class TestBalanceUsageChartHonoursAZeroPercentSleeve:
     """What the operator SEES must agree with what the sizing code does."""
 
-    def _totals(self, monkeypatch, pct):
+    def _totals(self, monkeypatch, pct, account_balance=100_000.0):
         import sys
         from ba2_trade_platform.ui.components.BalanceUsagePerExpertChart import (
             BalanceUsagePerExpertChart,
@@ -98,7 +98,7 @@ class TestBalanceUsageChartHonoursAZeroPercentSleeve:
             "ba2_trade_platform.ui.components.BalanceUsagePerExpertChart"]
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
-        account._balance = 100_000.0
+        account._balance = account_balance
         create_expert_instance(
             account_id=acct_def.id, expert="MockExpert", virtual_equity_pct=pct
         )
@@ -120,6 +120,15 @@ class TestBalanceUsageChartHonoursAZeroPercentSleeve:
     def test_an_ordinary_percentage_is_unchanged(self, monkeypatch):
         data = self._totals(monkeypatch, pct=25.0)
         assert [d["total"] for d in data.values()] == [pytest.approx(25_000.0)]
+
+    def test_a_zero_ACCOUNT_balance_still_charts_the_expert(self, monkeypatch):
+        """THE INVERSE at the other end: the guard above the multiply is
+        `if account_balance is None: continue`, and it must stay an `is None`. An
+        account that measurably holds $0 belongs on the chart AT ZERO -- dropping it
+        makes an empty account indistinguishable from an unreachable broker."""
+        data = self._totals(monkeypatch, pct=25.0, account_balance=0.0)
+        assert len(data) == 1, "a $0 account is measured, not missing"
+        assert [d["total"] for d in data.values()] == [0.0]
 
 
 class TestSmartRiskManagerEquityHonoursAZeroPercentSleeve:
