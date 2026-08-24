@@ -121,6 +121,13 @@ def _render_account_filter_dropdown():
         # window.location.reload() forces a real document reload of the current URL
         # *including* the hash, so the active tab is still restored by
         # setup_tab_navigation while the filter actually refreshes.
+        #
+        # NOT awaited, on purpose: awaiting an AwaitableResponse waits for a REPLY from a
+        # document that is busy tearing itself down. The un-awaited call is still sent --
+        # AwaitableResponse.__init__ schedules it (nicegui/awaitable_response.py:21). That
+        # only holds while nothing wraps Client.run_javascript in a coroutine; ui/main.py
+        # once did, and this reload silently stopped happening. See
+        # tests/test_ui_account_switch_reload.py.
         ui.run_javascript('window.location.reload()')
     
     with ui.row().classes('items-center gap-1 mr-4'):
