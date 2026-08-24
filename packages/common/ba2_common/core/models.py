@@ -200,6 +200,21 @@ class Transaction(SQLModel, table=True):
     # Contract multiplier for P&L/value math: 100 for standard options, null (=1) for
     # equity. Populated from the originating order so option premium scales correctly.
     multiplier: int | None = Field(default=None, description="Contract multiplier (100 for standard options; null/1 for equity)")
+    # --- The option INTENT. The transaction says WHAT was meant ("a bull call
+    # spread on ACN, expiring 2026-08-21"); the TradingOrder rows underneath say
+    # which contracts actually filled. `symbol` above stays the UNDERLYING ticker
+    # and must never hold an OCC contract string -- JobManager selects
+    # `distinct Transaction.symbol` and submits a market analysis per value.
+    asset_class: AssetClass = Field(default=AssetClass.EQUITY, index=True,
+                                    description="EQUITY or OPTION. Before this existed the only "
+                                                "tell was multiplier=100.")
+    option_strategy: str | None = Field(default=None,
+                                        description="The INTENT: bull_call_spread, iron_condor, "
+                                                    "covered_call... None for equity.")
+    expiry: date | None = Field(default=None, index=True,
+                                description="The structure's expiry. Valid as a single value ONLY "
+                                            "because every supported structure is single-expiry "
+                                            "(no calendars/diagonals). See Task 2.")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
     # JSON field for storing additional data (e.g., TradeConditionsData)
