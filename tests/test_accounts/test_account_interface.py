@@ -753,6 +753,26 @@ class TestCloseNeverFallsBackToTheOrderedQuantity:
         assert len(submitted) == 1
         assert submitted[0].quantity == 100.0
 
+    def test_a_fractional_remainder_is_still_a_position(self, monkeypatch):
+        """THE INVERSE #3: Alpaca trades FRACTIONAL shares, so the flat guard must
+        test for zero and nothing wider. 0.25 of a share is a real, measured holding
+        that a `<= 0.5` guard would silently abandon with its stops still armed."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        submitted = []
+        monkeypatch.setattr(account, "submit_order",
+                            lambda o, **k: submitted.append(o) or o)
+        transaction = self._txn_with_orders(
+            acct_def, ordered_qty=1.5,
+            fills=[(OrderDirection.BUY, 1.5), (OrderDirection.SELL, 1.25)],
+        )
+
+        result = account.submit_close_order_for_transaction(transaction)
+
+        assert result["success"] is True
+        assert len(submitted) == 1
+        assert submitted[0].quantity == pytest.approx(0.25)
+
     def test_short_position_closes_the_absolute_net(self, monkeypatch):
         """A short's net is negative; the close is a BUY of its magnitude."""
         acct_def = create_account_definition()
