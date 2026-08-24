@@ -420,6 +420,14 @@ class ExpertEventType(str, Enum):
     N_PERCENT_ABOVE_RECENT_LOW = "percent_above_recent_low"    # Percent the current price is above the recent low
     N_IV_RANK = "iv_rank"                                      # Implied volatility rank (0-100)
     N_DAYS_TO_EARNINGS = "days_to_earnings"                    # Calendar days until the next earnings announcement
+    # Calendar days of option life REMAINING (expiry - the evaluation date). The complement of
+    # N_DAYS_OPENED, which counts days ELAPSED: with the entry DTE window itself a tuned gene,
+    # "21 days after opening" and "21 days before expiry" are different quantities. This is what
+    # makes roll-at-DTE expressible as a RULE (it previously existed only inside
+    # OptionPortfolioManager, so no other expert could roll and the GA could not optimise the
+    # roll point) and it is the only exit criterion a 0DTE structure can have. Negative past
+    # expiry; UNEVALUABLE (never 0, never infinity) when the expiry cannot be determined.
+    N_DAYS_TO_EXPIRY = "days_to_expiry"
 
 
 class ExpertActionType(str, Enum):
@@ -540,7 +548,8 @@ def get_numeric_event_values():
         ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH.value,
         ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW.value,
         ExpertEventType.N_IV_RANK.value,
-        ExpertEventType.N_DAYS_TO_EARNINGS.value
+        ExpertEventType.N_DAYS_TO_EARNINGS.value,
+        ExpertEventType.N_DAYS_TO_EXPIRY.value
     ]
 
 

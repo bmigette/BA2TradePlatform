@@ -2392,6 +2392,221 @@ class DaysToEarningsCondition(CompareCondition):
         return f"{int(self.calculated_value)}d"
 
 
+class DaysToExpiryCondition(CompareCondition):
+    """Calendar days of option life REMAINING: ``expiry - the evaluation date``.
+
+    The complement of ``DaysOpenedCondition``, which counts days ELAPSED. They are NOT
+    interchangeable: the grid tunes the entry DTE window as its own gene, so "21 days
+    after opening" lands on a different remaining life for every trial. Until this
+    existed, roll-at-DTE was reachable only from the hardcoded ``OptionPortfolioManager``
+    (so only ``PremiumSeller`` could roll, and the GA could not optimise the roll point
+    for anything else), and a 0DTE structure had no exit criterion at all.
+
+    Sign: positive while the structure is alive, ``0`` on the expiry date itself, and
+    NEGATIVE past it. Past-expiry is a real (and alarming) state for a still-open
+    structure; clamping it to 0 would make ``days_to_expiry > 0`` answer "still alive".
+
+    Unknown is never a value
+    ------------------------
+    Follows ``option_lifecycle``'s ``LIFECYCLE_UNKNOWN`` discipline (and its ``_dte``
+    helper specifically). When the expiry cannot be determined the condition is
+    UNEVALUABLE: ``calculated_value`` stays ``None``, ``evaluate()`` returns False for
+    EVERY operator, and ``get_actual_value_display()`` renders the REASON rather than a
+    number, so an audit row can never show a plausible DTE for a measurement we did not
+    make. The two defaults it refuses:
+
+    * ``0`` — would satisfy ``days_to_expiry <= N`` and flatten, on sight, every position
+      whose expiry we happen not to see. The worst available failure mode.
+    * ``+inf`` / a large sentinel — would make the exit permanently inert while looking
+      configured. That is precisely the dead roll-DTE gene an entire GA campaign tuned.
+
+    (A ``DaysSinceLastCloseCondition``-style ``1e9`` sentinel is right THERE — "never
+    closed" is a real, knowable fact — and wrong here: "no expiry recorded" is ignorance
+    about a structure that definitely has one.)
+
+    Where the expiry comes from
+    ---------------------------
+    Every source is consulted and they must AGREE; the union is the candidate set, the
+    same way ``option_lifecycle._dte`` builds it:
+
+    1. ``Transaction.expiry``  — the structure's declared intent.
+    2. the parent ``TradingOrder.expiry`` — NULL for every multi-leg before it started
+       being stamped, which is exactly why roll-at-DTE never fired.
+    3. the HELD legs — netted per contract over the executed option orders (BUY ``+``,
+       SELL ``-``), so a leg bought back to close stops counting and its stale expiry
+       cannot manufacture a permanent contradiction. Historical rows carry no stamp on
+       either row above, so the legs are what keeps them measurable.
+
+    Empty candidate set -> unevaluable. More than one distinct date -> unevaluable: a
+    structure whose own rows disagree about when it expires has no DTE, and picking
+    ``min()`` (closes early) or ``max()`` (never closes) would be inventing one.
+    Multi-expiry structures are refused at submit time, but pre-existing rows are not.
+    A leg with no expiry at all simply adds no information and never vetoes the legs
+    that have one.
+
+    The "today" is the recommendation's ``created_at`` — the simulated as-of bar in a
+    backtest, wall-clock in live — never ``date.today()``, so the value is deterministic
+    under a frozen clock and correct in backtest. The comparison is by DATE, so every bar
+    of one session reports the same DTE.
+    """
+
+    #: Rendered instead of a number when the measurement could not be made.
+    unknown_reason: Optional[str] = None
+
+    @staticmethod
+    def _as_date(value):
+        """A ``date`` from a ``date``/``datetime`` (mirrors ``option_lifecycle._as_date``)."""
+        if isinstance(value, datetime):
+            return value.date()
+        return value
+
+    def _as_of_date(self):
+        """The evaluation DATE, or None when there is no as-of to evaluate against."""
+        as_of = getattr(self.expert_recommendation, "created_at", None)
+        if as_of is None:
+            return None
+        return self._as_of_to_date(as_of)
+
+    @staticmethod
+    def _as_of_to_date(as_of):
+        if isinstance(as_of, datetime):
+            if as_of.tzinfo is None:
+                as_of = as_of.replace(tzinfo=timezone.utc)
+            return as_of.astimezone(timezone.utc).date()
+        return as_of
+
+    def _held_leg_expiries(self, transaction_id):
+        """Distinct expiries of the still-HELD legs of ``transaction_id``.
+
+        Netted per contract symbol over the EXECUTED option orders exactly as
+        ``_get_spread_pnl_via_transaction`` does — a contract whose signed quantity nets
+        to zero is closed and contributes nothing.
+        """
+        from ba2_common.core.trade_store import orders_where
+        from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus
+
+        if transaction_id is None:
+            return set()
+
+        executed = OrderStatus.get_executed_statuses()
+        net: Dict[str, float] = {}
+        # contract -> EVERY distinct expiry its rows carry. Deliberately not "the first
+        # one wins": an OCC symbol determines its expiry, so two different values on one
+        # contract are corrupt data, and quietly keeping whichever row was read first is
+        # the silent-default this class exists to refuse. Both land in the candidate set
+        # and the caller's contradiction check turns them into a loud unknown.
+        expiry_by_contract: Dict[str, set] = {}
+        for o in orders_where(transaction_id=transaction_id):
+            if getattr(o, "asset_class", None) != AssetClass.OPTION or not o.contract_symbol:
+                continue
+            if o.status not in executed:
+                continue
+            qty = abs(float(o.filled_qty or o.quantity or 0.0))
+            if qty <= 0:
+                continue
+            sign = 1.0 if o.side == OrderDirection.BUY else -1.0
+            net[o.contract_symbol] = net.get(o.contract_symbol, 0.0) + sign * qty
+            if o.expiry is not None:
+                expiry_by_contract.setdefault(o.contract_symbol, set()).add(
+                    self._as_date(o.expiry))
+
+        out = set()
+        for contract, qty in net.items():
+            if abs(qty) > 1e-9:
+                out |= expiry_by_contract.get(contract, set())
+        return out
+
+    def _resolve_expiry(self):
+        """(expiry, "") or (None, why it is unmeasurable). Never guesses."""
+        order = self.existing_order
+        if order is None:
+            return None, ("no open position on this evaluation — there is no option "
+                          "life to measure")
+
+        candidates = set()
+        txn_id = getattr(order, "transaction_id", None)
+        if txn_id is not None:
+            from ba2_common.core.models import Transaction
+            from ba2_common.core.trade_store import get_or_none
+            txn = get_or_none(Transaction, txn_id)
+            if txn is not None and txn.expiry is not None:
+                candidates.add(self._as_date(txn.expiry))
+
+        order_expiry = getattr(order, "expiry", None)
+        if order_expiry is not None:
+            candidates.add(self._as_date(order_expiry))
+
+        candidates |= self._held_leg_expiries(txn_id)
+
+        if not candidates:
+            return None, (f"no expiry on the transaction, the order or any held leg of "
+                          f"{self.instrument_name} — the remaining option life cannot be "
+                          f"determined")
+        if len(candidates) > 1:
+            listed = ", ".join(str(e) for e in sorted(candidates))
+            return None, (f"conflicting expiries on one {self.instrument_name} structure "
+                          f"({listed}) — its remaining life is undefined")
+        return candidates.pop(), ""
+
+    def evaluate(self) -> bool:
+        try:
+            self.calculated_value = None
+            self.unknown_reason = None
+
+            as_of = self._as_of_date()
+            if as_of is None:
+                # Substituting the wall clock here is the lookahead bug DaysOpenedCondition's
+                # docstring was written about; refusing is the only honest option.
+                self.unknown_reason = ("no evaluation date on the recommendation — "
+                                       "'days remaining' has no reference point")
+                logger.warning(f"days_to_expiry for {self.instrument_name} is unevaluable: "
+                               f"{self.unknown_reason}")
+                return False
+
+            expiry, blind = self._resolve_expiry()
+            if expiry is None:
+                self.unknown_reason = blind
+                logger.warning(f"days_to_expiry for {self.instrument_name} is unevaluable: "
+                               f"{blind}")
+                return False
+
+            days = (expiry - as_of).days
+            self.calculated_value = days
+
+            if days < 0:
+                logger.warning(
+                    f"{self.instrument_name} structure is {abs(days)} day(s) PAST its "
+                    f"expiry {expiry.isoformat()} and still open")
+            else:
+                logger.debug(f"Days to expiry for {self.instrument_name}: {days} "
+                             f"(expiry {expiry.isoformat()}, as of {as_of.isoformat()})")
+
+            return self.operator_func(days, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating days-to-expiry for {self.instrument_name}: {e}",
+                         exc_info=True)
+            self.calculated_value = None
+            self.unknown_reason = f"error computing the remaining option life: {e}"
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if days until {self.instrument_name}'s option expiry is "
+                f"{self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            reason = getattr(self, "unknown_reason", None)
+            # Never None-and-silent, and never a number: the audit row must say that this
+            # was not measured, and which input was missing.
+            return f"unknown ({reason})" if reason else None
+        days = int(self.calculated_value)
+        if days < 0:
+            return f"{days} DTE (expired {abs(days)}d ago)"
+        return f"{days} DTE"
+
+
 class HasOptionPositionCondition(FlagCondition):
     """Check if this expert has an open option position for the underlying."""
 
@@ -2615,6 +2830,7 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW: PercentAboveRecentLowCondition,
         ExpertEventType.N_IV_RANK: IVRankCondition,
         ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
+        ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
         ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
         ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
         ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,

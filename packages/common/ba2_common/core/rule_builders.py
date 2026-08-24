@@ -33,6 +33,10 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     "profit_loss_percent": ExpertEventType.N_PROFIT_LOSS_PERCENT,
     "profit_loss_amount": ExpertEventType.N_PROFIT_LOSS_AMOUNT,
     "days_opened": ExpertEventType.N_DAYS_OPENED,
+    # Remaining option life (expiry - the evaluation date), the complement of days_opened.
+    # MUST be listed here or the leaf is silently dropped by triggers_from_condition_tree
+    # ("an unknown field is skipped") and the engine never sees the gate at all.
+    "days_to_expiry": ExpertEventType.N_DAYS_TO_EXPIRY,
     "percent_to_current_target": ExpertEventType.N_PERCENT_TO_CURRENT_TARGET,
     "new_target_percent": ExpertEventType.N_NEW_TARGET_PERCENT,
 }

@@ -288,6 +288,22 @@ def get_event_type_documentation() -> dict:
             "description": "Calendar days until the underlying's next earnings announcement (best-effort, FMP-backed). Lower values mean earnings are imminent. Use it to TIME long-volatility entries just before earnings (straddle/strangle) or to AVOID opening positions that would straddle the event. If no upcoming earnings date is available the condition does not fire. Used with numeric comparisons.",
             "type": "numeric",
             "example": "Enter a straddle into earnings: days_to_earnings <= 5"
+        },
+        ExpertEventType.N_DAYS_TO_EXPIRY.value: {
+            "name": "Days to Expiry (remaining option life)",
+            "description": (
+                "For open OPTION positions: calendar days of life REMAINING on the structure "
+                "(expiry minus today). This is the complement of days_opened, which counts days "
+                "ELAPSED — with a tuned entry DTE window the two are different quantities. Use it "
+                "to express roll-at-DTE ('close/roll once only 21 days remain', the conventional "
+                "point for 30-45 DTE structures) or a 0DTE exit ('close on the expiry day', "
+                "days_to_expiry <= 0). The value is 0 on the expiry date itself and NEGATIVE for a "
+                "structure still open past expiry. If the expiry cannot be determined — no expiry "
+                "recorded anywhere, or the legs disagree — the condition is unevaluable and does "
+                "NOT fire in either direction (it is never treated as 0 days left)."
+            ),
+            "type": "numeric",
+            "example": "Roll/close the structure when days_to_expiry <= 21"
         }
     }
 

@@ -33,6 +33,7 @@ _FIELD_ABBR: Dict[str, str] = {
     "days_since_last_losing_close": "sinceLoss",
     "iv_rank": "ivRank",
     "days_to_earnings": "toEarn",
+    "days_to_expiry": "toExp",
     "percent_below_recent_high": "belowHigh",
     "percent_above_recent_low": "aboveLow",
     "instrument_account_share": "acctShare",
