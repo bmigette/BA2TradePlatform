@@ -1093,14 +1093,15 @@ def test_the_transaction_is_failed_even_when_the_row_never_learned_its_id(file_d
 
     _run_enter(expert, account, inst.id)
 
-    entry_row_txn_id = [o for o in _orders("AAPL")
-                        if o.order_type == OrderType.MARKET][0].transaction_id
     txns = _transactions("AAPL")
     assert len(txns) >= 1
     assert all(t.status == TransactionStatus.FAILED for t in txns), \
         [(t.id, t.status) for t in txns]
     entry = [o for o in _orders("AAPL") if o.order_type == OrderType.MARKET][0]
     assert entry.status == OrderStatus.CANCELED
+    assert entry.transaction_id == txns[0].id, (
+        "compensating from the in-memory object also repairs the order->transaction link the "
+        "lost write never made, so the pair is no longer orphaned on disk")
 
 
 def test_nothing_is_refreshed_when_nothing_was_submitted(file_db):
