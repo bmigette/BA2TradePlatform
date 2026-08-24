@@ -932,10 +932,12 @@ async def _noop_refresh():
 # ---------------------------------------------------------------------------
 
 def _payload(views, mode=VALUATION_MODE_COST, *, base_notional=None,
-             available_buying_power=None, unallocated_pct=0.0):
+             available_buying_power=None, unallocated_pct=0.0,
+             account_value=None):
     return {'views': views, 'symbols_by_label': {}, 'valuation_mode': mode,
             'base_notional': base_notional,
             'available_buying_power': available_buying_power,
+            'account_value': account_value,
             'unallocated_pct': unallocated_pct}
 
 
@@ -2002,6 +2004,193 @@ def test_the_page_shows_free_buying_power_as_a_third_stat_card(nicegui_client):
 
     assert 'Free buying power' in texts
     assert '$7,500.00' in texts
+
+
+# ---------------------------------------------------------------------------
+# THE ACCOUNT VALUE CARD
+#
+# 'Managed value' is the market value of the managed positions, which on a
+# margin account exceeds the account's own equity -- $4,853.48 of positions
+# against roughly $2,400 of account value on the reporting user's book. The
+# page showed only the first, so it described an account twice its real size.
+#
+# The decisions (which snapshot field, and what an unknown renders as) are in
+# ``ui/utils/portfolio_allocation_view.py``; these are the wiring tests.
+# ---------------------------------------------------------------------------
+
+def test_the_view_payload_carries_the_accounts_own_value(monkeypatch, account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            cash=2_511.90, buying_power=170.31,
+                            positions=[_pos('AAPL', 10, 1000.0, 4853.48)],
+                            prices={'AAPL': 485.348})
+    _use_account(monkeypatch, account)
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    # ``_AllocAccount`` mirrors net_liquidation onto ``cash`` exactly as both live
+    # adapters mirror equity onto net_liquidation.
+    assert payload['account_value'] == 2_511.90
+    # ...and it is NOT the managed value, which is the whole complaint.
+    assert payload['account_value'] != 4_853.48
+
+
+def test_the_account_value_costs_no_second_broker_call(monkeypatch, account_id):
+    """One snapshot per render. ``_load_view_payload`` already reads it for buying
+    power; a second ``get_account_snapshot()`` here would double the REST cost of
+    every refresh (and on Alpaca the second call is two endpoints, not one)."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[_pos('AAPL', 10, 1000.0, 2500.0)],
+                            prices={'AAPL': 250.0})
+    calls = []
+    inner = account.get_account_snapshot
+    account.get_account_snapshot = lambda: (calls.append(1), inner())[1]
+    _use_account(monkeypatch, account)
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert len(calls) == 1
+    assert payload['account_value'] == 50_000.0
+
+
+def test_a_snapshot_the_broker_will_not_give_leaves_the_account_value_unknown(
+        monkeypatch, account_id):
+    """``None``, never 0.0 -- the page turns that into "n/a", and a 0.0 here would
+    reach the card as a perfectly formatted $0.00."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[_pos('AAPL', 10, 1000.0, 2500.0)],
+                            prices={'AAPL': 250.0})
+    account.get_account_snapshot = lambda: (_ for _ in ()).throw(RuntimeError('503'))
+    _use_account(monkeypatch, account)
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert payload['account_value'] is None
+    assert [v.label for v in payload['views']] == ['ARK26']
+
+
+def test_the_account_value_survives_a_base_notional_that_blows_up(monkeypatch,
+                                                                  account_id):
+    """The snapshot read and the base arithmetic share one ``try``. The account
+    value is extracted FIRST, so a failure in the arithmetic below costs the
+    reserve row -- which it always has -- and not the card as well."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            cash=2_511.90,
+                            positions=[_pos('AAPL', 10, 1000.0, 2500.0)],
+                            prices={'AAPL': 250.0})
+    _use_account(monkeypatch, account)
+    monkeypatch.setattr(page, 'compute_base_notional',
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError('boom')))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert payload['account_value'] == 2_511.90
+    assert payload['base_notional'] is None
+
+
+def _account_value_views(managed_value):
+    """One label holding one symbol worth exactly ``managed_value`` at cost."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
+    positions = positions_by_symbol([_pos('AAPL', 10, managed_value, managed_value)])
+    return build_label_views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']},
+                             positions, {}, valuation_mode=VALUATION_MODE_COST)
+
+
+def test_the_page_draws_the_account_value_beside_the_managed_value(nicegui_client):
+    """Both numbers, in the same row, so the leverage is visible rather than
+    implied. The reporting user's own figures."""
+    with nicegui_client:
+        page._render_labels(1, _payload(_account_value_views(4_853.48),
+                                        account_value=2_511.90,
+                                        available_buying_power=170.31),
+                            _noop_refresh)
+        texts = ' | '.join(_texts(nicegui_client.layout))
+
+    assert 'Account value' in texts
+    assert '$2,511.90' in texts
+    assert '$4,853.48' in texts          # the managed card is untouched
+    # And the multiple between them, said out loud -- that IS the user's question.
+    assert '1.93x' in texts
+
+
+def test_an_unknown_account_value_renders_n_a_with_a_reason_never_zero(
+        nicegui_client):
+    """THE regression. ``$0.00`` under 'Account value' reads as an account with
+    nothing in it; this project has just fixed 25 instances of that pattern."""
+    with nicegui_client:
+        page._render_labels(1, _payload(_account_value_views(4_853.48),
+                                        account_value=None),
+                            _noop_refresh)
+        texts = _texts(nicegui_client.layout)
+
+    joined = ' | '.join(texts)
+    assert 'Account value' in joined            # the card is still drawn
+    assert '$0.00' not in joined
+    # Read the card's own three lines positionally, so nothing elsewhere on the
+    # page can satisfy -- or spoil -- the assertion.
+    index = texts.index('Account value')
+    assert texts[index + 1] == 'n/a'
+    assert '$' not in texts[index + 1]
+    assert '0' not in texts[index + 1]
+    # ...and it says WHY, rather than leaving a bare "n/a".
+    assert 'net liquidating value' in texts[index + 2]
+    assert 'x this' not in joined               # and no leverage multiple
+
+
+def test_an_account_genuinely_worth_zero_still_prints_the_zero(nicegui_client):
+    """The inverse error: a fully withdrawn account IS worth $0.00, and hiding
+    that behind "unavailable" reports an outage that did not happen."""
+    with nicegui_client:
+        page._render_labels(1, _payload(_account_value_views(0.0),
+                                        account_value=0.0),
+                            _noop_refresh)
+        joined = ' | '.join(_texts(nicegui_client.layout))
+
+    assert 'Account value' in joined
+    assert '$0.00' in joined
+    assert 'n/a' not in joined
+
+
+def test_the_account_value_card_is_not_the_managed_value_again(nicegui_client):
+    """A card wired to ``managed_total_value`` would look right on every fixture
+    where the two happen to agree. They do not agree here, by construction."""
+    with nicegui_client:
+        page._render_labels(1, _payload(_account_value_views(4_853.48),
+                                        account_value=2_511.90),
+                            _noop_refresh)
+        texts = _texts(nicegui_client.layout)
+
+    # The card's own three lines, read positionally: caption, money, detail.
+    index = texts.index('Account value')
+    assert texts[index + 1] == '$2,511.90'
+    assert texts[index + 1] != '$4,853.48'
+
+
+def test_the_whole_page_shows_the_account_value_end_to_end(
+        monkeypatch, nicegui_client, account_id):
+    """Through the real ``content()``: snapshot -> payload -> card."""
+    monkeypatch.setattr(page, 'get_selected_account_id', lambda: account_id)
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            cash=2_511.90, buying_power=170.31,
+                            positions=[_pos('AAPL', 10, 1000.0, 4853.48)],
+                            prices={'AAPL': 485.348})
+    _use_account(monkeypatch, account)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+
+    _run_in_client(nicegui_client, page.content)
+
+    text = ' '.join(_texts(nicegui_client.layout))
+    assert 'Account value' in text
+    assert '$2,511.90' in text
+    assert '$4,853.48' in text
 
 
 def test_the_page_omits_the_unallocated_group_when_the_broker_gave_no_base(

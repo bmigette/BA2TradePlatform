@@ -1294,6 +1294,156 @@ def managed_total_value(views) -> float:
     return float(sum(seen.values()))
 
 
+# ---------------------------------------------------------------------------
+# THE ACCOUNT VALUE CARD
+#
+# ``managed_total_value`` above is the market value of the MANAGED POSITIONS. On
+# a margin account that is not what the account is worth: the reporting book had
+# $4,853.48 of managed positions against roughly $2,400 of account value, so a
+# summary row carrying only the first described an account twice its real size.
+# Both figures are useful and neither substitutes for the other -- the leverage
+# between them is precisely the thing the user could not see.
+# ---------------------------------------------------------------------------
+
+#: The card's caption. "Account value", not "Equity" or "Net liquidation": those
+#: are broker words for the same quantity and the row already makes the reader
+#: hold three other denominators in mind.
+ACCOUNT_VALUE_TITLE = 'Account value'
+
+#: What the money line reads when the figure is UNKNOWN. Deliberately not a
+#: number and deliberately not blank: ``$0.00`` under this caption reads as an
+#: account with nothing in it, and an empty card reads as a rendering bug.
+ACCOUNT_VALUE_UNAVAILABLE_TEXT = 'n/a'
+
+#: ...and why, in the manner of the expert cards' ``Confidence: n/a — <reason>``.
+#: A bare "n/a" leaves the reader unable to tell an outage from a setting. The
+#: closing clause is the one that matters, and it is spelled "not zero" rather
+#: than "not $0.00" on purpose: the sentence must not itself contain the string
+#: the card is promising never to print.
+ACCOUNT_VALUE_UNAVAILABLE_DETAIL = (
+    'the broker published no net liquidating value — unknown, not zero')
+
+#: The leverage clause, under the money. "this" is unambiguous because the line
+#: sits inside the account-value card, directly under the figure it divides by.
+#: Two decimals, because the interesting range is 1.00x-3.00x and one decimal
+#: cannot separate 1.95 from 2.04.
+ACCOUNT_VALUE_LEVERAGE_FMT = 'managed positions are {leverage:,.2f}x this'
+
+
+def account_value_from_snapshot(snapshot) -> Optional[float]:
+    """The account's OWN value out of a broker snapshot. Pure. ``None`` if unknown.
+
+    ``net_liquidation`` is THE field, and the choice is the ``AccountSnapshot``
+    contract's own: "Neither is the allocation denominator ... so report
+    ``net_liquidation`` as the account's headline total value." The neighbours are
+    all wrong here and each would look plausible:
+
+    * ``cash`` is NEGATIVE while a margin loan is outstanding;
+    * ``long_market_value`` is (roughly) the number the 'Managed value' card
+      already shows -- the very duplication this card exists to break;
+    * ``buying_power`` is the third card;
+    * ``equity`` is the same number in practice (see below) but is Alpaca's word,
+      and the contract nominates the other one.
+
+    Alpaca and TastyTrade DO NOT DIVERGE on it. Alpaca maps
+    ``TradeAccount.equity`` onto both fields (``AlpacaAccount.py``:
+    ``net_liquidation=equity``) and TastyTrade maps ``net-liquidating-value``
+    onto both (``TastyTradeAccount.py``: ``equity=net_liquidation``); the base
+    ``ReadOnlyAccountInterface.get_account_snapshot`` mirrors whichever one a
+    third broker publishes onto the other. So there is no adapter on which
+    reading ``net_liquidation`` can come back ``None`` while ``equity`` is set,
+    and a fallback chain between them would be an untestable second rule.
+
+    ``None`` means UNKNOWN and is never turned into 0.0 -- an all-``None``
+    snapshot is what both adapters return on an auth failure.
+
+    A non-numeric value raises rather than being swallowed: the caller
+    (``_load_view_payload``) already wraps the snapshot read in the try/except
+    that turns a broker problem into "unavailable" WITH a log line, and silently
+    returning ``None`` here would lose the log line.
+    """
+    if snapshot is None:
+        return None
+    value = getattr(snapshot, 'net_liquidation', None)
+    if value is None:
+        return None
+    return float(value)
+
+
+def format_account_money(value: float) -> str:
+    """``$2,511.90`` / ``-$1,200.00``. Pure.
+
+    The sign goes OUTSIDE the currency symbol, where ``f'${v:,.2f}'`` would put it
+    inside (``$-1,200.00``). The neighbouring cards use the plain form because
+    none of them can go negative; this one can -- an account underwater on its
+    margin loan -- and the minus is the single character in that string that
+    changes what it means, so it leads.
+    """
+    return ('-' if value < 0 else '') + f'${abs(value):,.2f}'
+
+
+@dataclass
+class AccountValueCard:
+    """The 'Account value' summary card, decided. Pure.
+
+    ``available is False`` means the broker gave us no figure: ``text`` is
+    ``n/a`` and ``detail`` says why. It is NOT the same as an account genuinely
+    worth nothing, which is ``available=True`` with ``text='$0.00'`` -- a fully
+    withdrawn account is a real state, and reporting it as an outage is the
+    inverse of the bug this card is careful about.
+
+    ``leverage`` is ``managed / account`` or ``None`` when it cannot be stated.
+    ``detail`` carries either the leverage clause or the unavailable reason,
+    never both: they are mutually exclusive by construction.
+    """
+    title: str
+    text: str
+    detail: str
+    available: bool
+    leverage: Optional[float]
+
+
+def account_value_card(*, account_value: Optional[float],
+                       managed_value: float) -> AccountValueCard:
+    """Build the 'Account value' card. Pure; never raises, never divides by zero.
+
+    Args:
+        account_value: ``account_value_from_snapshot``'s answer. ``None`` is
+            UNKNOWN -- the broker did not answer, or published no net liquidating
+            value -- and is the case the whole function is shaped around.
+        managed_value: ``managed_total_value(views)``, the figure in the card next
+            door, used only for the leverage clause.
+
+    Returns:
+        AccountValueCard: with ``leverage`` (and its clause) present only when
+        ``account_value`` is a POSITIVE number. At exactly 0 the ratio is
+        undefined and ``inf x`` is not a caption; below 0 the account is
+        underwater and a negative multiple of a negative base inverts the sense
+        of "leveraged". Both still print their figure -- it is the multiple that
+        is dropped, not the money.
+
+        A negative ``managed_value`` (a net-short managed book, which this page
+        signs negative) DOES produce a negative multiple: that is a fact about
+        the book rather than an undefined quantity.
+    """
+    if account_value is None:
+        return AccountValueCard(title=ACCOUNT_VALUE_TITLE,
+                                text=ACCOUNT_VALUE_UNAVAILABLE_TEXT,
+                                detail=ACCOUNT_VALUE_UNAVAILABLE_DETAIL,
+                                available=False, leverage=None)
+
+    value = float(account_value)
+    if value > 0.0:
+        leverage = float(managed_value or 0.0) / value
+        detail = ACCOUNT_VALUE_LEVERAGE_FMT.format(leverage=leverage)
+    else:
+        leverage = None
+        detail = ''
+    return AccountValueCard(title=ACCOUNT_VALUE_TITLE,
+                            text=format_account_money(value),
+                            detail=detail, available=True, leverage=leverage)
+
+
 def missing_quote_symbols(views) -> List[str]:
     """Symbols that are HELD but have no quote, sorted and de-duplicated.
 
