@@ -189,6 +189,15 @@ _OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10
 # with activity; the threshold sits near the p75-p80 of the measured cache distribution
 # (p10=1, p25=3, p50=14, p75=71, p90=319 contracts/day).
 #
+# WHERE IT APPLIES (corrected 2026-08-24): every option fill, LIMIT ones included. As first
+# shipped the model only reached ``_option_fill_price``'s market-style branch, which multi-leg
+# combo CHILDREN take (they carry no limit_price — the parent holds the net limit) but which
+# NO single-leg order takes: TradeActions and PremiumSeller submit single legs as
+# ``order_type="limit"``, always with a limit_price. So the wheel / 0DTE / long-option branch
+# crossed no spread on either end while credit structures paid on all 8 leg-crossings — a
+# systematic tilt in favour of exactly the single-leg premium sellers the grid evaluates. A
+# limit now crosses the quote (``_option_cross``) and is re-tested against its limit.
+#
 # All of this is a MODELING ASSUMPTION, not observed data — it is a defensible estimate
 # replacing an indefensible zero. Real quotes (e.g. ThetaData EOD bid/ask) should supersede it.
 _OPTION_SPREAD_LIQUID_VOLUME = 100.0   # at/above this daily volume, no thin-widening
@@ -1486,11 +1495,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         equity branch's non-crossing limit).
 
         LIMIT handling mirrors the equity path: the premium bar yields ONE reference price
-        (open/close per ``fill_model``), so the cross test uses it directly — a BUY_LIMIT
-        fills only when ``px <= limit``, a SELL_LIMIT only when ``px >= limit`` — and the
-        fill is at the BAR price when it is better than the limit (never worse, no slippage
-        on a limit fill). A LIMIT-typed leg carrying NO ``limit_price`` (a multi-leg child —
-        the PARENT holds the combo's net limit) falls through to the market-style fill.
+        (open/close per ``fill_model``), which is a MID — so the order first CROSSES the
+        modeled bid-ask spread (``_option_cross``: a buy lifts the ask ``px + half``, a sell
+        hits the bid ``px - half``) and the limit is re-tested against THAT price — a
+        BUY_LIMIT fills only when ``px + half <= limit``, a SELL_LIMIT only when
+        ``px - half >= limit``. An order that no longer clears once the spread is crossed
+        does NOT fill; it stays pending and retries the next bar. The fill is at the crossed
+        price, which is by construction no worse than the limit (never worse, and no
+        execution ``slippage_bps`` on a limit fill — see ``_option_cross``). A LIMIT-typed
+        leg carrying NO ``limit_price`` (a multi-leg child — the PARENT holds the combo's
+        net limit) falls through to the market-style fill.
 
         NO-ARBITRAGE guard: a resolved premium is validated against the underlying's own bar
         on the fill day (``_arb_fill_reject_reason``); a junk indicative print is rejected
@@ -1529,13 +1543,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         limit = getattr(order, "limit_price", None)
         ot = order.order_type
         if limit is not None and ot == OrderType.BUY_LIMIT:
-            if px > float(limit):
+            # CROSS FIRST, THEN RE-TEST. ``px`` is the bar's single reference premium (a
+            # mid); a buy actually lifts the ASK. Testing the limit against the raw ``px``
+            # let every single-leg option order — and they ALL carry a limit_price, unlike
+            # multi-leg children — fill without paying the spread on either end.
+            fill_px = self._option_cross(px, True, bar)
+            if fill_px > float(limit):
                 return None
-            fill_px = px
         elif limit is not None and ot == OrderType.SELL_LIMIT:
-            if px < float(limit):
+            fill_px = self._option_cross(px, False, bar)   # a sell hits the BID
+            if fill_px < float(limit):
                 return None
-            fill_px = px
         else:
             # Option-specific cost model (percent of premium), NOT the equity _slip. Multi-leg
             # combo CHILDREN are LIMIT-typed but carry no limit_price (the parent holds the net
@@ -1583,6 +1601,24 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if volume is None or float(volume) < _OPTION_SPREAD_LIQUID_VOLUME:
             full *= _OPTION_SPREAD_THIN_MULT
         return full / 2.0
+
+    def _option_cross(self, px: float, side_is_buy: bool, bar: dict) -> float:
+        """Premium after CROSSING the modeled bid-ask spread — the LIMIT-fill cost.
+
+        A buy lifts the ask (``px + half``), a sell hits the bid (``px - half``). This is
+        ``_option_slip`` without ``slippage_bps``, and the split is deliberate and matches
+        the equity path: generic execution slippage is a MARKET/STOP cost (``_slip``), while
+        a LIMIT's realistic cost is having to cross the quote to trade at all (equity
+        expresses the same thing by widening the limit's trigger threshold,
+        ``_limit_trigger_price``). Options cross the price instead of widening a threshold
+        because an option "bar" contributes ONE reference premium, not a [low, high] range
+        the threshold could be tested against.
+
+        Floored at zero on the sell side for the same reason as ``_option_slip``: a modeled
+        spread wider than the premium must not pay the account to sell.
+        """
+        half = self._option_half_spread(px, bar)
+        return px + half if side_is_buy else max(0.0, px - half)
 
     def _option_slip(self, px: float, side_is_buy: bool, bar: dict) -> float:
         """Option fill price after execution slippage + the modeled half bid-ask spread.
