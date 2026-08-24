@@ -13,7 +13,12 @@ import functools
 
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
-from ...core.types import OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus
+from ...core.types import (
+    OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus,
+    # Aliased: the module-level `AssetClass` imported above from alpaca.trading.enums is
+    # the BROKER's (us_equity/us_option/crypto), a different enum from ours.
+    AssetClass as CoreAssetClass,
+)
 from ...core.interfaces import AccountInterface
 from ...core.account_types import (
     AccountSnapshot, CashTransfer, MarginInfo, MarketHours, FractionalPreview,
@@ -745,7 +750,121 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             
         except Exception as e:
             logger.error(f"Error inserting OCO order legs for order {parent_order.id}: {e}", exc_info=True)
-    
+
+    def _reconcile_option_leg_fills(self, parent_order: TradingOrder, raw_order) -> int:
+        """Copy each broker leg's own fill onto the matching child order row.
+
+        A multi-leg option order is stored as one parent plus N children sharing a
+        ``transaction_id``. The parent is the row the broker fills, and it carries only the
+        NET price of the structure; the children carry the contract identity — the OCC
+        symbol, strike, right — and are therefore the only place per-leg economics can live.
+        Until this method existed nothing ever updated them: measured on the live DB,
+        transaction 660's children 2148/2149 held the right ``broker_order_id`` and sat at
+        ``ACCEPTED / filled_qty=0 / open_price=NULL`` for the whole life of the position and
+        beyond its close. "Which leg killed this trade?" had no answer, and the executed
+        position had to be inferred from rows the database itself said never executed.
+
+        The link is ``parent.legs_broker_ids`` ↔ ``child.broker_order_id``: both were
+        written from the same broker ids at submit time, and ``_fetch_raw_alpaca_orders``
+        sets ``nested = True`` so the refresh response carries those same legs as full order
+        objects. Matching is on that id and nothing else — NOT on list position. The broker
+        is under no obligation to return the legs in submission order, and positional
+        matching would put the long leg's price on the short leg: two rows that still look
+        entirely plausible and a structure whose P&L is exactly wrong.
+
+        WHAT SILENCE MEANS. A leg the broker does not return is left completely untouched —
+        not marked filled, not marked anything. "The response didn't mention this leg" is
+        not "this leg didn't fill", the same distinction as ``get_positions()`` returning
+        ``None`` (fetch failed) versus ``[]`` (confirmed flat), whose conflation has caused
+        five separate incidents here. That covers both an absent leg and ``legs=None``.
+        Likewise a value the broker omits: a leg with no ``filled_avg_price`` keeps its NULL
+        rather than gaining a zero, because unknown is never a value.
+
+        The parent is not touched at all — the caller has already reconciled it from the
+        top-level response, and its ``open_price`` is the structure's net debit/credit,
+        which is not any leg's price.
+
+        Args:
+            parent_order: the persisted multi-leg parent (already reconciled by the caller)
+            raw_order: the raw Alpaca order for that parent, from a nested fetch
+
+        Returns:
+            int: number of child rows actually changed.
+        """
+        broker_legs = getattr(raw_order, 'legs', None)
+        if not broker_legs:
+            logger.debug(
+                f"Order {parent_order.id}: broker returned no legs — leaving all leg "
+                f"children untouched (silence is not a fill)"
+            )
+            return 0
+
+        legs_by_broker_id = {}
+        for leg in broker_legs:
+            leg_id = getattr(leg, 'id', None)
+            if leg_id:
+                legs_by_broker_id[str(leg_id)] = leg
+        if not legs_by_broker_id:
+            logger.warning(
+                f"Order {parent_order.id}: broker returned {len(broker_legs)} leg(s) with no "
+                f"ids — cannot match them to leg children, leaving the children untouched"
+            )
+            return 0
+
+        with Session(get_db().bind) as session:
+            child_ids = [row.id for row in session.exec(
+                select(TradingOrder).where(TradingOrder.parent_order_id == parent_order.id)
+            ).all()]
+
+        updated = 0
+        for child_id in child_ids:
+            child = get_instance(TradingOrder, child_id)
+            leg = legs_by_broker_id.get(child.broker_order_id) if child.broker_order_id else None
+            if leg is None:
+                logger.debug(
+                    f"Leg child {child.id} ({child.contract_symbol}, "
+                    f"broker_order_id={child.broker_order_id}) was not in the broker's "
+                    f"response for order {parent_order.id} — left unchanged"
+                )
+                continue
+
+            has_changes = False
+
+            leg_status = self._sanitize_enum_field(
+                getattr(leg, 'status', None), OrderStatus, 'status', nullable=True
+            )
+            if leg_status is not None and leg_status != child.status:
+                logger.debug(f"Leg child {child.id} status changed: {child.status} -> {leg_status}")
+                child.status = leg_status
+                has_changes = True
+
+            leg_filled_qty = self._safe_float(getattr(leg, 'filled_qty', None))
+            if leg_filled_qty is not None and (child.filled_qty is None
+                                               or float(child.filled_qty) != leg_filled_qty):
+                logger.debug(f"Leg child {child.id} filled_qty changed: {child.filled_qty} -> {leg_filled_qty}")
+                child.filled_qty = leg_filled_qty
+                has_changes = True
+
+            # A working leg reports filled_avg_price as null (or, outside market hours, as
+            # "0"): neither is a price, so the row keeps its NULL instead of recording a
+            # fill at zero that the P&L would then believe.
+            leg_price = self._safe_float(getattr(leg, 'filled_avg_price', None))
+            if leg_price and (child.open_price is None or float(child.open_price) != leg_price):
+                logger.debug(f"Leg child {child.id} open_price changed: {child.open_price} -> {leg_price}")
+                child.open_price = leg_price
+                has_changes = True
+
+            if has_changes:
+                update_instance(child)
+                updated += 1
+
+        if updated:
+            logger.info(
+                f"Order {parent_order.id}: reconciled {updated} option leg child order(s) "
+                f"from the broker's per-leg fills"
+            )
+        return updated
+
     @staticmethod
     def _map_order_type(alpaca_type, side: OrderDirection) -> "CoreOrderType":
         """Map an Alpaca order type to our directional OrderType.
@@ -2862,6 +2981,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
                         if legs_inserted > 0 or legs_updated > 0:
                             logger.info(f"Order {db_order.id}: Updated {legs_updated} OCO legs, Inserted {legs_inserted} OCO leg orders")
+
+                    # Step 3b: Reconcile a multi-leg OPTION order's per-leg fills onto its
+                    # children. Separate from the OCO branch above because these are not
+                    # OCO legs: nothing cancels anything, all N legs execute together, and
+                    # the children already exist with their broker ids (written at submit).
+                    # They are simply never updated afterwards, which is why every leg row
+                    # of every spread in the live DB still says it did not execute.
+                    elif db_order.asset_class == CoreAssetClass.OPTION:
+                        self._reconcile_option_leg_fills(db_order, raw_order)
 
             # Step 4: Mark database orders with broker_order_ids that don't exist in Alpaca as CANCELED
             # This catches orders that were canceled in Alpaca but status wasn't updated in database
