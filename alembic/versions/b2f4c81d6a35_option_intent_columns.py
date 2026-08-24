@@ -32,23 +32,29 @@ create_all path and this one stop building the same column;
 tests/test_option_intent_migration.py runs alembic's own comparator with
 compare_type=True and will say so.
 
-FORWARD-ONLY: NOTHING IS BACK-FILLED
-====================================
-Every pre-existing row gets 'EQUITY' from the server default and keeps NULL
-``option_strategy`` / ``expiry``. 23 of the 82 historical option orders have
-unrecoverable contracts, so reconstructing the strategy or the expiry would be
-guesswork wearing a fact's clothing.
+ONE COLUMN IS BACK-FILLED, AND ONLY ONE
+=======================================
+``asset_class`` IS back-filled; ``option_strategy`` and ``expiry`` are NOT. The line
+between them is lookup versus guess.
 
-The honest cost, measured read-only on ~/Documents/ba2/trade/db.sqlite on
-2026-08-24: 20 transactions there DO have an option TradingOrder underneath (13 of
-them still OPEN) and every one of them will read as EQUITY. That is recoverable
-later and cheaply -- ``o.asset_class = 'OPTION'`` on the child order is a recorded
-fact, not a guess -- but it is a separate revision and a separate decision, and it
-is stated here rather than papered over.
+23 of the 82 historical option orders have unrecoverable contracts, so reconstructing
+a strategy or an expiry for those transactions would be guesswork wearing a fact's
+clothing. Both columns therefore stay NULL on every pre-existing row, forever.
+
+``asset_class`` is a different kind of thing: ``tradingorder.asset_class`` was
+recorded at execution time (revision 08de6c7b6eed) and reading it back is not
+reconstruction. Measured read-only on ~/Documents/ba2/trade/db.sqlite on 2026-08-24,
+20 of 721 transactions have an option TradingOrder underneath and 13 of those are
+still OPEN. Left at the 'EQUITY' default they are not merely mislabelled: the
+lifecycle pass -- expiry, assignment, early exercise -- selects on exactly this
+column, so all 13 open option positions would silently go unmanaged. See
+_backfill_asset_class_from_child_orders for the derivation and why it is the child
+order rather than ``multiplier`` (which gets 18 of the 20).
 
 IDEMPOTENT ON PURPOSE
 =====================
-Every add is guarded by a column check, because THIS REVISION RACES init_db().
+Every add is guarded by a column check and the back-fill only ever promotes EQUITY to
+OPTION, because THIS REVISION RACES init_db().
 Starting the app once on this branch runs ``SQLModel.metadata.create_all()``, which
 materialises the three columns outside alembic on any database that is not brand new
 (init_db only stamps head when the schema was ABSENT beforehand -- see
@@ -74,19 +80,29 @@ For ~/Documents/ba2/trade/db.sqlite. Read step 1 before touching anything.
 
    NOTHING listed -> the ordinary path, step 3.
    ALL THREE listed and current is behind -> the app already added them with
-   create_all; step 2 applies and is the cheaper move.
+   create_all; step 2 applies, but READ IT: stamping is no longer the whole job.
    SOME of the three -> a previous half-finished run. Step 3 still works; that is
    the whole point of the guards.
 
-2. IF create_all ALREADY ADDED THEM, `alembic stamp b2f4c81d6a35` IS LEGITIMATE:
+2. IF create_all ALREADY ADDED THEM, `alembic stamp b2f4c81d6a35` IS LEGITIMATE
+   FOR THE COLUMNS AND SKIPS THE BACK-FILL:
 
        venv/bin/python -m alembic stamp b2f4c81d6a35
+       sqlite3 db.sqlite "UPDATE \"transaction\" SET asset_class = 'OPTION' \
+           WHERE asset_class <> 'OPTION' AND EXISTS (SELECT 1 FROM tradingorder o \
+           WHERE o.transaction_id = \"transaction\".id AND o.asset_class = 'OPTION')"
 
-   It is legitimate because the columns this revision adds are PROVEN equal to the
-   ones create_all builds: tests/test_option_intent_migration.py runs alembic's own
+   The stamp is legitimate because the columns this revision adds are PROVEN equal to
+   the ones create_all builds: tests/test_option_intent_migration.py runs alembic's own
    autogenerate comparator over the migrated ``transaction`` table against
    SQLModel.metadata and asserts ZERO differences -- types, nullability, indexes.
    Stamping records a fact rather than skipping work.
+
+   The SECOND line is not optional and is the one create_all cannot do for you.
+   create_all builds columns; it does not know that 20 existing transactions have an
+   option order underneath. Stamping alone leaves all 20 at 'EQUITY' -- 13 of them
+   open -- and the lifecycle pass then never sees them. It is the same statement the
+   revision body runs and re-running it is free; step 4 checks the result either way.
 
    One difference is expected and is NOT drift: column ORDER. ``ALTER TABLE ADD
    COLUMN`` appends, so a migrated database has the three at the end while a
@@ -106,18 +122,27 @@ For ~/Documents/ba2/trade/db.sqlite. Read step 1 before touching anything.
 4. VERIFY:
 
        sqlite3 db.sqlite 'PRAGMA table_info("transaction");' | grep -cE 'asset_class|option_strategy|expiry'   -> 3
-       sqlite3 db.sqlite 'SELECT DISTINCT asset_class FROM "transaction";'                                      -> EQUITY
+       sqlite3 db.sqlite 'SELECT asset_class, COUNT(*) FROM "transaction" GROUP BY 1;'                          -> EQUITY|701 and OPTION|20
+       sqlite3 db.sqlite 'SELECT COUNT(*) FROM "transaction" WHERE option_strategy IS NOT NULL OR expiry IS NOT NULL;' -> 0
        venv/bin/python -m alembic current                                                                       -> b2f4c81d6a35
 
-   'EQUITY' in capitals is the correct answer. Lowercase 'equity' means the default
-   was written as the enum VALUE and every one of those rows is unreadable by the
-   ORM -- see THE ENUM IS STORED BY NAME above.
+   CAPITALS are the correct answer. Lowercase 'equity'/'option' means a value was
+   written as the enum VALUE and every one of those rows is unreadable by the ORM --
+   see THE ENUM IS STORED BY NAME above.
 
-5. IF IT FAILS, JUST RE-RUN IT. Nothing here deletes or rewrites a row; the worst a
-   half-finished run can leave behind is some of the three columns, and the next run
-   skips exactly those. Do NOT hand-type an ALTER TABLE -- create_all and this
-   revision agree today (step 2 proves it) and a hand-typed one is how they would
-   stop agreeing.
+   OPTION|20 is the count measured on 2026-08-24 and it is a floor, not a constant:
+   any option position opened between then and the upgrade adds one. What must NOT
+   happen is OPTION|0 -- that is step 2 stamped without its second line -- or
+   OPTION|18, which is what a ``multiplier = 100`` derivation produces and means ids
+   406 and 407 were dropped. The third line is the other half of the decision:
+   ``option_strategy`` and ``expiry`` are NOT recovered and must still be empty.
+
+5. IF IT FAILS, JUST RE-RUN IT. Nothing here deletes a row; the only write is the
+   back-fill, which sets one column one way and skips rows already set, so a second
+   run reports 0. The worst a half-finished run can leave behind is some of the three
+   columns, and the next run skips exactly those. Do NOT hand-type an ALTER TABLE --
+   create_all and this revision agree today (step 2 proves it) and a hand-typed one is
+   how they would stop agreeing.
 """
 from typing import Sequence, Union
 
@@ -131,6 +156,7 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 TABLE = "transaction"
+ORDERS_TABLE = "tradingorder"
 
 
 def _require_table(inspector, action: str) -> None:
@@ -197,6 +223,64 @@ def _create_index_if_absent(index_name: str, columns) -> None:
     op.create_index(index_name, TABLE, columns)
 
 
+def _backfill_asset_class_from_child_orders() -> int:
+    """Recover ``asset_class`` on rows that predate the column. Returns rows changed.
+
+    A LOOKUP, NOT A GUESS -- which is the whole reason this one column is back-filled
+    and the other two are not. ``tradingorder.asset_class`` was recorded at execution
+    time by revision 08de6c7b6eed; reading it back is not reconstruction.
+
+    THE DERIVATION IS THE CHILD ORDER, NOT ``multiplier``. On the live database 20
+    transactions have an option TradingOrder underneath and only 18 have
+    ``multiplier = 100``: ids 406 and 407, both SPY, both still OPEN, are real option
+    positions with a NULL multiplier. Multiplier gets 18 of 20 and drops exactly the
+    two nobody would think to re-check; the child order gets 20 of 20. ``multiplier``
+    was only ever a coincidence of P&L arithmetic standing in for a fact.
+
+    ANY OPTION LEG WINS. A transaction with one child of each kind -- an assigned
+    wheel, once the equity fill that settles an exercised short put is recorded under
+    the same transaction -- is OPTION. ``asset_class`` is the filter for the lifecycle
+    pass (expiry, assignment, early exercise), so EQUITY there drops the row out of
+    that pass and an option leg expires unmanaged, while OPTION at worst runs an
+    option check that finds nothing to do.
+
+    ONLY PROMOTES. ``asset_class <> 'OPTION'`` is not just an idempotence trick: this
+    revision races init_db(), so on a create_all database it runs over rows the
+    RUNNING APP already wrote intent into. Setting EQUITY where no option child exists
+    would overrule that from a migration. Recovering unset rows and overruling set
+    ones are different jobs and this does the first only. It also makes the count
+    printed below true on a re-run -- zero, not "the same 20 again".
+
+    'OPTION' in capitals: SQLAlchemy persists the enum's NAME. Written as the value,
+    'option', these rows would be exactly as invisible as the EQUITY they replaced --
+    worse, actually, since the ORM raises LookupError rather than returning a wrong
+    answer. See THE ENUM IS STORED BY NAME in the header.
+    """
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    _require_table(inspector, f"back-fill {TABLE}.asset_class")
+    if not inspector.has_table(ORDERS_TABLE):
+        raise RuntimeError(
+            f"cannot back-fill {TABLE}.asset_class: table {ORDERS_TABLE!r} is missing, "
+            "and it is the entire derivation. Skipping would move alembic_version to "
+            "head with every historical option position still labelled EQUITY and "
+            "nothing left to notice it.")
+    if "asset_class" not in {c["name"] for c in inspector.get_columns(TABLE)}:
+        raise RuntimeError(
+            f"cannot back-fill {TABLE}.asset_class: the column is missing, which means "
+            "the ADD COLUMN above silently did nothing")
+
+    result = bind.execute(sa.text(
+        f'UPDATE "{TABLE}" SET asset_class = \'OPTION\' '
+        "WHERE asset_class <> 'OPTION' "
+        f'  AND EXISTS (SELECT 1 FROM {ORDERS_TABLE} o '
+        f'              WHERE o.transaction_id = "{TABLE}".id '
+        "                AND o.asset_class = 'OPTION')"))
+    changed = result.rowcount
+    print(f"[option-intent] back-filled {TABLE}.asset_class = OPTION on {changed} row(s)")
+    return changed
+
+
 def _drop_index_if_present(index_name: str) -> None:
     inspector = sa.inspect(op.get_bind())
     if not inspector.has_table(TABLE) or not inspector.has_index(TABLE, index_name):
@@ -231,6 +315,10 @@ def upgrade() -> None:
     # "everything expiring within N days" run on every open_positions trigger.
     _create_index_if_absent("ix_transaction_asset_class", ["asset_class"])
     _create_index_if_absent("ix_transaction_expiry", ["expiry"])
+
+    # AFTER the adds, necessarily: it writes the column they create. Not guarded by a
+    # "have I run before" flag -- the UPDATE is its own guard and re-running is free.
+    _backfill_asset_class_from_child_orders()
 
 
 def downgrade() -> None:

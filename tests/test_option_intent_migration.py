@@ -138,6 +138,60 @@ def _version(db_path):
         con.close()
 
 
+def _insert_transaction(engine, tx_id, *, symbol="ACN", multiplier=None,
+                        status="OPENED", asset_class=None):
+    """A transaction row, by default in PRE-migration shape: no asset_class to fill.
+
+    ``multiplier`` defaults to NULL on purpose -- ids 406 and 407 on the live
+    database are real open SPY option positions with a NULL multiplier.
+
+    ``asset_class`` must be passed on a create_all database, where the column is
+    already there and is NOT NULL with no *server* default (SQLModel's default is
+    client-side, so a raw INSERT that omits it fails). Pass the stored enum NAME.
+    """
+    columns = "id, symbol, quantity, side, status, multiplier, " \
+              "tp_manual_override, sl_manual_override, created_at"
+    values = ":id, :symbol, 1, 'BUY', :status, :multiplier, 0, 0, '2026-08-01 00:00:00'"
+    params = {"id": tx_id, "symbol": symbol, "status": status, "multiplier": multiplier}
+    if asset_class is not None:
+        columns += ", asset_class"
+        values += ", :asset_class"
+        params["asset_class"] = asset_class
+    with engine.begin() as connection:
+        connection.execute(
+            text(f'INSERT INTO "transaction" ({columns}) VALUES ({values})'), params)
+
+
+def _insert_order(engine, order_id, *, transaction_id, asset_class, symbol="ACN"):
+    """A child TradingOrder. ``asset_class`` is the stored enum NAME: 'OPTION'/'EQUITY'."""
+    with engine.begin() as connection:
+        connection.execute(text(
+            "INSERT INTO tradingorder (id, account_id, symbol, quantity, side, order_type, "
+            "status, open_type, asset_class, transaction_id, created_at) "
+            "VALUES (:id, 1, :symbol, 1, 'BUY', 'MARKET', 'FILLED', 'AUTOMATIC', "
+            ":asset_class, :transaction_id, '2026-08-01 00:00:00')"),
+            {"id": order_id, "symbol": symbol, "asset_class": asset_class,
+             "transaction_id": transaction_id})
+
+
+def _asset_class(db_path, tx_id):
+    con = sqlite3.connect(str(db_path))
+    try:
+        return con.execute('SELECT asset_class FROM "transaction" WHERE id = ?',
+                           (tx_id,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def _intent_rows(db_path):
+    con = sqlite3.connect(str(db_path))
+    try:
+        return con.execute('SELECT id, asset_class, option_strategy, expiry, multiplier '
+                           'FROM "transaction" ORDER BY id').fetchall()
+    finally:
+        con.close()
+
+
 # --- the three end-to-end scenarios, through the real alembic CLI -----------
 
 def test_a_database_without_the_columns_gains_all_three(tmp_path):
@@ -244,29 +298,31 @@ def test_a_row_that_predates_the_column_reads_back_through_the_ORM(tmp_path):
         assert rows[0].option_strategy is None and rows[0].expiry is None
 
 
-def test_a_historical_option_transaction_also_reads_as_EQUITY(tmp_path):
-    """FORWARD-ONLY, pinned rather than discovered later.
+def test_a_historical_option_transaction_is_backfilled_to_OPTION(tmp_path):
+    """The inverse of what this test asserted when the revision first landed.
 
-    Nothing is back-filled: 23 of the 82 historical option orders have unrecoverable
-    contracts, so ``option_strategy`` and ``expiry`` cannot be reconstructed. The
-    price is that ``asset_class`` on a pre-existing option row says EQUITY -- on the
-    live database that is 20 transactions, 13 of them still OPEN, every one of which
-    carries a TradingOrder with asset_class 'OPTION' and multiplier 100.
+    It used to be ``test_a_historical_option_transaction_also_reads_as_EQUITY`` and
+    it pinned the forward-only decision: nothing was back-filled, so the 20
+    transactions on the live database that carry an option TradingOrder (13 of them
+    still OPEN) all read EQUITY. Its own docstring named the recovery UPDATE and said
+    "this assertion is what will fail, loudly and in the right place, when that
+    revision lands". It did, and this is that landing.
 
-    They are not wrong by accident and this test says so out loud. Recovering them
-    is a separate, cheap revision (``UPDATE "transaction" SET asset_class='OPTION'
-    WHERE EXISTS (SELECT 1 FROM tradingorder o WHERE o.transaction_id = id AND
-    o.asset_class = 'OPTION')`` -- a lookup of a recorded fact, not a guess), and
-    this assertion is what will fail, loudly and in the right place, when that
-    revision lands.
+    The decision it was pinning was right for ``option_strategy`` and ``expiry`` --
+    23 of the 82 historical option orders have unrecoverable contracts, so both stay
+    NULL below and always will. It was wrong for ``asset_class``, which is not a
+    guess: ``o.asset_class = 'OPTION'`` on the child order is a recorded fact, and
+    Task 8's lifecycle pass filters on exactly this column, so leaving it EQUITY
+    silently drops 13 live option positions out of management.
+
+    The row is built the way the old docstring described the live ones -- an option
+    TradingOrder underneath -- which is also the whole difference: the derivation is
+    the child order, not ``multiplier``.
     """
     db = tmp_path / "historical_option.sqlite"
     engine = _build_pre_migration(db)
-    with engine.begin() as connection:
-        connection.execute(text(
-            'INSERT INTO "transaction" (id, symbol, quantity, side, status, multiplier, '
-            " tp_manual_override, sl_manual_override, created_at) "
-            "VALUES (1, 'ACN', 1, 'BUY', 'OPENED', 100, 0, 0, '2026-08-01 00:00:00')"))
+    _insert_transaction(engine, 1, multiplier=100)
+    _insert_order(engine, 1, transaction_id=1, asset_class="OPTION")
 
     _alembic_upgrade_head(db)
 
@@ -276,7 +332,205 @@ def test_a_historical_option_transaction_also_reads_as_EQUITY(tmp_path):
                           'FROM "transaction" WHERE id = 1').fetchone()
     finally:
         con.close()
-    assert row == ("EQUITY", 100, None, None)
+    assert row == ("OPTION", 100, None, None), (
+        "asset_class is a lookup and must be recovered; strategy and expiry are "
+        "guesswork and must stay NULL")
+
+
+# --- the asset_class back-fill ------------------------------------------------
+
+def test_the_backfill_separates_option_transactions_from_equity_ones(tmp_path):
+    """The base case, both directions at once: a child order decides, per row.
+
+    An UPDATE with no WHERE, or one whose EXISTS is inverted, passes half of this.
+    """
+    db = tmp_path / "backfill.sqlite"
+    engine = _build_pre_migration(db)
+    _insert_transaction(engine, 1, symbol="ACN", multiplier=100)
+    _insert_order(engine, 1, transaction_id=1, asset_class="OPTION", symbol="ACN260821C00300000")
+    _insert_transaction(engine, 2, symbol="AAPL")
+    _insert_order(engine, 2, transaction_id=2, asset_class="EQUITY", symbol="AAPL")
+
+    _alembic_upgrade_head(db)
+
+    assert _asset_class(db, 1) == "OPTION"
+    assert _asset_class(db, 2) == "EQUITY"
+
+
+def test_a_NULL_multiplier_still_backfills(tmp_path):
+    """Ids 406 and 407 on the live database, and why the derivation is not multiplier.
+
+    Both are real SPY option transactions, both still OPEN, and both have
+    ``multiplier`` NULL -- 18 of the 20 live option transactions have multiplier 100
+    and these two do not. A multiplier-derived back-fill gets 18 of 20 and abandons
+    exactly the rows nobody would think to check.
+    """
+    db = tmp_path / "null_multiplier.sqlite"
+    engine = _build_pre_migration(db)
+    _insert_transaction(engine, 406, symbol="SPY", multiplier=None)
+    _insert_order(engine, 1, transaction_id=406, asset_class="OPTION", symbol="SPY260821P00600000")
+    _insert_transaction(engine, 407, symbol="SPY", multiplier=None)
+    _insert_order(engine, 2, transaction_id=407, asset_class="OPTION", symbol="SPY260821C00600000")
+
+    _alembic_upgrade_head(db)
+
+    assert _asset_class(db, 406) == "OPTION"
+    assert _asset_class(db, 407) == "OPTION"
+    # and the multiplier is left exactly as it was -- this revision back-fills ONE column
+    assert [row[4] for row in _intent_rows(db)] == [None, None]
+
+
+def test_a_transaction_whose_children_are_all_equity_stays_EQUITY(tmp_path):
+    """multiplier = 100 on an equity-only transaction must NOT make it an option.
+
+    ``multiplier`` was only ever a coincidence of P&L arithmetic; a stock split
+    adjustment or a hand-fixed row can carry 100 without a single option leg. The
+    child order's ``asset_class`` is the recorded fact and it is the only input.
+    """
+    db = tmp_path / "equity_children.sqlite"
+    engine = _build_pre_migration(db)
+    _insert_transaction(engine, 1, symbol="AAPL", multiplier=100)
+    _insert_order(engine, 1, transaction_id=1, asset_class="EQUITY", symbol="AAPL")
+    _insert_order(engine, 2, transaction_id=1, asset_class="EQUITY", symbol="AAPL")
+
+    _alembic_upgrade_head(db)
+
+    assert _asset_class(db, 1) == "EQUITY"
+
+
+def test_a_transaction_with_no_orders_at_all_stays_EQUITY(tmp_path):
+    """No child order is no evidence, and no evidence is not an option.
+
+    EXISTS answers false and the server default stands. This is most of the 701
+    other rows on the live database.
+    """
+    db = tmp_path / "orphan.sqlite"
+    engine = _build_pre_migration(db)
+    _insert_transaction(engine, 1, symbol="AAPL", multiplier=100)
+
+    _alembic_upgrade_head(db)
+
+    assert _asset_class(db, 1) == "EQUITY"
+
+
+def test_a_transaction_with_both_equity_and_option_children_is_OPTION(tmp_path):
+    """ANY option leg wins. There is no such thing as a half-option position here.
+
+    No live row is shaped like this yet, but an assigned wheel is once Task 5 lands:
+    a short put is exercised, the equity fill that settles it is recorded under the
+    same transaction, and the row now has one child of each kind. OPTION is the
+    answer that costs least when wrong. ``asset_class`` is the filter for Task 8's
+    lifecycle pass -- expiry, assignment, early-exercise -- so calling a mixed row
+    EQUITY drops it out of that pass entirely and an option leg expires unmanaged,
+    whereas calling it OPTION at worst runs an option check over a position whose
+    option side is already closed, which finds nothing to do.
+    """
+    db = tmp_path / "mixed.sqlite"
+    engine = _build_pre_migration(db)
+    _insert_transaction(engine, 1, symbol="ACN", multiplier=100)
+    _insert_order(engine, 1, transaction_id=1, asset_class="EQUITY", symbol="ACN")
+    _insert_order(engine, 2, transaction_id=1, asset_class="OPTION", symbol="ACN260821P00300000")
+
+    _alembic_upgrade_head(db)
+
+    assert _asset_class(db, 1) == "OPTION"
+
+
+def test_the_backfill_writes_the_NAME_so_the_ORM_reads_an_enum_back(tmp_path):
+    """'OPTION', not 'option'. The value would produce rows no query matches.
+
+    SQLAlchemy persists a SQLModel str-enum by NAME, so a back-fill written as the
+    enum's VALUE leaves a string it refuses to map back: the ORM raises LookupError
+    on the read instead of returning the position, and every
+    ``where(asset_class == AssetClass.OPTION)`` -- which is how Task 8 finds work --
+    silently returns nothing.
+    """
+    db = tmp_path / "enum_name.sqlite"
+    engine = _build_pre_migration(db)
+    _insert_transaction(engine, 1, symbol="ACN")
+    _insert_order(engine, 1, transaction_id=1, asset_class="OPTION")
+    _insert_transaction(engine, 2, symbol="AAPL")
+
+    _alembic_upgrade_head(db)
+
+    assert _asset_class(db, 1) == "OPTION"
+    assert _asset_class(db, 1) != "option"
+
+    with Session(create_engine(f"sqlite:///{db}")) as session:
+        options = session.exec(
+            select(Transaction).where(Transaction.asset_class == AssetClass.OPTION)).all()
+        assert [row.id for row in options] == [1]
+        assert options[0].asset_class is AssetClass.OPTION
+        assert options[0].option_strategy is None and options[0].expiry is None
+        equities = session.exec(
+            select(Transaction).where(Transaction.asset_class == AssetClass.EQUITY)).all()
+        assert [row.id for row in equities] == [2]
+
+
+def test_running_the_backfill_a_second_time_changes_nothing(tmp_path):
+    """"IF IT FAILS, JUST RE-RUN IT" now covers an UPDATE, not only ADD COLUMNs.
+
+    The second pass must report ZERO rows, not "the same 20 again": an operator
+    following the runbook reads that number to decide whether the first run worked.
+    """
+    db = tmp_path / "backfill_twice.sqlite"
+    engine = _build_pre_migration(db)
+    _insert_transaction(engine, 1, symbol="ACN")
+    _insert_order(engine, 1, transaction_id=1, asset_class="OPTION")
+    _insert_transaction(engine, 2, symbol="AAPL")
+    _insert_order(engine, 2, transaction_id=2, asset_class="EQUITY")
+    _alembic_upgrade_head(db)
+    before = _intent_rows(db)
+    assert before == [(1, "OPTION", None, None, None), (2, "EQUITY", None, None, None)]
+
+    _upgrade(engine)              # the revision's own body, a second time
+    assert _intent_rows(db) == before
+
+    module = _load_revision()
+    with engine.begin() as connection:
+        with Operations.context(MigrationContext.configure(connection)):
+            assert module._backfill_asset_class_from_child_orders() == 0
+
+
+def test_the_backfill_only_promotes_and_never_demotes(tmp_path):
+    """A row the APP already marked OPTION survives a re-run with equity-only children.
+
+    The revision races init_db(): on a create_all database the columns are already
+    there and already carry values the running app wrote. A back-fill that also set
+    EQUITY where no option child exists would rewrite live intent -- a spread whose
+    legs were closed and whose closing fills happen to be equity-shaped, say -- from
+    a migration. Recovering unset rows and overruling set ones are different jobs and
+    this one only does the first.
+    """
+    db = tmp_path / "no_demote.sqlite"
+    engine = _build_via_create_all(db)
+    _insert_transaction(engine, 1, symbol="ACN", asset_class="OPTION")
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE \"transaction\" SET option_strategy = 'bull_call_spread' WHERE id = 1"))
+    _insert_order(engine, 1, transaction_id=1, asset_class="EQUITY")
+
+    _alembic_upgrade_head(db)
+
+    assert _intent_rows(db) == [(1, "OPTION", "bull_call_spread", None, None)]
+
+
+def test_the_backfill_refuses_a_database_with_no_tradingorder_table(tmp_path):
+    """The evidence table is the whole derivation; missing, it must say so.
+
+    Letting sqlite's "no such table: tradingorder" surface from two layers down would
+    look like a broken revision rather than a database this revision cannot read. And
+    skipping instead would be worse: the columns would be added, alembic_version would
+    move to head, and 13 open option positions would sit there labelled EQUITY with
+    nothing left to notice it.
+    """
+    db = tmp_path / "no_orders.sqlite"
+    engine = _build_pre_migration(db)
+    with engine.begin() as connection:
+        connection.execute(text("DROP TABLE tradingorder"))
+
+    with pytest.raises(RuntimeError, match="tradingorder"):
+        _upgrade(engine)
 
 
 def test_the_intent_columns_are_indexed_under_the_names_create_all_uses(tmp_path):
