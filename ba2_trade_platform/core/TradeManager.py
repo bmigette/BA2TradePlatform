@@ -1701,6 +1701,23 @@ class TradeManager:
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
+            # INVARIANT FOR THIS WHOLE BLOCK: `session` is READ-ONLY. Nothing loaded through it
+            # may be mutated, and nothing may be added to it.
+            #
+            # It stays open across the broker round trip, and sqlite has ONE write lock per
+            # database. The moment this session owns a modified row, the next query on it
+            # autoflushes, takes that lock, and holds it for the rest of the block — while
+            # submit_order writes the Transaction and the order from a SECOND connection on the
+            # same thread. That connection then waits for a lock its own caller holds and nobody
+            # is left to release it: measured on PROD as ~15 minutes with no write of any kind,
+            # ending 15 ms after this block exited. CVS 2026-08-10 and WSC 2026-08-24 were both
+            # funded by the risk manager and both lost that way.
+            #
+            # The 2026-08-10 attempt wrapped ONE query in `no_autoflush`. It did not hold: the
+            # rows it hid stayed dirty, and the NEXT candidate's first query flushed them instead.
+            # Guarding flush SITES is unwinnable — every future query is another one. Owning no
+            # dirty state is the invariant that cannot be routed around. Writes from inside this
+            # block go through update_instance()/add_instance() on their own short-lived sessions.
             with get_db() as session:
                 # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
@@ -1708,9 +1725,9 @@ class TradeManager:
                     ExpertRecommendation.created_at >= cutoff_time,
                     ExpertRecommendation.recommended_action != OrderRecommendation.HOLD
                 ).order_by(ExpertRecommendation.created_at.desc())  # Most recent first
-                
+
                 all_recommendations = session.exec(statement).all()
-                
+
                 if not all_recommendations:
                     self.logger.info(f"No actionable recommendations found for expert {expert_instance_id}")
                     return created_orders
@@ -1873,8 +1890,16 @@ class TradeManager:
                                     if result.get('success') and isinstance(result.get('data'), dict):
                                         oid = result['data'].get('order_id')
                                         if oid:
-                                            from sqlmodel import select as _select
-                                            o = session.exec(_select(TradingOrder).where(TradingOrder.id == oid)).first()
+                                            # DETACHED on purpose — see the block comment above
+                                            # this loop's `with get_db() as session:`. Fetching
+                                            # through the long-lived `session` attaches the row,
+                                            # the RM stamp two lines below makes that session
+                                            # DIRTY, and the next query on it autoflushes and
+                                            # takes sqlite's one write lock — which submit_order
+                                            # then blocks on from its own second connection.
+                                            # get_instance(session=None) opens and closes its own
+                                            # session and hands back a fully loaded, detached row.
+                                            o = self._row_or_none(TradingOrder, oid)
                                             if o and o.side in (OrderDirection.BUY, OrderDirection.SELL) and order is None:
                                                 order = o
                                 if order is None:
@@ -1896,9 +1921,9 @@ class TradeManager:
                                 # quantity<=0 guard and cancelled, leaving those positions with a
                                 # stop and NO take-profit.
                                 #
-                                # Doing it here closes the race at the source: same session, same
-                                # value, same moment. Scoped to legs of THIS entry, created seconds
-                                # ago by THIS execute(), so they are all full-position legs — the
+                                # Doing it here closes the race at the source: same value, same
+                                # moment. Scoped to legs of THIS entry, created seconds ago by
+                                # THIS execute(), so they are all full-position legs — the
                                 # partial-close case (a leg sized for the REMAINING shares behind a
                                 # close order) hangs off a different parent and cannot be reached.
                                 #
@@ -1907,29 +1932,29 @@ class TradeManager:
                                 # (`held = abs(net)`), so it cannot inherit a transient 0 and has no
                                 # equivalent defect. Live must stage the leg before the fill because
                                 # the broker needs it resting; that constraint is live-only.
+                                #
+                                # PERSISTED HERE, per leg, through its own short-lived session —
+                                # NOT left as a pending mutation on the enter loop's session. That
+                                # is what the previous version did behind `no_autoflush`, and it
+                                # only moved the problem: the legs stayed dirty and attached, so
+                                # the NEXT candidate's first query flushed them instead and took
+                                # the write lock right before ITS submit. `no_autoflush` closes one
+                                # column; owning nothing on that session closes them all.
                                 try:
                                     from sqlmodel import select as _leg_select
-                                    # no_autoflush IS THE POINT, not a detail. `order` is dirty from
-                                    # the line above, so running this query normally AUTOFLUSHES it --
-                                    # which takes sqlite's single WRITE LOCK on this session. The very
-                                    # next thing we do is submit_order(), which inserts the Transaction
-                                    # from a DIFFERENT session and therefore blocks on its own caller
-                                    # for the full 30s busy_timeout, four times, and the funded trade is
-                                    # lost. That is exactly what happened to CVS on 2026-08-10 (and to
-                                    # 5 dev entries the same day: 161 lock events, none before this code
-                                    # shipped on the 08-08, with the 09th a closed Sunday in between).
-                                    # Suppressing the autoflush keeps the lock unheld across the broker
-                                    # round trip; the order + legs still persist together at the outer
-                                    # commit, which is after submit and long before any leg is promoted.
-                                    with session.no_autoflush:
-                                        legs = session.exec(_leg_select(TradingOrder).where(
-                                            TradingOrder.depends_on_order == order.id)).all()
-                                    for leg in legs:
-                                        if leg.quantity != order.quantity:
+                                    from .db import get_db as _get_db
+                                    with _get_db() as leg_session:
+                                        leg_ids = [l.id for l in leg_session.exec(
+                                            _leg_select(TradingOrder).where(
+                                                TradingOrder.depends_on_order == order.id)).all()]
+                                    for leg_id in leg_ids:
+                                        leg = self._row_or_none(TradingOrder, leg_id)
+                                        if leg is not None and leg.quantity != order.quantity:
                                             self.logger.info(
                                                 f"Stamped protective leg {leg.id} ({leg.order_type}) "
                                                 f"qty {leg.quantity} -> {order.quantity} from entry {order.id}")
                                             leg.quantity = order.quantity
+                                            update_instance(leg)
                                 except Exception as leg_err:  # noqa: BLE001 — never block the entry
                                     self.logger.error(
                                         f"Failed to stamp protective-leg quantity for order {order.id}: "
@@ -1943,7 +1968,11 @@ class TradeManager:
                                     account, order, sl_price=fo.stop_price or None)
                                 if submitted_order:
                                     submitted_count += 1
-                                    session.expunge(order)
+                                    # No expunge: `order` was never attached to this session in
+                                    # the first place (see the detached fetch above), so there is
+                                    # nothing to detach — and expunging only ever covered the
+                                    # entry, never the legs, which is how the flush found another
+                                    # way through on the next iteration.
                                     created_orders.append(order)
                                     self.logger.info(f"Successfully submitted order {order.id} to broker")
                                 else:

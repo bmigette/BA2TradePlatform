@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import threading
 import time as _real_time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -769,3 +770,148 @@ def test_a_washtrade_expiry_still_cancels_order_legs_and_transaction(file_db):
         assert s.get(TradingOrder, order.id).status == OrderStatus.CANCELED
         assert s.get(TradingOrder, leg.id).status == OrderStatus.CANCELED
         assert s.get(Transaction, txn.id).status == TransactionStatus.FAILED
+
+
+# ========================================================================================= #
+# F1 — the long-lived session must never be dirty across the broker round trip
+# ========================================================================================= #
+@contextmanager
+def _without_the_db_layer_safety_net():
+    """Neutralise ``ba2_common.core.db._guard_foreign_session`` for the duration.
+
+    That guard (added 2026-08-24, in the DB layer) notices ``update_instance(row)`` being handed
+    a row a DIFFERENT live session still owns and reroutes the write onto the owning session
+    instead of opening a second connection. It is a backstop for exactly this bug and it works —
+    but as a side effect it COMMITS the enter loop's session, which releases the write lock and
+    makes the invariant under test unobservable from up here.
+
+    TradeManager must hold the property on its own: the backstop cannot fix the attachment, it
+    logs an error on every occurrence, and its own message says "FIX THE CALL SITE". So this
+    test measures TradeManager with the net taken away. It is a no-op if the net is absent, so
+    the test does not depend on that DB-layer change landing.
+    """
+    import ba2_common.core.db as _db
+    if not hasattr(_db, "_guard_foreign_session"):
+        yield
+        return
+    with patch.object(_db, "_guard_foreign_session",
+                      lambda _op, _instance, session: session):
+        yield
+
+
+def test_funded_entry_loop_holds_no_write_transaction_across_submit(file_db):
+    """THE SELF-DEADLOCK, deterministically.
+
+    The enter loop runs inside one ``with get_db() as session:`` block. Fetching the just-created
+    order through THAT session attaches it; stamping the RM quantity on it makes the session
+    DIRTY; and the next query on the session AUTOFLUSHES, which takes sqlite's single write lock.
+    ``submit_order`` then writes the Transaction from a SECOND connection and blocks on a lock
+    its own thread is holding. No retry can win that — measured on PROD as ~15 minutes of total
+    write silence, ending 15 ms after the with-block exited.
+
+    TWO candidates is load-bearing. On candidate #1 there is nothing pending to flush yet, so
+    only the attachment shows; the write lock appears on candidate #2, flushed by the entry
+    re-fetch at the top of that iteration writing the leg the PREVIOUS iteration dirtied and
+    never expunged. The 2026-08-10 fix wrapped ONE query in ``no_autoflush``; the next iteration
+    simply flushed through a different query.
+    """
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    with _without_the_db_layer_safety_net():
+        _run_enter(expert, account, inst.id)
+
+    # Precondition — holds with or without the fix.
+    assert sorted({s["symbol"] for s in account.submits}) == ["AAPL", "MSFT"], \
+        f"the scenario must fund BOTH candidates: {account.submits}"
+
+    # Reported TOGETHER on purpose: pre-fix the attachment shows on candidate #1 and the held
+    # write lock only on candidate #2, and seeing one without the other invites patching the
+    # single flush site that happens to be visible — which is exactly how this regressed once.
+    violations = {"still attached to the loop's session": account.attached_at_submit,
+                  "write transaction held across submit": account.write_locks_at_submit}
+    assert violations == {"still attached to the loop's session": [],
+                          "write transaction held across submit": []}, violations
+
+    # And the consequence: the funded trade actually goes out, first try, no lock retries.
+    assert [s["symbol"] for s in account.submits] == ["AAPL", "MSFT"], \
+        f"a funded entry was retried (i.e. lost to a lock) instead of submitted: {account.submits}"
+    assert all(o.status == OrderStatus.NEW
+               for o in _orders() if o.order_type == OrderType.MARKET), \
+        [(o.symbol, o.status) for o in _orders() if o.order_type == OrderType.MARKET]
+
+
+def test_the_enter_loops_session_is_never_dirty(file_db):
+    """The property behind the property. ``no_autoflush`` only hides a dirty session from ONE
+    query; the fix is to never dirty it at all, so no query anywhere — present or future — can
+    flush it mid-submit."""
+    from ba2_common.core import db as _db_mod
+
+    seen = []
+    real_get_db = _db_mod.get_db
+
+    def _tracking_get_db():
+        session = real_get_db()
+        seen.append(session)
+        return session
+
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    dirty_snapshots = []
+    real_submit = _FundedEntryAccount.submit_order
+
+    def _snapshotting_submit(self, trading_order, **kw):
+        for s in seen:
+            if s.is_active and (s.dirty or s.new or s.deleted):
+                dirty_snapshots.append(
+                    (trading_order.symbol, [repr(o) for o in list(s.dirty) + list(s.new)]))
+        return real_submit(self, trading_order, **kw)
+
+    # TradeManager does ``from .db import get_db`` INSIDE the method. ``.db`` is the Phase-6
+    # re-export SHIM, which bound its own module-level ``get_db`` at import time — so the shim
+    # must be patched as well as the package, or the enter loop keeps the original.
+    import ba2_trade_platform.core.db as _shim_db
+    with patch.object(_db_mod, "get_db", _tracking_get_db), \
+         patch.object(_shim_db, "get_db", _tracking_get_db), \
+         patch.object(_FundedEntryAccount, "submit_order", _snapshotting_submit):
+        _run_enter(expert, account, inst.id)
+
+    assert seen, "the enter loop must have opened at least one session (patch did not take)"
+
+    assert len(account.submits) == 2, account.submits
+    assert dirty_snapshots == [], (
+        f"a session opened by the enter loop was dirty at submit time: {dirty_snapshots}")
+
+
+def test_the_protective_legs_get_the_rm_quantity_ON_DISK(file_db):
+    """Detaching the fetch must not lose what the attached fetch was there to do — and in fact
+    the attached version never DID it.
+
+    The enter loop's ``with get_db() as session:`` block contains no commit anywhere, so
+    ``leg.quantity = order.quantity`` on that session was rolled back when the block closed.
+    Measured against the pre-fix code with the DB-layer net removed: the leg ``execute()``
+    staged went to disk with quantity 0.0 — precisely the WKC / GNTX / CSTL symptom the stamp
+    was written to prevent (a zero-quantity protective leg is cancelled by the broker and the
+    position runs uncovered). Only the leg the ACCOUNT created inside submit_order survived,
+    because that one is written by the account with its own session.
+
+    Asserting on the row read back from the database, not on the in-memory object, is the whole
+    point of the test.
+    """
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    with _without_the_db_layer_safety_net():
+        _run_enter(expert, account, inst.id)
+
+    for symbol in ("AAPL", "MSFT"):
+        entry = [o for o in _orders(symbol) if o.order_type == OrderType.MARKET][0]
+        legs = [o for o in _orders(symbol) if o.depends_on_order == entry.id]
+        assert entry.quantity == 400.0, (symbol, entry.quantity)
+        assert legs, f"no protective leg staged for {symbol}"
+        for leg in legs:
+            assert leg.quantity == entry.quantity, (
+                f"{symbol} leg {leg.id} kept quantity {leg.quantity} instead of the entry's "
+                f"{entry.quantity}; a zero/short leg is cancelled by the broker and the "
+                f"position runs uncovered")
