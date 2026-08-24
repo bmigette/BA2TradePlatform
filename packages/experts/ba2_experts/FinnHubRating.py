@@ -196,6 +196,12 @@ class FinnHubRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, Market
             raw_outputs={"name": "FinnHub Recommendation Analysis",
                          "type": "finnhub_rating_analysis", "text": rec["details"],
                          "mean": rec["mean"], "total": rec["total"],
+                         # The five per-bucket counts the consensus mean was
+                         # computed FROM. They used to stop here: only the mean
+                         # and the total survived, so a card could never show
+                         # the breakdown ("all analysts data") without
+                         # re-parsing the prose in `details`.
+                         "counts": rec["counts"],
                          "period": rec["period"]})
 
     def analyze_as_of(self, as_of: datetime, context: BacktestContext) -> Recommendation:
@@ -396,11 +402,27 @@ Confidence (agreement on dominant side): {confidence:.1f}%
         mean = raw.get("mean")
         total = raw.get("total")
         period = raw.get("period")
+        counts = raw.get("counts") or {}
         base.append(ExpertMetric(
-            "Consensus mean (1=Strong Sell .. 5=Strong Buy)", mean, self._fmt_mean(mean)))
+            "Consensus mean (1=Strong Sell .. 5=Strong Buy)", mean, self._fmt_mean(mean),
+            detail=("Mean of the five rating buckets weighted 1..5 "
+                    "(Strong Sell=1 .. Strong Buy=5); see the Analysts row for "
+                    "the counts it averaged." if counts else None)))
+        # The per-bucket breakdown as (label, value) rows the card draws as a
+        # table. `counts` is EMPTY (not five zeros) on the no-data fallback --
+        # rendering zeros there would assert "16 analysts, all neutral" when in
+        # fact no period resolved at all.
         base.append(ExpertMetric(
             "Analysts", total, str(total),
-            detail=f"Period: {period}" if period else None))
+            detail=f"Period: {period}" if period else None,
+            detail_table=([
+                ("Strong Buy", str(counts.get("strongBuy", 0))),
+                ("Buy", str(counts.get("buy", 0))),
+                ("Hold", str(counts.get("hold", 0))),
+                ("Sell", str(counts.get("sell", 0))),
+                ("Strong Sell", str(counts.get("strongSell", 0))),
+                ("Period", str(period)),
+            ] if counts else None)))
         return base
 
     def _create_expert_recommendation(self, recommendation_data: Dict[str, Any],

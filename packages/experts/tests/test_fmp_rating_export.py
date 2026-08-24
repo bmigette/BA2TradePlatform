@@ -87,7 +87,11 @@ def test_export_symbol_data_buy_shows_analyst_consensus_rows(monkeypatch):
     total = next(m for m in result.metrics if m.label == "Total analysts")
     assert total.value == 20
     assert total.display == "20"
-    assert total.detail == "10 Strong Buy / 5 Buy / 3 Hold / 1 Sell / 1 Strong Sell"
+    # The bucket breakdown moved from a prose `detail` into structured
+    # (label, value) rows the card draws as a small table -- see
+    # test_analyst_card_breakdown.py.
+    assert dict(total.detail_table) == {
+        "Strong Buy": "10", "Buy": "5", "Hold": "3", "Sell": "1", "Strong Sell": "1"}
 
 
 def test_export_symbol_data_sell_flips_upside_signal(monkeypatch):

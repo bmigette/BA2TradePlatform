@@ -5,7 +5,7 @@ tested directly against known inputs. The expert orchestrates these; data
 fetching lives in ``data.py`` and execution in ``portfolio.py``.
 """
 
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
@@ -74,20 +74,83 @@ def quality_score(data: Dict[str, dict]) -> Dict[str, float]:
     return out
 
 
+def _winsorized_array(values: Dict[str, float], winsorize_pct: float):
+    """The array the z-score is ACTUALLY taken over (post-winsorize), plus its
+    symbol order. Shared by cross_sectional_zscore and cross_sectional_stats so
+    the reported comparator can never drift from the one used."""
+    syms = list(values)
+    arr = np.array([values[s] for s in syms], dtype=float)
+    if winsorize_pct > 0 and len(arr) > 2:
+        lo, hi = np.quantile(arr, [winsorize_pct, 1 - winsorize_pct])
+        arr = np.clip(arr, lo, hi)
+    return syms, arr
+
+
 def cross_sectional_zscore(values: Dict[str, float], winsorize_pct: float = 0.0) -> Dict[str, float]:
     """Z-score raw factor values across the universe (mean 0, std 1).
 
     Optionally winsorize the tails at ``winsorize_pct`` before standardizing.
     If the cross-section has zero dispersion, all z-scores are 0.
     """
-    syms = list(values)
-    arr = np.array([values[s] for s in syms], dtype=float)
-    if winsorize_pct > 0 and len(arr) > 2:
-        lo, hi = np.quantile(arr, [winsorize_pct, 1 - winsorize_pct])
-        arr = np.clip(arr, lo, hi)
+    syms, arr = _winsorized_array(values, winsorize_pct)
     mu, sd = arr.mean(), arr.std()
     z = (arr - mu) / sd if sd > 0 else np.zeros_like(arr)
     return {s: float(z[i]) for i, s in enumerate(syms)}
+
+
+def cross_sectional_stats(values: Dict[str, float], winsorize_pct: float = 0.0) -> Dict[str, Any]:
+    """The comparator ``cross_sectional_zscore`` measured against, made visible.
+
+    Returns ``n`` / ``mean`` / ``sd`` of the (post-winsorize) cross-section and
+    ``degenerate``: True when ``sd == 0``, i.e. the branch where every z-score
+    is forced to exactly 0 REGARDLESS of the underlying values. That happens
+    for a one-symbol universe by definition, and for any universe whose members
+    all carry the same value -- in both cases 0.0 means "not computable here",
+    not "average".
+    """
+    _, arr = _winsorized_array(values, winsorize_pct)
+    if arr.size == 0:
+        return {"n": 0, "mean": None, "sd": 0.0, "degenerate": True,
+                "winsorize_pct": float(winsorize_pct)}
+    sd = float(arr.std())
+    return {"n": int(arr.size), "mean": float(arr.mean()), "sd": sd,
+            "degenerate": not (sd > 0), "winsorize_pct": float(winsorize_pct)}
+
+
+def describe_composite_availability(universe_size: int,
+                                    factor_stats: Dict[str, Dict[str, Any]],
+                                    weights: Dict[str, float]) -> Tuple[bool, Optional[str]]:
+    """Is the composite a real measurement here, and if not, why not?
+
+    The composite is a weighted sum of cross-sectional z-scores. When every
+    CONTRIBUTING factor's cross-section is degenerate the sum is arithmetically
+    pinned to 0.0 and carries no information about the symbol -- reporting that
+    as a number invites it to be read as "neutral", which is a different and
+    false statement.
+
+    ``factor_stats`` may be empty (a book stored before these stats existed);
+    the universe size alone then decides, which is the only structurally
+    certain case.
+    """
+    if universe_size <= 1:
+        return False, (
+            f"Not computable in this view. The composite is a weighted sum of "
+            f"CROSS-SECTIONAL z-scores, which need a peer universe to rank against; "
+            f"this card scores exactly 1 symbol, so the standard deviation of the "
+            f"cross-section is 0 and every z-score — and therefore the composite — is "
+            f"forced to +0.000 whatever the underlying factor values are. "
+            f"See the raw per-factor values below for the numbers that were actually "
+            f"measured.")
+    contributing = [n for n, w in (weights or {}).items() if w] or list(factor_stats or {})
+    stats = [factor_stats[n] for n in contributing if n in (factor_stats or {})]
+    if stats and all(s.get("degenerate") for s in stats):
+        names = ", ".join(n for n in contributing if n in factor_stats)
+        return False, (
+            f"Not computable in this view. Every weighted factor ({names}) has ZERO "
+            f"dispersion across the {universe_size}-symbol universe, so its "
+            f"cross-sectional z-score is forced to 0 for every name and the composite "
+            f"with it. See the raw per-factor values below.")
+    return True, None
 
 
 def composite_score(factor_values: Dict[str, Dict[str, float]], weights: Dict[str, float],

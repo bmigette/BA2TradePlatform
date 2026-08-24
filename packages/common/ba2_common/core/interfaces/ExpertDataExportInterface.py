@@ -28,12 +28,81 @@ from ba2_common.logger import logger as _module_logger
 
 @dataclass
 class ExpertMetric:
-    """One row in a SYMBOL360 metric card."""
+    """One row in a SYMBOL360 metric card.
+
+    ``detail`` is free text explaining the number: the raw inputs, what they
+    were compared against, and the arithmetic that produced ``value``. It may
+    be a one-liner or a multi-step derivation -- see ``plan_metric_detail``
+    for which of those gets a hover tooltip and which gets an expandable
+    panel. ``detail_table`` carries the same kind of evidence in the shape it
+    is actually easiest to read: (label, value) pairs rendered as a small
+    two-column table (analyst-rating buckets, price targets, the components
+    that sum to a section score).
+    """
     label: str
     value: Any
     display: str
     signal: Optional[str] = None   # "buy" | "sell" | "neutral" | None (n/a)
     detail: Optional[str] = None
+    detail_table: Optional[List[Tuple[str, str]]] = None
+
+
+#: A detail longer than this (or containing ANY newline) cannot be read in a
+#: hover tooltip and goes to an expandable panel instead. Tooltips are HTML:
+#: newlines collapse to spaces, so a multi-step derivation renders as one
+#: continuous line wider than the viewport, clipped at both ends and
+#: impossible to scroll, select or copy. That is the FMPRating card's actual
+#: defect, and it is shared by every card that puts structured text in
+#: ``detail``.
+DETAIL_INLINE_MAX_CHARS = 90
+
+#: Applied to whatever legitimately STAYS a tooltip, so even a short detail
+#: can never overflow the viewport again.
+DETAIL_TOOLTIP_STYLE = "white-space: pre-line; max-width: 28rem;"
+
+
+@dataclass
+class MetricDetailLayout:
+    """Where one metric's evidence should be drawn. Pure: the renderer only
+    draws what this decides, so the rule is unit-testable without a browser."""
+    mode: str                      # "none" | "tooltip" | "panel"
+    text: str = ""                 # normalized detail text ("" when absent)
+    lines: List[str] = field(default_factory=list)
+    table: List[Tuple[str, str]] = field(default_factory=list)
+    title: str = ""                # panel heading
+
+
+def _normalize_detail(detail: Optional[str]) -> str:
+    """CRLF -> LF, strip trailing/leading blank lines and per-line trailing
+    whitespace. A whitespace-only detail is 'no detail'."""
+    if not detail:
+        return ""
+    lines = [ln.rstrip() for ln in str(detail).replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(lines)
+
+
+def plan_metric_detail(metric: ExpertMetric) -> MetricDetailLayout:
+    """Decide how ``metric``'s detail is presented.
+
+    Long derivations belong in an expandable panel, not a hover bubble: a
+    calculation you cannot scroll, select or copy is not readable. Only a
+    genuinely short one-liner (no newlines, <= DETAIL_INLINE_MAX_CHARS) stays
+    a tooltip, and even that gets a wrapping, width-capped style.
+    """
+    text = _normalize_detail(getattr(metric, "detail", None))
+    table = [(str(k), str(v)) for k, v in (getattr(metric, "detail_table", None) or [])]
+    if not text and not table:
+        return MetricDetailLayout(mode="none")
+    lines = text.split("\n") if text else []
+    if table or len(lines) > 1 or len(text) > DETAIL_INLINE_MAX_CHARS:
+        return MetricDetailLayout(mode="panel", text=text, lines=lines, table=table,
+                                  title=f"{metric.label} — details")
+    return MetricDetailLayout(mode="tooltip", text=text, lines=lines, table=table,
+                              title=f"{metric.label} — details")
 
 
 @dataclass
@@ -50,6 +119,20 @@ class ExpertDataExport:
     skipped: bool = False   # True when the expert's Recommendation had skip=True
                              # (e.g. no analyst coverage, empty universe) — distinct
                              # from a normal HOLD; see rec.skip_reason on the metric row
+    signal_unavailable_reason: Optional[str] = None
+    # Set when the expert declared (via EXPORT_SIGNAL_UNAVAILABLE_REASON) that
+    # its Recommendation.signal is not a per-symbol verdict. ``overall_signal``
+    # is then None so a UI draws no badge: a constant badge is worse than no
+    # badge, since it looks like a per-symbol call and is identical for every
+    # symbol ever searched.
+    confidence_unavailable_reason: Optional[str] = None
+    # Set when the expert declared (via EXPORT_CONFIDENCE_UNAVAILABLE_REASON)
+    # that it does not compute a per-symbol confidence at all, so the 0.0 its
+    # Recommendation carries is a placeholder, not a measurement. ``confidence``
+    # is then None and a UI must say "n/a" plus this reason -- printing
+    # "Confidence: 0.0%" states zero conviction, which is a different and false
+    # claim. A genuinely computed 0.0 (expert with no such declaration) is
+    # untouched and still reported as 0.0.
     relevant_settings: Tuple[str, ...] = ()
     # Curated allowlist of settings_used keys worth showing/editing in a
     # SYMBOL360-style UI settings panel -- see
@@ -95,6 +178,22 @@ class ExpertDataExportInterface:
     #: (excluding its own expected_profit_percent/_mode/dynamic_scale, which
     #: only affect a Recommendation field this expert's card never renders).
     EXPORT_RELEVANT_SETTINGS: Optional[Tuple[str, ...]] = None
+
+    #: Set to a short sentence by an expert that never computes a per-symbol
+    #: confidence (a basket/ranking expert whose Recommendation carries a
+    #: literal 0.0 placeholder). export_symbol_data then reports
+    #: confidence=None + this reason instead of a bare 0.0, which a card
+    #: renders as "0.0%" and a reader takes for zero conviction. Leave at
+    #: None for every expert whose confidence is a real measurement --
+    #: including one that legitimately measures 0.0.
+    EXPORT_CONFIDENCE_UNAVAILABLE_REASON: Optional[str] = None
+
+    #: Same opt-in for the header BADGE: set by an expert whose
+    #: Recommendation.signal is a fixed constant rather than a per-symbol
+    #: verdict (a basket/ranking expert says "here is the book", so its card
+    #: would show the identical badge for every symbol ever searched). None
+    #: for every expert whose signal really is about the requested symbol.
+    EXPORT_SIGNAL_UNAVAILABLE_REASON: Optional[str] = None
 
     @classmethod
     def export_default_settings(cls) -> Dict[str, Any]:
@@ -198,10 +297,15 @@ class ExpertDataExportInterface:
                 raise TypeError(f"{cls.__name__}.analyze_as_of returned a list; "
                                 f"per-symbol export is not defined for basket experts")
             metrics = self._build_export_metrics(rec, settings)
+            no_conf = cls.EXPORT_CONFIDENCE_UNAVAILABLE_REASON
+            no_sig = cls.EXPORT_SIGNAL_UNAVAILABLE_REASON
             return ExpertDataExport(
                 expert_name=cls.__name__, symbol=symbol,
-                overall_signal=_SIGNAL_MAP.get(rec.signal),
-                confidence=rec.confidence, metrics=metrics,
+                overall_signal=None if no_sig else _SIGNAL_MAP.get(rec.signal),
+                signal_unavailable_reason=no_sig,
+                confidence=None if no_conf else rec.confidence,
+                confidence_unavailable_reason=no_conf,
+                metrics=metrics,
                 settings_used=settings, raw=dict(rec.raw_outputs or {}),
                 skipped=rec.skip, relevant_settings=cls.export_relevant_settings())
         except Exception as e:  # noqa: BLE001 — intentional: this IS the isolation boundary
