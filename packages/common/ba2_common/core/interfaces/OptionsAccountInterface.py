@@ -9,11 +9,55 @@ delegates the broker call to the abstract _submit_option_order_impl().
 """
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import date
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 from ba2_common.core.option_types import OptionContract, OptionQuote, OptionLeg, OptionPosition
 from ba2_common.core.types import OptionRight
+
+#: Contracts below this are "flat". Order quantities are whole contracts, but they
+#: arrive as floats off ``filled_qty`` and are summed, so an exact ``== 0`` test would
+#: eventually be defeated by float addition.
+_ASSIGNMENT_EPS = 1e-9
+
+
+@dataclass(frozen=True)
+class ReservePool:
+    """The buying-power reserve, WITH the orders whose reserve could not be read.
+
+    ``total`` is a lower bound whenever ``unmeasurable`` is non-empty: those orders hold
+    an unknown amount of capital, and an unknown is not zero. Every gate must treat an
+    unmeasurable pool as a refusal rather than as ``total``.
+    """
+    total: float
+    unmeasurable: Tuple[str, ...] = ()
+
+    @property
+    def is_measurable(self) -> bool:
+        return not self.unmeasurable
+
+
+@dataclass(frozen=True)
+class AssignmentExposure:
+    """Cash owed if every open SHORT PUT were assigned at once — the second view.
+
+    ``cost`` is ``None`` when ANY held short put could not be priced: a sum with a
+    missing addend is an unknown sum, not a smaller one. ``unmeasurable`` then names
+    each order and why, so a caller learns which input was missing rather than only
+    that something was.
+
+    ``contracts`` is the short-put contract count that WAS measurable, and is reported
+    even alongside an unknown cost: "how much of the book is short puts" stays useful
+    when "what it would cost" does not.
+    """
+    cost: Optional[float]
+    contracts: float = 0.0
+    unmeasurable: Tuple[str, ...] = ()
+
+    @property
+    def is_measurable(self) -> bool:
+        return self.cost is not None
 
 
 class OptionsAccountInterface(ABC):
@@ -708,58 +752,296 @@ class OptionsAccountInterface(ABC):
             f"option_reserve_required({strategy!r}): listed in RESERVING_STRATEGIES but "
             f"no branch prices it — refusing to fall back to a zero reserve.")
 
-    def reserved_option_buying_power(self) -> float:
-        """Sum of stored reserves across this account's OPEN short-premium option positions.
+    def open_option_orders_book_wide(self) -> List[Any]:
+        """EVERY non-terminal OPTION order on this ACCOUNT whose position is still open.
 
-        A reserve belongs to the POSITION, not to the order row that created it: the broker
-        frees the margin/cash the moment the structure is flattened, so this must too.
+        The account-level counterpart of ``trade_repository.open_option_orders``, which
+        is scoped to one expert *and* one underlying and therefore cannot answer any
+        question about the book as a whole. Two account-level views are built on this —
+        the buying-power reserve pool and the short-put assignment exposure — and they
+        deliberately consume the SAME list, so "the same CSP appears in both totals" is
+        a property of one query rather than a coincidence of two.
 
-        Previously this summed ``data["option_reserve"]`` over every order not in a TERMINAL
-        status — but ``FILLED`` is NOT terminal (see ``OrderStatus.get_terminal_statuses``),
-        and nothing ever cleared the field or terminalised a filled entry order. The reserve
-        was therefore a ONE-WAY RATCHET: every credit/naked structure ever opened consumed
-        buying power for the remainder of the run, even long after it closed. On the options
-        grid's $20k account that exhausted BP after 1-3 structures, which is why the RESERVING
-        groups (OS2/OS3) capped out at 10-20 trades all clustered in the run's opening weeks
-        while the non-reserving debit groups (OS1/OS4) traded 43-214 times over the identical
-        window — and why the GA appeared to "win by barely trading" (it could not trade).
+        What counts as still open is exactly what the reserve pool has always meant:
+        WAITING/OPENED/CLOSING still hold the position (a submitted-but-unfilled close
+        has freed nothing yet); CLOSED/FAILED release it. An order with no transaction
+        yet — submitted, not linked — is still in flight and still counts.
 
-        Now a reserve counts only while its owning transaction is still open. WAITING/OPENED/
-        CLOSING all still hold the position (a submitted-but-unfilled close has not freed
-        anything yet); CLOSED/FAILED release it. A reserve-carrying order with no transaction
-        yet (submitted, not linked) is still counted — that capital is genuinely in flight.
+        Routed through ``orders_where``/``transactions_where`` rather than a raw
+        ``select`` because a raw select silently returns EMPTY while the SQL-less
+        in-memory "dict trades" backtest store is active, and an empty book reads as a
+        flat book at every gate.
         """
         from ba2_common.core.trade_store import orders_where, transactions_where
         from ba2_common.core.types import AssetClass, OrderStatus, TransactionStatus
 
         terminal = OrderStatus.get_terminal_statuses()
-        unlinked_total = 0.0
-        linked: list = []  # (transaction_id, reserve)
-        for o in orders_where(account_id=self.id, not_statuses=terminal):
-            if o.asset_class != AssetClass.OPTION:
-                continue
-            reserve = float((o.data or {}).get("option_reserve", 0) or 0)
-            if reserve <= 0:
-                continue
-            if o.transaction_id is None:
-                unlinked_total += reserve
-            else:
-                linked.append((o.transaction_id, reserve))
-        if not linked:
-            return unlinked_total
+        option_orders = [o for o in orders_where(account_id=self.id,
+                                                 not_statuses=terminal)
+                         if o.asset_class == AssetClass.OPTION]
+        if not any(o.transaction_id is not None for o in option_orders):
+            return option_orders
         # One bulk lookup of the OPEN book (small — bounded by held positions), not N queries.
         live_ids = {
             t.id for t in transactions_where(
                 not_statuses=(TransactionStatus.CLOSED, TransactionStatus.FAILED))
         }
-        return unlinked_total + sum(r for txn_id, r in linked if txn_id in live_ids)
+        return [o for o in option_orders
+                if o.transaction_id is None or o.transaction_id in live_ids]
 
-    def available_option_buying_power(self) -> float:
-        bal = self.get_balance() or 0.0
-        return bal - self.reserved_option_buying_power()
+    def reserved_option_buying_power_detail(self) -> "ReservePool":
+        """The reserve pool WITH its unknowns named — the honest form of the answer.
+
+        A reserve belongs to the POSITION, not to the order row that created it: the broker
+        frees the margin/cash the moment the structure is flattened, so this must too.
+
+        Previously the sum ran over every order not in a TERMINAL status — but ``FILLED``
+        is NOT terminal (see ``OrderStatus.get_terminal_statuses``), and nothing ever
+        cleared the field or terminalised a filled entry order. The reserve was therefore a
+        ONE-WAY RATCHET: every credit/naked structure ever opened consumed buying power for
+        the remainder of the run, even long after it closed. On the options grid's $20k
+        account that exhausted BP after 1-3 structures, which is why the RESERVING groups
+        (OS2/OS3) capped out at 10-20 trades all clustered in the run's opening weeks while
+        the non-reserving debit groups (OS1/OS4) traded 43-214 times over the identical
+        window — and why the GA appeared to "win by barely trading" (it could not trade).
+
+        UNKNOWN IS NOT ZERO — the defect this method exists for. The sum used to read
+        ``float((o.data or {}).get("option_reserve", 0) or 0)``, so an OPEN order for a
+        strategy that MUST reserve, whose ``option_reserve`` had gone missing (the persist
+        step in ``TradeActions._submit_option_order`` is best-effort and logs on failure; a
+        row written by an older build; a manual repair), contributed 0. An unknown reserve
+        therefore *freed* buying power, and the next structure was waved through on money
+        already committed. Measured: one such row on a $100k account reported
+        ``reserved=0.0``, ``available=100000.0``, ``check_option_buying_power(100000)=True``.
+
+        Which orders are expected to carry one is decided BY NAME, never by guessing:
+
+        * ``option_strategy in RESERVING_STRATEGIES`` -> a reserve is mandatory, and a
+          missing / unreadable / non-positive one is UNMEASURABLE. Non-positive counts as
+          unmeasurable because every ``return 0.0`` inside ``option_reserve_required`` for a
+          reserving name fires when a *sizing input was missing*, so a stored 0 on a priced
+          strategy is that same fail-open one layer down. Checked against the write path:
+          all seven credit builders size with ``_size_by_reserve``, which returns 0 for a
+          non-positive per-contract reserve, and every one of them refuses at
+          ``quantity < 1`` — so a legitimate submission can never persist a 0 here, and
+          this branch only ever fires on a corrupted or legacy row.
+        * anything else contributes 0.0, genuinely: ``ZERO_RESERVE_STRATEGIES`` reserve
+          nothing by definition, ``"close"`` describes an action rather than a position, and
+          multi-leg leg CHILDREN carry no ``option_strategy`` at all (the parent holds the
+          reserve). Flagging those would make every spread permanently unknown.
+        """
+        from ba2_common.logger import logger
+
+        total = 0.0
+        blind: List[str] = []
+        for o in self.open_option_orders_book_wide():
+            strategy = getattr(o, "option_strategy", None)
+            raw = (o.data or {}).get("option_reserve") if isinstance(o.data, dict) else None
+            reserve = None
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                value = float(raw)
+                if math.isfinite(value):
+                    reserve = value
+            if strategy in self.RESERVING_STRATEGIES:
+                if reserve is None or reserve <= 0:
+                    blind.append(
+                        f"order {getattr(o, 'id', '?')} ({strategy} on "
+                        f"{getattr(o, 'symbol', '?')}) is OPEN and must reserve capital, "
+                        f"but its data['option_reserve'] is {raw!r} — an unreadable "
+                        f"reserve is UNKNOWN, and unknown must not read as zero (that "
+                        f"frees buying power that is already committed)")
+                    continue
+                total += reserve
+            elif reserve is not None and reserve > 0:
+                # Not a priced reserving name, but it recorded a reserve anyway. Honour
+                # it: the money is spoken for whatever the row calls itself.
+                total += reserve
+        if blind:
+            logger.error(
+                f"Account {self.id}: {len(blind)} open option order(s) have an "
+                f"unreadable buying-power reserve, so available option buying power is "
+                f"UNKNOWN and every buying-power gate will refuse until it is repaired. "
+                + "; ".join(blind))
+        return ReservePool(total=total, unmeasurable=tuple(blind))
+
+    def reserved_option_buying_power(self) -> float:
+        """Sum of the reserves this account can actually READ, as a plain float.
+
+        Kept for reporting and for backward compatibility. It is a LOWER BOUND: when
+        ``reserved_option_buying_power_detail().unmeasurable`` is non-empty the true
+        figure is higher by an unknown amount, which is precisely why the gate
+        (``check_option_buying_power``) consults the detail and not this number.
+        """
+        return self.reserved_option_buying_power_detail().total
+
+    def available_option_buying_power(self) -> Optional[float]:
+        """Balance minus reserves, or ``None`` when either is unknown.
+
+        ``None``, not ``0.0``. The previous ``self.get_balance() or 0.0`` turned an
+        unreadable balance into a real number; it happened to fail closed, but "we could
+        not read the balance" and "the balance is zero" are still different facts and
+        only one of them is ever true.
+        """
+        pool = self.reserved_option_buying_power_detail()
+        if not pool.is_measurable:
+            return None
+        bal = self.get_balance()
+        if bal is None:
+            return None
+        return bal - pool.total
 
     def check_option_buying_power(self, required: float) -> bool:
-        """True if `required` reserve fits in available buying power."""
+        """True if `required` reserve fits in available buying power.
+
+        A required reserve of zero always passes: reserving nothing needs no capacity,
+        and refusing it would break the entire long/debit arm the moment one unrelated
+        row lost its reserve. Anything above zero measured against an UNKNOWN pool
+        refuses — "we cannot measure this" and "this is fine" must never be the same
+        answer.
+        """
         if required <= 0:
             return True
-        return required <= self.available_option_buying_power()
+        available = self.available_option_buying_power()
+        if available is None:
+            return False
+        return required <= available
+
+    # --- Assignment capacity (the SECOND view of the same legs) -------------
+    def short_put_assignment_exposure(self) -> "AssignmentExposure":
+        """Cash this account would owe if EVERY open short put were assigned at once.
+
+        A SECOND VIEW of the same order rows the reserve pool reads, answering a
+        different question. ``reserved_option_buying_power`` asks "how much margin/cash
+        is already spoken for?", priced the way a broker prices each structure — the
+        full ``strike x 100`` for a ``cash_secured_put``, but only Reg-T naked margin
+        (~20% of notional, floored at 10%) for a ``short_strangle``. This asks "could we
+        take delivery?", which is one number for every short put alive: the strike.
+
+        WHY THIS IS NOT SIMPLY ADDED TO THE RESERVE POOL. CSP, jade lizard and put ratio
+        already reserve the full strike there. Charging them again in the same pool
+        would spend the same cash twice against the same budget and refuse trades the
+        account can plainly afford. The two totals are each measured against their own
+        independently-derived budget — the pool against balance-minus-reserves, this
+        against the balance itself — and neither subtracts the other.
+
+        SHORT CALLS ARE EXCLUDED, deliberately. A short call assigned delivers shares
+        and pays cash IN; it consumes share inventory, not cash. A covered call charged
+        here would decline trades for an obligation that does not exist. (A *share*
+        capacity notion for uncovered short calls is a real and separate feature —
+        nothing here tracks share inventory — and is out of scope.)
+
+        Netting is per contract symbol over EXECUTED orders (BUY ``+``, SELL ``−``), the
+        same netting the close paths perform, so a short bought back stops counting.
+        A submitted-but-unfilled SELL is added on top without netting: it can fill at any
+        moment and can only ever ADD an obligation, whereas an unfilled BUY-to-close has
+        closed nothing and must not hand capacity back early.
+        """
+        from ba2_common.core.option_lifecycle import put_assignment_cost
+        from ba2_common.core.types import OrderDirection, OrderStatus
+
+        executed = OrderStatus.get_executed_statuses()
+        net: dict = {}            # contract symbol -> signed contracts (BUY +, SELL -)
+        meta: dict = {}           # contract symbol -> a representative order row
+        pending_shorts: list = []
+        blind: List[str] = []
+
+        for o in self.open_option_orders_book_wide():
+            contract = getattr(o, "contract_symbol", None)
+            if not contract:
+                # A multi-leg PARENT carries no contract, no strike and no right — its
+                # legs do, one row each. Skipping it is not a gap; counting it would be
+                # a double count with no identity to attach.
+                continue
+            is_sell = o.side == OrderDirection.SELL
+            if o.option_type is None:
+                if is_sell:
+                    blind.append(
+                        f"order {getattr(o, 'id', '?')} ({contract}) is a SHORT option "
+                        f"with no option type recorded — whether it is a put that can be "
+                        f"assigned to us is unknown, and unknown must not resolve to "
+                        f"'not a put'")
+                # A BUY with no right cannot be netted off a short, which only ever
+                # OVERSTATES the exposure. Conservative, so it is not an unknown.
+                continue
+            if o.option_type != OptionRight.PUT:
+                continue
+            raw_qty = o.filled_qty if o.filled_qty else o.quantity
+            if is_sell and (raw_qty is None or float(raw_qty) <= 0):
+                # A SHORT PUT with no usable size is an obligation of unknown size, and
+                # `or 0.0` would price it at nothing — the same fail-open one field over.
+                # A BUY is left to fall through to 0: it can only fail to relieve a
+                # short, which overstates the bill, which is the safe direction.
+                blind.append(
+                    f"order {getattr(o, 'id', '?')} ({contract}) is a SHORT PUT with no "
+                    f"usable quantity (filled_qty={o.filled_qty!r}, "
+                    f"quantity={o.quantity!r}) — how many contracts could be assigned to "
+                    f"us is unknown, and unknown is not zero")
+                continue
+            qty = float(raw_qty or 0.0)
+            if o.status in executed:
+                net[contract] = net.get(contract, 0.0) + (-qty if is_sell else qty)
+                meta[contract] = o
+            elif is_sell:
+                pending_shorts.append((o, qty))
+
+        cost = 0.0
+        contracts = 0.0
+        for contract in sorted(net):
+            held = net[contract]
+            if held >= -_ASSIGNMENT_EPS:      # flat, or net LONG: nothing can be put to us
+                continue
+            o = meta[contract]
+            leg = put_assignment_cost(o.strike, abs(held), getattr(o, "multiplier", None))
+            if leg is None:
+                blind.append(
+                    f"order {getattr(o, 'id', '?')} ({contract}) is a held SHORT PUT but "
+                    f"its strike ({o.strike!r}) / contract count ({held!r}) / multiplier "
+                    f"({getattr(o, 'multiplier', None)!r}) cannot price delivery — the "
+                    f"cash it would take to accept assignment is unmeasurable")
+                continue
+            cost += leg
+            contracts += abs(held)
+
+        for o, qty in pending_shorts:
+            leg = put_assignment_cost(o.strike, qty, getattr(o, "multiplier", None))
+            if leg is None:
+                blind.append(
+                    f"order {getattr(o, 'id', '?')} ({o.contract_symbol}) is an in-flight "
+                    f"SHORT PUT but its strike ({o.strike!r}) / quantity ({o.quantity!r}) "
+                    f"/ multiplier ({getattr(o, 'multiplier', None)!r}) cannot price "
+                    f"delivery — the cash it would take to accept assignment is "
+                    f"unmeasurable")
+                continue
+            cost += leg
+            contracts += qty
+
+        if blind:
+            return AssignmentExposure(None, contracts, tuple(blind))
+        return AssignmentExposure(cost, contracts, ())
+
+    def check_assignment_capacity(self, additional_cost: float) -> bool:
+        """Could this account still take delivery after adding ``additional_cost``?
+
+        Measured against the BALANCE, never against ``available_option_buying_power()``:
+        the reserve pool has already subtracted the very CSP strikes this total is
+        charging, so netting the two would double-charge the same cash and refuse a
+        fully funded wheel at exactly the size it is funded for.
+
+        Exactly equal ADMITS. That is the same boundary every other cap in the option
+        risk path uses (``check_option_buying_power``, and the deployment / leverage /
+        naked rails in ``option_book``), and one gate with a different boundary is a
+        trap nobody will remember. The safety margin belongs in the operator's cash
+        figure, not smuggled into the comparison.
+
+        Unknown ANYTHING refuses: an unmeasurable exposure, an unreadable balance, or a
+        negative ``additional_cost`` (which would buy capacity nobody funded).
+        """
+        if additional_cost is None or additional_cost < 0:
+            return False
+        exposure = self.short_put_assignment_exposure()
+        if not exposure.is_measurable:
+            return False
+        cash = self.get_balance()
+        if cash is None:
+            return False
+        return exposure.cost + additional_cost <= cash

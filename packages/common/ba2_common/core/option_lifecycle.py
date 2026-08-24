@@ -67,6 +67,7 @@ declined.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -285,6 +286,54 @@ def structure_metrics(structure: OptionStructure) -> StructureMetrics:
             committed += naked * max(l.strike for l in side_shorts) * 100.0
 
     return StructureMetrics(not any_naked, notional, committed)
+
+
+# ---------------------------------------------------------------------------
+# assignment cost -- ONE formula, two callers
+# ---------------------------------------------------------------------------
+def put_assignment_cost(strike: Optional[float],
+                        contracts: Optional[float],
+                        multiplier: Optional[int]) -> Optional[float]:
+    """Cash to take delivery on ``contracts`` SHORT puts at ``strike``, or ``None``.
+
+    ``strike x contracts x multiplier``, and nothing else: when a short put is assigned
+    the account buys the shares at the strike, in cash, that night. No credit is netted
+    off (the premium was banked at entry and is already in the balance this is measured
+    against), and no long wing is netted off either — the long put is OUR right, which
+    we would have to choose to exercise, on a LATER day, *after* paying for the shares.
+
+    THE single definition of the arithmetic, deliberately shared by the two callers so
+    they cannot fork the way the two IV-rank implementations did:
+
+    * ``option_book.book_totals`` — the PURE sleeve rail, summing over ``LifecycleLeg``
+      values supplied by the caller;
+    * ``OptionsAccountInterface.short_put_assignment_exposure`` — the account-wide
+      second view, summing over netted order rows.
+
+    ``None`` means UNMEASURABLE and every caller must decline on it. Zero is returned
+    only for a genuine zero — ``contracts == 0`` (nothing is held, so nothing can be
+    assigned). A strike of ``0`` is NOT a free put: no listed equity option has one, so
+    it is a missing field, and this codebase's rule is that a missing field is unknown.
+    """
+    if contracts is None or multiplier is None or strike is None:
+        return None
+    try:
+        strike = float(strike)
+        contracts = float(contracts)
+        multiplier = float(multiplier)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(strike) and math.isfinite(contracts)
+            and math.isfinite(multiplier)):
+        return None
+    if strike <= 0 or multiplier <= 0:
+        return None
+    if contracts < 0:
+        # A negative contract count would BUY capacity: it is the sign of a caller that
+        # passed a signed net_qty instead of its magnitude, not of an obligation we owe
+        # less than nothing on.
+        return None
+    return strike * contracts * multiplier
 
 
 # ---------------------------------------------------------------------------

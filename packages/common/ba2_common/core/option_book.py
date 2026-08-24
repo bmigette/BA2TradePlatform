@@ -79,6 +79,49 @@ silently inert, which is why ``RailVerdict.evaluated`` reports which rails actua
 undefined risk) and that is a readable fact rather than a silence.
 
 
+Assignment capacity: a SECOND VIEW of the same legs
+---------------------------------------------------
+The rails above are all about *committed capital* — how much of the sleeve is at work
+and how levered it is. None of them asks the question a short-premium book actually
+dies of: **if every short put I hold were assigned tomorrow, could I pay for the
+shares?**
+
+``OptionsAccountInterface.option_reserve_required`` does not answer it either, and
+cannot. It is a *buying-power* reserve, priced per structure the way a broker prices
+it, and it charges wildly different things: a ``cash_secured_put`` reserves the full
+``strike x 100``, while a ``short_strangle`` reserves Reg-T naked margin — ~20% of
+notional, floored at 10%. A book of short strangles therefore reserves roughly one
+fifth of what it owes if everything is assigned at once, and a short put *vertical*
+reserves only its wing width even though the short leg can be assigned tonight while
+the long is not exercised until expiry.
+
+``short_put_assignment`` on ``BookTotals`` / ``CandidateStructure`` is that second
+view, and ``RAIL_ASSIGNMENT_CAPACITY`` is the entry gate built on it.
+
+**It is deliberately NOT "add short puts to the reserve pool".** CSP, jade lizard and
+put ratio already reserve the full strike there; adding them again would charge the
+same cash twice against the same budget and refuse trades the account can plainly
+afford. The two views are each measured against their own, independently-measured
+budget — the reserve pool against balance-minus-reserves, capacity against the cash
+the caller passes in — and neither subtracts the other. That is what lets both be
+correct at once, and it is the one property a future "simplification" must not break.
+
+Three consequences worth stating, because each is a decision:
+
+* **Short CALLS consume none of it.** A short call assigned delivers shares and pays
+  cash IN; it is the opposite cash flow. A covered call charged to a cash-capacity
+  total would decline trades for an obligation that does not exist. (Whether a short
+  call needs its own *share*-capacity notion is a separate feature and is out of scope
+  here — nothing in this module tracks share inventory.)
+* **A long put wing nets nothing off.** It is our right, exercisable later, after the
+  shares are already paid for.
+* **The rail is inapplicable, and visibly so, when neither the book nor the candidate
+  holds a short put** — ``evaluated`` omits it, exactly as it omits
+  ``undefined_risk_max_pct`` for a defined-risk candidate. When the *book* owes and the
+  candidate does not, the rail still runs: a sleeve that already cannot fund delivery
+  of what it holds may not add more risk of any kind.
+
+
 The circuit breaker feeds the lifecycle; it does not re-implement the flatten
 ----------------------------------------------------------------------------
 ``option_lifecycle`` already produces ``LIFECYCLE_BREAKER`` from an optional
@@ -124,13 +167,16 @@ from ba2_common.core.option_lifecycle import (
     SETTING_BREAKER_TRIPPED,
     UNDEFINED_RISK_STRATEGIES,
     OptionStructure,
+    put_assignment_cost,
     structure_metrics,
 )
+from ba2_common.core.types import OptionRight
 
 #: Nothing declined.
 RAIL_OK = "ok"
 #: Declines that are "we cannot measure this", not "this breaches a limit".
 RAIL_UNKNOWN_EQUITY = "unknown_equity"
+RAIL_UNKNOWN_ASSIGNMENT_CASH = "unknown_assignment_cash"
 RAIL_UNMEASURABLE_BOOK = "unmeasurable_book"
 RAIL_UNMEASURABLE_CANDIDATE = "unmeasurable_candidate"
 #: The decline that is a STATE: the drawdown breaker has stood this sleeve down.
@@ -141,13 +187,18 @@ RAIL_ONE_PER_UNDERLYING = "one_per_underlying"
 RAIL_MAX_DEPLOYMENT = "max_deployment_pct"
 RAIL_MAX_NOTIONAL_LEVERAGE = "max_notional_leverage"
 RAIL_UNDEFINED_RISK = "undefined_risk_max_pct"
+#: Could the sleeve pay for delivery of every short put it would then hold?
+RAIL_ASSIGNMENT_CAPACITY = "assignment_capacity"
 
 #: The order rails are evaluated in, promoted from ``rebalance`` + ``_within_rails``:
 #: the two caps first (they were the loop's own guards), then equity, then the three
 #: percentage rails. Fixed, because the *reason* a candidate was declined is recorded
-#: and a reordering would silently re-label history.
+#: and a reordering would silently re-label history — which is also why
+#: ``assignment_capacity`` was APPENDED rather than inserted where it "belongs": every
+#: decline already on record keeps the reason it was given.
 RAIL_ORDER = (RAIL_MAX_CONCURRENT, RAIL_ONE_PER_UNDERLYING, RAIL_MAX_DEPLOYMENT,
-              RAIL_MAX_NOTIONAL_LEVERAGE, RAIL_UNDEFINED_RISK)
+              RAIL_MAX_NOTIONAL_LEVERAGE, RAIL_UNDEFINED_RISK,
+              RAIL_ASSIGNMENT_CAPACITY)
 
 #: How far a sleeve must climb back out of a drawdown before its stand-down lifts,
 #: as a fraction of the trip depth. 0.5 with a 20% breaker means: trip at -20%,
@@ -193,6 +244,16 @@ class CandidateStructure:
     defaulted to zero: a candidate that risks nothing and controls nothing is not a free
     trade, it is a spec nobody measured.
 
+    ``short_put_assignment`` is the total cash this structure would owe if every short
+    put in it were assigned: ``strike x 100 x qty`` per short put leg, with no credit
+    and no long wing netted off (see ``put_assignment_cost``). It is REQUIRED and not
+    defaulted, for the same reason ``max_loss`` and ``notional`` are: "the caller did
+    not state an assignment obligation" and "this structure has none" are different
+    facts, and a default would quietly make every un-updated call site look
+    obligation-free. It is genuinely ``0.0`` for anything with no short put — a long
+    call, a bear call spread, a covered call — and ``None`` when it could not be
+    measured, which declines.
+
     ``is_defined_risk`` is optional and means "declared". ``None`` = not declared, and
     the undefined-risk rail then falls back to the promoted strategy-name gate.
     """
@@ -200,6 +261,7 @@ class CandidateStructure:
     strategy: str
     max_loss: Optional[float]
     notional: Optional[float]
+    short_put_assignment: Optional[float]
     is_defined_risk: Optional[bool] = None
 
 
@@ -215,6 +277,12 @@ class BookTotals:
     ``naked_committed`` the undefined-risk share of ``committed``.
     ``notional``       short-side stress notional only; the leverage rail's basis.
     ``premium_outlay`` the debit share of ``committed`` (long-only structures).
+    ``short_put_assignment`` the SECOND VIEW: cash the sleeve would owe if every short
+                       put it holds were assigned at once. Deliberately *not* folded
+                       into any of the four above — it answers a different question
+                       against a different budget, and leaking it into ``committed``
+                       would make the deployment rail refuse at a fifth of its
+                       configured cap with no way to tell which rail did it.
 
     ``structure_count`` and ``underlyings`` are never unknown: they come from the
     caller's own list of open structures, exactly as ``len(holdings)`` and
@@ -227,6 +295,7 @@ class BookTotals:
     naked_committed: Optional[float]
     notional: Optional[float]
     premium_outlay: Optional[float]
+    short_put_assignment: Optional[float]
     structure_count: int
     underlyings: FrozenSet[str]
     unmeasurable: Tuple[str, ...] = ()
@@ -312,27 +381,66 @@ def _premium_outlay(structure: OptionStructure) -> Tuple[Optional[float], str]:
     return premium * abs(structure.quantity) * structure.multiplier, ""
 
 
+def _short_put_assignment(structure: OptionStructure) -> Tuple[Optional[float], str]:
+    """(cash owed if every held short PUT is assigned, "") or (None, why unknown).
+
+    Only SHORT PUTS. A short CALL delivers shares and takes cash IN, and a LONG put is
+    our right rather than our obligation — neither can have shares put to us. A long
+    put wing is deliberately NOT netted against the short it protects: the short can be
+    assigned tonight while the long is not exercised until expiry, which is exactly why
+    a put vertical's delivery bill is the full short strike and not the wing width.
+
+    The multiplier is the structure's own (``strike x contracts x multiplier``), not a
+    hardcoded 100, because it is the field that says how many shares a contract
+    delivers. Note ``structure_metrics`` DOES hardcode 100 for its notional; that is
+    pre-existing and out of scope here, but it means a non-100 multiplier makes the two
+    numbers disagree by design rather than by accident.
+    """
+    total = 0.0
+    for leg in structure.held_legs:          # contract-symbol ordered, so stable
+        if not leg.is_short:
+            continue
+        if leg.option_type is None:
+            return None, (f"no option type for short {leg.contract_symbol} — whether it "
+                          f"is a put that can be assigned to us is unknown, and unknown "
+                          f"must not resolve to 'not a put'")
+        if leg.option_type != OptionRight.PUT:
+            continue
+        cost = put_assignment_cost(leg.strike, abs(leg.net_qty), structure.multiplier)
+        if cost is None:
+            return None, (f"short put {leg.contract_symbol} has no usable strike "
+                          f"({leg.strike!r}), contract count ({leg.net_qty!r}) or "
+                          f"contract multiplier ({structure.multiplier!r}) — the cash it "
+                          f"would take to accept delivery is unmeasurable")
+        total += cost
+    return total, ""
+
+
 def _structure_totals(structure: OptionStructure
                       ) -> Tuple[Optional[float], Optional[float], Optional[float],
-                                 Optional[float], str]:
-    """(committed, naked_committed, notional, premium_outlay, why-unmeasurable)."""
+                                 Optional[float], Optional[float], str]:
+    """(committed, naked, notional, premium_outlay, short_put_assignment, why-blind)."""
     # Legs recorded, none of them still held: we SAW this structure go flat. That is a
     # measured zero, and it is a different fact from a structure whose legs we never saw
     # -- which structure_metrics rightly calls unmeasurable.
     if structure.legs and not structure.held_legs:
-        return 0.0, 0.0, 0.0, 0.0, ""
+        return 0.0, 0.0, 0.0, 0.0, 0.0, ""
 
     metrics = structure_metrics(structure)
     if metrics.committed is None or metrics.notional is None:
-        return None, None, None, None, metrics.detail
+        return None, None, None, None, None, metrics.detail
 
     outlay, blind = _premium_outlay(structure)
     if outlay is None:
-        return None, None, None, None, blind
+        return None, None, None, None, None, blind
+
+    assignment, blind = _short_put_assignment(structure)
+    if assignment is None:
+        return None, None, None, None, None, blind
 
     committed = metrics.committed + outlay
     naked = 0.0 if metrics.is_defined_risk else committed
-    return committed, naked, metrics.notional, outlay, ""
+    return committed, naked, metrics.notional, outlay, assignment, ""
 
 
 def book_totals(structures: Iterable[OptionStructure]) -> BookTotals:
@@ -343,13 +451,13 @@ def book_totals(structures: Iterable[OptionStructure]) -> BookTotals:
                        ``get_option_holdings`` was.
     """
     ordered = sorted(structures, key=lambda s: s.transaction_id)
-    committed = naked = notional = outlay = 0.0
+    committed = naked = notional = outlay = assignment = 0.0
     underlyings = set()
     blind: List[str] = []
 
     for structure in ordered:
         underlyings.add(structure.underlying)
-        c, nk, n, o, why = _structure_totals(structure)
+        c, nk, n, o, a, why = _structure_totals(structure)
         if why:
             blind.append(f"transaction {structure.transaction_id}: {why}")
             continue
@@ -357,18 +465,24 @@ def book_totals(structures: Iterable[OptionStructure]) -> BookTotals:
         naked += nk
         notional += n
         outlay += o
+        assignment += a
 
     count = len(ordered)
     if blind:
-        return BookTotals(None, None, None, None, count, frozenset(underlyings),
-                          tuple(blind))
-    return BookTotals(committed, naked, notional, outlay, count,
+        return BookTotals(None, None, None, None, None, count,
+                          frozenset(underlyings), tuple(blind))
+    return BookTotals(committed, naked, notional, outlay, assignment, count,
                       frozenset(underlyings), ())
 
 
 # ---------------------------------------------------------------------------
 # rails (promoted _within_rails + rebalance's two loop guards)
 # ---------------------------------------------------------------------------
+def _is_zero(value: Optional[float]) -> bool:
+    """A MEASURED zero. ``None`` is not zero and never answers True here."""
+    return value is not None and abs(value) < _EPS
+
+
 def _is_undefined_risk(candidate: CandidateStructure) -> bool:
     """Does the naked cap apply to this candidate?
 
@@ -398,6 +512,10 @@ def _charge(book: BookTotals, candidate: CandidateStructure) -> BookTotals:
                                                 if _is_undefined_risk(candidate) else 0.0),
         notional=book.notional + candidate.notional,
         premium_outlay=book.premium_outlay + (candidate.max_loss if is_debit else 0.0),
+        # The second view accumulates on its OWN axis. It is not added to `committed`:
+        # a CSP already commits its max loss there and would otherwise be charged the
+        # strike twice against one budget.
+        short_put_assignment=book.short_put_assignment + candidate.short_put_assignment,
         structure_count=book.structure_count + 1,
         underlyings=book.underlyings | {candidate.underlying},
         unmeasurable=book.unmeasurable,
@@ -408,7 +526,8 @@ def check_rails(candidate: CandidateStructure,
                 book: BookTotals,
                 equity: Optional[float],
                 settings: Mapping[str, Any],
-                breaker: BreakerState) -> RailVerdict:
+                breaker: BreakerState,
+                assignment_cash: Optional[float]) -> RailVerdict:
     """May this ONE candidate be opened against this sleeve? Pure.
 
     :param candidate: the structure being considered.
@@ -425,6 +544,16 @@ def check_rails(candidate: CandidateStructure,
                       trading" are different facts, and treating the first as the
                       second is exactly how the stand-down came to gate nothing. A
                       sleeve with no breaker passes ``BreakerState()`` and says so.
+    :param assignment_cash: the cash available to fund delivery if every short put in
+                      the resulting book were assigned at once. A SIBLING of ``equity``,
+                      not a setting: it is a measurement, and which measurement is the
+                      caller's decision (settled cash for a cash-secured book; whatever
+                      the operator is prepared to commit to delivery for a margin one).
+                      What it must NOT be is buying power net of the reserve pool — the
+                      reserve pool has already subtracted the CSPs whose strikes this
+                      total is charging, and netting the two would double-charge the
+                      same cash. ``None`` DECLINES, and is REQUIRED rather than
+                      defaulted for the same reason ``breaker`` is.
     """
     if not isinstance(breaker, BreakerState):
         raise TypeError(
@@ -539,6 +668,50 @@ def check_rails(candidate: CandidateStructure,
                            f"{candidate.max_loss:.2f} > undefined_risk_max_pct "
                            f"{naked_pct:g}% of {equity:.2f} ({naked_cap:.2f})")
 
+    # 9. assignment capacity -- the SECOND VIEW of the same legs. Everything above is
+    #    about committed capital; this asks whether the sleeve could actually PAY if
+    #    every short put it would then hold were assigned tomorrow.
+    #
+    #    Inapplicable, and visibly so, when neither side holds a short put: a debit arm
+    #    has no delivery obligation and must not be gated on a cash figure it does not
+    #    need. It is NOT skipped merely because the candidate is call-only — a sleeve
+    #    that already cannot fund delivery of what it holds may not add more risk.
+    if not (_is_zero(book.short_put_assignment)
+            and _is_zero(candidate.short_put_assignment)):
+        ran.append(RAIL_ASSIGNMENT_CAPACITY)
+        if book.short_put_assignment is None:
+            return verdict(RAIL_UNMEASURABLE_BOOK,
+                           "the sleeve's short-put assignment cost is unmeasurable — "
+                           "what it would take to accept delivery is unknown, and "
+                           "unknown is not zero: " + ("; ".join(book.unmeasurable)
+                                                      or "no detail recorded"))
+        if candidate.short_put_assignment is None:
+            return verdict(RAIL_UNMEASURABLE_CANDIDATE,
+                           f"{candidate.strategy} on {candidate.underlying} has no "
+                           f"short_put_assignment — the cash it would take to accept "
+                           f"delivery on its short puts is unmeasurable")
+        if candidate.short_put_assignment < 0 or book.short_put_assignment < 0:
+            return verdict(RAIL_UNMEASURABLE_CANDIDATE,
+                           f"{candidate.strategy} on {candidate.underlying} reports a "
+                           f"negative assignment cost "
+                           f"({book.short_put_assignment:g}/"
+                           f"{candidate.short_put_assignment:g}) — a negative addend "
+                           f"would buy capacity nobody funded")
+        if assignment_cash is None:
+            return verdict(RAIL_UNKNOWN_ASSIGNMENT_CASH,
+                           f"no cash figure for assignment — the sleeve would owe "
+                           f"{book.short_put_assignment + candidate.short_put_assignment:.2f} "
+                           f"if every short put were assigned and there is nothing to "
+                           f"measure that against")
+        owed = book.short_put_assignment + candidate.short_put_assignment
+        if owed > assignment_cash:
+            return verdict(RAIL_ASSIGNMENT_CAPACITY,
+                           f"short-put assignment {book.short_put_assignment:.2f} + "
+                           f"{candidate.short_put_assignment:.2f} = {owed:.2f} > cash "
+                           f"available for assignment {assignment_cash:.2f} — the "
+                           f"sleeve could not take delivery of the book it would then "
+                           f"hold")
+
     return verdict(RAIL_OK,
                    f"{candidate.strategy} on {candidate.underlying} is within every "
                    f"sleeve rail", allowed=True, after=_charge(book, candidate))
@@ -548,7 +721,8 @@ def admit(candidates: Sequence[CandidateStructure],
           book: BookTotals,
           equity: Optional[float],
           settings: Mapping[str, Any],
-          breaker: BreakerState) -> List[RailVerdict]:
+          breaker: BreakerState,
+          assignment_cash: Optional[float]) -> List[RailVerdict]:
     """Walk ``candidates`` in order, charging each admission to the running sleeve.
 
     This is ``rebalance``'s gate loop with the submission removed: three 20k candidates
@@ -563,11 +737,20 @@ def admit(candidates: Sequence[CandidateStructure],
 
     ``breaker`` is required for the same reason it is on ``check_rails``: a standing-down
     sleeve declines every candidate in the pass, not just the first.
+
+    ``assignment_cash`` is the whole point of running the pass rather than checking each
+    candidate alone. N cash-secured puts, each individually affordable, are collectively
+    beyond one account's cash; because every admission charges its delivery cost to the
+    running sleeve, the pass declines the one that tips it over instead of opening all N
+    and discovering the shortfall as a margin call. Note the cash figure itself does NOT
+    shrink as candidates are admitted — the reserve is charged on the other axis, and
+    subtracting it here as well would be the double-charge this feature exists to avoid.
     """
     verdicts: List[RailVerdict] = []
     running = book
     for candidate in candidates:
-        verdict = check_rails(candidate, running, equity, settings, breaker)
+        verdict = check_rails(candidate, running, equity, settings, breaker,
+                              assignment_cash)
         verdicts.append(verdict)
         if verdict.allowed:
             running = verdict.book_after
