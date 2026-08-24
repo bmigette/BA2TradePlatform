@@ -74,6 +74,8 @@ class OptionsAccountInterface(ABC):
         single leg -> one option TradingOrder (contract_symbol set)
         2-4 legs   -> a parent option order (option_strategy set, no contract_symbol)
                       + leg children linked via parent_order_id.
+
+        Raises ValueError if the legs span more than one expiry (see the guard below).
         """
         from ba2_common.core.db import add_instance, get_instance, update_instance
         from ba2_common.core.models import TradingOrder
@@ -84,6 +86,34 @@ class OptionsAccountInterface(ABC):
             raise ValueError("submit_option_order requires at least one leg")
         if len(legs) > 4:
             raise ValueError("Alpaca supports a maximum of 4 option legs")
+
+        # SINGLE-EXPIRY INVARIANT — checked here, BEFORE the parent order, the leg children
+        # and the Transaction are written, so a refusal leaves nothing half-recorded (and
+        # before the try/except below, which would otherwise convert this into a silent
+        # `return None`).
+        #
+        # `Transaction.expiry` is ONE date and is documented as "the structure's expiry".
+        # That is honest only because all 16 supported structures — the four singles, the
+        # four verticals, straddle/strangle and their short forms, iron condor, jade lizard,
+        # call butterfly, put ratio spread — put every leg on one expiry. A calendar or a
+        # diagonal does not make that field incomplete, it makes it WRONG: a money record
+        # asserting a date half the position does not honour, with nothing anywhere to
+        # contradict it. Adding such a structure must therefore start by teaching the
+        # Transaction to carry per-leg expiries — this refusal is the reminder.
+        #
+        # A leg whose expiry is None is UNKNOWN, not a second expiry, and is not counted:
+        # the close paths rebuild legs from stored order rows (PremiumSeller/portfolio.py
+        # reads `getattr(o, "expiry", None)`), and refusing there would strand an open
+        # position that can no longer be flattened — much worse than an incomplete intent.
+        expiries = sorted({leg.expiry for leg in legs if leg.expiry is not None})
+        if len(expiries) > 1:
+            raise ValueError(
+                f"An option structure must be on a single expiry, but these {len(legs)} legs "
+                f"span {len(expiries)}: {', '.join(d.isoformat() for d in expiries)}. "
+                "Transaction.expiry holds a SINGLE value for the whole structure, so a "
+                "calendar/diagonal would be recorded with an expiry that is simply wrong for "
+                "part of the position. No order or transaction has been created."
+            )
 
         first = legs[0]
         is_multi = len(legs) > 1
