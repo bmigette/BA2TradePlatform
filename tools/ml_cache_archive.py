@@ -38,6 +38,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -84,6 +85,47 @@ def _safe_sqlite_copy(src_path: str, dst_path: str) -> None:
             dst.close()
     finally:
         src.close()
+
+
+def _robocopy_move(src_path: str, dest_dir: str, dest_name: str) -> None:
+    """Move a large file onto a possibly-flaky mount (cloud-sync drives, etc.) via robocopy.
+
+    2026-08-24 INCIDENT: a 32GB export completed cleanly, then shutil.move's fallback
+    copy2->open() failed with OSError [Errno 22] ("Ressources systeme insuffisantes" /
+    ERROR_NO_SYSTEM_RESOURCES / WinError 1450) writing to a Google-Drive-streamed mount under
+    local memory pressure from a concurrently-running grid. That is a KERNEL-level resource
+    transient, not a size or permissions problem -- the SAME single-shot open() will often just
+    fail again a second later. robocopy is the Windows-native tool built for exactly this: it
+    retries a failed copy on its own (/R retries, /W wait-seconds-between), rather than a Python
+    file handle raising once and giving up.
+
+    Raises RuntimeError with robocopy's own exit code on failure (robocopy's return codes are
+    NOT unix-style -- 0-7 all mean some degree of success, only 8+ is a real failure).
+    """
+    args = [
+        "robocopy", os.path.dirname(src_path), dest_dir, os.path.basename(src_path),
+        "/R:8", "/W:20",      # retry up to 8 times, 20s apart -- rides out a transient resource dip
+        "/NP", "/NFL", "/NDL",  # quiet: no per-file/per-dir noise for a single multi-GB file
+    ]
+    # capture as bytes + decode with errors="replace": robocopy writes the console's OEM
+    # codepage (e.g. cp850 on a French locale), not Python's default text encoding -- decoding
+    # as text=True raised UnicodeDecodeError in the subprocess reader thread during testing.
+    result = subprocess.run(args, capture_output=True)
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    if result.returncode >= 8:
+        raise RuntimeError(f"robocopy failed (exit {result.returncode}): {stdout[-2000:]}\n{stderr[-2000:]}")
+    copied = os.path.join(dest_dir, os.path.basename(src_path))
+    if not os.path.exists(copied):
+        raise RuntimeError(f"robocopy reported success (exit {result.returncode}) but "
+                           f"{copied} does not exist")
+    if os.path.getsize(copied) != os.path.getsize(src_path):
+        raise RuntimeError(
+            f"robocopy reported success (exit {result.returncode}) but sizes differ: "
+            f"src={os.path.getsize(src_path)} dst={os.path.getsize(copied)}")
+    if copied != os.path.join(dest_dir, dest_name):
+        os.replace(copied, os.path.join(dest_dir, dest_name))
+    os.remove(src_path)
 
 
 def _iter_cache_files(cache_dir: str):
@@ -225,9 +267,31 @@ def cmd_export(args: argparse.Namespace) -> None:
 
         zip_size = os.path.getsize(tmp_zip)
         print(f"Moving to {final_path} ...")
-        shutil.move(tmp_zip, final_path)
+        try:
+            # Fast path: same-drive or a mount that behaves like a normal filesystem.
+            shutil.move(tmp_zip, final_path)
+        except OSError as e:
+            # Cross-device (WinError 17) or a resource transient (WinError 1450 / errno 22,
+            # seen writing to a Google-Drive-streamed mount under memory pressure) -- fall back
+            # to robocopy, which retries on its own instead of failing once and giving up.
+            print(f"  shutil.move failed ({e!r}); retrying via robocopy (auto-retries on "
+                 f"transient failures)...")
+            _robocopy_move(tmp_zip, args.dest_dir, name)
+        moved = True
+    except BaseException:
+        moved = False
+        raise
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        # NEVER discard a successfully-built zip just because the MOVE failed -- that is what
+        # threw away 32GB / hours of work on 2026-08-24. Only clean up the temp dir once the
+        # file has actually landed at final_path.
+        if moved or not os.path.exists(tmp_zip):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        else:
+            print(f"\nMOVE FAILED -- the completed export was NOT deleted, it is still at:\n"
+                 f"  {tmp_zip}\n"
+                 f"Move it to {final_path} by hand, or re-run this command (robocopy resumes "
+                 f"a partial transfer rather than re-copying from scratch).")
 
     elapsed = time.monotonic() - t0
     print(f"Done in {elapsed:.0f}s: {final_path} ({_human(zip_size)})")
