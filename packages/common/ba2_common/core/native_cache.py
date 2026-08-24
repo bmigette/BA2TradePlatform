@@ -213,6 +213,31 @@ def find_timeseries_path(provider: str, symbol: str, interval: str) -> Optional[
     return None
 
 
+def timeseries_row_count(provider: str, symbol: str, interval: str) -> Optional[int]:
+    """Rows physically on disk for a (provider, symbol, interval), or None if absent.
+
+    Reads only the parquet FOOTER (row-group metadata), so it is O(1) regardless of
+    series length. Exists so a caller can tell the three states apart:
+
+      None -> no cache file (a real MISS: fetch)
+      0    -> a file that holds no bars (a broken/empty cache: fetch)
+      N>0  -> a populated cache. An ``as_of`` slice of it that comes back EMPTY means
+              "this symbol had not traded yet at that as_of" -- a legitimate HIT, NOT
+              a reason to re-download the history (see
+              ``MarketDataProviderInterface.get_ohlcv_data``; conflating the two
+              re-fetched the full 15-year payload on every such read).
+    """
+    path = find_timeseries_path(provider, symbol, interval)
+    if path is None:
+        return None
+    try:
+        import pyarrow.parquet as pq
+        return int(pq.ParquetFile(path).metadata.num_rows)
+    except Exception as e:  # unreadable/corrupt -> treat as a miss so it can refill
+        logger.warning(f"Could not read parquet row count for {path}: {e}")
+        return None
+
+
 def read_timeseries(provider: str, symbol: str, interval: str,
                     as_of: Optional[datetime]):
     """Read a parquet time-series sliced to effective_date<=as_of. None on miss.
@@ -235,8 +260,20 @@ def read_timeseries(provider: str, symbol: str, interval: str,
 
 def write_timeseries(provider: str, symbol: str, interval: str, df) -> None:
     """Atomic temp+rename parquet write. df MUST carry an effective_date column
-    (for OHLCV effective_date == bar Date)."""
-    path = timeseries_path(provider, symbol, interval)
+    (for OHLCV effective_date == bar Date).
+
+    The target is the file that ALREADY EXISTS under any alias spelling, and only
+    falls back to the canonical write path when there is none. Building the path from
+    the caller's spelling verbatim (as this did) meant a write with ``"5m"`` created
+    ``<SYM>_5m.parquet`` beside a complete ``<SYM>_5min.parquet`` — and since
+    ``find_timeseries_path`` prefers the CANONICAL spelling on read, the new stub
+    permanently SHADOWED the real cache. Measured on the dev cache: ``AMC_5m.parquet``
+    holds 596 bars (2026-06-09..2026-06-18) in front of ``AMC_5min.parquet``'s 69 621
+    bars (2022-06-06..2025-12-31); 8 such pairs existed. Every read then sliced the
+    stub to empty and re-downloaded the whole intraday window.
+    """
+    path = find_timeseries_path(provider, symbol, interval) or \
+        timeseries_path(provider, symbol, interval)
     with _lock_for(path):
         tmp = path + ".tmp"
         df.to_parquet(tmp, index=False)

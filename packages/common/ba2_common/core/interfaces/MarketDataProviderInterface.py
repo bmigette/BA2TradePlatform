@@ -475,13 +475,51 @@ class MarketDataProviderInterface(DataProviderInterface):
     # ---- native parquet as_of store helpers (get_ohlcv_data) -----------------
     def _write_ohlcv_parquet(self, df: pd.DataFrame, provider_name: str,
                              symbol: str, interval: str) -> None:
-        """Persist a cleaned OHLCV frame to the parquet as_of store, stamping each
+        """MERGE a cleaned OHLCV frame into the parquet as_of store, stamping each
         bar's effective_date == its Date (OHLCV becomes public on its bar date, so
-        a read sliced to effective_date<=as_of is no-lookahead)."""
+        a read sliced to effective_date<=as_of is no-lookahead).
+
+        MERGE, not replace. This used to overwrite the file with just the frame it was
+        handed, and the intraday cache-fill range is clamped to the CALLER's window —
+        so one narrow miss destroyed a wide cache (e.g. a 1-day 5-minute fill wiping a
+        3.5-year series). The truncated cache then made the next read for any other
+        window miss too, and each miss re-downloaded and re-truncated: a self-sustaining
+        re-fetch loop. Rows already present are kept (dedupe on Date, last write wins),
+        so a re-write of the same range is a no-op.
+        """
         from ba2_common.core import native_cache
         out = df.copy()
         out['Date'] = pd.to_datetime(out['Date'])
         out['effective_date'] = out['Date']
+
+        existing = None
+        path = native_cache.find_timeseries_path(provider_name, symbol, interval)
+        if path is not None:
+            try:
+                existing = pd.read_parquet(path)
+            except Exception as e:
+                # A corrupt cache must not block the refill; fall back to writing the
+                # fresh frame alone (the pre-merge behaviour) rather than raising.
+                logger.warning(f"Could not read {path} to merge, overwriting: {e}")
+                existing = None
+
+        if existing is not None and len(existing):
+            existing = existing.copy()
+            existing['Date'] = pd.to_datetime(existing['Date'])
+            if 'effective_date' not in existing.columns:
+                existing['effective_date'] = existing['Date']
+            # Align the NEW rows' tz-awareness to the CACHE's convention before concat:
+            # mixing aware and naive Dates yields an object column that later
+            # pd.to_datetime calls reject. Matching the existing file (rather than
+            # forcing one convention) keeps already-written caches byte-identical.
+            out['Date'] = self._match_tz(out['Date'], existing['Date'])
+            out['effective_date'] = out['Date']
+            merged = pd.concat([existing, out], ignore_index=True)
+            merged = (merged.drop_duplicates(subset=['Date'], keep='last')
+                            .sort_values('Date')
+                            .reset_index(drop=True))
+            out = merged
+
         native_cache.write_timeseries(provider_name, symbol, interval, out)
 
     def _refresh_parquet_if_stale(
@@ -777,7 +815,28 @@ class MarketDataProviderInterface(DataProviderInterface):
         if use_cache:
             df = native_cache.read_timeseries(provider_name, symbol, interval, as_of=end_date)
             if df is not None and df.empty:
-                df = None
+                # An EMPTY as_of slice is NOT the same thing as an absent cache.
+                #
+                # read_timeseries returns the rows with effective_date<=as_of. For a
+                # symbol whose FIRST cached bar postdates the as_of that slice is
+                # legitimately empty — the instrument had not traded yet — and the
+                # right answer is an empty frame, served free from disk.
+                #
+                # Mapping it to ``df = None`` (as this did) sent it into the cold-fetch
+                # branch below, which for daily asks for now-15y..now: a ~450 KB
+                # ``historical-price-full`` payload. The fetch cannot add rows below the
+                # symbol's real first bar, so the NEXT read slices to empty again and
+                # re-downloads — unbounded, once per read, forever. On the dev cache
+                # 5 640 of 10 919 ``*_1d.parquet`` files (51.7%) have a first bar after
+                # 2020-01-01, which is the window the 2020 forward test replays; FMP
+                # billed 146.26k historical-price-full calls / 65.25 GB in one month,
+                # and 65.25 GB / 146.26k = ~446 KB = exactly one full-history payload
+                # per call.
+                #
+                # Only an ABSENT file, or one holding NO bars at all (a broken cache
+                # that must be allowed to refill), is a real miss.
+                if not native_cache.timeseries_row_count(provider_name, symbol, interval):
+                    df = None
             # LATEST/live request: top the cache up so we never serve indefinitely stale
             # bars. A pinned historical end_date is immutable and skips this entirely, so
             # backtest reads stay byte-identical.
@@ -791,7 +850,13 @@ class MarketDataProviderInterface(DataProviderInterface):
             # that gate every live daily read between sessions would re-hit the API (60+
             # symbols x many cycles -> FMP rate limiting), since the last bar legitimately
             # is not today on a Monday morning or over a weekend.
-            if df is not None and is_latest:
+            #
+            # ``not df.empty`` guards the top-up: since an empty as_of slice is now a
+            # HIT (see above), df can legitimately hold zero rows here, and
+            # _refresh_parquet_if_stale indexes ``df['Date'].iloc[-1]``. An empty slice
+            # at a LATEST as_of would mean the cache's every bar is in the future,
+            # which is not a staleness problem to fix by fetching.
+            if df is not None and not df.empty and is_latest:
                 if interval in _INTRADAY_INTERVALS:
                     df = self._refresh_parquet_if_stale(
                         df, symbol, interval, provider_name)
