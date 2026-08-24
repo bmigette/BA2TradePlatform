@@ -454,15 +454,88 @@ class TradeManager:
         Also cancels any WAITING_TRIGGER protective leg hanging off it. Those legs wait on a
         parent status that will now never arrive, so leaving them would just move the leak.
         """
+        self._fail_unsent_entry(
+            order,
+            f"locked {age_hours:.1f}h (limit {_WASHTRADE_LOCK_MAX_AGE_HOURS}h) behind "
+            f"opposite-side order {blocker.id} ({blocker.order_type.value}, still working); "
+            f"the entry signal is stale and this blocker may never clear",
+        )
+
+    @staticmethod
+    def _row_or_none(model_class, row_id):
+        """``get_instance`` that answers None instead of raising InstanceNotFound.
+
+        "The row is gone" is a legitimate answer for a compensation routine — it means there is
+        nothing left to compensate — and must not abort the caller.
+        """
+        from .db import InstanceNotFound
+        if not row_id:
+            return None
+        try:
+            return get_instance(model_class, row_id)
+        except InstanceNotFound:
+            return None
+
+    def _fail_unsent_entry(self, order, reason: str) -> bool:
+        """Cancel an entry that never reached the broker, and release everything behind it.
+
+        WHY IT IS SHARED. Two places give up on an entry — the wash-trade lock expiry and a
+        failed submit in the funded-entry loop — and both leave the SAME debris: the entry row,
+        its WAITING_TRIGGER protective legs, and the Transaction that ``submit_order`` created
+        in WAITING before anything went wrong. The transaction is the expensive one. The
+        enter_market SAFETY CHECK refuses any symbol+expert that already has an OPENED or
+        WAITING transaction, and nothing sweeps a stranded WAITING — so one failed submit
+        retires that symbol for that expert permanently. Measured on PROD: CVS 2026-08-10 and
+        WSC 2026-08-24, both funded by the RM, both lost, both leaving the symbol blocked.
+
+        SAFETY — WHY THIS CAN NEVER CANCEL A LIVE ORDER. Writing CANCELED onto an order that is
+        actually working at the broker would be far worse than the leak it fixes: the position
+        opens and the platform cannot see it. So the compensation is refused unless the
+        in-memory object AND the row on disk BOTH agree that
+
+          * the order carries no ``broker_order_id`` (brokers hand one back on acceptance), and
+          * its status is one of ``OrderStatus.get_unsent_statuses()`` — PENDING,
+            WAITING_TRIGGER, WASHTRADE_LOCKED — i.e. states that exist only in this database.
+
+        Anything the broker has touched (NEW/ACCEPTED/FILLED/... ) or that the submit path has
+        already marked ERROR falls outside that set and is left strictly alone.
+
+        Returns True when it compensated, False when it refused or had nothing to do.
+        """
         from sqlmodel import select
         from .db import get_db
         from .types import TransactionStatus
 
+        order_id = getattr(order, 'id', None)
+        if not order_id:
+            self.logger.error(f"Cannot compensate an unsaved entry order ({reason})")
+            return False
+
+        on_disk = self._row_or_none(TradingOrder, order_id)
+        if on_disk is None:
+            self.logger.warning(
+                f"Order {order_id} no longer exists — nothing to compensate ({reason})")
+            return False
+
+        unsent = OrderStatus.get_unsent_statuses()
+        for view, where in ((order, "in memory"), (on_disk, "on disk")):
+            broker_id = getattr(view, 'broker_order_id', None)
+            if broker_id:
+                self.logger.error(
+                    f"REFUSING to compensate order {order_id} ({order.symbol}): it carries "
+                    f"broker id {broker_id} ({where}), so it REACHED the broker — cancelling it "
+                    f"in the database would hide a live order. Reason was: {reason}")
+                return False
+            if view.status not in unsent:
+                self.logger.error(
+                    f"REFUSING to compensate order {order_id} ({order.symbol}): status is "
+                    f"{view.status} ({where}), which is not an unsent status — it may be working "
+                    f"at the broker. Reason was: {reason}")
+                return False
+
         self.logger.warning(
-            f"Order {order.id} ({order.symbol} {order.side.value} {order.quantity}) locked "
-            f"{age_hours:.1f}h (limit {_WASHTRADE_LOCK_MAX_AGE_HOURS}h) behind opposite-side order "
-            f"{blocker.id} ({blocker.order_type.value}, still working) — cancelling: the entry "
-            f"signal is stale and this blocker may never clear"
+            f"Order {order_id} ({order.symbol} {order.side.value} {order.quantity}) never "
+            f"reached the broker — cancelling: {reason}"
         )
         order.status = OrderStatus.CANCELED
         update_instance(order)
@@ -470,30 +543,39 @@ class TradeManager:
         with get_db() as session:
             dependents = session.exec(
                 select(TradingOrder).where(
-                    TradingOrder.depends_on_order == order.id,
+                    TradingOrder.depends_on_order == order_id,
                     TradingOrder.status == OrderStatus.WAITING_TRIGGER,
                 )
             ).all()
             dependent_ids = [d.id for d in dependents]
         for dep_id in dependent_ids:
-            dep = get_instance(TradingOrder, dep_id)
+            dep = self._row_or_none(TradingOrder, dep_id)
             if dep and dep.status == OrderStatus.WAITING_TRIGGER:
                 dep.status = OrderStatus.CANCELED
                 update_instance(dep)
-                self.logger.info(f"Cancelled protective leg {dep_id} of expired locked order {order.id}")
+                self.logger.info(f"Cancelled protective leg {dep_id} of unsent order {order_id}")
 
         # Only fail a transaction this order never managed to open. An OPENED transaction has
-        # other filled orders behind it and a real position at the broker; the expired order was
+        # other filled orders behind it and a real position at the broker; the unsent order was
         # an add-on, not the position itself.
-        if order.transaction_id:
-            txn = get_instance(Transaction, order.transaction_id)
+        #
+        # The transaction id is read from the IN-MEMORY object first: submit_order creates the
+        # Transaction and stamps trading_order.transaction_id, then persists it with a SEPARATE
+        # update_instance. When that update is what failed, the row on disk has no
+        # transaction_id at all while a WAITING transaction very much exists — and that orphan
+        # is precisely what would keep blocking the symbol.
+        transaction_id = getattr(order, 'transaction_id', None) or on_disk.transaction_id
+        if transaction_id:
+            txn = self._row_or_none(Transaction, transaction_id)
             if txn and txn.status == TransactionStatus.WAITING:
                 txn.status = TransactionStatus.FAILED
                 update_instance(txn)
                 self.logger.warning(
                     f"Transaction {txn.id} ({txn.symbol}) marked FAILED — its entry order "
-                    f"{order.id} expired in WASHTRADE_LOCKED without ever reaching the broker"
+                    f"{order_id} never reached the broker; leaving it WAITING would block every "
+                    f"future entry for this symbol+expert"
                 )
+        return True
 
     # Transient DB-lock retries for a FUNDED entry. See _submit_funded_entry_with_retry.
     _ENTRY_SUBMIT_RETRIES = 3
@@ -1522,11 +1604,14 @@ class TradeManager:
                             fo = funded_by_symbol.get(candidate.symbol)
                             if fo is None or not (fo.quantity and fo.quantity > 0):
                                 continue  # unfunded — never persisted (no churn / delete)
+                            # BEFORE the try, and per iteration: the except handler below
+                            # compensates `order`, and a name left bound by the PREVIOUS
+                            # iteration would make it compensate the wrong symbol's entry.
+                            order = None
                             try:
                                 # Persist the real order + transaction + TP/SL bracket (execute is
                                 # byte-identical to the old flow; now called ONLY for funded symbols).
                                 execution_results = evaluator.execute()
-                                order = None
                                 for result in execution_results:
                                     if result.get('success') and isinstance(result.get('data'), dict):
                                         oid = result['data'].get('order_id')
@@ -1605,9 +1690,29 @@ class TradeManager:
                                     created_orders.append(order)
                                     self.logger.info(f"Successfully submitted order {order.id} to broker")
                                 else:
+                                    # COMPENSATE. Logging and moving on used to leave the entry
+                                    # PENDING, its protective legs WAITING_TRIGGER and — the part
+                                    # that actually costs trades — the Transaction submit_order
+                                    # had already created sitting in WAITING. The SAFETY CHECK
+                                    # above refuses any symbol+expert with a WAITING transaction
+                                    # and nothing sweeps one, so a single failed submit retired
+                                    # the symbol permanently. _fail_unsent_entry refuses unless
+                                    # the order provably never reached the broker.
                                     self.logger.warning(f"Failed to submit order {order.id} to broker")
+                                    self._fail_unsent_entry(
+                                        order,
+                                        f"the funded entry submit for {order.symbol} returned "
+                                        f"nothing (DB-lock retries exhausted, or the broker "
+                                        f"layer declined to send it)")
                             except Exception as submit_error:
                                 self.logger.error(f"Error executing/submitting funded {candidate.symbol}: {submit_error}", exc_info=True)
+                                # Same leak, other exit: submit_order RAISED (a validation error,
+                                # a broker rejection, a lock that escaped the retry classifier).
+                                # `order` is None when execute() itself failed, in which case
+                                # there is nothing persisted to compensate.
+                                if order is not None:
+                                    self._fail_unsent_entry(
+                                        order, f"submit raised for {candidate.symbol}: {submit_error}")
 
                         self.logger.info(f"Created + auto-submitted {submitted_count}/{len(entry_candidates)} orders to broker")
                         
