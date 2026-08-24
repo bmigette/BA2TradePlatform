@@ -448,6 +448,7 @@ class ExpertActionType(str, Enum):
     BUY_PROTECTIVE_PUT = "buy_protective_put"
     SELL_CASH_SECURED_PUT = "sell_cash_secured_put"
     OPEN_BEAR_CALL_SPREAD = "open_bear_call_spread"
+    OPEN_BULL_PUT_SPREAD = "open_bull_put_spread"
     OPEN_STRADDLE = "open_straddle"
     OPEN_STRANGLE = "open_strangle"
     OPEN_SHORT_STRADDLE = "open_short_straddle"
@@ -580,6 +581,7 @@ def get_option_action_values():
         ExpertActionType.BUY_PROTECTIVE_PUT.value,
         ExpertActionType.SELL_CASH_SECURED_PUT.value,
         ExpertActionType.OPEN_BEAR_CALL_SPREAD.value,
+        ExpertActionType.OPEN_BULL_PUT_SPREAD.value,
         ExpertActionType.OPEN_STRADDLE.value,
         ExpertActionType.OPEN_STRANGLE.value,
         ExpertActionType.OPEN_SHORT_STRADDLE.value,

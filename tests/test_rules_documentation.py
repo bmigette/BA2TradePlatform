@@ -15,6 +15,7 @@ NEW_ACTIONS = [
     ExpertActionType.SELL_COVERED_CALL, ExpertActionType.BUY_PUT,
     ExpertActionType.OPEN_BEAR_PUT_SPREAD, ExpertActionType.BUY_PROTECTIVE_PUT,
     ExpertActionType.SELL_CASH_SECURED_PUT, ExpertActionType.OPEN_BEAR_CALL_SPREAD,
+    ExpertActionType.OPEN_BULL_PUT_SPREAD,
     ExpertActionType.OPEN_STRADDLE, ExpertActionType.OPEN_STRANGLE,
     ExpertActionType.CLOSE_OPTION,
 ]

@@ -440,7 +440,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         {"bull_call_spread", "bear_put_spread", "call_butterfly"}
     )
     DEFINED_RISK_SHORT_STRATEGIES = frozenset(
-        {"bear_call_spread", "iron_condor"}
+        {"bear_call_spread", "bull_put_spread", "iron_condor"}
     )
 
     def _option_positions_mtm(self) -> float:
@@ -566,7 +566,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
           * ``iron_condor`` (4 strikes k1<k2<k3<k4): ``max(k2-k1, k4-k3)`` — the wider WING.
             The widest adjacent gap is usually the BODY ``k3-k2``, which is not risk (both
             short strikes sit inside it) and made the bound ~2x too loose.
-          * 2-strike verticals (bull_call/bear_put/bear_call spread): the single gap.
+          * 2-strike verticals (bull_call/bear_put/bear_call/bull_put spread): the single gap.
           * ``call_butterfly`` (3 strikes k1<k2<k3): ``min(k2-k1, k3-k2)`` — the binding wing
             of a (possibly broken-wing) fly; equal wings unchanged.
           * any other shape/strategy: the widest adjacent gap (defensive fallback — the

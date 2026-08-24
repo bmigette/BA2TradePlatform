@@ -678,7 +678,7 @@ class OptionsAccountInterface(ABC):
     #: lockstep with those branches by ``test_the_two_strategy_lists_match_the_branches``.
     RESERVING_STRATEGIES = frozenset({
         "cash_secured_put",
-        "bear_call_spread", "credit_spread",
+        "bear_call_spread", "bull_put_spread", "credit_spread",
         "short_straddle", "short_strangle", "naked_put",
         "put_ratio_spread",
         "jade_lizard",
@@ -750,7 +750,12 @@ class OptionsAccountInterface(ABC):
             # shares is set aside): reserve the full assignment cost.
             _require(strike=strike)
             return strike * 100.0 * quantity
-        if strategy in ("bear_call_spread", "credit_spread"):
+        if strategy in ("bear_call_spread", "bull_put_spread", "credit_spread"):
+            # Defined-risk credit VERTICALS: the broker margins them at their textbook max
+            # loss (the two-leg case Alpaca's MLEG engine does recognise — unlike the
+            # jade_lizard / put_ratio_spread shapes below). Identical arithmetic on either
+            # right: the call spread's risk is (higher - lower) above the short call, the
+            # put spread's is (higher - lower) below the short put.
             _require(spread_width=spread_width, net_credit=net_credit)
             max_loss = (spread_width - net_credit)
             return max(0.0, max_loss) * 100.0 * quantity
@@ -885,7 +890,7 @@ class OptionsAccountInterface(ABC):
           unmeasurable because every ``return 0.0`` inside ``option_reserve_required`` for a
           reserving name fires when a *sizing input was missing*, so a stored 0 on a priced
           strategy is that same fail-open one layer down. Checked against the write path:
-          all seven credit builders size with ``_size_by_reserve``, which returns 0 for a
+          all eight credit builders size with ``_size_by_reserve``, which returns 0 for a
           non-positive per-contract reserve, and every one of them refuses at
           ``quantity < 1`` — so a legitimate submission can never persist a 0 here, and
           this branch only ever fires on a corrupted or legacy row.

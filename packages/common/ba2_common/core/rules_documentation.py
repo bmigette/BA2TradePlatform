@@ -487,6 +487,17 @@ def get_action_type_documentation() -> dict:
             "parameters": "long/short strike params (short = closer/lower-strike sold leg, long = further-OTM/higher-strike bought leg), dte_min, dte_max, max-loss sizing (pct_equity / (width - net credit)), min_open_interest, max_spread_pct",
             "example": "When bearish and iv_rank >= 60, open_bear_call_spread (short ~0.30 delta / long +5 strikes, 30-45 DTE). Net credit limit is negative; max-loss (width - credit) is reserved."
         },
+        ExpertActionType.OPEN_BULL_PUT_SPREAD.value: {
+            "name": "Open Bull Put Spread",
+            "description": "Open a credit put spread (sell a higher-strike put, buy a lower-strike put, same expiry). Short-premium, defined-risk bullish/neutral structure - the put mirror of the bear call spread and the canonical defined-risk income trade: you collect a net credit (short.bid - long.ask) up front and the maximum loss equals (spread width - net credit), which is reserved against buying power. It pays as long as the underlying stays ABOVE the short strike. The short leg carries ASSIGNMENT risk if it finishes in the money, and the long wing does NOT reduce that: the short put can be assigned tonight while exercising your own lower-strike put is a choice made later, so the account is charged the FULL short strike of delivery capacity.",
+            "use_cases": [
+                "Bullish/neutral exposure with strictly defined risk and an up-front credit",
+                "Sell premium below support when iv_rank is high (expensive volatility)",
+                "Collect income on a name you are constructive on without reserving the full cash a cash-secured put demands"
+            ],
+            "parameters": "long/short strike params (short = closer/higher-strike sold leg, long = further-OTM/lower-strike bought leg), dte_min, dte_max, max-loss sizing (pct_equity / (width - net credit)), min_open_interest, max_spread_pct",
+            "example": "When bullish and iv_rank >= 60, open_bull_put_spread (short ~0.30 delta / long -5 strikes, 30-45 DTE). Net credit limit is negative; max-loss (width - credit) is reserved and the full short strike is charged against assignment capacity."
+        },
         ExpertActionType.OPEN_STRADDLE.value: {
             "name": "Open Long Straddle",
             "description": "Buy an at-the-money call AND an at-the-money put at the SAME strike (the strike nearest spot) and SAME expiry. Long-volatility debit structure that profits from a large move in EITHER direction. Net debit = call.ask + put.ask is paid up front; the position loses if the underlying stays near the strike. Commonly used to play an expected volatility expansion (e.g. ahead of earnings).",

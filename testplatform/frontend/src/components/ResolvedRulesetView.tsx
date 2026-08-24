@@ -19,7 +19,8 @@ const ACTION_LABELS: Record<string, string> = {
   buy_call: 'Buy Call', buy_put: 'Buy Put', sell_covered_call: 'Sell Covered Call',
   sell_cash_secured_put: 'Sell Cash-Secured Put', buy_protective_put: 'Buy Protective Put',
   open_bull_call_spread: 'Bull Call Spread', open_bear_put_spread: 'Bear Put Spread',
-  open_bear_call_spread: 'Bear Call Spread', open_straddle: 'Straddle',
+  open_bear_call_spread: 'Bear Call Spread', open_bull_put_spread: 'Bull Put Spread',
+  open_straddle: 'Straddle',
   open_strangle: 'Strangle', close_option: 'Close Option',
 };
 

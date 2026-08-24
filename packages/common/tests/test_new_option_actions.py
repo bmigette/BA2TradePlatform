@@ -432,11 +432,15 @@ def test_every_strategy_the_platform_can_submit_has_a_priced_reserve():
                                      option_type=OptionRight.PUT)
 
 
-def test_the_seven_reserving_builders_still_price_the_same_dollars():
+def test_the_eight_reserving_builders_still_price_the_same_dollars():
     """The raise must not disturb a single number the credit builders already reserve."""
     acct = OptionsAccountInterface
     assert acct.option_reserve_required("cash_secured_put", 2, strike=150.0) == 30_000.0
     assert acct.option_reserve_required("bear_call_spread", 1, spread_width=5.0,
+                                        net_credit=1.5) == 350.0
+    # The put mirror of the bear call spread: same defined-risk vertical arithmetic, and
+    # sharing the branch is what keeps the two from drifting apart.
+    assert acct.option_reserve_required("bull_put_spread", 1, spread_width=5.0,
                                         net_credit=1.5) == 350.0
     assert acct.option_reserve_required("credit_spread", 1, spread_width=5.0,
                                         net_credit=1.5) == 350.0
@@ -478,6 +482,8 @@ MISSING_SIZING_INPUT = [
     ("cash_secured_put", dict(strike=None), "strike"),
     ("bear_call_spread", dict(spread_width=None, net_credit=1.0), "spread_width"),
     ("bear_call_spread", dict(spread_width=5.0, net_credit=None), "net_credit"),
+    ("bull_put_spread", dict(spread_width=None, net_credit=1.0), "spread_width"),
+    ("bull_put_spread", dict(spread_width=5.0, net_credit=None), "net_credit"),
     ("credit_spread", dict(spread_width=None, net_credit=1.0), "spread_width"),
     ("credit_spread", dict(spread_width=5.0, net_credit=None), "net_credit"),
     ("short_straddle", dict(strike=None), "strike"),

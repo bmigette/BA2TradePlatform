@@ -2206,6 +2206,21 @@ _OPTION_STRATS = {
         "option_strike_param_max": 16.0, "option_strike_param_step": 2.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
         "option_dte_max_range": 60, "option_dte_step": 5},
+    "O_BULLPS": {  # bull put vertical (credit, defined risk) — the PUT mirror of O_BEARCS:
+        # sell the nearer-the-money put, buy further OTM as protection. Directional-BULLISH
+        # credit, so it sits in OS3's skewed-credit group alongside O_BEARCS rather than in
+        # OS2's delta-neutral one. It is the group's (and, after the affordability filter,
+        # the whole searched credit set's) only BULLISH defined-risk short-premium
+        # expression — before it, the sell arm could bet down (O_BEARCS) or sideways (O_IC)
+        # and nothing else. Reserves (width - credit)*100 like any vertical: $160-$1,280 per
+        # contract on this universe, i.e. affordable everywhere O_BEARCS is.
+        "action_type": "open_bull_put_spread", "option_strike_method": "percent_otm",
+        "option_strike_param": 8.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 15.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 4.0,
+        "option_strike_param_max": 16.0, "option_strike_param_step": 2.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 60, "option_dte_step": 5},
     "O_CSP": {  # cash-secured put (credit, income) — sized off strike*100 reserve, not
         # premium (see SellCashSecuredPutAction). Further OTM than O_LP's debit purchase
         # is typical (reduce assignment risk while still collecting premium).
@@ -2260,6 +2275,7 @@ _OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
 #     short_strangle          400      1,000      2,000      3,200
 #     short_straddle          800      2,000      4,000      6,400
 #     bear_call_spread        160        400        800      1,280
+#     bull_put_spread         160        400        800      1,280
 #     iron_condor             160        400        800      1,280
 #
 # That is why v8's OS2/OS3 only ever traded the cheapest underlyings (BAC $41, INTC $35) and
@@ -2280,7 +2296,11 @@ _FULL_NOTIONAL_OPTION_KINDS = {"O_CSP", "O_JL", "O_RS"}
 _OPTION_GROUPS_ALL = {
     "OS1": ["O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS"],  # directional DEBIT (long premium / defined)
     "OS2": ["O_SSTG", "O_SSTD", "O_IC", "O_CSP"],           # neutral CREDIT (short premium)
-    "OS3": ["O_JL", "O_RS", "O_BEARCS"],                    # skewed CREDIT (asymmetric short premium)
+    # OS3 is the DIRECTIONAL/skewed credit family. O_BULLPS is its (and, after the
+    # affordability filter below, the entire searched credit set's) only BULLISH member:
+    # without it the sell arm could express bearish (O_BEARCS) and neutral (OS2's O_IC)
+    # short premium and nothing else.
+    "OS3": ["O_JL", "O_RS", "O_BEARCS", "O_BULLPS"],        # skewed CREDIT (asymmetric short premium)
     "OS4": ["O_STRD", "O_STRG"],                            # volatility DEBIT (non-directional)
 }
 _OPTION_GROUPS = {
@@ -2709,6 +2729,7 @@ _STRATEGY_BUILDERS = {
     "O_BF": _build_strategy_option, "O_RS": _build_strategy_option,
     "O_LP": _build_strategy_option,
     "O_BULLCS": _build_strategy_option, "O_BEARCS": _build_strategy_option,
+    "O_BULLPS": _build_strategy_option,
     "O_CSP": _build_strategy_option, "O_STRD": _build_strategy_option,
     "O_STRG": _build_strategy_option,
     "O_CC": _build_strategy_covered_call, "O_STK": _build_strategy_stock,

@@ -199,6 +199,12 @@ STRADDLE = dict(strike_method="percent_otm", strike_param=0.0,
 STRADDLE_TIGHT = dict(STRADDLE, sizing=25.0)
 CSP = dict(strike_method="percent_otm", strike_param=0.0,
            dte_min=10, dte_max=40, sizing=25.0)
+#: Bull put CREDIT spread: SHORT the 95 put, LONG the 90 wing. Reserves the $5 width
+#: minus the credit (a few hundred dollars) and owes 95 x 100 per contract on delivery —
+#: the widest reserve-vs-delivery gap of any two-leg structure in the file, which is
+#: exactly the shape this gate exists for.
+BULL_PUT = dict(strike_method="percent_otm", strike_param=[5.0, 10.0],
+                dte_min=10, dte_max=40, sizing=5.0)
 
 
 def is_capacity_refusal(res):
@@ -340,9 +346,10 @@ def test_a_cash_secured_put_on_a_full_book_is_refused(full_book):
     ("open_put_ratio_spread", "put_ratio_spread",
      dict(strike_method="percent_otm", strike_param=5.0, wing_width_pct=5.0,
           dte_min=10, dte_max=40, sizing=20.0)),
+    ("open_bull_put_spread", "bull_put_spread", BULL_PUT),
 ])
 def test_every_builder_carrying_a_short_put_is_charged(full_book, action, strategy, kw):
-    """Six of the seven reserving builders carry a SHORT PUT and must be refused on a
+    """Seven of the eight reserving builders carry a SHORT PUT and must be refused on a
     book that is already at its delivery capacity."""
     res = act(full_book, action, **kw).execute()
     assert is_capacity_refusal(res), f"{strategy}: {res['message']}"
@@ -612,6 +619,7 @@ MULTI_CONTRACT = [
     ("open_put_ratio_spread", dict(strike_method="percent_otm", strike_param=5.0,
                                    wing_width_pct=5.0, dte_min=10, dte_max=40,
                                    sizing=3.0)),
+    ("open_bull_put_spread", dict(BULL_PUT, sizing=0.2)),
 ]
 
 
@@ -694,7 +702,7 @@ def _gated_strategies():
 def test_only_the_builders_that_carry_a_SHORT_PUT_call_the_capacity_gate():
     """Charging a structure that owes no cash on assignment refuses trades for an
     obligation that does not exist, and it is silent: the refusal looks exactly like a
-    correct one. Six of the seven reserving builders carry a short put; the leg
+    correct one. Seven of the eight reserving builders carry a short put; the leg
     construction, per builder:
 
     ==================  ============================================================
@@ -704,18 +712,19 @@ def test_only_the_builders_that_carry_a_SHORT_PUT_call_the_capacity_gate():
     iron_condor         ``SELL`` put + ``BUY`` put wing + ``SELL``/``BUY`` calls -> YES
     jade_lizard         ``SELL`` naked put + ``SELL`` call + ``BUY`` call wing -> YES
     put_ratio_spread    ``BUY`` 1 put + ``SELL`` 2 puts (``ratio_qty=2``)    -> YES
+    bull_put_spread     ``SELL`` higher put + ``BUY`` lower put wing         -> YES
     bear_call_spread    ``SELL`` lower call + ``BUY`` higher call            -> NO
     ==================  ============================================================
 
     KNOWN AND REPORTED, deliberately out of this commit's scope: ``bear_put_spread``
     (``BUY`` the higher-strike put, ``SELL`` the lower one) also carries a short put and
-    is NOT gated — it is a DEBIT builder outside the seven, with no reserve call of its
+    is NOT gated — it is a DEBIT builder outside the eight, with no reserve call of its
     own. Its short leg IS counted by ``short_put_assignment_exposure`` once open (pinned
     just below), so the book is never blind to it; only its entry is ungated.
     """
     assert _gated_strategies() == {
         "cash_secured_put", "short_straddle", "short_strangle",
-        "iron_condor", "jade_lizard", "put_ratio_spread",
+        "iron_condor", "jade_lizard", "put_ratio_spread", "bull_put_spread",
     }
 
 
@@ -743,6 +752,135 @@ def test_a_structure_with_no_short_put_opens_on_a_book_at_full_capacity(full_boo
     res = act(full_book, action, **kw).execute()
     assert res["success"], res["message"]
     assert ASSIGNMENT_CAPACITY_REFUSAL not in res["message"]
+
+
+# ==========================================================================
+# THE BULL PUT SPREAD — the reserve is the WIDTH, the bill is the STRIKE
+# ==========================================================================
+def test_the_bull_put_spreads_long_wing_nets_NOTHING_off_the_assignment_bill():
+    """The defect this structure is most exposed to, stated as an experiment.
+
+    A bull put spread SELLS the 95 put and BUYS the 90 wing. Its RESERVE is the $5 width
+    minus the credit — a few hundred dollars. Its DELIVERY BILL is the full 95 x 100 per
+    contract, because the short leg is assigned TONIGHT while exercising our own 90 put
+    is a choice we make LATER, after the shares have already been paid for. Nothing about
+    holding the wing puts cash in the account on assignment night.
+
+    Netted (95 - 90) x 100 the bill would be $500/contract instead of $9,500 — a 19x
+    understatement, and one that fails OPEN: every entry sails through.
+
+    Derived from the legs the builder actually produced, so it cannot drift from them.
+    """
+    opened = _leaving_room(1_000_000.0)
+    res = act(opened, "open_bull_put_spread", **BULL_PUT).execute()
+    assert res["success"], res["message"]
+    sub = opened.submitted[-1]
+    short = [l for l in sub["legs"]
+             if l.option_type == OptionRight.PUT and l.side == OrderDirection.SELL][0]
+    long_ = [l for l in sub["legs"]
+             if l.option_type == OptionRight.PUT and l.side == OrderDirection.BUY][0]
+    assert short.strike > long_.strike
+    contracts = short.ratio_qty * sub["quantity"]
+
+    full = short.strike * 100.0 * contracts           # what the gate MUST charge
+    netted = (short.strike - long_.strike) * 100.0 * contracts   # the wing-netted lie
+    assert netted < full / 2, "the two must be far enough apart to discriminate"
+
+    # Exactly the FULL bill of room admits...
+    assert act(_leaving_room(full), "open_bull_put_spread", **BULL_PUT).execute()["success"]
+    # ...one cent under it does not...
+    tight = act(_leaving_room(full - 0.01), "open_bull_put_spread", **BULL_PUT).execute()
+    assert is_capacity_refusal(tight), tight["message"]
+    # ...and the wing-netted figure is nowhere near enough.
+    netted_room = act(_leaving_room(netted), "open_bull_put_spread", **BULL_PUT).execute()
+    assert is_capacity_refusal(netted_room), netted_room["message"]
+    # Nor is the RESERVE the structure sets aside — the two budgets are unrelated.
+    reserve = res["data"]["option_reserve"]
+    assert reserve < full
+    by_reserve = act(_leaving_room(reserve), "open_bull_put_spread", **BULL_PUT).execute()
+    assert is_capacity_refusal(by_reserve), by_reserve["message"]
+
+
+def test_the_bull_put_spread_is_charged_its_SHORT_strike_not_its_LONG_one():
+    """Reading the wrong leg here fails OPEN (the long strike is the LOWER one), which
+    is the direction a mistake hides in — unlike the jade lizard's B17, where the wrong
+    leg happened to be the larger number and fail-safe.
+
+    Rooms are one cent apart around each leg's bill, so only the strike being charged
+    can decide the verdict.
+    """
+    opened = _leaving_room(1_000_000.0)
+    act(opened, "open_bull_put_spread", **BULL_PUT).execute()
+    sub = opened.submitted[-1]
+    short = [l for l in sub["legs"] if l.side == OrderDirection.SELL][0]
+    long_ = [l for l in sub["legs"] if l.side == OrderDirection.BUY][0]
+    contracts = short.ratio_qty * sub["quantity"]
+
+    at_long = long_.strike * 100.0 * contracts
+    assert at_long < short.strike * 100.0 * contracts
+    refused = act(_leaving_room(at_long), "open_bull_put_spread", **BULL_PUT).execute()
+    assert is_capacity_refusal(refused), refused["message"]
+
+
+def test_the_bull_put_spread_reserves_the_width_but_is_gated_on_the_strike():
+    """Both gates are live and they measure DIFFERENT budgets. Buying power says yes
+    (the width is cheap); assignment capacity says no (the strike is not). If the
+    capacity gate were wired to the reserve — or omitted — this opens.
+    """
+    acct = FakeAccount(spot=100.0, balance=50_000.0)
+    acct.hold(held_structure("short_strangle", 1.0,
+                             (OptionRight.PUT, 450.0, 1, OrderDirection.SELL)))
+    assert acct.short_put_assignment_exposure().cost == pytest.approx(45_000.0)
+    assert acct.check_option_buying_power(2_000.0) is True   # the width is affordable
+
+    res = act(acct, "open_bull_put_spread", **BULL_PUT).execute()
+    assert is_capacity_refusal(res), res["message"]
+    assert "bull_put_spread" in res["message"], res["message"]
+    assert res["data"]["option_strategy"] == "bull_put_spread"
+    assert acct.submitted == []
+
+
+def test_a_held_bull_put_spread_owes_its_full_short_strike_in_the_book_view():
+    """The entry gate and the book view must agree about the same structure, or the
+    second one opened is measured against a bill the first one under-reported."""
+    acct = FakeAccount(spot=100.0, balance=100_000.0)
+    acct.hold(held_structure("bull_put_spread", 400.0,
+                             (OptionRight.PUT, 95.0, 3, OrderDirection.SELL),
+                             (OptionRight.PUT, 90.0, 3, OrderDirection.BUY)))
+    # 3 x 95 x 100 — and the 90 long wing nets nothing off it.
+    assert acct.short_put_assignment_exposure().cost == pytest.approx(28_500.0)
+
+
+def test_netting_is_ONE_FOR_ONE_and_only_within_a_SINGLE_contract_symbol():
+    """FOUND BY MUTATION N02, which over-credited every long put by 2x and survived the
+    whole suite.
+
+    Two properties, and the bull put spread depends on the second one being true:
+
+    * ONE-FOR-ONE. Buying back 1 of a 2-lot short leaves 1 contract of delivery, not 0.
+      Over-crediting the close reports a flat book while the account is still short.
+    * PER SYMBOL. The spread's long wing sits on a DIFFERENT contract, so it cannot net
+      anything off the short leg at all — which is the arithmetic reason the wing does
+      not reduce the assignment bill, stated where the netting actually happens.
+    """
+    acct = FakeAccount(spot=100.0, balance=1_000_000.0)
+    short = held_structure("cash_secured_put", 20_000.0,
+                           (OptionRight.PUT, 100.0, 2, OrderDirection.SELL))
+    acct.hold(short)
+    assert acct.short_put_assignment_exposure().cost == pytest.approx(20_000.0)
+
+    # A long put on a DIFFERENT strike (a wing) nets NOTHING off.
+    acct.hold(held_structure("bull_put_spread", 0.0,
+                             (OptionRight.PUT, 95.0, 2, OrderDirection.BUY)))
+    assert acct.short_put_assignment_exposure().cost == pytest.approx(20_000.0)
+
+    # Buying back ONE of the two on the SAME contract leaves exactly one short.
+    same = held_structure("cash_secured_put", 0.0,
+                          (OptionRight.PUT, 100.0, 1, OrderDirection.BUY))
+    same[1].contract_symbol = short[1].contract_symbol
+    acct.hold(same)
+    assert acct.short_put_assignment_exposure().cost == pytest.approx(10_000.0)
+    assert acct.short_put_assignment_exposure().contracts == pytest.approx(1.0)
 
 
 def test_the_bear_put_spreads_short_leg_is_still_counted_once_it_is_OPEN():

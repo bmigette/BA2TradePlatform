@@ -2678,6 +2678,120 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
         return f"Open bear call spread on {self.instrument_name}"
 
 
+class OpenBullPutSpreadAction(_OptionEntryAction):
+    """Open a bull put (credit) vertical spread: sell the HIGHER strike, buy the LOWER.
+
+    The put mirror of ``OpenBearCallSpreadAction`` and the canonical defined-risk income
+    structure — it was the sell arm's only missing directional expression (the searched
+    credit residue was one neutral and one bearish structure). SHORT leg is the higher
+    strike (sold at BID), LONG leg is the lower strike (bought at ASK as protection).
+    net_credit = short.bid - long.ask (must be > 0). The limit price is NEGATIVE (Alpaca
+    MLEG convention: negative = net credit). Max loss = (width - net_credit) is reserved
+    as buying power. Bullish/neutral: it pays while the underlying stays ABOVE the short
+    strike.
+
+    ASSIGNMENT. The short leg is a PUT, so this structure can have shares put to it and
+    is charged the full short strike by ``_refuse_if_cannot_take_delivery``. The long
+    wing nets NOTHING off that bill — see the comment at the gate below.
+    """
+
+    OPTION_TYPE = OptionRight.PUT
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_BULL_PUT_SPREAD.value
+
+    def _spread_params(self) -> Tuple[Any, Any]:
+        """Split strike_param into (long, short) params for the two legs."""
+        sp = self.strike_param
+        if isinstance(sp, dict):
+            return sp.get("long"), sp.get("short")
+        if isinstance(sp, (list, tuple)) and len(sp) == 2:
+            return sp[0], sp[1]
+        # Single value: use the same param for both legs (selector dedups by strike).
+        return sp, sp
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
+        spot = self._spot()
+        long_param, short_param = self._spread_params()
+        pair = select_vertical_spread(
+            chain, method=self.strike_method, long_param=long_param, short_param=short_param,
+            spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), target_price=self._consensus_target(),
+            **liq)
+        if pair is None:
+            return self._result(False, f"No liquid bull put spread for {self.instrument_name}")
+        # For a PUT chain the selector returns its DEBIT ordering: (higher, lower) =
+        # (long, short) for a bear put spread. A bull put CREDIT spread is the mirror —
+        # SHORT the higher strike, LONG the lower one.
+        hi_c, lo_c = pair
+        short_c, long_c = hi_c, lo_c
+        if short_c.strike is None or long_c.strike is None:
+            return self._result(False, f"Missing strike for spread legs on {self.instrument_name}")
+        if short_c.strike <= long_c.strike:
+            # Long ABOVE short is a bear put DEBIT spread: a different max loss, a
+            # different (zero) reserve, and the opposite directional thesis. Opening it
+            # under this label would reserve a max loss that does not apply and charge
+            # assignment capacity against the wrong leg.
+            return self._result(
+                False,
+                f"Inverted bull put spread for {self.instrument_name}: the short leg "
+                f"({short_c.strike}) must be ABOVE the long leg ({long_c.strike}) — a long "
+                f"above a short is a bear put DEBIT spread, not a put credit spread")
+        if short_c.bid is None or long_c.ask is None:
+            return self._result(False, f"Missing quote for spread legs on {self.instrument_name}")
+        net_credit = round(short_c.bid - long_c.ask, 4)     # sell short@bid, buy long@ask
+        if net_credit <= 0:
+            return self._result(False,
+                                f"Non-positive net credit ({net_credit}) for {self.instrument_name} "
+                                f"bull put spread")
+        width = round(short_c.strike - long_c.strike, 4)
+        if width <= 0:
+            return self._result(False, f"Non-positive spread width ({width}) for {self.instrument_name}")
+        per_spread_reserve = (width - net_credit) * 100.0   # max loss per spread
+        if per_spread_reserve <= 0:
+            return self._result(False,
+                                f"Non-positive max-loss reserve for {self.instrument_name} bull put spread")
+        # Routed through the shared _size_by_reserve() (not inlined) so it also gets capped by
+        # max_virtual_equity_per_instrument_percent, same as every other structure.
+        quantity = self._size_by_reserve(per_spread_reserve, self.sizing)
+        if quantity < 1:
+            return self._result(False,
+                                f"Insufficient budget to size bull_put_spread for {self.instrument_name} "
+                                f"(max_loss={per_spread_reserve})")
+        reserve = self.account.option_reserve_required(
+            "bull_put_spread", quantity, spread_width=width, net_credit=net_credit)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False,
+                                f"Insufficient buying power to reserve {reserve} for bull_put_spread "
+                                f"on {self.instrument_name} (available="
+                                f"{self.account.available_option_buying_power()})")
+        # The SHORT PUT leg (the HIGHER strike), `quantity` contracts, charged at its FULL
+        # strike. The long put wing nets NOTHING off: the short leg can be assigned
+        # TONIGHT, while exercising our own lower-strike put is a choice we make LATER —
+        # after the shares have already been paid for. Netting the width here would price
+        # a $9,500 obligation at $500 and wave every entry through.
+        refusal = self._refuse_if_cannot_take_delivery(
+            "bull_put_spread", strike=short_c.strike, contracts=quantity)
+        if refusal is not None:
+            return refusal
+        short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
+                              position_intent="sell_to_open", option_type=self.OPTION_TYPE,
+                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
+        long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
+                             position_intent="buy_to_open", option_type=self.OPTION_TYPE,
+                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
+        limit_price = -net_credit                           # NEGATIVE = net credit (Alpaca MLEG)
+        return self._submit_option_order([short_leg, long_leg], quantity, limit_price,
+                                         "bull_put_spread", option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open bull put spread on {self.instrument_name}"
+
+
 class OpenStraddleAction(_OptionEntryAction):
     """Open a long straddle: BUY an ATM call AND an ATM put at the SAME strike.
 
@@ -3571,6 +3685,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.BUY_PROTECTIVE_PUT: BuyProtectivePutAction,
         ExpertActionType.SELL_CASH_SECURED_PUT: SellCashSecuredPutAction,
         ExpertActionType.OPEN_BEAR_CALL_SPREAD: OpenBearCallSpreadAction,
+        ExpertActionType.OPEN_BULL_PUT_SPREAD: OpenBullPutSpreadAction,
         ExpertActionType.OPEN_STRADDLE: OpenStraddleAction,
         ExpertActionType.OPEN_STRANGLE: OpenStrangleAction,
         ExpertActionType.OPEN_SHORT_STRADDLE: OpenShortStraddleAction,

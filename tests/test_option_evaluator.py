@@ -72,6 +72,7 @@ def test_get_action_type_maps_all_option_actions(mock_account, sample_recommenda
         ExpertActionType.OPEN_BEAR_PUT_SPREAD: {**_option_cfg(), "action_type": "open_bear_put_spread"},
         ExpertActionType.SELL_CASH_SECURED_PUT: {**_option_cfg(), "action_type": "sell_cash_secured_put"},
         ExpertActionType.OPEN_BEAR_CALL_SPREAD: {**_option_cfg(), "action_type": "open_bear_call_spread"},
+        ExpertActionType.OPEN_BULL_PUT_SPREAD: {**_option_cfg(), "action_type": "open_bull_put_spread"},
         ExpertActionType.CLOSE_OPTION: {**_option_cfg(), "action_type": "close_option"},
     }
     for enum_member, cfg in cases.items():
