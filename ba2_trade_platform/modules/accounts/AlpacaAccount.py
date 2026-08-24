@@ -6211,6 +6211,21 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 price = None
 
             # IDEMPOTENCY: skip if already processed for this account.
+            #
+            # "PROCESSED" MEANS AN EFFECT WAS APPLIED, NOT "WE HAVE SEEN THIS ID".
+            # An ``unhandled: ...`` row is written by a handler that REFUSED before
+            # touching the ledger (missing qty, unparseable OCC symbol, no handler for
+            # the type). Treating it as done made it a tombstone: the activity could
+            # never be reconciled, however much better the next pass's information.
+            # Those rows are retried, and the retry UPDATES the row rather than
+            # inserting a second one under the same (account_id, activity_id) key.
+            #
+            # ``unhandled: exception:`` is deliberately NOT retried. That prefix is
+            # written by this loop's own `except` after an arbitrary crash inside
+            # _apply_option_activity, so the ledger may be HALF-applied (e.g. the
+            # equity Transaction inserted and its entry order not). Replaying it would
+            # double the position — a worse failure than the stuck row.
+            retry_row_id = None
             try:
                 with get_db() as session:
                     existing = session.exec(
@@ -6218,12 +6233,22 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         .where(OptionActivity.account_id == self.id)
                         .where(OptionActivity.activity_id == str(activity_id))
                     ).first()
+                    existing_id = existing.id if existing is not None else None
+                    existing_result = str(existing.result or "") if existing is not None else ""
                 if existing is not None:
-                    logger.debug(
-                        f"[Account {self.id}] Option activity {activity_id} already "
-                        f"processed; skipping (idempotent).")
-                    results.append({"activity_id": activity_id, "result": "already_processed"})
-                    continue
+                    retryable = (existing_result.startswith("unhandled:")
+                                 and not existing_result.startswith("unhandled: exception:"))
+                    if not retryable:
+                        logger.debug(
+                            f"[Account {self.id}] Option activity {activity_id} already "
+                            f"processed; skipping (idempotent).")
+                        results.append({"activity_id": activity_id, "result": "already_processed"})
+                        continue
+                    logger.info(
+                        f"[Account {self.id}] Option activity {activity_id} was previously "
+                        f"recorded as {existing_result!r} — no ledger effect was applied, "
+                        f"so retrying it on this pass.")
+                    retry_row_id = existing_id
             except Exception as e:
                 logger.error(
                     f"[Account {self.id}] Idempotency check failed for {activity_id}: {e}",
@@ -6249,16 +6274,31 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 result_str = f"unhandled: exception: {e}"
 
             # Always record an audit/idempotency row, even for unhandled ones.
+            # On a retry, UPDATE the row that made this activity retryable — inserting a
+            # second row under the same (account_id, activity_id) would break the
+            # idempotency key itself: the next pass's ``.first()`` could pick the stale
+            # "unhandled:" one and replay an effect that has already been applied.
             try:
-                add_instance(OptionActivity(
-                    account_id=self.id,
-                    activity_id=str(activity_id),
-                    activity_type=str(activity_type) if activity_type is not None else "",
-                    symbol=symbol,
-                    qty=qty,
-                    price=price,
-                    result=result_str,
-                ))
+                if retry_row_id is not None:
+                    row = get_instance(OptionActivity, retry_row_id)
+                if retry_row_id is not None and row is not None:
+                    row.activity_type = str(activity_type) if activity_type is not None else ""
+                    row.symbol = symbol
+                    row.qty = qty
+                    row.price = price
+                    row.result = result_str
+                    row.processed_at = datetime.now(timezone.utc)
+                    update_instance(row)
+                else:
+                    add_instance(OptionActivity(
+                        account_id=self.id,
+                        activity_id=str(activity_id),
+                        activity_type=str(activity_type) if activity_type is not None else "",
+                        symbol=symbol,
+                        qty=qty,
+                        price=price,
+                        result=result_str,
+                    ))
             except Exception as e:
                 logger.error(
                     f"[Account {self.id}] Failed to persist OptionActivity audit row "
@@ -6277,7 +6317,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         from ...core.types import (AssetClass, OptionRight, OrderDirection, TransactionStatus,
                                    TXN_ORIGIN_CSP_ASSIGNMENT)
 
-        contracts = qty if qty is not None else 0.0
+        # NOT ``qty if qty is not None else 0.0``. A missing quantity is not an
+        # assignment of nothing — see the OPASN guard below, which refuses BEFORE any
+        # ledger write. Leaving it None here means any future branch that reads it
+        # without checking raises (caught by the caller) instead of silently ledgering
+        # a zero.
+        contracts = qty
 
         # Parse OCC symbol; malformed -> unhandled (no crash).
         if not symbol:
@@ -6300,6 +6345,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     expert_id = opt_txn.expert_id
 
         atype = str(activity_type).upper() if activity_type is not None else ""
+
+        # ASSIGNMENT IS SIZED AS 100 * contracts, SO REFUSE AN UNKNOWN SIZE HERE —
+        # BEFORE ANY LEDGER WRITE. With ``contracts`` coerced to 0.0 this used to open a
+        # PERMANENT 0-share equity Transaction (and close the short option against it),
+        # then the (account_id, activity_id) audit row stopped any later pass from ever
+        # correcting it. Only OPASN reads the quantity; OPEXP/OPEXC do not, and must
+        # still be able to close their option leg without one.
+        if atype == "OPASN" and contracts is None:
+            logger.error(
+                f"[Account {self.id}] Option assignment {activity_id} on {symbol} reports "
+                f"NO quantity. Refusing to ledger it — 100 x an unknown number of "
+                f"contracts is not zero shares. It will be retried on a later pass.")
+            return "unhandled: missing qty"
 
         # --- OPASN: assignment ---
         if atype == "OPASN":
