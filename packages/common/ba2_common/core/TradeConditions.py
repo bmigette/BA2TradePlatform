@@ -7,7 +7,7 @@ that can be used in rulesets and automated trading decisions.
 
 from abc import ABC, abstractmethod
 from typing import List, Optional, Any, Dict
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, time as _time, timezone, timedelta
 import operator
 
 from ba2_common.core.interfaces import AccountInterface
@@ -30,6 +30,13 @@ from ba2_common.core.portfolio_allocation import PositionFetchFailed
 # then any data-driven condition raises a loud, explicit error rather than
 # silently importing a provider package.
 _provider_resolver = None
+
+#: Returned by ``TradeCondition._simulated_as_of_date`` when the account ADVERTISES a
+#: simulated clock (``_as_of_date``) that could not be read. Deliberately distinct from
+#: ``None``, which means "live — there is no simulated clock and the wall clock is correct".
+#: Collapsing the two would let a broken backtest clock silently degrade into wall-clock
+#: reads, which is the lookahead this sentinel exists to prevent.
+AS_OF_UNAVAILABLE = object()
 
 
 def set_provider_resolver(fn):
@@ -215,7 +222,7 @@ class TradeCondition(ABC):
     def get_current_price(self) -> Optional[float]:
         """
         Get current market price for the instrument.
-        
+
         Returns:
             Current price or None if unavailable
         """
@@ -225,7 +232,73 @@ class TradeCondition(ABC):
             absorb_if_benign(e)
             logger.error(f"Error getting current price: {e}", exc_info=True)
             return None
-    
+
+    # --- the evaluation clock -------------------------------------------------------
+    # A condition that reads the WALL CLOCK in a backtest does not merely lose accuracy,
+    # it fabricates signal: the simulated bar can be years before ``date.today()``, and a
+    # historical fetch left unclamped returns the whole run window, so a "recent high" or
+    # a "days to earnings" is computed from the simulated FUTURE. Both helpers below are
+    # duck-typed on the account exactly as ``TradeActions._today()`` is, so LIVE behaviour
+    # is byte-identical (no ``_as_of_date`` -> nothing changes).
+
+    def _simulated_as_of_date(self) -> Any:
+        """The BACKTEST bar's calendar date, ``None`` in live, or ``AS_OF_UNAVAILABLE``.
+
+        ``BacktestAccount`` exposes its simulated bar via ``_as_of_date()``; a live account
+        has no such attribute and its wall clock IS the right answer.
+
+        Unlike ``TradeActions._today()`` this deliberately does NOT fall back to
+        ``date.today()`` when the accessor exists but fails or returns None. For an action
+        the wall clock is a degraded answer; for a CONDITION it is the lookahead bug itself,
+        so the caller must treat the condition as unevaluable rather than measure against a
+        date the simulation never reached.
+        """
+        accessor = getattr(self.account, "_as_of_date", None)
+        if not callable(accessor):
+            return None  # live: no simulated clock
+        try:
+            as_of = accessor()
+        except Exception as e:  # noqa: BLE001 — a broken sim clock must not read as "live"
+            # Deliberately NOT absorb_if_benign: this is not error absorption, it is a
+            # measurement that failed, translated into the tri-state result the callers
+            # already handle — the same discipline as DaysToExpiryCondition._resolve_expiry
+            # returning (None, reason). Re-raising here would escape evaluate()'s own
+            # absorb_if_benign in strict mode and abort the WHOLE rule evaluation for the
+            # bar, taking every other gate with it, to report one unreadable clock.
+            logger.error(
+                f"Simulated clock (_as_of_date) failed for {self.instrument_name}; refusing "
+                f"to substitute the wall clock: {e}", exc_info=True)
+            return AS_OF_UNAVAILABLE
+        if as_of is None:
+            logger.error(
+                f"Simulated clock (_as_of_date) returned None for {self.instrument_name}; "
+                f"refusing to substitute the wall clock")
+            return AS_OF_UNAVAILABLE
+        return as_of.date() if isinstance(as_of, datetime) else as_of
+
+    def _as_of_fetch_end(self):
+        """``(end_date, ok)`` — the as-of ceiling for a historical market-data fetch.
+
+        ``end_date`` is ``None`` in LIVE. That is not laziness: ``end_date=None`` is the
+        spelling ``MarketDataProviderInterface._is_latest_request`` recognises as "give me
+        the latest", which is what permits the parquet cache top-up. Passing an explicit
+        end-of-day stamp instead would suppress the top-up whenever the local date is behind
+        UTC (US evenings), so live keeps the exact call it makes today.
+
+        In a BACKTEST it is the END of the simulated bar's day, so the bar itself is included
+        whatever time of day its rows are stamped, and nothing after it can be.
+
+        ``ok`` is False only when a simulated clock exists and could not be read — the caller
+        must then not fetch at all.
+        """
+        as_of = self._simulated_as_of_date()
+        if as_of is AS_OF_UNAVAILABLE:
+            return None, False
+        if as_of is None:
+            return None, True
+        return datetime.combine(as_of, _time.max, tzinfo=timezone.utc), True
+
+
     def has_expert_position(self) -> bool:
         """
         Check if this expert has an open position for this instrument by checking transactions.
@@ -2034,10 +2107,20 @@ class PercentBelowRecentHighCondition(CompareCondition):
                 self.calculated_value = None
                 return False
 
+            # CLAMP THE FETCH TO THE EVALUATION BAR. Without end_date the backtest's
+            # MemoizedOHLCVProvider — which discards lookback_days — returns the ENTIRE
+            # [start - warmup, run end] window, so tail(RECENT_WINDOW) below was the high of
+            # the last 20 days of the whole RUN: a number out of the simulated future that
+            # fabricates dips that never happened. None in live (unchanged call).
+            end_date, clock_ok = self._as_of_fetch_end()
+            if not clock_ok:
+                self.calculated_value = None
+                return False
+
             # Resolve the OHLCV provider via the host-injected resolver
             # (ba2_common never imports ba2_providers).
             df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
-                self.instrument_name, interval="1d",
+                self.instrument_name, interval="1d", end_date=end_date,
                 lookback_days=self.RECENT_WINDOW * 2 + 10)
             if df is None or df.empty:
                 logger.warning(f"No OHLCV data for {self.instrument_name}")
@@ -2092,10 +2175,17 @@ class PercentAboveRecentLowCondition(CompareCondition):
                 self.calculated_value = None
                 return False
 
+            # CLAMP THE FETCH TO THE EVALUATION BAR — see PercentBelowRecentHighCondition.
+            # Unclamped, tail(RECENT_WINDOW) reads the last 20 bars of the whole RUN.
+            end_date, clock_ok = self._as_of_fetch_end()
+            if not clock_ok:
+                self.calculated_value = None
+                return False
+
             # Resolve the OHLCV provider via the host-injected resolver
             # (ba2_common never imports ba2_providers).
             df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
-                self.instrument_name, interval="1d",
+                self.instrument_name, interval="1d", end_date=end_date,
                 lookback_days=self.RECENT_WINDOW * 2 + 10)
             if df is None or df.empty:
                 logger.warning(f"No OHLCV data for {self.instrument_name}")
