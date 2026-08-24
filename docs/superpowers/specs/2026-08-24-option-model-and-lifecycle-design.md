@@ -296,11 +296,29 @@ unit-tested but has **zero production callers**. That seam already exists; use i
 inventing a second one. Streaming, not REST, so the shape is a paced crawl over contracts with
 backpressure — not a drop-in for `fetch_options.py`'s request loop.
 
-**H2 — cache schema migration.** `option_bar` predates the greeks feature and has **no
-`iv`/`delta`/`gamma`/`theta`/`vega` columns**, while `_BAR_COLS` names them in the INSERT. Because
-the DDL is `CREATE TABLE IF NOT EXISTS`, opening the existing file never adds them and **a rebuild
-crashes on the first bar write** (reproduced). Needs an explicit `ALTER TABLE ADD COLUMN`, or a
-fresh file. `open_interest` needs a column too.
+**H2 — the cache moves to PARQUET ON DISK, not SQLite.** DECIDED.
+
+The current cache is a single 10 GB SQLite file
+(`~/Documents/ba2/common/cache/options/options_history.sqlite`) and it is the **outlier** in this
+platform: the cache tier holds **33,425 parquet files against 2 sqlite ones**. OHLCV
+(`ohlcv_cache_provider.py`), the screener metric store, the news store and `native_cache.py` are
+all parquet via `pyarrow` (24.0.0, already installed). Options should match rather than introduce a
+third convention.
+
+Beyond consistency, it fits the workload better: columnar compression on 63M+ mostly-numeric bars,
+cheap date-range scans via row groups, natural partitioning by underlying (1,917 of them), and —
+the operational one — **no write-lock contention when several GA workers read the cache
+concurrently**, which a single SQLite file across processes handles badly.
+
+It also makes the schema problem vanish rather than needing a fix. The recorded blocker was that
+`option_bar` has no `iv`/`delta`/`gamma`/`theta`/`vega` columns, `_BAR_COLS` names them in the
+INSERT, and because the DDL is `CREATE TABLE IF NOT EXISTS` a rebuild **crashes on the first bar
+write** (reproduced). Writing a fresh parquet store sidesteps the `ALTER TABLE` entirely — the new
+store simply has the columns, including `open_interest`.
+
+Follow the existing OHLCV cache layout for partitioning and naming so one mental model covers both.
+The old SQLite file is not migrated: the warm-up rebuilds 2023-01-01 onward from TastyTrade, which
+is a superset of what it holds for that window and carries the IV and OI it never had.
 
 **H3 — the warm-up script.** Build the grid's cache over **2023-01-01 → today**. Chosen because it
 sits inside the IV floor, so every bar carries IV rather than starting ragged. It must be
