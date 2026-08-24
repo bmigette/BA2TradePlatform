@@ -304,6 +304,13 @@ class OrderOpenType(str, Enum):
     EXTERNAL = "external"
     NOTOPENED = "notopened"
 
+
+# ``Transaction.meta_data["origin"]`` values for share positions the platform did NOT
+# buy — the stock leg of an option assignment. Written by the broker account's option-
+# activity reconciler (AlpacaAccount._apply_option_activity) and read by
+# HasAssignedSharesCondition; shared here so writer and reader cannot drift apart.
+TXN_ORIGIN_CSP_ASSIGNMENT = "csp_assignment"   # long stock put to us by an assigned short put
+
 class OrderRecommendation(str, Enum):
     SELL = "SELL"
     UNDERWEIGHT = "UNDERWEIGHT"
@@ -376,6 +383,10 @@ class ExpertEventType(str, Enum):
     F_HAS_OPTION_POSITION = "has_option_position"  # Expert has an open option position
     F_HAS_COVERED_CALL = "has_covered_call"        # Expert has an open covered call
     F_HAS_PROTECTIVE_PUT = "has_protective_put"    # Expert has an open protective put
+    # Shares the expert did not buy: the stock leg of an assigned short put. The wheel's
+    # covered-call rule needs this INSTEAD of has_buy_position, which cannot tell assigned
+    # stock apart from stock the same expert bought outright.
+    F_HAS_ASSIGNED_SHARES = "has_assigned_shares"  # Expert holds stock from an option assignment
 
     # N = Number/Count
     N_EXPECTED_PROFIT_TARGET_PERCENT = "expected_profit_target_percent"

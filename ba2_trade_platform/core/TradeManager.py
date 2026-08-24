@@ -119,6 +119,37 @@ def rebase_price_to_fill(target_price, reference_price, fill_price):
     return round(fill_price * (target_price / reference_price), 4)
 
 
+def resolve_entry_order(session, transaction):
+    """The transaction's ENTRY order: its oldest FILLED order on the transaction's own side.
+
+    This single row is what the open-positions pass hands to every condition as
+    ``existing_order``, and a surprising amount hangs off it being found:
+    ``DaysOpenedCondition``, ``ProfitLossAmountCondition`` and
+    ``ProfitLossPercentCondition`` each return False unconditionally without one, and
+    ``CloseAction`` only takes its ``close_transaction()`` path (the one that links the
+    close back to the transaction, so ``has_pending_closing_order`` can see it) when the
+    order carries a ``transaction_id``. A position whose shares arrived without an order
+    row — an option assignment used to be exactly that — is therefore unmanageable and
+    silently so. Extracted from ``process_open_positions_recommendations`` so that
+    property is directly testable.
+    """
+    from sqlmodel import select
+
+    if transaction is None:
+        return None
+    stmt = (
+        select(TradingOrder)
+        .where(
+            TradingOrder.transaction_id == transaction.id,
+            TradingOrder.side == transaction.side,
+            TradingOrder.status == OrderStatus.FILLED
+        )
+        .order_by(TradingOrder.created_at.asc())
+        .limit(1)
+    )
+    return session.exec(stmt).first()
+
+
 class TradeManager:
 
     """
@@ -2257,22 +2288,17 @@ class TradeManager:
 
                         # Resolve the primary (entry) order from the oldest open transaction
                         # This is needed for conditions like DaysOpenedCondition that use order.created_at
-                        existing_order = None
                         oldest_transaction = min(existing_transactions, key=lambda t: t.open_date or t.created_at)
-                        if oldest_transaction:
-                            entry_order_stmt = (
-                                select(TradingOrder)
-                                .where(
-                                    TradingOrder.transaction_id == oldest_transaction.id,
-                                    TradingOrder.side == oldest_transaction.side,
-                                    TradingOrder.status == OrderStatus.FILLED
-                                )
-                                .order_by(TradingOrder.created_at.asc())
-                                .limit(1)
-                            )
-                            existing_order = session.exec(entry_order_stmt).first()
-                            if existing_order:
-                                self.logger.debug(f"Resolved entry order {existing_order.id} for {recommendation.symbol} (created: {existing_order.created_at})")
+                        existing_order = resolve_entry_order(session, oldest_transaction)
+                        if existing_order:
+                            self.logger.debug(f"Resolved entry order {existing_order.id} for {recommendation.symbol} (created: {existing_order.created_at})")
+                        else:
+                            # Not benign: every P&L / days-opened condition on this symbol will
+                            # now evaluate False and CloseAction loses its transaction link.
+                            self.logger.warning(
+                                f"No FILLED {oldest_transaction.side} order on transaction "
+                                f"{oldest_transaction.id} ({recommendation.symbol}) — exit "
+                                f"conditions needing an entry order cannot evaluate")
 
                         # Evaluate recommendation through the open_positions ruleset
                         self.logger.debug(f"Evaluating recommendation {recommendation.id} for {recommendation.symbol} (open_positions)")

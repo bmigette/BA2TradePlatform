@@ -198,6 +198,15 @@ def get_event_type_documentation() -> dict:
             "type": "boolean",
             "example": "Avoid stacking a second hedge (require NOT has_protective_put before buy_protective_put)"
         },
+        ExpertEventType.F_HAS_ASSIGNED_SHARES.value: {
+            "name": "Has Assigned Shares",
+            "description": ("Triggers when this expert holds shares of the symbol that came from an "
+                            "option assignment (a short put that was exercised against us) rather "
+                            "than from a stock purchase. Unlike has_buy_position, it does not fire "
+                            "on ordinary long equity the same expert bought outright."),
+            "type": "boolean",
+            "example": "The wheel's second leg: when has_assigned_shares, sell_covered_call (so the overlay only covers stock that was put to us)"
+        },
 
         # Numeric Events (N_ prefix)
         ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT.value: {

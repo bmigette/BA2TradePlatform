@@ -6035,14 +6035,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         - OPASN on a SHORT PUT  (order side SELL, right PUT): cash-secured put
           assigned -> open an equity LONG Transaction (qty = 100 * contracts,
           open_price = strike, expert-attributed, meta_data.origin=
-          "csp_assignment"); close the short-put option Transaction
-          (close_reason="assigned").
+          "csp_assignment") AND its filled equity entry TradingOrder (see
+          ``_record_assignment_equity_order`` — without that row the shares are
+          invisible to covered-call sizing and to every exit condition); close
+          the short-put option Transaction (close_reason="assigned").
         - OPASN on a SHORT CALL (order side SELL, right CALL): shares called away
-          -> close the expert's OPENED equity long for the underlying
-          (close_reason="called_away", close_price=strike); close the
-          short-call option Transaction (close_reason="assigned"). If no equity
-          long is found, record result "called_away_no_long" (still closes the
-          option leg).
+          -> record the closing equity SELL order and close the expert's OPENED
+          equity long for the underlying (close_reason="called_away",
+          close_price=strike), preferring an assignment-origin lot (see
+          ``_find_open_equity_long``); close the short-call option Transaction
+          (close_reason="assigned"). If no equity long is found, record result
+          "called_away_no_long" (still closes the option leg).
         - OPEXP (expiry): close the option Transaction (close_reason="expired",
           close_price=0.0).
         - OPEXC (exercise): close the option Transaction (close_reason=
@@ -6143,7 +6146,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         the Transaction ledger. Returns a result string. Raises on truly
         unexpected errors (caught by the caller). Returns an "unhandled: ..."
         string for expected-but-unmappable inputs (malformed symbol, etc.)."""
-        from ...core.types import AssetClass, OptionRight, OrderDirection, TransactionStatus
+        from ...core.types import (AssetClass, OptionRight, OrderDirection, TransactionStatus,
+                                   TXN_ORIGIN_CSP_ASSIGNMENT)
 
         contracts = qty if qty is not None else 0.0
 
@@ -6176,19 +6180,29 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if right == OptionRight.PUT and is_short:
                 # Cash-secured put assigned -> we BUY 100*contracts shares @ strike.
                 share_qty = 100.0 * contracts
+                now = datetime.now(timezone.utc)
                 equity_txn = Transaction(
                     symbol=underlying,
                     quantity=share_qty,
                     side=OrderDirection.BUY,
                     open_price=strike,
                     status=TransactionStatus.OPENED,
-                    open_date=datetime.now(timezone.utc),
+                    open_date=now,
                     expert_id=expert_id,
                     close_reason=None,
-                    meta_data={"origin": "csp_assignment", "activity_id": activity_id,
-                               "contract": symbol},
+                    meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT,
+                               "activity_id": activity_id, "contract": symbol},
                 )
-                add_instance(equity_txn)
+                equity_txn_id = add_instance(equity_txn)
+                # The assignment's ENTRY order row. Without it the shares exist only as a
+                # Transaction and are invisible to every order-driven consumer (see
+                # _record_assignment_equity_order) -- the wheel's covered-call leg then
+                # reports "shares=0.0" forever.
+                self._record_assignment_equity_order(
+                    transaction_id=equity_txn_id, symbol=underlying,
+                    side=OrderDirection.BUY, shares=share_qty, price=strike,
+                    contract=symbol, activity_id=activity_id, created_at=now,
+                    origin=TXN_ORIGIN_CSP_ASSIGNMENT)
                 self._close_txn(opt_txn, close_reason="assigned")
                 return (f"csp_assignment: opened equity long {underlying} "
                         f"{share_qty}@{strike}; closed short put txn")
@@ -6198,6 +6212,26 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 held = self._find_open_equity_long(underlying, expert_id)
                 self._close_txn(opt_txn, close_reason="assigned")
                 if held is not None:
+                    called_qty = 100.0 * contracts
+                    held_qty = abs(float(held.quantity or 0.0))
+                    if held_qty and abs(held_qty - called_qty) > 1e-9:
+                        # The lot sizes disagree, and _close_txn closes the transaction
+                        # WHOLE either way (there is no partial-close/split here). Say so
+                        # loudly rather than let the ledger drift silently: the recorded
+                        # exit order below is the TRUE called-away quantity.
+                        logger.warning(
+                            f"[Account {self.id}] Called-away lot mismatch on {underlying}: "
+                            f"{called_qty:g} shares assigned away but transaction "
+                            f"{held.id} holds {held_qty:g}; closing the whole transaction "
+                            f"(residual {held_qty - called_qty:+g} shares unaccounted).")
+                    # Mirror of the CSP entry: the shares LEFT the book, so the closing
+                    # order row must exist too or the transaction is a filled BUY with no
+                    # matching SELL.
+                    self._record_assignment_equity_order(
+                        transaction_id=held.id, symbol=underlying,
+                        side=OrderDirection.SELL, shares=called_qty, price=strike,
+                        contract=symbol, activity_id=activity_id,
+                        created_at=datetime.now(timezone.utc), origin="called_away")
                     self._close_txn(held, close_reason="called_away", close_price=strike)
                     return (f"called_away: closed equity long {underlying} @ {strike}; "
                             f"closed short call txn")
@@ -6230,8 +6264,108 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # --- OPCSH / anything else: no specific handler ---
         return f"unhandled: no handler for activity_type {atype!r}"
 
+    def _record_assignment_equity_order(self, *, transaction_id, symbol: str, side,
+                                        shares: float, price: float, contract: str,
+                                        activity_id: str, created_at, origin: str) -> "Optional[int]":
+        """Persist the equity ``TradingOrder`` that an option ASSIGNMENT produced.
+
+        WHY THIS ROW MUST EXIST. Almost nothing in the platform reads share counts off
+        ``Transaction``; the order rows are the ledger of what actually executed:
+
+          * ``_OptionEntryAction._held_equity_shares`` (TradeActions) sums ``filled_qty``
+            over the non-option orders of the expert's OPENED transactions — the ONLY
+            input to covered-call / protective-put sizing. Assigned stock with no order
+            row sizes to 0 contracts, so the wheel's second leg never gets written.
+          * ``TradeManager``'s open-positions pass resolves ``existing_order`` as the
+            oldest FILLED order on the transaction matching its side, and hands it to
+            every condition. With no such order ``DaysOpenedCondition`` /
+            ``ProfitLossAmountCondition`` / ``ProfitLossPercentCondition`` all return
+            False unconditionally, and ``CloseAction`` falls through to its legacy
+            broker-position branch, whose order is NOT linked to the transaction — so
+            ``has_pending_closing_order`` never sees it and a close is re-submitted every
+            cycle.
+
+        HONESTY. This is book-keeping for something the OCC did TO us, not a trade we
+        placed, and the row says so rather than impersonating a fill:
+
+          * ``open_type = EXTERNAL`` — the platform did not originate this order (every
+            order the platform places is AUTOMATIC, every one a human places is MANUAL).
+          * ``broker_order_id = None`` — there is no broker order to point at. Minting an
+            id would risk colliding with a real one and would make ``refresh_orders``
+            try to reconcile a row the broker has never heard of; left None the row is
+            simply invisible to broker reconciliation, which is exactly right.
+          * ``open_price = price`` — the STRIKE. An assignment transacts stock at the
+            strike, never at the market, and the transaction's cost basis must agree
+            (``refresh_transactions`` re-derives ``open_price`` from the oldest filled
+            entry order, so a wrong value here would silently rewrite the basis).
+          * ``filled_qty = quantity = shares`` and ``status = FILLED`` — an assignment is
+            complete the instant it is reported; there is no working remainder.
+          * ``order_type = MARKET`` — the codebase's value for a plain position-level
+            order (as opposed to an OCO/TP/SL leg); the UI's "main orders" counters key
+            off it, and the backtest's own synthetic rows use it. No ``limit_price`` is
+            set, since no limit was ever placed.
+          * ``asset_class = EQUITY`` — set explicitly, not defaulted: the whole point of
+            the row is that these are SHARES, and ``_held_equity_shares`` skips OPTION.
+          * ``comment`` names the origin, the contract and the broker activity id, so the
+            row can be traced back to the activity that created it.
+
+        The closing (called-away) side additionally carries ``depends_on_order`` = the
+        transaction's entry order, so it can never be mistaken for the entry by the
+        oldest-first resolution in ``TradeManager`` / ``has_pending_closing_order``.
+
+        IDEMPOTENCY is the caller's: this runs inside ``reconcile_option_assignments``'s
+        ``OptionActivity(account_id, activity_id)`` guard, so a repeated 7-day-lookback
+        batch never reaches here twice for the same activity.
+
+        Returns the new order id, or None if the insert failed (logged, never raised —
+        one bad row must not abort the reconcile batch).
+        """
+        from ...core.types import AssetClass
+
+        depends_on = None
+        if side == OrderDirection.SELL and transaction_id is not None:
+            depends_on = self._entry_order_id_for_transaction(transaction_id)
+
+        try:
+            return add_instance(TradingOrder(
+                account_id=self.id,
+                symbol=symbol,
+                quantity=abs(float(shares)),
+                filled_qty=abs(float(shares)),
+                side=side,
+                order_type=CoreOrderType.MARKET,
+                status=OrderStatus.FILLED,
+                open_price=float(price),
+                transaction_id=transaction_id,
+                depends_on_order=depends_on,
+                asset_class=AssetClass.EQUITY,
+                open_type=OrderOpenType.EXTERNAL,
+                broker_order_id=None,
+                comment=(f"{origin}: option assignment of {contract} at strike "
+                         f"{price} (broker activity {activity_id}) — synthetic fill, "
+                         f"no broker order exists"),
+                created_at=created_at,
+            ))
+        except Exception as e:
+            logger.error(
+                f"[Account {self.id}] Failed to record {origin} equity order for "
+                f"{symbol} (activity {activity_id}): {e}", exc_info=True)
+            return None
+
+    def _entry_order_id_for_transaction(self, transaction_id: int) -> "Optional[int]":
+        """Id of the transaction's oldest entry-level order (``depends_on_order IS NULL``)."""
+        with get_db() as session:
+            stmt = (
+                select(TradingOrder)
+                .where(TradingOrder.transaction_id == transaction_id)
+                .where(TradingOrder.depends_on_order.is_(None))
+                .order_by(TradingOrder.created_at.asc(), TradingOrder.id.asc())
+            )
+            row = session.exec(stmt).first()
+            return row.id if row is not None else None
+
     def _find_open_equity_long(self, underlying: str, expert_id):
-        """Find an OPENED equity LONG (side BUY) Transaction for the underlying.
+        """Find the OPENED equity LONG (side BUY) Transaction a short call was written on.
 
         When ``expert_id`` is known (the usual case - the short call was written
         by an expert) the search is RESTRICTED to that expert's transactions:
@@ -6239,8 +6373,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         the only scoping that prevents closing another account's/expert's long.
         Only when the option was unattributed (``expert_id`` is None) do we fall
         back to the most recent unattributed open long. Returns None if none.
+
+        Among that expert's candidates an ASSIGNMENT-ORIGIN long
+        (``meta_data.origin == "csp_assignment"``) wins over a plain one, newest first.
+        On a wheel the called-away shares ARE the ones the assigned put put to us, and
+        the same expert can perfectly well hold stock it bought outright in the same
+        name; "most recent open BUY" alone would close that unrelated position instead,
+        destroying its cost basis and leaving the assigned lot on the books forever.
+        Provenance is the only signal available here — quantity does not disambiguate
+        (both lots are round hundreds) and there is no lot linkage on the contract.
         """
-        from ...core.types import OrderDirection, TransactionStatus
+        from ...core.types import OrderDirection, TransactionStatus, TXN_ORIGIN_CSP_ASSIGNMENT
         with get_db() as session:
             stmt = (
                 select(Transaction)
@@ -6253,7 +6396,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 stmt = stmt.where(Transaction.expert_id == expert_id)
             else:
                 stmt = stmt.where(Transaction.expert_id.is_(None))
-            return session.exec(stmt).first()
+            candidates = session.exec(stmt).all()
+            if not candidates:
+                return None
+            for txn in candidates:
+                if (isinstance(txn.meta_data, dict)
+                        and txn.meta_data.get("origin") == TXN_ORIGIN_CSP_ASSIGNMENT):
+                    return txn
+            return candidates[0]
 
     def _close_txn(self, txn, close_reason: str, close_price=None) -> None:
         """Close a Transaction (set CLOSED + reason + optional close_price + date)

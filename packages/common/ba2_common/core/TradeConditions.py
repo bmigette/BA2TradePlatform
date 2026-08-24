@@ -2493,6 +2493,60 @@ class HasProtectivePutCondition(FlagCondition):
         return f"Protective put found: {'Yes' if has else 'No'}"
 
 
+class HasAssignedSharesCondition(FlagCondition):
+    """True when this expert holds stock it did NOT buy — the leg of an assigned short put.
+
+    ``has_buy_position`` cannot express this. It fires on ANY open equity long the expert
+    holds, so a wheel's covered-call overlay hung off it writes calls over ordinary stock
+    the same expert bought outright, capping upside on a position that was never meant to
+    be covered. That is the whole reason the assignment writes
+    ``meta_data["origin"] = "csp_assignment"`` — until this condition existed nothing read
+    it back.
+
+    Deliberately a CONDITION rather than a narrowing of
+    ``_OptionEntryAction._held_equity_shares``: coverage and eligibility are different
+    questions. A covered call written over 100 assigned + 100 bought shares is still fully
+    covered, so the SIZING input must keep counting every share whatever its provenance
+    (narrowing it would under-size genuinely covered positions — the same bug, quieter).
+    Whether the overlay should fire at all is a ruleset decision, and rulesets speak in
+    conditions. Opt-in: existing rulesets are untouched; a wheel ANDs this into its trigger.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            from ba2_common.core.trade_repository import get_trade_repository
+            from ba2_common.core.types import OrderDirection, TXN_ORIGIN_CSP_ASSIGNMENT
+
+            # Repository, never a raw select(): Transaction is an IN_MEM_MODEL, so under the
+            # backtest store a select() returns EMPTY instead of raising (see
+            # HasBuyPositionCondition).
+            open_txns = get_trade_repository().open_transactions(
+                expert_id=self.expert_recommendation.instance_id,
+                symbol=self.instrument_name, side=OrderDirection.BUY,
+            )
+            self._has = any(
+                isinstance(t.meta_data, dict)
+                and t.meta_data.get("origin") == TXN_ORIGIN_CSP_ASSIGNMENT
+                for t in open_txns
+            )
+            return self._has
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(
+                f"Error checking assigned shares for {self.instrument_name}: {e}", exc_info=True)
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if this expert holds {self.instrument_name} shares acquired by "
+                f"option assignment")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        has = getattr(self, '_has', None)
+        if has is None:
+            return None
+        return f"Assigned shares found: {'Yes' if has else 'No'}"
+
+
 # Factory function to create conditions based on event type
 
 
@@ -2564,6 +2618,7 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
         ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
         ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,
+        ExpertEventType.F_HAS_ASSIGNED_SHARES: HasAssignedSharesCondition,
     }
     condition_class = condition_map.get(event_type)
     if not condition_class:

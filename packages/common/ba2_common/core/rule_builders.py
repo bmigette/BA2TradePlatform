@@ -56,6 +56,9 @@ FLAG_FIELD_EVENT: Dict[str, ExpertEventType] = {
     "has_option_position": ExpertEventType.F_HAS_OPTION_POSITION,
     "has_covered_call": ExpertEventType.F_HAS_COVERED_CALL,
     "has_protective_put": ExpertEventType.F_HAS_PROTECTIVE_PUT,
+    # The wheel's entry guard: stock the expert was ASSIGNED, as opposed to any stock it
+    # holds (has_buy_position), which would let the overlay cover ordinary long equity.
+    "has_assigned_shares": ExpertEventType.F_HAS_ASSIGNED_SHARES,
     "short_term": ExpertEventType.F_SHORT_TERM,
     "medium_term": ExpertEventType.F_MEDIUM_TERM,
     "long_term": ExpertEventType.F_LONG_TERM,
