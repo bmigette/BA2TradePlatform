@@ -517,8 +517,23 @@ def test_build_results_rejects_a_nan_trade_pnl():
 def test_build_results_rejects_a_nan_trade_price():
     trades = [{"symbol": "AAA", "side": "buy", "pnl": 100.0, "pnl_pct": 1.0,
                "bars_held": 1, "date": D1, "price": float("nan"), "qty": 5}]
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="entry_price"):
         _build([_snap(D1, 100_000.0), _snap(D2, 100_500.0)], trades)
+
+
+@pytest.mark.parametrize(
+    "field, key",
+    [("trade.size", "qty"), ("trade.pnl_pct", "pnl_pct"), ("trade.exit_price", "exit_price")],
+)
+def test_build_results_rejects_a_nan_in_any_trade_money_field(field, key):
+    """Every money/price/quantity field on the row gets the same guard — a NaN size silently
+    became 0.0 (a zero-quantity "trade"), which also zeroes the profit cap's cost basis and so
+    exempts that trade from the per-trade cap entirely."""
+    trade = {"symbol": "AAA", "side": "buy", "pnl": 100.0, "pnl_pct": 1.0,
+             "bars_held": 1, "date": D1, "price": 10.0, "qty": 5, "exit_price": 12.0}
+    trade[key] = float("nan")
+    with pytest.raises(ValueError, match=field.replace(".", r"\.")):
+        _build([_snap(D1, 100_000.0), _snap(D2, 100_500.0)], [trade])
 
 
 def test_build_results_accepts_a_legitimate_zero_pnl_scratch_trade():
@@ -580,7 +595,9 @@ _FLAT_DD = [{"date": p["date"], "drawdown": 0.0} for p in _EXTREME_CURVE]
 def test_metric_boundary_rejects_a_metric_that_overflowed_to_nan():
     from app.services.backtest.results import _compute_metrics
 
-    with pytest.raises(ValueError, match="not finite"):
+    # Name the metric, not just "something raised": with only a generic match, reverting ONE
+    # metric line is masked by the next one that is also non-finite, and the mutation survives.
+    with pytest.raises(ValueError, match="sharpe_ratio is not finite"):
         _compute_metrics(_EXTREME_CURVE, _FLAT_DD, [], 1e-200, 1e-200, {})
 
 
