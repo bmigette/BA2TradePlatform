@@ -203,16 +203,26 @@ short-sign divergence happened.
 - **C — contract and structure selection.** Scoring over the joint expiry/strike/premium space
   rather than nearest-delta; condition-gated structure choice; short vs swing DTE regimes.
 - **D — optimization**, including the **grid runner** for a 0DTE arm and a 30–45 DTE arm across
-  `FMPRating` and `DeterministicScorer`, both screener-driven on large caps. Two constraints are
-  recorded now because they shape that work:
-  - **0DTE on large-cap equities is Friday-only.** Individual equities list weeklies expiring
-    Friday; daily expiries exist only on index ETFs. A 0DTE arm screened on large caps is a
-    once-weekly strategy. Whether the arm is "Friday weeklies on large caps" or "daily on index
-    ETFs" is an open decision.
-  - **Analysis-day alignment is a grid parameter, not a setting.** 0DTE requires the analysis to run
-    *on* the expiry day; 30–45 DTE requires entry days that land on a real listed expiry.
+  `FMPRating` and `DeterministicScorer`. This gets its own spec and plan as the immediate follow-up
+  to A+B. Constraints settled now, because they shape that work:
+  - **DECIDED: the 0DTE arm covers BOTH ETFs and stocks, and the grid tests both.** They are not
+    the same strategy and must be separate arms rather than one universe:
+
+    | | expiry cadence | analysis day | universe |
+    |---|---|---|---|
+    | **Index ETFs** (SPY, QQQ, IWM…) | daily | any trading day | small, fixed, no screener needed |
+    | **Large-cap stocks** | weeklies expiring Friday | Friday only | screener-driven |
+
+    Treating them as one arm would either waste four days a week of ETF opportunity or generate
+    stock entries on days with no listed same-day expiry. The grid runs both and they are compared,
+    not merged.
+  - **Analysis-day alignment is a grid parameter, not a setting**, and it is universe-dependent per
+    the table above. 0DTE requires the analysis to run *on* the expiry day; 30–45 DTE requires entry
+    days that land on a real listed expiry. The schedule genes must therefore be aware of which arm
+    they belong to.
   - **An optionable-symbol screener filter needs a source.** FMP does not expose one; the options
-    are deriving it from the broker contract list and caching, or a maintained universe file.
+    are deriving it from the broker contract list and caching, or a maintained universe file. It
+    matters only for the stock arms — the ETF arm's universe is fixed and known-optionable.
 - **E — backtest fidelity** beyond the wheel: greeks column migration, spread-cost calibration.
 - **F — dedicated options UI page**, which depends on this spec landing first.
 - **G — TastyTrade options support**, and Alpaca parity. Both brokers must reach the same
