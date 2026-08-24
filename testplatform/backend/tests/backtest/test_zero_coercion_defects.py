@@ -562,6 +562,73 @@ def _build(snaps, trades):
     return build_results(_PlainStub(snaps, trades), {"initial_capital": 100_000.0})
 
 
+# --- the METRIC boundary specifically (not the input boundaries) ------------
+# ``_compute_metrics`` is called directly by whatif.recompute_curves as well as by
+# build_results, and a curve whose points are individually FINITE can still overflow the
+# risk-metric arithmetic (a ratio of ~1e400 between two adjacent points saturates to inf,
+# and inf - inf in the variance sum is NaN). Pre-fix ``_safe_float`` mapped that NaN Sharpe
+# and inf volatility to 0.0 -- "no risk at all" -- which is precisely the shape of a
+# flawless-looking result nobody re-reads.
+_EXTREME_CURVE = [
+    {"date": D1, "equity": 1e-200},
+    {"date": D2, "equity": 1e200},
+    {"date": D3, "equity": 1e-200},
+]
+_FLAT_DD = [{"date": p["date"], "drawdown": 0.0} for p in _EXTREME_CURVE]
+
+
+def test_metric_boundary_rejects_a_metric_that_overflowed_to_nan():
+    from app.services.backtest.results import _compute_metrics
+
+    with pytest.raises(ValueError, match="not finite"):
+        _compute_metrics(_EXTREME_CURVE, _FLAT_DD, [], 1e-200, 1e-200, {})
+
+
+def test_metric_boundary_would_otherwise_have_reported_zero_risk():
+    """Documents WHAT the coercion produced, so the fix is not just 'it raises now':
+    ``_safe_float`` turns the same NaN Sharpe / inf volatility into 0.0 and 0.0."""
+    from app.services.backtest.metrics_utils import _safe_float
+    from app.services.backtest.results import _sharpe, _std, _step_returns
+
+    equities = [p["equity"] for p in _EXTREME_CURVE]
+    steps = _step_returns(equities)
+    sharpe = _sharpe(steps, 252.0)
+    vol = _std(steps) * (252.0 ** 0.5) * 100.0
+    assert not math.isfinite(sharpe) and not math.isfinite(vol)
+    assert _safe_float(sharpe) == 0.0      # "zero risk-adjusted return"
+    assert _safe_float(vol) == 0.0         # "zero volatility"
+
+
+def test_metric_boundary_passes_an_ordinary_curve():
+    from app.services.backtest.results import _compute_metrics
+
+    curve = [{"date": D1, "equity": 100_000.0}, {"date": D2, "equity": 90_000.0},
+             {"date": D3, "equity": 105_000.0}]
+    dd = [{"date": D1, "drawdown": 0.0}, {"date": D2, "drawdown": -10.0},
+          {"date": D3, "drawdown": 0.0}]
+    m = _compute_metrics(curve, dd, [], 100_000.0, 105_000.0, {})
+    assert math.isfinite(m["sharpe_ratio"])
+    assert m["max_drawdown"] == pytest.approx(-10.0)
+
+
+def test_a_nan_drawdown_point_is_rejected_rather_than_silently_skipped():
+    """A NaN drawdown never becomes a NaN metric — ``min()`` and ``< 0`` both quietly IGNORE
+    it — so the trough simply vanishes and max_drawdown is UNDERSTATED. Rejecting the point at
+    the curve boundary is the only place this is visible."""
+    from app.services.backtest.results import _compute_metrics
+
+    dd_with_nan = [{"date": D1, "drawdown": 0.0}, {"date": D2, "drawdown": float("nan")},
+                   {"date": D3, "drawdown": -1.0}]
+    curve = [{"date": D1, "equity": 100_000.0}, {"date": D2, "equity": 50_000.0},
+             {"date": D3, "equity": 99_000.0}]
+    silently_ignored = _compute_metrics(curve, dd_with_nan, [], 100_000.0, 99_000.0, {})
+    assert silently_ignored["max_drawdown"] == pytest.approx(-1.0)  # the -50% trough vanished
+
+    # build_results computes the drawdown curve itself and now rejects the NaN at source.
+    with pytest.raises(ValueError):
+        _build([_snap(D1, 100_000.0), _snap(D2, float("nan")), _snap(D3, 99_000.0)], [])
+
+
 # ---------------------------------------------------------------------------
 # Shared option fixture with a NON-zero commission (the round-trip module's own
 # fixture uses commission 0.0, which cannot distinguish the commission defects).
