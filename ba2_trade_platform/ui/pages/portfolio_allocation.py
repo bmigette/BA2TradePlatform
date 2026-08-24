@@ -105,7 +105,8 @@ from ..utils.portfolio_allocation_view import (
     DEFAULT_MACHINE_LABEL_FAMILIES, GATE_NO_ACCOUNT, LABEL_STATUS_CLASSES,
     LABEL_TOTAL_NOTICE_CLASSES, MARKET_SOURCE_UNAVAILABLE, NO_LABEL_COLOR,
     GateResult, ManagedLabel,
-    PositionFetchFailed, build_label_bars, build_label_views,
+    PositionFetchFailed, account_value_card, account_value_from_snapshot,
+    build_label_bars, build_label_views,
     collect_managed_symbols, diff_managed_labels,
     evaluate_gate, evaluate_market_gate, expert_shortname_families,
     format_allocation_footer, format_label_header, format_label_target_tooltip,
@@ -231,9 +232,15 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
         weights[entry.label] = get_symbol_weights(
             account_id, entry.label, symbols_by_label.get(entry.label, []))
 
-    buying_power = base_notional = None
+    buying_power = base_notional = account_value = None
     try:
+        # ONE snapshot for both figures. A second ``get_account_snapshot()`` for
+        # the account value would double the REST cost of every refresh -- and on
+        # Alpaca that call is two endpoints, not one.
         snapshot = account.get_account_snapshot()
+        # Extracted FIRST, so a failure in the base arithmetic below costs the
+        # reserve row (as it always has) and not the account-value card as well.
+        account_value = account_value_from_snapshot(snapshot)
         if snapshot is not None and snapshot.buying_power is not None:
             buying_power = float(snapshot.buying_power)
             # Exactly ``compute_base_notional``'s rule, which is what the wizard's
@@ -264,6 +271,9 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
         'valuation_mode': valuation_mode,
         'base_notional': base_notional,
         'available_buying_power': buying_power,
+        # The account's OWN value (net liquidating value), as distinct from the
+        # managed positions' market value. ``None`` is UNKNOWN, never 0.0.
+        'account_value': account_value,
         'unallocated_pct': unallocated_pct,
     }
 
@@ -1486,10 +1496,25 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)
+    # Every decision here -- which snapshot field, what an unknown reads as,
+    # whether the leverage clause can be stated -- is in the pure module. This
+    # draws three labels.
+    value_card = account_value_card(account_value=payload['account_value'],
+                                    managed_value=total)
     with ui.row().classes('w-full gap-4 items-start'):
         with ui.column().classes('stat-card p-3'):
             ui.label(f'Managed value — {mode_label}').classes('text-xs text-secondary-custom')
             ui.label(f'${total:,.2f}').classes('text-lg font-bold').style(TABULAR_NUMS)
+        # SECOND, immediately beside the managed value, because the pair is the
+        # point: on a margin account the first exceeds this one and the page used
+        # to show only the first. Drawn UNCONDITIONALLY, unlike the buying-power
+        # card below -- a card that vanishes when the broker will not answer is
+        # indistinguishable from a page that never had one.
+        with ui.column().classes('stat-card p-3'):
+            ui.label(value_card.title).classes('text-xs text-secondary-custom')
+            ui.label(value_card.text).classes('text-lg font-bold').style(TABULAR_NUMS)
+            if value_card.detail:
+                ui.label(value_card.detail).classes('text-xs text-secondary-custom')
         with ui.column().classes('stat-card p-3'):
             ui.label('Managed labels').classes('text-xs text-secondary-custom')
             ui.label(str(len(views))).classes('text-lg font-bold')

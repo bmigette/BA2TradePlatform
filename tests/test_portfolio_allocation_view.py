@@ -11,6 +11,8 @@ from ba2_trade_platform.core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed,
 )
 from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+    ACCOUNT_VALUE_TITLE, ACCOUNT_VALUE_UNAVAILABLE_DETAIL,
+    ACCOUNT_VALUE_UNAVAILABLE_TEXT, account_value_card, account_value_from_snapshot,
     DEFAULT_MACHINE_LABEL_FAMILIES, GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT,
     GATE_OK, LEGACY_MACHINE_LABEL_FAMILIES,
     EDIT_BLANK, EDIT_LABELS_OVER_100, EDIT_NEGATIVE, EDIT_NOT_A_NUMBER, EDIT_OK,
@@ -2327,3 +2329,148 @@ def test_a_bar_with_no_base_still_reports_the_share_of_MANAGED_it_does_have():
     bar = build_label_bars(views, base_notional=None, unallocated_pct=0.0)[0]
     assert bar.current_pct == 90.0
     assert bar.current_value == 9_000.0
+
+
+# ---------------------------------------------------------------------------
+# THE ACCOUNT VALUE CARD
+#
+# The summary row showed MANAGED value -- the market value of the managed
+# positions -- and nothing else in dollars. On a margin account that number
+# exceeds the account's own equity (the reporting user's book: $4,853.48 of
+# managed positions against roughly $2,400 of account value), so the page read
+# as if it were describing an account twice its real size.
+#
+# ``net_liquidation`` is the field, per ``AccountSnapshot``'s own contract
+# ("report ``net_liquidation`` as the account's headline total value"), and the
+# UNAVAILABLE case is the one that matters: a card that renders $0.00 for
+# "the broker did not answer" is a claim about money.
+# ---------------------------------------------------------------------------
+
+def _snapshot(**kw):
+    """A real ``AccountSnapshot``, so the field names are the contract's own."""
+    from ba2_common.core.account_types import AccountSnapshot
+    return AccountSnapshot(**kw)
+
+
+def test_the_account_value_is_read_from_net_liquidation():
+    assert account_value_from_snapshot(
+        _snapshot(net_liquidation=2_511.90, equity=2_511.90)) == 2_511.90
+
+
+def test_the_account_value_is_net_liquidation_and_not_any_neighbouring_balance():
+    """Five nearby quantities, none of them interchangeable on a margin account.
+
+    ``cash`` is NEGATIVE while a margin loan is outstanding, ``long_market_value``
+    is the very figure the 'Managed value' card already shows, and
+    ``buying_power`` is the free cash the third card shows. Picking any of them
+    would put a plausible number under the right caption.
+    """
+    snapshot = _snapshot(cash=-2_341.58, equity=1.0, net_liquidation=2_511.90,
+                         buying_power=170.31, long_market_value=4_853.48,
+                         non_marginable_buying_power=0.0)
+    assert account_value_from_snapshot(snapshot) == 2_511.90
+
+
+def test_a_snapshot_that_published_no_net_liquidation_is_unknown_not_zero():
+    assert account_value_from_snapshot(_snapshot(buying_power=170.31)) is None
+
+
+def test_no_snapshot_at_all_is_unknown_not_zero():
+    assert account_value_from_snapshot(None) is None
+
+
+def test_an_uncoerced_broker_decimal_is_made_a_float_rather_than_taking_the_page_down():
+    """``AccountSnapshot`` says every money field is a plain float and the ADAPTER
+    coerces -- but TastyTrade's balances arrive as ``Decimal`` and it is one
+    forgotten ``float()`` away from shipping one. It formats fine, so the card
+    would look right; the LEVERAGE clause then does ``float / Decimal`` and
+    raises TypeError, 500-ing the whole page from a cosmetic caption.
+
+    A mutation removing the coercion survived every other test in this file.
+    """
+    from decimal import Decimal
+
+    value = account_value_from_snapshot(_snapshot(net_liquidation=Decimal('2511.90')))
+    assert isinstance(value, float)
+    assert value == 2_511.90
+    # ...and the clause it feeds is computable rather than a TypeError.
+    assert account_value_card(account_value=value,
+                              managed_value=4_853.48).leverage is not None
+
+
+def test_the_account_value_card_prints_the_money_the_broker_reported():
+    card = account_value_card(account_value=2_511.90, managed_value=4_853.48)
+    assert card.available is True
+    assert card.text == '$2,511.90'
+    assert card.title == ACCOUNT_VALUE_TITLE
+
+
+def test_the_account_value_card_says_n_a_rather_than_zero_when_it_is_unknown():
+    """THE regression this card exists to avoid. ``$0.00`` under 'Account value'
+    reads as an account with nothing in it, which is a statement about money the
+    broker never made."""
+    card = account_value_card(account_value=None, managed_value=4_853.48)
+    assert card.available is False
+    assert card.text == ACCOUNT_VALUE_UNAVAILABLE_TEXT
+    assert '0.00' not in card.text
+    assert '$' not in card.text
+    assert '0.00' not in card.detail
+    assert '$' not in card.detail
+    # ...and it says WHY, in the manner of the expert cards' "n/a — <reason>".
+    assert card.detail == ACCOUNT_VALUE_UNAVAILABLE_DETAIL
+    assert card.detail
+
+
+def test_an_account_genuinely_worth_zero_is_reported_as_zero_not_as_unknown():
+    """The INVERSE error. A fully withdrawn account really is worth $0.00, and
+    suppressing that as "unavailable" hides a real state behind an outage."""
+    card = account_value_card(account_value=0.0, managed_value=0.0)
+    assert card.available is True
+    assert card.text == '$0.00'
+    assert card.detail != ACCOUNT_VALUE_UNAVAILABLE_DETAIL
+
+
+def test_the_card_states_the_leverage_the_managed_value_is_carrying():
+    """The user's actual point: 'managed value (which is leveraged)'. The two
+    numbers sit side by side and the multiple between them is said out loud."""
+    card = account_value_card(account_value=2_511.90, managed_value=4_853.48)
+    assert card.leverage == pytest.approx(4_853.48 / 2_511.90)
+    assert '1.93x' in card.detail
+
+
+def test_an_unleveraged_book_says_so_rather_than_going_quiet():
+    card = account_value_card(account_value=5_000.0, managed_value=5_000.0)
+    assert card.leverage == pytest.approx(1.0)
+    assert '1.00x' in card.detail
+
+
+def test_the_leverage_clause_is_dropped_rather_than_dividing_by_zero():
+    """A $0.00 account value is a real state and must still render the $0.00 --
+    but ``managed / 0`` is not a number, and ``inf x`` is not a caption."""
+    card = account_value_card(account_value=0.0, managed_value=4_853.48)
+    assert card.available is True
+    assert card.text == '$0.00'
+    assert card.leverage is None
+    assert 'x' not in card.detail
+
+
+def test_a_negative_account_value_is_shown_but_carries_no_multiple():
+    """An account underwater on its margin loan. The figure is a fact worth
+    printing; a NEGATIVE multiple of it is arithmetic nobody can act on."""
+    card = account_value_card(account_value=-1_200.0, managed_value=4_853.48)
+    assert card.available is True
+    assert card.text == '-$1,200.00'
+    assert card.leverage is None
+
+
+def test_a_net_short_managed_book_reports_its_negative_multiple():
+    """Shorts are signed negative on this page, so the managed value legitimately
+    is. The multiple follows the sign rather than being hidden."""
+    card = account_value_card(account_value=2_000.0, managed_value=-1_000.0)
+    assert card.leverage == pytest.approx(-0.5)
+    assert '-0.50x' in card.detail
+
+
+def test_the_unavailable_card_carries_no_multiple_either():
+    card = account_value_card(account_value=None, managed_value=4_853.48)
+    assert card.leverage is None

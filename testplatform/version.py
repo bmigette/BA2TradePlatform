@@ -20,4 +20,4 @@
 # same `app_version` key. A collision there would look like "already converged" while the worker
 # ran stale code. (`ensure_synced` also detects pre-split workers positively, via the
 # `version_scheme` field — this padding is the second line of defence, not the only one.)
-TEST_APP_VERSION = "2026.08.0008"
+TEST_APP_VERSION = "2026.08.0009"

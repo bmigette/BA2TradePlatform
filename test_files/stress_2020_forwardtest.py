@@ -55,6 +55,50 @@ def metric_store_first_ym():
     return yms[0] if yms else None
 
 
+def ohlcv_coverage(symbols, interval):
+    """Split a universe by what its OHLCV parquet cache actually holds.
+
+    Returns ``(absent, starts_late, ok)`` symbol lists, where ``starts_late`` means the
+    cache EXISTS but its first bar postdates START.
+
+    PREREQUISITE #1 in the docstring above says the 1d OHLCV cache reaching 2020 is
+    "CHECKED, not assumed" -- it was not. Only the metric_store was. That mattered
+    twice over:
+
+      * ``absent``      -> the run silently drops those symbols (``AsOfPriceSource.
+                           preload`` tolerates up to 5 / 1% before it hard-fails), so
+                           the stress runs a DIFFERENT universe than the baseline it
+                           is being compared against.
+      * ``starts_late`` -> normal and fine (the instrument had not listed yet), but it
+                           is exactly the state that, until the 2026-08-24 as_of-cache
+                           fix, made every read below the first bar re-download the
+                           symbol's whole history from FMP. Reported so the split is
+                           visible rather than inferred from a bill.
+    """
+    from ba2_common.core import native_cache
+    cutoff = datetime.fromisoformat(START)
+    absent, late, ok = [], [], []
+    for sym in symbols:
+        path = native_cache.find_timeseries_path("FMPOHLCVProvider", sym, interval)
+        if path is None:
+            absent.append(sym)
+            continue
+        try:
+            import pandas as pd
+            import pyarrow.parquet as pq
+            col = pq.read_table(path, columns=["Date"]).column("Date").to_pandas()
+            if not len(col):
+                absent.append(sym)
+                continue
+            first = pd.Timestamp(col.min())
+            first = first.tz_localize(None) if first.tz is not None else first
+        except Exception:
+            absent.append(sym)
+            continue
+        (late if first > cutoff else ok).append(sym)
+    return absent, late, ok
+
+
 def _uses_metric_store(cfg) -> bool:
     """True if this config reads the screener metric_store, by ANY of the paths it can appear on.
 
@@ -149,8 +193,20 @@ def main():
 
             print(f"  baseline: {str(src.start_date)[:10]}->{str(src.end_date)[:10]}  "
                   f"return={src.total_return}%  trades={src.total_trades}  sharpe={src.sharpe_ratio}")
-            print(f"  stress  : {START}->{END}  universe={len(cfg.get('enabled_instruments') or [])}  "
+            universe = list(cfg.get("enabled_instruments") or [])
+            print(f"  stress  : {START}->{END}  universe={len(universe)}  "
                   f"interval={cfg.get('execution_interval')}  screener_store={uses_store}")
+            # PREREQUISITE #1, actually checked (see ohlcv_coverage).
+            if universe:
+                absent, late, ok = ohlcv_coverage(universe, cfg.get("execution_interval") or "1d")
+                print(f"  ohlcv   : {len(ok)} reach {START}, {len(late)} listed later, "
+                      f"{len(absent)} NOT CACHED")
+                if absent:
+                    print(f"  !! {len(absent)} symbol(s) have no cached bars and will be DROPPED "
+                          f"from the run -- its results are NOT comparable with the baseline. "
+                          f"Cache them first: ba2-test fetch-cache --provider fmp --timeframes "
+                          f"{cfg.get('execution_interval') or '1d'} --symbols "
+                          f"{' '.join(absent[:10])}{' ...' if len(absent) > 10 else ''}")
             if a.dry_run:
                 print()
                 continue

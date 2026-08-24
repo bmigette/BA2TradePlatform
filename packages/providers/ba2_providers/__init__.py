@@ -63,7 +63,8 @@ from .macro import FREDMacroProvider
 from .insider import FMPInsiderProvider
 from .socialmedia import StockTwitsSentiment, StockTwitsTrending
 from .screener import FMPScreenerProvider, FMPHistoricalScreenerProvider
-from .options import AlpacaOptionsProvider, ThetaDataOptionsProvider
+from .options import (AlpacaOptionsProvider, TastyTradeOptionsProvider,
+                      ThetaDataOptionsProvider)
 from .riskstats import FinanceCalcRiskStatsProvider
 from .valuation import FinanceCalcValuationProvider
 
@@ -136,9 +137,14 @@ SCREENER_PROVIDERS: Dict[str, Type[ScreenerProviderInterface]] = {
 # side -- that is OptionsAccountInterface). "alpaca" is the incumbent but is capped at a
 # measured 2024-01-18 history floor at every tier; "thetadata" exists to reach further
 # back (4-12y by tier) and needs a locally-running Theta Terminal rather than an API key.
+# "tastytrade" reads dxfeed, which serves daily candles for ALREADY-EXPIRED contracts and
+# is the only one of the three whose bars carry imp_volatility and open_interest -- the two
+# fields that are NULL across all 6,757,055 rows of the incumbent cache and that therefore
+# kill delta selection and min_open_interest in backtest.
 OPTIONS_PROVIDERS: Dict[str, Type[OptionsDataProviderInterface]] = {
     "alpaca": AlpacaOptionsProvider,
     "thetadata": ThetaDataOptionsProvider,
+    "tastytrade": TastyTradeOptionsProvider,
 }
 
 
