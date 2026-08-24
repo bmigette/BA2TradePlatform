@@ -2285,6 +2285,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     # look up delta/underlying bars without re-deriving them from the order set.
                     "contract_symbol": getattr(opening, "contract_symbol", None),
                     "underlying_symbol": getattr(opening, "underlying_symbol", None),
+                    # The STRUCTURE this row belongs to. Rows are per-LEG (see the group key
+                    # above), but a multi-leg spread is ONE economic bet: results.py's profit
+                    # cap re-joins the legs on this id so a condor is capped on its NET P&L
+                    # against its NET cost, not leg-by-leg (which capped the winning leg while
+                    # leaving the losing one, scoring a max-profit condor NEGATIVE).
+                    "transaction_id": txn_id,
+                    # The EXACT multiplier ``pnl`` above was computed with (1 for equity, the
+                    # contract multiplier for an option). Recorded rather than re-derived so a
+                    # consumer's cost basis (entry_price x size x multiplier) can never fall
+                    # out of step with the P&L it is compared against.
+                    "multiplier": mult,
                 }
             )
         # Deterministic order: by entry time then symbol.

@@ -35,6 +35,13 @@ import os
 import subprocess
 import sys
 
+# Sibling helper in tools/ (shared by all three matrix drivers). The directory is put on the
+# path explicitly so the import works however the script is reached (path, -m, or a test import).
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from matrix_flags import cap_passthrough  # noqa: E402
+
 _UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "senate_universe.txt")
 _EXPERT = "FMPSenateTraderWeight"
 _DEFAULT_STRATEGIES = ["S2", "S3", "S5", "S6"]
@@ -137,10 +144,9 @@ def main() -> int:
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
-        if args.profit_cap_pct and args.profit_cap_pct > 0:
-            cmd += ["--profit-cap-pct", str(args.profit_cap_pct)]
-        if args.profit_share_cap_pct and args.profit_share_cap_pct > 0:
-            cmd += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
+        # "Pass 0 to disable" (see the --profit-cap-pct help): a 0 must be FORWARDED, because
+        # omitting the flag lets ba2test_launcher re-apply its own 2000/25 default instead.
+        cmd += cap_passthrough(args)
         if args.workers:
             cmd += ["--workers", args.workers]
         if args.spread_bps and args.spread_bps > 0:
