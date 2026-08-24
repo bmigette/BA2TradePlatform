@@ -464,3 +464,99 @@ def test_trade_rows_carry_transaction_id_and_multiplier():
     t = r["trades"][0]
     assert t["transaction_id"] == 42
     assert t["multiplier"] == pytest.approx(100.0)
+
+
+# --------------------------------------------------------------------------- #
+# 10. THE MERGE INVARIANT: the contract multiplier hits the basis EXACTLY ONCE
+# --------------------------------------------------------------------------- #
+#
+# Two independent lines of work fixed "the option profit-cap basis is missing its x100":
+# ``_deployed_capital`` (kept) and a per-trade ``entry_price * size * multiplier`` written
+# inline at the call site (dropped in the merge). Keeping BOTH would have multiplied by 100
+# twice -- a basis 100x too LARGE, which does not throw, does not look wrong, and simply
+# stops the cap from ever binding. Dropping both puts it 100x too SMALL and throttles every
+# option genome. The number below is the whole point: it is wrong in a different, visible
+# direction under each mistake.
+def test_option_deployed_basis_applies_the_multiplier_exactly_once():
+    """A 2-contract option at premium $2.00 has a deployed basis of **$400**.
+
+    $400 = 2.00 premium/share x 2 contracts x 100 shares/contract.
+
+    Not $4    (2.00 x 2 -- the multiplier never applied),
+    not $40,000 (2.00 x 2 x 100 x 100 -- applied twice, once in ``_deployed_capital`` and
+    again at the call site).
+    """
+    from app.services.backtest.results import _deployed_capital
+
+    leg = _opt(1, "AAPL231215C00180000", "buy", 2.00, 7.00, 2, 1_000.0, 1.0)
+
+    basis = _deployed_capital(leg)
+    assert basis == pytest.approx(400.0), (
+        f"deployed basis {basis} != 400.0 -- the contract multiplier is applied "
+        f"{basis / 4.0:g} time(s) instead of exactly once"
+    )
+    # Pin the two failure modes explicitly so the assertion above cannot be "fixed" by
+    # loosening it: the wrong answers are 100x out in either direction.
+    assert basis != pytest.approx(4.0)       # multiplier dropped entirely
+    assert basis != pytest.approx(40_000.0)  # multiplier applied twice
+
+
+def test_profit_cap_binds_on_the_400_dollar_basis_end_to_end():
+    """The same $400 basis, observed through ``build_results`` rather than the helper.
+
+    2 contracts @ $2.00 -> $400 deployed; exit @ $7.00 -> gross (7-2) x 2 x 100 = +$1,000.
+    At ``profit_cap_pct=100`` the allowed gain is exactly 1.0 x the basis, so the cap bites
+    and keeps $400 of the $1,000: adjusted final = 100,000 + 400 -> **+0.40%**.
+
+    The two mis-scalings are separated by an order of magnitude in the OUTPUT, not just the
+    intermediate:
+      * multiplier dropped   -> basis $4      -> allowed $4      -> +0.00%
+      * multiplier twice     -> basis $40,000 -> $1,000 < cap    -> uncapped, +1.00%
+    """
+    r = _run(100_000.0, 101_000.0,
+             [_opt(1, "AAPL231215C00180000", "buy", 2.00, 7.00, 2, 1_000.0, 1.0)],
+             profit_cap_pct=100.0)
+
+    assert r["total_return"] == pytest.approx(1.0)          # raw, uncapped
+    assert r["adjusted_total_return"] == pytest.approx(0.4)  # capped at the $400 basis
+    assert r["adjusted_total_return"] != pytest.approx(0.0)  # not the 100x-too-small basis
+    assert r["adjusted_total_return"] != pytest.approx(1.0)  # not the 100x-too-large basis
+
+
+def test_a_non_finite_multiplier_is_rejected_because_or_1_cannot_catch_it():
+    """The multiplier column must be validated at the trade-row boundary, not merely
+    defaulted at each use site.
+
+    Every consumer guards it as ``float(row.get("multiplier") or 1.0)``. That idiom is safe
+    for ``None`` and for ``0``, but **NaN is truthy in Python**, so ``NaN or 1.0`` evaluates
+    to NaN -- the fallback is never reached. A NaN multiplier would then flow into
+    ``_deployed_capital`` (basis -> NaN; the caller's ``cost > 0`` guard is False for NaN, so
+    the structure is silently left UNCAPPED) and into ``monte_carlo.apply_spread_cost``
+    (notional -> NaN; ``notional <= 0`` is likewise False, so every downstream pct is NaN).
+
+    Both are silent: no exception, no obviously-wrong number, just a cap that stopped working.
+    ``_finite`` is what makes it loud.
+    """
+    # Pin the language semantic the whole argument rests on.
+    nan = float("nan")
+    assert (nan or 1.0) is nan, "NaN is truthy; `or 1.0` cannot rescue a NaN multiplier"
+
+    with pytest.raises(ValueError, match="trade.multiplier"):
+        _run(100_000.0, 101_000.0,
+             [_opt(1, "AAPL231215C00180000", "buy", 2.00, 7.00, 2, 1_000.0, 1.0, mult=nan)],
+             profit_cap_pct=100.0)
+
+
+def test_a_missing_multiplier_still_defaults_to_the_one_that_is_a_no_op():
+    """``None`` is legitimate -- equities, per-FILL fallback rows and trade blobs persisted
+    before the round-trip recorder published the column all lack it. It must become 1.0 (an
+    exact no-op), NOT raise: only a value that is not a number at all is rejected."""
+    leg = _opt(1, "AAPL231215C00180000", "buy", 2.00, 7.00, 2, 1_000.0, 1.0)
+    leg["multiplier"] = None
+    r = _run(100_000.0, 101_000.0, [leg])
+    assert r["trades"][0]["multiplier"] == pytest.approx(1.0)
+
+    # And an equity row (multiplier 1) is unchanged by the coercion.
+    r_eq = _run(100_000.0, 101_000.0,
+                [_eq(1, "AAPL", "buy", 100.0, 110.0, 100, 1_000.0, 1.0)])
+    assert r_eq["trades"][0]["multiplier"] == pytest.approx(1.0)

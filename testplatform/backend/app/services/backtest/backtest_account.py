@@ -53,6 +53,7 @@ Field/enum names verified against the installed ba2_common:
 from __future__ import annotations
 
 import bisect
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -1080,9 +1081,22 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         anything the sim computes past that point is unbounded and meaningless (this is what
         produces impossible drawdowns like -1900%). The engine's main loop stops the run as
         soon as this flag is set; see its docstring for the full story.
+
+        A NON-FINITE (NaN/Inf) net_liquidating_value is a different animal and is REJECTED, not
+        clamped: zero and negative equity are real, meaningful states, but NaN is arithmetic
+        that went wrong (a NaN price/premium reaching the mark). Recording it let the run finish
+        and score, because ``results._safe_float`` swapped every NaN equity point for the
+        initial capital -- turning a broken run into a flat, zero-drawdown one whose calmar_ratio
+        equals its annualised return. A run that produced nonsense must fail, not look flawless.
         """
         equity_value = self._open_positions_mtm()
         nlv = self._cash + equity_value
+        if not math.isfinite(nlv):
+            raise ValueError(
+                f"[backtest] non-finite net_liquidating_value at {as_of}: cash={self._cash!r} "
+                f"open-position MTM={equity_value!r}. A NaN/Inf equity point cannot be scored; "
+                f"the run is rejected rather than silently coerced to a flat curve."
+            )
         if nlv <= 0:
             self._wiped_out = True
             nlv = 0.0
@@ -2246,7 +2260,6 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     default=None,
                 )
                 exit_reason = self._exit_reason(last_exit_fill, exit_px)
-                comm = commission * 2.0
             else:
                 # Still open at run end: mark-to-market at the last available price.
                 size = entry_qty
@@ -2283,13 +2296,25 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                         exit_px = entry_px  # never priced after entry -> flat (near-zero trade)
                 exit_dt = self._price.now()
                 exit_reason = "open_at_end"
-                comm = commission
+
+            # ONE commission PER FILL -- exactly what the cash ledger charged (``_apply_fill`` /
+            # ``_apply_option_fill``: ``self._cash -= commission`` once per fill). The old flat
+            # ``commission * 2`` (or * 1 on the open_at_end branch) assumed every round-trip was
+            # a single buy + a single sell, so any transaction with MORE fills -- a rebalance ADD,
+            # a scaled/partial exit, a multi-fill open still held at run end -- was undercharged
+            # in the trade rows while the equity curve had already paid the real amount. A
+            # one-sided error: it can only ever flatter the reported P&L, never penalise it.
+            comm = commission * (len(entries) + len(exits))
 
             # Options quote premium PER SHARE but a contract controls ``multiplier`` (100)
-            # shares, so realised option P&L scales by the contract multiplier. Equity entries
-            # are not options -> mult stays 1 and the P&L is unchanged.
+            # shares, so realised option P&L scales by the contract multiplier. The NULL fallback
+            # must be 100 -- the same fallback the cash ledger (``_apply_option_fill``), the MTM
+            # equity curve and every other option site uses. It was ``or 1`` here alone, so a
+            # NULL-multiplier option round-trip booked P&L 100x too small against an equity curve
+            # that had already moved by the full 100x amount. Equity entries are not options ->
+            # ``else 1`` is CORRECT and must stay (shares have no contract multiplier).
             mult = (
-                (opening.multiplier or 1)
+                (opening.multiplier or 100)
                 if getattr(opening, "asset_class", None) == AssetClass.OPTION
                 else 1
             )
@@ -2313,6 +2338,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     "entry_price": entry_px,
                     "exit_price": exit_px,
                     "size": size,
+                    # PUBLISH the contract multiplier the P&L above used (100 for an option,
+                    # 1 for equity). Without it every downstream consumer that rebuilds "the
+                    # capital deployed in this trade" from entry_price x size is 100x too small
+                    # for an option -- which is exactly what the results profit cap and the
+                    # monte-carlo spread-stress notional were doing. No consumer should have to
+                    # re-derive it from asset_class.
+                    "multiplier": float(mult),
                     "pnl": pnl,
                     "pnl_pct": pnl_pct,
                     "bars_held": bars_held,

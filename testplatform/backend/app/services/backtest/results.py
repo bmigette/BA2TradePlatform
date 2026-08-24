@@ -12,8 +12,10 @@ Reuses the existing guards from ``backtest_handler``:
   * profit-factor cap at 999.99 (mirrored from ``_convert_bt_results``).
 
 No defaults rule (``backend/CLAUDE.md``): ``config`` is read via ``config[...]`` for the
-load-bearing keys (the handler validates fail-early before calling here); only the genuinely
-optional ``commission_per_trade`` (already folded into the ledger) is absent from this layer.
+load-bearing keys (the handler validates fail-early before calling here). That includes
+``config["account_settings"]["commission_per_trade"]`` -- it is NOT optional and it is NOT a
+top-level key; reading it with a ``.get(...) or 0.0`` silently priced the intraday-drawdown
+refinement at zero cost on every run.
 """
 from __future__ import annotations
 
@@ -57,6 +59,35 @@ _WORKER_5M_BARS_CACHE_MAX = int(os.getenv("BT_5M_BARS_CACHE_MAX", "300"))
 _WORKER_5M_BARS_CACHE: "OrderedDict[Tuple[str, Any, Any], Any]" = OrderedDict()
 
 
+def _finite(value: Any, what: str, default: Optional[float] = None) -> float:
+    """Finite-or-RAISE float coercion — the strict counterpart of ``_safe_float``.
+
+    ``_safe_float`` maps NaN/Inf to a default (0.0 for almost every metric). That is exactly
+    wrong at the boundaries where a NaN means "this run computed nonsense": it converts a broken
+    equity point into "flat at the initial capital", a broken trade P&L into "a scratch trade",
+    and a broken risk metric into "zero risk" — so a NaN run scores as FLAWLESS (drawdown 0 ->
+    calmar_ratio == annualised_return) and, being a good-looking result, is never scrutinised.
+
+    Zero and negative are LEGITIMATE and pass through untouched (a wiped-out equity curve, a
+    scratch trade, a losing book). ``None`` maps to ``default`` when one is supplied (an absent
+    optional field), and raises when it is not.
+    """
+    if value is None:
+        if default is not None:
+            return float(default)
+        raise ValueError(f"{what} is None; a missing value cannot be scored")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{what} is not numeric: {value!r}") from e
+    if not math.isfinite(result):
+        raise ValueError(
+            f"{what} is not finite ({value!r}). The run produced nonsense and is rejected "
+            f"rather than coerced to a harmless-looking number."
+        )
+    return result
+
+
 def clear_worker_5m_bars_cache() -> None:
     """Drop every cached 5-minute frame (test isolation / explicit reset)."""
     _WORKER_5M_BARS_CACHE.clear()
@@ -94,8 +125,12 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     initial = float(config["initial_capital"])
 
     snaps = account.get_balance_history()
+    # Strict (finite-or-raise): a NaN equity point used to be swapped for ``initial``, i.e. a
+    # broken bar silently became "the account was flat here" — which is what let a NaN run come
+    # out looking riskless. Zero/negative equity is legitimate and still passes.
     equity_curve = [
-        {"date": _iso(s["date"]), "equity": _safe_float(s["net_liquidating_value"], initial)}
+        {"date": _iso(s["date"]),
+         "equity": _finite(s["net_liquidating_value"], "equity_curve point")}
         for s in snaps
     ]
     drawdown_curve = _drawdown_curve(equity_curve)
@@ -147,7 +182,14 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
     cache = getattr(options, "cache", None)
     if cache is None:
         return None
-    commission = float(config.get("commission_per_trade") or 0.0)
+    # ``commission_per_trade`` lives under ``account_settings`` (the BacktestAccount's resolved
+    # config -- see daily_backtest_handler._build_config), NEVER at the top level. Reading it as
+    # ``config.get("commission_per_trade") or 0.0`` therefore hit the ``or 0.0`` on EVERY run,
+    # so the intraday-drawdown refinement always priced its worst case as if trading were free:
+    # a less-negative worst-case P&L -> a smaller estimated dip -> an understated max_drawdown
+    # and an OVERSTATED calmar_ratio. Explicit indexing (house rule: no defaults on config) so a
+    # missing key fails the run loudly instead of silently zeroing a cost.
+    commission = float(config["account_settings"]["commission_per_trade"])
     # get_provider() constructs a FRESH provider instance every call (no internal caching) --
     # build it ONCE per backtest here, not once per flagged trade inside _bars_5m_between.
     from ba2_providers import get_provider
@@ -262,7 +304,10 @@ def _drawdown_curve(equity_curve: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if peak is None or eq > peak:
             peak = eq
         dd = ((eq - peak) / peak * 100.0) if peak and peak != 0 else 0.0
-        out.append({"date": pt["date"], "drawdown": _safe_float(dd)})
+        # Strict: the equity points are already validated finite, so a non-finite drawdown here
+        # would mean the arithmetic itself broke — reject rather than record a clean-looking 0.0
+        # (which reads as "no drawdown at all" and inflates calmar_ratio).
+        out.append({"date": pt["date"], "drawdown": _finite(dd, "drawdown_curve point")})
     return out
 
 
@@ -284,16 +329,22 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
     direction = _normalise_direction(side if side is not None else trade.get("direction"))
     entry_time = trade.get("entry_time", trade.get("date"))
     entry_price = trade.get("entry_price", trade.get("price"))
+    # Strict (finite-or-raise) on the money/price/quantity fields: a NaN P&L used to become 0.0,
+    # i.e. an invented SCRATCH trade — indistinguishable from a real flat round-trip, and it
+    # quietly improves win_rate's denominator, profit_factor, expectancy and SQN. A genuine 0.0
+    # (a real scratch) and a genuine negative are legitimate and still pass. ``default=0.0`` is
+    # kept ONLY for the fields the per-FILL fallback rows legitimately do not carry (a filled
+    # order has no exit/pnl yet); the presence of a NON-FINITE value always raises.
     return {
         "symbol": trade.get("symbol"),
         "entry_time": _iso(entry_time),
         "exit_time": _iso(trade.get("exit_time")),
         "direction": direction,
-        "entry_price": _safe_float(entry_price),
-        "exit_price": _safe_float(trade.get("exit_price")),
-        "size": _safe_float(trade.get("size", trade.get("qty"))),
-        "pnl": _safe_float(trade.get("pnl")),
-        "pnl_pct": _safe_float(trade.get("pnl_pct")),
+        "entry_price": _finite(entry_price, "trade.entry_price", default=0.0),
+        "exit_price": _finite(trade.get("exit_price"), "trade.exit_price", default=0.0),
+        "size": _finite(trade.get("size", trade.get("qty")), "trade.size", default=0.0),
+        "pnl": _finite(trade.get("pnl"), "trade.pnl", default=0.0),
+        "pnl_pct": _finite(trade.get("pnl_pct"), "trade.pnl_pct", default=0.0),
         "bars_held": int(trade.get("bars_held", 0) or 0),
         "exit_reason": trade.get("exit_reason", "unknown"),
         # Only set for option legs (passed through unchanged, no frontend consumer today) --
@@ -305,8 +356,18 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         # option leg's cost basis is premium x contracts x multiplier. Both are recorded by
         # ``BacktestAccount.get_round_trip_trades``; absent (None) on the per-FILL fallback
         # rows, where the equity-shaped ``entry_price * size`` basis is already correct.
+        #
+        # The multiplier goes through ``_finite`` (not a bare ``.get``) because every consumer
+        # guards it with ``float(... or 1.0)`` — and NaN is TRUTHY in Python, so ``NaN or 1.0``
+        # is NaN, not 1.0. A non-finite multiplier would therefore sail straight past the
+        # fallback into ``_deployed_capital`` (basis -> NaN -> ``cost > 0`` False -> the profit
+        # cap silently does nothing for that structure) and into
+        # ``monte_carlo.apply_spread_cost`` (notional -> NaN -> ``notional <= 0`` False -> the
+        # whole MC pnl_pct series poisoned). ``default=1.0`` keeps None legitimate — the exact
+        # no-op for equities, per-FILL fallback rows and blobs persisted before the round-trip
+        # recorder published the column.
         "transaction_id": trade.get("transaction_id"),
-        "multiplier": trade.get("multiplier"),
+        "multiplier": _finite(trade.get("multiplier"), "trade.multiplier", default=1.0),
     }
 
 
@@ -534,6 +595,16 @@ def _compute_metrics(
             p = sum((trades[i].get("pnl") or 0.0) for i in idxs)
             raw.append(p)
             if has_basis_cap:
+                # Capital DEPLOYED (``_deployed_capital``), summed over the BET's legs. That
+                # helper is the single place the contract multiplier is applied to the basis —
+                # premium x contracts x multiplier for an option leg, price x shares (multiplier
+                # ignored) for equity — so the multiplier is applied EXACTLY ONCE. Applying it
+                # again here would make an option's basis 100x too large and silently disable
+                # the cap; omitting it makes the basis 100x too small and throttles every option
+                # genome. It also keeps equity UNSIGNED, signs option legs by direction so a
+                # multi-leg structure sums to its true net debit (negative for a net credit,
+                # which the ``cost > 0`` guard then leaves uncapped), and it acts on the GROUP
+                # rather than the row — a per-trade basis would cap a condor leg by leg.
                 cost = sum(_deployed_capital(trades[i]) for i in idxs)
                 cp1.append(min(p, cost * cap_frac) if (p > 0 and cost > 0) else p)
             else:
@@ -602,7 +673,8 @@ def _compute_metrics(
         # Trade FREQUENCY: trades / calendar-year of the run. Used by the optional fitness
         # trade-frequency scale (``fitness_trade_scale``) so the GA can down-weight statistically
         # thin (few-trade) configs that win on a handful of lucky trades.
-        "avg_trades_per_year": round(_safe_float((total_trades / years) if years else 0.0), 2),
+        "avg_trades_per_year": round(_finite((total_trades / years) if years else 0.0,
+                                             "avg_trades_per_year"), 2),
         "fitness_trade_scale": bool(config.get("fitness_trade_scale")),
         # Cap (trades/year) for the scale: avg_trades_per_year is clamped to this before scaling so
         # the GA is not rewarded for over-trading. None -> the fitness default (100 = factor <= 1.0).
@@ -626,46 +698,51 @@ def _compute_metrics(
         "robust_fitness": bool(config.get("robust_fitness")),
         "winning_trades": winning_trades,
         "losing_trades": losing_trades,
-        "win_rate": round(_safe_float(win_rate), 2),
+        # THE METRIC BOUNDARY. Every number below goes through ``_finite`` (finite-or-RAISE),
+        # NOT ``_safe_float`` (NaN/Inf -> 0.0). Coercing here is what let a NaN run score as a
+        # flawless one: a NaN max_drawdown became 0.0, and calmar_ratio = annualised_return /
+        # max(|0.0|, 1.0) = the full annualised return with no risk charged at all. Legitimate
+        # zeros and negatives are untouched — only a value that is not a number at all raises.
+        "win_rate": round(_finite(win_rate, "win_rate"), 2),
         # Return metrics
-        "total_return": round(_safe_float(total_return), 2),
-        "annualized_return": round(_safe_float(annualized_return), 2),
-        "buy_hold_return": round(_safe_float(buy_hold_return), 2),
+        "total_return": round(_finite(total_return, "total_return"), 2),
+        "annualized_return": round(_finite(annualized_return, "annualized_return"), 2),
+        "buy_hold_return": round(_finite(buy_hold_return, "buy_hold_return"), 2),
         # Profit-capped (per-trade) variants — equal to the raw values when no cap is set. The
         # optimizer uses the adjusted fitness so one lucky mega-winner can't dominate the search.
         "profit_cap_pct": (float(cap_pct) if has_basis_cap else None),
         "profit_share_cap_pct": (float(share_cap_pct) if has_share_cap else None),
-        "adjusted_total_return": round(_safe_float(adjusted_total_return), 2),
-        "adjusted_annualized_return": round(_safe_float(adjusted_annualized_return), 2),
-        "adjusted_calmar_ratio": round(_safe_float(adjusted_calmar), 2),
-        "adjusted_profit_factor": round(_safe_float(adjusted_profit_factor), 2),
-        "adjusted_expectancy": round(_safe_float(adjusted_expectancy), 2),
-        "adjusted_avg_trade": round(_safe_float(adjusted_avg_trade), 2),
-        "adjusted_best_trade": round(_safe_float(adjusted_best_trade), 2),
-        "adjusted_worst_trade": round(_safe_float(adjusted_worst_trade), 2),
-        "adjusted_sqn": round(_safe_float(adjusted_sqn), 2),
+        "adjusted_total_return": round(_finite(adjusted_total_return, "adjusted_total_return"), 2),
+        "adjusted_annualized_return": round(_finite(adjusted_annualized_return, "adjusted_annualized_return"), 2),
+        "adjusted_calmar_ratio": round(_finite(adjusted_calmar, "adjusted_calmar_ratio"), 2),
+        "adjusted_profit_factor": round(_finite(adjusted_profit_factor, "adjusted_profit_factor"), 2),
+        "adjusted_expectancy": round(_finite(adjusted_expectancy, "adjusted_expectancy"), 2),
+        "adjusted_avg_trade": round(_finite(adjusted_avg_trade, "adjusted_avg_trade"), 2),
+        "adjusted_best_trade": round(_finite(adjusted_best_trade, "adjusted_best_trade"), 2),
+        "adjusted_worst_trade": round(_finite(adjusted_worst_trade, "adjusted_worst_trade"), 2),
+        "adjusted_sqn": round(_finite(adjusted_sqn, "adjusted_sqn"), 2),
         # Risk metrics
-        "sharpe_ratio": round(_safe_float(sharpe), 2),
-        "sortino_ratio": round(_safe_float(sortino), 2),
-        "calmar_ratio": round(_safe_float(calmar), 2),
-        "volatility": round(_safe_float(volatility), 2),
+        "sharpe_ratio": round(_finite(sharpe, "sharpe_ratio"), 2),
+        "sortino_ratio": round(_finite(sortino, "sortino_ratio"), 2),
+        "calmar_ratio": round(_finite(calmar, "calmar_ratio"), 2),
+        "volatility": round(_finite(volatility, "volatility"), 2),
         # Drawdown metrics
-        "max_drawdown": round(_safe_float(max_drawdown), 2),
-        "avg_drawdown": round(_safe_float(avg_drawdown), 2),
-        "max_drawdown_duration": round(_safe_float(max_dd_duration), 1),
+        "max_drawdown": round(_finite(max_drawdown, "max_drawdown"), 2),
+        "avg_drawdown": round(_finite(avg_drawdown, "avg_drawdown"), 2),
+        "max_drawdown_duration": round(_finite(max_dd_duration, "max_drawdown_duration"), 1),
         # Trade quality metrics
-        "profit_factor": round(_safe_float(profit_factor), 2),
-        "expectancy": round(_safe_float(expectancy), 2),
-        "sqn": round(_safe_float(sqn), 2),
-        "avg_trade": round(_safe_float(avg_trade), 2),
-        "best_trade": round(_safe_float(best_trade), 2),
-        "worst_trade": round(_safe_float(worst_trade), 2),
+        "profit_factor": round(_finite(profit_factor, "profit_factor"), 2),
+        "expectancy": round(_finite(expectancy, "expectancy"), 2),
+        "sqn": round(_finite(sqn, "sqn"), 2),
+        "avg_trade": round(_finite(avg_trade, "avg_trade"), 2),
+        "best_trade": round(_finite(best_trade, "best_trade"), 2),
+        "worst_trade": round(_finite(worst_trade, "worst_trade"), 2),
         # Duration metrics
-        "avg_trade_duration": round(_safe_float(avg_trade_duration), 1),
-        "exposure_time": round(_safe_float(exposure_time), 2),
+        "avg_trade_duration": round(_finite(avg_trade_duration, "avg_trade_duration"), 1),
+        "exposure_time": round(_finite(exposure_time, "exposure_time"), 2),
         # Equity metrics
-        "final_equity": round(_safe_float(final, initial), 2),
-        "equity_peak": round(_safe_float(equity_peak, initial), 2),
+        "final_equity": round(_finite(final, "final_equity", default=initial), 2),
+        "equity_peak": round(_finite(equity_peak, "equity_peak", default=initial), 2),
         # Run config echoed into the result so the fill granularity is visible after the fact
         # (History / report): the FILL clock interval (e.g. 5min for precise TP/SL) and the
         # analysis cadence (weekly when run_schedule_override pins a single weekday, else daily).
