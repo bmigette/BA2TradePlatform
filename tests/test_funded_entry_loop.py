@@ -915,3 +915,76 @@ def test_the_protective_legs_get_the_rm_quantity_ON_DISK(file_db):
                 f"{symbol} leg {leg.id} kept quantity {leg.quantity} instead of the entry's "
                 f"{entry.quantity}; a zero/short leg is cancelled by the broker and the "
                 f"position runs uncovered")
+
+
+# ========================================================================================= #
+# F4 — the funding must be on disk BEFORE the broker call
+# ========================================================================================= #
+def test_the_rm_quantity_is_on_disk_before_the_broker_is_called(file_db):
+    """A funded entry must never be un-sized on disk while the broker call is in flight.
+
+    ``_submit_funded_entry_with_retry``'s own docstring says it: the RM-sized quantity and the
+    safeguard stop exist only in memory at this point, and "re-deriving them later from a
+    stranded row is not possible". Anything that goes wrong from here — a lock, a crash, a
+    restart — leaves a row nothing can re-drive unless the funding was written first.
+    """
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    _run_enter(expert, account, inst.id)
+
+    assert account.disk_qty_at_submit == {"AAPL": 400.0, "MSFT": 400.0}, (
+        f"the funded quantity was still un-persisted when submit_order was entered: "
+        f"{account.disk_qty_at_submit}")
+
+
+def test_the_rm_safeguard_stop_is_on_disk_before_the_broker_is_called(file_db):
+    """Same argument for the stop. The DB sizing path (``review_and_prioritize_pending_orders``)
+    writes ``order.stop_price`` because there the candidate IS the persisted row; the temp-list
+    path sizes a TRANSIENT candidate and only ever passed the stop as an argument, so the row
+    kept a null stop. That is the value ``_check_all_washtrade_locked_orders`` re-reads to
+    rebuild the protective leg on a re-submit — with no stop on the row it re-sends the entry
+    naked."""
+    _acct, inst, expert = _make_scenario(["AAPL"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    _run_enter(expert, account, inst.id)
+
+    submitted_sl = account.submits[0]["sl_price"]
+    assert submitted_sl, "the scenario must produce an RM safeguard stop"
+    assert account.disk_stop_at_submit["AAPL"] == submitted_sl, (
+        f"the row carried stop_price={account.disk_stop_at_submit['AAPL']} while the broker was "
+        f"being asked for {submitted_sl}")
+
+
+def test_a_stop_the_ruleset_already_set_is_not_overwritten(file_db):
+    """``_ensure_safeguard_stop`` no-ops when the order already has a stop, because an explicit
+    SL from the ruleset always wins. Persisting the RM's must obey the same rule."""
+    from ba2_trade_platform.core.TradeManager import get_trade_manager
+
+    acct = factories.create_account_definition(provider="MockAccount")
+    order = factories.create_trading_order(
+        account_id=acct.id, symbol="WSC", quantity=0.0, status=OrderStatus.PENDING,
+        stop_price=88.0)
+
+    get_trade_manager()._persist_funded_entry(order, quantity=7.0, stop_price=93.0)
+
+    with get_db() as s:
+        row = s.get(TradingOrder, order.id)
+        assert row.quantity == 7.0
+        assert row.stop_price == 88.0, "the ruleset's own stop must survive"
+
+
+def test_a_failed_submit_leaves_the_funded_quantity_on_the_row(file_db):
+    """The whole point: after the trade is lost, the row still says what the RM decided."""
+    _acct, inst, expert = _make_scenario(["AAPL"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db, fail_symbols={"AAPL"},
+                                  fail_exc=_locked_error())
+
+    _run_enter(expert, account, inst.id)
+
+    entry = [o for o in _orders("AAPL") if o.order_type == OrderType.MARKET][0]
+    assert entry.quantity == 400.0, (
+        f"the lost entry is on disk with quantity {entry.quantity}; nothing can re-derive the "
+        f"RM's size from that row afterwards")
+    assert entry.stop_price == account.submits[0]["sl_price"]

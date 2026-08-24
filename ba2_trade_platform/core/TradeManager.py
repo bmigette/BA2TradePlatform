@@ -834,6 +834,39 @@ class TradeManager:
                 )
         return True
 
+    def _persist_funded_entry(self, order, quantity: float, stop_price=None) -> None:
+        """Write the risk manager's decision onto the entry row BEFORE the broker is called.
+
+        WHY IT MUST BE BEFORE. At this point the RM-sized quantity and the safeguard stop exist
+        only in memory, on a TRANSIENT candidate object that is about to be thrown away — see
+        ``_submit_funded_entry_with_retry``'s own docstring: "re-deriving them later from a
+        stranded row is not possible". Everything that can go wrong from here (a lock, a broker
+        rejection, a crash, a restart) leaves a row on disk, and that row is either sized and
+        re-drivable or it is a dead qty-0 stub nothing can reconstruct. Order 460 on PROD
+        2026-08-10 was the latter and sat untouched for 8 hours.
+
+        Persisting first also makes the broker submit the ONLY thing left that can fail, which
+        is what lets the compensation in ``_fail_unsent_entry`` be a simple, provable statement
+        about a row rather than a guess about how far the submit got.
+
+        ``stop_price`` mirrors what the DB sizing path already does. There the candidate IS the
+        persisted row, so ``_ensure_safeguard_stop``'s write lands in the database for free; the
+        temp-order-list path sizes a transient candidate and only ever passed the stop as a
+        ``submit_order`` argument, leaving the row's ``stop_price`` null. That null is what
+        ``_check_all_washtrade_locked_orders`` re-reads to rebuild the protective leg when it
+        re-submits a cleared lock — with no stop on the row it re-sends the entry naked.
+
+        An explicit stop the ruleset already put on the order always wins, exactly as in
+        ``_ensure_safeguard_stop``: the RM's is a SAFEGUARD, not an override.
+
+        Safe to call here only because the order is DETACHED (see the enter loop's read-only
+        session invariant). On an attached row this update_instance is the self-deadlock.
+        """
+        order.quantity = quantity
+        if stop_price and not order.stop_price:
+            order.stop_price = stop_price
+        update_instance(order)
+
     # Transient DB-lock retries for a FUNDED entry. See _submit_funded_entry_with_retry.
     _ENTRY_SUBMIT_RETRIES = 3
     _ENTRY_SUBMIT_BACKOFF_S = 2.0
@@ -1905,7 +1938,9 @@ class TradeManager:
                                 if order is None:
                                     self.logger.warning(f"No main order created for funded {candidate.symbol}")
                                     continue
-                                order.quantity = fo.quantity  # RM-sized quantity from the candidate pass
+                                # RM-sized quantity + safeguard stop from the candidate pass,
+                                # WRITTEN TO DISK before the broker is asked for anything.
+                                self._persist_funded_entry(order, fo.quantity, fo.stop_price or None)
 
                                 # ...and stamp the SAME quantity onto the protective legs execute()
                                 # just created. They were built by the account from the entry's
