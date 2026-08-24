@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import threading
 import time as _real_time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -214,13 +215,15 @@ class _FundedEntryAccount(MockAccount):
     """
 
     def __init__(self, id_val, probe=None, fail_symbols=(), fail_exc=None,
-                 broker_id_before_failure=False, washtrade_lock_symbols=()):
+                 broker_id_before_failure=False, washtrade_lock_symbols=(),
+                 fail_after_transaction_symbols=()):
         super().__init__(id_val)
         self._probe = probe
         self._fail_symbols = set(fail_symbols)
         self._fail_exc = fail_exc
         self._broker_id_before_failure = broker_id_before_failure
         self._washtrade_lock_symbols = set(washtrade_lock_symbols)
+        self._fail_after_transaction_symbols = set(fail_after_transaction_symbols)
         self._balance = 100_000.0
         self._prices = {"AAPL": 100.0, "MSFT": 100.0, "GOOGL": 100.0}
         self.submits = []               # list of dicts, one per submit_order call
@@ -269,6 +272,16 @@ class _FundedEntryAccount(MockAccount):
             got = s.exec(select(TradingOrder.quantity, TradingOrder.stop_price)
                          .where(TradingOrder.id == order_id)).first()
         return (got[0], got[1]) if got is not None else None
+
+    def _handle_transaction_requirements(self, trading_order):
+        """THE CVS SHAPE. The Transaction is created and its id stamped on the in-memory
+        order; the SEPARATE update_instance that would put that id on the row is the write
+        that loses to the lock. The row on disk therefore has no transaction_id at all while a
+        WAITING transaction very much exists."""
+        from ba2_common.core.interfaces.AccountInterface import AccountInterface
+        AccountInterface._handle_transaction_requirements(self, trading_order)
+        if trading_order.symbol in self._fail_after_transaction_symbols:
+            raise _locked_error()
 
     # -- broker double ------------------------------------------------------------------ #
     def _submit_order_impl(self, trading_order, tp_price=None, sl_price=None,
@@ -769,3 +782,353 @@ def test_a_washtrade_expiry_still_cancels_order_legs_and_transaction(file_db):
         assert s.get(TradingOrder, order.id).status == OrderStatus.CANCELED
         assert s.get(TradingOrder, leg.id).status == OrderStatus.CANCELED
         assert s.get(Transaction, txn.id).status == TransactionStatus.FAILED
+
+
+# ========================================================================================= #
+# F1 — the long-lived session must never be dirty across the broker round trip
+# ========================================================================================= #
+@contextmanager
+def _without_the_db_layer_safety_net():
+    """Neutralise ``ba2_common.core.db._guard_foreign_session`` for the duration.
+
+    That guard (added 2026-08-24, in the DB layer) notices ``update_instance(row)`` being handed
+    a row a DIFFERENT live session still owns and reroutes the write onto the owning session
+    instead of opening a second connection. It is a backstop for exactly this bug and it works —
+    but as a side effect it COMMITS the enter loop's session, which releases the write lock and
+    makes the invariant under test unobservable from up here.
+
+    TradeManager must hold the property on its own: the backstop cannot fix the attachment, it
+    logs an error on every occurrence, and its own message says "FIX THE CALL SITE". So this
+    test measures TradeManager with the net taken away. It is a no-op if the net is absent, so
+    the test does not depend on that DB-layer change landing.
+    """
+    import ba2_common.core.db as _db
+    if not hasattr(_db, "_guard_foreign_session"):
+        yield
+        return
+    with patch.object(_db, "_guard_foreign_session",
+                      lambda _op, _instance, session: session):
+        yield
+
+
+def test_funded_entry_loop_holds_no_write_transaction_across_submit(file_db):
+    """THE SELF-DEADLOCK, deterministically.
+
+    The enter loop runs inside one ``with get_db() as session:`` block. Fetching the just-created
+    order through THAT session attaches it; stamping the RM quantity on it makes the session
+    DIRTY; and the next query on the session AUTOFLUSHES, which takes sqlite's single write lock.
+    ``submit_order`` then writes the Transaction from a SECOND connection and blocks on a lock
+    its own thread is holding. No retry can win that — measured on PROD as ~15 minutes of total
+    write silence, ending 15 ms after the with-block exited.
+
+    TWO candidates is load-bearing. On candidate #1 there is nothing pending to flush yet, so
+    only the attachment shows; the write lock appears on candidate #2, flushed by the entry
+    re-fetch at the top of that iteration writing the leg the PREVIOUS iteration dirtied and
+    never expunged. The 2026-08-10 fix wrapped ONE query in ``no_autoflush``; the next iteration
+    simply flushed through a different query.
+    """
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    with _without_the_db_layer_safety_net():
+        _run_enter(expert, account, inst.id)
+
+    # Precondition — holds with or without the fix.
+    assert sorted({s["symbol"] for s in account.submits}) == ["AAPL", "MSFT"], \
+        f"the scenario must fund BOTH candidates: {account.submits}"
+
+    # Reported TOGETHER on purpose: pre-fix the attachment shows on candidate #1 and the held
+    # write lock only on candidate #2, and seeing one without the other invites patching the
+    # single flush site that happens to be visible — which is exactly how this regressed once.
+    violations = {"still attached to the loop's session": account.attached_at_submit,
+                  "write transaction held across submit": account.write_locks_at_submit}
+    assert violations == {"still attached to the loop's session": [],
+                          "write transaction held across submit": []}, violations
+
+    # And the consequence: the funded trade actually goes out, first try, no lock retries.
+    assert [s["symbol"] for s in account.submits] == ["AAPL", "MSFT"], \
+        f"a funded entry was retried (i.e. lost to a lock) instead of submitted: {account.submits}"
+    assert all(o.status == OrderStatus.NEW
+               for o in _orders() if o.order_type == OrderType.MARKET), \
+        [(o.symbol, o.status) for o in _orders() if o.order_type == OrderType.MARKET]
+
+
+def test_the_enter_loops_session_is_never_dirty(file_db):
+    """The property behind the property. ``no_autoflush`` only hides a dirty session from ONE
+    query; the fix is to never dirty it at all, so no query anywhere — present or future — can
+    flush it mid-submit."""
+    from ba2_common.core import db as _db_mod
+
+    seen = []
+    real_get_db = _db_mod.get_db
+
+    def _tracking_get_db():
+        session = real_get_db()
+        seen.append(session)
+        return session
+
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    dirty_snapshots = []
+    real_submit = _FundedEntryAccount.submit_order
+
+    def _snapshotting_submit(self, trading_order, **kw):
+        for s in seen:
+            if s.is_active and (s.dirty or s.new or s.deleted):
+                dirty_snapshots.append(
+                    (trading_order.symbol, [repr(o) for o in list(s.dirty) + list(s.new)]))
+        return real_submit(self, trading_order, **kw)
+
+    # TradeManager does ``from .db import get_db`` INSIDE the method. ``.db`` is the Phase-6
+    # re-export SHIM, which bound its own module-level ``get_db`` at import time — so the shim
+    # must be patched as well as the package, or the enter loop keeps the original.
+    import ba2_trade_platform.core.db as _shim_db
+    with patch.object(_db_mod, "get_db", _tracking_get_db), \
+         patch.object(_shim_db, "get_db", _tracking_get_db), \
+         patch.object(_FundedEntryAccount, "submit_order", _snapshotting_submit):
+        _run_enter(expert, account, inst.id)
+
+    assert seen, "the enter loop must have opened at least one session (patch did not take)"
+
+    assert len(account.submits) == 2, account.submits
+    assert dirty_snapshots == [], (
+        f"a session opened by the enter loop was dirty at submit time: {dirty_snapshots}")
+
+
+def test_the_protective_legs_get_the_rm_quantity_ON_DISK(file_db):
+    """Detaching the fetch must not lose what the attached fetch was there to do — and in fact
+    the attached version never DID it.
+
+    The enter loop's ``with get_db() as session:`` block contains no commit anywhere, so
+    ``leg.quantity = order.quantity`` on that session was rolled back when the block closed.
+    Measured against the pre-fix code with the DB-layer net removed: the leg ``execute()``
+    staged went to disk with quantity 0.0 — precisely the WKC / GNTX / CSTL symptom the stamp
+    was written to prevent (a zero-quantity protective leg is cancelled by the broker and the
+    position runs uncovered). Only the leg the ACCOUNT created inside submit_order survived,
+    because that one is written by the account with its own session.
+
+    Asserting on the row read back from the database, not on the in-memory object, is the whole
+    point of the test.
+    """
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    with _without_the_db_layer_safety_net():
+        _run_enter(expert, account, inst.id)
+
+    for symbol in ("AAPL", "MSFT"):
+        entry = [o for o in _orders(symbol) if o.order_type == OrderType.MARKET][0]
+        legs = [o for o in _orders(symbol) if o.depends_on_order == entry.id]
+        assert entry.quantity == 400.0, (symbol, entry.quantity)
+        assert legs, f"no protective leg staged for {symbol}"
+        for leg in legs:
+            assert leg.quantity == entry.quantity, (
+                f"{symbol} leg {leg.id} kept quantity {leg.quantity} instead of the entry's "
+                f"{entry.quantity}; a zero/short leg is cancelled by the broker and the "
+                f"position runs uncovered")
+
+
+# ========================================================================================= #
+# F4 — the funding must be on disk BEFORE the broker call
+# ========================================================================================= #
+def test_the_rm_quantity_is_on_disk_before_the_broker_is_called(file_db):
+    """A funded entry must never be un-sized on disk while the broker call is in flight.
+
+    ``_submit_funded_entry_with_retry``'s own docstring says it: the RM-sized quantity and the
+    safeguard stop exist only in memory at this point, and "re-deriving them later from a
+    stranded row is not possible". Anything that goes wrong from here — a lock, a crash, a
+    restart — leaves a row nothing can re-drive unless the funding was written first.
+    """
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    _run_enter(expert, account, inst.id)
+
+    assert account.disk_qty_at_submit == {"AAPL": 400.0, "MSFT": 400.0}, (
+        f"the funded quantity was still un-persisted when submit_order was entered: "
+        f"{account.disk_qty_at_submit}")
+
+
+def test_the_rm_safeguard_stop_is_on_disk_before_the_broker_is_called(file_db):
+    """Same argument for the stop. The DB sizing path (``review_and_prioritize_pending_orders``)
+    writes ``order.stop_price`` because there the candidate IS the persisted row; the temp-list
+    path sizes a TRANSIENT candidate and only ever passed the stop as an argument, so the row
+    kept a null stop. That is the value ``_check_all_washtrade_locked_orders`` re-reads to
+    rebuild the protective leg on a re-submit — with no stop on the row it re-sends the entry
+    naked."""
+    _acct, inst, expert = _make_scenario(["AAPL"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    _run_enter(expert, account, inst.id)
+
+    submitted_sl = account.submits[0]["sl_price"]
+    assert submitted_sl, "the scenario must produce an RM safeguard stop"
+    assert account.disk_stop_at_submit["AAPL"] == submitted_sl, (
+        f"the row carried stop_price={account.disk_stop_at_submit['AAPL']} while the broker was "
+        f"being asked for {submitted_sl}")
+
+
+def test_a_stop_the_ruleset_already_set_is_not_overwritten(file_db):
+    """``_ensure_safeguard_stop`` no-ops when the order already has a stop, because an explicit
+    SL from the ruleset always wins. Persisting the RM's must obey the same rule."""
+    from ba2_trade_platform.core.TradeManager import get_trade_manager
+
+    acct = factories.create_account_definition(provider="MockAccount")
+    order = factories.create_trading_order(
+        account_id=acct.id, symbol="WSC", quantity=0.0, status=OrderStatus.PENDING,
+        stop_price=88.0)
+
+    get_trade_manager()._persist_funded_entry(order, quantity=7.0, stop_price=93.0)
+
+    with get_db() as s:
+        row = s.get(TradingOrder, order.id)
+        assert row.quantity == 7.0
+        assert row.stop_price == 88.0, "the ruleset's own stop must survive"
+
+
+def test_a_failed_submit_leaves_the_funded_quantity_on_the_row(file_db):
+    """The whole point: after the trade is lost, the row still says what the RM decided."""
+    _acct, inst, expert = _make_scenario(["AAPL"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db, fail_symbols={"AAPL"},
+                                  fail_exc=_locked_error())
+
+    _run_enter(expert, account, inst.id)
+
+    entry = [o for o in _orders("AAPL") if o.order_type == OrderType.MARKET][0]
+    assert entry.quantity == 400.0, (
+        f"the lost entry is on disk with quantity {entry.quantity}; nothing can re-derive the "
+        f"RM's size from that row afterwards")
+    assert entry.stop_price == account.submits[0]["sl_price"]
+
+
+# ========================================================================================= #
+# Guards found by mutation testing
+# ========================================================================================= #
+def test_only_THIS_orders_dependents_are_cancelled(file_db):
+    """The ``depends_on_order == order_id`` filter is the only thing standing between a single
+    failed entry and every WAITING_TRIGGER leg in the database. A protective leg belonging to a
+    different, healthy position must not be touched."""
+    from ba2_trade_platform.core.TradeManager import get_trade_manager
+
+    acct = factories.create_account_definition(provider="MockAccount")
+    order = factories.create_trading_order(
+        account_id=acct.id, symbol="WSC", quantity=7.0, status=OrderStatus.PENDING)
+    mine = factories.create_trading_order(
+        account_id=acct.id, symbol="WSC", quantity=7.0, side=OrderDirection.SELL,
+        order_type=OrderType.SELL_STOP, stop_price=90.0, status=OrderStatus.WAITING_TRIGGER,
+        depends_on_order=order.id, depends_order_status_trigger=OrderStatus.FILLED)
+
+    other_parent = factories.create_trading_order(
+        account_id=acct.id, symbol="CVS", quantity=3.0, status=OrderStatus.FILLED)
+    stranger = factories.create_trading_order(
+        account_id=acct.id, symbol="CVS", quantity=3.0, side=OrderDirection.SELL,
+        order_type=OrderType.SELL_STOP, stop_price=60.0, status=OrderStatus.WAITING_TRIGGER,
+        depends_on_order=other_parent.id, depends_order_status_trigger=OrderStatus.FILLED)
+
+    assert get_trade_manager()._fail_unsent_entry(order, "test") is True
+    with get_db() as s:
+        assert s.get(TradingOrder, mine.id).status == OrderStatus.CANCELED
+        assert s.get(TradingOrder, stranger.id).status == OrderStatus.WAITING_TRIGGER, \
+            "another position's protective leg was cancelled by an unrelated failed entry"
+
+
+def test_a_real_db_error_during_compensation_is_not_swallowed(file_db):
+    """``_row_or_none`` absorbs exactly one thing: "that row does not exist". A lock, a schema
+    error or a corrupt file are not answers, and silently treating them as "no row" would turn
+    a failed compensation into a silent no-op — the same blindness this whole change is about."""
+    from sqlalchemy.exc import OperationalError
+    from ba2_trade_platform.core import TradeManager as _tm_mod
+    from ba2_trade_platform.core.TradeManager import get_trade_manager
+
+    boom = OperationalError("SELECT tradingorder", {}, Exception("disk I/O error"))
+    with patch.object(_tm_mod, "get_instance", side_effect=boom):
+        with pytest.raises(OperationalError):
+            get_trade_manager()._row_or_none(TradingOrder, 1)
+
+
+def test_an_unfunded_candidate_is_never_submitted(file_db):
+    """The RM funds by profit priority until the balance runs out. A candidate it did not fund
+    must never be persisted or sent — the whole point of the temp-order-list flow is that
+    unfunded candidates never touch the database."""
+    # 50% per instrument on a $100k book funds two symbols at $50k each; the third gets nothing.
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT", "GOOGL"], per_instrument_pct=50.0)
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    _run_enter(expert, account, inst.id)
+
+    assert sorted(s["symbol"] for s in account.submits) == ["AAPL", "MSFT"], account.submits
+    assert _orders("GOOGL") == [], "an unfunded candidate must never be persisted"
+    assert all(s["quantity"] and s["quantity"] > 0 for s in account.submits), account.submits
+
+
+def test_the_broker_is_re_read_once_after_a_funded_batch(file_db):
+    """Market entries fill immediately; the loop refreshes order statuses after submitting so a
+    FILLED entry is seen in the same pass rather than a cycle later."""
+    _acct, inst, expert = _make_scenario(["AAPL", "MSFT"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+    calls = []
+    account.refresh_orders = lambda fetch_all=False: calls.append(fetch_all)
+
+    _run_enter(expert, account, inst.id)
+
+    assert calls == [True], f"expected exactly one fetch_all refresh after the batch: {calls}"
+
+
+def test_the_transaction_is_failed_even_when_the_row_never_learned_its_id(file_db):
+    """THE CVS 2026-08-10 SHAPE, end to end.
+
+    submit_order creates the Transaction, stamps ``trading_order.transaction_id`` in memory,
+    and then persists it with a SEPARATE ``update_instance``. When THAT write is the one that
+    loses to the lock, the row on disk has no transaction_id — but the WAITING transaction is
+    real and is what blocks every later entry for the symbol. Compensating from the row alone
+    would miss it entirely.
+    """
+    # No SL action in the ruleset ON PURPOSE: with one, execute()'s Phase 1.5 creates the
+    # transaction and persists the link itself, and the row already knows. The orphan only
+    # exists when submit_order is the thing that creates the transaction.
+    _acct, inst, expert = _make_scenario(["AAPL"], with_stop_loss=False)
+    account = _FundedEntryAccount(_acct.id, probe=file_db,
+                                  fail_after_transaction_symbols={"AAPL"})
+
+    _run_enter(expert, account, inst.id)
+
+    txns = _transactions("AAPL")
+    assert len(txns) >= 1
+    assert all(t.status == TransactionStatus.FAILED for t in txns), \
+        [(t.id, t.status) for t in txns]
+    entry = [o for o in _orders("AAPL") if o.order_type == OrderType.MARKET][0]
+    assert entry.status == OrderStatus.CANCELED
+    assert entry.transaction_id == txns[0].id, (
+        "compensating from the in-memory object also repairs the order->transaction link the "
+        "lost write never made, so the pair is no longer orphaned on disk")
+
+
+def test_nothing_is_refreshed_when_nothing_was_submitted(file_db):
+    """The refresh is a broker round trip per pass. It exists to catch an immediate market fill,
+    so a pass that submitted nothing must not pay for it."""
+    _acct, inst, expert = _make_scenario(["AAPL"])
+    account = _FundedEntryAccount(_acct.id, probe=file_db, fail_symbols={"AAPL"},
+                                  fail_exc=_locked_error())
+    calls = []
+    account.refresh_orders = lambda fetch_all=False: calls.append(fetch_all)
+
+    _run_enter(expert, account, inst.id)
+
+    assert account.submits, "precondition: the loop did try to submit"
+    assert calls == [], f"nothing reached the broker, so nothing should be re-read: {calls}"
+
+
+def test_the_safety_check_still_blocks_a_genuine_duplicate(file_db):
+    """The compensation exists so a DEAD transaction stops blocking. A LIVE one still must."""
+    _acct, inst, expert = _make_scenario(["AAPL"])
+    factories.create_transaction(symbol="AAPL", status=TransactionStatus.WAITING,
+                                 expert_id=inst.id)
+    account = _FundedEntryAccount(_acct.id, probe=file_db)
+
+    _run_enter(expert, account, inst.id)
+
+    assert account.submits == [], \
+        f"a second position was opened behind a live WAITING transaction: {account.submits}"
+    assert [o for o in _orders("AAPL") if o.order_type == OrderType.MARKET] == [], \
+        "the duplicate entry was persisted even though the safety check should have skipped it"

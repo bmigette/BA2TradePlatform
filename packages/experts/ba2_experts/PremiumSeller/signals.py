@@ -25,14 +25,31 @@ _GRADE_SCORE = {
 
 
 def iv_rank(history: Iterable[Optional[float]], current: Optional[float]) -> Optional[float]:
-    """IVR: % of historical points <= current IV (0-100). None when < 20 valid
-    points or current is None — the gate must fail closed (caller skips the
-    filter decision per its own rule)."""
-    vals = [v for v in history if v is not None]
-    if current is None or len(vals) < IV_RANK_MIN_POINTS:
-        return None
-    below = sum(1 for v in vals if v <= current)
-    return 100.0 * below / len(vals)
+    """IVR: % of trailing points strictly BELOW ``current`` (0-100), or None.
+
+    ONE IMPLEMENTATION, DELIBERATELY NOT A SECOND ONE. This used to be its own
+    arithmetic — it counted ``<=`` and returned an unrounded float, while the
+    account-level ``OptionsAccountInterface._iv_rank_from_series`` counts strictly ``<``
+    and rounds to 2dp. Two functions computing one statistic differently is precisely how
+    the short-sign divergence happened in this codebase, and here it had already bitten:
+    the caller appends today's IV to ``_iv_history`` before ranking, so under ``<=``
+    today's own sample always counted itself and no symbol could ever score below 100/N.
+    Delegating also inherits the shared plausibility bound, so a 0.0 from a broken feed
+    yields None (gate stays shut) instead of 0.0 (gate wide open).
+
+    WHAT LEGITIMATELY STILL DIFFERS is the SERIES, not the arithmetic. This expert keeps
+    an in-memory, per-instance history cold-started from ~52 WEEKLY points off the OPRA
+    cache and then extended one point per bar (``_update_iv_history``); the account-level
+    rank reads a recorded or provider-derived DAILY grid. Same statistic, coarser and
+    shorter sample grid — an expert-local signal that must work on the first bar of a
+    backtest, where no daily history exists yet.
+
+    None when fewer than 20 usable points exist or ``current`` is unusable — the gate
+    must fail closed (caller skips the filter decision per its own rule).
+    """
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+    return OptionsAccountInterface._iv_rank_from_series(
+        history, current, min_samples=IV_RANK_MIN_POINTS)
 
 
 def realized_vol_annualized(closes: List[float], window: int) -> Optional[float]:

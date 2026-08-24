@@ -320,8 +320,12 @@ class SmartRiskManagerQueue:
                     account_info = account.get_account_info()
                     if account_info and account_info.equity:
                         account_equity = float(account_info.equity)
-                        # Calculate expert virtual equity based on percentage allocation
-                        virtual_equity_pct = expert_record.virtual_equity_pct if expert_record.virtual_equity_pct else 100.0
+                        # Calculate expert virtual equity based on percentage allocation.
+                        # NO ``if pct else 100.0``: the column is NOT NULL with a 100.0
+                        # default, so the fallback only ever fired on a real 0% sleeve and
+                        # told the risk manager it owned the entire account. Same coercion
+                        # as MarketExpertInterface.get_virtual_balance.
+                        virtual_equity_pct = expert_record.virtual_equity_pct
                         initial_portfolio_equity = account_equity * (virtual_equity_pct / 100.0)
                         logger.debug(f"Initial portfolio equity: Account=${account_equity:,.2f} × {virtual_equity_pct}% = ${initial_portfolio_equity:,.2f}")
             except Exception as e:
@@ -358,8 +362,10 @@ class SmartRiskManagerQueue:
                     account_info = account.get_account_info()
                     if account_info and account_info.equity:
                         account_equity = float(account_info.equity)
-                        # Calculate expert virtual equity based on percentage allocation
-                        virtual_equity_pct = expert_record.virtual_equity_pct if expert_record.virtual_equity_pct else 100.0
+                        # Calculate expert virtual equity based on percentage allocation.
+                        # Same non-coercion as the initial-equity read above: a 0% sleeve
+                        # is 0, not the whole account.
+                        virtual_equity_pct = expert_record.virtual_equity_pct
                         final_portfolio_equity = account_equity * (virtual_equity_pct / 100.0)
                         logger.debug(f"Final portfolio equity: Account=${account_equity:,.2f} × {virtual_equity_pct}% = ${final_portfolio_equity:,.2f}")
             except Exception as e:

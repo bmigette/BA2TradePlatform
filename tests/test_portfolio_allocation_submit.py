@@ -38,6 +38,16 @@ from ba2_trade_platform.core import portfolio_allocation_service as svc
 #: priced as a short open (commit 1d099e8).
 NOT_PASSED = "<not passed>"
 
+#: Marks "the broker advanced the status but reported NO fill quantity", which
+#: lands in the DB as a NULL ``filled_qty``. ``None`` cannot spell this in
+#: ``FakeAccount.fills`` -- there it already means "this order's OWN quantity" --
+#: and it is not the same thing as a 0.0 either: 0.0 is a measurement of zero
+#: shares, this is the absence of a measurement. Both real adapters produce it:
+#: AlpacaAccount.py:2928 only writes a quantity the broker actually sent, and
+#: TastyTradeAccount.py:1473 compares ``float(db or 0.0) != float(broker or 0.0)``
+#: so its ``_fills_summary`` answer of ``(0.0, None)`` never overwrites the NULL.
+NO_FILL_QTY_REPORTED = "<no filled_qty reported>"
+
 
 class FakePosition:
     """Minimal stand-in for a broker Position row.
@@ -295,10 +305,17 @@ class FakeAccount:
             if reported is None:
                 continue
             status, filled_qty, open_price = reported
-            self._write_order(
-                order_id, status=status,
-                filled_qty=float(quantity or 0.0) if filled_qty is None else filled_qty,
-                open_price=open_price)
+            if filled_qty is NO_FILL_QTY_REPORTED:
+                # The broker said nothing about the quantity, so the row keeps its
+                # NULL. Written explicitly rather than skipped so the test reads as
+                # "the refresh ran and still left it NULL".
+                resolved = None
+            elif filled_qty is None:
+                resolved = float(quantity or 0.0)
+            else:
+                resolved = filled_qty
+            self._write_order(order_id, status=status, filled_qty=resolved,
+                              open_price=open_price)
         return True
 
 
@@ -2212,6 +2229,98 @@ def test_run_allocation_does_not_spend_income_on_an_add_the_broker_refused(activ
     assert txn_quantity(txn_id) == pytest.approx(10.0)
 
 
+def test_run_allocation_will_not_settle_a_run_whose_fill_reported_no_quantity(activity):
+    """THE income double-spend, end to end.
+
+    The broker says FILLED and gives a price but no quantity. Read as a measured
+    zero, the run settles, consumes 0 and takes its one-shot ``income_consumed_at``
+    stamp -- so the 5,000 still reads as unallocated even though 1,600 of stock was
+    just bought with it, and it can never be reconciled afterwards because the
+    stamp is gone. Unsettled + unstamped is the only recoverable answer.
+    """
+    from ba2_trade_platform.core.portfolio_allocation_store import get_unconsumed_runs
+
+    account = FakeAccount(account_id=111)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, NO_FILL_QTY_REPORTED, 160.0)}
+    add_instance(PortfolioIncomeEvent(account_id=111, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+
+    result = svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["settled"] is False
+    assert result["filled_buy_value"] == pytest.approx(0.0)
+    assert result["income_consumed"] == pytest.approx(0.0)
+    assert svc.get_open_income_total(111) == pytest.approx(5_000.0)
+    # Recoverable: still listed, still unstamped, so a later pass can finish it.
+    assert [r.id for r in get_unconsumed_runs(111)] == [result["run_id"]]
+    assert the_run().income_consumed_at is None
+
+
+def test_the_run_summary_says_what_filled_and_that_the_income_is_not_consumed(
+        activity):
+    """The one line most people read. A run that could not be measured shows
+    "0 submitted ... 0 failed", so without the money figure and the unsettled
+    sentence it reads as a clean success while the deposit still sits unallocated.
+    Both halves are asserted here because both are what the user acts on."""
+    account = FakeAccount(account_id=113)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, NO_FILL_QTY_REPORTED, 160.0)}
+
+    svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    description = activity[0]["description"]
+    assert "0.00 bought / 0.00 sold (filled)" in description
+    assert "income not consumed yet" in description
+    assert "refresh FAILED" not in description
+
+
+def test_a_measured_run_says_what_it_bought_and_claims_nothing_is_outstanding(
+        activity):
+    """The contrast case, so the sentence above cannot be hard-coded: a run that
+    really was measured reports its money and says nothing about waiting."""
+    account = FakeAccount(account_id=114)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+
+    svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    description = activity[0]["description"]
+    assert "1600.00 bought / 0.00 sold (filled)" in description
+    assert "income not consumed yet" not in description
+
+
+def test_the_income_a_null_quantity_run_finally_measures_is_consumed_exactly_once(
+        activity):
+    """Idempotence across passes. Once the broker admits the quantity, the deferred
+    run consumes its 1,600 ONE time; every later drain re-measures the same settled
+    run and must take nothing more. The guard is ``income_consumed_at``, checked and
+    set inside the same ``BEGIN IMMEDIATE`` transaction as the ledger writes."""
+    account = FakeAccount(account_id=112)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, NO_FILL_QTY_REPORTED, 160.0)}
+    add_instance(PortfolioIncomeEvent(account_id=112, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+    first = svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                               mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+    assert svc.get_open_income_total(112) == pytest.approx(5_000.0)
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    assert svc.reconcile_unconsumed_runs(account) == [first["run_id"]]
+    assert svc.get_open_income_total(112) == pytest.approx(3_400.0)
+
+    for _ in range(3):
+        assert svc.reconcile_unconsumed_runs(account) == []
+    assert svc.get_open_income_total(112) == pytest.approx(3_400.0)
+    run = get_instance(PortfolioAllocationRun, first["run_id"])
+    assert run.income_consumed_amount == pytest.approx(1_600.0)
+
+
 def test_run_allocation_counts_the_sells_a_partly_successful_close_really_made(activity):
     """I3 end to end. Two of three transactions closed. Reporting the row FAILED
     values those two sells at ZERO, so the run treats the buys as unfunded and
@@ -2810,6 +2919,45 @@ def test_collect_order_fills_reports_a_vanished_order_row_as_still_working():
     assert [f.order_id for f in fills] == [9_999_999]
     assert fills[0].status is None
     assert svc.measure_filled_values(fills).settled is False
+
+
+def test_collect_order_fills_hands_a_null_filled_qty_through_as_unknown():
+    """A NULL ``filled_qty`` must reach the ledger AS a NULL.
+
+    ``float(filled_qty or 0.0)`` turned it into a measured fill of zero shares one
+    line above ``float(open_price) if open_price is not None else None`` -- the
+    sibling field, on the very next line, already got this right. The whole income
+    double-spend lived in that asymmetry.
+    """
+    order_id = add_instance(TradingOrder(
+        account_id=46, symbol="AAPL", quantity=10.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, good_for='day', status=OrderStatus.FILLED,
+        open_type=OrderOpenType.MANUAL, filled_qty=None, open_price=160.0))
+
+    fills = svc.collect_order_fills(46, [order_id])
+
+    assert fills[0].filled_quantity is None
+    assert fills[0].fill_price == pytest.approx(160.0)
+    totals = svc.measure_filled_values(fills)
+    assert totals.buy_value == 0.0
+    assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [order_id]
+
+
+def test_collect_order_fills_still_reads_a_real_zero_as_a_measured_zero():
+    """The broker DID answer, and the answer was "nothing filled". That is a
+    measurement, and it must not be confused with the NULL above."""
+    order_id = add_instance(TradingOrder(
+        account_id=46, symbol="AAPL", quantity=10.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, good_for='day', status=OrderStatus.REJECTED,
+        open_type=OrderOpenType.MANUAL, filled_qty=0.0, open_price=None))
+
+    fills = svc.collect_order_fills(46, [order_id])
+
+    assert fills[0].filled_quantity == 0.0
+    totals = svc.measure_filled_values(fills)
+    assert totals.settled is True
+    assert totals.unmeasurable_order_ids == []
 
 
 def test_collect_order_fills_never_reads_another_accounts_order():

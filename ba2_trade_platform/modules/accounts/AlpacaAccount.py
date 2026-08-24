@@ -13,7 +13,12 @@ import functools
 
 from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
-from ...core.types import OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus
+from ...core.types import (
+    OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus,
+    # Aliased: the module-level `AssetClass` imported above from alpaca.trading.enums is
+    # the BROKER's (us_equity/us_option/crypto), a different enum from ours.
+    AssetClass as CoreAssetClass,
+)
 from ...core.interfaces import AccountInterface
 from ...core.account_types import (
     AccountSnapshot, CashTransfer, MarginInfo, MarketHours, FractionalPreview,
@@ -745,7 +750,121 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             
         except Exception as e:
             logger.error(f"Error inserting OCO order legs for order {parent_order.id}: {e}", exc_info=True)
-    
+
+    def _reconcile_option_leg_fills(self, parent_order: TradingOrder, raw_order) -> int:
+        """Copy each broker leg's own fill onto the matching child order row.
+
+        A multi-leg option order is stored as one parent plus N children sharing a
+        ``transaction_id``. The parent is the row the broker fills, and it carries only the
+        NET price of the structure; the children carry the contract identity — the OCC
+        symbol, strike, right — and are therefore the only place per-leg economics can live.
+        Until this method existed nothing ever updated them: measured on the live DB,
+        transaction 660's children 2148/2149 held the right ``broker_order_id`` and sat at
+        ``ACCEPTED / filled_qty=0 / open_price=NULL`` for the whole life of the position and
+        beyond its close. "Which leg killed this trade?" had no answer, and the executed
+        position had to be inferred from rows the database itself said never executed.
+
+        The link is ``parent.legs_broker_ids`` ↔ ``child.broker_order_id``: both were
+        written from the same broker ids at submit time, and ``_fetch_raw_alpaca_orders``
+        sets ``nested = True`` so the refresh response carries those same legs as full order
+        objects. Matching is on that id and nothing else — NOT on list position. The broker
+        is under no obligation to return the legs in submission order, and positional
+        matching would put the long leg's price on the short leg: two rows that still look
+        entirely plausible and a structure whose P&L is exactly wrong.
+
+        WHAT SILENCE MEANS. A leg the broker does not return is left completely untouched —
+        not marked filled, not marked anything. "The response didn't mention this leg" is
+        not "this leg didn't fill", the same distinction as ``get_positions()`` returning
+        ``None`` (fetch failed) versus ``[]`` (confirmed flat), whose conflation has caused
+        five separate incidents here. That covers both an absent leg and ``legs=None``.
+        Likewise a value the broker omits: a leg with no ``filled_avg_price`` keeps its NULL
+        rather than gaining a zero, because unknown is never a value.
+
+        The parent is not touched at all — the caller has already reconciled it from the
+        top-level response, and its ``open_price`` is the structure's net debit/credit,
+        which is not any leg's price.
+
+        Args:
+            parent_order: the persisted multi-leg parent (already reconciled by the caller)
+            raw_order: the raw Alpaca order for that parent, from a nested fetch
+
+        Returns:
+            int: number of child rows actually changed.
+        """
+        broker_legs = getattr(raw_order, 'legs', None)
+        if not broker_legs:
+            logger.debug(
+                f"Order {parent_order.id}: broker returned no legs — leaving all leg "
+                f"children untouched (silence is not a fill)"
+            )
+            return 0
+
+        legs_by_broker_id = {}
+        for leg in broker_legs:
+            leg_id = getattr(leg, 'id', None)
+            if leg_id:
+                legs_by_broker_id[str(leg_id)] = leg
+        if not legs_by_broker_id:
+            logger.warning(
+                f"Order {parent_order.id}: broker returned {len(broker_legs)} leg(s) with no "
+                f"ids — cannot match them to leg children, leaving the children untouched"
+            )
+            return 0
+
+        with Session(get_db().bind) as session:
+            child_ids = [row.id for row in session.exec(
+                select(TradingOrder).where(TradingOrder.parent_order_id == parent_order.id)
+            ).all()]
+
+        updated = 0
+        for child_id in child_ids:
+            child = get_instance(TradingOrder, child_id)
+            leg = legs_by_broker_id.get(child.broker_order_id) if child.broker_order_id else None
+            if leg is None:
+                logger.debug(
+                    f"Leg child {child.id} ({child.contract_symbol}, "
+                    f"broker_order_id={child.broker_order_id}) was not in the broker's "
+                    f"response for order {parent_order.id} — left unchanged"
+                )
+                continue
+
+            has_changes = False
+
+            leg_status = self._sanitize_enum_field(
+                getattr(leg, 'status', None), OrderStatus, 'status', nullable=True
+            )
+            if leg_status is not None and leg_status != child.status:
+                logger.debug(f"Leg child {child.id} status changed: {child.status} -> {leg_status}")
+                child.status = leg_status
+                has_changes = True
+
+            leg_filled_qty = self._safe_float(getattr(leg, 'filled_qty', None))
+            if leg_filled_qty is not None and (child.filled_qty is None
+                                               or float(child.filled_qty) != leg_filled_qty):
+                logger.debug(f"Leg child {child.id} filled_qty changed: {child.filled_qty} -> {leg_filled_qty}")
+                child.filled_qty = leg_filled_qty
+                has_changes = True
+
+            # A working leg reports filled_avg_price as null (or, outside market hours, as
+            # "0"): neither is a price, so the row keeps its NULL instead of recording a
+            # fill at zero that the P&L would then believe.
+            leg_price = self._safe_float(getattr(leg, 'filled_avg_price', None))
+            if leg_price and (child.open_price is None or float(child.open_price) != leg_price):
+                logger.debug(f"Leg child {child.id} open_price changed: {child.open_price} -> {leg_price}")
+                child.open_price = leg_price
+                has_changes = True
+
+            if has_changes:
+                update_instance(child)
+                updated += 1
+
+        if updated:
+            logger.info(
+                f"Order {parent_order.id}: reconciled {updated} option leg child order(s) "
+                f"from the broker's per-leg fills"
+            )
+        return updated
+
     @staticmethod
     def _map_order_type(alpaca_type, side: OrderDirection) -> "CoreOrderType":
         """Map an Alpaca order type to our directional OrderType.
@@ -2862,6 +2981,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
                         if legs_inserted > 0 or legs_updated > 0:
                             logger.info(f"Order {db_order.id}: Updated {legs_updated} OCO legs, Inserted {legs_inserted} OCO leg orders")
+
+                    # Step 3b: Reconcile a multi-leg OPTION order's per-leg fills onto its
+                    # children. Separate from the OCO branch above because these are not
+                    # OCO legs: nothing cancels anything, all N legs execute together, and
+                    # the children already exist with their broker ids (written at submit).
+                    # They are simply never updated afterwards, which is why every leg row
+                    # of every spread in the live DB still says it did not execute.
+                    elif db_order.asset_class == CoreAssetClass.OPTION:
+                        self._reconcile_option_leg_fills(db_order, raw_order)
 
             # Step 4: Mark database orders with broker_order_ids that don't exist in Alpaca as CANCELED
             # This catches orders that were canceled in Alpaca but status wasn't updated in database
@@ -6035,14 +6163,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         - OPASN on a SHORT PUT  (order side SELL, right PUT): cash-secured put
           assigned -> open an equity LONG Transaction (qty = 100 * contracts,
           open_price = strike, expert-attributed, meta_data.origin=
-          "csp_assignment"); close the short-put option Transaction
-          (close_reason="assigned").
+          "csp_assignment") AND its filled equity entry TradingOrder (see
+          ``_record_assignment_equity_order`` — without that row the shares are
+          invisible to covered-call sizing and to every exit condition); close
+          the short-put option Transaction (close_reason="assigned").
         - OPASN on a SHORT CALL (order side SELL, right CALL): shares called away
-          -> close the expert's OPENED equity long for the underlying
-          (close_reason="called_away", close_price=strike); close the
-          short-call option Transaction (close_reason="assigned"). If no equity
-          long is found, record result "called_away_no_long" (still closes the
-          option leg).
+          -> record the closing equity SELL order and close the expert's OPENED
+          equity long for the underlying (close_reason="called_away",
+          close_price=strike), preferring an assignment-origin lot (see
+          ``_find_open_equity_long``); close the short-call option Transaction
+          (close_reason="assigned"). If no equity long is found, record result
+          "called_away_no_long" (still closes the option leg).
         - OPEXP (expiry): close the option Transaction (close_reason="expired",
           close_price=0.0).
         - OPEXC (exercise): close the option Transaction (close_reason=
@@ -6080,6 +6211,21 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 price = None
 
             # IDEMPOTENCY: skip if already processed for this account.
+            #
+            # "PROCESSED" MEANS AN EFFECT WAS APPLIED, NOT "WE HAVE SEEN THIS ID".
+            # An ``unhandled: ...`` row is written by a handler that REFUSED before
+            # touching the ledger (missing qty, unparseable OCC symbol, no handler for
+            # the type). Treating it as done made it a tombstone: the activity could
+            # never be reconciled, however much better the next pass's information.
+            # Those rows are retried, and the retry UPDATES the row rather than
+            # inserting a second one under the same (account_id, activity_id) key.
+            #
+            # ``unhandled: exception:`` is deliberately NOT retried. That prefix is
+            # written by this loop's own `except` after an arbitrary crash inside
+            # _apply_option_activity, so the ledger may be HALF-applied (e.g. the
+            # equity Transaction inserted and its entry order not). Replaying it would
+            # double the position — a worse failure than the stuck row.
+            retry_row_id = None
             try:
                 with get_db() as session:
                     existing = session.exec(
@@ -6087,12 +6233,22 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         .where(OptionActivity.account_id == self.id)
                         .where(OptionActivity.activity_id == str(activity_id))
                     ).first()
+                    existing_id = existing.id if existing is not None else None
+                    existing_result = str(existing.result or "") if existing is not None else ""
                 if existing is not None:
-                    logger.debug(
-                        f"[Account {self.id}] Option activity {activity_id} already "
-                        f"processed; skipping (idempotent).")
-                    results.append({"activity_id": activity_id, "result": "already_processed"})
-                    continue
+                    retryable = (existing_result.startswith("unhandled:")
+                                 and not existing_result.startswith("unhandled: exception:"))
+                    if not retryable:
+                        logger.debug(
+                            f"[Account {self.id}] Option activity {activity_id} already "
+                            f"processed; skipping (idempotent).")
+                        results.append({"activity_id": activity_id, "result": "already_processed"})
+                        continue
+                    logger.info(
+                        f"[Account {self.id}] Option activity {activity_id} was previously "
+                        f"recorded as {existing_result!r} — no ledger effect was applied, "
+                        f"so retrying it on this pass.")
+                    retry_row_id = existing_id
             except Exception as e:
                 logger.error(
                     f"[Account {self.id}] Idempotency check failed for {activity_id}: {e}",
@@ -6118,16 +6274,31 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 result_str = f"unhandled: exception: {e}"
 
             # Always record an audit/idempotency row, even for unhandled ones.
+            # On a retry, UPDATE the row that made this activity retryable — inserting a
+            # second row under the same (account_id, activity_id) would break the
+            # idempotency key itself: the next pass's ``.first()`` could pick the stale
+            # "unhandled:" one and replay an effect that has already been applied.
             try:
-                add_instance(OptionActivity(
-                    account_id=self.id,
-                    activity_id=str(activity_id),
-                    activity_type=str(activity_type) if activity_type is not None else "",
-                    symbol=symbol,
-                    qty=qty,
-                    price=price,
-                    result=result_str,
-                ))
+                if retry_row_id is not None:
+                    row = get_instance(OptionActivity, retry_row_id)
+                if retry_row_id is not None and row is not None:
+                    row.activity_type = str(activity_type) if activity_type is not None else ""
+                    row.symbol = symbol
+                    row.qty = qty
+                    row.price = price
+                    row.result = result_str
+                    row.processed_at = datetime.now(timezone.utc)
+                    update_instance(row)
+                else:
+                    add_instance(OptionActivity(
+                        account_id=self.id,
+                        activity_id=str(activity_id),
+                        activity_type=str(activity_type) if activity_type is not None else "",
+                        symbol=symbol,
+                        qty=qty,
+                        price=price,
+                        result=result_str,
+                    ))
             except Exception as e:
                 logger.error(
                     f"[Account {self.id}] Failed to persist OptionActivity audit row "
@@ -6143,9 +6314,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         the Transaction ledger. Returns a result string. Raises on truly
         unexpected errors (caught by the caller). Returns an "unhandled: ..."
         string for expected-but-unmappable inputs (malformed symbol, etc.)."""
-        from ...core.types import AssetClass, OptionRight, OrderDirection, TransactionStatus
+        from ...core.types import (AssetClass, OptionRight, OrderDirection, TransactionStatus,
+                                   TXN_ORIGIN_CSP_ASSIGNMENT)
 
-        contracts = qty if qty is not None else 0.0
+        # NOT ``qty if qty is not None else 0.0``. A missing quantity is not an
+        # assignment of nothing — see the OPASN guard below, which refuses BEFORE any
+        # ledger write. Leaving it None here means any future branch that reads it
+        # without checking raises (caught by the caller) instead of silently ledgering
+        # a zero.
+        contracts = qty
 
         # Parse OCC symbol; malformed -> unhandled (no crash).
         if not symbol:
@@ -6169,6 +6346,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         atype = str(activity_type).upper() if activity_type is not None else ""
 
+        # ASSIGNMENT IS SIZED AS 100 * contracts, SO REFUSE AN UNKNOWN SIZE HERE —
+        # BEFORE ANY LEDGER WRITE. With ``contracts`` coerced to 0.0 this used to open a
+        # PERMANENT 0-share equity Transaction (and close the short option against it),
+        # then the (account_id, activity_id) audit row stopped any later pass from ever
+        # correcting it. Only OPASN reads the quantity; OPEXP/OPEXC do not, and must
+        # still be able to close their option leg without one.
+        if atype == "OPASN" and contracts is None:
+            logger.error(
+                f"[Account {self.id}] Option assignment {activity_id} on {symbol} reports "
+                f"NO quantity. Refusing to ledger it — 100 x an unknown number of "
+                f"contracts is not zero shares. It will be retried on a later pass.")
+            return "unhandled: missing qty"
+
         # --- OPASN: assignment ---
         if atype == "OPASN":
             # Short option assigned. Determine PUT vs CALL from the contract.
@@ -6176,31 +6366,43 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if right == OptionRight.PUT and is_short:
                 # Cash-secured put assigned -> we BUY 100*contracts shares @ strike.
                 share_qty = 100.0 * contracts
+                now = datetime.now(timezone.utc)
                 equity_txn = Transaction(
                     symbol=underlying,
                     quantity=share_qty,
                     side=OrderDirection.BUY,
                     open_price=strike,
                     status=TransactionStatus.OPENED,
-                    open_date=datetime.now(timezone.utc),
+                    open_date=now,
                     expert_id=expert_id,
                     close_reason=None,
-                    meta_data={"origin": "csp_assignment", "activity_id": activity_id,
-                               "contract": symbol},
+                    meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT,
+                               "activity_id": activity_id, "contract": symbol},
                 )
-                add_instance(equity_txn)
+                equity_txn_id = add_instance(equity_txn)
+                # The assignment's ENTRY order row. Without it the shares exist only as a
+                # Transaction and are invisible to every order-driven consumer (see
+                # _record_assignment_equity_order) -- the wheel's covered-call leg then
+                # reports "shares=0.0" forever.
+                self._record_assignment_equity_order(
+                    transaction_id=equity_txn_id, symbol=underlying,
+                    side=OrderDirection.BUY, shares=share_qty, price=strike,
+                    contract=symbol, activity_id=activity_id, created_at=now,
+                    origin=TXN_ORIGIN_CSP_ASSIGNMENT)
                 self._close_txn(opt_txn, close_reason="assigned")
                 return (f"csp_assignment: opened equity long {underlying} "
                         f"{share_qty}@{strike}; closed short put txn")
 
             if right == OptionRight.CALL and is_short:
-                # Short call assigned -> shares called away. Close held equity long.
+                # Short call assigned -> shares called away. The held equity long is
+                # SPLIT when it is bigger than the assignment (see _settle_called_away),
+                # never erased.
                 held = self._find_open_equity_long(underlying, expert_id)
                 self._close_txn(opt_txn, close_reason="assigned")
                 if held is not None:
-                    self._close_txn(held, close_reason="called_away", close_price=strike)
-                    return (f"called_away: closed equity long {underlying} @ {strike}; "
-                            f"closed short call txn")
+                    return self._settle_called_away(
+                        held=held, underlying=underlying, contracts=contracts,
+                        strike=strike, contract=symbol, activity_id=activity_id)
                 logger.warning(
                     f"[Account {self.id}] Short CALL {symbol} assigned but no OPENED "
                     f"equity long found for {underlying} (expert {expert_id}).")
@@ -6230,8 +6432,294 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # --- OPCSH / anything else: no specific handler ---
         return f"unhandled: no handler for activity_type {atype!r}"
 
+    # Share quantities are floats (Alpaca trades fractional stock), so lot arithmetic is
+    # compared against a tolerance rather than to 0.0 exactly. Well below any tradeable
+    # fraction, well above float noise on a 6-figure share count.
+    _SHARE_EPS = 1e-9
+
+    def _settle_called_away(self, *, held, underlying: str, contracts: float,
+                            strike: float, contract: str, activity_id: str) -> str:
+        """Take the called-away shares off ONE equity lot, SPLITTING it when the lot is
+        larger than the assignment.
+
+        THE BUG THIS EXISTS TO FIX. A covered call is written against 100 shares, but the
+        lot behind it is very often bigger (300 shares, one call). ``_close_txn`` can only
+        close a transaction WHOLE, so one assigned contract used to close all 300: 200
+        real shares, still sitting at the broker, disappeared from the ledger — invisible
+        to covered-call sizing, to every exit condition and to the P&L, while the next
+        reconcile cheerfully wrote another call over stock it could no longer see. It was
+        reported as a warning and nothing else.
+
+        THE SPLIT:
+
+          * the ORIGINAL transaction becomes the lot that LEFT — ``quantity`` = the called
+            shares, ``close_price`` = the STRIKE (an assignment transacts at the strike,
+            never at the market), ``close_reason`` = "called_away". Its ``open_price`` is
+            untouched, so the realized P&L is that of the shares that actually left
+            ($2,000 on 100 shares bought at 140 and called at 160 — not $6,000).
+          * a NEW OPENED transaction holds the remainder, carrying the original
+            ``open_price`` (cost basis), ``open_date`` (the remaining shares were acquired
+            THEN — ``DaysOpenedCondition`` reads it, and re-stamping it with "now" would
+            restart every time-based exit on an assignment that had nothing to do with
+            those shares), ``expert_id``, and ``meta_data`` — including
+            ``origin=csp_assignment``, without which the remainder stops being wheel stock
+            for ``has_assigned_shares``. It also gets its own filled entry ORDER, because
+            share counts are read off order rows and never off ``Transaction.quantity``
+            (``_held_equity_shares``, ``get_current_open_qty``,
+            ``AccountInterface.close_transaction``): a remainder with no order row is
+            invisible stock that cannot be covered-called and that a later close would
+            "sell" zero of.
+
+        OVER-ASSIGNMENT (more shares called away than this lot holds) cannot happen with a
+        correctly covered call, so it is an ERROR rather than a split, and it is handled
+        rather than assumed away: the whole lot closes, the exit order is CAPPED at what
+        the lot actually held, and the excess is named in the log. An uncapped exit order
+        would drive the transaction's order-derived quantity NEGATIVE — a phantom short
+        that ``close_transaction`` would try to buy back — and a blind ``held - called``
+        remainder would be a negative-quantity OPEN position.
+
+        NOT ADDRESSED HERE (pre-existing, and unchanged by the split): any protective
+        TP/SL orders still working against the lot are left armed at the broker when the
+        transaction closes, and the remainder is deliberately given no TP/SL of its own
+        rather than a price with no order behind it. An assignment-origin lot never has
+        them (``_record_assignment_equity_order`` mints only the entry), but a lot bought
+        outright — which ``_find_open_equity_long`` will fall back to — can.
+
+        Returns the audit string recorded on the ``OptionActivity`` row.
+        """
+        called_qty = 100.0 * float(contracts)
+        held_qty = abs(float(held.quantity or 0.0))
+        eps = self._SHARE_EPS
+
+        if held_qty <= eps:
+            # A lot with no size is already broken; do not invent one. Close it and record
+            # the assignment at its true size.
+            logger.error(
+                f"[Account {self.id}] Called-away on {underlying}: transaction {held.id} "
+                f"is OPENED with quantity {held.quantity!r}; closing it and recording the "
+                f"{called_qty:g}-share exit as reported by the broker.")
+            exit_qty, remainder_qty = called_qty, 0.0
+        elif called_qty - held_qty > eps:
+            logger.error(
+                f"[Account {self.id}] Called-away OVER-ASSIGNMENT on {underlying}: "
+                f"{called_qty:g} shares assigned away but transaction {held.id} holds only "
+                f"{held_qty:g}. Closing the whole lot and recording an exit of {held_qty:g}; "
+                f"the excess {called_qty - held_qty:g} shares belong to no lot this account "
+                f"knows about and are NOT recorded.")
+            exit_qty, remainder_qty = held_qty, 0.0
+        else:
+            exit_qty = called_qty
+            remainder_qty = held_qty - called_qty
+            if remainder_qty <= eps:
+                remainder_qty = 0.0
+
+        remainder_id = None
+        if remainder_qty > 0.0:
+            remainder_id = self._open_called_away_remainder(
+                held=held, underlying=underlying, remainder_qty=remainder_qty,
+                exit_qty=exit_qty, contract=contract, activity_id=activity_id)
+            # The original row now describes ONLY the shares that left. Persisted by the
+            # _close_txn below (update_instance writes the whole object).
+            held.quantity = exit_qty
+            meta = dict(held.meta_data) if isinstance(held.meta_data, dict) else {}
+            meta["called_away_split"] = {
+                "original_quantity": held_qty,
+                "shares_called_away": exit_qty,
+                "shares_remaining": remainder_qty,
+                "remainder_transaction_id": remainder_id,
+                "activity_id": activity_id,
+            }
+            held.meta_data = meta
+
+        # Mirror of the CSP entry: the shares LEFT the book, so the closing order row must
+        # exist too or the transaction is a filled BUY with no matching SELL.
+        self._record_assignment_equity_order(
+            transaction_id=held.id, symbol=underlying, side=OrderDirection.SELL,
+            shares=exit_qty, price=strike, contract=contract, activity_id=activity_id,
+            created_at=datetime.now(timezone.utc), origin="called_away")
+        self._close_txn(held, close_reason="called_away", close_price=strike)
+
+        if remainder_id is not None:
+            return (f"called_away: {exit_qty:g} of {held_qty:g} {underlying} left at "
+                    f"{strike} (transaction {held.id} closed); {remainder_qty:g} shares "
+                    f"stay open as transaction {remainder_id}; closed short call txn")
+        return (f"called_away: closed equity long {underlying} @ {strike}; "
+                f"closed short call txn")
+
+    def _open_called_away_remainder(self, *, held, underlying: str, remainder_qty: float,
+                                    exit_qty: float, contract: str,
+                                    activity_id: str) -> "Optional[int]":
+        """Open the transaction that holds the shares a partial called-away LEFT BEHIND.
+
+        It is the same position as before, only smaller: same symbol, side, cost basis,
+        open date, expert and provenance (see ``_settle_called_away`` for why each of
+        those matters). ``meta_data`` is copied to a NEW dict — mutating the original's in
+        place would not mark it dirty for SQLAlchemy, and both rows must keep their own.
+
+        Its entry ORDER is minted the same way an assignment's is (EXTERNAL, no
+        ``broker_order_id``, FILLED, priced at the ORIGINAL basis rather than the strike)
+        because the shares are only countable through an order row. ``created_at`` is the
+        lot's own ``open_date``: this row stands in for the part of the original purchase
+        that is still held, so ``DaysOpenedCondition``'s order-level fallback lands on the
+        same date as the transaction's ``open_date``.
+        """
+        from ...core.types import TransactionStatus
+
+        meta = dict(held.meta_data) if isinstance(held.meta_data, dict) else {}
+        meta["split_from_transaction_id"] = held.id
+        meta["split_reason"] = "called_away"
+        meta["split_activity_id"] = activity_id
+
+        remainder_id = add_instance(Transaction(
+            symbol=held.symbol,
+            quantity=remainder_qty,
+            side=held.side,
+            open_price=held.open_price,
+            status=TransactionStatus.OPENED,
+            open_date=held.open_date,
+            expert_id=held.expert_id,
+            asset_class=held.asset_class,
+            multiplier=held.multiplier,
+            close_reason=None,
+            meta_data=meta,
+        ))
+        entry_id = self._record_assignment_equity_order(
+            transaction_id=remainder_id, symbol=underlying, side=OrderDirection.BUY,
+            shares=remainder_qty, price=held.open_price, contract=contract,
+            activity_id=activity_id,
+            created_at=(held.open_date or datetime.now(timezone.utc)),
+            origin="called_away_remainder",
+            comment=(f"called_away_remainder: {remainder_qty:g} of {held.symbol} kept "
+                     f"after {exit_qty:g} were called away by {contract} (broker activity "
+                     f"{activity_id}) — the un-called part of transaction {held.id}, "
+                     f"synthetic fill, no broker order exists"))
+        if entry_id is None:
+            # Without the order row the remaining shares exist only as a Transaction, and
+            # every share count in the platform reads orders. Say so: the split is still
+            # better than erasing them, but the lot is not fully visible.
+            logger.error(
+                f"[Account {self.id}] Called-away remainder transaction {remainder_id} "
+                f"({remainder_qty:g} {held.symbol}) has NO entry order; those shares are "
+                f"invisible to covered-call sizing and to close_transaction until it is "
+                f"repaired.")
+        logger.info(
+            f"[Account {self.id}] Called-away split on {held.symbol}: transaction "
+            f"{held.id} closes with {exit_qty:g} shares; {remainder_qty:g} shares stay "
+            f"open as transaction {remainder_id} (basis {held.open_price}, opened "
+            f"{held.open_date}).")
+        return remainder_id
+
+    def _record_assignment_equity_order(self, *, transaction_id, symbol: str, side,
+                                        shares: float, price, contract: str,
+                                        activity_id: str, created_at, origin: str,
+                                        comment: "Optional[str]" = None) -> "Optional[int]":
+        """Persist the equity ``TradingOrder`` that an option ASSIGNMENT produced.
+
+        WHY THIS ROW MUST EXIST. Almost nothing in the platform reads share counts off
+        ``Transaction``; the order rows are the ledger of what actually executed:
+
+          * ``_OptionEntryAction._held_equity_shares`` (TradeActions) sums ``filled_qty``
+            over the non-option orders of the expert's OPENED transactions — the ONLY
+            input to covered-call / protective-put sizing. Assigned stock with no order
+            row sizes to 0 contracts, so the wheel's second leg never gets written.
+          * ``TradeManager``'s open-positions pass resolves ``existing_order`` as the
+            oldest FILLED order on the transaction matching its side, and hands it to
+            every condition. With no such order ``DaysOpenedCondition`` /
+            ``ProfitLossAmountCondition`` / ``ProfitLossPercentCondition`` all return
+            False unconditionally, and ``CloseAction`` falls through to its legacy
+            broker-position branch, whose order is NOT linked to the transaction — so
+            ``has_pending_closing_order`` never sees it and a close is re-submitted every
+            cycle.
+
+        HONESTY. This is book-keeping for something the OCC did TO us, not a trade we
+        placed, and the row says so rather than impersonating a fill:
+
+          * ``open_type = EXTERNAL`` — the platform did not originate this order (every
+            order the platform places is AUTOMATIC, every one a human places is MANUAL).
+          * ``broker_order_id = None`` — there is no broker order to point at. Minting an
+            id would risk colliding with a real one and would make ``refresh_orders``
+            try to reconcile a row the broker has never heard of; left None the row is
+            simply invisible to broker reconciliation, which is exactly right.
+          * ``open_price = price`` — the STRIKE. An assignment transacts stock at the
+            strike, never at the market, and the transaction's cost basis must agree
+            (``refresh_transactions`` re-derives ``open_price`` from the oldest filled
+            entry order, so a wrong value here would silently rewrite the basis).
+          * ``filled_qty = quantity = shares`` and ``status = FILLED`` — an assignment is
+            complete the instant it is reported; there is no working remainder.
+          * ``order_type = MARKET`` — the codebase's value for a plain position-level
+            order (as opposed to an OCO/TP/SL leg); the UI's "main orders" counters key
+            off it, and the backtest's own synthetic rows use it. No ``limit_price`` is
+            set, since no limit was ever placed.
+          * ``asset_class = EQUITY`` — set explicitly, not defaulted: the whole point of
+            the row is that these are SHARES, and ``_held_equity_shares`` skips OPTION.
+          * ``comment`` names the origin, the contract and the broker activity id, so the
+            row can be traced back to the activity that created it. A caller may pass its
+            own ``comment`` when "option assignment ... at strike" would be a lie — the
+            split remainder's entry order is priced at the ORIGINAL BASIS, not a strike
+            (see ``_open_called_away_remainder``); everything else about the row, and the
+            honesty invariants above, stay identical.
+
+        The closing (called-away) side additionally carries ``depends_on_order`` = the
+        transaction's entry order, so it can never be mistaken for the entry by the
+        oldest-first resolution in ``TradeManager`` / ``has_pending_closing_order``.
+
+        IDEMPOTENCY is the caller's: this runs inside ``reconcile_option_assignments``'s
+        ``OptionActivity(account_id, activity_id)`` guard, so a repeated 7-day-lookback
+        batch never reaches here twice for the same activity.
+
+        Returns the new order id, or None if the insert failed (logged, never raised —
+        one bad row must not abort the reconcile batch).
+        """
+        from ...core.types import AssetClass
+
+        depends_on = None
+        if side == OrderDirection.SELL and transaction_id is not None:
+            depends_on = self._entry_order_id_for_transaction(transaction_id)
+
+        try:
+            return add_instance(TradingOrder(
+                account_id=self.id,
+                symbol=symbol,
+                quantity=abs(float(shares)),
+                filled_qty=abs(float(shares)),
+                side=side,
+                order_type=CoreOrderType.MARKET,
+                status=OrderStatus.FILLED,
+                # A lot whose basis was never recorded keeps a NULL price rather than
+                # borrowing the strike: an invented basis is fabricated P&L on every
+                # report thereafter, and the shares still need to be countable.
+                open_price=(float(price) if price is not None else None),
+                transaction_id=transaction_id,
+                depends_on_order=depends_on,
+                asset_class=AssetClass.EQUITY,
+                open_type=OrderOpenType.EXTERNAL,
+                broker_order_id=None,
+                comment=(comment if comment is not None else
+                         f"{origin}: option assignment of {contract} at strike "
+                         f"{price} (broker activity {activity_id}) — synthetic fill, "
+                         f"no broker order exists"),
+                created_at=created_at,
+            ))
+        except Exception as e:
+            logger.error(
+                f"[Account {self.id}] Failed to record {origin} equity order for "
+                f"{symbol} (activity {activity_id}): {e}", exc_info=True)
+            return None
+
+    def _entry_order_id_for_transaction(self, transaction_id: int) -> "Optional[int]":
+        """Id of the transaction's oldest entry-level order (``depends_on_order IS NULL``)."""
+        with get_db() as session:
+            stmt = (
+                select(TradingOrder)
+                .where(TradingOrder.transaction_id == transaction_id)
+                .where(TradingOrder.depends_on_order.is_(None))
+                .order_by(TradingOrder.created_at.asc(), TradingOrder.id.asc())
+            )
+            row = session.exec(stmt).first()
+            return row.id if row is not None else None
+
     def _find_open_equity_long(self, underlying: str, expert_id):
-        """Find an OPENED equity LONG (side BUY) Transaction for the underlying.
+        """Find the OPENED equity LONG (side BUY) Transaction a short call was written on.
 
         When ``expert_id`` is known (the usual case - the short call was written
         by an expert) the search is RESTRICTED to that expert's transactions:
@@ -6239,8 +6727,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         the only scoping that prevents closing another account's/expert's long.
         Only when the option was unattributed (``expert_id`` is None) do we fall
         back to the most recent unattributed open long. Returns None if none.
+
+        Among that expert's candidates an ASSIGNMENT-ORIGIN long
+        (``meta_data.origin == "csp_assignment"``) wins over a plain one, newest first.
+        On a wheel the called-away shares ARE the ones the assigned put put to us, and
+        the same expert can perfectly well hold stock it bought outright in the same
+        name; "most recent open BUY" alone would close that unrelated position instead,
+        destroying its cost basis and leaving the assigned lot on the books forever.
+        Provenance is the only signal available here — quantity does not disambiguate
+        (both lots are round hundreds) and there is no lot linkage on the contract.
         """
-        from ...core.types import OrderDirection, TransactionStatus
+        from ...core.types import OrderDirection, TransactionStatus, TXN_ORIGIN_CSP_ASSIGNMENT
         with get_db() as session:
             stmt = (
                 select(Transaction)
@@ -6253,7 +6750,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 stmt = stmt.where(Transaction.expert_id == expert_id)
             else:
                 stmt = stmt.where(Transaction.expert_id.is_(None))
-            return session.exec(stmt).first()
+            candidates = session.exec(stmt).all()
+            if not candidates:
+                return None
+            for txn in candidates:
+                if (isinstance(txn.meta_data, dict)
+                        and txn.meta_data.get("origin") == TXN_ORIGIN_CSP_ASSIGNMENT):
+                    return txn
+            return candidates[0]
 
     def _close_txn(self, txn, close_reason: str, close_price=None) -> None:
         """Close a Transaction (set CLOSED + reason + optional close_price + date)

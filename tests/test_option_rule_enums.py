@@ -24,6 +24,7 @@ def test_new_action_enum_values():
     assert ExpertActionType.BUY_PROTECTIVE_PUT.value == "buy_protective_put"
     assert ExpertActionType.SELL_CASH_SECURED_PUT.value == "sell_cash_secured_put"
     assert ExpertActionType.OPEN_BEAR_CALL_SPREAD.value == "open_bear_call_spread"
+    assert ExpertActionType.OPEN_BULL_PUT_SPREAD.value == "open_bull_put_spread"
     assert ExpertActionType.OPEN_STRADDLE.value == "open_straddle"
     assert ExpertActionType.OPEN_STRANGLE.value == "open_strangle"
     assert ExpertActionType.CLOSE_OPTION.value == "close_option"
@@ -41,6 +42,7 @@ def test_option_action_classifier():
     for a in ("buy_call", "open_bull_call_spread", "sell_covered_call",
               "buy_put", "open_bear_put_spread", "buy_protective_put",
               "sell_cash_secured_put", "open_bear_call_spread",
+              "open_bull_put_spread",
               "open_straddle", "open_strangle", "close_option"):
         assert a in vals
         assert is_option_action(a)

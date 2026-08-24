@@ -98,7 +98,15 @@ def recompute_curves(
     axis = pd.to_datetime([p["date"] for p in equity_curve], utc=True)
     axis_i8 = axis.asi8  # int64 UTC-ns, ascending — for searchsorted
     interval = _interval_token([d.to_pydatetime() for d in axis[: min(len(axis), 400)]])
-    initial = float(initial_capital or 0.0) or 10000.0
+    # No fabricated capital base. ``float(initial_capital or 0.0) or 10000.0`` quietly
+    # substituted a $10,000 book for a missing/zero one, and EVERY percentage this function
+    # returns (total_return / annualized_return / calmar, all derived from ``initial``) would
+    # then be measured against capital the run never had -- a wrong answer that looks right.
+    if initial_capital is None or float(initial_capital) <= 0:
+        raise ValueError(
+            f"backtest has no usable initial_capital to recompute against: {initial_capital!r}"
+        )
+    initial = float(initial_capital)
 
     nlv = np.full(len(axis), float(initial), dtype="float64")
     close_cache: Dict[str, Any] = {}

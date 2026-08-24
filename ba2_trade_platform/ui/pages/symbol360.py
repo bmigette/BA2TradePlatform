@@ -33,6 +33,9 @@ from ..components.symbol_chart_data import build_chart_data
 # DeterministicScorer.data has no in-tree shim (package-only helper, like
 # symbol_snapshot below) -- reached directly, same convention Task 9/10 used.
 from ba2_experts.DeterministicScorer.data import fetch_price_targets
+from ba2_common.core.interfaces.ExpertDataExportInterface import (
+    DETAIL_TOOLTIP_STYLE, plan_metric_detail,
+)
 from ba2_providers.symbol_snapshot import (
     fetch_profile, fetch_quote, rvol_from_quote, weinstein_from_closes,
 )
@@ -518,6 +521,14 @@ class Symbol360Tab:
                     if export.skipped:
                         ui.icon("skip_next", color="orange").tooltip("Skipped")
                     _signal_badge(export.overall_signal)
+                    if export.signal_unavailable_reason:
+                        # No badge: the expert declared its signal is a fixed
+                        # constant, not a verdict on this symbol (see
+                        # EXPORT_SIGNAL_UNAVAILABLE_REASON). Say why, rather
+                        # than leaving a silent gap where a badge used to be.
+                        ui.label(f"no per-symbol signal — "
+                                 f"{export.signal_unavailable_reason}").classes(
+                            "text-xs").style("color: #a0aec0;")
             if export is None:
                 ui.label("Failed to load").classes("text-sm text-red-400")
                 return
@@ -527,15 +538,54 @@ class Symbol360Tab:
             if export.confidence is not None:
                 ui.label(f"Confidence: {export.confidence:.1f}%").classes("text-xs").style(
                     "color: #a0aec0;")
+            elif export.confidence_unavailable_reason:
+                # The expert declared it never computes one (see
+                # EXPORT_CONFIDENCE_UNAVAILABLE_REASON). Printing "0.0%" here --
+                # what the placeholder in its Recommendation would produce --
+                # asserts zero conviction, which it never said.
+                ui.label(f"Confidence: n/a — {export.confidence_unavailable_reason}").classes(
+                    "text-xs").style("color: #a0aec0;")
             for m in export.metrics:
+                layout = plan_metric_detail(m)
                 with ui.row().classes("w-full items-center gap-2"):
                     if m.signal:
                         ui.badge("", color=_SIGNAL_COLOR.get(m.signal, "grey")).classes("w-3 h-3 p-0")
                     ui.label(m.label).classes("text-sm font-medium").style("min-width: 12rem;")
                     ui.label(m.display).classes("text-sm")
-                    if m.detail:
-                        ui.icon("info", size="xs").tooltip(m.detail).classes("text-xs")
+                    if layout.mode == "tooltip":
+                        # ui.icon(...).tooltip(text) gives a q-tooltip with NO width
+                        # bound; nest an explicit ui.tooltip so the shared wrapping /
+                        # max-width style can be applied to it.
+                        with ui.icon("info", size="xs").classes("text-xs"):
+                            ui.tooltip(layout.text).style(DETAIL_TOOLTIP_STYLE)
+                if layout.mode == "panel":
+                    self._render_detail_panel(layout)
             self._render_settings_expander(export)
+
+    @staticmethod
+    def _render_detail_panel(layout) -> None:
+        """A metric's evidence, in a collapsed expander instead of a tooltip.
+
+        A multi-step derivation is not tooltip content: hover text is HTML, so
+        its newlines collapse into one unreadable line that cannot be scrolled,
+        selected or copied (the FMPRating card's reported defect). Structured
+        (label, value) evidence is drawn as a small two-column table; the
+        step-by-step text keeps its line breaks via `white-space: pre-wrap`.
+        Which detail lands here is decided by the pure `plan_metric_detail`."""
+        with ui.expansion(layout.title).classes("w-full"):
+            if layout.table:
+                ui.table(
+                    columns=[
+                        {"name": "k", "label": "", "field": "k", "align": "left"},
+                        {"name": "v", "label": "", "field": "v", "align": "right"},
+                    ],
+                    rows=[{"id": i, "k": k, "v": v} for i, (k, v) in enumerate(layout.table)],
+                    row_key="id",
+                ).props("dense flat hide-header").classes("w-full dark-pagination")
+            if layout.text:
+                ui.label(layout.text).classes("text-xs").style(
+                    "white-space: pre-wrap; font-family: ui-monospace, monospace; "
+                    "color: #cbd5e0;")
 
     def _render_settings_expander(self, export: ExpertDataExport) -> None:
         """Collapsed '⚙ Settings' expander pre-filled from settings_used,

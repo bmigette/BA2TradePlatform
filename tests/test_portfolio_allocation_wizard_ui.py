@@ -1014,6 +1014,11 @@ def _income_events():
     ]
 
 
+def _income_table(root):
+    from nicegui import ui
+    return next(el for el in root.descendants() if isinstance(el, ui.table))
+
+
 def test_the_income_panel_draws_every_event_with_what_is_left(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
@@ -1021,12 +1026,15 @@ def test_the_income_panel_draws_every_event_with_what_is_left(nicegui_client):
         wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
                                 on_sync=lambda: None, on_invest=lambda amount: None)
         texts = _rendered_texts(nicegui_client.layout)
+        rows = _income_table(nicegui_client.layout).rows
 
-    assert "DIVIDEND" in texts and "DEPOSIT" in texts
-    assert "2026-05-10" in texts and "2026-05-01" in texts
-    assert "42.50" in texts and "5,000.00" in texts
+    # The rows live in a ``ui.table`` now, so they are DATA rather than labels; the
+    # money is a raw float there and Quasar's ``format`` puts the separators in.
+    assert {r["event_type"] for r in rows} == {"DIVIDEND", "DEPOSIT"}
+    assert {r["event_date"] for r in rows} == {"2026-05-10", "2026-05-01"}
+    assert {r["amount"] for r in rows} == {42.5, 5_000.0}
     # What is LEFT, not what arrived: the deposit is 5,000 with 1,500 open.
-    assert "1,500.00" in texts
+    assert {r["open_amount"] for r in rows} == {42.5, 1_500.0}
     assert any("1,542.50" in t for t in texts)
 
 
@@ -1038,11 +1046,10 @@ def test_the_income_panel_shows_a_dash_for_an_event_with_no_payer_symbol(nicegui
     with nicegui_client:
         wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
                                 on_sync=lambda: None, on_invest=lambda a: None)
-        texts = _rendered_texts(nicegui_client.layout)
+        rows = _income_table(nicegui_client.layout).rows
 
-    assert "AAPL" in texts
-    assert "-" in texts
-    assert "None" not in texts
+    assert [r["symbol"] for r in rows] == ["AAPL", "-"]
+    assert None not in {r["symbol"] for r in rows}
 
 
 def test_the_income_panel_says_so_when_there_is_no_income(nicegui_client):
@@ -3205,3 +3212,183 @@ def test_a_labels_percentage_is_money_weighted_not_a_mean_of_its_symbols(nicegui
 
     assert '+1,000.00 (+10.00%)' in drawn[0], drawn[0]
     assert '50.00%' not in drawn[0], drawn[0]
+
+
+# ---------------------------------------------------------------------------
+# The income panel is a REAL table now
+#
+# "This table is ugly, make it similar to others." It was hand-rolled out of
+# ``ui.row()`` + ``ui.label()`` with hardcoded widths (``w-28``, ``w-24``, ...)
+# while every other table on this page is a ``ui.table`` with
+# ``.classes('w-full dark-pagination')`` -- so it had no shared header treatment,
+# no alignment, no sorting and no pagination. Presentation only: the panel lists
+# exactly the events it always did.
+# ---------------------------------------------------------------------------
+
+def test_the_income_panel_is_a_real_table(nicegui_client):
+    from nicegui import ui
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        tables = [el for el in nicegui_client.layout.descendants()
+                  if isinstance(el, ui.table)]
+
+    assert len(tables) == 1
+
+
+def test_the_income_table_is_styled_like_every_other_table_on_this_page(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        table = _income_table(nicegui_client.layout)
+
+    assert 'w-full' in table._classes
+    assert 'dark-pagination' in table._classes
+
+
+def test_the_income_table_has_the_five_columns_it_always_showed(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        table = _income_table(nicegui_client.layout)
+
+    assert [c['label'] for c in table.columns] == ['Date', 'Type', 'Symbol',
+                                                   'Amount', 'Open']
+
+
+def test_the_income_tables_money_columns_are_right_aligned(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        table = _income_table(nicegui_client.layout)
+
+    by_name = {c['name']: c for c in table.columns}
+    assert by_name['amount']['align'] == 'right'
+    assert by_name['open_amount']['align'] == 'right'
+    assert by_name['event_date']['align'] == 'left'
+
+
+def test_the_income_table_sorts_on_the_RAW_number_and_formats_for_display(
+        nicegui_client):
+    """Pre-formatting "5,000.00" into the row would sort it as a STRING, putting
+    5,000.00 before 42.50. The number stays a number and Quasar's ``format``
+    renders it -- which is also how ``{:,.2f}`` survives the conversion."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        table = _income_table(nicegui_client.layout)
+
+    by_name = {c['name']: c for c in table.columns}
+    assert by_name['amount']['sortable'] is True
+    assert table.rows[0]['amount'] == 42.5
+    assert isinstance(table.rows[1]['amount'], float)
+    assert 'minimumFractionDigits: 2' in by_name['amount'][':format']
+    assert 'minimumFractionDigits: 2' in by_name['open_amount'][':format']
+
+
+def test_the_income_table_lists_exactly_the_events_it_was_given(nicegui_client):
+    """Presentation only -- the panel must not start filtering.
+
+    A FULLY CONSUMED event is in the fixture on purpose: it is the one a "only show
+    what is still open" filter would swallow, and it is exactly the row the user
+    looks for when asking where last week's dividend went. A mutation adding
+    ``if event['open_amount']`` to the comprehension survived a fixture without one.
+    """
+    from datetime import date
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    events = _income_events() + [
+        {"id": 3, "external_id": "div-2", "event_date": date(2026, 4, 28),
+         "event_type": "DIVIDEND", "symbol": "MSFT", "amount": 18.0,
+         "open_amount": 0.0},
+    ]
+    with nicegui_client:
+        wiz.render_income_panel(events, 1_542.5, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        table = _income_table(nicegui_client.layout)
+
+    assert [r['external_id'] for r in table.rows] == ['div-1', 'csd-1', 'div-2']
+    assert [r['open_amount'] for r in table.rows] == [42.5, 1_500.0, 0.0]
+
+
+def test_the_income_table_still_shows_a_dash_for_an_event_with_no_payer_symbol(
+        nicegui_client):
+    """A deposit has no symbol, and a bare ``None`` in a table cell renders empty
+    -- which reads as "we do not know" rather than "there is none"."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        table = _income_table(nicegui_client.layout)
+
+    assert [r['symbol'] for r in table.rows] == ['AAPL', '-']
+
+
+def test_the_income_table_renders_the_date_as_text_not_a_date_object(nicegui_client):
+    """``date`` is not JSON-serialisable, and NiceGUI sends the rows to the browser
+    as JSON -- the hand-rolled version got away with it because it called ``str()``."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        table = _income_table(nicegui_client.layout)
+
+    assert [r['event_date'] for r in table.rows] == ['2026-05-10', '2026-05-01']
+    assert all(isinstance(r['event_date'], str) for r in table.rows)
+
+
+def test_the_income_panel_header_row_is_untouched(nicegui_client):
+    """The title, the green unallocated total, Refresh and Invest stay exactly as
+    they were: this change was about the table underneath them."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert 'Income (last 30 days)' in texts
+    assert any('Unallocated: 1,542.50' in t for t in texts)
+    assert 'Refresh' in texts and 'Invest' in texts
+
+
+def test_an_empty_income_panel_draws_no_table_at_all(nicegui_client):
+    from nicegui import ui
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel([], 0.0, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        tables = [el for el in nicegui_client.layout.descendants()
+                  if isinstance(el, ui.table)]
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert tables == []
+    assert any('No deposits or dividends' in t for t in texts)
+
+
+def test_the_income_table_is_keyed_on_the_brokers_idempotency_key(nicegui_client):
+    """``row_key`` is Quasar's ``:key``. Keyed on anything that repeats -- the type,
+    the date -- rows collapse into one another on a re-render."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        table = _income_table(nicegui_client.layout)
+
+    assert table.row_key == 'external_id'
+    keys = [r[table.row_key] for r in table.rows]
+    assert len(set(keys)) == len(keys)

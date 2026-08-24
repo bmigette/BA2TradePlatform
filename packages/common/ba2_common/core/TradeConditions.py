@@ -7,7 +7,7 @@ that can be used in rulesets and automated trading decisions.
 
 from abc import ABC, abstractmethod
 from typing import List, Optional, Any, Dict
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, time as _time, timezone, timedelta
 import operator
 
 from ba2_common.core.interfaces import AccountInterface
@@ -30,6 +30,13 @@ from ba2_common.core.portfolio_allocation import PositionFetchFailed
 # then any data-driven condition raises a loud, explicit error rather than
 # silently importing a provider package.
 _provider_resolver = None
+
+#: Returned by ``TradeCondition._simulated_as_of_date`` when the account ADVERTISES a
+#: simulated clock (``_as_of_date``) that could not be read. Deliberately distinct from
+#: ``None``, which means "live — there is no simulated clock and the wall clock is correct".
+#: Collapsing the two would let a broken backtest clock silently degrade into wall-clock
+#: reads, which is the lookahead this sentinel exists to prevent.
+AS_OF_UNAVAILABLE = object()
 
 
 def set_provider_resolver(fn):
@@ -215,7 +222,7 @@ class TradeCondition(ABC):
     def get_current_price(self) -> Optional[float]:
         """
         Get current market price for the instrument.
-        
+
         Returns:
             Current price or None if unavailable
         """
@@ -225,7 +232,90 @@ class TradeCondition(ABC):
             absorb_if_benign(e)
             logger.error(f"Error getting current price: {e}", exc_info=True)
             return None
-    
+
+    # --- the evaluation clock -------------------------------------------------------
+    # A condition that reads the WALL CLOCK in a backtest does not merely lose accuracy,
+    # it fabricates signal: the simulated bar can be years before ``date.today()``, and a
+    # historical fetch left unclamped returns the whole run window, so a "recent high" or
+    # a "days to earnings" is computed from the simulated FUTURE. Both helpers below are
+    # duck-typed on the account exactly as ``TradeActions._today()`` is, so LIVE behaviour
+    # is byte-identical (no ``_as_of_date`` -> nothing changes).
+
+    def _simulated_as_of_date(self) -> Any:
+        """The BACKTEST bar's calendar date, ``None`` in live, or ``AS_OF_UNAVAILABLE``.
+
+        ``BacktestAccount`` exposes its simulated bar via ``_as_of_date()``; a live account
+        has no such attribute and its wall clock IS the right answer.
+
+        Unlike ``TradeActions._today()`` this deliberately does NOT fall back to
+        ``date.today()`` when the accessor exists but fails or returns None. For an action
+        the wall clock is a degraded answer; for a CONDITION it is the lookahead bug itself,
+        so the caller must treat the condition as unevaluable rather than measure against a
+        date the simulation never reached.
+        """
+        accessor = getattr(self.account, "_as_of_date", None)
+        if not callable(accessor):
+            return None  # live: no simulated clock
+        try:
+            as_of = accessor()
+        except Exception as e:  # noqa: BLE001 — a broken sim clock must not read as "live"
+            # Deliberately NOT absorb_if_benign: this is not error absorption, it is a
+            # measurement that failed, translated into the tri-state result the callers
+            # already handle — the same discipline as DaysToExpiryCondition._resolve_expiry
+            # returning (None, reason). Re-raising here would escape evaluate()'s own
+            # absorb_if_benign in strict mode and abort the WHOLE rule evaluation for the
+            # bar, taking every other gate with it, to report one unreadable clock.
+            logger.error(
+                f"Simulated clock (_as_of_date) failed for {self.instrument_name}; refusing "
+                f"to substitute the wall clock: {e}", exc_info=True)
+            return AS_OF_UNAVAILABLE
+        if as_of is None:
+            logger.error(
+                f"Simulated clock (_as_of_date) returned None for {self.instrument_name}; "
+                f"refusing to substitute the wall clock")
+            return AS_OF_UNAVAILABLE
+        return as_of.date() if isinstance(as_of, datetime) else as_of
+
+    def _as_of_fetch_end(self):
+        """``(end_date, ok)`` — the as-of ceiling for a historical market-data fetch.
+
+        ``end_date`` is ``None`` in LIVE. That is not laziness: ``end_date=None`` is the
+        spelling ``MarketDataProviderInterface._is_latest_request`` recognises as "give me
+        the latest", which is what permits the parquet cache top-up. Passing an explicit
+        end-of-day stamp instead would suppress the top-up whenever the local date is behind
+        UTC (US evenings), so live keeps the exact call it makes today.
+
+        In a BACKTEST it is the END of the simulated bar's day, so the bar itself is included
+        whatever time of day its rows are stamped, and nothing after it can be.
+
+        ``ok`` is False only when a simulated clock exists and could not be read — the caller
+        must then not fetch at all.
+        """
+        as_of = self._simulated_as_of_date()
+        if as_of is AS_OF_UNAVAILABLE:
+            return None, False
+        if as_of is None:
+            return None, True
+        return datetime.combine(as_of, _time.max, tzinfo=timezone.utc), True
+
+    def _evaluation_date(self) -> Optional[date]:
+        """The condition's "today" as a concrete ``date``, or ``None`` when unmeasurable.
+
+        The simulated bar in a backtest, ``date.today()`` in live. ``None`` only when the
+        account advertises a simulated clock that could not be read — in which case the
+        caller must report the condition UNEVALUABLE rather than measure a duration against
+        a date the simulation never reached.
+
+        Use this (not ``date.today()``) for anything that counts days: in a backtest the
+        wall clock is not "now", it is years after the last bar, so a wall-clock duration is
+        the same wrong number on every bar of every year.
+        """
+        as_of = self._simulated_as_of_date()
+        if as_of is AS_OF_UNAVAILABLE:
+            return None
+        return date.today() if as_of is None else as_of
+
+
     def has_expert_position(self) -> bool:
         """
         Check if this expert has an open position for this instrument by checking transactions.
@@ -1842,6 +1932,12 @@ class DaysSinceLastCloseCondition(CompareCondition):
     backtest, ≈ wall-clock in live) — NOT ``datetime.now()`` — so the value is correct under
     the backtest clock and never leaks wall time. When no qualifying close exists the value is
     a large sentinel (1e9) so a ">" cooldown passes (no prior trade -> entry allowed).
+
+    That sentinel is ONLY for a KNOWABLE "never closed". If a close exists but cannot be
+    classified — no P&L to read its profit sign from, or no ``close_date`` to age it — the
+    condition goes UNEVALUABLE (``calculated_value = None``, ``evaluate()`` False) instead.
+    Reusing 1e9 there answers "infinitely long ago" to a question nobody measured, and the
+    cooldown then never fires.
     """
 
     _profit_sign = 0  # 0=any, +1=profitable only, -1=losing only
@@ -1861,12 +1957,29 @@ class DaysSinceLastCloseCondition(CompareCondition):
             # every GA trial and the optimizer tuned a gene that did nothing. Live (SQLite) the
             # gate DID fire, so a deployed config behaved unlike its own backtest: the same
             # genome scored 103 trades / 17.55% annualised in-memory vs 169 / 0.20% on disk.
-            most_recent = get_trade_repository().last_closed_transaction(
+            from ba2_common.core.trade_repository import LAST_CLOSE_UNCLASSIFIABLE
+
+            most_recent, reason = get_trade_repository().last_closed_transaction_with_reason(
                 expert_id=expert_id, symbol=self.instrument_name,
                 profit_sign=self._profit_sign,
             )
 
             if most_recent is None:
+                if reason == LAST_CLOSE_UNCLASSIFIABLE:
+                    # "COULD NOT DETERMINE" IS NOT "NEVER CLOSED". The 1e9 sentinel says
+                    # "infinitely long ago", which makes a ">N day" cooldown pass — so a
+                    # close the repository could not classify (no close price recorded, so
+                    # no profit sign; or no close_date, so no age) silently DISABLED the
+                    # gate. The sentinel is only honest for a knowable "never". Go
+                    # unevaluable instead of inventing a measurement.
+                    logger.error(
+                        f"days-since-last-close for {self.instrument_name}: a close EXISTS "
+                        f"but cannot be classified (profit_sign={self._profit_sign}); the "
+                        f"cooldown is UNDETERMINABLE. Not using the 'never closed' sentinel "
+                        f"— that would silently pass the gate."
+                    )
+                    self.calculated_value = None
+                    return False
                 self.calculated_value = 1e9  # never closed (qualifying) -> "infinitely" long ago
                 return self.operator_func(self.calculated_value, self.value)
 
@@ -2034,10 +2147,20 @@ class PercentBelowRecentHighCondition(CompareCondition):
                 self.calculated_value = None
                 return False
 
+            # CLAMP THE FETCH TO THE EVALUATION BAR. Without end_date the backtest's
+            # MemoizedOHLCVProvider — which discards lookback_days — returns the ENTIRE
+            # [start - warmup, run end] window, so tail(RECENT_WINDOW) below was the high of
+            # the last 20 days of the whole RUN: a number out of the simulated future that
+            # fabricates dips that never happened. None in live (unchanged call).
+            end_date, clock_ok = self._as_of_fetch_end()
+            if not clock_ok:
+                self.calculated_value = None
+                return False
+
             # Resolve the OHLCV provider via the host-injected resolver
             # (ba2_common never imports ba2_providers).
             df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
-                self.instrument_name, interval="1d",
+                self.instrument_name, interval="1d", end_date=end_date,
                 lookback_days=self.RECENT_WINDOW * 2 + 10)
             if df is None or df.empty:
                 logger.warning(f"No OHLCV data for {self.instrument_name}")
@@ -2092,10 +2215,17 @@ class PercentAboveRecentLowCondition(CompareCondition):
                 self.calculated_value = None
                 return False
 
+            # CLAMP THE FETCH TO THE EVALUATION BAR — see PercentBelowRecentHighCondition.
+            # Unclamped, tail(RECENT_WINDOW) reads the last 20 bars of the whole RUN.
+            end_date, clock_ok = self._as_of_fetch_end()
+            if not clock_ok:
+                self.calculated_value = None
+                return False
+
             # Resolve the OHLCV provider via the host-injected resolver
             # (ba2_common never imports ba2_providers).
             df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
-                self.instrument_name, interval="1d",
+                self.instrument_name, interval="1d", end_date=end_date,
                 lookback_days=self.RECENT_WINDOW * 2 + 10)
             if df is None or df.empty:
                 logger.warning(f"No OHLCV data for {self.instrument_name}")
@@ -2303,25 +2433,113 @@ class IVRankCondition(CompareCondition):
 class DaysToEarningsCondition(CompareCondition):
     """Compare the number of calendar days until the underlying's next earnings.
 
-    calculated_value = (next_earnings_date - today).days. Useful for timing volatility
-    plays (e.g. buy a straddle a few days before earnings) or for AVOIDING entries that
-    would straddle an earnings event. The next-earnings date is fetched via the
-    monkeypatchable `_next_earnings_date` seam (best-effort, FMP-backed). When no
-    upcoming earnings date is available the calculated value is None and evaluate
-    returns False (the condition simply does not fire).
+    ``calculated_value = (next_earnings_date - the evaluation bar).days``. Useful for timing
+    volatility plays (e.g. buy a straddle a few days before earnings) or for AVOIDING entries
+    that would straddle an earnings event.
+
+    The clock
+    ---------
+    "Today" is ``self._evaluation_date()`` — the SIMULATED bar in a backtest, the wall clock
+    in live — never ``date.today()``. It used to be ``date.today()`` on both sides, which in
+    a backtest measured the distance from the REAL-WORLD today to the next earnings:
+    identical on every simulated bar of every year, and a live-vs-backtest divergence on a
+    documented entry gate.
+
+    The calendar
+    ------------
+    The date comes from FMP's QUARTERLY earnings calendar (``get_past_earnings``, which
+    despite its name wraps ``historical_earning_calendar``: every row carries the actual
+    announcement ``report_date`` and the endpoint also returns already-SCHEDULED future
+    prints). It used to come from ``get_earnings_estimates``, which never passes a period
+    parameter to ``/api/v3/analyst-estimates`` — that endpoint defaults to ANNUAL, so
+    ``frequency="quarterly"`` was decorative and the "next earnings" was the next fiscal
+    YEAR end. Measured against the on-disk cache, on a 2024-03-15 bar: MSFT 2024-04-25 (41d)
+    truth vs 2024-06-30 (107d) annual; AAPL 2024-05-02 (48d) vs 2024-09-27 (196d); NVDA
+    2024-05-22 (68d) vs 2025-01-25 (316d). Combined with the wall clock the gate was a
+    per-symbol CONSTANT (MSFT 310d, AAPL 34d, NVDA 154d on every bar), which is why the
+    documented ``iv_rank<=30 and days_to_earnings<=5 -> open_straddle`` rule could never fire.
+
+    The annual estimates remain as a FALLBACK for a symbol whose calendar carries no
+    scheduled future print — degraded, not absent.
+
+    Unknown is never a value: with no usable evaluation date or no upcoming earnings from
+    either source, ``calculated_value`` stays None and ``evaluate()`` returns False for every
+    operator.
     """
 
-    def _next_earnings_date(self, symbol: str):
-        """Best-effort next (future) earnings date for ``symbol``, or None.
+    #: How far past the evaluation bar to read the earnings calendar. Comfortably more than
+    #: one quarter (so a delayed print is still found) and bounded, so a stale calendar
+    #: cannot hand back a date from the far future as if it were the next one.
+    EARNINGS_HORIZON_DAYS = 200
+    #: Calendar rows to pull. The provider returns rows <= end_date newest-first, so this
+    #: only needs to span [bar, bar + horizon] plus a little history.
+    EARNINGS_CALENDAR_PERIODS = 8
 
-        Resolves the company-details provider via the host-injected provider
-        resolver (ba2_common never imports fmpsdk / ba2_providers) and reads the
-        earliest forward earnings estimate date. Isolated so tests can monkeypatch
-        it without any network I/O. Returns a ``datetime.date`` or None (best
-        effort: any failure, missing provider, or missing data yields None and the
-        condition simply does not fire).
+    @staticmethod
+    def _parse_day(value):
+        """A ``date`` from a 'YYYY-MM-DD' string / date / datetime, or None."""
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if not value:
+            return None
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return None
+
+    def _next_scheduled_report(self, provider, symbol: str, as_of: date):
+        """Earliest quarterly report date on or after ``as_of`` from the earnings CALENDAR.
+
+        Earnings day itself counts as 0 days away, so the bound is inclusive.
         """
-        from datetime import date as _date
+        horizon = datetime.combine(as_of + timedelta(days=self.EARNINGS_HORIZON_DAYS),
+                                   _time.max, tzinfo=timezone.utc)
+        result = provider.get_past_earnings(
+            symbol, frequency="quarterly", end_date=horizon,
+            lookback_periods=self.EARNINGS_CALENDAR_PERIODS, format_type="dict",
+        )
+        rows = (result or {}).get("earnings") or []
+        upcoming = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            # report_date is the announcement; fiscal_date_ending is the period it covers.
+            # The gate is about the EVENT, so the announcement wins when both are present.
+            d = self._parse_day(row.get("report_date")) or \
+                self._parse_day(row.get("fiscal_date_ending"))
+            if d is not None and d >= as_of:
+                upcoming.append(d)
+        return min(upcoming) if upcoming else None
+
+    def _next_estimate_period(self, provider, symbol: str, as_of: date):
+        """Earliest forward analyst-estimate period end on or after ``as_of``. FALLBACK ONLY:
+        FMP serves these ANNUAL regardless of the frequency argument, so the answer is a
+        fiscal year end rather than an earnings date."""
+        result = provider.get_earnings_estimates(
+            symbol, frequency="quarterly",
+            as_of_date=datetime.combine(as_of, _time.min, tzinfo=timezone.utc),
+            lookback_periods=4, format_type="dict",
+        )
+        estimates = (result or {}).get("estimates") or []
+        future = []
+        for est in estimates:
+            if not isinstance(est, dict):
+                continue
+            d = self._parse_day(est.get("fiscal_date_ending"))
+            if d is not None and d >= as_of:
+                future.append(d)
+        return min(future) if future else None
+
+    def _next_earnings_date(self, symbol: str, as_of: date):
+        """Best-effort next earnings date for ``symbol`` as of ``as_of``, or None.
+
+        Resolves the company-details provider via the host-injected provider resolver
+        (ba2_common never imports fmpsdk / ba2_providers). Isolated so tests can monkeypatch
+        it without any network I/O. Best effort: any failure, missing provider or missing
+        data yields None and the condition simply does not fire.
+        """
         try:
             if get_provider_resolver() is None:
                 logger.warning(
@@ -2329,29 +2547,18 @@ class DaysToEarningsCondition(CompareCondition):
                     "cannot fetch next earnings date")
                 return None
             provider = _get_provider("fundamentals_details", "fmp")
-            # Forward analyst estimates are returned future-only, sorted ascending,
-            # each row carrying a 'fiscal_date_ending' (YYYY-MM-DD).
-            result = provider.get_earnings_estimates(
-                symbol, frequency="quarterly",
-                as_of_date=datetime.now(timezone.utc),
-                lookback_periods=4, format_type="dict",
-            )
-            estimates = (result or {}).get("estimates") or []
-            today = _date.today()
-            future = []
-            for est in estimates:
-                ds = est.get("fiscal_date_ending") if isinstance(est, dict) else None
-                if not ds:
-                    continue
-                try:
-                    d = datetime.strptime(ds, "%Y-%m-%d").date()
-                except (ValueError, TypeError):
-                    continue
-                if d >= today:
-                    future.append(d)
-            if not future:
-                return None
-            return min(future)
+
+            scheduled = self._next_scheduled_report(provider, symbol, as_of)
+            if scheduled is not None:
+                return scheduled
+
+            estimated = self._next_estimate_period(provider, symbol, as_of)
+            if estimated is not None:
+                logger.info(
+                    f"No scheduled earnings report for {symbol} within "
+                    f"{self.EARNINGS_HORIZON_DAYS} days of {as_of.isoformat()}; falling back "
+                    f"to the (annual) analyst-estimate period {estimated.isoformat()}")
+            return estimated
         except Exception as e:
             absorb_if_benign(e)
             logger.error(f"Error fetching next earnings date for {symbol}: {e}", exc_info=True)
@@ -2359,15 +2566,23 @@ class DaysToEarningsCondition(CompareCondition):
 
     def evaluate(self) -> bool:
         try:
-            from datetime import date as _date
+            as_of = self._evaluation_date()
+            if as_of is None:
+                # A backtest account whose simulated clock is unreadable. Substituting
+                # date.today() here is exactly the bug this condition was fixed for.
+                logger.warning(
+                    f"days_to_earnings for {self.instrument_name} is unevaluable: no usable "
+                    f"evaluation date")
+                self.calculated_value = None
+                return False
 
-            next_earnings = self._next_earnings_date(self.instrument_name)
+            next_earnings = self._next_earnings_date(self.instrument_name, as_of)
             if next_earnings is None:
                 logger.warning(f"No upcoming earnings date for {self.instrument_name}")
                 self.calculated_value = None
                 return False
 
-            days = (next_earnings - _date.today()).days
+            days = (next_earnings - as_of).days
             self.calculated_value = days
 
             logger.info(
@@ -2390,6 +2605,221 @@ class DaysToEarningsCondition(CompareCondition):
         if self.calculated_value is None:
             return None
         return f"{int(self.calculated_value)}d"
+
+
+class DaysToExpiryCondition(CompareCondition):
+    """Calendar days of option life REMAINING: ``expiry - the evaluation date``.
+
+    The complement of ``DaysOpenedCondition``, which counts days ELAPSED. They are NOT
+    interchangeable: the grid tunes the entry DTE window as its own gene, so "21 days
+    after opening" lands on a different remaining life for every trial. Until this
+    existed, roll-at-DTE was reachable only from the hardcoded ``OptionPortfolioManager``
+    (so only ``PremiumSeller`` could roll, and the GA could not optimise the roll point
+    for anything else), and a 0DTE structure had no exit criterion at all.
+
+    Sign: positive while the structure is alive, ``0`` on the expiry date itself, and
+    NEGATIVE past it. Past-expiry is a real (and alarming) state for a still-open
+    structure; clamping it to 0 would make ``days_to_expiry > 0`` answer "still alive".
+
+    Unknown is never a value
+    ------------------------
+    Follows ``option_lifecycle``'s ``LIFECYCLE_UNKNOWN`` discipline (and its ``_dte``
+    helper specifically). When the expiry cannot be determined the condition is
+    UNEVALUABLE: ``calculated_value`` stays ``None``, ``evaluate()`` returns False for
+    EVERY operator, and ``get_actual_value_display()`` renders the REASON rather than a
+    number, so an audit row can never show a plausible DTE for a measurement we did not
+    make. The two defaults it refuses:
+
+    * ``0`` — would satisfy ``days_to_expiry <= N`` and flatten, on sight, every position
+      whose expiry we happen not to see. The worst available failure mode.
+    * ``+inf`` / a large sentinel — would make the exit permanently inert while looking
+      configured. That is precisely the dead roll-DTE gene an entire GA campaign tuned.
+
+    (A ``DaysSinceLastCloseCondition``-style ``1e9`` sentinel is right THERE — "never
+    closed" is a real, knowable fact — and wrong here: "no expiry recorded" is ignorance
+    about a structure that definitely has one.)
+
+    Where the expiry comes from
+    ---------------------------
+    Every source is consulted and they must AGREE; the union is the candidate set, the
+    same way ``option_lifecycle._dte`` builds it:
+
+    1. ``Transaction.expiry``  — the structure's declared intent.
+    2. the parent ``TradingOrder.expiry`` — NULL for every multi-leg before it started
+       being stamped, which is exactly why roll-at-DTE never fired.
+    3. the HELD legs — netted per contract over the executed option orders (BUY ``+``,
+       SELL ``-``), so a leg bought back to close stops counting and its stale expiry
+       cannot manufacture a permanent contradiction. Historical rows carry no stamp on
+       either row above, so the legs are what keeps them measurable.
+
+    Empty candidate set -> unevaluable. More than one distinct date -> unevaluable: a
+    structure whose own rows disagree about when it expires has no DTE, and picking
+    ``min()`` (closes early) or ``max()`` (never closes) would be inventing one.
+    Multi-expiry structures are refused at submit time, but pre-existing rows are not.
+    A leg with no expiry at all simply adds no information and never vetoes the legs
+    that have one.
+
+    The "today" is the recommendation's ``created_at`` — the simulated as-of bar in a
+    backtest, wall-clock in live — never ``date.today()``, so the value is deterministic
+    under a frozen clock and correct in backtest. The comparison is by DATE, so every bar
+    of one session reports the same DTE.
+    """
+
+    #: Rendered instead of a number when the measurement could not be made.
+    unknown_reason: Optional[str] = None
+
+    @staticmethod
+    def _as_date(value):
+        """A ``date`` from a ``date``/``datetime`` (mirrors ``option_lifecycle._as_date``)."""
+        if isinstance(value, datetime):
+            return value.date()
+        return value
+
+    def _as_of_date(self):
+        """The evaluation DATE, or None when there is no as-of to evaluate against."""
+        as_of = getattr(self.expert_recommendation, "created_at", None)
+        if as_of is None:
+            return None
+        return self._as_of_to_date(as_of)
+
+    @staticmethod
+    def _as_of_to_date(as_of):
+        if isinstance(as_of, datetime):
+            if as_of.tzinfo is None:
+                as_of = as_of.replace(tzinfo=timezone.utc)
+            return as_of.astimezone(timezone.utc).date()
+        return as_of
+
+    def _held_leg_expiries(self, transaction_id):
+        """Distinct expiries of the still-HELD legs of ``transaction_id``.
+
+        Netted per contract symbol over the EXECUTED option orders exactly as
+        ``_get_spread_pnl_via_transaction`` does — a contract whose signed quantity nets
+        to zero is closed and contributes nothing.
+        """
+        from ba2_common.core.trade_store import orders_where
+        from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus
+
+        if transaction_id is None:
+            return set()
+
+        executed = OrderStatus.get_executed_statuses()
+        net: Dict[str, float] = {}
+        # contract -> EVERY distinct expiry its rows carry. Deliberately not "the first
+        # one wins": an OCC symbol determines its expiry, so two different values on one
+        # contract are corrupt data, and quietly keeping whichever row was read first is
+        # the silent-default this class exists to refuse. Both land in the candidate set
+        # and the caller's contradiction check turns them into a loud unknown.
+        expiry_by_contract: Dict[str, set] = {}
+        for o in orders_where(transaction_id=transaction_id):
+            if getattr(o, "asset_class", None) != AssetClass.OPTION or not o.contract_symbol:
+                continue
+            if o.status not in executed:
+                continue
+            qty = abs(float(o.filled_qty or o.quantity or 0.0))
+            if qty <= 0:
+                continue
+            sign = 1.0 if o.side == OrderDirection.BUY else -1.0
+            net[o.contract_symbol] = net.get(o.contract_symbol, 0.0) + sign * qty
+            if o.expiry is not None:
+                expiry_by_contract.setdefault(o.contract_symbol, set()).add(
+                    self._as_date(o.expiry))
+
+        out = set()
+        for contract, qty in net.items():
+            if abs(qty) > 1e-9:
+                out |= expiry_by_contract.get(contract, set())
+        return out
+
+    def _resolve_expiry(self):
+        """(expiry, "") or (None, why it is unmeasurable). Never guesses."""
+        order = self.existing_order
+        if order is None:
+            return None, ("no open position on this evaluation — there is no option "
+                          "life to measure")
+
+        candidates = set()
+        txn_id = getattr(order, "transaction_id", None)
+        if txn_id is not None:
+            from ba2_common.core.models import Transaction
+            from ba2_common.core.trade_store import get_or_none
+            txn = get_or_none(Transaction, txn_id)
+            if txn is not None and txn.expiry is not None:
+                candidates.add(self._as_date(txn.expiry))
+
+        order_expiry = getattr(order, "expiry", None)
+        if order_expiry is not None:
+            candidates.add(self._as_date(order_expiry))
+
+        candidates |= self._held_leg_expiries(txn_id)
+
+        if not candidates:
+            return None, (f"no expiry on the transaction, the order or any held leg of "
+                          f"{self.instrument_name} — the remaining option life cannot be "
+                          f"determined")
+        if len(candidates) > 1:
+            listed = ", ".join(str(e) for e in sorted(candidates))
+            return None, (f"conflicting expiries on one {self.instrument_name} structure "
+                          f"({listed}) — its remaining life is undefined")
+        return candidates.pop(), ""
+
+    def evaluate(self) -> bool:
+        try:
+            self.calculated_value = None
+            self.unknown_reason = None
+
+            as_of = self._as_of_date()
+            if as_of is None:
+                # Substituting the wall clock here is the lookahead bug DaysOpenedCondition's
+                # docstring was written about; refusing is the only honest option.
+                self.unknown_reason = ("no evaluation date on the recommendation — "
+                                       "'days remaining' has no reference point")
+                logger.warning(f"days_to_expiry for {self.instrument_name} is unevaluable: "
+                               f"{self.unknown_reason}")
+                return False
+
+            expiry, blind = self._resolve_expiry()
+            if expiry is None:
+                self.unknown_reason = blind
+                logger.warning(f"days_to_expiry for {self.instrument_name} is unevaluable: "
+                               f"{blind}")
+                return False
+
+            days = (expiry - as_of).days
+            self.calculated_value = days
+
+            if days < 0:
+                logger.warning(
+                    f"{self.instrument_name} structure is {abs(days)} day(s) PAST its "
+                    f"expiry {expiry.isoformat()} and still open")
+            else:
+                logger.debug(f"Days to expiry for {self.instrument_name}: {days} "
+                             f"(expiry {expiry.isoformat()}, as of {as_of.isoformat()})")
+
+            return self.operator_func(days, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating days-to-expiry for {self.instrument_name}: {e}",
+                         exc_info=True)
+            self.calculated_value = None
+            self.unknown_reason = f"error computing the remaining option life: {e}"
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if days until {self.instrument_name}'s option expiry is "
+                f"{self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            reason = getattr(self, "unknown_reason", None)
+            # Never None-and-silent, and never a number: the audit row must say that this
+            # was not measured, and which input was missing.
+            return f"unknown ({reason})" if reason else None
+        days = int(self.calculated_value)
+        if days < 0:
+            return f"{days} DTE (expired {abs(days)}d ago)"
+        return f"{days} DTE"
 
 
 class HasOptionPositionCondition(FlagCondition):
@@ -2493,7 +2923,130 @@ class HasProtectivePutCondition(FlagCondition):
         return f"Protective put found: {'Yes' if has else 'No'}"
 
 
+class HasAssignedSharesCondition(FlagCondition):
+    """True when this expert holds stock it did NOT buy — the leg of an assigned short put.
+
+    ``has_buy_position`` cannot express this. It fires on ANY open equity long the expert
+    holds, so a wheel's covered-call overlay hung off it writes calls over ordinary stock
+    the same expert bought outright, capping upside on a position that was never meant to
+    be covered. That is the whole reason the assignment writes
+    ``meta_data["origin"] = "csp_assignment"`` — until this condition existed nothing read
+    it back.
+
+    Deliberately a CONDITION rather than a narrowing of
+    ``_OptionEntryAction._held_equity_shares``: coverage and eligibility are different
+    questions. A covered call written over 100 assigned + 100 bought shares is still fully
+    covered, so the SIZING input must keep counting every share whatever its provenance
+    (narrowing it would under-size genuinely covered positions — the same bug, quieter).
+    Whether the overlay should fire at all is a ruleset decision, and rulesets speak in
+    conditions. Opt-in: existing rulesets are untouched; a wheel ANDs this into its trigger.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            from ba2_common.core.trade_repository import get_trade_repository
+            from ba2_common.core.types import OrderDirection, TXN_ORIGIN_CSP_ASSIGNMENT
+
+            # Repository, never a raw select(): Transaction is an IN_MEM_MODEL, so under the
+            # backtest store a select() returns EMPTY instead of raising (see
+            # HasBuyPositionCondition).
+            open_txns = get_trade_repository().open_transactions(
+                expert_id=self.expert_recommendation.instance_id,
+                symbol=self.instrument_name, side=OrderDirection.BUY,
+            )
+            self._has = any(
+                isinstance(t.meta_data, dict)
+                and t.meta_data.get("origin") == TXN_ORIGIN_CSP_ASSIGNMENT
+                for t in open_txns
+            )
+            return self._has
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(
+                f"Error checking assigned shares for {self.instrument_name}: {e}", exc_info=True)
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if this expert holds {self.instrument_name} shares acquired by "
+                f"option assignment")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        has = getattr(self, '_has', None)
+        if has is None:
+            return None
+        return f"Assigned shares found: {'Yes' if has else 'No'}"
+
+
 # Factory function to create conditions based on event type
+
+# (from_rating, to_rating) for the six 3-bucket rating TRANSITION events, all served by
+# RatingChangeCondition. Module level (not rebuilt per call) and importable, so the
+# "every registered condition is reachable from a rule" invariant test can read the
+# REAL registry rather than a copy of it that could drift.
+RATING_CHANGE_CONDITIONS: Dict[ExpertEventType, tuple] = {
+    ExpertEventType.F_RATING_NEGATIVE_TO_NEUTRAL: (OrderRecommendation.SELL, OrderRecommendation.HOLD),
+    ExpertEventType.F_RATING_NEGATIVE_TO_POSITIVE: (OrderRecommendation.SELL, OrderRecommendation.BUY),
+    ExpertEventType.F_RATING_NEUTRAL_TO_NEGATIVE: (OrderRecommendation.HOLD, OrderRecommendation.SELL),
+    ExpertEventType.F_RATING_NEUTRAL_TO_POSITIVE: (OrderRecommendation.HOLD, OrderRecommendation.BUY),
+    ExpertEventType.F_RATING_POSITIVE_TO_NEGATIVE: (OrderRecommendation.BUY, OrderRecommendation.SELL),
+    ExpertEventType.F_RATING_POSITIVE_TO_NEUTRAL: (OrderRecommendation.BUY, OrderRecommendation.HOLD),
+}
+
+# ExpertEventType -> the TradeCondition subclass that implements it. The REGISTRY: every
+# event type a rule can name must appear here (or in RATING_CHANGE_CONDITIONS above), and
+# every entry here must have a rule_builders.FIELD_EVENT / FLAG_FIELD_EVENT mapping or a
+# rule leaf naming it is silently dropped before the engine ever sees it. That invariant is
+# enforced by tests/test_condition_registry_coverage.py.
+CONDITION_MAP: Dict[ExpertEventType, type] = {
+    ExpertEventType.F_BEARISH: BearishCondition,
+    ExpertEventType.F_BULLISH: BullishCondition,
+    ExpertEventType.F_HAS_NO_POSITION: HasNoPositionCondition,
+    ExpertEventType.F_HAS_POSITION: HasPositionCondition,
+    ExpertEventType.F_HAS_BUY_POSITION: HasBuyPositionCondition,
+    ExpertEventType.F_HAS_SELL_POSITION: HasSellPositionCondition,
+    ExpertEventType.F_HAS_NO_POSITION_ACCOUNT: HasNoPositionAccountCondition,
+    ExpertEventType.F_HAS_POSITION_ACCOUNT: HasPositionAccountCondition,
+    ExpertEventType.F_LONG_TERM: LongTermCondition,
+    ExpertEventType.F_MEDIUM_TERM: MediumTermCondition,
+    ExpertEventType.F_SHORT_TERM: ShortTermCondition,
+    ExpertEventType.F_CURRENT_RATING_POSITIVE: CurrentRatingPositiveCondition,
+    ExpertEventType.F_CURRENT_RATING_OVERWEIGHT: CurrentRatingOverweightCondition,
+    ExpertEventType.F_CURRENT_RATING_NEUTRAL: CurrentRatingNeutralCondition,
+    ExpertEventType.F_CURRENT_RATING_UNDERWEIGHT: CurrentRatingUnderweightCondition,
+    ExpertEventType.F_CURRENT_RATING_NEGATIVE: CurrentRatingNegativeCondition,
+    ExpertEventType.F_RATING_UPGRADED: RatingUpgradedCondition,
+    ExpertEventType.F_RATING_DOWNGRADED: RatingDowngradedCondition,
+    ExpertEventType.F_HIGHRISK: HighRiskCondition,
+    ExpertEventType.F_MEDIUMRISK: MediumRiskCondition,
+    ExpertEventType.F_LOWRISK: LowRiskCondition,
+    ExpertEventType.F_NEW_TARGET_HIGHER: NewTargetHigherCondition,
+    ExpertEventType.F_NEW_TARGET_LOWER: NewTargetLowerCondition,
+    ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT: ExpectedProfitTargetPercentCondition,
+    ExpertEventType.N_PERCENT_TO_CURRENT_TARGET: PercentToCurrentTargetCondition,
+    ExpertEventType.N_PERCENT_TO_NEW_TARGET: PercentToNewTargetCondition,
+    ExpertEventType.N_NEW_TARGET_PERCENT: NewTargetPercentCondition,
+    ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
+    ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
+    ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
+    ExpertEventType.N_DAYS_SINCE_LAST_CLOSE: DaysSinceLastCloseCondition,
+    ExpertEventType.N_DAYS_SINCE_LAST_PROFITABLE_CLOSE: DaysSinceLastProfitableCloseCondition,
+    ExpertEventType.N_DAYS_SINCE_LAST_LOSING_CLOSE: DaysSinceLastLosingCloseCondition,
+    ExpertEventType.N_CONFIDENCE: ConfidenceCondition,
+    ExpertEventType.N_PRICE_VS_TARGET_LOW_PERCENT: PriceVsTargetLowCondition,
+    ExpertEventType.N_PRICE_VS_TARGET_HIGH_PERCENT: PriceVsTargetHighCondition,
+    ExpertEventType.N_PRICE_VS_TARGET_CONSENSUS_PERCENT: PriceVsTargetConsensusCondition,
+    ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE: InstrumentAccountShareCondition,
+    ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET: PercentOpenToNewTargetCondition,
+    ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH: PercentBelowRecentHighCondition,
+    ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW: PercentAboveRecentLowCondition,
+    ExpertEventType.N_IV_RANK: IVRankCondition,
+    ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
+    ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
+    ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
+    ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
+    ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,
+    ExpertEventType.F_HAS_ASSIGNED_SHARES: HasAssignedSharesCondition,
+}
 
 
 def create_condition(event_type: ExpertEventType, account: AccountInterface,
@@ -2503,69 +3056,11 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
     """
     Factory function to create appropriate condition based on event type.
     """
-    # Define rating change mappings
-    rating_changes = {
-        ExpertEventType.F_RATING_NEGATIVE_TO_NEUTRAL: (OrderRecommendation.SELL, OrderRecommendation.HOLD),
-        ExpertEventType.F_RATING_NEGATIVE_TO_POSITIVE: (OrderRecommendation.SELL, OrderRecommendation.BUY),
-        ExpertEventType.F_RATING_NEUTRAL_TO_NEGATIVE: (OrderRecommendation.HOLD, OrderRecommendation.SELL),
-        ExpertEventType.F_RATING_NEUTRAL_TO_POSITIVE: (OrderRecommendation.HOLD, OrderRecommendation.BUY),
-        ExpertEventType.F_RATING_POSITIVE_TO_NEGATIVE: (OrderRecommendation.BUY, OrderRecommendation.SELL),
-        ExpertEventType.F_RATING_POSITIVE_TO_NEUTRAL: (OrderRecommendation.BUY, OrderRecommendation.HOLD),
-    }
-    if event_type in rating_changes:
-        from_rating, to_rating = rating_changes[event_type]
-        return RatingChangeCondition(account, instrument_name, expert_recommendation, 
+    if event_type in RATING_CHANGE_CONDITIONS:
+        from_rating, to_rating = RATING_CHANGE_CONDITIONS[event_type]
+        return RatingChangeCondition(account, instrument_name, expert_recommendation,
                                    from_rating, to_rating, existing_order)
-    # Add time horizon flags and N_CONFIDENCE to condition_map
-    condition_map = {
-        ExpertEventType.F_BEARISH: BearishCondition,
-        ExpertEventType.F_BULLISH: BullishCondition,
-        ExpertEventType.F_HAS_NO_POSITION: HasNoPositionCondition,
-        ExpertEventType.F_HAS_POSITION: HasPositionCondition,
-        ExpertEventType.F_HAS_BUY_POSITION: HasBuyPositionCondition,
-        ExpertEventType.F_HAS_SELL_POSITION: HasSellPositionCondition,
-        ExpertEventType.F_HAS_NO_POSITION_ACCOUNT: HasNoPositionAccountCondition,
-        ExpertEventType.F_HAS_POSITION_ACCOUNT: HasPositionAccountCondition,
-        ExpertEventType.F_LONG_TERM: LongTermCondition,
-        ExpertEventType.F_MEDIUM_TERM: MediumTermCondition,
-        ExpertEventType.F_SHORT_TERM: ShortTermCondition,
-        ExpertEventType.F_CURRENT_RATING_POSITIVE: CurrentRatingPositiveCondition,
-        ExpertEventType.F_CURRENT_RATING_OVERWEIGHT: CurrentRatingOverweightCondition,
-        ExpertEventType.F_CURRENT_RATING_NEUTRAL: CurrentRatingNeutralCondition,
-        ExpertEventType.F_CURRENT_RATING_UNDERWEIGHT: CurrentRatingUnderweightCondition,
-        ExpertEventType.F_CURRENT_RATING_NEGATIVE: CurrentRatingNegativeCondition,
-        ExpertEventType.F_RATING_UPGRADED: RatingUpgradedCondition,
-        ExpertEventType.F_RATING_DOWNGRADED: RatingDowngradedCondition,
-        ExpertEventType.F_HIGHRISK: HighRiskCondition,
-        ExpertEventType.F_MEDIUMRISK: MediumRiskCondition,
-        ExpertEventType.F_LOWRISK: LowRiskCondition,
-        ExpertEventType.F_NEW_TARGET_HIGHER: NewTargetHigherCondition,
-        ExpertEventType.F_NEW_TARGET_LOWER: NewTargetLowerCondition,
-        ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT: ExpectedProfitTargetPercentCondition,
-        ExpertEventType.N_PERCENT_TO_CURRENT_TARGET: PercentToCurrentTargetCondition,
-        ExpertEventType.N_PERCENT_TO_NEW_TARGET: PercentToNewTargetCondition,
-        ExpertEventType.N_NEW_TARGET_PERCENT: NewTargetPercentCondition,
-        ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
-        ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
-        ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
-        ExpertEventType.N_DAYS_SINCE_LAST_CLOSE: DaysSinceLastCloseCondition,
-        ExpertEventType.N_DAYS_SINCE_LAST_PROFITABLE_CLOSE: DaysSinceLastProfitableCloseCondition,
-        ExpertEventType.N_DAYS_SINCE_LAST_LOSING_CLOSE: DaysSinceLastLosingCloseCondition,
-        ExpertEventType.N_CONFIDENCE: ConfidenceCondition,
-        ExpertEventType.N_PRICE_VS_TARGET_LOW_PERCENT: PriceVsTargetLowCondition,
-        ExpertEventType.N_PRICE_VS_TARGET_HIGH_PERCENT: PriceVsTargetHighCondition,
-        ExpertEventType.N_PRICE_VS_TARGET_CONSENSUS_PERCENT: PriceVsTargetConsensusCondition,
-        ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE: InstrumentAccountShareCondition,
-        ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET: PercentOpenToNewTargetCondition,
-        ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH: PercentBelowRecentHighCondition,
-        ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW: PercentAboveRecentLowCondition,
-        ExpertEventType.N_IV_RANK: IVRankCondition,
-        ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
-        ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
-        ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
-        ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,
-    }
-    condition_class = condition_map.get(event_type)
+    condition_class = CONDITION_MAP.get(event_type)
     if not condition_class:
         raise ValueError(f"Unknown event type: {event_type}")
     if issubclass(condition_class, FlagCondition):

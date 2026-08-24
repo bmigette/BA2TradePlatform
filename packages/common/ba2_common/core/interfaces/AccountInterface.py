@@ -1103,6 +1103,22 @@ class AccountInterface(ReadOnlyAccountInterface):
                 # would otherwise be double-counted against itself.
                 available_balance = expert_interface.get_available_balance(exclude_transaction_id=transaction.id)
                 if available_balance is None:
+                    # AN UNREADABLE BALANCE IS NOT A PASS. This used to ``return errors``
+                    # with the list still empty, which every caller reads as "validated,
+                    # no problems". ``TastyTradeAccount.get_balance()`` returns None on ANY
+                    # exception, so one broker hiccup silently opened the gate. Same rule
+                    # as the equity branch in _validate_position_size_limits below.
+                    logger.error(
+                        f"EXPERT BALANCE VALIDATION CANNOT RUN for {trading_order.symbol}: "
+                        f"expert {expert_instance.id} published no available balance "
+                        f"(get_available_balance() returned None). Rejecting the order "
+                        f"rather than treating an unrun risk check as passed."
+                    )
+                    errors.append(
+                        f"Cannot validate the expert's available balance: it is unavailable "
+                        f"for expert {expert_instance.id}. Refusing the order rather than "
+                        f"skipping the check."
+                    )
                     return errors
 
                 # New position - check if order value exceeds available balance
@@ -1120,6 +1136,21 @@ class AccountInterface(ReadOnlyAccountInterface):
                 # Adding to position - check if additional value exceeds available balance
                 available_balance = expert_interface.get_available_balance()
                 if available_balance is None:
+                    # Same rule as the new-position branch above: the add-to-position path
+                    # has its own balance read and its own bare ``return errors``, so
+                    # fixing only one of them leaves the gate open for every top-up.
+                    logger.error(
+                        f"EXPERT BALANCE VALIDATION CANNOT RUN for {trading_order.symbol} "
+                        f"(adding to an existing position): expert {expert_instance.id} "
+                        f"published no available balance. Rejecting the order rather than "
+                        f"treating an unrun risk check as passed."
+                    )
+                    errors.append(
+                        f"Cannot validate the expert's available balance before adding to "
+                        f"the {trading_order.symbol} position: it is unavailable for expert "
+                        f"{expert_instance.id}. Refusing the order rather than skipping "
+                        f"the check."
+                    )
                     return errors
 
                 additional_value = trading_order.quantity * current_price
@@ -1226,7 +1257,24 @@ class AccountInterface(ReadOnlyAccountInterface):
             # Get current price
             current_price = self.get_instrument_current_price(trading_order.symbol)
             if current_price is None:
-                logger.warning(f"Could not get current price for {trading_order.symbol} in position size validation")
+                # NO PRICE MEANS NEITHER GATE RAN. Both the per-instrument cap and the
+                # expert available-balance check below are priced off this quote, so a
+                # bare ``return errors`` here skipped BOTH of them and reported the order
+                # as validated -- on a MARKET order that already carries a transaction_id,
+                # i.e. one that is about to be sent. Same rule as the equity branch above.
+                logger.error(
+                    f"POSITION SIZE VALIDATION CANNOT RUN for {trading_order.symbol} on "
+                    f"account {self.id}: no current price is available "
+                    f"({self.__class__.__name__}.get_instrument_current_price returned None), "
+                    f"so neither the per-instrument cap nor the expert balance check could be "
+                    f"priced. Rejecting the order rather than treating an unrun risk check "
+                    f"as passed."
+                )
+                errors.append(
+                    f"position-size validation could not run: no price for "
+                    f"{trading_order.symbol}. Refusing the order rather than skipping "
+                    f"the check."
+                )
                 return errors
             
             # Validate position size limits
@@ -1496,7 +1544,33 @@ class AccountInterface(ReadOnlyAccountInterface):
         from ba2_common.core.types import OrderDirection, OrderType
 
         close_side = OrderDirection.SELL if transaction.side == OrderDirection.BUY else OrderDirection.BUY
-        current_qty = abs(transaction.get_current_open_qty()) or transaction.quantity
+
+        # SIZE THE CLOSE OFF WHAT WE MEASURED, AND NOTHING ELSE.
+        #
+        # This was ``abs(get_current_open_qty()) or transaction.quantity``. A net of zero
+        # is a MEASURED answer -- "the book is flat" -- but ``or`` cannot tell that from
+        # "unknown", so it fell through to ``transaction.quantity``: the quantity that was
+        # ORDERED, which after a partial exit / external close / assignment no longer
+        # describes anything the account holds. The close then acted on a number it never
+        # measured. On a long-only cash account Alpaca rejects it (40310000) instead of
+        # opening a short, which is luck, not a safeguard.
+        net = abs(transaction.get_current_open_qty())
+        if net <= 0:
+            logger.info(
+                f"submit_close_order_for_transaction: transaction {transaction.id} "
+                f"({transaction.symbol}) has a net open quantity of {net}; already flat, "
+                f"nothing to close. NOT falling back to the ordered quantity "
+                f"({transaction.quantity})."
+            )
+            return {
+                "success": True,
+                "message": (
+                    f"{transaction.symbol} transaction {transaction.id} is already flat "
+                    f"(net open quantity 0) — nothing to close"
+                ),
+                "close_order_id": None,
+            }
+        current_qty = net
 
         close_order = TradingOrder(
             account_id=self.id,

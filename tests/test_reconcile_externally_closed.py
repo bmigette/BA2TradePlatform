@@ -172,6 +172,96 @@ class TestReconcileExternallyClosed:
         assert closed == 0
         assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
 
+    def test_unreadable_position_qty_does_not_force_a_close(self):
+        """THE DEFECT: an UNREADABLE per-position quantity dropped the symbol from
+        ``broker_symbols``, so reconcile concluded the position was gone and
+        force-closed the transaction -- cancelling its protective stops on the way out.
+
+        ``abs(float(qty or 0))`` is what did it: the ``or 0`` turns None into a
+        measured zero BEFORE the ``except (TypeError, ValueError)`` that was written
+        for exactly this case can ever see it, so the guard was dead code. A broker
+        that reports a position but not its size is telling us the position EXISTS."""
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "AMPX", "qty": None}]
+        txn = _open_txn(acct.id, "AMPX")
+
+        closed = account.reconcile_externally_closed_transactions()
+
+        assert closed == 0, "an unreadable quantity is not a flat book"
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
+
+    def test_unreadable_position_qty_is_logged_loudly(self, monkeypatch):
+        """Silently keeping the position would just move the blindness. Say so."""
+        import sys
+        module = sys.modules["ba2_common.core.interfaces.ReadOnlyAccountInterface"]
+        errors = []
+        monkeypatch.setattr(module.logger, "error",
+                            lambda msg, *a, **k: errors.append(str(msg)))
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "AMPX", "qty": None}]
+        _open_txn(acct.id, "AMPX")
+
+        account.reconcile_externally_closed_transactions()
+
+        assert any("AMPX" in m and "unreadable" in m.lower() for m in errors), errors
+
+    def test_a_garbage_position_qty_also_keeps_the_symbol(self):
+        """The ``except (TypeError, ValueError)`` branch the ``or 0`` was defeating:
+        a non-numeric qty is unreadable too."""
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "AMPX", "qty": "n/a"}]
+        txn = _open_txn(acct.id, "AMPX")
+
+        assert account.reconcile_externally_closed_transactions() == 0
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
+
+    def test_a_missing_qty_key_also_keeps_the_symbol(self):
+        """A position dict with no ``qty`` key at all: still a reported position."""
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "AMPX"}]
+        txn = _open_txn(acct.id, "AMPX")
+
+        assert account.reconcile_externally_closed_transactions() == 0
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
+
+    def test_a_measured_zero_qty_still_reconciles(self):
+        """THE INVERSE, and the whole point. A broker that reports qty EXACTLY 0 has
+        MEASURED a flat position -- that is the signal reconcile exists to act on. The
+        fix must not blunt it into 'unknown, keep it open forever'."""
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "AMPX", "qty": 0.0}]
+        txn = _open_txn(acct.id, "AMPX")
+
+        closed = account.reconcile_externally_closed_transactions()
+
+        assert closed == 1, "a measured zero position is a genuine close signal"
+        assert get_instance(Transaction, txn.id).close_reason == "position_not_at_broker"
+
+    def test_a_string_zero_qty_still_reconciles(self):
+        """Alpaca reports quantities as decimal STRINGS; "0" is a measured zero."""
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "AMPX", "qty": "0"}]
+        txn = _open_txn(acct.id, "AMPX")
+
+        assert account.reconcile_externally_closed_transactions() == 1
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.CLOSED
+
+    def test_an_unreadable_qty_on_ANOTHER_symbol_does_not_shield_this_one(self):
+        """Keeping an unreadable symbol must not accidentally keep every symbol."""
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "MSFT", "qty": None}]
+        txn = _open_txn(acct.id, "AMPX")
+
+        assert account.reconcile_externally_closed_transactions() == 1
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.CLOSED
+
     def test_only_affects_this_account(self):
         acct1 = create_account_definition(name="A1")
         acct2 = create_account_definition(name="A2")
@@ -190,3 +280,27 @@ def _orders_for(txn_id):
     from ba2_trade_platform.core.db import get_db
     with get_db() as session:
         return list(session.exec(select(TradingOrder).where(TradingOrder.transaction_id == txn_id)).all())
+
+
+class TestReconcileShortPositions:
+    """A SHORT position at the broker reports a NEGATIVE quantity."""
+
+    def test_a_short_broker_position_is_still_a_position(self):
+        """`abs()` is load-bearing: without it a short reads as <= 0 and reconcile
+        force-closes a live short, cancelling its stops."""
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "AMPX", "qty": -2.0}]
+        txn = _open_txn(acct.id, "AMPX")
+
+        assert account.reconcile_externally_closed_transactions() == 0
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
+
+    def test_a_short_reported_as_a_negative_string_is_also_a_position(self):
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = [{"symbol": "AMPX", "qty": "-2"}]
+        txn = _open_txn(acct.id, "AMPX")
+
+        assert account.reconcile_externally_closed_transactions() == 0
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED

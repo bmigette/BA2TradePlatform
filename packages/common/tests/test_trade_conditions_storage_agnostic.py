@@ -293,3 +293,292 @@ def test_both_backends_resolve_open_option_orders_identically(tmp_path):
 
     assert len(sql_hits) == 1
     assert len(mem_hits) == len(sql_hits), "both backends must resolve the txn->order link"
+
+
+# ---------------------------------------------------------------------------
+# "Never closed" and "could not determine" are DIFFERENT answers.
+#
+# ``last_closed_transaction`` skipped any close whose P&L it could not compute and
+# then returned None -- the same None it returns when the expert has genuinely never
+# closed the symbol. ``DaysSinceLastCloseCondition`` turned that None into the 1e9
+# "infinitely long ago" sentinel, so a ">N day" re-entry cooldown PASSED. The sentinel
+# is defensible for "never closed" (there is nothing to wait for); it is a fabricated
+# measurement for "we could not tell whether the last close was a profit".
+#
+# The repository now reports WHY it found nothing, and the condition goes unevaluable
+# (``calculated_value = None``) rather than inventing a number.
+#
+# Related: ``calculate_transaction_pnl`` used truthiness on ``close_price``, so EVERY
+# option that expired worthless (close_price == 0.0) was "unclassifiable". With that
+# fixed, a worthless expiry is an ordinary measured LOSS again -- pinned below.
+# ---------------------------------------------------------------------------
+
+def _reasons():
+    """The repository's "why did you find nothing" vocabulary.
+
+    Imported lazily so that a missing constant fails the ONE test that asserts on it
+    rather than the whole module's collection.
+    """
+    from ba2_common.core import trade_repository as tr
+    return tr.LAST_CLOSE_FOUND, tr.LAST_CLOSE_NONE, tr.LAST_CLOSE_UNCLASSIFIABLE
+
+
+def _unclassifiable_close(days_ago, **kw):
+    """A CLOSED transaction whose P&L cannot be computed: no close price was recorded."""
+    txn = _closed_txn(days_ago, **kw)
+    txn.close_price = None
+    return txn
+
+
+def _worthless_expiry(days_ago, side=OrderDirection.BUY, **kw):
+    """A long option that expired worthless: closed at a MEASURED 0.00."""
+    txn = _closed_txn(days_ago, **kw)
+    txn.side = side
+    txn.open_price = 2.50
+    txn.close_price = 0.0
+    txn.multiplier = 100
+    return txn
+
+
+def _losing_close(days_ago, **kw):
+    txn = _closed_txn(days_ago, **kw)
+    txn.open_price, txn.close_price = 110.0, 100.0
+    return txn
+
+
+def _days_since_profitable_close(value=15.0):
+    from ba2_common.core.TradeConditions import DaysSinceLastProfitableCloseCondition
+    return DaysSinceLastProfitableCloseCondition(
+        account=None, instrument_name=SYMBOL, expert_recommendation=_Rec(),
+        operator_str=">", value=value, existing_order=None,
+    )
+
+
+def _days_since_losing_close(value=15.0):
+    from ba2_common.core.TradeConditions import DaysSinceLastLosingCloseCondition
+    return DaysSinceLastLosingCloseCondition(
+        account=None, instrument_name=SYMBOL, expert_recommendation=_Rec(),
+        operator_str=">", value=value, existing_order=None,
+    )
+
+
+def _capture_condition_errors(monkeypatch):
+    """Collect ``logger.error`` from TradeConditions.
+
+    NOT caplog: ``ba2_common/logger.py`` sets ``propagate = False``, so caplog's root
+    handler never sees these records.
+    """
+    import sys
+    module = sys.modules["ba2_common.core.TradeConditions"]
+    messages = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+class TestLastClosedTransactionReportsWhyItFoundNothing:
+    def test_no_close_at_all_is_reported_as_such(self, repo):
+        _found, _none, _unclass = _reasons()
+        assert repo.last_closed_transaction_with_reason(
+            expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=1) == (None, _none)
+
+    def test_a_qualifying_close_is_reported_as_found(self, repo):
+        _found, _none, _unclass = _reasons()
+        repo.rows.append(_closed_txn(days_ago=3))
+        txn, reason = repo.last_closed_transaction_with_reason(
+            expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=1)
+        assert reason == _found
+        assert txn is not None
+
+    def test_a_close_whose_pnl_cannot_be_computed_is_unclassifiable(self, repo):
+        _found, _none, _unclass = _reasons()
+        repo.rows.append(_unclassifiable_close(days_ago=3))
+        assert repo.last_closed_transaction_with_reason(
+            expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=1
+        ) == (None, _unclass)
+
+    def test_an_unclassifiable_close_is_irrelevant_when_no_sign_is_requested(self, repo):
+        """profit_sign=0 never consults the P&L, so nothing is unclassifiable."""
+        _found, _none, _unclass = _reasons()
+        repo.rows.append(_unclassifiable_close(days_ago=3))
+        txn, reason = repo.last_closed_transaction_with_reason(
+            expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=0)
+        assert reason == _found
+        assert txn is not None
+
+    def test_a_newer_unclassifiable_close_hides_an_older_qualifying_one(self, repo):
+        """"Days since the LAST profitable close" is 3 or 20 -- unknowable. Returning
+        20 would be a fabricated measurement."""
+        _found, _none, _unclass = _reasons()
+        repo.rows += [_unclassifiable_close(days_ago=3), _closed_txn(days_ago=20)]
+        assert repo.last_closed_transaction_with_reason(
+            expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=1
+        ) == (None, _unclass)
+
+    def test_an_older_unclassifiable_close_does_not_hide_a_newer_qualifying_one(self, repo):
+        """THE INVERSE: the newest close already answers the question; anything older
+        cannot change it."""
+        _found, _none, _unclass = _reasons()
+        repo.rows += [_closed_txn(days_ago=3), _unclassifiable_close(days_ago=20)]
+        txn, reason = repo.last_closed_transaction_with_reason(
+            expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=1)
+        assert reason == _found
+        assert txn.close_date == NOW - timedelta(days=3)
+
+    def test_a_classifiable_non_qualifying_close_is_not_unclassifiable(self, repo):
+        """THE INVERSE: a close we CAN price and that simply is not a profit leaves
+        'never had a profitable close' intact -- a knowable answer."""
+        _found, _none, _unclass = _reasons()
+        repo.rows.append(_losing_close(days_ago=3))
+        assert repo.last_closed_transaction_with_reason(
+            expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=1) == (None, _none)
+
+    def test_a_close_with_no_close_date_is_unclassifiable_not_absent(self, repo):
+        """A CLOSED row with no close_date cannot be DATED, so 'days since' is
+        unknowable. It used to be filtered out silently and read as 'never closed'."""
+        dateless = _closed_txn(days_ago=3)
+        dateless.close_date = None
+        _found, _none, _unclass = _reasons()
+        repo.rows.append(dateless)
+        assert repo.last_closed_transaction_with_reason(
+            expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=0
+        ) == (None, _unclass)
+
+    def test_the_original_single_value_api_still_works(self, repo):
+        repo.rows.append(_closed_txn(days_ago=3))
+        assert repo.last_closed_transaction(
+            expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=1) is not None
+        assert repo.last_closed_transaction(
+            expert_id=EXPERT_ID, symbol=SYMBOL + "X", profit_sign=1) is None
+
+
+class TestProfitCooldownGoesUnevaluableRatherThanInventing1e9:
+    def test_an_unclassifiable_close_makes_the_gate_unevaluable(self, repo, monkeypatch):
+        """THE DEFECT: a close exists 3 days ago but its profit sign is unknown. The
+        1e9 sentinel made a '>15 day' profitable-close cooldown PASS."""
+        repo.rows.append(_unclassifiable_close(days_ago=3))
+        errors = _capture_condition_errors(monkeypatch)
+        cond = _days_since_profitable_close()
+
+        allowed = cond.evaluate()
+
+        assert cond.calculated_value is None, (
+            "an undeterminable cooldown must be unevaluable, not 1e9")
+        assert allowed is False
+        assert errors, "going unevaluable must be reported"
+        assert cond.get_actual_value_display() is None
+
+    def test_never_closed_still_uses_the_sentinel(self, repo):
+        """THE INVERSE #1: 'this expert has never closed the symbol' is KNOWABLE, and
+        the sentinel is the right answer -- the cooldown must still allow entry."""
+        cond = _days_since_profitable_close()
+        assert cond.evaluate() is True
+        assert cond.calculated_value == 1e9
+        assert cond.get_actual_value_display() == "no prior close"
+
+    def test_a_measured_losing_close_still_means_no_profitable_close(self, repo):
+        """THE INVERSE #2: a close we CAN classify, that simply was not a profit,
+        leaves the gate on the knowable 'never' branch."""
+        repo.rows.append(_losing_close(days_ago=3))
+        cond = _days_since_profitable_close()
+        assert cond.evaluate() is True
+        assert cond.calculated_value == 1e9
+
+    def test_a_recent_profitable_close_still_blocks(self, repo):
+        """THE INVERSE #3: the ordinary path is untouched."""
+        repo.rows.append(_closed_txn(days_ago=3))
+        cond = _days_since_profitable_close()
+        assert cond.evaluate() is False
+        assert cond.calculated_value == 3.0
+
+    def test_the_any_close_gate_is_unaffected_by_an_unpriceable_close(self, repo):
+        """THE INVERSE #4: with profit_sign=0 the P&L is never consulted, so a close
+        with no close_price is still perfectly datable. This must NOT become
+        unevaluable -- that would be the fix refusing a knowable answer."""
+        repo.rows.append(_unclassifiable_close(days_ago=3))
+        cond = _days_since_close()
+        assert cond.evaluate() is False
+        assert cond.calculated_value == 3.0
+
+    def test_a_worthless_expiry_is_a_measured_loss_not_an_unknown(self, repo):
+        """The item-4 link: an option that expired worthless closes at a MEASURED
+        0.00. While ``calculate_transaction_pnl`` used truthiness on close_price it
+        was 'unclassifiable' and poisoned BOTH sign-narrowed gates. It is a LOSS:
+        the losing-close cooldown sees it, the profitable one does not."""
+        repo.rows.append(_worthless_expiry(days_ago=3))
+
+        losing = _days_since_losing_close()
+        assert losing.evaluate() is False
+        assert losing.calculated_value == 3.0
+
+        profitable = _days_since_profitable_close()
+        assert profitable.evaluate() is True
+        assert profitable.calculated_value == 1e9
+
+    def test_a_worthless_expiry_of_a_SHORT_option_is_a_measured_profit(self, repo):
+        """And the other side of it: the seller kept the whole premium."""
+        repo.rows.append(_worthless_expiry(days_ago=3, side=OrderDirection.SELL))
+
+        profitable = _days_since_profitable_close()
+        assert profitable.evaluate() is False
+        assert profitable.calculated_value == 3.0
+
+
+def _breakeven_close(days_ago, **kw):
+    """A SCRATCH: closed at exactly the open price. P&L is a MEASURED 0.0."""
+    txn = _closed_txn(days_ago, **kw)
+    txn.open_price = txn.close_price = 100.0
+    return txn
+
+
+def test_a_breakeven_close_is_knowable_not_unclassifiable(repo):
+    """THE INVERSE that guards the ``pnl is None`` test against becoming truthiness.
+
+    A scratch has a P&L of exactly 0.0 -- a MEASUREMENT. It qualifies as neither a
+    profit nor a loss, which leaves 'never had a profitable close': knowable, so the
+    1e9 sentinel is right and the cooldown must still allow entry. Reading it as
+    'unclassifiable' would be the fix refusing a legitimate zero and jamming the gate
+    shut on every break-even trade."""
+    _found, _none, _unclass = _reasons()
+    repo.rows.append(_breakeven_close(days_ago=3))
+
+    assert repo.last_closed_transaction_with_reason(
+        expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=1) == (None, _none)
+    assert repo.last_closed_transaction_with_reason(
+        expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=-1) == (None, _none)
+
+    cond = _days_since_profitable_close()
+    assert cond.evaluate() is True
+    assert cond.calculated_value == 1e9
+
+    # And with no sign requested it is simply the last close, 3 days ago.
+    any_close = _days_since_close()
+    assert any_close.evaluate() is False
+    assert any_close.calculated_value == 3.0
+
+
+def test_a_dateless_close_hides_an_otherwise_qualifying_one(repo):
+    """A CLOSED row with no close_date is invisible to the ordering, so it could be
+    NEWER than the close we matched -- "days since" is then unknowable even though a
+    perfectly good qualifying close exists. Without a datable close alongside it the
+    match path is never reached, so this needs both."""
+    _found, _none, _unclass = _reasons()
+    dateless = _closed_txn(days_ago=1)
+    dateless.close_date = None
+    repo.rows += [dateless, _closed_txn(days_ago=3)]
+
+    assert repo.last_closed_transaction_with_reason(
+        expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=0) == (None, _unclass)
+
+    cond = _days_since_close()
+    assert cond.evaluate() is False
+    assert cond.calculated_value is None
+
+
+def test_every_close_dated_is_still_an_ordinary_answer(repo):
+    """THE INVERSE: nothing about the dateless check may disturb dated closes."""
+    _found, _none, _unclass = _reasons()
+    repo.rows += [_closed_txn(days_ago=3), _closed_txn(days_ago=30)]
+    txn, reason = repo.last_closed_transaction_with_reason(
+        expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=0)
+    assert reason == _found
+    assert txn.close_date == NOW - timedelta(days=3)

@@ -201,8 +201,10 @@ class PremiumSeller(MarketExpertInterface):
             return None
 
         iv_now = account.get_atm_implied_volatility(sym)
-        self._update_iv_history(sym, as_of, account, iv_now)
-        ivr = signals.iv_rank(self._iv_history.get(sym, []), iv_now)
+        # Rank against the TRAILING history the update returns, not the post-append list:
+        # today's own sample can never be below itself, so including it could only ever
+        # bias the rank. Same definition as the live recorder and the backtest override.
+        ivr = signals.iv_rank(self._update_iv_history(sym, as_of, account, iv_now), iv_now)
 
         if settings["iv_rank_enabled"]:
             if ivr is None or ivr < float(settings["iv_rank_min"]):
@@ -251,7 +253,16 @@ class PremiumSeller(MarketExpertInterface):
         return None
 
     # -- data helpers ----------------------------------------------------
-    def _update_iv_history(self, sym: str, as_of: datetime, account, iv_now) -> None:
+    def _update_iv_history(self, sym: str, as_of: datetime, account, iv_now) -> List[float]:
+        """Extend the rolling ATM-IV history and RETURN the trailing series to rank against.
+
+        The return value is the history as it stood BEFORE ``iv_now`` was appended (but
+        after any cold-start seeding, so the very first bar still gets a usable series).
+        Callers must rank against that, not against ``self._iv_history[sym]``: today's
+        sample cannot be strictly below itself, so leaving it in the series can only
+        distort the percentile. The account-level rank excludes today's sample for the
+        same reason, and the two must mean the same thing.
+        """
         hist = self._iv_history.setdefault(sym, [])
         provider = getattr(account, "options_provider", None)
         if not hist and provider is not None:
@@ -265,9 +276,11 @@ class PremiumSeller(MarketExpertInterface):
                     v = None
                 if v is not None:
                     hist.append(v)
+        trailing = list(hist)
         if iv_now is not None:
             hist.append(iv_now)
         del hist[: max(0, len(hist) - 5 * _IV_SEED_WEEKS)]
+        return trailing
 
     def _fetch_closes(self, sym: str, as_of: datetime,
                       settings: Dict[str, Any]) -> Optional[List[float]]:

@@ -66,12 +66,15 @@ def test_export_symbol_data_pins_single_symbol_universe(monkeypatch):
     assert "Composite factor score" in labels
     assert "Factor: value (raw)" in labels
     composite = next(m for m in result.metrics if m.label == "Composite factor score")
-    # single-symbol universe -> the composite z-score is exactly 0.0 (no
-    # cross-section to compare against, zero variance by definition) --
-    # no signal badge, since it's not a real assessment, just a
-    # mathematical inevitability.
-    assert composite.value == 0.0
+    # single-symbol universe -> the composite z-score is arithmetically forced
+    # to 0.0 (no cross-section to compare against, zero variance by
+    # definition). That is "not computable", NOT a neutral reading, so it is
+    # reported as unavailable-with-a-reason rather than as the number 0.000 --
+    # see test_factorranker_composite_unavailable.py.
+    assert composite.value is None
+    assert composite.display == "n/a"
     assert composite.signal is None
+    assert "1 symbol" in composite.detail
 
     # The RAW (pre-z-score) value factor row is the one that actually
     # differs by symbol -- this is the whole point of adding it: eps_ttm/

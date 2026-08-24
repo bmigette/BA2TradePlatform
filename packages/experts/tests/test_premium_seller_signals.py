@@ -9,8 +9,8 @@ from ba2_experts.PremiumSeller.signals import (
 
 def test_iv_rank_basic():
     hist = [0.10, 0.20, 0.30, 0.40] * 6          # 24 points
-    assert iv_rank(hist, 0.40) == 100.0          # all <= current
-    assert iv_rank(hist, 0.05) == 0.0            # none <= current
+    assert iv_rank(hist, 0.50) == 100.0          # all strictly below current
+    assert iv_rank(hist, 0.05) == 0.0            # none below current
     assert iv_rank(hist, 0.25) == 50.0
 
 
@@ -18,6 +18,38 @@ def test_iv_rank_insufficient_history_returns_none():
     assert iv_rank([0.2] * 19, 0.3) is None      # floor: >= 20 points
     assert iv_rank([0.2] * 25, None) is None
     assert iv_rank([], 0.3) is None
+
+
+def test_iv_rank_is_the_one_shared_implementation():
+    """There were two "IV rank" functions in this repo computing DIFFERENT numbers:
+    this one counted ``<=`` and returned an unrounded float; the account-level
+    ``_iv_rank_from_series`` counts strictly ``<`` and rounds to 2dp. Two implementations
+    of one statistic is exactly how the short-sign divergence happened, so this one now
+    delegates. The SERIES each is fed still differs legitimately (see the docstring);
+    the ARITHMETIC may not."""
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+
+    hist = [0.10, 0.20, 0.30, 0.40] * 6
+    for current in (0.05, 0.20, 0.25, 0.40, 0.50):
+        assert iv_rank(hist, current) == OptionsAccountInterface._iv_rank_from_series(
+            hist, current, min_samples=20)
+
+
+def test_iv_rank_does_not_count_a_sample_equal_to_current():
+    """``<=`` made the gate self-fulfilling: the caller appends today's IV to the history
+    BEFORE ranking, so today's own sample always counted itself and every rank was
+    inflated by 100/N. Strict ``<`` is what the live and backtest paths use."""
+    hist = [0.30] * 24
+    assert iv_rank(hist, 0.30) == 0.0, "an equal sample is not a lower one"
+
+
+def test_iv_rank_rejects_an_impossible_iv():
+    """Shared bound: 0.0 and NaN are broken-feed values, not the cheapest tape of the
+    year. Returning a rank here would open the ``iv_rank_min`` gate at its widest."""
+    hist = [0.10, 0.20, 0.30, 0.40] * 6
+    assert iv_rank(hist, 0.0) is None
+    assert iv_rank(hist, float("nan")) is None
+    assert iv_rank([0.0] * 24, 0.30) is None, "a zero-filled history is not 24 samples"
 
 
 def test_realized_vol():

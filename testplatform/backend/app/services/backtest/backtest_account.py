@@ -53,6 +53,7 @@ Field/enum names verified against the installed ba2_common:
 from __future__ import annotations
 
 import bisect
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -188,6 +189,15 @@ _OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10
 # edge concentrates. The thin-volume multiplier reflects that quoted width scales inversely
 # with activity; the threshold sits near the p75-p80 of the measured cache distribution
 # (p10=1, p25=3, p50=14, p75=71, p90=319 contracts/day).
+#
+# WHERE IT APPLIES (corrected 2026-08-24): every option fill, LIMIT ones included. As first
+# shipped the model only reached ``_option_fill_price``'s market-style branch, which multi-leg
+# combo CHILDREN take (they carry no limit_price — the parent holds the net limit) but which
+# NO single-leg order takes: TradeActions and PremiumSeller submit single legs as
+# ``order_type="limit"``, always with a limit_price. So the wheel / 0DTE / long-option branch
+# crossed no spread on either end while credit structures paid on all 8 leg-crossings — a
+# systematic tilt in favour of exactly the single-leg premium sellers the grid evaluates. A
+# limit now crosses the quote (``_option_cross``) and is re-tested against its limit.
 #
 # All of this is a MODELING ASSUMPTION, not observed data — it is a defensible estimate
 # replacing an indefensible zero. Real quotes (e.g. ThetaData EOD bid/ask) should supersede it.
@@ -431,7 +441,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         {"bull_call_spread", "bear_put_spread", "call_butterfly"}
     )
     DEFINED_RISK_SHORT_STRATEGIES = frozenset(
-        {"bear_call_spread", "iron_condor"}
+        {"bear_call_spread", "bull_put_spread", "iron_condor"}
     )
 
     def _option_positions_mtm(self) -> float:
@@ -557,7 +567,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
           * ``iron_condor`` (4 strikes k1<k2<k3<k4): ``max(k2-k1, k4-k3)`` — the wider WING.
             The widest adjacent gap is usually the BODY ``k3-k2``, which is not risk (both
             short strikes sit inside it) and made the bound ~2x too loose.
-          * 2-strike verticals (bull_call/bear_put/bear_call spread): the single gap.
+          * 2-strike verticals (bull_call/bear_put/bear_call/bull_put spread): the single gap.
           * ``call_butterfly`` (3 strikes k1<k2<k3): ``min(k2-k1, k3-k2)`` — the binding wing
             of a (possibly broken-wing) fly; equal wings unchanged.
           * any other shape/strategy: the widest adjacent gap (defensive fallback — the
@@ -1071,9 +1081,22 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         anything the sim computes past that point is unbounded and meaningless (this is what
         produces impossible drawdowns like -1900%). The engine's main loop stops the run as
         soon as this flag is set; see its docstring for the full story.
+
+        A NON-FINITE (NaN/Inf) net_liquidating_value is a different animal and is REJECTED, not
+        clamped: zero and negative equity are real, meaningful states, but NaN is arithmetic
+        that went wrong (a NaN price/premium reaching the mark). Recording it let the run finish
+        and score, because ``results._safe_float`` swapped every NaN equity point for the
+        initial capital -- turning a broken run into a flat, zero-drawdown one whose calmar_ratio
+        equals its annualised return. A run that produced nonsense must fail, not look flawless.
         """
         equity_value = self._open_positions_mtm()
         nlv = self._cash + equity_value
+        if not math.isfinite(nlv):
+            raise ValueError(
+                f"[backtest] non-finite net_liquidating_value at {as_of}: cash={self._cash!r} "
+                f"open-position MTM={equity_value!r}. A NaN/Inf equity point cannot be scored; "
+                f"the run is rejected rather than silently coerced to a flat curve."
+            )
         if nlv <= 0:
             self._wiped_out = True
             nlv = 0.0
@@ -1486,11 +1509,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         equity branch's non-crossing limit).
 
         LIMIT handling mirrors the equity path: the premium bar yields ONE reference price
-        (open/close per ``fill_model``), so the cross test uses it directly — a BUY_LIMIT
-        fills only when ``px <= limit``, a SELL_LIMIT only when ``px >= limit`` — and the
-        fill is at the BAR price when it is better than the limit (never worse, no slippage
-        on a limit fill). A LIMIT-typed leg carrying NO ``limit_price`` (a multi-leg child —
-        the PARENT holds the combo's net limit) falls through to the market-style fill.
+        (open/close per ``fill_model``), which is a MID — so the order first CROSSES the
+        modeled bid-ask spread (``_option_cross``: a buy lifts the ask ``px + half``, a sell
+        hits the bid ``px - half``) and the limit is re-tested against THAT price — a
+        BUY_LIMIT fills only when ``px + half <= limit``, a SELL_LIMIT only when
+        ``px - half >= limit``. An order that no longer clears once the spread is crossed
+        does NOT fill; it stays pending and retries the next bar. The fill is at the crossed
+        price, which is by construction no worse than the limit (never worse, and no
+        execution ``slippage_bps`` on a limit fill — see ``_option_cross``). A LIMIT-typed
+        leg carrying NO ``limit_price`` (a multi-leg child — the PARENT holds the combo's
+        net limit) falls through to the market-style fill.
 
         NO-ARBITRAGE guard: a resolved premium is validated against the underlying's own bar
         on the fill day (``_arb_fill_reject_reason``); a junk indicative print is rejected
@@ -1529,13 +1557,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         limit = getattr(order, "limit_price", None)
         ot = order.order_type
         if limit is not None and ot == OrderType.BUY_LIMIT:
-            if px > float(limit):
+            # CROSS FIRST, THEN RE-TEST. ``px`` is the bar's single reference premium (a
+            # mid); a buy actually lifts the ASK. Testing the limit against the raw ``px``
+            # let every single-leg option order — and they ALL carry a limit_price, unlike
+            # multi-leg children — fill without paying the spread on either end.
+            fill_px = self._option_cross(px, True, bar)
+            if fill_px > float(limit):
                 return None
-            fill_px = px
         elif limit is not None and ot == OrderType.SELL_LIMIT:
-            if px < float(limit):
+            fill_px = self._option_cross(px, False, bar)   # a sell hits the BID
+            if fill_px < float(limit):
                 return None
-            fill_px = px
         else:
             # Option-specific cost model (percent of premium), NOT the equity _slip. Multi-leg
             # combo CHILDREN are LIMIT-typed but carry no limit_price (the parent holds the net
@@ -1583,6 +1615,24 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if volume is None or float(volume) < _OPTION_SPREAD_LIQUID_VOLUME:
             full *= _OPTION_SPREAD_THIN_MULT
         return full / 2.0
+
+    def _option_cross(self, px: float, side_is_buy: bool, bar: dict) -> float:
+        """Premium after CROSSING the modeled bid-ask spread — the LIMIT-fill cost.
+
+        A buy lifts the ask (``px + half``), a sell hits the bid (``px - half``). This is
+        ``_option_slip`` without ``slippage_bps``, and the split is deliberate and matches
+        the equity path: generic execution slippage is a MARKET/STOP cost (``_slip``), while
+        a LIMIT's realistic cost is having to cross the quote to trade at all (equity
+        expresses the same thing by widening the limit's trigger threshold,
+        ``_limit_trigger_price``). Options cross the price instead of widening a threshold
+        because an option "bar" contributes ONE reference premium, not a [low, high] range
+        the threshold could be tested against.
+
+        Floored at zero on the sell side for the same reason as ``_option_slip``: a modeled
+        spread wider than the premium must not pay the account to sell.
+        """
+        half = self._option_half_spread(px, bar)
+        return px + half if side_is_buy else max(0.0, px - half)
 
     def _option_slip(self, px: float, side_is_buy: bool, bar: dict) -> float:
         """Option fill price after execution slippage + the modeled half bid-ask spread.
@@ -2210,7 +2260,6 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     default=None,
                 )
                 exit_reason = self._exit_reason(last_exit_fill, exit_px)
-                comm = commission * 2.0
             else:
                 # Still open at run end: mark-to-market at the last available price.
                 size = entry_qty
@@ -2247,13 +2296,25 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                         exit_px = entry_px  # never priced after entry -> flat (near-zero trade)
                 exit_dt = self._price.now()
                 exit_reason = "open_at_end"
-                comm = commission
+
+            # ONE commission PER FILL -- exactly what the cash ledger charged (``_apply_fill`` /
+            # ``_apply_option_fill``: ``self._cash -= commission`` once per fill). The old flat
+            # ``commission * 2`` (or * 1 on the open_at_end branch) assumed every round-trip was
+            # a single buy + a single sell, so any transaction with MORE fills -- a rebalance ADD,
+            # a scaled/partial exit, a multi-fill open still held at run end -- was undercharged
+            # in the trade rows while the equity curve had already paid the real amount. A
+            # one-sided error: it can only ever flatter the reported P&L, never penalise it.
+            comm = commission * (len(entries) + len(exits))
 
             # Options quote premium PER SHARE but a contract controls ``multiplier`` (100)
-            # shares, so realised option P&L scales by the contract multiplier. Equity entries
-            # are not options -> mult stays 1 and the P&L is unchanged.
+            # shares, so realised option P&L scales by the contract multiplier. The NULL fallback
+            # must be 100 -- the same fallback the cash ledger (``_apply_option_fill``), the MTM
+            # equity curve and every other option site uses. It was ``or 1`` here alone, so a
+            # NULL-multiplier option round-trip booked P&L 100x too small against an equity curve
+            # that had already moved by the full 100x amount. Equity entries are not options ->
+            # ``else 1`` is CORRECT and must stay (shares have no contract multiplier).
             mult = (
-                (opening.multiplier or 1)
+                (opening.multiplier or 100)
                 if getattr(opening, "asset_class", None) == AssetClass.OPTION
                 else 1
             )
@@ -2277,6 +2338,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     "entry_price": entry_px,
                     "exit_price": exit_px,
                     "size": size,
+                    # PUBLISH the contract multiplier the P&L above used (100 for an option,
+                    # 1 for equity). Without it every downstream consumer that rebuilds "the
+                    # capital deployed in this trade" from entry_price x size is 100x too small
+                    # for an option -- which is exactly what the results profit cap and the
+                    # monte-carlo spread-stress notional were doing. No consumer should have to
+                    # re-derive it from asset_class.
+                    "multiplier": float(mult),
                     "pnl": pnl,
                     "pnl_pct": pnl_pct,
                     "bars_held": bars_held,
@@ -2285,6 +2353,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     # look up delta/underlying bars without re-deriving them from the order set.
                     "contract_symbol": getattr(opening, "contract_symbol", None),
                     "underlying_symbol": getattr(opening, "underlying_symbol", None),
+                    # The STRUCTURE this row belongs to. Rows are per-LEG (see the group key
+                    # above), but a multi-leg spread is ONE economic bet: results.py's profit
+                    # cap re-joins the legs on this id so a condor is capped on its NET P&L
+                    # against its NET cost, not leg-by-leg (which capped the winning leg while
+                    # leaving the losing one, scoring a max-profit condor NEGATIVE).
+                    "transaction_id": txn_id,
+                    # The EXACT multiplier ``pnl`` above was computed with (1 for equity, the
+                    # contract multiplier for an option). Recorded rather than re-derived so a
+                    # consumer's cost basis (entry_price x size x multiplier) can never fall
+                    # out of step with the P&L it is compared against.
+                    "multiplier": mult,
                 }
             )
         # Deterministic order: by entry time then symbol.
@@ -2363,8 +2442,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # reads degrade to empty/None so equity behaviour is unaffected. The two abstract
     # ORDER methods (``_submit_option_order_impl`` / ``close_option_position``) are stubs
     # here — they are implemented in Task 5 — but the class still instantiates (no abstract
-    # method left). ``get_iv_rank`` / ``submit_option_order`` are concrete in the base mixin
-    # and are NOT overridden.
+    # method left). ``submit_option_order`` is concrete in the base mixin and is NOT
+    # overridden; ``get_iv_rank`` IS (see below — the base reads a live-only SQL table).
     # ======================================================================
     def _as_of_date(self):
         """The simulated bar's calendar date (the provider's as-of clamp boundary)."""
@@ -2385,6 +2464,113 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     def get_atm_implied_volatility(self, underlying):
         return None if self._options is None else self._options.get_atm_iv(
             underlying, self._as_of_date())
+
+    #: Spacing of the trailing ATM-IV grid, in SESSIONS. 1 == every trading day, which
+    #: MATCHES the live recorder's daily cron so the two compute the same statistic over
+    #: the same sample density. Raise it to trade parity for speed on a very wide
+    #: universe: cost is bounded by the number of DISTINCT (symbol, date) pairs a run
+    #: touches — ~lookback + run length per symbol — because get_atm_iv is memoized
+    #: per (db_path, underlying, as_of) for the life of the worker process, not
+    #: recomputed per bar.
+    #:
+    #: Sessions, not calendar days: the old calendar-day step SKIPPED weekends rather
+    #: than stepping over them, so any value above 1 produced a grid that drifted through
+    #: the week and dropped a varying number of samples. Counting sessions makes "every
+    #: Nth sample" mean the same thing wherever the window starts.
+    IV_RANK_SAMPLE_STEP_DAYS = 1
+
+    def _iv_rank_sample_dates(self, as_of, lookback_days: int):
+        """Trading-session grid over the trailing window, EXCLUDING ``as_of`` itself.
+
+        NON-SESSIONS ARE SKIPPED BECAUSE THE PROVIDER CLAMPS. ``get_atm_iv`` returns the
+        latest snapshot on or before a date, so any closed day silently returns the
+        previous session's number again and that session gets counted twice. The original
+        grid handled weekends (``weekday() < 5``) and missed market HOLIDAYS, which are
+        the same bug at 1/12th the volume: nine weekdays a year on which the exchange is
+        shut, each double-weighting the session before it — and clustered around
+        year-end and quarter turns, where IV is least typical. The NYSE calendar answers
+        both cases from one source, and half-days are real sessions with real closes so
+        they correctly stay in.
+
+        ``as_of`` is excluded because ``_iv_rank_from_series`` counts strictly ``<`` and
+        the memoized provider returns a bit-identical value for the same date — including
+        it would guarantee one sample that can never be below ``current`` and bias every
+        rank down by 100/N (20 points at the production min_samples of 5). Live has the
+        same shape: the stored series is yesterday-and-earlier, ``current`` is a fresh
+        read.
+
+        DEGRADES, NEVER DIES. ``pandas_market_calendars`` is a pinned dependency, but a
+        remote GA worker that somehow lacks it must produce a slightly coarser grid — the
+        old weekday fallback — rather than failing every trial in the job.
+        """
+        from datetime import timedelta
+        from ba2_common.core import market_calendar
+
+        first = as_of - timedelta(days=lookback_days)
+        last = as_of - timedelta(days=1)
+        try:
+            days = [o.astimezone(market_calendar.NY_TZ).date()
+                    for o, _c in market_calendar.nyse_regular_sessions(first, last)]
+        except Exception as e:
+            logger.warning(
+                f"NYSE calendar unavailable ({e}); falling back to a weekday IV-rank grid. "
+                f"Market holidays will be sampled, double-counting the session before "
+                f"each one.")
+            days, day = [], first
+            while day <= last:
+                if day.weekday() < 5:
+                    days.append(day)
+                day += timedelta(days=1)
+
+        step = max(1, int(self.IV_RANK_SAMPLE_STEP_DAYS))
+        return days[::step]
+
+    def get_iv_rank(self, underlying, lookback_days: Optional[int] = None,
+                    min_samples: int = 20, current=None):
+        """OVERRIDE: percentile of today's ATM IV against a provider-derived series.
+
+        The base mixin reads ``option_iv_snapshot`` — a live table keyed by an
+        ``account_id`` FK into ``accountdefinition``, which nothing in a backtest ever
+        writes. Inheriting it meant the rank was always None and every iv_rank rule was
+        silently, permanently False.
+
+        We deliberately do NOT start writing that table. A persisted, accumulating
+        series would make GA trial N depend on trials 1..N-1 (per-trial reproducibility
+        is the point of this platform), it has no as-of notion so it could leak
+        look-ahead, and it would be a write plus a read to recover a number the memoized
+        provider already holds. Building the series from ``self._options`` keeps every
+        sample inside the as-of clamp by construction. The precedent is
+        ``PremiumSeller._update_iv_history``, which seeds its own in-memory series the
+        same way.
+
+        The PERCENTILE MATH is the shared ``_iv_rank_from_series``, so live and backtest
+        cannot drift on what "IV rank 60" means — including its plausibility bound, which
+        is this path's ONLY boundary since nothing here writes a row a recorder could
+        have vetted. Returns None (never 0.0) when the provider yields fewer than
+        ``min_samples`` usable points — which is the case on every options cache built
+        before the greeks columns existed, and is exactly what keeps ``IVRankCondition``
+        failing closed there.
+
+        WHAT IS NOT SHARED, and must not be claimed as such: the ATM CONTRACT. Live picks
+        the strike nearest spot across the whole 20-45 DTE chain; this provider has no
+        point-in-time spot, so it proxies with the CALL whose |delta| is nearest 0.50 (see
+        ``HistoricalOptionsProvider.get_atm_iv``). The two series are the same KIND of
+        number sampled on the same grid, but they are not the same statistic, and an
+        ``iv_rank`` threshold tuned here does not transfer to live at full precision.
+
+        ``lookback_days`` defaults to the shared ``IV_RANK_LOOKBACK_DAYS`` (calendar
+        days), so live and backtest cannot disagree on the window width either.
+        """
+        if self._options is None:
+            return None
+        if lookback_days is None:
+            lookback_days = self.IV_RANK_LOOKBACK_DAYS
+        as_of = self._as_of_date()
+        if current is None:
+            current = self._options.get_atm_iv(underlying, as_of)
+        series = [self._options.get_atm_iv(underlying, d)
+                  for d in self._iv_rank_sample_dates(as_of, lookback_days)]
+        return self._iv_rank_from_series(series, current, min_samples)
 
     def get_option_positions(self):
         """Held option positions, derived from OPENED transactions whose entry is an OPTION.

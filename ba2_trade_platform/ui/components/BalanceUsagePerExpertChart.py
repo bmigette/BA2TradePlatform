@@ -86,7 +86,12 @@ class BalanceUsagePerExpertChart:
                 account_balance = balance_by_account[acc_id]
                 if account_balance is None:
                     continue
-                virtual_balance = account_balance * ((expert.virtual_equity_pct or 100.0) / 100.0)
+                # NO ``or 100.0``: virtual_equity_pct is NOT NULL with a 100.0 default,
+                # so that only ever fired on a real 0% allocation and drew the sleeve as
+                # owning the whole account. Same coercion as
+                # MarketExpertInterface.get_virtual_balance; what the operator sees must
+                # agree with what the sizing code does.
+                virtual_balance = account_balance * (expert.virtual_equity_pct / 100.0)
                 balance_data[_expert_name(expert)] = {
                     'pending': 0.0,
                     'filled': 0.0,

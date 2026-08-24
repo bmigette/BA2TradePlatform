@@ -1363,11 +1363,31 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         for pos in positions:
             pos_dict = pos if isinstance(pos, dict) else dict(pos)
             sym = pos_dict.get('symbol')
-            qty = pos_dict.get('qty', 0)
+            # SENTINEL, not 0. ``pos_dict.get('qty', 0)`` defaulted a MISSING key to a
+            # measured zero, which is the same "unknown reads as zero" the block below
+            # exists to stop.
+            qty = pos_dict.get('qty', None)
+            # AN UNREADABLE QUANTITY IS NOT A FLAT POSITION.
+            #
+            # This was ``abs(float(qty or 0)) > 1e-6``. The ``or 0`` converted None into a
+            # measured zero BEFORE the except clause below -- written for exactly this
+            # case -- could ever fire, so the guard was dead code. The symbol then never
+            # entered ``broker_symbols``, reconcile concluded the position was gone, and
+            # FORCE-CLOSED the transaction, cancelling its protective stops on the way
+            # out. A broker that reports a position but not its size is telling us the
+            # position EXISTS; only a quantity we actually read as ~0 is a close signal.
             try:
-                has_qty = abs(float(qty or 0)) > 1e-6
+                if qty is None:
+                    raise TypeError("no quantity reported")
+                has_qty = abs(float(qty)) > 1e-6
             except (TypeError, ValueError):
-                has_qty = bool(qty)
+                logger.error(
+                    f"[Account {self.id}] reconcile: broker position for {sym!r} reports an "
+                    f"UNREADABLE quantity ({qty!r}). Treating the position as STILL HELD — "
+                    f"an unmeasurable size must never be read as 'flat' and force-close the "
+                    f"transaction."
+                )
+                has_qty = True
             if sym and has_qty:
                 broker_symbols.add(sym)
 

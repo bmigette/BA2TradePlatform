@@ -119,6 +119,37 @@ def rebase_price_to_fill(target_price, reference_price, fill_price):
     return round(fill_price * (target_price / reference_price), 4)
 
 
+def resolve_entry_order(session, transaction):
+    """The transaction's ENTRY order: its oldest FILLED order on the transaction's own side.
+
+    This single row is what the open-positions pass hands to every condition as
+    ``existing_order``, and a surprising amount hangs off it being found:
+    ``DaysOpenedCondition``, ``ProfitLossAmountCondition`` and
+    ``ProfitLossPercentCondition`` each return False unconditionally without one, and
+    ``CloseAction`` only takes its ``close_transaction()`` path (the one that links the
+    close back to the transaction, so ``has_pending_closing_order`` can see it) when the
+    order carries a ``transaction_id``. A position whose shares arrived without an order
+    row — an option assignment used to be exactly that — is therefore unmanageable and
+    silently so. Extracted from ``process_open_positions_recommendations`` so that
+    property is directly testable.
+    """
+    from sqlmodel import select
+
+    if transaction is None:
+        return None
+    stmt = (
+        select(TradingOrder)
+        .where(
+            TradingOrder.transaction_id == transaction.id,
+            TradingOrder.side == transaction.side,
+            TradingOrder.status == OrderStatus.FILLED
+        )
+        .order_by(TradingOrder.created_at.asc())
+        .limit(1)
+    )
+    return session.exec(stmt).first()
+
+
 class TradeManager:
 
     """
@@ -329,6 +360,232 @@ class TradeManager:
                 f"[Account {getattr(account, 'id', '?')}] Option reconciliation failed: {e}",
                 exc_info=True
             )
+
+    # ======================================================================
+    # Daily ATM-IV recorder — the series behind IVRankCondition
+    # ======================================================================
+    def _resolve_options_account(self, account_id: int):
+        """Return ``(AccountDefinition | None, options-capable account | None)``.
+
+        The account is None (having logged why) for a missing definition, an unknown
+        provider, a construction failure, or an equity-only account. Callers here are
+        scheduled jobs, so a single bad account must never abort the pass.
+        """
+        from .interfaces.OptionsAccountInterface import OptionsAccountInterface
+        from ..modules.accounts import get_account_class
+        from .models import AccountDefinition
+
+        try:
+            account_def = get_instance(AccountDefinition, account_id)
+            if account_def is None:
+                self.logger.warning(
+                    f"iv_rank-gated rules reference account {account_id}, which no longer exists")
+                return None, None
+            account_class = get_account_class(account_def.provider)
+            if not account_class:
+                self.logger.warning(
+                    f"No account class for provider {account_def.provider} "
+                    f"(account {account_def.name}); cannot record ATM IV")
+                return account_def, None
+            account = account_class(account_id)
+            if not isinstance(account, OptionsAccountInterface):
+                self.logger.warning(
+                    f"Account {account_def.name} hosts iv_rank-gated rules but is not "
+                    f"options-capable; those rules can never fire")
+                return account_def, None
+            return account_def, account
+        except Exception as e:
+            self.logger.error(
+                f"Could not resolve account {account_id} for ATM-IV recording: {e}",
+                exc_info=True)
+            return None, None
+
+    def record_daily_iv_snapshots(self):
+        """Record ONE trailing ATM-IV sample per iv_rank-gated underlying.
+
+        CADENCE: once per weekday, after the US close (JobManager's
+        ``IV_SNAPSHOT_JOB_ID`` cron). ``get_iv_rank`` is an unweighted percentile over
+        a 252-day window, so the sample GRID is part of the statistic's definition, not
+        an implementation detail: hanging this off the 5-minute account refresh would
+        put ~288 rows/day into the window and quietly redefine "IV rank" as a
+        last-few-days percentile. ``record_atm_iv`` is idempotent per UTC day, so a
+        coalesced/missed run, a manual trigger or an app restart cannot double-sample —
+        this method is safe to call as often as you like.
+
+        WHAT is sampled comes from ``iv_rank_audit.recording_targets()``: only the
+        underlyings of enabled experts that actually have an iv_rank-gated rule. Each
+        symbol costs one full option-chain request, so sampling the whole account
+        universe would be a large daily bill for series nothing reads.
+
+        A symbol whose chain carries no IV is SKIPPED and named in the log. Nothing is
+        ever interpolated, carried forward or defaulted: this table feeds a live
+        trading gate, and a fabricated sample would arm real option rules off invented
+        data. A missing sample leaves ``IVRankCondition`` failing closed instead.
+        """
+        from ba2_common.core.iv_rank_audit import find_iv_rank_gates, recording_targets
+
+        gates = find_iv_rank_gates()
+        targets = recording_targets(gates)
+        blind = [g for g in gates if not g.universe_is_known]
+        if blind:
+            # NOT a debug line. "No targets" and "I cannot see what the targets are" are
+            # opposite facts, and the second one means live rules stay permanently inert.
+            self.logger.warning(
+                f"ATM-IV recorder cannot see the instrument universe of {len(blind)} "
+                f"iv_rank-gated expert(s): "
+                + "; ".join(f"{g.expert_id} ({g.expert})"
+                            + (f" selects via {'/'.join(g.deferred_modes)} and has not "
+                               f"analysed anything recently" if g.deferred_modes
+                               else " could not be resolved")
+                            + f" — inert rule(s): {', '.join(g.rule_names)}"
+                            for g in blind)
+                + ". No ATM-IV series is being kept for them, so those rules cannot fire.")
+        if not targets:
+            if not gates:
+                self.logger.debug(
+                    "No iv_rank-gated rules configured; skipping ATM-IV recording")
+            return
+
+        total_recorded = 0
+        total_missing = 0
+        for account_id, symbols in sorted(targets.items()):
+            account_def, account = self._resolve_options_account(account_id)
+            if account is None:
+                total_missing += len(symbols)
+                continue
+
+            recorded, missing = 0, []
+            for symbol in symbols:
+                try:
+                    if account.record_atm_iv(symbol) is None:
+                        missing.append(symbol)
+                    else:
+                        recorded += 1
+                except Exception as e:
+                    missing.append(symbol)
+                    self.logger.error(
+                        f"[Account {account_def.name}] ATM-IV sampling failed for {symbol}: {e}",
+                        exc_info=True)
+
+            total_recorded += recorded
+            total_missing += len(missing)
+            self.logger.info(
+                f"[Account {account_def.name}] ATM-IV series up to date for "
+                f"{recorded}/{len(symbols)} iv_rank-gated underlying(s)")
+            if missing:
+                self.logger.warning(
+                    f"[Account {account_def.name}] No ATM IV available for "
+                    f"{len(missing)}/{len(symbols)} iv_rank-gated underlying(s): "
+                    f"{', '.join(missing)}. No sample was recorded for them (a rank is "
+                    f"never fabricated), so their iv_rank gates stay CLOSED.")
+
+        if total_recorded == 0 and total_missing > 0:
+            self.logger.error(
+                f"ATM-IV recorder sampled NOTHING ({total_missing} underlying(s) attempted). "
+                f"Every iv_rank-gated rule is permanently inert until this is fixed. Most "
+                f"likely the broker's option feed returns no implied_volatility on the "
+                f"configured feed — check the account's options_feed setting.")
+
+    def report_iv_rank_readiness(self):
+        """Log which iv_rank-gated rules are inert and which are armed.
+
+        Called once at JobManager startup. Nine live rules across seven experts have
+        never been able to fire (no ATM-IV history existed, so ``get_iv_rank`` always
+        returned None and ``IVRankCondition`` always failed closed). Once the recorder
+        has run ``IV_RANK_MIN_SAMPLES`` times they begin placing real orders. That is a
+        deliberate change of behaviour and the operator should read it in the startup
+        log, not infer it from an unexpected fill.
+
+        Deliberately counts samples only — it does NOT compute the rank, because that
+        would fetch a full option chain per symbol on every app start.
+
+        NO GATE MAY BE RENDERED AS A COUNT THE REPORT CANNOT STAND BEHIND. An expert
+        whose universe is UNKNOWN (a screener that has not run, a resolver that raised)
+        has no denominator, and printing one — ``0/0 underlying(s) ARMED`` — is the worst
+        available output: literally true, indistinguishable from a healthy start, and
+        emitted precisely when the recorder is blind and the rules are dead. Those gates
+        go to WARNING with the rules they are killing named, and the summary line carries
+        the count so it cannot read as an all-clear.
+        """
+        from ba2_common.core import iv_rank_audit as iv_audit
+        from ba2_common.core.iv_rank_audit import find_iv_rank_gates, UNIVERSE_CONFIGURED
+        from ba2_common.core.TradeConditions import IVRankCondition
+
+        gates = find_iv_rank_gates()
+        if not gates:
+            return
+
+        min_samples = IVRankCondition.IV_RANK_MIN_SAMPLES
+        self.logger.info(
+            f"IV-rank gate readiness: {len(gates)} enabled expert(s) have iv_rank-gated "
+            f"rules. A gate cannot fire until {min_samples} trailing daily ATM-IV samples "
+            f"exist for its underlying; once they do, those rules start trading.")
+
+        accounts = {}
+        armed_total = 0
+        blind_total = 0
+        for gate in gates:
+            if gate.account_id not in accounts:
+                accounts[gate.account_id] = self._resolve_options_account(gate.account_id)[1]
+            account = accounts[gate.account_id]
+            rules = ', '.join(gate.rule_names)
+            self.logger.info(
+                f"  expert {gate.expert_id} ({gate.expert}) — gated rule(s): {rules}")
+
+            if not gate.universe_is_known:
+                blind_total += 1
+                why = (f"selects instruments via {'/'.join(gate.deferred_modes)} and has "
+                       f"analysed nothing in the last "
+                       f"{iv_audit.DEFERRED_UNIVERSE_LOOKBACK_DAYS} days"
+                       if gate.deferred_modes else
+                       "its instrument universe could not be resolved (see the error above)")
+                self.logger.warning(
+                    f"    UNIVERSE UNKNOWN — expert {gate.expert_id} ({gate.expert}) {why}, "
+                    f"so no ATM-IV series is being recorded for it and its rule(s) "
+                    f"({rules}) CANNOT FIRE. This is not the same as having no "
+                    f"underlyings: the recorder does not know what to record.")
+                continue
+
+            if not gate.symbols:
+                self.logger.warning(
+                    f"    NO UNDERLYINGS — expert {gate.expert_id} ({gate.expert}) has an "
+                    f"iv_rank-gated rule ({rules}) but no enabled instruments configured, "
+                    f"so it has nothing to trade and nothing to sample.")
+                continue
+
+            if account is None:
+                self.logger.info(
+                    f"    {len(gate.symbols)} underlying(s) — UNKNOWN (account "
+                    f"{gate.account_id} unavailable; see the warning above)")
+                continue
+
+            counts = {s: account.iv_sample_count(s) for s in gate.symbols}
+            armed = [s for s, c in counts.items() if c >= min_samples]
+            inert = [s for s, c in counts.items() if c < min_samples]
+            armed_total += len(armed)
+            origin = ("" if gate.universe_source == UNIVERSE_CONFIGURED else
+                      f" [{gate.universe_source}: recovered from the last "
+                      f"{iv_audit.DEFERRED_UNIVERSE_LOOKBACK_DAYS} days of analyses, not a "
+                      f"configured list — it moves with the {'/'.join(gate.deferred_modes)}]")
+            self.logger.info(
+                f"    {len(armed)}/{len(gate.symbols)} underlying(s) ARMED{origin}"
+                + (f": {self._sample_list(armed, counts, min_samples)}" if armed else "")
+                + (f"; INERT (iv_rank is None, so the rule cannot fire): "
+                   f"{self._sample_list(inert, counts, min_samples)}" if inert else ""))
+
+        self.logger.info(
+            f"IV-rank gate readiness: {armed_total} underlying(s) armed across "
+            f"{len(gates)} expert(s)"
+            + (f"; {blind_total} expert(s) with an UNKNOWN universe whose gated rules "
+               f"cannot fire at all" if blind_total else ""))
+
+    @staticmethod
+    def _sample_list(symbols, counts, min_samples, limit: int = 12) -> str:
+        """``AAPL 3/5, MSFT 5/5, ... (+18 more)`` — capped so a 30-name universe stays
+        one readable log line."""
+        head = ", ".join(f"{s} {counts[s]}/{min_samples}" for s in symbols[:limit])
+        extra = len(symbols) - limit
+        return head + (f", (+{extra} more)" if extra > 0 else "")
 
     def _check_all_washtrade_locked_orders(self):
         """Re-submit WASHTRADE_LOCKED orders whose symbol no longer has an opposite-side
@@ -576,6 +833,39 @@ class TradeManager:
                     f"future entry for this symbol+expert"
                 )
         return True
+
+    def _persist_funded_entry(self, order, quantity: float, stop_price=None) -> None:
+        """Write the risk manager's decision onto the entry row BEFORE the broker is called.
+
+        WHY IT MUST BE BEFORE. At this point the RM-sized quantity and the safeguard stop exist
+        only in memory, on a TRANSIENT candidate object that is about to be thrown away — see
+        ``_submit_funded_entry_with_retry``'s own docstring: "re-deriving them later from a
+        stranded row is not possible". Everything that can go wrong from here (a lock, a broker
+        rejection, a crash, a restart) leaves a row on disk, and that row is either sized and
+        re-drivable or it is a dead qty-0 stub nothing can reconstruct. Order 460 on PROD
+        2026-08-10 was the latter and sat untouched for 8 hours.
+
+        Persisting first also makes the broker submit the ONLY thing left that can fail, which
+        is what lets the compensation in ``_fail_unsent_entry`` be a simple, provable statement
+        about a row rather than a guess about how far the submit got.
+
+        ``stop_price`` mirrors what the DB sizing path already does. There the candidate IS the
+        persisted row, so ``_ensure_safeguard_stop``'s write lands in the database for free; the
+        temp-order-list path sizes a transient candidate and only ever passed the stop as a
+        ``submit_order`` argument, leaving the row's ``stop_price`` null. That null is what
+        ``_check_all_washtrade_locked_orders`` re-reads to rebuild the protective leg when it
+        re-submits a cleared lock — with no stop on the row it re-sends the entry naked.
+
+        An explicit stop the ruleset already put on the order always wins, exactly as in
+        ``_ensure_safeguard_stop``: the RM's is a SAFEGUARD, not an override.
+
+        Safe to call here only because the order is DETACHED (see the enter loop's read-only
+        session invariant). On an attached row this update_instance is the self-deadlock.
+        """
+        order.quantity = quantity
+        if stop_price and not order.stop_price:
+            order.stop_price = stop_price
+        update_instance(order)
 
     # Transient DB-lock retries for a FUNDED entry. See _submit_funded_entry_with_retry.
     _ENTRY_SUBMIT_RETRIES = 3
@@ -1444,6 +1734,23 @@ class TradeManager:
             # Get recent recommendations based on lookback_days parameter
             cutoff_time = datetime.now(timezone.utc) - timedelta(days=lookback_days)
 
+            # INVARIANT FOR THIS WHOLE BLOCK: `session` is READ-ONLY. Nothing loaded through it
+            # may be mutated, and nothing may be added to it.
+            #
+            # It stays open across the broker round trip, and sqlite has ONE write lock per
+            # database. The moment this session owns a modified row, the next query on it
+            # autoflushes, takes that lock, and holds it for the rest of the block — while
+            # submit_order writes the Transaction and the order from a SECOND connection on the
+            # same thread. That connection then waits for a lock its own caller holds and nobody
+            # is left to release it: measured on PROD as ~15 minutes with no write of any kind,
+            # ending 15 ms after this block exited. CVS 2026-08-10 and WSC 2026-08-24 were both
+            # funded by the risk manager and both lost that way.
+            #
+            # The 2026-08-10 attempt wrapped ONE query in `no_autoflush`. It did not hold: the
+            # rows it hid stayed dirty, and the NEXT candidate's first query flushed them instead.
+            # Guarding flush SITES is unwinnable — every future query is another one. Owning no
+            # dirty state is the invariant that cannot be routed around. Writes from inside this
+            # block go through update_instance()/add_instance() on their own short-lived sessions.
             with get_db() as session:
                 # Get all recommendations for this expert instance within the time window
                 statement = select(ExpertRecommendation).where(
@@ -1451,9 +1758,9 @@ class TradeManager:
                     ExpertRecommendation.created_at >= cutoff_time,
                     ExpertRecommendation.recommended_action != OrderRecommendation.HOLD
                 ).order_by(ExpertRecommendation.created_at.desc())  # Most recent first
-                
+
                 all_recommendations = session.exec(statement).all()
-                
+
                 if not all_recommendations:
                     self.logger.info(f"No actionable recommendations found for expert {expert_instance_id}")
                     return created_orders
@@ -1616,14 +1923,24 @@ class TradeManager:
                                     if result.get('success') and isinstance(result.get('data'), dict):
                                         oid = result['data'].get('order_id')
                                         if oid:
-                                            from sqlmodel import select as _select
-                                            o = session.exec(_select(TradingOrder).where(TradingOrder.id == oid)).first()
+                                            # DETACHED on purpose — see the block comment above
+                                            # this loop's `with get_db() as session:`. Fetching
+                                            # through the long-lived `session` attaches the row,
+                                            # the RM stamp two lines below makes that session
+                                            # DIRTY, and the next query on it autoflushes and
+                                            # takes sqlite's one write lock — which submit_order
+                                            # then blocks on from its own second connection.
+                                            # get_instance(session=None) opens and closes its own
+                                            # session and hands back a fully loaded, detached row.
+                                            o = self._row_or_none(TradingOrder, oid)
                                             if o and o.side in (OrderDirection.BUY, OrderDirection.SELL) and order is None:
                                                 order = o
                                 if order is None:
                                     self.logger.warning(f"No main order created for funded {candidate.symbol}")
                                     continue
-                                order.quantity = fo.quantity  # RM-sized quantity from the candidate pass
+                                # RM-sized quantity + safeguard stop from the candidate pass,
+                                # WRITTEN TO DISK before the broker is asked for anything.
+                                self._persist_funded_entry(order, fo.quantity, fo.stop_price or None)
 
                                 # ...and stamp the SAME quantity onto the protective legs execute()
                                 # just created. They were built by the account from the entry's
@@ -1639,9 +1956,9 @@ class TradeManager:
                                 # quantity<=0 guard and cancelled, leaving those positions with a
                                 # stop and NO take-profit.
                                 #
-                                # Doing it here closes the race at the source: same session, same
-                                # value, same moment. Scoped to legs of THIS entry, created seconds
-                                # ago by THIS execute(), so they are all full-position legs — the
+                                # Doing it here closes the race at the source: same value, same
+                                # moment. Scoped to legs of THIS entry, created seconds ago by
+                                # THIS execute(), so they are all full-position legs — the
                                 # partial-close case (a leg sized for the REMAINING shares behind a
                                 # close order) hangs off a different parent and cannot be reached.
                                 #
@@ -1650,29 +1967,29 @@ class TradeManager:
                                 # (`held = abs(net)`), so it cannot inherit a transient 0 and has no
                                 # equivalent defect. Live must stage the leg before the fill because
                                 # the broker needs it resting; that constraint is live-only.
+                                #
+                                # PERSISTED HERE, per leg, through its own short-lived session —
+                                # NOT left as a pending mutation on the enter loop's session. That
+                                # is what the previous version did behind `no_autoflush`, and it
+                                # only moved the problem: the legs stayed dirty and attached, so
+                                # the NEXT candidate's first query flushed them instead and took
+                                # the write lock right before ITS submit. `no_autoflush` closes one
+                                # column; owning nothing on that session closes them all.
                                 try:
                                     from sqlmodel import select as _leg_select
-                                    # no_autoflush IS THE POINT, not a detail. `order` is dirty from
-                                    # the line above, so running this query normally AUTOFLUSHES it --
-                                    # which takes sqlite's single WRITE LOCK on this session. The very
-                                    # next thing we do is submit_order(), which inserts the Transaction
-                                    # from a DIFFERENT session and therefore blocks on its own caller
-                                    # for the full 30s busy_timeout, four times, and the funded trade is
-                                    # lost. That is exactly what happened to CVS on 2026-08-10 (and to
-                                    # 5 dev entries the same day: 161 lock events, none before this code
-                                    # shipped on the 08-08, with the 09th a closed Sunday in between).
-                                    # Suppressing the autoflush keeps the lock unheld across the broker
-                                    # round trip; the order + legs still persist together at the outer
-                                    # commit, which is after submit and long before any leg is promoted.
-                                    with session.no_autoflush:
-                                        legs = session.exec(_leg_select(TradingOrder).where(
-                                            TradingOrder.depends_on_order == order.id)).all()
-                                    for leg in legs:
-                                        if leg.quantity != order.quantity:
+                                    from .db import get_db as _get_db
+                                    with _get_db() as leg_session:
+                                        leg_ids = [l.id for l in leg_session.exec(
+                                            _leg_select(TradingOrder).where(
+                                                TradingOrder.depends_on_order == order.id)).all()]
+                                    for leg_id in leg_ids:
+                                        leg = self._row_or_none(TradingOrder, leg_id)
+                                        if leg is not None and leg.quantity != order.quantity:
                                             self.logger.info(
                                                 f"Stamped protective leg {leg.id} ({leg.order_type}) "
                                                 f"qty {leg.quantity} -> {order.quantity} from entry {order.id}")
                                             leg.quantity = order.quantity
+                                            update_instance(leg)
                                 except Exception as leg_err:  # noqa: BLE001 — never block the entry
                                     self.logger.error(
                                         f"Failed to stamp protective-leg quantity for order {order.id}: "
@@ -1686,7 +2003,11 @@ class TradeManager:
                                     account, order, sl_price=fo.stop_price or None)
                                 if submitted_order:
                                     submitted_count += 1
-                                    session.expunge(order)
+                                    # No expunge: `order` was never attached to this session in
+                                    # the first place (see the detached fetch above), so there is
+                                    # nothing to detach — and expunging only ever covered the
+                                    # entry, never the legs, which is how the flush found another
+                                    # way through on the next iteration.
                                     created_orders.append(order)
                                     self.logger.info(f"Successfully submitted order {order.id} to broker")
                                 else:
@@ -2191,22 +2512,17 @@ class TradeManager:
 
                         # Resolve the primary (entry) order from the oldest open transaction
                         # This is needed for conditions like DaysOpenedCondition that use order.created_at
-                        existing_order = None
                         oldest_transaction = min(existing_transactions, key=lambda t: t.open_date or t.created_at)
-                        if oldest_transaction:
-                            entry_order_stmt = (
-                                select(TradingOrder)
-                                .where(
-                                    TradingOrder.transaction_id == oldest_transaction.id,
-                                    TradingOrder.side == oldest_transaction.side,
-                                    TradingOrder.status == OrderStatus.FILLED
-                                )
-                                .order_by(TradingOrder.created_at.asc())
-                                .limit(1)
-                            )
-                            existing_order = session.exec(entry_order_stmt).first()
-                            if existing_order:
-                                self.logger.debug(f"Resolved entry order {existing_order.id} for {recommendation.symbol} (created: {existing_order.created_at})")
+                        existing_order = resolve_entry_order(session, oldest_transaction)
+                        if existing_order:
+                            self.logger.debug(f"Resolved entry order {existing_order.id} for {recommendation.symbol} (created: {existing_order.created_at})")
+                        else:
+                            # Not benign: every P&L / days-opened condition on this symbol will
+                            # now evaluate False and CloseAction loses its transaction link.
+                            self.logger.warning(
+                                f"No FILLED {oldest_transaction.side} order on transaction "
+                                f"{oldest_transaction.id} ({recommendation.symbol}) — exit "
+                                f"conditions needing an entry order cannot evaluate")
 
                         # Evaluate recommendation through the open_positions ruleset
                         self.logger.debug(f"Evaluating recommendation {recommendation.id} for {recommendation.symbol} (open_positions)")

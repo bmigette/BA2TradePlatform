@@ -304,6 +304,13 @@ class OrderOpenType(str, Enum):
     EXTERNAL = "external"
     NOTOPENED = "notopened"
 
+
+# ``Transaction.meta_data["origin"]`` values for share positions the platform did NOT
+# buy — the stock leg of an option assignment. Written by the broker account's option-
+# activity reconciler (AlpacaAccount._apply_option_activity) and read by
+# HasAssignedSharesCondition; shared here so writer and reader cannot drift apart.
+TXN_ORIGIN_CSP_ASSIGNMENT = "csp_assignment"   # long stock put to us by an assigned short put
+
 class OrderRecommendation(str, Enum):
     SELL = "SELL"
     UNDERWEIGHT = "UNDERWEIGHT"
@@ -376,6 +383,10 @@ class ExpertEventType(str, Enum):
     F_HAS_OPTION_POSITION = "has_option_position"  # Expert has an open option position
     F_HAS_COVERED_CALL = "has_covered_call"        # Expert has an open covered call
     F_HAS_PROTECTIVE_PUT = "has_protective_put"    # Expert has an open protective put
+    # Shares the expert did not buy: the stock leg of an assigned short put. The wheel's
+    # covered-call rule needs this INSTEAD of has_buy_position, which cannot tell assigned
+    # stock apart from stock the same expert bought outright.
+    F_HAS_ASSIGNED_SHARES = "has_assigned_shares"  # Expert holds stock from an option assignment
 
     # N = Number/Count
     N_EXPECTED_PROFIT_TARGET_PERCENT = "expected_profit_target_percent"
@@ -409,6 +420,14 @@ class ExpertEventType(str, Enum):
     N_PERCENT_ABOVE_RECENT_LOW = "percent_above_recent_low"    # Percent the current price is above the recent low
     N_IV_RANK = "iv_rank"                                      # Implied volatility rank (0-100)
     N_DAYS_TO_EARNINGS = "days_to_earnings"                    # Calendar days until the next earnings announcement
+    # Calendar days of option life REMAINING (expiry - the evaluation date). The complement of
+    # N_DAYS_OPENED, which counts days ELAPSED: with the entry DTE window itself a tuned gene,
+    # "21 days after opening" and "21 days before expiry" are different quantities. This is what
+    # makes roll-at-DTE expressible as a RULE (it previously existed only inside
+    # OptionPortfolioManager, so no other expert could roll and the GA could not optimise the
+    # roll point) and it is the only exit criterion a 0DTE structure can have. Negative past
+    # expiry; UNEVALUABLE (never 0, never infinity) when the expiry cannot be determined.
+    N_DAYS_TO_EXPIRY = "days_to_expiry"
 
 
 class ExpertActionType(str, Enum):
@@ -429,6 +448,7 @@ class ExpertActionType(str, Enum):
     BUY_PROTECTIVE_PUT = "buy_protective_put"
     SELL_CASH_SECURED_PUT = "sell_cash_secured_put"
     OPEN_BEAR_CALL_SPREAD = "open_bear_call_spread"
+    OPEN_BULL_PUT_SPREAD = "open_bull_put_spread"
     OPEN_STRADDLE = "open_straddle"
     OPEN_STRANGLE = "open_strangle"
     OPEN_SHORT_STRADDLE = "open_short_straddle"
@@ -529,7 +549,8 @@ def get_numeric_event_values():
         ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH.value,
         ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW.value,
         ExpertEventType.N_IV_RANK.value,
-        ExpertEventType.N_DAYS_TO_EARNINGS.value
+        ExpertEventType.N_DAYS_TO_EARNINGS.value,
+        ExpertEventType.N_DAYS_TO_EXPIRY.value
     ]
 
 
@@ -560,6 +581,7 @@ def get_option_action_values():
         ExpertActionType.BUY_PROTECTIVE_PUT.value,
         ExpertActionType.SELL_CASH_SECURED_PUT.value,
         ExpertActionType.OPEN_BEAR_CALL_SPREAD.value,
+        ExpertActionType.OPEN_BULL_PUT_SPREAD.value,
         ExpertActionType.OPEN_STRADDLE.value,
         ExpertActionType.OPEN_STRANGLE.value,
         ExpertActionType.OPEN_SHORT_STRADDLE.value,

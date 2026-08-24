@@ -117,7 +117,8 @@ __all__ = [
     "compute_base_notional", "compute_allocation", "compute_label_investment",
     "apply_order_impacts", "consume_income_events",
     # filled-value measurement (the income ledger's input)
-    "SETTLED_ORDER_STATUSES", "OrderFill", "FilledTotals", "measure_filled_values",
+    "SETTLED_ORDER_STATUSES", "UNEXECUTED_ORDER_STATUSES",
+    "OrderFill", "FilledTotals", "measure_filled_values",
     "UNCONSUMED_RUNS_NOTICE_FMT", "UNFINISHED_RUNS_NOTICE_FMT",
     "unconsumed_income_notice",
     "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
@@ -3911,6 +3912,34 @@ SETTLED_ORDER_STATUSES = frozenset(OrderStatus.get_terminal_statuses()) | {
     OrderStatus.WASHTRADE_LOCKED,
 }
 
+#: Statuses that are THEMSELVES a measurement of zero, so a missing
+#: ``filled_quantity`` on one of them needs no explanation:
+#:
+#:   REJECTED          the broker refused the order. It was never working, so no
+#:                     share of it can have traded.
+#:   ERROR             our own stamp for a submission that failed
+#:                     (``AccountInterface._handle_order_submit_error``).
+#:   WASHTRADE_LOCKED  our own gate. The order was never sent.
+#:
+#: Needed because a refused allocation order reaches the ledger with a NULL
+#: quantity and NOT an explicit 0.0: the row is persisted with ``filled_qty``
+#: unset (``portfolio_allocation_service._submit_row``) and the refusal stamps
+#: only the status, while a broker refresh writes no quantity for an order the
+#: broker never accepted. Without this set the commonest outcome there is -- one
+#: row refused -- would make the whole run permanently unmeasurable, and income
+#: that is never consumed gets deployed a second time by the next run just as
+#: surely as income consumed for zero.
+#:
+#: Every OTHER settled status -- FILLED, CANCELED, EXPIRED, STOPPED, REPLACED,
+#: CLOSED, DONE_FOR_DAY -- can carry shares that really traded (a cancel after a
+#: partial is the ordinary case), so a missing quantity on one of those is
+#: UNKNOWN, not zero, and stalls the ledger.
+UNEXECUTED_ORDER_STATUSES = frozenset({
+    OrderStatus.REJECTED,
+    OrderStatus.ERROR,
+    OrderStatus.WASHTRADE_LOCKED,
+})
+
 
 @dataclass(frozen=True)
 class OrderFill:
@@ -3922,11 +3951,21 @@ class OrderFill:
     ``status=None`` is the live collector's spelling for "that order id has no row
     any more", which is an inconsistency, not an emptiness: it is treated as still
     working so the run stalls instead of quietly consuming income.
+
+    ``filled_quantity=None`` and ``fill_price=None`` mean the same thing as each
+    other -- "nobody reported this" -- and both make the order UNMEASURABLE. The
+    quantity default is ``None`` and NOT ``0.0`` for the same reason the price
+    default is: ``0.0`` is a measurement of zero shares, and reading a NULL
+    ``filled_qty`` as one is what let two runs deploy the same income (a FILLED
+    TastyTrade order whose ``_fills_summary`` answered ``(0.0, None)`` settled the
+    run at zero, took the one-shot ``income_consumed_at`` stamp, and left the money
+    looking unallocated). A quantity that is genuinely zero must be passed
+    EXPLICITLY, which is what a broker that answered "nothing filled" produces.
     """
     order_id: int
     side: Optional[OrderDirection] = None
     status: Optional[OrderStatus] = None
-    filled_quantity: float = 0.0
+    filled_quantity: Optional[float] = None
     fill_price: Optional[float] = None
 
 
@@ -3984,6 +4023,14 @@ def measure_filled_values(fills: List[OrderFill]) -> FilledTotals:
     income consumed against money that was only ever intended, made permanent by
     the one-shot ``income_consumed_at``.
 
+    A MISSING QUANTITY is treated exactly like a missing price: ``None`` is
+    unmeasurable, and only an EXPLICIT zero (``abs(quantity) <= QUANTITY_EPSILON``)
+    is the measured "nothing filled" that contributes zero and settles. Zero was
+    once the reading of both, so a NULL ``filled_qty`` on a FILLED order settled the
+    run at zero value, stamped it, and left the income it had really spent looking
+    unallocated for the next run to spend again. The one exception is
+    ``UNEXECUTED_ORDER_STATUSES``, where the status alone proves nothing traded.
+
     A partial fill counts its filled part (that money moved) AND blocks settlement
     (more can still move). A rejected, cancelled, errored or wash-trade-locked
     order contributes zero and is settled.
@@ -4004,17 +4051,21 @@ def measure_filled_values(fills: List[OrderFill]) -> FilledTotals:
             totals.settled = False
             totals.working_order_ids.append(fill.order_id)
 
-        quantity = float(fill.filled_quantity or 0.0)
-        if abs(quantity) <= QUANTITY_EPSILON:
+        quantity = fill.filled_quantity
+        if quantity is None and fill.status in UNEXECUTED_ORDER_STATUSES:
+            # The status IS the measurement: the order was refused or never sent,
+            # so there is no quantity to be missing. See UNEXECUTED_ORDER_STATUSES.
+            continue
+        if quantity is not None and abs(float(quantity)) <= QUANTITY_EPSILON:
             continue
 
         price = fill.fill_price
-        if fill.side is None or price is None or float(price) <= 0:
+        if quantity is None or fill.side is None or price is None or float(price) <= 0:
             totals.settled = False
             totals.unmeasurable_order_ids.append(fill.order_id)
             continue
 
-        value = abs(quantity) * float(price)
+        value = abs(float(quantity)) * float(price)
         if fill.side == OrderDirection.BUY:
             totals.buy_value += value
         elif fill.side == OrderDirection.SELL:

@@ -3,16 +3,113 @@ Structured Condition Schema and Evaluator for PennyMomentumTrader.
 
 Defines condition types for entry/exit signals and provides a deterministic
 evaluator that checks conditions against live market data without LLM calls.
+
+
+Unknown is never a value
+------------------------
+Every handler here used to answer ``False`` when it could not measure -- no OHLCV
+bar, no RVOL history, no entry price, an unknown condition type, any exception at
+all -- and ``evaluate`` ran the builtin ``all()``/``any()`` over those. Measured
+before the fix, on one and the same hard stop::
+
+    price known, -10% vs entry -> stop fires : True
+    price UNKNOWN              -> stop fires : False
+    feed RAISES                -> stop fires : False
+    no entry price recorded    -> stop fires : False
+    unparseable condition type -> stop fires : False
+    consecutive blind ticks with no exit: 1000 (and counting -- forever)
+
+Every one of those ``False`` values is the SAME answer as "measured, and the stop
+has not been hit", so on the exact tick the feed breaks a live protective stop
+silently does not fire and the position is held blind indefinitely. The debug line
+even read ``unmet (price=N/A, ...)``.
+
+So handlers now return ``Optional[bool]`` -- ``None`` means "we could not measure
+this" and is never coerced -- and the composites use KLEENE (three-valued) logic,
+because the builtins get this exactly wrong: ``all([True, None])`` is ``False`` and
+``any([False, None])`` is ``False``, which is how an unmeasurable leg turned into a
+measured one.
+
+The asymmetry between entries and exits is the whole point:
+
+* ``evaluate`` is the ENTRY policy: unknown -> ``False``. An entry that cannot be
+  measured must not fire, and that is the safe direction there.
+* ``evaluate_exit`` is the EXIT policy: unknown ESCALATES. A stop we cannot evaluate
+  is not a stop that passed, so after ``max_unknown_ticks`` CONSECUTIVE unmeasurable
+  ticks the position is flattened rather than held forever. A tick we CAN measure
+  resets the streak, so the escalation can never fire on a measurable bar.
 """
 
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import pytz
 
 from ba2_common.logger import logger
+
+
+#: Consecutive ticks an EXIT may go unmeasurable before it is forced. The monitor
+#: loop's default cadence is 60s (``monitoring_interval_seconds``), so 3 ticks is
+#: about three minutes: long enough to ride out a single flaky vendor call or one
+#: timed-out request (the overwhelmingly common case), short enough that a penny
+#: stock -- which can lose a fifth of its value in that time -- is never held with an
+#: unevaluable stop for longer. 1 would flatten good positions on ordinary API noise;
+#: "never" is the defect this constant exists to remove.
+DEF_MAX_UNKNOWN_EXIT_TICKS = 3
+
+
+def kleene_all(values: Iterable[Optional[bool]]) -> Optional[bool]:
+    """Three-valued AND. ``False`` beats everything; otherwise any ``None`` wins.
+
+    NOT ``all()``: the builtin answers ``False`` for ``[True, None]`` because
+    ``None`` is falsy, which silently converts "one leg is unmeasurable" into "the
+    condition is definitely not met".
+    """
+    unknown = False
+    for v in values:
+        if v is None:
+            unknown = True
+        elif not v:
+            return False          # a definite False decides regardless of the rest
+    return None if unknown else True
+
+
+def kleene_any(values: Iterable[Optional[bool]]) -> Optional[bool]:
+    """Three-valued OR. ``True`` beats everything; otherwise any ``None`` wins.
+
+    NOT ``any()``: the builtin answers ``False`` for ``[False, None]``, which is the
+    shape of a multi-leg stop with one blind leg.
+    """
+    unknown = False
+    for v in values:
+        if v is None:
+            unknown = True
+        elif v:
+            return True           # a definite True decides regardless of the rest
+    return None if unknown else False
+
+
+@dataclass(frozen=True)
+class ExitEvaluation:
+    """The decision about ONE exit condition set on ONE tick.
+
+    ``verdict``        True/False as measured, or ``None`` for unmeasurable.
+    ``fire``           act now: exit the position.
+    ``escalated``      ``fire`` is because we have been blind too long, NOT because
+                       the condition was met. Never both.
+    ``unknown_streak`` the consecutive-unmeasurable count to PERSIST for next tick.
+                       0 whenever the tick was measurable, at all.
+    ``detail``         human-readable, naming the condition that could not be
+                       measured -- the ``option_lifecycle`` discipline.
+    """
+    verdict: Optional[bool]
+    fire: bool
+    escalated: bool
+    unknown_streak: int
+    detail: str
 
 
 # ---------------------------------------------------------------------------
@@ -351,8 +448,18 @@ class ConditionEvaluator:
     # -------------------------------------------------------------------
 
     def evaluate(self, conditions: dict, symbol: str, entry_price: Optional[float] = None) -> bool:
+        """ENTRY policy: True only if the conditions were MEASURED and met.
+
+        Unknown collapses to False here on purpose -- an entry we cannot measure
+        must not open a position. That collapse is a POLICY, applied once, at the
+        edge; the measurement itself (``evaluate_tristate``) keeps unknown distinct.
+        Exits must NOT use this: see ``evaluate_exit``.
         """
-        Evaluate a composite condition (with 'all'/'any' logic).
+        return self.evaluate_tristate(conditions, symbol, entry_price) is True
+
+    def evaluate_tristate(self, conditions: dict, symbol: str,
+                          entry_price: Optional[float] = None) -> Optional[bool]:
+        """Evaluate a composite condition (with 'all'/'any' logic), three-valued.
 
         Args:
             conditions: Composite condition dict with 'all' or 'any' key,
@@ -361,51 +468,112 @@ class ConditionEvaluator:
             entry_price: Entry price for percent-based conditions.
 
         Returns:
-            True if conditions are met.
+            True (met), False (not met) or None (at least one leg could not be
+            measured and the measured ones did not decide it).
         """
         if "all" in conditions:
-            return all(
-                self.evaluate(c, symbol, entry_price) for c in conditions["all"]
+            return kleene_all(
+                self.evaluate_tristate(c, symbol, entry_price) for c in conditions["all"]
             )
         if "any" in conditions:
-            return any(
-                self.evaluate(c, symbol, entry_price) for c in conditions["any"]
+            return kleene_any(
+                self.evaluate_tristate(c, symbol, entry_price) for c in conditions["any"]
             )
         # Single condition
         return self.evaluate_single(conditions, symbol, entry_price)
 
-    def evaluate_single(self, condition: dict, symbol: str, entry_price: Optional[float] = None) -> bool:
+    def evaluate_exit(self, conditions: dict, symbol: str,
+                      entry_price: Optional[float] = None,
+                      unknown_streak: int = 0,
+                      max_unknown_ticks: int = DEF_MAX_UNKNOWN_EXIT_TICKS) -> ExitEvaluation:
+        """EXIT policy: unknown escalates instead of quietly holding.
+
+        ``unknown_streak`` is how many CONSECUTIVE ticks this exit has already been
+        unmeasurable; the caller persists ``ExitEvaluation.unknown_streak`` and hands
+        it back next tick (0/absent is a genuinely fresh position, not an unknown).
+
+        Two properties this must have, and both are pinned by tests:
+
+        * **it cannot deadlock.** Each consecutive unmeasurable tick increments the
+          streak by exactly 1 and ``max_unknown_ticks`` is clamped to >= 1, so the
+          exit is forced by tick N. There is no path that holds a position with an
+          unevaluable stop forever -- which is exactly what the old ``False`` did.
+        * **it cannot fire on a measurable bar.** Escalation requires
+          ``verdict is None``, and the verdict is None only when a handler could not
+          measure. Any measurable tick -- including a plain "not hit" -- resets the
+          streak to 0. Firing on a healthy position would exit good trades, which is
+          the expensive inverse of the defect.
+        """
+        window = max(1, int(max_unknown_ticks))
+        verdict = self.evaluate_tristate(conditions, symbol, entry_price)
+        if verdict is not None:
+            return ExitEvaluation(
+                verdict, bool(verdict), False, 0,
+                "exit condition met" if verdict else "exit condition not met")
+
+        streak = int(unknown_streak or 0) + 1
+        blind = ", ".join(self._unmeasurable_conditions(conditions, symbol, entry_price)) \
+            or "the exit conditions"
+        if streak >= window:
+            return ExitEvaluation(
+                None, True, True, streak,
+                f"could not evaluate {blind} for {streak} consecutive ticks "
+                f"(limit {window}) — forcing the exit rather than holding a position "
+                f"whose stop cannot be measured")
+        return ExitEvaluation(
+            None, False, False, streak,
+            f"could not evaluate {blind} ({streak}/{window} consecutive blind ticks)")
+
+    def _unmeasurable_conditions(self, conditions: dict, symbol: str,
+                                 entry_price: Optional[float]) -> List[str]:
+        """The condition types that came back unknown -- so the log names the input
+        that is missing rather than shrugging. Cheap: the per-cycle indicator cache
+        means re-walking the tree does no extra fetching."""
+        out: List[str] = []
+        for key, value in self.get_condition_status(conditions, symbol, entry_price).items():
+            if value is None:
+                out.append(key)
+        return out
+
+    def evaluate_single(self, condition: dict, symbol: str,
+                        entry_price: Optional[float] = None) -> Optional[bool]:
         """
         Evaluate a single condition dict.
 
-        Returns False (and logs warning) if the condition type is unknown
-        or data is unavailable.
+        Returns None (and logs a warning) if the condition type is unknown, the
+        handler raised, or the data it needs is unavailable -- "we could not measure
+        this" is NOT the same answer as "this condition is not met", and an exit rule
+        we cannot even parse is a stop that will never fire.
         """
         ctype = condition.get("type")
         handler = self._handlers.get(ctype)
         if handler is None:
             logger.warning(f"Unknown condition type: {ctype}")
-            return False
+            return None
         try:
-            return bool(handler(self, condition, symbol, entry_price))
+            result = handler(self, condition, symbol, entry_price)
         except Exception as e:
             logger.warning(f"Error evaluating condition {ctype} for {symbol}: {e}")
-            return False
+            return None
+        return None if result is None else bool(result)
 
     def get_condition_status(
         self, conditions: dict, symbol: str, entry_price: Optional[float] = None
-    ) -> Dict[str, bool]:
+    ) -> Dict[str, Optional[bool]]:
         """
         Return per-condition evaluation status for UI display.
 
         For composite conditions, returns a flat dict keyed by condition description.
+        A value of None means the condition could not be measured this tick (the UI
+        renders that distinctly from a red "not met" cross).
         """
-        result: Dict[str, bool] = {}
+        result: Dict[str, Optional[bool]] = {}
         self._collect_status(conditions, symbol, entry_price, result)
         return result
 
     def _collect_status(
-        self, conditions: dict, symbol: str, entry_price: Optional[float], result: Dict[str, bool]
+        self, conditions: dict, symbol: str, entry_price: Optional[float],
+        result: Dict[str, Optional[bool]]
     ) -> None:
         if "all" in conditions:
             for c in conditions["all"]:
@@ -470,10 +638,14 @@ class ConditionEvaluator:
         cond: dict,
         symbol: str,
         entry_price: Optional[float],
-        met: bool,
+        met: Optional[bool],
     ) -> str:
-        """Return a human-readable detail string for a single condition."""
-        label = "met" if met else "unmet"
+        """Return a human-readable detail string for a single condition.
+
+        Three labels, not two: the old one printed ``unmet (price=N/A, ...)`` -- an
+        admission that the price was missing, filed under "the condition is not met".
+        """
+        label = "met" if met is True else ("unmet" if met is False else "unknown")
         ctype = cond.get("type", "")
         try:
             if ctype in ("price_above", "price_below"):
@@ -508,14 +680,15 @@ class ConditionEvaluator:
                     required = avg * cond["multiplier"]
                     return (
                         f"{label} (today_vol={self._fmt(cur)} "
-                        f"{'≥' if met else '<'} "
+                        f"{'≥' if met is True else ('<' if met is False else '?')} "
                         f"need≥{self._fmt(required)} "
                         f"[{cond['multiplier']}× avg{cond['window']}d={self._fmt(avg)}])"
                     )
 
             if ctype == "rvol_above":
                 rvol = self._get_rvol(symbol)
-                return f"{label} (rvol={self._fmt(rvol)} {'≥' if met else '<'} {cond['threshold']}x)"
+                op = '≥' if met is True else ('<' if met is False else '?')
+                return f"{label} (rvol={self._fmt(rvol)} {op} {cond['threshold']}x)"
 
             if ctype in ("rsi_above", "rsi_below", "rsi_between"):
                 rsi = self._get_rsi(symbol, cond["period"], cond["timeframe"])
@@ -651,7 +824,8 @@ class ConditionEvaluator:
         self._indicator_cache[cache_key] = value
         return value
 
-    def _check_macd_cross(self, symbol: str, timeframe: str, bullish: bool) -> bool:
+    def _check_macd_cross(self, symbol: str, timeframe: str,
+                          bullish: bool) -> Optional[bool]:
         cache_key = f"macd_cross:{symbol}:{timeframe}:{bullish}"
         if cache_key in self._indicator_cache:
             return self._indicator_cache[cache_key]
@@ -659,8 +833,8 @@ class ConditionEvaluator:
         lookback = _TIMEFRAME_LOOKBACK.get(timeframe, 30)
         df = self._get_ohlcv(symbol, timeframe, lookback)
         if df is None or len(df) < 35:  # Need enough data for MACD(12,26,9)
-            self._indicator_cache[cache_key] = False
-            return False
+            self._indicator_cache[cache_key] = None
+            return None
 
         close = df["close"]
         ema12 = close.ewm(span=12, adjust=False).mean()
@@ -670,8 +844,8 @@ class ConditionEvaluator:
 
         # Check crossover on the last two bars
         if len(macd_line) < 2:
-            self._indicator_cache[cache_key] = False
-            return False
+            self._indicator_cache[cache_key] = None
+            return None
 
         prev_diff = macd_line.iloc[-2] - signal_line.iloc[-2]
         curr_diff = macd_line.iloc[-1] - signal_line.iloc[-1]
@@ -686,7 +860,7 @@ class ConditionEvaluator:
 
     def _check_ema_cross(
         self, symbol: str, fast: int, slow: int, timeframe: str, above: bool
-    ) -> bool:
+    ) -> Optional[bool]:
         cache_key = f"ema_cross:{symbol}:{fast}:{slow}:{timeframe}:{above}"
         if cache_key in self._indicator_cache:
             return self._indicator_cache[cache_key]
@@ -694,15 +868,15 @@ class ConditionEvaluator:
         lookback = _TIMEFRAME_LOOKBACK.get(timeframe, 30)
         df = self._get_ohlcv(symbol, timeframe, lookback)
         if df is None or len(df) < slow + 1:
-            self._indicator_cache[cache_key] = False
-            return False
+            self._indicator_cache[cache_key] = None
+            return None
 
         fast_ema = df["close"].ewm(span=fast, adjust=False).mean()
         slow_ema = df["close"].ewm(span=slow, adjust=False).mean()
 
         if len(fast_ema) < 2:
-            self._indicator_cache[cache_key] = False
-            return False
+            self._indicator_cache[cache_key] = None
+            return None
 
         prev_diff = fast_ema.iloc[-2] - slow_ema.iloc[-2]
         curr_diff = fast_ema.iloc[-1] - slow_ema.iloc[-1]
@@ -767,29 +941,29 @@ class ConditionEvaluator:
         self._indicator_cache[cache_key] = float(vwap)
         return float(vwap)
 
-    def _check_opening_range_breakout(self, symbol: str, minutes: int) -> bool:
+    def _check_opening_range_breakout(self, symbol: str, minutes: int) -> Optional[bool]:
         cache_key = f"orb:{symbol}:{minutes}"
         if cache_key in self._indicator_cache:
             return self._indicator_cache[cache_key]
 
         df = self._get_ohlcv(symbol, "1m", 1)
         if df is None or len(df) < minutes:
-            self._indicator_cache[cache_key] = False
-            return False
+            self._indicator_cache[cache_key] = None
+            return None
 
         # Filter to today's regular session to get the actual opening range
         df = self._filter_today_session(df)
         if len(df) < minutes:
-            self._indicator_cache[cache_key] = False
-            return False
+            self._indicator_cache[cache_key] = None
+            return None
 
         # Take first N minutes of today's session
         opening_high = df["high"].iloc[:minutes].max()
         current_price = self._get_current_price(symbol)
 
         if current_price is None:
-            self._indicator_cache[cache_key] = False
-            return False
+            self._indicator_cache[cache_key] = None
+            return None
 
         result = current_price > opening_high
         self._indicator_cache[cache_key] = result
@@ -871,22 +1045,25 @@ class ConditionEvaluator:
         self._indicator_cache[cache_key] = rvol
         return rvol
 
-    def _check_volume_spike(self, symbol: str, multiplier: float, minutes: int) -> bool:
+    def _check_volume_spike(self, symbol: str, multiplier: float,
+                            minutes: int) -> Optional[bool]:
         cache_key = f"vol_spike:{symbol}:{multiplier}:{minutes}"
         if cache_key in self._indicator_cache:
             return self._indicator_cache[cache_key]
 
         df = self._get_ohlcv(symbol, "1m", 5)
         if df is None or len(df) < minutes + 20:
-            self._indicator_cache[cache_key] = False
-            return False
+            self._indicator_cache[cache_key] = None
+            return None
 
         recent_vol = df["volume"].iloc[-minutes:].mean()
         avg_vol = df["volume"].iloc[:-minutes].mean()
 
         if avg_vol == 0:
-            self._indicator_cache[cache_key] = False
-            return False
+            # No baseline to compare against (a halted name): the RATIO is undefined,
+            # which is not the same fact as "the volume test failed".
+            self._indicator_cache[cache_key] = None
+            return None
 
         result = recent_vol >= avg_vol * multiplier
         self._indicator_cache[cache_key] = result
@@ -896,143 +1073,147 @@ class ConditionEvaluator:
     # Condition handler methods
     # -------------------------------------------------------------------
 
-    def _handle_price_above(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_price_above(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         price = self._get_current_price(symbol)
         if price is None:
-            return False
+            return None
         return price > cond["value"]
 
-    def _handle_price_below(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_price_below(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         price = self._get_current_price(symbol)
         if price is None:
-            return False
+            return None
         return price < cond["value"]
 
-    def _handle_price_above_ema(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_price_above_ema(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         price = self._get_current_price(symbol)
         ema = self._get_ema(symbol, cond["period"], cond["timeframe"])
         if price is None or ema is None:
-            return False
+            return None
         return price > ema
 
-    def _handle_price_below_ema(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_price_below_ema(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         price = self._get_current_price(symbol)
         ema = self._get_ema(symbol, cond["period"], cond["timeframe"])
         if price is None or ema is None:
-            return False
+            return None
         return price < ema
 
-    def _handle_price_above_sma(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_price_above_sma(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         price = self._get_current_price(symbol)
         sma = self._get_sma(symbol, cond["period"], cond["timeframe"])
         if price is None or sma is None:
-            return False
+            return None
         return price > sma
 
-    def _handle_price_below_sma(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_price_below_sma(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         price = self._get_current_price(symbol)
         sma = self._get_sma(symbol, cond["period"], cond["timeframe"])
         if price is None or sma is None:
-            return False
+            return None
         return price < sma
 
-    def _handle_price_above_vwap(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_price_above_vwap(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         price = self._get_current_price(symbol)
         vwap = self._get_vwap(symbol, cond["timeframe"])
         if price is None or vwap is None:
-            return False
+            return None
         return price > vwap
 
-    def _handle_price_below_vwap(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_price_below_vwap(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         price = self._get_current_price(symbol)
         vwap = self._get_vwap(symbol, cond["timeframe"])
         if price is None or vwap is None:
-            return False
+            return None
         return price < vwap
 
-    def _handle_opening_range_breakout(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_opening_range_breakout(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         return self._check_opening_range_breakout(symbol, cond["minutes"])
 
-    def _handle_volume_above_avg(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_volume_above_avg(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         lookback = _TIMEFRAME_LOOKBACK.get("1d", 365)
         df = self._get_ohlcv(symbol, "1d", lookback)
         if df is None or len(df) < cond["window"]:
-            return False
+            return None
         avg_vol = df["volume"].iloc[-cond["window"]:].mean()
         current_vol = df["volume"].iloc[-1]
         if avg_vol == 0:
-            return False
+            # No baseline: the multiple is undefined, not unmet.
+            return None
         return current_vol >= avg_vol * cond["multiplier"]
 
-    def _handle_rvol_above(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_rvol_above(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         rvol = self._get_rvol(symbol)
         if rvol is None:
-            return False
+            return None
         return rvol >= cond["threshold"]
 
-    def _handle_volume_spike(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_volume_spike(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         return self._check_volume_spike(symbol, cond["multiplier"], cond["minutes"])
 
-    def _handle_rsi_above(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_rsi_above(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         rsi = self._get_rsi(symbol, cond["period"], cond["timeframe"])
         if rsi is None:
-            return False
+            return None
         return rsi > cond["threshold"]
 
-    def _handle_rsi_below(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_rsi_below(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         rsi = self._get_rsi(symbol, cond["period"], cond["timeframe"])
         if rsi is None:
-            return False
+            return None
         return rsi < cond["threshold"]
 
-    def _handle_rsi_between(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_rsi_between(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         rsi = self._get_rsi(symbol, cond["period"], cond["timeframe"])
         if rsi is None:
-            return False
+            return None
         return cond["min"] <= rsi <= cond["max"]
 
-    def _handle_macd_bullish_cross(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_macd_bullish_cross(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         return self._check_macd_cross(symbol, cond["timeframe"], bullish=True)
 
-    def _handle_macd_bearish_cross(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_macd_bearish_cross(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         return self._check_macd_cross(symbol, cond["timeframe"], bullish=False)
 
-    def _handle_ema_cross_above(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_ema_cross_above(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         return self._check_ema_cross(
             symbol, cond["fast_period"], cond["slow_period"], cond["timeframe"], above=True
         )
 
-    def _handle_ema_cross_below(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_ema_cross_below(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         return self._check_ema_cross(
             symbol, cond["fast_period"], cond["slow_period"], cond["timeframe"], above=False
         )
 
-    def _handle_percent_above_entry(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_percent_above_entry(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         if entry_price is None:
-            return False
+            return None
         price = self._get_current_price(symbol)
         if price is None:
-            return False
+            return None
         target = entry_price * (1.0 + cond["percent"] / 100.0)
         return price >= target
 
-    def _handle_percent_below_entry(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_percent_below_entry(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
+        # THE hard stop. Without an entry price or a current price the move cannot be
+        # measured at all -- and answering False there is what made this stop silently
+        # skip on the exact tick the feed broke.
         if entry_price is None:
-            return False
+            return None
         price = self._get_current_price(symbol)
         if price is None:
-            return False
+            return None
         target = entry_price * (1.0 - cond["percent"] / 100.0)
         return price <= target
 
-    def _handle_time_after(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_time_after(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         tz = pytz.timezone(self.market_timezone)
         now = datetime.now(tz)
         parts = cond["time"].split(":")
         target_hour, target_minute = int(parts[0]), int(parts[1])
         return (now.hour, now.minute) >= (target_hour, target_minute)
 
-    def _handle_time_before(self, cond: dict, symbol: str, entry_price: Optional[float]) -> bool:
+    def _handle_time_before(self, cond: dict, symbol: str, entry_price: Optional[float]) -> Optional[bool]:
         tz = pytz.timezone(self.market_timezone)
         now = datetime.now(tz)
         parts = cond["time"].split(":")

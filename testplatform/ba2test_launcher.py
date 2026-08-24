@@ -2206,6 +2206,21 @@ _OPTION_STRATS = {
         "option_strike_param_max": 16.0, "option_strike_param_step": 2.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
         "option_dte_max_range": 60, "option_dte_step": 5},
+    "O_BULLPS": {  # bull put vertical (credit, defined risk) — the PUT mirror of O_BEARCS:
+        # sell the nearer-the-money put, buy further OTM as protection. Directional-BULLISH
+        # credit, so it sits in OS3's skewed-credit group alongside O_BEARCS rather than in
+        # OS2's delta-neutral one. It is the group's (and, after the affordability filter,
+        # the whole searched credit set's) only BULLISH defined-risk short-premium
+        # expression — before it, the sell arm could bet down (O_BEARCS) or sideways (O_IC)
+        # and nothing else. Reserves (width - credit)*100 like any vertical: $160-$1,280 per
+        # contract on this universe, i.e. affordable everywhere O_BEARCS is.
+        "action_type": "open_bull_put_spread", "option_strike_method": "percent_otm",
+        "option_strike_param": 8.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 15.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 4.0,
+        "option_strike_param_max": 16.0, "option_strike_param_step": 2.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 60, "option_dte_step": 5},
     "O_CSP": {  # cash-secured put (credit, income) — sized off strike*100 reserve, not
         # premium (see SellCashSecuredPutAction). Further OTM than O_LP's debit purchase
         # is typical (reduce assignment risk while still collecting premium).
@@ -2260,6 +2275,7 @@ _OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
 #     short_strangle          400      1,000      2,000      3,200
 #     short_straddle          800      2,000      4,000      6,400
 #     bear_call_spread        160        400        800      1,280
+#     bull_put_spread         160        400        800      1,280
 #     iron_condor             160        400        800      1,280
 #
 # That is why v8's OS2/OS3 only ever traded the cheapest underlyings (BAC $41, INTC $35) and
@@ -2280,7 +2296,11 @@ _FULL_NOTIONAL_OPTION_KINDS = {"O_CSP", "O_JL", "O_RS"}
 _OPTION_GROUPS_ALL = {
     "OS1": ["O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS"],  # directional DEBIT (long premium / defined)
     "OS2": ["O_SSTG", "O_SSTD", "O_IC", "O_CSP"],           # neutral CREDIT (short premium)
-    "OS3": ["O_JL", "O_RS", "O_BEARCS"],                    # skewed CREDIT (asymmetric short premium)
+    # OS3 is the DIRECTIONAL/skewed credit family. O_BULLPS is its (and, after the
+    # affordability filter below, the entire searched credit set's) only BULLISH member:
+    # without it the sell arm could express bearish (O_BEARCS) and neutral (OS2's O_IC)
+    # short premium and nothing else.
+    "OS3": ["O_JL", "O_RS", "O_BEARCS", "O_BULLPS"],        # skewed CREDIT (asymmetric short premium)
     "OS4": ["O_STRD", "O_STRG"],                            # volatility DEBIT (non-directional)
 }
 _OPTION_GROUPS = {
@@ -2449,8 +2469,9 @@ _DEBIT_OPTION_KINDS = {"O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS", "O_STRD", "
 
 
 def _option_exit_rules(kind: str):
-    """Close the held option at a premium-profit TP, plus a time exit — both optimizable +
-    on/off-toggleable. (CLOSE on the held option position via ``close_option``.)
+    """Close the held option at a premium-profit TP, an ELAPSED-time exit and a
+    REMAINING-life (DTE) exit — all optimizable + on/off-toggleable. (CLOSE on the held
+    option position via ``close_option``.)
 
     Bands differ by payoff profile. DEBIT kinds get a WIDE TP band (default 100%, range
     25-200%): long premium lives off the right tail — a 25-75% cap truncates the few big
@@ -2459,6 +2480,28 @@ def _option_exit_rules(kind: str):
     tight band (default 50% of credit) and additionally get a toggleable STOP-LOSS at -100%
     of credit (range -200..-50) so the GA can manage the short-premium left tail (v6 OS2/OS3:
     56-87% win rate but only 3.8-18% TR — small wins eaten by uncapped losers).
+
+    ``opt_dte`` (``days_to_expiry <= N``) is the roll-at-DTE exit, and it is NOT split by
+    payoff profile — one band for debit and credit alike:
+
+    * ``days_opened`` cannot express it. The entry DTE window is itself a gene
+      (``option_dte``, decoded to a >= 14-day-wide window), so "28 days after opening"
+      lands on a different remaining life in every trial. Elapsed and remaining are
+      different quantities the moment the entry tenor moves.
+    * Until this rule existed, roll-at-DTE lived only inside the hardcoded
+      ``OptionPortfolioManager``: no other expert could roll and the GA could not optimise
+      the roll point at all.
+    * Both profiles want it. Short premium wants out of the terminal gamma window (21 DTE
+      is the tastytrade convention for 30-45 DTE structures); long premium wants out of
+      the terminal theta cliff. Gating it on ``_DEBIT_OPTION_KINDS`` like the TP band
+      would be denying half the grid an exit that applies to it.
+
+    Band: 0..21 step 3 (8 levels), default 21, toggleable. It must REACH 0 — a 0DTE arm's
+    only exit criterion is "close on the expiry day" — and 21 is the natural cap: the
+    grid's entry windows bottom out near 10-13 DTE (``option_dte`` centre 20 with a
+    +/-10 half-width), so a higher threshold only buys a degenerate open-and-immediately-
+    close region that burns GA budget. Step 3 lands exactly on the conventional 21 / 14 /
+    7 / 0 points without inflating the search.
     """
     debit = kind in _DEBIT_OPTION_KINDS
     tp = ({"value": 100, "value_min": 25, "value_max": 200, "value_step": 25} if debit
@@ -2474,6 +2517,13 @@ def _option_exit_rules(kind: str):
          "conditions": {"type": "AND", "conditions": [
              {"id": "td", "field": "days_opened", "op": ">",
               "optimize": True, **td}]}},
+        # Its OWN rule, not another leaf on opt_time: leaves inside one rule are ANDed, so
+        # folding it in would demand "held N days AND M days left" and would cost the DTE
+        # exit its own on/off gene.
+        {"id": "opt_dte", "action_type": "close_option", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "dte", "field": "days_to_expiry", "op": "<=", "value": 21,
+              "optimize": True, "value_min": 0, "value_max": 21, "value_step": 3}]}},
     ]
     if not debit:
         rules.append(
@@ -2679,6 +2729,7 @@ _STRATEGY_BUILDERS = {
     "O_BF": _build_strategy_option, "O_RS": _build_strategy_option,
     "O_LP": _build_strategy_option,
     "O_BULLCS": _build_strategy_option, "O_BEARCS": _build_strategy_option,
+    "O_BULLPS": _build_strategy_option,
     "O_CSP": _build_strategy_option, "O_STRD": _build_strategy_option,
     "O_STRG": _build_strategy_option,
     "O_CC": _build_strategy_covered_call, "O_STK": _build_strategy_stock,

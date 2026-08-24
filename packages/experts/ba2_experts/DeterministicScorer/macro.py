@@ -115,13 +115,23 @@ def sahm_score(unrate_history: Optional[pd.Series]) -> Optional[float]:
 
 def regime_composite(inputs: Dict[str, Optional[float]],
                      weights: Optional[Dict[str, float]] = None) -> Dict[str, Any]:
-    """Weighted composite over the NON-None inputs (weights renormalized)."""
+    """Weighted composite over the NON-None inputs (weights renormalized).
+
+    ``score`` is ``None`` -- NOT 0.0 -- when no weighted input resolved. A cold FRED
+    cache (every series absent, as on 2026-08-11) leaves the divisor at 0, and the old
+    0.0 was a computed-looking number built from nothing: ``exposure_multiplier`` turns
+    it into a 0.625 factor that sizes the book down by 37.5% on data that does not
+    exist, and ``gate`` mode records a macro check that never ran. ``final_score``
+    handles ``None`` on both arms (macro simply does not apply), and the SYMBOL360 card
+    renders it "n/a". A regime whose measured inputs genuinely average to 0.0 still
+    returns 0.0 with ``n_inputs > 0`` -- that one IS neutral.
+    """
     w = dict(weights or DEF_MW)
     used = {k: (w.get(k, 0.0), v) for k, v in inputs.items()
             if v is not None and w.get(k, 0.0) > 0}
     total_w = sum(wt for wt, _ in used.values())
     if total_w <= 0:
-        return {"score": 0.0, "components": {}, "n_inputs": 0}
+        return {"score": None, "components": {}, "n_inputs": 0}
     score = sum(wt * v for wt, v in used.values()) / total_w
     return {
         "score": float(np.clip(score, -1.0, 1.0)),

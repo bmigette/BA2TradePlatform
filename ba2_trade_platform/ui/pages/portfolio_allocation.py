@@ -1,18 +1,49 @@
 """Portfolio Allocation page — manually traded accounts only.
 
 Shows the account's current allocation, grouped by the instrument labels the user
-chose to manage, and lets those labels, their symbols and their comments be
-edited. Every decision this page makes lives in the pure, unit-tested module
+chose to manage, and IS WHERE THE TARGETS ARE SET. Every decision this page makes
+lives in the pure, unit-tested module
 ``ba2_trade_platform/ui/utils/portfolio_allocation_view.py``; this file only does
 IO (broker + DB) and draws widgets.
 
+THREE THINGS ARE EDITED INLINE, AND THAT IS THE POINT
+=====================================================
+Each label's PORTFOLIO target, each symbol's SHARE OF ITS LABEL, and the account's
+cash RESERVE. All three used to be reachable only from inside the Allocate wizard,
+which meant that on an account nobody had run the wizard on every label sat at
+``target_pct = 0`` while the symbol table cheerfully printed a 20% share --
+``get_symbol_weights``'s even-split default -- resolving to a target value of
+$0.00, because 20% of a 0% label is nothing. The page showed a plausible number
+that meant nothing.
+
+The Allocate button is still here, and it is now for EXECUTING against the saved
+targets: dry run, precheck, submit. Both sides write the same rows, and
+``_load_flow_inputs`` re-reads them at the moment the wizard opens, so a fresh
+inline edit is what the dry run solves with.
+
+TWO DIFFERENT THINGS CALLED "TARGET"
+====================================
+A label's target is its share of the PORTFOLIO; a symbol's is its share of THAT
+LABEL. Both numbers were right and neither said its denominator, which is why
+"target 0.0%" over a column of 20s looked like a bug. The column is now
+"Share of label %", the header says "portfolio target", and the ⓘ beside each
+label reconciles the two.
+
 Everything persists ON CHANGE, not behind a Save button: switching the global
 account calls ``ui.run_javascript('window.location.reload()')``
-(``ui/layout.py``), so the page never gets a chance to flush a pending edit.
+(``ui/layout.py``), so the page never gets a chance to flush a pending edit. A
+REFUSED edit is put back to the stored value rather than left on screen -- a
+number the database does not have is the defect this feature exists to remove.
 Symbols can be added to or removed from a label whether or not they have an open
 position (but they do have to exist at the broker — ``symbols_exist``, or a typo
 becomes a permanent global ``Instrument`` row), and a symbol carrying two managed
 labels is allowed — it just gets a warning icon.
+
+The over-100 rule is enforced HERE, without a dry run, exactly as the wizard's
+step 1 always has: an inline label target that would take the set past 100 is
+refused (``validate_label_target_edit``, on the engine's own tolerance and in the
+engine's own words), and a running advisory plus a totals footer report the set as
+it stands.
 
 Eager persistence has ONE exception, and it is deliberate: unmanaging a label
 DESTROYS its target, its comment and every per-symbol weight and comment under it,
@@ -60,7 +91,7 @@ from ...core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
     compute_base_notional, compute_label_investment, current_value,
-    effective_target_pct, unconsumed_income_notice,
+    unconsumed_income_notice,
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
@@ -71,11 +102,19 @@ from ...core.portfolio_allocation_store import (
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
 from ..utils.portfolio_allocation_view import (
-    DEFAULT_MACHINE_LABEL_FAMILIES, GATE_NO_ACCOUNT, MARKET_SOURCE_UNAVAILABLE,
+    DEFAULT_MACHINE_LABEL_FAMILIES, GATE_NO_ACCOUNT, LABEL_STATUS_CLASSES,
+    LABEL_TOTAL_NOTICE_CLASSES, MARKET_SOURCE_UNAVAILABLE, NO_LABEL_COLOR,
     GateResult, ManagedLabel,
-    PositionFetchFailed, build_label_views, collect_managed_symbols, diff_managed_labels,
-    evaluate_gate, evaluate_market_gate, expert_shortname_families, managed_total_value,
-    missing_quote_symbols, picker_options, positions_by_symbol, unallocated_row,
+    PositionFetchFailed, build_label_bars, build_label_views,
+    collect_managed_symbols, diff_managed_labels,
+    evaluate_gate, evaluate_market_gate, expert_shortname_families,
+    format_allocation_footer, format_label_header, format_label_target_tooltip,
+    format_label_total_notice, format_reserve_caption,
+    format_reserve_row, label_color_options, managed_total_value,
+    missing_quote_symbols, picker_options, positions_by_symbol,
+    resolve_label_icon_color, sort_label_views, store_color_value,
+    symbol_target_values,
+    validate_label_target_edit, validate_reserve_edit, validate_symbol_weight_edit,
     working_orders_notice,
 )
 from .portfolio_allocation_wizard import (
@@ -87,6 +126,12 @@ from .portfolio_allocation_wizard import (
 #: convention is that blocking work goes through ``asyncio.to_thread``, and this
 #: keeps the number of those round trips down to one per pause in typing.
 COMMENT_DEBOUNCE_MS = 600
+
+#: Same, for the inline TARGET % boxes -- and here it does more than save round
+#: trips. A rejected edit is put BACK (see ``_revert_symbol_cell``), and without a
+#: debounce the "1" on the way to "15" would be judged, accepted and persisted as
+#: 1% before the user finished the number.
+TARGET_DEBOUNCE_MS = 600
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +193,8 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
     """
     from ...core.utils import get_account_instance_from_id, get_symbols_by_label
 
-    managed = [ManagedLabel(label=row.label, target_pct=row.target_pct, comment=row.comment)
+    managed = [ManagedLabel(label=row.label, target_pct=row.target_pct,
+                            comment=row.comment, color=row.color)
                for row in get_managed_labels(account_id)]
     symbols_by_label = get_symbols_by_label([m.label for m in managed])
     symbols = collect_managed_symbols(symbols_by_label)
@@ -425,8 +471,12 @@ def _load_picker_data(account_id: int) -> Dict[str, Any]:
     """Current managed labels, every label in use, and the machine-tag families."""
     from ...core.utils import get_all_instrument_labels
 
+    managed = get_managed_labels(account_id)
     return {
-        'current': [row.label for row in get_managed_labels(account_id)],
+        'current': [row.label for row in managed],
+        # NULL stays None: "no colour chosen" is a different fact from a stored
+        # default, and it is what makes the picker's "No colour" entry truthful.
+        'colors': {row.label: row.color for row in managed},
         'all_labels': get_all_instrument_labels(),
         'machine_families': _expert_label_families(),
     }
@@ -464,6 +514,412 @@ def _validate_symbols(account_id: int, symbols: List[str]):
 # Eager persistence handlers (no Save button -- switching the global account
 # hard-reloads the document, so a pending edit would be lost)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# The live figure registry
+#
+# Inline editing is only worth having if the CONSEQUENCE of an edit is on screen
+# immediately, and this page rebuilds by ``container.clear()`` -- which would tear
+# down the very ``ui.number`` the change event came from. So one render's widgets
+# and their inputs are registered here and the derived figures are rewritten IN
+# PLACE. Every number in it is produced by a pure function in
+# ``ui/utils/portfolio_allocation_view.py``; nothing below does arithmetic.
+#
+# Three edits, three blast radii, and all three have to work:
+#   * a SYMBOL weight  -> that label's table only (but ALL its rows -- the unstored
+#                         siblings share whatever is left of 100, so storing one
+#                         weight moves what the others resolve to);
+#   * a LABEL target   -> that label's header AND every row beneath it;
+#   * the RESERVE      -> the reserve line, every header and every row on the page.
+# ---------------------------------------------------------------------------
+
+#: Severity -> stylesheet classes for the totals footer. Red the moment the label
+#: targets pass 100, which is the existing validation surfaced BEFORE the user
+#: presses Allocate rather than inside the dry run.
+FOOTER_CLASSES = {
+    'ok': 'text-xs text-secondary-custom',
+    'warning': 'text-xs text-orange-400',
+    'negative': 'text-xs text-red-400 font-bold',
+}
+
+#: Money and percentages line up column-to-column only if the digits are the same
+#: width. Applied to every figure on the label rows, so 39.5% and 1.4% put their
+#: decimal points in the same place.
+TABULAR_NUMS = 'font-variant-numeric: tabular-nums;'
+
+#: NiceGUI markers on the mini-bar's two positioned divs. Their entire content is
+#: an inline style -- the geometry IS the information -- so a test needs a handle
+#: on each that does not depend on document order.
+MARKER_BAR_FILL = 'pf-bar-fill'
+MARKER_BAR_NOTCH = 'pf-bar-notch'
+#: The whole label header row, so a test can assert on the row rather than on a
+#: count of everything that happens to share a style.
+MARKER_BAR_ROW = 'pf-bar-row'
+
+#: The mini-bar track. Height and radius only -- the FILL's colour comes from the
+#: label's own palette entry, which is what makes the bars tell labels apart.
+BAR_TRACK_STYLE = ('position:relative;height:10px;border-radius:3px;'
+                   'background:rgba(255,255,255,0.08);')
+#: The target notch. White and 2px, i.e. deliberately not one of the palette hues:
+#: it has to read against every fill colour, including the pale yellow.
+BAR_NOTCH_STYLE = ('position:absolute;top:-3px;bottom:-3px;width:2px;'
+                   'background:#FFFFFF;opacity:0.85;')
+
+
+def _new_live_state(*, base_notional: Optional[float] = None,
+                    available_buying_power: Optional[float] = None,
+                    unallocated_pct: float = 0.0) -> Dict[str, Any]:
+    """One render's mutable view of what is on screen. Not persisted anywhere.
+
+    ``views`` is the ORDERED ``LabelView`` list and is the single source for every
+    per-label number; an accepted edit mutates the view in place and the redraw
+    reads it back. Keeping a parallel ``{label: target}`` dict beside it was the
+    obvious alternative and is exactly how the header and the bar would come to
+    disagree.
+    """
+    return {
+        'base_notional': base_notional,
+        'available_buying_power': available_buying_power,
+        'unallocated_pct': float(unallocated_pct or 0.0),
+        'views': [],            # ordered LabelView list, MUTATED on an accepted edit
+        'view_by_label': {},
+        'weights': {},          # label -> {symbol: effective weight %}
+        'tables': {},           # label -> ui.table
+        'captions': {},         # label -> [elements whose text IS the header line]
+        'label_inputs': {},     # label -> the label's target ui.number
+        'expansions': {},       # label -> ui.expansion
+        'bars': {},             # label -> the mini-bar row's mutable elements
+        'reserve_row': None,    # the "Unallocated (free buying power)" line
+        'reserve_caption': None,
+        'reserve_number': None,
+        'reserve_slider': None,
+        'total_notice': None,   # the running "labels total N%" advisory
+        'footer': None,         # the totals line under the list
+    }
+
+
+def _register_view(live: Dict[str, Any], view) -> None:
+    """Put one label's view into the registry, preserving render order."""
+    if view.label not in live['view_by_label']:
+        live['views'].append(view)
+    live['view_by_label'][view.label] = view
+
+
+def _label_targets(live: Dict[str, Any]) -> Dict[str, float]:
+    """``{label: target_pct}`` as it stands right now. Derived, never stored twice."""
+    return {v.label: float(v.target_pct or 0.0) for v in live['views']}
+
+
+def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
+    """Rewrite one label's Share-of-label % and Target value cells. In place.
+
+    Every row, not just the edited one: ``get_symbol_weights`` fills the symbols
+    with no stored row from an even split of whatever is left of 100, so storing a
+    weight for ONE symbol changes what its siblings resolve to. Showing them their
+    old numbers is how the table stops matching the database.
+    """
+    table = live['tables'].get(label)
+    if table is None:
+        return
+    view = live['view_by_label'].get(label)
+    weights = live['weights'].get(label) or {}
+    values = symbol_target_values(
+        weights, label_target_pct=(float(view.target_pct or 0.0) if view else 0.0),
+        base_notional=live['base_notional'], unallocated_pct=live['unallocated_pct'])
+    for row in table.rows:
+        symbol = row['symbol']
+        if symbol not in weights:
+            continue
+        row['weight_pct'] = round(float(weights[symbol]), 2)
+        value = values.get(symbol)
+        row['target_value'] = None if value is None else round(value, 2)
+    table.update()
+
+
+def _apply_bars(live: Dict[str, Any]) -> None:
+    """Redraw every mini-bar, header line and status word. In place.
+
+    ALL of them, on any change, because the track's scale spans the whole page: one
+    label's target rising can move the notch and the fill of every other row. A
+    per-row update would leave the rest measured against a scale that no longer
+    exists, which is the same class of defect as a notch drawn on its own scale.
+    """
+    bars = build_label_bars(live['views'], base_notional=live['base_notional'],
+                            unallocated_pct=live['unallocated_pct'])
+    for bar in bars:
+        widgets = live['bars'].get(bar.label)
+        if widgets is None:
+            continue
+        widgets['fill'].style(replace=(
+            f'position:absolute;left:0;top:0;bottom:0;border-radius:3px;'
+            f'width:{bar.bar_fraction * 100.0:.2f}%;background:{bar.color};'))
+        if bar.notch_fraction is None:
+            widgets['notch'].set_visibility(False)
+        else:
+            widgets['notch'].set_visibility(True)
+            widgets['notch'].style(
+                replace=BAR_NOTCH_STYLE + f'left:{bar.notch_fraction * 100.0:.2f}%;')
+        widgets['value'].set_text(f'${bar.current_value:,.2f}')
+        widgets['pct'].set_text(f'{bar.current_pct:.1f}%')
+        widgets['target'].set_text(f'tgt {bar.target_pct:.1f}%')
+        widgets['status'].set_text(bar.status)
+        widgets['status'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+        widgets['tooltip'].set_text(format_label_target_tooltip(
+            target_pct=bar.raw_target_pct, base_notional=live['base_notional'],
+            unallocated_pct=live['unallocated_pct']))
+        for element in live['captions'].get(bar.label, []):
+            element.set_text(format_label_header(
+                label=bar.label,
+                current_value=live['view_by_label'][bar.label].current_value,
+                target_pct=bar.raw_target_pct,
+                pct_of_base=live['view_by_label'][bar.label].pct_of_base,
+                pct_of_total=live['view_by_label'][bar.label].pct_of_total,
+                base_notional=live['base_notional'],
+                unallocated_pct=live['unallocated_pct']))
+
+
+def _apply_total_notice(live: Dict[str, Any]) -> None:
+    """Refresh the running "labels total N%" advisory and the totals footer.
+
+    This is the page's own over/under-100 check -- no dry run needed, exactly as in
+    the wizard's step 1. Both readouts come from the same targets, so they cannot
+    say different things.
+    """
+    targets = _label_targets(live)
+    element = live['total_notice']
+    if element is not None:
+        notice = format_label_total_notice(targets)
+        if notice is None:
+            element.set_text('')
+            element.set_visibility(False)
+        else:
+            text, severity = notice
+            element.set_text(text)
+            element.classes(replace=LABEL_TOTAL_NOTICE_CLASSES[severity])
+            element.set_visibility(True)
+    footer = live['footer']
+    if footer is not None:
+        text, severity = format_allocation_footer(targets, live['unallocated_pct'])
+        footer.set_text(text)
+        footer.classes(replace=FOOTER_CLASSES[severity])
+
+
+def _apply_page_figures(live: Dict[str, Any]) -> None:
+    """Everything derived, redrawn: bars, headers, every table, both totals.
+
+    ONE entry point for the two edits whose blast radius is the whole page -- a
+    label target (it moves the shared bar scale and both totals) and the reserve
+    (it re-bases every target). A symbol weight is the cheap case and keeps its own
+    ``_apply_symbol_figures``.
+    """
+    _apply_bars(live)
+    for label in list(live['view_by_label']):
+        _apply_symbol_figures(live, label)
+    _apply_total_notice(live)
+
+
+def _apply_reserve(live: Dict[str, Any]) -> None:
+    """The reserve moved: redraw its own two lines and EVERYTHING it re-bases.
+
+    Raising the reserve shrinks ``investable_notional``, so every label's target
+    money, every symbol's share of it, every notch and every status word move with
+    it. That is the entire reason the control is worth having on this page.
+    """
+    if live['reserve_caption'] is not None:
+        live['reserve_caption'].set_text(
+            format_reserve_caption(live['base_notional'], live['unallocated_pct']))
+    if live['reserve_row'] is not None:
+        text = format_reserve_row(base_notional=live['base_notional'],
+                                  available_buying_power=live['available_buying_power'],
+                                  unallocated_pct=live['unallocated_pct'])
+        if text is not None:
+            live['reserve_row'].set_text(text)
+    _apply_page_figures(live)
+
+
+def _revert_symbol_cell(live: Dict[str, Any], label: str, symbol: str) -> None:
+    """Put a REFUSED target cell back to the stored number.
+
+    The cell is a Quasar ``q-input`` bound to ``props.value``; leaving the row data
+    alone leaves the typed text in the DOM, because Vue's watcher only fires when
+    the bound value CHANGES. So the row carries a ``weight_key`` that the template
+    uses as the input's ``:key`` -- bumping it remounts the input from the row data.
+
+    A rejected edit must never leave a number on screen the database does not have.
+    That is the same defect ("a plausible-looking number that means nothing") this
+    whole feature exists to remove.
+    """
+    table = live['tables'].get(label)
+    if table is None:
+        return
+    for row in table.rows:
+        if row['symbol'] == symbol:
+            row['weight_key'] = int(row.get('weight_key', 0)) + 1
+    table.update()
+
+
+def _restore_value(widget, value) -> None:
+    """Put a plain ``ui.number`` / ``ui.slider`` back, tolerating an absent widget.
+
+    The write-back fires the widget's own change handler; every handler here starts
+    with a compare-against-stored and returns on a match, so the echo is a no-op.
+    That is the same guard ``_set_mode`` uses for the valuation selector.
+    """
+    if widget is not None:
+        widget.set_value(value)
+
+
+def _write_symbol_weight(account_id: int, label: str, symbol: str, weight_pct: float,
+                         label_symbols: List[str]):
+    """Persist ONE symbol's target weight and read the label's map back. Blocking.
+
+    Returns ``None`` -- a refusal, not an empty result -- when the label is no
+    longer managed. A page rendered before the label was unmanaged (in the picker,
+    in another tab, by an account switch) still has its table on screen, and
+    ``set_symbol_weight`` creates rows unconditionally, so typing in it would leave
+    an orphan allocation row under a label the account does not manage. Same guard,
+    same reason, as ``_write_label_comment``.
+
+    The map is re-read rather than patched locally because writing one row changes
+    what the UNSTORED siblings resolve to: ``get_symbol_weights`` shares whatever is
+    left of 100 among them. One reader, so the table and the engine cannot disagree.
+
+    ``comment`` is deliberately NOT passed: ``None`` leaves it alone, and a ``''``
+    here would wipe the symbol's note on every accepted keystroke.
+    """
+    if label not in {row.label for row in get_managed_labels(account_id)}:
+        return None
+    set_symbol_weight(account_id, label, symbol, weight_pct=float(weight_pct))
+    return get_symbol_weights(account_id, label, label_symbols)
+
+
+async def _save_symbol_weight(account_id: int, live: Dict[str, Any], label: str,
+                              symbol: str, raw, label_symbols: List[str]) -> None:
+    """One TARGET % cell. Validate, persist, then redraw the label's rows."""
+    edit = validate_symbol_weight_edit(label=label, symbol=symbol, raw=raw)
+    if not edit.accepted:
+        ui.notify(edit.message, type='warning')
+        _revert_symbol_cell(live, label, symbol)
+        return
+    try:
+        weights = await asyncio.to_thread(_write_symbol_weight, account_id, label,
+                                          symbol, edit.value, label_symbols)
+    except Exception as e:
+        logger.error(f"Saving target for {label}/{symbol} failed: {e}", exc_info=True)
+        ui.notify(f'Could not save target: {e}', type='negative')
+        _revert_symbol_cell(live, label, symbol)
+        return
+    if weights is None:
+        logger.warning(f"Target for '{label}'/{symbol} ignored: the label is no longer "
+                       f"managed by account {account_id}")
+        ui.notify(f"'{label}' is no longer managed — refresh the page", type='warning')
+        _revert_symbol_cell(live, label, symbol)
+        return
+    live['weights'][label] = weights
+    _apply_symbol_figures(live, label)
+
+
+def _write_label_target(account_id: int, label: str, target_pct: float) -> bool:
+    """Save a managed label's target. Blocking; returns False when it is STALE.
+
+    ``set_managed_label`` CREATES the row when it is absent, so without this an
+    edit made after the label was unmanaged elsewhere would resurrect it -- and
+    resurrect it as a label the user did not choose to manage, holding money.
+    """
+    if label not in {row.label for row in get_managed_labels(account_id)}:
+        return False
+    set_managed_label(account_id, label, target_pct=float(target_pct))
+    return True
+
+
+async def _save_label_target(account_id: int, live: Dict[str, Any], label: str,
+                             raw) -> None:
+    """One label's TARGET % box.
+
+    The over-100 refusal is the wizard's own, moved onto the page with the box:
+    ``validate_label_target_edit`` measures the typed value against the OTHER
+    labels' stored targets with the engine's tolerance. A refused edit writes
+    nothing and the box goes back to the stored number.
+    """
+    targets = _label_targets(live)
+    stored = targets.get(label, 0.0)
+    # The WHOLE map, including this label's own entry: ``validate_label_target_edit``
+    # drops the entry matching ``label`` itself, and filtering here as well put the
+    # same rule in two places -- so a mutation to either survived, because the other
+    # covered for it. One guard, in the pure layer, where it is tested.
+    edit = validate_label_target_edit(label=label, raw=raw, other_targets=targets)
+    if not edit.accepted:
+        ui.notify(edit.message, type='warning')
+        _restore_value(live['label_inputs'].get(label), stored)
+        return
+    if edit.value == stored:
+        return                      # a no-op, or the echo of a programmatic set
+    try:
+        saved = await asyncio.to_thread(_write_label_target, account_id, label,
+                                        edit.value)
+    except Exception as e:
+        logger.error(f"Saving target for label '{label}' failed: {e}", exc_info=True)
+        ui.notify(f'Could not save target: {e}', type='negative')
+        _restore_value(live['label_inputs'].get(label), stored)
+        return
+    if not saved:
+        logger.warning(f"Target for '{label}' ignored: the label is no longer managed "
+                       f"by account {account_id}")
+        ui.notify(f"'{label}' is no longer managed — refresh the page", type='warning')
+        _restore_value(live['label_inputs'].get(label), stored)
+        return
+    view = live['view_by_label'].get(label)
+    if view is not None:
+        view.target_pct = edit.value
+    _apply_page_figures(live)
+
+
+async def _save_reserve(account_id: int, live: Dict[str, Any], raw, *, echo_to) -> None:
+    """The cash-reserve slider and its bound number box.
+
+    ONE stored field (``unallocated_pct``), two controls: whichever moved writes it
+    and then mirrors the other, and the mirror's echo is absorbed by the
+    compare-against-stored above. The dollar figure beside them is DERIVED and is
+    deliberately not a second input -- see ``format_reserve_caption``.
+    """
+    edit = validate_reserve_edit(raw)
+    if not edit.accepted:
+        ui.notify(edit.message, type='warning')
+        _restore_value(live['reserve_number'], live['unallocated_pct'])
+        _restore_value(live['reserve_slider'], live['unallocated_pct'])
+        return
+    if edit.value == live['unallocated_pct']:
+        return                      # a no-op, or the echo of the mirrored control
+    try:
+        await asyncio.to_thread(set_allocation_config, account_id,
+                                unallocated_pct=float(edit.value))
+    except Exception as e:
+        logger.error(f"Saving the unallocated reserve failed: {e}", exc_info=True)
+        ui.notify(f'Could not save the reserve: {e}', type='negative')
+        _restore_value(live['reserve_number'], live['unallocated_pct'])
+        _restore_value(live['reserve_slider'], live['unallocated_pct'])
+        return
+    live['unallocated_pct'] = edit.value
+    _restore_value(echo_to, edit.value)
+    _apply_reserve(live)
+
+
+def _focus_label_target(live: Dict[str, Any], label: str) -> None:
+    """The pencil beside the chevron: OPEN the label and put the cursor in its box.
+
+    ``value = True``, never a toggle: this is "edit this label", and a pencil that
+    closed an already-open section would be doing the chevron's job badly. The
+    listener is registered as ``click.stop`` and the expansion carries
+    ``expand-icon-toggle``, so neither propagation nor Quasar's default
+    click-anywhere-on-the-header can fold it as a side effect.
+    """
+    expansion = live['expansions'].get(label)
+    if expansion is not None:
+        expansion.value = True
+    number = live['label_inputs'].get(label)
+    if number is not None:
+        number.run_method('focus')
+
 
 def _write_label_comment(account_id: int, label: str, value: str) -> bool:
     """Save a managed label's comment. Blocking; returns False when it is STALE.
@@ -624,6 +1080,42 @@ def _confirm_unmanage(labels: List[str], counts: Dict[str, int],
     dialog.open()
 
 
+def _write_label_color(account_id: int, label: str, value: str) -> bool:
+    """Save a managed label's swatch. Blocking; returns False when it is STALE.
+
+    Guarded exactly as ``_write_label_comment`` is, and for the same reason:
+    ``set_managed_label`` CREATES the row, so recolouring a label that was unmanaged
+    in another tab would resurrect it at ``target_pct=0`` -- which the engine reads
+    as "hold none of this".
+
+    ``store_color_value`` is what turns the picker's "No colour" into the ``''`` the
+    store maps to NULL. Handing the store the ``None`` that
+    ``normalise_label_color`` returns would mean LEAVE UNCHANGED, and the swatch
+    would be impossible to remove.
+    """
+    if label not in {row.label for row in get_managed_labels(account_id)}:
+        return False
+    set_managed_label(account_id, label, color=store_color_value(value))
+    return True
+
+
+async def _save_label_color(account_id: int, label: str, value: str, swatch) -> None:
+    """Colour-picker handler: persist, then retint the swatch beside the row."""
+    try:
+        saved = await asyncio.to_thread(_write_label_color, account_id, label, value)
+    except Exception as e:
+        logger.error(f"Saving the colour for label '{label}' failed: {e}", exc_info=True)
+        ui.notify(f'Could not save the colour: {e}', type='negative')
+        return
+    if not saved:
+        logger.warning(f"Colour for '{label}' ignored: the label is no longer managed "
+                       f"by account {account_id}")
+        ui.notify(f"'{label}' is no longer managed — refresh the page", type='warning')
+        return
+    if swatch is not None:
+        swatch.style(replace=f'color: {resolve_label_icon_color(value)}')
+
+
 async def _persist_managed_labels(account_id: int, current: List[str],
                                   selected: List[str], restore) -> None:
     """Apply one picker change: additions immediately, removals only once confirmed.
@@ -672,6 +1164,7 @@ def _open_label_picker(account_id: int, refresh) -> None:
         return
 
     current = list(data['current'])
+    colors = dict(data['colors'])
     all_labels = data['all_labels']
     families = data['machine_families']
 
@@ -696,6 +1189,26 @@ def _open_label_picker(account_id: int, refresh) -> None:
                       picker_options(all_labels, current, show_all=bool(e.value),
                                      machine_families=families),
                       value=picker.value))
+
+        if current:
+            ui.label('Colours').classes('text-sm font-bold mt-3')
+            ui.label('A fixed palette, not a free picker: this UI is dark-themed, so '
+                     'an arbitrary colour is one you cannot read back. These seven '
+                     'are Okabe & Ito’s colour-universal-design set — chosen to stay '
+                     'distinguishable to the common forms of colour blindness.'
+                     ).classes('text-xs text-secondary-custom')
+        for label in current:
+            with ui.row().classes('w-full items-center gap-2'):
+                # ``lbl=label`` on BOTH the swatch and the handler: without the
+                # default-argument capture every row would recolour the last label.
+                swatch = ui.icon('label').style(
+                    f'color: {resolve_label_icon_color(colors.get(label))}')
+                ui.label(label).classes('flex-grow truncate')
+                ui.select(label_color_options(),
+                          value=(colors.get(label) or NO_LABEL_COLOR),
+                          on_change=lambda e, lbl=label, sw=swatch: _save_label_color(
+                              account_id, lbl, e.value, sw)
+                          ).props('dense outlined').classes('w-44')
 
         async def _close() -> None:
             dialog.close()
@@ -722,21 +1235,50 @@ def _render_gate_blocked(gate: GateResult) -> None:
                           on_click=lambda: ui.navigate.to('/settings')).props('outline')
 
 
-def _render_label_body(account_id: int, view, refresh) -> None:
-    """One managed label's comment box, symbol table and add/remove controls."""
+def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
+    """One managed label's target box, comment box, symbol table and controls.
+
+    ``live`` is the render's figure registry (``_new_live_state``). It is optional
+    only so that the body can be drawn in isolation; without it the boxes still
+    persist, but there is no base notional to recompute the money against and
+    nothing else on the page to keep in step.
+    """
+    if live is None:
+        live = _new_live_state()
+    _register_view(live, view)
     label_symbols = [r.symbol for r in view.rows]
+    live['weights'][view.label] = {r.symbol: float(r.weight_pct)
+                                   for r in view.rows if r.weight_pct is not None}
 
     with ui.row().classes('w-full items-center gap-2'):
+        # THE label target, on the page at last. It used to be reachable only from
+        # inside the Allocate wizard, which is why every label on an untouched
+        # account sat at 0 while the table below printed a share of nothing.
+        target_input = ui.number(
+            label='Portfolio target %', value=view.target_pct, min=0, max=100,
+            step=0.01, suffix='%',
+            on_change=lambda e, lbl=view.label: _save_label_target(
+                account_id, live, lbl, e.value)
+        ).props(f'dense outlined debounce={TARGET_DEBOUNCE_MS}').classes('w-44')
+        live['label_inputs'][view.label] = target_input
         ui.input('Label comment', value=view.comment or '',
                  on_change=lambda e, lbl=view.label: _save_label_comment(account_id, lbl, e.value)
                  ).props(f'dense outlined debounce={COMMENT_DEBOUNCE_MS}').classes('flex-grow')
         ui.button('Add symbol', icon='add',
                   on_click=lambda lbl=view.label: _open_add_symbol_dialog(account_id, lbl, refresh)
                   ).props('outline dense')
+    # The sentence that resolves the collision the user tripped over: the box above
+    # is a share of the PORTFOLIO, the column below is a share of THIS LABEL.
+    ui.label('This label’s share of the whole portfolio. The “Share of label %” '
+             'column below divides THIS label’s money between its symbols — a '
+             'different denominator, which is why the two can read 0 and 20 at the '
+             'same time and both be right.').classes('text-xs text-secondary-custom')
 
     rows = [{
         'flag': '⚠' if r.multi_label else '',
         'symbol': r.symbol,
+        # KEPT although the Labels COLUMN is gone: the ⚠ cell's tooltip is now the
+        # only place a symbol's other managed labels are named, and it reads this.
         'labels': ', '.join(r.labels),
         'current_value': round(r.current_value, 2),
         'pct_of_label': round(r.pct_of_label, 2),
@@ -745,6 +1287,10 @@ def _render_label_body(account_id: int, view, refresh) -> None:
         # notional have no target, and 0.00 there would be a claim rather than a gap.
         'weight_pct': None if r.weight_pct is None else round(r.weight_pct, 2),
         'target_value': None if r.target_value is None else round(r.target_value, 2),
+        # Bumped when an edit is REFUSED, and used as the ``:key`` of the cell's
+        # input so the refusal actually puts the typed text back -- see
+        # ``_revert_symbol_cell``.
+        'weight_key': 0,
         'quantity': round(r.quantity, 4),
         'cost_basis': round(r.cost_basis, 2),
         'price': None if r.price is None else round(r.price, 4),
@@ -752,14 +1298,22 @@ def _render_label_body(account_id: int, view, refresh) -> None:
         'comment': r.comment or '',
     } for r in view.rows]
 
+    # The LABELS column is gone. Every row inside a label's own section repeated the
+    # same value, and the section header already says which label this is; the one
+    # case where the value differs -- a symbol carrying two managed labels -- is
+    # named by the ⚠ cell's tooltip, which is why ``labels`` stays in the row DATA.
+    # The table is built here and nowhere else (no cross-label or "all symbols" view
+    # reuses it), so there is nothing to make the column conditional for.
     columns = [
         {'name': 'flag', 'label': '', 'field': 'flag', 'align': 'center'},
         {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
-        {'name': 'labels', 'label': 'Labels', 'field': 'labels', 'align': 'left'},
         {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
         {'name': 'pct_of_label', 'label': '% of label', 'field': 'pct_of_label', 'sortable': True, 'align': 'right'},
         {'name': 'pct_of_total', 'label': '% of total', 'field': 'pct_of_total', 'sortable': True, 'align': 'right'},
-        {'name': 'weight_pct', 'label': 'Target %', 'field': 'weight_pct', 'sortable': True, 'align': 'right'},
+        # "Share of label %", not "Target %": the label header above prints a target
+        # too, and that one is a share of the PORTFOLIO. Two different quantities
+        # under one word is what made "target 0.0%" over a column of 20s look wrong.
+        {'name': 'weight_pct', 'label': 'Share of label %', 'field': 'weight_pct', 'sortable': True, 'align': 'right'},
         {'name': 'target_value', 'label': 'Target value', 'field': 'target_value', 'sortable': True, 'align': 'right'},
         {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'sortable': True, 'align': 'right'},
         {'name': 'cost_basis', 'label': 'Cost basis', 'field': 'cost_basis', 'sortable': True, 'align': 'right'},
@@ -770,12 +1324,29 @@ def _render_label_body(account_id: int, view, refresh) -> None:
 
     table = ui.table(columns=columns, rows=rows, row_key='symbol',
                      selection='multiple').classes('w-full dark-pagination')
+    live['tables'][view.label] = table
     table.add_slot('body-cell-flag', r'''
         <q-td :props="props">
             <span v-if="props.value" :title="'Also in: ' + props.row.labels"
                   style="color:#f6ad55;font-weight:600">{{ props.value }}</span>
         </q-td>
     ''')
+    # ``:key`` is load-bearing, not decoration: the input is bound to
+    # ``props.value``, so Vue's watcher only fires when THAT changes -- and a
+    # REFUSED edit leaves it unchanged by definition. Bumping the key remounts the
+    # input from the row data, which is how a rejected number gets put back instead
+    # of sitting on screen as a value the database does not have.
+    table.add_slot('body-cell-weight_pct', r'''
+        <q-td :props="props">
+            <q-input :key="props.row.weight_key" :model-value="props.value"
+                     type="number" dense borderless input-class="text-right"
+                     debounce="''' + str(TARGET_DEBOUNCE_MS) + r'''"
+                     @update:model-value="(val) => $parent.$emit('weightChange', props.row.symbol, val)" />
+        </q-td>
+    ''')
+    table.on('weightChange',
+             lambda e, lbl=view.label, syms=label_symbols: _save_symbol_weight(
+                 account_id, live, lbl, e.args[0], e.args[1], syms))
     # ``debounce`` matters here: without it every keystroke fires a round trip that
     # reads the label's whole weight map and writes a row, on the event loop.
     table.add_slot('body-cell-comment', r'''
@@ -809,8 +1380,96 @@ def _render_label_body(account_id: int, view, refresh) -> None:
                   ).props('outline color=negative dense')
 
 
+def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
+    """The editable cash reserve: a slider, a bound number box and the money.
+
+    ONE stored field, ``PortfolioAllocationConfig.unallocated_pct``, and two
+    controls over it -- whichever moves writes it and mirrors the other. The DOLLAR
+    figure beside them is derived and read-only: the user asked for "a field for the
+    value we want to keep", but taking one would need ``pct = dollars / base``,
+    which is undefined on the accounts that have no base and would silently disagree
+    with the slider on the ones that do. Percent stays the single source of truth.
+
+    The slider steps in whole percent because dragging a 10,000-notch track is
+    unusable; the box takes two decimals. Quasar's slider does not re-emit a model
+    value it was GIVEN, so setting 12.34 on it from the box cannot snap the stored
+    figure back to 12.
+    """
+    with ui.column().classes('stat-card p-3'):
+        ui.label('Unallocated reserve').classes('text-xs text-secondary-custom')
+        with ui.row().classes('items-center gap-3 no-wrap'):
+            slider = ui.slider(min=0, max=100, step=1,
+                               value=live['unallocated_pct']).classes('w-40')
+            number = ui.number(value=live['unallocated_pct'], min=0, max=100, step=0.01,
+                               suffix='%').props('dense outlined').classes('w-28') \
+                .style(TABULAR_NUMS)
+        live['reserve_slider'] = slider
+        live['reserve_number'] = number
+        slider.on_value_change(lambda e: _save_reserve(account_id, live, e.value,
+                                                       echo_to=number))
+        number.on_value_change(lambda e: _save_reserve(account_id, live, e.value,
+                                                       echo_to=slider))
+        live['reserve_caption'] = ui.label(
+            format_reserve_caption(live['base_notional'], live['unallocated_pct'])
+        ).classes('text-xs text-secondary-custom').style(TABULAR_NUMS)
+
+
+def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) -> None:
+    """One label: the mini-bar header row, and the symbol table it folds open.
+
+    ``expand-icon-toggle`` is deliberate. The header now carries a control (the edit
+    pencil), and Quasar's default is that a click ANYWHERE on the header folds the
+    section -- so the pencil would open the label and the same click would shut it
+    again. With this prop only the chevron toggles, and the pencil's own listener is
+    registered as ``click.stop`` on top of that. Belt and braces, because the failure
+    is invisible in a unit test and infuriating in a browser.
+    """
+    expansion = ui.expansion('').classes('w-full').props('expand-icon-toggle')
+    live['expansions'][view.label] = expansion
+    widgets: Dict[str, Any] = {}
+    live['bars'][view.label] = widgets
+
+    with expansion.add_slot('header'):
+        with ui.row().classes('w-full items-center gap-3 no-wrap') \
+                .style(TABULAR_NUMS).mark(MARKER_BAR_ROW):
+            ui.icon('label').style(f'color: {resolve_label_icon_color(view.color)}')
+            ui.label(view.label).classes('w-48 truncate font-medium')
+            widgets['value'] = ui.label('').classes('w-28 text-right')
+            with ui.element('div').classes('flex-grow min-w-[80px]').style(BAR_TRACK_STYLE):
+                # Marked, because the two are otherwise indistinguishable bare divs
+                # whose whole content is an inline style -- and the geometry IS the
+                # information here, so a test has to be able to read it back.
+                widgets['fill'] = ui.element('div').mark(MARKER_BAR_FILL)
+                widgets['notch'] = ui.element('div').mark(MARKER_BAR_NOTCH)
+            widgets['pct'] = ui.label('').classes('w-16 text-right')
+            widgets['target'] = ui.label('').classes('w-24 text-right')
+            widgets['status'] = ui.label('').classes('w-14')
+            # The pencil. It OPENS the label and focuses its target box; it never
+            # closes one, because "edit this" is not a toggle.
+            ui.icon('edit').classes('cursor-pointer text-secondary-custom') \
+                .on('click.stop',
+                    lambda _e=None, lbl=view.label: _focus_label_target(live, lbl)) \
+                .tooltip('Edit this label’s portfolio target')
+            # The ⓘ that took the long clause off the header line. Its tooltip is
+            # created ONCE and re-texted on every redraw: calling ``.tooltip()``
+            # again would add a second tooltip element, and by the tenth keystroke
+            # there would be ten of them stacked on one icon.
+            with ui.icon('info_outline').classes('text-secondary-custom') as info:
+                widgets['tooltip'] = ui.tooltip('')
+            widgets['info'] = info
+    # The expansion's own ``label`` prop is kept in step with the header slot: it is
+    # what a screen reader and a collapsed-state tooltip read, and it is the one
+    # place the whole sentence still exists.
+    live['captions'][view.label] = [expansion]
+
+    with expansion:
+        _render_label_body(account_id, view, refresh, live=live)
+
+
 def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
-    views = payload['views']
+    # Biggest holding first. The 39.5% row used to sit between two 1-5% rows,
+    # because the order was whatever ``sort_order`` happened to be.
+    views = sort_label_views(payload['views'])
     if not views:
         with ui.element('div').classes('alert-banner info w-full p-3'):
             ui.label('No labels are managed for this account yet — click "Manage labels".')
@@ -819,22 +1478,31 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     mode = payload['valuation_mode']
     base_notional = payload['base_notional']
     buying_power = payload['available_buying_power']
+    live = _new_live_state(base_notional=base_notional,
+                           available_buying_power=buying_power,
+                           unallocated_pct=payload['unallocated_pct'])
     mode_label = ('cost basis (what you paid)' if mode == VALUATION_MODE_COST
                   else 'market value (qty x price)')
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)
-    with ui.row().classes('w-full gap-4'):
+    with ui.row().classes('w-full gap-4 items-start'):
         with ui.column().classes('stat-card p-3'):
             ui.label(f'Managed value — {mode_label}').classes('text-xs text-secondary-custom')
-            ui.label(f'${total:,.2f}').classes('text-lg font-bold')
+            ui.label(f'${total:,.2f}').classes('text-lg font-bold').style(TABULAR_NUMS)
         with ui.column().classes('stat-card p-3'):
             ui.label('Managed labels').classes('text-xs text-secondary-custom')
             ui.label(str(len(views))).classes('text-lg font-bold')
         if buying_power is not None:
             with ui.column().classes('stat-card p-3'):
                 ui.label('Free buying power').classes('text-xs text-secondary-custom')
-                ui.label(f'${buying_power:,.2f}').classes('text-lg font-bold')
+                ui.label(f'${buying_power:,.2f}').classes('text-lg font-bold') \
+                    .style(TABULAR_NUMS)
+        _render_reserve_card(account_id, live)
+
+    # The running over/under-100 check, on the PAGE and without a dry run -- the
+    # same advisory the wizard's step 1 has always shown, moved here with the boxes.
+    live['total_notice'] = ui.label('').classes('text-xs text-orange-400')
 
     # DANGER, not warning, since market became the default (W1). This is no longer
     # "your percentages are slightly off": those positions contribute 0 to the
@@ -873,55 +1541,40 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # guard let that one value through and the ``:.1f`` below raised on the None,
     # 500-ing the entire page. ``buying_power`` keeps ``is not None``: 0.00 of free
     # buying power is a fact worth drawing, and only None means "unknown".
-    if base_notional and buying_power is not None:
-        reserve = unallocated_row(base_notional=base_notional,
-                                  available_buying_power=buying_power,
-                                  unallocated_pct=payload['unallocated_pct'])
+    reserve_text = format_reserve_row(base_notional=base_notional,
+                                      available_buying_power=buying_power,
+                                      unallocated_pct=payload['unallocated_pct'])
+    if reserve_text is not None:
         with ui.element('div').classes('alert-banner info w-full p-3'):
             # "of base", SAID OUT LOUD, because the label headers below print a
             # target too and theirs is a RELATIVE weight on what this row leaves.
             # In identical grammar the two read as one column and sum past 100 --
             # a 25% reserve above a single label at 100% rendered "target 25.00%"
             # over "target 100.0%" for a book that is exactly 25 + 75.
-            ui.label(f'Unallocated (free buying power) — ${reserve.current_value:,.2f} '
-                     f'({reserve.pct_of_base:.1f}% of base, target '
-                     f'{reserve.target_pct:.2f}% of base = ${reserve.target_value:,.2f})')
-            if reserve.target_pct:
-                # Said out loud, because it is the counter-intuitive half: a reserve
-                # on a fully invested book is funded by SELLING, and the dry run is
-                # where that becomes visible.
-                ui.label('The labels below divide what is left after this — raising '
-                         'it on a fully invested account will generate sell orders.'
-                         ).classes('text-xs text-secondary-custom')
+            live['reserve_row'] = ui.label(reserve_text).style(TABULAR_NUMS)
+            # Said out loud, because it is the counter-intuitive half: a reserve on
+            # a fully invested book is funded by SELLING, and the dry run is where
+            # that becomes visible. Drawn unconditionally now that the reserve is
+            # editable in place -- a caption that appears only above 0% is one the
+            # user never reads before moving the slider.
+            ui.label('The labels below divide what is left after this — raising it '
+                     'on a fully invested account will generate sell orders.'
+                     ).classes('text-xs text-secondary-custom')
 
-    reserve_pct = payload['unallocated_pct']
     for view in views:
-        # ONE denominator when there is a base to use: ``pct_of_total`` divides by
-        # the managed value while ``target_pct`` is a share of buying power PLUS
-        # managed value, so printing them side by side invited a comparison that is
-        # false whenever buying power is non-zero. With no base, say which one was
-        # used rather than inventing the other.
-        #
-        # THREE figures, not two, once a reserve exists. ``target_pct`` is the
-        # RELATIVE weight the user typed and divides what the reserve left -- so
-        # beside a holding measured against the GROSS base it is not comparable,
-        # and a label sitting at "50.0% of base" against a box reading 50 looked
-        # on target on a row the plan will trim by a tenth. The weight keeps its
-        # own denominator in words, and ``effective_target_pct`` restates it
-        # against the base so that this line, the reserve row above it and every
-        # other "% of base" on the page can be read as one column.
-        if view.pct_of_base is not None:
-            header = (f'{view.label} — ${view.current_value:,.2f} '
-                      f'({view.pct_of_base:.1f}% of base, target '
-                      f'{view.target_pct:.1f}% of what the reserve leaves '
-                      f'= ${view.target_value:,.2f}, i.e. '
-                      f'{effective_target_pct(view.target_pct, reserve_pct):.1f}% of base)')
-        else:
-            header = (f'{view.label} — ${view.current_value:,.2f} '
-                      f'({view.pct_of_total:.1f}% of managed, target '
-                      f'{view.target_pct:.1f}% of what the reserve leaves)')
-        with ui.expansion(header, icon='label').classes('w-full'):
-            _render_label_body(account_id, view, refresh)
+        # Registered by ``_render_label_body`` inside the row, not here: two calls
+        # to ``_register_view`` for one view made its idempotence guard the only
+        # thing standing between the page and a doubled bar list, and a guard whose
+        # removal changes nothing observable is a guard no test can hold.
+        _render_label_bar_row(account_id, live, view, refresh)
+
+    with ui.row().classes('w-full items-center gap-3'):
+        live['footer'] = ui.label('').style(TABULAR_NUMS)
+        ui.label('███ current    ╎ target notch').classes('text-xs text-secondary-custom')
+
+    # Everything derived, drawn once through the SAME path an edit uses -- so the
+    # first paint and every keystroke after it cannot land on different numbers.
+    _apply_page_figures(live)
 
 
 def _market_gate_for(hours):

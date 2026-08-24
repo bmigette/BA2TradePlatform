@@ -730,8 +730,14 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 logger.error(f"Could not get balance for account {expert_instance.account_id}")
                 return None
             
-            # Calculate virtual balance based on virtual_equity_pct
-            virtual_equity_pct = expert_instance.virtual_equity_pct or 100.0
+            # Calculate virtual balance based on virtual_equity_pct.
+            #
+            # NO ``or 100.0``. The column is ``float = Field(default=100.0)`` -- NOT NULL,
+            # so the coercion could never fire on a missing value; its ONLY reachable
+            # trigger was a user-entered 0, which it turned into "give this expert the
+            # ENTIRE account". The Settings page writes this straight from a free-text
+            # input with no lower bound. 0% means 0%.
+            virtual_equity_pct = expert_instance.virtual_equity_pct
             virtual_balance = account_balance * (virtual_equity_pct / 100.0)
             
             logger.debug(f"Expert {self.id}: Account balance=${account_balance}, "

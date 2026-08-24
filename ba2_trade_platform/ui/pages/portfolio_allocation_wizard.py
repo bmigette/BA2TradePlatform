@@ -1701,18 +1701,44 @@ def render_income_panel(events: List[Dict], open_total: float,
             ui.label('No deposits or dividends in the last 30 days.') \
                 .classes('text-sm text-gray-400')
             return
-        with ui.row().classes('w-full text-xs font-bold border-b py-1'):
-            for header, width in (('Date', 'w-28'), ('Type', 'w-24'), ('Symbol', 'w-24'),
-                                  ('Amount', 'w-28'), ('Open', 'w-28')):
-                ui.label(header).classes(width)
-        for event in events:
-            with ui.row().classes('w-full text-sm border-b py-1'):
-                ui.label(str(event['event_date'])).classes('w-28')
-                ui.label(event['event_type']).classes('w-24')
-                # A deposit has no payer symbol; a bare None would draw "None".
-                ui.label(event['symbol'] or '-').classes('w-24')
-                ui.label(f"{event['amount']:,.2f}").classes('w-28')
-                ui.label(f"{event['open_amount']:,.2f}").classes('w-28')
+        # A real ``ui.table``, like every other table on this page. It was hand-rolled
+        # out of ``ui.row()`` + ``ui.label()`` with hardcoded widths, so it had none of
+        # the shared header treatment, alignment, sorting or pagination -- and the
+        # columns drifted out of line with the rows on any zoom level.
+        #
+        # The money stays a FLOAT in the row and is formatted by Quasar's ``format``
+        # (a dynamic ``:`` property, evaluated client-side). Pre-formatting
+        # "5,000.00" into the row would sort it as a string, putting 5,000.00 before
+        # 42.50 -- and the point of moving to a real table was to get sorting.
+        money = (':format', 'value => Number(value).toLocaleString("en-US", '
+                            '{minimumFractionDigits: 2, maximumFractionDigits: 2})')
+        columns = [
+            {'name': 'event_date', 'label': 'Date', 'field': 'event_date',
+             'sortable': True, 'align': 'left'},
+            {'name': 'event_type', 'label': 'Type', 'field': 'event_type',
+             'sortable': True, 'align': 'left'},
+            {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol',
+             'sortable': True, 'align': 'left'},
+            {'name': 'amount', 'label': 'Amount', 'field': 'amount',
+             'sortable': True, 'align': 'right', money[0]: money[1]},
+            {'name': 'open_amount', 'label': 'Open', 'field': 'open_amount',
+             'sortable': True, 'align': 'right', money[0]: money[1]},
+        ]
+        rows = [{
+            # ``str``, because NiceGUI sends the rows to the browser as JSON and a
+            # ``date`` is not serialisable. The hand-rolled version got away with it
+            # only because it called ``str()`` on the way into a label.
+            'event_date': str(event['event_date']),
+            'event_type': event['event_type'],
+            # A deposit has no payer symbol; a bare None renders as an EMPTY cell,
+            # which reads as "we do not know" rather than "there is none".
+            'symbol': event['symbol'] or '-',
+            'amount': float(event['amount']),
+            'open_amount': float(event['open_amount']),
+            'external_id': event['external_id'],
+        } for event in events]
+        ui.table(columns=columns, rows=rows, row_key='external_id') \
+            .classes('w-full dark-pagination')
 
 
 #: Status -> colour class. Keyed on the SERVICE's own constants, never on

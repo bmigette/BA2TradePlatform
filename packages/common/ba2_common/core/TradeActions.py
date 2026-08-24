@@ -2147,6 +2147,45 @@ class _OptionEntryAction(TradeAction):
         return self.create_and_save_action_result(
             action_type=self._action_type_value(), success=success, message=message, data=data or {})
 
+    def _refuse_if_cannot_take_delivery(self, option_strategy: str, *,
+                                        strike: Optional[float],
+                                        contracts: Optional[float]
+                                        ) -> Optional[Dict[str, Any]]:
+        """ENFORCING assignment-capacity gate. Returns a refusal, or None to proceed.
+
+        Only structures carrying a SHORT PUT reach here, and they pass their short put
+        LEG (its strike and its total contract count across the whole order, ratios
+        included) rather than a dollar figure — the pricing lives in one place,
+        ``option_lifecycle.put_assignment_cost``, reached via
+        ``check_short_put_assignment_capacity``.
+
+        WHY THIS IS NOT THE BUYING-POWER GATE AGAIN. The reserve pool asks "can I set
+        aside what this ONE structure needs?", priced the way a broker prices it —
+        Reg-T naked margin (~20% of notional) for a short strangle, the wing width for
+        an iron condor. This asks "if EVERY open short put were assigned tonight, could
+        we pay for the shares?", which is one number for all of them: the strike. A book
+        of short straddles can pass the first gate five times over and still owe more
+        delivery than the account holds — measured, five 100-strike puts reserving
+        $2,000 each against $45,000 of cash and a $50,000 bill.
+
+        Placed AFTER ``check_option_buying_power`` deliberately: an entry that the
+        pre-existing gate already refuses keeps the message it has always had, so no
+        decline already on record is re-labelled and the new refusal only ever appears
+        where something genuinely new is being caught.
+        """
+        verdict = self.account.check_short_put_assignment_capacity(
+            strike=strike, contracts=contracts)
+        if verdict.ok:
+            return None
+        logger.warning(f"{self._action_type_value()} for {self.instrument_name}: "
+                       f"{option_strategy} REFUSED — {verdict.reason}")
+        return self._result(
+            False, f"{verdict.reason} Refusing {option_strategy} on {self.instrument_name}.",
+            {"option_strategy": option_strategy,
+             "assignment_held_cost": verdict.held_cost,
+             "assignment_candidate_cost": verdict.candidate_cost,
+             "assignment_cash": verdict.cash})
+
     def _submit_option_order(self, legs: List[OptionLeg], quantity: int,
                              limit_price: float, option_strategy: str,
                              option_reserve: Optional[float] = None) -> Dict[str, Any]:
@@ -2538,6 +2577,11 @@ class SellCashSecuredPutAction(_OptionEntryAction):
                                 f"Insufficient buying power to reserve {reserve} for cash_secured_put "
                                 f"on {self.instrument_name} (available="
                                 f"{self.account.available_option_buying_power()})")
+        # ONE short put, `quantity` contracts, at contract.strike.
+        refusal = self._refuse_if_cannot_take_delivery(
+            "cash_secured_put", strike=contract.strike, contracts=quantity)
+        if refusal is not None:
+            return refusal
         limit_price = contract.bid                          # sell at BID
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.SELL,
                         position_intent="sell_to_open", option_type=self.OPTION_TYPE,
@@ -2632,6 +2676,120 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
 
     def get_description(self) -> str:
         return f"Open bear call spread on {self.instrument_name}"
+
+
+class OpenBullPutSpreadAction(_OptionEntryAction):
+    """Open a bull put (credit) vertical spread: sell the HIGHER strike, buy the LOWER.
+
+    The put mirror of ``OpenBearCallSpreadAction`` and the canonical defined-risk income
+    structure — it was the sell arm's only missing directional expression (the searched
+    credit residue was one neutral and one bearish structure). SHORT leg is the higher
+    strike (sold at BID), LONG leg is the lower strike (bought at ASK as protection).
+    net_credit = short.bid - long.ask (must be > 0). The limit price is NEGATIVE (Alpaca
+    MLEG convention: negative = net credit). Max loss = (width - net_credit) is reserved
+    as buying power. Bullish/neutral: it pays while the underlying stays ABOVE the short
+    strike.
+
+    ASSIGNMENT. The short leg is a PUT, so this structure can have shares put to it and
+    is charged the full short strike by ``_refuse_if_cannot_take_delivery``. The long
+    wing nets NOTHING off that bill — see the comment at the gate below.
+    """
+
+    OPTION_TYPE = OptionRight.PUT
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_BULL_PUT_SPREAD.value
+
+    def _spread_params(self) -> Tuple[Any, Any]:
+        """Split strike_param into (long, short) params for the two legs."""
+        sp = self.strike_param
+        if isinstance(sp, dict):
+            return sp.get("long"), sp.get("short")
+        if isinstance(sp, (list, tuple)) and len(sp) == 2:
+            return sp[0], sp[1]
+        # Single value: use the same param for both legs (selector dedups by strike).
+        return sp, sp
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
+        spot = self._spot()
+        long_param, short_param = self._spread_params()
+        pair = select_vertical_spread(
+            chain, method=self.strike_method, long_param=long_param, short_param=short_param,
+            spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), target_price=self._consensus_target(),
+            **liq)
+        if pair is None:
+            return self._result(False, f"No liquid bull put spread for {self.instrument_name}")
+        # For a PUT chain the selector returns its DEBIT ordering: (higher, lower) =
+        # (long, short) for a bear put spread. A bull put CREDIT spread is the mirror —
+        # SHORT the higher strike, LONG the lower one.
+        hi_c, lo_c = pair
+        short_c, long_c = hi_c, lo_c
+        if short_c.strike is None or long_c.strike is None:
+            return self._result(False, f"Missing strike for spread legs on {self.instrument_name}")
+        if short_c.strike <= long_c.strike:
+            # Long ABOVE short is a bear put DEBIT spread: a different max loss, a
+            # different (zero) reserve, and the opposite directional thesis. Opening it
+            # under this label would reserve a max loss that does not apply and charge
+            # assignment capacity against the wrong leg.
+            return self._result(
+                False,
+                f"Inverted bull put spread for {self.instrument_name}: the short leg "
+                f"({short_c.strike}) must be ABOVE the long leg ({long_c.strike}) — a long "
+                f"above a short is a bear put DEBIT spread, not a put credit spread")
+        if short_c.bid is None or long_c.ask is None:
+            return self._result(False, f"Missing quote for spread legs on {self.instrument_name}")
+        net_credit = round(short_c.bid - long_c.ask, 4)     # sell short@bid, buy long@ask
+        if net_credit <= 0:
+            return self._result(False,
+                                f"Non-positive net credit ({net_credit}) for {self.instrument_name} "
+                                f"bull put spread")
+        width = round(short_c.strike - long_c.strike, 4)
+        if width <= 0:
+            return self._result(False, f"Non-positive spread width ({width}) for {self.instrument_name}")
+        per_spread_reserve = (width - net_credit) * 100.0   # max loss per spread
+        if per_spread_reserve <= 0:
+            return self._result(False,
+                                f"Non-positive max-loss reserve for {self.instrument_name} bull put spread")
+        # Routed through the shared _size_by_reserve() (not inlined) so it also gets capped by
+        # max_virtual_equity_per_instrument_percent, same as every other structure.
+        quantity = self._size_by_reserve(per_spread_reserve, self.sizing)
+        if quantity < 1:
+            return self._result(False,
+                                f"Insufficient budget to size bull_put_spread for {self.instrument_name} "
+                                f"(max_loss={per_spread_reserve})")
+        reserve = self.account.option_reserve_required(
+            "bull_put_spread", quantity, spread_width=width, net_credit=net_credit)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False,
+                                f"Insufficient buying power to reserve {reserve} for bull_put_spread "
+                                f"on {self.instrument_name} (available="
+                                f"{self.account.available_option_buying_power()})")
+        # The SHORT PUT leg (the HIGHER strike), `quantity` contracts, charged at its FULL
+        # strike. The long put wing nets NOTHING off: the short leg can be assigned
+        # TONIGHT, while exercising our own lower-strike put is a choice we make LATER —
+        # after the shares have already been paid for. Netting the width here would price
+        # a $9,500 obligation at $500 and wave every entry through.
+        refusal = self._refuse_if_cannot_take_delivery(
+            "bull_put_spread", strike=short_c.strike, contracts=quantity)
+        if refusal is not None:
+            return refusal
+        short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
+                              position_intent="sell_to_open", option_type=self.OPTION_TYPE,
+                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
+        long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
+                             position_intent="buy_to_open", option_type=self.OPTION_TYPE,
+                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
+        limit_price = -net_credit                           # NEGATIVE = net credit (Alpaca MLEG)
+        return self._submit_option_order([short_leg, long_leg], quantity, limit_price,
+                                         "bull_put_spread", option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open bull put spread on {self.instrument_name}"
 
 
 class OpenStraddleAction(_OptionEntryAction):
@@ -2805,6 +2963,13 @@ class OpenShortStraddleAction(_OptionEntryAction):
             "short_straddle", quantity, strike=call_c.strike, spot=spot)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for short straddle on {self.instrument_name}")
+        # ONE short put leg (put_c), `quantity` contracts. The short CALL at the same
+        # strike consumes no PUT-assignment capacity: assigned, it delivers shares and
+        # pays cash IN.
+        refusal = self._refuse_if_cannot_take_delivery(
+            "short_straddle", strike=put_c.strike, contracts=quantity)
+        if refusal is not None:
+            return refusal
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
                              position_intent="sell_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
@@ -2873,6 +3038,12 @@ class OpenShortStrangleAction(_OptionEntryAction):
             "short_strangle", quantity, strike=put_c.strike, spot=spot, option_type=OptionRight.PUT)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for short strangle on {self.instrument_name}")
+        # ONE short put leg (put_c, the lower strike), `quantity` contracts. The short
+        # OTM call is not put-assignment capacity.
+        refusal = self._refuse_if_cannot_take_delivery(
+            "short_strangle", strike=put_c.strike, contracts=quantity)
+        if refusal is not None:
+            return refusal
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
                              position_intent="sell_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
@@ -2941,6 +3112,15 @@ class OpenIronCondorAction(_OptionEntryAction):
             "iron_condor", quantity, spread_width=width, net_credit=net_credit)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for iron condor on {self.instrument_name}")
+        # The SHORT PUT leg (sp), `quantity` contracts. The long put WING (lp) nets
+        # NOTHING off: the short leg can be assigned tonight, while exercising our own
+        # put is a choice we make LATER — after the shares have already been paid for.
+        # A condor is sized off its wing width, which is why it is the structure this
+        # gate bites hardest.
+        refusal = self._refuse_if_cannot_take_delivery(
+            "iron_condor", strike=sp.strike, contracts=quantity)
+        if refusal is not None:
+            return refusal
         legs = [
             OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
                       option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
@@ -3015,6 +3195,12 @@ class OpenJadeLizardAction(_OptionEntryAction):
             "jade_lizard", quantity, strike=sp.strike, spread_width=call_wing_width, net_credit=net_credit)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for jade lizard on {self.instrument_name}")
+        # The NAKED short put leg (sp), `quantity` contracts. The other two legs are the
+        # call credit spread, which owes shares rather than cash.
+        refusal = self._refuse_if_cannot_take_delivery(
+            "jade_lizard", strike=sp.strike, contracts=quantity)
+        if refusal is not None:
+            return refusal
         legs = [
             OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
                       option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
@@ -3151,6 +3337,13 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
             "put_ratio_spread", quantity, strike=short_p.strike, net_credit=net_credit)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for ratio spread on {self.instrument_name}")
+        # TWO short puts per structure (`ratio_qty=2` on the short leg below), so the
+        # delivery bill is 2 x quantity contracts at the SHORT strike. The single long
+        # put at the higher strike nets nothing off, same as the condor's wing.
+        refusal = self._refuse_if_cannot_take_delivery(
+            "put_ratio_spread", strike=short_p.strike, contracts=2 * quantity)
+        if refusal is not None:
+            return refusal
         legs = [
             OptionLeg(contract_symbol=long_p.symbol, side=OrderDirection.BUY, ratio_qty=1,
                       position_intent="buy_to_open", option_type=OptionRight.PUT,
@@ -3492,6 +3685,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.BUY_PROTECTIVE_PUT: BuyProtectivePutAction,
         ExpertActionType.SELL_CASH_SECURED_PUT: SellCashSecuredPutAction,
         ExpertActionType.OPEN_BEAR_CALL_SPREAD: OpenBearCallSpreadAction,
+        ExpertActionType.OPEN_BULL_PUT_SPREAD: OpenBullPutSpreadAction,
         ExpertActionType.OPEN_STRADDLE: OpenStraddleAction,
         ExpertActionType.OPEN_STRANGLE: OpenStrangleAction,
         ExpertActionType.OPEN_SHORT_STRADDLE: OpenShortStraddleAction,

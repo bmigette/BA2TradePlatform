@@ -200,6 +200,21 @@ class Transaction(SQLModel, table=True):
     # Contract multiplier for P&L/value math: 100 for standard options, null (=1) for
     # equity. Populated from the originating order so option premium scales correctly.
     multiplier: int | None = Field(default=None, description="Contract multiplier (100 for standard options; null/1 for equity)")
+    # --- The option INTENT. The transaction says WHAT was meant ("a bull call
+    # spread on ACN, expiring 2026-08-21"); the TradingOrder rows underneath say
+    # which contracts actually filled. `symbol` above stays the UNDERLYING ticker
+    # and must never hold an OCC contract string -- JobManager selects
+    # `distinct Transaction.symbol` and submits a market analysis per value.
+    asset_class: AssetClass = Field(default=AssetClass.EQUITY, index=True,
+                                    description="EQUITY or OPTION. Before this existed the only "
+                                                "tell was multiplier=100.")
+    option_strategy: str | None = Field(default=None,
+                                        description="The INTENT: bull_call_spread, iron_condor, "
+                                                    "covered_call... None for equity.")
+    expiry: date | None = Field(default=None, index=True,
+                                description="The structure's expiry. Valid as a single value ONLY "
+                                            "because every supported structure is single-expiry "
+                                            "(no calendars/diagonals). See Task 2.")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
     # JSON field for storing additional data (e.g., TradeConditionsData)
@@ -237,12 +252,32 @@ class Transaction(SQLModel, table=True):
         executed = OrderStatus.get_executed_statuses()
         for order in orders:
             # Only count filled orders
-            if order.status in executed and order.filled_qty:
-                # Add to total based on side (BUY is positive, SELL is negative)
-                if order.side == OrderDirection.BUY:
-                    total_qty += order.filled_qty
-                elif order.side == OrderDirection.SELL:
-                    total_qty -= order.filled_qty
+            if order.status not in executed:
+                continue
+            # ONE TRUTHINESS TEST USED TO DO TWO DIFFERENT JOBS. This was
+            # ``if order.status in executed and order.filled_qty:``, which collapsed
+            # "the broker said it filled but never said how much" (filled_qty NULL --
+            # UNMEASURABLE) into "nothing filled" (filled_qty 0.0 -- a MEASUREMENT).
+            # The total that came out looked like a number either way, and fed
+            # AccountInterface.submit_close_order_for_transaction and Smart-RM close
+            # sizing. The value cannot carry the tri-state (this returns a float and
+            # ~10 call sites add/compare it), so the gap is made LOUD instead of
+            # silent: skipped, and reported.
+            if order.filled_qty is None:
+                from ba2_common.logger import logger
+                logger.error(
+                    f"Transaction {self.id}.get_current_open_qty(): order {order.id} "
+                    f"({order.symbol} {order.side}) is {order.status} but has NO "
+                    f"filled_qty — the filled amount is UNMEASURABLE, not zero. "
+                    f"Excluding it; the returned net open quantity is therefore "
+                    f"incomplete and must not be treated as a measured position size."
+                )
+                continue
+            # Add to total based on side (BUY is positive, SELL is negative)
+            if order.side == OrderDirection.BUY:
+                total_qty += order.filled_qty
+            elif order.side == OrderDirection.SELL:
+                total_qty -= order.filled_qty
 
         return total_qty
 
@@ -895,6 +930,17 @@ class PortfolioAllocationLabel(SQLModel, table=True):
     which is a different answer from a stored 0.0 ("the last run allocated nothing
     to this"), and it is what makes the wizard's Load-last button's disabled state
     a fact rather than a guess.
+
+    ``color`` is the label's swatch, one of the seven hexes in
+    ``ba2_trade_platform.ui.utils.portfolio_allocation_view.LABEL_COLOR_PALETTE``
+    (Okabe & Ito's colour-universal-design set). NULLABLE and never back-filled, on
+    exactly ``previous_target_pct``'s terms: NULL means "the user has not chosen a
+    colour", which is a different fact from a stored default -- a default would make
+    every label that predates the column claim a colour nobody picked, and the
+    picker could then never show "No colour" truthfully. Nothing in the platform
+    reads it for money; it is a display key only, and the RENDER whitelists it
+    against the palette, so a hand-edited value falls back to neutral grey rather
+    than reaching a CSS ``style`` attribute.
     """
     __tablename__ = "portfolio_allocation_label"
     __table_args__ = (
@@ -908,6 +954,7 @@ class PortfolioAllocationLabel(SQLModel, table=True):
     previous_target_pct: float | None = Field(default=None, description="The target this label ran with before the current one; None means there is no last")
     sort_order: int = Field(default=0, description="Display order of the label expansion on the page")
     comment: str | None = Field(default=None, description="Free-text note shown on the label header")
+    color: str | None = Field(default=None, description="Palette hex for this label's icon (e.g. '#56B4E9'); None means no colour chosen")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
 

@@ -214,3 +214,30 @@ def test_a_symbol_round_trips_a_previous_weight(mock_account_def):
     with get_db() as session:
         row = session.exec(select(PortfolioAllocationSymbol)).one()
         assert row.previous_weight_pct == 30.0
+
+
+def test_a_label_has_a_nullable_colour_that_defaults_to_no_colour(mock_account_def):
+    """NULL means "no colour chosen", which is a DIFFERENT fact from a stored
+    default -- so the column is nullable and nothing backfills it."""
+    add_instance(PortfolioAllocationLabel(
+        account_id=mock_account_def.id, label="ARK26", target_pct=40.0))
+    with get_db() as session:
+        row = session.exec(select(PortfolioAllocationLabel)).one()
+        assert row.color is None
+
+
+def test_a_labels_colour_round_trips(mock_account_def):
+    add_instance(PortfolioAllocationLabel(
+        account_id=mock_account_def.id, label="ARK26", target_pct=40.0,
+        color="#56B4E9"))
+    with get_db() as session:
+        assert session.exec(select(PortfolioAllocationLabel)).one().color == "#56B4E9"
+
+
+def test_the_colour_column_is_declared_nullable_with_no_server_default():
+    """A server default would make every pre-existing label claim a colour the user
+    never picked, and the picker could then never show "no colour" truthfully."""
+    column = PortfolioAllocationLabel.__table__.columns['color']
+    assert column.nullable is True
+    assert column.server_default is None
+    assert column.default is None or column.default.arg is None
