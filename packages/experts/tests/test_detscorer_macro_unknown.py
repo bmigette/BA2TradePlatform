@@ -29,7 +29,7 @@ from ba2_experts.DeterministicScorer import DeterministicScorer
 from ba2_experts.DeterministicScorer import explain
 from ba2_experts.DeterministicScorer.combine import final_score
 from ba2_experts.DeterministicScorer.macro import (
-    DEF_MW, exposure_multiplier, regime_composite, trend_score,
+    DEF_MW, credit_score, exposure_multiplier, regime_composite, trend_score,
 )
 
 
@@ -59,6 +59,29 @@ def test_all_weights_zero_is_unknown_not_zero():
     assert out["n_inputs"] == 0
 
 
+def test_a_zero_weight_input_does_not_count_as_a_resolved_one():
+    """n_inputs is the corroboration count the hard risk-off cutoff is gated on
+    (exposure_multiplier's min_inputs_for_riskoff). An input carrying no weight
+    contributes nothing and must not arm that cutoff."""
+    out = regime_composite({"trend_index": -1.0, "vix": 1.0},
+                           {"trend_index": 1.0, "vix": 0.0})
+    assert out["n_inputs"] == 1
+    assert out["score"] == pytest.approx(-1.0)
+    assert exposure_multiplier(out["score"], n_inputs=out["n_inputs"]) > 0.0
+
+
+def test_an_out_of_range_input_is_clipped_into_the_exposure_domain():
+    """Every scorer is documented as [-1, +1]; a stand-in that breaks that must
+    not push the exposure multiplier out of [0, 1]."""
+    out = regime_composite({"vix": 7.0}, {"vix": 1.0})
+    assert out["score"] == 1.0
+
+
+def test_a_credit_series_with_no_dispersion_is_unknown():
+    """Zero sigma means the z-score is undefined, not that spreads are average."""
+    assert credit_score(pd.Series([3.0] * 80)) is None
+
+
 def test_a_too_short_index_history_is_unknown_not_flat():
     """``trend_score`` is +-1 BY CONSTRUCTION, so a 0.0 out of it could only ever
     be a fabricated 'no trend' -- and it is the one input the degraded backtest
@@ -71,6 +94,11 @@ def test_a_measurable_index_history_still_reports_its_trend():
     rising = pd.Series([float(100 + i) for i in range(260)])
     assert trend_score(rising, sma_period=200) == 1.0
     assert trend_score(rising.iloc[::-1].reset_index(drop=True), sma_period=200) == -1.0
+
+
+def test_a_non_positive_index_sma_is_unknown():
+    """A zero/negative SMA is a corrupt series, not a downtrend."""
+    assert trend_score(pd.Series([0.0] * 260), sma_period=200) is None
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +163,22 @@ def test_gate_mode_reports_that_the_gate_never_ran():
     assert res["regime"] is None
 
 
+def test_gate_mode_with_a_MEASURED_regime_gates_instead_of_scaling():
+    """The control for the cold-cache tests above: when the regime IS measured,
+    gate mode must flatten a bullish score and must NOT apply the multiply arm's
+    exposure factor. If both arms fired, 'gate' would silently be 'gate AND
+    multiply' and the cold-cache assertions would be measuring the wrong thing."""
+    s = {"macro_mode": "gate", "macro_gate_min": -0.5}
+    bad = final_score(technical=0.8, fundamental=0.4, analyst=None,
+                      regime=-0.9, s=s, regime_n_inputs=4)
+    assert bad["final"] <= 0.0
+    assert bad["exposure_multiplier"] == 1.0        # gate does not scale
+    ok = final_score(technical=0.8, fundamental=0.4, analyst=None,
+                     regime=-0.2, s=s, regime_n_inputs=4)
+    assert ok["final"] > 0.0
+    assert ok["exposure_multiplier"] == 1.0
+
+
 def test_input_mode_drops_the_unmeasured_macro_section():
     """input mode: an unmeasured macro must be renormalized away, not averaged in
     as a 0.0 that drags every score toward flat."""
@@ -146,6 +190,8 @@ def test_input_mode_drops_the_unmeasured_macro_section():
                       regime_n_inputs=cold["n_inputs"])
     assert res["raw"] == pytest.approx(1.0)
     assert "macro" not in res["components"]
+    # ... and the count of sections behind the score must not claim the macro one.
+    assert res["n_sections"] == 2
 
 
 # ---------------------------------------------------------------------------

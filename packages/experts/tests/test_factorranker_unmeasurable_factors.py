@@ -86,6 +86,18 @@ def test_momentum_with_a_non_positive_start_price_is_unknown():
     assert momentum_12_1({"X": s})["X"] is None
 
 
+def test_momentum_counts_only_the_closes_it_actually_has():
+    """A series padded to 300 rows with 150 NaNs holds 150 closes, not 300. Measuring
+    the window off the padded length reads the return off whatever landed at the
+    index -- a number computed from absent data, which is the same defect indexed
+    differently."""
+    real = [100.0 + i for i in range(150)]
+    padded = pd.Series(real + [float("nan")] * 150)
+    assert momentum_12_1({"X": padded})["X"] is None
+    long_enough = pd.Series(real + [float("nan")] * 150 + [250.0 + i for i in range(150)])
+    assert momentum_12_1({"X": long_enough})["X"] is not None
+
+
 # ===========================================================================
 # B. the composite: renormalize over what was measured, record n_factors
 # ===========================================================================
@@ -206,6 +218,34 @@ def test_the_default_K_is_two():
     assert DEF_MIN_MEASURED_FACTORS == 2
 
 
+def test_a_caller_can_tighten_K():
+    """The default is a default, not a hard-coding: a caller asking for full
+    coverage must get it."""
+    values = _three_factor_universe()          # DDD is missing quality
+    assert "DDD" in composite_score(values, _THREE, min_factors=2)
+    assert "DDD" not in composite_score(values, _THREE, min_factors=3)
+
+
+def test_a_negative_weight_cannot_produce_a_sign_flipped_score():
+    """Renormalizing divides by the measured weight; a negative total would flip
+    the sign of every contribution. Such a symbol is not scorable."""
+    values = {"momentum": {"AAA": 0.3, "BBB": 0.1}}
+    detail = composite_detail(values, {"momentum": -1.0}, min_factors=1)
+    assert detail["AAA"]["score"] is None
+    assert "AAA" not in composite_score(values, {"momentum": -1.0}, min_factors=1)
+
+
+def test_the_renormalisation_target_is_the_weight_actually_in_play():
+    """A weighted factor whose fetcher returned NOTHING contributes no column at
+    all. Scaling up to include its weight would inflate every composite in the
+    book by a factor nobody chose."""
+    values = {"momentum": {"AAA": 0.3, "BBB": 0.1, "CCC": -0.2}}
+    weights = {"momentum": 1.0, "value": 1.0}      # value produced no column
+    z = cross_sectional_zscore(values["momentum"])
+    got = composite_score(values, weights, min_factors=1)
+    assert got["AAA"] == pytest.approx(z["AAA"])
+
+
 # ===========================================================================
 # C. the cross-section: an unmeasured value is not part of the comparator
 # ===========================================================================
@@ -319,6 +359,16 @@ def test_pead_outside_the_drift_window_is_a_measured_zero():
                                    "estimate_std": 0.1, "days_since": 90}},
                             drift_window_days=60)
     assert out["X"] == 0.0
+
+
+def test_the_drift_window_boundary_is_inclusive():
+    """days_since == the window is still INSIDE the drift window; the day after is
+    not. An off-by-one here silently deletes a day of the signal."""
+    sue = {"actual": 1.5, "estimate": 1.0, "estimate_std": 0.1}
+    assert earnings_surprise({"X": dict(sue, days_since=60)},
+                             drift_window_days=60)["X"] == pytest.approx(5.0)
+    assert earnings_surprise({"X": dict(sue, days_since=61)},
+                             drift_window_days=60)["X"] == 0.0
 
 
 def test_pead_without_a_report_date_is_unknown():

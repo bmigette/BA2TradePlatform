@@ -71,6 +71,13 @@ def _blind():
     return ConditionEvaluator(_Provider(None))
 
 
+def _short(bars=5):
+    """Price READABLE, indicators not: enough bars for a last close, far too few
+    for a 9-period EMA/SMA or a 14-period RSI. Without this shape a handler that
+    coerces its indicator to 0.0 hides behind the price also being None."""
+    return ConditionEvaluator(_Provider(_df([10.0] * bars)))
+
+
 # ==========================================================================
 # A. the handlers: unknown is None, measured is a bool
 # ==========================================================================
@@ -103,6 +110,50 @@ _BLIND_CASES = [
 @pytest.mark.parametrize("cond", _BLIND_CASES, ids=lambda c: c["type"])
 def test_every_handler_reports_unknown_when_it_cannot_measure(cond):
     assert _blind().evaluate_single(cond, "X", entry_price=10.0) is None
+
+
+@pytest.mark.parametrize("cond", [
+    {"type": "price_above_ema", "period": 9, "timeframe": "5m"},
+    {"type": "price_below_ema", "period": 9, "timeframe": "5m"},
+    {"type": "price_above_sma", "period": 9, "timeframe": "5m"},
+    {"type": "price_below_sma", "period": 9, "timeframe": "5m"},
+    {"type": "rsi_above", "threshold": 70, "period": 14, "timeframe": "5m"},
+    {"type": "rsi_below", "threshold": 30, "period": 14, "timeframe": "5m"},
+    {"type": "rsi_between", "min": 30, "max": 70, "period": 14, "timeframe": "5m"},
+    {"type": "macd_bullish_cross", "timeframe": "5m"},
+    {"type": "ema_cross_above", "fast_period": 9, "slow_period": 21, "timeframe": "5m"},
+], ids=lambda c: c["type"])
+def test_a_readable_price_with_an_unreadable_indicator_is_still_unknown(cond):
+    """The nastier half of the blind case: the quote arrives, the history does
+    not. An indicator coerced to 0.0 here compares against a real price and
+    produces a confident, fabricated verdict."""
+    assert _short().evaluate_single(cond, "X", entry_price=10.0) is None
+
+
+def test_rvol_with_no_same_slot_history_is_unknown():
+    idx = pd.date_range("2024-03-15 09:30", periods=2, freq="30min", tz="US/Eastern")
+    frame = _df([10.0, 10.0]).set_index(idx)
+    ev = ConditionEvaluator(_Provider(frame))
+    assert ev.evaluate_single({"type": "rvol_above", "threshold": 2.0}, "X") is None
+
+
+def test_vwap_over_a_zero_volume_session_is_unknown():
+    """No volume means no volume-weighted price -- not a VWAP of zero, which
+    every quoted price is trivially above."""
+    frame = _df([10.0] * 30, volumes=[0] * 30)
+    ev = ConditionEvaluator(_Provider(frame))
+    assert ev.evaluate_single({"type": "price_above_vwap", "timeframe": "5m"},
+                              "X") is None
+
+
+def test_a_measurable_cross_answers_a_plain_python_bool():
+    """The crossover helpers build their verdict out of numpy scalars, so the
+    result can be a numpy.bool_ -- which is NOT ``False``/``True`` by identity and
+    would slip past a three-valued check that tests for the singletons."""
+    rising = ConditionEvaluator(_Provider(_df([10.0 + i * 0.5 for i in range(80)])))
+    got = rising.evaluate_single({"type": "macd_bullish_cross", "timeframe": "5m"}, "X")
+    assert got is True or got is False
+    assert isinstance(got, bool) and not isinstance(got, np.bool_)
 
 
 def test_an_unknown_condition_type_is_unmeasurable_not_false():
@@ -272,6 +323,15 @@ def test_entry_conditions_still_fire_when_they_are_measurably_met():
                             "X") is True
 
 
+def test_entry_conditions_do_not_fire_when_they_are_measurably_unmet():
+    """The other half of the entry policy: collapsing unknown to False must not
+    be done by collapsing everything-that-is-not-unknown to True."""
+    assert _live().evaluate({"all": [{"type": "price_above", "value": 500.0}]},
+                            "X") is False
+    assert _live().evaluate({"any": [{"type": "price_above", "value": 500.0}]},
+                            "X") is False
+
+
 # ==========================================================================
 # D. the exit escalation
 # ==========================================================================
@@ -399,6 +459,29 @@ def test_the_detail_names_the_condition_that_could_not_be_measured():
     assert "percent_below_entry" in out.detail
 
 
+def test_the_detail_reports_how_long_we_have_been_blind():
+    out = _blind().evaluate_exit(_STOP, "X", entry_price=10.0, unknown_streak=6,
+                                 max_unknown_ticks=3)
+    assert "7 consecutive ticks" in out.detail
+
+
+def test_an_absent_streak_is_read_as_a_fresh_position_not_a_crash():
+    """Callers persist the streak in a JSON blob, where the key is simply absent
+    the first time. That must be a zero, not a TypeError that kills the tick."""
+    for start in (None, 0):
+        out = _blind().evaluate_exit(_STOP, "X", entry_price=10.0,
+                                     unknown_streak=start, max_unknown_ticks=3)
+        assert out.unknown_streak == 1
+        assert out.fire is False
+
+
+def test_the_decision_is_immutable():
+    """A decision a caller can edit is a decision no test can pin."""
+    out = _live().evaluate_exit(_STOP, "X", entry_price=10.0)
+    with pytest.raises(Exception):
+        out.fire = True
+
+
 def test_the_default_window_is_three_ticks():
     assert DEF_MAX_UNKNOWN_EXIT_TICKS == 3
 
@@ -487,6 +570,20 @@ def test_the_monitor_loop_escalates_the_stop_and_only_the_stop():
     assert "evaluator.evaluate(entry_conds" in src
     assert "evaluate_exit(tp_condition" not in src
     assert "evaluate_exit(entry_conds" not in src
+
+
+def test_the_monitor_loop_acts_on_fire_and_honours_the_configured_window():
+    """Two ways to neuter the escalation without touching conditions.py: branch on
+    the raw ``verdict`` (None is falsy, so the escalation is dropped on the floor
+    and we are back to holding forever), or forget to pass the configured window
+    so the helper's default silently wins."""
+    import inspect
+    src = inspect.getsource(MonitoringPhasesMixin)
+    assert "if stop_eval.fire:" in src
+    assert "if grace_eval.fire:" in src
+    assert "if stop_eval.verdict:" not in src
+    assert "if grace_eval.verdict:" not in src
+    assert src.count("max_blind_ticks=blind_ticks") == 2
 
 
 def test_a_log_price_that_could_not_be_read_does_not_blow_up_the_exit():
