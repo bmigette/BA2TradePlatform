@@ -712,12 +712,17 @@ class TestCloseNeverFallsBackToTheOrderedQuantity:
 
     def test_partial_exit_closes_the_remainder_not_the_ordered_quantity(self, monkeypatch):
         """THE INVERSE #1: a real, measured net must still be closed -- and it is the
-        REMAINDER (60), never the ordered 100."""
+        REMAINDER (60), never the ordered 100. The ACTIVITY LOG has its own copy of
+        that number and must not drift from the order."""
+        import ba2_common.core.utils as _utils
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
         submitted = []
+        logged = []
         monkeypatch.setattr(account, "submit_order",
                             lambda o, **k: submitted.append(o) or o)
+        monkeypatch.setattr(_utils, "log_close_order_activity",
+                            lambda **kw: logged.append(kw))
         transaction = self._txn_with_orders(
             acct_def, ordered_qty=100.0,
             fills=[(OrderDirection.BUY, 100.0), (OrderDirection.SELL, 40.0)],
@@ -729,6 +734,7 @@ class TestCloseNeverFallsBackToTheOrderedQuantity:
         assert len(submitted) == 1
         assert submitted[0].quantity == 60.0
         assert submitted[0].side == OrderDirection.SELL
+        assert [k["quantity"] for k in logged] == [60.0]
 
     def test_ordinary_full_position_still_closes(self, monkeypatch):
         """THE INVERSE #2: the everyday path is untouched."""
