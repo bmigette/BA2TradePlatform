@@ -220,6 +220,20 @@ short-sign divergence happened.
     the table above. 0DTE requires the analysis to run *on* the expiry day; 30–45 DTE requires entry
     days that land on a real listed expiry. The schedule genes must therefore be aware of which arm
     they belong to.
+  - **DECIDED: the grid searches DEFINED-RISK structures only.** No position whose loss is
+    unbounded. Of the 16 entry structures that splits as:
+
+    | | |
+    |---|---|
+    | **In** | `buy_call`, `buy_put`, `bull_call_spread`, `bear_put_spread`, `bear_call_spread`, `buy_protective_put`, `open_call_butterfly`, `open_iron_condor`, `open_straddle` and `open_strangle` (LONG — a paid debit, loss capped at the premium), `sell_covered_call` (covered by shares), `sell_cash_secured_put` (bounded at strike x 100, and cash-reserved) |
+    | **Out** | `open_short_straddle`, `open_short_strangle` — naked on both sides; `open_put_ratio_spread` — the extra short put is naked below the long strike |
+    | **Judgement** | `open_jade_lizard` — no upside risk by construction, downside equals a cash-secured put. Defensible as "in", but excluded unless deliberately re-admitted |
+
+    Note the LONG straddle and strangle are defined-risk and stay in; it is their SHORT forms that
+    go. The codebase already has this concept: `PremiumSeller` defaults `enable_short_put` and
+    `enable_short_strangle` to `False` and carries an `undefined_risk_max_pct` rail, which the
+    lifecycle pass inherits (plan Task 7).
+
   - **An optionable-symbol screener filter needs a source.** FMP does not expose one; the options
     are deriving it from the broker contract list and caching, or a maintained universe file. It
     matters only for the stock arms — the ETF arm's universe is fixed and known-optionable.
