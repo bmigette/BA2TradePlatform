@@ -22,9 +22,13 @@ from ba2_providers.options.thetadata import ThetaDataOptionsProvider, _occ_symbo
 # --------------------------------------------------------------------------- #
 # registry / contract
 # --------------------------------------------------------------------------- #
-def test_both_providers_registered_under_the_options_category():
-    assert set(OPTIONS_PROVIDERS) == {"alpaca", "thetadata"}
-    for name in ("alpaca", "thetadata"):
+def test_every_provider_registered_under_the_options_category():
+    """One seam, three vendors: "alpaca" (the incumbent, floored at 2024-01-18), "thetadata"
+    (deeper, needs a paid local terminal) and "tastytrade" (dxfeed — the only one whose bars
+    carry imp_volatility and open_interest). Adding a fourth belongs here, not in a parallel
+    mechanism."""
+    assert set(OPTIONS_PROVIDERS) == {"alpaca", "thetadata", "tastytrade"}
+    for name in ("alpaca", "thetadata", "tastytrade"):
         assert isinstance(get_provider("options", name), OptionsDataProviderInterface)
 
 
