@@ -6336,33 +6336,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         f"{share_qty}@{strike}; closed short put txn")
 
             if right == OptionRight.CALL and is_short:
-                # Short call assigned -> shares called away. Close held equity long.
+                # Short call assigned -> shares called away. The held equity long is
+                # SPLIT when it is bigger than the assignment (see _settle_called_away),
+                # never erased.
                 held = self._find_open_equity_long(underlying, expert_id)
                 self._close_txn(opt_txn, close_reason="assigned")
                 if held is not None:
-                    called_qty = 100.0 * contracts
-                    held_qty = abs(float(held.quantity or 0.0))
-                    if held_qty and abs(held_qty - called_qty) > 1e-9:
-                        # The lot sizes disagree, and _close_txn closes the transaction
-                        # WHOLE either way (there is no partial-close/split here). Say so
-                        # loudly rather than let the ledger drift silently: the recorded
-                        # exit order below is the TRUE called-away quantity.
-                        logger.warning(
-                            f"[Account {self.id}] Called-away lot mismatch on {underlying}: "
-                            f"{called_qty:g} shares assigned away but transaction "
-                            f"{held.id} holds {held_qty:g}; closing the whole transaction "
-                            f"(residual {held_qty - called_qty:+g} shares unaccounted).")
-                    # Mirror of the CSP entry: the shares LEFT the book, so the closing
-                    # order row must exist too or the transaction is a filled BUY with no
-                    # matching SELL.
-                    self._record_assignment_equity_order(
-                        transaction_id=held.id, symbol=underlying,
-                        side=OrderDirection.SELL, shares=called_qty, price=strike,
-                        contract=symbol, activity_id=activity_id,
-                        created_at=datetime.now(timezone.utc), origin="called_away")
-                    self._close_txn(held, close_reason="called_away", close_price=strike)
-                    return (f"called_away: closed equity long {underlying} @ {strike}; "
-                            f"closed short call txn")
+                    return self._settle_called_away(
+                        held=held, underlying=underlying, contracts=contracts,
+                        strike=strike, contract=symbol, activity_id=activity_id)
                 logger.warning(
                     f"[Account {self.id}] Short CALL {symbol} assigned but no OPENED "
                     f"equity long found for {underlying} (expert {expert_id}).")
@@ -6392,9 +6374,187 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # --- OPCSH / anything else: no specific handler ---
         return f"unhandled: no handler for activity_type {atype!r}"
 
+    # Share quantities are floats (Alpaca trades fractional stock), so lot arithmetic is
+    # compared against a tolerance rather than to 0.0 exactly. Well below any tradeable
+    # fraction, well above float noise on a 6-figure share count.
+    _SHARE_EPS = 1e-9
+
+    def _settle_called_away(self, *, held, underlying: str, contracts: float,
+                            strike: float, contract: str, activity_id: str) -> str:
+        """Take the called-away shares off ONE equity lot, SPLITTING it when the lot is
+        larger than the assignment.
+
+        THE BUG THIS EXISTS TO FIX. A covered call is written against 100 shares, but the
+        lot behind it is very often bigger (300 shares, one call). ``_close_txn`` can only
+        close a transaction WHOLE, so one assigned contract used to close all 300: 200
+        real shares, still sitting at the broker, disappeared from the ledger — invisible
+        to covered-call sizing, to every exit condition and to the P&L, while the next
+        reconcile cheerfully wrote another call over stock it could no longer see. It was
+        reported as a warning and nothing else.
+
+        THE SPLIT:
+
+          * the ORIGINAL transaction becomes the lot that LEFT — ``quantity`` = the called
+            shares, ``close_price`` = the STRIKE (an assignment transacts at the strike,
+            never at the market), ``close_reason`` = "called_away". Its ``open_price`` is
+            untouched, so the realized P&L is that of the shares that actually left
+            ($2,000 on 100 shares bought at 140 and called at 160 — not $6,000).
+          * a NEW OPENED transaction holds the remainder, carrying the original
+            ``open_price`` (cost basis), ``open_date`` (the remaining shares were acquired
+            THEN — ``DaysOpenedCondition`` reads it, and re-stamping it with "now" would
+            restart every time-based exit on an assignment that had nothing to do with
+            those shares), ``expert_id``, and ``meta_data`` — including
+            ``origin=csp_assignment``, without which the remainder stops being wheel stock
+            for ``has_assigned_shares``. It also gets its own filled entry ORDER, because
+            share counts are read off order rows and never off ``Transaction.quantity``
+            (``_held_equity_shares``, ``get_current_open_qty``,
+            ``AccountInterface.close_transaction``): a remainder with no order row is
+            invisible stock that cannot be covered-called and that a later close would
+            "sell" zero of.
+
+        OVER-ASSIGNMENT (more shares called away than this lot holds) cannot happen with a
+        correctly covered call, so it is an ERROR rather than a split, and it is handled
+        rather than assumed away: the whole lot closes, the exit order is CAPPED at what
+        the lot actually held, and the excess is named in the log. An uncapped exit order
+        would drive the transaction's order-derived quantity NEGATIVE — a phantom short
+        that ``close_transaction`` would try to buy back — and a blind ``held - called``
+        remainder would be a negative-quantity OPEN position.
+
+        NOT ADDRESSED HERE (pre-existing, and unchanged by the split): any protective
+        TP/SL orders still working against the lot are left armed at the broker when the
+        transaction closes, and the remainder is deliberately given no TP/SL of its own
+        rather than a price with no order behind it. An assignment-origin lot never has
+        them (``_record_assignment_equity_order`` mints only the entry), but a lot bought
+        outright — which ``_find_open_equity_long`` will fall back to — can.
+
+        Returns the audit string recorded on the ``OptionActivity`` row.
+        """
+        called_qty = 100.0 * float(contracts)
+        held_qty = abs(float(held.quantity or 0.0))
+        eps = self._SHARE_EPS
+
+        if held_qty <= eps:
+            # A lot with no size is already broken; do not invent one. Close it and record
+            # the assignment at its true size.
+            logger.error(
+                f"[Account {self.id}] Called-away on {underlying}: transaction {held.id} "
+                f"is OPENED with quantity {held.quantity!r}; closing it and recording the "
+                f"{called_qty:g}-share exit as reported by the broker.")
+            exit_qty, remainder_qty = called_qty, 0.0
+        elif called_qty - held_qty > eps:
+            logger.error(
+                f"[Account {self.id}] Called-away OVER-ASSIGNMENT on {underlying}: "
+                f"{called_qty:g} shares assigned away but transaction {held.id} holds only "
+                f"{held_qty:g}. Closing the whole lot and recording an exit of {held_qty:g}; "
+                f"the excess {called_qty - held_qty:g} shares belong to no lot this account "
+                f"knows about and are NOT recorded.")
+            exit_qty, remainder_qty = held_qty, 0.0
+        else:
+            exit_qty = called_qty
+            remainder_qty = held_qty - called_qty
+            if remainder_qty <= eps:
+                remainder_qty = 0.0
+
+        remainder_id = None
+        if remainder_qty > 0.0:
+            remainder_id = self._open_called_away_remainder(
+                held=held, underlying=underlying, remainder_qty=remainder_qty,
+                exit_qty=exit_qty, contract=contract, activity_id=activity_id)
+            # The original row now describes ONLY the shares that left. Persisted by the
+            # _close_txn below (update_instance writes the whole object).
+            held.quantity = exit_qty
+            meta = dict(held.meta_data) if isinstance(held.meta_data, dict) else {}
+            meta["called_away_split"] = {
+                "original_quantity": held_qty,
+                "shares_called_away": exit_qty,
+                "shares_remaining": remainder_qty,
+                "remainder_transaction_id": remainder_id,
+                "activity_id": activity_id,
+            }
+            held.meta_data = meta
+
+        # Mirror of the CSP entry: the shares LEFT the book, so the closing order row must
+        # exist too or the transaction is a filled BUY with no matching SELL.
+        self._record_assignment_equity_order(
+            transaction_id=held.id, symbol=underlying, side=OrderDirection.SELL,
+            shares=exit_qty, price=strike, contract=contract, activity_id=activity_id,
+            created_at=datetime.now(timezone.utc), origin="called_away")
+        self._close_txn(held, close_reason="called_away", close_price=strike)
+
+        if remainder_id is not None:
+            return (f"called_away: {exit_qty:g} of {held_qty:g} {underlying} left at "
+                    f"{strike} (transaction {held.id} closed); {remainder_qty:g} shares "
+                    f"stay open as transaction {remainder_id}; closed short call txn")
+        return (f"called_away: closed equity long {underlying} @ {strike}; "
+                f"closed short call txn")
+
+    def _open_called_away_remainder(self, *, held, underlying: str, remainder_qty: float,
+                                    exit_qty: float, contract: str,
+                                    activity_id: str) -> "Optional[int]":
+        """Open the transaction that holds the shares a partial called-away LEFT BEHIND.
+
+        It is the same position as before, only smaller: same symbol, side, cost basis,
+        open date, expert and provenance (see ``_settle_called_away`` for why each of
+        those matters). ``meta_data`` is copied to a NEW dict — mutating the original's in
+        place would not mark it dirty for SQLAlchemy, and both rows must keep their own.
+
+        Its entry ORDER is minted the same way an assignment's is (EXTERNAL, no
+        ``broker_order_id``, FILLED, priced at the ORIGINAL basis rather than the strike)
+        because the shares are only countable through an order row. ``created_at`` is the
+        lot's own ``open_date``: this row stands in for the part of the original purchase
+        that is still held, so ``DaysOpenedCondition``'s order-level fallback lands on the
+        same date as the transaction's ``open_date``.
+        """
+        from ...core.types import TransactionStatus
+
+        meta = dict(held.meta_data) if isinstance(held.meta_data, dict) else {}
+        meta["split_from_transaction_id"] = held.id
+        meta["split_reason"] = "called_away"
+        meta["split_activity_id"] = activity_id
+
+        remainder_id = add_instance(Transaction(
+            symbol=held.symbol,
+            quantity=remainder_qty,
+            side=held.side,
+            open_price=held.open_price,
+            status=TransactionStatus.OPENED,
+            open_date=held.open_date,
+            expert_id=held.expert_id,
+            asset_class=held.asset_class,
+            multiplier=held.multiplier,
+            close_reason=None,
+            meta_data=meta,
+        ))
+        entry_id = self._record_assignment_equity_order(
+            transaction_id=remainder_id, symbol=underlying, side=OrderDirection.BUY,
+            shares=remainder_qty, price=held.open_price, contract=contract,
+            activity_id=activity_id,
+            created_at=(held.open_date or datetime.now(timezone.utc)),
+            origin="called_away_remainder",
+            comment=(f"called_away_remainder: {remainder_qty:g} of {held.symbol} kept "
+                     f"after {exit_qty:g} were called away by {contract} (broker activity "
+                     f"{activity_id}) — the un-called part of transaction {held.id}, "
+                     f"synthetic fill, no broker order exists"))
+        if entry_id is None:
+            # Without the order row the remaining shares exist only as a Transaction, and
+            # every share count in the platform reads orders. Say so: the split is still
+            # better than erasing them, but the lot is not fully visible.
+            logger.error(
+                f"[Account {self.id}] Called-away remainder transaction {remainder_id} "
+                f"({remainder_qty:g} {held.symbol}) has NO entry order; those shares are "
+                f"invisible to covered-call sizing and to close_transaction until it is "
+                f"repaired.")
+        logger.info(
+            f"[Account {self.id}] Called-away split on {held.symbol}: transaction "
+            f"{held.id} closes with {exit_qty:g} shares; {remainder_qty:g} shares stay "
+            f"open as transaction {remainder_id} (basis {held.open_price}, opened "
+            f"{held.open_date}).")
+        return remainder_id
+
     def _record_assignment_equity_order(self, *, transaction_id, symbol: str, side,
-                                        shares: float, price: float, contract: str,
-                                        activity_id: str, created_at, origin: str) -> "Optional[int]":
+                                        shares: float, price, contract: str,
+                                        activity_id: str, created_at, origin: str,
+                                        comment: "Optional[str]" = None) -> "Optional[int]":
         """Persist the equity ``TradingOrder`` that an option ASSIGNMENT produced.
 
         WHY THIS ROW MUST EXIST. Almost nothing in the platform reads share counts off
@@ -6435,7 +6595,11 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
           * ``asset_class = EQUITY`` — set explicitly, not defaulted: the whole point of
             the row is that these are SHARES, and ``_held_equity_shares`` skips OPTION.
           * ``comment`` names the origin, the contract and the broker activity id, so the
-            row can be traced back to the activity that created it.
+            row can be traced back to the activity that created it. A caller may pass its
+            own ``comment`` when "option assignment ... at strike" would be a lie — the
+            split remainder's entry order is priced at the ORIGINAL BASIS, not a strike
+            (see ``_open_called_away_remainder``); everything else about the row, and the
+            honesty invariants above, stay identical.
 
         The closing (called-away) side additionally carries ``depends_on_order`` = the
         transaction's entry order, so it can never be mistaken for the entry by the
@@ -6463,13 +6627,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 side=side,
                 order_type=CoreOrderType.MARKET,
                 status=OrderStatus.FILLED,
-                open_price=float(price),
+                # A lot whose basis was never recorded keeps a NULL price rather than
+                # borrowing the strike: an invented basis is fabricated P&L on every
+                # report thereafter, and the shares still need to be countable.
+                open_price=(float(price) if price is not None else None),
                 transaction_id=transaction_id,
                 depends_on_order=depends_on,
                 asset_class=AssetClass.EQUITY,
                 open_type=OrderOpenType.EXTERNAL,
                 broker_order_id=None,
-                comment=(f"{origin}: option assignment of {contract} at strike "
+                comment=(comment if comment is not None else
+                         f"{origin}: option assignment of {contract} at strike "
                          f"{price} (broker activity {activity_id}) — synthetic fill, "
                          f"no broker order exists"),
                 created_at=created_at,

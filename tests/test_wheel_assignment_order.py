@@ -475,13 +475,17 @@ def test_called_away_closes_the_assigned_lot_not_stock_bought_outright(mock_acco
     assert get_instance(Transaction, bought_id).status == TransactionStatus.OPENED
 
 
-def test_called_away_lot_mismatch_is_reported(monkeypatch, mock_account,
-                                              mock_expert_instance):
-    """One contract assigned against a 300-share transaction closes all 300.
+def test_called_away_of_part_of_a_lot_splits_it_instead_of_erasing_the_rest(
+        monkeypatch, mock_account, mock_expert_instance):
+    """One contract assigned against a 300-share transaction takes 100 and leaves 200.
 
-    ``_close_txn`` has no partial-close, so the residual 200 shares silently vanish from
-    the ledger. Not fixed here (a real partial close needs a transaction split), but it
-    must not be silent.
+    This test used to pin the OPPOSITE: ``_close_txn`` had no partial-close path, so all
+    300 were closed and the residual 200 real shares vanished from the ledger while
+    sitting at the broker — reported as a "Called-away lot mismatch" warning and nothing
+    else. The split landed with tests/test_called_away_partial.py, which covers the
+    remainder's basis/open_date/meta_data/entry-order and the over-assignment case; what
+    is checked here is that the warning is GONE (writing one call against 300 shares is
+    ordinary, not a discrepancy) and that the lot really did split.
     """
     # NOT caplog: ba2_trade_platform.logger installs its own handler with propagate=False,
     # so caplog's root handler never sees the record. Patch the module's own logger. The
@@ -509,10 +513,16 @@ def test_called_away_lot_mismatch_is_reported(monkeypatch, mock_account,
                        OptionRight.CALL, strike=160.0, contracts=1)
     _assign(acct, CALL_OCC, 1, "act-mismatch")
 
-    assert any("Called-away lot mismatch" in w for w in warnings), warnings
+    assert not any("mismatch" in w.lower() for w in warnings), warnings
     # The recorded exit order states the TRUE called-away quantity, not the whole lot.
     exits = [o for o in _orders_for(held_id) if o.side == OrderDirection.SELL]
     assert len(exits) == 1 and exits[0].filled_qty == 100.0
+    # ...and the 200 shares that were NOT called away are still on the book.
+    held_after = get_instance(Transaction, held_id)
+    assert held_after.status == TransactionStatus.CLOSED and held_after.quantity == 100.0
+    remaining = _equity_txns(mock_expert_instance.id)
+    assert len(remaining) == 1 and remaining[0].quantity == 200.0
+    assert remaining[0].id != held_id
 
 
 # ---------------------------------------------------------------------------
