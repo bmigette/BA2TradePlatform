@@ -26,9 +26,9 @@ from ba2_common.logger import get_expert_logger
 from ba2_experts.FactorRanker import data
 from ba2_experts.FactorRanker.construction import long_only_top_n
 from ba2_experts.FactorRanker.factors import (
-    composite_score, cross_sectional_stats, cross_sectional_zscore,
-    describe_composite_availability, earnings_surprise, momentum_12_1,
-    quality_score, rank_symbols, value_score,
+    DEF_MIN_MEASURED_FACTORS, composite_detail, cross_sectional_stats,
+    cross_sectional_zscore, describe_composite_availability, earnings_surprise,
+    momentum_12_1, quality_score, rank_symbols, value_score,
 )
 from ba2_experts.FactorRanker.portfolio import FactorPortfolioManager
 
@@ -626,7 +626,12 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
 
         momentum = None
         if all("momentum_12_1" in rows[s] for s in universe):
-            momentum = {s: (_num(rows[s].get("momentum_12_1")) or 0.0) for s in universe}
+            # A NaN in the store means the 252-bar window had not filled at that scan
+            # date -- exactly what ``factors.momentum_12_1`` now reports as None. The
+            # old ``or 0.0`` turned that into the best momentum reading in a falling
+            # cross-section, and did so on the FAST path only, so the store-backed run
+            # and the OHLCV run disagreed about the same symbol.
+            momentum = {s: _num(rows[s].get("momentum_12_1")) for s in universe}
         price_as_of = None
         if all(_num(rows[s].get("close")) is not None for s in universe):
             price_as_of = {s: _num(rows[s].get("close")) for s in universe}
@@ -661,7 +666,9 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             if float(weights.get(name, 0.0)) == 0.0:
                 continue
             if name == "momentum" and precomputed_momentum is not None:
-                factors[name] = {s: precomputed_momentum.get(s, 0.0) for s in universe}
+                # .get(s) -- a symbol the store has no momentum for is UNMEASURED,
+                # not flat. See _store_factor_inputs.
+                factors[name] = {s: precomputed_momentum.get(s) for s in universe}
                 continue
             factors[name] = self._compute_factor(
                 name, fetch_name, calc, universe, as_of=as_of,
@@ -704,7 +711,15 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         winsorize_pct = float(settings["winsorize_pct"] or 0.0)
         gross_exposure = float(settings["gross_exposure"])
 
-        comp = composite_score(data_bundle["factors"], weights, winsorize_pct)
+        # composite_detail carries the score AND the coverage evidence: a symbol
+        # measured on fewer than DEF_MIN_MEASURED_FACTORS weighted factors has
+        # score=None and is absent from ``comp``, so it is never ranked and never
+        # targeted. It still reaches the book (with its reason) so the UI and the
+        # SYMBOL360 card can say WHY it was dropped instead of it just vanishing --
+        # and so a held name that becomes unrankable is still marked SELL.
+        detail = composite_detail(data_bundle["factors"], weights, winsorize_pct,
+                                  DEF_MIN_MEASURED_FACTORS)
+        comp = {s: d["score"] for s, d in detail.items() if d["score"] is not None}
         ranked = rank_symbols(comp)
         targets = long_only_top_n(
             ranked, comp,
@@ -715,7 +730,8 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         )
         book = self._build_book(
             ranked, comp, data_bundle["factors"], targets, weights, winsorize_pct,
-            held=set(data_bundle["holdings"]), gross_exposure=gross_exposure)
+            held=set(data_bundle["holdings"]), gross_exposure=gross_exposure,
+            detail=detail)
         return Recommendation(
             OrderRecommendation.OVERWEIGHT, 0.0, current_price,
             f"Ranked {len(ranked)} names, holding {len(targets)}",
@@ -785,7 +801,7 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         return calc(inputs)
 
     def _build_book(self, ranked, comp, factor_values, targets, weights, winsorize_pct,
-                    held=None, gross_exposure=None) -> Dict[str, Any]:
+                    held=None, gross_exposure=None, detail=None) -> Dict[str, Any]:
         """Assemble the ranked-book dict stored in MarketAnalysis.state / shown in the UI.
 
         ``action`` is the intended trade for this rebalance, comparing the target
@@ -795,6 +811,12 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         ``gross_exposure`` is supplied by the caller (resolved settings) so this stays
         free of ``self.get_setting`` reads on the pure ``_process`` path; it falls
         back to the live setting only when not provided (legacy direct callers).
+
+        ``detail`` is ``composite_detail``'s output. Symbols it could not score (too
+        few measured factors) are appended AFTER the ranked rows with ``rank=None``,
+        ``composite=None``, a zero target and an ``excluded_reason`` -- present so the
+        exclusion is visible and so a held-but-now-unrankable name still shows SELL,
+        absent from ``ranked``/``targets`` so it is never bought.
         """
         held = held or set()
         if gross_exposure is None:
@@ -813,6 +835,13 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             name: cross_sectional_stats(vals, winsorize_pct)
             for name, vals in factor_values.items()
         }
+        detail = detail or {}
+
+        def _round(v):
+            """A measured number is rounded; an unmeasured one stays None. ``or 0.0``
+            here would put the fabricated zero straight back into the stored book."""
+            return None if v is None else round(v, 4)
+
         ranking = []
         for i, sym in enumerate(ranked):
             in_target = sym in targets
@@ -827,8 +856,9 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
             ranking.append({
                 "symbol": sym,
                 "rank": i + 1,
-                "composite": round(comp.get(sym, 0.0), 4),
-                "factors": {name: round(z.get(sym, 0.0), 4) for name, z in zscores.items()},
+                "composite": _round(comp.get(sym)),
+                "n_factors": (detail.get(sym) or {}).get("n_factors"),
+                "factors": {name: _round(z.get(sym)) for name, z in zscores.items()},
                 # Raw (pre-z-score) factor values, ADDITIVE to "factors" above --
                 # purely informational, not consumed by ranking/rebalancing (which
                 # only ever use the z-scored "factors"/"composite"). Exists because
@@ -837,13 +867,30 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
                 # the real underlying value -- SYMBOL360's single-symbol export
                 # (FactorRanker._build_export_metrics) shows these instead, since
                 # they're the only numbers that differ from 0 in that case.
-                "factors_raw": {name: round(vals.get(sym, 0.0), 4) for name, vals in factor_values.items()},
+                "factors_raw": {name: _round(vals.get(sym)) for name, vals in factor_values.items()},
                 "target_weight": round(targets.get(sym, 0.0), 4),
                 "action": action,
             })
+
+        # The names that could not be scored. They are NOT ranked and NOT targeted;
+        # they appear so the drop is auditable rather than silent.
+        for sym in sorted(s for s, d in detail.items() if d.get("score") is None):
+            ranking.append({
+                "symbol": sym,
+                "rank": None,
+                "composite": None,
+                "n_factors": detail[sym].get("n_factors"),
+                "factors": {name: _round(z.get(sym)) for name, z in zscores.items()},
+                "factors_raw": {name: _round(vals.get(sym)) for name, vals in factor_values.items()},
+                "target_weight": 0.0,
+                "action": "SELL" if sym in held else "—",
+                "excluded_reason": detail[sym].get("detail", ""),
+            })
+
         return {
             "rebalanced_at": datetime.now(timezone.utc).isoformat(),
             "universe_size": len(ranked),
+            "excluded_count": sum(1 for d in detail.values() if d.get("score") is None),
             "held_count": len(targets),
             "gross_exposure": float(gross_exposure),
             "weights": {k: v for k, v in weights.items() if v},
@@ -957,9 +1004,19 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         available, reason = describe_composite_availability(
             universe_size, cross.get("factors") or {}, cross.get("weights") or {})
 
+        # A symbol the composite REFUSED to score (too few measured factors) is
+        # unavailable for a second, independent reason, and its own reason is the
+        # more specific one -- say that rather than the cross-section boilerplate.
         composite = row.get("composite")
-        if available:
-            composite = composite or 0.0
+        excluded_reason = row.get("excluded_reason")
+        if excluded_reason and composite is None:
+            available, reason = False, (
+                f"Not computable for this symbol: {excluded_reason}. The composite "
+                f"is a weighted blend of factors, and this name was measured on too "
+                f"few of them to be ranked against its peers. See the raw per-factor "
+                f"values below for what WAS measured.")
+
+        if available and composite is not None:
             out = [ExpertMetric(
                 "Composite factor score", composite, f"{composite:+.3f}", None,
                 self._composite_detail(universe_size, cross),
@@ -970,11 +1027,28 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
                 detail_table=self._composite_detail_table(row, cross))]
 
         for name, raw_val in (row.get("factors_raw") or {}).items():
-            raw_val = raw_val or 0.0
+            # ``or 0.0`` here would print +0.0000 for a factor that could not be
+            # measured at all -- the same lie the composite row above exists to
+            # avoid, and on the ONLY rows a single-symbol card actually shows.
+            if raw_val is None:
+                out.append(ExpertMetric(
+                    f"Factor: {name} (raw)", None, "n/a", None,
+                    self._factor_unmeasured_detail(name)))
+                continue
             out.append(ExpertMetric(
                 f"Factor: {name} (raw)", raw_val, f"{raw_val:+.4f}", None,
                 self._factor_raw_detail(name, raw_val, cross)))
         return out
+
+    @staticmethod
+    def _factor_unmeasured_detail(name: str) -> str:
+        """Why a raw factor row says n/a. Never "0"."""
+        return (f"The {name} factor could not be measured for this symbol, so there "
+                f"is no value to report. This is NOT a reading of zero: the inputs it "
+                f"needs were missing (for momentum, fewer than the 252 daily closes "
+                f"the 12-1 window requires — a recent listing is enough; for the "
+                f"fundamental factors, the statement fields the calculator divides by). "
+                f"A factor that was measured AND came out at zero is shown as +0.0000.")
 
     # -- detail builders (pure string formatting over the recorded evidence) --
 
