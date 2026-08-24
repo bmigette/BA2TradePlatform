@@ -521,3 +521,36 @@ class TestProfitCooldownGoesUnevaluableRatherThanInventing1e9:
         profitable = _days_since_profitable_close()
         assert profitable.evaluate() is False
         assert profitable.calculated_value == 3.0
+
+
+def _breakeven_close(days_ago, **kw):
+    """A SCRATCH: closed at exactly the open price. P&L is a MEASURED 0.0."""
+    txn = _closed_txn(days_ago, **kw)
+    txn.open_price = txn.close_price = 100.0
+    return txn
+
+
+def test_a_breakeven_close_is_knowable_not_unclassifiable(repo):
+    """THE INVERSE that guards the ``pnl is None`` test against becoming truthiness.
+
+    A scratch has a P&L of exactly 0.0 -- a MEASUREMENT. It qualifies as neither a
+    profit nor a loss, which leaves 'never had a profitable close': knowable, so the
+    1e9 sentinel is right and the cooldown must still allow entry. Reading it as
+    'unclassifiable' would be the fix refusing a legitimate zero and jamming the gate
+    shut on every break-even trade."""
+    _found, _none, _unclass = _reasons()
+    repo.rows.append(_breakeven_close(days_ago=3))
+
+    assert repo.last_closed_transaction_with_reason(
+        expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=1) == (None, _none)
+    assert repo.last_closed_transaction_with_reason(
+        expert_id=EXPERT_ID, symbol=SYMBOL, profit_sign=-1) == (None, _none)
+
+    cond = _days_since_profitable_close()
+    assert cond.evaluate() is True
+    assert cond.calculated_value == 1e9
+
+    # And with no sign requested it is simply the last close, 3 days ago.
+    any_close = _days_since_close()
+    assert any_close.evaluate() is False
+    assert any_close.calculated_value == 3.0

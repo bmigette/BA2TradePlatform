@@ -625,6 +625,9 @@ class TestCloseNeverFallsBackToTheOrderedQuantity:
         assert submitted == [], "an already-flat transaction must not submit a close order"
         assert result["close_order_id"] is None
         assert "flat" in result["message"].lower(), result["message"]
+        # Already-flat is the state the caller ASKED for, so it is a success: reporting
+        # failure would make close_transaction retry a close it must never send.
+        assert result["success"] is True
 
     def test_flat_book_does_not_queue_a_deferred_close_either(self, monkeypatch):
         """The deferred (depends_on_order) branch writes the order straight to the DB
@@ -647,6 +650,7 @@ class TestCloseNeverFallsBackToTheOrderedQuantity:
 
         assert result["close_order_id"] is None
         assert "flat" in result["message"].lower(), result["message"]
+        assert result["success"] is True
 
     def test_partial_exit_closes_the_remainder_not_the_ordered_quantity(self, monkeypatch):
         """THE INVERSE #1: a real, measured net must still be closed -- and it is the
