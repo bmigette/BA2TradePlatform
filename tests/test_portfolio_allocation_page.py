@@ -140,6 +140,18 @@ def _texts(root):
     return [el._text for el in root.descendants(include_self=True) if el._text]
 
 
+def _button_labels(root):
+    """The caption of every ``ui.button``.
+
+    ``_texts`` misses them: ``q-btn`` carries its caption in ``_props['label']``,
+    not ``_text``, so an assertion that a button was NOT drawn is vacuous unless it
+    looks here.
+    """
+    from nicegui import ui as nicegui_ui
+    return [el._props.get('label', '') for el in root.descendants()
+            if isinstance(el, nicegui_ui.button)]
+
+
 def _expansion_headers(root):
     """The caption of every ``ui.expansion``.
 
@@ -263,17 +275,125 @@ def test_load_gate_ignores_another_accounts_enabled_expert(monkeypatch, account_
     assert page._load_gate(account_id).allowed is True
 
 
+def test_load_gate_for_an_expert_free_account_never_names_another_brokers_experts(
+        monkeypatch):
+    """The 2026-08 report, exactly: TastyTrade selected, TastyTrade owns ZERO
+    experts, and the banner named the two ENABLED experts of the *Alpaca* account.
+
+    Both accounts are built here, with Alpaca carrying the reported mix of enabled
+    and disabled experts, so a gate that leaked across accounts would have to leak
+    the right names to pass.
+    """
+    alpaca = create_account_definition(name='Alcapa Live', provider='MockAccount')
+    tasty = create_account_definition(name='Tasty', provider='MockAccount')
+    create_expert_instance(account_id=alpaca.id, expert='FMPPScreener', enabled=True)
+    create_expert_instance(account_id=alpaca.id, expert='MockExpert', enabled=False,
+                           alias='goal6-small_ED_S2')
+    create_expert_instance(account_id=alpaca.id, expert='MockExpert', enabled=True,
+                           alias='goal6-small_ED_S1top1')
+    _use_account(monkeypatch, _Account(tasty.id, {'manual_trading_enabled': True}))
+
+    gate = page._load_gate(tasty.id)
+
+    assert gate.allowed is True
+    assert gate.reason_code == GATE_OK
+    assert gate.expert_names == []
+    assert 'FMPPScreener' not in gate.message
+    assert 'goal6-small_ED_S1top1' not in gate.message
+
+    # ... and the account that DOES own them still reports exactly its own enabled two.
+    _use_account(monkeypatch, _Account(alpaca.id, {'manual_trading_enabled': True}))
+    owner_gate = page._load_gate(alpaca.id)
+    assert owner_gate.reason_code == GATE_HAS_EXPERTS
+    assert sorted(owner_gate.expert_names) == ['FMPPScreener', 'goal6-small_ED_S1top1']
+
+
+def test_content_for_an_expert_free_account_never_draws_another_brokers_experts(
+        monkeypatch, nicegui_client):
+    """The same case through the real ``content()``, i.e. what the user actually saw.
+
+    ``content()`` reads the selection ONCE, at build; given the TastyTrade id it
+    must never render Alpaca's expert names. (When the page shows them anyway, the
+    id it was built with was the previous one -- see
+    ``tests/test_ui_account_switch_reload.py``.)
+    """
+    alpaca = create_account_definition(name='Alcapa Live', provider='MockAccount')
+    tasty = create_account_definition(name='Tasty', provider='MockAccount')
+    create_expert_instance(account_id=alpaca.id, expert='FMPPScreener', enabled=True)
+    create_expert_instance(account_id=alpaca.id, expert='MockExpert', enabled=True,
+                           alias='goal6-small_ED_S1top1')
+    monkeypatch.setattr(page, 'get_selected_account_id', lambda: tasty.id)
+    _use_account(monkeypatch, _Account(tasty.id, {'manual_trading_enabled': True},
+                                       positions=[]))
+
+    _run_in_client(nicegui_client, page.content)
+
+    text = ' '.join(_texts(nicegui_client.layout))
+    assert 'FMPPScreener' not in text
+    assert 'goal6-small_ED_S1top1' not in text
+    assert 'has enabled experts' not in text
+    assert 'No labels are managed for this account yet' in text   # got past the gate
+
+
+def test_expert_management_and_the_allocation_gate_read_the_same_enabled_field(
+        monkeypatch, nicegui_client, account_id):
+    """Ruled out, not dropped: the ENABLED tick and the gate are one field.
+
+    The first hypothesis for the report was that Settings' Expert Management table
+    and ``_enabled_expert_names`` disagreed about what "enabled" means. They do not
+    -- the table row is ``dict(ExpertInstance)``, the column renders that row's
+    ``enabled`` key, and the gate filters ``ExpertInstance.enabled == True`` -- so a
+    green tick and a named expert can never contradict each other. The whole table
+    is rendered here rather than just the row builder, because the column-to-field
+    mapping is the half that decides which value the tick actually shows.
+    """
+    from ba2_trade_platform.ui.pages import settings as settings_page
+
+    create_expert_instance(account_id=account_id, expert='FMPPScreener', enabled=True)
+    create_expert_instance(account_id=account_id, expert='MockExpert', enabled=False,
+                           alias='Retired')
+    _use_account(monkeypatch, _Account(account_id, {'manual_trading_enabled': True}))
+
+    tab = object.__new__(settings_page.ExpertSettingsTab)
+    with nicegui_client:
+        settings_page.ExpertSettingsTab.render(tab)
+
+    column = next(c for c in tab.experts_table.columns if c['name'] == 'enabled')
+    assert column['field'] == 'enabled'          # the tick reads ExpertInstance.enabled
+
+    # ... and a TRUE value is the green tick, not the red cross. Inverting this
+    # template is the one way the screen could contradict the gate.
+    template = ' '.join(tab.experts_table.slots['body-cell-enabled'].template.split())
+    assert "props.value ? 'check_circle' : 'cancel'" in template
+    assert "props.value ? 'green' : 'red'" in template
+
+    ticked = {(r['alias'] or r['expert']) for r in tab.experts_table.rows
+              if r['account_id'] == account_id and r[column['field']]}
+
+    assert ticked == set(page._enabled_expert_names(account_id)) == {'FMPPScreener'}
+    assert 'Retired' not in ticked
+    assert 'Retired' not in page._enabled_expert_names(account_id)
+
+
 def test_load_gate_with_no_account_selected_asks_for_one(monkeypatch):
-    """'All accounts' is account_id None, and no broker call may be made for it."""
+    """'All accounts' is account_id None, and no broker call may be made for it.
+
+    Raising from the factory is not enough on its own: ``_load_gate`` catches
+    everything the factory throws and still ends up at GATE_NO_ACCOUNT, so the call
+    is counted rather than only booby-trapped.
+    """
     import ba2_trade_platform.core.utils as core_utils
+    calls = []
 
     def _explode(account_id):
+        calls.append(account_id)
         raise AssertionError('the account must not be instantiated for "All accounts"')
 
     monkeypatch.setattr(core_utils, 'get_account_instance_from_id', _explode)
     gate = page._load_gate(None)
     assert gate.allowed is False
     assert gate.reason_code == GATE_NO_ACCOUNT
+    assert calls == []
 
 
 def test_load_gate_reports_an_uninstantiable_account_instead_of_crashing(
@@ -903,14 +1023,28 @@ def test_content_draws_the_whole_page_for_a_manual_account(
 
 def test_content_renders_the_block_message_for_a_non_manual_account(
         monkeypatch, nicegui_client, account_id):
+    """A blocked gate renders the banner and NOTHING else.
+
+    Not merely cosmetic: without the early ``return`` the page goes on to load the
+    valuation mode and refresh, which asks the broker for positions on an account
+    the gate just refused to manage.
+    """
     monkeypatch.setattr(page, 'get_selected_account_id', lambda: account_id)
-    _use_account(monkeypatch, _Account(account_id, {'manual_trading_enabled': False}))
+    account = _use_account(monkeypatch, _Account(account_id,
+                                                 {'manual_trading_enabled': False},
+                                                 positions=[_pos('AAPL', 10, 6000.0)],
+                                                 prices={'AAPL': 800.0}))
+    set_managed_label(account_id, 'ARK26', target_pct=60.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
 
     _run_in_client(nicegui_client, page.content)
 
     text = ' '.join(_texts(nicegui_client.layout))
     assert 'not available for this selection' in text
     assert 'Manually traded account' in text
+    assert 'Allocate' not in _button_labels(nicegui_client.layout)  # no toolbar
+    assert 'ARK26' not in text                                      # no body
+    assert account.quote_requests == []      # and the broker was never asked
 
 
 def test_content_shows_the_broker_outage_banner_rather_than_an_empty_book(

@@ -38,19 +38,23 @@ try:
 except Exception as e:
     logger.warning(f"Could not patch JavaScript request timeout: {e}")
 
-# Also patch the client's run_javascript method to use higher timeout by default
-try:
-    from nicegui.client import Client
-    original_run_javascript = Client.run_javascript
-    
-    async def new_run_javascript(self, code, *, timeout=5.0):
-        return await original_run_javascript(self, code, timeout=timeout)
-    
-    Client.run_javascript = new_run_javascript
-    logger.info("Successfully patched Client.run_javascript timeout to 5.0 seconds")
-    
-except Exception as e:
-    logger.warning(f"Could not patch Client.run_javascript timeout: {e}")
+# NOT patched: Client.run_javascript. An `async def` wrapper used to be installed here
+# to force the same 5s timeout, and it broke every FIRE-AND-FORGET call in the app --
+# the header account switch (ui/layout.py) and TradingAgentsUI's post-save reload both
+# stopped reloading the browser, so the account filter changed in the widget while every
+# page body kept showing the previous account (2026-08 report).
+#
+# ui.run_javascript() returns an AwaitableResponse whose __init__ already schedules the
+# send (nicegui/awaitable_response.py:21 -> _fire -> fire_and_forget), which is why a
+# call that is deliberately not awaited still reaches the browser. Wrapping the method in
+# a coroutine replaces that object with a bare coroutine; nobody awaits it, so the
+# AwaitableResponse is never even constructed and the JavaScript is never enqueued.
+#
+# The wrapper bought nothing in exchange: ui.run_javascript passes `timeout=` explicitly
+# on every call (nicegui/functions/javascript.py:24), so the wrapper's own default never
+# applied. Call sites that need a longer timeout must pass it themselves:
+#   await ui.run_javascript(code, timeout=5.0)
+# See tests/test_ui_account_switch_reload.py, which fails if this comes back.
 
 
 

@@ -110,10 +110,15 @@ def set_selected_account_id(account_id: Optional[int]) -> None:
         account_id: The account ID to filter by, or None for "All".
     """
     global _last_known_account_id
-    _last_known_account_id = _coerce_account_id(account_id)  # mirror first (always succeeds)
+    # Coerce ONCE and store the same value in both places. Mirroring the coerced id while
+    # persisting the raw one let the two disagree about the same choice ("2" vs 2), and
+    # app.storage.user is serialised to JSON on every write, so a stray string would have
+    # outlived the session it came from.
+    coerced = _coerce_account_id(account_id)
+    _last_known_account_id = coerced  # mirror first (always succeeds)
     try:
-        app.storage.user[ACCOUNT_FILTER_KEY] = account_id
-        logger.debug(f"Set account filter to: {account_id}")
+        app.storage.user[ACCOUNT_FILTER_KEY] = coerced
+        logger.debug(f"Set account filter to: {coerced}")
     except Exception as e:
         logger.warning(f"Error setting selected account ID: {e}")
 
