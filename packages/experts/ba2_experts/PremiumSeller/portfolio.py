@@ -130,8 +130,12 @@ class OptionPortfolioManager:
     # -- entry (engine: rebalance) --------------------------------------
     def rebalance(self, targets: Dict) -> List[Any]:
         """Open the gap between the desired structures and the held book (entry cadence).
-        A new entry cycle clears a circuit-breaker stand-down."""
-        self._halted = False
+
+        An entry cycle that actually RE-ENTERS clears a circuit-breaker stand-down (see
+        the end of this method). Merely running one does not: the engine calls rebalance
+        on every entry bar, including bars where no candidate passes the gates or the
+        rails decline them all, so clearing the halt up here re-armed a halted sleeve
+        without a single contract being opened."""
         structures = (targets or {}).get("structures") or []
         holdings = self.get_option_holdings()
         held_underlyings = {txn.symbol for txn, _ in holdings.values()}
@@ -167,6 +171,16 @@ class OptionPortfolioManager:
                 book[2] += spec.notional
                 if spec.strategy in ("short_put", "short_strangle"):
                     book[1] += spec.max_loss
+        if submitted and self._halted:
+            # Re-arm ONLY on a real re-entry. manage_open is a full no-op while halted,
+            # so a sleeve that re-opens structures and stays halted would never manage
+            # them again (no profit capture, no stop, no roll, no breaker) — the halt has
+            # to clear the moment the sleeve holds something again. The peak is
+            # deliberately KEPT (option_book.rearm): re-arming at the trough would erase
+            # the drawdown that caused the stand-down.
+            logger.info(f"PremiumSeller[{self.expert_instance_id}]: circuit-breaker "
+                        f"stand-down cleared — sleeve re-entered")
+            self._halted = False
         logger.info(f"PremiumSeller[{self.expert_instance_id}]: opened {len(submitted)} structures")
         return submitted
 
@@ -174,16 +188,31 @@ class OptionPortfolioManager:
     def manage_open(self, as_of: datetime) -> List[Any]:
         """Per-structure exit rules in spec §5 priority order; circuit breaker first."""
         holdings = self.get_option_holdings()
-        if not holdings:
-            return []
+        # Ratchet the peak on EVERY evaluation, INCLUDING a flat sleeve — this must stay
+        # above the `not holdings` early return. A sleeve the breaker just flattened is
+        # flat, so returning first stopped it tracking its peak entirely and it would then
+        # measure its next drawdown from wherever equity stood on re-entry (i.e. from the
+        # trough), which is no drawdown at all. Same rule as option_book.update_breaker.
         balance = self.account.get_balance()
         if balance is not None:
             self._peak_equity = balance if self._peak_equity is None else max(self._peak_equity, balance)
+        if not holdings:
+            return []
         if self._halted:
             return []
         breaker = float(self._s("circuit_breaker_pct"))
-        if (balance is not None and self._peak_equity
-                and balance <= self._peak_equity * (1.0 - breaker / 100.0)):
+        # BOTH operands are Optional[float] and BOTH are tested explicitly — never by
+        # truthiness, which cannot tell "not measured" from a legitimate 0.0:
+        #   balance is None -> equity was not measured; blind, and blind is not a trip.
+        #   balance == 0.0  -> a 100% drawdown, the deepest there is. It MUST trip.
+        # A peak-to-trough drawdown is likewise only defined against a POSITIVE peak
+        # (`and self._peak_equity` read a peak of exactly 0.0 as "no breaker", and a
+        # negative peak as a usable baseline — against which `peak x 0.8` sits ABOVE
+        # the peak and fired on a phantom drawdown). Same three-way split as
+        # option_book.update_breaker: unknown / unusable-peak / measured.
+        peak = self._peak_equity
+        if (balance is not None and peak is not None and peak > 0
+                and balance <= peak * (1.0 - breaker / 100.0)):
             logger.warning(f"PremiumSeller: circuit breaker hit (dd>{breaker}%) — flattening book")
             self._halted = True
             # Filter Nones like the normal path below: _close_structure returns None
