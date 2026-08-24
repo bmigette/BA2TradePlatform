@@ -759,6 +759,15 @@ def test_consume_income_events_never_takes_more_than_the_ledger_holds():
     assert sum(a for _, a in out) == pytest.approx(150.0)
 
 
+def test_consume_income_events_steps_over_an_event_with_nothing_left_in_it():
+    """An event already spent to the last cent (or one the store handed over with a
+    NULL open amount) contributes nothing and produces no entry -- taking from it
+    would invent money, and writing a zero entry would list it in the run's
+    ``income_consumed_events`` as though it had funded the run."""
+    out = pa.consume_income_events([(1, 0.0), (2, None), (3, 250.0)], 300.0)
+    assert out == [(3, 250.0)]
+
+
 def test_current_value_in_cost_mode_is_the_cost_basis():
     state = _pos("AAA", 200.0, quantity=10.0, cost_basis=900.0)
     assert pa.current_value(state, pa.VALUATION_MODE_COST) == 900.0
@@ -2092,7 +2101,8 @@ def test_a_legal_whole_share_order_under_five_dollars_is_not_refused_by_the_floo
 # ---------------------------------------------------------------------------
 
 from ba2_common.core.portfolio_allocation import (  # noqa: E402
-    SETTLED_ORDER_STATUSES, FilledTotals, OrderFill, measure_filled_values,
+    SETTLED_ORDER_STATUSES, UNEXECUTED_ORDER_STATUSES,
+    FilledTotals, OrderFill, measure_filled_values,
 )
 from ba2_common.core.types import OrderStatus  # noqa: E402
 
@@ -2219,6 +2229,167 @@ def test_a_fill_with_no_side_is_unmeasurable():
         _fill(1, None, OrderStatus.FILLED, qty=10.0, price=100.0)])
     assert totals.buy_value == 0.0
     assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [1]
+
+
+# -- a MISSING quantity is the sibling of a missing price -------------------
+#
+# The income double-spend. A NULL ``filled_qty`` used to arrive here as ``0.0``
+# (``float(fill.filled_quantity or 0.0)``) and be read as a MEASURED fill of zero
+# shares: the run settled, consumed nothing, and took its one-shot
+# ``income_consumed_at`` stamp -- leaving the income open for the NEXT run to
+# spend on shares this run had already bought. Nothing in the ledger can undo
+# that second deployment.
+
+
+def test_a_filled_order_with_no_reported_quantity_is_unmeasurable_never_a_zero_fill():
+    """THE bug report. FILLED, priced, and nobody said how many shares.
+
+    "We were not told" is not "it filled nothing". A quantity that never arrived
+    is exactly as unmeasurable as a price that never arrived
+    (test_a_fill_with_no_price_is_unmeasurable_never_estimated), and takes the
+    same exit: unmeasurable, unsettled, income untouched.
+    """
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=None, price=160.0)])
+    assert totals.buy_value == 0.0
+    assert totals.net_buy_value == 0.0
+    assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [1]
+
+
+def test_a_tastytrade_shaped_zero_none_fill_on_a_filled_order_is_unmeasurable():
+    """The cleanest producer. ``TastyTradeAccount._fills_summary`` answers
+    ``(0.0, None)`` when the legs carry no fill records, and its refresh then does
+    ``if float(db.filled_qty or 0.0) != float(broker.filled_qty or 0.0)`` -- which
+    is False for a NULL row against that 0.0 -- so the quantity is never written
+    while the status IS advanced to FILLED. The row that reaches the ledger is
+    FILLED with a NULL quantity and no price: a contradiction, not a zero.
+    """
+    totals = measure_filled_values([
+        _fill(7, OrderDirection.BUY, OrderStatus.FILLED, qty=None, price=None)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [7]
+
+
+def test_an_explicit_zero_quantity_on_a_rejected_order_is_still_a_plain_skip():
+    """The INVERSE defect, and the more expensive one. A refused order really did
+    fill zero shares; routing its explicit 0.0 into ``unmeasurable`` would leave
+    every run that had one row refused permanently unsettled, and its income
+    permanently unconsumed."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.REJECTED, qty=0.0, price=None)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is True
+    assert totals.unmeasurable_order_ids == []
+    assert totals.working_order_ids == []
+
+
+def test_an_explicit_zero_quantity_on_a_cancelled_order_is_still_a_plain_skip():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.CANCELED, qty=0.0, price=None)])
+    assert totals.settled is True
+    assert totals.unmeasurable_order_ids == []
+
+
+def test_a_refused_order_with_no_quantity_at_all_is_worth_zero_not_unmeasurable():
+    """A status that PROVES nothing executed measures itself.
+
+    The allocation path persists its TradingOrder with ``filled_qty`` unset
+    (portfolio_allocation_service._submit_row) and the broker refusal stamps only
+    the status, so a rejected row reaches the ledger as REJECTED with a NULL
+    quantity -- never an explicit 0.0. Reading that NULL as "unknown" would strand
+    the income of every run that had a single row refused, which is the most
+    ordinary outcome there is.
+    """
+    for status in (OrderStatus.REJECTED, OrderStatus.ERROR,
+                   OrderStatus.WASHTRADE_LOCKED):
+        totals = measure_filled_values([
+            _fill(1, OrderDirection.BUY, status, qty=None, price=None)])
+        assert totals.settled is True, status
+        assert totals.buy_value == 0.0, status
+        assert totals.unmeasurable_order_ids == [], status
+        assert totals.working_order_ids == [], status
+
+
+def test_a_null_quantity_on_a_settled_status_that_can_carry_a_fill_still_stalls():
+    """The other side of that carve-out, and the reason it is three statuses and
+    not ``SETTLED_ORDER_STATUSES``. Every one of these can be reached with shares
+    already traded -- a cancel after a partial fill is the ordinary case (C3) -- so
+    a missing quantity on one of them is UNKNOWN, and valuing it at zero would
+    consume income for a purchase that really happened."""
+    for status in (OrderStatus.CANCELED, OrderStatus.EXPIRED, OrderStatus.STOPPED,
+                   OrderStatus.REPLACED, OrderStatus.CLOSED,
+                   OrderStatus.DONE_FOR_DAY, OrderStatus.FILLED):
+        totals = measure_filled_values([
+            _fill(1, OrderDirection.BUY, status, qty=None, price=160.0)])
+        assert totals.settled is False, status
+        assert totals.unmeasurable_order_ids == [1], status
+        assert totals.buy_value == 0.0, status
+
+
+def test_the_statuses_that_measure_themselves_are_settled_and_never_filled():
+    """``UNEXECUTED_ORDER_STATUSES`` may only ever contain statuses that are
+    already settled (otherwise skipping the quantity would ALSO skip the stall)
+    and that cannot possibly have traded a share."""
+    assert UNEXECUTED_ORDER_STATUSES <= SETTLED_ORDER_STATUSES
+    assert not (UNEXECUTED_ORDER_STATUSES & OrderStatus.get_executed_statuses())
+    assert OrderStatus.FILLED not in UNEXECUTED_ORDER_STATUSES
+    assert OrderStatus.CANCELED not in UNEXECUTED_ORDER_STATUSES
+    assert OrderStatus.DONE_FOR_DAY not in UNEXECUTED_ORDER_STATUSES
+
+
+def test_a_measurable_fill_beside_a_null_quantity_keeps_its_money_and_stalls():
+    """A mixed batch. The 1,600 that really moved is still counted -- losing it
+    would UNDER-consume the ledger -- and the run still refuses to settle, naming
+    the order nobody could measure."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=10.0, price=160.0),
+        _fill(2, OrderDirection.BUY, OrderStatus.FILLED, qty=None, price=200.0),
+    ])
+    assert totals.buy_value == pytest.approx(1600.0)
+    assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [2]
+    assert totals.working_order_ids == []
+
+
+def test_a_missing_quantity_and_a_missing_price_are_answered_identically():
+    """Whichever half of ``quantity * price`` is absent, the answer is the same
+    one. There is no asymmetry between the two fields to remember."""
+    missing_price = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=10.0, price=None)])
+    missing_quantity = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=None, price=10.0)])
+    assert missing_quantity.to_dict() == missing_price.to_dict()
+
+
+def test_an_order_fill_cannot_be_edited_after_it_is_lifted_off_the_row():
+    """``frozen=True``, so nothing between the collector and the ledger can quietly
+    revise a fill. The whole point of lifting plain values off the ORM row is that
+    the measurement is a fact, not a mutable draft."""
+    fill = OrderFill(order_id=1, side=OrderDirection.BUY, status=OrderStatus.FILLED,
+                     filled_quantity=None, fill_price=160.0)
+    with pytest.raises(Exception):
+        fill.filled_quantity = 10.0
+    assert fill.filled_quantity is None
+
+
+def test_order_fill_defaults_its_quantity_to_unknown_and_not_to_zero():
+    """The default is the value every producer means when it omits the field:
+    "nobody told us". ``0.0`` there would be a measurement of zero shares -- the
+    exact confusion that spends the same income twice."""
+    assert OrderFill(order_id=1).filled_quantity is None
+    assert OrderFill(order_id=1).fill_price is None
+
+
+def test_a_null_quantity_on_a_still_working_order_stalls_and_is_not_valued():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.PARTIALLY_FILLED,
+              qty=None, price=160.0)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is False
+    assert totals.working_order_ids == [1]
     assert totals.unmeasurable_order_ids == [1]
 
 
