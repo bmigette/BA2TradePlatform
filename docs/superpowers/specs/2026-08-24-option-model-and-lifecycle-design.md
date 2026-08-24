@@ -277,8 +277,10 @@ short-sign divergence happened.
     (`backtest_account.py:433`), so it gets no MTM clamp and no unit combo-expiry settlement. It is
     not a drop-in. Either build `open_bull_put_spread` end to end (enum member + `_OptionEntryAction`
     + `action_map` + `_OPTION_STRATS` key + the tag added to `DEFINED_RISK_SHORT_STRATEGIES` +
-    registration in `_DEBIT_OPTION_KINDS`'s complement), or raise `--initial-capital` to ~$100k to
-    re-admit `O_CSP`. Registering any new group key is **three** edits — `_OPTION_GROUPS_ALL`
+    registration in `_DEBIT_OPTION_KINDS`'s complement). **Superseded on the capital question:** the
+    grid now runs at **$20,000** with a per-structure affordability filter (see the capital decision
+    below), so `O_CSP` is re-admitted for the names it actually fits rather than by raising capital
+    to ~$100k. Registering any new group key is **three** edits — `_OPTION_GROUPS_ALL`
     (`:2280`), `_STRATEGY_BUILDERS` (`:2687`), `_DEBIT_OPTION_KINDS` (`:2447`) — and skipping the
     third silently hands a debit group the credit exit profile (tight TP plus a stop that can
     never fire).
@@ -390,16 +392,20 @@ short-sign divergence happened.
     are deriving it from the broker contract list and caching, or a maintained universe file. It
     matters only for the stock arms — the ETF arm's universe is fixed and known-optionable.
 
-  - **DECIDED: the grid runs at $10,000 initial capital, and the UNIVERSE adapts to the capital —
+  - **DECIDED: the grid runs at $20,000 initial capital, and the UNIVERSE adapts to the capital —
     not the other way round.** The alternative (raising `--initial-capital` to ~$100k so a CSP on a
     $320 stock fits) was rejected: it optimises a strategy the user cannot actually run, and it
-    silently changes what every other arm is searching.
+    silently changes what every other arm is searching. $20,000 rather than the current $10,000
+    default because it roughly doubles the affordable strike and, with it, the tradeable universe —
+    at $10,000 a 30% cap admits only sub-$30 names, which skews the whole grid toward low-priced
+    stocks and their wider relative spreads.
 
     The consequence is that **affordability becomes a screener criterion**. A cash-secured put
-    obligates `strike × 100` per contract, so at $10,000 a single CSP on a $320 underlying needs
-    $32,000 — 3.2× the whole account. That is exactly why `_FULL_NOTIONAL_OPTION_KINDS`
+    obligates `strike × 100` per contract, so at $20,000 a single CSP on a $320 underlying needs
+    $32,000 — still 1.6× the whole account. That is exactly why `_FULL_NOTIONAL_OPTION_KINDS`
     (`ba2test_launcher.py:2270`) currently strips `O_CSP`/`O_JL`/`O_RS` from the searched groups:
-    a blunt workaround for a universe that was never filtered for the capital.
+    a blunt workaround for a universe that was never filtered for the capital. With a per-structure
+    affordability filter they can be re-admitted for the names where they genuinely fit.
 
     **The filter is a fraction of equity, not a fixed price cap**, so it scales as the account
     grows and one gene means the same thing at every account size:
@@ -408,20 +414,21 @@ short-sign divergence happened.
     max_affordable_strike = equity × max_position_fraction / contract_multiplier
     ```
 
-    At $10,000 with a 30% cap that is a **$30** maximum strike; at $100,000 it is $300. Express
+    At $20,000 with a 30% cap that is a **$60** maximum strike; at $100,000 it is $300. Express
     `max_position_fraction` as a **GA gene** so the optimiser can trade concentration against
     universe breadth — a tight fraction gives a wide, cheap universe with small positions, a loose
     one gives a narrow universe with meaningful ones. That is a real strategy dimension, not a
     setting.
 
     Four consequences to design around:
-    - **The ETF arm cannot sell cash-secured puts at $10,000 at all.** SPY at ~$600 obligates
-      $60,000 a contract. Its credit expression is limited to defined-risk spreads, whose
+    - **The ETF arm cannot sell cash-secured puts at $20,000 either.** SPY at ~$600 obligates
+      $60,000 a contract — 3× the account, so the extra capital does not change this. Its credit
+      expression is limited to defined-risk spreads, whose
       obligation is the wing width rather than the strike. (Moot until the zero-option-rows problem
       below is solved, but it must not be discovered late.)
     - **Defined-risk structures need a different filter from naked ones.** A put credit spread's
       capital at risk is `(width − credit) × 100`, which is affordable on a $320 underlying at
-      $10,000; a CSP on the same name is not. Filtering the whole universe on the CSP rule would
+      $20,000; a CSP on the same name is not. Filtering the whole universe on the CSP rule would
       needlessly exclude spreads. **The affordability test belongs per structure, not per symbol.**
     - **It must agree between live and backtest.** A universe filter that runs in one and not the
       other produces genomes that cannot be traded — the same class of divergence as the dead
