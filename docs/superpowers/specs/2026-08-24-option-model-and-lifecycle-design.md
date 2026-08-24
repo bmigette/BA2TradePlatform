@@ -234,6 +234,142 @@ short-sign divergence happened.
     `enable_short_strangle` to `False` and carries an `undefined_risk_max_pct` rail, which the
     lifecycle pass inherits (plan Task 7).
 
+  - **DECIDED: direction is a third grid axis — BUY-ONLY (net debit) vs SELL-ONLY (net credit).**
+    Premium *buying* (pay a debit, make money when the contract is worth more) and premium
+    *selling* (collect a credit, make money on decay) are different businesses with mirrored
+    skew, and the grid tests them as separate arms. With the two axes already decided that gives
+    8 cells: {0DTE, 30–45 DTE} × {index ETF, large-cap stock} × {buy, sell}.
+
+    **The debit/credit discriminator already exists in the code** and must be reused rather than
+    re-derived: exactly the 7 short-premium builders pass `option_reserve=` to their submit call
+    (`TradeActions.py:2546` CSP, `:2631` bear call, `:2815` short straddle, `:2883` short strangle,
+    `:2955` IC, `:3027` jade lizard, `:3163` put ratio); debit builders pass none. Do **not** use
+    the sign of `limit_price` — covered call and CSP submit a *positive* limit at `contract.bid`
+    (`:2445`, `:2541`) while bear call spread and IC submit negative (`:2629`, `:2954`), so a sign
+    test misfiles two of the In-list structures.
+
+    **Expressed as arms, not as a gene.** The "sweep group" object already exists — `_OPTION_GROUPS`
+    (`ba2test_launcher.py:2276-2296`) is one optimize job searching a family, each member becoming
+    a toggleable `entry:<member>-entry:enabled` 0/1 gene. A `structure_mode` categorical is not
+    expressible anyway (only `model:*` keys take categoricals; everything else routes through
+    `_range_entry`, int/float only), and more decisively the split governs *run-level* things a
+    per-individual gene cannot vary: the exit-rule template (`_option_exit_rules:2451-2484`
+    branches on `_DEBIT_OPTION_KINDS`), the row-level `fitness_metric`, the per-invocation fitness
+    knobs, and the hand-set `option_sizing` constants (5–8% debit vs 15–20% credit).
+
+    | arm | today | note |
+    |---|---|---|
+    | **BUY** | `--strategies OS1,OS4` — works with **zero new code** | `OS1` = `O_LC`, `O_LP`, `O_VERT`, `O_BF`, `O_BULLCS` ("directional DEBIT"); `OS4` = `O_STRD`, `O_STRG` ("volatility DEBIT") |
+    | **SELL** | needs a new group key | `OS2`/`OS3` as shipped are mostly unusable — see below |
+
+    **The sell arm is the problem, not the buy arm.** After the spec's own defined-risk filter
+    removes `open_short_straddle`/`open_short_strangle`, and after `_FULL_NOTIONAL_OPTION_KINDS`
+    (`:2270`) strips `O_CSP`/`O_JL`/`O_RS` because a CSP reserves ~$28,800 at spot 320 against the
+    `--initial-capital` default of **10,000** (`:3842`), the searched credit residue is just
+    **`O_IC` and `O_BEARCS`** — one neutral, one bearish. Against the buy arm's 7. **The sell arm
+    has no bullish defined-risk credit expression at all.**
+
+    **`bull_put_spread` is confirmed absent** — zero hits repo-wide across `.py`/`.md`/`.ts`. The
+    put credit spread is the canonical defined-risk income structure and its absence is the single
+    largest gap in the axis. A `build_put_credit_spread` does exist at
+    `packages/experts/ba2_experts/PremiumSeller/structures.py:87`, but it bypasses `TradeActions`
+    entirely and is **not** in `BacktestAccount.DEFINED_RISK_SHORT_STRATEGIES`
+    (`backtest_account.py:433`), so it gets no MTM clamp and no unit combo-expiry settlement. It is
+    not a drop-in. Either build `open_bull_put_spread` end to end (enum member + `_OptionEntryAction`
+    + `action_map` + `_OPTION_STRATS` key + the tag added to `DEFINED_RISK_SHORT_STRATEGIES` +
+    registration in `_DEBIT_OPTION_KINDS`'s complement), or raise `--initial-capital` to ~$100k to
+    re-admit `O_CSP`. Registering any new group key is **three** edits — `_OPTION_GROUPS_ALL`
+    (`:2280`), `_STRATEGY_BUILDERS` (`:2687`), `_DEBIT_OPTION_KINDS` (`:2447`) — and skipping the
+    third silently hands a debit group the credit exit profile (tight TP plus a stop that can
+    never fire).
+
+  - **BLOCKER — the adjusted-fitness profit cap is broken for options, and it is not a skew
+    argument, it is a units bug.** `results.py:448` computes
+    `cost = (t["entry_price"] or 0.0) * (t["size"] or 0.0)`. For an option leg `entry_price` is
+    premium **per share** and `size` is **contracts**, so the ×100 contract multiplier is missing —
+    even though the P&L eleven lines earlier in the same function *does* apply it
+    (`gross = (exit_px - entry_px) * size * direction * mult`, `backtest_account.py:2258`). `cost`
+    is therefore 1/100th of the capital actually deployed while `pnl` is full size, so the
+    default-on `--profit-cap-pct 2000` caps a trade's gain at **20% of deployed capital, not 20×**.
+
+    This is not a buy-arm inconvenience; it invalidates option grid results already produced:
+    - A long call that triples has its gain truncated to 0.2× the premium paid. The buy arm's
+      entire right tail is deleted.
+    - Trades are paired **per leg** (`backtest_account.py:2134-2156`, group key
+      `(transaction_id, contract_symbol)`), so a spread's *winning* leg is capped and its *losing*
+      leg is not. **An iron condor at maximum profit scores a negative adjusted return.**
+    - `_consistent_annual_return` — the default fitness for every pure-option kind
+      (`_resolve_fitness:2304-2316`) — ranks on `adjusted_annualized_return` whenever either cap
+      key is set (`strategy_fitness.py:669-673`). The default path *is* the broken path.
+
+    And it cannot currently be switched off from the driver: `tools/run_options_matrix.py:204-207`
+    forwards each flag only `if args.X and args.X > 0`, so passing `0` makes it falsy, **omits** the
+    flag, and lets the launcher re-apply 2000.0/25.0. The help text "Pass 0 to disable" (`:132-138`)
+    is wrong. The same guard bug is in `run_senate_matrix.py:142-143` and
+    `run_screener_capband_matrix.py:409-410`. Until fixed, disable by invoking `ba2-test optimize`
+    directly with **both** `--profit-cap-pct 0 --profit-share-cap-pct 0` (line 669 ORs the two).
+
+    Fixing the multiplier also forces a real design decision that must be made explicitly rather
+    than inherited: **should the cap apply per leg or per structure?** Per-leg capping is what
+    produces the negative-scoring iron condor, so a multiplier fix alone does not make spread
+    scoring correct.
+
+  - **Other measurement biases against the buy arm**, each to be settled before the arms are
+    compared:
+    - `trade_gate` counts **legs, not structures** (`results.py:383`, `:502`). One iron condor entry
+      is 4 trades, one long call is 1. The gate hard-disqualifies below 12/yr with a `-1e8`
+      sentinel and ramps to full credit at 30/yr, so the sell arm clears both thresholds on roughly
+      half the structure count. The same mechanism scrambles `win_rate`: an iron condor **at max
+      profit** books 2 winning and 2 losing legs — a 50% win rate.
+    - `dd_guard = min(20/max(dd,1), 2.0)` rewards the smooth premium seller, capped at 2×.
+    - `--fitness-win-rate-factor` multiplies by `2 × win_rate` (~0.70× for a 35%-win buy arm vs
+      ~1.60× for an 80%-win seller). `--robust-fitness`'s concentration screen returns **exactly
+      0.0** when the top 5 trades reach 100% of net P&L — which *is* the definition of a
+      tail-carried buy book, leaving the GA no gradient whatsoever. Both are opt-in; decide
+      explicitly rather than inheriting a default.
+    - **Cross-arm comparison must use a yardstick computed outside `compute_fitness`.** The bias is
+      metric-specific rather than uniform — on synthetic equal-P&L books `total_return` is exactly
+      neutral while `sharpe`/`sqn`/`car` favour the seller ~1.7–1.8× and `sortino` inverts to an 8×
+      buy-side advantage. Use dollar expectancy per unit of defined risk, or plain `total_return`.
+      Per-arm `--fitness` already works (`--fitness` short-circuits `_resolve_fitness` at `:2314`),
+      so the two arms can be *scored* differently and *compared* on a neutral third measure.
+
+  - **Backtest fidelity, buy-arm specifics.** One feared distortion is absent and one is real:
+    - **Long ITM expiry IS monetised** — `settle_single_leg_expiry` (`backtest_account.py:2736-2766`)
+      sells to close at the expiry bar's premium, falling back to intrinsic. The buy arm's rare big
+      win is paid. Good.
+    - **Spread crossing is charged only on multi-leg children.** `_option_fill_price:1529-1544`
+      applies the modelled spread only when there is no `limit_price`; every single-leg option order
+      carries one, multi-leg children do not. So `O_LC`/`O_LP` pay **zero** spread while `O_IC` pays
+      it 4× — the cost cliff runs *inside* the buy arm, and an unconstrained GA will discover "use
+      the single-leg structure" as a cost artefact rather than as economics. There is no derived
+      spread to charge anyway: `_pit_quotes` sets bid = ask = close, and **zero** of 4,328,587
+      quoted chain rows have `ask > bid`.
+    - **`straddle` and `strangle` — the whole of OS4 — are missing from
+      `DEFINED_RISK_LONG_STRATEGIES`** (`backtest_account.py:430-432`), so they get no group MTM
+      clamp and a single outlier premium print can distort their drawdown, which feeds `dd_guard`.
+    - **Pin the interval and fill model.** `tools/run_options_matrix.py` defaults `--interval 1d`;
+      `ba2-test optimize` defaults `5min`, at which `_apply_option_expiry` settles at ~09:35 on
+      expiry day and deletes the final session's move. Worse, at `1d` with the default
+      `--fill-model next_bar_open` a **0DTE contract has no D+1 bar and never fills at all**
+      (`get_bar` is an exact-date lookup with no forward-fill). The 0DTE arm needs
+      `same_bar_close` plus a last-bar-of-session settlement gate. **Verify empirically** — this is
+      deduced from the code, not observed in a run.
+
+  - **Exit rules that misbehave on debit structures.** Nothing crashes, but meanings flip:
+    `profit_loss_percent` divides by `abs(entry net premium)` (`TradeConditions.py:1643`), which is
+    max *profit* for a credit and max *loss* for a debit. **No stop-loss gene exists for the buy arm
+    at all** — `_option_exit_rules` appends `opt_sl` only `if not debit` (`:2478`). PremiumSeller's
+    stop is a range problem rather than a missing gene: `dr_stop_credit_mult` ranged 1.5–3.0 gives
+    −150%..−300%, unreachable below a debit's −100% floor, but `mult = 0.5` is exactly a "−50% of
+    debit paid" stop, so extending the range below 1.0 and renaming suffices. `_tested` does
+    `if n >= 0: continue` — a permanent no-op on all-long structures, and on a debit vertical it
+    would fire against the short leg *at maximum profit*, so it must not be promoted verbatim into
+    the shared lifecycle pass (plan Task 6). Finally `max_deployment_pct`, `max_notional_leverage`
+    and `undefined_risk_max_pct` are all blind to a long-only book — `_txn_metrics` returns
+    `(True, 0.0, 0.0)` with no executed SELL leg, so a pure-debit arm reports zero deployment and
+    the rails never engage. They must be reimplemented on a premium-outlay basis.
+
   - **An optionable-symbol screener filter needs a source.** FMP does not expose one; the options
     are deriving it from the broker contract list and caching, or a maintained universe file. It
     matters only for the stock arms — the ETF arm's universe is fixed and known-optionable.
