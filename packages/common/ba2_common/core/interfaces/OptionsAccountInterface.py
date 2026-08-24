@@ -141,10 +141,23 @@ class OptionsAccountInterface(ABC):
             multiplier=100,
             option_strategy=option_strategy or ("spread" if is_multi else "single"),
             position_intent=(first.position_intent if not is_multi else None),
+            # A MULTI-LEG PARENT HAS NO SINGLE CONTRACT — and says so.
+            # Four legs have four contracts, four strikes and (for a condor) both rights;
+            # any one of them recorded here would read as "the" contract of the position.
+            # The legs below carry the complete identity, one row each.
             contract_symbol=(first.contract_symbol if not is_multi else None),
             option_type=(first.option_type if not is_multi else None),
             strike=(first.strike if not is_multi else None),
-            expiry=(first.expiry if not is_multi else None),
+            # EXPIRY IS THE EXCEPTION, and it is a fact about the WHOLE structure.
+            # The single-expiry guard above has already refused anything spanning two dates,
+            # so `expiries` holds at most one element: the structure's expiry, or nothing when
+            # no leg records one (the flatten path, where legs are rebuilt from stored rows and
+            # may carry expiry=None — UNKNOWN stays NULL here rather than becoming an invented
+            # date). The parent IS the row the broker fills, and it was NULL here for every
+            # multi-leg, which is why `OptionPortfolioManager._should_close`'s roll-at-DTE
+            # branch — `expiry is not None and (expiry - as_of.date()).days <= roll_dte` — had
+            # never once fired for a spread or a strangle.
+            expiry=(expiries[0] if expiries else None),
             expert_recommendation_id=expert_recommendation_id,
             transaction_id=transaction_id,
         )
@@ -156,6 +169,14 @@ class OptionsAccountInterface(ABC):
             self._create_transaction_for_order(parent)
             update_instance(parent)
             parent = get_instance(TradingOrder, parent_id)
+
+        # ...and record the INTENT on it. Stamped here rather than inside
+        # `_create_transaction_for_order` because that factory is shared with equity and,
+        # more importantly, because the transaction is often NOT created here at all:
+        # `OptionPortfolioManager.rebalance` pre-creates its own so the structure is
+        # attributed to the expert, and passes `transaction_id=`. That is the path every
+        # short_strangle and put_credit_spread in the GA took.
+        self._record_option_intent_on_transaction(parent)
 
         leg_orders = []
         if is_multi:
@@ -190,6 +211,74 @@ class OptionsAccountInterface(ABC):
             parent.comment = f"{(parent.comment or '')} | option submit error: {str(e)[:200]}"
             update_instance(parent)
             return None
+
+    #: Strategy tags that describe what is being DONE, not what the position IS. An order
+    #: carrying one of these must never define the transaction's intent: both close paths
+    #: (``TradeActions`` and ``OptionPortfolioManager._close_structure``) submit offsetting
+    #: legs tagged "close" on the SAME transaction, so letting one through would relabel
+    #: every flattened structure in the book and make the strategy family unrecoverable.
+    NON_INTENT_STRATEGIES = ("close",)
+
+    def _record_option_intent_on_transaction(self, parent) -> None:
+        """Stamp ``asset_class`` / ``option_strategy`` / ``expiry`` on the parent's Transaction.
+
+        The order rows say which CONTRACTS executed; the transaction says what was MEANT — "a
+        bull call spread on ACN expiring 2026-08-21". Before this, the only tell that a
+        transaction held an option was ``multiplier == 100``, a coincidence of P&L arithmetic
+        standing in for a fact.
+
+        ``symbol`` is deliberately not touched: it is the UNDERLYING ticker and must stay that
+        way. ``JobManager._execute_open_positions_analysis`` selects ``distinct
+        Transaction.symbol`` and submits one market analysis per value, so an OCC string there
+        would be analysed as a ticker and would break the wheel's second leg along with every
+        rating, price and screener condition.
+
+        FILL-ONLY for the two nullable fields: a value already recorded is the OPENING intent
+        and a later order on the same transaction (a close, an add) does not redefine it.
+        ``asset_class`` is set unconditionally because it is not an opinion — every order
+        reaching this method is an option order, and the column is NOT NULL with an EQUITY
+        default, so "still EQUITY" cannot be distinguished from "deliberately EQUITY".
+
+        A failure here must never cost the order. The broker call has not happened yet, but the
+        parent and its legs are already written and the caller is about to submit; an
+        unstampable transaction is a reporting gap, whereas raising would turn it into a
+        position that exists at the broker with no order rows the platform will act on.
+        """
+        from ba2_common.core.db import InstanceNotFound, get_instance, update_instance
+        from ba2_common.core.failure_modes import absorb_if_benign
+        from ba2_common.core.models import Transaction
+        from ba2_common.core.types import AssetClass
+        from ba2_common.logger import logger
+
+        if parent.transaction_id is None:
+            return
+        try:
+            txn = get_instance(Transaction, parent.transaction_id)
+        except Exception as e:
+            # A transaction id that resolves to nothing is the only failure this site
+            # legitimately expects (a stale id from a caller); anything else is a defect and
+            # propagates, per the house `absorb_if_benign` discipline.
+            absorb_if_benign(e, InstanceNotFound)
+            logger.error(f"Option order {parent.id} points at transaction "
+                         f"{parent.transaction_id}, which could not be read — the position's "
+                         f"intent (asset class/strategy/expiry) is NOT recorded: {e}",
+                         exc_info=True)
+            return
+
+        strategy = parent.option_strategy
+        changed = False
+        if txn.asset_class != AssetClass.OPTION:
+            txn.asset_class = AssetClass.OPTION
+            changed = True
+        if (txn.option_strategy is None and strategy
+                and strategy not in self.NON_INTENT_STRATEGIES):
+            txn.option_strategy = strategy
+            changed = True
+        if txn.expiry is None and parent.expiry is not None:
+            txn.expiry = parent.expiry
+            changed = True
+        if changed:
+            update_instance(txn)
 
     @abstractmethod
     def close_option_position(self, position: OptionPosition,
