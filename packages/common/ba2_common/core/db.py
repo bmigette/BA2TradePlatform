@@ -3,7 +3,11 @@ from sqlmodel import Session, SQLModel, create_engine
 from ba2_common.config import DB_FILE as _DEFAULT_DB_FILE, DB_PERF_LOG_THRESHOLD_MS
 from ba2_common.logger import logger
 from sqlalchemy import select, event
+# Underscored: ``ba2_trade_platform/core/db.py`` re-exports this module with ``import *``, and a
+# bare ``object_session`` there would be a new public name nobody asked for.
+from sqlalchemy.orm import object_session as _object_session
 import os
+import sys
 import threading
 import time
 from queue import Queue
@@ -172,30 +176,74 @@ def _log_db_perf(operation: str, detail: str, duration_ms: float):
             logger.info(msg)
 
 
+def _who(depth: int = 2) -> str:
+    """``<thread name>/<calling function>()`` for the frame ``depth`` levels up, or a safe
+    placeholder. Deliberately cheap: ``sys._getframe`` + two attribute reads, no
+    ``inspect.stack()`` (which materialises the WHOLE stack -- the old lock-wait log built it
+    up to three times per contended acquire)."""
+    try:
+        name = sys._getframe(depth).f_code.co_name
+    except Exception:  # noqa: BLE001 -- a diagnostic must never break a write
+        name = "unknown"
+    return f"{threading.current_thread().name}/{name}()"
+
+
 class _TimedWriteLock:
-    """Wrapper around threading.Lock that measures wait time for acquisition."""
+    """``threading.Lock`` that reports who waited, how long, and WHO WAS HOLDING IT.
+
+    Read the log line carefully before blaming SQLite. This is a plain, NON-REENTRANT,
+    in-process mutex serialising this process's own writers. It is NOT a sqlite lock and a wait
+    here says nothing about database contention -- the old wording,
+    ``update_instance() waited for write lock``, was read as SQLite contention by every
+    investigator of the 2026-08 incidents (and by the incident report), which sent days of
+    analysis in the wrong direction.
+
+    The holder is recorded on acquire so a wait line is ACTIONABLE: a line that says only that
+    somebody waited tells you nothing about whom to go and look at.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
+        # "<thread>/<function>()" of the current holder. Only ever written while the lock is
+        # held (or cleared just before release), so the racy read below can see a stale-but-
+        # plausible name at worst -- acceptable for a diagnostic, and far better than nothing.
+        self._holder = None
 
     def __enter__(self):
+        blocked_by = "nobody (uncontended)"
         start = time.perf_counter()
-        self._lock.acquire()
+        if not self._lock.acquire(blocking=False):
+            # Snapshot the holder BEFORE blocking: that is the thread that is making us wait.
+            blocked_by = self._holder or "unknown (released while we were queuing)"
+            self._lock.acquire()
         wait_ms = (time.perf_counter() - start) * 1000
         self._caller_wait_ms = wait_ms
+        self._holder = _who()
         if wait_ms >= DB_PERF_LOG_THRESHOLD_MS:
-            import inspect
-            caller = inspect.stack()[1].function if len(inspect.stack()) > 1 else "unknown"
-            _log_db_perf("lock_wait", f"{caller}() waited for write lock", wait_ms)
+            _log_db_perf(
+                "lock_wait",
+                f"{self._holder} waited for the in-process write mutex "
+                f"(db._db_write_lock, a threading.Lock -- NOT a SQLite lock), "
+                f"held by {blocked_by}",
+                wait_ms,
+            )
         return self
 
     def __exit__(self, *args):
+        self._holder = None
         self._lock.release()
 
     def acquire(self, *args, **kwargs):
-        return self._lock.acquire(*args, **kwargs)
+        # Kept in step with __enter__ so a holder recorded here is never stale/missing for the
+        # next waiter (nothing uses these directly today; a future caller must not silently
+        # lose the attribution).
+        got = self._lock.acquire(*args, **kwargs)
+        if got:
+            self._holder = _who()
+        return got
 
     def release(self):
+        self._holder = None
         return self._lock.release()
 
 
@@ -236,10 +284,15 @@ def activity_logging_disabled():
 def retry_on_lock(func):
     """Decorator to retry database operations on lock errors with exponential backoff."""
     def wrapper(*args, **kwargs):
-        max_retries = 4  # Increased from 5 to 8 for better resilience
-        base_delay = 1.0  # Start with 1 second (increased from 0.1s)
-        max_delay = 30.0  # Cap maximum delay at 30 seconds
-        
+        max_retries = 4    # 4 tries => sleeps after attempts 0, 1, 2 only (3 sleeps, not 4)
+        base_delay = 1.0   # first sleep is ~1s
+        max_delay = 30.0   # ceiling on ONE sleep -- see reachable_cap below: never reached
+        # min(1.0 * 2**attempt, 30.0) over attempt in {0,1,2} = 1 + 2 + 4 = 7s of backoff.
+        # The 30s ceiling would need attempt >= 5, which this loop cannot reach, so reporting
+        # it as the delay budget (as this decorator used to) overstates the real wait 4x.
+        reachable_cap = min(base_delay * (2 ** (max_retries - 2)), max_delay)
+        delays = []
+
         for attempt in range(max_retries):
             try:
                 return func(*args, **kwargs)
@@ -256,10 +309,25 @@ def retry_on_lock(func):
                         
                         # Only show warning without stack trace for retry attempts
                         logger.warning(f"Database locked, retrying in {actual_delay:.2f}s (attempt {attempt + 1}/{max_retries})")
+                        delays.append(actual_delay)
                         time.sleep(actual_delay)
                     else:
-                        # Show full error with stack trace only on final attempt
-                        logger.error(f"Database locked after {max_retries} attempts with up to {max_delay}s delays", exc_info=True)
+                        # Report what ACTUALLY happened. The old line -- "Database locked after 4
+                        # attempts with up to 30.0s delays" -- was wrong twice: it implied a ~2
+                        # minute wait, when the real total is ~7s, and it advertised a 30s cap
+                        # this loop can never reach. Investigators sized their expectations off
+                        # this line and looked for a stall that was 4x longer than the real one.
+                        waited = sum(delays)
+                        detail = ", ".join(f"{d:.2f}s" for d in delays) or "none"
+                        logger.error(
+                            f"Database locked: gave up after {max_retries} attempts and "
+                            f"{waited:.2f}s of actual backoff (sleeps: {detail}); the longest "
+                            f"single delay this decorator can ever reach is {reachable_cap:.1f}s "
+                            f"(the {max_delay:.0f}s ceiling needs more attempts than it makes). "
+                            f"Any stall much longer than {waited:.2f}s came from somewhere else "
+                            f"- e.g. sqlite's 30s busy_timeout, or the in-process write mutex.",
+                            exc_info=True,
+                        )
                         raise
                 else:
                     # Not a lock error, raise immediately with stack trace
@@ -341,6 +409,62 @@ def _stop_activity_log_worker():
 
 # Register cleanup function to stop worker on exit
 atexit.register(_stop_activity_log_worker)
+
+
+def _foreign_session(instance, session):
+    """The live Session that owns ``instance`` and that is NOT the one the caller told us to
+    use -- or None. See ``_guard_foreign_session`` for why that combination is the bug.
+
+    ``update_instance(row, session)`` where ``row`` came out of that same ``session`` is the
+    NORMAL, CORRECT shape (``ExtendableSettingsInterface.set_setting`` and the whole settings UI
+    do it): no second connection is opened, so there is nothing to flag. Only a session we are
+    NOT going to use is dangerous.
+    """
+    try:
+        owner = _object_session(instance)
+    except Exception:  # noqa: BLE001 -- a safety check must never break a write
+        return None
+    return None if owner is None or owner is session else owner
+
+
+def _guard_foreign_session(op: str, instance, session):
+    """Detect the single-thread self-deadlock and return the session that must be used.
+
+    THE BUG (PROD 2026-08-10, and again 2026-08-24 after a partial fix): a caller holds a
+    long-lived Session, an autoflush emits an UPDATE -- which takes sqlite's one write lock on
+    THAT connection -- and then the same thread calls ``update_instance(row)`` with no session.
+    We open a SECOND connection whose COMMIT waits for a lock its own caller is holding and
+    nobody is left to release. 15 minutes of no writes, ending 15 ms after the outer session
+    closed; a funded trade lost, twice.
+
+    So: if a live session other than ``session`` owns this row, using a different connection is
+    never correct. We say so LOUDLY (with a stack, so the call site is attributable and gets
+    fixed) and then use the owning session, which is the only connection that can commit this
+    row without waiting for itself.
+
+    Note that ``expunge(instance)`` -- the first fix considered -- does NOT work: detaching the
+    object removes it from the owner's identity map but leaves the owner's already-flushed
+    UPDATE, and therefore the write lock, exactly where it was. It converts the freeze into a
+    ``database is locked`` after the full busy_timeout. ``tests/test_db_attached_instance_guard``
+    pins that.
+
+    Returns the Session to use (the caller's ``session`` when there is nothing wrong).
+    """
+    owner = _foreign_session(instance, session)
+    if owner is None:
+        return session
+    pk = getattr(instance, "id", None)
+    logger.error(
+        f"{op}({type(instance).__name__} id={pk}) was handed a row that session "
+        f"id={id(owner)} still owns"
+        + (f", while the caller asked for session id={id(session)}" if session is not None else
+           " (no session argument)")
+        + ". Using a second connection for a row a live session already holds is what "
+          "self-deadlocked production on 2026-08-10 and 2026-08-24. Falling back to the owning "
+          "session -- FIX THE CALL SITE: pass the session explicitly, or commit/close it first.",
+        stack_info=True,
+    )
+    return owner
 
 
 def _inmem_route(instance_or_model) -> bool:
@@ -569,6 +693,11 @@ def add_instance(instance, session: Session | None = None, expunge_after_flush: 
     Thread-safe: Uses a lock to prevent concurrent write conflicts.
     Retries on database lock errors with exponential backoff.
 
+    If a LIVE session other than ``session`` still owns ``instance``, this logs a loud,
+    stack-carrying error and writes through the OWNING session instead of opening a second
+    connection to a row that session already holds (which self-deadlocked production twice in
+    2026-08). That owning session gets committed as a result. See ``_guard_foreign_session``.
+
     Args:
         instance: The instance to add.
         session (Session, optional): An existing SQLModel session. If not provided, a new session is created.
@@ -584,6 +713,9 @@ def add_instance(instance, session: Session | None = None, expunge_after_flush: 
     if _inmem_route(instance):
         from ba2_common.core import trade_store as _ts
         return _ts.store_add(instance)
+    # Self-deadlock guard. Placed after the in-memory route (those rows never touch a Session,
+    # and the BT hot path should not pay for the check) but before ANY connection is taken.
+    session = _guard_foreign_session("add_instance", instance, session)
     start = time.perf_counter()
     instance_class = instance.__class__.__name__
     try:
@@ -624,8 +756,12 @@ def update_instance(instance, session: Session | None = None):
     Thread-safe: Uses a lock to prevent concurrent write conflicts.
     Retries on database lock errors with exponential backoff.
 
-    Handles objects already attached to different sessions by merging them
-    into the current session.
+    If a LIVE session other than ``session`` still owns ``instance``, that is the
+    self-deadlock of 2026-08-10/2026-08-24: this logs a loud, stack-carrying error and then
+    writes through the OWNING session, because no other connection can commit that row while
+    its owner holds the write lock. Note the consequence -- that owning session gets committed,
+    so any other pending work in it is committed too. See ``_guard_foreign_session``; the fix
+    is to stop calling this with an attached row, not to rely on the fallback.
 
     Args:
         instance: The instance to update.
@@ -639,6 +775,9 @@ def update_instance(instance, session: Session | None = None):
     if _inmem_route(instance):
         from ba2_common.core import trade_store as _ts
         return _ts.store_update(instance)
+    # Self-deadlock guard. Placed after the in-memory route (those rows never touch a Session,
+    # and the BT hot path should not pay for the check) but before ANY connection is taken.
+    session = _guard_foreign_session("update_instance", instance, session)
     start = time.perf_counter()
     instance_class = instance.__class__.__name__
     try:
