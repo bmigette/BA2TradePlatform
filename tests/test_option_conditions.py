@@ -116,18 +116,30 @@ def test_has_protective_put(mock_account, mock_expert_instance, sample_recommend
 
 
 def test_days_to_earnings(monkeypatch, mock_account, sample_recommendation):
+    """LIVE semantics: ``mock_account`` has no simulated clock, so "today" is the wall clock.
+
+    ``_next_earnings_date`` now takes the evaluation date (``(self, symbol, as_of)``) — it
+    must not read ``date.today()`` itself. The backtest/as-of behaviour and the quarterly
+    calendar source are covered in packages/common/tests/test_days_to_earnings_as_of.py.
+    """
     from datetime import date, timedelta
     from ba2_trade_platform.core.TradeConditions import DaysToEarningsCondition
 
-    # Earnings 5 days from today (monkeypatch the data seam — no network).
+    seen = {}
     next_earnings = date.today() + timedelta(days=5)
-    monkeypatch.setattr(DaysToEarningsCondition, "_next_earnings_date",
-                        lambda self, symbol: next_earnings, raising=True)
+
+    def _stub(self, symbol, as_of):
+        seen["as_of"] = as_of
+        return next_earnings
+
+    monkeypatch.setattr(DaysToEarningsCondition, "_next_earnings_date", _stub, raising=True)
 
     cond = create_condition(ExpertEventType.N_DAYS_TO_EARNINGS, mock_account, "AAPL",
                             sample_recommendation, operator_str="<=", value=7.0)
     assert cond.evaluate() is True            # 5 days <= 7
     assert cond.get_actual_value_display() == "5d"
+    # The lookup is handed the evaluation date, not left to read the clock itself.
+    assert seen["as_of"] == date.today()
 
     cond2 = create_condition(ExpertEventType.N_DAYS_TO_EARNINGS, mock_account, "AAPL",
                              sample_recommendation, operator_str=">=", value=10.0)
@@ -135,7 +147,7 @@ def test_days_to_earnings(monkeypatch, mock_account, sample_recommendation):
 
     # No earnings date available -> calculated_value None, evaluate False.
     monkeypatch.setattr(DaysToEarningsCondition, "_next_earnings_date",
-                        lambda self, symbol: None, raising=True)
+                        lambda self, symbol, as_of: None, raising=True)
     cond3 = create_condition(ExpertEventType.N_DAYS_TO_EARNINGS, mock_account, "AAPL",
                              sample_recommendation, operator_str="<=", value=7.0)
     assert cond3.evaluate() is False

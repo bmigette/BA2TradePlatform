@@ -298,6 +298,23 @@ class TradeCondition(ABC):
             return None, True
         return datetime.combine(as_of, _time.max, tzinfo=timezone.utc), True
 
+    def _evaluation_date(self) -> Optional[date]:
+        """The condition's "today" as a concrete ``date``, or ``None`` when unmeasurable.
+
+        The simulated bar in a backtest, ``date.today()`` in live. ``None`` only when the
+        account advertises a simulated clock that could not be read — in which case the
+        caller must report the condition UNEVALUABLE rather than measure a duration against
+        a date the simulation never reached.
+
+        Use this (not ``date.today()``) for anything that counts days: in a backtest the
+        wall clock is not "now", it is years after the last bar, so a wall-clock duration is
+        the same wrong number on every bar of every year.
+        """
+        as_of = self._simulated_as_of_date()
+        if as_of is AS_OF_UNAVAILABLE:
+            return None
+        return date.today() if as_of is None else as_of
+
 
     def has_expert_position(self) -> bool:
         """
@@ -2393,25 +2410,113 @@ class IVRankCondition(CompareCondition):
 class DaysToEarningsCondition(CompareCondition):
     """Compare the number of calendar days until the underlying's next earnings.
 
-    calculated_value = (next_earnings_date - today).days. Useful for timing volatility
-    plays (e.g. buy a straddle a few days before earnings) or for AVOIDING entries that
-    would straddle an earnings event. The next-earnings date is fetched via the
-    monkeypatchable `_next_earnings_date` seam (best-effort, FMP-backed). When no
-    upcoming earnings date is available the calculated value is None and evaluate
-    returns False (the condition simply does not fire).
+    ``calculated_value = (next_earnings_date - the evaluation bar).days``. Useful for timing
+    volatility plays (e.g. buy a straddle a few days before earnings) or for AVOIDING entries
+    that would straddle an earnings event.
+
+    The clock
+    ---------
+    "Today" is ``self._evaluation_date()`` — the SIMULATED bar in a backtest, the wall clock
+    in live — never ``date.today()``. It used to be ``date.today()`` on both sides, which in
+    a backtest measured the distance from the REAL-WORLD today to the next earnings:
+    identical on every simulated bar of every year, and a live-vs-backtest divergence on a
+    documented entry gate.
+
+    The calendar
+    ------------
+    The date comes from FMP's QUARTERLY earnings calendar (``get_past_earnings``, which
+    despite its name wraps ``historical_earning_calendar``: every row carries the actual
+    announcement ``report_date`` and the endpoint also returns already-SCHEDULED future
+    prints). It used to come from ``get_earnings_estimates``, which never passes a period
+    parameter to ``/api/v3/analyst-estimates`` — that endpoint defaults to ANNUAL, so
+    ``frequency="quarterly"`` was decorative and the "next earnings" was the next fiscal
+    YEAR end. Measured against the on-disk cache, on a 2024-03-15 bar: MSFT 2024-04-25 (41d)
+    truth vs 2024-06-30 (107d) annual; AAPL 2024-05-02 (48d) vs 2024-09-27 (196d); NVDA
+    2024-05-22 (68d) vs 2025-01-25 (316d). Combined with the wall clock the gate was a
+    per-symbol CONSTANT (MSFT 310d, AAPL 34d, NVDA 154d on every bar), which is why the
+    documented ``iv_rank<=30 and days_to_earnings<=5 -> open_straddle`` rule could never fire.
+
+    The annual estimates remain as a FALLBACK for a symbol whose calendar carries no
+    scheduled future print — degraded, not absent.
+
+    Unknown is never a value: with no usable evaluation date or no upcoming earnings from
+    either source, ``calculated_value`` stays None and ``evaluate()`` returns False for every
+    operator.
     """
 
-    def _next_earnings_date(self, symbol: str):
-        """Best-effort next (future) earnings date for ``symbol``, or None.
+    #: How far past the evaluation bar to read the earnings calendar. Comfortably more than
+    #: one quarter (so a delayed print is still found) and bounded, so a stale calendar
+    #: cannot hand back a date from the far future as if it were the next one.
+    EARNINGS_HORIZON_DAYS = 200
+    #: Calendar rows to pull. The provider returns rows <= end_date newest-first, so this
+    #: only needs to span [bar, bar + horizon] plus a little history.
+    EARNINGS_CALENDAR_PERIODS = 8
 
-        Resolves the company-details provider via the host-injected provider
-        resolver (ba2_common never imports fmpsdk / ba2_providers) and reads the
-        earliest forward earnings estimate date. Isolated so tests can monkeypatch
-        it without any network I/O. Returns a ``datetime.date`` or None (best
-        effort: any failure, missing provider, or missing data yields None and the
-        condition simply does not fire).
+    @staticmethod
+    def _parse_day(value):
+        """A ``date`` from a 'YYYY-MM-DD' string / date / datetime, or None."""
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if not value:
+            return None
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return None
+
+    def _next_scheduled_report(self, provider, symbol: str, as_of: date):
+        """Earliest quarterly report date on or after ``as_of`` from the earnings CALENDAR.
+
+        Earnings day itself counts as 0 days away, so the bound is inclusive.
         """
-        from datetime import date as _date
+        horizon = datetime.combine(as_of + timedelta(days=self.EARNINGS_HORIZON_DAYS),
+                                   _time.max, tzinfo=timezone.utc)
+        result = provider.get_past_earnings(
+            symbol, frequency="quarterly", end_date=horizon,
+            lookback_periods=self.EARNINGS_CALENDAR_PERIODS, format_type="dict",
+        )
+        rows = (result or {}).get("earnings") or []
+        upcoming = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            # report_date is the announcement; fiscal_date_ending is the period it covers.
+            # The gate is about the EVENT, so the announcement wins when both are present.
+            d = self._parse_day(row.get("report_date")) or \
+                self._parse_day(row.get("fiscal_date_ending"))
+            if d is not None and d >= as_of:
+                upcoming.append(d)
+        return min(upcoming) if upcoming else None
+
+    def _next_estimate_period(self, provider, symbol: str, as_of: date):
+        """Earliest forward analyst-estimate period end on or after ``as_of``. FALLBACK ONLY:
+        FMP serves these ANNUAL regardless of the frequency argument, so the answer is a
+        fiscal year end rather than an earnings date."""
+        result = provider.get_earnings_estimates(
+            symbol, frequency="quarterly",
+            as_of_date=datetime.combine(as_of, _time.min, tzinfo=timezone.utc),
+            lookback_periods=4, format_type="dict",
+        )
+        estimates = (result or {}).get("estimates") or []
+        future = []
+        for est in estimates:
+            if not isinstance(est, dict):
+                continue
+            d = self._parse_day(est.get("fiscal_date_ending"))
+            if d is not None and d >= as_of:
+                future.append(d)
+        return min(future) if future else None
+
+    def _next_earnings_date(self, symbol: str, as_of: date):
+        """Best-effort next earnings date for ``symbol`` as of ``as_of``, or None.
+
+        Resolves the company-details provider via the host-injected provider resolver
+        (ba2_common never imports fmpsdk / ba2_providers). Isolated so tests can monkeypatch
+        it without any network I/O. Best effort: any failure, missing provider or missing
+        data yields None and the condition simply does not fire.
+        """
         try:
             if get_provider_resolver() is None:
                 logger.warning(
@@ -2419,29 +2524,18 @@ class DaysToEarningsCondition(CompareCondition):
                     "cannot fetch next earnings date")
                 return None
             provider = _get_provider("fundamentals_details", "fmp")
-            # Forward analyst estimates are returned future-only, sorted ascending,
-            # each row carrying a 'fiscal_date_ending' (YYYY-MM-DD).
-            result = provider.get_earnings_estimates(
-                symbol, frequency="quarterly",
-                as_of_date=datetime.now(timezone.utc),
-                lookback_periods=4, format_type="dict",
-            )
-            estimates = (result or {}).get("estimates") or []
-            today = _date.today()
-            future = []
-            for est in estimates:
-                ds = est.get("fiscal_date_ending") if isinstance(est, dict) else None
-                if not ds:
-                    continue
-                try:
-                    d = datetime.strptime(ds, "%Y-%m-%d").date()
-                except (ValueError, TypeError):
-                    continue
-                if d >= today:
-                    future.append(d)
-            if not future:
-                return None
-            return min(future)
+
+            scheduled = self._next_scheduled_report(provider, symbol, as_of)
+            if scheduled is not None:
+                return scheduled
+
+            estimated = self._next_estimate_period(provider, symbol, as_of)
+            if estimated is not None:
+                logger.info(
+                    f"No scheduled earnings report for {symbol} within "
+                    f"{self.EARNINGS_HORIZON_DAYS} days of {as_of.isoformat()}; falling back "
+                    f"to the (annual) analyst-estimate period {estimated.isoformat()}")
+            return estimated
         except Exception as e:
             absorb_if_benign(e)
             logger.error(f"Error fetching next earnings date for {symbol}: {e}", exc_info=True)
@@ -2449,15 +2543,23 @@ class DaysToEarningsCondition(CompareCondition):
 
     def evaluate(self) -> bool:
         try:
-            from datetime import date as _date
+            as_of = self._evaluation_date()
+            if as_of is None:
+                # A backtest account whose simulated clock is unreadable. Substituting
+                # date.today() here is exactly the bug this condition was fixed for.
+                logger.warning(
+                    f"days_to_earnings for {self.instrument_name} is unevaluable: no usable "
+                    f"evaluation date")
+                self.calculated_value = None
+                return False
 
-            next_earnings = self._next_earnings_date(self.instrument_name)
+            next_earnings = self._next_earnings_date(self.instrument_name, as_of)
             if next_earnings is None:
                 logger.warning(f"No upcoming earnings date for {self.instrument_name}")
                 self.calculated_value = None
                 return False
 
-            days = (next_earnings - _date.today()).days
+            days = (next_earnings - as_of).days
             self.calculated_value = days
 
             logger.info(
