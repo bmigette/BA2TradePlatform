@@ -365,10 +365,26 @@ short-sign divergence happened.
     debit paid" stop, so extending the range below 1.0 and renaming suffices. `_tested` does
     `if n >= 0: continue` — a permanent no-op on all-long structures, and on a debit vertical it
     would fire against the short leg *at maximum profit*, so it must not be promoted verbatim into
-    the shared lifecycle pass (plan Task 6). Finally `max_deployment_pct`, `max_notional_leverage`
-    and `undefined_risk_max_pct` are all blind to a long-only book — `_txn_metrics` returns
-    `(True, 0.0, 0.0)` with no executed SELL leg, so a pure-debit arm reports zero deployment and
-    the rails never engage. They must be reimplemented on a premium-outlay basis.
+    the shared lifecycle pass (plan Task 6).
+
+    Finally the rails. All three are blind to a long-only book — `_txn_metrics` returns
+    `(True, 0.0, 0.0)` when a transaction has no executed SELL leg, so a pure-debit arm reports
+    zero deployment and nothing engages. **But they must not all be fixed the same way**, and an
+    earlier draft of this spec was wrong to say they should all move to a premium-outlay basis.
+    Collapsing three distinct risks onto one number would make the same setting name mean
+    different things in the two arms:
+
+    | rail | for a debit arm |
+    |---|---|
+    | `max_deployment_pct` | **Reimplement on premium outlay.** Capital at risk is capital at risk, and for a debit the outlay *is* the max loss. This one shares cleanly. |
+    | `max_notional_leverage` | **Leave short-side.** It caps assignment exposure, and a long option cannot be assigned against you. Outlay is not notional; a long-strike number here would not be comparable to the credit arm's under the same setting. |
+    | `undefined_risk_max_pct` | **Leave inert — that is correct.** A debit structure has no undefined risk. A premium-outlay naked cap would be meaningless. |
+
+    Inertness must be *visible* rather than silent: the promoted rail check reports which rails
+    actually ran, so "this rail did not apply" is distinguishable from "this rail passed". A
+    candidate that declares itself undefined-risk hits the naked cap whatever its strategy is
+    called, so a naked structure under a novel name cannot skip the rail — the existing hardcoded
+    `("short_put", "short_strangle")` tuple fails open otherwise.
 
   - **An optionable-symbol screener filter needs a source.** FMP does not expose one; the options
     are deriving it from the broker contract list and caching, or a maintained universe file. It
