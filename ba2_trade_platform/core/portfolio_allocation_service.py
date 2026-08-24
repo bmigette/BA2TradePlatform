@@ -1146,6 +1146,14 @@ def collect_order_fills(account_id: int, order_ids: List[int]) -> List[OrderFill
     stalling is the only safe reading of it. The query is scoped by ``account_id``
     as well, so an order that belongs to somebody else reads as absent rather than
     pricing this run from another account's fill.
+
+    A NULL ``filled_qty`` is passed through AS ``None``, exactly like a NULL
+    ``open_price`` on the next line -- never coerced to 0.0. Both broker adapters
+    leave that column NULL after advancing a status (AlpacaAccount only writes a
+    quantity the broker actually sent; TastyTradeAccount's
+    ``float(db or 0.0) != float(broker or 0.0)`` never overwrites a NULL with its
+    ``_fills_summary`` zero), and reading it as a measured zero-share fill let the
+    run settle for nothing and its income be deployed a second time.
     """
     if not order_ids:
         return []
@@ -1176,7 +1184,7 @@ def collect_order_fills(account_id: int, order_ids: List[int]) -> List[OrderFill
             continue
         fills.append(OrderFill(
             order_id=order_id, side=side, status=status,
-            filled_quantity=float(filled_qty or 0.0),
+            filled_quantity=float(filled_qty) if filled_qty is not None else None,
             fill_price=float(open_price) if open_price is not None else None,
         ))
     return fills
