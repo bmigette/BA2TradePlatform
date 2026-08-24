@@ -172,10 +172,10 @@ class _TastyShapedAccount(MockAccount):
         }
 
 
-def _expert_with_cap(account_id, max_position_pct):
-    """An ExpertInstance at 100% virtual equity with a per-instrument cap setting."""
+def _expert_with_cap(account_id, max_position_pct, virtual_equity_pct=100.0):
+    """An ExpertInstance with a per-instrument cap setting (100% sleeve by default)."""
     expert_instance = create_expert_instance(
-        account_id=account_id, expert="MockExpert", virtual_equity_pct=100.0
+        account_id=account_id, expert="MockExpert", virtual_equity_pct=virtual_equity_pct
     )
     add_instance(
         ExpertSetting(
@@ -206,12 +206,18 @@ class _StubExpertResolver:
 
 
 class _StubExpertInterface:
-    """Only the one method ``_validate_expert_available_balance`` calls."""
+    """Only the one method ``_validate_expert_available_balance`` calls.
+
+    Records the ``exclude_transaction_id`` it was called with: which branch excludes
+    the order's own WAITING transaction is a real money decision, not a detail.
+    """
 
     def __init__(self, available_balance):
         self._available_balance = available_balance
+        self.exclude_calls = []
 
     def get_available_balance(self, exclude_transaction_id=None):
+        self.exclude_calls.append(exclude_transaction_id)
         return self._available_balance
 
 
@@ -764,3 +770,171 @@ class TestCloseNeverFallsBackToTheOrderedQuantity:
         assert len(submitted) == 1
         assert submitted[0].quantity == 100.0
         assert submitted[0].side == OrderDirection.BUY
+
+
+class TestPerInstrumentCapHonoursItsOwnNumbers:
+    """Gaps a 212-mutation run found in the cap arithmetic these fixes sit on."""
+
+    def test_a_zero_percent_per_instrument_cap_blocks_everything(self, monkeypatch):
+        """The same "0% means 0%" question as the virtual-equity sleeve, one level
+        down. ``if max_position_pct is None`` must NOT decay into ``if not
+        max_position_pct``: an operator who caps a symbol at 0% of the sleeve has
+        said 'never hold this', and truthiness would read it as 'no cap at all'."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=0.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=1.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("exceeds expert's max allowed $0.00" in e for e in errors), errors
+
+    def test_adding_to_a_position_is_capped_on_the_TOTAL_and_on_the_SLEEVE(self, monkeypatch):
+        """Three separate mutations survived here: the add-to-position comparison
+        could be inverted, the EXISTING holding could be dropped from the new total,
+        and the sleeve percentage could be ignored so the cap was measured against
+        the whole account. One case pins all three."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        # $100k account x 50% sleeve = $50k virtual; 10% cap = $5,000.
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0,
+                                           virtual_equity_pct=50.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        # Already holding 30 shares = $4,500 -- inside the cap on its own.
+        transaction = create_transaction(
+            symbol="AAPL", quantity=30.0, side=OrderDirection.BUY,
+            status=TransactionStatus.OPENED, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=30.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=transaction.id, filled_qty=30.0,
+        )
+        # Adding 10 more ($1,500, also inside the cap alone) takes the TOTAL to
+        # $6,000 -- over the $5,000 cap.
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("exceeding expert's max allowed $5000.00" in e for e in errors), errors
+
+    def test_the_add_to_position_balance_check_counts_the_whole_position(self, monkeypatch):
+        """``exclude_transaction_id`` belongs ONLY to the new-position branch, where
+        the order's own WAITING transaction would otherwise be double-counted against
+        itself. On a top-up the existing holding is REAL exposure and must stay in the
+        used balance -- excluding it would silently raise the ceiling."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
+        stub = _StubExpertInterface(available_balance=10_000.0)
+        monkeypatch.setattr("ba2_common.core.instance_resolver._resolver",
+                            _StubExpertResolver(stub))
+        transaction = create_transaction(
+            symbol="MSFT", quantity=1.0, side=OrderDirection.BUY,
+            status=TransactionStatus.OPENED, open_price=400.0,
+            expert_id=expert_instance.id,
+        )
+        create_trading_order(
+            account_id=acct_def.id, symbol="MSFT", quantity=1.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=transaction.id, filled_qty=1.0,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="MSFT", quantity=1.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        account._validate_expert_available_balance(
+            order, transaction, expert_instance, current_price=400.0)
+
+        assert stub.exclude_calls == [None], (
+            "a top-up must not exclude its own (real) position from used balance",
+            stub.exclude_calls)
+
+    def test_a_new_position_DOES_exclude_its_own_waiting_transaction(self, monkeypatch):
+        """The inverse of the above, on the branch where the exclusion is correct."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0)
+        stub = _StubExpertInterface(available_balance=10_000.0)
+        monkeypatch.setattr("ba2_common.core.instance_resolver._resolver",
+                            _StubExpertResolver(stub))
+        transaction = create_transaction(
+            symbol="MSFT", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=400.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="MSFT", quantity=1.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        account._validate_expert_available_balance(
+            order, transaction, expert_instance, current_price=400.0)
+
+        assert stub.exclude_calls == [transaction.id]
+
+
+class TestDeferredCloseAuditTrail:
+    def test_the_deferred_close_records_the_MEASURED_quantity(self, monkeypatch):
+        """The deferred branch writes the close order straight to the DB and logs the
+        activity itself. Both must carry the measured remainder: an audit trail that
+        says 100 when 60 shares were sold is a lie about money, and nothing pinned
+        the activity log's copy of it."""
+        import ba2_common.core.utils as _utils
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        logged = []
+        monkeypatch.setattr(_utils, "log_close_order_activity",
+                            lambda **kw: logged.append(kw))
+
+        transaction = create_transaction(
+            symbol="AAPL", quantity=100.0, side=OrderDirection.BUY,
+            status=TransactionStatus.OPENED, open_price=150.0,
+        )
+        for side, filled in [(OrderDirection.BUY, 100.0), (OrderDirection.SELL, 40.0)]:
+            create_trading_order(
+                account_id=acct_def.id, symbol="AAPL", quantity=filled,
+                side=side, status=OrderStatus.FILLED,
+                transaction_id=transaction.id, filled_qty=filled,
+            )
+        blocker = create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=40.0,
+            side=OrderDirection.SELL, status=OrderStatus.CANCELED,
+            transaction_id=transaction.id,
+        )
+
+        result = account.submit_close_order_for_transaction(
+            transaction, last_broker_canceled_order_id=blocker.id)
+
+        from ba2_trade_platform.core.db import get_instance
+        from ba2_trade_platform.core.models import TradingOrder as _TO
+        created = get_instance(_TO, result["close_order_id"])
+        assert created.quantity == 60.0
+        assert created.depends_on_order == blocker.id
+        assert [k["quantity"] for k in logged] == [60.0]

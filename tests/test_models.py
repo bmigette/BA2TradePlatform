@@ -234,3 +234,58 @@ class TestGetCurrentOpenQtyUnmeasurableFill:
 
         assert txn.get_current_open_qty() == 10.0
         assert errors, "the unmeasurable SELL must still be reported"
+
+
+class TestGetCurrentOpenQtyMutationGaps:
+    """Gaps a 212-mutation run found in the surrounding accounting."""
+
+    def test_an_unmeasurable_order_does_not_abort_the_scan(self, monkeypatch):
+        """``continue``, not ``break``. With the unmeasurable order FIRST, aborting
+        would silently drop every later fill and return a smaller 'measured' net."""
+        acct_def = create_account_definition()
+        txn = create_transaction(symbol="AAPL", quantity=10.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=4.0,
+            side=OrderDirection.SELL, status=OrderStatus.FILLED,
+            transaction_id=txn.id, filled_qty=None,
+        )
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=txn.id, filled_qty=10.0,
+        )
+        errors = _capture_model_errors(monkeypatch)
+
+        assert txn.get_current_open_qty() == 10.0
+        assert errors, "the unmeasurable order is still reported"
+
+    def test_a_resting_order_with_a_partial_fill_is_still_not_counted(self, monkeypatch):
+        """Splitting the status test from the fill test must not let a NON-executed
+        order through just because it happens to carry a filled_qty."""
+        acct_def = create_account_definition()
+        txn = create_transaction(symbol="AAPL", quantity=10.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, status=OrderStatus.PENDING,
+            transaction_id=txn.id, filled_qty=5.0,
+        )
+        errors = _capture_model_errors(monkeypatch)
+
+        assert txn.get_current_open_qty() == 0.0
+        assert errors == [], errors
+
+    def test_a_partly_filled_SELL_counts_what_filled_not_what_was_ordered(self, monkeypatch):
+        acct_def = create_account_definition()
+        txn = create_transaction(symbol="AAPL", quantity=10.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=txn.id, filled_qty=10.0,
+        )
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.SELL, status=OrderStatus.FILLED,
+            transaction_id=txn.id, filled_qty=4.0,
+        )
+
+        assert txn.get_current_open_qty() == 6.0

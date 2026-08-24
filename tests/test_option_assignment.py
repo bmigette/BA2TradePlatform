@@ -379,7 +379,11 @@ def test_a_missing_qty_assignment_is_retried_once_the_qty_is_known(
             if r.activity_id == "act-retry-1"]
     assert len(rows) == 1, "a retry must UPDATE the audit row, not duplicate the key"
     assert "csp_assignment" in (rows[0].result or "")
+    # The row must describe the pass that ACTUALLY applied the effect, not the
+    # refusal it replaced -- it is the audit trail for a 200-share position.
     assert rows[0].qty == 2.0
+    assert rows[0].symbol == PUT_OCC
+    assert rows[0].activity_type == "OPASN"
 
 
 def test_a_measured_zero_qty_is_not_treated_as_missing(
