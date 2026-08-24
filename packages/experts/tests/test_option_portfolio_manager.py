@@ -341,22 +341,26 @@ def test_entry_cycle_whose_candidates_are_all_declined_does_not_rearm(monkeypatc
     assert pm._halted is True
 
 
-def test_entry_cycle_that_opens_a_structure_rearms(monkeypatch):
-    """Defect 3, the other half: a sleeve that actually re-enters MUST re-arm, or
-    the new structures would never be managed (manage_open no-ops while halted)."""
+def test_an_entry_cycle_is_no_longer_what_rearms_a_sleeve(monkeypatch):
+    """REVERSED, deliberately. 46195b1 re-armed on a real re-entry because manage_open
+    no-ops while halted, so structures opened by a halted sleeve would never be managed.
+    A halted sleeve can no longer open anything, so that reason is gone — and keeping the
+    entry-triggered clear alongside the entry gate would be the deadlock: blocked because
+    halted, halted because never entered."""
     pm = make_manager()
+    pm._peak_equity = 10_000.0
     pm._halted = True
     monkeypatch.setattr(pm, "get_option_holdings", lambda: {})
     pm.rebalance({"structures": [_spec()]})
-    assert len(pm.account.submitted) == 1
-    assert pm._halted is False
+    assert pm.account.submitted == []
+    assert pm._halted is True
 
 
-def test_breaker_can_fire_again_after_a_reentry(monkeypatch):
-    """The latch must not be a one-shot: halt -> re-enter -> the breaker still works.
+def test_breaker_can_fire_again_after_a_recovery_and_reentry(monkeypatch):
+    """The latch must not be a one-shot: halt -> recover -> re-enter -> it still works.
 
-    The peak is deliberately KEPT across the re-arm (option_book.rearm), so a sleeve
-    that re-enters while still under water trips again immediately."""
+    The peak is deliberately KEPT across the clear (option_book.rearm), so the sleeve
+    measures its next drawdown from 10k and not from wherever it recovered to."""
     pm = make_manager(balance=7_000.0)
     pm._peak_equity = 10_000.0
     holdings = _one_holding()
@@ -366,12 +370,16 @@ def test_breaker_can_fire_again_after_a_reentry(monkeypatch):
     monkeypatch.setattr(pm, "_close_structure", lambda txn, parent: closed.append(txn.id) or None)
     pm.manage_open(datetime(2024, 1, 3))
     assert closed == [7] and pm._halted is True
-    pm.rebalance({"structures": [_spec("ABC")]})    # a real re-entry re-arms
+    pm.account._balance = 9_500.0                   # -5%: recovered past the -10% line
+    pm.manage_open(datetime(2024, 1, 4))
     assert pm._halted is False
     assert pm._peak_equity == 10_000.0              # ... without forgetting the peak
+    pm.rebalance({"structures": [_spec("ABC")]})    # and the sleeve may re-enter
+    assert len(pm.account.submitted) == 1
     closed.clear()
+    pm.account._balance = 7_000.0                   # back under water
     pm.manage_open(datetime(2024, 1, 5))
-    assert closed == [7]                            # and the breaker fires again
+    assert closed == [7]                            # the breaker fires again
     assert pm._halted is True
 
 
@@ -415,3 +423,169 @@ def test_tested_combo_short_leg_under_threshold(monkeypatch):
         SimpleNamespace(symbol="XYZP90", delta=None)]    # None delta -> no action
     parent = SimpleNamespace(id=70, transaction_id=7)
     assert pm._tested(parent) is False
+
+
+# ---------------------------------------------------------------------------
+# Circuit-breaker stopgap, part 2 (2026-08): a stand-down never stopped ENTRY.
+#
+# `_halted` short-circuited manage_open and nothing else, so the breaker flattened
+# the book and the very next entry bar re-opened it — at the bottom of the drawdown
+# that had just flattened it. With re-arming conditioned on `submitted` (46195b1)
+# that re-entry also cleared the halt, so the sleeve could cycle open/flatten
+# indefinitely while under water, paying the spread every round.
+#
+# rebalance is now gated on `_halted`, which forces the question of what clears a
+# stand-down. It is a RECOVERY: manage_open lifts the halt once equity climbs back
+# to within half the trip depth of the peak (option_book.BREAKER_REARM_DEPTH_FRACTION
+# — trip at -20%, re-arm at -10%). Not an entry (that would be unreachable now, and is
+# the deadlock); not a bar count (the peak is KEPT, so a sleeve re-armed under water
+# re-trips on its first managed bar and the cycle just runs slower).
+# ---------------------------------------------------------------------------
+def test_a_halted_sleeve_opens_nothing_on_the_next_entry_bar(monkeypatch):
+    """THE defect: the stand-down suppressed exits and let entries straight through."""
+    pm = make_manager(balance=7_000.0)
+    pm._peak_equity = 10_000.0
+    pm._halted = True
+    monkeypatch.setattr(pm, "get_option_holdings", lambda: {})
+    assert pm.rebalance({"structures": [_spec("ABC")]}) == []
+    assert pm.account.submitted == []
+    assert pm._halted is True
+
+
+def test_the_open_flatten_cycle_cannot_repeat_while_the_sleeve_is_under_water():
+    """The whole pathology in one test: flatten, then ten entry bars at the trough.
+
+    Before the gate this opened a structure on every one of them (and re-armed on
+    each), so the sleeve churned the same drawdown for the rest of the run."""
+    pm = make_manager(balance=7_000.0)
+    pm._peak_equity = 10_000.0
+    holdings = _one_holding()
+    pm.get_option_holdings = lambda: holdings
+    pm._should_close = lambda txn, parent, as_of: False
+    pm._close_structure = lambda txn, parent: None
+    pm.manage_open(datetime(2024, 1, 3))
+    assert pm._halted is True
+    holdings.clear()                                  # the flatten emptied the book
+    for day in range(4, 14):
+        pm.manage_open(datetime(2024, 1, day))
+        pm.rebalance({"structures": [_spec("ABC")]})
+    assert pm.account.submitted == [], "the sleeve re-risked into the drawdown"
+    assert pm._halted is True
+
+
+def test_the_halt_clears_when_equity_recovers_past_the_rearm_line(monkeypatch):
+    """NO DEADLOCK. Entry is blocked while halted, so the clear cannot depend on an
+    entry — it has to be reachable by a sleeve that is flat and opening nothing. It is,
+    and manage_open evaluates it ABOVE the flat-book early return for exactly that
+    reason."""
+    pm = make_manager(balance=7_000.0)
+    pm._peak_equity = 10_000.0
+    pm._halted = True
+    monkeypatch.setattr(pm, "get_option_holdings", lambda: {})   # flat, as the flatten left it
+    pm.account._balance = 9_000.0                                # -10%: the re-arm line
+    pm.manage_open(datetime(2024, 1, 4))
+    assert pm._halted is False
+    assert pm._peak_equity == 10_000.0            # ...and the peak is not forgotten
+    # ...and the sleeve may trade again.
+    pm.rebalance({"structures": [_spec("ABC")]})
+    assert len(pm.account.submitted) == 1
+
+
+def test_a_partial_recovery_does_not_clear_the_halt(monkeypatch):
+    pm = make_manager(balance=8_500.0)             # -15%: better, not better enough
+    pm._peak_equity = 10_000.0
+    pm._halted = True
+    monkeypatch.setattr(pm, "get_option_holdings", lambda: {})
+    pm.manage_open(datetime(2024, 1, 4))
+    assert pm._halted is True
+    pm.rebalance({"structures": [_spec("ABC")]})
+    assert pm.account.submitted == []
+
+
+def test_the_rearm_line_is_inclusive_at_half_the_trip_depth(monkeypatch):
+    """Exactly -10% under a 20% breaker clears; a hair worse does not. Re-arming AT the
+    trip line instead would leave no hysteresis and the sleeve would flap."""
+    for balance, expected_halt in ((9_000.0, False), (8_999.99, True), (8_000.01, True)):
+        pm = make_manager(balance=balance)
+        pm._peak_equity = 10_000.0
+        pm._halted = True
+        monkeypatch.setattr(pm, "get_option_holdings", lambda: {})
+        pm.manage_open(datetime(2024, 1, 4))
+        assert pm._halted is expected_halt, f"balance {balance}"
+
+
+def test_unknown_equity_does_not_clear_a_halt(monkeypatch):
+    """Blind is not recovered — the same discipline as the trip side."""
+    pm = make_manager(balance=None)
+    pm._peak_equity = 10_000.0
+    pm._halted = True
+    monkeypatch.setattr(pm, "get_option_holdings", lambda: {})
+    pm.manage_open(datetime(2024, 1, 4))
+    assert pm._halted is True
+
+
+def test_a_sleeve_that_is_not_halted_still_enters(monkeypatch):
+    """The gate must cost an armed sleeve nothing: a breaker that blocks entry when it
+    has NOT tripped switches the whole strategy off without ever firing."""
+    pm = make_manager(balance=10_000.0)
+    pm._peak_equity = 10_000.0
+    assert pm._halted is False
+    monkeypatch.setattr(pm, "get_option_holdings", lambda: {})
+    pm.rebalance({"structures": [_spec("ABC")]})
+    assert len(pm.account.submitted) == 1
+
+
+def test_the_stopgap_and_option_book_agree_on_the_rearm_line():
+    """The live manager and the pure module Task 8 rewires onto must not drift: the
+    stopgap spells the fraction out rather than importing it (46195b1's policy — no
+    half-wired hybrid), so something has to compare the two."""
+    from ba2_common.core.option_book import (
+        BREAKER_REARM_DEPTH_FRACTION, BreakerState, update_breaker,
+    )
+
+    book_settings = {"circuit_breaker_pct": SETTINGS["circuit_breaker_pct"]}
+    for balance in (7_000.0, 8_000.01, 8_999.99, 9_000.0, 9_500.0, 12_000.0):
+        pm = make_manager(balance=balance)
+        pm._peak_equity = 10_000.0
+        pm._halted = True
+        pm.get_option_holdings = lambda: {}
+        pm.manage_open(datetime(2024, 1, 4))
+        state = update_breaker(BreakerState(peak_equity=10_000.0, halted=True),
+                               balance, book_settings)
+        assert pm._halted is state.halted, (
+            f"balance {balance}: manager halted={pm._halted}, "
+            f"option_book halted={state.halted}")
+    assert BREAKER_REARM_DEPTH_FRACTION == 0.5
+
+
+def test_a_non_positive_peak_cannot_measure_a_recovery_so_the_halt_stands(monkeypatch):
+    """The re-arm line is a percentage OF the peak. An unusable peak makes the recovery
+    test undefined, and undefined is not recovered — the same discipline the trip side
+    already has (test_breaker_does_not_read_a_non_positive_peak_as_a_baseline)."""
+    # -4,000 IS an improvement on a -5,000 peak: a rule that only looked at the
+    # direction of travel would clear the halt there.
+    for peak, balance in ((0.0, 0.0), (-5_000.0, -4_000.0), (-5_000.0, -6_000.0)):
+        pm = make_manager(balance=balance)
+        pm._peak_equity = peak
+        pm._halted = True
+        monkeypatch.setattr(pm, "get_option_holdings", lambda: {})
+        pm.manage_open(datetime(2024, 1, 4))
+        assert pm._halted is True, f"peak {peak}, balance {balance}"
+
+
+def test_a_halted_sleeve_still_manages_nothing_but_the_recovery_test_still_runs(monkeypatch):
+    """The halt keeps short-circuiting the exit pass (unchanged), but the recovery test
+    has to sit ABOVE that short-circuit or it could never fire on a halted sleeve."""
+    pm = make_manager(balance=7_000.0)
+    pm._peak_equity = 10_000.0
+    pm._halted = True
+    seen = []
+    monkeypatch.setattr(pm, "get_option_holdings", lambda: _one_holding())
+    monkeypatch.setattr(pm, "_should_close",
+                        lambda txn, parent, as_of: bool(seen.append(txn.id)))
+    monkeypatch.setattr(pm, "_close_structure", lambda txn, parent: None)
+    assert pm.manage_open(datetime(2024, 1, 4)) == []
+    assert seen == []                       # still a no-op while standing down
+    pm.account._balance = 9_500.0           # ...and the recovery is still noticed
+    pm.manage_open(datetime(2024, 1, 5))
+    assert pm._halted is False

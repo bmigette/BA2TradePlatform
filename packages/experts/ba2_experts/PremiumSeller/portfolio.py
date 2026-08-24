@@ -131,11 +131,23 @@ class OptionPortfolioManager:
     def rebalance(self, targets: Dict) -> List[Any]:
         """Open the gap between the desired structures and the held book (entry cadence).
 
-        An entry cycle that actually RE-ENTERS clears a circuit-breaker stand-down (see
-        the end of this method). Merely running one does not: the engine calls rebalance
-        on every entry bar, including bars where no candidate passes the gates or the
-        rails decline them all, so clearing the halt up here re-armed a halted sleeve
-        without a single contract being opened."""
+        A circuit-breaker stand-down opens NOTHING. The latch used to short-circuit
+        manage_open and nothing else, so the breaker flattened the book and this method
+        re-opened it on the very next entry bar — at the bottom of the drawdown that had
+        just flattened it — whereupon the next managed bar flattened it again. The sleeve
+        could run that cycle for the rest of the campaign, paying the spread every round,
+        and (once re-arming was conditioned on a real re-entry) each round also cleared
+        the halt, so the breaker's only lasting effect was the round trip.
+
+        The halt is NOT cleared here. What clears it is a recovery, tested in manage_open
+        on every evaluation including a flat one — see the comment there for why it is
+        neither an entry (unreachable now that entry is gated: that is the deadlock) nor
+        a bar count (the peak is kept, so a sleeve re-armed under water re-trips at once
+        and the cycle merely runs slower)."""
+        if self._halted:
+            logger.info(f"PremiumSeller[{self.expert_instance_id}]: standing down after "
+                        f"the circuit breaker — opening no new structures")
+            return []
         structures = (targets or {}).get("structures") or []
         holdings = self.get_option_holdings()
         held_underlyings = {txn.symbol for txn, _ in holdings.values()}
@@ -171,16 +183,6 @@ class OptionPortfolioManager:
                 book[2] += spec.notional
                 if spec.strategy in ("short_put", "short_strangle"):
                     book[1] += spec.max_loss
-        if submitted and self._halted:
-            # Re-arm ONLY on a real re-entry. manage_open is a full no-op while halted,
-            # so a sleeve that re-opens structures and stays halted would never manage
-            # them again (no profit capture, no stop, no roll, no breaker) — the halt has
-            # to clear the moment the sleeve holds something again. The peak is
-            # deliberately KEPT (option_book.rearm): re-arming at the trough would erase
-            # the drawdown that caused the stand-down.
-            logger.info(f"PremiumSeller[{self.expert_instance_id}]: circuit-breaker "
-                        f"stand-down cleared — sleeve re-entered")
-            self._halted = False
         logger.info(f"PremiumSeller[{self.expert_instance_id}]: opened {len(submitted)} structures")
         return submitted
 
@@ -196,11 +198,37 @@ class OptionPortfolioManager:
         balance = self.account.get_balance()
         if balance is not None:
             self._peak_equity = balance if self._peak_equity is None else max(self._peak_equity, balance)
+        breaker = float(self._s("circuit_breaker_pct"))
+        # Clearing a stand-down: a RECOVERY, and nothing else. This also has to sit above
+        # the `not holdings` early return — a standing-down sleeve is flat by definition
+        # (the breaker just flattened it) and rebalance now opens nothing while halted, so
+        # a clear evaluated only on a sleeve that holds something could never be reached.
+        #
+        # Why not the alternatives:
+        #   * a successful entry (what 46195b1 used) is unreachable once entry is gated:
+        #     blocked because halted, halted because never entered. That is the deadlock.
+        #   * a bar count / cool-off re-arms a sleeve that is still under water, and the
+        #     peak is deliberately KEPT, so it trips again on its first managed bar — the
+        #     same open/flatten cycle, just slower.
+        #   * an operator reset alone leaves the only exit outside the system.
+        # A recovery is the one condition under which resuming does not immediately
+        # re-trip. The re-arm line is HALF the trip depth (trip -20% -> re-arm -10%):
+        # re-arming on the trip line itself leaves no hysteresis and the sleeve flaps.
+        # Kept numerically identical to option_book.BREAKER_REARM_DEPTH_FRACTION (0.5),
+        # which Task 8 rewires onto; test_the_stopgap_and_option_book_agree_on_the_rearm_line
+        # fails if the two ever drift.
+        if self._halted:
+            peak = self._peak_equity
+            if (balance is not None and peak is not None and peak > 0
+                    and balance >= peak * (1.0 - 0.5 * breaker / 100.0)):
+                logger.info(f"PremiumSeller[{self.expert_instance_id}]: circuit-breaker "
+                            f"stand-down cleared — equity {balance} recovered to within "
+                            f"{0.5 * breaker}% of peak {peak}")
+                self._halted = False
         if not holdings:
             return []
         if self._halted:
             return []
-        breaker = float(self._s("circuit_breaker_pct"))
         # BOTH operands are Optional[float] and BOTH are tested explicitly — never by
         # truthiness, which cannot tell "not measured" from a legitimate 0.0:
         #   balance is None -> equity was not measured; blind, and blind is not a trip.

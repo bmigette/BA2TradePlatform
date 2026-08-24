@@ -186,7 +186,7 @@ def test_one_unmeasurable_structure_makes_the_whole_total_unknown():
     # structure on the very underlying it cannot measure.
     assert book.structure_count == 2
     assert book.underlyings == frozenset({"AAA", "BBB"})
-    assert check_rails(candidate("BBB"), book, EQUITY, settings()).reason == \
+    assert check_rails(candidate("BBB"), book, EQUITY, settings(), BreakerState()).reason == \
         RAIL_ONE_PER_UNDERLYING
 
 
@@ -215,7 +215,7 @@ def test_a_measurable_book_totals_the_same_whatever_order_it_arrives_in():
 def test_the_deployment_rail_refuses_a_structure_past_max_deployment_pct():
     """40% of 100k = 40k. 39.6k already committed + a 500 candidate = 40.1k."""
     book = dataclasses.replace(book_totals([]), committed=39_600.0)
-    v = check_rails(candidate(max_loss=500.0), book, EQUITY, settings())
+    v = check_rails(candidate(max_loss=500.0), book, EQUITY, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_MAX_DEPLOYMENT
     assert "40" in v.detail
@@ -224,7 +224,7 @@ def test_the_deployment_rail_refuses_a_structure_past_max_deployment_pct():
 def test_the_deployment_rail_admits_a_structure_exactly_at_the_cap():
     """The promoted comparison is a strict `>`: landing exactly on the cap is legal."""
     book = dataclasses.replace(book_totals([]), committed=39_500.0)
-    v = check_rails(candidate(max_loss=500.0, notional=0.0), book, EQUITY, settings())
+    v = check_rails(candidate(max_loss=500.0, notional=0.0), book, EQUITY, settings(), BreakerState())
     assert v.allowed is True
     assert v.reason == RAIL_OK
 
@@ -234,23 +234,23 @@ def test_the_deployment_rail_counts_the_book_already_held():
     that is fine against an empty book is refused against a nearly-full one."""
     empty = book_totals([])
     assert check_rails(candidate(max_loss=500.0, notional=0.0), empty, EQUITY,
-                       settings()).allowed is True
+                       settings(), BreakerState()).allowed is True
     full = dataclasses.replace(empty, committed=39_999.0)
     assert check_rails(candidate(max_loss=500.0, notional=0.0), full, EQUITY,
-                       settings()).allowed is False
+                       settings(), BreakerState()).allowed is False
 
 
 def test_the_notional_leverage_rail_refuses_a_structure_past_the_multiple():
     """3.0 x 100k = 300k of short notional."""
     book = dataclasses.replace(book_totals([]), notional=295_000.0)
-    v = check_rails(candidate(max_loss=100.0, notional=6_000.0), book, EQUITY, settings())
+    v = check_rails(candidate(max_loss=100.0, notional=6_000.0), book, EQUITY, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_MAX_NOTIONAL_LEVERAGE
 
 
 def test_the_notional_leverage_rail_admits_exactly_at_the_multiple():
     book = dataclasses.replace(book_totals([]), notional=295_000.0)
-    v = check_rails(candidate(max_loss=100.0, notional=5_000.0), book, EQUITY, settings())
+    v = check_rails(candidate(max_loss=100.0, notional=5_000.0), book, EQUITY, settings(), BreakerState())
     assert v.allowed is True
 
 
@@ -259,7 +259,7 @@ def test_the_undefined_risk_rail_refuses_a_naked_structure_past_its_own_cap():
     book = dataclasses.replace(book_totals([]), naked_committed=19_800.0,
                                committed=19_800.0)
     v = check_rails(candidate(strategy="short_put", max_loss=500.0, notional=10_000.0),
-                    book, EQUITY, settings())
+                    book, EQUITY, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_UNDEFINED_RISK
 
@@ -270,7 +270,7 @@ def test_the_undefined_risk_rail_admits_a_structure_exactly_at_the_naked_cap():
     book = dataclasses.replace(book_totals([]), naked_committed=19_500.0,
                                committed=19_500.0)
     v = check_rails(candidate(strategy="short_put", max_loss=500.0, notional=10_000.0),
-                    book, EQUITY, settings())
+                    book, EQUITY, settings(), BreakerState())
     assert v.allowed is True
     assert RAIL_UNDEFINED_RISK in v.evaluated
 
@@ -280,7 +280,7 @@ def test_the_undefined_risk_rail_leaves_a_defined_risk_candidate_alone():
     book = dataclasses.replace(book_totals([]), naked_committed=19_800.0,
                                committed=19_800.0)
     v = check_rails(candidate(strategy="put_credit_spread", max_loss=500.0,
-                              notional=10_000.0), book, EQUITY, settings())
+                              notional=10_000.0), book, EQUITY, settings(), BreakerState())
     assert v.allowed is True
     assert RAIL_UNDEFINED_RISK not in v.evaluated
 
@@ -290,7 +290,7 @@ def test_the_undefined_risk_rail_covers_both_strategies_the_setting_names():
                                committed=19_800.0)
     for strategy in UNDEFINED_RISK_STRATEGIES:
         v = check_rails(candidate(strategy=strategy, max_loss=500.0, notional=10_000.0),
-                        book, EQUITY, settings())
+                        book, EQUITY, settings(), BreakerState())
         assert v.allowed is False, strategy
         assert v.reason == RAIL_UNDEFINED_RISK
 
@@ -303,7 +303,7 @@ def test_an_undeclared_strategy_measured_as_naked_still_hits_the_undefined_risk_
                                committed=19_800.0)
     v = check_rails(candidate(strategy="ratio_spread", max_loss=500.0,
                               notional=10_000.0, is_defined_risk=False),
-                    book, EQUITY, settings())
+                    book, EQUITY, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_UNDEFINED_RISK
 
@@ -314,13 +314,13 @@ def test_the_rails_evaluated_are_reported_so_an_inert_rail_is_visible_not_silent
     a silence, or it becomes the next 'gene that could not fire'."""
     book = book_totals([])
     debit = check_rails(candidate(strategy="long_call", max_loss=300.0, notional=0.0),
-                        book, EQUITY, settings())
+                        book, EQUITY, settings(), BreakerState())
     assert RAIL_UNDEFINED_RISK not in debit.evaluated
     assert RAIL_MAX_DEPLOYMENT in debit.evaluated
     assert RAIL_MAX_NOTIONAL_LEVERAGE in debit.evaluated
 
     naked = check_rails(candidate(strategy="short_put", max_loss=300.0, notional=1.0),
-                        book, EQUITY, settings())
+                        book, EQUITY, settings(), BreakerState())
     assert RAIL_UNDEFINED_RISK in naked.evaluated
 
 
@@ -329,7 +329,7 @@ def test_the_rails_evaluated_are_reported_so_an_inert_rail_is_visible_not_silent
 # --------------------------------------------------------------------------
 def test_the_concurrent_cap_refuses_a_structure_past_the_limit():
     book = dataclasses.replace(book_totals([]), structure_count=10)
-    v = check_rails(candidate(), book, EQUITY, settings(max_concurrent_structures=10))
+    v = check_rails(candidate(), book, EQUITY, settings(max_concurrent_structures=10), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_MAX_CONCURRENT
 
@@ -338,7 +338,7 @@ def test_the_concurrent_cap_is_a_ceiling_not_an_off_by_one():
     """max=2 means TWO open structures, not one and not three. The promoted test is
     `len(holdings) + len(submitted) >= max`, so the second admission is the last."""
     verdicts = admit([candidate("A"), candidate("B"), candidate("C")],
-                     book_totals([]), EQUITY, settings(max_concurrent_structures=2))
+                     book_totals([]), EQUITY, settings(max_concurrent_structures=2), BreakerState())
     assert [v.allowed for v in verdicts] == [True, True, False]
     assert verdicts[2].reason == RAIL_MAX_CONCURRENT
 
@@ -346,21 +346,21 @@ def test_the_concurrent_cap_is_a_ceiling_not_an_off_by_one():
 def test_the_concurrent_cap_counts_the_structures_already_held():
     """One held plus one admitted reaches a cap of two; the next is refused."""
     verdicts = admit([candidate("A"), candidate("B")], book_totals([put_spread(1, "Z")]),
-                     EQUITY, settings(max_concurrent_structures=2))
+                     EQUITY, settings(max_concurrent_structures=2), BreakerState())
     assert [v.allowed for v in verdicts] == [True, False]
 
 
 def test_the_cap_admits_the_last_slot_rather_than_refusing_it():
     verdicts = admit([candidate("A")], book_totals([put_spread(1, "Z")]), EQUITY,
-                     settings(max_concurrent_structures=2))
+                     settings(max_concurrent_structures=2), BreakerState())
     assert verdicts[0].allowed is True
 
 
 def test_only_one_structure_per_underlying():
     book = book_totals([put_spread(1, "XYZ")])
-    assert check_rails(candidate("XYZ"), book, EQUITY, settings()).reason == \
+    assert check_rails(candidate("XYZ"), book, EQUITY, settings(), BreakerState()).reason == \
         RAIL_ONE_PER_UNDERLYING
-    assert check_rails(candidate("ABC"), book, EQUITY, settings()).allowed is True
+    assert check_rails(candidate("ABC"), book, EQUITY, settings(), BreakerState()).allowed is True
 
 
 def test_the_one_per_underlying_cap_is_keyed_on_the_underlying_not_the_contract_symbol():
@@ -368,14 +368,14 @@ def test_the_one_per_underlying_cap_is_keyed_on_the_underlying_not_the_contract_
     Keyed on the contract symbol nothing would ever match and the cap would be inert."""
     book = book_totals([put_spread(1, "XYZ")])
     assert book.underlyings == frozenset({"XYZ"})
-    v = check_rails(candidate("XYZ"), book, EQUITY, settings())
+    v = check_rails(candidate("XYZ"), book, EQUITY, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_ONE_PER_UNDERLYING
 
 
 def test_two_candidates_on_one_underlying_in_a_single_pass_admit_only_the_first():
     verdicts = admit([candidate("XYZ"), candidate("XYZ")], book_totals([]), EQUITY,
-                     settings())
+                     settings(), BreakerState())
     assert [v.allowed for v in verdicts] == [True, False]
     assert verdicts[1].reason == RAIL_ONE_PER_UNDERLYING
 
@@ -387,7 +387,7 @@ def test_admit_charges_each_admission_to_the_running_book():
     verdicts = admit([candidate("A", max_loss=20_000.0, notional=0.0),
                       candidate("B", max_loss=20_000.0, notional=0.0),
                       candidate("C", max_loss=20_000.0, notional=0.0)],
-                     book_totals([]), EQUITY, settings())
+                     book_totals([]), EQUITY, settings(), BreakerState())
     assert [v.allowed for v in verdicts] == [True, True, False]
     assert verdicts[2].reason == RAIL_MAX_DEPLOYMENT
 
@@ -398,7 +398,7 @@ def test_a_refused_candidate_is_not_charged_to_the_book():
     verdicts = admit([candidate("A", max_loss=39_000.0, notional=0.0),
                       candidate("B", max_loss=2_000.0, notional=0.0),
                       candidate("C", max_loss=500.0, notional=0.0)],
-                     book_totals([]), EQUITY, settings())
+                     book_totals([]), EQUITY, settings(), BreakerState())
     assert [v.allowed for v in verdicts] == [True, False, True]
 
 
@@ -407,7 +407,7 @@ def test_admitting_a_debit_candidate_charges_the_running_books_premium_outlay():
     premium it will pay. Charging it to `committed` without also charging it to
     `premium_outlay` would leave the running book internally inconsistent."""
     verdicts = admit([candidate("A", strategy="long_call", max_loss=600.0, notional=0.0)],
-                     book_totals([]), EQUITY, settings())
+                     book_totals([]), EQUITY, settings(), BreakerState())
     assert verdicts[0].allowed is True
     assert verdicts[0].book_after.committed == pytest.approx(600.0)
     assert verdicts[0].book_after.premium_outlay == pytest.approx(600.0)
@@ -417,7 +417,7 @@ def test_admitting_a_debit_candidate_charges_the_running_books_premium_outlay():
 def test_admitting_a_credit_candidate_charges_notional_and_not_the_outlay():
     verdicts = admit([candidate("A", strategy="short_put", max_loss=9_800.0,
                                 notional=10_000.0)],
-                     book_totals([]), EQUITY, settings())
+                     book_totals([]), EQUITY, settings(), BreakerState())
     after = verdicts[0].book_after
     assert after.committed == pytest.approx(9_800.0)
     assert after.naked_committed == pytest.approx(9_800.0)
@@ -429,7 +429,7 @@ def test_admitting_a_credit_candidate_charges_notional_and_not_the_outlay():
 
 def test_a_refusal_leaves_the_running_book_untouched():
     verdicts = admit([candidate("A", max_loss=500_000.0, notional=0.0)],
-                     book_totals([]), EQUITY, settings())
+                     book_totals([]), EQUITY, settings(), BreakerState())
     assert verdicts[0].allowed is False
     assert verdicts[0].book_after.committed == pytest.approx(0.0)
     assert verdicts[0].book_after.structure_count == 0
@@ -437,12 +437,12 @@ def test_a_refusal_leaves_the_running_book_untouched():
 
 def test_admit_returns_one_verdict_per_candidate_in_the_order_given():
     verdicts = admit([candidate("C"), candidate("A"), candidate("B")], book_totals([]),
-                     EQUITY, settings())
+                     EQUITY, settings(), BreakerState())
     assert [v.candidate.underlying for v in verdicts] == ["C", "A", "B"]
 
 
 def test_no_candidates_is_no_verdicts():
-    assert admit([], book_totals([]), EQUITY, settings()) == []
+    assert admit([], book_totals([]), EQUITY, settings(), BreakerState()) == []
 
 
 # --------------------------------------------------------------------------
@@ -451,7 +451,7 @@ def test_no_candidates_is_no_verdicts():
 def test_an_unknown_account_equity_declines_rather_than_assuming():
     """PremiumSeller's rails declined when balance was unknown rather than fabricating.
     Keep it."""
-    v = check_rails(candidate(), book_totals([]), None, settings())
+    v = check_rails(candidate(), book_totals([]), None, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_UNKNOWN_EQUITY
     assert "balance" in v.detail or "equity" in v.detail
@@ -459,7 +459,7 @@ def test_an_unknown_account_equity_declines_rather_than_assuming():
 
 def test_a_zero_or_negative_equity_declines():
     for equity in (0.0, -1.0):
-        v = check_rails(candidate(), book_totals([]), equity, settings())
+        v = check_rails(candidate(), book_totals([]), equity, settings(), BreakerState())
         assert v.allowed is False, equity
         assert v.reason == RAIL_UNKNOWN_EQUITY
 
@@ -468,21 +468,21 @@ def test_an_unmeasurable_book_declines_rather_than_assuming_zero():
     """A book we cannot total is not an empty book. Admitting against it is exactly the
     all-zeros regime that let a live sleeve open structures without limit."""
     blind = OptionStructure(1, "AAA", "put_credit_spread", [])
-    v = check_rails(candidate("XYZ"), book_totals([blind]), EQUITY, settings())
+    v = check_rails(candidate("XYZ"), book_totals([blind]), EQUITY, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_UNMEASURABLE_BOOK
     assert "no held option legs" in v.detail
 
 
 def test_a_candidate_with_an_unknown_max_loss_declines():
-    v = check_rails(candidate(max_loss=None), book_totals([]), EQUITY, settings())
+    v = check_rails(candidate(max_loss=None), book_totals([]), EQUITY, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_UNMEASURABLE_CANDIDATE
     assert "max_loss" in v.detail
 
 
 def test_a_candidate_with_an_unknown_notional_declines():
-    v = check_rails(candidate(notional=None), book_totals([]), EQUITY, settings())
+    v = check_rails(candidate(notional=None), book_totals([]), EQUITY, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_UNMEASURABLE_CANDIDATE
     assert "notional" in v.detail
@@ -493,14 +493,14 @@ def test_a_candidate_that_claims_to_risk_nothing_at_all_is_refused():
     the signature of an unmeasured spec, and it is the exact shape `_txn_metrics`
     returned -- (True, 0.0, 0.0) -- for a debit structure it could not see."""
     v = check_rails(candidate(max_loss=0.0, notional=0.0), book_totals([]), EQUITY,
-                    settings())
+                    settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_UNMEASURABLE_CANDIDATE
 
 
 def test_a_negative_max_loss_is_refused_rather_than_relieving_the_book():
     """A negative addend would BUY room under the deployment cap."""
-    v = check_rails(candidate(max_loss=-500.0), book_totals([]), EQUITY, settings())
+    v = check_rails(candidate(max_loss=-500.0), book_totals([]), EQUITY, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_UNMEASURABLE_CANDIDATE
 
@@ -527,7 +527,7 @@ def test_a_long_only_book_engages_the_deployment_rail():
     book = book_totals(held)
     assert book.committed == pytest.approx(39_500.0)
     v = check_rails(candidate("BBB", strategy="long_call", max_loss=600.0, notional=0.0),
-                    book, EQUITY, settings())
+                    book, EQUITY, settings(), BreakerState())
     assert v.allowed is False
     assert v.reason == RAIL_MAX_DEPLOYMENT
 
@@ -685,11 +685,22 @@ def test_the_breaker_latches_and_stands_the_sleeve_down():
     assert state.tripped is False, "the flatten edge must be reported once, not re-fired"
 
 
-def test_a_recovery_alone_does_not_clear_the_latch():
+def test_a_full_recovery_clears_the_latch_on_its_own():
+    """REVERSED, deliberately: this test used to assert that a recovery changed nothing
+    because "only a new entry cycle re-arms the sleeve".
+
+    That was coherent only while entry was ungated. Now that a stand-down declines every
+    candidate (``check_rails``), an entry-triggered clear can never fire — blocked
+    because halted, halted because never entered — so the clear has to be something the
+    sleeve can reach while flat. A recovery is that something, and it is also the only
+    clear that does not hand the sleeve straight back to the breaker: the peak is kept,
+    so re-arming anywhere below the trip line re-trips on the next managed bar."""
     state = update_breaker(BreakerState(), 10_000.0, settings())
     state = update_breaker(state, 7_000.0, settings())
+    assert state.halted is True
     state = update_breaker(state, 10_500.0, settings())
-    assert state.halted is True, "only a new entry cycle re-arms the sleeve"
+    assert state.halted is False
+    assert state.peak_equity == pytest.approx(10_500.0)   # and the peak still ratchets
 
 
 def test_re_arming_clears_the_latch_and_keeps_the_peak():
@@ -805,16 +816,16 @@ def test_a_missing_rail_setting_is_an_error_not_a_default(key):
     s = settings()
     del s[key]
     with pytest.raises(KeyError, match=key):
-        check_rails(candidate(), book_totals([]), EQUITY, s)
+        check_rails(candidate(), book_totals([]), EQUITY, s, BreakerState())
 
 
 def test_a_missing_undefined_risk_setting_is_an_error_only_when_the_rail_applies():
     s = settings()
     del s["undefined_risk_max_pct"]
     # A defined-risk candidate never reads it.
-    assert check_rails(candidate(), book_totals([]), EQUITY, s).allowed is True
+    assert check_rails(candidate(), book_totals([]), EQUITY, s, BreakerState()).allowed is True
     with pytest.raises(KeyError, match="undefined_risk_max_pct"):
-        check_rails(candidate(strategy="short_put"), book_totals([]), EQUITY, s)
+        check_rails(candidate(strategy="short_put"), book_totals([]), EQUITY, s, BreakerState())
 
 
 def test_the_rails_are_evaluated_in_the_declared_order():
@@ -823,7 +834,7 @@ def test_the_rails_are_evaluated_in_the_declared_order():
     from ba2_common.core.option_book import RAIL_ORDER
 
     v = check_rails(candidate(strategy="short_put", max_loss=100.0, notional=1_000.0),
-                    book_totals([]), EQUITY, settings())
+                    book_totals([]), EQUITY, settings(), BreakerState())
     assert v.evaluated == RAIL_ORDER
     assert [r for r in v.evaluated] == sorted(v.evaluated, key=RAIL_ORDER.index)
 
@@ -861,3 +872,186 @@ def test_the_module_reaches_for_no_database_and_no_broker():
          "ba2_trade_platform"],
     )
     assert verdict == "CLEAN", f"option_book is not pure: {verdict}"
+
+
+# --------------------------------------------------------------------------
+# the stand-down gates ENTRY, and what clears it
+# --------------------------------------------------------------------------
+def halted_state():
+    """A sleeve the breaker has just flattened: -30% against a 20% breaker."""
+    state = update_breaker(BreakerState(), 10_000.0, settings())
+    state = update_breaker(state, 7_000.0, settings())
+    assert (state.tripped, state.halted) == (True, True)
+    return state
+
+
+def test_a_standing_down_sleeve_may_not_open_a_new_structure():
+    """THE defect: the latch suppressed exits and nothing else. A sleeve the breaker
+    had just flattened could re-open the whole book on the very next entry bar, at the
+    bottom of the drawdown that flattened it, and then flatten again — paying the
+    spread every round. The docstring said 'stays flat until a new entry cycle'; no
+    code said it."""
+    from ba2_common.core.option_book import RAIL_BREAKER_HALTED
+
+    v = check_rails(candidate(), book_totals([]), EQUITY, settings(), halted_state())
+    assert v.allowed is False
+    assert v.reason == RAIL_BREAKER_HALTED
+    assert "stand" in v.detail or "halt" in v.detail
+
+
+def test_the_halt_gate_runs_before_every_rail():
+    """A standing-down sleeve is not 'within its rails' — no rail was consulted at all,
+    and `evaluated` has to say so rather than implying the caps let it through."""
+    v = check_rails(candidate(), book_totals([]), EQUITY, settings(), halted_state())
+    assert v.evaluated == ()
+    assert v.book_after.structure_count == 0     # nothing was charged to the sleeve
+
+
+def test_admit_declines_every_candidate_while_the_sleeve_stands_down():
+    from ba2_common.core.option_book import RAIL_BREAKER_HALTED
+
+    verdicts = admit([candidate("A"), candidate("B"), candidate("C")], book_totals([]),
+                     EQUITY, settings(), halted_state())
+    assert [v.allowed for v in verdicts] == [False, False, False]
+    assert {v.reason for v in verdicts} == {RAIL_BREAKER_HALTED}
+
+
+def test_a_sleeve_that_is_not_standing_down_is_not_blocked_by_the_gate():
+    """The gate must cost an armed sleeve nothing — a breaker that blocks entry when it
+    has NOT tripped is a whole strategy switched off by a risk control that never fired."""
+    healthy = update_breaker(BreakerState(), 10_000.0, settings())
+    assert healthy.halted is False
+    assert check_rails(candidate(), book_totals([]), EQUITY, settings(),
+                       healthy).allowed is True
+    assert check_rails(candidate(), book_totals([]), EQUITY, settings(),
+                       BreakerState()).allowed is True
+
+
+def test_check_rails_will_not_assume_a_missing_breaker_is_an_un_halted_one():
+    """No default. A caller who has not said whether the sleeve is standing down has
+    not said 'it is trading' — and that is precisely the substitution that let the
+    stand-down be ignored for as long as it was."""
+    with pytest.raises(TypeError):
+        check_rails(candidate(), book_totals([]), EQUITY, settings())
+    with pytest.raises(TypeError, match="BreakerState"):
+        check_rails(candidate(), book_totals([]), EQUITY, settings(), None)
+    with pytest.raises(TypeError):
+        admit([candidate()], book_totals([]), EQUITY, settings())
+
+
+def test_a_recovery_out_of_the_drawdown_clears_the_stand_down():
+    """What clears a stand-down is the drawdown healing — nothing else.
+
+    It cannot be 'the next entry cycle': entry is now blocked while standing down, so
+    an entry-triggered clear is unreachable and the sleeve would be halted forever.
+    It cannot be a bar count either: the peak is deliberately KEPT across a re-arm, so
+    a sleeve that resumes while still under water trips again on its first managed bar
+    and the open/flatten cycle simply repeats more slowly. Recovery is the only
+    condition under which resuming does not immediately re-trip."""
+    state = halted_state()
+    state = update_breaker(state, 9_000.0, settings())    # -10%, out of the stand-down
+    assert state.halted is False
+    assert state.tripped is False
+    assert check_rails(candidate(), book_totals([]), EQUITY, settings(),
+                       state).allowed is True
+
+
+def test_a_partial_recovery_still_deep_in_the_drawdown_does_not_clear_it():
+    state = halted_state()
+    state = update_breaker(state, 8_500.0, settings())    # -15%: better, not better enough
+    assert state.halted is True
+    assert check_rails(candidate(), book_totals([]), EQUITY, settings(),
+                       state).allowed is False
+
+
+def test_the_rearm_line_is_inclusive_at_half_the_trip_depth():
+    """20% trip -> 10% re-arm. Exactly on the line clears, a hair under does not."""
+    from ba2_common.core.option_book import BREAKER_REARM_DEPTH_FRACTION
+
+    assert BREAKER_REARM_DEPTH_FRACTION == 0.5
+    assert update_breaker(halted_state(), 9_000.0, settings()).halted is False
+    assert update_breaker(halted_state(), 8_999.99, settings()).halted is True
+
+
+def test_the_rearm_line_is_strictly_shallower_than_the_trip_line():
+    """The hysteresis IS the fix. Re-arming at the trip line lets a sleeve hovering on
+    the boundary flap open/flatten on rounding — the same cycle, one cent wide."""
+    state = update_breaker(halted_state(), 8_000.01, settings())   # just above the trip line
+    assert state.halted is True, "re-arm must need a real recovery, not one basis point"
+
+
+def test_a_cleared_stand_down_does_not_immediately_re_trip():
+    """The proof that recovery is the RIGHT clear condition: on the bar it resumes, the
+    sleeve is by construction out of breaker territory, so it can actually hold a
+    position instead of being flattened again on the next evaluation."""
+    state = update_breaker(halted_state(), 9_500.0, settings())
+    assert state.halted is False
+    state = update_breaker(state, 9_500.0, settings())
+    assert state.tripped is False and state.halted is False
+
+
+def test_clearing_a_stand_down_keeps_the_peak():
+    """Re-arming at the trough would erase the drawdown that caused the stand-down and
+    hand the sleeve a fresh 20% to lose."""
+    state = update_breaker(halted_state(), 9_000.0, settings())
+    assert state.peak_equity == pytest.approx(10_000.0)
+
+
+def test_an_unknown_equity_does_not_clear_a_stand_down():
+    """Blind is not recovered."""
+    state = update_breaker(halted_state(), None, settings())
+    assert state.halted is True
+    assert state.blind is True
+
+
+def test_a_stand_down_clears_without_the_sleeve_ever_opening_anything():
+    """NO DEADLOCK. Entry is blocked while standing down, so if the clear depended on a
+    successful entry the sleeve could never re-arm: blocked because halted, halted
+    because never entered. This walks the whole loop with entry refused on every bar
+    and shows the halt still lifts on its own."""
+    from ba2_common.core.option_book import RAIL_BREAKER_HALTED
+
+    state = halted_state()
+    for equity in (7_000.0, 7_200.0, 8_000.0, 8_900.0):
+        state = update_breaker(state, equity, settings())
+        v = check_rails(candidate(), book_totals([]), EQUITY, settings(), state)
+        assert v.allowed is False and v.reason == RAIL_BREAKER_HALTED
+    state = update_breaker(state, 9_100.0, settings())
+    assert state.halted is False
+    assert check_rails(candidate(), book_totals([]), EQUITY, settings(),
+                       state).allowed is True
+
+
+def test_the_explicit_rearm_still_overrides_without_any_recovery():
+    """The operator escape hatch. `rearm` is unconditional on purpose: it is the one
+    way out that does not depend on the market, and it is what keeps 'halted forever'
+    off the table even for a sleeve whose equity never moves again."""
+    state = rearm(halted_state())
+    assert state.halted is False
+    assert state.peak_equity == pytest.approx(10_000.0)
+    assert check_rails(candidate(), book_totals([]), EQUITY, settings(),
+                       state).allowed is True
+
+
+def test_a_non_positive_peak_cannot_measure_a_recovery_so_the_stand_down_stands():
+    """The re-arm line is a percentage OF the peak, so an unusable peak makes the
+    recovery test undefined — and undefined must not read as recovered. Same three-way
+    split as the trip side: unknown / unusable-peak / measured."""
+    after = update_breaker(BreakerState(peak_equity=0.0, halted=True), 0.0, settings())
+    assert after.halted is True
+    assert after.blind is True
+    assert "peak" in after.detail
+    # a NEGATIVE peak is not a baseline a recovery can be measured against either --
+    # and note that -4,000 IS an improvement on -5,000, so a rule that only looked at
+    # the direction of travel would clear here.
+    negative = update_breaker(BreakerState(peak_equity=-5_000.0, halted=True),
+                              -4_000.0, settings())
+    assert negative.halted is True
+    assert negative.blind is True
+
+
+def test_the_stand_down_does_not_leak_into_the_flatten_signal():
+    """`tripped` stays the edge across a clear: the recovery bar must not re-signal a
+    flatten at the very moment the sleeve is allowed to trade again."""
+    state = update_breaker(halted_state(), 9_500.0, settings())
+    assert breaker_signal(state) == {SETTING_BREAKER_TRIPPED: False}

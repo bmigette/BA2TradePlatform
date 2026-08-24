@@ -571,6 +571,32 @@ class OptionsAccountInterface(ABC):
         floor = cls.NAKED_MARGIN_FLOOR_FRACTION * spot
         return max(primary, floor) * 100.0
 
+    #: Strategies whose reserve is GENUINELY zero, named one by one.
+    #:
+    #: Every one of these is long/debit (the maximum loss is the premium already paid
+    #: at entry, so there is nothing further to set aside) except ``covered_call``,
+    #: whose short call is covered by the 100 shares rather than by cash. This list is
+    #: the *only* way to get a zero out of ``option_reserve_required``: a strategy that
+    #: is merely unrecognised raises instead. The distinction is the whole point — an
+    #: unknown capital requirement and a zero capital requirement are not the same
+    #: fact, and collapsing them let every unrecognised structure pass every
+    #: buying-power gate.
+    ZERO_RESERVE_STRATEGIES = frozenset({
+        "long_call", "long_put", "bull_call_spread", "bear_put_spread",
+        "straddle", "strangle", "covered_call", "protective_put",
+    })
+
+    #: Strategies ``option_reserve_required`` prices with a branch of its own. Kept in
+    #: lockstep with those branches by ``test_the_two_strategy_lists_match_the_branches``.
+    RESERVING_STRATEGIES = frozenset({
+        "cash_secured_put",
+        "bear_call_spread", "credit_spread",
+        "short_straddle", "short_strangle", "naked_put",
+        "put_ratio_spread",
+        "jade_lizard",
+        "iron_condor", "call_butterfly", "debit_spread",
+    })
+
     @classmethod
     def option_reserve_required(cls, strategy: str, quantity: int, *, strike: float | None = None,
                                spread_width: float | None = None, net_credit: float | None = None,
@@ -582,8 +608,28 @@ class OptionsAccountInterface(ABC):
         is direction-aware, so a missing right would silently misstate the reserve.
         ``short_straddle`` needs none: it shorts BOTH rights at the same strike and
         Reg-T margins a straddle at the GREATER of the two legs, so the worst case
-        over both rights is reserved."""
+        over both rights is reserved.
+
+        An **unrecognised** ``strategy`` raises ``ValueError``. It used to fall off the
+        end of the branch chain into a bare ``return 0.0``, which meant that the one
+        structure nobody had priced was also the one structure the buying-power gate
+        could never refuse: ``check_option_buying_power(0.0)`` always passes. A capital
+        requirement we do not know is not a capital requirement of nothing. The
+        strategies that genuinely need no reserve are enumerated in
+        ``ZERO_RESERVE_STRATEGIES`` and answer 0.0 by name."""
+        # Validated BEFORE the quantity short-circuit: an unrecognised strategy is a
+        # code defect, and a defect does not stop being one at size zero.
+        if (strategy not in cls.ZERO_RESERVE_STRATEGIES
+                and strategy not in cls.RESERVING_STRATEGIES):
+            raise ValueError(
+                f"option_reserve_required({strategy!r}): unknown option strategy — its "
+                f"capital requirement is undefined, and an undefined requirement must "
+                f"not be reported as zero (that would pass every buying-power gate). "
+                f"Add a branch that prices it, or name it in ZERO_RESERVE_STRATEGIES "
+                f"if it genuinely reserves nothing.")
         if quantity <= 0:
+            return 0.0
+        if strategy in cls.ZERO_RESERVE_STRATEGIES:
             return 0.0
         if strategy == "cash_secured_put":
             # A CSP is fully cash-secured by definition (the cash to buy the assigned
@@ -654,7 +700,13 @@ class OptionsAccountInterface(ABC):
                 return 0.0
             credit = net_credit if net_credit is not None else 0.0
             return max(0.0, (spread_width - credit)) * 100.0 * quantity
-        return 0.0
+        # Unreachable while RESERVING_STRATEGIES and the branches above agree. It is a
+        # raise and not a `return 0.0` because the two CAN drift — someone adds a name
+        # to the set and forgets the branch — and the cost of that drift being silent is
+        # a structure that reserves nothing and is therefore always affordable.
+        raise ValueError(
+            f"option_reserve_required({strategy!r}): listed in RESERVING_STRATEGIES but "
+            f"no branch prices it — refusing to fall back to a zero reserve.")
 
     def reserved_option_buying_power(self) -> float:
         """Sum of stored reserves across this account's OPEN short-premium option positions.

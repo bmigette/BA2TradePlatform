@@ -89,10 +89,25 @@ the two can never drift.
 
 The latch is promoted behaviour. ``manage_open`` sets ``self._halted = True`` on the bar
 it flattens and then returns ``[]`` on every later bar — no exits at all while standing
-down — and only ``rebalance`` (a new entry cycle) clears it. ``tripped`` is therefore the
-*edge* (flatten now) and ``halted`` is the *state* (standing down); ``rearm()`` is the
-new entry cycle. Signalling ``tripped`` every bar would re-issue closes against a book
+down. ``tripped`` is therefore the *edge* (flatten now) and ``halted`` is the *state*
+(standing down). Signalling ``tripped`` every bar would re-issue closes against a book
 that is already flat.
+
+The stand-down gates ENTRY as well, and that is not promoted — it is the promotion of
+what the promoted code *said* it did. ``manage_open``'s latch suppressed exits only;
+``rebalance`` was never gated on it, so a flattened sleeve re-opened the whole book on
+its next entry bar, at the bottom of the drawdown that had just flattened it, and then
+flattened again. ``check_rails`` declines every candidate while ``halted``, ahead of
+every rail.
+
+Gating entry forces the question of what clears the latch, because the promoted answer
+("a new entry cycle") becomes unreachable the moment entry is blocked. The answer is a
+**recovery**: ``update_breaker`` lifts the stand-down once equity climbs back to within
+``BREAKER_REARM_DEPTH_FRACTION`` of the trip depth. It is the only condition under which
+resuming does not immediately re-trip — the peak is kept, so a sleeve re-armed on a
+timer or a bar count is flattened again on its first managed bar. ``rearm()`` survives
+as the unconditional operator override, and is the reason "halted forever" is never a
+terminal state.
 
 One promoted quirk is deliberately NOT reproduced, and the caller must not reintroduce
 it: ``manage_open`` returned early on ``if not holdings`` **before** ratcheting the
@@ -118,6 +133,8 @@ RAIL_OK = "ok"
 RAIL_UNKNOWN_EQUITY = "unknown_equity"
 RAIL_UNMEASURABLE_BOOK = "unmeasurable_book"
 RAIL_UNMEASURABLE_CANDIDATE = "unmeasurable_candidate"
+#: The decline that is a STATE: the drawdown breaker has stood this sleeve down.
+RAIL_BREAKER_HALTED = "circuit_breaker_halted"
 #: Declines that are a configured limit doing its job.
 RAIL_MAX_CONCURRENT = "max_concurrent_structures"
 RAIL_ONE_PER_UNDERLYING = "one_per_underlying"
@@ -131,6 +148,19 @@ RAIL_UNDEFINED_RISK = "undefined_risk_max_pct"
 #: and a reordering would silently re-label history.
 RAIL_ORDER = (RAIL_MAX_CONCURRENT, RAIL_ONE_PER_UNDERLYING, RAIL_MAX_DEPLOYMENT,
               RAIL_MAX_NOTIONAL_LEVERAGE, RAIL_UNDEFINED_RISK)
+
+#: How far a sleeve must climb back out of a drawdown before its stand-down lifts,
+#: as a fraction of the trip depth. 0.5 with a 20% breaker means: trip at -20%,
+#: re-arm at -10%.
+#:
+#: It is a derived constant rather than a setting because the one thing it must never
+#: be is *equal to* the trip depth. Re-arming exactly on the trip line leaves no
+#: hysteresis at all: a sleeve sitting on the boundary lifts its stand-down, opens,
+#: and is flattened again by the next tick down — the same open/flatten cycle the
+#: stand-down exists to stop, one basis point wide. Halving the depth is the smallest
+#: buffer that is unambiguously a *recovery* and not rounding, and it moves in the
+#: safe direction: a shallower re-arm line is harder to reach than the trip line.
+BREAKER_REARM_DEPTH_FRACTION = 0.5
 
 _EPS = 1e-9
 
@@ -231,8 +261,10 @@ class BreakerState:
     """The sleeve drawdown breaker, as a value. Carry it across evaluations.
 
     ``tripped`` is the EDGE: this evaluation is the one that flattens the book.
-    ``halted`` is the STATE: the sleeve is standing down and stays flat until a new
-    entry cycle calls ``rearm()``. ``blind`` means the breaker could not be evaluated at
+    ``halted`` is the STATE: the sleeve is standing down. It stays flat AND opens
+    nothing (``check_rails`` declines every candidate) until the drawdown recovers past
+    the re-arm line, which ``update_breaker`` tests on every evaluation, or until an
+    operator calls ``rearm()``. ``blind`` means the breaker could not be evaluated at
     all — an equity we could not read, or a peak that is not a positive number — which
     is distinct from a measured "not tripped".
     """
@@ -375,7 +407,8 @@ def _charge(book: BookTotals, candidate: CandidateStructure) -> BookTotals:
 def check_rails(candidate: CandidateStructure,
                 book: BookTotals,
                 equity: Optional[float],
-                settings: Mapping[str, Any]) -> RailVerdict:
+                settings: Mapping[str, Any],
+                breaker: BreakerState) -> RailVerdict:
     """May this ONE candidate be opened against this sleeve? Pure.
 
     :param candidate: the structure being considered.
@@ -387,13 +420,40 @@ def check_rails(candidate: CandidateStructure,
                       ``max_deployment_pct``, ``max_notional_leverage``; plus
                       ``undefined_risk_max_pct`` when the candidate is undefined risk.
                       A missing one raises rather than defaulting.
+    :param breaker:   the sleeve's drawdown breaker (``update_breaker``). REQUIRED and
+                      not defaulted: "the caller did not say" and "the sleeve is
+                      trading" are different facts, and treating the first as the
+                      second is exactly how the stand-down came to gate nothing. A
+                      sleeve with no breaker passes ``BreakerState()`` and says so.
     """
+    if not isinstance(breaker, BreakerState):
+        raise TypeError(
+            f"check_rails requires a BreakerState, got {type(breaker).__name__} — a "
+            f"missing breaker is not an un-halted one. Pass BreakerState() if this "
+            f"sleeve genuinely has no drawdown breaker.")
+
     ran: List[str] = []
 
     def verdict(reason: str, detail: str, allowed: bool = False,
                 after: Optional[BookTotals] = None) -> RailVerdict:
         return RailVerdict(allowed, reason, detail, candidate, tuple(ran),
                            after if after is not None else book)
+
+    # 0. the stand-down, ahead of every rail.
+    #
+    # This is a statement about the SLEEVE, not about the candidate, and it outranks
+    # the caps for the same reason the breaker outranks every per-structure exit: the
+    # book has just been flattened *because* the sleeve is in a drawdown it should not
+    # be adding to. Nothing below is even consulted, so `evaluated` stays empty — a
+    # halted sleeve was not "within its rails", it was never asked.
+    #
+    # Without this the latch suppressed exits only, and a flattened sleeve re-opened
+    # the whole book on its next entry bar at the bottom of the drawdown that flattened
+    # it, tripped again, flattened again, and paid the spread every round.
+    if breaker.halted:
+        return verdict(RAIL_BREAKER_HALTED,
+                       "the sleeve is standing down after the circuit breaker — no new "
+                       "structures until the drawdown recovers: " + (breaker.detail or ""))
 
     # 1. the concurrent-structure cap. `len(holdings) + len(submitted) >= max`.
     max_concurrent = int(_require(settings, "max_concurrent_structures"))
@@ -487,7 +547,8 @@ def check_rails(candidate: CandidateStructure,
 def admit(candidates: Sequence[CandidateStructure],
           book: BookTotals,
           equity: Optional[float],
-          settings: Mapping[str, Any]) -> List[RailVerdict]:
+          settings: Mapping[str, Any],
+          breaker: BreakerState) -> List[RailVerdict]:
     """Walk ``candidates`` in order, charging each admission to the running sleeve.
 
     This is ``rebalance``'s gate loop with the submission removed: three 20k candidates
@@ -499,11 +560,14 @@ def admit(candidates: Sequence[CandidateStructure],
     exactly as ``rebalance``'s ``continue`` did. The concurrent cap ends the sleeve's
     capacity for this pass rather than just this candidate (``rebalance`` used ``break``),
     but the effect is identical: the count only rises, so nothing after it could fit.
+
+    ``breaker`` is required for the same reason it is on ``check_rails``: a standing-down
+    sleeve declines every candidate in the pass, not just the first.
     """
     verdicts: List[RailVerdict] = []
     running = book
     for candidate in candidates:
-        verdict = check_rails(candidate, running, equity, settings)
+        verdict = check_rails(candidate, running, equity, settings, breaker)
         verdicts.append(verdict)
         if verdict.allowed:
             running = verdict.book_after
@@ -526,6 +590,24 @@ def update_breaker(state: BreakerState,
 
     The comparison is the promoted one, ``equity <= peak x (1 - pct/100)``, so exactly
     -20% trips and the arithmetic cannot drift at the boundary.
+
+    **What clears a stand-down: a recovery, and only a recovery.** Once ``halted``, the
+    sleeve stays flat until equity climbs back to within ``BREAKER_REARM_DEPTH_FRACTION``
+    of the trip depth (``-10%`` under a 20% breaker), at which point the latch lifts on
+    its own — no entry required. Three candidate rules were rejected:
+
+    * *the next entry cycle* (what the old docstring said) cannot work now that entry is
+      gated on the latch: it would be a clear that only fires on an entry that only
+      happens after the clear. That is the deadlock, and the module must not ship it.
+    * *a bar/time cool-off* re-arms a sleeve that is still under water. The peak is
+      deliberately KEPT across a re-arm, so such a sleeve trips again on its first
+      managed bar: the same open/flatten cycle, merely slower.
+    * *an operator reset alone* leaves the only exit outside the system. ``rearm()``
+      remains exactly that — an unconditional override — but it is the escape hatch,
+      not the mechanism.
+
+    Recovery is the only condition under which resuming does not immediately re-trip,
+    which is what makes it the right one.
     """
     pct = float(_require(settings, "circuit_breaker_pct"))
 
@@ -539,10 +621,28 @@ def update_breaker(state: BreakerState,
                             "be evaluated this bar", blind=True)
 
     if state.halted:
-        # `_halted` short-circuited manage_open entirely: the flatten happened once.
+        # `_halted` short-circuits manage_open, and it now also declines every entry
+        # (check_rails). It lifts when the drawdown has healed past the re-arm line.
+        rearm_pct = pct * BREAKER_REARM_DEPTH_FRACTION
+        if peak is not None and peak > 0:
+            drawdown = (peak - equity) / peak * 100.0
+            if equity >= peak * (1.0 - rearm_pct / 100.0):
+                return BreakerState(peak, False, False,
+                                    f"sleeve drawdown {drawdown:.2f}% (peak {peak:.2f} "
+                                    f"-> {equity:.2f}) has recovered past the re-arm "
+                                    f"line {rearm_pct:g}% — the circuit-breaker "
+                                    f"stand-down is cleared")
+            return BreakerState(peak, True, False,
+                                f"sleeve is standing down after the circuit breaker — "
+                                f"drawdown {drawdown:.2f}% is still worse than the "
+                                f"{rearm_pct:g}% re-arm line")
+        # An unusable peak makes the recovery test undefined, and undefined must not
+        # read as recovered. Note the ratchet above has already run, so a peak can only
+        # still be non-positive here when equity is too.
         return BreakerState(peak, True, False,
-                            "sleeve is standing down after the circuit breaker — a new "
-                            "entry cycle re-arms it")
+                            f"sleeve is standing down after the circuit breaker — peak "
+                            f"sleeve equity {peak!r} is not positive, so the recovery "
+                            f"that would clear it cannot be measured", blind=True)
 
     if peak is None or peak <= 0:
         return BreakerState(peak, False, False,
@@ -561,7 +661,15 @@ def update_breaker(state: BreakerState,
 
 
 def rearm(state: BreakerState) -> BreakerState:
-    """Clear a circuit-breaker stand-down, as ``rebalance``'s ``self._halted = False`` did.
+    """Clear a circuit-breaker stand-down UNCONDITIONALLY: the operator override.
+
+    This is no longer "what an entry cycle does" — a stand-down now declines entry
+    (``check_rails``) and lifts on its own once the drawdown recovers
+    (``update_breaker``), so a clear driven by entry would be a clear that can never
+    fire. What is left for this function is the deliberate override: the one way out
+    that does not depend on the market, for a sleeve whose equity cannot move because
+    it is flat and alone in its account. Calling it re-risks a sleeve that has not
+    recovered, which is why nothing calls it automatically.
 
     The peak is deliberately KEPT. ``rebalance`` never touched ``_peak_equity``, and
     resetting it would erase the drawdown that caused the stand-down: the sleeve would
@@ -569,7 +677,7 @@ def rearm(state: BreakerState) -> BreakerState:
     trip again.
     """
     return BreakerState(state.peak_equity, False, False,
-                        "circuit-breaker stand-down cleared by a new entry cycle")
+                        "circuit-breaker stand-down cleared by an explicit re-arm")
 
 
 def breaker_signal(state: BreakerState) -> Dict[str, bool]:
