@@ -34,6 +34,14 @@ from .types import WorkerTaskStatus
 
 # Scheduler id of the periodic account/order/transaction reconciliation job.
 ACCOUNT_REFRESH_JOB_ID = "account_refresh_job"
+
+# Scheduler id of the daily ATM-IV sampler that feeds IVRankCondition.
+IV_SNAPSHOT_JOB_ID = "option_iv_snapshot_job"
+# 16:30 America/New_York, Mon-Fri: half an hour after the regular close, so the sample
+# is a settled end-of-day IV rather than a mid-session print. Deliberately a CRON in
+# MARKET time and not an IntervalTrigger -- the series is an unweighted 252-day
+# percentile, so "one sample per trading day" is part of the statistic's definition.
+IV_SNAPSHOT_HOUR, IV_SNAPSHOT_MINUTE = 16, 30
 from .types import AnalysisUseCase
 
 
@@ -230,8 +238,14 @@ class JobManager:
         # Schedule account refresh job
         self._schedule_account_refresh_job()
 
+        # Schedule the daily ATM-IV sampler that feeds IVRankCondition.
+        self._schedule_iv_snapshot_job()
+
         # Watch it for the rest of the process lifetime: losing this job is silent.
         self._start_account_refresh_watchdog()
+
+        # Announce which iv_rank-gated rules are still inert and which are armed.
+        self._report_iv_rank_readiness()
 
         logger.info("JobManager started successfully")
         
@@ -633,6 +647,51 @@ class JobManager:
         except Exception as e:
             logger.error(f"Error scheduling account refresh job: {e}", exc_info=True)
     
+    def _schedule_iv_snapshot_job(self):
+        """Schedule the daily ATM-IV sampler that feeds ``IVRankCondition``.
+
+        A dedicated job rather than a hook inside ``refresh_accounts`` (5-minute
+        interval) or inside rule evaluation (per expert-symbol-subtype, and only daily
+        by accident of ``_parse_schedule`` using ``times[0]``). ``get_iv_rank`` reads an
+        unweighted 252-day window, so anything faster than daily silently reweights the
+        percentile toward the last few days. The recorder is idempotent per UTC day, so
+        a coalesced or manually re-run job is harmless.
+        """
+        try:
+            trigger = CronTrigger(hour=IV_SNAPSHOT_HOUR, minute=IV_SNAPSHOT_MINUTE,
+                                  day_of_week='mon-fri', timezone=_MARKET_TZ)
+            job = self._scheduler.add_job(
+                func=self._execute_iv_snapshot,
+                trigger=trigger,
+                id=IV_SNAPSHOT_JOB_ID,
+                name="Daily ATM-IV Snapshot Job",
+                replace_existing=True,
+                max_instances=1,
+                coalesce=True,
+            )
+            self._scheduled_jobs[IV_SNAPSHOT_JOB_ID] = job
+            logger.info(
+                f"Daily ATM-IV snapshot job scheduled for {IV_SNAPSHOT_HOUR:02d}:"
+                f"{IV_SNAPSHOT_MINUTE:02d} America/New_York, Mon-Fri")
+        except Exception as e:
+            logger.error(f"Error scheduling ATM-IV snapshot job: {e}", exc_info=True)
+
+    def _execute_iv_snapshot(self):
+        """Run the daily ATM-IV recorder."""
+        try:
+            from .TradeManager import get_trade_manager
+            get_trade_manager().record_daily_iv_snapshots()
+        except Exception as e:
+            logger.error(f"Error executing ATM-IV snapshot job: {e}", exc_info=True)
+
+    def _report_iv_rank_readiness(self):
+        """Startup visibility for iv_rank-gated rules (never fatal)."""
+        try:
+            from .TradeManager import get_trade_manager
+            get_trade_manager().report_iv_rank_readiness()
+        except Exception as e:
+            logger.error(f"Error reporting IV-rank readiness: {e}", exc_info=True)
+
     def execute_account_refresh_immediately(self):
         """
         Execute account refresh as an immediate job without blocking the main thread.

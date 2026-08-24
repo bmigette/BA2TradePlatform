@@ -48,8 +48,14 @@ def test_percent_above_recent_low(monkeypatch, mock_account, sample_recommendati
 
 
 def test_iv_rank_condition(mock_account, sample_recommendation):
-    for iv in (0.10, 0.20, 0.30, 0.40, 0.50):
-        mock_account.record_atm_iv("AAPL", iv)
+    # One sample per past day: record_atm_iv is daily-idempotent, so a 5-point series
+    # spans 5 days (that is what the daily recorder produces live).
+    from datetime import datetime, timedelta, timezone
+    from ba2_trade_platform.core.models import OptionIVSnapshot
+    now = datetime.now(timezone.utc)
+    for days_ago, iv in enumerate((0.10, 0.20, 0.30, 0.40, 0.50), start=1):
+        add_instance(OptionIVSnapshot(account_id=mock_account.id, underlying="AAPL",
+                                      atm_iv=iv, recorded_at=now - timedelta(days=days_ago)))
     # current ATM IV (mock) = 0.30 -> rank 40 (2 of 5 below)
     cond = create_condition(ExpertEventType.N_IV_RANK, mock_account, "AAPL",
                             sample_recommendation, operator_str="<=", value=50.0)

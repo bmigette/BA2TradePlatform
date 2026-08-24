@@ -182,20 +182,90 @@ class OptionsAccountInterface(ABC):
         below = sum(1 for v in vals if v < current)
         return round(below / len(vals) * 100, 2)
 
+    @staticmethod
+    def _utc_day_start():
+        """Midnight UTC today — the dedup boundary for the daily ATM-IV sample."""
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def _todays_iv_snapshot_id(self, underlying: str) -> Optional[int]:
+        """Row id of today's (UTC) ATM-IV sample for `underlying`, or None."""
+        from sqlmodel import select
+        from ba2_common.core.db import get_db
+        from ba2_common.core.models import OptionIVSnapshot
+        with get_db() as session:
+            return session.exec(
+                select(OptionIVSnapshot.id).where(
+                    OptionIVSnapshot.account_id == self.id,
+                    OptionIVSnapshot.underlying == underlying,
+                    OptionIVSnapshot.recorded_at >= self._utc_day_start(),
+                ).order_by(OptionIVSnapshot.id)
+            ).first()
+
     def record_atm_iv(self, underlying: str, iv: Optional[float] = None) -> Optional[int]:
-        """Persist one ATM-IV sample for the trailing series. Returns the row id."""
+        """Persist ONE ATM-IV sample per (account, underlying) per UTC calendar day.
+
+        Returns the row id of today's sample (freshly written or pre-existing), or
+        None when no honest ATM IV is available.
+
+        DAILY IDEMPOTENCY IS PART OF THE CONTRACT, NOT THE CALLER'S JOB. The series
+        this feeds is read by ``get_iv_rank`` as an unweighted percentile over a
+        252-day window, so N samples on one day give that day N/252 of the vote. The
+        most natural-looking hook in the codebase (``TradeManager.refresh_accounts``)
+        runs every 5 minutes; wiring the recorder there without this guard would put
+        ~288 rows/day into the window and silently convert a "1-year IV percentile"
+        into a "last-few-days IV percentile" — a live trading gate reading a
+        differently-defined statistic than its name and its rules assume. Enforcing it
+        here means no future caller can reintroduce that. A matching
+        ``UNIQUE(account_id, underlying, date(recorded_at))`` index backs it at the DB
+        level (alembic ``a3f1c07d9e21``); this check also spares the broker call.
+
+        The guard runs BEFORE the IV fetch on purpose: ``get_atm_implied_volatility``
+        is a full option-chain request per symbol, so a re-run of the daily job (or a
+        manual trigger) costs nothing.
+
+        NO FABRICATION. When the chain carries no IV the sample is simply not written
+        and the omission is logged. An invented number here would silently arm nine
+        live option rules with a statistic derived from nothing; a missing row leaves
+        ``IVRankCondition`` failing closed, which is the safe direction.
+        """
         from ba2_common.core.db import add_instance
         from ba2_common.core.models import OptionIVSnapshot
+        from ba2_common.logger import logger
+
+        existing = self._todays_iv_snapshot_id(underlying)
+        if existing is not None:
+            logger.debug(
+                f"ATM-IV sample already recorded today for {underlying} on account "
+                f"{self.id} (row {existing}); skipping")
+            return existing
+
         if iv is None:
             iv = self.get_atm_implied_volatility(underlying)
         if iv is None:
+            logger.warning(
+                f"No ATM implied volatility available for {underlying} on account "
+                f"{self.id} — NO IV sample recorded. Any iv_rank-gated rule for this "
+                f"underlying stays inert (IVRankCondition fails closed).")
             return None
         return add_instance(OptionIVSnapshot(account_id=self.id, underlying=underlying, atm_iv=iv))
 
-    def get_iv_rank(self, underlying: str, lookback_days: int = 252,
-                    min_samples: int = 20) -> Optional[float]:
-        """IV percentile (0-100) over the stored trailing window, or None if
-        insufficient history."""
+    def _iv_series(self, underlying: str, lookback_days: int):
+        """HISTORY: stored ATM-IV samples strictly BEFORE today (UTC), in window.
+
+        Today's own sample is excluded. ``_iv_rank_from_series`` counts strictly ``<``,
+        so a sample equal to (or, after the daily recorder ran, nearly equal to)
+        ``current`` can never count as below it. Including it would therefore bias the
+        rank down by 100/N — 20 whole points at the production min_samples of 5 — and,
+        worse, only for evaluations that happen AFTER the recorder's 16:30 ET run: the
+        same rule on the same tape would score differently in the morning and in the
+        evening. Excluding it makes the series mean one thing ("the trailing days") at
+        every hour, and makes the live definition identical to the backtest override's.
+
+        Not collapsed per day: ``record_atm_iv`` plus the unique index are the single
+        enforcement point for one-sample-per-day. Collapsing here as well would mask a
+        writer that broke that contract instead of letting the duplicate show up.
+        """
         from datetime import datetime, timezone, timedelta
         from sqlmodel import select
         from ba2_common.core.db import get_db
@@ -207,10 +277,45 @@ class OptionsAccountInterface(ABC):
                     OptionIVSnapshot.account_id == self.id,
                     OptionIVSnapshot.underlying == underlying,
                     OptionIVSnapshot.recorded_at >= cutoff,
+                    OptionIVSnapshot.recorded_at < self._utc_day_start(),
                 )
             ).all()
-            series = [r.atm_iv for r in rows]   # read while session is open
-        current = self.get_atm_implied_volatility(underlying)
+            return [r.atm_iv for r in rows]   # read while session is open
+
+    def iv_sample_count(self, underlying: str, lookback_days: int = 252) -> int:
+        """How many trailing ATM-IV samples ``get_iv_rank`` would actually use.
+
+        Exposed so readiness can be REPORTED rather than inferred: "no rank" and
+        "rank of 0" are different facts, and an operator needs to see which
+        underlyings are still short of ``min_samples`` before their rules wake up.
+        Counts exactly what the rank counts (today's sample excluded), so the report
+        cannot say "armed" a day before the gate can actually open.
+        """
+        return len(self._iv_series(underlying, lookback_days))
+
+    def get_iv_rank(self, underlying: str, lookback_days: int = 252,
+                    min_samples: int = 20,
+                    current: Optional[float] = None) -> Optional[float]:
+        """IV percentile (0-100) of the CURRENT ATM IV against the stored trailing
+        window (today's own sample excluded — see ``_iv_series``), or None if fewer
+        than `min_samples` historical points exist.
+
+        None means "not enough data" and is deliberately DISTINCT from 0.0 ("cheapest
+        IV in the window"): ``IVRankCondition`` turns None into a closed gate, whereas
+        0.0 would satisfy every "IV is low" rule.
+
+        `current` may be supplied by a caller that already holds the ATM IV; otherwise
+        it is fetched. Note this is a full option-chain request per call, and
+        ``iv_rank`` is ``trigger_0`` on some live rules (nothing short-circuits ahead of
+        it), so a 30-symbol enter-market pass costs 30 chain fetches per expert. During
+        market hours that fetch is unavoidable — the day's sample has not been recorded
+        yet and a stale IV would be the wrong number — so the parameter exists for
+        callers (the backtest override; any future per-pass memo) that legitimately have
+        it in hand.
+        """
+        series = self._iv_series(underlying, lookback_days)
+        if current is None:
+            current = self.get_atm_implied_volatility(underlying)
         return self._iv_rank_from_series(series, current, min_samples)
 
     # --- Cash / buying-power reserve (short-premium defense-in-depth) -------

@@ -2363,8 +2363,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # reads degrade to empty/None so equity behaviour is unaffected. The two abstract
     # ORDER methods (``_submit_option_order_impl`` / ``close_option_position``) are stubs
     # here — they are implemented in Task 5 — but the class still instantiates (no abstract
-    # method left). ``get_iv_rank`` / ``submit_option_order`` are concrete in the base mixin
-    # and are NOT overridden.
+    # method left). ``submit_option_order`` is concrete in the base mixin and is NOT
+    # overridden; ``get_iv_rank`` IS (see below — the base reads a live-only SQL table).
     # ======================================================================
     def _as_of_date(self):
         """The simulated bar's calendar date (the provider's as-of clamp boundary)."""
@@ -2385,6 +2385,69 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     def get_atm_implied_volatility(self, underlying):
         return None if self._options is None else self._options.get_atm_iv(
             underlying, self._as_of_date())
+
+    #: Spacing of the trailing ATM-IV grid, in calendar days. 1 == every weekday, which
+    #: MATCHES the live recorder (a Mon-Fri cron) so the two compute the same statistic
+    #: over the same sample density. Raise it to trade parity for speed on a very wide
+    #: universe: cost is bounded by the number of DISTINCT (symbol, date) pairs a run
+    #: touches — ~lookback + run length per symbol — because get_atm_iv is memoized
+    #: per (db_path, underlying, as_of) for the life of the worker process, not
+    #: recomputed per bar.
+    IV_RANK_SAMPLE_STEP_DAYS = 1
+
+    def _iv_rank_sample_dates(self, as_of, lookback_days: int):
+        """Weekday grid over the trailing window, EXCLUDING ``as_of`` itself.
+
+        Weekends are skipped because the provider clamps to the latest snapshot on or
+        before a date: a Saturday lookup silently returns Friday's number again, so
+        sampling them would triple-count every Friday. ``as_of`` is excluded because
+        ``_iv_rank_from_series`` counts strictly ``<`` and the memoized provider returns
+        a bit-identical value for the same date — including it would guarantee one
+        sample that can never be below ``current`` and bias every rank down by 100/N
+        (20 points at the production min_samples of 5). Live has the same shape: the
+        stored series is yesterday-and-earlier, ``current`` is a fresh read.
+        """
+        from datetime import timedelta
+        out, day = [], as_of - timedelta(days=lookback_days)
+        step = timedelta(days=max(1, int(self.IV_RANK_SAMPLE_STEP_DAYS)))
+        while day < as_of:
+            if day.weekday() < 5:
+                out.append(day)
+            day += step
+        return out
+
+    def get_iv_rank(self, underlying, lookback_days: int = 252,
+                    min_samples: int = 20, current=None):
+        """OVERRIDE: percentile of today's ATM IV against a provider-derived series.
+
+        The base mixin reads ``option_iv_snapshot`` — a live table keyed by an
+        ``account_id`` FK into ``accountdefinition``, which nothing in a backtest ever
+        writes. Inheriting it meant the rank was always None and every iv_rank rule was
+        silently, permanently False.
+
+        We deliberately do NOT start writing that table. A persisted, accumulating
+        series would make GA trial N depend on trials 1..N-1 (per-trial reproducibility
+        is the point of this platform), it has no as-of notion so it could leak
+        look-ahead, and it would be a write plus a read to recover a number the memoized
+        provider already holds. Building the series from ``self._options`` keeps every
+        sample inside the as-of clamp by construction. The precedent is
+        ``PremiumSeller._update_iv_history``, which seeds its own in-memory series the
+        same way.
+
+        The PERCENTILE MATH is the shared ``_iv_rank_from_series``, so live and backtest
+        cannot drift on what "IV rank 60" means. Returns None (never 0.0) when the
+        provider yields fewer than ``min_samples`` usable points — which is the case on
+        every options cache built before the greeks columns existed, and is exactly what
+        keeps ``IVRankCondition`` failing closed there.
+        """
+        if self._options is None:
+            return None
+        as_of = self._as_of_date()
+        if current is None:
+            current = self._options.get_atm_iv(underlying, as_of)
+        series = [self._options.get_atm_iv(underlying, d)
+                  for d in self._iv_rank_sample_dates(as_of, lookback_days)]
+        return self._iv_rank_from_series(series, current, min_samples)
 
     def get_option_positions(self):
         """Held option positions, derived from OPENED transactions whose entry is an OPTION.

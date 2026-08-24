@@ -330,6 +330,177 @@ class TradeManager:
                 exc_info=True
             )
 
+    # ======================================================================
+    # Daily ATM-IV recorder — the series behind IVRankCondition
+    # ======================================================================
+    def _resolve_options_account(self, account_id: int):
+        """Return ``(AccountDefinition | None, options-capable account | None)``.
+
+        The account is None (having logged why) for a missing definition, an unknown
+        provider, a construction failure, or an equity-only account. Callers here are
+        scheduled jobs, so a single bad account must never abort the pass.
+        """
+        from .interfaces.OptionsAccountInterface import OptionsAccountInterface
+        from ..modules.accounts import get_account_class
+        from .models import AccountDefinition
+
+        try:
+            account_def = get_instance(AccountDefinition, account_id)
+            if account_def is None:
+                self.logger.warning(
+                    f"iv_rank-gated rules reference account {account_id}, which no longer exists")
+                return None, None
+            account_class = get_account_class(account_def.provider)
+            if not account_class:
+                self.logger.warning(
+                    f"No account class for provider {account_def.provider} "
+                    f"(account {account_def.name}); cannot record ATM IV")
+                return account_def, None
+            account = account_class(account_id)
+            if not isinstance(account, OptionsAccountInterface):
+                self.logger.warning(
+                    f"Account {account_def.name} hosts iv_rank-gated rules but is not "
+                    f"options-capable; those rules can never fire")
+                return account_def, None
+            return account_def, account
+        except Exception as e:
+            self.logger.error(
+                f"Could not resolve account {account_id} for ATM-IV recording: {e}",
+                exc_info=True)
+            return None, None
+
+    def record_daily_iv_snapshots(self):
+        """Record ONE trailing ATM-IV sample per iv_rank-gated underlying.
+
+        CADENCE: once per weekday, after the US close (JobManager's
+        ``IV_SNAPSHOT_JOB_ID`` cron). ``get_iv_rank`` is an unweighted percentile over
+        a 252-day window, so the sample GRID is part of the statistic's definition, not
+        an implementation detail: hanging this off the 5-minute account refresh would
+        put ~288 rows/day into the window and quietly redefine "IV rank" as a
+        last-few-days percentile. ``record_atm_iv`` is idempotent per UTC day, so a
+        coalesced/missed run, a manual trigger or an app restart cannot double-sample —
+        this method is safe to call as often as you like.
+
+        WHAT is sampled comes from ``iv_rank_audit.recording_targets()``: only the
+        underlyings of enabled experts that actually have an iv_rank-gated rule. Each
+        symbol costs one full option-chain request, so sampling the whole account
+        universe would be a large daily bill for series nothing reads.
+
+        A symbol whose chain carries no IV is SKIPPED and named in the log. Nothing is
+        ever interpolated, carried forward or defaulted: this table feeds a live
+        trading gate, and a fabricated sample would arm real option rules off invented
+        data. A missing sample leaves ``IVRankCondition`` failing closed instead.
+        """
+        from ba2_common.core.iv_rank_audit import recording_targets
+
+        targets = recording_targets()
+        if not targets:
+            self.logger.debug("No iv_rank-gated rules configured; skipping ATM-IV recording")
+            return
+
+        total_recorded = 0
+        total_missing = 0
+        for account_id, symbols in sorted(targets.items()):
+            account_def, account = self._resolve_options_account(account_id)
+            if account is None:
+                total_missing += len(symbols)
+                continue
+
+            recorded, missing = 0, []
+            for symbol in symbols:
+                try:
+                    if account.record_atm_iv(symbol) is None:
+                        missing.append(symbol)
+                    else:
+                        recorded += 1
+                except Exception as e:
+                    missing.append(symbol)
+                    self.logger.error(
+                        f"[Account {account_def.name}] ATM-IV sampling failed for {symbol}: {e}",
+                        exc_info=True)
+
+            total_recorded += recorded
+            total_missing += len(missing)
+            self.logger.info(
+                f"[Account {account_def.name}] ATM-IV series up to date for "
+                f"{recorded}/{len(symbols)} iv_rank-gated underlying(s)")
+            if missing:
+                self.logger.warning(
+                    f"[Account {account_def.name}] No ATM IV available for "
+                    f"{len(missing)}/{len(symbols)} iv_rank-gated underlying(s): "
+                    f"{', '.join(missing)}. No sample was recorded for them (a rank is "
+                    f"never fabricated), so their iv_rank gates stay CLOSED.")
+
+        if total_recorded == 0 and total_missing > 0:
+            self.logger.error(
+                f"ATM-IV recorder sampled NOTHING ({total_missing} underlying(s) attempted). "
+                f"Every iv_rank-gated rule is permanently inert until this is fixed. Most "
+                f"likely the broker's option feed returns no implied_volatility on the "
+                f"configured feed — check the account's options_feed setting.")
+
+    def report_iv_rank_readiness(self):
+        """Log which iv_rank-gated rules are inert and which are armed.
+
+        Called once at JobManager startup. Nine live rules across seven experts have
+        never been able to fire (no ATM-IV history existed, so ``get_iv_rank`` always
+        returned None and ``IVRankCondition`` always failed closed). Once the recorder
+        has run ``IV_RANK_MIN_SAMPLES`` times they begin placing real orders. That is a
+        deliberate change of behaviour and the operator should read it in the startup
+        log, not infer it from an unexpected fill.
+
+        Deliberately counts samples only — it does NOT compute the rank, because that
+        would fetch a full option chain per symbol on every app start.
+        """
+        from ba2_common.core.iv_rank_audit import find_iv_rank_gates
+        from ba2_common.core.TradeConditions import IVRankCondition
+
+        gates = find_iv_rank_gates()
+        if not gates:
+            return
+
+        min_samples = IVRankCondition.IV_RANK_MIN_SAMPLES
+        self.logger.info(
+            f"IV-rank gate readiness: {len(gates)} enabled expert(s) have iv_rank-gated "
+            f"rules. A gate cannot fire until {min_samples} trailing daily ATM-IV samples "
+            f"exist for its underlying; once they do, those rules start trading.")
+
+        accounts = {}
+        armed_total = 0
+        for gate in gates:
+            if gate.account_id not in accounts:
+                accounts[gate.account_id] = self._resolve_options_account(gate.account_id)[1]
+            account = accounts[gate.account_id]
+            self.logger.info(
+                f"  expert {gate.expert_id} ({gate.expert}) — gated rule(s): "
+                f"{', '.join(gate.rule_names)}")
+            if account is None:
+                self.logger.info(
+                    f"    {len(gate.symbols)} underlying(s) — UNKNOWN (account "
+                    f"{gate.account_id} unavailable; see the warning above)")
+                continue
+
+            counts = {s: account.iv_sample_count(s) for s in gate.symbols}
+            armed = [s for s, c in counts.items() if c >= min_samples]
+            inert = [s for s, c in counts.items() if c < min_samples]
+            armed_total += len(armed)
+            self.logger.info(
+                f"    {len(armed)}/{len(gate.symbols)} underlying(s) ARMED"
+                + (f": {self._sample_list(armed, counts, min_samples)}" if armed else "")
+                + (f"; INERT (iv_rank is None, so the rule cannot fire): "
+                   f"{self._sample_list(inert, counts, min_samples)}" if inert else ""))
+
+        self.logger.info(
+            f"IV-rank gate readiness: {armed_total} underlying(s) armed across "
+            f"{len(gates)} expert(s)")
+
+    @staticmethod
+    def _sample_list(symbols, counts, min_samples, limit: int = 12) -> str:
+        """``AAPL 3/5, MSFT 5/5, ... (+18 more)`` — capped so a 30-name universe stays
+        one readable log line."""
+        head = ", ".join(f"{s} {counts[s]}/{min_samples}" for s in symbols[:limit])
+        extra = len(symbols) - limit
+        return head + (f", (+{extra} more)" if extra > 0 else "")
+
     def _check_all_washtrade_locked_orders(self):
         """Re-submit WASHTRADE_LOCKED orders whose symbol no longer has an opposite-side
         order working at the broker.
