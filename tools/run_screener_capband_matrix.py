@@ -25,6 +25,13 @@ import os
 import subprocess
 import sys
 
+# Sibling helper in tools/ (shared by all three matrix drivers). The directory is put on the
+# path explicitly so the import works however the script is reached (path, -m, or a test import).
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from matrix_flags import cap_passthrough  # noqa: E402
+
 _STORE = r"C:\Users\basti\Documents\ba2\common\cache\screener\metric_store"
 # A real --universe is required by the CLI but is OVERRIDDEN by the screened union when --screener
 # is set; pass the NDQ30 as a harmless placeholder.
@@ -404,10 +411,9 @@ def main() -> int:
             cmd += ["--sizing-mode", args.sizing_mode]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
-        if args.profit_cap_pct and args.profit_cap_pct > 0:
-            cmd += ["--profit-cap-pct", str(args.profit_cap_pct)]
-        if args.profit_share_cap_pct and args.profit_share_cap_pct > 0:
-            cmd += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
+        # "Pass 0 to disable" (see the --profit-cap-pct help): a 0 must be FORWARDED, because
+        # omitting the flag lets ba2test_launcher re-apply its own 2000/25 default instead.
+        cmd += cap_passthrough(args)
         _stress = stress_by_band.get(band, 0.0)
         if _stress > 0:
             cmd += ["--stress-spread-bps", str(_stress)]

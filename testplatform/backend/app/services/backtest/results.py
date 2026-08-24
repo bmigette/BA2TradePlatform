@@ -300,7 +300,81 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         # lets the intraday_drawdown refinement look up delta/underlying bars per trade.
         "contract_symbol": trade.get("contract_symbol"),
         "underlying_symbol": trade.get("underlying_symbol"),
+        # Structure identity + contract size for the profit cap (see _cap_groups /
+        # _deployed_capital): option legs sharing a transaction_id are ONE economic bet, and an
+        # option leg's cost basis is premium x contracts x multiplier. Both are recorded by
+        # ``BacktestAccount.get_round_trip_trades``; absent (None) on the per-FILL fallback
+        # rows, where the equity-shaped ``entry_price * size`` basis is already correct.
+        "transaction_id": trade.get("transaction_id"),
+        "multiplier": trade.get("multiplier"),
     }
+
+
+def _is_option_leg(trade: Dict[str, Any]) -> bool:
+    """True for an OPTION leg row. ``contract_symbol`` is set on every option round-trip
+    ``get_round_trip_trades`` emits (the multi-leg net-only PARENT is dropped there) and is
+    never set for equity, so it is the marker for "premium-quoted, multiplier-scaled"."""
+    return bool(trade.get("contract_symbol"))
+
+
+def _cap_groups(trades: List[Dict[str, Any]]) -> List[List[int]]:
+    """Partition trade INDEXES into the units the profit cap treats as one economic bet.
+
+    Option legs sharing a ``transaction_id`` are ONE structure (a vertical/condor/strangle is a
+    single bet whose legs are meaningless apart). Everything else — equity, and any option leg
+    with no transaction id — is its own group, so the equity path is untouched.
+
+    Equity is excluded from the join ON PURPOSE, even when it shares a transaction with an
+    option leg (a covered call books shares + short call under one transaction): the shares are
+    a separate, unsigned, multiplier-1 cost basis and folding them into a structure's signed net
+    debit would change equity numbers this fix must not move.
+
+    Groups are returned in first-appearance order and their union is exactly ``range(len)``,
+    which is what makes the cap's ``excess`` bookkeeping exact.
+    """
+    groups: List[List[int]] = []
+    slot_of_txn: Dict[Any, int] = {}
+    for i, t in enumerate(trades):
+        txn = t.get("transaction_id")
+        if _is_option_leg(t) and txn is not None:
+            slot = slot_of_txn.get(txn)
+            if slot is None:
+                slot_of_txn[txn] = len(groups)
+                groups.append([i])
+            else:
+                groups[slot].append(i)
+        else:
+            groups.append([i])
+    return groups
+
+
+def _deployed_capital(trade: Dict[str, Any]) -> float:
+    """Dollars of capital this trade put to work — the profit cap's cost basis.
+
+    EQUITY: ``entry_price * size``, unchanged and deliberately UNSIGNED (a short sale's notional
+    is the basis it has always used; nothing about this fix may move an equity number).
+
+    OPTION LEG: premium is quoted PER SHARE while ``size`` counts CONTRACTS, so the contract
+    ``multiplier`` is mandatory — without it the basis was 1/100th of the truth while the P&L it
+    is compared against already carried the x100 (``get_round_trip_trades``:
+    ``gross = (exit-entry) * size * direction * multiplier``), which turned "cap the gain at 20x
+    capital deployed" into "cap it at 20% of it". The multiplier is read off the row (recorded
+    there as the exact value the P&L used) rather than assumed, so the two can never diverge.
+
+    The option value is also SIGNED by direction, so a structure's legs sum to its true NET
+    debit — or, for a credit structure, to a NEGATIVE number. That is not a basis: no capital was
+    deployed, and a credit structure's gain is already bounded by the credit it collected, so the
+    caller's ``cost > 0`` guard leaves it uncapped (stage 2's share cap is what bounds its weight
+    in the book). Taking ``abs()`` there would invent a basis out of the credit and clip a
+    maximum-profit condor.
+    """
+    px = trade.get("entry_price") or 0.0
+    size = trade.get("size") or 0.0
+    if not _is_option_leg(trade):
+        return px * size
+    mult = float(trade.get("multiplier") or 1.0)
+    sign = -1.0 if trade.get("direction") == "sell" else 1.0
+    return px * size * mult * sign
 
 
 def _normalise_direction(value: Any) -> str:
@@ -415,15 +489,26 @@ def _compute_metrics(
     # ~97% of P&L and dominate the fitness, so the GA overfits to one lucky, non-reproducible
     # trade. TWO complementary caps build the ADJUSTED return/calmar (raw metrics untouched; with
     # neither cap set the adjusted values equal the raw ones exactly):
-    #   1. ``profit_cap_pct`` — caps EACH trade's gain at that % of the capital deployed in it
-    #      (cost basis = entry_price x size). Stops a low-priced name's huge %-move from counting.
-    #   2. ``profit_share_cap_pct`` — caps each trade's gain at that % of the run's NET profit, so
-    #      no single trade contributes more than (say) 25% of total return even if its %-on-basis
-    #      is modest. A trade can pass cap #1 (508% of a $14k basis = $69k) yet still be 60% of the
+    #   1. ``profit_cap_pct`` — caps a bet's gain at that % of the capital deployed in it
+    #      (cost basis, see ``_deployed_capital``). Stops a low-priced name's huge %-move counting.
+    #   2. ``profit_share_cap_pct`` — caps a bet's gain at that % of the run's NET profit, so
+    #      no single bet contributes more than (say) 25% of total return even if its %-on-basis
+    #      is modest. A bet can pass cap #1 (508% of a $14k basis = $69k) yet still be 60% of the
     #      book's profit; cap #2 is what bounds THAT. Applied as a single pass against the net
-    #      profit AFTER cap #1 (no iteration — capping the top trade shrinks net, which would spiral
-    #      if re-applied; one pass deducts the dominant trade's excess and is stable/monotone).
+    #      profit AFTER cap #1 (no iteration — capping the top bet shrinks net, which would spiral
+    #      if re-applied; one pass deducts the dominant bet's excess and is stable/monotone).
     # The excess removed by both caps is deducted from final equity to get adjusted_*.
+    #
+    # THE UNIT OF ACCOUNT IS THE BET (``_cap_groups``), NOT THE TRADE ROW. Option round-trips are
+    # recorded PER LEG (``get_round_trip_trades`` keys on (transaction_id, contract_symbol)), but a
+    # multi-leg structure is ONE economic bet: capping its legs independently clipped the winning
+    # leg while leaving the losing leg untouched, so an iron condor at MAXIMUM PROFIT booked a
+    # NEGATIVE adjusted return. Option legs are therefore re-joined on ``transaction_id`` and both
+    # stages act on the structure's NET P&L; the capped total is then spread back over the legs
+    # pro-rata for the per-trade quality metrics. BOTH stages use the same grouping — mixing units
+    # between them would let a 4-leg structure claim 4 x the share cap, and would make ``excess``
+    # (which is accumulated once per GROUP) incoherent. Equity trades are always their own group,
+    # so every equity number is bit-for-bit what it was before structures existed.
     cap_pct = config.get("profit_cap_pct")
     share_cap_pct = config.get("profit_share_cap_pct")
     has_basis_cap = cap_pct is not None and float(cap_pct) > 0
@@ -440,37 +525,55 @@ def _compute_metrics(
     adjusted_sqn = sqn
     if has_basis_cap or has_share_cap:
         cap_frac = (float(cap_pct) / 100.0) if has_basis_cap else None
-        # Stage 1 — per-trade basis cap (cp1 == raw pnl when cap #1 is off).
+        # One group per BET: a multi-leg option structure's legs together, else the single trade.
+        groups = _cap_groups(trades)
+        # Stage 1 — per-STRUCTURE basis cap (cp1 == the group's raw net pnl when cap #1 is off).
+        raw: List[float] = []
         cp1: List[float] = []
-        for t in trades:
-            p = t.get("pnl") or 0.0
+        for idxs in groups:
+            p = sum((trades[i].get("pnl") or 0.0) for i in idxs)
+            raw.append(p)
             if has_basis_cap:
-                cost = (t.get("entry_price") or 0.0) * (t.get("size") or 0.0)
+                cost = sum(_deployed_capital(trades[i]) for i in idxs)
                 cp1.append(min(p, cost * cap_frac) if (p > 0 and cost > 0) else p)
             else:
                 cp1.append(p)
-        # Stage 2 — portfolio-share cap: bound each trade at share% of NET profit after stage 1.
+        # Stage 2 — portfolio-share cap: bound each BET at share% of NET profit after stage 1.
         # Only meaningful when the book is net-profitable; for a net-losing run "% of total return"
-        # is undefined, so we skip it (leaving cp1 as the adjusted pnls).
+        # is undefined, so we skip it (leaving cp1 as the adjusted pnls). The grouping does not
+        # move this denominator: the groups PARTITION the trades, so sum(cp1) is still the whole
+        # book's post-stage-1 net profit.
         share_abs = None
         if has_share_cap:
             net_after_basis = sum(cp1)
             if net_after_basis > 0:
                 share_abs = (float(share_cap_pct) / 100.0) * net_after_basis
         excess = 0.0
-        adj_pnls: List[float] = []
-        adj_pcts: List[float] = []
-        for t, p1 in zip(trades, cp1):
-            p = t.get("pnl") or 0.0
+        # Indexed (not appended) so the adjusted per-trade series stays in TRADE order no matter
+        # how the legs were grouped.
+        adj_pnls: List[float] = [0.0] * len(trades)
+        adj_pcts: List[float] = [0.0] * len(trades)
+        for idxs, p, p1 in zip(groups, raw, cp1):
             cp = p1
             if share_abs is not None and cp > share_abs:
                 cp = share_abs
+            # Accumulated ONCE PER GROUP against the group's RAW net P&L, so a capped structure's
+            # excess is neither multiplied by its leg count nor lost. Because the groups partition
+            # the trades, sum(excess) == sum(raw pnl) - sum(adjusted pnl) exactly.
             excess += max(0.0, p - cp)
-            adj_pnls.append(cp)
             # pnl_pct is equity-relative (pnl / equity_at_entry); scale it by the same factor the
-            # dollar pnl was capped so best/worst/expectancy reflect the capped trade.
-            pct = t.get("pnl_pct") or 0.0
-            adj_pcts.append(pct * (cp / p) if p else pct)
+            # dollar pnl was capped so best/worst/expectancy reflect the capped trade. For a
+            # multi-leg structure the SAME ratio is applied to every leg, so the legs still sum to
+            # the structure's capped total and each leg keeps its own sign (winner vs loser).
+            ratio = (cp / p) if p else 1.0
+            if len(idxs) == 1:
+                i = idxs[0]
+                adj_pnls[i] = cp  # exact, not p * (cp/p) — keeps single-trade results bit-identical
+                adj_pcts[i] = (trades[i].get("pnl_pct") or 0.0) * ratio
+            else:
+                for i in idxs:
+                    adj_pnls[i] = (trades[i].get("pnl") or 0.0) * ratio
+                    adj_pcts[i] = (trades[i].get("pnl_pct") or 0.0) * ratio
         adj_final = final - excess
         adjusted_total_return = ((adj_final - initial) / initial * 100.0) if initial else 0.0
         adjusted_annualized_return = _annualized_return(initial, adj_final, years)
