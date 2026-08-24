@@ -16,6 +16,17 @@ from typing import Any, List, Optional, Tuple
 from ba2_common.core.option_types import OptionContract, OptionQuote, OptionLeg, OptionPosition
 from ba2_common.core.types import OptionRight
 
+#: Marker carried by EVERY assignment-capacity refusal, so it can be told apart from a
+#: buying-power refusal at a glance and with one grep.
+#:
+#: The two have DIFFERENT REMEDIES and conflating them wastes an afternoon. A
+#: buying-power refusal is about the RESERVE POOL: it frees up by closing (or repairing
+#: the ``option_reserve`` of) *any* reserving structure — a bear call spread will do —
+#: or by adding margin. A capacity refusal is about CASH FOR DELIVERY: nothing but
+#: closing a SHORT PUT or funding the account moves it, and closing that bear call
+#: spread does precisely nothing. Neither message uses the other's vocabulary.
+ASSIGNMENT_CAPACITY_REFUSAL = "ASSIGNMENT CAPACITY"
+
 #: Contracts below this are "flat". Order quantities are whole contracts, but they
 #: arrive as floats off ``filled_qty`` and are summed, so an exact ``== 0`` test would
 #: eventually be defeated by float addition.
@@ -58,6 +69,28 @@ class AssignmentExposure:
     @property
     def is_measurable(self) -> bool:
         return self.cost is not None
+
+
+@dataclass(frozen=True)
+class AssignmentCapacity:
+    """A capacity verdict WITH the reason it was reached.
+
+    ``check_assignment_capacity`` answers yes/no, which is all a gate needs but not all
+    an OPERATOR needs: "refused" and "refused because order 41's strike is missing" send
+    someone to two different places. ``reason`` is empty when ``ok``; otherwise it is a
+    complete sentence carrying ``ASSIGNMENT_CAPACITY_REFUSAL`` and naming the input that
+    is missing or the money that is short.
+
+    The figures are reported even when the verdict is a refusal, and each is ``None``
+    exactly when it could not be measured — an unknown must not arrive as a zero here
+    either.
+    """
+    ok: bool
+    reason: str = ""
+    held_cost: Optional[float] = None
+    candidate_cost: Optional[float] = None
+    cash: Optional[float] = None
+    unmeasurable: Tuple[str, ...] = ()
 
 
 class OptionsAccountInterface(ABC):
@@ -602,9 +635,20 @@ class OptionsAccountInterface(ABC):
         x100, and the collected premium already sits in the account's cash where it
         offsets the requirement (callers reserve/margin the bracket only). ``spot``
         is used when known; without it, falls back to ``0.20*strike*100`` (OTM term
-        dropped) — still ~5x cheaper than the old full strike*100 cash proxy."""
+        dropped) — still ~5x cheaper than the old full strike*100 cash proxy.
+
+        An UNUSABLE ``strike`` raises. It used to answer ``0.0``, which is a margin
+        requirement of nothing on a NAKED short — the most fail-open answer in this
+        file, and one that ``check_option_buying_power(0.0)`` passes unconditionally.
+        ``<= 0`` counts as unusable alongside ``None`` because no listed equity option
+        has a strike of zero: it is an unpopulated field, exactly as
+        ``option_lifecycle.put_assignment_cost`` already treats it."""
         if strike is None or strike <= 0:
-            return 0.0
+            raise ValueError(
+                f"naked_margin_per_contract(strike={strike!r}): a naked short's margin "
+                f"cannot be computed from a missing or non-positive strike, and it must "
+                f"not be reported as 0.0 — a zero requirement passes every "
+                f"buying-power gate on a position with unbounded risk.")
         if spot is None or spot <= 0:
             return cls.NAKED_MARGIN_FRACTION * strike * 100.0
         if option_type == OptionRight.CALL:
@@ -660,7 +704,33 @@ class OptionsAccountInterface(ABC):
         could never refuse: ``check_option_buying_power(0.0)`` always passes. A capital
         requirement we do not know is not a capital requirement of nothing. The
         strategies that genuinely need no reserve are enumerated in
-        ``ZERO_RESERVE_STRATEGIES`` and answer 0.0 by name."""
+        ``ZERO_RESERVE_STRATEGIES`` and answer 0.0 by name.
+
+        A **known** strategy whose SIZING INPUT is missing raises for the same reason.
+        Six branches below used to answer ``0.0`` when the strike / spread width / net
+        credit they price with was ``None`` — the identical fail-open one layer in, and
+        arguably worse, because the strategy was recognised and looked priced. A
+        ``cash_secured_put`` that arrived without a strike reserved nothing and was
+        therefore affordable at any size on any account. A non-positive STRIKE counts as
+        missing too (no listed equity option has one). The only zeros left are the two
+        legitimate ones — ``quantity <= 0``, and ``ZERO_RESERVE_STRATEGIES`` by name —
+        plus a genuinely COMPUTED zero (a credit at least as wide as the spread has no
+        max loss to set aside), which is arithmetic rather than an absent field."""
+        def _require(**inputs):
+            """Refuse a priced branch whose sizing input is absent (or, for a strike,
+            non-positive). Named per field so the error says which one to go and fix."""
+            for field, value in inputs.items():
+                if value is None:
+                    raise ValueError(
+                        f"option_reserve_required({strategy!r}): {field} is missing, so "
+                        f"the capital this structure must set aside is UNKNOWN — and an "
+                        f"unknown requirement must not be reported as zero (a zero "
+                        f"reserve passes every buying-power gate).")
+                if field == "strike" and value <= 0:
+                    raise ValueError(
+                        f"option_reserve_required({strategy!r}): strike is {value!r}. No "
+                        f"listed equity option has a non-positive strike, so this is an "
+                        f"unpopulated field, and pricing it would reserve nothing.")
         # Validated BEFORE the quantity short-circuit: an unrecognised strategy is a
         # code defect, and a defect does not stop being one at size zero.
         if (strategy not in cls.ZERO_RESERVE_STRATEGIES
@@ -678,18 +748,15 @@ class OptionsAccountInterface(ABC):
         if strategy == "cash_secured_put":
             # A CSP is fully cash-secured by definition (the cash to buy the assigned
             # shares is set aside): reserve the full assignment cost.
-            if strike is None:
-                return 0.0
+            _require(strike=strike)
             return strike * 100.0 * quantity
         if strategy in ("bear_call_spread", "credit_spread"):
-            if spread_width is None or net_credit is None:
-                return 0.0
+            _require(spread_width=spread_width, net_credit=net_credit)
             max_loss = (spread_width - net_credit)
             return max(0.0, max_loss) * 100.0 * quantity
         if strategy in ("short_straddle", "short_strangle", "naked_put"):
             # NAKED short premium: reserve the Reg-T naked-option margin, not full cash.
-            if strike is None:
-                return 0.0
+            _require(strike=strike)
             if strategy == "short_straddle":
                 # Both a short call AND a short put at the SAME strike: reserve the
                 # worst-case leg (only one side can finish ITM; Reg-T charges the greater).
@@ -713,8 +780,7 @@ class OptionsAccountInterface(ABC):
             # cost_basis=$859,050 == 30 * (290*100 - 3.65*100) = 30 * 28,635. The previous formula
             # (naked_margin_per_contract on the short strike alone) reserved only ~$3,289/contract
             # for the same order -- an ~8.7x underestimate.
-            if strike is None:
-                return 0.0
+            _require(strike=strike)
             credit = net_credit if net_credit is not None else 0.0
             per_contract = strike * 100.0 - credit * 100.0
             return max(0.0, per_contract) * quantity
@@ -734,14 +800,12 @@ class OptionsAccountInterface(ABC):
             # entirely) reserved only ~$3,289 for that same order -- a ~10x underestimate that
             # would silently let the platform think a position is affordable when Alpaca will
             # actually reject it.
-            if strike is None or spread_width is None:
-                return 0.0
+            _require(strike=strike, spread_width=spread_width)
             credit = net_credit if net_credit is not None else 0.0
             per_contract = strike * 100.0 + spread_width * 100.0 - credit * 100.0
             return max(0.0, per_contract) * quantity
         if strategy in ("iron_condor", "call_butterfly", "debit_spread"):
-            if spread_width is None:
-                return 0.0
+            _require(spread_width=spread_width)
             credit = net_credit if net_credit is not None else 0.0
             return max(0.0, (spread_width - credit)) * 100.0 * quantity
         # Unreachable while RESERVING_STRATEGIES and the branches above agree. It is a
@@ -1019,8 +1083,12 @@ class OptionsAccountInterface(ABC):
             return AssignmentExposure(None, contracts, tuple(blind))
         return AssignmentExposure(cost, contracts, ())
 
-    def check_assignment_capacity(self, additional_cost: float) -> bool:
+    def assignment_capacity(self, additional_cost: float) -> "AssignmentCapacity":
         """Could this account still take delivery after adding ``additional_cost``?
+
+        THE decision, with its reason. ``check_assignment_capacity`` is the yes/no view
+        of this same method, so the gate and the message a refusal carries can never
+        disagree about why.
 
         Measured against the BALANCE, never against ``available_option_buying_power()``:
         the reserve pool has already subtracted the very CSP strikes this total is
@@ -1037,11 +1105,73 @@ class OptionsAccountInterface(ABC):
         negative ``additional_cost`` (which would buy capacity nobody funded).
         """
         if additional_cost is None or additional_cost < 0:
-            return False
+            return AssignmentCapacity(
+                False,
+                f"{ASSIGNMENT_CAPACITY_REFUSAL}: the delivery cost of this structure is "
+                f"{additional_cost!r} — an unknown or negative cost cannot be admitted "
+                f"(a negative one would BUY capacity nobody funded).")
         exposure = self.short_put_assignment_exposure()
         if not exposure.is_measurable:
-            return False
+            return AssignmentCapacity(
+                False,
+                f"{ASSIGNMENT_CAPACITY_REFUSAL}: what this account already owes on "
+                f"assignment cannot be measured, so whether it could take delivery of "
+                f"one more short put is unknown — and unknown is not 'fine'. "
+                + "; ".join(exposure.unmeasurable),
+                candidate_cost=additional_cost,
+                unmeasurable=exposure.unmeasurable)
         cash = self.get_balance()
         if cash is None:
-            return False
-        return exposure.cost + additional_cost <= cash
+            return AssignmentCapacity(
+                False,
+                f"{ASSIGNMENT_CAPACITY_REFUSAL}: the account balance could not be read, "
+                f"so the cash available to take delivery on "
+                f"{exposure.contracts:g} open short put contract(s) "
+                f"(costing {exposure.cost:,.2f}) is unknown.",
+                held_cost=exposure.cost,
+                candidate_cost=additional_cost)
+        ok = exposure.cost + additional_cost <= cash
+        reason = "" if ok else (
+            f"{ASSIGNMENT_CAPACITY_REFUSAL}: this account could not take delivery. "
+            f"Assignment of every open short put would cost "
+            f"{exposure.cost + additional_cost:,.2f} "
+            f"({exposure.cost:,.2f} for the {exposure.contracts:g} contract(s) already "
+            f"open + {additional_cost:,.2f} for this structure) against {cash:,.2f} of "
+            f"cash. Close a short put or fund the account — the reserve pool is a "
+            f"separate budget and repairing it will not help.")
+        return AssignmentCapacity(ok, reason, held_cost=exposure.cost,
+                                  candidate_cost=additional_cost, cash=cash)
+
+    def check_assignment_capacity(self, additional_cost: float) -> bool:
+        """Yes/no form of :meth:`assignment_capacity` — see it for the whole contract."""
+        return self.assignment_capacity(additional_cost).ok
+
+    def check_short_put_assignment_capacity(
+        self, *, strike: Optional[float], contracts: Optional[float],
+        multiplier: Optional[int] = 100,
+    ) -> "AssignmentCapacity":
+        """Capacity verdict for a CANDIDATE short put, priced from its LEG facts.
+
+        The entry point every credit builder uses. It takes the leg (strike, how many
+        contracts, the multiplier) rather than a dollar figure so no caller can fork the
+        arithmetic: the price comes from ``option_lifecycle.put_assignment_cost``, the
+        single definition the pure rail and the account-wide exposure already share.
+
+        THE CANDIDATE IS INCLUDED IN THE SUM, which is the entire point — admitting the
+        fifth short put because the first four fit is the defect this gate exists for.
+
+        A candidate that cannot be priced REFUSES and says which field was missing. A
+        structure whose delivery cost we cannot compute is not a structure that costs
+        nothing.
+        """
+        from ba2_common.core.option_lifecycle import put_assignment_cost
+
+        cost = put_assignment_cost(strike, contracts, multiplier)
+        if cost is None:
+            return AssignmentCapacity(
+                False,
+                f"{ASSIGNMENT_CAPACITY_REFUSAL}: this structure's delivery cost cannot "
+                f"be priced from strike={strike!r}, contracts={contracts!r}, "
+                f"multiplier={multiplier!r} — an unpriceable obligation must not be "
+                f"admitted as a free one.")
+        return self.assignment_capacity(cost)
