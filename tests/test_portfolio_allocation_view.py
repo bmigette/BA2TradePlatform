@@ -13,9 +13,23 @@ from ba2_trade_platform.core.portfolio_allocation import (
 from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
     DEFAULT_MACHINE_LABEL_FAMILIES, GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT,
     GATE_OK, LEGACY_MACHINE_LABEL_FAMILIES,
+    EDIT_BLANK, EDIT_LABELS_OVER_100, EDIT_NEGATIVE, EDIT_NOT_A_NUMBER, EDIT_OK,
+    EDIT_OVER_100,
     ManagedLabel, build_label_views, collect_managed_symbols, diff_managed_labels,
     evaluate_gate, expert_shortname_families, filter_selectable_labels, is_machine_label,
-    managed_total_value, missing_quote_symbols, picker_options, positions_by_symbol,
+    managed_total_value, missing_quote_symbols, parse_pct, picker_options,
+    DEFAULT_LABEL_ICON_COLOR, LABEL_COLOR_PALETTE, LABEL_STATUS_NONE,
+    LABEL_STATUS_OK, LABEL_STATUS_OVER, LABEL_STATUS_TOLERANCE_PCT,
+    LABEL_STATUS_UNDER, LabelView, NO_LABEL_COLOR,
+    bar_scale_pct, build_label_bars, format_allocation_footer,
+    sort_label_views,
+    format_label_header, format_label_target_tooltip, format_label_total_notice,
+    format_reserve_caption,
+    format_reserve_row,
+    label_color_options, normalise_label_color, resolve_label_icon_color,
+    store_color_value,
+    positions_by_symbol, reserve_dollars, symbol_target_values,
+    validate_label_target_edit, validate_reserve_edit, validate_symbol_weight_edit,
 )
 
 
@@ -1380,3 +1394,936 @@ def test_no_reserve_leaves_every_target_value_exactly_where_it_was():
                               valuation_mode=VALUATION_MODE_MARKET,
                               base_notional=10_000.0)
     assert views[0].target_value == 4_000.0
+
+
+# ---------------------------------------------------------------------------
+# INLINE TARGET EDITING -- the page itself is now where targets are set, so the
+# validation that used to live behind the Allocate wizard has to exist here as a
+# pure, testable decision. Every target box on the page goes through these.
+# ---------------------------------------------------------------------------
+
+def test_parse_pct_reads_a_plain_number():
+    edit = parse_pct(42.5)
+    assert edit.accepted is True
+    assert edit.value == 42.5
+    assert edit.reason_code == EDIT_OK
+
+
+def test_parse_pct_reads_a_typed_string_with_its_percent_sign():
+    """``ui.number`` normally yields a float, but a Quasar input can hand back the
+    raw string it is holding -- and the box carries ``suffix='%'``."""
+    assert parse_pct(' 42.5 % ').value == 42.5
+
+
+def test_parse_pct_refuses_a_blank_box_rather_than_calling_it_zero():
+    """Clearing a ``ui.number`` yields None. Persisting that as 0.0 would tell the
+    engine to hold NONE of this label -- a sell order from a cleared box."""
+    edit = parse_pct(None)
+    assert edit.accepted is False
+    assert edit.reason_code == EDIT_BLANK
+    assert edit.value is None
+
+
+def test_parse_pct_refuses_an_empty_string_for_the_same_reason():
+    assert parse_pct('').reason_code == EDIT_BLANK
+    assert parse_pct('   ').reason_code == EDIT_BLANK
+
+
+def test_parse_pct_refuses_text():
+    edit = parse_pct('abc')
+    assert edit.accepted is False
+    assert edit.reason_code == EDIT_NOT_A_NUMBER
+
+
+def test_parse_pct_itself_carries_no_message_because_it_knows_no_box():
+    """The wording names the box ('label ARK26', 'ARK26 / AAPL', 'the unallocated
+    reserve'), so it belongs to the three validators, not to the number reader."""
+    assert parse_pct('abc').message == ''
+    assert parse_pct(None).message == ''
+
+
+def test_the_named_validators_quote_the_text_that_was_refused():
+    """'That is not a number' without saying WHICH is a message the user cannot act
+    on -- especially on a page holding one box per label plus one per symbol."""
+    assert 'abc' in validate_symbol_weight_edit(label='ARK26', symbol='AAPL',
+                                                raw='abc').message
+    assert 'AAPL' in validate_symbol_weight_edit(label='ARK26', symbol='AAPL',
+                                                 raw='abc').message
+    assert 'abc' in validate_label_target_edit(label='ARK26', raw='abc',
+                                               other_targets={}).message
+    assert 'ARK26' in validate_label_target_edit(label='ARK26', raw='abc',
+                                                 other_targets={}).message
+
+
+def test_parse_pct_refuses_a_bool_which_python_would_otherwise_read_as_a_number():
+    """``float(True)`` is 1.0 and ``isinstance(True, int)`` is True, so a checkbox
+    wired to the wrong handler would silently store a 1% target."""
+    assert parse_pct(True).reason_code == EDIT_NOT_A_NUMBER
+    assert parse_pct(False).reason_code == EDIT_NOT_A_NUMBER
+
+
+def test_parse_pct_refuses_nan_and_infinity():
+    """``float('nan') < 0`` and ``float('nan') > 100`` are BOTH False, so a bare
+    range check waves NaN straight through and every derived figure becomes NaN."""
+    assert parse_pct(float('nan')).reason_code == EDIT_NOT_A_NUMBER
+    assert parse_pct(float('inf')).reason_code == EDIT_NOT_A_NUMBER
+    assert parse_pct(float('-inf')).reason_code == EDIT_NOT_A_NUMBER
+    assert parse_pct('nan').reason_code == EDIT_NOT_A_NUMBER
+
+
+def test_parse_pct_does_not_range_check_it_only_reads_the_number():
+    """The range belongs to the three validators, which disagree about it: the
+    reserve uses the ENGINE's message, a label target also has to fit under 100
+    alongside its siblings, and a symbol weight is only bounded 0-100."""
+    assert parse_pct(140.0).accepted is True
+    assert parse_pct(-5.0).accepted is True
+
+
+# -- one symbol's weight within its label ------------------------------------
+
+def test_a_symbol_weight_edit_accepts_a_number_in_range():
+    edit = validate_symbol_weight_edit(label='ARK26', symbol='AAPL', raw=62.5)
+    assert edit.accepted is True
+    assert edit.value == 62.5
+
+
+def test_a_symbol_weight_edit_refuses_a_negative_weight():
+    edit = validate_symbol_weight_edit(label='ARK26', symbol='AAPL', raw=-1.0)
+    assert edit.accepted is False
+    assert edit.reason_code == EDIT_NEGATIVE
+    assert 'AAPL' in edit.message
+
+
+def test_a_symbol_weight_edit_refuses_more_than_100():
+    edit = validate_symbol_weight_edit(label='ARK26', symbol='AAPL', raw=101.0)
+    assert edit.accepted is False
+    assert edit.reason_code == EDIT_OVER_100
+    assert 'AAPL' in edit.message
+
+
+def test_a_symbol_weight_of_exactly_zero_or_exactly_100_is_legal():
+    """0 is an explicit "hold none of this" and 100 is a single-symbol label."""
+    assert validate_symbol_weight_edit(label='A', symbol='X', raw=0.0).accepted is True
+    assert validate_symbol_weight_edit(label='A', symbol='X', raw=100.0).accepted is True
+
+
+def test_a_symbol_weight_edit_refuses_a_blank_box():
+    assert validate_symbol_weight_edit(label='A', symbol='X', raw=None).reason_code == EDIT_BLANK
+
+
+# -- one label's own target, against its siblings ----------------------------
+
+def test_a_label_target_edit_accepts_a_set_that_still_fits_under_100():
+    edit = validate_label_target_edit(label='ARK26', raw=40.0,
+                                      other_targets={'HighRisk': 50.0})
+    assert edit.accepted is True
+    assert edit.value == 40.0
+
+
+def test_a_label_target_edit_accepts_a_set_that_lands_exactly_on_100():
+    edit = validate_label_target_edit(label='ARK26', raw=50.0,
+                                      other_targets={'HighRisk': 50.0})
+    assert edit.accepted is True
+
+
+def test_a_label_target_edit_refuses_a_set_that_would_pass_100():
+    """THE guard the Allocate wizard has always had, now on the inline path too.
+    Without it the page persists a set the engine will refuse, and the user only
+    finds out at the dry run."""
+    edit = validate_label_target_edit(label='ARK26', raw=60.0,
+                                      other_targets={'HighRisk': 50.0})
+    assert edit.accepted is False
+    assert edit.reason_code == EDIT_LABELS_OVER_100
+    assert 'ARK26' in edit.message
+    assert '110.00' in edit.message              # the total
+    assert '10.00' in edit.message               # the overshoot
+
+
+def test_a_label_target_edit_uses_the_engines_own_over_100_sentence():
+    """One rule, one wording: the inline refusal must quote the same sentence
+    ``validate_label_targets`` produces, or the page and the dry run describe the
+    same defect in two ways."""
+    from ba2_trade_platform.core.portfolio_allocation import ERROR_LABEL_TOTAL_FMT
+
+    edit = validate_label_target_edit(label='ARK26', raw=60.0,
+                                      other_targets={'HighRisk': 50.0})
+    assert ERROR_LABEL_TOTAL_FMT.format(total=110.0, over=10.0) in edit.message
+
+
+def test_a_label_target_edit_shares_the_engines_tolerance():
+    """``LABEL_TOTAL_TOLERANCE_PCT`` is 0.01pp and the two-decimal splits the page
+    offers land a hair either side of 100. An inline guard with no tolerance would
+    refuse a set the engine accepts."""
+    from ba2_trade_platform.core.portfolio_allocation import LABEL_TOTAL_TOLERANCE_PCT
+
+    just_inside = 100.0 + LABEL_TOTAL_TOLERANCE_PCT / 2.0
+    assert validate_label_target_edit(label='A', raw=just_inside,
+                                      other_targets={}).accepted is True
+    assert validate_label_target_edit(label='A', raw=100.0 + 1.0,
+                                      other_targets={}).accepted is False
+
+
+def test_a_label_target_edit_ignores_the_labels_OWN_previous_value():
+    """``other_targets`` is the OTHER labels. Counting the label being edited twice
+    would make lowering an over-target label impossible."""
+    edit = validate_label_target_edit(label='ARK26', raw=30.0,
+                                      other_targets={'ARK26': 90.0, 'HighRisk': 50.0})
+    assert edit.accepted is True
+
+
+def test_a_label_target_edit_allows_a_set_that_is_UNDER_100():
+    """Under 100 is an error at SUBMIT, not at edit time: the user has to be able
+    to pass through 40/0 on the way to 40/60."""
+    assert validate_label_target_edit(label='A', raw=40.0, other_targets={'B': 0.0}) \
+        .accepted is True
+
+
+def test_a_label_target_edit_refuses_a_negative_and_a_blank():
+    assert validate_label_target_edit(label='A', raw=-1.0,
+                                      other_targets={}).reason_code == EDIT_NEGATIVE
+    assert validate_label_target_edit(label='A', raw=None,
+                                      other_targets={}).reason_code == EDIT_BLANK
+
+
+def test_a_label_target_edit_refuses_over_100_even_with_no_siblings():
+    """The plain box message, not the "lower another label first" one: there IS no
+    other label to lower, and telling the user to go and do that is a dead end."""
+    edit = validate_label_target_edit(label='A', raw=140.0, other_targets={})
+    assert edit.accepted is False
+    assert edit.reason_code == EDIT_OVER_100
+    assert 'Lower another label' not in edit.message
+
+
+def test_a_symbol_weight_edit_shares_the_engines_tolerance_too():
+    """``validate_symbol_weights`` measures the label total at 0.01pp, so a lone
+    symbol at 100.005 is engine-legal and must not be refused on the way in."""
+    from ba2_trade_platform.core.portfolio_allocation import LABEL_TOTAL_TOLERANCE_PCT
+
+    just_inside = 100.0 + LABEL_TOTAL_TOLERANCE_PCT / 2.0
+    assert validate_symbol_weight_edit(label='A', symbol='X',
+                                       raw=just_inside).accepted is True
+    assert validate_symbol_weight_edit(label='A', symbol='X', raw=101.0).accepted is False
+
+
+# -- the cash reserve --------------------------------------------------------
+
+def test_a_reserve_edit_accepts_both_ends_of_the_range():
+    """100% is a legitimate setting: allocate nothing this cycle."""
+    assert validate_reserve_edit(0.0).accepted is True
+    assert validate_reserve_edit(100.0).accepted is True
+    assert validate_reserve_edit(100.0).value == 100.0
+
+
+def test_a_reserve_edit_quotes_the_engines_own_range_sentence():
+    from ba2_trade_platform.core.portfolio_allocation import validate_unallocated_pct
+
+    edit = validate_reserve_edit(140.0)
+    assert edit.accepted is False
+    assert edit.message == validate_unallocated_pct(140.0)[0]
+
+
+def test_a_reserve_edit_refuses_a_negative_which_would_INFLATE_the_base():
+    edit = validate_reserve_edit(-20.0)
+    assert edit.accepted is False
+    assert '-20' in edit.message
+
+
+def test_a_reserve_edit_refuses_a_blank_and_a_nan():
+    assert validate_reserve_edit(None).reason_code == EDIT_BLANK
+    assert validate_reserve_edit(float('nan')).reason_code == EDIT_NOT_A_NUMBER
+
+
+# ---------------------------------------------------------------------------
+# LIVE DERIVED FIGURES
+#
+# Inline editing is only worth having if the CONSEQUENCE of an edit is visible
+# immediately, so the label header line and the symbol table's TARGET VALUE column
+# are built by pure functions with two callers each: the first render, and the
+# in-place update after a box changes. One formatter, so a typed number and a
+# reloaded page can never disagree.
+# ---------------------------------------------------------------------------
+
+def test_the_label_header_names_the_PORTFOLIO_target_not_just_a_target():
+    """7a: two different quantities were both called "target" -- the label's share
+    of the PORTFOLIO (0.0%) and a symbol's share of ITS LABEL (20). Both numbers
+    were right; neither said its denominator, and the user asked why one said 0
+    while the column beside it said 20."""
+    text = format_label_header(label='ARK26', current_value=9_000.0, target_pct=50.0,
+                               pct_of_base=90.0, pct_of_total=100.0,
+                               base_notional=10_000.0, unallocated_pct=10.0)
+    assert text == 'ARK26 — $9,000.00 (90.0% of base, portfolio target 45.0%)'
+
+
+def test_the_label_header_states_the_target_on_the_SAME_scale_as_the_holding():
+    """The holding is a share of the GROSS base; the stored target is a share of
+    what the reserve LEFT. Printed side by side untranslated they invite a
+    comparison that is false whenever there is a reserve, so the header restates the
+    target through ``effective_target_pct``."""
+    text = format_label_header(label='A', current_value=4_500.0, target_pct=50.0,
+                               pct_of_base=45.0, pct_of_total=100.0,
+                               base_notional=10_000.0, unallocated_pct=10.0)
+    assert '45.0% of base' in text
+    assert 'portfolio target 45.0%' in text
+
+
+def test_the_label_header_no_longer_repeats_the_reserve_clause_on_every_row():
+    """It was identical on all eight rows and made the line ~100 characters. The
+    information moved to the tooltip; it did not go away."""
+    text = format_label_header(label='A', current_value=1.0, target_pct=50.0,
+                               pct_of_base=1.0, pct_of_total=1.0,
+                               base_notional=10_000.0, unallocated_pct=10.0)
+    assert 'what the reserve leaves' not in text
+    assert len(text) < 70
+
+
+def test_the_label_header_falls_back_to_percent_of_managed_with_no_base():
+    text = format_label_header(label='ARK26', current_value=9_000.0, target_pct=50.0,
+                               pct_of_base=None, pct_of_total=75.0,
+                               base_notional=None, unallocated_pct=0.0)
+    assert text == ('ARK26 — $9,000.00 (75.0% of managed, portfolio target '
+                    'unavailable — no base notional)')
+
+
+def test_the_label_header_at_a_100_percent_reserve_reads_zero_not_nan():
+    """100% is a legitimate setting -- allocate nothing -- and the conversion that
+    would blow up (a target back to a share of base needs /(1 - r/100)) is
+    deliberately not performed anywhere: every reserve conversion MULTIPLIES."""
+    text = format_label_header(label='A', current_value=1.0, target_pct=100.0,
+                               pct_of_base=0.01, pct_of_total=100.0,
+                               base_notional=10_000.0, unallocated_pct=100.0)
+    assert 'portfolio target 0.0%' in text
+    assert 'nan' not in text.lower()
+    assert 'inf' not in text.lower()
+
+
+# -- the tooltip that took the long clause -----------------------------------
+
+def test_the_tooltip_keeps_every_number_the_header_stopped_printing():
+    tip = format_label_target_tooltip(target_pct=50.0, base_notional=10_000.0,
+                                      unallocated_pct=10.0)
+    assert '50.0% of what the reserve leaves' in tip
+    assert '$4,500.00' in tip
+    assert '45.0% of the base' in tip
+
+
+def test_the_tooltip_explains_the_two_things_called_target():
+    """7a's actual fix: the header target is a share of the PORTFOLIO, the column
+    below is a share of THE LABEL, and the tooltip is where that is said."""
+    tip = format_label_target_tooltip(target_pct=50.0, base_notional=10_000.0,
+                                      unallocated_pct=0.0)
+    assert 'share of the label' in tip.lower()
+
+
+def test_the_tooltip_says_there_is_no_dollar_figure_rather_than_showing_zero():
+    tip = format_label_target_tooltip(target_pct=50.0, base_notional=None,
+                                      unallocated_pct=0.0)
+    assert '$' not in tip
+    assert 'no base notional' in tip
+
+
+def test_the_tooltip_money_follows_the_reserve():
+    at_zero = format_label_target_tooltip(target_pct=100.0, base_notional=10_000.0,
+                                          unallocated_pct=0.0)
+    at_forty = format_label_target_tooltip(target_pct=100.0, base_notional=10_000.0,
+                                           unallocated_pct=40.0)
+    assert '$10,000.00' in at_zero
+    assert '$6,000.00' in at_forty
+
+
+# -- the symbol table's TARGET VALUE column ----------------------------------
+
+def test_symbol_target_values_split_the_labels_money_by_weight():
+    values = symbol_target_values({'AAA': 75.0, 'BBB': 25.0}, label_target_pct=40.0,
+                                  base_notional=10_000.0, unallocated_pct=0.0)
+    assert values == {'AAA': 3_000.0, 'BBB': 1_000.0}
+
+
+def test_symbol_target_values_are_scaled_by_the_reserve_exactly_once():
+    values = symbol_target_values({'AAA': 75.0, 'BBB': 25.0}, label_target_pct=100.0,
+                                  base_notional=10_000.0, unallocated_pct=10.0)
+    assert values == {'AAA': 6_750.0, 'BBB': 2_250.0}
+
+
+def test_symbol_target_values_are_None_without_a_base_rather_than_zero():
+    """A page with no base notional has no answer, and 0.00 there is a claim."""
+    values = symbol_target_values({'AAA': 75.0}, label_target_pct=40.0,
+                                  base_notional=None, unallocated_pct=0.0)
+    assert values == {'AAA': None}
+
+
+def test_symbol_target_values_treat_a_zero_base_as_absent_too():
+    values = symbol_target_values({'AAA': 75.0}, label_target_pct=40.0,
+                                  base_notional=0.0, unallocated_pct=0.0)
+    assert values == {'AAA': None}
+
+
+def test_symbol_target_values_agree_with_the_view_the_page_first_rendered():
+    """The in-place update after a keystroke must land on the same numbers a full
+    reload would -- otherwise editing a box drifts the table away from the DB."""
+    view = build_label_views([ManagedLabel('A', 40.0)], {'A': ['AAA', 'BBB']}, {}, {},
+                             valuation_mode=VALUATION_MODE_MARKET,
+                             base_notional=10_000.0, unallocated_pct=10.0,
+                             symbol_weights={'A': {'AAA': 62.5, 'BBB': 37.5}})[0]
+    live = symbol_target_values({'AAA': 62.5, 'BBB': 37.5}, label_target_pct=40.0,
+                                base_notional=10_000.0, unallocated_pct=10.0)
+    assert {r.symbol: r.target_value for r in view.rows} == live
+
+
+def test_symbol_target_values_at_a_100_percent_reserve_are_zero_not_nan():
+    values = symbol_target_values({'AAA': 100.0}, label_target_pct=100.0,
+                                  base_notional=10_000.0, unallocated_pct=100.0)
+    assert values == {'AAA': 0.0}
+
+
+# -- the reserve's own money -------------------------------------------------
+
+def test_reserve_dollars_is_what_the_engine_holds_back():
+    assert reserve_dollars(10_000.0, 25.0) == 2_500.0
+    assert reserve_dollars(10_000.0, 0.0) == 0.0
+    assert reserve_dollars(10_000.0, 100.0) == 10_000.0
+
+
+def test_reserve_dollars_without_a_base_is_None_not_zero():
+    assert reserve_dollars(None, 25.0) is None
+    assert reserve_dollars(0.0, 25.0) is None
+
+
+def test_the_reserve_caption_states_the_money_and_what_is_left():
+    assert format_reserve_caption(10_000.0, 25.0) == \
+        '= $2,500.00 held back, $7,500.00 investable'
+
+
+def test_the_reserve_caption_says_so_when_there_is_no_base_instead_of_showing_zero():
+    text = format_reserve_caption(None, 25.0)
+    assert '$' not in text
+    assert 'no' in text.lower()
+
+
+def test_the_reserve_row_line_is_the_string_the_page_has_always_drawn():
+    text = format_reserve_row(base_notional=10_000.0, available_buying_power=1_000.0,
+                              unallocated_pct=25.0)
+    assert text == ('Unallocated (free buying power) — $1,000.00 (10.0% of base, '
+                    'target 25.00% of base = $2,500.00)')
+
+
+def test_the_reserve_row_line_is_None_when_there_is_nothing_to_divide_by():
+    assert format_reserve_row(base_notional=0.0, available_buying_power=1_000.0,
+                              unallocated_pct=25.0) is None
+    assert format_reserve_row(base_notional=None, available_buying_power=1_000.0,
+                              unallocated_pct=25.0) is None
+    assert format_reserve_row(base_notional=10_000.0, available_buying_power=None,
+                              unallocated_pct=25.0) is None
+
+
+def test_the_reserve_row_line_follows_the_reserve_box():
+    text = format_reserve_row(base_notional=10_000.0, available_buying_power=1_000.0,
+                              unallocated_pct=60.0)
+    assert 'target 60.00% of base = $6,000.00' in text
+
+
+# ---------------------------------------------------------------------------
+# LABEL COLOURS
+#
+# A FIXED palette, never a free colour picker: this UI is dark-themed and an
+# arbitrary picker produces unreadable choices (and, since the value ends up
+# interpolated into a CSS ``style`` attribute, an unbounded one is a place to put
+# something other than a colour).
+# ---------------------------------------------------------------------------
+
+def test_the_palette_is_the_okabe_ito_colour_universal_design_set():
+    """Okabe-Ito is the published colour-universal-design set: it is validated for
+    protanopia, deuteranopia and tritanopia, and it deliberately contains no
+    red-versus-green pair that carries meaning on its own."""
+    assert [hex_value for _name, hex_value in LABEL_COLOR_PALETTE] == [
+        '#E69F00', '#56B4E9', '#009E73', '#F0E442',
+        '#0072B2', '#D55E00', '#CC79A7',
+    ]
+
+
+def test_the_palette_leaves_out_okabe_itos_black_because_the_ui_is_dark():
+    assert '#000000' not in {hex_value for _n, hex_value in LABEL_COLOR_PALETTE}
+
+
+def test_every_swatch_clears_the_non_text_contrast_floor_on_this_background():
+    """WCAG 1.4.11 wants 3:1 for a graphical object. The page's dark surface is
+    #1E1E1E; a swatch below that floor is a colour the user cannot see they chose."""
+    def _luminance(hex_value):
+        parts = [int(hex_value[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+        linear = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+                  for c in parts]
+        return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+
+    background = _luminance('#1E1E1E')
+    for name, hex_value in LABEL_COLOR_PALETTE:
+        contrast = (_luminance(hex_value) + 0.05) / (background + 0.05)
+        assert contrast >= 3.0, f'{name} {hex_value} is only {contrast:.2f}:1'
+
+
+def test_every_swatch_is_distinguishable_from_every_other_by_lightness_or_hue():
+    """Two swatches a colour-blind user reads as the same colour AND the same
+    lightness are one swatch with two names."""
+    seen = {hex_value for _n, hex_value in LABEL_COLOR_PALETTE}
+    assert len(seen) == len(LABEL_COLOR_PALETTE)
+    names = {name for name, _h in LABEL_COLOR_PALETTE}
+    assert len(names) == len(LABEL_COLOR_PALETTE)
+
+
+def test_the_options_offer_an_explicit_no_colour_entry():
+    """"No colour" is a choice the user has to be able to make and to go BACK to;
+    without it a colour, once set, could never be cleared."""
+    options = label_color_options()
+    assert NO_LABEL_COLOR in options
+    assert options[NO_LABEL_COLOR] == 'No colour'
+    for _name, hex_value in LABEL_COLOR_PALETTE:
+        assert hex_value in options
+
+
+def test_the_no_colour_option_is_the_empty_string_not_None():
+    """NiceGUI's ``Select`` drops a value that is not in its options and treats
+    ``None`` as "nothing selected", so the cleared state needs a real value."""
+    assert NO_LABEL_COLOR == ''
+
+
+def test_normalising_a_palette_colour_returns_its_canonical_hex():
+    assert normalise_label_color('#e69f00') == '#E69F00'
+    assert normalise_label_color(' #E69F00 ') == '#E69F00'
+
+
+def test_normalising_no_colour_gives_None_which_is_what_NULL_means():
+    assert normalise_label_color(None) is None
+    assert normalise_label_color('') is None
+    assert normalise_label_color('   ') is None
+
+
+def test_normalising_refuses_anything_that_is_not_in_the_palette():
+    """The write path. An unbounded value here is a CSS ``style`` injection AND a
+    colour nobody can read on this background."""
+    with pytest.raises(ValueError):
+        normalise_label_color('#123456')
+    with pytest.raises(ValueError):
+        normalise_label_color('red')
+    with pytest.raises(ValueError):
+        normalise_label_color('#E69F00; background:url(x)')
+
+
+def test_resolving_a_stored_colour_gives_the_hex_to_draw_with():
+    assert resolve_label_icon_color('#E69F00') == '#E69F00'
+    assert resolve_label_icon_color('#e69f00') == '#E69F00'
+
+
+def test_resolving_no_colour_gives_the_neutral_default_not_an_empty_style():
+    """NULL means "no colour chosen", which is a different fact from a stored
+    default -- but something still has to be drawn."""
+    assert resolve_label_icon_color(None) == DEFAULT_LABEL_ICON_COLOR
+    assert resolve_label_icon_color('') == DEFAULT_LABEL_ICON_COLOR
+
+
+def test_resolving_a_value_that_is_not_in_the_palette_falls_back_rather_than_drawing_it():
+    """The READ path is tolerant where the write path refuses: a hand-edited row
+    must not take the page down, and it must not reach the style attribute either."""
+    assert resolve_label_icon_color('#123456') == DEFAULT_LABEL_ICON_COLOR
+    assert resolve_label_icon_color('red; content:"x"') == DEFAULT_LABEL_ICON_COLOR
+
+
+def test_a_managed_label_carries_its_colour_into_the_view():
+    views = build_label_views([ManagedLabel('ARK26', 40.0, color='#56B4E9')],
+                              {'ARK26': []}, {}, {},
+                              valuation_mode=VALUATION_MODE_COST)
+    assert views[0].color == '#56B4E9'
+
+
+def test_a_label_with_no_colour_reaches_the_view_as_None_not_as_a_default():
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': []}, {}, {},
+                              valuation_mode=VALUATION_MODE_COST)
+    assert views[0].color is None
+
+
+# ---------------------------------------------------------------------------
+# The running label total, live on the page
+#
+# The page has to say "these do not add up" WITHOUT a dry run -- that is the
+# validation the Allocate wizard has always done at step 1, and moving the boxes
+# onto the page moves the advisory with them.
+# ---------------------------------------------------------------------------
+
+def test_a_label_set_that_totals_100_says_nothing():
+    assert format_label_total_notice({'A': 60.0, 'B': 40.0}) is None
+
+
+def test_a_label_set_under_100_is_a_warning_in_the_engines_words():
+    from ba2_trade_platform.core.portfolio_allocation import ERROR_LABEL_UNDER_FMT
+
+    text, severity = format_label_total_notice({'A': 60.0, 'B': 30.0})
+    assert text == ERROR_LABEL_UNDER_FMT.format(total=90.0, under=10.0)
+    assert severity == 'warning'
+
+
+def test_a_label_set_over_100_is_an_error_in_the_engines_words():
+    """Unreachable through the inline boxes, which refuse it -- but reachable from
+    a database written before this page had boxes at all, and from the wizard."""
+    from ba2_trade_platform.core.portfolio_allocation import ERROR_LABEL_TOTAL_FMT
+
+    text, severity = format_label_total_notice({'A': 60.0, 'B': 60.0})
+    assert text == ERROR_LABEL_TOTAL_FMT.format(total=120.0, over=20.0)
+    assert severity == 'negative'
+
+
+def test_the_running_total_uses_the_engines_tolerance():
+    from ba2_trade_platform.core.portfolio_allocation import LABEL_TOTAL_TOLERANCE_PCT
+
+    inside = 100.0 - LABEL_TOTAL_TOLERANCE_PCT / 2.0
+    assert format_label_total_notice({'A': inside}) is None
+    assert format_label_total_notice({'A': 99.0}) is not None
+
+
+def test_an_account_with_no_managed_labels_is_not_told_it_is_10_percent_short():
+    """Nothing is managed, so there is no set to be wrong. The empty-state banner
+    already says what to do."""
+    assert format_label_total_notice({}) is None
+
+
+def test_the_running_total_reports_the_default_all_zero_state_the_page_shipped_with():
+    """THE defect: labels have only ever been settable in the Allocate wizard, so on
+    an untouched account every target is 0 and the page said nothing about it."""
+    text, severity = format_label_total_notice({'A': 0.0, 'B': 0.0})
+    assert '100.00%' in text
+    assert severity == 'warning'
+
+
+def test_the_store_value_for_a_chosen_colour_is_its_hex():
+    assert store_color_value('#e69f00') == '#E69F00'
+
+
+def test_the_store_value_for_no_colour_is_the_empty_string_not_None():
+    """``set_managed_label(color=None)`` means LEAVE UNCHANGED, so handing it the
+    ``None`` that ``normalise_label_color`` returns would make "clear the colour"
+    silently do nothing -- the swatch would be un-removable."""
+    assert store_color_value(NO_LABEL_COLOR) == ''
+    assert store_color_value(None) == ''
+    assert store_color_value('') == ''
+
+
+def test_the_store_value_still_refuses_a_colour_outside_the_palette():
+    with pytest.raises(ValueError):
+        store_color_value('#123456')
+
+
+# ---------------------------------------------------------------------------
+# THE LABEL MINI-BAR ROW
+#
+# One bar per label showing the CURRENT share, tinted with the label's own colour,
+# plus a NOTCH marking the target and a status WORD. The bar and the notch share
+# ONE scale -- if they did not, "over"/"under" would be a lie that no reader could
+# spot by eye.
+# ---------------------------------------------------------------------------
+
+def _view(label, current, target, *, base=10_000.0, reserve=0.0, color=None):
+    """A LabelView with the two numbers the bar reads, and nothing else."""
+    return LabelView(label=label, target_pct=target, current_value=current,
+                     pct_of_base=(current / base * 100.0) if base else None,
+                     pct_of_total=0.0, color=color)
+
+
+def test_the_bar_scale_is_the_largest_of_every_current_and_every_target():
+    """Scaling to 100% of base leaves every bar stubby on a diversified book;
+    scaling to the largest figure on the page makes the biggest bar fill the track
+    and keeps every row comparable against it."""
+    views = [_view('A', 3_950.0, 25.0), _view('B', 2_200.0, 30.0)]
+    assert bar_scale_pct(views, unallocated_pct=0.0) == 39.5
+
+
+def test_the_bar_scale_can_be_set_by_a_TARGET_rather_than_a_holding():
+    """A label that is entirely un-bought has a target far above every current
+    value, and its notch has to fit on the track."""
+    views = [_view('A', 500.0, 80.0)]
+    assert bar_scale_pct(views, unallocated_pct=0.0) == 80.0
+
+
+def test_the_bar_scale_measures_targets_on_the_SAME_denominator_as_holdings():
+    """The holding is a share of the GROSS base and the stored target is a share of
+    what the reserve LEFT, so the reserve has to be applied before they are compared
+    -- otherwise a 100% label under a 50% reserve stretches the track to twice what
+    anything can reach."""
+    views = [_view('A', 1_000.0, 100.0)]
+    assert bar_scale_pct(views, unallocated_pct=50.0) == 50.0
+
+
+def test_the_bar_scale_never_returns_zero_to_divide_by():
+    """Every label at zero with no target is a real state (a fresh account)."""
+    assert bar_scale_pct([_view('A', 0.0, 0.0)], unallocated_pct=0.0) > 0.0
+    assert bar_scale_pct([], unallocated_pct=0.0) > 0.0
+
+
+def test_a_short_labels_negative_value_does_not_stretch_the_scale():
+    """Shorts carry a NEGATIVE current value (see the page docstring). Feeding one
+    to a max() is harmless, but it must not become the scale."""
+    views = [_view('SHORT', -5_000.0, 10.0), _view('LONG', 2_000.0, 10.0)]
+    assert bar_scale_pct(views, unallocated_pct=0.0) == 20.0
+
+
+def test_the_bar_and_the_notch_are_computed_on_ONE_scale():
+    """THE mutation this section exists for: a notch on a different scale silently
+    inverts over/under and no reader would spot it."""
+    views = [_view('A', 4_000.0, 40.0), _view('B', 2_000.0, 80.0)]
+    bars = {bar.label: bar for bar in build_label_bars(views, base_notional=10_000.0,
+                                                       unallocated_pct=0.0)}
+    scale = bar_scale_pct(views, unallocated_pct=0.0)          # 80.0
+    assert bars['A'].bar_fraction == pytest.approx(40.0 / scale)
+    assert bars['A'].notch_fraction == pytest.approx(40.0 / scale)
+    assert bars['B'].bar_fraction == pytest.approx(20.0 / scale)
+    assert bars['B'].notch_fraction == pytest.approx(80.0 / scale)
+
+
+def test_the_biggest_row_fills_the_whole_track():
+    views = [_view('A', 3_950.0, 25.0), _view('B', 500.0, 5.0)]
+    bars = {bar.label: bar for bar in build_label_bars(views, base_notional=10_000.0,
+                                                       unallocated_pct=0.0)}
+    assert bars['A'].bar_fraction == pytest.approx(1.0)
+
+
+def test_one_label_at_100_percent_fills_the_track_and_notches_at_the_end():
+    views = [_view('A', 10_000.0, 100.0)]
+    bar = build_label_bars(views, base_notional=10_000.0, unallocated_pct=0.0)[0]
+    assert bar.bar_fraction == pytest.approx(1.0)
+    assert bar.notch_fraction == pytest.approx(1.0)
+
+
+def test_every_label_at_zero_draws_empty_bars_rather_than_dividing_by_zero():
+    views = [_view('A', 0.0, 0.0), _view('B', 0.0, 0.0)]
+    bars = build_label_bars(views, base_notional=10_000.0, unallocated_pct=0.0)
+    assert [bar.bar_fraction for bar in bars] == [0.0, 0.0]
+    assert [bar.notch_fraction for bar in bars] == [0.0, 0.0]
+
+
+def test_a_negative_current_value_clamps_the_BAR_but_not_the_NUMBER():
+    """A short label's value is negative. Rendered as a fraction of a track it must
+    not come out as a giant positive bar; the figure beside it stays negative."""
+    views = [_view('SHORT', -5_000.0, 10.0), _view('LONG', 2_000.0, 10.0)]
+    bar = build_label_bars(views, base_notional=10_000.0, unallocated_pct=0.0)[0]
+    assert bar.bar_fraction == 0.0
+    assert bar.current_pct == -50.0
+
+
+def test_a_bar_fraction_never_exceeds_the_track():
+    views = [_view('A', 20_000.0, 10.0)]
+    assert build_label_bars(views, base_notional=10_000.0,
+                            unallocated_pct=0.0)[0].bar_fraction <= 1.0
+
+
+def test_the_notch_moves_when_the_reserve_does():
+    """A notch that does not move when the reserve is dragged is the stale-figure
+    bug in visual form."""
+    # A second, bigger holding pins the track so the notch is measured against
+    # something that does NOT move -- otherwise the notch sets its own scale and
+    # sits at 1.0 whatever the reserve is.
+    views = [_view('A', 4_000.0, 100.0), _view('BIG', 10_000.0, 0.0)]
+    at_zero = build_label_bars(views, base_notional=10_000.0, unallocated_pct=0.0)[0]
+    at_sixty = build_label_bars(views, base_notional=10_000.0, unallocated_pct=60.0)[0]
+    assert at_zero.target_pct == 100.0
+    assert at_sixty.target_pct == 40.0
+    assert at_zero.notch_fraction == pytest.approx(1.0)
+    assert at_sixty.notch_fraction == pytest.approx(0.4)
+    # The BAR did not move: only the target did.
+    assert at_zero.bar_fraction == at_sixty.bar_fraction
+
+
+def test_each_bar_carries_its_own_labels_colour():
+    views = [_view('A', 100.0, 10.0, color='#56B4E9'), _view('B', 100.0, 10.0)]
+    bars = build_label_bars(views, base_notional=10_000.0, unallocated_pct=0.0)
+    assert bars[0].color == '#56B4E9'
+    assert bars[1].color == DEFAULT_LABEL_ICON_COLOR
+
+
+# -- the status word ---------------------------------------------------------
+
+def test_a_label_on_target_reads_ok():
+    views = [_view('A', 2_500.0, 25.0)]
+    assert build_label_bars(views, base_notional=10_000.0,
+                            unallocated_pct=0.0)[0].status == LABEL_STATUS_OK
+
+
+def test_a_label_above_its_target_reads_over():
+    views = [_view('A', 3_950.0, 25.0)]
+    assert build_label_bars(views, base_notional=10_000.0,
+                            unallocated_pct=0.0)[0].status == LABEL_STATUS_OVER
+
+
+def test_a_label_below_its_target_reads_under():
+    views = [_view('A', 1_400.0, 30.0)]
+    assert build_label_bars(views, base_notional=10_000.0,
+                            unallocated_pct=0.0)[0].status == LABEL_STATUS_UNDER
+
+
+def test_the_ok_band_is_a_tolerance_not_an_equality_and_holds_at_both_edges():
+    """Floating point makes exact equality meaningless and a fraction of a
+    percentage point is not actionable, so ``ok`` is a band -- pinned here at both
+    edges so widening or narrowing it is a deliberate act."""
+    edge = LABEL_STATUS_TOLERANCE_PCT
+    base = 10_000.0
+
+    just_inside_high = _view('A', (25.0 + edge * 0.99) / 100.0 * base, 25.0)
+    just_inside_low = _view('A', (25.0 - edge * 0.99) / 100.0 * base, 25.0)
+    just_outside_high = _view('A', (25.0 + edge * 1.01) / 100.0 * base, 25.0)
+    just_outside_low = _view('A', (25.0 - edge * 1.01) / 100.0 * base, 25.0)
+
+    def _status(view):
+        return build_label_bars([view], base_notional=base,
+                                unallocated_pct=0.0)[0].status
+
+    assert _status(just_inside_high) == LABEL_STATUS_OK
+    assert _status(just_inside_low) == LABEL_STATUS_OK
+    assert _status(just_outside_high) == LABEL_STATUS_OVER
+    assert _status(just_outside_low) == LABEL_STATUS_UNDER
+
+
+def test_a_label_with_no_position_and_no_target_reads_as_a_dash():
+    """Not 'ok'. Nothing has been asked of it and nothing is held; calling that
+    "on target" would put a tick beside a label the user has not configured."""
+    views = [_view('A', 0.0, 0.0)]
+    assert build_label_bars(views, base_notional=10_000.0,
+                            unallocated_pct=0.0)[0].status == LABEL_STATUS_NONE
+
+
+def test_the_status_words_are_words_and_not_only_colours():
+    """Colour alone excludes the readers change 4's palette was chosen for."""
+    assert {LABEL_STATUS_OVER, LABEL_STATUS_UNDER, LABEL_STATUS_OK,
+            LABEL_STATUS_NONE} == {'over', 'under', 'ok', '—'}
+
+
+def test_with_no_base_the_status_is_unknown_rather_than_a_false_comparison():
+    """"% of managed" and "% of base" are different denominators. Without a base
+    there is nothing to compare the target against, and guessing would produce an
+    over/under nobody can act on."""
+    views = [LabelView(label='A', target_pct=50.0, current_value=9_000.0,
+                       pct_of_base=None, pct_of_total=90.0)]
+    bar = build_label_bars(views, base_notional=None, unallocated_pct=0.0)[0]
+    assert bar.status == LABEL_STATUS_NONE
+    assert bar.notch_fraction is None
+
+
+# -- display order and the totals footer -------------------------------------
+
+def test_labels_are_sorted_by_current_value_largest_first():
+    """The 39.5% row used to sit between two 1-5% rows."""
+    views = [_view('small', 72.63, 5.0), _view('big', 2_021.84, 25.0),
+             _view('mid', 1_126.88, 30.0)]
+    assert [v.label for v in sort_label_views(views)] == ['big', 'mid', 'small']
+
+
+def test_labels_with_equal_value_are_ordered_by_name_so_the_page_is_stable():
+    views = [_view('Zulu', 0.0, 0.0), _view('Alpha', 0.0, 0.0)]
+    assert [v.label for v in sort_label_views(views)] == ['Alpha', 'Zulu']
+
+
+def test_sorting_does_not_dim_or_drop_an_empty_label():
+    """Explicitly declined by the user: zero-value labels stay fully visible."""
+    views = [_view('empty', 0.0, 0.0), _view('full', 100.0, 100.0)]
+    assert len(sort_label_views(views)) == 2
+    assert 'empty' in {v.label for v in sort_label_views(views)}
+
+
+def test_sorting_leaves_the_caller_s_list_alone():
+    views = [_view('a', 1.0, 0.0), _view('b', 2.0, 0.0)]
+    sort_label_views(views)
+    assert [v.label for v in views] == ['a', 'b']
+
+
+def test_the_footer_accounts_for_the_labels_AND_the_reserve():
+    text, severity = format_allocation_footer({'A': 60.0, 'B': 40.0},
+                                              unallocated_pct=10.0)
+    assert '100.00%' in text            # the label total
+    assert '90.00%' in text             # what that is as a share of the base
+    assert '10.00%' in text             # the reserve
+    assert severity == 'ok'
+
+
+def test_the_footer_turns_red_the_moment_the_labels_pass_100():
+    text, severity = format_allocation_footer({'A': 60.0, 'B': 45.0},
+                                              unallocated_pct=0.0)
+    assert severity == 'negative'
+    assert '105.00%' in text
+
+
+def test_the_footer_flags_a_shortfall_as_well():
+    text, severity = format_allocation_footer({'A': 60.0}, unallocated_pct=0.0)
+    assert severity == 'warning'
+    assert '60.00%' in text
+
+
+def test_the_footer_of_an_account_managing_nothing_says_so_without_crying_wolf():
+    text, severity = format_allocation_footer({}, unallocated_pct=0.0)
+    assert severity == 'ok'
+    assert 'no managed labels' in text.lower()
+
+
+def test_the_footer_adds_up_to_100_of_base_at_every_reserve():
+    for reserve in (0.0, 10.0, 50.0, 100.0):
+        text, severity = format_allocation_footer({'A': 100.0},
+                                                  unallocated_pct=reserve)
+        assert severity == 'ok', reserve
+        assert '= 100.00% of base' in text, reserve
+
+
+def test_the_ok_band_is_exactly_half_a_percentage_point():
+    """Pinned as a LITERAL, not derived from the constant.
+
+    The edge test above computes its inputs FROM ``LABEL_STATUS_TOLERANCE_PCT``, so
+    widening the band to 5pp moves the test with it and the change passes unseen --
+    a mutation proved exactly that. This is the assertion the band cannot slide
+    past: changing it has to be a deliberate edit of a number in a test.
+    """
+    assert LABEL_STATUS_TOLERANCE_PCT == 0.5
+
+
+def test_the_status_flips_between_a_0_4_and_a_0_6_point_drift():
+    """The same band, stated in absolute figures rather than in terms of itself."""
+    base = 10_000.0
+
+    def _status(current_pct):
+        view = LabelView(label='A', target_pct=25.0,
+                         current_value=current_pct / 100.0 * base,
+                         pct_of_base=current_pct, pct_of_total=0.0)
+        return build_label_bars([view], base_notional=base,
+                                unallocated_pct=0.0)[0].status
+
+    assert _status(25.4) == LABEL_STATUS_OK
+    assert _status(24.6) == LABEL_STATUS_OK
+    assert _status(25.6) == LABEL_STATUS_OVER
+    assert _status(24.4) == LABEL_STATUS_UNDER
+
+
+def test_the_bar_geometry_clamps_at_both_ends_of_the_track():
+    """``_bar_fraction`` direct, because neither clamp is reachable through
+    ``build_label_bars`` today -- the scale IS the page maximum, so nothing can
+    exceed it, and the lower clamp is only hit by a short.
+
+    They are defence-in-depth against a caller measuring against a scale computed
+    over a different set (a cached one, a second page section), which is precisely
+    the mistake that silently inverts a bar. A mutation removing the upper clamp
+    survived everything else in this file.
+    """
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import _bar_fraction
+
+    assert _bar_fraction(50.0, 100.0) == 0.5
+    assert _bar_fraction(-50.0, 100.0) == 0.0      # a short is empty, not full
+    assert _bar_fraction(150.0, 100.0) == 1.0      # never past the end of the track
+    assert _bar_fraction(0.0, 100.0) == 0.0
+
+
+def test_the_footer_clamps_an_out_of_range_reserve_instead_of_printing_it():
+    """The controls refuse one, but a database written before they existed can hold
+    it. Printing "+ 140.00% reserve = 140.00% of base" would be arithmetic nobody
+    can act on."""
+    text, _severity = format_allocation_footer({'A': 100.0}, unallocated_pct=140.0)
+    assert '100.00% reserve' in text
+    assert '140' not in text
+
+
+def test_a_bar_with_no_base_still_reports_the_share_of_MANAGED_it_does_have():
+    """``pct_of_base`` is None, so the figure beside the bar falls back to
+    ``pct_of_total`` -- 0.0 there would claim the label holds nothing."""
+    views = [LabelView(label='A', target_pct=50.0, current_value=9_000.0,
+                       pct_of_base=None, pct_of_total=90.0)]
+    bar = build_label_bars(views, base_notional=None, unallocated_pct=0.0)[0]
+    assert bar.current_pct == 90.0
+    assert bar.current_value == 9_000.0

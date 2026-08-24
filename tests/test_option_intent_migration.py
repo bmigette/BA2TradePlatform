@@ -104,11 +104,17 @@ def _build_pre_migration(db_path, *, stamp=PARENT_REV):
     return engine
 
 
-def _alembic_upgrade_head(db_path):
-    """`alembic upgrade head` in a subprocess, against a THROWAWAY file."""
+def _alembic_upgrade_head(db_path, target=REV):
+    """`alembic upgrade <target>` in a subprocess, against a THROWAWAY file.
+
+    THIS revision, not ``head``: revisions land after it (c4d7e2b18a93 was the
+    first), and `upgrade head` would then run them too and leave
+    ``alembic_version`` past the value these tests are about. Naming the target
+    keeps each revision's own tests measuring that revision.
+    """
     env = {**os.environ, "BA2_DB_FILE": str(db_path)}
     result = subprocess.run(
-        [str(ROOT / "venv/bin/python"), "-m", "alembic", "upgrade", "head"],
+        [str(ROOT / "venv/bin/python"), "-m", "alembic", "upgrade", target],
         capture_output=True, text=True, env=env, cwd=str(ROOT))
     assert result.returncode == 0, result.stdout + result.stderr
     return result
@@ -686,12 +692,20 @@ def test_downgrade_removes_the_three_columns_and_tolerates_their_absence(tmp_pat
 
 
 def test_the_revision_is_chained_onto_the_option_iv_revision():
+    """One head, and this revision is on the path to it.
+
+    It was the head when it shipped; later revisions chain onto it (c4d7e2b18a93
+    first). What still has to hold is that the history has not BRANCHED -- two heads
+    make `alembic upgrade head` refuse outright -- and that this revision's own
+    parent is unchanged.
+    """
     from alembic.config import Config
     from alembic.script import ScriptDirectory
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
     heads = script.get_heads()
     assert len(heads) == 1, f"alembic history has branched: {heads}"
-    assert heads[0] == REV
+    ancestry = {r.revision for r in script.iterate_revisions(heads[0], "base")}
+    assert REV in ancestry, f"{REV} is no longer on the path to {heads[0]}"
     revision = script.get_revision(REV)
     assert revision.down_revision == PARENT_REV
     assert script.get_revision(PARENT_REV) is not None

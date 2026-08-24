@@ -73,11 +73,27 @@ def get_managed_labels(account_id: int) -> List[PortfolioAllocationLabel]:
 def set_managed_label(account_id: int, label: str, *,
                       target_pct: Optional[float] = None,
                       sort_order: Optional[int] = None,
-                      comment: Optional[str] = None) -> PortfolioAllocationLabel:
+                      comment: Optional[str] = None,
+                      color: Optional[str] = None) -> PortfolioAllocationLabel:
     """Create the managed-label row, or update only the fields you pass.
 
     ``None`` for a field means LEAVE IT UNCHANGED, so the page can save a comment
-    without disturbing the percentage. Pass ``""`` to clear a comment.
+    without disturbing the percentage -- or a target without wiping the colour, which
+    matters now that both are edited inline on the page and the comment box writes on
+    every debounced keystroke. Pass ``""`` to clear a comment or a colour.
+
+    ``color`` differs from ``comment`` in ONE way and it is deliberate: an empty
+    comment is stored as ``''``, an empty colour as SQL NULL. ``''`` is not a colour,
+    so storing it would create a third state that means exactly what NULL means and
+    that nothing can render; NULL is how "no colour chosen" is spelled, and it is a
+    different fact from a stored default (which is why the column is never
+    back-filled -- see the model and revision c4d7e2b18a93).
+
+    The VALUE is not validated here. The palette is a UI decision and lives in
+    ``ba2_trade_platform.ui.utils.portfolio_allocation_view`` (``normalise_label_color``
+    on the way in, ``resolve_label_icon_color`` whitelisting on the way out), so this
+    module keeps its one job -- persistence -- and does not grow a dependency on the
+    UI layer to write a display string.
 
     Raises:
         ValueError: when ``label`` is blank -- a nameless managed label is
@@ -102,6 +118,10 @@ def set_managed_label(account_id: int, label: str, *,
             row.sort_order = int(sort_order)
         if comment is not None:
             row.comment = comment
+        if color is not None:
+            # '' clears to NULL rather than storing an empty string: see the
+            # docstring -- '' is not a colour and would be a third state.
+            row.color = color or None
         session.commit()
         session.refresh(row)
         session.expunge(row)

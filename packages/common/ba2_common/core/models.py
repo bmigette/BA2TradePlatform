@@ -910,6 +910,17 @@ class PortfolioAllocationLabel(SQLModel, table=True):
     which is a different answer from a stored 0.0 ("the last run allocated nothing
     to this"), and it is what makes the wizard's Load-last button's disabled state
     a fact rather than a guess.
+
+    ``color`` is the label's swatch, one of the seven hexes in
+    ``ba2_trade_platform.ui.utils.portfolio_allocation_view.LABEL_COLOR_PALETTE``
+    (Okabe & Ito's colour-universal-design set). NULLABLE and never back-filled, on
+    exactly ``previous_target_pct``'s terms: NULL means "the user has not chosen a
+    colour", which is a different fact from a stored default -- a default would make
+    every label that predates the column claim a colour nobody picked, and the
+    picker could then never show "No colour" truthfully. Nothing in the platform
+    reads it for money; it is a display key only, and the RENDER whitelists it
+    against the palette, so a hand-edited value falls back to neutral grey rather
+    than reaching a CSS ``style`` attribute.
     """
     __tablename__ = "portfolio_allocation_label"
     __table_args__ = (
@@ -923,6 +934,7 @@ class PortfolioAllocationLabel(SQLModel, table=True):
     previous_target_pct: float | None = Field(default=None, description="The target this label ran with before the current one; None means there is no last")
     sort_order: int = Field(default=0, description="Display order of the label expansion on the page")
     comment: str | None = Field(default=None, description="Free-text note shown on the label header")
+    color: str | None = Field(default=None, description="Palette hex for this label's icon (e.g. '#56B4E9'); None means no colour chosen")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
 

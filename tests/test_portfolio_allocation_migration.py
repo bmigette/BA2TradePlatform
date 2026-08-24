@@ -46,6 +46,29 @@ def _upgrade(engine):
             module.upgrade()
 
 
+#: Revisions chained AFTER this one that also touch the allocation tables. The
+#: "does alembic build what create_all builds" claims are about the CHAIN, not about
+#: one revision: a column added later exists in ``SQLModel.metadata`` from the moment
+#: it is declared, so comparing a partially-upgraded database against it would report
+#: drift that is really just "you stopped early".
+LATER_ALLOCATION_REVISIONS = (
+    "c4d7e2b18a93_add_portfolio_allocation_label_color.py",
+)
+
+
+def _upgrade_through_the_chain(engine):
+    """This revision plus every later one that touches these five tables."""
+    _upgrade(engine)
+    for filename in LATER_ALLOCATION_REVISIONS:
+        path = REVISION_FILE.parent / filename
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with engine.begin() as connection:
+            with Operations.context(MigrationContext.configure(connection)):
+                module.upgrade()
+
+
 def _create_all_allocation_tables(engine, only=None):
     """Build the allocation tables the way ``init_db()``'s create_all does.
 
@@ -65,8 +88,16 @@ def test_migration_creates_all_five_allocation_tables(migrated_engine):
 
 
 @pytest.mark.parametrize("table_name", ALLOCATION_TABLES)
-def test_migration_columns_match_the_model(migrated_engine, table_name):
-    migrated = {c["name"] for c in inspect(migrated_engine).get_columns(table_name)}
+def test_migration_columns_match_the_model(tmp_path, table_name):
+    """The alembic CHAIN builds every column the model declares.
+
+    Through the chain, not through this revision alone: ``portfolio_allocation_label``
+    gained ``color`` in c4d7e2b18a93, which is in ``SQLModel.metadata`` from the
+    moment it is declared.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'chained.sqlite'}")
+    _upgrade_through_the_chain(engine)
+    migrated = {c["name"] for c in inspect(engine).get_columns(table_name)}
     declared = {c.name for c in SQLModel.metadata.tables[table_name].columns}
     assert migrated == declared
 
@@ -95,6 +126,7 @@ def test_the_migrated_schema_is_what_create_all_would_have_built(migrated_engine
             return (name or "").startswith("portfolio_")
         return True
 
+    _upgrade_through_the_chain(migrated_engine)   # see LATER_ALLOCATION_REVISIONS
     with migrated_engine.connect() as connection:
         context = MigrationContext.configure(
             connection, opts={"include_object": _ours, "compare_type": True})
@@ -392,8 +424,16 @@ def test_the_migrated_column_ORDER_is_the_one_create_all_would_have_built(tmp_pa
     from_create_all = create_engine(f"sqlite:///{tmp_path / 'ordered_create_all.sqlite'}")
     _create_all_allocation_tables(from_create_all)
 
-    assert ([c["name"] for c in inspect(migrated).get_columns(table_name)]
-            == [c["name"] for c in inspect(from_create_all).get_columns(table_name)])
+    migrated_names = [c["name"] for c in inspect(migrated).get_columns(table_name)]
+    # Only THIS revision is applied to ``migrated``, so a column a LATER revision
+    # adds is legitimately absent -- and it could not match the order anyway, since
+    # ``ALTER TABLE ADD COLUMN`` appends while create_all puts it where the model
+    # declares it. The claim under test is that the columns this revision creates
+    # are in the same ORDER, which is what catches one silently moved to the end by
+    # a stray ``_add_column_if_absent`` repair.
+    create_all_names = [c["name"] for c in inspect(from_create_all).get_columns(table_name)
+                        if c["name"] in set(migrated_names)]
+    assert migrated_names == create_all_names
 
 
 def test_adding_a_previous_column_preserves_the_rows_already_there(tmp_path):
