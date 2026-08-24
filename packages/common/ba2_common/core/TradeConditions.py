@@ -2764,6 +2764,75 @@ class HasAssignedSharesCondition(FlagCondition):
 
 # Factory function to create conditions based on event type
 
+# (from_rating, to_rating) for the six 3-bucket rating TRANSITION events, all served by
+# RatingChangeCondition. Module level (not rebuilt per call) and importable, so the
+# "every registered condition is reachable from a rule" invariant test can read the
+# REAL registry rather than a copy of it that could drift.
+RATING_CHANGE_CONDITIONS: Dict[ExpertEventType, tuple] = {
+    ExpertEventType.F_RATING_NEGATIVE_TO_NEUTRAL: (OrderRecommendation.SELL, OrderRecommendation.HOLD),
+    ExpertEventType.F_RATING_NEGATIVE_TO_POSITIVE: (OrderRecommendation.SELL, OrderRecommendation.BUY),
+    ExpertEventType.F_RATING_NEUTRAL_TO_NEGATIVE: (OrderRecommendation.HOLD, OrderRecommendation.SELL),
+    ExpertEventType.F_RATING_NEUTRAL_TO_POSITIVE: (OrderRecommendation.HOLD, OrderRecommendation.BUY),
+    ExpertEventType.F_RATING_POSITIVE_TO_NEGATIVE: (OrderRecommendation.BUY, OrderRecommendation.SELL),
+    ExpertEventType.F_RATING_POSITIVE_TO_NEUTRAL: (OrderRecommendation.BUY, OrderRecommendation.HOLD),
+}
+
+# ExpertEventType -> the TradeCondition subclass that implements it. The REGISTRY: every
+# event type a rule can name must appear here (or in RATING_CHANGE_CONDITIONS above), and
+# every entry here must have a rule_builders.FIELD_EVENT / FLAG_FIELD_EVENT mapping or a
+# rule leaf naming it is silently dropped before the engine ever sees it. That invariant is
+# enforced by tests/test_condition_registry_coverage.py.
+CONDITION_MAP: Dict[ExpertEventType, type] = {
+    ExpertEventType.F_BEARISH: BearishCondition,
+    ExpertEventType.F_BULLISH: BullishCondition,
+    ExpertEventType.F_HAS_NO_POSITION: HasNoPositionCondition,
+    ExpertEventType.F_HAS_POSITION: HasPositionCondition,
+    ExpertEventType.F_HAS_BUY_POSITION: HasBuyPositionCondition,
+    ExpertEventType.F_HAS_SELL_POSITION: HasSellPositionCondition,
+    ExpertEventType.F_HAS_NO_POSITION_ACCOUNT: HasNoPositionAccountCondition,
+    ExpertEventType.F_HAS_POSITION_ACCOUNT: HasPositionAccountCondition,
+    ExpertEventType.F_LONG_TERM: LongTermCondition,
+    ExpertEventType.F_MEDIUM_TERM: MediumTermCondition,
+    ExpertEventType.F_SHORT_TERM: ShortTermCondition,
+    ExpertEventType.F_CURRENT_RATING_POSITIVE: CurrentRatingPositiveCondition,
+    ExpertEventType.F_CURRENT_RATING_OVERWEIGHT: CurrentRatingOverweightCondition,
+    ExpertEventType.F_CURRENT_RATING_NEUTRAL: CurrentRatingNeutralCondition,
+    ExpertEventType.F_CURRENT_RATING_UNDERWEIGHT: CurrentRatingUnderweightCondition,
+    ExpertEventType.F_CURRENT_RATING_NEGATIVE: CurrentRatingNegativeCondition,
+    ExpertEventType.F_RATING_UPGRADED: RatingUpgradedCondition,
+    ExpertEventType.F_RATING_DOWNGRADED: RatingDowngradedCondition,
+    ExpertEventType.F_HIGHRISK: HighRiskCondition,
+    ExpertEventType.F_MEDIUMRISK: MediumRiskCondition,
+    ExpertEventType.F_LOWRISK: LowRiskCondition,
+    ExpertEventType.F_NEW_TARGET_HIGHER: NewTargetHigherCondition,
+    ExpertEventType.F_NEW_TARGET_LOWER: NewTargetLowerCondition,
+    ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT: ExpectedProfitTargetPercentCondition,
+    ExpertEventType.N_PERCENT_TO_CURRENT_TARGET: PercentToCurrentTargetCondition,
+    ExpertEventType.N_PERCENT_TO_NEW_TARGET: PercentToNewTargetCondition,
+    ExpertEventType.N_NEW_TARGET_PERCENT: NewTargetPercentCondition,
+    ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
+    ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
+    ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
+    ExpertEventType.N_DAYS_SINCE_LAST_CLOSE: DaysSinceLastCloseCondition,
+    ExpertEventType.N_DAYS_SINCE_LAST_PROFITABLE_CLOSE: DaysSinceLastProfitableCloseCondition,
+    ExpertEventType.N_DAYS_SINCE_LAST_LOSING_CLOSE: DaysSinceLastLosingCloseCondition,
+    ExpertEventType.N_CONFIDENCE: ConfidenceCondition,
+    ExpertEventType.N_PRICE_VS_TARGET_LOW_PERCENT: PriceVsTargetLowCondition,
+    ExpertEventType.N_PRICE_VS_TARGET_HIGH_PERCENT: PriceVsTargetHighCondition,
+    ExpertEventType.N_PRICE_VS_TARGET_CONSENSUS_PERCENT: PriceVsTargetConsensusCondition,
+    ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE: InstrumentAccountShareCondition,
+    ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET: PercentOpenToNewTargetCondition,
+    ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH: PercentBelowRecentHighCondition,
+    ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW: PercentAboveRecentLowCondition,
+    ExpertEventType.N_IV_RANK: IVRankCondition,
+    ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
+    ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
+    ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
+    ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
+    ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,
+    ExpertEventType.F_HAS_ASSIGNED_SHARES: HasAssignedSharesCondition,
+}
+
 
 def create_condition(event_type: ExpertEventType, account: AccountInterface,
                     instrument_name: str, expert_recommendation: ExpertRecommendation,
@@ -2772,71 +2841,11 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
     """
     Factory function to create appropriate condition based on event type.
     """
-    # Define rating change mappings
-    rating_changes = {
-        ExpertEventType.F_RATING_NEGATIVE_TO_NEUTRAL: (OrderRecommendation.SELL, OrderRecommendation.HOLD),
-        ExpertEventType.F_RATING_NEGATIVE_TO_POSITIVE: (OrderRecommendation.SELL, OrderRecommendation.BUY),
-        ExpertEventType.F_RATING_NEUTRAL_TO_NEGATIVE: (OrderRecommendation.HOLD, OrderRecommendation.SELL),
-        ExpertEventType.F_RATING_NEUTRAL_TO_POSITIVE: (OrderRecommendation.HOLD, OrderRecommendation.BUY),
-        ExpertEventType.F_RATING_POSITIVE_TO_NEGATIVE: (OrderRecommendation.BUY, OrderRecommendation.SELL),
-        ExpertEventType.F_RATING_POSITIVE_TO_NEUTRAL: (OrderRecommendation.BUY, OrderRecommendation.HOLD),
-    }
-    if event_type in rating_changes:
-        from_rating, to_rating = rating_changes[event_type]
-        return RatingChangeCondition(account, instrument_name, expert_recommendation, 
+    if event_type in RATING_CHANGE_CONDITIONS:
+        from_rating, to_rating = RATING_CHANGE_CONDITIONS[event_type]
+        return RatingChangeCondition(account, instrument_name, expert_recommendation,
                                    from_rating, to_rating, existing_order)
-    # Add time horizon flags and N_CONFIDENCE to condition_map
-    condition_map = {
-        ExpertEventType.F_BEARISH: BearishCondition,
-        ExpertEventType.F_BULLISH: BullishCondition,
-        ExpertEventType.F_HAS_NO_POSITION: HasNoPositionCondition,
-        ExpertEventType.F_HAS_POSITION: HasPositionCondition,
-        ExpertEventType.F_HAS_BUY_POSITION: HasBuyPositionCondition,
-        ExpertEventType.F_HAS_SELL_POSITION: HasSellPositionCondition,
-        ExpertEventType.F_HAS_NO_POSITION_ACCOUNT: HasNoPositionAccountCondition,
-        ExpertEventType.F_HAS_POSITION_ACCOUNT: HasPositionAccountCondition,
-        ExpertEventType.F_LONG_TERM: LongTermCondition,
-        ExpertEventType.F_MEDIUM_TERM: MediumTermCondition,
-        ExpertEventType.F_SHORT_TERM: ShortTermCondition,
-        ExpertEventType.F_CURRENT_RATING_POSITIVE: CurrentRatingPositiveCondition,
-        ExpertEventType.F_CURRENT_RATING_OVERWEIGHT: CurrentRatingOverweightCondition,
-        ExpertEventType.F_CURRENT_RATING_NEUTRAL: CurrentRatingNeutralCondition,
-        ExpertEventType.F_CURRENT_RATING_UNDERWEIGHT: CurrentRatingUnderweightCondition,
-        ExpertEventType.F_CURRENT_RATING_NEGATIVE: CurrentRatingNegativeCondition,
-        ExpertEventType.F_RATING_UPGRADED: RatingUpgradedCondition,
-        ExpertEventType.F_RATING_DOWNGRADED: RatingDowngradedCondition,
-        ExpertEventType.F_HIGHRISK: HighRiskCondition,
-        ExpertEventType.F_MEDIUMRISK: MediumRiskCondition,
-        ExpertEventType.F_LOWRISK: LowRiskCondition,
-        ExpertEventType.F_NEW_TARGET_HIGHER: NewTargetHigherCondition,
-        ExpertEventType.F_NEW_TARGET_LOWER: NewTargetLowerCondition,
-        ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT: ExpectedProfitTargetPercentCondition,
-        ExpertEventType.N_PERCENT_TO_CURRENT_TARGET: PercentToCurrentTargetCondition,
-        ExpertEventType.N_PERCENT_TO_NEW_TARGET: PercentToNewTargetCondition,
-        ExpertEventType.N_NEW_TARGET_PERCENT: NewTargetPercentCondition,
-        ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
-        ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
-        ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
-        ExpertEventType.N_DAYS_SINCE_LAST_CLOSE: DaysSinceLastCloseCondition,
-        ExpertEventType.N_DAYS_SINCE_LAST_PROFITABLE_CLOSE: DaysSinceLastProfitableCloseCondition,
-        ExpertEventType.N_DAYS_SINCE_LAST_LOSING_CLOSE: DaysSinceLastLosingCloseCondition,
-        ExpertEventType.N_CONFIDENCE: ConfidenceCondition,
-        ExpertEventType.N_PRICE_VS_TARGET_LOW_PERCENT: PriceVsTargetLowCondition,
-        ExpertEventType.N_PRICE_VS_TARGET_HIGH_PERCENT: PriceVsTargetHighCondition,
-        ExpertEventType.N_PRICE_VS_TARGET_CONSENSUS_PERCENT: PriceVsTargetConsensusCondition,
-        ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE: InstrumentAccountShareCondition,
-        ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET: PercentOpenToNewTargetCondition,
-        ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH: PercentBelowRecentHighCondition,
-        ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW: PercentAboveRecentLowCondition,
-        ExpertEventType.N_IV_RANK: IVRankCondition,
-        ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
-        ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
-        ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
-        ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
-        ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,
-        ExpertEventType.F_HAS_ASSIGNED_SHARES: HasAssignedSharesCondition,
-    }
-    condition_class = condition_map.get(event_type)
+    condition_class = CONDITION_MAP.get(event_type)
     if not condition_class:
         raise ValueError(f"Unknown event type: {event_type}")
     if issubclass(condition_class, FlagCondition):

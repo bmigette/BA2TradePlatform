@@ -45,6 +45,24 @@ _FIELD_ABBR: Dict[str, str] = {
     "current_rating_positive": "ratingPos", "current_rating_negative": "ratingNeg",
     "current_rating_neutral": "ratingNeu",
     "new_target_higher": "tgtUp", "new_target_lower": "tgtDown",
+    # Curated because the camelCase fallback TRUNCATES AT 12 CHARS and collides: all three
+    # price_vs_target_* events rendered as "priceVsTarge", both 5-grade rating buckets as
+    # "currentRatin", and each rating-transition pair as "ratingNegati"/"ratingNeutra"/
+    # "ratingPositi" — so a generated rule name could not tell them apart. Uniqueness is
+    # pinned by tests/test_condition_registry_coverage.py.
+    "price_vs_target_low_percent": "vsTgtLow",
+    "price_vs_target_high_percent": "vsTgtHigh",
+    "price_vs_target_consensus_percent": "vsTgtCons",
+    "percent_to_new_target": "toNewTgt",
+    "percent_open_to_new_target": "openToNewTgt",
+    "current_rating_overweight": "ratingOW", "current_rating_underweight": "ratingUW",
+    "rating_upgraded": "upgraded", "rating_downgraded": "downgraded",
+    "rating_negative_to_neutral": "negToNeu", "rating_negative_to_positive": "negToPos",
+    "rating_neutral_to_negative": "neuToNeg", "rating_neutral_to_positive": "neuToPos",
+    "rating_positive_to_negative": "posToNeg", "rating_positive_to_neutral": "posToNeu",
+    "has_position_account": "acctPos", "has_no_position_account": "acctNoPos",
+    "has_option_position": "optPos", "has_covered_call": "hasCC",
+    "has_protective_put": "hasPP", "has_assigned_shares": "assigned",
 }
 _OP_TOKEN: Dict[str, str] = {
     ">": "gt", ">=": "gte", "<": "lt", "<=": "lte", "==": "eq", "!=": "ne",
