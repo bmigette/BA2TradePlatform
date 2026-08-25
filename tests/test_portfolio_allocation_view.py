@@ -3267,14 +3267,25 @@ def test_the_pnl_caption_carries_the_engines_own_wording_and_nothing_else():
 
 def test_the_pnl_colour_is_an_accent_and_never_the_message():
     """Grey covers three different things on purpose -- nothing measurable,
-    nothing held, and a genuine flat 0.00 -- because none of them is a verdict."""
-    from ba2_trade_platform.core.portfolio_allocation import UnrealisedPnL
+    nothing held, and a genuine flat 0.00 -- because none of them is a verdict,
+    and painting "break-even" red is inventing one.
+
+    Both directions are asserted on every case: a survivor of the mutation run
+    dropped the epsilon band, which turned an exact 0.00 red while still keeping
+    "green" out of the string.
+    """
+    from ba2_trade_platform.core.portfolio_allocation import MONEY_EPSILON, UnrealisedPnL
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import pnl_classes
 
-    assert 'green' in pnl_classes(UnrealisedPnL(amount=1.0))
-    assert 'red' in pnl_classes(UnrealisedPnL(amount=-1.0))
-    assert 'green' not in pnl_classes(UnrealisedPnL(amount=0.0))
-    assert 'red' not in pnl_classes(UnrealisedPnL(amount=None))
+    assert 'text-green-500' in pnl_classes(UnrealisedPnL(amount=1.0))
+    assert 'text-red-500' in pnl_classes(UnrealisedPnL(amount=-1.0))
+    for neutral in (UnrealisedPnL(amount=0.0),
+                    UnrealisedPnL(amount=MONEY_EPSILON / 2.0),
+                    UnrealisedPnL(amount=-MONEY_EPSILON / 2.0),
+                    UnrealisedPnL(amount=None),
+                    None):
+        classes = pnl_classes(neutral)
+        assert 'green' not in classes and 'red' not in classes, neutral
 
 
 def test_the_label_bar_states_the_last_target_and_the_pnl_beside_the_delta():

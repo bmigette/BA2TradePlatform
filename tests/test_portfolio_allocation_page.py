@@ -6041,3 +6041,41 @@ def test_the_fractional_toggle_is_remembered_for_the_next_run(monkeypatch,
         switch.set_value(False)
 
     assert get_allocation_config(account_id).allow_fractional is False
+
+
+def test_a_label_level_press_moves_the_VIEWS_before_it_pushes_the_BOXES(
+        monkeypatch, nicegui_client, account_id):
+    """Survivor of the mutation run: swapping those two loops.
+
+    A programmatic ``set_value`` fires the box's own change handler, and that
+    handler measures the incoming number against the OTHER labels AS THE VIEWS
+    CURRENTLY HOLD THEM. Push first and swapping 10/90 for 90/10 refuses the first
+    write for taking the set to 180%, then reverts the box to 10 over a database
+    that says 90 -- exactly the "a number the database does not have" defect
+    inline editing exists to remove.
+
+    The views move first, so every echo lands on a set that already adds to 100
+    and is absorbed by the compare-against-stored guard. Asserted at the MOMENT of
+    the push, because the echo itself is a coroutine NiceGUI drops without a
+    running loop -- so a test that only read the end state would pass either way.
+    """
+    sent = _capture_notifications(monkeypatch)
+    live_states, pushes = [], []
+    real_new_state, real_restore = page._new_live_state, page._restore_value
+    monkeypatch.setattr(page, '_new_live_state',
+                        lambda **kw: live_states.append(real_new_state(**kw))
+                        or live_states[-1])
+    monkeypatch.setattr(page, '_restore_value',
+                        lambda widget, value: pushes.append(
+                            (page._label_targets(live_states[-1]), value))
+                        or real_restore(widget, value))
+
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, a=10.0, b=90.0, previous=(90.0, 10.0)))
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 90.0, 'TECH': 10.0}
+    # The FIRST box is pushed into a page that already agrees with it.
+    assert pushes and pushes[0][0] == {'ARK26': 90.0, 'TECH': 10.0}
+    assert [value for _targets, value in pushes] == [90.0, 10.0]
+    assert not any('NOT saved' in m for m, _t in sent), sent
