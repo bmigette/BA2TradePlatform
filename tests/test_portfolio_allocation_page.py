@@ -4924,3 +4924,406 @@ def test_the_Fill_100_group_keeps_the_LEFT_of_its_row_for_its_siblings(
 
     assert 'justify-end' not in ' '.join(row._classes)
     assert [el for el in row.descendants() if isinstance(el, ui.space)]
+
+
+# ---------------------------------------------------------------------------
+# THE SYMBOL INFO PANEL, WIRED INTO THE PAGE
+#
+# ``ui/components/symbol_info_panel.py`` shipped finished and UNREACHABLE: a
+# 1,000-line component, 83 tests of its own, and not one caller. These are the two
+# entry points that give it one -- an ⓘ on every symbol row, and Compare over a
+# ticked selection -- plus the two guards they share.
+#
+# THE DOUBLE. ``page.open_symbol_info`` is replaced rather than driven for real:
+# the panel fetches from FMP over the network, and no unit test here does that.
+# What the double does NOT relax is the CALL: it binds every one against the real
+# function's ``inspect.signature``, so a renamed keyword, a missing ``as_of`` or a
+# positional/keyword mix-up fails in this file instead of in a browser.
+#
+# THE CLOCK is frozen and is deliberately NOT today's date: ``as_of=date.today()``
+# asserted against ``date.today()`` is a tautology that would survive the page
+# passing any other clock at all.
+# ---------------------------------------------------------------------------
+
+from datetime import date as _date                             # noqa: E402
+
+#: The page's frozen "today". A Tuesday, and pointedly not the day these tests
+#: were written on.
+PANEL_AS_OF = _date(2026, 3, 17)
+
+
+def _panel_calls(monkeypatch):
+    """Record every ``open_symbol_info`` call, CHECKED against the real signature."""
+    import inspect
+    from ba2_trade_platform.ui.components.symbol_info_panel import (
+        open_symbol_info as real_open_symbol_info)
+
+    signature = inspect.signature(real_open_symbol_info)
+    opened = []
+
+    def _record(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)     # TypeError on a wrong call
+        bound.apply_defaults()
+        opened.append(dict(bound.arguments))
+        return object()
+
+    monkeypatch.setattr(page, 'open_symbol_info', _record)
+    return opened
+
+
+def _fmp_key(monkeypatch, value='FMP-TEST-KEY'):
+    """Answer the page's app-setting read, and record WHICH key it asked for."""
+    asked = []
+
+    def _get(key, default=None):
+        asked.append(key)
+        return value
+
+    monkeypatch.setattr(page, 'get_app_setting', _get)
+    return asked
+
+
+def _freeze_today(monkeypatch, day=PANEL_AS_OF):
+    """Freeze the page's own clock, so ``as_of`` is a value and not a tautology."""
+    class _FrozenDate(_date):
+        @classmethod
+        def today(cls):
+            return day
+
+    monkeypatch.setattr(page, 'date', _FrozenDate)
+    return day
+
+
+def _compare_button(root, index=0):
+    from nicegui import ui
+    buttons = [el for el in root.descendants()
+               if isinstance(el, ui.button) and el._props.get('label') == 'Compare']
+    assert buttons, 'no Compare button was drawn'
+    return buttons[index]
+
+
+def _tick(table, *symbols):
+    """Tick rows in the table's own checkbox selection, in the order given."""
+    by_symbol = {r['symbol']: r for r in table.rows}
+    table.selected = [by_symbol[s] for s in symbols]
+    return table
+
+
+# -- the ⓘ on every symbol row -----------------------------------------------
+
+def test_every_symbol_row_carries_an_info_control(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    table = _tables(root)[0]
+
+    assert 'info' in {c['name'] for c in table.columns}
+    assert 'body-cell-info' in table.slots
+    assert 'symbolInfo' in _listener_types(table)
+
+
+def test_the_info_control_emits_the_symbol_of_the_row_it_sits_in(nicegui_client,
+                                                                  account_id):
+    """``props.row.symbol``, not a value captured when the table was built. The
+    Vue template is the only thing that knows which row was clicked."""
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+
+    assert 'props.row.symbol' in _tables(root)[0].slots['body-cell-info'].template
+
+
+def test_the_info_icon_opens_the_panel_for_ITS_OWN_row(monkeypatch, nicegui_client,
+                                                        account_id):
+    """THE late-binding test. Three rows are drawn and EACH is clicked in turn: a
+    handler that closed over the render loop's variable, or over the label's symbol
+    list, opens the last symbol every time and passes a one-row test."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+    table = _tables(root)[0]
+
+    for symbol in ('AAPL', 'MSFT', 'TSLA'):
+        _emit(table, 'symbolInfo', [symbol])
+
+    assert [call['symbols'] for call in opened] == [['AAPL'], ['MSFT'], ['TSLA']]
+
+
+def test_the_info_control_says_what_it_will_show(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-info'].template
+
+    assert 'Holdings, dividends and total return' in template
+
+
+def test_every_label_gets_its_own_info_column(nicegui_client, account_id):
+    """One table per label, so one wiring per label -- exactly as ``weightChange``
+    and ``commentChange`` are wired."""
+    views = _views([ManagedLabel('A', 50.0), ManagedLabel('B', 50.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT']},
+                   weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
+    root = _draw(nicegui_client, account_id, views)
+
+    assert all('symbolInfo' in _listener_types(t) for t in _tables(root))
+
+
+# -- Compare, over the ticked rows -------------------------------------------
+
+def test_every_label_gets_its_own_Compare_button(nicegui_client, account_id):
+    views = _views([ManagedLabel('A', 50.0), ManagedLabel('B', 50.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT']},
+                   weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
+    root = _draw(nicegui_client, account_id, views)
+
+    from nicegui import ui
+    assert len([el for el in root.descendants()
+                if isinstance(el, ui.button)
+                and el._props.get('label') == 'Compare']) == 2
+
+
+def test_Compare_passes_every_ticked_symbol_IN_ORDER(monkeypatch, nicegui_client,
+                                                      account_id):
+    """All of them, and in the order the table hands them over -- the comparison
+    columns are laid out left to right in exactly that order."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+    _tick(_tables(root)[0], 'TSLA', 'AAPL', 'MSFT')
+
+    _press(_compare_button(root))
+
+    assert [call['symbols'] for call in opened] == [['TSLA', 'AAPL', 'MSFT']]
+
+
+def test_Compare_reads_the_SAME_ticked_rows_the_remove_button_does(
+        monkeypatch, nicegui_client, account_id):
+    """One selection mechanism, not two. The checkbox column already exists
+    (``selection='multiple'``) and "Remove selected from label" already reads it."""
+    from ba2_trade_platform.core.utils import get_symbols_by_label
+    from nicegui import ui
+
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT', 'TSLA'], 'ARK26')
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+    _tick(_tables(root)[0], 'MSFT')
+
+    _press(_compare_button(root))
+    remove = [el for el in root.descendants()
+              if isinstance(el, ui.button)
+              and el._props.get('label') == 'Remove selected from label'][0]
+    _press(remove)
+
+    assert [call['symbols'] for call in opened] == [['MSFT']]
+    assert get_symbols_by_label(['ARK26'])['ARK26'] == ['AAPL', 'TSLA']
+
+
+def test_ONE_reader_of_the_ticked_rows_serves_BOTH_buttons():
+    """Survivor: ``_remove_selected`` going back to its own inline
+    ``table.selected`` read.
+
+    Behaviourally identical today, which is exactly why it needs saying: two
+    readers of one selection is how the two buttons come to disagree about what
+    "selected" means -- an ``or []`` on one side, a ``.get('symbol')`` on the
+    other. There is one reader, and neither caller touches ``table.selected``.
+    """
+    import inspect
+    source = inspect.getsource(page._render_label_body)
+
+    assert source.count('_selected_symbols(') == 2, source.count('_selected_symbols(')
+    assert 'table.selected' not in source
+
+
+def test_Compare_never_reaches_into_ANOTHER_labels_selection(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    """Two labels, two tables, two selections. A Compare wired to "the first table"
+    rather than to its own would open B's tick from A's button."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    sent = _capture_notifications(monkeypatch)
+    views = _views([ManagedLabel('A', 50.0), ManagedLabel('B', 50.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT']},
+                   weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
+    root = _draw(nicegui_client, account_id, views)
+    _tick(_tables(root)[1], 'MSFT')
+
+    _press(_compare_button(root, 0))
+    assert opened == []
+    assert any('at least one symbol' in m.lower() for m, _t in sent)
+
+    _press(_compare_button(root, 1))
+    assert [call['symbols'] for call in opened] == [['MSFT']]
+
+
+def test_Compare_with_nothing_ticked_says_so_and_opens_NOTHING(monkeypatch,
+                                                                nicegui_client,
+                                                                account_id):
+    """A dialog titled "Symbol info — " over an empty comparison is worse than a
+    refusal: it looks like the fetch failed."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+
+    _press(_compare_button(root))
+
+    assert opened == []
+    assert ('Select at least one symbol first', 'warning') in sent
+
+
+def test_Compare_sits_with_the_harmless_buttons_and_not_beside_Remove(
+        nicegui_client, account_id):
+    """The row is "harmless actions | space | the one that deletes things", and it
+    is sized for the wizard's step-2 siblings still to come. Compare is a READ; it
+    belongs on the left of the space, not wedged against the destructive button."""
+    from nicegui import ui
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    row = _fill_button(root).parent_slot.parent
+    children = list(row.default_slot.children)
+    names = [c._props.get('label', type(c).__name__) for c in children]
+    space_at = next(i for i, c in enumerate(children) if isinstance(c, ui.space))
+
+    assert names.index('Compare') < space_at, names
+    assert space_at < names.index('Remove selected from label'), names
+
+
+# -- the two guards, shared by both entry points -----------------------------
+
+def test_a_missing_FMP_key_stops_the_INFO_ICON_and_says_where_to_set_it(
+        monkeypatch, nicegui_client, account_id):
+    """No silent no-op and no crash: the panel's every figure comes from FMP, so
+    with no key there is nothing to show and a reason worth printing."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch, value=None)
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert opened == []
+    assert any('FMP_API_KEY' in m and 'Settings' in m for m, _t in sent), sent
+    assert [t for _m, t in sent] == ['warning']
+
+
+def test_a_missing_FMP_key_stops_COMPARE_too(monkeypatch, nicegui_client, account_id):
+    """ONE helper behind both entry points -- the guards cannot drift apart."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch, value=None)
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+    _tick(_tables(root)[0], 'AAPL')
+
+    _press(_compare_button(root))
+
+    assert opened == []
+    assert any('FMP_API_KEY' in m for m, _t in sent), sent
+
+
+def test_a_BLANK_FMP_key_is_a_missing_one(monkeypatch, nicegui_client, account_id):
+    """The Settings page stores what was typed; an empty box is an empty string,
+    and ``get_app_setting`` returns it rather than None."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch, value='')
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert opened == []
+    assert any('FMP_API_KEY' in m for m, _t in sent), sent
+
+
+def test_the_missing_key_is_reported_even_when_nothing_is_ticked(monkeypatch,
+                                                                  nicegui_client,
+                                                                  account_id):
+    """Which is the actionable half: ticking a row would not have helped."""
+    _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch, value=None)
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _press(_compare_button(root))
+
+    assert any('FMP_API_KEY' in m for m, _t in sent), sent
+
+
+# -- what the panel is actually handed ---------------------------------------
+
+def test_the_page_reads_the_key_the_SETTINGS_page_writes(monkeypatch, nicegui_client,
+                                                          account_id):
+    asked = _fmp_key(monkeypatch)
+    _panel_calls(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert asked == ['FMP_API_KEY']
+
+
+def test_the_key_really_comes_from_the_app_settings_ROW(monkeypatch, nicegui_client,
+                                                         account_id):
+    """No stub on ``get_app_setting`` here. The row the Settings page writes is the
+    row this page has to read, and only an unstubbed read proves the two agree."""
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import AppSetting
+
+    add_instance(AppSetting(key='FMP_API_KEY', value_str='ROW-KEY'))
+    opened = _panel_calls(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert [call['api_key'] for call in opened] == ['ROW-KEY']
+
+
+def test_no_app_settings_row_at_all_is_a_refusal_not_a_crash(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    """Unstubbed again, against an empty settings table."""
+    opened = _panel_calls(monkeypatch)
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert opened == []
+    assert any('FMP_API_KEY' in m for m, _t in sent), sent
+
+
+def test_the_panel_is_given_the_pages_own_clock_and_the_key(monkeypatch,
+                                                             nicegui_client,
+                                                             account_id):
+    """``as_of`` is REQUIRED by the panel and is the only clock it has."""
+    day = _freeze_today(monkeypatch)
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert opened[0]['as_of'] == day
+    assert opened[0]['api_key'] == 'FMP-TEST-KEY'
+
+
+def test_the_panel_is_NOT_built_while_the_page_renders(monkeypatch, nicegui_client,
+                                                        account_id):
+    """It fetches from FMP -- one round trip per symbol. Building it at render time
+    would put that behind every refresh of this page, for every managed symbol."""
+    opened = _panel_calls(monkeypatch)
+    asked = _fmp_key(monkeypatch)
+
+    _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+
+    assert opened == []
+    assert asked == []          # not even the key is read until something is clicked
+
+
+def test_the_panel_is_imported_directly_and_not_through_the_components_package():
+    """It is deliberately absent from ``ui/components/__init__.py`` so the eager
+    import graph does not grow -- the same convention as ``symbol_chart_data`` and
+    ``echart_theme``. Re-exporting it there would undo that."""
+    import inspect
+    import ba2_trade_platform.ui.components as components
+
+    assert not hasattr(components, 'open_symbol_info')
+    assert ('from ..components.symbol_info_panel import open_symbol_info'
+            in inspect.getsource(page))

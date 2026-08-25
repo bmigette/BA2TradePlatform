@@ -63,6 +63,14 @@ Two house rules are load-bearing here:
   work for symbols with no position. Alpaca's default feed is ``delayed_sip``
   (15 minutes delayed), which the page states next to the data.
 
+WHAT A SYMBOL IS, WITHOUT LEAVING THE PAGE
+==========================================
+Two entry points into ``ui/components/symbol_info_panel.py`` (holdings,
+dividends, total return, chart): the ⓘ on each symbol row, and Compare over the
+rows ticked in one label's table. Both go through ``_open_symbol_info``, so the
+FMP-key and empty-selection refusals exist once, and the panel is built ON CLICK
+-- never at render -- because it fetches over the network.
+
 This repo uses no ``ui.refreshable`` / ``ui.stepper`` / ``ui.aggrid``: refresh is
 ``container.clear()`` followed by rebuilding inside ``with container:``. Blocking
 broker work goes through ``asyncio.to_thread``.
@@ -77,12 +85,13 @@ keeps the registries out of THIS module's own graph, so the deferral survives if
 the package ``__init__`` is ever trimmed.
 """
 import asyncio
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from nicegui import ui
 from sqlmodel import select
 
+from ...config import get_app_setting
 from ...core import portfolio_allocation_service as svc
 from ...core.db import get_db
 from ...core.models import ExpertInstance
@@ -101,6 +110,10 @@ from ...core.portfolio_allocation_store import (
 )
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
+# The MODULE, deliberately: the panel is absent from ``ui/components/__init__.py``
+# (same convention as ``symbol_chart_data`` and ``echart_theme``) so importing it
+# does not grow the eager import graph every page already pays for.
+from ..components.symbol_info_panel import open_symbol_info
 from ..utils.portfolio_allocation_view import (
     BASIS_LEGEND, DEFAULT_MACHINE_LABEL_FAMILIES, GATE_NO_ACCOUNT,
     LABEL_COLOR_PALETTE, LABEL_STATUS_CLASSES, LABEL_TARGET_CAPTION,
@@ -1402,6 +1415,58 @@ def _open_label_picker(account_id: int, refresh) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The symbol info panel (``ui/components/symbol_info_panel.py``)
+#
+# Two ways in -- the ⓘ on a symbol row, and Compare over a ticked selection --
+# and ONE function behind both, so the guards below exist exactly once.
+# ---------------------------------------------------------------------------
+
+def _selected_symbols(table) -> List[str]:
+    """The symbols TICKED in one label's table, in the order the table reports them.
+
+    The symbol table has carried ``selection='multiple'`` since it was built and
+    "Remove selected from label" has always read ``table.selected``; this is that
+    same read, named once, so Compare and Remove cannot come to disagree about what
+    "selected" means. A second selection mechanism beside a working one is how a
+    button ends up acting on rows the user did not tick.
+
+    Order is preserved deliberately: the comparison lays its columns out left to
+    right in exactly the order it is handed.
+    """
+    return [row['symbol'] for row in (table.selected or [])]
+
+
+def _open_symbol_info(symbols) -> None:
+    """Open the symbol-info dialog for ``symbols``. THE entry point, for both callers.
+
+    Neither guard is cosmetic:
+
+    * Every figure the panel draws comes from FMP, so with no key there is nothing
+      to show. An empty dialog would read as a failed fetch rather than as
+      unfinished configuration, and doing nothing at all would read as a broken
+      button -- so it says which setting is missing and where it lives.
+    * An empty selection would open a dialog titled "Symbol info — " over an empty
+      comparison, which tells the same lie.
+
+    The clock is passed EXPLICITLY. The panel has no clock of its own by design, so
+    that nothing can quietly compare two symbols as of two different days.
+
+    Not a coroutine: NiceGUI runs a sync click handler ON the event loop, which is
+    the running loop ``open_symbol_info`` needs for the task it starts. The fetch
+    itself is the panel's own ``asyncio.to_thread``, so nothing blocks here.
+    """
+    api_key = get_app_setting('FMP_API_KEY')
+    if not api_key:
+        ui.notify('FMP API key not configured. Please set FMP_API_KEY in '
+                  'Settings > App Settings.', type='warning')
+        return
+    if not symbols:
+        ui.notify('Select at least one symbol first', type='warning')
+        return
+    open_symbol_info(symbols, api_key=api_key, as_of=date.today())
+
+
+# ---------------------------------------------------------------------------
 # Rendering (eyeball-only; all decisions already made above)
 # ---------------------------------------------------------------------------
 
@@ -1488,6 +1553,10 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     columns = [
         {'name': 'flag', 'label': '', 'field': 'flag', 'align': 'center'},
         {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
+        # The ⓘ, beside the symbol it describes rather than at the far end of
+        # eleven columns. ``field`` is required by Quasar and is never printed --
+        # the slot below draws a button over it.
+        {'name': 'info', 'label': '', 'field': 'symbol', 'align': 'center'},
         {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
         {'name': 'pct_of_label', 'label': '% of label', 'field': 'pct_of_label', 'sortable': True, 'align': 'right'},
         {'name': 'pct_of_total', 'label': '% of total', 'field': 'pct_of_total', 'sortable': True, 'align': 'right'},
@@ -1512,6 +1581,22 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                   style="color:#f6ad55;font-weight:600">{{ props.value }}</span>
         </q-td>
     ''')
+    # The row's OWN symbol, read off ``props.row`` in the template and carried by
+    # the emit. A NiceGUI cell slot is rendered ONCE and reused by Quasar for every
+    # row, so a Python ``ui.button`` per row is not available inside a ``ui.table``
+    # -- and the identity has to travel with the click or every row opens the same
+    # symbol. That is the same wiring ``weightChange`` and ``commentChange`` below
+    # use, and it leaves no loop variable for a handler to close over.
+    table.add_slot('body-cell-info', r'''
+        <q-td :props="props">
+            <q-btn dense flat round size="sm" icon="info" color="grey-5"
+                   @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
+                <q-tooltip>Holdings, dividends and total return for
+                    {{ props.row.symbol }}</q-tooltip>
+            </q-btn>
+        </q-td>
+    ''')
+    table.on('symbolInfo', lambda e: _open_symbol_info([e.args[0]]))
     # ``:key`` is load-bearing, not decoration: the input is bound to
     # ``props.value``, so Vue's watcher only fires when THAT changes -- and a
     # REFUSED edit leaves it unchanged by definition. Bumping the key remounts the
@@ -1542,7 +1627,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                  account_id, lbl, e.args[0], e.args[1], syms))
 
     async def _remove_selected() -> None:
-        symbols = [r['symbol'] for r in (table.selected or [])]
+        symbols = _selected_symbols(table)
         if not symbols:
             ui.notify('Tick one or more symbols first', type='warning')
             return
@@ -1567,6 +1652,15 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                   ).props('outline dense') \
             .tooltip('Make these shares total 100%: fill the empty ones if there '
                      'are any, otherwise scale them all proportionally.')
+        # LEFT of the space, with the harmless buttons. Compare reads the same
+        # ticked rows Remove does, but it only READS them; sitting it against the
+        # one button on this row that deletes things is how a mis-aimed click stops
+        # being harmless.
+        ui.button('Compare', icon='compare_arrows',
+                  on_click=lambda t=table: _open_symbol_info(_selected_symbols(t))
+                  ).props('outline dense') \
+            .tooltip('Holdings, dividends and total return for the ticked '
+                     'symbols, side by side.')
         ui.space()
         ui.button('Remove selected from label', icon='delete', on_click=_remove_selected
                   ).props('outline color=negative dense')
