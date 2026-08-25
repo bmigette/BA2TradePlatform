@@ -15,6 +15,15 @@ For an account with no experts that list is ``[]``, the query short-circuits, an
 widget renders as though the account had never traded -- a MEASURED-LOOKING ZERO over
 real money. "This account has no experts" is not "this account has no data".
 
+THAT WAS ONLY HALF OF IT. Fixing the QUERY still left ``Floating P/L Per Account``
+building its rows out of the transactions that came back, so an account with
+nothing open produced no group, no row, and no statement about itself at all --
+which is how TastyTrade (manual, and flat) stayed missing from the card after the
+expert filter was gone. An account-level card lists the ACCOUNTS, and each one is
+in exactly one of three states: measured, measured at zero, or unmeasurable. The
+block near ``test_floating_pl_per_account_lists_a_flat_account_at_a_measured_zero``
+pins all three, in both directions.
+
 ``📊 Floating P/L Per Expert`` is deliberately NOT in this file's remit: it is
 genuinely per-expert and an account with no experts correctly shows nothing there.
 ``test_the_per_expert_widget_stays_per_expert`` pins that, so a future "fix" cannot
@@ -587,8 +596,19 @@ def test_floating_pl_per_account_never_shows_another_accounts_positions(
     assert '$100.00' not in texts
 
 
-def test_floating_pl_per_account_on_a_genuinely_empty_account_says_so(
+def test_floating_pl_per_account_on_a_genuinely_empty_account_measures_it_at_zero(
         nicegui_client, select_account, monkeypatch, manual_account, expert_account):
+    """SUPERSEDED RULE, kept as a test so the reasoning is not lost.
+
+    This used to assert the whole card said 'No open positions' and drew NO row
+    and no total. That was defensible while the card was a list of positions --
+    but it is a list of ACCOUNTS, and the selected account exists, was asked, and
+    answered '[]'. Saying nothing about it is strictly less than saying '$0.00',
+    and it is the same silence that hid TastyTrade.
+
+    What survives from the old test is the part that was always right: the other
+    account's money stays out of it, and the spinner is gone.
+    """
     other_account, expert_id = expert_account
     _open_trade(other_account, 'MSFT', expert_id=expert_id, qty=10.0, open_price=100.0)
     _use_brokers(monkeypatch, {
@@ -599,9 +619,11 @@ def test_floating_pl_per_account_on_a_genuinely_empty_account_says_so(
     select_account(manual_account)
     texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
 
-    assert 'No open positions' in texts
-    assert 'Total P/L:' not in texts
-    assert '$0.00' not in texts
+    assert 'Manual' in texts
+    assert texts.count('$0.00') == 2        # the row, and a total that is also zero
+    assert 'Automated' not in texts
+    assert '$50.00' not in texts
+    assert 'No open positions' not in texts
     assert '🔄 Calculating floating P/L...' not in texts
 
 
@@ -639,6 +661,377 @@ def test_floating_pl_per_account_includes_a_manual_trade_in_an_expert_account(
     texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
 
     assert '$150.00' in texts      # 100 from the expert trade + 50 from the manual one
+
+
+# ===========================================================================
+# 📊 Floating P/L Per Account: EVERY account in scope gets a row, in ONE OF
+# THREE states
+#
+# The card lists ACCOUNTS, so the list of accounts is the list of accounts --
+# read from ``AccountDefinition``, not inferred from whatever happens to have an
+# open transaction (and certainly not from the experts). An account that is
+# missing from the card makes NO STATEMENT about itself, and the three statements
+# the card can actually make are all different:
+#
+#   * a measured figure        -> '$52.43'      (positions read, priced)
+#   * a measured ZERO          -> '$0.00'       (broker answered [] -- flat)
+#   * could not be measured    -> 'P/L unknown' (broker answered None / no
+#                                                account instance / raised)
+#
+# TastyTrade shows 'Open: 0' in the Orders widget and had no row here at all:
+# grouping the rows out of the transaction table meant an account with nothing
+# open produced no key, so it vanished -- the same defect as dropping it for
+# having no experts, one layer further down.
+# ===========================================================================
+
+def _flat(balance=None):
+    """A broker that answers 'I hold nothing' -- ``[]``, not ``None``."""
+    return _Broker([], balance=balance)
+
+
+def _unreadable(balance=None):
+    """A broker whose position fetch FAILED -- ``None``, per the tri-state."""
+    return _Broker(None, balance=balance)
+
+
+def test_floating_pl_per_account_lists_a_flat_account_at_a_measured_zero(
+        nicegui_client, select_account, monkeypatch, manual_account):
+    """THE BUG. 'Open: 0' is a measurement; no row at all is not.
+
+    The account has no experts AND no open transactions, which is exactly the
+    shape that produced no row. The broker answered ``[]``, so the floating P/L
+    is measured, and it is $0.00.
+    """
+    _use_brokers(monkeypatch, {manual_account: _flat(balance=1_234.56)})
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert 'Manual' in texts
+    assert '$0.00' in texts
+    assert 'Bal: $1,234.56' in texts
+    assert 'P/L unknown' not in texts
+    assert 'No open positions' not in texts
+
+
+def test_floating_pl_per_account_lists_a_flat_account_next_to_a_trading_one(
+        nicegui_client, select_account, monkeypatch, manual_account, expert_account):
+    """THE SCREENSHOT: 'All' selected, one account flat, one holding. TWO rows.
+
+    The flat account's balance counts towards the total balance too -- the header
+    row read 'Bal: $717.37' when that was only one of the two accounts.
+    """
+    other_account, expert_id = expert_account
+    _open_trade(other_account, 'MSFT', expert_id=expert_id, qty=10.0, open_price=100.0)
+    _use_brokers(monkeypatch, {
+        manual_account: _flat(balance=717.37),
+        other_account: _Broker([_price('MSFT', 105.0)], balance=1_000.00),
+    })
+
+    select_account(None)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert 'Manual' in texts and 'Automated' in texts
+    assert '$0.00' in texts                 # the flat account, measured
+    assert 'Bal: $717.37' in texts
+    assert 'Bal: $1,717.37' in texts        # the TOTAL, including the flat account
+    assert texts.count('$50.00') == 2       # the trading row, and the total
+
+
+def test_floating_pl_per_account_lists_each_account_exactly_once(
+        nicegui_client, select_account, monkeypatch, manual_account):
+    """Seeding the row from the account table must not double the rows of an
+    account that ALSO has open transactions."""
+    _open_trade(manual_account, 'AAPL', qty=10.0, open_price=100.0)
+    _use_brokers(monkeypatch, {manual_account: _Broker([_price('AAPL', 110.0)])})
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert texts.count('Manual') == 1
+    assert texts.count('$100.00') == 2      # the row and the total, nothing more
+
+
+def test_floating_pl_per_account_does_not_list_an_account_outside_the_selection(
+        nicegui_client, select_account, monkeypatch, manual_account, expert_account):
+    """The seed honours the dropdown: 'All' is the ONLY selection that widens it."""
+    other_account, _ = expert_account
+    _use_brokers(monkeypatch, {manual_account: _flat(), other_account: _flat()})
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert 'Manual' in texts
+    assert 'Automated' not in texts
+
+
+def test_floating_pl_per_account_says_unknown_when_the_position_book_could_not_be_read(
+        nicegui_client, select_account, monkeypatch, manual_account):
+    """``get_positions()`` returns ``None`` on FAILURE -- never ``[]``.
+
+    Drawing '$0.00' for a broker outage tells the user their account is flat;
+    drawing nothing tells them nothing. Both are worse than saying so.
+    """
+    _open_trade(manual_account, 'AAPL', qty=10.0, open_price=100.0)
+    _use_brokers(monkeypatch, {manual_account: _unreadable(balance=500.0)})
+    errors = _capture_errors(monkeypatch, fpl_mod)
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert 'Manual' in texts
+    assert texts.count('P/L unknown') == 2   # the row, and the total it poisoned
+    assert '$0.00' not in texts
+    assert 'Bal: $500.00' in texts           # the balance WAS readable; keep it
+    assert errors                            # and the failure was logged
+
+
+def test_floating_pl_per_account_says_unknown_when_the_account_cannot_be_instantiated(
+        nicegui_client, select_account, monkeypatch, manual_account):
+    """No broker object at all is the same class of failure as ``None`` positions.
+
+    The log line is asserted on because it is the only thing that separates this
+    from letting ``None.get_positions()`` throw: both reach the user's 'unknown',
+    but the AttributeError sends whoever reads the log hunting an outage that
+    never happened.
+    """
+    _use_brokers(monkeypatch, {})
+    errors = _capture_errors(monkeypatch, fpl_mod)
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert 'Manual' in texts
+    assert 'P/L unknown' in texts
+    assert '$0.00' not in texts
+    assert any('Could not build an account instance' in e for e in errors), errors
+
+
+def test_floating_pl_per_account_says_unknown_when_the_broker_raises(
+        nicegui_client, select_account, monkeypatch, manual_account):
+    """An exception is a failed measurement, not a zero one."""
+    class _Exploding:
+        def get_balance(self):
+            raise RuntimeError('balance boom')
+
+        def get_positions(self):
+            raise RuntimeError('positions boom')
+
+    _use_brokers(monkeypatch, {manual_account: _Exploding()})
+    errors = _capture_errors(monkeypatch, fpl_mod)
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert 'Manual' in texts
+    assert 'P/L unknown' in texts
+    assert '$0.00' not in texts
+    assert errors
+
+
+def test_floating_pl_per_account_tells_a_measured_zero_apart_from_an_unknown(
+        nicegui_client, select_account, monkeypatch, manual_account, expert_account):
+    """BOTH DIRECTIONS, on one screen.
+
+    Collapsing either way is a lie: the flat account is not unknown, and the
+    unreadable one is not flat.
+    """
+    other_account, _ = expert_account
+    _use_brokers(monkeypatch, {manual_account: _flat(), other_account: _unreadable()})
+    _capture_errors(monkeypatch, fpl_mod)
+
+    select_account(None)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert 'Manual' in texts and 'Automated' in texts
+    assert texts.count('$0.00') == 1         # ONLY the flat one
+    assert texts.count('P/L unknown') == 1   # ONLY the unreadable one
+
+
+def test_floating_pl_per_account_total_is_partial_and_names_what_it_left_out(
+        nicegui_client, select_account, monkeypatch, manual_account, expert_account):
+    """``50 + unknown`` is not ``50``.
+
+    The total may still show the part it could add, but it must not present that
+    as THE total, and it must say whose money is missing from it.
+    """
+    other_account, expert_id = expert_account
+    _open_trade(other_account, 'MSFT', expert_id=expert_id, qty=10.0, open_price=100.0)
+    _use_brokers(monkeypatch, {
+        manual_account: _unreadable(),
+        other_account: _Broker([_price('MSFT', 105.0)]),
+    })
+    _capture_errors(monkeypatch, fpl_mod)
+
+    select_account(None)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert '$50.00 (partial)' in texts
+    assert texts.count('$50.00') == 1        # the row only; the total is marked
+    assert any('Manual' in t and 'could not be measured' in t for t in texts), texts
+
+
+def test_floating_pl_per_account_total_is_unknown_when_nothing_could_be_read(
+        nicegui_client, select_account, monkeypatch, manual_account, expert_account):
+    other_account, _ = expert_account
+    _use_brokers(monkeypatch, {
+        manual_account: _unreadable(),
+        other_account: _unreadable(),
+    })
+    _capture_errors(monkeypatch, fpl_mod)
+
+    select_account(None)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert texts.count('P/L unknown') == 3   # two rows and the total
+    assert '$0.00' not in texts
+    assert '(partial)' not in ''.join(texts)
+
+
+def test_floating_pl_per_account_says_when_a_balance_could_not_be_read(
+        nicegui_client, select_account, monkeypatch, manual_account, expert_account):
+    """The balance is a second, independent read -- and its own tri-state.
+
+    A balance that would not come back must not silently drop out of the total
+    balance, which is how 'Bal: $717.37' came to be presented as both accounts'.
+    """
+    other_account, _ = expert_account
+    _use_brokers(monkeypatch, {
+        manual_account: _flat(balance=None),        # balance unreadable
+        other_account: _flat(balance=1_000.00),
+    })
+
+    select_account(None)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert 'Bal: unknown' in texts
+    assert 'Bal: $1,000.00' in texts                # the row that DID answer
+    assert 'Bal: $1,000.00 (partial)' in texts      # the total, honestly marked
+    assert any('Manual' in t and 'balance' in t.lower() for t in texts), texts
+
+
+def test_floating_pl_per_account_total_balance_is_unknown_when_none_could_be_read(
+        nicegui_client, select_account, monkeypatch, manual_account):
+    _use_brokers(monkeypatch, {manual_account: _flat(balance=None)})
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert texts.count('Bal: unknown') == 2         # the row and the total
+    assert 'Bal: $0.00' not in texts
+
+
+def test_floating_pl_per_account_keeps_a_genuinely_zero_balance(
+        nicegui_client, select_account, monkeypatch, manual_account):
+    """The inverse error. ``0.0`` is a real balance and must print as one."""
+    _use_brokers(monkeypatch, {manual_account: _flat(balance=0.0)})
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert texts.count('Bal: $0.00') == 2           # the row and the total
+    assert 'Bal: unknown' not in texts
+
+
+def test_floating_pl_per_account_marks_a_row_partial_when_a_held_position_has_no_price(
+        nicegui_client, select_account, monkeypatch, manual_account):
+    """A position the broker did not quote is a MISSING LEG, not a zero one.
+
+    Silently skipping it (what the widget did) understated the account's P/L by
+    however much that position is worth, with nothing on screen to say so.
+    """
+    _open_trade(manual_account, 'AAPL', qty=10.0, open_price=100.0)
+    _open_trade(manual_account, 'MSFT', qty=10.0, open_price=100.0)
+    _use_brokers(monkeypatch, {manual_account: _Broker([_price('AAPL', 110.0)])})
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert '$100.00 (partial)' in texts
+    assert any('MSFT' in t for t in texts), texts
+
+
+def test_floating_pl_per_account_does_not_call_a_pending_order_unpriced(
+        nicegui_client, select_account, monkeypatch, manual_account):
+    """A WAITING transaction holds NO position, so its P/L is a measured zero.
+
+    'No net position' and 'no price for a position we hold' are different, and
+    conflating them would mark every account with a resting order as partial.
+    """
+    txn = create_transaction(symbol='AAPL', quantity=10.0, side=OrderDirection.BUY,
+                             status=TransactionStatus.WAITING, open_price=100.0)
+    create_trading_order(account_id=manual_account, symbol='AAPL', quantity=10.0,
+                         side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                         status=OrderStatus.PENDING, transaction_id=txn.id,
+                         filled_qty=0.0)
+    _use_brokers(monkeypatch, {manual_account: _flat()})
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert '$0.00' in texts
+    assert '(partial)' not in ''.join(texts)
+    assert 'P/L unknown' not in texts
+
+
+def test_floating_pl_per_account_with_no_accounts_at_all_says_so(
+        nicegui_client, select_account, monkeypatch):
+    """No accounts configured is its own statement -- and not 'no positions'."""
+    _use_brokers(monkeypatch, {})
+
+    select_account(None)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert 'No accounts configured' in texts
+    assert '$0.00' not in texts
+    assert 'Total P/L:' not in texts
+
+
+def test_the_per_expert_widget_is_not_seeded_with_accounts(
+        nicegui_client, select_account, monkeypatch, manual_account, expert_account):
+    """The per-EXPERT card lists experts, so the account seed must not reach it.
+
+    Seeding it would put an account name in a list of experts and, for a manual
+    account, resurrect exactly the row 'Floating P/L Per Expert' is supposed not
+    to have.
+    """
+    other_account, _ = expert_account
+    _use_brokers(monkeypatch, {manual_account: _flat(), other_account: _flat()})
+
+    select_account(None)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerExpertWidget)
+
+    assert texts == ['No open positions']
+
+
+def test_the_per_expert_widget_reports_an_unreadable_broker_as_unknown(
+        nicegui_client, select_account, monkeypatch, expert_account):
+    """Same tri-state, same card body: a failed fetch is not a flat expert."""
+    account_id, expert_id = expert_account
+    _open_trade(account_id, 'AAPL', expert_id=expert_id, qty=10.0, open_price=100.0)
+    _use_brokers(monkeypatch, {account_id: _unreadable()})
+    _capture_errors(monkeypatch, fpl_mod)
+
+    select_account(account_id)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerExpertWidget)
+
+    assert f'Alpha-{expert_id}' in texts
+    assert 'P/L unknown' in texts
+    assert '$0.00' not in texts
+
+
+def test_the_per_expert_widget_shows_no_balance_row(
+        nicegui_client, select_account, monkeypatch, expert_account):
+    """``_show_balance`` is False there: an expert has no broker balance."""
+    account_id, expert_id = expert_account
+    _open_trade(account_id, 'AAPL', expert_id=expert_id, qty=10.0, open_price=100.0)
+    _use_brokers(monkeypatch, {account_id: _Broker([_price('AAPL', 110.0)],
+                                                   balance=9_999.0)})
+
+    select_account(account_id)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerExpertWidget)
+
+    assert not [t for t in texts if t.startswith('Bal:')], texts
 
 
 def test_the_per_expert_widget_stays_per_expert(
