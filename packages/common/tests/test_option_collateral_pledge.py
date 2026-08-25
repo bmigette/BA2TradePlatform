@@ -1233,3 +1233,95 @@ class TestTheEntrySeamRefusesAnUncoveredCoveredCall:
             _write(SubmittingAccount(book=None, positions=None))
 
         assert store.all(TradingOrder) == [] and store.all(Transaction) == []
+
+
+# ===========================================================================
+# THE REFUSAL CHANNEL — a VERDICT for callers that have one, the raise as backstop
+#
+# The decision is ``check_cover_for_covered_call``, which returns a
+# ``CoverCapacity`` exactly as ``check_assignment_capacity`` returns an
+# ``AssignmentCapacity``: the three rails on this entry path (buying power,
+# assignment capacity, share cover) refuse with three different remedies and
+# must all reach a caller the same way. ``SellCoveredCallAction`` consumes the
+# verdict and records ``_result(False, ...)``
+# (``tests/test_option_actions.py``); the seam keeps RAISING for the direct
+# callers — ``PremiumSeller.rebalance``, ``OptionPortfolioManager`` — that have
+# nowhere to put one, where the only alternative is a silent naked write.
+#
+# Both paths are pinned: every test in the class above still drives the seam and
+# still requires a ``ValueError``.
+# ===========================================================================
+class TestTheCoverVerdictAndItsBackstop:
+
+    def test_a_covered_write_returns_an_OK_verdict_with_no_reason(self, store):
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100.0)])
+
+        verdict = acct.check_cover_for_covered_call(
+            [option_leg()], 1, "covered_call")
+
+        assert verdict.ok is True
+        assert verdict.reason == "", "an OK verdict must carry no complaint"
+
+    def test_a_strategy_this_guard_does_not_police_is_OK_not_silent(self, store):
+        """The tag filter returns a VERDICT too. Returning ``None`` for the
+        99% of writes that are not covered calls would make every caller's
+        ``verdict.ok`` an AttributeError on the ordinary path."""
+        acct = SubmittingAccount(book=[], positions=[])
+
+        verdict = acct.check_cover_for_covered_call(
+            [option_leg()], 1, "bear_call_spread")
+
+        assert verdict.ok is True
+
+    def test_a_shortfall_verdict_carries_the_figures_the_operator_needs(self, store):
+        """``AssignmentCapacity``'s shape: the reason AND what was measured.
+        "refused" and "refused, held 100 of the 300 needed" send someone to two
+        different places, and the second is a number they can act on."""
+        acct = SubmittingAccount(book=[short_call(qty=1)],
+                                 positions=[equity_position(qty=200.0)])
+
+        verdict = acct.check_cover_for_covered_call(
+            [option_leg()], 3, "covered_call")
+
+        assert verdict.ok is False
+        assert COVER_REFUSAL in verdict.reason
+        assert (verdict.underlying, verdict.required) == ("AAPL", 300)
+        assert (verdict.held, verdict.pledged) == (200, 100)
+
+    def test_an_unmeasurable_figure_arrives_as_None_never_as_a_zero(self, store):
+        """The tri-state survives the trip into the verdict. A ``pledged`` of 0
+        on an unreadable book would be read as "nothing is spoken for" — the
+        exact conflation the accessors exist to prevent."""
+        acct = SubmittingAccount(book=None, positions=[equity_position(qty=100.0)])
+
+        verdict = acct.check_cover_for_covered_call(
+            [option_leg()], 1, "covered_call")
+
+        assert verdict.ok is False
+        assert verdict.pledged is None, "UNKNOWN must not arrive as 0"
+        assert verdict.held == 100
+
+    def test_the_backstop_raises_the_verdicts_OWN_sentence_verbatim(self, store):
+        """One refusal, one text. If the seam ever paraphrased, an operator
+        reading a refused action result and an operator reading a direct
+        caller's traceback would be comparing two different descriptions of the
+        same event."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100.0)])
+        legs, quantity = [option_leg()], 3
+        verdict = acct.check_cover_for_covered_call(legs, quantity, "covered_call")
+        assert verdict.ok is False
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, legs=legs, quantity=quantity)
+
+        assert str(excinfo.value) == verdict.reason
+
+    def test_asking_the_verdict_writes_nothing_and_reaches_no_broker(self, store):
+        """It MEASURES. A check with a side effect could not be placed before
+        the sizing decision it is meant to inform."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100.0)])
+
+        acct.check_cover_for_covered_call([option_leg()], 1, "covered_call")
+
+        assert store.all(TradingOrder) == [] and store.all(Transaction) == []
+        assert acct.submitted == []

@@ -176,6 +176,12 @@ def test_sell_covered_call_requires_long(monkeypatch, mock_account, mock_expert_
     add_instance(TradingOrder(account_id=mock_account.id, symbol="AAPL", quantity=300,
         side=OrderDirection.BUY, order_type=OrderType.MARKET, status=OrderStatus.FILLED,
         filled_qty=300, open_price=150.0, transaction_id=txn_id))  # equity (asset_class defaults EQUITY)
+    # ...and the BROKER holds them too. The order rows above are the platform's view and
+    # are what SIZES the write (`_held_equity_shares`); the cover gate reads the
+    # ACCOUNT-WIDE position feed, because shares bought by another expert still cover the
+    # call. A double that published only one of the two views made the account read as
+    # flat, and the write was — quite correctly — refused as uncovered.
+    mock_account._positions = [{"symbol": "AAPL", "qty": 300.0, "asset_class": "us_equity"}]
     cap = _capture_submit(monkeypatch, mock_account)
     res2 = action.execute()
     assert res2["success"] is True
@@ -184,6 +190,85 @@ def test_sell_covered_call_requires_long(monkeypatch, mock_account, mock_expert_
     assert cap["legs"][0].position_intent == "sell_to_open"
     assert cap["option_strategy"] == "covered_call"
     assert cap["limit_price"] == 2.0                         # sell at BID
+
+
+def _seed_expert_equity_long(mock_account, mock_expert_instance, shares):
+    """The platform's view of a held equity long: an OPENED txn + its FILLED entry order.
+
+    This is what ``_OptionEntryAction._held_equity_shares`` sums, i.e. what SIZES a
+    covered call. It deliberately does NOT touch the position feed — the cover gate
+    reads that separately, and the two views disagreeing is the case under test below.
+    """
+    txn_id = add_instance(Transaction(symbol="AAPL", quantity=shares, side=OrderDirection.BUY,
+        status=TransactionStatus.OPENED, open_price=150.0, expert_id=mock_expert_instance.id))
+    add_instance(TradingOrder(account_id=mock_account.id, symbol="AAPL", quantity=shares,
+        side=OrderDirection.BUY, order_type=OrderType.MARKET, status=OrderStatus.FILLED,
+        filled_qty=shares, open_price=150.0, transaction_id=txn_id))
+    return txn_id
+
+
+def test_sell_covered_call_short_of_cover_returns_a_refusal_and_never_raises(
+        monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    """A cover shortfall is an OUTCOME, and it must arrive as a failed result.
+
+    Raised instead, it leaves ``execute()`` and ``TradeActionEvaluator.execute()``, so
+    every action queued behind this one on this instrument is skipped and NO
+    ``TradeActionResult`` is written for any of them — and a routine condition (a feed
+    outage, a second call on the same lot, shares not yet visible at the broker) logs a
+    stack trace at ERROR. The two money rails on this same path
+    (``check_option_buying_power``, ``_refuse_if_cannot_take_delivery``) both return a
+    verdict; this is the third.
+
+    The double publishes 300 shares to the platform and 100 to the BROKER, which is a
+    real state (a partial fill, a settlement lag) and not a contrived one: the write is
+    sized at 3 contracts by the platform's view and refused by the account-wide one.
+    """
+    chain = [_call(160, delta=0.30, bid=2.0, ask=2.2, oi=2000)]
+    monkeypatch.setattr(mock_account, "get_option_chain", lambda *a, **k: chain, raising=False)
+    _seed_expert_equity_long(mock_account, mock_expert_instance, 300)
+    mock_account._positions = [{"symbol": "AAPL", "qty": 100.0, "asset_class": "us_equity"}]
+    cap = _capture_submit(monkeypatch, mock_account)
+    action = create_action(action_type=ExpertActionType.SELL_COVERED_CALL, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.HOLD, existing_order=None,
+        expert_recommendation=sample_recommendation, strike_method="percent_otm", strike_param=5.0,
+        dte_min=20, dte_max=45, min_open_interest=100, max_spread_pct=20.0)
+
+    res = action.execute()                       # NOT pytest.raises: that is the point
+
+    assert res["success"] is False
+    assert "UNCOVERED SHORT CALL" in res["message"], res["message"]
+    assert "short by 200" in res["message"], res["message"]
+    assert res["data"]["cover_required"] == 300 and res["data"]["cover_held"] == 100
+    assert res["data"]["cover_pledged"] == 0
+    assert cap == {}, "the refused covered call still reached submit_option_order"
+
+
+def test_sell_covered_call_refusal_is_recorded_not_swallowed_by_the_catch_all(
+        monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    """A DISCRIMINATING test for the channel, not just for the refusal.
+
+    ``execute()``'s catch-all also produces ``_result(False, ...)``, so "the result says
+    False" alone cannot tell a returned verdict from a raise that was caught: both look
+    the same to the caller of ONE action. What differs is the message — the catch-all
+    prefixes "Error executing option action" and logs a traceback — so that string is
+    what pins which path ran.
+    """
+    chain = [_call(160, delta=0.30, bid=2.0, ask=2.2, oi=2000)]
+    monkeypatch.setattr(mock_account, "get_option_chain", lambda *a, **k: chain, raising=False)
+    _seed_expert_equity_long(mock_account, mock_expert_instance, 100)
+    mock_account._positions = []                 # the broker holds nothing at all
+    action = create_action(action_type=ExpertActionType.SELL_COVERED_CALL, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.HOLD, existing_order=None,
+        expert_recommendation=sample_recommendation, strike_method="percent_otm", strike_param=5.0,
+        dte_min=20, dte_max=45, min_open_interest=100, max_spread_pct=20.0)
+
+    res = action.execute()
+
+    assert res["success"] is False
+    assert "Error executing option action" not in res["message"], (
+        "the refusal came out of the catch-all, i.e. it was RAISED and caught rather "
+        "than returned: " + res["message"])
+    assert res["message"].startswith("UNCOVERED SHORT CALL"), res["message"]
 
 
 def test_buy_protective_put_requires_long(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):

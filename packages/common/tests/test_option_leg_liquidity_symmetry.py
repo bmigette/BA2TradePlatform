@@ -51,6 +51,15 @@ class _Acct(OptionsAccountInterface):
     def get_balance(self):
         return 1_000_000.0
 
+    def get_positions(self):
+        # The BROKER's view of the same 200 shares the ``spy`` fixture makes
+        # ``_held_equity_shares`` report. The covered-call cover gate reads this feed
+        # (account-wide) rather than the expert's own filled buys, so a double publishing
+        # only the platform's view has its covered call refused as uncovered — and this
+        # file is about the LIQUIDITY GATES, which are consulted before that refusal but
+        # whose spy assertions need the action to run to completion.
+        return [{"symbol": "AAPL", "qty": 200.0, "asset_class": "us_equity"}]
+
     def get_instrument_current_price(self, symbol, price_type=None):
         return self._spot
 

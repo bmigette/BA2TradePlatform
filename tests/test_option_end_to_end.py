@@ -110,7 +110,15 @@ def test_enter_market_dip_buys_call_end_to_end(monkeypatch):
 # 2. OPEN_POSITIONS: covered call on a held equity long
 # ---------------------------------------------------------------------------
 def _seed_equity_long(account, ei, shares=300.0):
-    """Create an OPENED equity long: a Transaction + a filled equity BUY order."""
+    """Create an OPENED equity long: a Transaction + a filled equity BUY order.
+
+    The same shares are ALSO published on the account's position feed. The two are
+    different readings: the order rows are the PLATFORM's (and this expert's) view, and
+    they are what SIZES a covered call, while the cover gate reads the ACCOUNT-WIDE feed
+    — shares bought by another expert still cover the call. A double that seeded only the
+    order rows leaves the broker holding nothing, so the covered call is refused as
+    uncovered, quite correctly.
+    """
     txn = create_transaction(symbol="AAPL", quantity=shares, side=OrderDirection.BUY,
                              status=TransactionStatus.OPENED, open_price=150.0,
                              expert_id=ei.id)
@@ -119,6 +127,8 @@ def _seed_equity_long(account, ei, shares=300.0):
         order_type=OrderType.MARKET, status=OrderStatus.FILLED, transaction_id=txn.id,
         filled_qty=shares, asset_class=AssetClass.EQUITY, open_price=150.0,
     )
+    account._positions = [{"symbol": "AAPL", "qty": float(shares),
+                           "asset_class": "us_equity"}]
     return txn, order
 
 

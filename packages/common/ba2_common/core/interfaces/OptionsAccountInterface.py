@@ -128,6 +128,42 @@ class AssignmentCapacity:
     unmeasurable: Tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class CoverCapacity:
+    """A SHARE-cover verdict WITH the reason it was reached — ``AssignmentCapacity``'s shape.
+
+    THE THREE REFUSALS ARE ONE FAMILY AND MUST TRAVEL THE SAME WAY. Buying power,
+    assignment capacity and share cover are three rails on the same entry path with
+    three different remedies (see ``COVER_REFUSAL``), and the first two already reach a
+    caller as a RETURNED verdict that becomes a failed ``TradeActionResult``. Cover was
+    the odd one out: it was only ever raised, which is the channel the *structural*
+    validations use (an empty leg list, five legs, two expiries) — defects in the call
+    itself, not operational outcomes. "The shares are not free yet" is an operational
+    outcome: routine, expected, and something an operator acts on. Raised from
+    ``TradeActions``' entry path it propagates out of ``execute()``, skipping every
+    action queued behind it on that instrument and writing no result row for any of
+    them, while logging a stack trace for a feed outage.
+
+    ``reason`` is empty when ``ok``; otherwise it is a complete sentence carrying
+    ``COVER_REFUSAL``, naming the input that could not be measured or the shares that
+    are short, and ending with the remedy. It is the SAME sentence the seam raises, so
+    an operator reading a refused action result and an operator reading the exception a
+    direct caller got are reading one text.
+
+    The figures are reported even on a refusal, and each is ``None`` exactly when it
+    could not be measured — an unknown must never arrive here as a zero either.
+    ``underlying`` names the ticker the verdict is about, which is not always the
+    action's instrument: the guard groups by leg underlying so a stray leg on another
+    name cannot be covered by the first name's shares.
+    """
+    ok: bool
+    reason: str = ""
+    underlying: Optional[str] = None
+    required: Optional[int] = None
+    held: Optional[int] = None
+    pledged: Optional[int] = None
+
+
 class OptionsAccountInterface(ABC):
     """Mixin granting an AccountInterface subclass option-trading capability."""
 
@@ -190,6 +226,13 @@ class OptionsAccountInterface(ABC):
         Raises ValueError if the legs span more than one expiry, or if a ``covered_call``
         is not covered by free shares (see the two guards below). Both refuse BEFORE any
         row is written, so a refusal leaves nothing half-recorded.
+
+        THE COVER RAISE IS A BACKSTOP, not the channel a caller should rely on. A short
+        cover is an operational outcome with a remedy, not a malformed call: a caller
+        that has somewhere to put a verdict asks :meth:`check_cover_for_covered_call`
+        first and records a refusal (``SellCoveredCallAction`` does, via
+        ``_refuse_if_cover_is_short``). The raise exists for the direct callers that have
+        no such channel, where the only alternative is a silent naked write.
         """
         from ba2_common.core.db import add_instance, get_instance, update_instance
         from ba2_common.core.models import TradingOrder
@@ -338,7 +381,36 @@ class OptionsAccountInterface(ABC):
 
     def _refuse_uncovered_covered_call(self, legs: List[OptionLeg], quantity: int,
                                        option_strategy: Optional[str]) -> None:
-        """Raise ``ValueError`` if a ``covered_call`` is not actually covered.
+        """THE BACKSTOP: raise ``ValueError`` when :meth:`check_cover_for_covered_call` refuses.
+
+        The refusal is DECIDED in ``check_cover_for_covered_call``, which returns a
+        ``CoverCapacity`` verdict; a caller with a result channel
+        (``SellCoveredCallAction`` via ``_refuse_if_cover_is_short``) consults it first
+        and turns the same sentence into a failed ``TradeActionResult``, so nothing is
+        raised on the path where a refusal is an ordinary outcome.
+
+        This raise stays because not every caller has such a channel.
+        ``PremiumSeller.rebalance``, ``OptionPortfolioManager`` and any future direct
+        caller reach ``submit_option_order`` with nowhere to put a verdict, and for them
+        the alternative to an exception is a silent naked write. It is a backstop and
+        not the primary channel: reaching it means a caller did not ask first.
+
+        It raises ``verdict.reason`` VERBATIM — the same text the action records — so
+        the two channels can never drift into describing the same refusal differently.
+        """
+        verdict = self.check_cover_for_covered_call(legs, quantity, option_strategy)
+        if not verdict.ok:
+            raise ValueError(verdict.reason)
+
+    def check_cover_for_covered_call(self, legs: List[OptionLeg], quantity: int,
+                                     option_strategy: Optional[str]) -> "CoverCapacity":
+        """Is this ``covered_call`` actually covered by free shares? A verdict, not an exception.
+
+        Returns ``CoverCapacity(ok=True)`` for anything that is covered — and for
+        everything this guard deliberately does not police (see below). Otherwise the
+        verdict carries the complete refusal sentence and whichever figures were
+        measurable. :meth:`_refuse_uncovered_covered_call` is the raising backstop over
+        it for callers that have no result channel.
 
         WHY THIS LIVES AT THE SEAM AND NOT IN THE ACTION. ``SellCoveredCallAction``
         checks cover too, and it stays — but it was the ONLY caller that did.
@@ -379,15 +451,15 @@ class OptionsAccountInterface(ABC):
         from ba2_common.core.types import OrderDirection
 
         if (option_strategy or "").strip().lower() != COVERED_CALL_STRATEGY:
-            return
+            return CoverCapacity(True)
 
         contracts = self._readable_positive_number(quantity)
         if contracts is None:
-            raise ValueError(
+            return CoverCapacity(False, (
                 f"{COVER_REFUSAL}: this covered_call has no usable size "
                 f"(quantity={quantity!r}), so how many shares it could have called away "
                 f"cannot be worked out — and an obligation of unknown size must not be "
-                f"written. No order, leg or transaction has been created.")
+                f"written. No order, leg or transaction has been created."))
 
         # Grouped by underlying rather than summed flat: a covered call is one ticker, but
         # a stray leg on another name must not be covered by the first name's shares.
@@ -398,42 +470,43 @@ class OptionsAccountInterface(ABC):
             contract = getattr(leg, "contract_symbol", None) or "?"
             right = getattr(leg, "option_type", None)
             if right is None:
-                raise ValueError(
+                return CoverCapacity(False, (
                     f"{COVER_REFUSAL}: leg {contract} of this covered_call is a SHORT "
                     f"option with no option type recorded, so whether it is the CALL that "
                     f"has to be covered is unknown — and unknown must not resolve to 'not "
-                    f"a call'. No order, leg or transaction has been created.")
+                    f"a call'. No order, leg or transaction has been created."))
             if right != OptionRight.CALL:
                 continue           # a short put obliges CASH: the capacity gate's question
             underlying = (getattr(leg, "underlying", None) or "").strip().upper()
             if not underlying:
-                raise ValueError(
+                return CoverCapacity(False, (
                     f"{COVER_REFUSAL}: leg {contract} of this covered_call is a SHORT CALL "
                     f"with no underlying recorded, so there is no ticker whose shares can "
                     f"be counted as its cover. No order, leg or transaction has been "
-                    f"created.")
+                    f"created."))
             ratio = self._readable_positive_number(getattr(leg, "ratio_qty", 1))
             if ratio is None:
-                raise ValueError(
+                return CoverCapacity(False, (
                     f"{COVER_REFUSAL}: leg {contract} of this covered_call has an "
                     f"unusable ratio_qty ({getattr(leg, 'ratio_qty', None)!r}), and it is "
                     f"what sizes the leg (quantity * ratio_qty), so how many {underlying} "
                     f"shares it can call away is unknown. No order, leg or transaction "
-                    f"has been created.")
+                    f"has been created."), underlying=underlying)
             raw_multiplier = getattr(leg, "multiplier", _MULTIPLIER_ABSENT)
             if raw_multiplier is _MULTIPLIER_ABSENT:
                 multiplier = float(DEFAULT_OPTION_MULTIPLIER)
             else:
                 multiplier = self._readable_positive_number(raw_multiplier)
                 if multiplier is None:
-                    raise ValueError(
+                    return CoverCapacity(False, (
                         f"{COVER_REFUSAL}: leg {contract} of this covered_call reports "
                         f"multiplier {raw_multiplier!r}, so how many {underlying} shares "
                         f"one contract can call away is unknown — and it must NOT be "
                         f"assumed to be {DEFAULT_OPTION_MULTIPLIER}, because an ADJUSTED "
                         f"contract (post-split, post-merger) delivers a different number "
                         f"and guessing under-states exactly the cover this write needs. "
-                        f"No order, leg or transaction has been created.")
+                        f"No order, leg or transaction has been created."),
+                        underlying=underlying)
             required[underlying] = (required.get(underlying, 0.0)
                                     + contracts * ratio * multiplier)
 
@@ -446,7 +519,7 @@ class OptionsAccountInterface(ABC):
             held = self.held_shares_for_cover(underlying)
             pledged = self.shares_pledged_to_short_calls(underlying)
             if held is None:
-                raise ValueError(
+                return CoverCapacity(False, (
                     f"{COVER_REFUSAL}: how many {underlying} shares this account holds "
                     f"could not be measured — held_shares_for_cover() returned UNKNOWN, "
                     f"i.e. the POSITION FEED did not answer (the logged error above names "
@@ -454,9 +527,10 @@ class OptionsAccountInterface(ABC):
                     f"be covered is therefore unknown, and writing a short call on an "
                     f"unknown is precisely how one goes naked. No order, leg or "
                     f"transaction has been created. This is NOT a shortfall: buying more "
-                    f"shares will not clear it, repairing the feed will.")
+                    f"shares will not clear it, repairing the feed will."),
+                    underlying=underlying, required=need, held=None, pledged=pledged)
             if pledged is None:
-                raise ValueError(
+                return CoverCapacity(False, (
                     f"{COVER_REFUSAL}: how many {underlying} shares are already pledged "
                     f"as cover for open short calls could not be measured — "
                     f"shares_pledged_to_short_calls() returned UNKNOWN, i.e. the OPTION "
@@ -464,17 +538,20 @@ class OptionsAccountInterface(ABC):
                     f"row). The {held} shares held may already be spoken for and there is "
                     f"no way to find out, so this covered_call could be the second call "
                     f"written against the same lot. No order, leg or transaction has been "
-                    f"created. Repair the option order book and retry.")
+                    f"created. Repair the option order book and retry."),
+                    underlying=underlying, required=need, held=held, pledged=None)
             free = held - pledged
             if free < need:
-                raise ValueError(
+                return CoverCapacity(False, (
                     f"{COVER_REFUSAL}: this covered_call writes {contracts:g} contract(s) "
                     f"on {underlying} and needs {need} shares of cover, but only {free} "
                     f"are free (the account holds {held}, with {pledged} already pledged "
                     f"to open short calls) — short by {need - free} share(s). No order, "
                     f"leg or transaction has been created. Buy the missing shares, write "
                     f"fewer contracts, or close a short call to release the cover it "
-                    f"holds; adding margin does nothing for this one.")
+                    f"holds; adding margin does nothing for this one."),
+                    underlying=underlying, required=need, held=held, pledged=pledged)
+        return CoverCapacity(True)
 
     #: Strategy tags that describe what is being DONE, not what the position IS. An order
     #: carrying one of these must never define the transaction's intent: both close paths

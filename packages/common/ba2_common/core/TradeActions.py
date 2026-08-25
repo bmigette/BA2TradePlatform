@@ -2186,6 +2186,43 @@ class _OptionEntryAction(TradeAction):
              "assignment_candidate_cost": verdict.candidate_cost,
              "assignment_cash": verdict.cash})
 
+    def _refuse_if_cover_is_short(self, legs: List[OptionLeg], quantity: int,
+                                  option_strategy: str) -> Optional[Dict[str, Any]]:
+        """ENFORCING share-cover gate. Returns a refusal, or None to proceed.
+
+        THE THIRD RAIL, DELIVERED THE SAME WAY AS THE OTHER TWO. Buying power,
+        assignment capacity and share cover all refuse the same entry path with three
+        different remedies, and the first two arrive here as a returned verdict that
+        becomes a failed ``TradeActionResult``. Cover was decided at the broker seam and
+        RAISED, which is the channel the structural validations use (five legs, two
+        expiries) — malformed calls, not outcomes. Raised from here it propagates out of
+        ``execute()`` and out of ``TradeActionEvaluator``, so every action queued behind
+        it on this instrument is skipped with no result row written for any of them, and
+        an ordinary condition — a feed outage, a second call on the same lot, shares not
+        yet visible on the broker's side — logs a stack trace at ERROR.
+
+        The seam's raise STAYS as the backstop for direct callers
+        (``PremiumSeller.rebalance``, ``OptionPortfolioManager``), which have nowhere to
+        put a verdict; this is the ask-first path for the caller that does. The verdict's
+        ``reason`` is the seam's own sentence verbatim, so both channels say one thing.
+
+        Placed AFTER sizing, like ``_refuse_if_cannot_take_delivery`` is placed after the
+        buying-power gate: an entry the pre-existing "held equity below one contract lot"
+        check already declines keeps the message it has always had.
+        """
+        verdict = self.account.check_cover_for_covered_call(legs, quantity, option_strategy)
+        if verdict.ok:
+            return None
+        logger.warning(f"{self._action_type_value()} for {self.instrument_name}: "
+                       f"{option_strategy} REFUSED — {verdict.reason}")
+        return self._result(
+            False, f"{verdict.reason} Refusing {option_strategy} on {self.instrument_name}.",
+            {"option_strategy": option_strategy,
+             "cover_underlying": verdict.underlying,
+             "cover_required": verdict.required,
+             "cover_held": verdict.held,
+             "cover_pledged": verdict.pledged})
+
     def _submit_option_order(self, legs: List[OptionLeg], quantity: int,
                              limit_price: float, option_strategy: str,
                              option_reserve: Optional[float] = None) -> Dict[str, Any]:
@@ -2485,6 +2522,15 @@ class SellCoveredCallAction(_OptionEntryAction):
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.SELL,
                         position_intent="sell_to_open", option_type=self.OPTION_TYPE,
                         strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+        # The ACCOUNT-WIDE cover check, which ``_held_equity_shares`` above is not: that
+        # sums THIS expert's own filled buys and consults no short-call book, so a second
+        # covered call written against the same lot passes it (and shares bought by
+        # another expert are invisible to it). The seam refuses the same write either
+        # way — asking here is what turns that refusal into a recorded result instead of
+        # an exception that skips every action queued behind this one.
+        refusal = self._refuse_if_cover_is_short([leg], quantity, "covered_call")
+        if refusal is not None:
+            return refusal
         return self._submit_option_order([leg], quantity, limit_price, "covered_call")
 
     def get_description(self) -> str:

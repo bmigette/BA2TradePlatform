@@ -149,6 +149,13 @@ def test_assigned_shares_can_size_a_covered_call(monkeypatch, mock_account,
     _seed_short_option(mock_account.id, mock_expert_instance.id, PUT_OCC,
                        OptionRight.PUT, strike=150.0, contracts=2)
     _assign(acct, PUT_OCC, 2, "act-cc-size")
+    # An assignment puts REAL shares in the account, so the broker's position feed shows
+    # them too — this double keeps its own list and the assignment above only writes
+    # order rows. The wheel's covered-call leg is sized from those rows
+    # (``_held_equity_shares``) but its cover is checked against the ACCOUNT-WIDE feed,
+    # so leaving the feed empty says the put was assigned into thin air.
+    mock_account._positions = [{"symbol": "AAPL", "qty": 200.0,
+                                "asset_class": "us_equity"}]
 
     monkeypatch.setattr(mock_account, "get_option_chain",
                         lambda *a, **k: [_chain_call(160)], raising=False)
