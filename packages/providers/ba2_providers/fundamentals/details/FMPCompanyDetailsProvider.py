@@ -197,6 +197,10 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                 # Markdown format
                 return self._format_balance_sheet_markdown(symbol, frequency, filtered_statements)
                 
+        except FMPError:
+            # A genuine FMP failure (rate-limit/quota) must fail the caller loud -- see the
+            # matching comment on get_past_earnings for the incident this guards against.
+            raise
         except Exception as e:
             logger.error(f"Error fetching FMP balance sheet for {symbol}: {e}")
             return f"Error fetching balance sheet: {str(e)}"
@@ -296,6 +300,8 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                 # Markdown format
                 return self._format_income_statement_markdown(symbol, frequency, filtered_statements)
                 
+        except FMPError:
+            raise
         except Exception as e:
             logger.error(f"Error fetching FMP income statement for {symbol}: {e}")
             return f"Error fetching income statement: {str(e)}"
@@ -399,6 +405,8 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                 # Markdown format
                 return self._format_cashflow_statement_markdown(symbol, frequency, filtered_statements)
                 
+        except FMPError:
+            raise
         except Exception as e:
             logger.error(f"Error fetching FMP cash flow statement for {symbol}: {e}")
             return f"Error fetching cash flow statement: {str(e)}"
@@ -881,6 +889,8 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             else:
                 return self._format_earnings_estimates_markdown(result)
         
+        except FMPError:
+            raise
         except Exception as e:
             logger.error(f"Error retrieving earnings estimates for {symbol}: {e}")
             if format_type == "dict":

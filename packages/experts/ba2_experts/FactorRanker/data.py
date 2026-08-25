@@ -14,6 +14,16 @@ Two layers:
 
 v1 uses the most recent *annual* statements for value/quality (simpler and robust);
 momentum uses ~400 calendar days of daily closes.
+
+ERROR POLICY (fetch_value_inputs / fetch_quality_inputs / fetch_pead_inputs): the
+per-symbol skip above is for SYMBOL-level gaps -- a thin small-cap missing a balance
+sheet, no analyst estimates yet, that kind of thing -- and stays intentional; do not
+make this file DeterministicScorer's "propagate everything but OSError" (that policy
+is for a hermetic backtest, where any silent gap breaks reproducibility; it is wrong
+here and would turn one normal missing-data symbol into a dead universe). The one
+exception is ``FMPError``: a rate-limit/quota failure hits every symbol identically,
+so 400 individual "dropping SYM (data unavailable)" warnings is worse than one loud
+failure. Each fetcher below re-raises ``FMPError`` before its per-symbol catch-all.
 """
 
 from datetime import datetime, timezone
@@ -22,6 +32,7 @@ from typing import Any, Dict, Optional
 import pandas as pd
 
 from ba2_common.logger import logger
+from ba2_providers.fmp_common import FMPError
 
 
 # --------------------------------------------------------------------------- #
@@ -284,6 +295,8 @@ def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
                 total_debt=total_debt,
                 cash=balance.get("cash_and_cash_equivalents"),
             )
+        except FMPError:
+            raise  # quota/rate-limit hits every symbol -- one loud failure, not a silent batch drop
         except Exception as e:
             logger.warning(
                 f"FactorRanker: dropping {sym} from value inputs (data unavailable): {e}"
@@ -358,6 +371,8 @@ def fetch_quality_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str,
                 )
                 continue
             out[sym] = inputs
+        except FMPError:
+            raise  # quota/rate-limit hits every symbol -- one loud failure, not a silent batch drop
         except Exception as e:
             logger.warning(
                 f"FactorRanker: dropping {sym} from quality inputs (data unavailable): {e}"
@@ -386,6 +401,8 @@ def fetch_pead_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str, di
                     details.get_earnings_estimates(sym, "quarterly", as_of, lookback_periods=1, format_type="dict"),
                     "estimates", "earnings estimates",
                 )
+            except FMPError:
+                raise  # same quota/rate-limit reasoning as the outer catch below
             except Exception as est_err:
                 logger.warning(
                     f"FactorRanker: {sym} earnings estimates unavailable "
@@ -401,6 +418,8 @@ def fetch_pead_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str, di
                 ),
                 "days_since": days_since(report_date, as_of),
             }
+        except FMPError:
+            raise  # quota/rate-limit hits every symbol -- one loud failure, not a silent batch drop
         except Exception as e:
             logger.warning(
                 f"FactorRanker: dropping {sym} from PEAD inputs (data unavailable): {e}"
