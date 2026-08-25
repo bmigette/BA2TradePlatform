@@ -47,10 +47,10 @@ def create_migration(message):
 
     cmd = _alembic_argv("revision", "--autogenerate", "-m", message)
     if run_command(cmd):
-        print(f"✅ Migration created successfully: {message}")
+        print(f"[OK] Migration created successfully: {message}")
         return True
     else:
-        print(f"❌ Failed to create migration: {message}")
+        print(f"[FAIL] Failed to create migration: {message}")
         return False
 
 
@@ -58,10 +58,10 @@ def upgrade_database(revision="head"):
     """Upgrade database to the specified revision (default: head)."""
     cmd = _alembic_argv("upgrade", revision)
     if run_command(cmd):
-        print(f"✅ Database upgraded to {revision}")
+        print(f"[OK] Database upgraded to {revision}")
         return True
     else:
-        print(f"❌ Failed to upgrade database to {revision}")
+        print(f"[FAIL] Failed to upgrade database to {revision}")
         return False
 
 
@@ -72,10 +72,10 @@ def downgrade_database(revision):
 
     cmd = _alembic_argv("downgrade", revision)
     if run_command(cmd):
-        print(f"✅ Database downgraded to {revision}")
+        print(f"[OK] Database downgraded to {revision}")
         return True
     else:
-        print(f"❌ Failed to downgrade database to {revision}")
+        print(f"[FAIL] Failed to downgrade database to {revision}")
         return False
 
 
@@ -101,10 +101,10 @@ def stamp_database(revision="head"):
     """Stamp database with the specified revision without running migrations."""
     cmd = _alembic_argv("stamp", revision)
     if run_command(cmd):
-        print(f"✅ Database stamped with {revision}")
+        print(f"[OK] Database stamped with {revision}")
         return True
     else:
-        print(f"❌ Failed to stamp database with {revision}")
+        print(f"[FAIL] Failed to stamp database with {revision}")
         return False
 
 def main():
