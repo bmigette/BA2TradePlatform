@@ -3540,3 +3540,64 @@ def test_the_symbol_share_helpers_preserve_the_order_they_were_given():
     result = _pure().even_split_symbol_shares('L', {'Z': 0.0, 'A': 0.0, 'M': 0.0})
     assert list(result.weights) == ['Z', 'A', 'M']
     assert result.weights['M'] == 33.34
+
+
+# ---------------------------------------------------------------------------
+# THE COMMA. A percentage box is 0-100, so a comma in it is a DECIMAL POINT.
+#
+# Reported off the live screen: the share cells render "11,11". The old parse
+# stripped every comma as a thousands separator, which turns a decimal comma into
+# a number a hundred times too big -- and the range check only catches HALF of
+# those. "11,11" becomes 1111 and is refused (visible, annoying); "0,5" becomes 5
+# and is ACCEPTED (silent, and ten times what was typed). The second is the one
+# that costs money.
+#
+# No legitimate value in a 0-100 box needs a thousands separator, so a lone comma
+# with no decimal point is read as the decimal point. A comma ALONGSIDE a dot
+# keeps its old meaning -- "1,234.5" is unambiguous in every locale that writes
+# it that way -- and is refused by the range check on its own merits.
+# ---------------------------------------------------------------------------
+
+def test_a_lone_comma_in_a_percentage_box_is_a_DECIMAL_point():
+    assert parse_pct('11,11').value == pytest.approx(11.11)
+    assert parse_pct('0,5').value == pytest.approx(0.5)
+    assert parse_pct(' 26,78 % ').value == pytest.approx(26.78)
+
+
+def test_the_silent_half_of_the_comma_bug_is_the_one_that_was_accepted():
+    """"0,5" used to parse as 5.0 -- in range, so nothing complained, and the
+    symbol got ten times the share the user typed."""
+    assert parse_pct('0,5').value != 5.0
+
+
+def test_a_comma_beside_a_decimal_point_keeps_its_thousands_meaning():
+    """Unambiguous, and out of range on its own merits rather than by accident."""
+    assert parse_pct('1,234.5').value == pytest.approx(1234.5)
+
+
+def test_two_commas_are_a_thousands_grouping_and_not_two_decimal_points():
+    assert parse_pct('1,234,567').value == pytest.approx(1234567.0)
+
+
+def test_a_comma_typed_into_a_symbol_share_box_survives_the_round_trip():
+    """The whole point: the value the user typed is the value that is stored."""
+    edit = validate_symbol_weight_edit(label='ARK26', symbol='AAPL', raw='26,78')
+    assert edit.accepted is True
+    assert edit.value == pytest.approx(26.78)
+
+
+def test_a_comma_typed_into_a_label_target_box_survives_it_too():
+    edit = validate_label_target_edit(label='ARK26', raw='13,5', other_targets={})
+    assert edit.accepted is True
+    assert edit.value == pytest.approx(13.5)
+
+
+def test_a_comma_typed_into_the_reserve_box_survives_it_too():
+    assert validate_reserve_edit('7,25').value == pytest.approx(7.25)
+
+
+def test_a_comma_value_that_is_genuinely_out_of_range_is_still_refused():
+    """The comma fix must not become a way past the 0-100 guard."""
+    edit = validate_symbol_weight_edit(label='ARK26', symbol='AAPL', raw='1,234.5')
+    assert edit.accepted is False
+    assert edit.reason_code == EDIT_OVER_100

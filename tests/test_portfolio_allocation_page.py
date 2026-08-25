@@ -6079,3 +6079,52 @@ def test_a_label_level_press_moves_the_VIEWS_before_it_pushes_the_BOXES(
     assert pushes and pushes[0][0] == {'ARK26': 90.0, 'TECH': 10.0}
     assert [value for _targets, value in pushes] == [90.0, 10.0]
     assert not any('NOT saved' in m for m, _t in sent), sent
+
+
+# ---------------------------------------------------------------------------
+# THE COMMA, END TO END
+#
+# The live page renders share cells as "11,11", and Quasar hands the raw string
+# back on change. Stripping the comma as a grouping mark made "0,5" arrive as 5.0
+# -- in range, silently accepted, ten times what was typed.
+# ---------------------------------------------------------------------------
+
+def test_a_comma_decimal_typed_into_a_share_cell_is_stored_as_typed(
+        nicegui_client, account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'weightChange', ['AAPL', '26,78'])
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].weight_pct == 26.78
+
+
+def test_the_silently_accepted_comma_no_longer_stores_ten_times_the_share(
+        nicegui_client, account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'weightChange', ['AAPL', '0,5'])
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].weight_pct == 0.5
+
+
+def test_the_share_cell_is_the_one_control_that_can_hand_back_a_RAW_string(
+        nicegui_client, account_id):
+    """Which is why the comma is a table-cell problem and not a page-wide one.
+
+    The label target and the reserve are ``ui.number``s: NiceGUI coerces their
+    model value and a comma never reaches the parser through them (a string put
+    into one raises inside ``Number._value_to_model_value``). The share cell is a
+    hand-written Quasar ``q-input`` in a table slot that emits whatever it is
+    holding, so it is the only widget on this page whose handler must survive
+    "26,78" -- and the parse is shared, so fixing it there fixed all three.
+    """
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    assert 'weightChange' in _listener_types(_tables(root)[0])
+    box = [n for n in _numbers(root)
+           if n._props.get('label') == 'Portfolio target %'][0]
+    with pytest.raises(Exception):
+        box.set_value('13,5')

@@ -828,15 +828,34 @@ def parse_pct(raw) -> TargetEdit:
     * ``nan`` / ``inf`` -- ``nan < 0`` and ``nan > 100`` are BOTH False, so every
       range check waves it through and every derived figure on the page becomes NaN.
 
-    A trailing ``%`` and thousands separators are tolerated: the boxes carry
-    ``suffix='%'`` and Quasar can hand back the raw string it is holding.
+    A trailing ``%`` is tolerated: the boxes carry ``suffix='%'`` and Quasar can
+    hand back the raw string it is holding.
+
+    THE COMMA IS A DECIMAL POINT HERE, and that is a deliberate reading rather
+    than a tolerance. Every box this parses is bounded 0-100, so no legitimate
+    value in one needs a thousands separator -- while a decimal comma is what a
+    large part of the world types, and what the live page was observed rendering
+    back ("11,11"). Stripping it as a grouping mark multiplies the number by a
+    hundred, and the range check only catches HALF of those: "11,11" becomes 1111
+    and is refused, which is visible; "0,5" becomes 5.0, which is in range, is
+    ACCEPTED, and gives the symbol ten times the share that was typed. The silent
+    one is the one that costs money.
+
+    So a LONE comma with no decimal point becomes the decimal point. A comma
+    alongside a dot keeps its grouping meaning -- "1,234.5" is unambiguous
+    wherever it is written that way -- and so does a repeated comma; both are then
+    refused by the range check on their own merits rather than by accident.
     """
     if isinstance(raw, bool):
         return TargetEdit(False, None, EDIT_NOT_A_NUMBER, "")
     if raw is None:
         return TargetEdit(False, None, EDIT_BLANK, "")
     if isinstance(raw, str):
-        text = raw.strip().rstrip('%').strip().replace(',', '')
+        text = raw.strip().rstrip('%').strip()
+        if text.count(',') == 1 and '.' not in text:
+            text = text.replace(',', '.')
+        else:
+            text = text.replace(',', '')
         if not text:
             return TargetEdit(False, None, EDIT_BLANK, "")
         try:
