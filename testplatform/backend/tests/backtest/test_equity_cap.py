@@ -307,3 +307,153 @@ def test_an_uncapped_account_has_the_cap_attribute_set_to_None(capped_account):
     acct = capped_account(cash=40_000.0, cap=None)
     assert acct._equity_cap is None
     assert acct.deployed_equity() == 40_000.0
+
+
+# ---------------------------------------------------------------------------
+# Task 5 -- the scoring conversion inside build_results
+# ---------------------------------------------------------------------------
+class _SnapshotAccount:
+    """The account stub ``build_results`` actually needs.
+
+    Copied from ``test_results_metrics._AccountStub`` (the real harness): ``build_results``
+    calls exactly ``get_balance_history()`` and ``get_filled_trades()``, and reads
+    ``_wiped_out`` via ``getattr``. It has no ``_price``/``_options``, so
+    ``_build_refine_drawdown_fn`` returns None and the intraday refinement is skipped.
+    """
+
+    def __init__(self, snapshots, trades=()):
+        self._snaps = list(snapshots)
+        self._trades = list(trades)
+
+    def get_balance_history(self):
+        return self._snaps
+
+    def get_filled_trades(self):
+        return self._trades
+
+
+def _snapshots(points):
+    """``[(datetime, net_liquidating_value), ...]`` -> the snapshot shape the account writes."""
+    return [{"date": d, "net_liquidating_value": float(nlv),
+             "cash_balance": float(nlv), "equity_value": 0.0} for d, nlv in points]
+
+
+def _results_config(*, initial_capital, equity_cap):
+    """The ``build_results`` config shape.
+
+    ``test_results_metrics`` uses the bare ``{"initial_capital": ...}``; the cap lives under
+    ``account_settings`` (where ``daily_backtest_handler._build_config`` puts it), so that
+    sub-dict is spelled out here rather than guessed.
+    """
+    return {
+        "initial_capital": float(initial_capital),
+        "account_settings": {
+            "starting_cash": float(initial_capital),
+            "commission_per_trade": 0.0,
+            "slippage_bps": 0.0,
+            "fill_model": "next_bar_open",
+            "equity_cap": equity_cap,
+        },
+    }
+
+
+_FIVE_K_A_YEAR = [
+    (datetime(2020, 1, 1), 20_000.0), (datetime(2021, 1, 1), 25_000.0),
+    (datetime(2022, 1, 1), 30_000.0), (datetime(2023, 1, 1), 35_000.0),
+    (datetime(2024, 1, 1), 40_000.0),
+]
+
+
+def test_build_results_scores_a_capped_run_on_the_fixed_denominator():
+    """$5k a year on a $20k cap: 25% a year, CAGR 25%, total return 144%."""
+    from app.services.backtest import results as R
+
+    account = _SnapshotAccount(_snapshots(_FIVE_K_A_YEAR))
+    out = R.build_results(account, _results_config(initial_capital=20_000.0,
+                                                   equity_cap=20_000.0))
+    assert out["equity_curve"][-1]["equity"] == pytest.approx(48_828.125)
+    assert out["annualized_return"] == pytest.approx(25.0, abs=0.05)
+    assert out["total_return"] == pytest.approx(144.14, abs=0.05)
+
+
+def test_the_same_run_uncapped_scores_on_the_real_curve():
+    from app.services.backtest import results as R
+
+    account = _SnapshotAccount(_snapshots([
+        (datetime(2020, 1, 1), 20_000.0), (datetime(2024, 1, 1), 40_000.0),
+    ]))
+    out = R.build_results(account, _results_config(initial_capital=20_000.0, equity_cap=None))
+    assert out["equity_curve"][-1]["equity"] == pytest.approx(40_000.0)
+    assert out["total_return"] == pytest.approx(100.0, abs=0.05)
+
+
+def test_the_uncapped_run_is_the_compounding_one_it_scores_worse_each_year():
+    """The defect the feature removes, stated positively: the SAME $5k/yr strategy scored
+    without a cap shows a FALLING annual return, so a flat CAGR would read as improvement."""
+    from app.services.backtest import results as R
+
+    account = _SnapshotAccount(_snapshots(_FIVE_K_A_YEAR))
+    out = R.build_results(account, _results_config(initial_capital=20_000.0, equity_cap=None))
+    assert out["equity_curve"][-1]["equity"] == pytest.approx(40_000.0)
+    assert out["total_return"] == pytest.approx(100.0, abs=0.05)
+    assert out["annualized_return"] == pytest.approx(18.92, abs=0.05)   # NOT 25
+
+
+def test_a_capped_runs_drawdown_is_denominated_in_the_cap():
+    from app.services.backtest import results as R
+
+    account = _SnapshotAccount(_snapshots([
+        (datetime(2020, 1, 1), 20_000.0), (datetime(2021, 1, 1), 40_000.0),
+        (datetime(2022, 1, 1), 38_000.0),
+    ]))
+    out = R.build_results(account, _results_config(initial_capital=20_000.0,
+                                                   equity_cap=20_000.0))
+    assert out["max_drawdown"] == pytest.approx(-10.0, abs=0.01)
+
+
+def test_the_capped_drawdown_is_measured_on_the_REAL_curve_not_the_synthetic_one():
+    """Order guard for results.build_results: ``capped_drawdown_curve`` takes the REAL curve
+    and must run BEFORE ``equity_curve`` is reassigned. Run on the synthetic curve the same
+    dip reads a plausible, smaller number -- which is exactly what makes the swap invisible.
+
+    20k -> 40k -> 38k. Real cumulative P&L peaks at +20,000 and falls to +18,000: -2,000, i.e.
+    -10% of the 20k cap. The SYNTHETIC curve is 20,000 -> 40,000 -> 20,000*2*0.9 = 36,000, a
+    -4,000 dip from a 40,000 peak -- and cap-denominated that reads -20%, while the running-peak
+    formula reads -10.0% too. So assert the whole curve, where the two differ point by point.
+    """
+    from app.services.backtest import results as R
+    from app.services.backtest.equity_cap import capped_drawdown_curve
+
+    points = [(datetime(2020, 1, 1), 20_000.0), (datetime(2021, 1, 1), 40_000.0),
+              (datetime(2022, 1, 1), 38_000.0), (datetime(2023, 1, 1), 39_000.0)]
+    out = R.build_results(_SnapshotAccount(_snapshots(points)),
+                          _results_config(initial_capital=20_000.0, equity_cap=20_000.0))
+    got = [round(p["drawdown"], 6) for p in out["drawdown_curve"]]
+
+    real_curve = [{"date": d, "equity": e} for d, e in points]
+    expected = [round(p["drawdown"], 6)
+                for p in capped_drawdown_curve(real_curve, cap=20_000.0)]
+    synthetic = [round(p["drawdown"], 6)
+                 for p in capped_drawdown_curve(
+                     [{"date": p["date"], "equity": p["equity"]}
+                      for p in out["equity_curve"]], cap=20_000.0)]
+    assert expected != synthetic, "the fixture no longer distinguishes the two curves"
+    assert got == expected, f"drawdown was measured on the SYNTHETIC curve: {got} vs {expected}"
+
+
+def test_an_absent_account_settings_block_is_not_a_configured_cap():
+    """``test_results_metrics``/``test_zero_coercion_defects`` call build_results with a bare
+    ``{"initial_capital": ...}``. That is not a cap of zero; it is no cap."""
+    from app.services.backtest import results as R
+
+    out = R.build_results(_SnapshotAccount(_snapshots(_FIVE_K_A_YEAR)),
+                          {"initial_capital": 20_000.0})
+    assert out["equity_curve"][-1]["equity"] == pytest.approx(40_000.0)
+
+
+def test_a_bad_cap_in_the_results_config_is_refused_not_ignored():
+    from app.services.backtest import results as R
+
+    with pytest.raises(EquityCapError, match="greater than zero"):
+        R.build_results(_SnapshotAccount(_snapshots(_FIVE_K_A_YEAR)),
+                        _results_config(initial_capital=20_000.0, equity_cap=0.0))
