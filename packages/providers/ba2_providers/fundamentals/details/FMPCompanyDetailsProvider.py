@@ -719,10 +719,30 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
     ) -> Dict[str, Any] | str:
         """
         Get future earnings estimates for a company from FMP.
-        
+
         Uses FMP's analyst estimates endpoint for forward-looking EPS estimates.
         Note: FMP SDK doesn't have analyst_estimates method, so we use direct API call.
-        
+
+        .. warning::
+           **``frequency`` does NOT reach FMP — the rows are always ANNUAL.** The request
+           below sends only ``apikey`` and ``limit``; ``/api/v3/analyst-estimates`` defaults
+           to ``period=annual``, so ``frequency="quarterly"`` selects nothing but the disk
+           cache namespace. Verified against the 4,695 cached
+           ``earnings_estimates_quarterly__*.json`` payloads: every one holds ~20 rows, one
+           per fiscal YEAR (MSFT 2017-06-29 .. 2036-06-30).
+
+           This is why ``DaysToEarningsCondition`` reads ``get_past_earnings`` (FMP's
+           ``historical_earning_calendar``, genuinely quarterly and carrying the actual
+           announcement ``report_date``) and keeps this method only as a fallback: taking a
+           "next earnings" from here yields the next fiscal-year end, e.g. 2024-06-30 (107
+           days) instead of the real 2024-04-25 (41 days) print for MSFT.
+
+           NOT fixed here on purpose. Adding ``"period": "quarter"`` cannot be validated
+           without a live FMP call, would change the shape every existing consumer
+           (``FactorRanker.data``, the TradingAgents "Forward Earnings Estimates" section)
+           has been tuned against, and would leave 4,695 cached files holding annual rows
+           under a namespace that now claims to be quarterly.
+
         Args:
             symbol: Stock ticker symbol
             frequency: Data frequency ('quarterly' or 'annual')

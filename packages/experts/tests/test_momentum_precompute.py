@@ -22,14 +22,20 @@ def test_precomputed_momentum_matches_runtime_factor():
 
     # For several point-in-time bars D, the runtime factor on closes[:D+1] must equal pre[D].
     for D in (251, 252, 300, 450, n - 1):
-        runtime = momentum_12_1({"X": close.iloc[: D + 1]})["X"]  # the factor's 0.0-on-short rule
+        runtime = momentum_12_1({"X": close.iloc[: D + 1]})["X"]
         precomp = pre.iloc[D]
-        precomp = 0.0 if pd.isna(precomp) else float(precomp)
-        assert abs(precomp - runtime) < 1e-9, f"bar {D}: pre={precomp} runtime={runtime}"
+        if pd.isna(precomp):
+            assert runtime is None, f"bar {D}: precompute NaN but runtime {runtime}"
+            continue
+        assert runtime is not None, f"bar {D}: precompute {precomp} but runtime None"
+        assert abs(float(precomp) - runtime) < 1e-9, f"bar {D}: pre={precomp} runtime={runtime}"
 
-    # Insufficient history (< lookback) -> factor returns 0.0; precompute is NaN (consumer maps ->0).
+    # Insufficient history (< lookback): the two now agree that it is NOT MEASURABLE --
+    # the factor says None, the vectorised series says NaN. They used to disagree (0.0
+    # vs NaN) and the consumer coerced the NaN back to 0.0, which is the single best
+    # momentum reading there is in a falling cross-section.
     short = close.iloc[:100]
-    assert momentum_12_1({"X": short})["X"] == 0.0
+    assert momentum_12_1({"X": short})["X"] is None
     assert pd.isna(momentum_12_1_series(short).iloc[-1])
 
 
@@ -51,8 +57,8 @@ def test_compute_daily_metrics_momentum_and_metrics_as_of_match_factor():
 
     D = n - 1
     runtime = momentum_12_1({"X": pd.Series(close[: D + 1])})["X"]
-    col = m["momentum_12_1"].iloc[D]
-    col = 0.0 if pd.isna(col) else float(col)
+    assert runtime is not None, "400 closes is enough to measure 12-1 momentum"
+    col = float(m["momentum_12_1"].iloc[D])
     assert abs(col - runtime) < 1e-6  # column is round(6)
 
     # A DAILY store: metrics_as_of lands on the exact bar -> same value the consumer reads.
@@ -61,14 +67,13 @@ def test_compute_daily_metrics_momentum_and_metrics_as_of_match_factor():
     store_df["symbol"] = "X"
     got = metrics_as_of(store_df, store_df["date"].iloc[D], ["momentum_12_1", "close"])
     assert "X" in got
-    read = got["X"]["momentum_12_1"]
-    read = 0.0 if pd.isna(read) else float(read)
+    read = float(got["X"]["momentum_12_1"])
     assert abs(read - runtime) < 1e-6
     assert abs(float(got["X"]["close"]) - float(close[D])) < 1e-6  # value-factor price source
 
 
-def test_precomputed_momentum_zero_on_nonpositive_start():
-    close = pd.Series([0.0] * 260 + [10.0] * 10)  # start price 0 -> factor returns 0.0
-    assert momentum_12_1({"X": close})["X"] == 0.0
-    # precompute -> NaN where start <= 0 (consumer maps to 0.0)
+def test_precomputed_momentum_unmeasurable_on_nonpositive_start():
+    """A start price of 0 makes the return undefined -- both paths say so."""
+    close = pd.Series([0.0] * 260 + [10.0] * 10)
+    assert momentum_12_1({"X": close})["X"] is None
     assert pd.isna(momentum_12_1_series(close).iloc[-1])

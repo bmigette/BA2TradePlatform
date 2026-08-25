@@ -1670,3 +1670,85 @@ def test_the_previous_readers_are_scoped_to_one_account(account_id):
 
     assert store.get_previous_label_targets(other.id) == {"ARK26": None}
     assert store.get_previous_symbol_weights(other.id, "ARK26", ["AAPL"]) == {"AAPL": None}
+
+
+# ---------------------------------------------------------------------------
+# LABEL COLOURS
+#
+# ``color`` follows ``comment``'s three-state convention exactly: ``None`` means
+# LEAVE IT ALONE (so the target/comment writers cannot wipe a colour), and the
+# empty string CLEARS it. It differs from ``comment`` in one way and it is
+# deliberate: an empty comment is stored as '', while an empty colour is stored as
+# NULL, because '' is not a colour and a third state there would be a value nothing
+# can render.
+# ---------------------------------------------------------------------------
+
+def test_a_new_label_has_no_colour(account_id):
+    row = store.set_managed_label(account_id, "ARK26", target_pct=40.0)
+    assert row.color is None
+
+
+def test_setting_a_colour_persists_it(account_id):
+    store.set_managed_label(account_id, "ARK26", target_pct=40.0)
+    store.set_managed_label(account_id, "ARK26", color="#56B4E9")
+    assert store.get_managed_labels(account_id)[0].color == "#56B4E9"
+
+
+def test_setting_a_colour_does_not_disturb_the_target_or_the_comment(account_id):
+    store.set_managed_label(account_id, "ARK26", target_pct=40.0, comment="growth")
+    store.set_managed_label(account_id, "ARK26", color="#56B4E9")
+    row = store.get_managed_labels(account_id)[0]
+    assert (row.target_pct, row.comment, row.color) == (40.0, "growth", "#56B4E9")
+
+
+def test_saving_a_target_or_a_comment_does_not_wipe_the_colour(account_id):
+    """``None`` means LEAVE UNCHANGED. Without that, every debounced keystroke in
+    the comment box would clear the swatch."""
+    store.set_managed_label(account_id, "ARK26", color="#56B4E9")
+    store.set_managed_label(account_id, "ARK26", target_pct=40.0)
+    store.set_managed_label(account_id, "ARK26", comment="growth")
+    assert store.get_managed_labels(account_id)[0].color == "#56B4E9"
+
+
+def test_an_empty_colour_clears_it_back_to_NULL(account_id):
+    """"No colour" has to be reachable again, or a colour once set is permanent."""
+    store.set_managed_label(account_id, "ARK26", color="#56B4E9")
+    store.set_managed_label(account_id, "ARK26", color="")
+    assert store.get_managed_labels(account_id)[0].color is None
+
+
+def test_clearing_a_colour_stores_NULL_and_not_an_empty_string(account_id):
+    """'' is not a colour. Stored, it would be a third state that means the same
+    thing as NULL and renders differently nowhere."""
+    store.set_managed_label(account_id, "ARK26", color="#56B4E9")
+    store.set_managed_label(account_id, "ARK26", color="")
+    with store.get_db() as session:
+        from ba2_common.core.models import PortfolioAllocationLabel
+        from sqlmodel import select as sqlmodel_select
+        row = session.exec(sqlmodel_select(PortfolioAllocationLabel)).one()
+        assert row.color is None
+
+
+def test_a_colour_is_written_to_the_label_that_was_named_and_no_other(account_id):
+    store.set_managed_label(account_id, "ARK26", target_pct=40.0)
+    store.set_managed_label(account_id, "HighRisk", target_pct=60.0)
+    store.set_managed_label(account_id, "ARK26", color="#D55E00")
+    by_label = {row.label: row.color for row in store.get_managed_labels(account_id)}
+    assert by_label == {"ARK26": "#D55E00", "HighRisk": None}
+
+
+def test_a_colour_is_scoped_to_one_account(account_id):
+    """The label NAME is shared across accounts; the row is not."""
+    from tests.factories import create_account_definition
+    other = create_account_definition(name="Other Colour Account")
+    store.set_managed_label(account_id, "ARK26", color="#D55E00")
+    store.set_managed_label(other.id, "ARK26", target_pct=100.0)
+    assert store.get_managed_labels(other.id)[0].color is None
+    assert store.get_managed_labels(account_id)[0].color == "#D55E00"
+
+
+def test_unmanaging_a_label_takes_its_colour_with_it(account_id):
+    store.set_managed_label(account_id, "ARK26", color="#D55E00")
+    store.remove_managed_label(account_id, "ARK26")
+    store.set_managed_label(account_id, "ARK26", target_pct=40.0)
+    assert store.get_managed_labels(account_id)[0].color is None

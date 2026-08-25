@@ -38,6 +38,13 @@ import os
 import subprocess
 import sys
 
+# Sibling helper in tools/ (shared by all three matrix drivers). The directory is put on the
+# path explicitly so the import works however the script is reached (path, -m, or a test import).
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from matrix_flags import cap_passthrough  # noqa: E402
+
 _UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "options_universe_top100.txt")
 # Grouped families first (the interesting structure search), then the equity-entry pair.
@@ -130,12 +137,15 @@ def main() -> int:
                     help="Local trial consumers per job (default 4; daily-interval trials are "
                          "far lighter than the 5min screener grid).")
     ap.add_argument("--profit-cap-pct", type=float, default=2000.0,
-                    help="Cap each trade's gain at this %% of cost basis for the ADJUSTED "
-                         "fitness (options tails are fat: one 40x long call must not own the "
-                         "GA). Default 2000. Pass 0 to disable.")
+                    help="Cap each BET's gain at this %% of the capital deployed in it for the "
+                         "ADJUSTED fitness (options tails are fat: one 40x long call must not "
+                         "own the GA). A multi-leg structure counts ONCE -- net P&L against net "
+                         "debit -- and a net-CREDIT structure has no basis, so only the share "
+                         "cap bounds it. Default 2000. Pass 0 to disable.")
     ap.add_argument("--profit-share-cap-pct", type=float, default=25.0,
-                    help="Cap each trade's share of the run's net profit for the ADJUSTED "
-                         "fitness. Default 25. Pass 0 to disable.")
+                    help="Cap each BET's share of the run's net profit for the ADJUSTED "
+                         "fitness (same per-structure unit as --profit-cap-pct). Default 25. "
+                         "Pass 0 to disable.")
     ap.add_argument("--fitness-trade-scale", action="store_true",
                     help="Down-weight thin-trade-count configs: multiplies a positive fitness "
                          "by min(avg_trades_per_year, cap)/100. Options entries are naturally "
@@ -201,10 +211,9 @@ def main() -> int:
             cmd += ["--fitness", args.fitness]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
-        if args.profit_cap_pct and args.profit_cap_pct > 0:
-            cmd += ["--profit-cap-pct", str(args.profit_cap_pct)]
-        if args.profit_share_cap_pct and args.profit_share_cap_pct > 0:
-            cmd += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
+        # "Pass 0 to disable" (see the --profit-cap-pct help): a 0 must be FORWARDED, because
+        # omitting the flag lets ba2test_launcher re-apply its own 2000/25 default instead.
+        cmd += cap_passthrough(args)
         if args.fitness_trade_scale:
             cmd += ["--fitness-trade-scale", "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap),
                     "--fitness-trade-scale-target", str(args.fitness_trade_scale_target)]

@@ -38,9 +38,14 @@ from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPApiKeyMixin
 
 from . import data
+from . import explain
 from .technical import technical_score
 from .fundamental import (fundamental_score, piotroski_f_score,
-                          altman_z_and_variant, growth_acceleration)
+                          piotroski_f_score_detail, altman_z_and_variant,
+                          altman_z_detail, growth_acceleration,
+                          growth_acceleration_detail,
+                          DEF_QUALITY_K, DEF_QUALITY_NEUTRAL_ROE,
+                          DEF_VALUE_K, DEF_VALUE_NEUTRAL_YIELD)
 from .analyst import (analyst_section_score, DEF_AW_GRADES, DEF_AW_TARGETS,
                       DEF_TARGET_WINDOW_DAYS, DEF_TARGET_SCALE, DEF_MIN_TARGETS)
 from ba2_experts.earnings_surprise import pead_score
@@ -550,6 +555,13 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
                 return stale
 
         snapshot: Dict[str, Any] = {}
+        # Raw inputs behind every normalized snapshot value. Without this the
+        # only thing that survives to the UI is e.g. tanh((roe - 0.10)/0.10),
+        # from which the ROE cannot be recovered honestly -- a renderer could
+        # only back-solve a plausible number, i.e. invent one. See explain.py.
+        evidence: Dict[str, Any] = {"quality": None, "value": None,
+                                    "piotroski": None, "altman": None,
+                                    "growth": {"revenue": None, "eps": None}}
         cur_inc = income[0] if income else {}
         prior_inc = income[1] if len(income) > 1 else {}
         cur_bal = balance[0] if balance else {}
@@ -570,24 +582,36 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         if income and balance:
             cur = {**cur_bal, **cur_inc, **cur_cf}
             prior = {**prior_bal, **prior_inc}
-            snapshot["fscore"] = piotroski_f_score(cur, prior)
+            pio = piotroski_f_score_detail(cur, prior)
+            snapshot["fscore"] = pio["score"]
+            evidence["piotroski"] = pio
             # Keep the variant: the distress cutoff differs (1.81 vs 1.1), so a
             # bare number cannot be thresholded correctly downstream.
-            snapshot["z"], snapshot["z_variant"] = altman_z_and_variant(
-                cur, market_cap, str(settings.get("altman_variant", "auto")))
+            alt = altman_z_detail(cur, market_cap,
+                                  str(settings.get("altman_variant", "auto")))
+            snapshot["z"], snapshot["z_variant"] = alt["z"], alt["variant"]
+            evidence["altman"] = alt
 
-        # Quality: ROE = net income / shareholder equity (tanh around 15%).
+        # Quality: ROE = net income / shareholder equity, tanh around a fixed
+        # DEF_QUALITY_NEUTRAL_ROE with scale DEF_QUALITY_K.
         ni = cur_inc.get("net_income") or cur_inc.get("netIncome")
         eq = cur_bal.get("total_shareholder_equity") or cur_bal.get("totalStockholdersEquity")
         if ni is not None and eq:
             try:
                 roe = float(ni) / float(eq)
-                snapshot["quality_norm"] = max(-1.0, min(1.0, math.tanh((roe - 0.10) / 0.10)))
+                norm = max(-1.0, min(1.0, math.tanh(
+                    (roe - DEF_QUALITY_NEUTRAL_ROE) / DEF_QUALITY_K)))
+                snapshot["quality_norm"] = norm
+                evidence["quality"] = {
+                    "roe": roe, "net_income": float(ni), "equity": float(eq),
+                    "neutral": DEF_QUALITY_NEUTRAL_ROE, "k": DEF_QUALITY_K,
+                    "normalized": norm,
+                }
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
 
         # Value: operating earnings yield on enterprise value, tanh around a
-        # 10% neutral yield (cheap = high yield = positive).
+        # fixed DEF_VALUE_NEUTRAL_YIELD (cheap = high yield = positive).
         opinc = cur_inc.get("operating_income") or cur_inc.get("operatingIncome")
         cash = cur_bal.get("cash_and_cash_equivalents") or cur_bal.get("cashAndCashEquivalents") or 0.0
         tl = cur_bal.get("total_liabilities") or cur_bal.get("totalLiabilities") or 0.0
@@ -596,7 +620,16 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
                 ev = market_cap + float(tl or 0.0) - float(cash or 0.0)
                 if ev > 0:
                     ey = float(opinc) / ev
-                    snapshot["value_norm"] = max(-1.0, min(1.0, math.tanh((ey - 0.10) / 0.10)))
+                    norm = max(-1.0, min(1.0, math.tanh(
+                        (ey - DEF_VALUE_NEUTRAL_YIELD) / DEF_VALUE_K)))
+                    snapshot["value_norm"] = norm
+                    evidence["value"] = {
+                        "earnings_yield": ey, "operating_income": float(opinc),
+                        "enterprise_value": ev, "market_cap": market_cap,
+                        "total_liabilities": float(tl or 0.0), "cash": float(cash or 0.0),
+                        "neutral": DEF_VALUE_NEUTRAL_YIELD, "k": DEF_VALUE_K,
+                        "normalized": norm,
+                    }
             except (TypeError, ValueError):
                 pass
 
@@ -604,7 +637,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         # (provider returns latest-first, so reverse to ascending). Uses the
         # shared calculator -- the inline reimplementation that used to live here
         # diverged from the unit-tested one and mis-signed negative earnings.
-        def _accel(*field_names) -> Optional[float]:
+        def _accel(*field_names) -> Dict[str, Any]:
             vals = []
             for stmt in reversed(income):
                 raw = next((stmt.get(f) for f in field_names
@@ -615,17 +648,20 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
                     vals.append(float(raw))
                 except (TypeError, ValueError):
                     continue
-            return growth_acceleration(vals, min_points=3)
+            return growth_acceleration_detail(vals, min_points=3)
 
-        rev_accel = _accel("total_revenue", "revenue")
-        if rev_accel is not None:
-            snapshot["rev_accel"] = rev_accel
-        eps_accel = _accel("eps_diluted", "epsdiluted", "eps")
-        if eps_accel is not None:
-            snapshot["eps_accel"] = eps_accel
+        rev_detail = _accel("total_revenue", "revenue")
+        evidence["growth"]["revenue"] = rev_detail
+        if rev_detail["acceleration"] is not None:
+            snapshot["rev_accel"] = rev_detail["acceleration"]
+        eps_detail = _accel("eps_diluted", "epsdiluted", "eps")
+        evidence["growth"]["eps"] = eps_detail
+        if eps_detail["acceleration"] is not None:
+            snapshot["eps_accel"] = eps_detail["acceleration"]
 
         result = fundamental_score(snapshot, settings)
         result["snapshot"] = snapshot
+        result["evidence"] = evidence
         result["market_cap"] = market_cap
         return result
 
@@ -708,37 +744,54 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         fund = raw.get("fundamental") or {}
         regime = raw.get("regime") or {}
         snap = fund.get("snapshot") or {}
+        ev = fund.get("evidence") or {}
         tech_score = tech.get("score")
         fund_score = fund.get("score")
         regime_score = regime.get("score") if regime else None
+
+        def _row(label, value, display, signal, explanation) -> ExpertMetric:
+            text, table = explanation
+            return ExpertMetric(label, value, display, signal, text, detail_table=table)
+
         out = [
-            ExpertMetric("Technical section", tech_score, self._fmt_score(tech_score),
-                        self._score_signal(tech_score),
-                        "Momentum/SMA200/RSI/Donchian composite"),
-            ExpertMetric("Fundamental section", fund_score, self._fmt_score(fund_score),
-                        self._score_signal(fund_score),
-                        "Piotroski/quality/value/growth composite"),
-            ExpertMetric("Macro regime", regime_score, self._fmt_score(regime_score),
-                        self._score_signal(regime_score)),
+            _row("Technical section", tech_score, self._fmt_score(tech_score),
+                 self._score_signal(tech_score),
+                 explain.explain_technical_section(tech, settings)),
+            _row("Fundamental section", fund_score, self._fmt_score(fund_score),
+                 self._score_signal(fund_score),
+                 explain.explain_fundamental_section(fund)),
+            _row("Macro regime", regime_score, self._fmt_score(regime_score),
+                 self._score_signal(regime_score),
+                 explain.explain_macro_section(regime)),
         ]
         # snap["fscore"]/snap["z"] are set (possibly to None -- too few periods
         # for Piotroski, or a missing market cap/balance field for Altman Z) by
         # _build_fundamental whenever statements were present at all, so
         # `"key" in snap` is not a value check: use `snap.get(key) is not None`.
         if snap.get("fscore") is not None:
-            out.append(ExpertMetric("Piotroski F-Score", snap["fscore"], f"{snap['fscore']} / 9",
-                                    "buy" if snap["fscore"] >= 7 else
-                                    ("sell" if snap["fscore"] <= 2 else "neutral")))
+            out.append(_row("Piotroski F-Score", snap["fscore"], f"{snap['fscore']} / 9",
+                            "buy" if snap["fscore"] >= 7 else
+                            ("sell" if snap["fscore"] <= 2 else "neutral"),
+                            explain.explain_piotroski(ev.get("piotroski"))))
         if snap.get("z") is not None:
-            veto = bool(fund.get("veto"))
-            out.append(ExpertMetric("Altman Z", snap["z"], f"{snap['z']:.2f}",
-                                    "sell" if veto else "neutral",
-                                    "Distress veto applied" if veto else None))
-        for key, label in (("quality_norm", "Quality (ROE)"), ("value_norm", "Value (earnings yield)"),
-                           ("rev_accel", "Revenue acceleration"), ("eps_accel", "EPS acceleration")):
+            out.append(_row("Altman Z", snap["z"], f"{snap['z']:.2f}",
+                            "sell" if bool(fund.get("veto")) else "neutral",
+                            explain.explain_altman(fund)))
+        growth_ev = ev.get("growth") or {}
+        for key, label, explanation in (
+            ("quality_norm", "Quality (ROE)",
+             lambda: explain.explain_quality(ev.get("quality"))),
+            ("value_norm", "Value (earnings yield)",
+             lambda: explain.explain_value(ev.get("value"))),
+            ("rev_accel", "Revenue acceleration",
+             lambda: explain.explain_growth("Revenue", growth_ev.get("revenue"))),
+            ("eps_accel", "EPS acceleration",
+             lambda: explain.explain_growth("EPS", growth_ev.get("eps"))),
+        ):
             if snap.get(key) is not None:
-                out.append(ExpertMetric(label, snap[key], f"{snap[key]:+.2f}",
-                                        self._score_signal(snap[key], pos=0.05, neg=-0.05)))
+                out.append(_row(label, snap[key], f"{snap[key]:+.2f}",
+                                self._score_signal(snap[key], pos=0.05, neg=-0.05),
+                                explanation()))
         return out
 
     # ------------------------------------------------------------- live entry

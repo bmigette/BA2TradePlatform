@@ -1,4 +1,24 @@
+from datetime import datetime, timedelta, timezone
+
 from ba2_trade_platform.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+
+
+def _seed_daily(account, underlying, ivs):
+    """Seed one ATM-IV sample per past day, oldest first.
+
+    ``record_atm_iv`` is deliberately one-row-per-(account, underlying)-per-UTC-day
+    (see its docstring and tests/test_iv_rank_wiring.py), so a multi-sample series can
+    only be built across distinct days — which is exactly what the daily recorder
+    produces in production.
+    """
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import OptionIVSnapshot
+    now = datetime.now(timezone.utc)
+    for i, iv in enumerate(ivs):
+        add_instance(OptionIVSnapshot(
+            account_id=account.id, underlying=underlying, atm_iv=iv,
+            recorded_at=now - timedelta(days=len(ivs) - i),
+        ))
 
 
 def test_iv_rank_percentile_math():
@@ -17,8 +37,7 @@ def test_iv_rank_percentile_math():
 
 def test_record_and_rank_roundtrip(mock_account):
     # mock_account.get_atm_implied_volatility("AAPL") returns 0.30
-    for iv in (0.10, 0.20, 0.30, 0.40, 0.50):
-        mock_account.record_atm_iv("AAPL", iv)
+    _seed_daily(mock_account, "AAPL", (0.10, 0.20, 0.30, 0.40, 0.50))
     rank = mock_account.get_iv_rank("AAPL", min_samples=3)
     assert rank == 40.0  # 2 of 5 below current 0.30
 
@@ -34,13 +53,11 @@ def test_record_atm_iv_uses_current_when_iv_none(mock_account):
 
 
 def test_get_iv_rank_excludes_samples_beyond_lookback(mock_account):
-    from datetime import datetime, timezone, timedelta
     from ba2_trade_platform.core.db import add_instance
     from ba2_trade_platform.core.models import OptionIVSnapshot
 
-    # 3 in-window samples (recorded "now") + 1 ancient sample that must be excluded.
-    for iv in (0.10, 0.20, 0.50):
-        mock_account.record_atm_iv("AAPL", iv)
+    # 3 in-window samples (one per recent day) + 1 ancient sample that must be excluded.
+    _seed_daily(mock_account, "AAPL", (0.10, 0.20, 0.50))
     old = OptionIVSnapshot(
         account_id=mock_account.id, underlying="AAPL", atm_iv=0.99,
         recorded_at=datetime.now(timezone.utc) - timedelta(days=400),

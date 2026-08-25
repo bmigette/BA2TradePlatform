@@ -50,8 +50,11 @@ def test_enter_market_routes_buy_and_skips_stop_processing():
 
 
 def test_numeric_enum_not_in_field_event_is_preserved():
-    # percent_to_new_target is a valid ExpertEventType but NOT in FIELD_EVENT; the old lossy
-    # entry path dropped it. Routed via a buy action it must survive as a raw-enum-value field.
+    # percent_to_new_target was a valid ExpertEventType that the old lossy entry path dropped
+    # (it was missing from FIELD_EVENT until the condition-registry coverage fix). The reverse
+    # converter derives its vocabulary from the ENUM, not from FIELD_EVENT, so this stays a
+    # regression test for that independence: routed via a buy action the leaf must survive as
+    # a raw-enum-value field.
     payload = {"export_type": "ruleset", "ruleset": _enter_ruleset([
         {"name": "BUY", "subtype": "enter_market",
          "triggers": {"t0": {"event_type": "percent_to_new_target", "operator": ">", "value": 3}},

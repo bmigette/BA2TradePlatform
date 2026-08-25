@@ -256,13 +256,17 @@ class TestConditionEvaluatorBasic:
         self.evaluator.clear_cache()
         assert self.evaluator._indicator_cache == {}
 
-    def test_unknown_condition_type_returns_false(self):
+    def test_unknown_condition_type_is_unmeasurable(self):
+        """None, not False: an exit rule we cannot even parse is a stop that will
+        never fire, and False said "measured, and not met". The ENTRY policy still
+        collapses it to False -- see the evaluate() assertion below."""
         result = self.evaluator.evaluate_single(
             {"type": "nonexistent"}, "AAPL"
         )
-        assert result is False
+        assert result is None
+        assert self.evaluator.evaluate({"type": "nonexistent"}, "AAPL") is False
 
-    def test_evaluate_single_with_error_returns_false(self):
+    def test_evaluate_single_with_error_is_unmeasurable(self):
         # Provider that raises
         provider = MagicMock()
         provider.get_ohlcv_data.side_effect = Exception("boom")
@@ -270,7 +274,8 @@ class TestConditionEvaluatorBasic:
         result = evaluator.evaluate_single(
             {"type": "price_above", "value": 5.0}, "AAPL"
         )
-        assert result is False
+        assert result is None
+        assert evaluator.evaluate({"type": "price_above", "value": 5.0}, "AAPL") is False
 
 
 class TestCompositeEvaluation:
@@ -398,13 +403,13 @@ class TestPercentConditions:
         result = self.evaluator.evaluate_single(
             {"type": "percent_above_entry", "percent": 10}, "TEST", entry_price=None
         )
-        assert result is False
+        assert result is None      # the move cannot be measured without a basis
 
     def test_percent_below_no_entry_price(self):
         result = self.evaluator.evaluate_single(
             {"type": "percent_below_entry", "percent": 5}, "TEST", entry_price=None
         )
-        assert result is False
+        assert result is None      # THE hard stop: unknown, never a silent "not hit"
 
 
 # ---------------------------------------------------------------------------
@@ -743,13 +748,14 @@ class TestRVOLConditions:
         assert result is False
 
     def test_rvol_above_no_data(self):
-        """RVOL should return False when no data is available."""
+        """RVOL is unmeasurable (None) when no data is available."""
         provider = MockOHLCVProvider()  # no data
         ev = ConditionEvaluator(provider)
         result = ev.evaluate_single(
             {"type": "rvol_above", "threshold": 1.5}, "X"
         )
-        assert result is False
+        assert result is None
+        assert ev.evaluate({"type": "rvol_above", "threshold": 1.5}, "X") is False
 
     def test_rvol_validation(self):
         """rvol_above should validate correctly."""
@@ -805,8 +811,9 @@ class TestCaching:
         ev.clear_cache()
         assert len(ev._indicator_cache) == 0
 
-    def test_empty_provider_returns_false(self):
+    def test_empty_provider_is_unmeasurable(self):
         provider = MockOHLCVProvider()  # no data
         ev = ConditionEvaluator(provider)
         result = ev.evaluate_single({"type": "price_above", "value": 5.0}, "X")
-        assert result is False
+        assert result is None
+        assert ev.evaluate({"type": "price_above", "value": 5.0}, "X") is False

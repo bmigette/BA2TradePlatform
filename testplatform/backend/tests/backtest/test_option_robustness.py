@@ -382,6 +382,16 @@ def _bear_call_spread(qty=1) -> Combo:
     return Combo("bear_call_spread", legs, qty, prem)
 
 
+def _bull_put_spread(qty=1) -> Combo:
+    # short 110 put @6, long 100 put @2 -> credit 4 ; width 10 ; max_loss (10-4)*100=600.
+    # The put MIRROR of _bear_call_spread, and the regime sweep matters more here than for
+    # any other 2-leg shape: its short leg is a PUT, so the "no residual stock" invariant is
+    # the one that catches a leg-by-leg settlement putting 100 shares into the account.
+    prem = {110.0: {"put": 6.0}, 100.0: {"put": 2.0}}
+    legs = [("put", 110.0, OrderDirection.SELL, 1), ("put", 100.0, OrderDirection.BUY, 1)]
+    return Combo("bull_put_spread", legs, qty, prem)
+
+
 def _call_butterfly(qty=1) -> Combo:
     # long 90 call @12, short 2x 100 call @5, long 110 call @1 -> debit 12-10+1=3 ; width 10
     prem = {90.0: {"call": 12.0}, 100.0: {"call": 5.0}, 110.0: {"call": 1.0}}
@@ -403,6 +413,7 @@ _COMBO_BUILDERS = {
     "bull_call_spread": _bull_call_spread,
     "bear_put_spread": _bear_put_spread,
     "bear_call_spread": _bear_call_spread,
+    "bull_put_spread": _bull_put_spread,
     "call_butterfly": _call_butterfly,
     "iron_condor": _iron_condor,
 }
@@ -468,7 +479,7 @@ def _assert_invariants(res: Dict[str, Any], combo: Combo, label: str,
 # Invariant tests: combos x expiry regimes
 # ===========================================================================
 _COMBOS_TO_TEST = ["bull_call_spread", "bear_put_spread", "bear_call_spread",
-                   "call_butterfly", "iron_condor"]
+                   "bull_put_spread", "call_butterfly", "iron_condor"]
 
 
 def _all_combo_regime_cases():
@@ -595,7 +606,7 @@ def _random_defined_risk_combo(rng: random.Random) -> Tuple[Combo, float, str]:
     description in the assertion message.
     """
     shape = rng.choice(["bull_call_spread", "bear_put_spread", "bear_call_spread",
-                        "call_butterfly", "iron_condor"])
+                        "bull_put_spread", "call_butterfly", "iron_condor"])
     base = rng.choice([80.0, 100.0, 120.0, 150.0])
     width = float(rng.choice([5, 10, 15, 20]))
     qty = rng.randint(1, 8)
@@ -614,6 +625,11 @@ def _random_defined_risk_combo(rng: random.Random) -> Tuple[Combo, float, str]:
         k1, k2 = base, base + width
         prem = {k1: {"call": width * 0.6}, k2: {"call": width * 0.2}}
         legs = [("call", k1, OrderDirection.SELL, 1), ("call", k2, OrderDirection.BUY, 1)]
+        combo = Combo(shape, legs, qty, prem)
+    elif shape == "bull_put_spread":
+        k1, k2 = base + width, base
+        prem = {k1: {"put": width * 0.6}, k2: {"put": width * 0.2}}
+        legs = [("put", k1, OrderDirection.SELL, 1), ("put", k2, OrderDirection.BUY, 1)]
         combo = Combo(shape, legs, qty, prem)
     elif shape == "call_butterfly":
         k1, k2, k3 = base, base + width, base + 2 * width

@@ -377,7 +377,17 @@ def calculate_transaction_pnl(transaction: Transaction) -> Optional[float]:
     Returns:
         P&L as float, or None if required fields are missing
     """
-    if not transaction.close_price or not transaction.open_price or not transaction.quantity:
+    # AN EXPLICIT `is None` TEST, NEVER TRUTHINESS. ``not transaction.close_price``
+    # cannot tell "no close price was ever recorded" from "it closed at 0.00", and
+    # 0.00 is the SINGLE MOST COMMON option close there is: every option that expires
+    # worthless. Under truthiness the realised loss (or, for a short, the full kept
+    # premium) came back as None -- indistinguishable from a missing measurement --
+    # and disappeared from the P&L pages, the per-expert profit chart and the
+    # profit-sign classification in TradeRepository.last_closed_transaction. Same for
+    # an open_price of 0.00 (a free/rolled leg) and a quantity of 0 (a fully-closed
+    # transaction, whose P&L is a measured 0.0, not an unknown).
+    if (transaction.close_price is None or transaction.open_price is None
+            or transaction.quantity is None):
         return None
     multiplier = getattr(transaction, "multiplier", None) or 1
     if transaction.side == OrderDirection.BUY:

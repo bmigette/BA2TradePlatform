@@ -304,13 +304,28 @@ class HistoricalOptionsProvider:
         """NEAR-ATM implied volatility (0-1) for ``underlying`` as of ``as_of`` — feeds
         ``IVRankCondition``'s rolling history.
 
-        Mirrors the LIVE semantics (AlpacaAccount.get_atm_implied_volatility): pick the ONE
+        Same SHAPE as live (AlpacaAccount.get_atm_implied_volatility): pick the ONE
         contract nearest the money in a 20-45 DTE expiry window and return ITS iv. The
         pre-2026-07-22 chain-wide MEAN (bug B7) averaged iv across all 10-16k cached
-        contracts — skew- and expiry-contaminated — breaking live/backtest parity of the
-        iv_rank condition.
+        contracts — skew- and expiry-contaminated — and fixing that restored the KIND of
+        number, which is as far as the claim goes.
 
-        ATM PROXY (documented): this layer has no point-in-time underlying SPOT — the
+        NOT THE SAME STATISTIC, and no docstring here should imply otherwise. Live and
+        this reader choose a DIFFERENT contract:
+
+        * live: ``min(candidates, key=|strike - spot|)`` over the whole window, BOTH
+          rights, all in-window expiries, first minimum wins in broker chain order — so
+          which of the tied call/put/expiry it lands on is not even deterministic;
+        * here: CALLS only, ``|delta|`` nearest 0.50, tie-broken by nearest expiry then
+          lowest strike — fully deterministic.
+
+        They agree closely for a liquid name with a strike near spot and diverge on wide
+        strike ladders and steep skew. Consequence to hold on to: an ``iv_rank`` threshold
+        tuned in a backtest transfers to live approximately, not exactly. Reconciling
+        would mean giving live the deterministic rule (it is the one with the arbitrary
+        tie-break), not giving this reader a spot it does not have.
+
+        ATM PROXY (why the difference exists): this layer has no point-in-time underlying SPOT — the
         options cache stores no underlying-price column (see options_cache._CHAIN_DDL /
         _BAR_DDL) and the backtest's OHLCV store lives in price_source.py, not the
         provider — so "nearest the money" is proxied by the contract whose |delta| is

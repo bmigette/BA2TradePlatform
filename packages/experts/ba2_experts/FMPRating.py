@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 from functools import cached_property
 import json
@@ -1133,22 +1133,55 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
                 "buy" if upside > 0 else "sell",
                 f"Using the '{settings['target_price_type']}' target"))
 
+        # The FOUR price targets with their distance from the current price,
+        # as (label, value) rows a card draws as a small table. These were
+        # previously reachable only by reading them out of the middle of the
+        # 1.5 kB `details` prose block.
         target_consensus = calc.get("target_consensus")
-        base.append(ExpertMetric("Consensus price target", target_consensus,
-                                 self._fmt_price(target_consensus)))
+        base.append(ExpertMetric(
+            "Consensus price target", target_consensus,
+            self._fmt_price(target_consensus), None,
+            detail="Analyst price-target set; the percentage is the distance "
+                   "from the current price.",
+            detail_table=self._price_target_table(calc, current_price)))
 
         analyst_count = calc.get("analyst_count", 0)
-        strong_buy = calc.get("strong_buy", 0)
-        buy = calc.get("buy", 0)
-        hold = calc.get("hold", 0)
-        sell = calc.get("sell", 0)
-        strong_sell = calc.get("strong_sell", 0)
         base.append(ExpertMetric(
             "Total analysts", analyst_count, str(analyst_count), None,
-            detail=f"{strong_buy} Strong Buy / {buy} Buy / {hold} Hold / "
-                   f"{sell} Sell / {strong_sell} Strong Sell"))
+            detail="Rating buckets from FMP's upgrade/downgrade feed; the "
+                   "confidence derivation on the Recommendation row weights "
+                   "the two 'Strong' buckets more heavily.",
+            detail_table=[
+                ("Strong Buy", str(calc.get("strong_buy", 0))),
+                ("Buy", str(calc.get("buy", 0))),
+                ("Hold", str(calc.get("hold", 0))),
+                ("Sell", str(calc.get("sell", 0))),
+                ("Strong Sell", str(calc.get("strong_sell", 0))),
+            ]))
 
         return base
+
+    def _price_target_table(self, calc: Dict[str, Any],
+                            current_price: Optional[float]) -> List[Tuple[str, str]]:
+        """(label, "$target (+x.x% from current)") for each of the four targets.
+
+        A target key can be absent from FMP's response; that renders "n/a", never
+        "$0.00 (-100%)" -- a missing target is not a zero-dollar target."""
+        rows: List[Tuple[str, str]] = []
+        for label, key in (("Consensus", "target_consensus"), ("High", "target_high"),
+                           ("Low", "target_low"), ("Median", "target_median")):
+            v = calc.get(key)
+            if v is None:
+                rows.append((label, "n/a"))
+                continue
+            if current_price:
+                pct = (v / current_price - 1.0) * 100.0
+                rows.append((label, f"${v:.2f}  ({pct:+.1f}% from current)"))
+            else:
+                rows.append((label, f"${v:.2f}"))
+        rows.append(("Current price",
+                     f"${current_price:.2f}" if current_price else "n/a"))
+        return rows
 
     def _store_analysis_outputs(self, market_analysis_id: int, symbol: str,
                                recommendation_data: Dict[str, Any],

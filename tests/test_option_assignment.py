@@ -306,3 +306,157 @@ def test_missing_activity_id_skipped_gracefully(mock_account_def):
     activities = [{"activity_type": "OPEXP", "symbol": PUT_OCC, "qty": "1"}]
     results = acct.reconcile_option_assignments(activities)  # must not raise
     assert isinstance(results, list)
+
+
+# ---------------------------------------------------------------------------
+# A MISSING QUANTITY IS NOT AN ASSIGNMENT OF ZERO SHARES.
+#
+# ``contracts = qty if qty is not None else 0.0`` turned "the broker did not tell us
+# how big the assignment was" into a MEASURED zero, and the OPASN handler then wrote
+# a PERMANENT 0-share equity ledger row (and closed the short option against it).
+# The idempotency key is (account_id, activity_id), so that wrong row was also the
+# thing that stopped a later, better-informed pass from ever correcting it: the
+# assignment was silently written off as done.
+#
+# The fix refuses BEFORE any ledger write, and an ``unhandled:`` audit row -- which by
+# construction means "no effect was applied" -- no longer blocks a retry.
+# ---------------------------------------------------------------------------
+
+def test_assignment_with_missing_qty_writes_no_zero_share_ledger_row(
+        mock_account_def, mock_expert_instance):
+    """THE DEFECT: a permanent 0-share position, and a short put closed against it."""
+    acct = _make_alpaca(mock_account_def.id)
+    expert_id = mock_expert_instance.id
+    opt_txn_id = _seed_option_order_and_txn(
+        mock_account_def.id, expert_id, PUT_OCC, OptionRight.PUT,
+        OrderDirection.SELL, strike=150.0, contracts=2,
+    )
+
+    activities = [{
+        "id": "act-noqty-1", "activity_type": "OPASN", "symbol": PUT_OCC,
+        "qty": None, "price": "0",
+    }]
+    acct.reconcile_option_assignments(activities)
+
+    assert _equity_longs_for_expert(expert_id) == [], (
+        "a 0-share equity position must never be ledgered from a missing quantity")
+    assert get_instance(Transaction, opt_txn_id).status == TransactionStatus.OPENED, (
+        "the short put must not be closed against an assignment we could not size")
+
+    rows = [r for r in _option_activities_for(mock_account_def.id)
+            if r.activity_id == "act-noqty-1"]
+    assert len(rows) == 1
+    assert rows[0].result == "unhandled: missing qty", rows[0].result
+
+
+def test_a_missing_qty_assignment_is_retried_once_the_qty_is_known(
+        mock_account_def, mock_expert_instance):
+    """An ``unhandled:`` row means NOTHING was applied, so it must not act as a
+    tombstone. The old check skipped on the row's mere existence."""
+    acct = _make_alpaca(mock_account_def.id)
+    expert_id = mock_expert_instance.id
+    opt_txn_id = _seed_option_order_and_txn(
+        mock_account_def.id, expert_id, PUT_OCC, OptionRight.PUT,
+        OrderDirection.SELL, strike=150.0, contracts=2,
+    )
+
+    acct.reconcile_option_assignments([{
+        "id": "act-retry-1", "activity_type": "OPASN", "symbol": PUT_OCC,
+        "qty": None, "price": "0",
+    }])
+    # A later pass, this time with the quantity present.
+    acct.reconcile_option_assignments([{
+        "id": "act-retry-1", "activity_type": "OPASN", "symbol": PUT_OCC,
+        "qty": "2", "price": "0",
+    }])
+
+    equity = _equity_longs_for_expert(expert_id)
+    assert len(equity) == 1
+    assert equity[0].quantity == 200.0
+    assert get_instance(Transaction, opt_txn_id).status == TransactionStatus.CLOSED
+
+    rows = [r for r in _option_activities_for(mock_account_def.id)
+            if r.activity_id == "act-retry-1"]
+    assert len(rows) == 1, "a retry must UPDATE the audit row, not duplicate the key"
+    assert "csp_assignment" in (rows[0].result or "")
+    # The row must describe the pass that ACTUALLY applied the effect, not the
+    # refusal it replaced -- it is the audit trail for a 200-share position.
+    assert rows[0].qty == 2.0
+    assert rows[0].symbol == PUT_OCC
+    assert rows[0].activity_type == "OPASN"
+
+
+def test_a_measured_zero_qty_is_not_treated_as_missing(
+        mock_account_def, mock_expert_instance):
+    """THE INVERSE: ``qty == 0`` is a MEASUREMENT the broker actually sent. It must
+    take the ordinary path, not the 'missing qty' refusal, and -- having been applied
+    -- must never be retried."""
+    acct = _make_alpaca(mock_account_def.id)
+    expert_id = mock_expert_instance.id
+    _seed_option_order_and_txn(
+        mock_account_def.id, expert_id, PUT_OCC, OptionRight.PUT,
+        OrderDirection.SELL, strike=150.0, contracts=1,
+    )
+
+    activities = [{
+        "id": "act-zeroqty-1", "activity_type": "OPASN", "symbol": PUT_OCC,
+        "qty": "0", "price": "0",
+    }]
+    acct.reconcile_option_assignments(activities)
+    acct.reconcile_option_assignments(activities)  # applied -> must be a no-op
+
+    rows = [r for r in _option_activities_for(mock_account_def.id)
+            if r.activity_id == "act-zeroqty-1"]
+    assert len(rows) == 1
+    assert rows[0].result != "unhandled: missing qty", (
+        "a measured zero is not a missing measurement")
+    assert len(_equity_longs_for_expert(expert_id)) == 1, (
+        "the measured path ran exactly once")
+
+
+def test_expiry_with_no_qty_still_closes_the_option(mock_account_def, mock_expert_instance):
+    """THE INVERSE: the OPEXP path never reads the quantity, so refusing it on a
+    missing qty would leave a worthless expiry OPEN forever."""
+    acct = _make_alpaca(mock_account_def.id)
+    opt_txn_id = _seed_option_order_and_txn(
+        mock_account_def.id, mock_expert_instance.id, PUT_OCC, OptionRight.PUT,
+        OrderDirection.SELL, strike=150.0, contracts=1,
+    )
+
+    acct.reconcile_option_assignments([{
+        "id": "act-exp-noqty", "activity_type": "OPEXP", "symbol": PUT_OCC,
+        "qty": None, "price": "0",
+    }])
+
+    opt_txn = get_instance(Transaction, opt_txn_id)
+    assert opt_txn.status == TransactionStatus.CLOSED
+    assert opt_txn.close_reason == "expired"
+
+
+def test_a_crashed_activity_is_not_retried_and_cannot_double_apply(
+        mock_account_def, mock_expert_instance, monkeypatch):
+    """The retry must stay narrow. ``unhandled: exception:`` is written by the CALLER
+    after an arbitrary crash, so the ledger may be half-applied — here the equity
+    Transaction is already in, and only its entry order failed. Re-running that would
+    open the position a SECOND time."""
+    acct = _make_alpaca(mock_account_def.id)
+    expert_id = mock_expert_instance.id
+    _seed_option_order_and_txn(
+        mock_account_def.id, expert_id, PUT_OCC, OptionRight.PUT,
+        OrderDirection.SELL, strike=150.0, contracts=1,
+    )
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("broker rejected the equity entry order")
+    monkeypatch.setattr(acct, "_record_assignment_equity_order", _boom)
+
+    activities = [{
+        "id": "act-crash-1", "activity_type": "OPASN", "symbol": PUT_OCC,
+        "qty": "1", "price": "0",
+    }]
+    acct.reconcile_option_assignments(activities)
+    monkeypatch.undo()
+    acct.reconcile_option_assignments(activities)
+
+    assert len(_equity_longs_for_expert(expert_id)) == 1, (
+        "a half-applied crash must not be replayed into a doubled position")

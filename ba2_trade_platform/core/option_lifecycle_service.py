@@ -1,0 +1,713 @@
+"""The LIVE option lifecycle pass: the runner that finally wires the pure modules in.
+
+``option_lifecycle`` (Task 6) and ``option_book`` (Task 7) are pure — positions and chain
+in, decisions out, no DB, no broker, no clock. This module is the only thing that gives them
+a database and a broker. Before it existed neither was called from anywhere but its own test
+file: two heavily-tested modules of dead code.
+
+What the pass does, in order, for ONE expert sleeve:
+
+1. refuse to act against a book it cannot see (``get_positions()``);
+2. load the expert's OPENED option transactions and net their legs into
+   ``OptionStructure`` values;
+3. fetch one option chain per (underlying, expiry) and index it by contract symbol;
+4. total the sleeve (``book_totals``) and ratchet/test the drawdown breaker
+   (``update_breaker``), feeding its EDGE into the decision via ``breaker_signal``;
+5. ask ``option_lifecycle.decide`` for exactly one decision per structure;
+6. submit a close for every ``should_close``, each one guarded by
+   ``has_pending_closing_order``.
+
+
+It must not invoke an expert, and that is the point
+---------------------------------------------------
+Roll at 21 DTE, capture 50% of a credit, defend a tested short, trip a drawdown breaker: not
+one of those needs an opinion about the underlying. The ledger and the chain already answer
+them. Paying for an FMP call plus an LLM analysis to discover that a spread is at 21 DTE is
+precisely the cost behind the project's "options must be as fast as stocks" requirement. The
+expert analyses still run afterwards, on whatever the pass left open, and still own anything
+that genuinely needs a view.
+
+Nothing in this module imports an expert, submits a ``MarketAnalysis`` or touches the
+``WorkerQueue``.
+
+
+Unknown is never a value
+------------------------
+``LIFECYCLE_UNKNOWN`` means the decision could not be made. It is NOT a hold, and this
+module must never let it read as one:
+
+* every unknown decision is collected in ``LifecyclePassResult.unknown`` and logged at
+  WARNING naming the input that was missing;
+* a structure whose legs cannot be netted is reported, not skipped in silence;
+* a P&L we cannot compute stays ``None`` and never becomes ``0.0``.
+
+Collapsing "we cannot measure this" into "this is fine" is what hid a dead roll-DTE gene for
+an entire GA campaign.
+
+
+A stand-down suppresses ENTRIES, not EXITS
+------------------------------------------
+``OptionPortfolioManager.manage_open`` returned ``[]`` on every bar while ``self._halted``,
+so the latch suppressed *exits*. That is the wrong half, and it is a real hole:
+
+* the breaker signals the **edge** (``BreakerState.tripped``), not the latch, precisely so a
+  flat book is not re-flattened every bar. A structure the flatten failed to close — the
+  broker rejected it, or a manual close was already working — therefore never receives
+  ``LIFECYCLE_BREAKER`` again;
+* with exits also suppressed, that structure is never managed again by ANY rule: no profit
+  capture, no stop, no roll. It runs to expiry unmanaged, inside the drawdown that tripped
+  the breaker;
+* the thing the latch was really protecting against — re-issuing a close over a working one
+  — has a purpose-built, per-transaction primitive: ``has_pending_closing_order``. A
+  book-wide latch is a blunt substitute that also blocks the closes that *should* happen;
+* entry suppression, the half that is genuinely correct, already lives in
+  ``option_book.check_rails``, which declines every candidate while ``halted`` ahead of every
+  rail.
+
+So this pass runs its exit rules on **every** evaluation regardless of ``halted``, and
+``LifecyclePassResult.breaker`` carries the stand-down out to whatever opens positions.
+``packages/experts/.../PremiumSeller`` still pins the opposite in
+``test_circuit_breaker_flattens_and_halts``; that expert is deleted in Task 12 and its
+behaviour is deliberately NOT treated as a specification here.
+
+
+The breaker peak is process state
+---------------------------------
+``BreakerState`` is a value and something has to carry it between evaluations. It is held in
+a module-level map keyed by expert instance, exactly as ``OptionPortfolioManager`` held
+``self._peak_equity`` on the manager. **A process restart forgets the peak**, and the sleeve
+then measures its next drawdown from wherever equity stands at restart. That is a known
+limitation of this task (persisting it needs a column, i.e. a migration) and it is stated
+rather than hidden. ``rearm_breaker`` is the operator override.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+from ba2_common.core.option_book import (
+    BookTotals, BreakerState, book_totals, breaker_signal, rearm, update_breaker,
+)
+from ba2_common.core.option_lifecycle import (
+    LIFECYCLE_UNKNOWN, LifecycleDecision, LifecycleLeg, OptionStructure, decide,
+)
+from ba2_common.core.option_types import OptionContract, OptionLeg
+
+from ..logger import logger
+
+_EPS = 1e-9
+
+#: Thresholds ``option_lifecycle.decide`` reads on EVERY structure, plus the one
+#: ``option_book.update_breaker`` needs. An expert missing any of these cannot be managed,
+#: and that is a loud configuration error rather than a substituted risk threshold.
+REQUIRED_SETTINGS: Tuple[str, ...] = (
+    "profit_capture_pct", "roll_dte", "tested_delta_enabled", "dr_stop_enabled",
+    "ur_stop_enabled", "circuit_breaker_pct",
+)
+
+#: Thresholds only some structures need (a strangle's capture, the stop multiples, the
+#: tested threshold) plus the sleeve rails ``check_rails`` consumes. Passed through when the
+#: expert declares them; a rule that needs one the expert did not declare raises inside
+#: ``decide`` and is reported by name — never defaulted.
+OPTIONAL_SETTINGS: Tuple[str, ...] = (
+    "strangle_capture_pct", "tested_delta", "dr_stop_credit_mult", "ur_stop_credit_mult",
+    "max_deployment_pct", "undefined_risk_max_pct", "max_notional_leverage",
+    "max_concurrent_structures",
+)
+
+
+# ---------------------------------------------------------------------------
+# results
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class SubmittedClose:
+    """One closing order the pass actually put on the wire."""
+    transaction_id: int
+    reason: str
+    legs: Tuple[OptionLeg, ...]
+    order: Any
+
+
+@dataclass
+class LifecyclePassResult:
+    """Everything one pass over one sleeve decided, did, and could not do.
+
+    Deliberately verbose. The whole point of the pass is that an option position is never
+    silently unmanaged, so every outcome has a field a caller (and a test) can read:
+    ``unknown`` is not folded into ``decisions``' holds, ``skipped_pending_close`` is not
+    folded into "nothing to do", and ``failed`` is not folded into ``submitted``.
+    """
+    expert_instance_id: int
+    as_of: datetime
+    aborted: bool = False
+    abort_reason: str = ""
+    decisions: List[LifecycleDecision] = field(default_factory=list)
+    #: Decisions whose reason is LIFECYCLE_UNKNOWN. A subset of ``decisions``, surfaced
+    #: separately because an unknown that reads as a hold is the failure this work exists
+    #: to remove.
+    unknown: List[LifecycleDecision] = field(default_factory=list)
+    submitted: List[SubmittedClose] = field(default_factory=list)
+    #: Transactions whose close was correctly withheld: one is already working.
+    skipped_pending_close: List[int] = field(default_factory=list)
+    #: Transactions whose close was decided but did NOT reach the broker.
+    failed: List[int] = field(default_factory=list)
+    #: Transactions that could not be turned into a structure at all (no legs on record).
+    unbuildable: List[int] = field(default_factory=list)
+    book: Optional[BookTotals] = None
+    breaker: BreakerState = field(default_factory=BreakerState)
+
+
+# ---------------------------------------------------------------------------
+# breaker state (process-lifetime, see the module docstring)
+# ---------------------------------------------------------------------------
+_BREAKER_STATE: Dict[int, BreakerState] = {}
+
+
+def reset_breaker_states() -> None:
+    """Forget every sleeve's breaker. Tests, and an operator starting clean."""
+    _BREAKER_STATE.clear()
+
+
+def get_breaker_state(expert_instance_id: int) -> BreakerState:
+    return _BREAKER_STATE.get(expert_instance_id, BreakerState())
+
+
+def rearm_breaker(expert_instance_id: int) -> BreakerState:
+    """Clear a stand-down UNCONDITIONALLY (``option_book.rearm``): the operator override.
+
+    Nothing calls this automatically — it re-risks a sleeve that has not recovered. The
+    peak is deliberately KEPT, so the drawdown that caused the stand-down is not erased.
+    """
+    state = rearm(get_breaker_state(expert_instance_id))
+    _BREAKER_STATE[expert_instance_id] = state
+    logger.warning(f"Option lifecycle: circuit-breaker stand-down for expert "
+                   f"{expert_instance_id} cleared by an explicit re-arm")
+    return state
+
+
+# ---------------------------------------------------------------------------
+# seams (patched in tests; live in ``core.utils``, imported late because
+# ``core.utils`` <-> ``modules.experts`` is a genuine import cycle)
+# ---------------------------------------------------------------------------
+def _resolve_expert(expert_instance_id: int):
+    from .utils import get_expert_instance_from_id
+    return get_expert_instance_from_id(expert_instance_id)
+
+
+def _resolve_account(account_id: int):
+    from .utils import get_account_instance_from_id
+    return get_account_instance_from_id(account_id)
+
+
+# ---------------------------------------------------------------------------
+# the pass
+# ---------------------------------------------------------------------------
+def run_option_lifecycle_pass(expert_instance_id: int,
+                              as_of: Optional[datetime] = None) -> LifecyclePassResult:
+    """Manage ONE expert's open option structures. Submits closes; never an analysis.
+
+    :param expert_instance_id: the sleeve to manage.
+    :param as_of:              the evaluation instant. Supplied by tests and by any caller
+                               that already holds one; defaults to now.
+
+    Returns a :class:`LifecyclePassResult` describing every decision and every action.
+    Expected failures (an unreadable position book, an expert with no option thresholds, a
+    threshold a rule needed) return an ``aborted`` result after logging; a genuine defect
+    propagates to the caller's guard rather than being disguised as "nothing to do".
+    """
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+    from .db import get_instance
+    from .models import ExpertInstance
+
+    as_of = as_of or datetime.now(timezone.utc)
+    result = LifecyclePassResult(expert_instance_id, as_of)
+
+    expert = _resolve_expert(expert_instance_id)
+    if expert is None:
+        return _abort(result, f"expert instance {expert_instance_id} could not be resolved "
+                              f"— its option positions are NOT being managed")
+
+    instance = get_instance(ExpertInstance, expert_instance_id)
+    if instance is None:
+        return _abort(result, f"expert instance {expert_instance_id} has no database row "
+                              f"— its option positions are NOT being managed")
+
+    account = _resolve_account(instance.account_id)
+    if account is None:
+        return _abort(result, f"account {instance.account_id} could not be resolved for "
+                              f"expert {expert_instance_id} — its option positions are NOT "
+                              f"being managed")
+
+    if not isinstance(account, OptionsAccountInterface):
+        # Not a failure: an equity-only broker has no option book to manage. Task 9 reports
+        # the case that IS a failure — an expert HOLDING options on such an account.
+        logger.debug(f"Option lifecycle: account {instance.account_id} does not support "
+                     f"options; nothing to manage for expert {expert_instance_id}")
+        return result
+
+    # 1. NEVER act against a book we cannot see. `get_positions()` returning None is
+    #    "the fetch failed", not "the account is flat" — the conflation that has
+    #    force-closed real positions and duplicated others five times on this project.
+    if not _broker_can_answer(account, expert_instance_id, result):
+        return result
+
+    # 2. The sleeve's holdings, as values.
+    transactions = _open_option_transactions(expert_instance_id)
+    structures = []
+    for txn in transactions:
+        structure = _build_structure(txn, result)
+        if structure is not None:
+            structures.append(structure)
+
+    # 3. The thresholds. Missing ones are a configuration error — but only worth saying so
+    #    when the sleeve actually holds something. A report that always warns gets ignored.
+    settings, missing = _lifecycle_settings(expert)
+    if missing:
+        if not structures:
+            logger.debug(f"Option lifecycle: expert {expert_instance_id} declares no option "
+                         f"thresholds and holds no option structures — nothing to do")
+            return result
+        return _abort(result,
+                      f"expert {expert_instance_id} holds {len(structures)} open option "
+                      f"structure(s) but does not declare {', '.join(missing)} — refusing "
+                      f"to substitute a default for a risk threshold. These positions are "
+                      f"NOT being managed.")
+
+    # 4. Quotes and greeks for every held leg.
+    chain_by_symbol = _fetch_chain(account, structures)
+
+    # 5. The sleeve total, and the drawdown breaker.
+    result.book = book_totals(structures)
+    if result.book.unmeasurable:
+        logger.warning(f"Option lifecycle: expert {expert_instance_id} has a sleeve whose "
+                       f"committed capital is UNMEASURABLE (entry rails will decline): "
+                       + "; ".join(result.book.unmeasurable))
+
+    equity = _sleeve_equity(account, expert_instance_id)
+    # Ratchet on EVERY evaluation, including a flat sleeve. `manage_open` returned before
+    # ratcheting on `not holdings`, so a just-flattened sleeve stopped tracking its peak and
+    # would re-arm against a stale one.
+    result.breaker = update_breaker(get_breaker_state(expert_instance_id), equity, settings)
+    _BREAKER_STATE[expert_instance_id] = result.breaker
+    if result.breaker.blind:
+        logger.warning(f"Option lifecycle: the drawdown breaker for expert "
+                       f"{expert_instance_id} could not be evaluated — "
+                       f"{result.breaker.detail}")
+    elif result.breaker.tripped:
+        logger.warning(f"Option lifecycle: expert {expert_instance_id} — "
+                       f"{result.breaker.detail}")
+
+    if not structures:
+        return result
+
+    # 6. One decision per structure. The breaker reaches LIFECYCLE_BREAKER through the
+    #    state key option_lifecycle itself exports, so producer and consumer cannot drift.
+    decide_settings = dict(settings)
+    decide_settings.update(breaker_signal(result.breaker))
+    try:
+        result.decisions = decide(structures, chain_by_symbol, decide_settings, as_of)
+    except KeyError as e:
+        return _abort(result,
+                      f"expert {expert_instance_id} does not declare a threshold one of its "
+                      f"{len(structures)} open option structure(s) needs ({e}) — refusing to "
+                      f"substitute a default. These positions are NOT being managed.")
+
+    # 7. Act.
+    by_id = {s.transaction_id: s for s in structures}
+    txn_by_id = {t.id: t for t in transactions}
+    for decision in result.decisions:
+        if decision.reason == LIFECYCLE_UNKNOWN:
+            # NOT a hold, and never silent: name the transaction and the missing input.
+            result.unknown.append(decision)
+            logger.warning(
+                f"Option lifecycle: transaction {decision.transaction_id} is UNKNOWN — the "
+                f"decision could not be made and this is NOT a hold: {decision.detail}")
+            continue
+        if not decision.should_close:
+            continue
+        _close(account, txn_by_id[decision.transaction_id], by_id[decision.transaction_id],
+               decision, result)
+
+    logger.info(
+        f"Option lifecycle for expert {expert_instance_id}: {len(structures)} structure(s), "
+        f"{len(result.submitted)} closed, {len(result.skipped_pending_close)} already "
+        f"closing, {len(result.failed)} failed, {len(result.unknown)} unknown")
+    return result
+
+
+def _abort(result: LifecyclePassResult, reason: str) -> LifecyclePassResult:
+    result.aborted = True
+    result.abort_reason = reason
+    logger.error(f"Option lifecycle pass aborted: {reason}")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# broker visibility
+# ---------------------------------------------------------------------------
+def _broker_can_answer(account, expert_instance_id: int,
+                       result: LifecyclePassResult) -> bool:
+    """True only when the broker DEMONSTRABLY answered about its positions.
+
+    Three outcomes, kept apart on purpose: a list (however empty) is an answer; ``None`` is
+    a failed fetch; an exception is a failed fetch. ``or []`` over this call is a recurring
+    bug class here — it turns an outage into a confident "flat" and the book is then acted
+    on as if every position had vanished.
+    """
+    try:
+        positions = account.get_positions()
+    except Exception as e:  # noqa: BLE001 — any broker failure is the same fact
+        _abort(result, f"could not read the position book for expert {expert_instance_id} "
+                       f"({e}) — refusing to manage a book this account cannot see")
+        return False
+    if positions is None:
+        _abort(result, f"the position book for expert {expert_instance_id} came back None: "
+                       f"the fetch FAILED, which is not the same as flat — refusing to "
+                       f"manage a book this account cannot see")
+        return False
+    return True
+
+
+def _sleeve_equity(account, expert_instance_id: int) -> Optional[float]:
+    """The balance the sleeve sizes against, or ``None`` — never a fabricated 0.0.
+
+    ``None`` leaves the breaker blind (it says so) rather than reporting a 100% drawdown
+    it never measured.
+    """
+    try:
+        return account.get_balance()
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Option lifecycle: could not read the balance for expert "
+                     f"{expert_instance_id} ({e}) — the drawdown breaker is blind this "
+                     f"pass", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# building the structures
+# ---------------------------------------------------------------------------
+def _open_option_transactions(expert_instance_id: int) -> List[Any]:
+    """This expert's OPENED transactions whose intent is OPTION.
+
+    OPENED only, not WAITING: a WAITING transaction has no executed leg, so there is
+    nothing to net, nothing to price and nothing to close — it would produce a stream of
+    UNKNOWNs about positions that do not exist yet. Same choice the backtest engine's
+    ``_held_transactions`` makes, and the same one ``get_option_holdings`` made.
+
+    The filter is ``Transaction.asset_class``, the intent column Task 1 added and Task 2
+    stamps at submit. Before it existed the only tell that a transaction held an option was
+    ``multiplier == 100`` — a coincidence of P&L arithmetic standing in for a fact.
+    """
+    from ba2_common.core.trade_store import transactions_where
+    from ba2_common.core.types import AssetClass, TransactionStatus
+
+    rows = transactions_where(expert_id=expert_instance_id,
+                              status=TransactionStatus.OPENED)
+    return sorted((t for t in rows if t.asset_class == AssetClass.OPTION),
+                  key=lambda t: t.id)
+
+
+def _executed_option_orders(transaction_id: int) -> List[Any]:
+    from ba2_common.core.trade_store import orders_where
+    from ba2_common.core.types import AssetClass, OrderStatus
+
+    executed = OrderStatus.get_executed_statuses()
+    return [o for o in orders_where(transaction_id=transaction_id)
+            if getattr(o, "asset_class", None) == AssetClass.OPTION
+            and getattr(o, "contract_symbol", None)
+            and o.status in executed]
+
+
+def _build_structure(txn, result: LifecyclePassResult) -> Optional[OptionStructure]:
+    """One ``OptionStructure`` from one transaction's order rows, or ``None``.
+
+    **Netting.** Per contract symbol over the transaction's EXECUTED option orders, BUY
+    ``+`` and SELL ``-`` — the same netting ``_close_structure``, ``_tested`` and
+    ``CloseOptionAction`` already do. A leg bought back to close nets to zero and stops
+    counting, which is exactly what ``_txn_metrics`` failed to do (a buy-to-close landed in
+    ``longs`` while the original short stayed in ``shorts``, so committed capital could only
+    ever rise). Leg identity — strike, right, expiry, underlying — comes from the LAST order
+    row seen for that contract; every row for one contract describes the same contract, so
+    the choice only matters when one row left a field NULL.
+
+    **Expiry.** Both sources are offered and ``option_lifecycle._dte`` reconciles them: the
+    transaction's ``expiry`` (the intent column, and the fix for the roll branch that had
+    never once fired on a multi-leg) plus each held leg's own. Agreement is the normal case;
+    a leg with no expiry adds no information and vetoes nothing; a genuine disagreement is
+    UNKNOWN, not ``max()`` and not ``min()`` — ``submit_option_order`` refuses multi-expiry
+    structures, so two dates on one structure is a contradiction in the ledger.
+
+    **The percent basis.** ``entry_net_premium`` is the transaction's ``open_price``, signed
+    the way ``TradeConditions._get_spread_pnl_via_transaction`` signs it (positive = debit
+    paid, negative = credit received), and ``realized_cash`` is the signed premium cash of
+    every executed fill MINUS that entry basis — so the two together reproduce
+    ``cash_collected`` exactly and a leg closed mid-life contributes its realised P&L. An
+    order with no fill price makes that cash unknowable, so ``entry_net_premium`` becomes
+    ``None`` and the P&L percent is undefined rather than optimistic. (``realized_cash`` is
+    then never read: ``_pnl_pct`` returns on the ``None`` basis first.)
+
+    Returns ``None`` only when the transaction has NO executed option leg on record. That
+    is reported in ``result.unbuildable`` rather than skipped silently — it is a position
+    the ledger cannot describe, which is a fact worth seeing.
+    """
+    from ba2_common.core.types import OrderDirection
+
+    orders = _executed_option_orders(txn.id)
+    if not orders:
+        result.unbuildable.append(txn.id)
+        logger.warning(
+            f"Option lifecycle: transaction {txn.id} ({txn.symbol}) is an OPENED option "
+            f"position with no executed option order rows — it cannot be netted, priced or "
+            f"closed by this pass. It is NOT being managed.")
+        return None
+
+    net: Dict[str, float] = {}
+    meta: Dict[str, Any] = {}
+    total_cash = 0.0
+    cash_known = True
+    for order in orders:
+        contract = order.contract_symbol
+        qty = float(order.filled_qty or order.quantity or 0.0)
+        sign = 1.0 if order.side == OrderDirection.BUY else -1.0
+        net[contract] = net.get(contract, 0.0) + sign * qty
+        meta[contract] = order
+        if order.open_price is None:
+            if cash_known:
+                logger.warning(
+                    f"Option lifecycle: executed option order {order.id} ({contract}) on "
+                    f"transaction {txn.id} has no fill price — the structure's realised "
+                    f"cash, and therefore its P&L percent, is UNMEASURABLE (not zero)")
+            cash_known = False
+            continue
+        total_cash += -sign * float(order.open_price) * qty
+
+    legs = tuple(
+        LifecycleLeg(
+            contract_symbol=contract,
+            net_qty=net[contract],
+            strike=getattr(meta[contract], "strike", None),
+            option_type=getattr(meta[contract], "option_type", None),
+            expiry=getattr(meta[contract], "expiry", None),
+            underlying=getattr(meta[contract], "underlying_symbol", None),
+        )
+        for contract in sorted(net)
+    )
+
+    quantity = abs(float(txn.quantity or 0.0))
+    entry_premium = _entry_net_premium(txn)
+    if entry_premium is None or not cash_known or quantity < _EPS:
+        entry_premium, realized_cash = None, 0.0
+    else:
+        realized_cash = total_cash - (-entry_premium * quantity)
+
+    return OptionStructure(
+        transaction_id=txn.id,
+        underlying=txn.symbol,
+        strategy=txn.option_strategy or "",
+        legs=legs,
+        quantity=quantity,
+        multiplier=int(txn.multiplier or 100),
+        entry_net_premium=entry_premium,
+        realized_cash=realized_cash,
+        expiry=txn.expiry,
+    )
+
+
+def _entry_net_premium(txn) -> Optional[float]:
+    """The structure's entry net premium per share, signed: ``+`` debit, ``-`` credit.
+
+    Normalised through the transaction's ``side`` exactly as
+    ``_get_spread_pnl_via_transaction`` does, so a row that stored the magnitude prices
+    identically to one that stored the sign. ``None`` (never recorded) stays ``None`` — it
+    is the percent basis, and an unknown basis is an undefined percentage, not a zero one.
+    """
+    from ba2_common.core.types import OrderDirection
+
+    if txn.open_price is None:
+        return None
+    premium = abs(float(txn.open_price))
+    return premium if txn.side == OrderDirection.BUY else -premium
+
+
+# ---------------------------------------------------------------------------
+# the chain
+# ---------------------------------------------------------------------------
+def _fetch_chain(account,
+                 structures: Sequence[OptionStructure]) -> Dict[str, OptionContract]:
+    """``{contract symbol: OptionContract}`` for every HELD leg, from the option chain.
+
+    One request per (underlying, expiry) rather than one per leg: a four-leg condor is one
+    call, and two structures on one expiry share it. The window is the leg's own expiry when
+    it has one and the structure's otherwise — a leg with neither cannot be located in any
+    chain, so it is simply absent from the map.
+
+    Quotes are NOT used as a fallback. ``get_option_quote`` carries no greeks on the live
+    broker, and ``_tested`` needs a delta; a map filled from quotes would answer "no delta"
+    for every short and turn the tested-delta defence into a permanent blind spot that
+    looked like a working feature. A symbol that is absent here is *unknown*, and
+    ``option_lifecycle`` says so by name.
+    """
+    wanted: Dict[Tuple[str, date], Set[str]] = {}
+    for structure in structures:
+        for leg in structure.held_legs:
+            expiry = leg.expiry or structure.expiry
+            underlying = leg.underlying or structure.underlying
+            if expiry is None or not underlying:
+                logger.warning(
+                    f"Option lifecycle: leg {leg.contract_symbol} on transaction "
+                    f"{structure.transaction_id} has no expiry/underlying on record — no "
+                    f"chain can be requested for it, so its quote and greeks are UNKNOWN")
+                continue
+            wanted.setdefault((underlying, expiry), set()).add(leg.contract_symbol)
+
+    out: Dict[str, OptionContract] = {}
+    for (underlying, expiry), symbols in sorted(wanted.items()):
+        try:
+            rows = account.get_option_chain(underlying, expiry, expiry)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Option lifecycle: option chain for {underlying} {expiry} could "
+                         f"not be fetched ({e}) — {len(symbols)} leg(s) are UNKNOWN this "
+                         f"pass, not zero", exc_info=True)
+            continue
+        if rows is None:
+            logger.error(f"Option lifecycle: option chain for {underlying} {expiry} came "
+                         f"back None — {len(symbols)} leg(s) are UNKNOWN this pass, which "
+                         f"is not the same as unquoted")
+            continue
+        for row in rows:
+            if row.symbol in symbols:
+                out[row.symbol] = row
+        for missing in sorted(symbols - set(out)):
+            logger.warning(f"Option lifecycle: {missing} is held but has no row in the "
+                           f"{underlying} {expiry} chain — its quote and greeks are UNKNOWN")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# closing
+# ---------------------------------------------------------------------------
+def _close(account, txn, structure: OptionStructure, decision: LifecycleDecision,
+           result: LifecyclePassResult) -> None:
+    """Flatten one structure — guarded, offsetting exactly what is still held.
+
+    ``has_pending_closing_order`` is checked HERE, immediately before submitting, and not
+    while loading the book: the pass may have submitted a close for this very transaction
+    moments ago on a decision it already made, and the guard has to see it. Without the
+    guard the pass re-submits a close on every cycle the first one takes to fill, each
+    crediting cash for contracts that may already be gone — the 2026-07-21 options-grid
+    trillion-scale equity runaway.
+
+    A MARKET order, matching the promoted ``_close_structure``. A resting limit that does
+    not fill is worse than the spread it saves: the pending-close guard then blocks this
+    structure from being managed at all until the next pass, and the pass is daily. An exit
+    the risk rules have decided on must actually execute.
+    """
+    try:
+        if account.has_pending_closing_order(txn.id):
+            result.skipped_pending_close.append(txn.id)
+            logger.info(f"Option lifecycle: transaction {txn.id} decided "
+                        f"{decision.reason} ({decision.detail}) but a closing order is "
+                        f"already working — not submitting a second one")
+            return
+
+        legs = _closing_legs(structure)
+        if legs is None:
+            result.failed.append(txn.id)
+            return
+        if not legs:
+            logger.info(f"Option lifecycle: transaction {txn.id} decided "
+                        f"{decision.reason} but every leg has already netted flat — "
+                        f"nothing left to close")
+            return
+
+        order = account.submit_option_order(
+            legs=list(legs), quantity=1, order_type="market",
+            option_strategy="close", transaction_id=txn.id)
+        if order is None:
+            result.failed.append(txn.id)
+            logger.error(
+                f"Option lifecycle: the close for transaction {txn.id} ({decision.reason}: "
+                f"{decision.detail}) was NOT accepted by the broker — the position is still "
+                f"open and unmanaged for this pass")
+            return
+        result.submitted.append(SubmittedClose(txn.id, decision.reason, legs, order))
+        logger.info(f"Option lifecycle: submitted a close for transaction {txn.id} "
+                    f"({txn.symbol}) — {decision.reason}: {decision.detail}")
+    except Exception as e:  # noqa: BLE001
+        # One structure's failure must not silence the rest of the book. Every other
+        # structure in this sleeve still gets its decision acted on.
+        result.failed.append(txn.id)
+        logger.error(f"Option lifecycle: closing transaction {txn.id} failed ({e}) — the "
+                     f"position is still open; the rest of the sleeve is unaffected",
+                     exc_info=True)
+
+
+def _closing_legs(structure: OptionStructure) -> Optional[Tuple[OptionLeg, ...]]:
+    """Offsetting legs for everything still held, or ``None`` if we must not submit.
+
+    Each held contract is reversed at its netted size: a net-long leg is SOLD to close, a
+    net-short leg is BOUGHT to close. ``quantity=1`` on the order with ``ratio_qty`` per leg
+    is how ``submit_option_order`` sizes children (``quantity * ratio_qty``), so an
+    unbalanced structure — one wing partially bought back — closes at its real remaining
+    sizes rather than at the parent's original ratio.
+
+    A net size that is not a whole number of contracts refuses the WHOLE close and returns
+    ``None``. Truncating it (``int(abs(n))``) would silently submit a partial flatten and
+    leave residual risk nobody asked for; options are integral, so this is a ledger defect
+    to surface, not a rounding to perform.
+    """
+    from ba2_common.core.types import OrderDirection
+
+    legs: List[OptionLeg] = []
+    for leg in structure.held_legs:                      # contract-symbol ordered
+        contracts = abs(leg.net_qty)
+        rounded = int(round(contracts))
+        if abs(contracts - rounded) > 1e-6 or rounded < 1:
+            logger.error(
+                f"Option lifecycle: transaction {structure.transaction_id} holds "
+                f"{leg.net_qty} of {leg.contract_symbol}, which is not a whole number of "
+                f"contracts — refusing to submit a close that would flatten only part of "
+                f"the structure")
+            return None
+        long_leg = leg.net_qty > 0
+        legs.append(OptionLeg(
+            contract_symbol=leg.contract_symbol,
+            side=OrderDirection.SELL if long_leg else OrderDirection.BUY,
+            ratio_qty=rounded,
+            position_intent="sell_to_close" if long_leg else "buy_to_close",
+            option_type=leg.option_type,
+            strike=leg.strike,
+            expiry=leg.expiry,
+            underlying=leg.underlying,
+        ))
+    return tuple(legs)
+
+
+# ---------------------------------------------------------------------------
+# settings
+# ---------------------------------------------------------------------------
+def _lifecycle_settings(expert) -> Tuple[Dict[str, Any], List[str]]:
+    """(the sleeve's thresholds, the REQUIRED ones the expert does not declare).
+
+    Read through ``get_setting_with_interface_default`` so a configured value wins and a
+    declared default is honoured, exactly as every other expert setting is read. A key the
+    expert's interface does not define at all raises ``ValueError`` there; here that means
+    "this expert has no such threshold", which is reported by name and never filled in.
+    """
+    settings: Dict[str, Any] = {}
+    missing: List[str] = []
+    for key in REQUIRED_SETTINGS + OPTIONAL_SETTINGS:
+        try:
+            value = expert.get_setting_with_interface_default(key, log_warning=False)
+        except Exception:  # noqa: BLE001 — ValueError today; any lookup failure is "absent"
+            value = None
+            if key in REQUIRED_SETTINGS:
+                missing.append(key)
+            continue
+        if value is None:
+            if key in REQUIRED_SETTINGS:
+                missing.append(key)
+            continue
+        settings[key] = value
+    return settings, missing

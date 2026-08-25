@@ -64,14 +64,69 @@ class TestCalculateTransactionPnl:
         )
         assert calculate_transaction_pnl(tx) is None
 
-    def test_zero_quantity_returns_none(self):
+    def test_zero_quantity_is_a_measured_zero_pnl(self):
+        """CHANGED with the truthiness fix, deliberately. A quantity of 0 -- what a
+        transaction holds after a full close -- is a MEASUREMENT: zero shares made
+        zero money. The old ``not transaction.quantity`` reported it as None, i.e.
+        "unknown", which is the same answer it gave for a genuinely missing field."""
         tx = Transaction(
             symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
             status=TransactionStatus.CLOSED, open_price=100.0, close_price=110.0,
             open_date=datetime.now(timezone.utc),
         )
-        # quantity is falsy (0.0), so returns None
+        assert calculate_transaction_pnl(tx) == pytest.approx(0.0)
+
+    def test_missing_quantity_still_returns_none(self):
+        """A NULL quantity is still genuinely unknown and must stay None."""
+        tx = Transaction(
+            symbol="AAPL", quantity=None, side=OrderDirection.BUY,
+            status=TransactionStatus.CLOSED, open_price=100.0, close_price=110.0,
+            open_date=datetime.now(timezone.utc),
+        )
         assert calculate_transaction_pnl(tx) is None
+
+    def test_worthless_option_expiry_is_a_measured_full_loss(self):
+        """THE DEFECT, and the highest-leverage line in the audit. A long option that
+        EXPIRES WORTHLESS closes at exactly 0.00 -- a measured price, the single most
+        common option outcome. ``if not transaction.close_price`` treated it as "no
+        close price recorded" and returned None, so the realised loss vanished from
+        every P&L consumer and from the profit-sign classification that
+        ``last_closed_transaction`` uses."""
+        tx = Transaction(
+            symbol="SPY", quantity=2.0, side=OrderDirection.BUY,
+            status=TransactionStatus.CLOSED, open_price=2.50, close_price=0.0,
+            open_date=datetime.now(timezone.utc), multiplier=100,
+        )
+        # 2 contracts bought at $2.50, expired worthless: -(2.50)*2*100 = -$500.
+        assert calculate_transaction_pnl(tx) == pytest.approx(-500.0)
+
+    def test_short_option_expiring_worthless_is_the_full_premium(self):
+        """The other side of the same expiry: the seller keeps everything."""
+        tx = Transaction(
+            symbol="SPY", quantity=2.0, side=OrderDirection.SELL,
+            status=TransactionStatus.CLOSED, open_price=2.50, close_price=0.0,
+            open_date=datetime.now(timezone.utc), multiplier=100,
+        )
+        assert calculate_transaction_pnl(tx) == pytest.approx(500.0)
+
+    def test_equity_closed_at_zero_is_a_total_loss_not_unknown(self):
+        """A delisted/bankrupt equity marked out at 0.00 is a -100% result, not a
+        missing measurement."""
+        tx = Transaction(
+            symbol="XYZ", quantity=100.0, side=OrderDirection.BUY,
+            status=TransactionStatus.CLOSED, open_price=3.0, close_price=0.0,
+            open_date=datetime.now(timezone.utc),
+        )
+        assert calculate_transaction_pnl(tx) == pytest.approx(-300.0)
+
+    def test_open_price_of_zero_is_still_a_price(self):
+        """A leg opened at 0.00 (a free/rolled leg) is measured too."""
+        tx = Transaction(
+            symbol="SPY", quantity=1.0, side=OrderDirection.BUY,
+            status=TransactionStatus.CLOSED, open_price=0.0, close_price=1.25,
+            open_date=datetime.now(timezone.utc), multiplier=100,
+        )
+        assert calculate_transaction_pnl(tx) == pytest.approx(125.0)
 
     def test_breakeven_long(self):
         tx = Transaction(

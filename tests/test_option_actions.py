@@ -345,6 +345,52 @@ def test_bear_call_spread_credit(monkeypatch, mock_account, mock_expert_instance
     assert (order.data or {}).get("option_reserve") == (10.0 - 2.0) * 100.0 * qty
 
 
+def test_bull_put_spread_credit(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    """The put MIRROR of ``test_bear_call_spread_credit``, with the same hard numbers.
+
+    Bull PUT credit spread: SHORT the HIGHER strike (150), LONG the lower one (140).
+    Everything the pair shares — sell@bid / buy@ask, a NEGATIVE limit, ``(width -
+    credit) x 100 x qty`` reserved and persisted — is asserted identically, so the two
+    verticals cannot drift apart.
+
+    Sizing is 4% rather than the call spread's 50%: this structure carries a SHORT PUT,
+    so it is also charged 150 x 100 per contract of assignment capacity against the
+    account's cash, and 50% would size past what the account could take delivery of.
+    """
+    chain = [_put(140, delta=-0.18, bid=1.8, ask=2.0, oi=2000),
+             _put(150, delta=-0.35, bid=4.0, ask=4.2, oi=2000)]
+    monkeypatch.setattr(mock_account, "get_option_chain", lambda *a, **k: chain, raising=False)
+    cap = _capture_submit_persisted(monkeypatch, mock_account)
+    action = create_action(action_type=ExpertActionType.OPEN_BULL_PUT_SPREAD, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.BUY, existing_order=None,
+        expert_recommendation=sample_recommendation, strike_method="delta",
+        strike_param={"long": 0.18, "short": 0.35}, dte_min=20, dte_max=45,
+        sizing=4.0, min_open_interest=100, max_spread_pct=20.0)
+    res = action.execute()
+    assert res["success"] is True, res["message"]
+    assert len(cap["legs"]) == 2
+    short_leg, long_leg = cap["legs"]
+    # SHORT = HIGHER strike (150), SELL/sell_to_open
+    assert short_leg.strike == 150.0
+    assert short_leg.side == OrderDirection.SELL and short_leg.position_intent == "sell_to_open"
+    assert short_leg.option_type == OptionRight.PUT
+    # LONG = LOWER strike (140), BUY/buy_to_open (protection)
+    assert long_leg.strike == 140.0
+    assert long_leg.side == OrderDirection.BUY and long_leg.position_intent == "buy_to_open"
+    assert long_leg.option_type == OptionRight.PUT
+    assert cap["option_strategy"] == "bull_put_spread"
+    # net_credit = short.bid - long.ask = 4.0 - 2.0 = 2.0; width = 150 - 140 = 10
+    # limit_price NEGATIVE (credit) = -2.0
+    assert abs(cap["limit_price"] - (-2.0)) < 1e-9
+    # per-spread reserve = (width - net_credit)*100 = (10-2)*100 = 800
+    # budget = 100000 * 4% = 4000; qty = floor(4000/800) = 5
+    qty = cap["quantity"]
+    assert qty == 5
+    from ba2_trade_platform.core.db import get_instance
+    order = get_instance(TradingOrder, cap["order_id"])
+    assert (order.data or {}).get("option_reserve") == (10.0 - 2.0) * 100.0 * qty
+
+
 def _capture_chain_by_right(monkeypatch, account, call_chain, put_chain):
     """Patch get_option_chain to return CALL or PUT chain based on option_type arg.
 

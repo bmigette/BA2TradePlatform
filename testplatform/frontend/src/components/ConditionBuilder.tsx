@@ -657,7 +657,8 @@ export interface ExitConditionSet {
   action: 'close' | 'sell' | 'buy' | 'adjust_take_profit' | 'adjust_stop_loss'
         | 'buy_call' | 'buy_put' | 'sell_covered_call' | 'sell_cash_secured_put'
         | 'buy_protective_put' | 'open_bull_call_spread' | 'open_bear_put_spread'
-        | 'open_bear_call_spread' | 'open_straddle' | 'open_strangle' | 'close_option';
+        | 'open_bear_call_spread' | 'open_bull_put_spread'
+        | 'open_straddle' | 'open_strangle' | 'close_option';
   actionValue?: number;
   actionValueOptimize?: boolean;
   actionValueMin?: number;

@@ -125,8 +125,11 @@ class Backtest(Base):
 
     # Performance metrics (from backtesting.py)
     total_return = Column(Float, nullable=True)
-    # Total return % with each trade's gain capped at profit_cap_pct of its cost basis (so one
-    # lucky mega-winner can't dominate). NULL when the run had no cap; raw total_return is kept.
+    # Total return % with each BET's gain capped at profit_cap_pct of its cost basis (so one
+    # lucky mega-winner can't dominate). The unit is the bet, not the trade row: a multi-leg
+    # option structure's legs are re-joined on transaction_id and capped once, on their NET P&L
+    # against their NET debit (see results._cap_groups). NULL when the run had no cap; raw
+    # total_return is kept.
     adjusted_total_return = Column(Float, nullable=True)
     # The GA's composite score for this genome, carried from the optimizer's all_results when a
     # top-N row is persisted (migration 030). NULL for manual runs and pre-030 rows. The metric

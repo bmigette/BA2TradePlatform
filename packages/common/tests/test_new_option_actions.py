@@ -101,8 +101,13 @@ def _mk(action_type, **kw):
 
 
 def test_short_strangle_two_short_legs_credit():
+    # SIZING REDUCED 20% -> 10% when the assignment-capacity gate went ENFORCING.
+    # At 20% this sized 20 contracts off $1,000/contract of Reg-T naked margin — and
+    # 20 short 90-strike puts is $180,000 of delivery on a $100,000 account, which is
+    # now refused (pinned in test_option_assignment_capacity_wiring.py). The leg
+    # construction this test exists to pin is unchanged; only the size is.
     acct, act = _mk("open_short_strangle", strike_method="percent_otm",
-                    strike_param=10.0, dte_min=20, dte_max=40, sizing=20.0)
+                    strike_param=10.0, dte_min=20, dte_max=40, sizing=10.0)
     res = act.execute()
     assert res["success"], res["message"]
     sub = acct.submitted[0]
@@ -127,8 +132,13 @@ def test_short_straddle_same_strike_both_short():
 
 
 def test_iron_condor_four_legs_credit_defined_risk():
+    # SIZING REDUCED 20% -> 5% when the assignment-capacity gate went ENFORCING.
+    # A condor is sized off its WING WIDTH ($460/contract here), so 20% bought 43 of
+    # them — $387,000 of short-put delivery on a $100,000 account. The wing does not
+    # pay for the shares: the short put is assigned tonight, our long put is a choice
+    # we make later. Refusal pinned in test_option_assignment_capacity_wiring.py.
     acct, act = _mk("open_iron_condor", strike_method="percent_otm",
-                    strike_param=10.0, dte_min=20, dte_max=40, sizing=20.0,
+                    strike_param=10.0, dte_min=20, dte_max=40, sizing=5.0,
                     wing_width_pct=5.0)
     res = act.execute()
     assert res["success"], res["message"]
@@ -340,3 +350,241 @@ def test_jade_lizard_and_put_ratio_spread_reserve_match_alpaca():
     # not a fraction -- no Reg-T discount applies here at all.
     r = acct.option_reserve_required("put_ratio_spread", 1, strike=200.0, net_credit=0.0)
     assert r == pytest.approx(20_000.0)
+
+
+# ---------------------------------------------------------------------------
+# option_reserve_required must not fail open on a strategy it does not know
+# ---------------------------------------------------------------------------
+def _submitted_option_strategies():
+    """Every option_strategy literal TradeActions can hand to the broker.
+
+    Read out of the SOURCE with ``ast`` rather than hard-coded, so the day someone
+    adds an eighth credit builder the coverage test below fails until its capital
+    requirement is priced. A hard-coded list would have to be edited by the same
+    person who forgot the reserve branch, which is no guard at all."""
+    import ast
+    import inspect
+
+    from ba2_common.core import TradeActions
+
+    tree = ast.parse(inspect.getsource(TradeActions))
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+        if name != "_submit_option_order":
+            continue
+        for arg in list(node.args) + [kw.value for kw in node.keywords]:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                found.add(arg.value)
+    assert found, "the ast scan found no strategies — the scan itself is broken"
+    return found
+
+
+def test_an_unknown_strategy_raises_rather_than_reserving_nothing():
+    """A strategy whose capital requirement is UNKNOWN must not be priced at zero.
+
+    The function used to end in a bare ``return 0.0``, so any strategy outside its
+    seven known branches reserved nothing and sailed through every buying-power
+    gate — the newest structure on the platform was always the one the risk check
+    could not see. Unknown is not free."""
+    acct = OptionsAccountInterface
+    for strategy in ("", "iron_butterfly", "broken_wing_condor", "SHORT_STRANGLE",
+                     "short strangle", "cash_secured_put "):
+        with pytest.raises(ValueError, match="option_reserve_required"):
+            acct.option_reserve_required(strategy, 1, strike=100.0, spread_width=5.0,
+                                         net_credit=1.0, spot=100.0,
+                                         option_type=OptionRight.PUT)
+
+
+def test_an_unknown_strategy_raises_even_for_a_zero_quantity():
+    """The quantity short-circuit must not swallow the unknown-strategy error: an
+    unrecognised name is a CODE defect and stays loud whatever the size is."""
+    with pytest.raises(ValueError, match="option_reserve_required"):
+        OptionsAccountInterface.option_reserve_required("iron_butterfly", 0, strike=100.0)
+
+
+def test_the_genuinely_zero_reserve_strategies_are_named_and_still_reserve_zero():
+    """The long/debit book legitimately reserves nothing — its max loss was paid at
+    entry — and covered_call is covered by the 100 shares. Those are now an EXPLICIT
+    list rather than the tail of a blanket default, so the answer 'zero' is a decision
+    somebody made per strategy instead of the answer everything unknown gets."""
+    acct = OptionsAccountInterface
+    for strategy in ("long_call", "long_put", "bull_call_spread", "bear_put_spread",
+                     "straddle", "strangle", "covered_call", "protective_put"):
+        assert acct.option_reserve_required(strategy, 5, strike=150.0, spot=150.0,
+                                            spread_width=5.0, net_credit=1.0,
+                                            option_type=OptionRight.CALL) == 0.0
+
+
+def test_every_strategy_the_platform_can_submit_has_a_priced_reserve():
+    """No submittable structure may fall through to the unknown-strategy error.
+
+    This is the other half of the raise: making the default loud is only safe if
+    every strategy the platform actually opens is priced. Scanned out of
+    TradeActions' source, so a new builder is caught here rather than in production."""
+    acct = OptionsAccountInterface
+    for strategy in sorted(_submitted_option_strategies()):
+        acct.option_reserve_required(strategy, 1, strike=100.0, spread_width=5.0,
+                                     net_credit=1.0, spot=100.0,
+                                     option_type=OptionRight.PUT)
+
+
+def test_the_eight_reserving_builders_still_price_the_same_dollars():
+    """The raise must not disturb a single number the credit builders already reserve."""
+    acct = OptionsAccountInterface
+    assert acct.option_reserve_required("cash_secured_put", 2, strike=150.0) == 30_000.0
+    assert acct.option_reserve_required("bear_call_spread", 1, spread_width=5.0,
+                                        net_credit=1.5) == 350.0
+    # The put mirror of the bear call spread: same defined-risk vertical arithmetic, and
+    # sharing the branch is what keeps the two from drifting apart.
+    assert acct.option_reserve_required("bull_put_spread", 1, spread_width=5.0,
+                                        net_credit=1.5) == 350.0
+    assert acct.option_reserve_required("credit_spread", 1, spread_width=5.0,
+                                        net_credit=1.5) == 350.0
+    assert acct.option_reserve_required("short_straddle", 2, strike=225.0,
+                                        spot=250.0) == pytest.approx(10_000.0)
+    assert acct.option_reserve_required("short_strangle", 1, strike=225.0, spot=250.0,
+                                        option_type=OptionRight.PUT) == pytest.approx(2_500.0)
+    assert acct.option_reserve_required("naked_put", 1, strike=225.0, spot=250.0,
+                                        option_type=OptionRight.PUT) == pytest.approx(2_500.0)
+    assert acct.option_reserve_required("iron_condor", 1, spread_width=5.0,
+                                        net_credit=1.0) == 400.0
+    assert acct.option_reserve_required("jade_lizard", 1, strike=290.0, spread_width=17.5,
+                                        net_credit=3.04) == pytest.approx(30_446.0)
+    assert acct.option_reserve_required("put_ratio_spread", 1, strike=200.0,
+                                        net_credit=0.0) == 20_000.0
+
+
+def test_the_two_strategy_lists_match_the_branches():
+    """The zero list and the priced list must be disjoint, and every priced name must
+    really reach a branch — otherwise a name in RESERVING_STRATEGIES with no branch
+    would fall through, which is the exact hole the raise closed."""
+    acct = OptionsAccountInterface
+    assert not (acct.ZERO_RESERVE_STRATEGIES & acct.RESERVING_STRATEGIES)
+    for strategy in sorted(acct.RESERVING_STRATEGIES):
+        r = acct.option_reserve_required(strategy, 1, strike=100.0, spread_width=5.0,
+                                         net_credit=1.0, spot=100.0,
+                                         option_type=OptionRight.PUT)
+        assert r > 0.0, f"{strategy} is listed as reserving but priced {r}"
+
+
+# ---------------------------------------------------------------------------
+# ...and the SAME hole, six branches further in: a KNOWN strategy whose SIZING
+# INPUT is missing. `3d30442` closed the unknown-strategy fall-through; these six
+# `return 0.0` guards were the identical fail-open one layer down. A reserve of
+# zero passes `check_option_buying_power` unconditionally, so a cash_secured_put
+# that arrived with no strike was affordable at any size.
+# ---------------------------------------------------------------------------
+MISSING_SIZING_INPUT = [
+    ("cash_secured_put", dict(strike=None), "strike"),
+    ("bear_call_spread", dict(spread_width=None, net_credit=1.0), "spread_width"),
+    ("bear_call_spread", dict(spread_width=5.0, net_credit=None), "net_credit"),
+    ("bull_put_spread", dict(spread_width=None, net_credit=1.0), "spread_width"),
+    ("bull_put_spread", dict(spread_width=5.0, net_credit=None), "net_credit"),
+    ("credit_spread", dict(spread_width=None, net_credit=1.0), "spread_width"),
+    ("credit_spread", dict(spread_width=5.0, net_credit=None), "net_credit"),
+    ("short_straddle", dict(strike=None), "strike"),
+    ("short_strangle", dict(strike=None, option_type=OptionRight.PUT), "strike"),
+    ("naked_put", dict(strike=None, option_type=OptionRight.PUT), "strike"),
+    ("put_ratio_spread", dict(strike=None, net_credit=1.0), "strike"),
+    ("jade_lizard", dict(strike=None, spread_width=5.0, net_credit=1.0), "strike"),
+    ("jade_lizard", dict(strike=100.0, spread_width=None, net_credit=1.0), "spread_width"),
+    ("iron_condor", dict(spread_width=None, net_credit=1.0), "spread_width"),
+    ("call_butterfly", dict(spread_width=None, net_credit=1.0), "spread_width"),
+    ("debit_spread", dict(spread_width=None, net_credit=1.0), "spread_width"),
+]
+
+
+@pytest.mark.parametrize("strategy,kw,missing", MISSING_SIZING_INPUT)
+def test_a_known_strategy_with_a_missing_sizing_input_raises(strategy, kw, missing):
+    """Unknown is not zero here either — and the message names the field."""
+    with pytest.raises(ValueError, match="option_reserve_required") as e:
+        OptionsAccountInterface.option_reserve_required(strategy, 3, **kw)
+    assert missing in str(e.value)
+
+
+@pytest.mark.parametrize("strategy,kw", [
+    ("cash_secured_put", dict(strike=0.0)),
+    ("cash_secured_put", dict(strike=-150.0)),
+    ("short_straddle", dict(strike=0.0)),
+    ("short_strangle", dict(strike=0.0, option_type=OptionRight.PUT)),
+    ("naked_put", dict(strike=-1.0, option_type=OptionRight.PUT)),
+    ("put_ratio_spread", dict(strike=0.0, net_credit=1.0)),
+    ("jade_lizard", dict(strike=0.0, spread_width=5.0, net_credit=1.0)),
+])
+def test_a_non_positive_strike_is_a_missing_field_not_a_free_option(strategy, kw):
+    """No listed equity option has a strike of zero, so a zero strike is an unpopulated
+    field — and it prices delivery, and the reserve, at exactly nothing. The same rule
+    ``option_lifecycle.put_assignment_cost`` already applies ("a strike of 0 is NOT a
+    free put")."""
+    with pytest.raises(ValueError, match="option_reserve_required"):
+        OptionsAccountInterface.option_reserve_required(strategy, 3, **kw)
+
+
+@pytest.mark.parametrize("strike", [None, 0.0, -225.0])
+def test_naked_margin_per_contract_refuses_a_strike_it_cannot_use(strike):
+    """The sibling guard. ``0.0`` here is a margin requirement of nothing on a naked
+    short — the most fail-open answer in the file."""
+    with pytest.raises(ValueError, match="naked_margin_per_contract"):
+        OptionsAccountInterface.naked_margin_per_contract(
+            strike, option_type=OptionRight.PUT, spot=250.0)
+
+
+def test_the_only_zeros_left_are_the_two_legitimate_ones():
+    """``quantity <= 0`` and ``ZERO_RESERVE_STRATEGIES`` by name are the only ways to
+    get a zero out of this function — plus a genuinely computed one (a credit at least
+    as wide as the spread has no max loss to reserve), which is arithmetic, not a
+    missing field."""
+    acct = OptionsAccountInterface
+    assert acct.option_reserve_required("cash_secured_put", 0, strike=150.0) == 0.0
+    assert acct.option_reserve_required("cash_secured_put", -3, strike=150.0) == 0.0
+    assert acct.option_reserve_required("long_call", 5, strike=150.0) == 0.0
+    assert acct.option_reserve_required("bear_call_spread", 1, spread_width=5.0,
+                                        net_credit=5.0) == 0.0
+    assert acct.option_reserve_required("iron_condor", 1, spread_width=5.0,
+                                        net_credit=9.0) == 0.0
+
+
+def test_a_missing_sizing_input_can_no_longer_pass_the_buying_power_gate():
+    """The whole point, stated as the gate sees it. Before: reserve 0.0 ->
+    ``check_option_buying_power(0.0)`` -> True, for any size, on any account."""
+    acct = FakeAccount()
+    assert acct.check_option_buying_power(0.0) is True      # unchanged, and correct
+    with pytest.raises(ValueError):
+        acct.check_option_buying_power(
+            acct.option_reserve_required("cash_secured_put", 1_000, strike=None))
+
+
+def test_a_reserve_refusal_stops_the_entry_and_submits_nothing(monkeypatch):
+    """THE BLAST RADIUS of failing closed, pinned rather than assumed.
+
+    ``_OptionEntryAction.execute`` catches broadly but routes through
+    ``absorb_if_benign(e, InstanceNotFound)``, and ``ValueError`` is deliberately NOT
+    benign (``failure_modes._BENIGN_DEFAULT`` is ``(OSError,)``), so the refusal
+    PROPAGATES instead of becoming a quiet failed result. It keeps propagating through
+    ``TradeActionEvaluator``'s phase-1 handler — also ``absorb_if_benign`` — and is
+    caught per-candidate by ``TradeManager`` (``except Exception as submit_error`` at
+    the funded-entry loop), which logs it with a traceback and moves to the next symbol.
+
+    So the consequence of every guard in this file is: THIS symbol's entry is refused,
+    loudly, and the run continues. Nothing reaches the broker. Identical to the blast
+    radius ``3d30442`` established for the unknown-strategy raise."""
+    acct = FakeAccount()
+
+    def _missing_input(*a, **k):
+        raise ValueError("option_reserve_required('cash_secured_put'): strike is missing")
+
+    monkeypatch.setattr(acct, "option_reserve_required", _missing_input)
+    rec = SimpleNamespace(id=1, instance_id=None, data=None, price_at_date=None,
+                          expected_profit_percent=None, recommended_action=None)
+    action = create_action(ExpertActionType("sell_cash_secured_put"), "AAPL", acct,
+                           SimpleNamespace(), None, rec,
+                           strike_method="percent_otm", strike_param=10.0,
+                           dte_min=20, dte_max=40, sizing=20.0)
+    action.submit_to_broker = True
+    with pytest.raises(ValueError, match="option_reserve_required"):
+        action.execute()
+    assert acct.submitted == []

@@ -198,6 +198,15 @@ def get_event_type_documentation() -> dict:
             "type": "boolean",
             "example": "Avoid stacking a second hedge (require NOT has_protective_put before buy_protective_put)"
         },
+        ExpertEventType.F_HAS_ASSIGNED_SHARES.value: {
+            "name": "Has Assigned Shares",
+            "description": ("Triggers when this expert holds shares of the symbol that came from an "
+                            "option assignment (a short put that was exercised against us) rather "
+                            "than from a stock purchase. Unlike has_buy_position, it does not fire "
+                            "on ordinary long equity the same expert bought outright."),
+            "type": "boolean",
+            "example": "The wheel's second leg: when has_assigned_shares, sell_covered_call (so the overlay only covers stock that was put to us)"
+        },
 
         # Numeric Events (N_ prefix)
         ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT.value: {
@@ -279,6 +288,22 @@ def get_event_type_documentation() -> dict:
             "description": "Calendar days until the underlying's next earnings announcement (best-effort, FMP-backed). Lower values mean earnings are imminent. Use it to TIME long-volatility entries just before earnings (straddle/strangle) or to AVOID opening positions that would straddle the event. If no upcoming earnings date is available the condition does not fire. Used with numeric comparisons.",
             "type": "numeric",
             "example": "Enter a straddle into earnings: days_to_earnings <= 5"
+        },
+        ExpertEventType.N_DAYS_TO_EXPIRY.value: {
+            "name": "Days to Expiry (remaining option life)",
+            "description": (
+                "For open OPTION positions: calendar days of life REMAINING on the structure "
+                "(expiry minus today). This is the complement of days_opened, which counts days "
+                "ELAPSED — with a tuned entry DTE window the two are different quantities. Use it "
+                "to express roll-at-DTE ('close/roll once only 21 days remain', the conventional "
+                "point for 30-45 DTE structures) or a 0DTE exit ('close on the expiry day', "
+                "days_to_expiry <= 0). The value is 0 on the expiry date itself and NEGATIVE for a "
+                "structure still open past expiry. If the expiry cannot be determined — no expiry "
+                "recorded anywhere, or the legs disagree — the condition is unevaluable and does "
+                "NOT fire in either direction (it is never treated as 0 days left)."
+            ),
+            "type": "numeric",
+            "example": "Roll/close the structure when days_to_expiry <= 21"
         }
     }
 
@@ -461,6 +486,17 @@ def get_action_type_documentation() -> dict:
             ],
             "parameters": "long/short strike params (short = closer/lower-strike sold leg, long = further-OTM/higher-strike bought leg), dte_min, dte_max, max-loss sizing (pct_equity / (width - net credit)), min_open_interest, max_spread_pct",
             "example": "When bearish and iv_rank >= 60, open_bear_call_spread (short ~0.30 delta / long +5 strikes, 30-45 DTE). Net credit limit is negative; max-loss (width - credit) is reserved."
+        },
+        ExpertActionType.OPEN_BULL_PUT_SPREAD.value: {
+            "name": "Open Bull Put Spread",
+            "description": "Open a credit put spread (sell a higher-strike put, buy a lower-strike put, same expiry). Short-premium, defined-risk bullish/neutral structure - the put mirror of the bear call spread and the canonical defined-risk income trade: you collect a net credit (short.bid - long.ask) up front and the maximum loss equals (spread width - net credit), which is reserved against buying power. It pays as long as the underlying stays ABOVE the short strike. The short leg carries ASSIGNMENT risk if it finishes in the money, and the long wing does NOT reduce that: the short put can be assigned tonight while exercising your own lower-strike put is a choice made later, so the account is charged the FULL short strike of delivery capacity.",
+            "use_cases": [
+                "Bullish/neutral exposure with strictly defined risk and an up-front credit",
+                "Sell premium below support when iv_rank is high (expensive volatility)",
+                "Collect income on a name you are constructive on without reserving the full cash a cash-secured put demands"
+            ],
+            "parameters": "long/short strike params (short = closer/higher-strike sold leg, long = further-OTM/lower-strike bought leg), dte_min, dte_max, max-loss sizing (pct_equity / (width - net credit)), min_open_interest, max_spread_pct",
+            "example": "When bullish and iv_rank >= 60, open_bull_put_spread (short ~0.30 delta / long -5 strikes, 30-45 DTE). Net credit limit is negative; max-loss (width - credit) is reserved and the full short strike is charged against assignment capacity."
         },
         ExpertActionType.OPEN_STRADDLE.value: {
             "name": "Open Long Straddle",

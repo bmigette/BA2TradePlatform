@@ -12,7 +12,9 @@ Leaf ``field`` is ALWAYS the raw ``ExpertEventType`` value (e.g. ``"confidence"`
 ``"long_term"``, ``"percent_to_new_target"``) — the same vocabulary the ``/api/ruleset/
 vocabulary`` endpoint exposes and the frontend ConditionBuilder keys on. This keeps entry and
 exit conversion identical and never drops a numeric event that happens to be absent from
-``FIELD_EVENT`` (the forward map only needs the tunable subset).
+``FIELD_EVENT``. (``FIELD_EVENT`` now covers every registered condition — see
+``tests/test_condition_registry_coverage.py`` — but deriving the vocabulary from the ENUM
+here keeps the reverse direction independent of that.)
 """
 from __future__ import annotations
 
@@ -186,8 +188,8 @@ def eventaction_to_entry_group(ea_id: Any, triggers: dict) -> Optional[Tuple[dic
     Returns ``(group, leaves)`` where ``group`` is ``{id, operator:"AND", conditions:[leaves]}``,
     or None if the EventAction yields no recognizable leaves (so an all-unknown rule is dropped
     rather than emitting an empty group). Uses the shared ``trigger_to_leaf`` (raw enum value
-    field) so numeric enums missing from ``FIELD_EVENT`` (e.g. ``percent_to_new_target``) are
-    PRESERVED.
+    field, derived from ``ExpertEventType`` itself) so a numeric enum is PRESERVED even if it
+    were ever missing from the forward ``FIELD_EVENT`` map.
     """
     leaves = _leaves_from_triggers(triggers)
     if not leaves:

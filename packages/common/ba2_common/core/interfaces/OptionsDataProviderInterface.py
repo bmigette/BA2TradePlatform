@@ -37,11 +37,18 @@ class OptionContractMeta:
 class OptionEodBar:
     """One contract's end-of-day bar.
 
-    ``iv``/greeks are intentionally ABSENT: the platform derives them itself by
-    Black-Scholes inversion of the contract's own close (see backtest/option_greeks.py),
-    so a vendor need only supply prices. ``bid``/``ask`` are optional — Alpaca's bars
-    endpoint returns none, ThetaData's EOD report does — and where present they give a
-    real spread instead of a synthesized one.
+    GREEKS are intentionally absent: the platform derives them itself by Black-Scholes
+    inversion of the contract's own close (see backtest/option_greeks.py), so a vendor need
+    only supply prices. ``bid``/``ask`` are optional — Alpaca's bars endpoint returns none,
+    ThetaData's EOD report does — and where present they give a real spread instead of a
+    synthesized one.
+
+    ``iv`` is the one exception, and it is OPTIONAL rather than derived-only: dxfeed (via
+    TastyTrade) puts ``imp_volatility`` on every candle, and a vendor print beats an
+    inversion — the inversion needs a risk-free rate and a dividend assumption, and it
+    cannot run at all where the close is missing. A vendor that does NOT serve IV leaves
+    this ``None`` and the platform inverts as before; ``None`` must never be coerced to 0.0,
+    which downstream reads as a free option rather than as "unknown".
     """
     occ_symbol: str
     bar_date: date
@@ -53,6 +60,9 @@ class OptionEodBar:
     bid: Optional[float] = None
     ask: Optional[float] = None
     open_interest: Optional[int] = None
+    #: Vendor-supplied implied volatility as a DECIMAL (0.2841 == 28.41%), or None.
+    #: Appended LAST so every existing positional construction is unaffected.
+    iv: Optional[float] = None
 
 
 class OptionsDataProviderInterface(ABC):

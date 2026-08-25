@@ -17,7 +17,10 @@ from ba2_common.core.db import add_instance, get_db, get_instance
 from ba2_common.core.types import MarketAnalysisStatus
 from ba2_common.core.interfaces.LLMServiceInterface import get_llm_service
 
-from ba2_experts.PennyMomentumTrader.conditions import ConditionEvaluator, get_condition_types_for_llm, validate_condition_set
+from ba2_experts.PennyMomentumTrader.conditions import (
+    DEF_MAX_UNKNOWN_EXIT_TICKS, ConditionEvaluator, ExitEvaluation,
+    get_condition_types_for_llm, validate_condition_set,
+)
 from ba2_experts.PennyMomentumTrader.tier_tracking import merge_tier_update, migrate_triggered_state
 from ba2_experts.PennyMomentumTrader.trailing import apply_trailing_ratchet, update_high_watermark
 from ba2_experts.PennyMomentumTrader.prompts import (
@@ -27,7 +30,40 @@ from ba2_experts.PennyMomentumTrader.prompts import (
 )
 
 
+def _fmt_px(v: Optional[float]) -> str:
+    """Format a price for a log line, tolerating None.
+
+    The escalated-exit path fires precisely BECAUSE the price could not be read, so a
+    bare ``f"{price:.4f}"`` would raise TypeError inside the monitor's per-symbol
+    try/except — swallowing the exit and reinstating the very defect being fixed.
+    """
+    return "n/a" if v is None else f"{v:.4f}"
+
+
 class MonitoringPhasesMixin:
+    def _evaluate_stop(self, evaluator, stop_loss: dict, symbol: str,
+                       entry_price: Optional[float], info: Dict[str, Any],
+                       max_blind_ticks: int = DEF_MAX_UNKNOWN_EXIT_TICKS) -> ExitEvaluation:
+        """Evaluate a PROTECTIVE stop and carry its consecutive-unmeasurable streak.
+
+        The evaluator is rebuilt every monitor tick, so the streak has to live with
+        the position: it is kept on ``info`` (``monitored_symbols[symbol]``), which is
+        persisted into ``MarketAnalysis.state`` and so survives a restart too.
+
+        ``info.get(...) or 0`` is not a defaulted measurement -- a position we have
+        never failed to read genuinely has a streak of zero, and that is the value the
+        key is absent for.
+        """
+        out = evaluator.evaluate_exit(
+            stop_loss, symbol, entry_price=entry_price,
+            unknown_streak=int(info.get("stop_unknown_streak") or 0),
+            max_unknown_ticks=max_blind_ticks)
+        info["stop_unknown_streak"] = out.unknown_streak
+        if out.verdict is None and not out.fire:
+            self.logger.warning(
+                f"{symbol}: stop loss NOT EVALUABLE this tick — {out.detail}")
+        return out
+
     def _phase_0_review(self, market_analysis: MarketAnalysis):
         """Review existing open positions and record current state."""
         self.logger.info("Phase 0: Reviewing existing positions")
@@ -179,6 +215,12 @@ class MonitoringPhasesMixin:
         market_tz_str = self.get_setting_with_interface_default(
             "market_timezone", log_warning=False
         )
+        # How many CONSECUTIVE ticks a protective stop may be unmeasurable before the
+        # position is flattened anyway. A stop we cannot evaluate is not a stop that
+        # passed; holding on it forever is the defect this window closes.
+        blind_ticks = int(self.get_setting_with_interface_default(
+            "exit_blind_max_ticks", log_warning=False
+        ))
 
         # Set up OHLCV provider for condition evaluation
         ohlcv_vendor_list = self.get_setting_with_interface_default(
@@ -493,62 +535,97 @@ class MonitoringPhasesMixin:
                                                 hard_stops.append(cond)
                                 if hard_stops:
                                     grace_sl = {"any": hard_stops}
-                                    if evaluator.evaluate(grace_sl, symbol, entry_price=entry_price):
+                                    grace_eval = self._evaluate_stop(
+                                        evaluator, grace_sl, symbol, entry_price, info,
+                                        max_blind_ticks=blind_ticks)
+                                    if grace_eval.fire:
                                         pnl_pct = ((current_price - entry_price) / entry_price * 100) if current_price and entry_price else None
                                         pnl_str = f", P&L={pnl_pct:+.2f}%" if pnl_pct is not None else ""
+                                        # Prices are formatted defensively: on an
+                                        # ESCALATED exit the price is precisely what we
+                                        # could not read, and a raw {None:.4f} would
+                                        # raise inside the try and skip the exit again.
+                                        why = ("Hard stop loss" if not grace_eval.escalated
+                                               else "UNMEASURABLE stop loss")
                                         self.logger.info(
-                                            f"Hard stop loss triggered for {symbol} during grace period"
-                                            f" (entry=${entry_price:.4f}, now=${current_price:.4f}{pnl_str})"
+                                            f"{why} triggered for {symbol} during grace period"
+                                            f" (entry=${_fmt_px(entry_price)}, now=${_fmt_px(current_price)}{pnl_str})"
+                                            f" — {grace_eval.detail}"
                                         )
+                                        reason = ("stop loss triggered (hard stop during grace)"
+                                                  if not grace_eval.escalated else
+                                                  f"stop loss unmeasurable for "
+                                                  f"{grace_eval.unknown_streak} ticks (grace)")
                                         sl_ok = trade_mgr.execute_exit(
-                                            symbol, exit_pct=100.0, reason="stop loss triggered (hard stop during grace)"
+                                            symbol, exit_pct=100.0, reason=reason
                                         )
                                         if sl_ok:
                                             info["status"] = "closed"
                                             self._record_trade(
-                                                market_analysis, symbol, "exit", "stop loss (grace)"
+                                                market_analysis, symbol, "exit",
+                                                "stop loss (grace)" if not grace_eval.escalated
+                                                else "stop loss unmeasurable (grace)"
                                             )
                                         else:
                                             self.logger.error(
                                                 f"Hard stop loss exit failed for {symbol} — will retry next tick"
                                             )
                                         continue
-                            elif evaluator.evaluate(
-                                stop_loss, symbol, entry_price=entry_price
-                            ):
-                                pnl_pct = ((current_price - entry_price) / entry_price * 100) if current_price and entry_price else None
-                                pnl_str = f", P&L={pnl_pct:+.2f}%" if pnl_pct is not None else ""
-                                hold_min_str = ""
-                                if triggered_at_str:
-                                    try:
-                                        ta = datetime.fromisoformat(triggered_at_str)
-                                        if ta.tzinfo is None:
-                                            ta = ta.replace(tzinfo=timezone.utc)
-                                        hold_min = (datetime.now(timezone.utc) - ta).total_seconds() / 60
-                                        hold_min_str = f", held={hold_min:.0f}m"
-                                    except Exception:
-                                        pass
-                                self.logger.info(
-                                    f"Stop loss triggered for {symbol}"
-                                    f" (entry=${entry_price:.4f}, now=${current_price:.4f}{pnl_str}{hold_min_str})"
-                                )
-                                sl_ok = trade_mgr.execute_exit(
-                                    symbol, exit_pct=100.0, reason="stop loss triggered"
-                                )
-                                if sl_ok:
-                                    info["status"] = "closed"
-                                    self._record_trade(
-                                        market_analysis, symbol, "exit", "stop loss"
+                            else:
+                                stop_eval = self._evaluate_stop(
+                                    evaluator, stop_loss, symbol, entry_price, info,
+                                    max_blind_ticks=blind_ticks)
+                                if stop_eval.fire:
+                                    pnl_pct = ((current_price - entry_price) / entry_price * 100) if current_price and entry_price else None
+                                    pnl_str = f", P&L={pnl_pct:+.2f}%" if pnl_pct is not None else ""
+                                    hold_min_str = ""
+                                    if triggered_at_str:
+                                        try:
+                                            ta = datetime.fromisoformat(triggered_at_str)
+                                            if ta.tzinfo is None:
+                                                ta = ta.replace(tzinfo=timezone.utc)
+                                            hold_min = (datetime.now(timezone.utc) - ta).total_seconds() / 60
+                                            hold_min_str = f", held={hold_min:.0f}m"
+                                        except Exception:
+                                            pass
+                                    why = ("Stop loss" if not stop_eval.escalated
+                                           else "UNMEASURABLE stop loss")
+                                    self.logger.info(
+                                        f"{why} triggered for {symbol}"
+                                        f" (entry=${_fmt_px(entry_price)}, now=${_fmt_px(current_price)}"
+                                        f"{pnl_str}{hold_min_str}) — {stop_eval.detail}"
                                     )
-                                else:
-                                    self.logger.error(
-                                        f"Stop loss exit failed for {symbol} — will retry next tick"
+                                    reason = ("stop loss triggered" if not stop_eval.escalated
+                                              else f"stop loss unmeasurable for "
+                                                   f"{stop_eval.unknown_streak} consecutive ticks")
+                                    sl_ok = trade_mgr.execute_exit(
+                                        symbol, exit_pct=100.0, reason=reason
                                     )
-                                continue
+                                    if sl_ok:
+                                        info["status"] = "closed"
+                                        self._record_trade(
+                                            market_analysis, symbol, "exit",
+                                            "stop loss" if not stop_eval.escalated
+                                            else "stop loss unmeasurable"
+                                        )
+                                    else:
+                                        self.logger.error(
+                                            f"Stop loss exit failed for {symbol} — will retry next tick"
+                                        )
+                                    continue
 
                         # Check take profit tiers (skip already-triggered tiers).
                         # Tiers are tracked by stable id, not index, so a tier fires
                         # exactly once even when the LLM rewrites the tier list.
+                        #
+                        # DELIBERATELY the plain (unknown -> False) evaluator, not
+                        # evaluate_exit: a take-profit is opportunistic, not
+                        # protective. Escalating it would sell part of a position at a
+                        # price we just admitted we cannot read, for no risk reason,
+                        # and — because a tier fires exactly once — would permanently
+                        # burn that tier. If the feed really is dead the PROTECTIVE
+                        # stop above escalates and flattens the whole position anyway,
+                        # which subsumes every tier.
                         take_profit = exit_conds.get("take_profit", [])
                         triggered_ids = info.get("triggered_tp_tier_ids", [])
                         for tier_idx, tp_tier in enumerate(take_profit):

@@ -19,6 +19,7 @@ from ba2_common.core.native_cache import (  # noqa: F401
     upsert_event_rows,
     read_event_rows,
     timeseries_path,
+    timeseries_row_count,
     read_timeseries,
     write_timeseries,
     CACHE_FOLDER,

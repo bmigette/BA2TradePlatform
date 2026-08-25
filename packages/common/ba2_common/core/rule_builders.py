@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from ba2_common.logger import logger
 from ba2_common.core.types import (
     ExpertActionType,
     ExpertEventType,
@@ -33,8 +34,31 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     "profit_loss_percent": ExpertEventType.N_PROFIT_LOSS_PERCENT,
     "profit_loss_amount": ExpertEventType.N_PROFIT_LOSS_AMOUNT,
     "days_opened": ExpertEventType.N_DAYS_OPENED,
+    # Remaining option life (expiry - the evaluation date), the complement of days_opened.
+    # MUST be listed here or the leaf is silently dropped by triggers_from_condition_tree
+    # ("an unknown field is skipped") and the engine never sees the gate at all.
+    "days_to_expiry": ExpertEventType.N_DAYS_TO_EXPIRY,
     "percent_to_current_target": ExpertEventType.N_PERCENT_TO_CURRENT_TARGET,
     "new_target_percent": ExpertEventType.N_NEW_TARGET_PERCENT,
+    # --- registered-but-unmapped numeric conditions -----------------------------------
+    # Every one of these has a working condition class in TradeConditions.CONDITION_MAP and
+    # was reachable from the UI / strategy builder, but was absent HERE — so the leaf was
+    # dropped by triggers_from_condition_tree and the engine never evaluated the gate while
+    # the GA kept tuning its :value/:enabled genes. On the built OS1 option group that was
+    # 40 of 77 genes (the four price_vs_target_* gates on all five members).
+    # The invariant is now enforced by
+    # packages/common/tests/test_condition_registry_coverage.py.
+    "percent_to_new_target": ExpertEventType.N_PERCENT_TO_NEW_TARGET,
+    "percent_open_to_new_target": ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET,
+    # Price vs. the FMPRating analyst target range — the option grid's dip/extension gates.
+    "price_vs_target_low_percent": ExpertEventType.N_PRICE_VS_TARGET_LOW_PERCENT,
+    "price_vs_target_high_percent": ExpertEventType.N_PRICE_VS_TARGET_HIGH_PERCENT,
+    "price_vs_target_consensus_percent": ExpertEventType.N_PRICE_VS_TARGET_CONSENSUS_PERCENT,
+    "instrument_account_share": ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE,
+    "percent_below_recent_high": ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH,
+    "percent_above_recent_low": ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW,
+    "iv_rank": ExpertEventType.N_IV_RANK,
+    "days_to_earnings": ExpertEventType.N_DAYS_TO_EARNINGS,
 }
 
 # Flag (boolean) condition fields -> ExpertEventType (no operator/value). Used by exit
@@ -56,6 +80,9 @@ FLAG_FIELD_EVENT: Dict[str, ExpertEventType] = {
     "has_option_position": ExpertEventType.F_HAS_OPTION_POSITION,
     "has_covered_call": ExpertEventType.F_HAS_COVERED_CALL,
     "has_protective_put": ExpertEventType.F_HAS_PROTECTIVE_PUT,
+    # The wheel's entry guard: stock the expert was ASSIGNED, as opposed to any stock it
+    # holds (has_buy_position), which would let the overlay cover ordinary long equity.
+    "has_assigned_shares": ExpertEventType.F_HAS_ASSIGNED_SHARES,
     "short_term": ExpertEventType.F_SHORT_TERM,
     "medium_term": ExpertEventType.F_MEDIUM_TERM,
     "long_term": ExpertEventType.F_LONG_TERM,
@@ -66,6 +93,26 @@ FLAG_FIELD_EVENT: Dict[str, ExpertEventType] = {
     "new_target_lower": ExpertEventType.F_NEW_TARGET_LOWER,
     "current_rating_positive": ExpertEventType.F_CURRENT_RATING_POSITIVE,
     "current_rating_negative": ExpertEventType.F_CURRENT_RATING_NEGATIVE,
+    # --- registered-but-unmapped flag conditions --------------------------------------
+    # Same silent-drop hole as the numeric block above. The 5-grade rating buckets and the
+    # ordinal upgrade/downgrade events have condition classes; the six 3-bucket rating
+    # TRANSITION events are served by RatingChangeCondition (TradeConditions.
+    # RATING_CHANGE_CONDITIONS). All were droppable leaves until now.
+    "current_rating_overweight": ExpertEventType.F_CURRENT_RATING_OVERWEIGHT,
+    "current_rating_neutral": ExpertEventType.F_CURRENT_RATING_NEUTRAL,
+    "current_rating_underweight": ExpertEventType.F_CURRENT_RATING_UNDERWEIGHT,
+    "rating_upgraded": ExpertEventType.F_RATING_UPGRADED,
+    "rating_downgraded": ExpertEventType.F_RATING_DOWNGRADED,
+    "rating_negative_to_neutral": ExpertEventType.F_RATING_NEGATIVE_TO_NEUTRAL,
+    "rating_negative_to_positive": ExpertEventType.F_RATING_NEGATIVE_TO_POSITIVE,
+    "rating_neutral_to_negative": ExpertEventType.F_RATING_NEUTRAL_TO_NEGATIVE,
+    "rating_neutral_to_positive": ExpertEventType.F_RATING_NEUTRAL_TO_POSITIVE,
+    "rating_positive_to_negative": ExpertEventType.F_RATING_POSITIVE_TO_NEGATIVE,
+    "rating_positive_to_neutral": ExpertEventType.F_RATING_POSITIVE_TO_NEUTRAL,
+    # Account-wide position flags (any expert holds it), as opposed to the expert-scoped
+    # has_position / has_no_position above.
+    "has_position_account": ExpertEventType.F_HAS_POSITION_ACCOUNT,
+    "has_no_position_account": ExpertEventType.F_HAS_NO_POSITION_ACCOUNT,
 }
 
 # action_type string -> (ExpertActionType, needs_reference_value). The adjust actions read
@@ -114,7 +161,16 @@ def tree_leaves(node: Any) -> Iterable[dict]:
 def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
     """Build an EventAction 'triggers' dict (ANDed) from a condition tree. Flag leaves ->
     value-less {event_type}; numeric leaves -> {event_type, operator, value}. Unknown fields
-    skipped so a partial/edited tree never silently breaks the rule."""
+    are skipped (a partial/edited tree must never break the rule) but NOT silently: the skip
+    is logged at WARNING with the field name.
+
+    Muteness here is what let three separate batches of registered conditions go unmapped —
+    the leaf vanishes, the rule seeds looking healthy, the strategy runs ungated and the GA
+    keeps scoring genes the engine cannot see. Dropping a gate is never routine, so it gets a
+    line in the log; the structural guarantee is
+    packages/common/tests/test_condition_registry_coverage.py, which fails if any condition
+    in ``TradeConditions.CONDITION_MAP`` lacks a mapping here.
+    """
     triggers: Dict[str, dict] = {}
     for i, leaf in enumerate(tree_leaves(tree)):
         field = str(leaf.get("field"))
@@ -123,12 +179,22 @@ def triggers_from_condition_tree(tree: Any) -> Dict[str, dict]:
             triggers[f"cond_{i}"] = {"event_type": flag_et.value}
             continue
         num_et = FIELD_EVENT.get(field)
-        if num_et is not None and leaf.get("value") is not None:
-            triggers[f"cond_{i}"] = {
-                "event_type": num_et.value,
-                "operator": _operator_of(leaf),
-                "value": leaf.get("value"),
-            }
+        if num_et is None:
+            logger.warning(
+                f"Condition leaf {leaf.get('id') or i!r} names field {field!r}, which has no "
+                f"rule_builders FIELD_EVENT/FLAG_FIELD_EVENT mapping — the gate is DROPPED "
+                f"and the rule will run without it")
+            continue
+        if leaf.get("value") is None:
+            logger.warning(
+                f"Numeric condition leaf {leaf.get('id') or i!r} ({field!r}) has no value — "
+                f"the gate is DROPPED and the rule will run without it")
+            continue
+        triggers[f"cond_{i}"] = {
+            "event_type": num_et.value,
+            "operator": _operator_of(leaf),
+            "value": leaf.get("value"),
+        }
     return triggers
 
 

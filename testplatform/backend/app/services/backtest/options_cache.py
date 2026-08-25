@@ -22,16 +22,48 @@ _CHAIN_COLS = ["occ_symbol","option_type","strike","expiry","bid","ask","last","
 _BAR_COLS = ["occ_symbol","date","open","high","low","close","volume","underlying",
              "option_type","strike","expiry","iv","delta","gamma","theta","vega"]
 
+# Columns added AFTER the tables first shipped. CREATE TABLE IF NOT EXISTS is a no-op on
+# an existing table, so a cache file built before the greeks feature keeps the old layout
+# and the first write_bar_rows dies with "table option_bar has no column named iv" --
+# which is what blocked re-fetching the 10 GB cache WITH computed IV, which in turn is
+# why get_atm_iv (and therefore the backtest's IV rank) returns None for everything.
+# ALTER ... ADD COLUMN is cheap in sqlite (a header rewrite, not a table copy) and leaves
+# existing rows with NULL in the new columns -- honest: those greeks were never fetched,
+# and every reader already treats a NULL iv/delta as unusable.
+_GREEK_COLS = ("iv", "delta", "gamma", "theta", "vega")
+
+
 class OptionsHistoryCache:
     def __init__(self, db_path: str):
         self.db_path = db_path
         with self._conn() as cx:
             cx.execute(_CHAIN_DDL); cx.execute(_BAR_DDL)
+            for table in ("option_chain", "option_bar"):
+                self._add_missing_columns(cx, table, _GREEK_COLS)
             # Speeds up options_provider.py's per-underlying chain load (the read-side worker
             # cache queries "WHERE underlying=?" once per underlying per worker process instead
             # of per bar/contract) -- idempotent, cheap no-op once built.
             cx.execute("CREATE INDEX IF NOT EXISTS idx_option_chain_underlying ON option_chain(underlying)")
             cx.execute("CREATE INDEX IF NOT EXISTS idx_option_bar_underlying ON option_bar(underlying)")
+
+    @staticmethod
+    def _add_missing_columns(cx, table: str, columns) -> None:
+        """Bring `table` up to the declared schema. Idempotent (runs on every open).
+
+        "Already there" is tolerated rather than raised: GA workers open the SHARED
+        cache concurrently, so two of them can both read PRAGMA before either ALTERs
+        and the loser would otherwise die on startup with "duplicate column name: iv".
+        The column existing is exactly the state we were trying to reach.
+        """
+        present = {r[1] for r in cx.execute(f"PRAGMA table_info({table})")}
+        for col in columns:
+            if col in present:
+                continue
+            try:
+                cx.execute(f"ALTER TABLE {table} ADD COLUMN {col} REAL")
+            except sqlite3.OperationalError as e:
+                if "duplicate column" not in str(e).lower():
+                    raise
 
     def _conn(self):
         cx = sqlite3.connect(self.db_path); cx.row_factory = sqlite3.Row; return cx

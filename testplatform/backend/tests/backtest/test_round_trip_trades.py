@@ -155,6 +155,28 @@ def test_plain_market_sell_closes_as_round_trip_not_open_at_end():
         ctx.__exit__(None, None, None)
 
 
+def test_equity_round_trip_records_transaction_id_and_multiplier_one():
+    """Every round-trip row carries the STRUCTURE keys ``results.py``'s profit cap groups and
+    scales by. For equity the multiplier is 1 — which is exactly why the cap's equity cost
+    basis (``entry_price * size``) was always right and must not change."""
+    from ba2_common.core.types import OrderDirection
+
+    acct, ctx, ps = _acct(account_id=104)
+    try:
+        buy_bid, txn = _open_entry(acct, qty=10, side=OrderDirection.BUY)
+        _fill(acct, buy_bid, 100.0, D2)
+        sell_bid = _attach_order(acct, txn, OrderDirection.SELL, qty=10)
+        _fill(acct, sell_bid, 120.0, D3)
+
+        t = acct.get_round_trip_trades()[0]
+        assert t["transaction_id"] == txn
+        assert t["multiplier"] == 1
+        # cost basis == the capital really deployed, in dollars
+        assert t["entry_price"] * t["size"] * t["multiplier"] == pytest.approx(1000.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 def test_plain_sell_at_loss_counts_as_losing_trade():
     """Bought then sold LOWER via a plain sell -> pnl < 0 so win_rate reflects the loss."""
     from ba2_common.core.types import OrderDirection
@@ -437,6 +459,24 @@ def test_option_round_trip_pnl_uses_multiplier(option_round_trip_account):
     rt = [t for t in acct.get_round_trip_trades() if t["exit_reason"] != "open_at_end"]
     # (1.50-1.00)*1*100 = 50 gross, minus commissions (0 here, so pnl == 50).
     assert any(abs(t["pnl"] - 50.0) <= 2.0 for t in rt)
+
+
+def test_option_round_trip_records_the_same_multiplier_the_pnl_used(option_round_trip_account):
+    """The row must carry the EXACT multiplier ``pnl`` was computed with, plus the
+    ``transaction_id`` the legs of a spread share.
+
+    ``results._deployed_capital`` builds an option leg's cost basis as
+    ``entry_price x size x multiplier`` and compares it against this ``pnl``. If the row did
+    not record the multiplier the basis would be 1/100th of the truth while the P&L kept its
+    x100 — the profit-cap units bug (a 20x cap acting as a 20% cap).
+    """
+    acct = option_round_trip_account
+    rt = [t for t in acct.get_round_trip_trades() if t["exit_reason"] != "open_at_end"]
+    t = next(t for t in rt if abs(t["pnl"] - 50.0) <= 2.0)
+    assert t["multiplier"] == 100
+    assert t["transaction_id"] is not None
+    # $100 of premium really left the account for this contract, not $1.
+    assert t["entry_price"] * t["size"] * t["multiplier"] == pytest.approx(100.0)
 
 
 # ---------------------------------------------------------------------------
