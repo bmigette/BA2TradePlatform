@@ -1,6 +1,7 @@
 """The optional fixed-notional equity cap. Pure arithmetic, no engine, no clock."""
 from __future__ import annotations
 
+import os
 from datetime import datetime
 
 import pytest
@@ -527,3 +528,69 @@ def test_the_cap_is_normalised_to_a_float_by_the_config():
 
     cfg = _build_config(_handler_payload(equity_cap=15_000))
     assert isinstance(cfg["account_settings"]["equity_cap"], float)
+
+
+# ---------------------------------------------------------------------------
+# Task 8 -- live safety
+# ---------------------------------------------------------------------------
+_CAP_ATTRS = ("deployed_equity", "_equity_cap")
+
+
+def _exposed_cap_attrs(cls):
+    """Which equity-cap attributes ``cls`` exposes. Factored out so the guard's DETECTION can
+    itself be tested (see the meta-test below) -- an assertion nobody has watched fail is not
+    a guard."""
+    names = dir(cls)
+    return [a for a in _CAP_ATTRS if a in names]
+
+
+def test_no_LIVE_account_class_can_reach_the_equity_cap():
+    """This is a backtest analysis tool. A live account must have no code path to it --
+    asserted rather than assumed, because 'we only call it from the backtest' is exactly the
+    kind of claim that stops being true."""
+    from ba2_common.core.interfaces.AccountInterface import AccountInterface
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+    from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
+    from ba2_trade_platform.modules.accounts.IBKRAccount import IBKRAccount
+    from ba2_trade_platform.modules.accounts.TastyTradeAccount import TastyTradeAccount
+
+    for cls in (AccountInterface, ReadOnlyAccountInterface, AlpacaAccount, IBKRAccount,
+                TastyTradeAccount):
+        assert _exposed_cap_attrs(cls) == [], \
+            f"{cls.__name__} exposes {_exposed_cap_attrs(cls)}"
+
+
+def test_the_live_safety_guard_actually_detects_an_exposed_cap():
+    """Meta-test: prove the guard bites. Without this, ``_exposed_cap_attrs`` could be
+    silently broken (wrong attribute names, a typo in ``dir``) and the guard above would pass
+    for every class forever."""
+    class _LeakyAccount:
+        _equity_cap = None
+
+        def deployed_equity(self):
+            return 0.0
+
+    assert sorted(_exposed_cap_attrs(_LeakyAccount)) == ["_equity_cap", "deployed_equity"]
+
+
+def test_the_backtest_account_is_the_ONLY_class_that_has_the_cap():
+    """The positive half: BacktestAccount does expose it (or Task 4 would be dead code), and it
+    is a BacktestAccount-only addition -- not something inherited down from AccountInterface."""
+    from app.services.backtest.backtest_account import BacktestAccount
+
+    assert sorted(_exposed_cap_attrs(BacktestAccount)) == ["deployed_equity"]
+    assert "deployed_equity" in vars(BacktestAccount), \
+        "deployed_equity is inherited, not defined on BacktestAccount -- the cap has leaked up"
+
+
+def test_a_live_account_config_key_named_equity_cap_is_never_honoured():
+    """The config side of the same rule: the ONLY reader of the key is BacktestAccount."""
+    import subprocess
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))))
+    out = subprocess.run(
+        ["git", "grep", "-l", "equity_cap", "--", "ba2_trade_platform", "packages"],
+        cwd=root, capture_output=True, text=True)
+    hits = [line for line in out.stdout.splitlines() if line.strip()]
+    assert hits == [], f"equity_cap reached live/shared code: {hits}"
