@@ -126,6 +126,43 @@ def test_tar_roundtrip_and_traversal(tmp_path):
     assert cache_sync.diff_missing(man["files"], cache_sync.build_manifest(str(dst))) == []
 
 
+def test_extract_tar_logs_progress_periodically(tmp_path, monkeypatch):
+    """A push can run tens of GB / a long time on a slow disk (module docstring) -- extraction
+    must not go silent for the whole duration. Time-based, not per-file: a fake monotonic clock
+    proves the cadence without a real sleep."""
+    src = tmp_path / "master"
+    for i in range(3):
+        _write(src / f"f{i}.parquet", b"x" * 100)
+
+    # Every call to time.monotonic() (one before the loop, one per extracted file) advances by a
+    # full interval, so each of the 3 files crosses the log threshold -- deterministic, no
+    # reliance on real wall-clock timing or on the log callback itself driving the clock.
+    calls = [0]
+
+    def fake_monotonic():
+        calls[0] += 1
+        return 1000.0 + calls[0] * cache_sync._PROGRESS_LOG_INTERVAL_S
+
+    monkeypatch.setattr(cache_sync.time, "monotonic", fake_monotonic)
+    logged = []
+
+    man = cache_sync.build_manifest(str(src))
+    buf = io.BytesIO(b"".join(cache_sync.iter_tar([f["rel_path"] for f in man["files"]], str(src))))
+    res = cache_sync.extract_tar(buf, str(tmp_path / "worker"), log=logged.append)
+
+    assert res["extracted"] == 3
+    assert len(logged) == 3, logged
+    assert all("cache extract:" in m and "file(s)" in m for m in logged), logged
+
+
+def test_extract_tar_default_log_is_module_logger(tmp_path):
+    """No explicit ``log`` -> falls back to this module's own logger (the worker's
+    _install_orchestration_file_logging root handler picks it up automatically)."""
+    import inspect
+    default = inspect.signature(cache_sync.extract_tar).parameters["log"].default
+    assert default == cache_sync.logger.info  # bound methods compare equal by (__self__, __func__)
+
+
 def test_extract_tar_rejects_traversal(tmp_path):
     import tarfile
     dst = tmp_path / "worker"
