@@ -3409,3 +3409,123 @@ def test_the_label_target_helpers_preserve_the_order_they_were_given():
     result = _pure().even_split_label_targets({'Z': 0.0, 'A': 0.0, 'M': 0.0})
     assert list(result.targets) == ['Z', 'A', 'M']
     assert result.targets['M'] == 33.34
+
+
+# -- the PER-LABEL group: Even split / Fill rest / Load last / Wipe -----------
+
+def test_an_even_split_of_a_labels_symbols_uses_the_engines_own_splitter():
+    result = _pure().even_split_symbol_shares('ARK26',
+                                              {'AAPL': 90.0, 'MSFT': 10.0, 'TSLA': 0.0})
+
+    assert result.changed is True
+    assert result.weights == {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34}
+
+
+def test_an_even_split_of_a_label_that_is_already_even_writes_nothing():
+    result = _pure().even_split_symbol_shares('ARK26', {'AAPL': 50.0, 'MSFT': 50.0})
+
+    assert result.changed is False
+    assert result.message
+
+
+def test_an_even_split_of_a_label_with_no_symbols_is_refused():
+    result = _pure().even_split_symbol_shares('EMPTY', {})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().WEIGHTS_NO_SYMBOLS
+
+
+def test_fill_rest_shares_the_remainder_between_the_EMPTY_slots_only():
+    """"Type the two you care about, let the rest sort themselves out". Every
+    non-zero weight is left EXACTLY as typed -- not re-normalised, not nudged."""
+    result = _pure().fill_rest_symbol_shares('ARK26', {'AAPL': 30.0, 'MSFT': 0.0,
+                                                       'TSLA': 0.0})
+
+    assert result.changed is True
+    assert result.weights == {'AAPL': 30.0, 'MSFT': 35.0, 'TSLA': 35.0}
+
+
+def test_fill_rest_is_NOT_the_same_button_as_fill_100_and_never_scales():
+    """``Fill 100%`` scales an over-allocated label down; ``Fill rest`` refuses.
+
+    That is the whole distinction between the two, and it is why both are on the
+    row: one repairs a set, the other only ever fills the gaps in one.
+    """
+    over = {'AAPL': 80.0, 'MSFT': 80.0, 'TSLA': 0.0}
+    assert _pure().fill_rest_symbol_shares('ARK26', over).changed is False
+    assert _pure().fill_label_to_100('ARK26', over).changed is True
+
+
+def test_fill_rest_with_no_empty_slot_writes_nothing_and_says_so():
+    result = _pure().fill_rest_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().WEIGHTS_NOTHING_TO_FILL
+    assert result.message
+
+
+def test_filling_a_completely_empty_label_lands_exactly_on_the_even_split():
+    """Not a coincidence to be re-checked: ``fill_remaining_symbol_weights`` is
+    ``split_pct_across`` is ``even_split_pct``, called with a total of 100."""
+    empty = {'A': 0.0, 'B': 0.0, 'C': 0.0, 'D': 0.0, 'E': 0.0, 'F': 0.0}
+    assert (_pure().fill_rest_symbol_shares('L', empty).weights
+            == _pure().even_split_symbol_shares('L', empty).weights)
+
+
+def test_load_last_restores_one_labels_symbol_weights():
+    result = _pure().load_last_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0},
+                                             {'AAPL': 50.0, 'MSFT': 50.0})
+
+    assert result.changed is True
+    assert result.weights == {'AAPL': 50.0, 'MSFT': 50.0}
+
+
+def test_load_last_for_symbols_reads_the_PREVIOUS_generation_and_not_the_current():
+    result = _pure().load_last_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0},
+                                             {'AAPL': 10.0, 'MSFT': 90.0})
+    assert result.weights == {'AAPL': 10.0, 'MSFT': 90.0}
+
+
+def test_a_symbol_with_no_history_keeps_the_weight_it_already_has():
+    result = _pure().load_last_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0},
+                                             {'AAPL': 50.0, 'MSFT': None})
+
+    assert result.weights == {'AAPL': 50.0, 'MSFT': 40.0}
+
+
+def test_load_last_for_a_label_with_no_history_at_all_writes_nothing():
+    result = _pure().load_last_symbol_shares('ARK26', {'AAPL': 60.0},
+                                             {'AAPL': None})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().WEIGHTS_NO_PREVIOUS
+
+
+def test_wipe_clears_every_weight_in_the_label_to_zero():
+    """0.0, never ``None``: every solver does arithmetic on ``weight_pct``, and 0.0
+    IS "empty" in this model -- which is what makes Fill rest coherent."""
+    result = _pure().wipe_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0})
+
+    assert result.changed is True
+    assert result.weights == {'AAPL': 0.0, 'MSFT': 0.0}
+
+
+def test_wipe_reports_a_label_that_is_already_clear_rather_than_rewriting_it():
+    result = _pure().wipe_symbol_shares('ARK26', {'AAPL': 0.0, 'MSFT': 0.0})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().WEIGHTS_ALREADY_CLEAR
+
+
+def test_wipe_is_available_on_exactly_the_set_fill_rest_refuses():
+    """The user is never cornered: an over-allocated label disables the fill and
+    Wipe is always the way out of it."""
+    over = {'AAPL': 80.0, 'MSFT': 80.0, 'TSLA': 0.0}
+    assert _pure().fill_rest_symbol_shares('L', over).changed is False
+    assert _pure().wipe_symbol_shares('L', over).changed is True
+
+
+def test_the_symbol_share_helpers_preserve_the_order_they_were_given():
+    result = _pure().even_split_symbol_shares('L', {'Z': 0.0, 'A': 0.0, 'M': 0.0})
+    assert list(result.weights) == ['Z', 'A', 'M']
+    assert result.weights['M'] == 33.34

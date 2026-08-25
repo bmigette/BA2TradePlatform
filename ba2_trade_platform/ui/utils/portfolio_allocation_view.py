@@ -1531,6 +1531,209 @@ def load_last_label_targets(targets, previous) -> TargetsUpdate:
                          TARGETS_MSG_LOADED_LAST_FMT.format(kept=kept))
 
 
+WEIGHTS_NO_SYMBOLS = "NO_SYMBOLS"
+WEIGHTS_UNCHANGED = "UNCHANGED"
+WEIGHTS_EVEN_SPLIT = "EVEN_SPLIT"
+WEIGHTS_FILLED_REST = "FILLED_REST"
+WEIGHTS_NOTHING_TO_FILL = "NOTHING_TO_FILL"
+WEIGHTS_NO_PREVIOUS = "NO_PREVIOUS"
+WEIGHTS_LOADED_LAST = "LOADED_LAST"
+WEIGHTS_WIPED = "WIPED"
+WEIGHTS_ALREADY_CLEAR = "ALREADY_CLEAR"
+
+WEIGHTS_MSG_NO_SYMBOLS_FMT = ("'{label}' has no symbols with a share — add one "
+                              "before splitting it.")
+WEIGHTS_MSG_EVEN_SPLIT_FMT = ("'{label}': every symbol now holds an equal share of "
+                              "the label's 100%.")
+WEIGHTS_MSG_ALREADY_EVEN_FMT = ("'{label}' is already split evenly — nothing was "
+                                "written.")
+WEIGHTS_MSG_FILLED_REST_FMT = ("'{label}': shared the remaining {remainder:.2f}% "
+                               "between {count} empty symbol(s). The weights you "
+                               "typed were left exactly as typed.")
+#: BOTH halves of ``can_fill_remaining_symbol_weights``' refusal in one sentence,
+#: because the two look identical from the button and have opposite fixes: nothing
+#: is empty (type a 0 into the one you want filled) versus nothing is left (the
+#: label is at or over 100 -- use Fill 100% to scale it, or Wipe to start again).
+WEIGHTS_MSG_NOTHING_TO_FILL_FMT = (
+    "'{label}': nothing to fill. Either every symbol already holds a share, or the "
+    "shares total {total:.2f}% and there is nothing left to hand out — 'Fill 100%' "
+    "scales an over-allocated label, 'Wipe' clears it.")
+WEIGHTS_MSG_NO_PREVIOUS_FMT = ("No symbol in '{label}' has a previous share — this "
+                               "label has never been allocated, so there is nothing "
+                               "to load.")
+WEIGHTS_MSG_LOADED_LAST_FMT = ("'{label}': restored the last run's shares. {kept} "
+                               "symbol(s) have no history and kept the share they "
+                               "had.")
+WEIGHTS_MSG_LAST_UNCHANGED_FMT = ("'{label}' already holds the shares of the last "
+                                  "run — nothing was written.")
+WEIGHTS_MSG_WIPED_FMT = ("'{label}': cleared {count} share(s) to 0%. 'Load last' "
+                         "puts them back — a wipe does not touch the history.")
+WEIGHTS_MSG_ALREADY_CLEAR_FMT = ("'{label}' is already at 0% throughout — there is "
+                                 "nothing to clear.")
+
+
+@dataclass
+class WeightsUpdate:
+    """One press of a PER-LABEL symbol-share button, decided. Pure.
+
+    Deliberately the same shape as ``FillToHundred`` (``changed``, ``reason_code``,
+    ``weights``, ``message``) so the page can drive all five buttons on the row
+    through one handler. ``changed is False`` means nothing is written and
+    ``weights`` is what came in; the message is never empty.
+
+    ``weights`` preserves the DISPLAY order it was given, for the reason
+    ``TargetsUpdate.targets`` does: the engine's splitter puts the rounding
+    remainder on the last entry.
+    """
+    changed: bool
+    reason_code: str
+    weights: Dict[str, float]
+    message: str
+
+
+def _symbols_as_engine(label: str, weights, previous=None):
+    """``{symbol: pct}`` -> the engine's ``LabelTarget``, order preserved. Internal.
+
+    ``target_pct`` is left at 0.0 and is never read back: every function this feeds
+    touches the symbol weights only, and the label's own target is a share of a
+    different denominator entirely.
+    """
+    history = previous or {}
+    from ...core.portfolio_allocation import LabelTarget, SymbolTarget
+    return LabelTarget(
+        label=label, target_pct=0.0,
+        symbols=[SymbolTarget(symbol=symbol, weight_pct=float(pct or 0.0),
+                              previous_weight_pct=history.get(symbol))
+                 for symbol, pct in (weights or {}).items()])
+
+
+def _weights_of(target) -> Dict[str, float]:
+    """A ``LabelTarget``'s symbol weights back as a plain map. Internal."""
+    return {st.symbol: float(st.weight_pct or 0.0) for st in (target.symbols or [])}
+
+
+def even_split_symbol_shares(label: str, weights) -> WeightsUpdate:
+    """The per-label "Even split": ONE label's symbols share its 100% equally. Pure.
+
+    ``even_split_symbol_weights``, which is ``even_split_pct``, which is what
+    ``build_symbol_targets`` fills an untouched label in with -- so the button and
+    the stored default cannot disagree about the same symbols. The label's own
+    target does not move: this is about shares WITHIN a label.
+
+    Unlike the wizard, a SINGLE-symbol label is not refused. The wizard disabled
+    the button there because "a single symbol already owns the whole 100 by
+    construction" -- which stopped being true when the boxes became editable on the
+    page, where that symbol can sit at 40 and the split is the repair.
+    """
+    from ...core.portfolio_allocation import even_split_symbol_weights
+
+    current = {s: float(pct or 0.0) for s, pct in (weights or {}).items()}
+    if not current:
+        return WeightsUpdate(False, WEIGHTS_NO_SYMBOLS, {},
+                             WEIGHTS_MSG_NO_SYMBOLS_FMT.format(label=label))
+    fresh = _weights_of(even_split_symbol_weights(_symbols_as_engine(label, current)))
+    if _same_pcts(current, fresh):
+        return WeightsUpdate(False, WEIGHTS_UNCHANGED, current,
+                             WEIGHTS_MSG_ALREADY_EVEN_FMT.format(label=label))
+    return WeightsUpdate(True, WEIGHTS_EVEN_SPLIT, fresh,
+                         WEIGHTS_MSG_EVEN_SPLIT_FMT.format(label=label))
+
+
+def fill_rest_symbol_shares(label: str, weights) -> WeightsUpdate:
+    """The per-label "Fill rest": spread what is left over the EMPTY slots. Pure.
+
+    NOT ``fill_label_to_100``, and the difference is the reason both buttons are on
+    the row. This one never SCALES: every non-zero weight survives exactly as
+    typed, and an over-allocated label is refused outright rather than trimmed.
+    ``Fill 100%`` is the repair; this is the "type the two you care about, let the
+    rest sort themselves out" half.
+
+    ``can_fill_remaining_symbol_weights`` is the engine's own predicate and owns
+    both halves of the refusal -- there has to be an empty slot AND something left
+    to put in it -- so the button and the validator underneath cannot disagree.
+    """
+    from ...core.portfolio_allocation import (
+        can_fill_remaining_symbol_weights, fill_remaining_symbol_weights)
+
+    current = {s: float(pct or 0.0) for s, pct in (weights or {}).items()}
+    if not current:
+        return WeightsUpdate(False, WEIGHTS_NO_SYMBOLS, {},
+                             WEIGHTS_MSG_NO_SYMBOLS_FMT.format(label=label))
+    item = _symbols_as_engine(label, current)
+    if not can_fill_remaining_symbol_weights(item):
+        return WeightsUpdate(
+            False, WEIGHTS_NOTHING_TO_FILL, current,
+            WEIGHTS_MSG_NOTHING_TO_FILL_FMT.format(
+                label=label, total=round(sum(current.values()), 2)))
+    fresh = _weights_of(fill_remaining_symbol_weights(item))
+    remainder = round(100.0 - sum(current.values()), 2)
+    empty = sum(1 for pct in current.values() if pct == 0.0)
+    return WeightsUpdate(True, WEIGHTS_FILLED_REST, fresh,
+                         WEIGHTS_MSG_FILLED_REST_FMT.format(
+                             label=label, remainder=remainder, count=empty))
+
+
+def load_last_symbol_shares(label: str, weights, previous) -> WeightsUpdate:
+    """The per-label "Load last": restore ONE label's shares from the last run. Pure.
+
+    ``previous`` is ``get_previous_symbol_weights``' answer, which is a SEPARATE
+    read from ``get_symbol_weights`` on purpose: that one fills an absent row with
+    the even-split default, and there is no default for a share nobody has ever
+    allocated with. Feeding this the live map turns the button into a no-op that
+    still reports success.
+
+    A symbol with no history keeps the share it has, and the label's own target
+    does not move.
+    """
+    from ...core.portfolio_allocation import (
+        has_previous_symbol_weights, load_previous_symbol_weights)
+
+    current = {s: float(pct or 0.0) for s, pct in (weights or {}).items()}
+    if not current:
+        return WeightsUpdate(False, WEIGHTS_NO_SYMBOLS, {},
+                             WEIGHTS_MSG_NO_SYMBOLS_FMT.format(label=label))
+    item = _symbols_as_engine(label, current, previous)
+    if not has_previous_symbol_weights(item):
+        return WeightsUpdate(False, WEIGHTS_NO_PREVIOUS, current,
+                             WEIGHTS_MSG_NO_PREVIOUS_FMT.format(label=label))
+    fresh = _weights_of(load_previous_symbol_weights(item))
+    if _same_pcts(current, fresh):
+        return WeightsUpdate(False, WEIGHTS_UNCHANGED, current,
+                             WEIGHTS_MSG_LAST_UNCHANGED_FMT.format(label=label))
+    kept = sum(1 for st in item.symbols if st.previous_weight_pct is None)
+    return WeightsUpdate(True, WEIGHTS_LOADED_LAST, fresh,
+                         WEIGHTS_MSG_LOADED_LAST_FMT.format(label=label, kept=kept))
+
+
+def wipe_symbol_shares(label: str, weights) -> WeightsUpdate:
+    """The per-label "Wipe": clear ONE label's shares so it can be redone. Pure.
+
+    What makes ``fill_rest_symbol_shares`` coherent: filling treats a 0 as an empty
+    slot, so the honest way to redo a label is to empty it outright, type the
+    handful that matter and fill the rest.
+
+    Writes 0.0, never ``None`` -- every solver does arithmetic on the weight, and
+    0.0 IS "empty" in this model. It is available on exactly the over-allocated set
+    ``fill_rest_symbol_shares`` refuses, so the user is never cornered, and it
+    leaves the previous generation untouched: Load last is its undo.
+    """
+    from ...core.portfolio_allocation import (
+        can_wipe_symbol_weights, wipe_symbol_weights)
+
+    current = {s: float(pct or 0.0) for s, pct in (weights or {}).items()}
+    if not current:
+        return WeightsUpdate(False, WEIGHTS_NO_SYMBOLS, {},
+                             WEIGHTS_MSG_NO_SYMBOLS_FMT.format(label=label))
+    item = _symbols_as_engine(label, current)
+    if not can_wipe_symbol_weights(item):
+        return WeightsUpdate(False, WEIGHTS_ALREADY_CLEAR, current,
+                             WEIGHTS_MSG_ALREADY_CLEAR_FMT.format(label=label))
+    return WeightsUpdate(True, WEIGHTS_WIPED, _weights_of(wipe_symbol_weights(item)),
+                         WEIGHTS_MSG_WIPED_FMT.format(
+                             label=label,
+                             count=sum(1 for pct in current.values() if pct != 0.0)))
+
+
 # ---------------------------------------------------------------------------
 # THE LABEL MINI-BAR ROW
 #

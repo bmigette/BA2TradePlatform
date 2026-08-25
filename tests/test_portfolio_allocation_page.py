@@ -5633,3 +5633,269 @@ def test_the_label_buttons_refuse_to_write_under_a_label_that_is_gone(
 
     assert _label_targets_now(account_id) == {'ARK26': 50.0}
     assert any('no longer managed' in m for m, _t in sent)
+
+
+# ---------------------------------------------------------------------------
+# GROUP 3: the PER-LABEL button group -- Even split / Fill rest / Load last / Wipe
+#
+# The wizard's step 2 owned these. They join ``Fill 100%`` and ``Compare`` in the
+# left-aligned group that was deliberately sized for them (346fdabb / cd3e1646),
+# on the harmless side of the ``ui.space()`` that separates them from Remove.
+# ---------------------------------------------------------------------------
+
+def _three_symbols(account_id, label='ARK26', weights=None, previous=None):
+    set_managed_label(account_id, label, target_pct=100.0)
+    return _views([ManagedLabel(label, 100.0)], {label: ['AAPL', 'MSFT', 'TSLA']},
+                  weights={label: dict(weights or {'AAPL': 33.33, 'MSFT': 33.33,
+                                                   'TSLA': 33.34})},
+                  previous_weights={label: dict(previous or {})})
+
+
+def _two_labelled_baskets(account_id, *, a_weights, b_weights):
+    for name in ('ARK26', 'TECH'):
+        set_managed_label(account_id, name, target_pct=50.0)
+    return _views([ManagedLabel('ARK26', 50.0), ManagedLabel('TECH', 50.0)],
+                  {'ARK26': ['AAPL', 'MSFT'], 'TECH': ['NVDA', 'AMD']},
+                  weights={'ARK26': dict(a_weights), 'TECH': dict(b_weights)})
+
+
+def _stored(account_id, label='ARK26', symbols=('AAPL', 'MSFT', 'TSLA')):
+    return get_symbol_weights(account_id, label, list(symbols))
+
+
+def test_every_label_gets_the_four_migrated_buttons(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 50.0, 'MSFT': 50.0},
+                                       b_weights={'NVDA': 50.0, 'AMD': 50.0}))
+
+    for marker in (page.MARKER_EVEN_SPLIT_SYMBOLS, page.MARKER_FILL_REST_SYMBOLS,
+                   page.MARKER_LOAD_LAST_SYMBOLS, page.MARKER_WIPE_SYMBOLS):
+        assert len(_marked_buttons(root, marker)) == 2, marker
+
+
+def test_the_symbol_even_split_writes_an_equal_share_and_persists_it(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 90.0, 'MSFT': 10.0, 'TSLA': 0.0}))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34}
+    assert _table_rows(root)['AAPL']['weight_pct'] == 33.33
+
+
+def test_fill_rest_fills_only_the_empty_slots_and_leaves_the_typed_ones_alone(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 30.0, 'MSFT': 0.0, 'TSLA': 0.0}))
+
+    _press(_marked_buttons(root, page.MARKER_FILL_REST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 30.0, 'MSFT': 35.0, 'TSLA': 35.0}
+
+
+def test_fill_rest_REFUSES_an_over_allocated_label_where_fill_100_scales_it(
+        monkeypatch, nicegui_client, account_id):
+    """The two buttons are not duplicates: one repairs a set, the other only fills
+    the gaps in one. A Fill rest that scaled would rewrite weights the user typed."""
+    sent = _capture_notifications(monkeypatch)
+    over = {'AAPL': 80.0, 'MSFT': 80.0, 'TSLA': 0.0}
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id, weights=over))
+
+    _press(_marked_buttons(root, page.MARKER_FILL_REST_SYMBOLS)[0])
+    assert get_symbol_rows(account_id, 'ARK26') == {}
+    assert any('nothing to fill' in m for m, _t in sent)
+
+    _press(_fill_button(root))
+    assert round(sum(_stored(account_id).values()), 2) == 100.0
+
+
+def test_symbol_load_last_restores_the_shares_of_the_last_run(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 90.0, 'MSFT': 5.0, 'TSLA': 5.0},
+                                previous={'AAPL': 10.0, 'MSFT': 10.0,
+                                          'TSLA': 80.0}))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 10.0, 'MSFT': 10.0, 'TSLA': 80.0}
+
+
+def test_symbol_load_last_reads_the_PREVIOUS_generation_not_the_live_one(
+        monkeypatch, nicegui_client, account_id):
+    """Mutation: hand it ``live['weights']``. The press then reports success and
+    changes nothing, which is the one failure this button cannot have."""
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 90.0, 'MSFT': 5.0, 'TSLA': 5.0},
+                                previous={'AAPL': 33.33, 'MSFT': 33.33,
+                                          'TSLA': 33.34}))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34}
+    assert any('restored' in m.lower() for m, _t in sent)
+
+
+def test_symbol_load_last_with_no_history_says_so_and_writes_nothing(
+        monkeypatch, nicegui_client, account_id):
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_SYMBOLS)[0])
+
+    assert get_symbol_rows(account_id, 'ARK26') == {}
+    assert any('nothing to load' in m for m, _t in sent)
+
+
+def test_wipe_clears_its_own_labels_shares_to_zero(monkeypatch, nicegui_client,
+                                                   account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 0.0, 'MSFT': 0.0, 'TSLA': 0.0}
+
+
+def test_wipe_clears_NOTHING_outside_its_own_label(monkeypatch, nicegui_client,
+                                                   account_id):
+    """The mutation: ``for label in live['weights']`` instead of the one label. The
+    user presses Wipe on one basket and every basket on the page empties."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 60.0, 'MSFT': 40.0},
+                                       b_weights={'NVDA': 70.0, 'AMD': 30.0}))
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+
+    assert _stored(account_id, 'ARK26', ('AAPL', 'MSFT')) == {'AAPL': 0.0,
+                                                              'MSFT': 0.0}
+    assert get_symbol_rows(account_id, 'TECH') == {}
+
+
+def test_each_migrated_button_writes_to_the_label_whose_row_it_sits_in(
+        monkeypatch, nicegui_client, account_id):
+    """The classic NiceGUI closure bug: without a default-argument capture every
+    button on the page rewrites the LAST label drawn."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 90.0, 'MSFT': 10.0},
+                                       b_weights={'NVDA': 70.0, 'AMD': 30.0}))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_SYMBOLS)[0])
+
+    assert _stored(account_id, 'ARK26', ('AAPL', 'MSFT')) == {'AAPL': 50.0,
+                                                              'MSFT': 50.0}
+    assert get_symbol_rows(account_id, 'TECH') == {}
+
+
+def test_the_SECOND_labels_button_writes_to_the_SECOND_label(monkeypatch,
+                                                             nicegui_client,
+                                                             account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 90.0, 'MSFT': 10.0},
+                                       b_weights={'NVDA': 70.0, 'AMD': 30.0}))
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[1])
+
+    assert get_symbol_rows(account_id, 'ARK26') == {}
+    assert _stored(account_id, 'TECH', ('NVDA', 'AMD')) == {'NVDA': 0.0, 'AMD': 0.0}
+
+
+def test_a_wipe_leaves_the_history_so_load_last_is_still_its_undo(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                previous={'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}))
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}
+
+
+def test_the_migrated_buttons_never_touch_the_labels_own_target(monkeypatch,
+                                                                nicegui_client,
+                                                                account_id):
+    """Shares WITHIN a label are a different denominator from the label's share of
+    the investable pool. A button that moved both would be mixing the two."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 100.0}
+
+
+def test_the_migrated_buttons_never_touch_the_cash_reserve(monkeypatch,
+                                                           nicegui_client,
+                                                           account_id):
+    _capture_notifications(monkeypatch)
+    set_allocation_config(account_id, unallocated_pct=15.0)
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id), reserve=15.0)
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_SYMBOLS)[0])
+
+    assert get_allocation_config(account_id).unallocated_pct == 15.0
+
+
+def test_a_migrated_button_refuses_to_write_under_an_unmanaged_label(
+        monkeypatch, nicegui_client, account_id):
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 90.0, 'MSFT': 5.0, 'TSLA': 5.0}))
+    remove_managed_label(account_id, 'ARK26')
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_SYMBOLS)[0])
+
+    assert get_symbol_rows(account_id, 'ARK26') == {}
+    assert any('no longer managed' in m for m, _t in sent)
+
+
+def test_the_migrated_buttons_read_the_SAME_live_map_the_inline_edit_writes(
+        monkeypatch, nicegui_client, account_id):
+    """One source of truth for what is on screen. If a button re-read the store it
+    would be blind to the edit the user just made, and the two would contradict
+    each other on every row."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+
+    _emit(_tables(root)[0], 'weightChange', ['AAPL', 0.0])      # 0 == EMPTY
+    _press(_marked_buttons(root, page.MARKER_FILL_REST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34}
+
+
+def test_the_four_migrated_buttons_land_LEFT_of_the_space_beside_Fill_100(
+        nicegui_client, account_id):
+    """The group was sized for exactly these four siblings (346fdabb). Everything
+    constructive sits before the ``ui.space()``; only Remove is after it."""
+    from nicegui import ui
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+    row = _fill_button(root).parent_slot.parent
+
+    order = [el for el in row.descendants()
+             if isinstance(el, (ui.button, ui.space))]
+    captions = [el._props.get('label', '<space>') if isinstance(el, ui.button)
+                else '<space>' for el in order]
+    assert captions[:6] == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
+                            'Wipe', 'Compare']
+    assert captions[6] == '<space>'
+    assert captions[7] == 'Remove selected from label'

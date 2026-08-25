@@ -124,17 +124,18 @@ from ..utils.portfolio_allocation_view import (
     build_label_bars, build_label_views,
     collect_managed_symbols, diff_managed_labels,
     evaluate_gate, evaluate_market_gate, even_split_label_targets,
-    expert_shortname_families,
-    fill_label_to_100, format_allocation_footer, format_label_header,
+    even_split_symbol_shares, expert_shortname_families,
+    fill_label_to_100, fill_rest_symbol_shares,
+    format_allocation_footer, format_label_header,
     format_label_target_tooltip,
     format_label_total_notice, format_reserve_caption,
     format_reserve_row, label_color_contrast_warning, load_last_label_targets,
-    managed_total_value,
+    load_last_symbol_shares, managed_total_value,
     missing_quote_symbols, picker_options, pnl_classes, positions_by_symbol,
     resolve_label_icon_color, sort_label_views, store_color_value,
     symbol_target_values,
     validate_label_target_edit, validate_reserve_edit, validate_symbol_weight_edit,
-    working_orders_notice,
+    wipe_symbol_shares, working_orders_notice,
 )
 from .portfolio_allocation_wizard import (
     open_allocation_steps, open_allocation_wizard, render_income_panel, render_outcomes,
@@ -967,16 +968,32 @@ def _write_symbol_weights(account_id: int, label: str, weights) -> bool:
     return True
 
 
-async def _fill_label_to_100(account_id: int, live: Dict[str, Any],
-                             label: str) -> None:
-    """The per-label "Fill 100%" button. Every decision is in the pure layer.
+def _previous_symbol_weights(live: Dict[str, Any], label: str):
+    """``{symbol: previous_weight_pct}`` for one label -- what "Load last" reads.
 
-    Reads ``live['weights'][label]`` -- the same map ``_save_symbol_weight`` patches
-    one key of -- and never the store. That is what makes the button and the
-    no-recalc rule agree about which symbols are empty: they are looking at the same
-    numbers the user is.
+    Off the rendered ``LabelView``, which carried it straight from
+    ``get_previous_symbol_weights``. That is a SEPARATE read from
+    ``get_symbol_weights``: this one leaves an absent row at ``None`` rather than
+    filling it with the even-split default, because there is no default for a share
+    nobody has ever allocated with.
     """
-    result = fill_label_to_100(label, live['weights'].get(label) or {})
+    view = live['view_by_label'].get(label)
+    if view is None:
+        return {}
+    return {row.symbol: row.previous_weight_pct for row in view.rows}
+
+
+async def _run_symbol_weights_button(account_id: int, live: Dict[str, Any],
+                                     label: str, result, *, what: str) -> None:
+    """Persist and draw one decided per-label press. THE handler, for all five.
+
+    ``result`` is a ``WeightsUpdate`` (or the identically shaped ``FillToHundred``)
+    from the pure layer, which has already decided what the new set is and what to
+    say when there is nothing to do. ``what`` names the action in the log line only.
+
+    The live map is replaced WHOLESALE and ``_apply_symbol_figures`` reads it back,
+    so the cells on screen and the rows in the database are written from one value.
+    """
     if not result.changed:
         # Said out loud. A button that does nothing when pressed is
         # indistinguishable from a broken one.
@@ -986,17 +1003,88 @@ async def _fill_label_to_100(account_id: int, live: Dict[str, Any],
         saved = await asyncio.to_thread(_write_symbol_weights, account_id, label,
                                         result.weights)
     except Exception as e:
-        logger.error(f"Filling '{label}' to 100% failed: {e}", exc_info=True)
+        logger.error(f"{what} for '{label}' failed: {e}", exc_info=True)
         ui.notify(f'Could not save: {e}', type='negative')
         return
     if not saved:
-        logger.warning(f"Fill 100% for '{label}' ignored: the label is no longer "
+        logger.warning(f"{what} for '{label}' ignored: the label is no longer "
                        f"managed by account {account_id}")
         ui.notify(f"'{label}' is no longer managed — refresh the page", type='warning')
         return
     live['weights'][label] = dict(result.weights)
     _apply_symbol_figures(live, label)
     ui.notify(result.message, type='positive')
+
+
+async def _fill_label_to_100(account_id: int, live: Dict[str, Any],
+                             label: str) -> None:
+    """The per-label "Fill 100%" button. Every decision is in the pure layer.
+
+    Reads ``live['weights'][label]`` -- the same map ``_save_symbol_weight`` patches
+    one key of -- and never the store. That is what makes the button and the
+    no-recalc rule agree about which symbols are empty: they are looking at the same
+    numbers the user is.
+    """
+    await _run_symbol_weights_button(
+        account_id, live, label,
+        fill_label_to_100(label, live['weights'].get(label) or {}),
+        what='Fill 100%')
+
+
+# ---------------------------------------------------------------------------
+# THE PER-LABEL BUTTON GROUP -- migrated off the wizard's step 2
+#
+# All four read ``live['weights'][label]``, the SAME map the inline edit patches
+# one key of, and never the store: a button blind to the edit the user just made
+# would contradict the number they are looking at. All four are scoped to ONE
+# label -- ``lbl=view.label`` is captured at the call site -- because the shares
+# inside a label divide that label's money and nothing else's.
+# ---------------------------------------------------------------------------
+
+async def _even_split_symbols(account_id: int, live: Dict[str, Any],
+                              label: str) -> None:
+    """Give every symbol in ONE label an equal share of that label's 100%."""
+    await _run_symbol_weights_button(
+        account_id, live, label,
+        even_split_symbol_shares(label, live['weights'].get(label) or {}),
+        what='Even split')
+
+
+async def _fill_rest_symbols(account_id: int, live: Dict[str, Any],
+                             label: str) -> None:
+    """Share what is left of ONE label's 100% across the symbols still at zero.
+
+    NOT ``Fill 100%``: this one never scales, so a weight the user typed survives
+    exactly as typed and an over-allocated label is refused rather than trimmed.
+    """
+    await _run_symbol_weights_button(
+        account_id, live, label,
+        fill_rest_symbol_shares(label, live['weights'].get(label) or {}),
+        what='Fill rest')
+
+
+async def _load_last_symbols(account_id: int, live: Dict[str, Any],
+                             label: str) -> None:
+    """Restore ONE label's shares from the last run. The label's target does not move."""
+    await _run_symbol_weights_button(
+        account_id, live, label,
+        load_last_symbol_shares(label, live['weights'].get(label) or {},
+                                _previous_symbol_weights(live, label)),
+        what='Load last')
+
+
+async def _wipe_symbols(account_id: int, live: Dict[str, Any], label: str) -> None:
+    """Clear ONE label's shares so the user can start it over.
+
+    NO confirmation, deliberately, and the contrast is with ``_confirm_unmanage``:
+    that one destroys stored weights AND comments AND the label's target with no
+    undo. This writes zeros over one label's weights, leaves the previous
+    generation untouched, and "Load last" beside it puts them straight back.
+    """
+    await _run_symbol_weights_button(
+        account_id, live, label,
+        wipe_symbol_shares(label, live['weights'].get(label) or {}),
+        what='Wipe')
 
 
 def _write_label_target(account_id: int, label: str, target_pct: float) -> bool:
@@ -1819,17 +1907,54 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         ui.notify(f"Removed {removed} symbol(s) from '{view.label}'", type='positive')
         await refresh()
 
-    # A GROUP, drawn as one even though it holds a single button today. The wizard's
-    # step 2 carries "Even split", "Fill rest", "Load last" and "Wipe" over the same
-    # weights, and that step is moving onto this page next; a row with room for five
-    # siblings is the difference between adding them and re-laying this out.
+    # THE GROUP, now holding what it was sized for. Fill 100% was here first and the
+    # wizard's step-2 four -- Even split, Fill rest, Load last, Wipe -- have joined
+    # it; Compare closes the constructive run.
+    #
+    # Constructive first, destructive last, with the ``ui.space()`` between them:
+    # everything to its left either writes numbers or only reads the ticked rows,
+    # and the single button that deletes something sits alone on the right where a
+    # mis-aimed click cannot reach it.
+    #
+    # ``lbl=view.label`` is load-bearing in EVERY lambda. Without the
+    # default-argument capture every button on the page would rewrite the LAST
+    # label drawn -- the classic NiceGUI closure bug, and here it would silently
+    # empty a basket the user was not looking at.
+    #
+    # None of them is DISABLED when it has nothing to do. The wizard greyed them
+    # out; this page reports the no-op in words instead, which is the convention
+    # Fill 100% set and which costs no per-keystroke sweep over every row.
     with ui.row().classes('w-full items-center gap-2 mt-2'):
         ui.button('Fill 100%', icon='functions',
                   on_click=lambda lbl=view.label: _fill_label_to_100(
                       account_id, live, lbl)
-                  ).props('outline dense') \
+                  ).props('outline dense').mark(MARKER_FILL_100) \
             .tooltip('Make these shares total 100%: fill the empty ones if there '
                      'are any, otherwise scale them all proportionally.')
+        ui.button('Even split', icon='balance',
+                  on_click=lambda lbl=view.label: _even_split_symbols(
+                      account_id, live, lbl)
+                  ).props('outline dense').mark(MARKER_EVEN_SPLIT_SYMBOLS) \
+            .tooltip('Give every symbol in this label an equal share of its 100%.')
+        ui.button('Fill rest', icon='format_color_fill',
+                  on_click=lambda lbl=view.label: _fill_rest_symbols(
+                      account_id, live, lbl)
+                  ).props('outline dense').mark(MARKER_FILL_REST_SYMBOLS) \
+            .tooltip('Share what is left of the 100% between the symbols still at '
+                     '0%. Unlike "Fill 100%" this never scales — what you typed '
+                     'stays exactly as typed.')
+        ui.button('Load last', icon='history',
+                  on_click=lambda lbl=view.label: _load_last_symbols(
+                      account_id, live, lbl)
+                  ).props('outline dense').mark(MARKER_LOAD_LAST_SYMBOLS) \
+            .tooltip('Put back the shares the last allocation run used. A symbol '
+                     'that has never run keeps the share it has.')
+        ui.button('Wipe', icon='clear_all',
+                  on_click=lambda lbl=view.label: _wipe_symbols(
+                      account_id, live, lbl)
+                  ).props('outline dense').mark(MARKER_WIPE_SYMBOLS) \
+            .tooltip('Clear every share in this label to 0% so it can be redone. '
+                     '"Load last" undoes it — the history is not touched.')
         # LEFT of the space, with the harmless buttons. Compare reads the same
         # ticked rows Remove does, but it only READS them; sitting it against the
         # one button on this row that deletes things is how a mis-aimed click stops
