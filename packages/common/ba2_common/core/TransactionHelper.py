@@ -729,18 +729,32 @@ class TransactionHelper:
             # layer further up, which is the defect being fixed.
             #
             # What it did before the guard, for a 2-contract position trimmed by 1: it persisted
-            # and SUBMITTED `Order(symbol=AAPL, quantity=1.0, side=SELL, type=MARKET)` -- one
-            # SHARE of the underlying, an instrument the account may not even hold -- then armed
-            # a follow-on OCO at the option's PREMIUM levels read as share prices (TP $5.20 /
-            # SL $1.10 against a $150 spot, i.e. instantly marketable), canceled the real
-            # protective legs on the way past, wrote the transaction down to 1 as though the
-            # trim had happened, and returned success=True. The false success is the worst of
-            # it: every caller here branches on result["success"].
+            # `Order(symbol=AAPL, quantity=1.0, side=SELL, type=MARKET)` -- one SHARE of the
+            # underlying, an instrument the account may not even hold -- armed a follow-on OCO
+            # at the option's PREMIUM levels read as share prices (TP $5.20 / SL $1.10 against a
+            # $150 spot, i.e. instantly marketable), wrote the transaction down to 1 as though
+            # the trim had happened, and returned success=True.
+            #
+            # WHEN that equity order reaches the broker depends on which of two mutually
+            # exclusive branches it takes, and neither is safe:
+            #   * with a live protective leg, the close order is created WAITING_TRIGGER and the
+            #     only broker traffic in-call is the CANCEL of the option's real TP/SL. The
+            #     equity order goes out later, from TradeManager's trigger sweep -- so the
+            #     option is stripped of its legs now and mis-hedged afterwards, with the
+            #     replacement OCO armed on the underlying rather than on the contract.
+            #   * with no live leg there is nothing to cancel, and the equity order is submitted
+            #     straight out inside this call.
+            # The false success is the worst of it either way: every caller here branches on
+            # result["success"].
             #
             # This refuses with the method's own failure convention -- a result dict, never a
-            # raise -- because that IS its contract: it cannot raise today (the whole body is
-            # inside this try/except), and all four call sites index result["success"]
-            # directly, two of them from NiceGUI handlers with no exception boundary.
+            # raise -- because that IS its contract: all four call sites index
+            # result["success"] directly, and a raise could not reach any of them anyway, since
+            # the whole body sits inside this try, whose `except Exception` at the bottom
+            # flattens every raise into a generic "Error: ..." string that loses the reason.
+            # (Both NiceGUI callers DO wrap their own handler bodies in try/except, so a missing
+            # exception boundary is not the reason; what makes the dict right is that the
+            # method provably cannot raise.)
             #
             # Placed ahead of the qty_change == 0 early return on purpose. That return reports
             # success, and "success" is never the right answer for an instrument this method
@@ -749,7 +763,9 @@ class TransactionHelper:
                 result["message"] = (
                     f"Transaction {transaction.id} is an OPTION position (underlying "
                     f"{transaction.symbol}); adjust_quantity_with_tpsl builds an EQUITY order "
-                    f"and cannot resize an option structure. No order was created."
+                    f"and cannot resize an option structure. No order was created. There is no "
+                    f"option resize API: close the position with close_option_position() / the "
+                    f"close_option action, then reopen it at the size you want."
                 )
                 logger.error(f"adjust_quantity_with_tpsl: {result['message']}")
                 return result
