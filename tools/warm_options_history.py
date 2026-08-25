@@ -49,6 +49,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ba2_common.core.interfaces.OptionsDataProviderInterface import (  # noqa: E402
     OptionContractMeta,
 )
+from ba2_providers.options.tastytrade import StreamInterrupted  # noqa: E402
 from ba2_providers.options.parquet_store import (  # noqa: E402
     OptionHistoryParquetStore, PartitionState,
 )
@@ -404,6 +405,31 @@ def _fmt_bytes(n: int) -> str:
     return f"{x:.1f} TB"  # pragma: no cover
 
 
+def _is_transient(e: Exception) -> bool:
+    """A retryable network/rate-limit condition vs a permanent one (auth, scope, bad request)
+    that will fail identically on every attempt.
+
+    Mirrors ``fetch_options.py``'s ``_is_transient`` (the FMP-style retry contract already
+    proven elsewhere in this repo): a fixed, evidence-backed signature list rather than
+    "anything is retryable". Without this distinction, a dead credential burned through every
+    unit's full retry budget with backoff before giving up -- on the 2026-08-25 TastyTrade
+    403 ("Token has insufficient scopes for this request"), that would have meant
+    ``max_retries`` attempts x doubling backoff repeated on EVERY one of 825 symbols' worth of
+    units before the run finished failing, instead of once.
+    """
+    if isinstance(e, StreamInterrupted):
+        # The tool's own "the candle stream died mid-fetch" signal -- always transient
+        # regardless of wording; fetch_bars_detailed already tried to absorb it internally
+        # (see tastytrade.py), so one reaching here means the socket genuinely could not
+        # recover and a fresh subscription attempt is exactly the right response.
+        return True
+    s = repr(e)
+    return any(m in s for m in (
+        "RemoteDisconnected", "Connection aborted", "ConnectionError", "ConnectionResetError",
+        "timed out", "Timeout", "Max retries", "TooManyRequests", "429",
+        "502", "503", "504", "Temporarily", "rate limit", "Rate limit"))
+
+
 def run_units(plan: Plan, provider, store: OptionHistoryParquetStore,
               start: date, end: date, ns: argparse.Namespace, *,
               clock: Callable[[], datetime], sleep: Callable[[float], None],
@@ -424,7 +450,18 @@ def run_units(plan: Plan, provider, store: OptionHistoryParquetStore,
                 # Deliberate: propagate immediately. Everything already written is whole,
                 # and the unit in flight simply has no manifest, so it is redone.
                 raise
-            except Exception as e:  # noqa: BLE001 — any transport failure is retryable
+            except Exception as e:  # noqa: BLE001 — classified below; never silently swallowed
+                if not _is_transient(e):
+                    # Fail THIS unit at once -- retrying a permanent error (auth, scope,
+                    # malformed request) just burns the whole backoff schedule for an
+                    # identical result every time. The run itself keeps going (matches
+                    # test_a_failing_unit_does_not_abort_the_rest_of_the_run): a symbol-
+                    # specific permanent error must not be conflated with an account-wide
+                    # one, and if it IS account-wide (a dead token), every subsequent unit
+                    # fails just as fast rather than each paying the full retry cost too.
+                    log(f"  [{unit.underlying} {unit.expiry}] attempt {attempt} failed "
+                        f"(permanent, not retrying): {type(e).__name__}: {e}")
+                    break
                 log(f"  [{unit.underlying} {unit.expiry}] attempt {attempt} failed: "
                     f"{type(e).__name__}: {e}")
             else:
