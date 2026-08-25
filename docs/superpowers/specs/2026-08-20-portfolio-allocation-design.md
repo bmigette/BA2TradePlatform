@@ -540,3 +540,80 @@ per row.
 anywhere in `AlpacaAccount`; off-hours market orders simply queue until the open,
 at prices that may differ from the dry-run. The dry-run states this rather than
 blocking submission.
+
+---
+
+# UI refinements — 2026-08-25
+
+Requirements gathered from live use of the page. Recorded here because they arrived across
+several sessions and are easy to lose.
+
+## The governing rule: the investable pool is 100%
+
+**DECIDED.** Every primary percentage a user reads or types is a share of *what the reserve
+leaves*, so label targets sum to 100 across labels. The share-of-gross-base figure is
+secondary — shown parenthetically or in the tooltip, never as the headline.
+
+A label header therefore reads `tgt 15% (real 13.5%)`: what the user typed first, the derived
+of-base figure second and visibly marked as derived. When the reserve is 0 the two coincide and
+only one is shown.
+
+Consequences:
+- **Current, target, the delta, the bar fill and the notch all use the investable denominator.**
+  Mixing bases makes the delta a subtraction across two scales — meaningless arithmetic that
+  looks like a number.
+- **Current may exceed 100%.** A leveraged book genuinely holds more than the pool it is
+  measured against ($3,193.96 managed against $3,025.58 investable). The number stays honest
+  even where the drawn bar caps.
+- **The unallocated reserve row is the one exception** — it *is* the part held back, so
+  restating it against what it leaves would be circular. It stays on the gross base and says so.
+
+## Where things live
+
+**DECIDED: target-setting moves to the page; the modal becomes a commit gate.**
+
+The Allocate wizard's "Rebalance — set targets" step migrates onto the main page: the label
+target inputs, the symbol share inputs, the unallocated reserve, the per-row `last` target and
+P&L in % and $, and the button groups currently trapped in the wizard —
+`Even split` / `Load last` at label level, and `Even split` / `Fill rest` / `Load last` / `Wipe`
+per label.
+
+**Allocate becomes "Review and commit"**, containing only what commits: the resolved order list
+(side, quantity, estimated price and value), cost versus value, which instruments are leveraged,
+the precheck warnings, and one validate button. It stays MODAL — a commit gate for real orders
+should be a deliberate stop, not something reachable by scrolling.
+
+**The one execution control that stays in the modal is `allow fractional shares`**, because it
+changes which orders are produced rather than what is being aimed at. **Toggling it must
+recompute the plan.**
+
+Side benefit worth preserving: the page and the wizard currently derive the same figures
+independently. Collapsing to one source removes a class of "these two screens disagree" bug.
+
+## Per-label controls
+
+- **No auto-recalculation on a symbol-share edit.** Editing one symbol's share changes that
+  symbol only; no sibling's number may move. Its own target value still updates.
+- **`Fill 100%` per label**, with three cases: total < 100% with some empty → fill only the
+  empties; total > 100% → scale all down proportionally; total < 100% with none empty → scale
+  all up proportionally. Parts must sum to exactly 100 after rounding.
+- **Delta from actual** beside the target, in percentage points and dollars, with direction.
+
+## Presentation
+
+- **Label colour**: a visible swatch picker, not a list of colour names. The fixed Okabe & Ito
+  colour-universal-design palette stays as one-click presets (an arbitrary colour on a dark theme
+  is one you cannot read back), plus a custom `#rrggbb` input that **warns** below WCAG 1.4.11's
+  3:1 contrast rather than blocking. The renderer's whitelist must survive as a strict parse —
+  "render whatever the DB says" is a CSS injection.
+- **The label row's tag icon takes the label's colour**, resolved through the same helper as the
+  swatch and the bar, so the three cannot disagree.
+- **Tooltips**: legible size, wrapped to a max width. A multi-step derivation belongs in an
+  expander, not a hover.
+- **Summary cards**: equal height, wrapping rather than clipping at narrow widths.
+
+## Symbol info panel — pending
+
+An info icon per symbol opening a panel with ETF holdings, dividend yield and payout, total
+return (with dividends) YTD/1y/3y/5y, and a chart carrying value, dividends and cumulative
+return. Multi-select to compare. Data layer landed; the UI is outstanding.
