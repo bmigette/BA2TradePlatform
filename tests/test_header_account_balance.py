@@ -276,16 +276,55 @@ def test_all_accounts_sums_the_readable_balances():
     assert unreadable == []
 
 
-def test_one_unreadable_account_makes_the_total_unknown_not_smaller():
-    """THE rule. ``1000 + unknown`` is not ``1000``.
+def test_one_unreadable_account_makes_the_total_partial_and_names_it():
+    """THE rule, and it has been SHARPENED. ``1000 + unknown`` is not ``1000``.
 
-    Dropping the unreadable leg would print a confident, wrong, SMALLER total —
-    the unknown-reads-as-zero pattern this project has just removed 25 instances
-    of. The whole total goes unknown and names the account that failed.
+    What must never happen is the unreadable leg quietly vanishing, leaving a
+    confident, wrong, SMALLER total — the unknown-reads-as-zero pattern. This used
+    to be prevented by making the whole total unknown, on the grounds that a bare
+    badge has no room to explain itself.
+
+    It now has room: under "All" the badge carries a per-account BREAKDOWN, and
+    the total is marked ' (partial)' in its own TEXT (not only in the hover, per
+    the same rule as ' (stale)') and names the account it excludes. That is
+    strictly more information than a dash — the reader keeps the $1,000 they can
+    actually see in the breakdown — and it says the same thing, the same way, as
+    the 'Floating P/L Per Account' card's total.
+
+    A total with NOTHING readable is still unknown; see the test below.
     """
     value, unreadable = combine_account_values([('Alpaca', 1000.0), ('Tasty', None)])
-    assert value is None
+    assert value == pytest.approx(1000.0)
     assert unreadable == ['Tasty']
+
+
+def test_a_total_with_nothing_readable_at_all_is_unknown():
+    """There is no part to show, so there is no partial to mark."""
+    value, unreadable = combine_account_values([('Alpaca', None), ('Tasty', None)])
+    assert value is None
+    assert unreadable == ['Alpaca', 'Tasty']
+
+
+def test_a_partial_total_is_marked_in_the_text_and_explained_in_the_detail():
+    view = header_balance(value=1000.0, as_of=T0, now=T0, unreadable=['Tasty'])
+    assert view.text == '$1,000.00' + layout.HEADER_BALANCE_PARTIAL_SUFFIX
+    assert view.partial is True
+    assert view.available is True
+    assert 'Tasty' in view.detail
+
+
+def test_a_complete_total_is_not_marked_partial():
+    view = header_balance(value=1000.0, as_of=T0, now=T0)
+    assert view.text == '$1,000.00'
+    assert view.partial is False
+
+
+def test_a_partial_total_that_is_also_stale_says_both():
+    view = header_balance(value=1000.0, as_of=T0, unreadable=['Tasty'],
+                          now=T0 + timedelta(seconds=HEADER_BALANCE_STALE_AFTER_SECONDS + 1))
+    assert layout.HEADER_BALANCE_PARTIAL_SUFFIX in view.text
+    assert view.text.endswith(HEADER_BALANCE_STALE_SUFFIX)
+    assert view.partial is True and view.stale is True
 
 
 def test_a_total_made_only_of_genuine_zeroes_is_zero_not_unknown():
@@ -460,18 +499,50 @@ def test_one_broken_account_does_not_stop_the_others_being_read(monkeypatch):
     assert header_balance_from_cache([(2, 'B')], utcnow=clock).text == '$10.00'
 
 
-def test_under_all_a_single_dead_broker_makes_the_header_unknown(monkeypatch):
-    """End to end through the cache: 1000 + dead is a dash, not $1,000.00."""
+def test_under_all_a_single_dead_broker_makes_the_header_partial(monkeypatch):
+    """End to end through the cache: 1000 + dead is '$1,000.00 (partial)'.
+
+    Never a bare '$1,000.00' -- that is the whole point -- and the account that
+    failed is named where the reader can find it.
+    """
     clock = Clock()
     _use_brokers(monkeypatch, {1: _Broker(net_liquidation=1000.0),
                                2: _Broker(raises=RuntimeError('down'))})
     refresh_header_balance_cache([1, 2], utcnow=clock)
 
     view = header_balance_from_cache([(1, 'Alpaca'), (2, 'Tasty')], utcnow=clock)
+    assert view.partial is True
+    assert view.text == '$1,000.00' + layout.HEADER_BALANCE_PARTIAL_SUFFIX
+    assert 'Tasty' in view.detail
+
+
+def test_under_all_two_dead_brokers_leave_the_header_with_no_number_at_all(monkeypatch):
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _Broker(raises=RuntimeError('down')),
+                               2: _Broker(raises=RuntimeError('down'))})
+    refresh_header_balance_cache([1, 2], utcnow=clock)
+
+    view = header_balance_from_cache([(1, 'Alpaca'), (2, 'Tasty')], utcnow=clock)
     assert view.available is False
     assert view.text == HEADER_BALANCE_UNAVAILABLE_TEXT
-    assert '1,000' not in view.text
-    assert 'Tasty' in view.detail
+    assert 'Alpaca' in view.detail and 'Tasty' in view.detail
+
+
+def test_a_single_unreadable_account_is_still_a_dash_and_never_a_partial_zero(monkeypatch):
+    """The one-account case must be untouched by the partial rule.
+
+    With one leg there is no "part" to show: nothing was readable, so the badge is
+    a dash. '$0.00 (partial)' would be the unknown-reads-as-zero bug wearing a
+    caveat.
+    """
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _Broker(raises=RuntimeError('down'))})
+    refresh_header_balance_cache([1], utcnow=clock)
+
+    view = header_balance_from_cache([(1, 'Alpaca')], utcnow=clock)
+    assert view.text == HEADER_BALANCE_UNAVAILABLE_TEXT
+    assert view.partial is False
+    assert view.available is False
 
 
 def test_an_all_total_is_dated_by_its_OLDEST_leg(monkeypatch):
@@ -774,6 +845,197 @@ def test_the_refresh_updates_the_label_in_place(nicegui_client, monkeypatch):
     asyncio.run(_drive())
 
     assert '$42.00' in _texts(nicegui_client.layout)
+
+
+# ---------------------------------------------------------------------------
+# THE "ALL" BREAKDOWN
+#
+# Under "All" the badge is a single number standing for several accounts, and
+# there was no way to see what it was made of -- which of two accounts the
+# $3,200.68 belonged to, or whether one of them had failed to answer at all. The
+# badge stays compact; the parts live in a menu hanging off it.
+#
+# Same three states as the Floating P/L card (commit 9738cd61), said the same
+# way: a figure, a measured '$0.00', or '—' for could-not-read. A total missing
+# a leg is marked ' (partial)' and names what it excludes.
+# ---------------------------------------------------------------------------
+
+def _render_header(monkeypatch, nicegui_client, options, selected):
+    """Draw the whole layout with *options* in the dropdown and *selected* chosen."""
+    monkeypatch.setattr(layout, 'get_selected_account_id', lambda: selected)
+    monkeypatch.setattr(layout, 'get_accounts_for_filter', lambda: options)
+    from nicegui import ui
+    with nicegui_client:
+        with layout.layout_render('Test'):
+            ui.label('body')
+    return _texts(nicegui_client.layout)
+
+
+def _seed(monkeypatch, values):
+    """Put real, freshly-read values in the cache for ``{account_id: value}``.
+
+    The REAL clock, as ``test_the_header_renders_the_cached_balance`` explains:
+    seeding from the pinned 2019 clock would make every entry seven years old and
+    the header would correctly draw it stale. Staleness has its own tests.
+    """
+    _use_brokers(monkeypatch, {acc_id: _Broker(net_liquidation=v)
+                               for acc_id, v in values.items()})
+    refresh_header_balance_cache(list(values))
+
+
+TWO_ACCOUNTS = [('All', None), ('Alpaca (X)', 1), ('Tasty (Y)', 2)]
+
+
+def test_the_breakdown_lists_every_account_and_a_total(nicegui_client, monkeypatch):
+    """THE ASK. 'All' shows a single number; this is what it is made of."""
+    _seed(monkeypatch, {1: 1000.0, 2: 2200.68})
+
+    texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
+
+    assert 'Alpaca (X)' in texts
+    assert 'Tasty (Y)' in texts
+    assert '$1,000.00' in texts
+    assert '$2,200.68' in texts
+    assert layout.HEADER_BALANCE_TOTAL_LABEL in texts
+    assert texts.count('$3,200.68') == 2      # the badge, and the Total line
+
+
+def test_the_breakdown_lists_each_account_exactly_once(nicegui_client, monkeypatch):
+    """Double-counting a leg is invisible when the legs are equal -- so they are."""
+    _seed(monkeypatch, {1: 1000.0, 2: 1000.0})
+
+    texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
+
+    assert texts.count('Alpaca (X)') == 1
+    assert texts.count('Tasty (Y)') == 1
+    assert texts.count('$1,000.00') == 2      # one per account line, and no more
+    assert texts.count('$2,000.00') == 2      # the badge and the Total
+
+
+def test_no_account_is_dropped_from_the_breakdown(nicegui_client, monkeypatch):
+    """An account that never answered is still one of the accounts."""
+    _seed(monkeypatch, {1: 1000.0})           # account 2 was never read at all
+
+    texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
+
+    assert 'Tasty (Y)' in texts
+    assert HEADER_BALANCE_UNAVAILABLE_TEXT in texts
+    assert '$1,000.00' in texts               # the one that DID answer, kept
+
+
+def test_a_partial_total_is_marked_and_names_what_it_excludes(nicegui_client, monkeypatch):
+    _seed(monkeypatch, {1: 1000.0})
+
+    texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
+
+    assert f'$1,000.00{layout.HEADER_BALANCE_PARTIAL_SUFFIX}' in texts
+    assert any('Tasty (Y)' in t and 'partial' in t for t in texts), texts
+
+
+def test_a_single_selected_account_gets_no_breakdown(nicegui_client, monkeypatch):
+    """Unchanged behaviour: there is nothing to break a single account down into."""
+    _seed(monkeypatch, {1: 1000.0, 2: 2200.68})
+
+    texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, 1)
+
+    assert '$1,000.00' in texts
+    assert layout.HEADER_BALANCE_TOTAL_LABEL not in texts
+    assert '$2,200.68' not in texts
+    assert '$3,200.68' not in texts
+
+
+def test_the_breakdown_shows_a_genuinely_empty_account_as_zero(nicegui_client, monkeypatch):
+    """The inverse error: a withdrawn account is not an unreadable one."""
+    _seed(monkeypatch, {1: 1000.0, 2: 0.0})
+
+    texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
+
+    assert '$0.00' in texts
+    assert HEADER_BALANCE_UNAVAILABLE_TEXT not in texts
+    # The badge, the Alpaca leg, and the Total -- the zero leg adds nothing to it.
+    assert texts.count('$1,000.00') == 3
+    assert layout.HEADER_BALANCE_PARTIAL_SUFFIX not in ''.join(texts)
+
+
+def test_the_breakdown_repaints_when_the_refresh_lands(nicegui_client, monkeypatch):
+    """The menu is drawn from the cache like the badge, so it must repaint too.
+
+    A breakdown frozen at the empty pre-refresh state would show dashes forever
+    beside a badge that had updated.
+    """
+    _use_brokers(monkeypatch, {1: _Broker(net_liquidation=1000.0),
+                               2: _Broker(net_liquidation=2200.68)})
+    monkeypatch.setattr(layout, 'get_selected_account_id', lambda: None)
+    monkeypatch.setattr(layout, 'get_accounts_for_filter', lambda: TWO_ACCOUNTS)
+
+    from nicegui import ui
+    with nicegui_client:
+        with layout.layout_render('Test'):
+            ui.label('body')
+    assert '$2,200.68' not in _texts(nicegui_client.layout)
+
+    once = _first_refresh_timer(nicegui_client.layout)
+
+    async def _drive():
+        with nicegui_client:
+            await once.callback()
+
+    asyncio.run(_drive())
+
+    texts = _texts(nicegui_client.layout)
+    assert '$2,200.68' in texts
+    assert texts.count('$3,200.68') == 2
+    assert texts.count('Tasty (Y)') == 1, 'the repaint must replace the menu, not append'
+
+
+def test_a_breakdown_that_explodes_still_renders_the_page(nicegui_client, monkeypatch):
+    """Same contract as the badge: the header degrades, the app does not."""
+    _seed(monkeypatch, {1: 1000.0, 2: 2200.68})
+    monkeypatch.setattr(layout, 'header_balance_breakdown',
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError('bad lines')))
+
+    texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
+
+    assert 'body' in texts
+
+
+# --- the pure decision behind the breakdown -------------------------------
+
+def test_the_breakdown_reads_one_line_per_account_from_the_cache(monkeypatch):
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _Broker(net_liquidation=1000.0),
+                               2: _Broker(net_liquidation=2200.68)})
+    refresh_header_balance_cache([1, 2], utcnow=clock)
+
+    view = layout.header_balance_breakdown([(1, 'Alpaca'), (2, 'Tasty')], utcnow=clock)
+
+    assert [label for label, _ in view.lines] == ['Alpaca', 'Tasty']
+    assert [line.text for _, line in view.lines] == ['$1,000.00', '$2,200.68']
+    assert view.total.text == '$3,200.68'
+    assert view.total.available is True
+
+
+def test_a_breakdown_line_for_an_unread_account_is_a_dash_not_a_zero(monkeypatch):
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _Broker(net_liquidation=1000.0)})
+    refresh_header_balance_cache([1], utcnow=clock)
+
+    view = layout.header_balance_breakdown([(1, 'Alpaca'), (2, 'Tasty')], utcnow=clock)
+
+    unread = dict(view.lines)['Tasty']
+    assert unread.text == HEADER_BALANCE_UNAVAILABLE_TEXT
+    assert unread.available is False
+    assert 'Tasty' in unread.detail and 'not zero' in unread.detail
+
+
+def test_a_breakdown_line_that_is_genuinely_zero_is_available(monkeypatch):
+    clock = Clock()
+    _use_brokers(monkeypatch, {1: _Broker(net_liquidation=0.0)})
+    refresh_header_balance_cache([1], utcnow=clock)
+
+    line = dict(layout.header_balance_breakdown([(1, 'Alpaca')], utcnow=clock).lines)['Alpaca']
+    assert line.text == '$0.00'
+    assert line.available is True
 
 
 def test_selecting_all_reads_every_account_not_just_the_first(monkeypatch):

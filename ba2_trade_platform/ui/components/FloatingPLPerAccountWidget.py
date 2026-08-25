@@ -90,12 +90,11 @@ def combine_measurements(
     reader is told the total is partial and which account is missing from it, or --
     when nothing at all was readable -- there is no total to show.
 
-    This is deliberately more forgiving than ``layout.combine_account_values``,
-    which makes the header's single badge unknown the moment ANY leg fails. The
-    difference is the breakdown: this card draws every account immediately above
-    its total, so "which one is missing" is already on screen and discarding the
-    readable part would throw away information the reader can see is real. The
-    header badge has no such context, so it refuses to show a number at all.
+    ``layout.combine_account_values`` -- the header badge's total -- now says the
+    same thing by the same rule, and for the same reason: both surfaces show the
+    accounts they are totalling, so "which one is missing" is on screen and
+    discarding the readable part would throw away information the reader can see
+    is real. Two totals over the same accounts must not be able to disagree.
 
     Nothing is rounded here; the legs are summed at full precision and formatted
     once, by the caller.
