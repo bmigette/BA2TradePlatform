@@ -2,7 +2,7 @@
 Floating P/L Per Expert Widget
 Displays unrealized profit/loss for open positions grouped by expert.
 """
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from sqlmodel import select, Session
 from ...logger import logger
 from ...core.models import Transaction, ExpertInstance, TradingOrder
@@ -17,6 +17,22 @@ class FloatingPLPerExpertWidget(_FloatingPLWidgetBase):
     def _get_extra_filters(self) -> list:
         """Only include transactions that have an expert attribution."""
         return [Transaction.expert_id.isnot(None)]
+
+    def _scope_query(self, query, selected_account_id: Optional[int],
+                     account_expert_ids: Optional[List[int]]):
+        """Scope by EXPERT -- this widget really is per-expert.
+
+        An account with no experts has nothing to say here, and ``[]`` must mean
+        exactly that: NO ROWS. It must never widen to "all experts" (that would put
+        every other account's experts under this account's name) and must never
+        fall back to the account (that would make this widget a duplicate of
+        'Floating P/L Per Account').
+        """
+        if account_expert_ids is None:
+            return query
+        if not account_expert_ids:
+            return None
+        return query.where(Transaction.expert_id.in_(account_expert_ids))
 
     def _group_transactions(
         self, transactions: List[Transaction], session: Session

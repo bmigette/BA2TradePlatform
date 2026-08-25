@@ -110,7 +110,7 @@ __all__ = [
     "PNL_UNMEASURABLE_MARK", "PNL_NO_PRICE_MARK", "PNL_PCT_FMT", "PNL_NO_COST_NOTE",
     "PNL_UNPRICED_FMT", "PNL_FMT",
     "round_quantity", "round_delta_quantity", "even_split_pct",
-    "split_pct_across",
+    "split_pct_across", "scale_pct_to_total",
     "build_symbol_targets", "validate_symbol_weights", "validate_label_targets",
     "validate_unallocated_pct", "clamp_unallocated_pct",
     "investable_notional", "reserved_notional_for",
@@ -1299,6 +1299,52 @@ def split_pct_across(total_pct: float, count: int) -> List[float]:
     each = math.floor(total_pct / count * 100.0) / 100.0
     out = [each] * count
     out[-1] = round(total_pct - each * (count - 1), 2)
+    return out
+
+
+def scale_pct_to_total(values, total_pct: float = 100.0) -> List[float]:
+    """Scale a set of weights PROPORTIONALLY so they sum to ``total_pct``, exact to 2dp.
+
+    ``split_pct_across``'s sibling, and deliberately its sibling rather than its
+    rival: both floor every part to the cent and hand the WHOLE residual to ONE
+    slot, so the parts sum to the target exactly in decimal. What differs is the
+    shares -- even there, proportional here -- and for equal inputs the two return
+    the identical list at every count. That equivalence is pinned by a test, and it
+    is the reason this lives beside the splitter instead of being a fourth
+    two-decimal rounding rule written in the UI layer.
+
+    The residual goes to the LARGEST part, not to the last one. That is the single
+    deliberate divergence, and it is about zeros: a slot at 0 is a symbol the user
+    asked to hold NONE of, and the splitter's last-slot rule would hand it a cent
+    whenever it happened to sit last -- turning "sell this out" into a position. A
+    tie goes to the LAST of the tied slots, which is what makes the all-equal case
+    reproduce ``split_pct_across`` exactly.
+
+    Args:
+        values: the current weights, in display order. ``None`` reads as 0.0.
+        total_pct: what they must add up to afterwards. 100 for a symbol set.
+
+    Returns:
+        List[float]: one part per input, in the same order, summing to
+        ``total_pct`` exactly in decimal. ``[]`` for an empty input.
+
+        An ALL-ZERO input has no proportions to preserve, so it falls back to
+        ``split_pct_across`` -- the even split -- rather than raising or returning
+        zeros. That is what makes "every symbol is empty" reach the same numbers
+        whichever of the two helpers a caller routes it through.
+    """
+    parts = [float(v or 0.0) for v in (values or [])]
+    if not parts:
+        return []
+    total = sum(parts)
+    if total <= 0.0:
+        return split_pct_across(total_pct, len(parts))
+    out = [math.floor(p / total * total_pct * 100.0) / 100.0 for p in parts]
+    # max() returns the FIRST maximum; the residual belongs on the last of the tied
+    # slots so that an all-equal input lands on ``split_pct_across``'s answer.
+    best = max(out)
+    index = len(out) - 1 - out[::-1].index(best)
+    out[index] = round(total_pct - sum(out[:index]) - sum(out[index + 1:]), 2)
     return out
 
 

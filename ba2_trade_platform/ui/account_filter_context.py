@@ -30,6 +30,39 @@ _expert_ids_cache: Dict[str, Any] = {
 }
 
 
+def refresh_accounts_for_filter() -> Optional[List[Tuple[str, int]]]:
+    """
+    Re-read the accounts list from the database, BYPASSING the 60-second cache.
+
+    Callers use "this id is not in the list" to decide an account was deleted, and
+    the cached list can be up to a minute out of date -- an account created moments
+    ago is legitimately missing from it. So that decision needs a listing read now,
+    not a possibly-stale one.
+
+    Returns:
+        The fresh options (same shape as ``get_accounts_for_filter``), or ``None``
+        if the database could not be read. ``None`` is NOT an empty list on
+        purpose: "could not tell" and "there are no accounts" must not be the same
+        answer, or one failed query would look like every account was deleted.
+    """
+    global _accounts_cache
+
+    try:
+        accounts = get_all_instances(AccountDefinition)
+    except Exception as e:
+        logger.error(f"Error fetching accounts for filter: {e}", exc_info=True)
+        return None
+
+    options = [("All", None)]
+    for account in accounts:
+        label = f"{account.name} ({account.provider})"
+        options.append((label, account.id))
+
+    _accounts_cache['data'] = options
+    _accounts_cache['timestamp'] = time.time()
+    return options
+
+
 def get_accounts_for_filter() -> List[Tuple[str, int]]:
     """
     Get list of accounts for filter dropdown (cached for 60 seconds).
@@ -46,21 +79,15 @@ def get_accounts_for_filter() -> List[Tuple[str, int]]:
         current_time - _accounts_cache['timestamp'] < _accounts_cache['ttl']):
         return _accounts_cache['data']
 
-    options = [("All", None)]
+    options = refresh_accounts_for_filter()
+    if options is not None:
+        return options
 
-    try:
-        accounts = get_all_instances(AccountDefinition)
-        for account in accounts:
-            label = f"{account.name} ({account.provider})"
-            options.append((label, account.id))
-
-        # Update cache
-        _accounts_cache['data'] = options
-        _accounts_cache['timestamp'] = current_time
-    except Exception as e:
-        logger.error(f"Error fetching accounts for filter: {e}", exc_info=True)
-
-    return options
+    # The read failed. Serve the last listing we know was real rather than an
+    # empty dropdown: the alternative reads to callers as "every account is gone".
+    if _accounts_cache['data'] is not None:
+        return _accounts_cache['data']
+    return [("All", None)]
 
 
 # Process-wide mirror of the per-session selection. app.storage.user is per-session and ONLY

@@ -23,8 +23,16 @@ from ..components import ProfitPerExpertChart, InstrumentDistributionChart, Bala
 from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
 from ..components.FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
+from ..components.account_scope import scope_transactions_to_account
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from .llm_usage import LLMUsagePage
+
+# The Trade Performance widget's empty states. An account that has never traded must
+# say so IN WORDS: a row of '0' and '$0.00' is a MEASUREMENT -- it claims the account
+# traded and broke even -- and that is exactly how the expert-id filtering bug used to
+# present a manual account's real, non-empty book.
+NO_TRADES_FOR_ACCOUNT = 'No trades recorded for this account'
+NO_TRADES_AT_ALL = 'No trades recorded'
 
 class OverviewTab:
     def __init__(self, tabs_ref=None):
@@ -513,35 +521,59 @@ class OverviewTab:
                 accounts = all_accounts
             
             all_positions_raw = []
-            
+            unreachable = []   # accounts whose position book could NOT be read
+
             for acc in accounts:
                 try:
                     provider_obj = get_account_instance_from_id(acc.id)
-                    if provider_obj:
-                        # Run in thread to avoid blocking event loop
-                        positions = await asyncio.to_thread(provider_obj.get_positions)
-                        for pos in positions:
-                            pos_dict = pos if isinstance(pos, dict) else dict(pos)
-                            pos_dict['account'] = acc.name
-                            all_positions_raw.append(pos_dict)
+                    if not provider_obj:
+                        unreachable.append(acc.name)
+                        logger.error(f"Could not build an account instance for {acc.name}")
+                        continue
+
+                    # Run in thread to avoid blocking event loop
+                    positions = await asyncio.to_thread(provider_obj.get_positions)
+
+                    # TRI-STATE (see ReadOnlyAccountInterface.get_positions): None is a
+                    # FETCH FAILURE, [] is a genuinely flat account. Folding them
+                    # together drew 'No open positions found.' for a broker outage --
+                    # a measured-looking zero that says the account holds nothing.
+                    if positions is None:
+                        unreachable.append(acc.name)
+                        logger.error(f"get_positions() failed for account {acc.name}; "
+                                     f"excluding it from the distribution chart")
+                        continue
+
+                    for pos in positions:
+                        pos_dict = pos if isinstance(pos, dict) else dict(pos)
+                        pos_dict['account'] = acc.name
+                        all_positions_raw.append(pos_dict)
                 except Exception as e:
+                    unreachable.append(acc.name)
                     logger.error(f"Error fetching positions from account {acc.name}: {e}", exc_info=True)
-            
+
             # Clear loading message - check if client still exists
             try:
                 loading_label.delete()
             except RuntimeError:
                 # Client has been deleted (user navigated away), stop processing
                 return
-            
+
             # Render chart - check if client still exists
             try:
                 with chart_container:
-                    InstrumentDistributionChart(positions=all_positions_raw, grouping_field=grouping_field)
+                    if unreachable:
+                        ui.label(f"⚠️ Could not load positions for: {', '.join(unreachable)}") \
+                            .classes('text-sm text-orange-600')
+                    # Draw the chart for whatever DID come back. If nothing came back and
+                    # the reason was a failure, the warning above is the whole answer --
+                    # an empty pie would be a claim we cannot support.
+                    if all_positions_raw or not unreachable:
+                        InstrumentDistributionChart(positions=all_positions_raw, grouping_field=grouping_field)
             except RuntimeError:
                 # Client has been deleted (user navigated away), stop processing
                 return
-                
+
         except Exception as e:
             # Clear loading message and show error - check if client still exists
             try:
@@ -778,8 +810,13 @@ class OverviewTab:
         from ...core.types import TransactionStatus
         timer = PerfLogger.start(PerfLogger.COMPONENT, PerfLogger.LOAD, "TradePerformanceWidget")
         try:
+            # SCOPED BY ACCOUNT, NOT BY EXPERT. Open trades, closed trades and P&L all
+            # belong to the ACCOUNT; the expert is just who happened to place them (and
+            # for a manual account, nobody did). Routing this through
+            # get_expert_ids_for_account meant an account with no ExpertInstance rows
+            # got an empty id list, matched no transactions, and rendered zeros over a
+            # real book. See ui/components/account_scope.py.
             selected_account_id = get_selected_account_id()
-            expert_ids = get_expert_ids_for_account(selected_account_id)
 
             now = datetime.now()
             d7 = now - timedelta(days=7)
@@ -788,35 +825,25 @@ class OverviewTab:
             d60 = now - timedelta(days=60)
 
             with get_db() as session:
-                def base_query():
-                    query = select(Transaction)
-                    if expert_ids is not None:
-                        if expert_ids:
-                            query = query.where(Transaction.expert_id.in_(expert_ids))
-                        else:
-                            return None
-                    return query
+                def scoped(query):
+                    return scope_transactions_to_account(query, selected_account_id)
 
-                def count_query(status):
-                    query = select(func.count(Transaction.id)).where(Transaction.status == status)
-                    if expert_ids is not None:
-                        if expert_ids:
-                            query = query.where(Transaction.expert_id.in_(expert_ids))
-                        else:
-                            return None
-                    return query
+                # Does this account have ANY transaction at all? Distinguishes "nothing
+                # has ever happened here" (render words) from "nothing happened in the
+                # last 30 days" (render the real, measured zeros).
+                total_count = session.exec(
+                    scoped(select(func.count(Transaction.id)))
+                ).first() or 0
 
                 # Open trade count
-                q = count_query(TransactionStatus.OPENED)
-                open_count = session.exec(q).first() if q is not None else 0
-                open_count = open_count or 0
+                open_count = session.exec(scoped(
+                    select(func.count(Transaction.id))
+                    .where(Transaction.status == TransactionStatus.OPENED)
+                )).first() or 0
 
                 # Closed trades in different periods
                 def get_closed_in_range(start, end):
-                    q = base_query()
-                    if q is None:
-                        return []
-                    q = q.where(
+                    q = scoped(select(Transaction)).where(
                         Transaction.status == TransactionStatus.CLOSED,
                         Transaction.close_date.isnot(None),
                         Transaction.close_date >= start,
@@ -853,6 +880,18 @@ class OverviewTab:
             try:
                 loading_label.delete()
             except RuntimeError:
+                return
+
+            if total_count == 0:
+                # Say it, don't imply it with zeros. See NO_TRADES_FOR_ACCOUNT.
+                try:
+                    with content_container:
+                        ui.label(
+                            NO_TRADES_FOR_ACCOUNT if selected_account_id is not None
+                            else NO_TRADES_AT_ALL
+                        ).classes('text-sm text-gray-500')
+                except RuntimeError:
+                    pass
                 return
 
             def render_pnl_comparison(label, current_pnl, prev_pnl):
