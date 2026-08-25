@@ -102,16 +102,19 @@ from ...core.portfolio_allocation_store import (
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
 from ..utils.portfolio_allocation_view import (
-    DEFAULT_MACHINE_LABEL_FAMILIES, GATE_NO_ACCOUNT, LABEL_STATUS_CLASSES,
-    LABEL_TOTAL_NOTICE_CLASSES, MARKET_SOURCE_UNAVAILABLE, NO_LABEL_COLOR,
+    BASIS_LEGEND, DEFAULT_MACHINE_LABEL_FAMILIES, GATE_NO_ACCOUNT,
+    LABEL_COLOR_PALETTE, LABEL_STATUS_CLASSES, LABEL_TARGET_CAPTION,
+    LABEL_TOOLTIP_STYLE, LABEL_TOTAL_NOTICE_CLASSES, MARKET_SOURCE_UNAVAILABLE,
+    NO_LABEL_COLOR, RESERVE_BASIS_NOTE,
     GateResult, ManagedLabel,
     PositionFetchFailed, account_value_card, account_value_from_snapshot,
     build_label_bars, build_label_views,
     collect_managed_symbols, diff_managed_labels,
     evaluate_gate, evaluate_market_gate, expert_shortname_families,
-    format_allocation_footer, format_label_header, format_label_target_tooltip,
+    fill_label_to_100, format_allocation_footer, format_label_header,
+    format_label_target_tooltip,
     format_label_total_notice, format_reserve_caption,
-    format_reserve_row, label_color_options, managed_total_value,
+    format_reserve_row, label_color_contrast_warning, managed_total_value,
     missing_quote_symbols, picker_options, positions_by_symbol,
     resolve_label_icon_color, sort_label_views, store_color_value,
     symbol_target_values,
@@ -565,6 +568,19 @@ MARKER_BAR_NOTCH = 'pf-bar-notch'
 #: The whole label header row, so a test can assert on the row rather than on a
 #: count of everything that happens to share a style.
 MARKER_BAR_ROW = 'pf-bar-row'
+#: The tag icon LEFT OF THE LABEL NAME. Marked because it is one ``ui.icon`` among
+#: several on the row and its whole content is an inline colour -- and because the
+#: user's complaint was precisely that it disagreed with the bar beside it.
+MARKER_LABEL_ICON = 'pf-label-icon'
+#: One preset colour chip. Bare divs whose entire content is a background colour.
+MARKER_COLOR_SWATCH = 'pf-color-swatch'
+#: The "no colour" chip, which is NOT a colour and therefore not one of the above.
+MARKER_COLOR_CLEAR = 'pf-color-clear'
+#: The custom-colour input.
+MARKER_COLOR_CUSTOM = 'pf-color-custom'
+#: The summary stat-card row, and the reserve card that no longer sits inside it.
+MARKER_SUMMARY_ROW = 'pf-summary-row'
+MARKER_RESERVE_CARD = 'pf-reserve-card'
 
 #: The mini-bar track. Height and radius only -- the FILL's colour comes from the
 #: label's own palette entry, which is what makes the bars tell labels apart.
@@ -574,6 +590,16 @@ BAR_TRACK_STYLE = ('position:relative;height:10px;border-radius:3px;'
 #: it has to read against every fill colour, including the pale yellow.
 BAR_NOTCH_STYLE = ('position:absolute;top:-3px;bottom:-3px;width:2px;'
                    'background:#FFFFFF;opacity:0.85;')
+
+#: One preset colour chip. A circle of the colour ITSELF -- "Make a color picker
+#: then": naming a colour is not showing it, and "Bluish green" beside "Vermillion"
+#: told the user nothing about what either would look like.
+COLOR_SWATCH_STYLE = ('width:20px;height:20px;border-radius:50%;cursor:pointer;'
+                      'border:1px solid rgba(255,255,255,0.35);')
+#: Quasar debounce (ms) on the custom-colour input. A colour picker emits a model
+#: value on every pixel of a drag; without this each one is a SELECT + UPDATE +
+#: commit on the event loop.
+COLOR_DEBOUNCE_MS = 400
 
 
 def _new_live_state(*, base_notional: Optional[float] = None,
@@ -623,10 +649,13 @@ def _label_targets(live: Dict[str, Any]) -> Dict[str, float]:
 def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
     """Rewrite one label's Share-of-label % and Target value cells. In place.
 
-    Every row, not just the edited one: ``get_symbol_weights`` fills the symbols
-    with no stored row from an even split of whatever is left of 100, so storing a
-    weight for ONE symbol changes what its siblings resolve to. Showing them their
-    old numbers is how the table stops matching the database.
+    It walks every row, and after the no-recalc change that is not the same thing as
+    MOVING every row. The cells are written from ``live['weights'][label]``, and an
+    accepted symbol edit now mutates exactly the one key it edited -- so a sibling's
+    cell is rewritten with the number it already had. What still legitimately moves
+    all of them is a LABEL TARGET or the RESERVE, which re-bases every row's money;
+    those two come through here as well, and that is why the loop is over the set
+    rather than over the edited symbol.
     """
     table = live['tables'].get(label)
     if table is None:
@@ -663,6 +692,14 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         widgets['fill'].style(replace=(
             f'position:absolute;left:0;top:0;bottom:0;border-radius:3px;'
             f'width:{bar.bar_fraction * 100.0:.2f}%;background:{bar.color};'))
+        # The tag icon is retinted HERE, in the same loop and from the same
+        # ``bar.color``, rather than at render time from ``view.color``. That is
+        # what makes "the label icon left to the title" and the bar incapable of
+        # disagreeing: there is one value and one writer, so a recolour cannot
+        # reach one of them and miss the other.
+        icon = widgets.get('icon')
+        if icon is not None:
+            icon.style(replace=f'color: {bar.color}')
         if bar.notch_fraction is None:
             widgets['notch'].set_visibility(False)
         else:
@@ -670,21 +707,24 @@ def _apply_bars(live: Dict[str, Any]) -> None:
             widgets['notch'].style(
                 replace=BAR_NOTCH_STYLE + f'left:{bar.notch_fraction * 100.0:.2f}%;')
         widgets['value'].set_text(f'${bar.current_value:,.2f}')
-        widgets['pct'].set_text(f'{bar.current_pct:.1f}%')
-        widgets['target'].set_text(f'tgt {bar.target_pct:.1f}%')
-        widgets['status'].set_text(bar.status)
-        widgets['status'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+        # Every string below is the PURE layer's, not this module's: the
+        # denominator rule, the "(real N%)" parenthetical and the over/under
+        # sentence are decisions, and decisions do not live in the renderer.
+        widgets['pct'].set_text(bar.current_text)
+        widgets['target'].set_text(bar.target_text)
+        widgets['delta'].set_text(bar.delta_text)
+        widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
         widgets['tooltip'].set_text(format_label_target_tooltip(
-            target_pct=bar.raw_target_pct, base_notional=live['base_notional'],
+            target_pct=bar.target_pct, base_notional=live['base_notional'],
             unallocated_pct=live['unallocated_pct']))
         for element in live['captions'].get(bar.label, []):
             element.set_text(format_label_header(
                 label=bar.label,
                 current_value=live['view_by_label'][bar.label].current_value,
-                target_pct=bar.raw_target_pct,
-                pct_of_base=live['view_by_label'][bar.label].pct_of_base,
+                target_pct=bar.target_pct,
+                pct_of_investable=bar.current_pct,
                 pct_of_total=live['view_by_label'][bar.label].pct_of_total,
-                base_notional=live['base_notional'],
+                delta_text=bar.delta_text,
                 unallocated_pct=live['unallocated_pct']))
 
 
@@ -779,54 +819,114 @@ def _restore_value(widget, value) -> None:
         widget.set_value(value)
 
 
-def _write_symbol_weight(account_id: int, label: str, symbol: str, weight_pct: float,
-                         label_symbols: List[str]):
-    """Persist ONE symbol's target weight and read the label's map back. Blocking.
+def _write_symbol_weight(account_id: int, label: str, symbol: str,
+                         weight_pct: float) -> bool:
+    """Persist ONE symbol's target weight. Blocking; False when it is STALE.
 
-    Returns ``None`` -- a refusal, not an empty result -- when the label is no
-    longer managed. A page rendered before the label was unmanaged (in the picker,
-    in another tab, by an account switch) still has its table on screen, and
-    ``set_symbol_weight`` creates rows unconditionally, so typing in it would leave
-    an orphan allocation row under a label the account does not manage. Same guard,
-    same reason, as ``_write_label_comment``.
+    Returns False -- a refusal -- when the label is no longer managed. A page
+    rendered before the label was unmanaged (in the picker, in another tab, by an
+    account switch) still has its table on screen, and ``set_symbol_weight`` creates
+    rows unconditionally, so typing in it would leave an orphan allocation row under
+    a label the account does not manage. Same guard, same reason, as
+    ``_write_label_comment``.
 
-    The map is re-read rather than patched locally because writing one row changes
-    what the UNSTORED siblings resolve to: ``get_symbol_weights`` shares whatever is
-    left of 100 among them. One reader, so the table and the engine cannot disagree.
+    It NO LONGER READS THE LABEL'S MAP BACK, and that is the whole of the no-recalc
+    change. ``get_symbol_weights`` shares whatever is left of 100 among the symbols
+    with no stored row, so re-reading it after a write moved every sibling on screen
+    -- the user edited one number and the rest of the row rearranged itself. The
+    caller now patches the one key it changed and the siblings keep the values they
+    are showing. "Fill 100%" is the deliberate way to put the set back to 100.
 
     ``comment`` is deliberately NOT passed: ``None`` leaves it alone, and a ``''``
     here would wipe the symbol's note on every accepted keystroke.
     """
     if label not in {row.label for row in get_managed_labels(account_id)}:
-        return None
+        return False
     set_symbol_weight(account_id, label, symbol, weight_pct=float(weight_pct))
-    return get_symbol_weights(account_id, label, label_symbols)
+    return True
 
 
 async def _save_symbol_weight(account_id: int, live: Dict[str, Any], label: str,
                               symbol: str, raw, label_symbols: List[str]) -> None:
-    """One TARGET % cell. Validate, persist, then redraw the label's rows."""
+    """One TARGET % cell. Validate, persist, then redraw THIS SYMBOL's figures.
+
+    ``label_symbols`` is kept in the signature although the write no longer needs
+    it: the table's event wiring passes it, and it is what the caller would need
+    again the moment anything here has to reason about the label's whole set.
+    """
     edit = validate_symbol_weight_edit(label=label, symbol=symbol, raw=raw)
     if not edit.accepted:
         ui.notify(edit.message, type='warning')
         _revert_symbol_cell(live, label, symbol)
         return
     try:
-        weights = await asyncio.to_thread(_write_symbol_weight, account_id, label,
-                                          symbol, edit.value, label_symbols)
+        saved = await asyncio.to_thread(_write_symbol_weight, account_id, label,
+                                        symbol, edit.value)
     except Exception as e:
         logger.error(f"Saving target for {label}/{symbol} failed: {e}", exc_info=True)
         ui.notify(f'Could not save target: {e}', type='negative')
         _revert_symbol_cell(live, label, symbol)
         return
-    if weights is None:
+    if not saved:
         logger.warning(f"Target for '{label}'/{symbol} ignored: the label is no longer "
                        f"managed by account {account_id}")
         ui.notify(f"'{label}' is no longer managed — refresh the page", type='warning')
         _revert_symbol_cell(live, label, symbol)
         return
-    live['weights'][label] = weights
+    # ONE key. The live map is the page's only record of what the row is showing,
+    # and it is also what "Fill 100%" reads -- so patching exactly the edited symbol
+    # is both "do not change other numbers" and the guarantee that the button sees
+    # the set the user is actually looking at.
+    live['weights'].setdefault(label, {})[symbol] = float(edit.value)
     _apply_symbol_figures(live, label)
+
+
+def _write_symbol_weights(account_id: int, label: str, weights) -> bool:
+    """Persist a whole label's symbol weights. Blocking; False when it is STALE.
+
+    The "Fill 100%" writer, guarded exactly as ``_write_symbol_weight`` is and for
+    the same reason. It writes EVERY symbol in the map rather than only the ones
+    whose value changed: a fill's whole promise is that the stored set totals 100,
+    and leaving a symbol un-stored would leave it resolving to the even-split default
+    again -- which is the recalculation this feature exists to remove.
+    """
+    if label not in {row.label for row in get_managed_labels(account_id)}:
+        return False
+    for symbol, pct in (weights or {}).items():
+        set_symbol_weight(account_id, label, symbol, weight_pct=float(pct))
+    return True
+
+
+async def _fill_label_to_100(account_id: int, live: Dict[str, Any],
+                             label: str) -> None:
+    """The per-label "Fill 100%" button. Every decision is in the pure layer.
+
+    Reads ``live['weights'][label]`` -- the same map ``_save_symbol_weight`` patches
+    one key of -- and never the store. That is what makes the button and the
+    no-recalc rule agree about which symbols are empty: they are looking at the same
+    numbers the user is.
+    """
+    result = fill_label_to_100(label, live['weights'].get(label) or {})
+    if not result.changed:
+        # Said out loud. A button that does nothing when pressed is
+        # indistinguishable from a broken one.
+        ui.notify(result.message, type='info')
+        return
+    try:
+        saved = await asyncio.to_thread(_write_symbol_weights, account_id, label,
+                                        result.weights)
+    except Exception as e:
+        logger.error(f"Filling '{label}' to 100% failed: {e}", exc_info=True)
+        ui.notify(f'Could not save: {e}', type='negative')
+        return
+    if not saved:
+        logger.warning(f"Fill 100% for '{label}' ignored: the label is no longer "
+                       f"managed by account {account_id}")
+        ui.notify(f"'{label}' is no longer managed — refresh the page", type='warning')
+        return
+    live['weights'][label] = dict(result.weights)
+    _apply_symbol_figures(live, label)
+    ui.notify(result.message, type='positive')
 
 
 def _write_label_target(account_id: int, label: str, target_pct: float) -> bool:
@@ -1109,10 +1209,33 @@ def _write_label_color(account_id: int, label: str, value: str) -> bool:
     return True
 
 
-async def _save_label_color(account_id: int, label: str, value: str, swatch) -> None:
-    """Colour-picker handler: persist, then retint the swatch beside the row."""
+async def _save_label_color(account_id: int, label: str, value: str,
+                            on_saved=None) -> None:
+    """THE colour writer. One of them, for the dialog and for the label row alike.
+
+    ``on_saved`` is handed ``(resolved_hex, stored_value)`` -- never the raw widget
+    value. The first is ``resolve_label_icon_color``'s answer, i.e. exactly what the
+    next render will draw, so a swatch cannot start lying the moment it is clicked.
+    The second is what went into the database (``''`` for no colour), which is the
+    only thing that distinguishes "cleared" from "the user chose a grey that happens
+    to equal the fallback".
+
+    Three things happen in order and the order matters. The value is PARSED first,
+    so a string that is not a colour is refused with a message instead of raising
+    inside a worker thread. It is then written. Only then is its CONTRAST reported,
+    as a warning rather than a refusal: the user read the palette argument and asked
+    for a picker anyway, and it is their UI.
+    """
     try:
-        saved = await asyncio.to_thread(_write_label_color, account_id, label, value)
+        normalised = store_color_value(value)
+    except ValueError as e:
+        # The parse refusal, and the only one. This is the guard that keeps a CSS
+        # ``style`` attribute from being handed something that is not a colour.
+        ui.notify(str(e), type='warning')
+        return
+    try:
+        saved = await asyncio.to_thread(_write_label_color, account_id, label,
+                                        normalised)
     except Exception as e:
         logger.error(f"Saving the colour for label '{label}' failed: {e}", exc_info=True)
         ui.notify(f'Could not save the colour: {e}', type='negative')
@@ -1122,8 +1245,57 @@ async def _save_label_color(account_id: int, label: str, value: str, swatch) -> 
                        f"by account {account_id}")
         ui.notify(f"'{label}' is no longer managed — refresh the page", type='warning')
         return
-    if swatch is not None:
-        swatch.style(replace=f'color: {resolve_label_icon_color(value)}')
+    warning = label_color_contrast_warning(normalised)
+    if warning:
+        ui.notify(warning, type='warning')
+    if on_saved is not None:
+        on_saved(resolve_label_icon_color(normalised), normalised)
+
+
+def _render_color_choices(account_id: int, label: str, current, on_saved) -> None:
+    """The colour chooser: seven preset SWATCHES, a clear, and a custom picker.
+
+    Drawn by BOTH the Manage-labels dialog and the tag icon on the label row, which
+    is the point -- "the colour picker already exists in Manage labels, the user
+    simply could not find it" was answered by making it reachable from the row, not
+    by building a second one. Everything here funnels into ``_save_label_color``.
+
+    SWATCHES, not names. The old control was a ``ui.select`` of "Orange" / "Sky
+    blue" / "Bluish green" / "Vermillion", and you cannot see what any of those look
+    like -- which was the actual complaint behind "Make a color picker then". The
+    seven are still the Okabe & Ito colour-universal-design set and the reasoning is
+    still shown; they are now one-click presets above a real colour input rather
+    than the only option.
+    """
+    with ui.column().classes('gap-2 p-2'):
+        ui.label('Label colour').classes('text-xs text-secondary-custom')
+        with ui.row().classes('items-center gap-2 no-wrap'):
+            for name, hex_value in LABEL_COLOR_PALETTE:
+                # ``hx=hex_value`` on the handler: without the default-argument
+                # capture every chip would save the last colour in the tuple.
+                ui.element('div').mark(MARKER_COLOR_SWATCH).style(
+                    COLOR_SWATCH_STYLE + f'background:{resolve_label_icon_color(hex_value)};'
+                ).tooltip(name).on(
+                    'click.stop',
+                    lambda _e=None, hx=hex_value: _save_label_color(
+                        account_id, label, hx, on_saved))
+            # The way BACK. A palette with no exit means a colour, once set, can
+            # never be removed -- and "no colour" is a different fact from black.
+            ui.icon('format_color_reset').mark(MARKER_COLOR_CLEAR).classes(
+                'cursor-pointer text-secondary-custom').tooltip('No colour').on(
+                'click.stop',
+                lambda _e=None: _save_label_color(account_id, label,
+                                                  NO_LABEL_COLOR, on_saved))
+        ui.color_input(
+            label='Custom', value=(current or ''), preview=True,
+            on_change=lambda e: _save_label_color(account_id, label, e.value, on_saved)
+        ).props(f'dense outlined debounce={COLOR_DEBOUNCE_MS}') \
+            .classes('w-44').mark(MARKER_COLOR_CUSTOM)
+        ui.label('The seven presets are Okabe & Ito’s colour-universal-design set — '
+                 'chosen to stay distinguishable under the common forms of colour '
+                 'blindness and to stay readable on this dark surface. A custom '
+                 'colour is accepted; one that is hard to see is flagged, not '
+                 'refused.').classes('text-xs text-secondary-custom max-w-[22rem]')
 
 
 async def _persist_managed_labels(account_id: int, current: List[str],
@@ -1202,10 +1374,8 @@ def _open_label_picker(account_id: int, refresh) -> None:
 
         if current:
             ui.label('Colours').classes('text-sm font-bold mt-3')
-            ui.label('A fixed palette, not a free picker: this UI is dark-themed, so '
-                     'an arbitrary colour is one you cannot read back. These seven '
-                     'are Okabe & Ito’s colour-universal-design set — chosen to stay '
-                     'distinguishable to the common forms of colour blindness.'
+            ui.label('The same chooser sits on the tag icon of every label row, so '
+                     'it no longer has to be found in here.'
                      ).classes('text-xs text-secondary-custom')
         for label in current:
             with ui.row().classes('w-full items-center gap-2'):
@@ -1214,11 +1384,13 @@ def _open_label_picker(account_id: int, refresh) -> None:
                 swatch = ui.icon('label').style(
                     f'color: {resolve_label_icon_color(colors.get(label))}')
                 ui.label(label).classes('flex-grow truncate')
-                ui.select(label_color_options(),
-                          value=(colors.get(label) or NO_LABEL_COLOR),
-                          on_change=lambda e, lbl=label, sw=swatch: _save_label_color(
-                              account_id, lbl, e.value, sw)
-                          ).props('dense outlined').classes('w-44')
+                # ONE chooser, shared with the label row. ``resolve_label_icon_color``
+                # is the only thing that answers "what colour is this label", here
+                # and on the row and in the bar.
+                _render_color_choices(
+                    account_id, label, colors.get(label),
+                    lambda hexed, stored, sw=swatch: sw.style(
+                        replace=f'color: {hexed}'))
 
         async def _close() -> None:
             dialog.close()
@@ -1278,11 +1450,10 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                   on_click=lambda lbl=view.label: _open_add_symbol_dialog(account_id, lbl, refresh)
                   ).props('outline dense')
     # The sentence that resolves the collision the user tripped over: the box above
-    # is a share of the PORTFOLIO, the column below is a share of THIS LABEL.
-    ui.label('This label’s share of the whole portfolio. The “Share of label %” '
-             'column below divides THIS label’s money between its symbols — a '
-             'different denominator, which is why the two can read 0 and 20 at the '
-             'same time and both be right.').classes('text-xs text-secondary-custom')
+    # is a share of the INVESTABLE POOL, the column below is a share of THIS LABEL.
+    # Its first half used to say "of the whole portfolio", which is false whenever a
+    # reserve is set -- and the row beside it said so, which is how it was caught.
+    ui.label(LABEL_TARGET_CAPTION).classes('text-xs text-secondary-custom')
 
     rows = [{
         'flag': '⚠' if r.multi_label else '',
@@ -1385,7 +1556,18 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         ui.notify(f"Removed {removed} symbol(s) from '{view.label}'", type='positive')
         await refresh()
 
-    with ui.row().classes('w-full justify-end'):
+    # A GROUP, drawn as one even though it holds a single button today. The wizard's
+    # step 2 carries "Even split", "Fill rest", "Load last" and "Wipe" over the same
+    # weights, and that step is moving onto this page next; a row with room for five
+    # siblings is the difference between adding them and re-laying this out.
+    with ui.row().classes('w-full items-center gap-2 mt-2'):
+        ui.button('Fill 100%', icon='functions',
+                  on_click=lambda lbl=view.label: _fill_label_to_100(
+                      account_id, live, lbl)
+                  ).props('outline dense') \
+            .tooltip('Make these shares total 100%: fill the empty ones if there '
+                     'are any, otherwise scale them all proportionally.')
+        ui.space()
         ui.button('Remove selected from label', icon='delete', on_click=_remove_selected
                   ).props('outline color=negative dense')
 
@@ -1405,7 +1587,7 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
     value it was GIVEN, so setting 12.34 on it from the box cannot snap the stored
     figure back to 12.
     """
-    with ui.column().classes('stat-card p-3'):
+    with ui.column().classes('stat-card p-3 w-full').mark(MARKER_RESERVE_CARD):
         ui.label('Unallocated reserve').classes('text-xs text-secondary-custom')
         with ui.row().classes('items-center gap-3 no-wrap'):
             slider = ui.slider(min=0, max=100, step=1,
@@ -1422,6 +1604,24 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
         live['reserve_caption'] = ui.label(
             format_reserve_caption(live['base_notional'], live['unallocated_pct'])
         ).classes('text-xs text-secondary-custom').style(TABULAR_NUMS)
+
+
+def _recolour_label(live: Dict[str, Any], label: str, stored: str) -> None:
+    """A colour was saved from the label row: put it in the registry and redraw.
+
+    It writes ``LabelView.color`` -- the STORED value, so ``''`` becomes the ``None``
+    that means "no colour chosen" -- and then lets ``_apply_bars`` do the painting,
+    rather than restyling the icon here. That is deliberate: the icon and the bar
+    fill are both written from ``LabelBar.color`` inside that one loop, so routing
+    through the redraw is what makes it IMPOSSIBLE for the two to end up different.
+    That is the exact defect being fixed ("make the label icon left to the title
+    same colour as the bar").
+    """
+    view = live['view_by_label'].get(label)
+    if view is None:
+        return
+    view.color = stored or None
+    _apply_bars(live)
 
 
 def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) -> None:
@@ -1442,7 +1642,26 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
     with expansion.add_slot('header'):
         with ui.row().classes('w-full items-center gap-3 no-wrap') \
                 .style(TABULAR_NUMS).mark(MARKER_BAR_ROW):
-            ui.icon('label').style(f'color: {resolve_label_icon_color(view.color)}')
+            # THE tag icon, drawn UNCOLOURED. ``_apply_bars`` paints it from
+            # ``bar.color``, in the same loop and from the same value as the fill
+            # below -- the two used to be set in different places and the user
+            # watched a yellow bar sit beside a grey icon. Tinting it here as well
+            # would put the rule in two places, and the second copy would be
+            # unfalsifiable: the redraw at the end of ``_render_labels`` overwrites
+            # it before anything can read it, so a wrong colour here is invisible.
+            # ONE WRITER, and it is the loop.
+            #
+            # The icon is also the way IN to the colour chooser: clicking it opens
+            # the same widget the Manage-labels dialog draws, which is the smallest
+            # thing that makes the feature findable.
+            with ui.icon('label').mark(MARKER_LABEL_ICON) \
+                    .classes('cursor-pointer') as icon:
+                with ui.menu().props('auto-close'):
+                    _render_color_choices(
+                        account_id, view.label, view.color,
+                        lambda hexed, stored, lbl=view.label: _recolour_label(
+                        live, lbl, stored))
+            widgets['icon'] = icon
             ui.label(view.label).classes('w-48 truncate font-medium')
             widgets['value'] = ui.label('').classes('w-28 text-right')
             with ui.element('div').classes('flex-grow min-w-[80px]').style(BAR_TRACK_STYLE):
@@ -1452,8 +1671,12 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                 widgets['fill'] = ui.element('div').mark(MARKER_BAR_FILL)
                 widgets['notch'] = ui.element('div').mark(MARKER_BAR_NOTCH)
             widgets['pct'] = ui.label('').classes('w-16 text-right')
-            widgets['target'] = ui.label('').classes('w-24 text-right')
-            widgets['status'] = ui.label('').classes('w-14')
+            widgets['target'] = ui.label('').classes('w-36 text-right')
+            # THE number that says what to do. It replaced the bare status word --
+            # "over" beside a bar already sitting past its notch said nothing the
+            # geometry had not -- and it keeps that word's COLOUR, so the row still
+            # scans at a glance without printing the same fact three times.
+            widgets['delta'] = ui.label('').classes('w-52')
             # The pencil. It OPENS the label and focuses its target box; it never
             # closes one, because "edit this" is not a toggle.
             ui.icon('edit').classes('cursor-pointer text-secondary-custom') \
@@ -1465,7 +1688,11 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # again would add a second tooltip element, and by the tenth keystroke
             # there would be ten of them stacked on one icon.
             with ui.icon('info_outline').classes('text-secondary-custom') as info:
-                widgets['tooltip'] = ui.tooltip('')
+                # ``LABEL_TOOLTIP_STYLE`` is the expert cards' own
+                # ``DETAIL_TOOLTIP_STYLE`` plus a legible size: "The info text is too
+                # small", and a tooltip is HTML, so without the max-width the
+                # sentence renders as one line wider than the viewport.
+                widgets['tooltip'] = ui.tooltip('').style(LABEL_TOOLTIP_STYLE)
             widgets['info'] = info
     # The expansion's own ``label`` prop is kept in step with the header slot: it is
     # what a screen reader and a collapsed-state tooltip read, and it is the one
@@ -1501,8 +1728,21 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # draws three labels.
     value_card = account_value_card(account_value=payload['account_value'],
                                     managed_value=total)
-    with ui.row().classes('w-full gap-4 items-start'):
-        with ui.column().classes('stat-card p-3'):
+    # FOUR read-only cards, EQUAL HEIGHT, and they WRAP.
+    #
+    # ``items-stretch`` rather than ``items-start``: the account-value card carries a
+    # leverage caption and the reserve card carried a slider, so the row rendered as
+    # a ragged set of different-height boxes rather than as one row of cards.
+    # ``flex-wrap`` with ``flex-1 min-w-[11rem]`` on each: five cards no longer fit
+    # at this width and the last one was CLIPPED at the edge of the viewport. A card
+    # that runs off the screen is worse than a card on the next line.
+    #
+    # ``justify-between`` inside each card so that, once the boxes are the same
+    # height, the figures still sit on the same baseline instead of floating.
+    card_classes = 'stat-card p-3 flex-1 min-w-[11rem] justify-between'
+    with ui.row().classes('w-full gap-4 items-stretch flex-wrap') \
+            .mark(MARKER_SUMMARY_ROW):
+        with ui.column().classes(card_classes):
             ui.label(f'Managed value — {mode_label}').classes('text-xs text-secondary-custom')
             ui.label(f'${total:,.2f}').classes('text-lg font-bold').style(TABULAR_NUMS)
         # SECOND, immediately beside the managed value, because the pair is the
@@ -1510,20 +1750,19 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
         # to show only the first. Drawn UNCONDITIONALLY, unlike the buying-power
         # card below -- a card that vanishes when the broker will not answer is
         # indistinguishable from a page that never had one.
-        with ui.column().classes('stat-card p-3'):
+        with ui.column().classes(card_classes):
             ui.label(value_card.title).classes('text-xs text-secondary-custom')
             ui.label(value_card.text).classes('text-lg font-bold').style(TABULAR_NUMS)
             if value_card.detail:
                 ui.label(value_card.detail).classes('text-xs text-secondary-custom')
-        with ui.column().classes('stat-card p-3'):
+        with ui.column().classes(card_classes):
             ui.label('Managed labels').classes('text-xs text-secondary-custom')
             ui.label(str(len(views))).classes('text-lg font-bold')
         if buying_power is not None:
-            with ui.column().classes('stat-card p-3'):
+            with ui.column().classes(card_classes):
                 ui.label('Free buying power').classes('text-xs text-secondary-custom')
                 ui.label(f'${buying_power:,.2f}').classes('text-lg font-bold') \
                     .style(TABULAR_NUMS)
-        _render_reserve_card(account_id, live)
 
     # The running over/under-100 check, on the PAGE and without a dry run -- the
     # same advisory the wizard's step 1 has always shown, moved here with the boxes.
@@ -1566,25 +1805,31 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # guard let that one value through and the ``:.1f`` below raised on the None,
     # 500-ing the entire page. ``buying_power`` keeps ``is not None``: 0.00 of free
     # buying power is a fact worth drawing, and only None means "unknown".
+    # THE RESERVE, on its own line and NOT in the card row above.
+    #
+    # It was the fifth card there and it did not belong: it is the only CONTROL
+    # among four read-only stats, it is the widest thing on the row (a slider, an
+    # input and a live dollar caption), and it was the one being clipped. Here it
+    # sits directly above the list it governs -- the labels divide what it leaves --
+    # which is also where a reader looks when they wonder why the targets moved.
+    _render_reserve_card(account_id, live)
+
     reserve_text = format_reserve_row(base_notional=base_notional,
                                       available_buying_power=buying_power,
                                       unallocated_pct=payload['unallocated_pct'])
     if reserve_text is not None:
         with ui.element('div').classes('alert-banner info w-full p-3'):
-            # "of base", SAID OUT LOUD, because the label headers below print a
-            # target too and theirs is a RELATIVE weight on what this row leaves.
-            # In identical grammar the two read as one column and sum past 100 --
-            # a 25% reserve above a single label at 100% rendered "target 25.00%"
-            # over "target 100.0%" for a book that is exactly 25 + 75.
+            # "of base", SAID OUT LOUD, because this is the ONE row on the page
+            # still measured against the gross base -- every label below divides the
+            # investable pool. In identical grammar the two read as one column and
+            # sum past 100.
             live['reserve_row'] = ui.label(reserve_text).style(TABULAR_NUMS)
             # Said out loud, because it is the counter-intuitive half: a reserve on
             # a fully invested book is funded by SELLING, and the dry run is where
             # that becomes visible. Drawn unconditionally now that the reserve is
             # editable in place -- a caption that appears only above 0% is one the
             # user never reads before moving the slider.
-            ui.label('The labels below divide what is left after this — raising it '
-                     'on a fully invested account will generate sell orders.'
-                     ).classes('text-xs text-secondary-custom')
+            ui.label(RESERVE_BASIS_NOTE).classes('text-xs text-secondary-custom')
 
     for view in views:
         # Registered by ``_render_label_body`` inside the row, not here: two calls
@@ -1596,6 +1841,10 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     with ui.row().classes('w-full items-center gap-3'):
         live['footer'] = ui.label('').style(TABULAR_NUMS)
         ui.label('███ current    ╎ target notch').classes('text-xs text-secondary-custom')
+    # The denominators, named ONCE for the whole page. The rows are terse
+    # ("tgt 15.0% (real 13.5%)") precisely because this line exists; spelling them
+    # out per row is what made the old header a hundred characters long.
+    ui.label(BASIS_LEGEND).classes('text-xs text-secondary-custom')
 
     # Everything derived, drawn once through the SAME path an edit uses -- so the
     # first paint and every keystroke after it cannot land on different numbers.

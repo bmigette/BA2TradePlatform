@@ -2250,3 +2250,119 @@ def test_format_unrealised_pnl_of_a_zero_cost_holding_shows_money_and_no_percent
     text = pa.format_unrealised_pnl(pa.unrealised_pnl([_held("GIFT", 10.0, 0.0, 5.0)]))
 
     assert text == '+50.00 (no cost basis)'
+
+
+# ---------------------------------------------------------------------------
+# ``scale_pct_to_total`` -- the PROPORTIONAL sibling of ``split_pct_across``.
+#
+# "Fill 100%" on the allocation page has three cases and two of them scale an
+# existing set rather than splitting a fresh total across empty slots. That is a
+# different apportionment, not a different ROUNDING RULE: both floor every part to
+# the cent and hand the whole residual to ONE slot, so the parts sum to the target
+# exactly in decimal. Writing a second rounding rule in the UI layer is what these
+# tests exist to prevent.
+# ---------------------------------------------------------------------------
+
+
+def test_scale_pct_to_total_is_split_pct_across_when_every_share_is_equal():
+    """The two primitives MUST agree wherever they overlap.
+
+    Equal inputs make "scale proportionally to 100" and "split 100 evenly" the same
+    question, and a second rounding rule is exactly the thing that answers it
+    differently at n=6. Checked across the same sparse range as the splitter.
+    """
+    for count in range(1, 61):
+        assert (pa.scale_pct_to_total([7.0] * count, 100.0)
+                == pa.split_pct_across(100.0, count)), count
+
+
+def test_scale_pct_to_total_scales_down_an_over_allocated_set():
+    """150 / 50 is 3:1, so 100 splits 75 / 25 -- and nothing is invented."""
+    assert pa.scale_pct_to_total([150.0, 50.0], 100.0) == [75.0, 25.0]
+
+
+def test_scale_pct_to_total_scales_up_an_under_allocated_set():
+    assert pa.scale_pct_to_total([10.0, 20.0], 100.0) == [33.33, 66.67]
+
+
+def test_scale_pct_to_total_gives_the_residual_to_the_LARGEST_part():
+    """NOT to the last slot, which is where ``split_pct_across`` puts it.
+
+    The difference is load-bearing here and only here: a slot sitting at 0 is a
+    symbol the user asked to hold NONE of, and last-slot residual would hand it a
+    cent -- turning "sell this out" into "hold $12 of it" every time the last row
+    happened to be the empty one. The cent lands where it is least significant
+    instead.
+    """
+    assert pa.scale_pct_to_total([100.0, 50.0, 0.0], 100.0) == [66.67, 33.33, 0.0]
+    # ...and a tie still goes to the LAST of the tied slots, so the equal case
+    # reproduces ``split_pct_across`` exactly (the test above depends on it).
+    assert pa.scale_pct_to_total([1.0, 1.0, 1.0], 100.0) == [33.33, 33.33, 33.34]
+
+
+def test_scale_pct_to_total_never_promotes_a_zero_slot():
+    """A 0 stays 0 at every count. Scaling is proportional: 0 x anything is 0."""
+    for count in range(2, 20):
+        parts = pa.scale_pct_to_total([0.0] + [3.0] * (count - 1), 100.0)
+        assert parts[0] == 0.0, count
+        assert round(sum(parts), 2) == 100.0, count
+
+
+def test_scale_pct_to_total_totals_its_target_exactly_in_decimal():
+    """The whole point: 99.99 is a set ``validate_symbol_weights`` refuses."""
+    from decimal import Decimal
+    for values in ([1.0, 1.0, 1.0], [10.0, 20.0, 30.0], [7.0] * 6, [0.01, 99.0],
+                   [33.33, 33.33, 33.34], [5.0] * 7, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]):
+        parts = pa.scale_pct_to_total(values, 100.0)
+        assert sum(Decimal(str(p)) for p in parts) == Decimal('100')
+
+
+def test_scale_pct_to_total_falls_back_to_the_EVEN_split_when_there_is_nothing_to_scale():
+    """An all-zero set has no proportions, so "scale it to 100" is meaningless.
+
+    It is answered with the even split rather than a ZeroDivisionError or a set of
+    zeros, and it is the SAME function -- so "all symbols empty" reaches the same
+    numbers whether the page routes it here or through ``split_pct_across``.
+    """
+    assert pa.scale_pct_to_total([0.0, 0.0, 0.0], 100.0) == pa.split_pct_across(100.0, 3)
+
+
+def test_scale_pct_to_total_returns_an_empty_list_for_an_empty_set():
+    assert pa.scale_pct_to_total([], 100.0) == []
+
+
+def test_scale_pct_to_total_handles_a_single_slot():
+    assert pa.scale_pct_to_total([37.5], 100.0) == [100.0]
+    assert pa.scale_pct_to_total([0.0], 100.0) == [100.0]
+
+
+def test_scale_pct_to_total_is_exported():
+    assert "scale_pct_to_total" in pa.__all__
+
+
+def test_scale_pct_to_total_reads_a_MISSING_share_as_zero_not_as_one():
+    """Found by mutation: ``float(v or 0.0)`` weakened to ``float(v if v is not
+    None else 1.0)``.
+
+    ``SymbolTarget.weight_pct`` is declared float but a cleared ``ui.number`` yields
+    ``None``, and ``_symbol_weight`` already says "'Unset' and 0 are one fact here".
+    Reading an unset slot as 1% would give it a share of the rescale -- a symbol the
+    user emptied quietly holding money again.
+    """
+    assert pa.scale_pct_to_total([None, 3.0, 3.0], 100.0) == \
+        pa.scale_pct_to_total([0.0, 3.0, 3.0], 100.0)
+    assert pa.scale_pct_to_total([None, 3.0, 3.0], 100.0)[0] == 0.0
+
+
+def test_scale_pct_to_total_honours_a_total_OTHER_than_100():
+    """Survivor: ``total_pct`` ignored in the body, twice -- every call site passes
+    100, so the parameter was free to be a lie.
+
+    It is not decoration: "scale this label's symbols into the 60% the label itself
+    holds" is the same arithmetic, and the next caller will want it.
+    """
+    assert pa.scale_pct_to_total([1.0, 1.0], 50.0) == [25.0, 25.0]
+    assert pa.scale_pct_to_total([3.0, 1.0], 40.0) == [30.0, 10.0]
+    assert pa.scale_pct_to_total([1.0, 1.0, 1.0], 10.0) == [3.33, 3.33, 3.34]
+    # ...including on the all-zero fallback, which routes through the splitter.
+    assert pa.scale_pct_to_total([0.0, 0.0], 50.0) == pa.split_pct_across(50.0, 2)
