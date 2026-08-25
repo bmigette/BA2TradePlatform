@@ -4,11 +4,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .menus import topmenu, sidemenu
 from .theme import COLORS
-from .account_filter_context import get_accounts_for_filter, get_selected_account_id, set_selected_account_id
+from .account_filter_context import (get_accounts_for_filter, get_selected_account_id,
+                                     refresh_accounts_for_filter, set_selected_account_id)
 # THE SAME helper the Portfolio Allocation page's 'Account value' card uses. Two
 # places showing "the account's value" from two different snapshot fields is the
 # drift this project keeps paying for, so the field choice (net_liquidation) and
@@ -504,27 +505,81 @@ def _paint(label, icon, tooltip, view: HeaderBalance) -> None:
     icon.props(f'name={glyph}')
 
 
+#: The ui.select key standing in for a ``None`` selection. A string, because
+#: ``None`` does not work well as a ui.select option key.
+ACCOUNT_FILTER_ALL = "all"
+
+
+def _account_filter_options(account_options) -> Dict[Any, str]:
+    """``[(label, id), ...]`` -> the ``{value: label}`` dict ui.select wants."""
+    return {(ACCOUNT_FILTER_ALL if acc_id is None else acc_id): label
+            for label, acc_id in account_options}
+
+
+def _account_filter_state() -> Tuple[Dict[Any, str], Any]:
+    """The dropdown's options and its value, with the value GUARANTEED to be one
+    of them.
+
+    THE CRASH THIS EXISTS FOR: the selected account can be DELETED while it is
+    selected. The id outlives it in ``app.storage.user`` -- and in the
+    process-global ``_last_known_account_id`` mirror, which nothing clears -- so
+    the next render hands ``ui.select`` a value that is not among its options and
+    NiceGUI raises ``ValueError: Invalid value: 2``. This header is built by EVERY
+    route, before the page body, so one deleted account 500s the entire
+    application on every page until storage is cleared by hand.
+
+    THE OTHER DIRECTION MATTERS JUST AS MUCH. Resetting a selection that was
+    actually fine is quieter than the crash and therefore worse to diagnose, so
+    "not in the options" is deliberately not treated as proof of anything:
+
+      * the listing is cached for 60 seconds, so an account created in the last
+        minute is missing from it while being a perfectly valid choice. Before
+        concluding an id is dead we re-read the accounts table once. That read is
+        on the RARE path only -- a selection that is already in the cached options
+        costs no database work, which is what keeps the cache worth having on a
+        header drawn once per navigation;
+      * a listing read can simply FAIL, and a failure is not a deletion. The
+        widget still has to be given a valid value, so it falls back to "All" for
+        this render, but nothing is persisted -- the next healthy render brings
+        the account back on its own.
+
+    Only a positively-confirmed absence is written back, and it is written through
+    ``set_selected_account_id`` so there is exactly one writer of the two stores.
+    """
+    options_dict = _account_filter_options(get_accounts_for_filter())
+    selected = get_selected_account_id()
+
+    if selected is None:
+        return options_dict, ACCOUNT_FILTER_ALL
+    if selected in options_dict:
+        return options_dict, selected
+
+    fresh = refresh_accounts_for_filter()
+    if fresh is None:
+        logger.warning(f"Account filter: could not verify selected account {selected} "
+                       f"(accounts unreadable); showing All for this render without "
+                       f"clearing the selection")
+        return options_dict, ACCOUNT_FILTER_ALL
+
+    options_dict = _account_filter_options(fresh)
+    if selected in options_dict:
+        return options_dict, selected
+
+    logger.warning(f"Account filter: selected account {selected} no longer exists; "
+                   f"resetting the filter to All")
+    set_selected_account_id(None)
+    return options_dict, ACCOUNT_FILTER_ALL
+
+
 def _render_account_filter_dropdown():
     """Render the account filter dropdown in the header."""
-    # Get accounts for dropdown options
-    account_options = get_accounts_for_filter()
-    
-    # Build options dict for ui.select: {value: label}
-    # Use "all" string instead of None for the "All" option (None doesn't work well with ui.select)
-    options_dict = {}
-    for label, acc_id in account_options:
-        key = "all" if acc_id is None else acc_id
-        options_dict[key] = label
-    
-    # Get current selection - convert None to "all" for ui.select
-    current_selection = get_selected_account_id()
-    current_value = "all" if current_selection is None else current_selection
-    
+    options_dict, current_value = _account_filter_state()
+
     async def on_account_change(e):
         """Handle account selection change."""
         new_value = e.value
         # Convert "all" back to None for storage
-        account_id = None if new_value == "all" else new_value
+        account_id = None if new_value == ACCOUNT_FILTER_ALL else new_value
         set_selected_account_id(account_id)
         # Reload the page so every tab re-reads the new selection. Use an explicit
         # window.location.reload() rather than ui.navigate.to(current_path) or
