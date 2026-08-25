@@ -70,3 +70,57 @@ def deployed_equity(real_equity: Optional[float],
     if cap is None:
         return real_equity
     return min(float(cap), float(real_equity))
+
+
+def scoring_curve(equity_curve: Sequence[Dict[str, Any]],
+                  *, cap: Optional[float]) -> List[Dict[str, Any]]:
+    """Restate a REAL equity curve on a fixed denominator, for the metrics.
+
+    Each period's return is ``period_pnl / cap`` -- the CAP, never the running equity -- and the
+    returns are compounded. $5,000 a year on a $20,000 cap therefore reads 25% every year rather
+    than 25 / 20 / 16.7 / 14.3, and a steady strategy scores the same whatever year it started.
+
+    ``equity_curve`` must be the REAL recorded series. Differencing the capped figure would report
+    zero P&L for every period spent above the cap.
+
+    A "period" is one point of the recorded curve -- whatever granularity ``snapshot_equity``
+    wrote. No resampling: a second time base would let this curve and the trade ledger disagree
+    about when a return happened.
+    """
+    if cap is None:
+        return list(equity_curve)
+    pts = list(equity_curve)
+    if not pts:
+        return []
+    out = [{**pts[0], "equity": float(cap)}]
+    level = float(cap)
+    for prev, cur in zip(pts, pts[1:]):
+        period_pnl = float(cur["equity"]) - float(prev["equity"])
+        level *= (1.0 + period_pnl / float(cap))
+        out.append({**cur, "equity": level})
+    return out
+
+
+def capped_drawdown_curve(equity_curve: Sequence[Dict[str, Any]],
+                          *, cap: Optional[float]) -> List[Dict[str, Any]]:
+    """Peak-to-trough on cumulative P&L, divided by the CAP.
+
+    A $2,000 trough is 10% of a $20,000 cap whenever it happens. On the compounded scoring curve
+    it would read -10% in year one and -5% in year four -- risk on a moving denominator while
+    returns sit on a fixed one, which hands a late-run strategy a better ``dd_guard`` multiplier
+    for no reason but arithmetic.
+    """
+    pts = list(equity_curve)
+    if not pts:
+        return []
+    if cap is None:
+        raise EquityCapError(
+            "capped_drawdown_curve called with cap=None; use results._drawdown_curve instead")
+    base = float(pts[0]["equity"])
+    peak_pnl = 0.0
+    out: List[Dict[str, Any]] = []
+    for pt in pts:
+        pnl = float(pt["equity"]) - base
+        peak_pnl = max(peak_pnl, pnl)
+        out.append({"date": pt["date"], "drawdown": (pnl - peak_pnl) / float(cap) * 100.0})
+    return out

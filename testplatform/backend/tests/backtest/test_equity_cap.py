@@ -1,10 +1,13 @@
 """The optional fixed-notional equity cap. Pure arithmetic, no engine, no clock."""
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from app.services.backtest.equity_cap import (
-    EquityCapError, deployed_equity, validate_equity_cap,
+    EquityCapError, capped_drawdown_curve, deployed_equity, scoring_curve,
+    validate_equity_cap,
 )
 
 
@@ -103,3 +106,79 @@ def test_unmeasurable_equity_is_unmeasurable_not_zero():
     """None in means None out. A broker/engine that cannot state equity has not stated zero."""
     assert deployed_equity(None, cap=20_000.0) is None
     assert deployed_equity(None, cap=None) is None
+
+
+# ---------------------------------------------------------------------------
+# Task 3 -- the scoring conversion
+# ---------------------------------------------------------------------------
+def _pt(y, equity):
+    return {"date": datetime(y, 1, 1), "equity": float(equity)}
+
+
+def test_five_k_a_year_on_twenty_k_reads_twenty_five_percent_every_year():
+    """THE headline case. The naive `cap + cumulative P&L` curve would read
+    25 / 20 / 16.7 / 14.3 for this identical strategy; that decline is the compounding
+    effect this feature exists to remove."""
+    real = [_pt(2020, 20_000), _pt(2021, 25_000), _pt(2022, 30_000),
+            _pt(2023, 35_000), _pt(2024, 40_000)]
+    got = [p["equity"] for p in scoring_curve(real, cap=20_000.0)]
+    assert got == pytest.approx([20_000.0, 25_000.0, 31_250.0, 39_062.5, 48_828.125])
+
+
+def test_the_curve_keeps_its_dates():
+    real = [_pt(2020, 20_000), _pt(2021, 25_000)]
+    assert [p["date"] for p in scoring_curve(real, cap=20_000.0)] == \
+           [datetime(2020, 1, 1), datetime(2021, 1, 1)]
+
+
+def test_with_no_cap_the_curve_is_returned_untouched():
+    real = [_pt(2020, 20_000), _pt(2021, 25_000)]
+    assert scoring_curve(real, cap=None) == real
+
+
+def test_a_flat_period_is_a_measured_zero_not_a_missing_one():
+    real = [_pt(2020, 20_000), _pt(2021, 20_000), _pt(2022, 25_000)]
+    got = [p["equity"] for p in scoring_curve(real, cap=20_000.0)]
+    assert got == pytest.approx([20_000.0, 20_000.0, 25_000.0])
+
+
+def test_a_loss_period_compounds_downward_on_the_fixed_denominator():
+    real = [_pt(2020, 20_000), _pt(2021, 18_000)]     # -2,000 = -10% of the 20k cap
+    got = [p["equity"] for p in scoring_curve(real, cap=20_000.0)]
+    assert got == pytest.approx([20_000.0, 18_000.0])
+
+
+def test_the_denominator_is_the_cap_not_the_running_equity():
+    """A +2,000 period reads +10% whether it happens first or last."""
+    early = scoring_curve([_pt(2020, 20_000), _pt(2021, 22_000)], cap=20_000.0)
+    late = scoring_curve([_pt(2020, 20_000), _pt(2021, 20_000), _pt(2022, 22_000)],
+                         cap=20_000.0)
+    first_step = early[1]["equity"] / early[0]["equity"] - 1.0
+    last_step = late[2]["equity"] / late[1]["equity"] - 1.0
+    assert first_step == pytest.approx(0.10)
+    assert last_step == pytest.approx(0.10)
+
+
+def test_a_single_point_curve_has_no_return_to_compute():
+    assert [p["equity"] for p in scoring_curve([_pt(2020, 20_000)], cap=20_000.0)] == [20_000.0]
+
+
+def test_an_empty_curve_stays_empty():
+    assert scoring_curve([], cap=20_000.0) == []
+
+
+def test_a_two_thousand_drawdown_is_ten_percent_whenever_it_happens():
+    """Risk is denominated in the cap too, or dd_guard rewards a late-run strategy by
+    arithmetic alone (dd_guard = min(20/max(dd,1), 2.0))."""
+    early = [_pt(2020, 20_000), _pt(2021, 18_000), _pt(2022, 20_000)]
+    late = [_pt(2020, 20_000), _pt(2021, 40_000), _pt(2022, 38_000)]
+    assert min(p["drawdown"] for p in capped_drawdown_curve(early, cap=20_000.0)) \
+        == pytest.approx(-10.0)
+    assert min(p["drawdown"] for p in capped_drawdown_curve(late, cap=20_000.0)) \
+        == pytest.approx(-10.0)
+
+
+def test_the_capped_drawdown_curve_keeps_its_dates_and_starts_flat():
+    pts = capped_drawdown_curve([_pt(2020, 20_000), _pt(2021, 18_000)], cap=20_000.0)
+    assert [p["date"] for p in pts] == [datetime(2020, 1, 1), datetime(2021, 1, 1)]
+    assert pts[0]["drawdown"] == pytest.approx(0.0)
