@@ -4086,7 +4086,7 @@ def test_choosing_a_colour_retints_the_swatch_beside_the_row(monkeypatch,
         before = (swatch._style or {}).get('color')
         _fire(_swatch_for(nicegui_client.layout, '#D55E00'))
 
-    assert before.lower() == _DEFAULT_ICON_COLOR.lower()
+    assert before.lower().startswith(_DEFAULT_ICON_COLOR.lower())
     assert '#D55E00' in (swatch._style or {}).get('color', '').upper()
 
 
@@ -4106,7 +4106,9 @@ def test_the_swatch_only_ever_takes_a_PARSED_colour(monkeypatch, nicegui_client,
         _drive_value(custom, 'red;content:"x"')
 
     assert get_managed_labels(account_id)[0].color is None
-    assert (swatch._style or {}).get('color') == f'{_DEFAULT_ICON_COLOR}'
+    # ``!important``, because ``styles.css`` greys icons with one of its own.
+    assert (swatch._style or {}).get('color') == _view_mod(
+        ).important_color_style(_DEFAULT_ICON_COLOR).removeprefix('color: ')
     assert 'content' not in (swatch._style or {}).get('color', '')
     assert any('not a colour' in text for text, _t in sent)
 
@@ -4864,7 +4866,8 @@ def test_a_custom_colour_retints_the_dialog_swatch_with_the_PARSED_value(
         _drive_value(_marked(nicegui_client.layout, page.MARKER_COLOR_CUSTOM)[0],
                      '#a1b2c3')
 
-    assert (swatch._style or {}).get('color') == 'color: #A1B2C3'.split(': ')[1]
+    assert (swatch._style or {}).get('color') == _view_mod(
+        ).important_color_style('#A1B2C3').removeprefix('color: ')
 
 
 def test_clearing_from_the_row_puts_NONE_back_in_the_registry_not_an_empty_string(
@@ -5471,164 +5474,6 @@ def _two_labels(account_id, *, a=70.0, b=30.0, previous=(None, None)):
                   weights={'ARK26': {'AAPL': 100.0}, 'TECH': {'MSFT': 100.0}})
 
 
-def test_the_page_offers_a_label_level_even_split_and_load_last(nicegui_client,
-                                                                account_id):
-    root = _draw(nicegui_client, account_id, _two_labels(account_id))
-
-    assert len(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)) == 1
-    assert len(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)) == 1
-
-
-def test_the_label_even_split_writes_100_across_every_label_and_persists_it(
-        monkeypatch, nicegui_client, account_id):
-    _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id, _two_labels(account_id))
-
-    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
-
-    assert _label_targets_now(account_id) == {'ARK26': 50.0, 'TECH': 50.0}
-
-
-def test_the_label_even_split_uses_the_engines_own_splitter(monkeypatch,
-                                                            nicegui_client,
-                                                            account_id):
-    """Three ways is 33.33 / 33.33 / 33.34, remainder on the LAST label."""
-    _capture_notifications(monkeypatch)
-    for name in ('A', 'B', 'C'):
-        set_managed_label(account_id, name, target_pct=0.0)
-    views = _views([ManagedLabel('A', 0.0), ManagedLabel('B', 0.0),
-                    ManagedLabel('C', 0.0)],
-                   {'A': ['AAPL'], 'B': ['MSFT'], 'C': ['TSLA']},
-                   positions=[], prices={'AAPL': 1.0, 'MSFT': 1.0, 'TSLA': 1.0})
-    root = _draw(nicegui_client, account_id, views)
-
-    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
-
-    stored = _label_targets_now(account_id)
-    assert sum(stored.values()) == 100.0
-    assert stored == {'A': 33.33, 'B': 33.33, 'C': 33.34}
-
-
-def test_the_label_even_split_redraws_the_boxes_rather_than_leaving_them_stale(
-        monkeypatch, nicegui_client, account_id):
-    """A ``ui.number`` does not follow the object it was built from, so a silent
-    model change leaves the user typing over numbers the database does not have."""
-    _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id, _two_labels(account_id))
-
-    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
-
-    assert sorted(n.value for n in _numbers(root)
-                  if n._props.get('label') == 'Portfolio target %') == [50.0, 50.0]
-
-
-def test_the_label_even_split_moves_every_bar_and_the_totals_footer(
-        monkeypatch, nicegui_client, account_id):
-    _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id, _two_labels(account_id))
-
-    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
-
-    targets = [el._text for el in _marked(root, page.MARKER_BAR_ROW)
-               for el in el.descendants() if (el._text or '').startswith('tgt ')]
-    assert targets == ['tgt 50.0%', 'tgt 50.0%']
-    assert 'Label targets total 100.00%' in ' '.join(_texts(root))
-
-
-def test_the_label_even_split_leaves_the_cash_reserve_alone(monkeypatch,
-                                                            nicegui_client,
-                                                            account_id):
-    """The labels divide what the reserve LEAVES, so an even split of anything but
-    the whole 100 would produce a set the submit gate refuses."""
-    _capture_notifications(monkeypatch)
-    set_allocation_config(account_id, unallocated_pct=10.0)
-    root = _draw(nicegui_client, account_id, _two_labels(account_id), reserve=10.0)
-
-    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
-
-    assert _label_targets_now(account_id) == {'ARK26': 50.0, 'TECH': 50.0}
-    assert get_allocation_config(account_id).unallocated_pct == 10.0
-
-
-def test_label_load_last_restores_the_targets_of_the_last_run(monkeypatch,
-                                                              nicegui_client,
-                                                              account_id):
-    _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id,
-                 _two_labels(account_id, previous=(60.0, 40.0)))
-
-    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
-
-    assert _label_targets_now(account_id) == {'ARK26': 60.0, 'TECH': 40.0}
-
-
-def test_label_load_last_reads_the_PREVIOUS_generation_and_not_the_current_one(
-        monkeypatch, nicegui_client, account_id):
-    """Mutation: feed it the live targets. The button then reports success while
-    changing nothing, and the user believes their last allocation is back."""
-    _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id,
-                 _two_labels(account_id, a=70.0, b=30.0, previous=(10.0, 90.0)))
-
-    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
-
-    assert _label_targets_now(account_id) == {'ARK26': 10.0, 'TECH': 90.0}
-
-
-def test_label_load_last_leaves_a_label_with_no_history_where_it_is(
-        monkeypatch, nicegui_client, account_id):
-    _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id,
-                 _two_labels(account_id, previous=(60.0, None)))
-
-    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
-
-    assert _label_targets_now(account_id) == {'ARK26': 60.0, 'TECH': 30.0}
-
-
-def test_label_load_last_with_no_history_at_all_says_so_and_writes_nothing(
-        monkeypatch, nicegui_client, account_id):
-    sent = _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id, _two_labels(account_id))
-
-    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
-
-    assert _label_targets_now(account_id) == {'ARK26': 70.0, 'TECH': 30.0}
-    assert any('nothing to load' in m for m, _t in sent)
-
-
-def test_the_label_buttons_never_shift_the_previous_generation(monkeypatch,
-                                                               nicegui_client,
-                                                               account_id):
-    """``save_allocation_targets`` is the ONE writer of the previous generation, and
-    these buttons are not it. A shift here would grind the real history away one
-    press at a time -- and would make Load last un-undoable, since pressing it
-    would immediately overwrite the very numbers it just restored."""
-    _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id,
-                 _two_labels(account_id, previous=(60.0, 40.0)))
-
-    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
-
-    rows = {row.label: row.previous_target_pct
-            for row in get_managed_labels(account_id)}
-    assert rows == {'ARK26': None, 'TECH': None}
-
-
-def test_the_label_buttons_refuse_to_write_under_a_label_that_is_gone(
-        monkeypatch, nicegui_client, account_id):
-    """``set_managed_label`` CREATES the row it cannot find, so an unguarded write
-    would resurrect a label the user deleted -- holding money."""
-    sent = _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id, _two_labels(account_id))
-    remove_managed_label(account_id, 'TECH')
-
-    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
-
-    assert _label_targets_now(account_id) == {'ARK26': 50.0}
-    assert any('no longer managed' in m for m, _t in sent)
-
-
 # ---------------------------------------------------------------------------
 # GROUP 3: the PER-LABEL button group -- Even split / Fill rest / Load last / Wipe
 #
@@ -6082,44 +5927,6 @@ def test_the_fractional_toggle_is_remembered_for_the_next_run(monkeypatch,
     assert get_allocation_config(account_id).allow_fractional is False
 
 
-def test_a_label_level_press_moves_the_VIEWS_before_it_pushes_the_BOXES(
-        monkeypatch, nicegui_client, account_id):
-    """Survivor of the mutation run: swapping those two loops.
-
-    A programmatic ``set_value`` fires the box's own change handler, and that
-    handler measures the incoming number against the OTHER labels AS THE VIEWS
-    CURRENTLY HOLD THEM. Push first and swapping 10/90 for 90/10 refuses the first
-    write for taking the set to 180%, then reverts the box to 10 over a database
-    that says 90 -- exactly the "a number the database does not have" defect
-    inline editing exists to remove.
-
-    The views move first, so every echo lands on a set that already adds to 100
-    and is absorbed by the compare-against-stored guard. Asserted at the MOMENT of
-    the push, because the echo itself is a coroutine NiceGUI drops without a
-    running loop -- so a test that only read the end state would pass either way.
-    """
-    sent = _capture_notifications(monkeypatch)
-    live_states, pushes = [], []
-    real_new_state, real_restore = page._new_live_state, page._restore_value
-    monkeypatch.setattr(page, '_new_live_state',
-                        lambda **kw: live_states.append(real_new_state(**kw))
-                        or live_states[-1])
-    monkeypatch.setattr(page, '_restore_value',
-                        lambda widget, value: pushes.append(
-                            (page._label_targets(live_states[-1]), value))
-                        or real_restore(widget, value))
-
-    root = _draw(nicegui_client, account_id,
-                 _two_labels(account_id, a=10.0, b=90.0, previous=(90.0, 10.0)))
-    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
-
-    assert _label_targets_now(account_id) == {'ARK26': 90.0, 'TECH': 10.0}
-    # The FIRST box is pushed into a page that already agrees with it.
-    assert pushes and pushes[0][0] == {'ARK26': 90.0, 'TECH': 10.0}
-    assert [value for _targets, value in pushes] == [90.0, 10.0]
-    assert not any('NOT saved' in m for m, _t in sent), sent
-
-
 # ---------------------------------------------------------------------------
 # THE COMMA, END TO END
 #
@@ -6291,29 +6098,6 @@ def test_the_total_bar_follows_an_inline_target_edit_IN_REAL_TIME(nicegui_client
 
     assert '100.00%' in _total_card_texts(root)
     assert '70.00%' not in _total_card_texts(root)
-
-
-def test_the_total_bar_follows_the_label_level_EVEN_SPLIT(monkeypatch,
-                                                           nicegui_client,
-                                                           account_id):
-    _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
-
-    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
-
-    assert '100.00%' in _total_card_texts(root)
-
-
-def test_the_total_bar_follows_the_label_level_LOAD_LAST(monkeypatch,
-                                                          nicegui_client,
-                                                          account_id):
-    _capture_notifications(monkeypatch)
-    root = _draw(nicegui_client, account_id,
-                 _two_labels(account_id, a=40.0, b=30.0, previous=(60.0, 40.0)))
-
-    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
-
-    assert '100.00%' in _total_card_texts(root)
 
 
 def test_the_total_bar_does_NOT_move_for_a_SYMBOL_level_press(monkeypatch,
@@ -6740,37 +6524,98 @@ def test_the_unallocated_row_gets_a_bar_beside_its_sentence(nicegui_client,
     assert _view_mod().RESERVE_BASIS_NOTE in texts
 
 
-def test_the_reserve_bar_reads_UNDER_when_the_cash_is_short_of_the_target(
+def test_the_allocation_bar_reads_OVER_when_the_cash_is_short_of_the_target(
         nicegui_client, account_id):
-    """$245.50 free (4.7% of base) against a 10.00% target. The sub-line already
-    says raising the reserve generates sells; a bar reading "over" here would be
-    contradicting it in the same box."""
+    """INVERTED: the bar's subject is what is ALLOCATED. $245.50 free of a
+    $5,260.90 base is 95.3% invested against a 90% target -- over-allocated, which
+    is the same fact as under-reserved and agrees with the warning beside it that
+    closing the gap means selling."""
     root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
                  base=5_260.9, buying_power=245.50, reserve=10.0)
     texts = _texts(_marked(root, page.MARKER_RESERVE_BAR_ROW)[0])
 
-    assert any(t.startswith('under by ') for t in texts)
-    assert not any(t.startswith('over by ') for t in texts)
+    assert any(t.startswith('over by ') for t in texts)
+    assert not any(t.startswith('under by ') for t in texts)
+
+
+def test_the_allocation_bar_FILLS_with_the_allocated_share(nicegui_client,
+                                                           account_id):
+    """5.3% reserve reads as a bar 94.7% full, not 5.3% full."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=279.25, reserve=10.0)
+
+    width = float(_marked(root, page.MARKER_RESERVE_BAR_FILL)[0]
+                  ._style['width'].removesuffix('%'))
+    assert width == pytest.approx(94.69, abs=0.05)
+
+
+def test_the_allocation_bars_TICK_is_inverted_with_it(nicegui_client, account_id):
+    """A 10% reserve target sits at 90% along, or the tick lands on the wrong side
+    of the fill and the bar contradicts its own caption."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=279.25, reserve=10.0)
+
+    left = float(_marked(root, page.MARKER_RESERVE_BAR_NOTCH)[0]
+                 ._style['left'].removesuffix('%'))
+    assert left == pytest.approx(90.0, abs=0.05)
+
+
+def test_the_allocation_bar_lives_INSIDE_the_reserve_card(nicegui_client,
+                                                          account_id):
+    """The amendment: fold it into the widget that already owns the concept rather
+    than adding a panel. The blue callout is gone."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=279.25, reserve=10.0)
+    card = _marked(root, page.MARKER_RESERVE_CARD)[0]
+
+    assert _marked(root, page.MARKER_RESERVE_BAR_ROW)[0] in list(card.descendants())
+    assert [el for el in root.descendants()
+            if 'alert-banner info' in ' '.join(el._classes)] == []
+
+
+def test_the_reserve_card_keeps_every_word_the_blue_panel_carried(nicegui_client,
+                                                                  account_id):
+    """The money line, the gross-base denominator and the sell warning. Losing any
+    of the three is losing something load-bearing."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=279.25, reserve=10.0)
+    texts = _texts(_marked(root, page.MARKER_RESERVE_CARD)[0])
+
+    assert any('Unallocated (free buying power)' in t for t in texts)
+    assert any('of base, target 10.00% of base' in t for t in texts)
+    assert _view_mod().RESERVE_BASIS_NOTE in texts
+    assert _view_mod().RESERVE_SELL_WARNING in texts
+    assert _view_mod().ALLOCATION_BAR_LEGEND in texts
 
 
 def test_the_reserve_bar_FOLLOWS_the_reserve_control(nicegui_client, account_id):
     root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
                  base=5_260.9, buying_power=245.50, reserve=10.0)
-    assert any(t.startswith('under by ')
+    assert any(t.startswith('over by ')
                for t in _texts(_marked(root, page.MARKER_RESERVE_BAR_ROW)[0]))
 
     _drive_value(_reserve_controls(root)[0], 2.0)
 
+    # A 2% reserve target is a 98% allocated target, and 95.3% invested is now
+    # UNDER it -- the verdict flips with the control, in the inverted sense.
     texts = _texts(_marked(root, page.MARKER_RESERVE_BAR_ROW)[0])
-    assert any(t.startswith('over by ') for t in texts)
+    assert any(t.startswith('under by ') for t in texts)
 
 
-def test_the_reserve_row_is_drawn_without_a_bar_when_there_is_no_base(
-        nicegui_client, account_id):
+def test_the_reserve_card_draws_an_EMPTY_bar_when_there_is_no_base(nicegui_client,
+                                                                   account_id):
+    """There is no denominator, so there is no verdict -- and no money line
+    either. The card and its control still draw: the reserve is settable on an
+    account the broker has not answered for yet."""
     root = _draw(nicegui_client, account_id, _one_label(account_id),
                  base=0.0, buying_power=None)
 
-    assert _marked(root, page.MARKER_RESERVE_BAR_FILL) == []
+    card = _marked(root, page.MARKER_RESERVE_CARD)[0]
+    assert card
+    # The bar is drawn but never painted: no base, no fraction, no verdict.
+    assert _marked(root, page.MARKER_RESERVE_BAR_FILL)[0]._style.get('width') is None
+    # ...and the money line is EMPTY rather than a share of a number nobody has.
+    assert not any('of base, target' in (el._text or '') for el in card.descendants())
 
 
 def test_all_three_bars_share_one_track_style(nicegui_client, account_id):
@@ -6942,3 +6787,240 @@ def test_the_icons_tooltip_separates_NO_COLOUR_from_an_unreadable_one(
     broken = _draw(nicegui_client, account_id,
                    _one_label(account_id, color='rgb(1,2,3)'))
     assert any('IGNORED' in t for t in _tooltip_texts(broken))
+
+
+# ---------------------------------------------------------------------------
+# THE ICON, THE P&L AND THE DELTA ARE PAINTED SO THE STYLESHEET CANNOT WIN
+#
+# Reported twice, and the second time with a screenshot: a cyan bar beside a grey
+# tag icon on the same row. The page's Python state was correct throughout -- the
+# icon carried ``style={'color': '#56B4E9'}`` -- which is why it looked right in
+# source and in every harness test. The defect is in the CASCADE:
+#
+#     ui/static/styles.css:  .q-expansion-item .q-icon { color: #a0aec0 !important }
+#
+# A stylesheet ``!important`` beats a plain inline style, the label icon lives in
+# the expansion HEADER, and #a0aec0 is exactly the grey that was reported. The
+# bar's fill is a bare div painted with ``background``, which that rule does not
+# touch -- hence one row, two answers.
+#
+# These tests read the real stylesheet, so they stay tied to the real cause: if
+# the offending rule is ever removed the first one fails and says the workaround
+# can go.
+# ---------------------------------------------------------------------------
+
+def _styles_css():
+    from pathlib import Path
+    return (Path(page.__file__).resolve().parents[1] / 'static' / 'styles.css'
+            ).read_text(encoding='utf-8')
+
+
+def test_the_stylesheet_really_does_grey_every_icon_inside_an_expansion():
+    """Guards the guard. If this rule goes, the ``!important`` below is no longer
+    needed and this test is where that gets noticed."""
+    import re
+    css = _styles_css()
+    rule = re.search(r'\.q-expansion-item\s+\.q-icon\s*\{([^}]*)\}', css)
+
+    assert rule is not None, 'the rule the icon fix exists for is gone'
+    assert 'color' in rule.group(1) and '!important' in rule.group(1)
+
+
+def test_the_label_icon_is_painted_with_an_inline_IMPORTANT(nicegui_client,
+                                                            account_id):
+    """The fix. Only an inline ``!important`` outranks a stylesheet one."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, color='#56B4E9'))
+    declared = (_row_icon(root)._style or {}).get('color', '')
+
+    assert '#56B4E9' in declared
+    assert '!important' in declared
+
+
+def test_the_label_rows_icon_and_bar_are_written_from_ONE_value(nicegui_client,
+                                                                account_id):
+    """Not two lookups of the same stored colour: one ``LabelBar.color``, painted
+    onto both in the same loop -- and now painted so both actually show it."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, color='#F0E442'))
+
+    icon_colour = (_row_icon(root)._style or {}).get('color', '')
+    assert _bar_fill(root)._style['background'].upper() in icon_colour.upper()
+    assert '!important' in icon_colour
+
+
+def test_an_uncoloured_labels_icon_is_still_pinned_to_the_neutral_grey(
+        nicegui_client, account_id):
+    """It resolves to the same grey the stylesheet would have forced, but it says
+    so itself -- so "no colour chosen" is a decision the page made, not one that
+    happened to it."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    grey = _view_mod().DEFAULT_LABEL_ICON_COLOR
+
+    declared = (_row_icon(root)._style or {}).get('color', '')
+    assert grey.lower() in declared.lower() and '!important' in declared
+
+
+def _pnl_and_delta(root, index=0):
+    row = _marked(root, page.MARKER_BAR_ROW)[index]
+    pnl = _marked(row, page.MARKER_LABEL_PNL)[0]
+    delta = next(el for el in row.descendants()
+                 if el._text and (el._text.startswith(('over by', 'under by'))
+                                  or el._text == 'on target'))
+    return pnl, delta
+
+
+def _two_verdicts(account_id):
+    """One label far OVER its target and up on the day, one UNDER and down."""
+    return _views([ManagedLabel('OVER', 5.0), ManagedLabel('UNDER', 90.0)],
+                  {'OVER': ['WIN'], 'UNDER': ['LOSE']},
+                  weights={'OVER': {'WIN': 100.0}, 'UNDER': {'LOSE': 100.0}},
+                  positions=[_pos('WIN', 10, 1000.0, 2500.0),
+                             _pos('LOSE', 10, 1000.0, 500.0)],
+                  prices={'WIN': 250.0, 'LOSE': 50.0})
+
+
+def test_a_positive_label_PNL_is_painted_GREEN(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _two_verdicts(account_id))
+    pnl, _delta = _pnl_and_delta(root, 0)
+
+    assert '+1,500.00' in pnl._text
+    assert (pnl._style or {}).get('color', '') == _view_mod().important_color_style(
+        _view_mod().PNL_POSITIVE_COLOR).removeprefix('color: ')
+
+
+def test_a_negative_label_PNL_is_painted_RED(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _two_verdicts(account_id))
+    pnl, _delta = _pnl_and_delta(root, 1)
+
+    assert '-500.00' in pnl._text
+    assert _view_mod().PNL_NEGATIVE_COLOR in (pnl._style or {}).get('color', '')
+
+
+def test_a_flat_or_unmeasurable_label_PNL_stays_NEUTRAL(nicegui_client, account_id):
+    """The epsilon band, kept exactly as it was. Break-even is not a verdict, and
+    neither is "could not be measured"."""
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('FLAT', 100.0)], {'FLAT': ['AAPL']},
+                        weights={'FLAT': {'AAPL': 100.0}},
+                        positions=[_pos('AAPL', 10, 2500.0, 2500.0)],
+                        prices={'AAPL': 250.0}))
+    pnl, _delta = _pnl_and_delta(root)
+
+    assert _view_mod().NEUTRAL_TEXT_COLOR in (pnl._style or {}).get('color', '')
+
+
+def test_OVER_BY_is_painted_ORANGE(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _two_verdicts(account_id))
+    _pnl, delta = _pnl_and_delta(root, 0)
+
+    assert delta._text.startswith('over by ')
+    assert _view_mod().STATUS_OVER_COLOR in (delta._style or {}).get('color', '')
+
+
+def test_UNDER_BY_is_left_NEUTRAL_for_now(nicegui_client, account_id):
+    """Deliberate: the user asked about "over" only. The two now differ, which is
+    reported rather than assumed."""
+    root = _draw(nicegui_client, account_id, _two_verdicts(account_id))
+    _pnl, delta = _pnl_and_delta(root, 1)
+
+    assert delta._text.startswith('under by ')
+    assert _view_mod().NEUTRAL_TEXT_COLOR in (delta._style or {}).get('color', '')
+
+
+def test_every_painted_verdict_carries_the_IMPORTANT(nicegui_client, account_id):
+    """One mechanism for all three, or the next stylesheet rule picks them off one
+    at a time."""
+    root = _draw(nicegui_client, account_id, _two_verdicts(account_id))
+    pnl, delta = _pnl_and_delta(root, 0)
+
+    for element in (pnl, delta, _row_icon(root)):
+        assert '!important' in (element._style or {}).get('color', ''), element
+
+
+# ---------------------------------------------------------------------------
+# THE GLOBAL "All labels" TOOLBAR IS GONE
+#
+# The user: "Event split / load last should be per label, we don't need to have
+# this globally." What went with it is the ability to divide the pool evenly
+# ACROSS labels -- an even split of ONE label's target is not a meaningful
+# operation, so there is nothing per-label to replace it with. Flagged, not
+# quietly reinstated.
+# ---------------------------------------------------------------------------
+
+def test_the_page_draws_NO_global_even_split_or_load_last_row(nicegui_client,
+                                                              account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    for gone in ('MARKER_LABEL_TOOLS', 'MARKER_EVEN_SPLIT_LABELS',
+                 'MARKER_LOAD_LAST_LABELS'):
+        assert not hasattr(page, gone), gone
+    assert 'All labels' not in _texts(root)
+
+
+def test_the_page_carries_no_label_level_target_writer_at_all(nicegui_client,
+                                                              account_id):
+    """Structural: a writer nobody calls is one somebody will call."""
+    for gone in ('_render_label_tools', '_even_split_labels', '_load_last_labels',
+                 '_run_label_target_button', '_write_label_targets',
+                 '_apply_label_targets'):
+        assert not hasattr(page, gone), gone
+
+
+def test_even_split_and_load_last_survive_PER_LABEL(nicegui_client, account_id):
+    """One of each per label, and nothing global."""
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 50.0, 'MSFT': 50.0},
+                                       b_weights={'NVDA': 50.0, 'AMD': 50.0}))
+
+    assert len(_marked_buttons(root, page.MARKER_EVEN_SPLIT_SYMBOLS)) == 2
+    assert len(_marked_buttons(root, page.MARKER_LOAD_LAST_SYMBOLS)) == 2
+    assert len(_marked_buttons(root, page.MARKER_LOAD_CURRENT_SYMBOLS)) == 2
+
+
+def test_per_label_LOAD_LAST_restores_the_last_SAVED_shares(monkeypatch,
+                                                            nicegui_client,
+                                                            account_id):
+    """"they should load last saved". ``previous_weight_pct`` is written by
+    ``save_allocation_targets`` and by nothing else, so that is what this reads --
+    not the values currently in the boxes."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 90.0, 'MSFT': 5.0, 'TSLA': 5.0},
+                                previous={'AAPL': 20.0, 'MSFT': 30.0,
+                                          'TSLA': 50.0}))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 20.0, 'MSFT': 30.0, 'TSLA': 50.0}
+
+
+def test_per_label_LOAD_CURRENT_loads_the_brokers_actual_allocation(
+        monkeypatch, nicegui_client, account_id):
+    """The other half of the pair, confirmed live: what is actually held now."""
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 100.0)],
+                        {'ARK26': ['AAPL', 'MSFT', 'TSLA']},
+                        weights={'ARK26': {'AAPL': 33.33, 'MSFT': 33.33,
+                                           'TSLA': 33.34}},
+                        positions=[_pos('AAPL', 10, 500.0, 5000.0),
+                                   _pos('MSFT', 10, 300.0, 3000.0),
+                                   _pos('TSLA', 10, 200.0, 2000.0)],
+                        prices={'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0}))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_CURRENT_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}
+
+
+def test_the_managed_labels_bar_says_what_it_IS(nicegui_client, account_id):
+    """The card is titled "Managed labels" and shows a COUNT. A bar under it with
+    no name is a rectangle the reader has to guess at."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+    texts = _total_card_texts(root)
+
+    assert _view_mod().LABEL_TOTAL_BAR_LEGEND in texts
+    # ...and the denominator caption is still doing its own, different job.
+    assert _view_mod().LABEL_TOTAL_BAR_CAPTION in texts

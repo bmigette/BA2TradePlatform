@@ -1284,12 +1284,28 @@ LABEL_TARGET_CAPTION = (
     'divides THIS label’s money between its symbols — a different denominator, '
     'which is why the two can read 0 and 20 at the same time and both be right.')
 
-#: Beside the reserve row, naming the one denominator change on the page.
+#: The one denominator change on the page, said where the control is. It used to
+#: live under a blue callout row beneath the labels ("Every label BELOW divides
+#: that remainder"); the reserve is a top-row card now, so the positional language
+#: had to go with it. What may NOT go is the fact: this is the only figure here
+#: measured against the GROSS base while every label divides the remainder, and
+#: unexplained that is just two silently different denominators.
 RESERVE_BASIS_NOTE = (
-    'This row is the only one measured against the gross account base — it IS the '
-    'part held back, so it cannot be restated against what it leaves. Every label '
-    'below divides that remainder, and raising this on a fully invested account '
-    'will generate sell orders.')
+    'This is the only figure on the page measured against the gross account base — '
+    'it IS the part held back, so it cannot be restated against what it leaves. '
+    'Every label divides the remainder it leaves behind.')
+
+#: The consequence, kept beside the slider that causes it. Split out of the note
+#: above so it can sit next to the control rather than in a caption: it is the one
+#: sentence telling the user that dragging this up is not free.
+RESERVE_SELL_WARNING = (
+    'Raising this on a fully invested account will generate SELL orders — the cash '
+    'has to come from somewhere.')
+
+#: The bar's legend. A card titled "Unallocated reserve" whose bar fills with
+#: ALLOCATED money reads as a contradiction unless the legend says which is which,
+#: so it names the fill AND the gap in one line.
+ALLOCATION_BAR_LEGEND = 'Allocated — the reserve is the gap at the end'
 
 #: The target pair, and the ONE place it is spelled. The row cell and the header
 #: line both render it, so they cannot disagree about which figure leads.
@@ -1678,6 +1694,17 @@ def _same_pcts(before, after, places: int = 2) -> bool:
 def even_split_label_targets(targets) -> TargetsUpdate:
     """The label-level "Even split": every label gets an equal share of 100%. Pure.
 
+    NO LIVE CALLER as of the 2026-08-25 UI pass. The user asked for Even split and
+    Load last to be per label ("we don't need to have this globally"), so the
+    toolbar that drove this was deleted -- and with it the only way to divide the
+    pool evenly ACROSS labels, because an even split of ONE label's target is not
+    a meaningful operation. The per-label "Even split" divides a label's 100
+    between its SYMBOLS, which is a different denominator.
+
+    Kept, with its tests, because that trade-off was flagged rather than agreed
+    and this is the reversible half: re-wiring a button is a line, re-deriving the
+    splitter is not. Delete it if the decision is confirmed.
+
     ALWAYS 100, independent of the reserve -- the reserve is its own stored field
     and the labels divide what it LEAVES, so any other total would produce a set
     ``validate_label_targets`` refuses. That reasoning is the engine's
@@ -1700,6 +1727,10 @@ def even_split_label_targets(targets) -> TargetsUpdate:
 
 def load_last_label_targets(targets, previous) -> TargetsUpdate:
     """The label-level "Load last": restore the targets the last RUN used. Pure.
+
+    NO LIVE CALLER -- see ``even_split_label_targets``. The per-label "Load last"
+    restores that label's SYMBOL shares; nothing restores a label's own target any
+    more. Kept on the same terms.
 
     ``previous`` is ``{label: previous_target_pct}`` -- the SEPARATE generation
     written only by ``save_allocation_targets``, never the live map. Reading the
@@ -2060,6 +2091,80 @@ LABEL_STATUS_CLASSES = {
     LABEL_STATUS_OK: 'text-secondary-custom',
     LABEL_STATUS_NONE: 'text-secondary-custom',
 }
+
+# ---------------------------------------------------------------------------
+# PAINTING AGAINST A STYLESHEET THAT FIGHTS BACK
+#
+# ``ui/static/styles.css`` is loaded on every page and is written almost entirely
+# in ``!important``. Two of its rules land squarely on the label row:
+#
+#     .q-expansion-item .q-icon { color: #a0aec0 !important; }
+#     p, span, div, label, ...  { color: #ffffff; }
+#
+# The first BEATS AN INLINE STYLE. A stylesheet ``!important`` outranks a plain
+# inline declaration, so the tag icon in the expansion HEADER rendered #a0aec0
+# grey beside a correctly coloured bar -- and no Python-level test could see it,
+# because the element carried ``style={'color': '#56B4E9'}`` the whole time. The
+# bar's fill is a bare div painted with ``background``, which nothing here
+# touches; that asymmetry is the whole reported symptom.
+#
+# So every colour this page paints is written as an inline ``!important``, which
+# is the top of the cascade, rather than as a Tailwind class name whose paint
+# depends both on a stylesheet we do not own and on the Tailwind JIT having
+# generated that class. The CLASS names below stay -- they are what the DOM reads
+# as, and several tests locate elements by them -- but they are no longer what
+# does the painting, and ``label_status_color`` / ``pnl_color`` are pinned against
+# them so the two renderings of one verdict cannot disagree.
+# ---------------------------------------------------------------------------
+
+#: The page's ordinary muted text. It is what ``text-secondary-custom`` resolves
+#: to in ``styles.css``; naming it here keeps "no verdict" one colour rather than
+#: two spellings of one.
+NEUTRAL_TEXT_COLOR = '#A0AEC0'
+
+#: Tailwind's own ``text-orange-400``, as a hex. Taken from the class the row has
+#: always carried so the appearance is the one that was intended all along.
+STATUS_OVER_COLOR = '#FB923C'
+
+#: Tailwind's ``text-green-500`` / ``text-red-500``, on the same terms.
+PNL_POSITIVE_COLOR = '#22C55E'
+PNL_NEGATIVE_COLOR = '#EF4444'
+
+IMPORTANT_COLOR_FMT = 'color: {color} !important'
+
+
+def important_color_style(color: str) -> str:
+    """``color: #RRGGBB !important`` -- an inline declaration nothing can outrank.
+
+    The ``!important`` is not defensive habit. ``styles.css`` greys every
+    ``.q-expansion-item .q-icon`` with one of its own, and a stylesheet
+    ``!important`` beats a plain inline style; without this the label row's tag
+    icon renders grey however carefully the colour was resolved.
+    """
+    return IMPORTANT_COLOR_FMT.format(color=color)
+
+
+def label_status_color(status: str) -> str:
+    """The colour an over/under verdict is painted in. Pure.
+
+    ONLY "over" is coloured. It is the actionable warning state -- the label is
+    holding more than it was told to and the plan will sell -- and the user asked
+    for that one. "under", "on target" and "no verdict" stay neutral, so the one
+    row that wants attention is the one row that gets it.
+    """
+    return STATUS_OVER_COLOR if status == LABEL_STATUS_OVER else NEUTRAL_TEXT_COLOR
+
+
+def pnl_color(pnl) -> str:
+    """The colour a P&L is painted in. Pure. Green up, red down, neutral between.
+
+    The SAME epsilon band ``pnl_classes`` applies, and for the same reason: a flat
+    0.00 and an unmeasurable figure are not verdicts, and painting break-even red
+    invents one. A test pins the two against each other so they cannot drift.
+    """
+    if pnl is None or pnl.amount is None or abs(pnl.amount) <= MONEY_EPSILON:
+        return NEUTRAL_TEXT_COLOR
+    return PNL_POSITIVE_COLOR if pnl.amount > 0 else PNL_NEGATIVE_COLOR
 
 #: Never let the track's denominator be 0. Every label at zero with no target is a
 #: real state (a brand-new account), and the bars are then simply empty.
@@ -2483,20 +2588,29 @@ def symbol_total_bar(weights) -> ShareBar:
                            target_pct=100.0)
 
 
-def reserve_bar(*, base_notional: Optional[float],
-                available_buying_power: Optional[float],
-                unallocated_pct: float) -> Optional[ShareBar]:
-    """The unallocated row's bar: free cash against the reserve target. Pure.
+def allocation_bar(*, base_notional: Optional[float],
+                   available_buying_power: Optional[float],
+                   unallocated_pct: float) -> Optional[ShareBar]:
+    """The reserve card's bar: what is ALLOCATED, reserve as the gap at the end.
 
-    Built from ``unallocated_row`` -- the same figures the sentence beside it
-    prints -- so the picture and the words cannot disagree. Both are on the GROSS
-    base, which is the page's one deliberate exception to the investable
-    denominator: the reserve IS the part held back, so restating it against what
-    it leaves would be circular.
+    INVERTED from the reserve it was, on the user's reading: "show what is
+    allocated and end of the bar should be the unallocated safety". A bar that
+    filled to a 5% reserve left 95% of the account's money as empty track.
 
-    CURRENT is the buying power and TARGET is the reserve, in that order. Read the
-    other way round an under-funded reserve reads "over" -- while the sub-line
-    beside it is explaining that raising the reserve will generate sells.
+    THE TICK IS INVERTED WITH IT. A 10% reserve target is a 90% ALLOCATED target,
+    so the notch sits at 90% along; left at 10% it would sit on the wrong side of
+    the fill and the bar would contradict its own caption.
+
+    Everything comes off ``unallocated_row`` and is then subtracted from the
+    whole, so the bar and the sentence beside it are one set of figures read two
+    ways rather than two derivations. Both are on the GROSS base -- this card is
+    the page's one deliberate exception to the investable denominator, and
+    ``RESERVE_BASIS_NOTE`` says so.
+
+    The verdict follows the bar's own subject: holding LESS cash than the target
+    is being MORE invested than the target, so an under-funded reserve reads "over
+    by", which is the state the page paints orange -- and which agrees with
+    ``RESERVE_SELL_WARNING`` about what closing the gap costs.
 
     ``None`` on a missing or zero base and on an unknown buying power, on exactly
     ``format_reserve_row``'s terms: there is no denominator, so there is no bar.
@@ -2506,9 +2620,11 @@ def reserve_bar(*, base_notional: Optional[float],
     row = unallocated_row(base_notional=base_notional,
                           available_buying_power=available_buying_power,
                           unallocated_pct=unallocated_pct)
-    return build_share_bar(current_pct=row.pct_of_base, target_pct=row.target_pct,
-                           current_value=row.current_value,
-                           target_value=row.target_value)
+    base = float(base_notional)
+    return build_share_bar(current_pct=100.0 - row.pct_of_base,
+                           target_pct=100.0 - row.target_pct,
+                           current_value=base - row.current_value,
+                           target_value=base - row.target_value)
 
 
 def sort_label_views(views) -> List["LabelView"]:
@@ -2623,7 +2739,11 @@ def format_label_total_notice(targets,
 
 LABEL_TOTAL_TITLE = 'Label targets total'
 
-#: Beside the bar, naming ITS denominator. The per-label bar says "shares of this
+#: What the bar IS. The card is titled "Managed labels" and shows a COUNT, so a
+#: bar under it with no name is a rectangle the reader has to guess at.
+LABEL_TOTAL_BAR_LEGEND = 'Total label allocation'
+
+#: ...and beside it, ITS denominator. The per-label bar says "shares of this
 #: label" for the same reason: two bars two inches apart on two denominators is
 #: the collision this page has spent its life unpicking.
 LABEL_TOTAL_BAR_CAPTION = 'of the investable pool'

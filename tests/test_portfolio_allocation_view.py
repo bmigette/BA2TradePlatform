@@ -4151,47 +4151,6 @@ def test_the_symbol_total_bar_of_a_label_with_no_symbols_is_not_a_verdict():
     assert symbol_total_bar({}).status == LABEL_STATUS_NONE
 
 
-def test_the_reserve_bar_reads_ACTUAL_against_TARGET_and_not_the_other_way():
-    """$245.50 of free cash (4.7% of base) against a 10.00% target is UNDER. Read
-    the two the wrong way round and the bar says "over" while the sentence beside
-    it says raising the reserve will generate sells."""
-    from ba2_trade_platform.ui.utils.portfolio_allocation_view import reserve_bar
-
-    bar = reserve_bar(base_notional=5_260.9, available_buying_power=245.50,
-                      unallocated_pct=10.0)
-
-    assert bar.current_pct == pytest.approx(4.67, abs=0.01)
-    assert bar.target_pct == 10.0
-    assert bar.status == LABEL_STATUS_UNDER
-    assert bar.delta_text.startswith('under by ')
-
-
-def test_the_reserve_bar_agrees_with_the_row_it_sits_beside():
-    """Same numbers, same source: ``unallocated_row``. A bar built from its own
-    arithmetic is how the picture and the sentence come to disagree."""
-    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
-        reserve_bar, unallocated_row)
-
-    row = unallocated_row(base_notional=5_260.9, available_buying_power=245.50,
-                          unallocated_pct=10.0)
-    bar = reserve_bar(base_notional=5_260.9, available_buying_power=245.50,
-                      unallocated_pct=10.0)
-
-    assert bar.current_pct == row.pct_of_base
-    assert bar.target_pct == row.target_pct
-
-
-def test_the_reserve_bar_is_absent_when_there_is_no_base_to_divide_by():
-    from ba2_trade_platform.ui.utils.portfolio_allocation_view import reserve_bar
-
-    assert reserve_bar(base_notional=0.0, available_buying_power=100.0,
-                       unallocated_pct=10.0) is None
-    assert reserve_bar(base_notional=None, available_buying_power=100.0,
-                       unallocated_pct=10.0) is None
-    assert reserve_bar(base_notional=1_000.0, available_buying_power=None,
-                       unallocated_pct=10.0) is None
-
-
 # ---------------------------------------------------------------------------
 # THE MANAGE-LABELS DIALOG: its grid, and what a colour state is CALLED
 # ---------------------------------------------------------------------------
@@ -4249,3 +4208,188 @@ def test_an_unreadable_stored_colour_says_it_is_being_IGNORED():
 
     said = describe_label_color('rgb(1,2,3)')
     assert 'ignored' in said.lower()
+
+
+# ---------------------------------------------------------------------------
+# PAINTING AGAINST A STYLESHEET THAT FIGHTS BACK
+#
+# ``ui/static/styles.css`` is loaded on every page and is written almost entirely
+# in ``!important``. Two of its rules land squarely on the label row:
+#
+#   .q-expansion-item .q-icon { color: #a0aec0 !important; }
+#   p, span, div, label, ...  { color: #ffffff; }
+#
+# The first BEATS AN INLINE STYLE -- a stylesheet ``!important`` outranks a plain
+# inline declaration -- so the tag icon rendered grey beside a correctly coloured
+# bar, which is exactly what the user reported and what no Python-level test could
+# see: the element carried ``style={'color': '#56B4E9'}`` the whole time.
+#
+# So colour on this page is written as an inline ``!important``, which is the top
+# of the cascade, and NOT as a Tailwind class name whose paint depends on a
+# stylesheet we do not control and on the Tailwind JIT having generated it.
+# ---------------------------------------------------------------------------
+
+def test_a_colour_this_page_paints_is_written_so_the_stylesheet_cannot_win():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        important_color_style)
+
+    assert important_color_style('#56B4E9') == 'color: #56B4E9 !important'
+
+
+def test_over_is_ORANGE_and_the_other_verdicts_stay_neutral():
+    """Item 4: "over by ..." is the actionable warning state. "under" is left
+    neutral deliberately -- the user asked about over only."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        NEUTRAL_TEXT_COLOR, label_status_color)
+
+    assert label_status_color(LABEL_STATUS_OVER) != NEUTRAL_TEXT_COLOR
+    assert 'F' in label_status_color(LABEL_STATUS_OVER).upper()   # a real hex
+    for quiet in (LABEL_STATUS_UNDER, LABEL_STATUS_OK, LABEL_STATUS_NONE):
+        assert label_status_color(quiet) == NEUTRAL_TEXT_COLOR
+
+
+def test_the_pnl_colour_is_green_up_red_down_and_neutral_in_the_band():
+    """The same epsilon band ``pnl_classes`` already had, as a paintable colour.
+    A flat 0.00 stays neutral and an unmeasurable P&L stays neutral -- neither is
+    a verdict, and painting break-even red invents one."""
+    from ba2_trade_platform.core.portfolio_allocation import MONEY_EPSILON, UnrealisedPnL
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        NEUTRAL_TEXT_COLOR, pnl_color)
+
+    assert pnl_color(UnrealisedPnL(amount=124.43)) != NEUTRAL_TEXT_COLOR
+    assert pnl_color(UnrealisedPnL(amount=-29.58)) != NEUTRAL_TEXT_COLOR
+    assert pnl_color(UnrealisedPnL(amount=124.43)) != pnl_color(
+        UnrealisedPnL(amount=-29.58))
+    for quiet in (UnrealisedPnL(amount=0.0),
+                  UnrealisedPnL(amount=MONEY_EPSILON / 2.0),
+                  UnrealisedPnL(amount=None), None):
+        assert pnl_color(quiet) == NEUTRAL_TEXT_COLOR, quiet
+
+
+def test_the_pnl_colour_and_the_pnl_CLASSES_cannot_disagree():
+    """Two renderings of one verdict. The classes stay for anything reading the
+    DOM; the inline colour is what actually paints."""
+    from ba2_trade_platform.core.portfolio_allocation import UnrealisedPnL
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        NEUTRAL_TEXT_COLOR, pnl_classes, pnl_color)
+
+    for pnl in (UnrealisedPnL(amount=1.0), UnrealisedPnL(amount=-1.0),
+                UnrealisedPnL(amount=0.0), UnrealisedPnL(amount=None)):
+        coloured = pnl_color(pnl) != NEUTRAL_TEXT_COLOR
+        assert coloured == ('green' in pnl_classes(pnl) or 'red' in pnl_classes(pnl))
+
+
+# ---------------------------------------------------------------------------
+# THE UNALLOCATED BAR, INVERTED AND RE-HOMED
+#
+# It filled to the RESERVE -- 5.3% of a bar, with 94.7% of the account's money
+# represented by empty track. The user asked for it the other way round: the fill
+# is what is ALLOCATED, and the reserve is the gap left at the right-hand end.
+#
+# The target tick has to travel with it. A 10% reserve target is a 90% ALLOCATED
+# target, so the tick sits at 90% along; leaving it at 10% would put it on the
+# wrong side of the fill and make the bar contradict its own caption.
+# ---------------------------------------------------------------------------
+
+def test_the_allocation_bar_fills_with_what_is_ALLOCATED():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import allocation_bar
+
+    bar = allocation_bar(base_notional=5_296.0, available_buying_power=279.25,
+                         unallocated_pct=10.0)
+
+    assert bar.current_pct == pytest.approx(94.73, abs=0.01)
+    assert bar.fraction == pytest.approx(0.9473, abs=0.0001)
+
+
+def test_the_allocation_bars_TICK_moves_with_the_inversion():
+    """A 10% reserve target is a 90% allocated target. A tick left at 10% would
+    sit on the wrong side of the fill and contradict the caption."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import allocation_bar
+
+    bar = allocation_bar(base_notional=5_296.0, available_buying_power=279.25,
+                         unallocated_pct=10.0)
+
+    assert bar.target_pct == pytest.approx(90.0)
+    assert bar.notch_fraction == pytest.approx(0.90, abs=0.0001)
+
+
+def test_the_allocation_bar_and_the_reserve_row_describe_ONE_account():
+    """Inverted, not re-derived: the two come from the same ``unallocated_row``,
+    so the bar and the sentence beside it cannot drift apart."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        allocation_bar, unallocated_row)
+
+    row = unallocated_row(base_notional=5_296.0, available_buying_power=279.25,
+                          unallocated_pct=10.0)
+    bar = allocation_bar(base_notional=5_296.0, available_buying_power=279.25,
+                         unallocated_pct=10.0)
+
+    assert bar.current_pct == pytest.approx(100.0 - row.pct_of_base)
+    assert bar.target_pct == pytest.approx(100.0 - row.target_pct)
+
+
+def test_being_UNDER_the_reserve_target_reads_as_OVER_allocated():
+    """The same fact from the bar's own subject. Holding less cash than the target
+    IS being more invested than the target, and "over" is the state the page
+    paints orange -- which agrees with the sub-line warning that closing the gap
+    means selling."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import allocation_bar
+
+    bar = allocation_bar(base_notional=5_296.0, available_buying_power=279.25,
+                         unallocated_pct=10.0)
+
+    assert bar.status == LABEL_STATUS_OVER
+    assert bar.delta_text.startswith('over by ')
+
+
+def test_holding_MORE_cash_than_the_target_reads_as_UNDER_allocated():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import allocation_bar
+
+    bar = allocation_bar(base_notional=1_000.0, available_buying_power=300.0,
+                         unallocated_pct=10.0)
+
+    assert bar.current_pct == pytest.approx(70.0)
+    assert bar.status == LABEL_STATUS_UNDER
+
+
+def test_the_allocation_bar_is_absent_when_there_is_no_base_to_divide_by():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import allocation_bar
+
+    assert allocation_bar(base_notional=0.0, available_buying_power=100.0,
+                          unallocated_pct=10.0) is None
+    assert allocation_bar(base_notional=None, available_buying_power=100.0,
+                          unallocated_pct=10.0) is None
+    assert allocation_bar(base_notional=1_000.0, available_buying_power=None,
+                          unallocated_pct=10.0) is None
+
+
+def test_the_bars_that_can_be_MISREAD_as_their_opposite_carry_a_legend():
+    """A card titled "Unallocated reserve" whose bar fills with ALLOCATED money is
+    a contradiction unless the legend says which is which. Same principle as the
+    label-total bar, which is a bar in a card about label COUNTS."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        ALLOCATION_BAR_LEGEND, LABEL_TOTAL_BAR_LEGEND)
+
+    assert 'llocated' in ALLOCATION_BAR_LEGEND
+    assert 'reserve' in ALLOCATION_BAR_LEGEND.lower()
+    assert LABEL_TOTAL_BAR_LEGEND
+
+
+def test_the_reserve_keeps_BOTH_things_the_blue_panel_was_saying():
+    """Moving it into the card must not drop either: the gross-base denominator
+    (this page's one exception, and unexplained it is just two silently different
+    denominators) or the consequence warning on the slider."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        RESERVE_BASIS_NOTE, RESERVE_SELL_WARNING)
+
+    assert 'gross account base' in RESERVE_BASIS_NOTE
+    assert 'SELL orders' in RESERVE_SELL_WARNING
+
+
+def test_the_reserve_note_no_longer_points_BELOW_itself():
+    """It is a top-row card now; the labels are not "below" it in any useful
+    sense."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        RESERVE_BASIS_NOTE)
+
+    assert 'below' not in RESERVE_BASIS_NOTE.lower()
