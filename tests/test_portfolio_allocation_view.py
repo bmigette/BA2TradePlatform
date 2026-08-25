@@ -3984,6 +3984,29 @@ def test_a_SAVED_target_does_not_mask_an_unmeasurable_holding():
     assert by_symbol['AAPL'].measurable is True
 
 
+def test_a_FLAT_position_ROW_with_no_quote_is_still_measurable():
+    """Survivor of the mutation run: dropping the ``not state.quantity`` guard.
+
+    A broker that returns a zero-quantity row for a symbol you have sold out of --
+    and no quote for it, because it is not worth quoting -- is worth EXACTLY
+    NOTHING, and that is a measurement. Calling it unmeasurable would blank every
+    unsaved share in the label around it and refuse "Load current", on the
+    strength of a position that does not exist.
+    """
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL', 'GONE']},
+                              {'AAPL': _pos('AAPL', 10, 500.0),
+                               'GONE': _pos('GONE', 0, 0.0)},
+                              {'AAPL': 500.0, 'GONE': None},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    by_symbol = {r.symbol: r for r in views[0].rows}
+
+    assert by_symbol['GONE'].measurable is True
+    # ...so the label keeps its verdict, and the flat row keeps its honest 0%.
+    assert by_symbol['AAPL'].weight_pct == 100.0
+    assert by_symbol['GONE'].weight_pct == 0.0
+
+
 def test_a_FLAT_holding_is_measurable_and_an_unpriced_one_is_not():
     """Nothing held is worth exactly nothing, which is a measurement. Only a
     holding with no price is unmeasurable, and only in MARKET mode -- the cost
