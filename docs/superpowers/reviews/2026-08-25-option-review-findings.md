@@ -834,13 +834,238 @@ the iron condor.
 
 ---
 
-## Pending — R3, R4
+---
 
-- **R3 (condition optimizability):** per-condition table of unit / domain / symbol-comparability /
-  registration / GA range vs real range. Includes the **RVOL** question — both *relative volume* and
-  *IV ÷ realised volatility* are wanted as genes. Note OPT-S12 above already surfaces a registry gap
-  from a different angle; R3 should be cross-checked against it.
+# R3 — are option conditions optimizable by the GA?
+
+27 agents, 33 conditions inventoried, 18 findings raised, **15 survived**, 3 refuted.
+
+## The answer, and why it is the opposite of what was expected
+
+The worry going in was that conditions on raw option values — bid, ask, premium in dollars —
+would be unbounded and symbol-scaled, and therefore un-optimizable. **Those conditions are not in
+any grid, correctly.** `profit_loss_amount` exists and is deliberately never given a range.
+
+The real problem is the inverse:
+
+> **`iv_rank` — the one genuinely bounded, symbol-comparable option quantity the platform owns —
+> has NO GA range anywhere in the rules-engine grid.**
+
+No `"field": "iv_rank"` leaf exists in any built strategy. The only literal hits repo-wide are the
+enum, `FIELD_EVENT`, the abbreviation map, the audit module and tests. It is fully implemented,
+correctly registered, and has a proper fail-closed unknown path
+(`TradeConditions.py:2382`, `_iv_rank_from_series` at `OptionsAccountInterface.py:436`) — and the
+GA never touches it.
+
+**Every option gene currently searched is a position-MANAGEMENT knob:** %OTM, DTE-window centre,
+wing width, %-of-premium TP/SL, days held, days-to-expiry. There is essentially no *entry
+selection* dimension in the search.
+
+And the single most heavily searched option gene is the symbol-scaled one:
+
+> **`percent_otm` is the only strike-selection gene in all 16 option grids, and it is
+> volatility-blind.** The normalized alternative — delta — is implemented, backtest-supported, and
+> the *live default*, yet never searched.
+
+Compounding this, the GA gene is literally **named `option_delta`** while carrying percent-OTM
+values in every range (`ba2test_launcher.py:2103-2255`). Two quantities, one name — the house bug
+pattern, in the gene space itself.
+
+`days_to_earnings` is likewise searchable nowhere, despite the documented straddle/strangle recipe
+`iv_rank <= 30 and days_to_earnings <= 5` (`rules_documentation.py:510, :521`) depending on both.
+
+## R3 findings
+
+| ID | Sev | Summary | Status |
+|---|---|---|---|
+| [OPT-C1](#opt-c1) | high | **No premium-richness criterion exists** — credit structures accepted on `net_credit > 0` alone | open |
+| [OPT-C2](#opt-c2) | high | The option cache's expiry horizon is per-symbol and frozen by `resume=True` — the universe decays symbol-by-symbol across the window | open |
+| [OPT-C3](#opt-c3) | medium | `percent_otm` is the only strike gene and is volatility-blind; delta is implemented but never searched | open |
+| [OPT-C4](#opt-c4) | medium | The buy/sell split is **structural only** — both halves search an identical, volatility-free condition set | open |
+| [OPT-C5](#opt-c5) | medium | ~32–38 % of the price-gate gene space is logically unsatisfiable, and the waste is centred on the authored default | open |
+| [OPT-C6](#opt-c6) | medium | The chain relabels a contract's LAST-TRADED bar as the as-of bar — stale quote/IV/delta with no age bound | open |
+| [OPT-C7](#opt-c7) | medium | Option TP/SL genes are unevaluable on non-printing bars while time exits always evaluate — the exit search is biased toward time exits | open |
+| [OPT-C8](#opt-c8) | medium | `get_atm_iv` falls back to a frozen start-date row whose IV can be **lookahead** — corrupting the one comparable statistic | open |
+| [OPT-C9](#opt-c9) | medium | Every vertical is exactly one strike wide, so the TP gene's live domain is set by a *different* gene | open |
+| [OPT-C10](#opt-c10) | low | `iv_rank` has no range, and the auto-range generator puts a fifth of its levels above the field's own ceiling | open |
+| [OPT-C11](#opt-c11) | low | `option_wing_width` collapses to 2–4 distinct structures out of 6 values, differently per symbol | open |
+| [OPT-C12](#opt-c12) | low | `price_vs_target_high_percent` sits at −31 % median — 77 % of the universe is outside the searched ±20 % window | open |
+| [OPT-C13](#opt-c13) | low | In GROUP jobs a dead member scores **neutral**, not catastrophic | open |
+| OPT-C14 | low | PremiumSeller `target_dte` declares 21..45 but decodes to {24,30,36,42,48} — floor unreachable, ceiling exceeded by 3 | dies with Task 12 |
+| OPT-C15 | high | PremiumSeller `spread_width` demands an exact listed strike, so each value silently deletes a different subset of the universe | dies with Task 12 |
+
+### OPT-C1 — No premium-richness entry criterion exists anywhere
+`packages/common/ba2_common/core/TradeActions.py:2642`
+
+Credit structures are admitted on **`net_credit > 0` alone**. There is no minimum credit, no
+credit-as-a-fraction-of-width, no return-on-collateral floor, no annualised-yield gate.
+
+Selling far-OTM options for near-zero credit expires worthless roughly 97 % of the time. So on any
+win-rate- or Sharpe-flavoured fitness the GA is **actively rewarded** for doing exactly that. This
+is the pennies-in-front-of-a-steamroller mechanism, and it is not merely unpenalised — the
+profitability criterion is absent from the search space entirely.
+
+**This is the single most important cross-link to R4.** No fitness change can fully compensate for
+an entry criterion that does not exist.
+
+### OPT-C2 — The option universe decays symbol-by-symbol across the window
+`testplatform/backend/app/services/backtest/fetch_options.py:454`
+
+The cache's expiry horizon is per-symbol and frozen by `resume=True`. Every option genome is
+therefore scored on a universe that shrinks on a fixed calendar schedule having nothing to do with
+the genome.
+
+Consequence: **fitness is dominated by *when* a genome trades.** A gene combination that happens to
+fire early scores against a full universe; one that fires later scores against a decayed one. This
+is the symbol-mix failure mode with a time axis, and it directly undermines the equity cap's
+premise that a stable setting should score the same regardless of start date.
+
+### OPT-C3 — The most-searched gene is the symbol-scaled one
+`testplatform/ba2test_launcher.py:2105`
+
+`percent_otm` maps to a wildly different assignment probability and premium per symbol — 5 % OTM on
+a 15-vol utility and on a 90-vol biotech are not comparable propositions. The $0.10 premium floor
+then silently removes the low-vol / low-price half of the universe, so the gene doubles as a
+universe filter.
+
+Delta is implemented, backtest-supported and the live default — and is never searched. Note the
+R1/cache finding that the legacy chain cache has **no IV and no greeks at all**, which may be *why*
+`percent_otm` was hard-coded; if so, wiring delta requires the parquet store to exist first.
+
+### OPT-C4 — The buy/sell split is structural only
+`testplatform/ba2test_launcher.py:2591`
+
+Debit and credit halves search an **identical, volatility-free condition set**. A premium seller
+wants IV rank *high*; a premium buyer wants it *low*. Neither can express its thesis, because the
+quantity that would express it is not a gene. The split the user asked for exists in the structures
+but not in the search.
+
+### OPT-C5 — A third of the entry-gate space is logically dead
+`testplatform/ba2test_launcher.py:2577-2586`
+
+The four price-vs-target gates are 8 genes per structure that collapse to a single interval on spot
+price. **31.6–38 % of the sampled sub-space is an empty conjunction** that guarantees zero trades,
+all scoring the identical `-1e9` sentinel, so selection gets no gradient from them.
+
+Worse, the waste is concentrated **exactly at the authored default (all-zero)** — which is where
+warm-start and every hand-seeded individual begins.
+
+### OPT-C6 — Stale bars relabelled as the as-of bar
+`testplatform/backend/app/services/backtest/options_provider.py:282`
+
+The chain relabels a contract's **last-traded** bar as the as-of bar, with no age bound. Volume,
+quote, IV and delta can all be arbitrarily stale.
+
+This partially defeats the `min_volume` tradability floor that the launcher deliberately made
+non-searchable (`ba2test_launcher.py:2341-2352`, default 25) — the GA's trade population ends up
+shaped by data *age* rather than by liquidity.
+
+### OPT-C7 — The exit search is structurally biased toward time exits
+`testplatform/backend/app/services/backtest/options_provider.py:287`
+
+Option TP/SL genes are **unevaluable on any bar the contract did not print**; the time-based exit
+genes always evaluate. Two of the four exit genes are silently data-gated and two are not.
+
+So the GA chooses between exit *mechanisms* on the basis of which one can be evaluated rather than
+which one is profitable. Credit structures are hit hardest — they carry the most legs and the
+cheapest, thinnest wings.
+
+### OPT-C8 — Lookahead in the one comparable statistic
+`testplatform/backend/app/services/backtest/options_provider.py:371`
+
+`get_atm_iv` falls back to the cache build's **start-date** chain row, whose IV can itself have been
+inverted from a price dated *after* the evaluation bar. The `iv_rank` series therefore mixes
+point-in-time IV with frozen — and sometimes lookahead — constants.
+
+`PremiumSeller.iv_rank_min` (`ba2test_launcher.py:1264`, 20..60 step 10) is the **only** place the
+GA searches an IV-rank threshold anywhere, so if the underlying statistic is corrupted on a
+meaningful fraction of bars, that one search is unreliable too.
+
+### OPT-C9 — The TP gene's domain is set by a different gene
+`testplatform/ba2test_launcher.py:2507`
+
+Every vertical is built exactly **one strike wide**, so the `profit_loss_percent` TP/SL basis is
+fixed by the strike ladder and by `option_strike_param`. The debit TP band's top half (125–200 %) is
+unreachable at the ATM end of the grid — roughly **19 % of the joint (strike_param, TP) grid is a
+dead TP** for O_VERT/O_BULLCS, and crossover routinely recombines the two into that dead region.
+
+### OPT-C10 — `iv_rank`'s only possible range is wrong
+`packages/common/ba2_common/core/rules_convert.py:70, :83`
+
+The sole path that would ever give `iv_rank` a range is the generic **±50 %-of-current-value**
+fallback used when a *live* ruleset is imported (`ruleset_meta.py:164, :279`). That generator puts
+about a fifth of its levels **above 100** — outside the field's own ceiling.
+
+### OPT-C11 — `option_wing_width` collapses to a handful of phenotypes
+`packages/common/ba2_common/core/option_selector.py:340`
+
+Six values collapse to 2–4 distinct structures, and *which* values collapse differs per symbol.
+`_mutate_individual` (`genetic.py:233-266`) uses σ = (8−3)/6 = 0.83, so a typical mutation moves one
+bucket — which on AAPL/MSFT/GOOGL is a no-op four times out of five. The GA burns evaluations
+re-testing an identical phenotype and reads the flat fitness as a plateau.
+
+### OPT-C12 — Two of the four price gates are inert on 77 % of the universe
+`testplatform/ba2test_launcher.py:2581`
+
+All four analyst-target gates share one ±20 % window, but `price_vs_target_high_percent` has a
+**−31 % median**. On ~77 % of symbols the gene cannot change any evaluation; on the other 23 % it
+acts as a symbol filter rather than a signal.
+
+### OPT-C13 — A dead member scores neutral in GROUP jobs
+`testplatform/ba2test_launcher.py:2577`
+
+In GROUP jobs a member that cannot trade scores **neutral**, not catastrophic. Contradictory or
+unsatisfiable genomes therefore survive selection as "not bad" rather than being driven out — the
+dangerous variant of the zero-trade case.
+
+## Other inventory facts worth keeping
+
+- **`option_sizing` is bounded, symbol-comparable, and NOT a gene.** `_collect_action_genes`
+  (`strategy_param_space.py:147-177`) emits genes only for `action_value`, the per-action toggle,
+  `option_delta`, `option_dte` and `option_wing_width`. There is no `option_sizing_optimize`
+  anywhere, so position size is a per-structure constant (5–20 %) the GA cannot touch.
+- **`days_to_expiry` is emitted as a FLOAT gene** — `strategy_param_space.py:134-137` hardcodes
+  `is_int=False` for every `cond:*:value`, so an integer day-count is sampled with
+  `random.uniform` and made integral only by step rounding.
+- **`min_volume` is deliberately not a gene** and the code says why
+  (`ba2test_launcher.py:2341-2352`): it is a tradability floor, not a strategy parameter. Correct.
+- **`has_covered_call` / `has_protective_put` guards carry no `toggle_optimize`**, so they are
+  fixed, unsearchable parts of every O_CC / O_PP genome.
+- **`percent_below_recent_high`'s 20-bar window is a hardcoded class constant** — even where the
+  threshold were a gene, the window could never be tuned.
+- **O_SSTD and O_STRD have no strike gene at all** (always ATM).
+- The `price_vs_target_*` registration gap is the same defect as **OPT-S12** — found independently
+  from a different angle, which is corroboration.
+
+## What to add — the user asked for RVOL
+
+The user asked for **relative volume** and **IV ÷ realised volatility** as genes. Both are the right
+shape (bounded, symbol-comparable). Sequencing note: they are additions on top of a **missing
+foundation** — `iv_rank` is already implemented and simply unwired, so wiring the gene that exists
+comes first and costs almost nothing.
+
+Design constraints for an RVOL gene, from the house rules:
+- **Underlying RVOL, not contract RVOL.** Most individual contracts trade zero on most days, so a
+  contract-level ratio is undefined far more often than informative. Volume ÷ open interest is the
+  better contract-level unusual-activity signal.
+- **The trailing window must exclude the current bar**, or the average absorbs the spike it is meant
+  to detect — and it must not reach forward (the lookahead shape already found in
+  `percent_below_recent_high` and again in OPT-C8).
+- **Insufficient history is unknown, not 1.0.** Defaulting to "normal" makes the gene silently
+  free-passing on every newly-listed symbol, and 1.0 looks plausible enough that nobody would notice.
+
+Also missing and worth considering, all bounded and symbol-comparable: premium as a percent of
+strike; credit as a percent of spread width (the classic "collect a third of the width" rule);
+annualised return on collateral; bid-ask spread as a percent of mid; distance to strike in standard
+deviations (the properly normalized "how far OTM", which is what OPT-C3 actually needs).
+
+---
+
+## Pending — R4
+
 - **R4 (fitness):** recommended option-specific fitness. The premise under test is that a
   consistency-rewarding fitness is precisely what a short-premium strategy games, and that options
   uniquely permit an **ex-ante** risk denominator because a defined-risk structure's max loss is
-  arithmetic rather than sampled.
+  arithmetic rather than sampled. **Cross-link: OPT-C1** — there is currently no premium-richness
+  entry criterion at all, so the GA is rewarded for selling near-worthless premium. No fitness
+  change fully compensates for a missing entry gate; these two must be fixed together.
