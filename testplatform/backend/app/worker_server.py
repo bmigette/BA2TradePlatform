@@ -456,16 +456,35 @@ def _job_status(job_id: str) -> dict:
 SessionLocal = None
 
 
-def _verify(authorization: Optional[str]) -> None:
-    """Bearer-check against the worker password (constant-time)."""
+def _client_ip(request: Request) -> str:
+    """The TCP peer's address — deliberately NOT X-Forwarded-For. This worker is not known to
+    sit behind a reverse proxy (see module docstring: bare uvicorn on --port), and trusting a
+    client-supplied header for the value a firewall ban keys on would let an attacker spoof
+    ANY IP into that header and either dodge the ban or frame an innocent address."""
+    return request.client.host if request.client else "unknown"
+
+
+def _verify(authorization: Optional[str], request: Request) -> None:
+    """Bearer-check against the worker password (constant-time).
+
+    Logs the caller's source IP on every failure. This worker is meant to be reachable over the
+    internet (see module docstring), and a brute-force/scan against it has no other visible
+    signature — this line is what a fail2ban filter matches to ban the IP at the firewall. The
+    submitted token itself is NEVER logged. Format is deliberately stable and single-line-per-
+    attempt: "auth failed from <ip>: <reason>".
+    """
+    ip = _client_ip(request)
     if not _PASSWORD:
         raise HTTPException(status_code=503, detail="Worker password not configured.")
     if not authorization:
+        logger.warning("auth failed from %s: missing Authorization header", ip)
         raise HTTPException(status_code=401, detail="Missing Authorization header.")
     parts = authorization.split(" ", 1)
     if len(parts) != 2 or parts[0].lower() != "bearer":
+        logger.warning("auth failed from %s: malformed Authorization header", ip)
         raise HTTPException(status_code=401, detail="Expected 'Bearer <password>'.")
     if not hmac.compare_digest(parts[1], _PASSWORD):
+        logger.warning("auth failed from %s: invalid worker password", ip)
         raise HTTPException(status_code=403, detail="Invalid worker password.")
 
 
@@ -589,7 +608,7 @@ def _hardware() -> dict:
 
 
 @worker_app.get("/health")
-def health(authorization: str = Header(default=None)):
+def health(request: Request, authorization: str = Header(default=None)):
     """Worker liveness + how much of it is actually AVAILABLE.
 
     Sweeps abandoned jobs first: the sweep used to run only from ``_submit_job``, so a worker
@@ -601,7 +620,7 @@ def health(authorization: str = Header(default=None)):
     report reality. A worker answering ok:true capacity:6 while holding 6 live jobs is exactly
     how the 2026-08-05/06 stalls looked from the master's side.
     """
-    _verify(authorization)
+    _verify(authorization, request)
     _sweep_orphaned_jobs()
     with _JOBS_LOCK:
         busy = sum(1 for f in _JOBS.values() if not f.done())
@@ -611,7 +630,7 @@ def health(authorization: str = Header(default=None)):
 
 
 @worker_app.post("/pool/resize")
-def pool_resize(body: dict, authorization: str = Header(default=None)):
+def pool_resize(body: dict, request: Request, authorization: str = Header(default=None)):
     """Resize the trial pool to ``workers`` slots, for the job the master is about to run.
 
     WHY THIS EXISTS. Pool children are spawned once at daemon start and stay resident no
@@ -623,7 +642,7 @@ def pool_resize(body: dict, authorization: str = Header(default=None)):
     --parallel 2) and a rebuild under a live trial would discard it. The running size wins
     and the caller is told why, rather than the resize silently half-applying.
     """
-    _verify(authorization)
+    _verify(authorization, request)
     global _CAPACITY
     try:
         want = int(body.get("workers"))
@@ -658,17 +677,17 @@ def pool_resize(body: dict, authorization: str = Header(default=None)):
 
 
 @worker_app.get("/version")
-def version(authorization: str = Header(default=None)):
-    _verify(authorization)
+def version(request: Request, authorization: str = Header(default=None)):
+    _verify(authorization, request)
     return self_update.get_version_info()
 
 
 @worker_app.get("/diag/memory")
-def diag_memory(authorization: str = Header(default=None)):
+def diag_memory(request: Request, authorization: str = Header(default=None)):
     """On-demand memory snapshot (see ``_memory_snapshot``) — lets the master check a remote
     worker's RSS/child-process footprint without SSH/RDP access, e.g. while investigating a
     slow or hung worker."""
-    _verify(authorization)
+    _verify(authorization, request)
     try:
         return {"ok": True, **_memory_snapshot()}
     except Exception as e:  # noqa: BLE001 — diagnostics must never 500 the caller
@@ -676,10 +695,10 @@ def diag_memory(authorization: str = Header(default=None)):
 
 
 @worker_app.get("/logs/list")
-def logs_list(authorization: str = Header(default=None)):
+def logs_list(request: Request, authorization: str = Header(default=None)):
     """List the log filenames in this worker's LOGS_DIR (app.log, app.debug.log,
     all.debug.log, all.error.log, ...) — see ``ba2_common.logger`` for what writes there."""
-    _verify(authorization)
+    _verify(authorization, request)
     from ba2_common.logger import LOGS_DIR
 
     try:
@@ -690,13 +709,13 @@ def logs_list(authorization: str = Header(default=None)):
 
 
 @worker_app.get("/logs")
-def logs_tail(file: str = "app.log", tail_lines: int = 500,
+def logs_tail(request: Request, file: str = "app.log", tail_lines: int = 500,
               authorization: str = Header(default=None)):
     """Return the last *tail_lines* lines of one log file under LOGS_DIR — the remote-debugging
     tool this worker didn't have before: without it, diagnosing a hang/crash/anomaly on a
     machine with no SSH/RDP access meant flying blind. ``file`` must be a bare filename (no `/`,
     `\\`, or `..`) so a caller can't read arbitrary paths off the worker's disk."""
-    _verify(authorization)
+    _verify(authorization, request)
     from ba2_common.logger import LOGS_DIR
 
     name = os.path.basename(file)
@@ -712,8 +731,9 @@ def logs_tail(file: str = "app.log", tail_lines: int = 500,
 
 
 @worker_app.get("/cache/manifest")
-def cache_manifest(with_hash: bool = False, authorization: str = Header(default=None)):
-    _verify(authorization)
+def cache_manifest(request: Request, with_hash: bool = False,
+                   authorization: str = Header(default=None)):
+    _verify(authorization, request)
     return cache_sync.build_manifest(with_hash=with_hash)
 
 
@@ -724,7 +744,7 @@ async def cache_push(request: Request, authorization: str = Header(default=None)
     Spools the upload to a temp file (disk, not memory) so an arbitrarily large tar streams safely,
     then extracts (traversal-guarded). Returns ``{extracted, bytes, skipped}``.
     """
-    _verify(authorization)
+    _verify(authorization, request)
     tmp = tempfile.NamedTemporaryFile(prefix="ba2-cache-push-", suffix=".tar", delete=False)
     try:
         async for chunk in request.stream():
@@ -742,11 +762,11 @@ async def cache_push(request: Request, authorization: str = Header(default=None)
 
 
 @worker_app.post("/submit-trial")
-def submit_trial(req: RunTrialReq, authorization: str = Header(default=None)):
+def submit_trial(req: RunTrialReq, request: Request, authorization: str = Header(default=None)):
     """Submit ONE deterministic trial to the worker pool and return a job_id IMMEDIATELY —
     does not wait for the trial. Poll /job-status/{job_id} for the result (see module
     docstring's SUBMIT/POLL note for why this replaced the old blocking /run-trial)."""
-    _verify(authorization)
+    _verify(authorization, request)
     _apply_inmem_trades_flag(req.inmem_trades)
     from app.services.strategy_optimization_handler import _trial_worker
     config = req.config
@@ -758,13 +778,14 @@ def submit_trial(req: RunTrialReq, authorization: str = Header(default=None)):
 
 
 @worker_app.post("/submit-trial-full")
-def submit_trial_full(req: RunTrialReq, authorization: str = Header(default=None)):
+def submit_trial_full(req: RunTrialReq, request: Request,
+                      authorization: str = Header(default=None)):
     """Like ``/submit-trial`` but for the FULL results dict (equity curve, metrics, ...)
     instead of the trimmed ``{ok,fitness,trades,error}`` summary — for diagnosing a fitness
     mismatch against a master-side result field-by-field, or persisting a top-N backtest.
     Not on the hot GA path (that stays on ``/submit-trial``'s small payload); this is an
     operator/debug + top-N-persist tool."""
-    _verify(authorization)
+    _verify(authorization, request)
     _apply_inmem_trades_flag(req.inmem_trades)
     from app.services.strategy_optimization_handler import _persist_trial_worker
     config = req.config
@@ -776,36 +797,36 @@ def submit_trial_full(req: RunTrialReq, authorization: str = Header(default=None
 
 
 @worker_app.get("/job-status/{job_id}")
-def job_status(job_id: str, authorization: str = Header(default=None)):
+def job_status(job_id: str, request: Request, authorization: str = Header(default=None)):
     """Poll a job submitted via /submit-trial or /submit-trial-full. 404 means the id is
     unknown — either a bad id, or (deliberately, see module docstring) this worker process
     restarted since the job was submitted, so the caller should treat it as lost and retry
     rather than keep polling."""
-    _verify(authorization)
+    _verify(authorization, request)
     return _job_status(job_id)
 
 
 @worker_app.post("/cancel-job/{job_id}")
-def cancel_job(job_id: str, authorization: str = Header(default=None)):
+def cancel_job(job_id: str, request: Request, authorization: str = Header(default=None)):
     """Abandon a job: flag it for cooperative cancellation and forget it.
 
     Called by a master that gave up (timeout). Without it the trial runs to completion for a
     result nobody will collect, holding a worker slot for up to _JOBS_MAX_ORPHAN_AGE — so a
     timeout REMOVED capacity instead of freeing it (see _JOB_CTL)."""
-    _verify(authorization)
+    _verify(authorization, request)
     return _cancel_job(job_id)
 
 
 @worker_app.post("/cache/prune")
-def cache_prune(req: PruneReq, authorization: str = Header(default=None)):
+def cache_prune(req: PruneReq, request: Request, authorization: str = Header(default=None)):
     """Delete rel_paths the master's CURRENT manifest no longer lists (leftovers from a rebuild/
     compaction, e.g. old screener metric_store fragments) — the reverse of ``/cache/push``."""
-    _verify(authorization)
+    _verify(authorization, request)
     return cache_sync.prune_paths(req.rel_paths)
 
 
 @worker_app.post("/secrets")
-def set_secrets(req: SecretsReq, authorization: str = Header(default=None)):
+def set_secrets(req: SecretsReq, request: Request, authorization: str = Header(default=None)):
     """Upsert credential app-settings (FMP_API_KEY, finnhub_api_key) into THIS worker's ba2_common
     DB so its hermetic trials resolve them via get_app_setting.
 
@@ -815,7 +836,7 @@ def set_secrets(req: SecretsReq, authorization: str = Header(default=None)):
     — the recurring 'FMP API key not configured' on remote trials). Idempotent upsert; values are
     never logged.
     """
-    _verify(authorization)
+    _verify(authorization, request)
     from sqlmodel import Session, select
     from ba2_common.core.db import get_engine, init_db
     from ba2_common.core.models import AppSetting
@@ -908,15 +929,16 @@ def _do_sync(model_cls, payload: dict, parent_fk: Optional[dict] = None) -> dict
 
 
 @worker_app.post("/sync/strategy")
-def sync_strategy(req: SyncRowReq, authorization: str = Header(default=None)):
+def sync_strategy(req: SyncRowReq, request: Request, authorization: str = Header(default=None)):
     """Upsert a replicated Strategy row, matched by (name, created_at)."""
-    _verify(authorization)
+    _verify(authorization, request)
     from app.models.strategy import Strategy
     return _do_sync(Strategy, req.model_dump())
 
 
 @worker_app.post("/sync/optimization")
-def sync_optimization(req: SyncRowReq, authorization: str = Header(default=None)):
+def sync_optimization(req: SyncRowReq, request: Request,
+                      authorization: str = Header(default=None)):
     """Upsert a replicated StrategyOptimization row, matched by (name, created_at).
 
     ``req`` carries strategy_name/strategy_created_at alongside the master's strategy_id
@@ -925,7 +947,7 @@ def sync_optimization(req: SyncRowReq, authorization: str = Header(default=None)
     ``upsert_by_natural_key`` skips the write (returns None) rather than raising — reported
     back as ``{"skipped": true}``, still HTTP 200 (expected/benign, self-heals on retry).
     """
-    _verify(authorization)
+    _verify(authorization, request)
     from app.models.strategy import Strategy
     from app.models.strategy_optimization import StrategyOptimization
     return _do_sync(
@@ -935,7 +957,7 @@ def sync_optimization(req: SyncRowReq, authorization: str = Header(default=None)
 
 
 @worker_app.post("/sync/backtest")
-def sync_backtest(req: SyncRowReq, authorization: str = Header(default=None)):
+def sync_backtest(req: SyncRowReq, request: Request, authorization: str = Header(default=None)):
     """Upsert a replicated Backtest row, matched by (name, created_at).
 
     ``req`` carries both strategy_name/strategy_created_at and
@@ -945,7 +967,7 @@ def sync_backtest(req: SyncRowReq, authorization: str = Header(default=None)):
     in practice, but the return is handled the same way for consistency with the other two
     endpoints.
     """
-    _verify(authorization)
+    _verify(authorization, request)
     from app.models.strategy import Strategy
     from app.models.strategy_optimization import StrategyOptimization
     from app.models.backtest import Backtest
@@ -984,9 +1006,9 @@ def _shutdown_pool_for_restart() -> None:
 
 
 @worker_app.post("/update")
-def update(authorization: str = Header(default=None)):
+def update(request: Request, authorization: str = Header(default=None)):
     """git pull + reinstall (if non-editable) + restart this worker process."""
-    _verify(authorization)
+    _verify(authorization, request)
     report = self_update.perform_update()
     if not report.get("ok"):
         raise HTTPException(status_code=500, detail=f"update failed: {report.get('git_pull')}")

@@ -1,0 +1,76 @@
+# systemd unit for the BA2 distributed GA trial worker (app/worker_server.py, run via the
+# `ba2-test worker` console command). Installed by sysprep_debian13.sh at
+# /etc/systemd/system/ba2-worker.service — do not hand-edit the installed copy, edit this file
+# and re-run the sysprep script (it re-copies + `daemon-reload`s idempotently).
+#
+# Secret handling: the bearer password the master must present (BA2_WORKER_PASSWORD) is NEVER
+# put in this unit file or in an EnvironmentFile. It is delivered via systemd's LoadCredential=
+# mechanism: /etc/ba2-worker/worker_password is root:root mode 0600 (unreadable by the ba2worker
+# user directly); systemd itself (running as root) reads it at activation time and exposes a
+# private, unit-scoped copy to THIS service only, at $CREDENTIALS_DIRECTORY/worker_password,
+# mode 0400, owned by the service's own user, torn down when the service stops. run-worker.sh
+# reads that file into an env var for this process only (never passed as a CLI arg, so it never
+# appears in `ps`/`/proc/*/cmdline`).
+[Unit]
+Description=BA2 distributed GA trial worker (app/worker_server.py)
+Documentation=https://github.com/bmigette/BA2TradePlatform
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ba2worker
+Group=ba2worker
+WorkingDirectory=/opt/ba2worker/BA2TradePlatform/testplatform
+
+# --- config ------------------------------------------------------------------------------
+# Port the worker listens on (must match the port opened in ufw and the master's Worker entry).
+Environment=BA2_WORKER_PORT=8100
+# Trial pool size. Left unset = auto (nproc-1, see ba2test_launcher.py:_cmd_worker). Uncomment
+# and set via `systemctl edit ba2-worker` (drop-in) rather than editing this file, so a re-run
+# of sysprep_debian13.sh doesn't clobber a site-specific override.
+#Environment=BA2_WORKER_SLOTS=6
+
+# The one secret this service needs, delivered as described above.
+LoadCredential=worker_password:/etc/ba2-worker/worker_password
+
+ExecStart=/opt/ba2worker/run-worker.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+# --- least-privilege sandbox ---------------------------------------------------------------
+# The service user (ba2worker) already has no login shell and no sudo rights (see
+# sysprep_debian13.sh); this sandboxes what the process itself can touch even if compromised
+# via a malicious trial payload. ReadWritePaths is the only writable path: git pull, pip
+# installs into the venv, logs, and the OHLCV/model cache all live under it (BA2_HOME defaults
+# to ~/Documents/ba2, and $HOME for this user IS /opt/ba2worker).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ba2worker
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+RemoveIPC=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0027
+# NOTE: MemoryDenyWriteExecute is deliberately NOT set — torch/lightgbm/darts JIT/compile code
+# paths need W+X memory pages; enabling it breaks trial execution.
+
+[Install]
+WantedBy=multi-user.target

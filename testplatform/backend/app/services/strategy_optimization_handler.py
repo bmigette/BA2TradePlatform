@@ -75,6 +75,30 @@ def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
     """
     import os
     import sys
+    import time as _time
+
+    def _proc_age() -> Optional[float]:
+        """Wall-clock seconds since the OS created THIS process — not just since this function
+        started. Most of a cold worker's real startup cost is the heavy import chain
+        (torch/pandas/ba2_common/ba2_providers/ba2_experts) that runs BEFORE this initializer is
+        even called under spawn; a timer started inside this function would miss all of it.
+        Best-effort: psutil may be unavailable, or the call may race process shutdown."""
+        try:
+            import psutil
+            return _time.time() - psutil.Process(os.getpid()).create_time()
+        except Exception:  # noqa: BLE001
+            return None
+
+    # _worker_log (not print()/logger directly): logging.disable(ERROR) below would silently
+    # drop a logger call from this point on in THIS process, and _worker_log durably persists
+    # to this pid's own log file (retrievable via worker_server.py's existing /logs endpoint)
+    # on top of printing — see its docstring for the full reasoning.
+    from app.services.backtest.price_source import _worker_log
+
+    _pid = os.getpid()
+    _age0 = _proc_age()
+    _worker_log(f">> worker init starting (pid {_pid}, {_age0:.2f}s since spawn)"
+               if _age0 is not None else f">> worker init starting (pid {_pid})")
     # Disable file logging in workers BEFORE ba2_common is imported: many processes sharing the
     # one RotatingFileHandler on app.log race on rollover (Windows WinError 32). Read by
     # ba2_common.config at import time.
@@ -107,6 +131,9 @@ def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
     _lg.disable(_lg.ERROR)  # workers are silent; the parent process logs the run summary
     for n in ("ba2_common", "ba2_providers", "ba2_experts", "app.services.backtest"):
         _lg.getLogger(n).setLevel(_lg.WARNING)
+    _age1 = _proc_age()
+    _worker_log(f">> worker init done (pid {_pid}, {_age1:.2f}s since spawn)"
+               if _age1 is not None else f">> worker init done (pid {_pid})")
 
 
 def _maybe_mark_want_full(config: Dict[str, Any], is_last_gen: bool) -> Dict[str, Any]:

@@ -1,0 +1,21 @@
+# NOT applied automatically by sysprep_debian13.sh -- see that script's header comment for why
+# (disabling password auth before confirming key-based access works is a self-lockout trap on a
+# box you can only reach over the network).
+#
+# Once you've confirmed you can `ssh` into this box with a key (not a password), apply this by
+# hand:
+#   sudo cp sshd-hardening.conf.example /etc/ssh/sshd_config.d/99-ba2-hardening.conf
+#   sudo sshd -t                      # validates syntax; fails loudly instead of restarting broken
+#   sudo systemctl restart ssh
+# Then, from a SEPARATE terminal/session (keep your current one open until this succeeds), verify
+# you can still `ssh` in before closing the working session.
+
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+X11Forwarding no
+AllowTcpForwarding no
+MaxAuthTries 3
+ClientAliveInterval 300
+ClientAliveCountMax 2
