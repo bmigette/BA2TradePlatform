@@ -120,8 +120,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--out", help="Store root (default: CACHE_FOLDER/TastyTradeOptionsProvider).")
     p.add_argument("--dry-run", action="store_true",
                    help="Print exactly what would be fetched and write NOTHING. Contract "
-                        "discovery still runs (a read-only listing call) so the counts are "
-                        "real; no bars are downloaded and no file is created.")
+                        "discovery still runs so the counts are real (free under the default "
+                        "--discovery synthetic, one read-only listing call under 'rest'); no "
+                        "bars are downloaded and no file is created.")
     p.add_argument("--limit", type=int,
                    help="Stop after this many units of work (counts only units that would "
                         "actually be fetched, never skipped ones).")
@@ -130,10 +131,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "(default 40). Only used by --discovery synthetic.")
     p.add_argument("--max-contracts", type=int,
                    help="Cap contracts per expiry, keeping the strikes nearest the money.")
-    p.add_argument("--discovery", choices=("rest", "synthetic"), default="rest",
-                   help="'rest' lists the real chain (expired included); 'synthetic' "
-                        "generates a Friday x strike-ladder grid and needs no listing "
-                        "endpoint (default rest).")
+    p.add_argument("--discovery", choices=("rest", "synthetic"), default="synthetic",
+                   help="'synthetic' (default) generates a Friday x strike-ladder grid and "
+                        "needs NO listing endpoint -- this is the mode that works with a "
+                        "personal OAuth app. 'rest' lists the real chain via "
+                        "/instruments/equity-options, which returns 403 'Token has "
+                        "insufficient scopes' for personal OAuth apps regardless of "
+                        "parameters; the three offered scopes (read/trade/openid) cannot "
+                        "grant it, so 'rest' needs a different credential type.")
     p.add_argument("--rate-limit", type=float, default=1.0,
                    help="Seconds to pause between units (default 1.0). Be polite.")
     p.add_argument("--max-retries", type=int, default=4,
@@ -276,9 +281,22 @@ def discover(provider, store: OptionHistoryParquetStore, underlying: str,
     if ns.discovery == "synthetic":
         contracts = _synthetic_contracts(underlying, start, end, ns)
     else:
-        contracts = provider.discover_contracts(
-            underlying, expiry_gte=start, expiry_lte=end,
-            max_contracts=ns.max_contracts)
+        try:
+            contracts = provider.discover_contracts(
+                underlying, expiry_gte=start, expiry_lte=end,
+                max_contracts=ns.max_contracts)
+        except Exception as e:
+            # /instruments/equity-options returns 403 "Token has insufficient scopes" for a
+            # personal OAuth app, with or without with-expired, and none of the three offered
+            # scopes (read/trade/openid) grants it -- openid is OpenID Connect identity only.
+            # Do not let that read as "this symbol has no contracts": say which mode works.
+            if "403" in str(e) or "insufficient scope" in str(e).lower():
+                raise SystemExit(
+                    f"--discovery rest cannot list contracts for {underlying}: "
+                    f"/instruments/equity-options returned 403 (insufficient scopes). A "
+                    f"personal OAuth app cannot reach that endpoint. Re-run with "
+                    f"--discovery synthetic, which needs no listing endpoint.") from e
+            raise
     if persist:
         store.write_contracts(underlying, contracts, start, end)
     return contracts
