@@ -396,8 +396,22 @@ class AllocationWizard:
             self._banner_container = ui.column().classes('w-full')
             self._render_market_banner()
             self._render_base_panel()
-            ui.switch('Allow fractional shares', value=self.allow_fractional,
-                      on_change=lambda e: self._refresh(bool(e.value)))
+            # THE ONE EXECUTION CONTROL. It stays at the gate because it changes
+            # WHICH ORDERS are produced rather than what is being aimed at -- and
+            # it RE-SOLVES: ``_refresh`` replaces ``self.plan``, so the table, the
+            # totals and what Submit sends all move together. A switch that only
+            # recorded a preference would show one plan and submit another.
+            fractional = ui.switch('Allow fractional shares',
+                                   value=self.allow_fractional,
+                                   on_change=lambda e: self._refresh(bool(e.value)))
+            # The broker's veto, which used to sit on the step-3 panel of the
+            # dialog that is gone. Offering a toggle the broker cannot honour would
+            # size the plan on a grid that does not exist: the engine silently
+            # falls back to whole shares, so the user would see quantities they
+            # never asked for. DISABLED, not hidden, and the reason said out loud.
+            fractional.set_enabled(bool(self.base.supports_fractional))
+            if not self.base.supports_fractional:
+                ui.label(NO_FRACTIONAL_SUPPORT_NOTE).classes('text-xs text-gray-400')
             ui.label(MARKET_ORDER_TIMING_NOTE).classes('text-xs text-orange-400')
             self._notices_container = ui.column().classes('w-full')
             self._rows_container = ui.column().classes('w-full gap-0')

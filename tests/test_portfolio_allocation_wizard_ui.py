@@ -2129,3 +2129,46 @@ def test_the_dry_run_keeps_EXACTLY_ONE_execution_control(nicegui_client):
     assert [s.text for s in switches] == ['Allow fractional shares']
     assert inputs == []
     assert wizard.allow_fractional is True
+
+
+def test_a_broker_that_cannot_split_shares_disables_the_gates_fractional_switch(
+        nicegui_client):
+    """The veto used to live on the step-3 panel of the dialog that is gone.
+
+    Offering a toggle the broker cannot honour produces a plan sized on a grid that
+    does not exist: the engine silently falls back to whole shares, so the user
+    would see quantities they never asked for. DISABLED rather than hidden, and the
+    reason is said out loud -- a control that vanishes is one the user cannot learn
+    exists.
+    """
+    from nicegui import ui
+
+    wiz = _wiz()
+    base = _base()
+    base.supports_fractional = False
+    with nicegui_client:
+        wiz.AllocationWizard(base, _mixed_plan(), market=_open_market(),
+                             on_refresh=lambda f: (_mixed_plan(), _open_market()),
+                             on_submit=lambda p: None).open()
+    switch = [el for el in nicegui_client.layout.descendants()
+              if isinstance(el, ui.switch)][0]
+
+    assert switch.enabled is False
+    assert wiz.NO_FRACTIONAL_SUPPORT_NOTE in _rendered_texts(nicegui_client.layout)
+
+
+def test_a_broker_that_CAN_split_shares_leaves_the_gates_switch_alone(nicegui_client):
+    from nicegui import ui
+
+    wiz = _wiz()
+    base = _base()
+    base.supports_fractional = True
+    with nicegui_client:
+        wiz.AllocationWizard(base, _mixed_plan(), market=_open_market(),
+                             on_refresh=lambda f: (_mixed_plan(), _open_market()),
+                             on_submit=lambda p: None).open()
+    switch = [el for el in nicegui_client.layout.descendants()
+              if isinstance(el, ui.switch)][0]
+
+    assert switch.enabled is True
+    assert wiz.NO_FRACTIONAL_SUPPORT_NOTE not in _rendered_texts(nicegui_client.layout)

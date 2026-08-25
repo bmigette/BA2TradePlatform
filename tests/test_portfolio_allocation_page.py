@@ -5862,3 +5862,182 @@ def test_the_four_migrated_buttons_land_LEFT_of_the_space_beside_Fill_100(
                             'Wipe', 'Compare']
     assert captions[6] == '<space>'
     assert captions[7] == 'Remove selected from label'
+
+
+# ---------------------------------------------------------------------------
+# GROUP 5: ONE SOURCE OF TRUTH, and the one execution control that stays
+#
+# The page and the wizard used to derive the same figures independently -- the
+# wizard's "target 13.50% of base" and the page's "tgt 13.5%" were one number
+# computed twice, on two denominators. There is one now, and these are the tests
+# that say so end to end: a target typed on the page is what the dry run solves
+# against, with no re-derivation in between.
+#
+# ``allow fractional shares`` is the ONE control left at the gate, because it
+# changes WHICH ORDERS are produced rather than what is being aimed at -- and
+# toggling it has to recompute the plan, not merely record a preference.
+# ---------------------------------------------------------------------------
+
+def _fractional_account(account_id, *, price=300.0):
+    """A book whose target does not land on a whole share: 100% of a 50,000 base
+    at 300 a share is 166.66 shares fractionally and 166 whole."""
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': price})
+    account.margin = {'AAPL': MarginInfo(symbol='AAPL', fractionable=True,
+                                         bp_factor=1.0)}
+    return account
+
+
+def test_a_target_typed_on_the_page_is_what_the_dry_run_solves_against(
+        monkeypatch, nicegui_client, account_id):
+    """The inline box writes ``portfolio_allocation_label.target_pct``;
+    ``_load_flow_inputs`` reads that same column back when the gate opens. Nothing
+    in between restates it, so 60% typed is 60% solved -- $30,000 of a $50,000
+    base, not the $50,000 an un-read target would have deployed."""
+    set_managed_label(account_id, 'ARK26', target_pct=0.0)
+    set_managed_label(account_id, 'CASHY', target_pct=40.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    add_label_to_instruments(['MSFT'], 'CASHY')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0, 'MSFT': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 0.0), ManagedLabel('CASHY', 40.0)],
+                        {'ARK26': ['AAPL'], 'CASHY': ['MSFT']},
+                        weights={'ARK26': {'AAPL': 100.0},
+                                 'CASHY': {'MSFT': 100.0}}))
+    # The user types 60 into ARK26's box. Nothing else is touched.
+    box = [n for n in _numbers(root)
+           if n._props.get('label') == 'Portfolio target %'][0]
+    _drive_value(box, 60.0)
+    assert _label_targets_now(account_id)['ARK26'] == 60.0
+
+    opened = _drive_the_flow(monkeypatch, nicegui_client, account_id)
+
+    by_symbol = {r.symbol: r for r in opened['plan'].rows}
+    assert opened['plan'].base_notional == 50_000.0
+    assert by_symbol['AAPL'].target_notional == 30_000.0
+
+
+def test_the_dry_run_does_not_RE_DERIVE_the_target_it_was_given(monkeypatch,
+                                                                nicegui_client,
+                                                                account_id):
+    """The two screens print one number. Whatever the page's own header says the
+    label is aiming at, the plan aims at the same thing."""
+    from ba2_trade_platform.core.portfolio_allocation_store import set_allocation_config
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_allocation_config(account_id, unallocated_pct=10.0)
+
+    opened = _drive_the_flow(monkeypatch, nicegui_client, account_id)
+
+    # The page's own pure layer, asked the same question about the same account.
+    views = _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']},
+                   base=opened['plan'].base_notional, reserve=10.0,
+                   weights={'ARK26': {'AAPL': 100.0}})
+    assert views[0].target_value == opened['plan'].investable_notional
+    assert opened['plan'].rows[0].target_notional == views[0].target_value
+
+
+def test_toggling_the_fractional_switch_RE_SOLVES_the_plan(monkeypatch,
+                                                           nicegui_client,
+                                                           account_id):
+    """Not "a handler fired": the QUANTITIES change. 100% of a 50,000 base at 300 a
+    share is 166.66666 fractional shares and 166 whole ones, so the plan the user
+    is about to submit is a different plan."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from nicegui import ui
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _fractional_account(account_id)
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+
+    opened = {}
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(opened['base'], opened['plan'],
+                                      market=opened['market'],
+                                      on_refresh=opened['on_refresh'],
+                                      on_submit=lambda p: None)
+        wizard.open()
+        before = wizard.plan.rows[0].delta_quantity
+        switch = [el for el in nicegui_client.layout.descendants()
+                  if isinstance(el, ui.switch)][0]
+        switch.set_value(False)
+        after = wizard.plan.rows[0].delta_quantity
+
+    assert before != after
+    assert before == pytest.approx(166.6666, abs=1e-3)
+    assert after == 166.0
+
+
+def test_the_re_solved_plan_is_what_SUBMIT_would_send(monkeypatch, nicegui_client,
+                                                      account_id):
+    """A toggle that redrew the table but left ``self.plan`` behind would show the
+    user one plan and submit another."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from nicegui import ui
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    _use_account(monkeypatch, _fractional_account(account_id))
+    _capture_notifications(monkeypatch)
+
+    opened, submitted = {}, []
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(opened['base'], opened['plan'],
+                                      market=opened['market'],
+                                      on_refresh=opened['on_refresh'],
+                                      on_submit=submitted.append)
+        wizard.open()
+        switch = [el for el in nicegui_client.layout.descendants()
+                  if isinstance(el, ui.switch)][0]
+        switch.set_value(False)
+        wizard._submit()
+
+    assert [r.delta_quantity for r in submitted[0].rows] == [166.0]
+
+
+def test_the_fractional_toggle_is_remembered_for_the_next_run(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    """It is the account's answer, not the dialog's. ``_on_refresh`` persists it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from nicegui import ui
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    _use_account(monkeypatch, _fractional_account(account_id))
+    _capture_notifications(monkeypatch)
+
+    opened = {}
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(opened['base'], opened['plan'],
+                                      market=opened['market'],
+                                      on_refresh=opened['on_refresh'],
+                                      on_submit=lambda p: None)
+        wizard.open()
+        switch = [el for el in nicegui_client.layout.descendants()
+                  if isinstance(el, ui.switch)][0]
+        switch.set_value(False)
+
+    assert get_allocation_config(account_id).allow_fractional is False
