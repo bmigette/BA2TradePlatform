@@ -44,6 +44,77 @@ class SmartRiskManagerTask:
         return f"smart_risk_manager_{self.expert_instance_id}"
 
 
+def _read_expert_virtual_equity(account_id: int, expert_record, phase: str) -> Optional[float]:
+    """The expert's virtual equity right now, or ``None`` if it is genuinely unknown.
+
+    Recorded on ``SmartRiskManagerJob`` at both ends of a run. Two rules, both of
+    which the two inline copies this replaced got wrong:
+
+    READ EQUITY THROUGH THE TYPED SEAM, never off ``get_account_info()``. That
+    return value is BROKER-SHAPED: a pydantic ``TradeAccount`` on Alpaca, a plain
+    dict on IBKR (``{"equity": ...}``) and TastyTrade (``{"net_liquidating_value":
+    ...}``, no ``equity`` key at all), ``{}`` on an auth failure. The old
+    ``float(account_info.equity)`` therefore raised ``AttributeError`` -- literally
+    ``'dict' object has no attribute 'equity'`` -- for EVERY dict-shaped broker; the
+    enclosing ``except Exception`` downgraded it to a warning and the job recorded
+    ``None`` equity for both ends of the run. ``get_account_snapshot()`` is the
+    broker-agnostic seam that exists for exactly this (same fix as
+    ``AccountInterface._validate_position_size_limits`` and TradeActions Task 34).
+
+    ``is None``, NEVER TRUTHINESS. The old gate was ``if account_info and
+    account_info.equity:`` -- a float test. A drained account measured at $0.00 is
+    falsy, so a correctly-read zero was thrown away and recorded as ``None``, making
+    "the account holds nothing" indistinguishable from "the broker would not tell
+    us". A measured zero is an ANSWER and is recorded as 0.0; only an equity the
+    broker never published is ``None``, and that is reported loudly rather than
+    left to be read later as a blank field.
+
+    Never raises: the equity figure is bookkeeping around the run, not the run.
+    """
+    from .utils import get_account_instance_from_id
+
+    try:
+        account = get_account_instance_from_id(account_id)
+        if not account:
+            logger.error(
+                f"{phase.capitalize()} portfolio equity unavailable: account "
+                f"{account_id} could not be instantiated. Recording it as unknown "
+                f"rather than as zero."
+            )
+            return None
+
+        account_equity = account.get_account_snapshot().equity
+        if account_equity is None:
+            logger.error(
+                f"{phase.capitalize()} portfolio equity unavailable: account "
+                f"{account_id} ({account.__class__.__name__}) published no equity "
+                f"(get_account_snapshot().equity is None). Recording it as unknown "
+                f"rather than as zero -- a risk manager reasoning about an unknown "
+                f"portfolio is not the same as one reasoning about an empty portfolio."
+            )
+            return None
+
+        account_equity = float(account_equity)
+        # NO ``if pct else 100.0``: the column is NOT NULL with a 100.0 default, so
+        # the fallback only ever fired on a real 0% sleeve and told the risk manager
+        # it owned the entire account. Same coercion as
+        # MarketExpertInterface.get_virtual_balance.
+        virtual_equity_pct = expert_record.virtual_equity_pct
+        virtual_equity = account_equity * (virtual_equity_pct / 100.0)
+        logger.debug(
+            f"{phase.capitalize()} portfolio equity: Account=${account_equity:,.2f} "
+            f"x {virtual_equity_pct}% = ${virtual_equity:,.2f}"
+        )
+        return virtual_equity
+    except Exception as e:
+        logger.error(
+            f"Could not read {phase} portfolio equity for account {account_id}: {e}. "
+            f"Recording it as unknown rather than as zero.",
+            exc_info=True,
+        )
+        return None
+
+
 class SmartRiskManagerQueue:
     """
     Dedicated worker queue for Smart Risk Manager jobs.
@@ -295,7 +366,7 @@ class SmartRiskManagerQueue:
             from .db import get_instance, add_instance, update_instance
             from .models import SmartRiskManagerJob, ExpertInstance
             from .SmartRiskManagerGraph import run_smart_risk_manager
-            from .utils import get_expert_instance_from_id, get_account_instance_from_id
+            from .utils import get_expert_instance_from_id
             
             # Get the expert instance class (not database record) to retrieve settings
             expert_instance = get_expert_instance_from_id(task.expert_instance_id)
@@ -313,24 +384,9 @@ class SmartRiskManagerQueue:
             user_instructions = settings.get("user_instructions", "")
             
             # Get initial portfolio equity (expert virtual equity = account equity × virtual_equity_pct)
-            initial_portfolio_equity = None
-            try:
-                account = get_account_instance_from_id(task.account_id)
-                if account:
-                    account_info = account.get_account_info()
-                    if account_info and account_info.equity:
-                        account_equity = float(account_info.equity)
-                        # Calculate expert virtual equity based on percentage allocation.
-                        # NO ``if pct else 100.0``: the column is NOT NULL with a 100.0
-                        # default, so the fallback only ever fired on a real 0% sleeve and
-                        # told the risk manager it owned the entire account. Same coercion
-                        # as MarketExpertInterface.get_virtual_balance.
-                        virtual_equity_pct = expert_record.virtual_equity_pct
-                        initial_portfolio_equity = account_equity * (virtual_equity_pct / 100.0)
-                        logger.debug(f"Initial portfolio equity: Account=${account_equity:,.2f} × {virtual_equity_pct}% = ${initial_portfolio_equity:,.2f}")
-            except Exception as e:
-                logger.warning(f"Could not get initial portfolio equity: {e}")
-            
+            initial_portfolio_equity = _read_expert_virtual_equity(
+                task.account_id, expert_record, "initial")
+
             # Create SmartRiskManagerJob record with RUNNING status
             smart_risk_job = SmartRiskManagerJob(
                 expert_instance_id=task.expert_instance_id,
@@ -355,22 +411,9 @@ class SmartRiskManagerQueue:
                 raise ValueError(f"SmartRiskManagerJob {job_id} not found after execution")
             
             # Get final portfolio equity (expert virtual equity = account equity × virtual_equity_pct)
-            final_portfolio_equity = None
-            try:
-                account = get_account_instance_from_id(task.account_id)
-                if account:
-                    account_info = account.get_account_info()
-                    if account_info and account_info.equity:
-                        account_equity = float(account_info.equity)
-                        # Calculate expert virtual equity based on percentage allocation.
-                        # Same non-coercion as the initial-equity read above: a 0% sleeve
-                        # is 0, not the whole account.
-                        virtual_equity_pct = expert_record.virtual_equity_pct
-                        final_portfolio_equity = account_equity * (virtual_equity_pct / 100.0)
-                        logger.debug(f"Final portfolio equity: Account=${account_equity:,.2f} × {virtual_equity_pct}% = ${final_portfolio_equity:,.2f}")
-            except Exception as e:
-                logger.warning(f"Could not get final portfolio equity: {e}")
-            
+            final_portfolio_equity = _read_expert_virtual_equity(
+                task.account_id, expert_record, "final")
+
             # Update job with results
             if result["success"]:
                 smart_risk_job.status = "COMPLETED"
