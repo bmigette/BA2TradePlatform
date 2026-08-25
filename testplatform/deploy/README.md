@@ -26,7 +26,9 @@ sudo ./sysprep_debian13.sh
 ```
 
 Defaults: service user `ba2worker` at `/opt/ba2worker`, repo `https://github.com/bmigette/BA2TradePlatform.git`
-branch `main`, SSH port `22`, worker port `8100`, trial pool size auto (`nproc-1`). Override any
+branch `dev` (matches the existing worker fleet — see `docs/RUNBOOK-goal2020-grid.md` §2a: a
+worker not tracking the master's branch is retry-excluded for the whole run), SSH port `22`,
+worker port `8100`, trial pool size auto (`nproc-1`). Override any
 of these — run `./sysprep_debian13.sh --help` for the full flag list. Pin the pool size
 explicitly with `--worker-slots N` when you don't want auto-sizing (e.g. a box dedicated
 entirely to this worker, or one shared with other things where you want to leave it headroom).

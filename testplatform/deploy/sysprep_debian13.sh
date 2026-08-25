@@ -11,9 +11,9 @@
 #   3. sysctl network hardening baseline (SYN cookies, no source routing, no ICMP redirects).
 #   4. Install + configure ufw: default deny incoming, allow outgoing, rate-limited SSH,
 #      allow the worker port.
-#   5. Install + configure fail2ban with the ba2-worker jail (testplatform/deploy/fail2ban/)
+#   5. Create the least-privilege service user (system account, no login shell, no sudo).
+#   6. Install + configure fail2ban with the ba2-worker jail (testplatform/deploy/fail2ban/)
 #      plus a standard sshd jail.
-#   6. Create the least-privilege service user (system account, no login shell, no sudo).
 #   7. Clone the repo over anonymous HTTPS (it's public -- no credential needed to pull; see
 #      README's "Why HTTPS, no deploy key" if you point --repo-url at a private fork instead)
 #      and run install.sh --test-only to build the ba2-test venv + package chain.
@@ -31,7 +31,10 @@
 #   --worker-user NAME     service account (default: ba2worker)
 #   --worker-home DIR      its home / install root (default: /opt/ba2worker)
 #   --repo-url URL         git remote to clone (default: https://github.com/bmigette/BA2TradePlatform.git)
-#   --branch NAME          branch to check out (default: main)
+#   --branch NAME          branch to check out (default: dev -- the existing worker fleet
+#                          (remote150) tracks dev, not main; see docs/RUNBOOK-goal2020-grid.md
+#                          section 2a. A worker on a different branch than the master's commit
+#                          is retry-excluded for the whole grid run.)
 #   --ssh-port N           sshd port to allow through ufw (default: 22)
 #   --worker-port N        worker server port -- ufw + fail2ban + systemd all use this (default: 8100)
 #   --worker-slots N       trial pool size (default: unset -> auto, nproc-1; see _cmd_worker)
@@ -46,7 +49,7 @@ set -euo pipefail
 WORKER_USER="ba2worker"
 WORKER_HOME="/opt/ba2worker"
 REPO_URL="https://github.com/bmigette/BA2TradePlatform.git"
-BRANCH="main"
+BRANCH="dev"
 SSH_PORT="22"
 WORKER_PORT="8100"
 WORKER_SLOTS=""
@@ -189,10 +192,31 @@ ufw --force enable
 ufw status verbose
 
 # ---------------------------------------------------------------------------------------------
-# 5. fail2ban
+# 5. Service user: system account, no login shell, no sudo group membership. Created BEFORE
+#    fail2ban below so the log file it pre-creates can be owned by this user from the start.
+# ---------------------------------------------------------------------------------------------
+step "creating service user $WORKER_USER"
+if ! id -u "$WORKER_USER" &>/dev/null; then
+    useradd --system --create-home --home-dir "$WORKER_HOME" --shell /usr/sbin/nologin "$WORKER_USER"
+    log "created $WORKER_USER (system account, home=$WORKER_HOME, shell=nologin, not in sudo/adm/any admin group)"
+else
+    log "$WORKER_USER already exists -- leaving as-is"
+fi
+chmod 750 "$WORKER_HOME"
+chown "$WORKER_USER:$WORKER_USER" "$WORKER_HOME"
+
+# ---------------------------------------------------------------------------------------------
+# 6. fail2ban
 # ---------------------------------------------------------------------------------------------
 step "configuring fail2ban (sshd + ba2-worker jails)"
 WORKER_LOG="$WORKER_HOME/Documents/ba2/test/logs/worker_server.log"   # BA2_HOME default; see ba2_common/config.py
+# fail2ban (1.1.0 on trixie) hard-fails at startup ("Have not found any log file for ba2-worker
+# jail") if logpath doesn't exist yet -- which it won't on a first run, since the worker service
+# that writes it isn't started until step 9. Pre-create an empty placeholder so fail2ban always
+# has something to tail; the worker's own file logging (_install_orchestration_file_logging in
+# app/worker_server.py) opens it in append mode and takes over from there.
+install -d -m 0750 -o "$WORKER_USER" -g "$WORKER_USER" "$(dirname "$WORKER_LOG")"
+[ -f "$WORKER_LOG" ] || install -m 0640 -o "$WORKER_USER" -g "$WORKER_USER" /dev/null "$WORKER_LOG"
 install -m 0644 "$HERE/fail2ban/ba2-worker.conf" /etc/fail2ban/filter.d/ba2-worker.conf
 sed "s#/path/to/worker/logs/worker_server.log#${WORKER_LOG}#; s/^port     = 8100/port     = ${WORKER_PORT}/" \
     "$HERE/fail2ban/ba2-worker.jail.conf" > /etc/fail2ban/jail.d/ba2-worker.conf
@@ -208,21 +232,8 @@ maxretry = 5
 findtime = 10m
 bantime  = 4h
 EOF
-systemctl enable --now fail2ban
+systemctl enable fail2ban
 systemctl restart fail2ban
-
-# ---------------------------------------------------------------------------------------------
-# 6. Service user: system account, no login shell, no sudo group membership
-# ---------------------------------------------------------------------------------------------
-step "creating service user $WORKER_USER"
-if ! id -u "$WORKER_USER" &>/dev/null; then
-    useradd --system --create-home --home-dir "$WORKER_HOME" --shell /usr/sbin/nologin "$WORKER_USER"
-    log "created $WORKER_USER (system account, home=$WORKER_HOME, shell=nologin, not in sudo/adm/any admin group)"
-else
-    log "$WORKER_USER already exists -- leaving as-is"
-fi
-chmod 750 "$WORKER_HOME"
-chown "$WORKER_USER:$WORKER_USER" "$WORKER_HOME"
 
 if [ "$SKIP_CLONE" = "1" ]; then
     step "skipping clone/venv build (--skip-clone)"
