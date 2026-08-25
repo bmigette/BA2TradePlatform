@@ -989,14 +989,25 @@ def test_the_breakdown_repaints_when_the_refresh_lands(nicegui_client, monkeypat
 
 
 def test_a_breakdown_that_explodes_still_renders_the_page(nicegui_client, monkeypatch):
-    """Same contract as the badge: the header degrades, the app does not."""
+    """Same contract as the badge: the header degrades, the app does not.
+
+    And it degrades LOUDLY. Swallowing the exception silently leaves a menu that
+    is simply absent -- indistinguishable, from the outside, from a single
+    account being selected -- with nothing anywhere to say a breakdown was ever
+    attempted. Never ``caplog``: ``logger.py`` sets ``propagate = False``.
+    """
     _seed(monkeypatch, {1: 1000.0, 2: 2200.68})
     monkeypatch.setattr(layout, 'header_balance_breakdown',
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError('bad lines')))
+    errors = []
+    monkeypatch.setattr(layout.logger, 'error',
+                        lambda msg, *a, **k: errors.append(str(msg)))
 
     texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
 
     assert 'body' in texts
+    assert '$3,200.68' in texts, 'the badge itself must survive the breakdown failing'
+    assert any('breakdown' in e for e in errors), errors
 
 
 # --- the pure decision behind the breakdown -------------------------------
