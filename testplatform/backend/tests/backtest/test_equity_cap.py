@@ -182,3 +182,128 @@ def test_the_capped_drawdown_curve_keeps_its_dates_and_starts_flat():
     pts = capped_drawdown_curve([_pt(2020, 20_000), _pt(2021, 18_000)], cap=20_000.0)
     assert [p["date"] for p in pts] == [datetime(2020, 1, 1), datetime(2021, 1, 1)]
     assert pts[0]["drawdown"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Task 4 -- the account's money surface
+# ---------------------------------------------------------------------------
+#: A frozen simulated clock. Never "today" — a wall-clock-dependent bar would make the
+#: mark-to-market (and therefore every assertion below) drift with the calendar.
+_BAR_DAY = datetime(2024, 3, 15)
+
+_ACCT_SEQ = [900]
+
+
+@pytest.fixture
+def capped_account():
+    """A REAL ``BacktestAccount`` over a throwaway backtest DB, with a known cash/MTM and an
+    optional cap.
+
+    Deliberately the genuine constructor (mirroring ``test_round_trip_trades._acct``) rather
+    than a ``__new__`` bypass: the cap is read out of the account config in ``__init__``, so a
+    fixture that skips ``__init__`` would leave that read untested.
+
+    ``mtm`` is produced by a REAL ledger position marked against a REAL price bar, not by
+    stubbing ``_open_positions_mtm`` — the whole point of ``deployed_equity`` is that it sees
+    unrealised marks.
+    """
+    from app.services.backtest.backtest_account import BacktestAccount
+    from app.services.backtest.backtest_db import (
+        backtest_trading_db, seed_account_definition,
+    )
+    from app.services.backtest.price_source import AsOfPriceSource
+    from app.services.backtest.seam_wiring import wire_backtest_seams
+
+    made = []
+
+    def _make(*, cash, cap, mtm=0.0, symbol="AAPL", mark=100.0):
+        _ACCT_SEQ[0] += 1
+        account_id = _ACCT_SEQ[0]
+        cfg = {
+            "starting_cash": float(cash),
+            "commission_per_trade": 0.0,
+            "slippage_bps": 0.0,
+            "fill_model": "next_bar_open",
+        }
+        if cap is not None:
+            cfg["equity_cap"] = float(cap)
+        wire_backtest_seams()
+        ctx = backtest_trading_db(f"equity-cap-{account_id}")
+        ctx.__enter__()
+        made.append(ctx)
+        seed_account_definition(account_id, cfg)
+        ps = AsOfPriceSource(ohlcv_provider=None)
+        ps.load_bars(symbol, [{"Date": _BAR_DAY, "Open": mark, "High": mark, "Low": mark,
+                               "Close": mark, "Volume": 1_000}])
+        ps.set_clock(_BAR_DAY)
+        acct = BacktestAccount(account_id, ps, cfg)
+        wire_backtest_seams().register_account(account_id, acct)
+        if mtm:
+            acct._update_position(symbol, float(mtm) / mark, mark)
+        return acct
+
+    try:
+        yield _make
+    finally:
+        for ctx in reversed(made):
+            ctx.__exit__(None, None, None)
+
+
+def test_with_no_cap_the_account_reports_its_real_money(capped_account):
+    acct = capped_account(cash=40_000.0, cap=None)
+    assert acct.get_balance() == 40_000.0
+    assert acct.get_account_info()["equity"] == 40_000.0
+    assert acct.get_account_info()["buying_power"] == 40_000.0
+
+
+def test_above_the_cap_equity_and_buying_power_are_capped(capped_account):
+    acct = capped_account(cash=40_000.0, cap=20_000.0)
+    assert acct.get_account_info()["equity"] == 20_000.0
+    assert acct.get_account_info()["buying_power"] == 20_000.0
+    assert acct.get_balance() == 20_000.0
+
+
+def test_below_the_cap_the_real_figures_are_reported(capped_account):
+    acct = capped_account(cash=15_000.0, cap=20_000.0)
+    assert acct.get_account_info()["equity"] == 15_000.0
+    assert acct.get_balance() == 15_000.0
+
+
+def test_cash_is_never_reported_above_what_is_actually_held(capped_account):
+    """Cap 20k, equity 40k, but only 5k in cash because the rest is invested. You cannot spend
+    money you do not have, so the cap must not RAISE the cash figure."""
+    acct = capped_account(cash=5_000.0, cap=20_000.0, mtm=35_000.0)
+    assert acct.equity() == pytest.approx(40_000.0)
+    assert acct.get_balance() == 5_000.0
+
+
+def test_buying_power_never_goes_negative(capped_account):
+    acct = capped_account(cash=-500.0, cap=20_000.0)
+    assert acct.get_account_info()["buying_power"] == 0.0
+
+
+def test_the_recorded_equity_curve_is_NEVER_capped(capped_account):
+    """The cap must not reach snapshot_equity or the run's own history becomes
+    unreconstructable -- and the scoring curve would then report zero P&L for every period
+    spent above the cap."""
+    acct = capped_account(cash=40_000.0, cap=20_000.0)
+    snap = acct.snapshot_equity(datetime(2024, 3, 15, 16, 0))
+    assert snap["net_liquidating_value"] == 40_000.0
+    assert snap["cash_balance"] == 40_000.0
+
+
+def test_the_account_snapshot_seam_inherits_the_cap(capped_account):
+    """``_validate_position_size_limits`` reads equity through ``get_account_snapshot()``, not
+    ``get_account_info()``. The base implementation derives it from ``get_account_info``, so
+    capping the one seam must be enough -- asserted rather than assumed."""
+    acct = capped_account(cash=40_000.0, cap=20_000.0)
+    snapshot = acct.get_account_snapshot()
+    assert snapshot.equity == 20_000.0
+    assert snapshot.buying_power == 20_000.0
+
+
+def test_an_uncapped_account_has_the_cap_attribute_set_to_None(capped_account):
+    """Off means None, never 0.0 -- a 0.0 cap would make every position unaffordable."""
+    acct = capped_account(cash=40_000.0, cap=None)
+    assert acct._equity_cap is None
+    assert acct.deployed_equity() == 40_000.0

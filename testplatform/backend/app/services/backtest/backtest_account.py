@@ -236,6 +236,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         #   starting_cash, commission_per_trade, slippage_bps, fill_model.
         self._cfg = settings
         self._cash: float = float(settings["starting_cash"])
+        # Optional fixed-notional cap. None = off; every path is then byte-identical to before.
+        # Validated at config time (daily_backtest_handler), so a bad value never reaches here.
+        # ``.get`` is correct rather than a hidden default: absence IS the off state, and 0.0
+        # would be a very different (and catastrophic) instruction — see equity_cap.py.
+        self._equity_cap: Optional[float] = settings.get("equity_cap")
         # symbol -> signed-position ledger.
         self._positions: Dict[str, _Position] = {}
         # The equity curve: one snapshot per simulated bar (engine appends via snapshot_equity).
@@ -681,6 +686,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     def equity(self) -> float:
         """Net liquidating value = cash + mark-to-market of open positions."""
         return self._cash + self._open_positions_mtm()
+
+    def deployed_equity(self) -> float:
+        """Equity the SIZER may see: ``min(cap, equity())``. Uncapped when no cap is set.
+
+        Every money accessor routes through here so the cap is enforced at ONE seam. Capping
+        inside the risk manager instead would leave buying power and margin reading the real
+        balance, letting a margin account deploy twice the cap while appearing capped.
+        """
+        from app.services.backtest.equity_cap import deployed_equity as _deployed
+        return _deployed(self.equity(), cap=self._equity_cap)
 
     # ======================================================================
     # Maintenance margin + forced liquidation (broker-style, bounds equity)
@@ -1153,18 +1168,29 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     # ReadOnlyAccountInterface abstracts (12)
     # ======================================================================
     def get_balance(self) -> Optional[float]:
-        """Current cash balance (the simulated cash ledger)."""
-        return self._cash
+        """Spendable cash, never more than the deployed equity allows.
+
+        (The simulated cash ledger when no equity cap is configured — the historical
+        behaviour, byte-identical.)
+
+        ``min`` in both directions matters: the cap must not RAISE cash above what is actually
+        held (money in open positions is not spendable), and cash must not exceed the cap when
+        the account is sitting flat above it.
+        """
+        if self._equity_cap is None:
+            return self._cash
+        return min(self._cash, self.deployed_equity())
 
     def get_account_info(self) -> Dict[str, Any]:
         """Account info dict; exposes ``.equity`` (read by _validate_position_size_limits)."""
-        eq = self.equity()
+        eq = self.deployed_equity()
+        cash = self.get_balance()
         return _AttrDict(
             {
-                "balance": self._cash,
-                "cash": self._cash,
+                "balance": cash,
+                "cash": cash,
                 "equity": eq,
-                "buying_power": max(self._cash, 0.0),
+                "buying_power": max(cash, 0.0),
             }
         )
 
