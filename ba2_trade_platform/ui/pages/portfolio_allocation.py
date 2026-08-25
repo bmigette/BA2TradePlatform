@@ -127,26 +127,30 @@ from ..utils.portfolio_allocation_view import (
     BASIS_LEGEND, DEFAULT_LABEL_ICON_COLOR, DEFAULT_MACHINE_LABEL_FAMILIES,
     GATE_NO_ACCOUNT,
     LABEL_COLOR_PALETTE, LABEL_STATUS_CLASSES, LABEL_TARGET_CAPTION,
-    LABEL_TOOLTIP_STYLE, label_column_width_ch, MARKET_SOURCE_UNAVAILABLE,
+    LABEL_TOOLTIP_STYLE, label_column_width_ch, label_status_color,
+    MARKET_SOURCE_UNAVAILABLE,
     NO_LABEL_COLOR, RESERVE_BASIS_NOTE,
     GateResult, ManagedLabel,
     PositionFetchFailed, account_value_card, account_value_from_snapshot,
     build_label_bars, build_label_views,
     collect_managed_symbols, diff_managed_labels,
     describe_label_color,
-    evaluate_gate, evaluate_market_gate, even_split_label_targets,
+    evaluate_gate, evaluate_market_gate,
     even_split_symbol_shares, expert_shortname_families,
     fill_label_to_100, fill_rest_symbol_shares,
     format_allocation_footer, format_label_header,
     format_label_target_tooltip,
     format_reserve_caption,
-    format_reserve_row, label_color_contrast_warning, reserve_bar,
+    format_reserve_row, label_color_contrast_warning,
+    ALLOCATION_BAR_LEGEND, allocation_bar, RESERVE_SELL_WARNING,
     SHARE_DEFAULT_NOTE, symbol_total_bar, SYMBOL_TOTAL_BAR_CAPTION,
-    LABEL_TOTAL_BAR_CAPTION, LABEL_TOTAL_CLASSES, LABEL_TOTAL_TOOLTIP,
+    LABEL_TOTAL_BAR_CAPTION, LABEL_TOTAL_BAR_LEGEND, LABEL_TOTAL_CLASSES,
+    LABEL_TOTAL_TOOLTIP,
     label_total_readout,
-    load_last_label_targets,
     load_current_symbol_shares, load_last_symbol_shares, managed_total_value,
-    missing_quote_symbols, picker_options, pnl_classes, positions_by_symbol,
+    important_color_style,
+    missing_quote_symbols, picker_options, pnl_classes, pnl_color,
+    positions_by_symbol,
     resolve_label_icon_color, resolve_symbol_weights,
     sort_label_views, store_color_value,
     symbol_target_values,
@@ -661,6 +665,9 @@ MARKER_BAR_NOTCH = 'pf-bar-notch'
 MARKER_SYMBOL_BAR_ROW = 'pf-symbol-bar-row'
 MARKER_SYMBOL_BAR_FILL = 'pf-symbol-bar-fill'
 MARKER_SYMBOL_BAR_NOTCH = 'pf-symbol-bar-notch'
+#: The reserve card's ALLOCATION bar -- it fills with what is allocated and
+#: leaves the reserve as the gap at the right-hand end. Named for the card it
+#: lives in rather than for the fill, because the card is what a test looks for.
 MARKER_RESERVE_BAR_ROW = 'pf-reserve-bar-row'
 MARKER_RESERVE_BAR_FILL = 'pf-reserve-bar-fill'
 MARKER_RESERVE_BAR_NOTCH = 'pf-reserve-bar-notch'
@@ -709,11 +716,12 @@ MARKER_ALLOCATION_FOOTER = 'pf-allocation-footer'
 # caption match would find whichever the renderer happened to draw first, which is
 # precisely the mis-aimed-write bug these markers make testable.
 
-#: The row holding the label-level group, above the list it rewrites.
-MARKER_LABEL_TOOLS = 'pf-label-tools'
-MARKER_EVEN_SPLIT_LABELS = 'pf-even-split-labels'
-MARKER_LOAD_LAST_LABELS = 'pf-load-last-labels'
 #: The per-label group, in the row that already held Fill 100% and Compare.
+#:
+#: There is no LABEL-LEVEL group any more. It carried Even split and Load last
+#: over every label's target at once; the user asked for both to be per label
+#: ("we don't need to have this globally"), so the row is gone. What went with it
+#: is stated in ``even_split_label_targets``' docstring, which is kept for it.
 MARKER_FILL_100 = 'pf-fill-100'
 MARKER_EVEN_SPLIT_SYMBOLS = 'pf-even-split-symbols'
 MARKER_FILL_REST_SYMBOLS = 'pf-fill-rest-symbols'
@@ -822,17 +830,6 @@ def _label_targets(live: Dict[str, Any]) -> Dict[str, float]:
     return {v.label: float(v.target_pct or 0.0) for v in live['views']}
 
 
-def _previous_label_targets(live: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    """``{label: previous_target_pct}`` -- the generation "Load last" restores.
-
-    Derived off the same ``LabelView`` list as ``_label_targets``, and NULL is
-    carried through as ``None``: "this label has never been allocated" is what
-    disables the restore, and it is a different fact from a previous target of 0.
-    A parallel dict beside the views is how the two would come to disagree.
-    """
-    return {v.label: v.previous_target_pct for v in live['views']}
-
-
 def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
     """Rewrite one label's Share-of-label % and Target value cells. In place.
 
@@ -888,7 +885,14 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         # reach one of them and miss the other.
         icon = widgets.get('icon')
         if icon is not None:
-            icon.style(replace=f'color: {bar.color}')
+            # INLINE ``!important``, and it is load-bearing rather than habit.
+            # ``styles.css`` carries ``.q-expansion-item .q-icon { color: #a0aec0
+            # !important }``; this icon sits in the expansion HEADER, and a
+            # stylesheet ``!important`` beats a plain inline style. Without this
+            # the icon renders grey beside a correctly coloured bar -- reported
+            # twice, and invisible to every Python test because the element
+            # carried the right value the whole time.
+            icon.style(replace=important_color_style(bar.color))
         widgets['value'].set_text(f'${bar.current_value:,.2f}')
         # Every string below is the PURE layer's, not this module's: the
         # denominator rule, the "(real N%)" parenthetical and the over/under
@@ -896,7 +900,12 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         widgets['pct'].set_text(bar.current_text)
         widgets['target'].set_text(bar.target_text)
         widgets['delta'].set_text(bar.delta_text)
+        # The CLASS stays -- it is what the DOM reads as and what several tests
+        # locate this by -- but the inline colour is what paints. "over" is the
+        # actionable warning and is the only verdict given a colour.
         widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+        widgets['delta'].style(replace=important_color_style(
+            label_status_color(bar.status)))
         # Neither of these moves on a keystroke -- the previous generation only
         # advances on a run, and the P&L is measured off the positions and quotes
         # this render opened with. They are rewritten in the same loop anyway, so
@@ -904,6 +913,9 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         widgets['last'].set_text(bar.last_text)
         widgets['pnl'].set_text(bar.pnl_text)
         widgets['pnl'].classes(replace=pnl_classes(bar.pnl))
+        # Green up, red down, neutral inside the epsilon band -- and painted, not
+        # merely classed, for the reason above.
+        widgets['pnl'].style(replace=important_color_style(pnl_color(bar.pnl)))
         widgets['tooltip'].set_text(format_label_target_tooltip(
             target_pct=bar.target_pct, base_notional=live['base_notional'],
             unallocated_pct=live['unallocated_pct']))
@@ -940,21 +952,36 @@ def _apply_symbol_bar(live: Dict[str, Any], label: str) -> None:
     widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
 
 
+def _apply_reserve_row(live: Dict[str, Any]) -> None:
+    """The reserve card's money line. In place.
+
+    ``format_reserve_row`` returns ``None`` when there is no base to divide by --
+    a brand-new or fully-withdrawn account -- and the line is then left empty
+    rather than filled with a share of a number nobody has.
+    """
+    if live['reserve_row'] is None:
+        return
+    text = format_reserve_row(base_notional=live['base_notional'],
+                              available_buying_power=live['available_buying_power'],
+                              unallocated_pct=live['unallocated_pct'])
+    live['reserve_row'].set_text(text or '')
+
+
 def _apply_reserve_bar(live: Dict[str, Any]) -> None:
     """Redraw the unallocated row's bar. In place.
 
-    CURRENT is the free buying power and TARGET is the reserve, in that order and
-    from ``reserve_bar`` -- which reads the same ``unallocated_row`` the sentence
-    beside it prints, so the picture and the words cannot disagree. Swapped, an
-    under-funded reserve would read "over" directly above a line explaining that
-    raising it generates sells.
+    It fills with what is ALLOCATED and leaves the reserve as the gap at the right
+    -- and the target tick is inverted with it, so a 10% reserve target sits at 90%
+    along. Both come off ``allocation_bar``, which reads the same
+    ``unallocated_row`` the sentence beside it prints, so the picture and the words
+    cannot disagree.
     """
     widgets = live['reserve_bar']
     if widgets is None:
         return
-    bar = reserve_bar(base_notional=live['base_notional'],
-                      available_buying_power=live['available_buying_power'],
-                      unallocated_pct=live['unallocated_pct'])
+    bar = allocation_bar(base_notional=live['base_notional'],
+                         available_buying_power=live['available_buying_power'],
+                         unallocated_pct=live['unallocated_pct'])
     if bar is None:
         return
     _paint_mini_bar(widgets, fraction=bar.fraction,
@@ -963,6 +990,8 @@ def _apply_reserve_bar(live: Dict[str, Any]) -> None:
     widgets['target'].set_text(bar.target_text)
     widgets['delta'].set_text(bar.delta_text)
     widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+    widgets['delta'].style(replace=important_color_style(
+        label_status_color(bar.status)))
 
 
 def _apply_total_notice(live: Dict[str, Any]) -> None:
@@ -1018,12 +1047,7 @@ def _apply_reserve(live: Dict[str, Any]) -> None:
     if live['reserve_caption'] is not None:
         live['reserve_caption'].set_text(
             format_reserve_caption(live['base_notional'], live['unallocated_pct']))
-    if live['reserve_row'] is not None:
-        text = format_reserve_row(base_notional=live['base_notional'],
-                                  available_buying_power=live['available_buying_power'],
-                                  unallocated_pct=live['unallocated_pct'])
-        if text is not None:
-            live['reserve_row'].set_text(text)
+    _apply_reserve_row(live)
     _apply_reserve_bar(live)
     _apply_page_figures(live)
 
@@ -1355,108 +1379,6 @@ async def _save_label_target(account_id: int, live: Dict[str, Any], label: str,
     if view is not None:
         view.target_pct = edit.value
     _apply_page_figures(live)
-
-
-# ---------------------------------------------------------------------------
-# THE LABEL-LEVEL BUTTON GROUP -- "Even split" and "Load last"
-#
-# Migrated off the Allocate wizard's step 1. They write through
-# ``set_managed_label``, i.e. the SAME column the inline box writes, and
-# deliberately NOT through ``save_allocation_targets``: that function is the one
-# writer of the previous generation, and a shift here would grind the real history
-# away one press at a time -- and would make Load last un-undoable, because
-# pressing it would immediately overwrite the very numbers it just restored.
-# ---------------------------------------------------------------------------
-
-def _write_label_targets(account_id: int, targets) -> List[str]:
-    """Persist a whole set of label targets. Blocking. Returns the SKIPPED labels.
-
-    Guarded exactly as ``_write_label_target`` is, and for the same reason:
-    ``set_managed_label`` CREATES the row it cannot find, so a write aimed at a
-    label unmanaged in another tab would resurrect it -- as a label the user did
-    not choose to manage, holding money.
-
-    A skip does NOT abort the rest. The set was decided over the labels on screen,
-    and refusing every one of them because one is stale would make the button
-    unusable on exactly the page that most needs a refresh.
-    """
-    managed = {row.label for row in get_managed_labels(account_id)}
-    skipped = [label for label in (targets or {}) if label not in managed]
-    for label, pct in (targets or {}).items():
-        if label in managed:
-            set_managed_label(account_id, label, target_pct=float(pct))
-    return skipped
-
-
-def _apply_label_targets(live: Dict[str, Any], targets) -> None:
-    """Put a new set of label targets on screen. In place.
-
-    The VIEWS move first and the boxes follow, and that order is load-bearing: a
-    programmatic ``set_value`` fires the box's own change handler, which compares
-    the incoming number against the stored one and returns on a match. Pushing the
-    widgets first would make every one of those echoes a real edit, re-validating
-    and re-persisting a set that is only half applied.
-    """
-    for label, pct in (targets or {}).items():
-        view = live['view_by_label'].get(label)
-        if view is not None:
-            view.target_pct = float(pct)
-    _apply_page_figures(live)
-    for label, pct in (targets or {}).items():
-        _restore_value(live['label_inputs'].get(label), float(pct))
-
-
-async def _run_label_target_button(account_id: int, live: Dict[str, Any],
-                                   result) -> None:
-    """Persist and draw one decided label-level press. THE handler, for both buttons.
-
-    ``result`` is a ``TargetsUpdate`` from the pure layer, which has already made
-    every decision -- what the new set is, whether it differs from the current one,
-    and what to say when it does not. This does the IO and the redraw.
-    """
-    if not result.changed:
-        # Said out loud. A button that does nothing when pressed is
-        # indistinguishable from a broken one.
-        ui.notify(result.message, type='info')
-        return
-    try:
-        skipped = await asyncio.to_thread(_write_label_targets, account_id,
-                                          result.targets)
-    except Exception as e:
-        logger.error(f"Saving the label targets failed: {e}", exc_info=True)
-        ui.notify(f'Could not save the targets: {e}', type='negative')
-        return
-    stale = set(skipped)
-    _apply_label_targets(live, {label: pct for label, pct in result.targets.items()
-                                if label not in stale})
-    if skipped:
-        logger.warning(f"Label target(s) for {sorted(skipped)} ignored: no longer "
-                       f"managed by account {account_id}")
-        ui.notify(f"{', '.join(sorted(skipped))} is no longer managed — refresh "
-                  f"the page", type='warning')
-        return
-    ui.notify(result.message, type='positive')
-
-
-async def _even_split_labels(account_id: int, live: Dict[str, Any]) -> None:
-    """Give every managed label an equal share of the whole 100%.
-
-    The reserve is not reachable from here by construction: it is a separate stored
-    field and the labels divide what it LEAVES, so the split is always of 100.
-    """
-    await _run_label_target_button(
-        account_id, live, even_split_label_targets(_label_targets(live)))
-
-
-async def _load_last_labels(account_id: int, live: Dict[str, Any]) -> None:
-    """Restore the label targets the LAST run was launched with.
-
-    ``_previous_label_targets`` and not ``_label_targets``: reading the live map
-    would make this a no-op that still reports success.
-    """
-    await _run_label_target_button(
-        account_id, live,
-        load_last_label_targets(_label_targets(live), _previous_label_targets(live)))
 
 
 async def _save_reserve(account_id: int, live: Dict[str, Any], raw, *, echo_to) -> None:
@@ -1882,7 +1804,7 @@ def _open_label_picker(account_id: int, refresh) -> None:
                 # icon with no way to tell which is right.
                 resolved = resolve_label_icon_color(colors.get(label))
                 swatch = ui.icon('label').classes('shrink-0') \
-                    .style(f'color: {resolved}')
+                    .style(important_color_style(resolved))
                 swatch.tooltip(describe_label_color(colors.get(label)))
                 # A FIXED column, so every block below starts at the same x. See
                 # ``label_column_width_ch``: floored so two short names still line
@@ -1895,7 +1817,7 @@ def _open_label_picker(account_id: int, refresh) -> None:
                 _render_color_choices(
                     account_id, label, colors.get(label),
                     lambda hexed, stored, sw=swatch: sw.style(
-                        replace=f'color: {hexed}'),
+                        replace=important_color_style(hexed)),
                     inline=True)
 
         async def _close() -> None:
@@ -2273,36 +2195,35 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
                                                        echo_to=number))
         number.on_value_change(lambda e: _save_reserve(account_id, live, e.value,
                                                        echo_to=slider))
+        # The consequence, kept NEXT TO THE SLIDER that causes it rather than in a
+        # caption: it is the one sentence saying that dragging this up is not free.
+        ui.label(RESERVE_SELL_WARNING).classes('text-xs text-orange-400')
         live['reserve_caption'] = ui.label(
             format_reserve_caption(live['base_notional'], live['unallocated_pct'])
         ).classes('text-xs text-secondary-custom').style(TABULAR_NUMS)
-
-
-def _render_label_tools(account_id: int, live: Dict[str, Any]) -> None:
-    """The LABEL-LEVEL button group, directly above the list it rewrites.
-
-    Migrated off the Allocate wizard's step 1, where it sat above the same boxes.
-    It is a row of its own rather than a member of the toolbar at the top of the
-    page: the toolbar's buttons are page-wide actions (allocate, refresh, manage
-    labels) and these two rewrite the targets of every label underneath them, so
-    they belong next to what they change.
-
-    Neither is DISABLED when it has nothing to do -- see the note on the pure
-    layer's button section. The press is always allowed and the no-op is reported
-    in words, which is the convention ``Fill 100%`` already set on this page.
-    """
-    with ui.row().classes('w-full items-center gap-2').mark(MARKER_LABEL_TOOLS):
-        ui.label('All labels').classes('text-xs text-secondary-custom')
-        ui.button('Even split', icon='balance',
-                  on_click=lambda: _even_split_labels(account_id, live)
-                  ).props('outline dense').mark(MARKER_EVEN_SPLIT_LABELS) \
-            .tooltip('Give every label an equal share of the whole 100%. The cash '
-                     'reserve is untouched — the labels divide what it leaves.')
-        ui.button('Load last', icon='history',
-                  on_click=lambda: _load_last_labels(account_id, live)
-                  ).props('outline dense').mark(MARKER_LOAD_LAST_LABELS) \
-            .tooltip('Put back the targets the last allocation run was launched '
-                     'with. A label that has never run keeps the target it has.')
+        # THE ALLOCATION BAR, folded into the card that already owns the concept --
+        # the slider is the TARGET, the row below is the ACTUAL, and the bar is the
+        # gap between them. It used to be a separate blue callout under the labels.
+        #
+        # The card is titled "Unallocated reserve" and this bar fills with
+        # ALLOCATED money, which is a contradiction unless the legend says which is
+        # which -- so it does.
+        live['reserve_row'] = ui.label('').style(TABULAR_NUMS)
+        ui.label(ALLOCATION_BAR_LEGEND).classes('text-xs text-secondary-custom')
+        with ui.row().classes('w-full items-center gap-3 no-wrap') \
+                .style(TABULAR_NUMS).mark(MARKER_RESERVE_BAR_ROW):
+            reserve_bar_widgets = _render_mini_bar(
+                fill_marker=MARKER_RESERVE_BAR_FILL,
+                notch_marker=MARKER_RESERVE_BAR_NOTCH)
+            reserve_bar_widgets['pct'] = ui.label('').classes('w-16 text-right')
+            reserve_bar_widgets['target'] = ui.label('').classes('w-28 text-right')
+            reserve_bar_widgets['delta'] = ui.label('').classes('w-52')
+            reserve_bar_widgets['color'] = DEFAULT_LABEL_ICON_COLOR
+        live['reserve_bar'] = reserve_bar_widgets
+        # The one denominator change on the page, said where the control is.
+        ui.label(RESERVE_BASIS_NOTE).classes('text-xs text-secondary-custom')
+        _apply_reserve_row(live)
+        _apply_reserve_bar(live)
 
 
 def _recolour_label(live: Dict[str, Any], label: str, stored: str) -> None:
@@ -2476,6 +2397,10 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
         with ui.column().classes(card_classes) as labels_card:
             ui.label('Managed labels').classes('text-xs text-secondary-custom')
             ui.label(str(len(views))).classes('text-lg font-bold')
+            # WHAT THE BAR IS. The card is titled "Managed labels" and shows a
+            # COUNT, so a bar under it with no name is a rectangle to be guessed
+            # at -- the same objection the reserve card's legend answers.
+            ui.label(LABEL_TOTAL_BAR_LEGEND).classes('text-xs text-secondary-custom')
             with ui.row().classes('w-full items-center gap-2 no-wrap') \
                     .style(TABULAR_NUMS).mark(MARKER_TOTAL_BAR_ROW):
                 total_widgets = _render_mini_bar(
@@ -2536,47 +2461,18 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # buying power is a fact worth drawing, and only None means "unknown".
     # THE RESERVE, on its own line and NOT in the card row above.
     #
-    # It was the fifth card there and it did not belong: it is the only CONTROL
-    # among four read-only stats, it is the widest thing on the row (a slider, an
-    # input and a live dollar caption), and it was the one being clipped. Here it
-    # sits directly above the list it governs -- the labels divide what it leaves --
-    # which is also where a reader looks when they wonder why the targets moved.
+    # It was the fifth card in the summary row and it did not belong: it is the
+    # only CONTROL among four read-only stats, it is the widest thing there (a
+    # slider, an input, a live dollar caption and now a bar), and it was the one
+    # being clipped. Here it sits directly above the list it governs -- the labels
+    # divide what it leaves -- which is also where a reader looks when they wonder
+    # why the targets moved.
+    #
+    # It carries the WHOLE reserve story now: the slider is the target, the money
+    # line is the actual, the bar is the gap, and the two notes are the
+    # denominator and the consequence. There is no separate blue callout under the
+    # labels any anymore -- one widget owning one concept.
     _render_reserve_card(account_id, live)
-
-    reserve_text = format_reserve_row(base_notional=base_notional,
-                                      available_buying_power=buying_power,
-                                      unallocated_pct=payload['unallocated_pct'])
-    if reserve_text is not None:
-        with ui.element('div').classes('alert-banner info w-full p-3'):
-            # "of base", SAID OUT LOUD, because this is the ONE row on the page
-            # still measured against the gross base -- every label below divides the
-            # investable pool. In identical grammar the two read as one column and
-            # sum past 100.
-            live['reserve_row'] = ui.label(reserve_text).style(TABULAR_NUMS)
-            # THE SAME bar component as the label rows. Every word of the sentence
-            # above stays; this only draws what it says. Neutral grey, because the
-            # reserve is not a label and has no palette entry of its own.
-            with ui.row().classes('w-full items-center gap-3 no-wrap') \
-                    .style(TABULAR_NUMS).mark(MARKER_RESERVE_BAR_ROW):
-                reserve_bar_widgets = _render_mini_bar(
-                    fill_marker=MARKER_RESERVE_BAR_FILL,
-                    notch_marker=MARKER_RESERVE_BAR_NOTCH)
-                reserve_bar_widgets['pct'] = ui.label('').classes('w-16 text-right')
-                reserve_bar_widgets['target'] = ui.label('').classes('w-28 text-right')
-                reserve_bar_widgets['delta'] = ui.label('').classes('w-52')
-                reserve_bar_widgets['color'] = DEFAULT_LABEL_ICON_COLOR
-            live['reserve_bar'] = reserve_bar_widgets
-            _apply_reserve_bar(live)
-            # Said out loud, because it is the counter-intuitive half: a reserve on
-            # a fully invested book is funded by SELLING, and the dry run is where
-            # that becomes visible. Drawn unconditionally now that the reserve is
-            # editable in place -- a caption that appears only above 0% is one the
-            # user never reads before moving the slider.
-            ui.label(RESERVE_BASIS_NOTE).classes('text-xs text-secondary-custom')
-
-    # The label-level group, between the reserve and the labels: it rewrites every
-    # target in the list below and nothing above it.
-    _render_label_tools(account_id, live)
 
     for view in views:
         # Registered by ``_render_label_body`` inside the row, not here: two calls
