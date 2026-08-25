@@ -109,8 +109,13 @@ def provider():
 def _run(provider, store, extra=(), clock=None, out=None):
     clock = clock or FakeClock()
     lines: List[str] = out if out is not None else []
+    # These tests drive the FAKE provider's discover_contracts, so they must ask for the
+    # provider-backed listing explicitly. The shipped DEFAULT is 'synthetic', because
+    # /instruments/equity-options answers 403 for a personal OAuth app and no available
+    # scope can change that -- see test_the_default_discovery_needs_no_listing_endpoint.
+    # ``extra`` is appended last, so an individual test can still override this.
     argv = ["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
-            "--rate-limit", "0", *extra]
+            "--rate-limit", "0", "--discovery", "rest", "--discovery", "rest", *extra]
     rc = warm.main(argv, provider=provider, store=store, clock=clock,
                    sleep=lambda s: clock.advance(s), log=lines.append)
     return rc, lines
@@ -261,7 +266,7 @@ def test_widening_the_window_refetches_rather_than_serving_the_narrower_cache(pr
     provider.fetched.clear()
     clock = FakeClock()
     warm.main(["--symbols", "AAPL", "--start", "2022-11-01", "--end", END.isoformat(),
-               "--rate-limit", "0"],
+               "--rate-limit", "0", "--discovery", "rest"],
               provider=provider, store=store, clock=clock,
               sleep=lambda s: clock.advance(s), log=lambda _l: None)
     assert sorted(provider.fetched) == EXPIRIES, \
@@ -344,7 +349,7 @@ def test_an_exception_from_the_stream_is_retried_with_exponential_backoff(provid
     clock = FakeClock()
     provider.raise_on = {EXPIRIES[1]}
     warm.main(["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
-               "--rate-limit", "0", "--max-retries", "4", "--backoff", "2"],
+               "--rate-limit", "0", "--discovery", "rest", "--max-retries", "4", "--backoff", "2"],
               provider=provider, store=store, clock=clock,
               sleep=lambda s: (slept.append(s), clock.advance(s))[0], log=lambda _l: None)
     backoffs = [s for s in slept if s > 0]
@@ -366,7 +371,7 @@ def test_it_rate_limits_between_units(provider, store):
     slept: List[float] = []
     clock = FakeClock()
     warm.main(["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
-               "--rate-limit", "1.5"],
+               "--rate-limit", "1.5", "--discovery", "rest"],
               provider=provider, store=store, clock=clock,
               sleep=lambda s: (slept.append(s), clock.advance(s))[0], log=lambda _l: None)
     assert slept.count(1.5) == 3, f"one pause per unit, got {slept}"
@@ -383,7 +388,7 @@ def test_progress_lines_carry_done_remaining_and_an_eta(provider, store):
     provider.fetch_bars_detailed = slow
     lines: List[str] = []
     warm.main(["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
-               "--rate-limit", "0", "--progress-every", "1"],
+               "--rate-limit", "0", "--discovery", "rest", "--progress-every", "1"],
               provider=provider, store=store, clock=clock,
               sleep=lambda s: clock.advance(s), log=lines.append)
     progress = [ln for ln in lines if "ETA" in ln]
@@ -444,7 +449,7 @@ def test_symbols_file_is_read_when_no_inline_symbols_are_given(provider, store, 
     f.write_text("AAPL\n# a comment\n\nMSFT\n")
     clock = FakeClock()
     warm.main(["--symbols-file", str(f), "--start", START.isoformat(),
-               "--end", END.isoformat(), "--rate-limit", "0", "--dry-run"],
+               "--end", END.isoformat(), "--rate-limit", "0", "--discovery", "rest", "--dry-run"],
               provider=provider, store=store, clock=clock,
               sleep=lambda s: clock.advance(s), log=lambda _l: None)
     assert provider.discovered == ["AAPL", "MSFT"]
@@ -453,7 +458,7 @@ def test_symbols_file_is_read_when_no_inline_symbols_are_given(provider, store, 
 def test_symbols_are_upper_cased_and_deduplicated(provider, store):
     clock = FakeClock()
     warm.main(["--symbols", "aapl,AAPL, msft ", "--start", START.isoformat(),
-               "--end", END.isoformat(), "--dry-run"],
+               "--end", END.isoformat(), "--dry-run", "--discovery", "rest"],
               provider=provider, store=store, clock=clock,
               sleep=lambda s: clock.advance(s), log=lambda _l: None)
     assert provider.discovered == ["AAPL", "MSFT"]
@@ -521,7 +526,7 @@ def test_the_discovery_cache_is_invalidated_by_a_wider_window(provider, store):
     provider.discovered.clear()
     clock = FakeClock()
     warm.main(["--symbols", "AAPL", "--start", "2022-11-01", "--end", END.isoformat(),
-               "--rate-limit", "0", "--dry-run"],
+               "--rate-limit", "0", "--discovery", "rest", "--dry-run"],
               provider=provider, store=store, clock=clock,
               sleep=lambda s: clock.advance(s), log=lambda _l: None)
     assert provider.discovered == ["AAPL"]
@@ -533,3 +538,27 @@ def _files_under(root):
     for dirpath, _dirs, files in os.walk(root):
         out.extend(os.path.join(dirpath, f) for f in files)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# discovery mode — the shipped default must work with a personal OAuth app
+# --------------------------------------------------------------------------- #
+def test_the_default_discovery_needs_no_listing_endpoint():
+    """/instruments/equity-options answers 403 'insufficient scopes' for a personal OAuth
+    app, with or without with-expired, and TastyTrade offers only read/trade/openid --
+    openid being OpenID Connect identity, not data. So the default must be the mode that
+    never calls it. The probe that proved dxfeed serves EXPIRED contracts synthesised its
+    streamer symbols exactly this way."""
+    assert warm.parse_args(["--symbols", "AAPL"]).discovery == "synthetic"
+
+
+def test_a_403_on_rest_discovery_names_the_mode_that_works(provider, store, monkeypatch):
+    """A scope refusal must never read as 'this symbol has no contracts'."""
+    def _boom(*a, **k):
+        raise RuntimeError("403 Client Error: Token has insufficient scopes for this request")
+    monkeypatch.setattr(provider, "discover_contracts", _boom)
+    with pytest.raises(SystemExit) as ei:
+        _run(provider, store, ["--dry-run"])
+    msg = str(ei.value)
+    assert "--discovery synthetic" in msg, msg
+    assert "403" in msg and "AAPL" in msg, msg
