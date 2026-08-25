@@ -1020,8 +1020,28 @@ class AccountInterface(ReadOnlyAccountInterface):
         errors = []
         max_position_value = virtual_equity * (max_position_pct / 100.0)
         
-        # Get current position size from the transaction
-        current_position_qty = abs(transaction.quantity or 0)
+        # SIZE THE EXISTING HOLDING OFF WHAT WE MEASURED, AND NOTHING ELSE.
+        #
+        # This was ``abs(transaction.quantity or 0)`` -- the quantity the transaction
+        # was ORDERED for. After a partial fill, a partial exit, an external close or
+        # an assignment that number no longer describes anything the account holds,
+        # and the per-instrument cap is then wrong in whichever direction reality
+        # drifted: a partially CLOSED position is counted at its full original size so
+        # the cap blocks a legitimate top-up, and a position GROWN past its opening
+        # order is counted at the smaller original size so the cap ADMITS a top-up
+        # that takes the real holding over it. The second direction is the one that
+        # loses money. Same staleness, one gate over, as the close bug fixed in
+        # submit_close_order_for_transaction.
+        #
+        # get_current_open_qty() is the measured net -- the same source the close path
+        # now uses. It returns a float, deliberately not Optional[float] (that would
+        # push None into arithmetic at ~10 call sites); when a fill is UNMEASURABLE it
+        # excludes that order and logs at error, and that log reaches the operator
+        # from here too (test: an unmeasurable fill is still reported loudly).
+        #
+        # The ``or 0`` is not carried over: ``Transaction.quantity`` is NOT NULL, so it
+        # could only ever have fired on a real, measured zero.
+        current_position_qty = abs(transaction.get_current_open_qty())
         current_position_value = current_position_qty * current_price
         
         # Check if this is adding to an existing position
