@@ -3601,3 +3601,97 @@ def test_a_comma_value_that_is_genuinely_out_of_range_is_still_refused():
     edit = validate_symbol_weight_edit(label='ARK26', symbol='AAPL', raw='1,234.5')
     assert edit.accepted is False
     assert edit.reason_code == EDIT_OVER_100
+
+
+# ---------------------------------------------------------------------------
+# THE LABEL-TOTAL CARD
+#
+# It was a sentence under the stat cards that appeared only when the set was
+# WRONG -- so the one moment the user wanted the running total (while typing
+# towards 100) was the one moment it said nothing. As a card it always carries
+# the figure, and the verdict rides along as its detail.
+#
+# The verdict is the SAME one ``format_label_total_notice`` and
+# ``format_allocation_footer`` reach, from one shared predicate, so three
+# readouts of one set cannot disagree.
+# ---------------------------------------------------------------------------
+
+def test_the_label_total_card_always_carries_the_figure_even_when_it_is_right():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        LABEL_TOTAL_CARD_TITLE, label_total_card)
+
+    card = label_total_card({'A': 60.0, 'B': 40.0})
+
+    assert card.title == LABEL_TOTAL_CARD_TITLE
+    assert card.text == '100.00%'
+    assert card.severity == 'ok'
+    assert card.detail
+
+
+def test_the_label_total_card_sums_and_never_averages():
+    """The mutation this exists for. Three labels at 25 total 75, not 25."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_card
+
+    assert label_total_card({'A': 25.0, 'B': 25.0, 'C': 25.0}).text == '75.00%'
+
+
+def test_the_label_total_card_speaks_the_engines_own_shortfall_sentence():
+    """Verbatim, so the card, the footer and the submit gate describe one defect
+    one way -- and so the "use the Unallocated box" guidance survives the move."""
+    from ba2_trade_platform.core.portfolio_allocation import ERROR_LABEL_UNDER_FMT
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_card
+
+    card = label_total_card({'A': 75.0})
+
+    assert card.text == '75.00%'
+    assert card.severity == 'warning'
+    assert card.detail == ERROR_LABEL_UNDER_FMT.format(total=75.0, under=25.0)
+    assert 'Unallocated box' in card.detail
+
+
+def test_the_label_total_card_speaks_the_engines_own_over_sentence_too():
+    from ba2_trade_platform.core.portfolio_allocation import ERROR_LABEL_TOTAL_FMT
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_card
+
+    card = label_total_card({'A': 70.0, 'B': 48.0})
+
+    assert card.text == '118.00%'
+    assert card.severity == 'negative'
+    assert card.detail == ERROR_LABEL_TOTAL_FMT.format(total=118.0, over=18.0)
+
+
+def test_the_label_total_card_agrees_with_the_notice_and_the_footer():
+    """One predicate, three readouts. A card that called 118% 'ok' while the
+    footer called it an error would be the two-screens bug at one screen's
+    distance."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        format_allocation_footer, format_label_total_notice, label_total_card)
+
+    for targets in ({'A': 118.0}, {'A': 75.0}, {'A': 100.0}, {'A': 99.995}):
+        card = label_total_card(targets)
+        notice = format_label_total_notice(targets)
+        _footer_text, footer_severity = format_allocation_footer(targets, 0.0)
+        assert card.severity == footer_severity, targets
+        assert (notice is None) == (card.severity == 'ok'), targets
+        if notice is not None:
+            assert notice[0] == card.detail, targets
+
+
+def test_the_label_total_card_measures_the_INVESTABLE_pool_not_the_gross_base():
+    """The reserve does not enter it. The labels divide what the reserve LEAVES,
+    so 100 typed across them is 100 whatever the reserve says -- an off-by-one
+    that netted the reserve out would call a correct set 'under by 10'."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_card
+
+    for _reserve in (0.0, 10.0, 90.0):
+        assert label_total_card({'A': 60.0, 'B': 40.0}).text == '100.00%'
+
+
+def test_the_label_total_card_of_an_account_managing_nothing_says_so():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_card
+
+    card = label_total_card({})
+
+    assert card.text == '0.00%'
+    assert card.severity == 'ok'
+    assert card.detail

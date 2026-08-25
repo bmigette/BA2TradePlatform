@@ -126,7 +126,7 @@ from ..components.symbol_info_panel import open_symbol_info
 from ..utils.portfolio_allocation_view import (
     BASIS_LEGEND, DEFAULT_MACHINE_LABEL_FAMILIES, GATE_NO_ACCOUNT,
     LABEL_COLOR_PALETTE, LABEL_STATUS_CLASSES, LABEL_TARGET_CAPTION,
-    LABEL_TOOLTIP_STYLE, LABEL_TOTAL_NOTICE_CLASSES, MARKET_SOURCE_UNAVAILABLE,
+    LABEL_TOOLTIP_STYLE, MARKET_SOURCE_UNAVAILABLE,
     NO_LABEL_COLOR, RESERVE_BASIS_NOTE,
     GateResult, ManagedLabel,
     PositionFetchFailed, account_value_card, account_value_from_snapshot,
@@ -137,8 +137,11 @@ from ..utils.portfolio_allocation_view import (
     fill_label_to_100, fill_rest_symbol_shares,
     format_allocation_footer, format_label_header,
     format_label_target_tooltip,
-    format_label_total_notice, format_reserve_caption,
-    format_reserve_row, label_color_contrast_warning, load_last_label_targets,
+    format_reserve_caption,
+    format_reserve_row, label_color_contrast_warning,
+    LABEL_TOTAL_CARD_CLASSES, LABEL_TOTAL_CARD_TITLE, LABEL_TOTAL_CARD_TOOLTIP,
+    label_total_card,
+    load_last_label_targets,
     load_last_symbol_shares, managed_total_value,
     missing_quote_symbols, picker_options, pnl_classes, positions_by_symbol,
     resolve_label_icon_color, sort_label_views, store_color_value,
@@ -619,6 +622,16 @@ MARKER_COLOR_CUSTOM = 'pf-color-custom'
 #: The summary stat-card row, and the reserve card that no longer sits inside it.
 MARKER_SUMMARY_ROW = 'pf-summary-row'
 MARKER_RESERVE_CARD = 'pf-reserve-card'
+#: The label-total card and its verdict line. The card was a conditional sentence
+#: under this row; it is a member of it now, built from the same ``card_classes``
+#: as every other card here. The DETAIL is marked separately because its whole
+#: signal is its colour, which a text search cannot read.
+MARKER_TOTAL_CARD = 'pf-total-card'
+MARKER_TOTAL_CARD_DETAIL = 'pf-total-card-detail'
+#: The totals footer under the label list. Marked because the card above it now
+#: opens with the same three words -- "Label targets total" -- so a text search
+#: finds whichever the renderer drew first, which is the card.
+MARKER_ALLOCATION_FOOTER = 'pf-allocation-footer'
 
 # ---- the migrated button groups --------------------------------------------
 #
@@ -685,7 +698,7 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         'reserve_caption': None,
         'reserve_number': None,
         'reserve_slider': None,
-        'total_notice': None,   # the running "labels total N%" advisory
+        'total_card': None,     # {'value':, 'detail':} of the label-total card
         'footer': None,         # the totals line under the list
     }
 
@@ -803,24 +816,24 @@ def _apply_bars(live: Dict[str, Any]) -> None:
 
 
 def _apply_total_notice(live: Dict[str, Any]) -> None:
-    """Refresh the running "labels total N%" advisory and the totals footer.
+    """Refresh the label-total CARD and the totals footer.
 
     This is the page's own over/under-100 check -- no dry run needed, exactly as in
-    the wizard's step 1. Both readouts come from the same targets, so they cannot
-    say different things.
+    the wizard's step 1. Both readouts come from the same targets through the same
+    ``judge_label_total``, so they cannot say different things.
+
+    REAL TIME, and only that. It rewrites what is DISPLAYED; it moves no target, it
+    solves nothing and it writes nothing. Auto-recalculation was rejected outright
+    earlier in this project and a redraw that quietly rebalanced the siblings to
+    make the total come out at 100 would be exactly it, wearing a card.
     """
     targets = _label_targets(live)
-    element = live['total_notice']
-    if element is not None:
-        notice = format_label_total_notice(targets)
-        if notice is None:
-            element.set_text('')
-            element.set_visibility(False)
-        else:
-            text, severity = notice
-            element.set_text(text)
-            element.classes(replace=LABEL_TOTAL_NOTICE_CLASSES[severity])
-            element.set_visibility(True)
+    card = live['total_card']
+    if card is not None:
+        decided = label_total_card(targets)
+        card['value'].set_text(decided.text)
+        card['detail'].set_text(decided.detail)
+        card['detail'].classes(replace=LABEL_TOTAL_CARD_CLASSES[decided.severity])
     footer = live['footer']
     if footer is not None:
         text, severity = format_allocation_footer(targets, live['unallocated_pct'])
@@ -2192,15 +2205,25 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
         with ui.column().classes(card_classes):
             ui.label('Managed labels').classes('text-xs text-secondary-custom')
             ui.label(str(len(views))).classes('text-lg font-bold')
+        # THE RUNNING TOTAL, as a card rather than as the conditional sentence it
+        # used to be under this row. Same ``card_classes`` as the three beside it
+        # -- one card component, because a forked second style is how this row
+        # goes ragged again the next time either is touched. Its figure and its
+        # verdict are rewritten in place by ``_apply_total_notice`` on every edit.
+        with ui.column().classes(card_classes).mark(MARKER_TOTAL_CARD) as total_card:
+            ui.label(LABEL_TOTAL_CARD_TITLE).classes('text-xs text-secondary-custom')
+            total_value = ui.label('').classes('text-lg font-bold').style(TABULAR_NUMS)
+            total_detail = ui.label('').mark(MARKER_TOTAL_CARD_DETAIL)
+            # At EVERY state, because the "use the Unallocated box" guidance rides
+            # inside the SHORTFALL sentence and vanishes the moment the set is
+            # right -- which is exactly when a user decides to leave a gap.
+            total_card.tooltip(LABEL_TOTAL_CARD_TOOLTIP)
+        live['total_card'] = {'value': total_value, 'detail': total_detail}
         if buying_power is not None:
             with ui.column().classes(card_classes):
                 ui.label('Free buying power').classes('text-xs text-secondary-custom')
                 ui.label(f'${buying_power:,.2f}').classes('text-lg font-bold') \
                     .style(TABULAR_NUMS)
-
-    # The running over/under-100 check, on the PAGE and without a dry run -- the
-    # same advisory the wizard's step 1 has always shown, moved here with the boxes.
-    live['total_notice'] = ui.label('').classes('text-xs text-orange-400')
 
     # DANGER, not warning, since market became the default (W1). This is no longer
     # "your percentages are slightly off": those positions contribute 0 to the
@@ -2276,7 +2299,8 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
         _render_label_bar_row(account_id, live, view, refresh)
 
     with ui.row().classes('w-full items-center gap-3'):
-        live['footer'] = ui.label('').style(TABULAR_NUMS)
+        live['footer'] = ui.label('').style(TABULAR_NUMS) \
+            .mark(MARKER_ALLOCATION_FOOTER)
         ui.label('███ current    ╎ target notch').classes('text-xs text-secondary-custom')
     # The denominators, named ONCE for the whole page. The rows are terse
     # ("tgt 15.0% (real 13.5%)") precisely because this line exists; spelling them

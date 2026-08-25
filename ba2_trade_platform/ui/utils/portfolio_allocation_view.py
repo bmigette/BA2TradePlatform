@@ -2194,14 +2194,115 @@ def format_label_total_notice(targets,
     """
     if not targets:
         return None
-    total = sum(float(pct or 0.0) for pct in targets.values())
+    _total, severity, sentence = judge_label_total(targets, tolerance)
+    return None if severity == 'ok' else (sentence, severity)
+
+
+# ---------------------------------------------------------------------------
+# THE LABEL-TOTAL CARD
+#
+# The running total was a sentence under the stat cards that appeared only when
+# the set was WRONG -- so the one moment the user most wanted it, while typing
+# towards 100, was the one moment it said nothing. It is a card now, in the same
+# row and built from the same ``card_classes`` as "Managed labels": the figure is
+# always there and the verdict rides along as its detail.
+#
+# ONE PREDICATE, THREE READOUTS. ``judge_label_total`` is what the card, the
+# advisory and the totals footer all ask, so a card calling 118% fine while the
+# footer calls it an error is not reachable.
+#
+# The denominator is the INVESTABLE POOL, and the reserve does not enter it: the
+# labels divide what the reserve LEAVES, so 100 typed across them is 100 at every
+# reserve. Netting the reserve out here would call a correct set "under by 10".
+# ---------------------------------------------------------------------------
+
+LABEL_TOTAL_CARD_TITLE = 'Label targets total'
+
+#: Said when the set is right. It states the denominator rather than just ticking,
+#: because "100.00%" alone does not say 100% OF WHAT -- and this page carries three
+#: different denominators within two inches of each other.
+LABEL_TOTAL_CARD_ON_TARGET = ('on target — the labels divide the whole investable '
+                              'pool')
+
+#: ...and when there are no labels at all. Not the on-target sentence: nothing has
+#: been asked of an unmanaged account and reporting it as correct is approval of a
+#: decision nobody made.
+LABEL_TOTAL_CARD_EMPTY = 'no managed labels yet — nothing is allocated'
+
+#: The card's tooltip, drawn at EVERY state. The shortfall sentence carries the
+#: "use the Unallocated box" guidance only while the set is short, and that is the
+#: one fact a user needs BEFORE they leave a gap on purpose -- so it is repeated
+#: here where it is always readable.
+LABEL_TOTAL_CARD_TOOLTIP = (
+    'Every label target is a share of the investable pool — what the cash reserve '
+    'leaves — so they add up to 100%. To hold money back, raise the Unallocated '
+    'reserve rather than leaving a shortfall here: a shortfall and a reserve '
+    'produce the same numbers and only you can tell which one you meant.')
+
+#: Severity -> stylesheet classes for the card's detail line. Same vocabulary as
+#: ``LABEL_TOTAL_NOTICE_CLASSES`` and ``FOOTER_CLASSES``, plus the 'ok' key those
+#: two express differently, so the card can always draw something.
+LABEL_TOTAL_CARD_CLASSES = {
+    'ok': 'text-xs text-secondary-custom',
+    'warning': 'text-xs text-orange-400',
+    'negative': 'text-xs text-red-400 font-bold',
+}
+
+
+def judge_label_total(targets, tolerance: float = LABEL_TOTAL_TOLERANCE_PCT):
+    """``(total, severity, sentence)`` for one set of label targets. Pure.
+
+    THE predicate. ``format_label_total_notice``, ``label_total_card`` and (through
+    its own copy of the same band) ``format_allocation_footer`` all reach their
+    verdict here, so the three readouts of one set cannot describe it differently.
+
+    ``total`` is a SUM and never a mean: three labels at 25% total 75%, which is a
+    set that is 25 points short, not one that averages 25.
+
+    The band is the engine's ``LABEL_TOTAL_TOLERANCE_PCT`` (0.01pp), because a
+    two-decimal three-way split really does total 100.01 and refusing the engine's
+    own even split would be absurd.
+    """
+    total = sum(float(pct or 0.0) for pct in (targets or {}).values())
     if total > 100.0 + tolerance:
-        return (ERROR_LABEL_TOTAL_FMT.format(total=total, over=total - 100.0),
-                'negative')
+        return total, 'negative', ERROR_LABEL_TOTAL_FMT.format(
+            total=total, over=total - 100.0)
     if total < 100.0 - tolerance:
-        return (ERROR_LABEL_UNDER_FMT.format(total=total, under=100.0 - total),
-                'warning')
-    return None
+        return total, 'warning', ERROR_LABEL_UNDER_FMT.format(
+            total=total, under=100.0 - total)
+    return total, 'ok', LABEL_TOTAL_CARD_ON_TARGET
+
+
+@dataclass
+class LabelTotalCard:
+    """The 'Label targets total' summary card, decided. Pure.
+
+    ``text`` is ALWAYS a figure -- that is the whole reason this stopped being a
+    conditional sentence. ``detail`` is the engine's own wording when the set is
+    off and a denominator-naming clause when it is not; ``severity`` keys
+    ``LABEL_TOTAL_CARD_CLASSES``.
+    """
+    title: str
+    text: str
+    detail: str
+    severity: str
+
+
+def label_total_card(targets,
+                     tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> LabelTotalCard:
+    """Build the label-total card. Pure; never raises.
+
+    An account managing NOTHING reports 0.00% at severity 'ok' with its own
+    sentence: there is no set to be wrong, so calling it an error would tell the
+    user off for not having configured a page they have just opened -- and the
+    empty-state banner already says what to do.
+    """
+    total, severity, sentence = judge_label_total(targets, tolerance)
+    if not targets:
+        return LabelTotalCard(title=LABEL_TOTAL_CARD_TITLE, text='0.00%',
+                              detail=LABEL_TOTAL_CARD_EMPTY, severity='ok')
+    return LabelTotalCard(title=LABEL_TOTAL_CARD_TITLE, text=f'{total:.2f}%',
+                          detail=sentence, severity=severity)
 
 
 def reserve_dollars(base_notional: Optional[float],

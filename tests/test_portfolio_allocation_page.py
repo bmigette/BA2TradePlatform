@@ -3670,7 +3670,7 @@ def test_the_totals_footer_accounts_for_the_labels_and_the_reserve(nicegui_clien
                    weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
     root = _draw(nicegui_client, account_id, views, reserve=10.0)
 
-    footer = next(t for t in _texts(root) if 'Label targets total' in t)
+    footer = _marked(root, page.MARKER_ALLOCATION_FOOTER)[0]._text
     assert '100.00% of what the reserve leaves' in footer
     assert '90.00% of base' in footer
     assert '10.00% reserve' in footer
@@ -3686,9 +3686,7 @@ def test_the_totals_footer_turns_red_the_moment_the_labels_pass_100(nicegui_clie
                    weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
     root = _draw(nicegui_client, account_id, views)
 
-    from nicegui import ui
-    footer = next(el for el in root.descendants()
-                  if isinstance(el, ui.label) and 'Label targets total' in (el._text or ''))
+    footer = _marked(root, page.MARKER_ALLOCATION_FOOTER)[0]
     assert 'text-red-400' in footer._classes
 
 
@@ -3700,7 +3698,7 @@ def test_the_totals_footer_follows_an_inline_edit(nicegui_client, account_id):
 
     _drive_value(_target_box(root, 0), 100.0)
 
-    footer = next(t for t in _texts(root) if 'Label targets total' in t)
+    footer = _marked(root, page.MARKER_ALLOCATION_FOOTER)[0]._text
     assert '100.00% of what the reserve leaves' in footer
 
 
@@ -3712,7 +3710,7 @@ def test_the_totals_footer_follows_the_reserve(nicegui_client, account_id):
 
     _drive_value(_reserve_controls(root)[0], 40.0)
 
-    footer = next(t for t in _texts(root) if 'Label targets total' in t)
+    footer = _marked(root, page.MARKER_ALLOCATION_FOOTER)[0]._text
     assert '60.00% of base, + 40.00% reserve = 100.00% of base' in footer
 
 
@@ -6128,3 +6126,193 @@ def test_the_share_cell_is_the_one_control_that_can_hand_back_a_RAW_string(
            if n._props.get('label') == 'Portfolio target %'][0]
     with pytest.raises(Exception):
         box.set_value('13,5')
+
+
+# ---------------------------------------------------------------------------
+# THE LABEL-TOTAL CARD, ON THE PAGE
+#
+# It was a sentence under the stat cards that only appeared when the set was
+# wrong. It is a card in the same row now, built from the SAME ``card_classes``
+# as "Managed labels" -- one card component, not two.
+#
+# REAL TIME means the DISPLAYED TOTAL recomputes as you type. It does NOT mean
+# targets recalculate: the user rejected auto-recalculation outright earlier in
+# this project, and nothing about this card may cause a re-solve, a re-plan or a
+# write beyond the one the edited box was already making.
+# ---------------------------------------------------------------------------
+
+def _card_titles(root):
+    return [el._text for el in _marked(root, page.MARKER_SUMMARY_ROW)[0].descendants()
+            if 'text-xs text-secondary-custom' in ' '.join(el._classes)
+            and el._text]
+
+
+def _total_card_texts(root, index=0):
+    return [el._text for el in
+            _marked(root, page.MARKER_TOTAL_CARD)[index].descendants() if el._text]
+
+
+def test_the_label_total_is_a_CARD_in_the_top_row(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=30.0))
+    card = _marked(root, page.MARKER_TOTAL_CARD)
+
+    assert len(card) == 1
+    # ...inside the summary row, beside the other stat cards.
+    assert card[0] in list(_marked(root, page.MARKER_SUMMARY_ROW)[0].descendants())
+    assert _view_mod().LABEL_TOTAL_CARD_TITLE in _total_card_texts(root)
+
+
+def test_the_total_card_reuses_the_managed_labels_card_component(nicegui_client,
+                                                                 account_id):
+    """One card style, not two. A forked second style is how the row goes ragged
+    again the next time either is touched."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+    summary = _marked(root, page.MARKER_SUMMARY_ROW)[0]
+    cards = [el for el in summary.descendants()
+             if 'stat-card' in ' '.join(el._classes)]
+    styles = {' '.join(sorted(el._classes)) for el in cards}
+
+    assert len(cards) >= 4
+    assert len(styles) == 1, styles
+
+
+def test_the_total_card_shows_the_figure_even_when_the_set_is_RIGHT(nicegui_client,
+                                                                    account_id):
+    """The old sentence appeared only when the set was wrong, so the running total
+    was missing at exactly the moment the user was typing towards it."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=30.0))
+
+    assert '100.00%' in _total_card_texts(root)
+
+
+def test_the_total_card_carries_the_engines_shortfall_sentence(nicegui_client,
+                                                               account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=35.0))
+    texts = _total_card_texts(root)
+
+    assert '75.00%' in texts
+    assert any('under 100%' in t and 'Unallocated box' in t for t in texts)
+
+
+def test_the_total_card_keeps_the_guidance_reachable_at_every_state(nicegui_client,
+                                                                    account_id):
+    """The "use the Unallocated box" clause rides inside the SHORTFALL sentence, so
+    it vanishes the moment the set is right or over. The tooltip carries it at
+    every state, which is when a user decides to leave a gap on purpose."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=30.0))
+    tips = _tooltip_texts(_marked(root, page.MARKER_TOTAL_CARD)[0])
+
+    assert len(tips) == 1
+    assert 'Unallocated reserve' in tips[0]
+
+
+def test_the_total_card_follows_an_inline_target_edit_IN_REAL_TIME(nicegui_client,
+                                                                   account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+    assert '70.00%' in _total_card_texts(root)
+
+    _drive_value(_target_box(root, 0), 70.0)
+
+    assert '100.00%' in _total_card_texts(root)
+    assert '70.00%' not in _total_card_texts(root)
+
+
+def test_the_total_card_follows_the_label_level_EVEN_SPLIT(monkeypatch,
+                                                           nicegui_client,
+                                                           account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    assert '100.00%' in _total_card_texts(root)
+
+
+def test_the_total_card_follows_the_label_level_LOAD_LAST(monkeypatch,
+                                                          nicegui_client,
+                                                          account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, a=40.0, b=30.0, previous=(60.0, 40.0)))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert '100.00%' in _total_card_texts(root)
+
+
+def test_the_total_card_does_NOT_move_for_a_SYMBOL_level_press(monkeypatch,
+                                                               nicegui_client,
+                                                               account_id):
+    """Fill 100% and Wipe rewrite shares WITHIN a label; the label's own target is
+    a different denominator and does not move. The live readout for those is the
+    per-label symbol bar, not this card -- a card that twitched on a symbol edit
+    would be claiming the portfolio split had changed when it had not."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 30.0, 'MSFT': 0.0, 'TSLA': 0.0}))
+    before = _total_card_texts(root)
+
+    _press(_fill_button(root))
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+
+    assert _total_card_texts(root) == before
+
+
+def test_the_total_cards_verdict_is_COLOURED_by_its_severity(nicegui_client,
+                                                              account_id):
+    """Orange short, red over. An over-100 set is not reachable through the inline
+    box -- ``validate_label_target_edit`` refuses the keystroke -- but the DATABASE
+    can already hold one, written by the wizard before the boxes moved here, and
+    the card has to say so before the user presses Allocate."""
+    short = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+    assert 'text-orange-400' in ' '.join(
+        _marked(short, page.MARKER_TOTAL_CARD_DETAIL)[0]._classes)
+
+    over = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=48.0))
+    detail = _marked(over, page.MARKER_TOTAL_CARD_DETAIL)[-1]
+    assert 'text-red-400' in ' '.join(detail._classes)
+    assert '118.00%' in _total_card_texts(over, -1)
+
+
+def test_the_total_cards_verdict_goes_QUIET_once_the_set_is_right(nicegui_client,
+                                                                  account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+    detail = _marked(root, page.MARKER_TOTAL_CARD_DETAIL)[0]
+    assert 'text-orange-400' in ' '.join(detail._classes)
+
+    _drive_value(_target_box(root, 0), 70.0)
+
+    assert 'text-orange-400' not in ' '.join(detail._classes)
+    assert 'text-red-400' not in ' '.join(detail._classes)
+
+
+def test_editing_a_target_NEVER_re_solves_or_re_plans(monkeypatch, nicegui_client,
+                                                      account_id):
+    """The user rejected auto-recalculation. "Real time" is the DISPLAYED total
+    recomputing, not the plan being rebuilt behind them -- a page that quietly
+    solved on every keystroke would also be issuing broker calls per character."""
+    solves, opened = [], []
+    monkeypatch.setattr(page, '_solve_plan',
+                        lambda *a, **kw: solves.append(kw) or pytest.fail(
+                            'the page re-solved on an edit'))
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.append(kw))
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+
+    _drive_value(_target_box(root, 0), 70.0)
+
+    assert solves == [] and opened == []
+    assert '100.00%' in _total_card_texts(root)
+
+
+def test_editing_one_target_leaves_every_SIBLING_target_where_it_was(
+        nicegui_client, account_id):
+    """The other half of "no auto-recalculation": the card recomputes, the numbers
+    do not. Nothing may rebalance the siblings to make the total come out at 100."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+
+    _drive_value(_target_box(root, 0), 55.0)
+
+    assert _label_targets_now(account_id) == {'ARK26': 55.0, 'TECH': 30.0}
+    assert '85.00%' in _total_card_texts(root)
