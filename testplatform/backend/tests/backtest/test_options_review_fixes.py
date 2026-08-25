@@ -300,10 +300,28 @@ def _aapl_180_bars():
     ]
 
 
-def _sell_calls(acct, sym, strike, contracts):
+def _sell_calls(acct, sym, strike, contracts, strategy="covered_call"):
+    """Write ``contracts`` short calls and fill them, tagged ``strategy``.
+
+    THE TAG IS NOT DECORATION HERE. ``submit_option_order`` refuses a ``covered_call``
+    whose share cover is short or unmeasurable (OPT-L1), so a fixture that wants a
+    PARTIALLY covered short call — the state this section's margin tests exist to price
+    — cannot ask for one under that tag, and should not: two contracts against 150
+    shares is one covered call plus one naked call, and calling the pair a covered call
+    is the mislabelling that seam exists to stop. Those fixtures pass
+    ``strategy="naked_call"`` (the tag ``test_margin_liquidation`` already uses for an
+    uncovered short call), which is what the position actually is.
+
+    Nothing downstream reads the tag: ``_covered_short_call_contracts`` allocates shares
+    against the LOTS, ``defined_risk_combo_strategy`` returns None for any single-leg
+    entry, and the fill path only logs it. The margin arithmetic under test is therefore
+    identical either way — see
+    ``test_the_entry_seam_refuses_a_partially_covered_call_in_the_backtest_too``, which
+    pins the refusal itself so the tag choice below cannot be mistaken for a workaround.
+    """
     acct.submit_option_order(
         legs=[_leg(sym, OrderDirection.SELL, OptionRight.CALL, strike)],
-        quantity=contracts, order_type="market", option_strategy="covered_call",
+        quantity=contracts, order_type="market", option_strategy=strategy,
     )
     acct.refresh_orders()
     acct.refresh_transactions()
@@ -332,15 +350,50 @@ def test_covered_call_zero_margin_and_never_liquidated(tmp_path):
         ctx.__exit__(None, None, None)
 
 
+def test_the_entry_seam_refuses_a_partially_covered_call_in_the_backtest_too(tmp_path):
+    """The BACKTEST account inherits OPT-L1: 2 contracts against 150 shares is refused.
+
+    Recorded here because the two margin tests below deliberately build that position
+    under the ``naked_call`` tag, and without this the tag change reads as ducking the
+    guard. It is the opposite: the guard is live in the simulator, the entry is refused
+    in the backtest exactly as it is in production, and the state is still reachable at
+    RUNTIME (sell some of the covering shares, take a partial assignment, or simply
+    write a naked call beside a covered one) — which is why the margin model must
+    still price it, and why it is priced below rather than argued away.
+    """
+    ps = _make_ps("AAPL", _aapl_180_bars(), datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, "f2rf", ps, "AAPL",
+                         [_c(_CC_A, 200.0)], [_bar(_CC_A, "2024-03-06", 3.0, "call", 200.0)])
+    try:
+        acct._update_position("AAPL", 150, 180.0)
+
+        with pytest.raises(ValueError) as excinfo:
+            _sell_calls(acct, _CC_A, 200.0, 2, strategy="covered_call")
+
+        message = str(excinfo.value)
+        assert "UNCOVERED SHORT CALL" in message, message
+        assert "short by 50" in message, message
+        assert acct._option_positions == {}, "a refused entry left an option lot behind"
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 def test_partially_covered_call_still_charged_and_liquidated(tmp_path):
     """150 shares against 2 short calls (need 200) is NOT covered: full naked margin is
-    charged and a breach buys the calls back."""
+    charged and a breach buys the calls back.
+
+    The entry is tagged ``naked_call`` because that is what an uncovered short call is
+    and because the covered-call seam refuses to write this pair (see
+    ``test_the_entry_seam_refuses_a_partially_covered_call_in_the_backtest_too``). What
+    is under test is the MARGIN MODEL, which sees only the lots and the shares: it must
+    charge the uncovered contract Reg-T naked margin and liquidate on a breach.
+    """
     ps = _make_ps("AAPL", _aapl_180_bars(), datetime(2024, 3, 5))
     acct, ctx = _account(tmp_path, "f2pc", ps, "AAPL",
                          [_c(_CC_A, 200.0)], [_bar(_CC_A, "2024-03-06", 3.0, "call", 200.0)])
     try:
         acct._update_position("AAPL", 150, 180.0)
-        _sell_calls(acct, _CC_A, 200.0, 2)
+        _sell_calls(acct, _CC_A, 200.0, 2, strategy="naked_call")
         ps.set_clock(datetime(2024, 3, 6))
 
         assert acct._covered_short_call_contracts() == set()
@@ -356,7 +409,14 @@ def test_partially_covered_call_still_charged_and_liquidated(tmp_path):
 
 def test_covered_call_greedy_cover_no_double_count(tmp_path):
     """100 shares cannot cover BOTH a 2-lot and a 1-lot short call: greedy (largest first)
-    covers neither the 2-lot (needs 200) nor double-counts — only the 1-lot is exempt."""
+    covers neither the 2-lot (needs 200) nor double-counts — only the 1-lot is exempt.
+
+    The 1-lot is entered as a real ``covered_call`` and the seam admits it (100 free
+    shares, nothing pledged yet). The 2-lot is entered as ``naked_call``, which is what
+    it is: by then the 100 shares are pledged to the first call, so nothing covers it and
+    the seam would refuse the covered-call tag. The margin model reads only the lots, so
+    the greedy allocation under test is unchanged either way.
+    """
     ps = _make_ps("AAPL", _aapl_180_bars(), datetime(2024, 3, 5))
     chain = [_c(_CC_A, 200.0), _c(_CC_B, 210.0)]
     bar_rows = [_bar(_CC_A, "2024-03-06", 3.0, "call", 200.0),
@@ -365,7 +425,7 @@ def test_covered_call_greedy_cover_no_double_count(tmp_path):
     try:
         acct._update_position("AAPL", 100, 180.0)
         _sell_calls(acct, _CC_A, 200.0, 1)
-        _sell_calls(acct, _CC_B, 210.0, 2)
+        _sell_calls(acct, _CC_B, 210.0, 2, strategy="naked_call")
         ps.set_clock(datetime(2024, 3, 8))
 
         assert acct._covered_short_call_contracts() == {_CC_A}
