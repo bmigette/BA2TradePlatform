@@ -170,9 +170,26 @@ def test_an_unfilled_buy_to_close_does_not_release_capacity_early(mock_account):
     assert mock_account.short_put_assignment_exposure().cost == pytest.approx(22_500.0)
 
 
-def test_a_partial_fill_owes_only_what_actually_filled(mock_account):
-    """3 contracts submitted, 1 filled: the account is short ONE put, and billing the
-    submitted size would overstate delivery threefold."""
+def test_a_partial_fill_owes_its_WHOLE_submitted_size(mock_account):
+    """3 contracts submitted, 1 filled: 1 is held and 2 are still WORKING. All three.
+
+    CORRECTED 2026-08 — this test previously asserted 22,500 on the grounds that
+    "the account is short ONE put". It is short one put and ALSO carries a live sell
+    order for two more, and the rule for that half is the one
+    ``test_an_unfilled_sell_to_open_still_counts_because_it_can_fill_any_moment``
+    pins directly above: a submitted-but-unfilled SELL can fill at any moment and can
+    only ever ADD an obligation. The two were incoherent — three unfilled contracts
+    owed 67,500, and then the FIRST fill dropped the same book to 22,500, i.e.
+    executing part of the order made the account look 45,000 LESS exposed.
+    ``PARTIALLY_FILLED`` is an EXECUTED status, so ``filled_qty if filled_qty else
+    quantity`` read the filled part and dropped the remainder on the floor; during
+    that window the next structure is admitted on capacity the following fill
+    consumes.
+
+    The equity-side twin of the same line — a partially filled sell-to-open pledging
+    100 shares of cover instead of 300 — is fixed in the same commit. The two views
+    deliberately consume ONE query and must not disagree about this window.
+    """
     mock_account._balance = 100_000.0
     add_instance(TradingOrder(
         account_id=mock_account.id, symbol="AAPL", underlying_symbol="AAPL", quantity=3,
@@ -181,7 +198,31 @@ def test_a_partial_fill_owes_only_what_actually_filled(mock_account):
         multiplier=100, contract_symbol="AAPL260101P00225000",
         option_type=OptionRight.PUT, strike=225.0, transaction_id=open_txn("AAPL"),
         data={}))
-    assert mock_account.short_put_assignment_exposure().cost == pytest.approx(22_500.0)
+    exposure = mock_account.short_put_assignment_exposure()
+    assert exposure.cost == pytest.approx(67_500.0)
+    # 3, not 4: the filled contract is counted ONCE (netted) and the remainder ONCE
+    # (in flight). Charging the ordered size ON TOP of the filled size is the other
+    # way to get this wrong and would read 90,000 here.
+    assert exposure.contracts == pytest.approx(3.0)
+
+
+def test_buying_back_the_filled_part_leaves_the_rest_of_the_order_owing(mock_account):
+    """The remainder lives in the in-flight total, never in the netted one.
+
+    Buying back the ONE contract that filled releases exactly that contract; the two
+    still working at the broker are beyond a buy-to-close's reach — the same
+    asymmetry as ``test_an_unfilled_buy_to_close_does_not_release_capacity_early``.
+    """
+    mock_account._balance = 100_000.0
+    txn = open_txn("AAPL")
+    add_instance(TradingOrder(
+        account_id=mock_account.id, symbol="AAPL", underlying_symbol="AAPL", quantity=3,
+        filled_qty=1, side=OrderDirection.SELL, order_type=OrderType.SELL_LIMIT,
+        status=OrderStatus.PARTIALLY_FILLED, asset_class=AssetClass.OPTION,
+        multiplier=100, contract_symbol="AAPL260101P00225000",
+        option_type=OptionRight.PUT, strike=225.0, transaction_id=txn, data={}))
+    buy_to_close_order(mock_account, strike=225.0, txn_id=txn)
+    assert mock_account.short_put_assignment_exposure().cost == pytest.approx(45_000.0)
 
 
 def test_a_multi_leg_parent_is_not_billed_alongside_its_legs(mock_account):

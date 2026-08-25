@@ -1070,9 +1070,29 @@ class OptionsAccountInterface(ABC):
 
     #: Types that mean "the world was uncooperative" on the seams below, absorbed into an
     #: UNMEASURABLE answer rather than propagated. ``OSError`` (the network/filesystem
-    #: family) is already benign everywhere; ``SQLAlchemyError`` is named here because the
+    #: family) is already benign everywhere; ``OperationalError`` is named here because the
     #: book is a DB read and a locked/failed database is a data condition, not a defect in
     #: this file.
+    #:
+    #: NARROWED FROM ``SQLAlchemyError`` (2026-08), which was far wider than the sentence
+    #: above justifies. Its subtree also contains ``ProgrammingError`` (bad SQL / "no such
+    #: column: multiplier"), ``IntegrityError`` (a constraint THIS code violated),
+    #: ``InvalidRequestError``/``DetachedInstanceError`` (a misused session) and
+    #: ``ArgumentError`` (a malformed query) — every one of them a statement about this
+    #: program's correctness rather than about the world. Probed on the pre-fix code: a
+    #: ``ProgrammingError`` was absorbed, ``None`` came back, and with the exit guard in
+    #: place that is a PERMANENT refusal of every share sale on every underlying, wearing
+    #: the face of a safety measure. ``OperationalError`` is the one SQLAlchemy class that
+    #: means what the justification says — "database is locked", "disk I/O error", "unable
+    #: to open database file", a dropped connection — and it is the class the rest of this
+    #: repo already uses to stand for exactly that (``test_funded_entry_loop``,
+    #: ``test_db_attached_instance_guard``, and the sibling seam's
+    #: ``test_a_LOCKED_DATABASE_is_not_read_as_NOT_AN_OPTION``).
+    #:
+    #: ``DBAPIError`` was considered and REJECTED as the wider option: it is
+    #: ``ProgrammingError``'s own parent, so choosing it would re-admit the very defect
+    #: this narrowing removes. The socket-level half of "the world was uncooperative" is
+    #: already covered by the globally-benign ``OSError``.
     #:
     #: NOTE THE INVERSION relative to the seam guards. There, absorbing a locked database
     #: meant "carry on" and was PROVED to cancel protective legs. Here, absorbing means
@@ -1082,8 +1102,8 @@ class OptionsAccountInterface(ABC):
     #: answers "unmeasurable" forever is a gate that has silently stopped working.
     @staticmethod
     def _cover_benign_errors() -> Tuple[type, ...]:
-        from sqlalchemy.exc import SQLAlchemyError
-        return (SQLAlchemyError,)
+        from sqlalchemy.exc import OperationalError
+        return (OperationalError,)
 
     @staticmethod
     def _readable_number(raw) -> Optional[float]:
@@ -1158,17 +1178,38 @@ class OptionsAccountInterface(ABC):
         netting the exposure view and the close paths perform, so a call bought back stops
         pledging. An unfilled SELL-to-open is added on top WITHOUT netting: it can fill at
         any moment and can only ever ADD an obligation, whereas an unfilled buy-to-close
-        has closed nothing and must not hand the cover back early.
+        has closed nothing and must not hand the cover back early. (Against a contract we
+        hold NET LONG an in-flight SELL can only close the long, so counting it there
+        OVER-reports — the safe direction, and cheaper than deciding which it is.)
+
+        A PARTIALLY FILLED SELL PLEDGES ITS WHOLE ORDERED SIZE, not just the filled part.
+        ``PARTIALLY_FILLED`` is an EXECUTED status, so the filled contracts net normally;
+        the unfilled remainder is added to the in-flight total under the very rule above —
+        it is still working at the broker and can fill at any moment. Reading only the
+        filled part reported a sell-to-open of 3 contracts with 1 filled as 100 shares
+        pledged rather than 300, and during that window a consumer frees 200 shares the
+        next fill leaves naked.
 
         WHAT MAKES A ROW UNMEASURABLE — each case is "this row could be a short call on
         the ticker you asked about, and I cannot rule it out":
 
+        * a SELL CALL with no usable quantity — an obligation of unknown size;
+        * a PARTIALLY FILLED SELL CALL whose ORDERED quantity is unreadable — the part
+          still working at the broker is an obligation of unknown size;
         * a SELL with no ``option_type``      — it might be the call;
         * a SELL CALL with no ``underlying_symbol`` — it might be on this ticker (there is
           no fallback to ``symbol``: on a leg child that field holds the OCC contract
           string, which would never match and would report the shares as free);
-        * a SELL CALL with no usable quantity — an obligation of unknown size;
         * a held short call with no readable multiplier.
+
+        THE LAST THREE ARE DEFERRED PER CONTRACT, not raised where they are found. Each is
+        a question about a CONTRACT, and a contract that is flat by the end of the book
+        pledges nothing whatever the answer would have been — so a call fully bought back
+        whose sell row lost its right, its ticker or its multiplier must not lock the gate
+        forever. The damaged row is still netted pessimistically (counted as a short call
+        on this ticker), so the deferral is only ever discharged by a real offsetting BUY.
+        The first two cannot be deferred: a size we cannot read cannot be netted off, so
+        there is no way to learn that the contract went flat.
 
         A BUY in any of those states is NOT flagged: failing to recognise a buy-to-close
         can only fail to RELIEVE a short, which overstates the pledge — the safe
@@ -1214,6 +1255,7 @@ class OptionsAccountInterface(ABC):
         pending: dict = {}      # contract -> in-flight SELL contracts, never netted
         mults: dict = {}        # contract -> set of readable multipliers seen
         mult_blind: dict = {}   # contract -> a reason its multiplier is unreadable
+        id_blind: dict = {}     # contract -> a reason a SELL row's identity is unreadable
         blind: List[str] = []
 
         for o in book:
@@ -1231,20 +1273,32 @@ class OptionsAccountInterface(ABC):
             row_underlying = (getattr(o, "underlying_symbol", None) or "").strip().upper()
             if row_underlying and row_underlying != wanted:
                 continue                    # definitively a different ticker
+
+            # An identity field this SELL row has lost. DEFERRED per CONTRACT rather than
+            # raised on the spot, for exactly the reason the multiplier below is deferred:
+            # a contract that is FLAT by the end of the book pledges nothing whatever its
+            # right or ticker turns out to have been, and refusing every share sale on
+            # {wanted} forever over a closed-out call's damaged row is a false refusal —
+            # one that, now the exit guard consumes this number, blocks selling the shares
+            # rather than merely blocking a write. The row is still netted PESSIMISTICALLY
+            # (counted as a short call on {wanted}) so the deferral can only ever be
+            # discharged by a real offsetting BUY, never by ignoring the row.
+            id_gap = None
             if right is None:
-                if is_sell:
-                    blind.append(
-                        f"order {getattr(o, 'id', '?')} ({contract}) is a SHORT option with "
-                        f"no option type recorded — whether it is a CALL that pledges "
-                        f"{wanted} shares is unknown, and unknown must not resolve to 'not "
-                        f"a call'")
-                continue
-            if not row_underlying:
-                if is_sell:
-                    blind.append(
-                        f"order {getattr(o, 'id', '?')} ({contract}) is a SHORT CALL with no "
-                        f"underlying recorded — whether it is written on {wanted} is "
-                        f"unknown, and unknown must not resolve to 'some other ticker'")
+                id_gap = (
+                    f"order {getattr(o, 'id', '?')} ({contract}) is a SHORT option with "
+                    f"no option type recorded — whether it is a CALL that pledges "
+                    f"{wanted} shares is unknown, and unknown must not resolve to 'not "
+                    f"a call'")
+            elif not row_underlying:
+                id_gap = (
+                    f"order {getattr(o, 'id', '?')} ({contract}) is a SHORT CALL with no "
+                    f"underlying recorded — whether it is written on {wanted} is "
+                    f"unknown, and unknown must not resolve to 'some other ticker'")
+            if id_gap is not None and not is_sell:
+                # A BUY in either state is NOT flagged and NOT netted: failing to
+                # recognise a buy-to-close can only fail to RELIEVE a short, which
+                # overstates the pledge — the safe direction.
                 continue
 
             raw_qty = o.filled_qty if o.filled_qty else o.quantity
@@ -1257,6 +1311,11 @@ class OptionsAccountInterface(ABC):
                         f"quantity={o.quantity!r}) — how many {wanted} shares it can call "
                         f"away is unknown, and unknown is not zero")
                 continue
+            if id_gap is not None:
+                # Its SIZE is readable, so it can be netted and the gap deferred. A size
+                # we could not read is handled above and is unconditionally blind: an
+                # obligation we cannot measure cannot be netted off either.
+                id_blind.setdefault(contract, id_gap)
 
             raw_mult = getattr(o, "multiplier", None)
             mult = self._readable_positive_number(raw_mult)
@@ -1276,6 +1335,31 @@ class OptionsAccountInterface(ABC):
 
             if o.status in executed:
                 net[contract] = net.get(contract, 0.0) + (-qty if is_sell else qty)
+                if is_sell and o.status == OrderStatus.PARTIALLY_FILLED:
+                    # THE PARTIAL-FILL WINDOW. ``qty`` above is only what has FILLED
+                    # (PARTIALLY_FILLED is an EXECUTED status — see
+                    # ``OrderStatus.get_executed_statuses``), so netting it alone reports
+                    # a sell-to-open of 3 contracts with 1 filled as a 100-share pledge
+                    # instead of 300. The unfilled remainder is still working at the
+                    # broker, and the docstring's rule for an in-flight SELL applies to it
+                    # verbatim: it can fill at any moment and can only ever ADD an
+                    # obligation. During that window a consumer would otherwise free 200
+                    # shares that the next fill leaves naked. It goes into ``pending``,
+                    # never into ``net``, so a buy-to-close cannot net it away early.
+                    ordered = self._readable_positive_number(o.quantity)
+                    if ordered is None:
+                        blind.append(
+                            f"order {getattr(o, 'id', '?')} ({contract}) is a PARTIALLY "
+                            f"FILLED SHORT CALL whose ordered quantity is unreadable "
+                            f"(quantity={o.quantity!r}, filled_qty={o.filled_qty!r}) — how "
+                            f"much of it is still working at the broker, and so how many "
+                            f"more {wanted} shares it can call away, is unknown")
+                    else:
+                        # max(): a filled_qty above the ordered quantity is a damaged row,
+                        # not a negative obligation that hands cover back.
+                        remainder = max(0.0, ordered - qty)
+                        if remainder > _ASSIGNMENT_EPS:
+                            pending[contract] = pending.get(contract, 0.0) + remainder
             elif is_sell:
                 pending[contract] = pending.get(contract, 0.0) + qty
 
@@ -1287,6 +1371,9 @@ class OptionsAccountInterface(ABC):
                 short_contracts += -held
             if short_contracts <= _ASSIGNMENT_EPS:
                 continue                     # flat, or net LONG: nothing is pledged
+            if contract in id_blind:
+                blind.append(id_blind[contract])
+                continue
             if contract in mult_blind:
                 blind.append(mult_blind[contract])
                 continue
@@ -1557,6 +1644,15 @@ class OptionsAccountInterface(ABC):
         A submitted-but-unfilled SELL is added on top without netting: it can fill at any
         moment and can only ever ADD an obligation, whereas an unfilled BUY-to-close has
         closed nothing and must not hand capacity back early.
+
+        A PARTIALLY FILLED SELL IS CHARGED ITS WHOLE ORDERED SIZE, the cash-side twin of
+        the rule in ``shares_pledged_to_short_calls`` and fixed with it. ``PARTIALLY_FILLED``
+        is an EXECUTED status, so the filled contracts net normally and the unfilled
+        remainder joins the in-flight total under the rule above. Charging only the filled
+        part priced a 3-contract cash-secured put with 1 filled at one strike instead of
+        three, and admitted the next structure on capacity the next fill consumes. The two
+        views deliberately read ONE query; leaving them inconsistent about the same window
+        would be worse than either behaviour alone.
         """
         from ba2_common.core.option_lifecycle import put_assignment_cost
         from ba2_common.core.types import OrderDirection, OrderStatus
@@ -1603,6 +1699,26 @@ class OptionsAccountInterface(ABC):
             if o.status in executed:
                 net[contract] = net.get(contract, 0.0) + (-qty if is_sell else qty)
                 meta[contract] = o
+                if is_sell and o.status == OrderStatus.PARTIALLY_FILLED:
+                    # The unfilled remainder of a partly-filled sell-to-open. See the
+                    # docstring: ``qty`` above is only what FILLED, and the rest is still
+                    # working at the broker under the in-flight rule. Priced through the
+                    # SAME pending list, so one code path covers "never filled" and "half
+                    # filled" and they cannot drift.
+                    ordered = self._readable_positive_number(o.quantity)
+                    if ordered is None:
+                        blind.append(
+                            f"order {getattr(o, 'id', '?')} ({contract}) is a PARTIALLY "
+                            f"FILLED SHORT PUT whose ordered quantity is unreadable "
+                            f"(quantity={o.quantity!r}, filled_qty={o.filled_qty!r}) — how "
+                            f"many more contracts are still working at the broker, and so "
+                            f"could be assigned to us, is unknown")
+                    else:
+                        # max(): a filled_qty above the ordered quantity is a damaged row,
+                        # not a negative obligation that buys capacity back.
+                        remainder = max(0.0, ordered - qty)
+                        if remainder > _ASSIGNMENT_EPS:
+                            pending_shorts.append((o, remainder))
             elif is_sell:
                 pending_shorts.append((o, qty))
 

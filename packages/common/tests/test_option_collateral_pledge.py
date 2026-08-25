@@ -83,6 +83,22 @@ def leg(right=OptionRight.CALL, side=OrderDirection.SELL, qty=1, underlying="AAP
                 status=status, quantity=qty, filled_qty=(qty if filled else None))
 
 
+def partly_filled(ordered, filled, right=OptionRight.CALL,
+                  side=OrderDirection.SELL, **kw):
+    """A sell-to-open still WORKING at the broker with part of it done.
+
+    ``PARTIALLY_FILLED`` is an EXECUTED status
+    (``OrderStatus.get_executed_statuses``), which is what makes this shape
+    interesting: the filled part nets like a fill while the remainder is as
+    in-flight as an untouched NEW order. ``leg()`` cannot build it — it ties
+    ``filled_qty`` to ``quantity`` — so the two sizes are set explicitly here.
+    """
+    row = leg(right=right, side=side, qty=ordered,
+              status=OrderStatus.PARTIALLY_FILLED, **kw)
+    row.filled_qty = filled
+    return row
+
+
 def short_call(**kw):
     return leg(right=OptionRight.CALL, side=OrderDirection.SELL, **kw)
 
@@ -283,6 +299,98 @@ def test_an_unfilled_buy_to_close_does_not_release_the_cover_early():
     assert acct.shares_pledged_to_short_calls("AAPL") == 100
 
 
+# ---------------------------------------------------------------------------
+# the PARTIAL-FILL window
+#
+# ``PARTIALLY_FILLED`` is an EXECUTED status, so the old ``filled_qty if
+# filled_qty else quantity`` read the filled part and nothing else: the unfilled
+# remainder was netted nowhere and pledged nothing. A sell-to-open of 3 with 1
+# filled reported 100 shares pledged instead of 300, and during that window a
+# consumer frees 200 shares the next fill leaves NAKED. The docstring's own rule
+# for an in-flight SELL -- "it can fill at any moment and can only ever ADD an
+# obligation" -- applies to the remaining 2 contracts verbatim.
+# ---------------------------------------------------------------------------
+def test_a_partially_filled_sell_to_open_pledges_its_WHOLE_ordered_size():
+    """3 contracts sold, 1 filled: 300 shares are spoken for, not 100."""
+    acct = FakeOptionsAccount(book=[partly_filled(ordered=3, filled=1)])
+    assert acct.shares_pledged_to_short_calls("AAPL") == 300
+
+
+def test_the_unfilled_remainder_is_pledged_on_TOP_of_a_holding():
+    """The two halves are counted once each, not one instead of the other."""
+    acct = FakeOptionsAccount(book=[partly_filled(ordered=3, filled=1)],
+                              positions=[equity_position(qty=300.0)])
+    assert acct.held_shares_for_cover("AAPL") - \
+        acct.shares_pledged_to_short_calls("AAPL") == 0, \
+        "not one of the 300 shares is free while the other 2 contracts are working"
+
+
+def test_the_remainder_of_a_partial_fill_is_never_netted_away_by_a_buy_to_close():
+    """It goes to the in-flight total, not to ``net``.
+
+    Buying back the 1 contract that FILLED releases that contract's cover and
+    nothing else — the 2 still working at the broker are untouched by it.
+    """
+    contract = occ()
+    acct = FakeOptionsAccount(book=[
+        partly_filled(ordered=3, filled=1, contract=contract),
+        long_call(qty=1, contract=contract),
+    ])
+    assert acct.shares_pledged_to_short_calls("AAPL") == 200
+
+
+def test_a_fully_filled_sell_has_no_remainder_to_add():
+    """The regression guard for every ordinary short call in the book.
+
+    Recorded as belt-and-braces rather than as a discriminating test: TWO
+    independent things keep a FILLED row out of the remainder (the
+    ``PARTIALLY_FILLED`` status test, and ``ordered - filled`` being zero once
+    ``raw_qty`` has fallen back to ``quantity``), so no single mutation of either
+    can make it fail. It is here because this is the shape of nearly every row in
+    a live book, and a partial-fill change that broke it would be the most
+    expensive way to be wrong. ``test_a_partially_filled_sell_to_open_pledges_its
+    _WHOLE_ordered_size`` and ``test_a_filled_qty_ABOVE_the_ordered_quantity...``
+    are the two that DO discriminate the arithmetic.
+    """
+    row = short_call(qty=2)
+    assert row.status == OrderStatus.FILLED and row.filled_qty == row.quantity
+    assert FakeOptionsAccount(book=[row]).shares_pledged_to_short_calls("AAPL") == 200
+
+
+def test_a_filled_qty_ABOVE_the_ordered_quantity_does_not_hand_cover_back():
+    """A damaged row is not a negative obligation.
+
+    ``ordered - filled`` would be -1 contract here, and adding it would report
+    the pledge as 100 shares smaller than the fills alone already prove.
+    """
+    acct = FakeOptionsAccount(book=[partly_filled(ordered=2, filled=3)])
+    assert acct.shares_pledged_to_short_calls("AAPL") == 300
+
+
+def test_a_partial_fill_whose_ORDERED_quantity_is_unreadable_is_unmeasurable():
+    """How much is still working at the broker is an obligation of unknown size.
+
+    ``filled_qty`` alone is readable, so the old code answered with it and looked
+    measured. ``quantity`` is non-nullable on ``TradingOrder``, so this is a
+    damaged row rather than a routine one — and a damaged row is not a small one.
+    """
+    row = partly_filled(ordered=3, filled=1)
+    row.quantity = None
+    assert FakeOptionsAccount(book=[row]).shares_pledged_to_short_calls("AAPL") is None
+
+
+def test_a_partially_filled_BUY_to_close_still_releases_only_what_filled():
+    """The mirror: an in-flight BUY has closed nothing and must not hand the
+    cover back early, whichever part of it has filled."""
+    contract = occ()
+    acct = FakeOptionsAccount(book=[
+        short_call(qty=3, contract=contract),
+        partly_filled(ordered=3, filled=1, side=OrderDirection.BUY,
+                      contract=contract),
+    ])
+    assert acct.shares_pledged_to_short_calls("AAPL") == 200
+
+
 def test_a_multi_leg_parent_row_is_skipped_and_its_short_call_leg_is_counted():
     """A parent carries no contract, no right and no size -- the legs do."""
     acct = FakeOptionsAccount(book=[spread_parent(), short_call(qty=1),
@@ -432,6 +540,131 @@ def test_one_unreadable_row_makes_the_WHOLE_pledge_unknown():
 
 
 # ===========================================================================
+# a damaged IDENTITY is deferred per CONTRACT, exactly like the multiplier
+#
+# The false-refusal argument written for the multiplier applies word for word to
+# ``option_type`` and ``underlying_symbol``: a contract that is FLAT by the end
+# of the book pledges nothing whatever the missing field would have said. Before
+# this, a call fully bought back whose SELL row had lost one of the two made
+# every future reading of that ticker UNKNOWN forever -- and once the exit guard
+# consumes this number, "forever unknown" stops being a blocked write and
+# becomes a permanently blocked SHARE SALE.
+#
+# (The missing-QUANTITY case genuinely cannot be deferred and is not: a size we
+# cannot read cannot be netted off, so there is no way to learn it went flat.)
+# ===========================================================================
+def test_a_bought_back_call_whose_SELL_row_lost_its_option_type_is_measurable():
+    contract = occ()
+    damaged = short_call(qty=1, contract=contract)
+    damaged.option_type = None
+    acct = FakeOptionsAccount(book=[damaged, long_call(qty=1, contract=contract)])
+    assert acct.shares_pledged_to_short_calls("AAPL") == 0
+
+
+def test_a_bought_back_call_whose_SELL_row_lost_its_underlying_is_measurable():
+    contract = occ()
+    damaged = short_call(qty=1, contract=contract)
+    damaged.underlying_symbol = None
+    acct = FakeOptionsAccount(book=[damaged, long_call(qty=1, contract=contract)])
+    assert acct.shares_pledged_to_short_calls("AAPL") == 0
+
+
+def test_a_damaged_row_is_netted_PESSIMISTICALLY_so_a_PARTIAL_buy_back_still_refuses():
+    """The deferral must only ever be discharged by a real offsetting BUY.
+
+    The damaged SELL is counted as a short call on this very ticker, so 3 sold
+    against 1 bought back is still net short 2 and still UNKNOWN — the deferral
+    is not "ignore the row", it is "ask again once the book says it is flat".
+    """
+    contract = occ()
+    damaged = short_call(qty=3, contract=contract)
+    damaged.option_type = None
+    acct = FakeOptionsAccount(book=[damaged, long_call(qty=1, contract=contract)])
+    assert acct.shares_pledged_to_short_calls("AAPL") is None
+
+
+def test_a_damaged_row_on_ANOTHER_contract_does_not_release_this_one():
+    """Deferral is per CONTRACT. A flat contract elsewhere in the book cannot
+    discharge a damaged row on the contract that is actually short."""
+    damaged = short_call(qty=1, strike=150.0)
+    damaged.underlying_symbol = None
+    flat = occ(strike=160.0)
+    acct = FakeOptionsAccount(book=[damaged,
+                                    short_call(qty=1, contract=flat, strike=160.0),
+                                    long_call(qty=1, contract=flat, strike=160.0)])
+    assert acct.shares_pledged_to_short_calls("AAPL") is None
+
+
+# ===========================================================================
+# WHICH exceptions are benign -- and which must reach the operator
+#
+# ``_cover_benign_errors`` named ``SQLAlchemyError``, whose subtree also holds
+# ``ProgrammingError`` ("no such column: multiplier"), ``IntegrityError``,
+# ``InvalidRequestError``/``DetachedInstanceError`` and ``ArgumentError``: every
+# one a DEFECT, not a data condition. Absorbed, they answer UNKNOWN forever,
+# which the accessors' own comment calls "a gate that has silently stopped
+# working" -- and which, at the exit guard, refuses every share sale on every
+# underlying until someone notices. Narrowed to ``OperationalError``, the one
+# class that means what the justification says.
+#
+# Both halves are pinned for BOTH accessors. Before this, the only exception
+# double in the file was an ``OSError`` subclass, benign via the DEFAULT set, so
+# the custom list was never exercised and the propagating half was never tested
+# at all: ``except Exception: return None`` would have broken nothing.
+# ===========================================================================
+def _locked_db():
+    """The condition the benign entry exists for: a transient, real-world DB lock."""
+    from sqlalchemy.exc import OperationalError
+    return OperationalError("SELECT 1", {}, Exception("database is locked"))
+
+
+def _schema_defect():
+    """A ``SQLAlchemyError`` that is a DEFECT: the query names a column that
+    does not exist. Not transient, not the world's fault, and permanent."""
+    from sqlalchemy.exc import ProgrammingError
+    return ProgrammingError("SELECT multiplier FROM tradingorder", {},
+                            Exception("no such column: multiplier"))
+
+
+@pytest.mark.parametrize("accessor, seam", [
+    ("shares_pledged_to_short_calls", "book"),
+    ("held_shares_for_cover", "positions"),
+])
+def test_a_locked_database_is_absorbed_into_an_UNMEASURABLE_answer(accessor, seam,
+                                                                   errors):
+    acct = FakeOptionsAccount(**{seam: _locked_db()})
+    assert getattr(acct, accessor)("AAPL") is None
+    assert any("UNKNOWN" in m for m in errors), errors
+
+
+@pytest.mark.parametrize("accessor, seam", [
+    ("shares_pledged_to_short_calls", "book"),
+    ("held_shares_for_cover", "positions"),
+])
+def test_a_TYPE_ERROR_from_the_seam_PROPAGATES(accessor, seam):
+    """A bad row shape is a defect in this program. It must reach the operator,
+    not become a permanent "unmeasurable" that reads as a working safety gate."""
+    acct = FakeOptionsAccount(**{seam: TypeError("a row is not what this expects")})
+    with pytest.raises(TypeError):
+        getattr(acct, accessor)("AAPL")
+
+
+@pytest.mark.parametrize("accessor, seam", [
+    ("shares_pledged_to_short_calls", "book"),
+    ("held_shares_for_cover", "positions"),
+])
+def test_a_SCHEMA_DEFECT_PROPAGATES_even_though_it_is_a_SQLAlchemyError(accessor, seam):
+    """The exact probe that motivated the narrowing. A missing column is a
+    permanent defect wearing a database-shaped exception; absorbing it turns
+    every share sale on every underlying into a refusal, indefinitely."""
+    from sqlalchemy.exc import ProgrammingError
+
+    acct = FakeOptionsAccount(**{seam: _schema_defect()})
+    with pytest.raises(ProgrammingError):
+        getattr(acct, accessor)("AAPL")
+
+
+# ===========================================================================
 # held_shares_for_cover
 # ===========================================================================
 def test_a_failed_position_fetch_is_unmeasurable(errors):
@@ -550,6 +783,60 @@ def test_an_account_with_no_short_calls_has_every_share_free():
                               positions=[equity_position(qty=100.0)])
     assert acct.held_shares_for_cover("AAPL") - \
         acct.shares_pledged_to_short_calls("AAPL") == 100
+
+
+# ===========================================================================
+# the CASH-side twin -- short_put_assignment_exposure, same partial-fill window
+#
+# It is tested HERE rather than beside its own tests because it inherited the
+# defect from the same line of code and is fixed in the same commit. The two
+# views deliberately consume ONE query (``open_option_orders_book_wide``), so
+# they must agree about what an in-flight obligation is; leaving one of them
+# under-reporting the same window would be worse than either behaviour alone.
+# ===========================================================================
+def test_a_partially_filled_short_put_is_charged_its_WHOLE_ordered_size():
+    """3 puts sold at 150, 1 filled: assignment would cost 45,000, not 15,000.
+
+    Under-charging is what admits the NEXT structure on capacity the remaining
+    two fills are about to consume — the exact defect ``assignment_capacity``
+    exists to prevent, one status early.
+    """
+    acct = FakeOptionsAccount(book=[partly_filled(ordered=3, filled=1,
+                                                  right=OptionRight.PUT)])
+    exposure = acct.short_put_assignment_exposure()
+    assert exposure.cost == pytest.approx(45_000.0)
+    assert exposure.contracts == pytest.approx(3.0)
+
+
+def test_a_fully_filled_short_put_is_not_double_charged():
+    """The boundary: FILLED has no remainder, and charging one would price every
+    ordinary cash-secured put in the book at twice its strike."""
+    acct = FakeOptionsAccount(book=[short_put(qty=2)])
+    assert acct.short_put_assignment_exposure().cost == pytest.approx(30_000.0)
+
+
+def test_the_remainder_of_a_partially_filled_short_put_is_never_netted_away():
+    """Buying back the filled contract relieves that one and no more."""
+    contract = occ(right=OptionRight.PUT)
+    acct = FakeOptionsAccount(book=[
+        partly_filled(ordered=3, filled=1, right=OptionRight.PUT, contract=contract),
+        leg(right=OptionRight.PUT, side=OrderDirection.BUY, qty=1, contract=contract),
+    ])
+    assert acct.short_put_assignment_exposure().cost == pytest.approx(30_000.0)
+
+
+def test_a_partially_filled_short_put_with_an_unreadable_ordered_size_is_unmeasurable():
+    row = partly_filled(ordered=3, filled=1, right=OptionRight.PUT)
+    row.quantity = None
+    exposure = FakeOptionsAccount(book=[row]).short_put_assignment_exposure()
+    assert exposure.cost is None
+    assert str(row.id) in "; ".join(exposure.unmeasurable), exposure.unmeasurable
+
+
+def test_a_short_put_filled_ABOVE_its_ordered_size_buys_no_capacity_back():
+    acct = FakeOptionsAccount(book=[partly_filled(ordered=2, filled=3,
+                                                  right=OptionRight.PUT)])
+    assert acct.short_put_assignment_exposure().cost == pytest.approx(45_000.0)
 
 
 # ===========================================================================
