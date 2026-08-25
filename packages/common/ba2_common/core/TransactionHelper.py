@@ -15,7 +15,8 @@ from datetime import datetime, timezone
 from sqlmodel import Session, select
 
 from ba2_common.core.models import Transaction, TradingOrder
-from ba2_common.core.types import OrderStatus, OrderDirection, OrderType, TransactionStatus
+from ba2_common.core.types import (
+    AssetClass, OrderStatus, OrderDirection, OrderType, TransactionStatus)
 from ba2_common.core.db import get_db, update_instance, add_instance, get_instance
 from ba2_common.logger import logger
 
@@ -721,6 +722,38 @@ class TransactionHelper:
         }
         
         try:
+            # SEAM 1 / OPT-L3 — same defect as AccountInterface.submit_close_order_for_transaction:
+            # this builds an EQUITY order from `transaction.symbol`, which for an option is the
+            # UNDERLYING, sized in CONTRACTS. Refuse rather than route: routing would make the
+            # generic equity path quietly become an option path, hiding the asset class one
+            # layer further up, which is the defect being fixed.
+            #
+            # What it did before the guard, for a 2-contract position trimmed by 1: it persisted
+            # and SUBMITTED `Order(symbol=AAPL, quantity=1.0, side=SELL, type=MARKET)` -- one
+            # SHARE of the underlying, an instrument the account may not even hold -- then armed
+            # a follow-on OCO at the option's PREMIUM levels read as share prices (TP $5.20 /
+            # SL $1.10 against a $150 spot, i.e. instantly marketable), canceled the real
+            # protective legs on the way past, wrote the transaction down to 1 as though the
+            # trim had happened, and returned success=True. The false success is the worst of
+            # it: every caller here branches on result["success"].
+            #
+            # This refuses with the method's own failure convention -- a result dict, never a
+            # raise -- because that IS its contract: it cannot raise today (the whole body is
+            # inside this try/except), and all four call sites index result["success"]
+            # directly, two of them from NiceGUI handlers with no exception boundary.
+            #
+            # Placed ahead of the qty_change == 0 early return on purpose. That return reports
+            # success, and "success" is never the right answer for an instrument this method
+            # cannot resize at all.
+            if transaction.asset_class == AssetClass.OPTION:
+                result["message"] = (
+                    f"Transaction {transaction.id} is an OPTION position (underlying "
+                    f"{transaction.symbol}); adjust_quantity_with_tpsl builds an EQUITY order "
+                    f"and cannot resize an option structure. No order was created."
+                )
+                logger.error(f"adjust_quantity_with_tpsl: {result['message']}")
+                return result
+
             # Validate inputs
             if qty_change == 0:
                 result["message"] = "Quantity change is zero, nothing to adjust"
