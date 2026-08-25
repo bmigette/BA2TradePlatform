@@ -1253,13 +1253,21 @@ def test_a_symbol_row_carries_its_target_weight_and_the_money_that_implies():
     assert by_symbol['MSFT'].target_value == 1_000.0
 
 
-def test_a_symbol_row_without_stored_weights_reports_none():
+def test_a_symbol_row_without_a_stored_weight_falls_back_to_its_ACTUAL_share():
+    """It used to report ``None`` here, and before that the fair share. The lone
+    member of a label holds all of it, so its actual share is 100%."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_ACTUAL)
+
     views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
                               {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0},
                               valuation_mode=VALUATION_MODE_MARKET,
                               base_notional=10_000.0)
-    assert views[0].rows[0].weight_pct is None
-    assert views[0].rows[0].target_value is None
+    row = views[0].rows[0]
+    assert row.weight_pct == 100.0
+    assert row.weight_source == WEIGHT_SOURCE_ACTUAL
+    # 40% of 10,000 is 4,000 for the label, and this row is the whole of it.
+    assert row.target_value == 4_000.0
 
 
 def test_the_unallocated_row_shows_the_STORED_reserve_in_percent_and_dollars():
@@ -3146,3 +3154,1098 @@ def test_the_delta_MONEY_can_be_written_either_way_and_lands_on_one_number():
                                unallocated_pct=reserve)[0]
         via_base = 4_500.0 - 10_000.0 * bar.effective_pct / 100.0
         assert bar.delta_value == pytest.approx(via_base)
+
+
+# ---------------------------------------------------------------------------
+# THE `last` GENERATION AND THE UNREALISED P&L, ON THE PAGE
+#
+# Both were trapped in the Allocate wizard's step 1 / step 2 captions. They are
+# facts about a LABEL and a SYMBOL, not about a run, so they belong on the screen
+# the user reads them from -- and once the target boxes moved onto the page, the
+# wizard was the only place left that could answer "what did I have here before".
+#
+# The wizard's own captions are NOT ported. They said "% of base" (see
+# ``LABEL_CURRENT_FMT`` in the wizard module), which is the denominator the page's
+# 2026-08-25 rework deliberately demoted to a parenthetical.
+# ---------------------------------------------------------------------------
+
+def test_a_label_view_carries_the_target_the_last_run_used():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import build_label_views
+
+    views = build_label_views(
+        [ManagedLabel('ARK26', 40.0, previous_target_pct=25.0)],
+        {'ARK26': ['AAPL']}, {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0},
+        valuation_mode=VALUATION_MODE_MARKET, base_notional=10_000.0)
+
+    assert views[0].previous_target_pct == 25.0
+
+
+def test_a_label_that_has_never_run_carries_None_and_not_a_zero():
+    """"never allocated" and "last time this got nothing" are different facts, and
+    0.0 is a legitimate value of the second."""
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {}, {}, valuation_mode=VALUATION_MODE_MARKET)
+    assert views[0].previous_target_pct is None
+
+
+def test_a_symbol_row_carries_the_weight_the_last_run_used():
+    views = build_label_views(
+        [ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL', 'MSFT']},
+        {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0, 'MSFT': 100.0},
+        valuation_mode=VALUATION_MODE_MARKET, base_notional=10_000.0,
+        symbol_weights={'ARK26': {'AAPL': 75.0, 'MSFT': 25.0}},
+        symbol_previous_weights={'ARK26': {'AAPL': 60.0}})
+
+    by_symbol = {r.symbol: r for r in views[0].rows}
+    assert by_symbol['AAPL'].previous_weight_pct == 60.0
+    assert by_symbol['MSFT'].previous_weight_pct is None
+
+
+def test_a_symbol_row_carries_its_unrealised_pnl_in_money_and_percent():
+    """$2,500 of AAPL bought for $1,000 is +$1,500, i.e. +150%."""
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+    pnl = views[0].rows[0].pnl
+    assert pnl.amount == pytest.approx(1_500.0)
+    assert pnl.pct == pytest.approx(150.0)
+
+
+def test_the_pnl_is_the_SAME_in_cost_mode_as_in_market_mode():
+    """The defect this guards: in COST valuation ``current_value`` IS the cost
+    basis, so a P&L derived from it reads 0.00 on every row of the account's
+    default mode. ``unrealised_pnl`` takes no valuation mode for that reason."""
+    args = ([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+            {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0})
+    cost = build_label_views(*args, valuation_mode=VALUATION_MODE_COST)
+    market = build_label_views(*args, valuation_mode=VALUATION_MODE_MARKET)
+
+    assert cost[0].rows[0].pnl.amount == market[0].rows[0].pnl.amount == 1_500.0
+
+
+def test_a_label_view_carries_the_TOTAL_pnl_of_its_symbols():
+    """ONE call over the whole membership, so the percentage is money-weighted --
+    averaging the symbols' own percentages would weight a $1,000 holding as
+    heavily as the $90,000 beside it."""
+    views = build_label_views([ManagedLabel('ARK26', 40.0)],
+                              {'ARK26': ['AAPL', 'MSFT']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0),
+                               'MSFT': _pos('MSFT', 1, 90_000.0)},
+                              {'AAPL': 250.0, 'MSFT': 90_000.0},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    pnl = views[0].pnl
+    assert pnl.amount == pytest.approx(1_500.0)
+    assert pnl.pct == pytest.approx(1_500.0 / 91_000.0 * 100.0)
+
+
+def test_an_unpriced_holding_is_excluded_from_the_pnl_rather_than_valued_at_zero():
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': None},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    pnl = views[0].rows[0].pnl
+    assert pnl.amount is None
+    assert pnl.unpriced == 1
+
+
+def test_the_last_figure_reads_as_a_dash_when_there_is_no_last():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        NO_PREVIOUS_MARK, format_last_pct)
+
+    assert format_last_pct(None) == NO_PREVIOUS_MARK
+    assert format_last_pct(0.0) == '0.00%'
+    assert format_last_pct(60.0) == '60.00%'
+
+
+def test_the_last_caption_names_itself_so_a_bare_percentage_cannot_be_misread():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import format_last_target
+
+    assert format_last_target(60.0) == 'last 60.00%'
+    assert format_last_target(None) == 'last -'
+
+
+def test_the_pnl_caption_carries_the_engines_own_wording_and_nothing_else():
+    from ba2_trade_platform.core.portfolio_allocation import unrealised_pnl
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import format_pnl_caption
+
+    state = _pos('AAPL', 10, 1000.0)
+    state.price = 250.0
+    assert format_pnl_caption(unrealised_pnl([state])) == 'P&L +1,500.00 (+150.00%)'
+
+
+def test_the_pnl_colour_is_an_accent_and_never_the_message():
+    """Grey covers three different things on purpose -- nothing measurable,
+    nothing held, and a genuine flat 0.00 -- because none of them is a verdict,
+    and painting "break-even" red is inventing one.
+
+    Both directions are asserted on every case: a survivor of the mutation run
+    dropped the epsilon band, which turned an exact 0.00 red while still keeping
+    "green" out of the string.
+    """
+    from ba2_trade_platform.core.portfolio_allocation import MONEY_EPSILON, UnrealisedPnL
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import pnl_classes
+
+    assert 'text-green-500' in pnl_classes(UnrealisedPnL(amount=1.0))
+    assert 'text-red-500' in pnl_classes(UnrealisedPnL(amount=-1.0))
+    for neutral in (UnrealisedPnL(amount=0.0),
+                    UnrealisedPnL(amount=MONEY_EPSILON / 2.0),
+                    UnrealisedPnL(amount=-MONEY_EPSILON / 2.0),
+                    UnrealisedPnL(amount=None),
+                    None):
+        classes = pnl_classes(neutral)
+        assert 'green' not in classes and 'red' not in classes, neutral
+
+
+def test_the_label_bar_states_the_last_target_and_the_pnl_beside_the_delta():
+    """One writer for the row: the bar. The header, the notch, the delta, the last
+    generation and the P&L all come out of ``build_label_bars`` together, so no
+    two of them can describe different states of the same label."""
+    view = LabelView(label='A', target_pct=30.0, current_value=4_500.0,
+                     pct_of_total=0.0, previous_target_pct=25.0)
+    bar = build_label_bars([view], base_notional=10_000.0, unallocated_pct=0.0)[0]
+
+    assert bar.last_text == 'last 25.00%'
+    assert bar.pnl_text == 'P&L -'
+
+
+def test_the_label_bars_last_text_is_a_dash_when_the_label_has_no_history():
+    bar = build_label_bars([_view('A', 4_500.0, 30.0)], base_notional=10_000.0,
+                           unallocated_pct=0.0)[0]
+    assert bar.last_text == 'last -'
+
+
+# ---------------------------------------------------------------------------
+# THE MIGRATED BUTTON GROUPS -- the DECISION half
+#
+# The Allocate wizard's step 1 carried "Even split" and "Load last" over the
+# LABEL targets; its step 2 carried "Even split", "Fill rest", "Load last" and
+# "Wipe" over one label's symbol weights. All six move onto the page, and the
+# arithmetic stays exactly where it was -- in the ENGINE
+# (``even_split_targets``, ``load_previous_targets``, ``even_split_symbol_weights``,
+# ``fill_remaining_symbol_weights``, ``load_previous_symbol_weights``,
+# ``wipe_symbol_weights``). These wrappers exist to translate between the page's
+# plain ``{name: pct}`` maps and the engine's ``LabelTarget``, and to decide
+# whether anything actually changed; they do no arithmetic of their own.
+# ---------------------------------------------------------------------------
+
+def _pure():
+    from ba2_trade_platform.ui.utils import portfolio_allocation_view as v
+    return v
+
+
+def test_an_even_split_of_the_labels_uses_the_engines_own_splitter():
+    """Three ways is 33.33 / 33.33 / 33.34 -- the remainder on the LAST label, so
+    the set totals exactly 100. A hand-rolled ``round(100/n, 2)`` agrees at n=3
+    and parts company at n=6, producing a set the submit gate refuses."""
+    result = _pure().even_split_label_targets({'A': 10.0, 'B': 20.0, 'C': 0.0})
+
+    assert result.changed is True
+    assert result.targets == {'A': 33.33, 'B': 33.33, 'C': 33.34}
+    assert sum(result.targets.values()) == 100.0
+
+
+def test_an_even_split_of_an_already_even_set_writes_NOTHING_and_says_so():
+    """A button that silently does nothing when pressed is indistinguishable from
+    a broken one."""
+    result = _pure().even_split_label_targets({'A': 50.0, 'B': 50.0})
+
+    assert result.changed is False
+    assert result.targets == {'A': 50.0, 'B': 50.0}
+    assert result.message
+
+
+def test_an_even_split_with_no_labels_at_all_is_refused_rather_than_dividing_by_zero():
+    result = _pure().even_split_label_targets({})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().TARGETS_NO_LABELS
+    assert result.targets == {}
+
+
+def test_an_even_split_always_splits_the_WHOLE_hundred_whatever_the_reserve():
+    """The reserve is its own stored field and the labels divide what it leaves,
+    so any total but 100 here would produce a set the validator refuses."""
+    result = _pure().even_split_label_targets({'A': 0.0, 'B': 0.0})
+    assert result.targets == {'A': 50.0, 'B': 50.0}
+
+
+def test_load_last_restores_the_targets_the_previous_run_used():
+    result = _pure().load_last_label_targets({'A': 70.0, 'B': 30.0},
+                                             {'A': 60.0, 'B': 40.0})
+
+    assert result.changed is True
+    assert result.targets == {'A': 60.0, 'B': 40.0}
+
+
+def test_load_last_reads_the_PREVIOUS_generation_and_never_the_current_one():
+    """The mutation this exists for: swapping ``previous`` for the live map turns
+    Load last into a no-op that still reports success, and the user believes their
+    last allocation has been restored when nothing moved."""
+    result = _pure().load_last_label_targets({'A': 70.0, 'B': 30.0},
+                                             {'A': 10.0, 'B': 90.0})
+    assert result.targets == {'A': 10.0, 'B': 90.0}
+
+
+def test_a_label_with_no_history_keeps_the_target_it_already_has():
+    """A partial history is the ORDINARY state -- a label added yesterday has none
+    -- and zeroing those would silently unallocate a real basket."""
+    result = _pure().load_last_label_targets({'A': 70.0, 'B': 30.0},
+                                             {'A': 60.0, 'B': None})
+
+    assert result.targets == {'A': 60.0, 'B': 30.0}
+
+
+def test_a_previous_target_of_zero_is_restored_and_not_read_as_no_history():
+    """0.0 is a real prior state -- the engine reads it as "hold none of this" --
+    and refusing to restore it would be refusing to undo the user's last change."""
+    result = _pure().load_last_label_targets({'A': 70.0}, {'A': 0.0})
+
+    assert result.changed is True
+    assert result.targets == {'A': 0.0}
+
+
+def test_load_last_with_no_history_anywhere_writes_nothing_and_says_why():
+    result = _pure().load_last_label_targets({'A': 70.0, 'B': 30.0},
+                                             {'A': None, 'B': None})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().TARGETS_NO_PREVIOUS
+    assert result.targets == {'A': 70.0, 'B': 30.0}
+    assert result.message
+
+
+def test_load_last_that_would_change_nothing_reports_it_rather_than_writing():
+    result = _pure().load_last_label_targets({'A': 60.0}, {'A': 60.0})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().TARGETS_UNCHANGED
+
+
+def test_the_label_target_helpers_preserve_the_order_they_were_given():
+    """The page hands these its DISPLAY order and writes the result straight back
+    onto the rows; a dict that came back re-sorted would move the remainder onto a
+    different label from the one the user is looking at."""
+    result = _pure().even_split_label_targets({'Z': 0.0, 'A': 0.0, 'M': 0.0})
+    assert list(result.targets) == ['Z', 'A', 'M']
+    assert result.targets['M'] == 33.34
+
+
+# -- the PER-LABEL group: Even split / Fill rest / Load last / Wipe -----------
+
+def test_an_even_split_of_a_labels_symbols_uses_the_engines_own_splitter():
+    result = _pure().even_split_symbol_shares('ARK26',
+                                              {'AAPL': 90.0, 'MSFT': 10.0, 'TSLA': 0.0})
+
+    assert result.changed is True
+    assert result.weights == {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34}
+
+
+def test_an_even_split_of_a_label_that_is_already_even_writes_nothing():
+    result = _pure().even_split_symbol_shares('ARK26', {'AAPL': 50.0, 'MSFT': 50.0})
+
+    assert result.changed is False
+    assert result.message
+
+
+def test_an_even_split_of_a_label_with_no_symbols_is_refused():
+    result = _pure().even_split_symbol_shares('EMPTY', {})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().WEIGHTS_NO_SYMBOLS
+
+
+def test_fill_rest_shares_the_remainder_between_the_EMPTY_slots_only():
+    """"Type the two you care about, let the rest sort themselves out". Every
+    non-zero weight is left EXACTLY as typed -- not re-normalised, not nudged."""
+    result = _pure().fill_rest_symbol_shares('ARK26', {'AAPL': 30.0, 'MSFT': 0.0,
+                                                       'TSLA': 0.0})
+
+    assert result.changed is True
+    assert result.weights == {'AAPL': 30.0, 'MSFT': 35.0, 'TSLA': 35.0}
+
+
+def test_fill_rest_is_NOT_the_same_button_as_fill_100_and_never_scales():
+    """``Fill 100%`` scales an over-allocated label down; ``Fill rest`` refuses.
+
+    That is the whole distinction between the two, and it is why both are on the
+    row: one repairs a set, the other only ever fills the gaps in one.
+    """
+    over = {'AAPL': 80.0, 'MSFT': 80.0, 'TSLA': 0.0}
+    assert _pure().fill_rest_symbol_shares('ARK26', over).changed is False
+    assert _pure().fill_label_to_100('ARK26', over).changed is True
+
+
+def test_fill_rest_with_no_empty_slot_writes_nothing_and_says_so():
+    result = _pure().fill_rest_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().WEIGHTS_NOTHING_TO_FILL
+    assert result.message
+
+
+def test_filling_a_completely_empty_label_lands_exactly_on_the_even_split():
+    """Not a coincidence to be re-checked: ``fill_remaining_symbol_weights`` is
+    ``split_pct_across`` is ``even_split_pct``, called with a total of 100."""
+    empty = {'A': 0.0, 'B': 0.0, 'C': 0.0, 'D': 0.0, 'E': 0.0, 'F': 0.0}
+    assert (_pure().fill_rest_symbol_shares('L', empty).weights
+            == _pure().even_split_symbol_shares('L', empty).weights)
+
+
+def test_load_last_restores_one_labels_symbol_weights():
+    result = _pure().load_last_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0},
+                                             {'AAPL': 50.0, 'MSFT': 50.0})
+
+    assert result.changed is True
+    assert result.weights == {'AAPL': 50.0, 'MSFT': 50.0}
+
+
+def test_load_last_for_symbols_reads_the_PREVIOUS_generation_and_not_the_current():
+    result = _pure().load_last_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0},
+                                             {'AAPL': 10.0, 'MSFT': 90.0})
+    assert result.weights == {'AAPL': 10.0, 'MSFT': 90.0}
+
+
+def test_a_symbol_with_no_history_keeps_the_weight_it_already_has():
+    result = _pure().load_last_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0},
+                                             {'AAPL': 50.0, 'MSFT': None})
+
+    assert result.weights == {'AAPL': 50.0, 'MSFT': 40.0}
+
+
+def test_load_last_for_a_label_with_no_history_at_all_writes_nothing():
+    result = _pure().load_last_symbol_shares('ARK26', {'AAPL': 60.0},
+                                             {'AAPL': None})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().WEIGHTS_NO_PREVIOUS
+
+
+def test_wipe_clears_every_weight_in_the_label_to_zero():
+    """0.0, never ``None``: every solver does arithmetic on ``weight_pct``, and 0.0
+    IS "empty" in this model -- which is what makes Fill rest coherent."""
+    result = _pure().wipe_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0})
+
+    assert result.changed is True
+    assert result.weights == {'AAPL': 0.0, 'MSFT': 0.0}
+
+
+def test_wipe_reports_a_label_that_is_already_clear_rather_than_rewriting_it():
+    result = _pure().wipe_symbol_shares('ARK26', {'AAPL': 0.0, 'MSFT': 0.0})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().WEIGHTS_ALREADY_CLEAR
+
+
+def test_wipe_is_available_on_exactly_the_set_fill_rest_refuses():
+    """The user is never cornered: an over-allocated label disables the fill and
+    Wipe is always the way out of it."""
+    over = {'AAPL': 80.0, 'MSFT': 80.0, 'TSLA': 0.0}
+    assert _pure().fill_rest_symbol_shares('L', over).changed is False
+    assert _pure().wipe_symbol_shares('L', over).changed is True
+
+
+def test_the_symbol_share_helpers_preserve_the_order_they_were_given():
+    result = _pure().even_split_symbol_shares('L', {'Z': 0.0, 'A': 0.0, 'M': 0.0})
+    assert list(result.weights) == ['Z', 'A', 'M']
+    assert result.weights['M'] == 33.34
+
+
+# ---------------------------------------------------------------------------
+# THE COMMA. A percentage box is 0-100, so a comma in it is a DECIMAL POINT.
+#
+# Reported off the live screen: the share cells render "11,11". The old parse
+# stripped every comma as a thousands separator, which turns a decimal comma into
+# a number a hundred times too big -- and the range check only catches HALF of
+# those. "11,11" becomes 1111 and is refused (visible, annoying); "0,5" becomes 5
+# and is ACCEPTED (silent, and ten times what was typed). The second is the one
+# that costs money.
+#
+# No legitimate value in a 0-100 box needs a thousands separator, so a lone comma
+# with no decimal point is read as the decimal point. A comma ALONGSIDE a dot
+# keeps its old meaning -- "1,234.5" is unambiguous in every locale that writes
+# it that way -- and is refused by the range check on its own merits.
+# ---------------------------------------------------------------------------
+
+def test_a_lone_comma_in_a_percentage_box_is_a_DECIMAL_point():
+    assert parse_pct('11,11').value == pytest.approx(11.11)
+    assert parse_pct('0,5').value == pytest.approx(0.5)
+    assert parse_pct(' 26,78 % ').value == pytest.approx(26.78)
+
+
+def test_the_silent_half_of_the_comma_bug_is_the_one_that_was_accepted():
+    """"0,5" used to parse as 5.0 -- in range, so nothing complained, and the
+    symbol got ten times the share the user typed."""
+    assert parse_pct('0,5').value != 5.0
+
+
+def test_a_comma_beside_a_decimal_point_keeps_its_thousands_meaning():
+    """Unambiguous, and out of range on its own merits rather than by accident."""
+    assert parse_pct('1,234.5').value == pytest.approx(1234.5)
+
+
+def test_two_commas_are_a_thousands_grouping_and_not_two_decimal_points():
+    assert parse_pct('1,234,567').value == pytest.approx(1234567.0)
+
+
+def test_a_comma_typed_into_a_symbol_share_box_survives_the_round_trip():
+    """The whole point: the value the user typed is the value that is stored."""
+    edit = validate_symbol_weight_edit(label='ARK26', symbol='AAPL', raw='26,78')
+    assert edit.accepted is True
+    assert edit.value == pytest.approx(26.78)
+
+
+def test_a_comma_typed_into_a_label_target_box_survives_it_too():
+    edit = validate_label_target_edit(label='ARK26', raw='13,5', other_targets={})
+    assert edit.accepted is True
+    assert edit.value == pytest.approx(13.5)
+
+
+def test_a_comma_typed_into_the_reserve_box_survives_it_too():
+    assert validate_reserve_edit('7,25').value == pytest.approx(7.25)
+
+
+def test_a_comma_value_that_is_genuinely_out_of_range_is_still_refused():
+    """The comma fix must not become a way past the 0-100 guard."""
+    edit = validate_symbol_weight_edit(label='ARK26', symbol='AAPL', raw='1,234.5')
+    assert edit.accepted is False
+    assert edit.reason_code == EDIT_OVER_100
+
+
+# ---------------------------------------------------------------------------
+# THE LABEL-TOTAL CARD
+#
+# It was a sentence under the stat cards that appeared only when the set was
+# WRONG -- so the one moment the user wanted the running total (while typing
+# towards 100) was the one moment it said nothing. As a card it always carries
+# the figure, and the verdict rides along as its detail.
+#
+# The verdict is the SAME one ``format_label_total_notice`` and
+# ``format_allocation_footer`` reach, from one shared predicate, so three
+# readouts of one set cannot disagree.
+# ---------------------------------------------------------------------------
+
+def test_the_label_total_readout_always_carries_the_figure_even_when_it_is_right():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        LABEL_TOTAL_TITLE, label_total_readout)
+
+    card = label_total_readout({'A': 60.0, 'B': 40.0})
+
+    assert card.title == LABEL_TOTAL_TITLE
+    assert card.text == '100.00%'
+    assert card.severity == 'ok'
+    assert card.detail
+
+
+def test_the_label_total_readout_sums_and_never_averages():
+    """The mutation this exists for. Three labels at 25 total 75, not 25."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_readout
+
+    assert label_total_readout({'A': 25.0, 'B': 25.0, 'C': 25.0}).text == '75.00%'
+
+
+def test_the_label_total_readout_speaks_the_engines_own_shortfall_sentence():
+    """Verbatim, so the card, the footer and the submit gate describe one defect
+    one way -- and so the "use the Unallocated box" guidance survives the move."""
+    from ba2_trade_platform.core.portfolio_allocation import ERROR_LABEL_UNDER_FMT
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_readout
+
+    card = label_total_readout({'A': 75.0})
+
+    assert card.text == '75.00%'
+    assert card.severity == 'warning'
+    assert card.detail == ERROR_LABEL_UNDER_FMT.format(total=75.0, under=25.0)
+    assert 'Unallocated box' in card.detail
+
+
+def test_the_label_total_readout_speaks_the_engines_own_over_sentence_too():
+    from ba2_trade_platform.core.portfolio_allocation import ERROR_LABEL_TOTAL_FMT
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_readout
+
+    card = label_total_readout({'A': 70.0, 'B': 48.0})
+
+    assert card.text == '118.00%'
+    assert card.severity == 'negative'
+    assert card.detail == ERROR_LABEL_TOTAL_FMT.format(total=118.0, over=18.0)
+
+
+def test_the_label_total_readout_agrees_with_the_notice_and_the_footer():
+    """One predicate, three readouts. A card that called 118% 'ok' while the
+    footer called it an error would be the two-screens bug at one screen's
+    distance."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        format_allocation_footer, format_label_total_notice, label_total_readout)
+
+    for targets in ({'A': 118.0}, {'A': 75.0}, {'A': 100.0}, {'A': 99.995}):
+        card = label_total_readout(targets)
+        notice = format_label_total_notice(targets)
+        _footer_text, footer_severity = format_allocation_footer(targets, 0.0)
+        assert card.severity == footer_severity, targets
+        assert (notice is None) == (card.severity == 'ok'), targets
+        if notice is not None:
+            assert notice[0] == card.detail, targets
+
+
+def test_the_label_total_readout_measures_the_INVESTABLE_pool_not_the_gross_base():
+    """The reserve does not enter it. The labels divide what the reserve LEAVES,
+    so 100 typed across them is 100 whatever the reserve says -- an off-by-one
+    that netted the reserve out would call a correct set 'under by 10'."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_readout
+
+    for _reserve in (0.0, 10.0, 90.0):
+        assert label_total_readout({'A': 60.0, 'B': 40.0}).text == '100.00%'
+
+
+def test_the_label_total_readout_of_an_account_managing_nothing_says_so():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_readout
+
+    card = label_total_readout({})
+
+    assert card.text == '0.00%'
+    assert card.severity == 'ok'
+    assert card.detail
+
+
+# ---------------------------------------------------------------------------
+# THE SHARE-OF-LABEL DEFAULT IS THE SYMBOL'S ACTUAL SHARE
+#
+# The column used to default every symbol to FAIR SHARE -- nine symbols in one
+# label all reading 11.11 while their real shares were 26.78 / 22.19 / 17.8 /
+# 16.65 / 16.57 / 0 / 0 / ... A default nobody chose, sitting in an editable box,
+# is a target the user never set and the plan will trade towards.
+#
+# A SAVED target always wins. The actual share is only a default.
+#
+# UNKNOWN IS NOT ZERO. A symbol whose price is unavailable has an UNMEASURABLE
+# share, and 0% means "hold none of this" -- the plan sells the position. Worse,
+# one unpriced member makes the LABEL's total unknown, so every unsaved share in
+# it is a fraction of a denominator nobody has. The whole label's unsaved
+# defaults go blank rather than being quietly restated against a smaller total.
+#
+# A GENUINE ZERO IS A REAL 0%. A symbol the account does not hold has an actual
+# share of exactly 0, and that is the honest default -- it just has to be
+# visible, because the old fair-share default would have bought it.
+# ---------------------------------------------------------------------------
+
+def test_the_default_share_is_the_symbols_ACTUAL_share_of_its_label():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_ACTUAL, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'MSFT', 'TSLA'], saved={},
+                                      values={'AAPL': 500.0, 'MSFT': 300.0,
+                                              'TSLA': 200.0},
+                                      unmeasurable=())
+
+    assert {s: r.weight_pct for s, r in resolved.items()} == {'AAPL': 50.0,
+                                                              'MSFT': 30.0,
+                                                              'TSLA': 20.0}
+    assert {r.source for r in resolved.values()} == {WEIGHT_SOURCE_ACTUAL}
+
+
+def test_the_default_is_NOT_the_fair_share_it_replaces():
+    """The exact behaviour being removed: nine symbols all reading 11.11."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['A', 'B', 'C'], saved={},
+                                      values={'A': 800.0, 'B': 100.0, 'C': 100.0},
+                                      unmeasurable=())
+
+    assert resolved['A'].weight_pct == 80.0
+    assert resolved['A'].weight_pct != pytest.approx(100.0 / 3.0, abs=0.01)
+
+
+def test_a_SAVED_target_wins_over_the_actual_share():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_ACTUAL, WEIGHT_SOURCE_SAVED, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'MSFT'], saved={'AAPL': 90.0},
+                                      values={'AAPL': 100.0, 'MSFT': 900.0},
+                                      unmeasurable=())
+
+    assert (resolved['AAPL'].weight_pct, resolved['AAPL'].source) == (
+        90.0, WEIGHT_SOURCE_SAVED)
+    assert (resolved['MSFT'].weight_pct, resolved['MSFT'].source) == (
+        90.0, WEIGHT_SOURCE_ACTUAL)
+
+
+def test_a_saved_target_of_ZERO_still_wins():
+    """0 is an explicit "hold none of this", not an absent row. Reading it as
+    absent would have the default quietly buy back a position the user sold out
+    of on purpose."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_SAVED, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL'], saved={'AAPL': 0.0},
+                                      values={'AAPL': 5_000.0}, unmeasurable=())
+
+    assert (resolved['AAPL'].weight_pct, resolved['AAPL'].source) == (
+        0.0, WEIGHT_SOURCE_SAVED)
+
+
+def test_a_symbol_the_account_does_not_hold_defaults_to_a_REAL_zero():
+    """CAS and GIAX hold nothing, so their actual share IS 0% -- and they will not
+    be bought. That is the correct reading of "default to actual"."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_ACTUAL, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'CAS'], saved={},
+                                      values={'AAPL': 1_000.0, 'CAS': 0.0},
+                                      unmeasurable=())
+
+    assert (resolved['CAS'].weight_pct, resolved['CAS'].source) == (
+        0.0, WEIGHT_SOURCE_ACTUAL)
+    assert resolved['AAPL'].weight_pct == 100.0
+
+
+def test_an_UNMEASURABLE_symbol_is_blank_and_never_zero():
+    """A price outage may not quietly zero a target: 0% means SELL IT ALL."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_UNKNOWN, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'DARK'], saved={},
+                                      values={'AAPL': 1_000.0},
+                                      unmeasurable=['DARK'])
+
+    assert resolved['DARK'].weight_pct is None
+    assert resolved['DARK'].source == WEIGHT_SOURCE_UNKNOWN
+
+
+def test_ONE_unmeasurable_member_makes_every_unsaved_share_in_the_label_unknown():
+    """The denominator is the label's whole value. With one member unpriced, that
+    total is unknown -- so no share OF it is knowable, and restating the others
+    against the measured remainder would overstate every one of them."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_UNKNOWN, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'MSFT', 'DARK'], saved={},
+                                      values={'AAPL': 600.0, 'MSFT': 400.0},
+                                      unmeasurable=['DARK'])
+
+    assert [r.weight_pct for r in resolved.values()] == [None, None, None]
+    assert {r.source for r in resolved.values()} == {WEIGHT_SOURCE_UNKNOWN}
+
+
+def test_a_SAVED_target_survives_an_unmeasurable_neighbour():
+    """It was never derived from the denominator, so losing the denominator cannot
+    take it away."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_SAVED, WEIGHT_SOURCE_UNKNOWN, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'DARK'], saved={'AAPL': 60.0},
+                                      values={'AAPL': 600.0},
+                                      unmeasurable=['DARK'])
+
+    assert (resolved['AAPL'].weight_pct, resolved['AAPL'].source) == (
+        60.0, WEIGHT_SOURCE_SAVED)
+    assert resolved['DARK'].source == WEIGHT_SOURCE_UNKNOWN
+
+
+def test_a_label_that_holds_NOTHING_defaults_every_symbol_to_zero():
+    """Not unknown: nothing is held, which is perfectly measurable. It means the
+    label will buy nothing until a share is typed or a fill button is pressed --
+    which the page has to make visible rather than surprising."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_ACTUAL, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['A', 'B'], saved={},
+                                      values={'A': 0.0, 'B': 0.0}, unmeasurable=())
+
+    assert [r.weight_pct for r in resolved.values()] == [0.0, 0.0]
+    assert {r.source for r in resolved.values()} == {WEIGHT_SOURCE_ACTUAL}
+
+
+def test_the_actual_shares_are_rounded_onto_the_stored_cent_grid():
+    """The boxes step by 0.01 and the store keeps two places; a default carrying
+    four would be refused by nothing and stored as something else."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['A', 'B', 'C'], saved={},
+                                      values={'A': 1.0, 'B': 1.0, 'C': 1.0},
+                                      unmeasurable=())
+
+    assert [r.weight_pct for r in resolved.values()] == [33.33, 33.33, 33.33]
+
+
+def test_a_SHORT_leg_keeps_its_sign_out_of_the_denominator():
+    """A net-short member makes the label's signed total smaller than its parts,
+    so a share of it can exceed 100 or flip sign. The denominator is the GROSS
+    money at work, which is the same choice ``UnrealisedPnL.pct`` makes."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['LONG', 'SHORT'], saved={},
+                                      values={'LONG': 900.0, 'SHORT': -100.0},
+                                      unmeasurable=())
+
+    assert resolved['LONG'].weight_pct == 90.0
+    assert resolved['SHORT'].weight_pct == -10.0
+
+
+def test_the_page_names_what_an_unsaved_share_is_showing():
+    """"Default to actual" changes what happens to a newly added symbol: fair
+    share would have bought it, an actual share of 0% will not. That is correct
+    and it has to be legible, or it is discovered later and by surprise."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        SHARE_DEFAULT_NOTE)
+
+    assert 'actual' in SHARE_DEFAULT_NOTE.lower()
+    assert '0%' in SHARE_DEFAULT_NOTE
+    assert 'Load current' in SHARE_DEFAULT_NOTE
+
+
+def test_load_current_replaces_every_unmeasurable_free_share_with_the_actual_one():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHTS_LOADED_CURRENT, load_current_symbol_shares)
+
+    result = load_current_symbol_shares(
+        'ARK26', {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34},
+        {'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0}, unmeasurable=())
+
+    assert result.changed is True
+    assert result.reason_code == WEIGHTS_LOADED_CURRENT
+    assert result.weights == {'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}
+
+
+def test_load_current_overwrites_a_SAVED_share_because_that_is_what_it_is_for():
+    """Unlike the DEFAULT, where a saved target wins. This is the button that says
+    "forget what I typed, start from where I actually am"."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        load_current_symbol_shares)
+
+    result = load_current_symbol_shares('ARK26', {'AAPL': 90.0, 'MSFT': 10.0},
+                                        {'AAPL': 200.0, 'MSFT': 800.0},
+                                        unmeasurable=())
+
+    assert result.weights == {'AAPL': 20.0, 'MSFT': 80.0}
+
+
+def test_load_current_refuses_a_label_whose_value_cannot_be_measured():
+    """There is no "current" to load. Writing 0 for the unpriced one and a
+    restated share for the rest would be a price outage rewriting real targets."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHTS_NOTHING_MEASURED, load_current_symbol_shares)
+
+    result = load_current_symbol_shares('ARK26', {'AAPL': 60.0, 'DARK': 40.0},
+                                        {'AAPL': 600.0}, unmeasurable=['DARK'])
+
+    assert result.changed is False
+    assert result.reason_code == WEIGHTS_NOTHING_MEASURED
+    assert result.weights == {'AAPL': 60.0, 'DARK': 40.0}
+    assert result.message
+
+
+def test_load_current_on_a_label_that_holds_nothing_says_so_rather_than_zeroing_it():
+    """Every actual share is a genuine 0 here, so the button would wipe the label.
+    Wipe is the control for that, and it is one button along."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHTS_NOTHING_MEASURED, load_current_symbol_shares)
+
+    result = load_current_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0},
+                                        {'AAPL': 0.0, 'MSFT': 0.0}, unmeasurable=())
+
+    assert result.changed is False
+    assert result.reason_code == WEIGHTS_NOTHING_MEASURED
+    assert result.weights == {'AAPL': 60.0, 'MSFT': 40.0}
+
+
+def test_load_current_that_would_change_nothing_reports_it_rather_than_writing():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHTS_UNCHANGED, load_current_symbol_shares)
+
+    result = load_current_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0},
+                                        {'AAPL': 600.0, 'MSFT': 400.0},
+                                        unmeasurable=())
+
+    assert result.changed is False
+    assert result.reason_code == WEIGHTS_UNCHANGED
+
+
+def test_a_SAVED_target_does_not_mask_an_unmeasurable_holding():
+    """The trap ``SymbolRow.measurable`` exists for. "Saved wins" short-circuits
+    ``weight_source``, so a saved row with no price reports SAVED and looks
+    perfectly measurable -- and "Load current" would then restate every share in
+    the label against a total nobody knows."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_SAVED)
+
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL', 'DARK']},
+                              {'AAPL': _pos('AAPL', 10, 500.0),
+                               'DARK': _pos('DARK', 10, 100.0)},
+                              {'AAPL': 500.0, 'DARK': None},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              symbol_weights={'ARK26': {'AAPL': 60.0,
+                                                        'DARK': 40.0}})
+    by_symbol = {r.symbol: r for r in views[0].rows}
+
+    assert by_symbol['DARK'].weight_source == WEIGHT_SOURCE_SAVED
+    assert by_symbol['DARK'].measurable is False
+    assert by_symbol['AAPL'].measurable is True
+
+
+def test_a_FLAT_position_ROW_with_no_quote_is_still_measurable():
+    """Survivor of the mutation run: dropping the ``not state.quantity`` guard.
+
+    A broker that returns a zero-quantity row for a symbol you have sold out of --
+    and no quote for it, because it is not worth quoting -- is worth EXACTLY
+    NOTHING, and that is a measurement. Calling it unmeasurable would blank every
+    unsaved share in the label around it and refuse "Load current", on the
+    strength of a position that does not exist.
+    """
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL', 'GONE']},
+                              {'AAPL': _pos('AAPL', 10, 500.0),
+                               'GONE': _pos('GONE', 0, 0.0)},
+                              {'AAPL': 500.0, 'GONE': None},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    by_symbol = {r.symbol: r for r in views[0].rows}
+
+    assert by_symbol['GONE'].measurable is True
+    # ...so the label keeps its verdict, and the flat row keeps its honest 0%.
+    assert by_symbol['AAPL'].weight_pct == 100.0
+    assert by_symbol['GONE'].weight_pct == 0.0
+
+
+def test_a_FLAT_holding_is_measurable_and_an_unpriced_one_is_not():
+    """Nothing held is worth exactly nothing, which is a measurement. Only a
+    holding with no price is unmeasurable, and only in MARKET mode -- the cost
+    basis is always published."""
+    args = ({'ARK26': ['FLAT', 'DARK']},
+            {'DARK': _pos('DARK', 10, 100.0)},
+            {'FLAT': 12.0, 'DARK': None})
+    market = build_label_views([ManagedLabel('ARK26', 100.0)], *args,
+                               valuation_mode=VALUATION_MODE_MARKET)
+    cost = build_label_views([ManagedLabel('ARK26', 100.0)], *args,
+                             valuation_mode=VALUATION_MODE_COST)
+
+    assert {r.symbol: r.measurable for r in market[0].rows} == {'FLAT': True,
+                                                                'DARK': False}
+    assert all(r.measurable for r in cost[0].rows)
+
+
+# ---------------------------------------------------------------------------
+# THE SHARE BAR -- one bar component, three places
+#
+# The label header has carried a current-versus-target bar since the rework. The
+# same geometry now answers two more questions: how the SYMBOL SHARES inside one
+# label add up against their 100, and how the account's free cash sits against
+# the reserve it is targeting. One builder, one tolerance band, one over/under
+# vocabulary -- so the whole page reads as one visual language and no bar can
+# disagree with the sentence beside it.
+# ---------------------------------------------------------------------------
+
+def _bar(**kw):
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import build_share_bar
+    return build_share_bar(**kw)
+
+
+def test_a_share_bar_puts_the_fill_and_the_notch_on_ONE_scale():
+    """The load-bearing property: if they did not share a scale, "over" and
+    "under" would be a lie no reader could catch by eye."""
+    bar = _bar(current_pct=25.0, target_pct=100.0)
+
+    assert bar.fraction == pytest.approx(0.25)
+    assert bar.notch_fraction == pytest.approx(1.0)
+
+
+def test_a_share_bar_that_is_SHORT_of_its_target_says_under():
+    bar = _bar(current_pct=75.0, target_pct=100.0)
+
+    assert bar.status == LABEL_STATUS_UNDER
+    assert bar.delta_text == 'under by 25.0pp'
+
+
+def test_a_share_bar_that_is_OVER_its_target_says_over():
+    bar = _bar(current_pct=118.0, target_pct=100.0)
+
+    assert bar.status == LABEL_STATUS_OVER
+    assert bar.delta_text == 'over by 18.0pp'
+
+
+def test_a_share_bar_inside_the_tolerance_band_is_on_target():
+    bar = _bar(current_pct=100.0, target_pct=100.0)
+
+    assert bar.status == LABEL_STATUS_OK
+    assert bar.delta_text == 'on target'
+
+
+def test_a_share_bar_over_100_stretches_the_track_rather_than_clipping():
+    """The notch stays visible and the fill stays honest -- the same choice the
+    label bars make, where a margin book legitimately holds more than the pool."""
+    bar = _bar(current_pct=150.0, target_pct=100.0)
+
+    assert bar.fraction == pytest.approx(1.0)
+    assert bar.notch_fraction == pytest.approx(2.0 / 3.0)
+    assert bar.current_text == '150.0%'
+
+
+def test_a_share_bar_states_its_delta_in_MONEY_too_when_there_is_money():
+    """The reserve row has both; a sum of symbol shares has only points."""
+    bar = _bar(current_pct=4.7, target_pct=10.0, current_value=245.50,
+               target_value=526.09)
+
+    assert bar.status == LABEL_STATUS_UNDER
+    assert bar.delta_text == 'under by 5.3pp ($280.59)'
+
+
+def test_a_share_bar_with_no_measurable_current_draws_no_verdict():
+    bar = _bar(current_pct=None, target_pct=100.0)
+
+    assert bar.status == LABEL_STATUS_NONE
+    assert bar.fraction == 0.0
+    assert bar.current_text == LABEL_STATUS_NONE
+    assert bar.delta_text == LABEL_STATUS_NONE
+
+
+def test_a_share_bar_never_renders_a_negative_current_as_a_full_track():
+    """A net-short set is genuinely negative and the figure says so; the bar
+    clamps to empty rather than wrapping round to full."""
+    bar = _bar(current_pct=-30.0, target_pct=100.0)
+
+    assert bar.fraction == 0.0
+    assert bar.current_text == '-30.0%'
+
+
+def test_the_points_only_delta_is_unreachable_from_the_LABEL_bars():
+    """``format_label_delta`` grew a money-less branch for the share bars. The
+    label bars set their two figures together, so they can never take it -- which
+    is what keeps the money out of exactly one of the page's bars by accident."""
+    for reserve in (0.0, 25.0):
+        for view in (_view('A', 4_500.0, 30.0), _view('B', 0.0, 0.0)):
+            bar = build_label_bars([view], base_notional=10_000.0,
+                                   unallocated_pct=reserve)[0]
+            assert (bar.delta_pct is None) == (bar.delta_value is None)
+
+
+def test_the_symbol_total_bar_sums_the_shares_WITHIN_one_label():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import symbol_total_bar
+
+    bar = symbol_total_bar({'AAPL': 26.78, 'MSFT': 22.19, 'TSLA': 17.8})
+
+    assert bar.current_pct == pytest.approx(66.77)
+    assert bar.target_pct == 100.0
+    assert bar.status == LABEL_STATUS_UNDER
+
+
+def test_the_symbol_total_bar_sums_and_never_averages():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import symbol_total_bar
+
+    assert symbol_total_bar({'A': 25.0, 'B': 25.0, 'C': 25.0}).current_pct == 75.0
+
+
+def test_the_symbol_total_bar_leaves_an_UNMEASURABLE_share_out_and_says_so():
+    """A blank share is not a zero. Counting it as 0 would report a label whose
+    total cannot be known as 25 points short of 100."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import symbol_total_bar
+
+    bar = symbol_total_bar({'AAPL': 60.0, 'DARK': None})
+
+    assert bar.current_pct is None
+    assert bar.status == LABEL_STATUS_NONE
+
+
+def test_the_symbol_total_bar_of_a_label_with_no_symbols_is_not_a_verdict():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import symbol_total_bar
+
+    assert symbol_total_bar({}).status == LABEL_STATUS_NONE
+
+
+def test_the_reserve_bar_reads_ACTUAL_against_TARGET_and_not_the_other_way():
+    """$245.50 of free cash (4.7% of base) against a 10.00% target is UNDER. Read
+    the two the wrong way round and the bar says "over" while the sentence beside
+    it says raising the reserve will generate sells."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import reserve_bar
+
+    bar = reserve_bar(base_notional=5_260.9, available_buying_power=245.50,
+                      unallocated_pct=10.0)
+
+    assert bar.current_pct == pytest.approx(4.67, abs=0.01)
+    assert bar.target_pct == 10.0
+    assert bar.status == LABEL_STATUS_UNDER
+    assert bar.delta_text.startswith('under by ')
+
+
+def test_the_reserve_bar_agrees_with_the_row_it_sits_beside():
+    """Same numbers, same source: ``unallocated_row``. A bar built from its own
+    arithmetic is how the picture and the sentence come to disagree."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        reserve_bar, unallocated_row)
+
+    row = unallocated_row(base_notional=5_260.9, available_buying_power=245.50,
+                          unallocated_pct=10.0)
+    bar = reserve_bar(base_notional=5_260.9, available_buying_power=245.50,
+                      unallocated_pct=10.0)
+
+    assert bar.current_pct == row.pct_of_base
+    assert bar.target_pct == row.target_pct
+
+
+def test_the_reserve_bar_is_absent_when_there_is_no_base_to_divide_by():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import reserve_bar
+
+    assert reserve_bar(base_notional=0.0, available_buying_power=100.0,
+                       unallocated_pct=10.0) is None
+    assert reserve_bar(base_notional=None, available_buying_power=100.0,
+                       unallocated_pct=10.0) is None
+    assert reserve_bar(base_notional=1_000.0, available_buying_power=None,
+                       unallocated_pct=10.0) is None
+
+
+# ---------------------------------------------------------------------------
+# THE MANAGE-LABELS DIALOG: its grid, and what a colour state is CALLED
+# ---------------------------------------------------------------------------
+
+def test_the_label_column_is_wide_enough_for_the_longest_name():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        label_column_width_ch)
+
+    assert label_column_width_ch(['BAST_TECH_ROBOT', 'WHEEL_L1_HR']) >= len(
+        'BAST_TECH_ROBOT')
+
+
+def test_the_label_column_has_a_floor_so_short_names_still_line_up():
+    """Every block starts at the same x or the dialog reads as broken -- which is
+    the actual complaint. A column that shrank to the longest of two short names
+    would jump the moment a third was managed."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        LABEL_COLUMN_MIN_CH, label_column_width_ch)
+
+    assert label_column_width_ch(['A', 'B']) == LABEL_COLUMN_MIN_CH
+    assert label_column_width_ch([]) == LABEL_COLUMN_MIN_CH
+    assert label_column_width_ch(None) == LABEL_COLUMN_MIN_CH
+
+
+def test_the_label_column_is_CAPPED_so_one_absurd_name_cannot_blow_the_dialog_out():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        LABEL_COLUMN_MAX_CH, label_column_width_ch)
+
+    assert label_column_width_ch(['X' * 200]) == LABEL_COLUMN_MAX_CH
+
+
+def test_a_label_with_no_colour_is_DESCRIBED_differently_from_an_unreadable_one():
+    """Both render the same neutral grey -- the parse decides what reaches a CSS
+    ``style`` attribute and it is not negotiable -- but they are different facts,
+    and the one the user can act on is the second."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        describe_label_color, resolve_label_icon_color)
+
+    assert resolve_label_icon_color(None) == resolve_label_icon_color('not-a-colour')
+    assert describe_label_color(None) != describe_label_color('not-a-colour')
+
+
+def test_a_chosen_colour_is_described_by_its_own_hex():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        describe_label_color)
+
+    assert '#F0E442' in describe_label_color('#F0E442')
+
+
+def test_an_unreadable_stored_colour_says_it_is_being_IGNORED():
+    """Not "no colour": the row has something in it, the renderer refused it, and
+    the user is the only one who can put it right."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        describe_label_color)
+
+    said = describe_label_color('rgb(1,2,3)')
+    assert 'ignored' in said.lower()

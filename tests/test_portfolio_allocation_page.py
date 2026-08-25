@@ -1325,11 +1325,12 @@ def test_solve_plan_in_invest_mode_reaches_the_service_too(monkeypatch, account_
 
 def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
         monkeypatch, nicegui_client, account_id):
-    """Allocate -> steps -> dry run -> Submit, with only the broker faked.
+    """Allocate -> dry run -> Submit, with only the broker faked.
 
-    Drives the page's real closures (``_run_dry_run``, ``_on_dry_run``,
-    ``_do_submit``) rather than re-implementing them, so a drift anywhere between
-    the page, the wizard and the service surfaces here.
+    NO target step in between: it moved onto the page, so pressing Allocate solves
+    at once against what the page last saved. Drives the page's real closures
+    (``_run_dry_run``, ``_do_submit``) rather than re-implementing them, so a drift
+    anywhere between the page, the wizard and the service surfaces here.
     """
     from ba2_trade_platform.core.portfolio_allocation_store import get_recent_runs
 
@@ -1339,15 +1340,14 @@ def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
     _capture_notifications(monkeypatch)
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
 
-    # The two dialog openers are captured rather than drawn: what is under test is
-    # the page's glue and the service beneath it, and the wizard's own rendering
+    # The dialog opener is captured rather than drawn: what is under test is the
+    # page's glue and the service beneath it, and the wizard's own rendering
     # already has tests/test_portfolio_allocation_wizard_ui.py.
-    opened, steps, pending = {}, {}, []
+    opened, pending = {}, []
     monkeypatch.setattr(page, 'open_allocation_wizard',
                         lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
     # The page uses ui.timer only to hop off a sync handler; queue the callback
     # instead so the test can await it with the client's slot stack active.
     monkeypatch.setattr(page.ui, 'timer',
@@ -1355,15 +1355,6 @@ def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
 
     _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
         account_id, VALUATION_MODE_COST, _noop_refresh))
-
-    # Step 1-3 opened with the account's real labels.
-    assert [lt.label for lt in steps['labels']] == ['ARK26']
-
-    # The user presses Continue.
-    steps['on_dry_run'](mode=ALLOCATION_MODE_REBALANCE, labels=steps['labels'],
-                        scope_label=None, amount=0.0, allow_fractional=True,
-                        unallocated_pct=0.0)
-    _run_in_client(nicegui_client, pending.pop())
 
     assert opened['market'].allowed is True
     assert [r.symbol for r in opened['plan'].rows] == ['AAPL']
@@ -1377,75 +1368,144 @@ def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
     assert len(runs) == 1 and runs[0].order_ids
 
 
+def test_pressing_allocate_opens_NO_dialog_before_the_dry_run(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    """The guard that step 1 does not come back through the page.
+
+    A second place to type a target is a second answer to "what am I aiming at",
+    and the two screens derived every one of those figures independently.
+    """
+    from nicegui import ui
+
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    opened = {}
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+
+    # The dry run was reached...
+    assert 'plan' in opened
+    # ...and nothing was drawn on the way: no dialog, no percentage box.
+    drawn = list(nicegui_client.layout.descendants())
+    assert [el for el in drawn if isinstance(el, ui.dialog)] == []
+    assert [el for el in drawn if isinstance(el, ui.number)] == []
+    assert not hasattr(page, 'open_allocation_steps')
+
+
 # ---------------------------------------------------------------------------
-# W0: Continue PERSISTS the targets. Until this, the wizard was write-only to
-# memory -- ``_on_dry_run`` saved the fractional switch and nothing else, so
-# every ``target_pct`` stayed at the 0.0 the picker created it with.
+# THE RUN PERSISTS WHAT IT WAS LAUNCHED WITH
+#
+# There is no Continue any more: the target step moved onto the page and pressing
+# Allocate solves at once. The three writes it used to make on Continue happen at
+# the moment the DRY RUN opens instead, which is the same instant for the same
+# reason -- "last" means the numbers the user last chose to allocate with, whether
+# or not they went through with the orders.
+#
+# On a REBALANCE the page has already persisted the targets inline, so these are
+# normally a re-write of what is stored. What the run still earns is the EXPLICIT
+# symbol rows.
 # ---------------------------------------------------------------------------
 
-def _drive_to_continue(monkeypatch, nicegui_client, account_id, *, labels_edit=None,
-                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None, amount=0.0,
-                       unallocated_pct=0.0):
-    """Open the real flow and press Continue, returning the steps' labels."""
+def _drive_the_flow(monkeypatch, nicegui_client, account_id, *,
+                    mode=ALLOCATION_MODE_REBALANCE, scope_label=None, amount=0.0,
+                    valuation_mode=VALUATION_MODE_MARKET, invest_edit=None,
+                    positions=None, prices=None):
+    """Press Allocate and let the flow run to the dry run. Returns its kwargs.
+
+    A REBALANCE opens no dialog at all. An INVEST run still opens the scope dialog,
+    which is captured rather than drawn and driven through its ``on_dry_run``.
+    """
     account = _AllocAccount(account_id, {'manual_trading_enabled': True},
-                            positions=[], prices={'AAPL': 100.0, 'MSFT': 100.0})
+                            positions=list(positions or []),
+                            prices=dict(prices or {'AAPL': 100.0, 'MSFT': 100.0}))
     _use_account(monkeypatch, account)
     _capture_notifications(monkeypatch)
 
-    steps, pending = {}, []
-    monkeypatch.setattr(page, 'open_allocation_wizard', lambda *a, **kw: None)
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
+    opened, scope, pending = {}, {}, []
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+    monkeypatch.setattr(page, 'open_invest_scope',
+                        lambda *a, **kw: scope.update(kw, base=a[0], labels=a[1]))
     monkeypatch.setattr(page.ui, 'timer',
                         lambda _delay, callback, once=False: pending.append(callback))
 
     _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
-        account_id, VALUATION_MODE_MARKET, _noop_refresh))
-    if labels_edit is not None:
-        labels_edit(steps['labels'])
-    steps['on_dry_run'](mode=mode, labels=steps['labels'], scope_label=scope_label,
-                        amount=amount, allow_fractional=True,
-                        unallocated_pct=unallocated_pct)
-    _run_in_client(nicegui_client, pending.pop())
-    return steps
+        account_id, valuation_mode, _noop_refresh, mode=mode, invest_amount=amount))
+    if mode == ALLOCATION_MODE_INVEST_LABEL:
+        if invest_edit is not None:
+            invest_edit(scope['labels'])
+        scope['on_dry_run'](mode=mode, labels=scope['labels'],
+                            scope_label=scope_label, amount=amount,
+                            allow_fractional=True, unallocated_pct=0.0)
+        _run_in_client(nicegui_client, pending.pop())
+    return opened
 
 
-def test_continue_persists_the_label_targets_the_user_typed(
-        monkeypatch, nicegui_client, account_id):
+def test_the_run_keeps_the_targets_the_page_saved(monkeypatch, nicegui_client,
+                                                  account_id):
+    """ONE source of truth. The page wrote 70/30; opening the dry run must not
+    restate them as anything else."""
     from ba2_trade_platform.core.portfolio_allocation_store import get_managed_labels
 
-    set_managed_label(account_id, 'ARK26', target_pct=0.0)
-    set_managed_label(account_id, 'TECH', target_pct=0.0)
+    set_managed_label(account_id, 'ARK26', target_pct=70.0)
+    set_managed_label(account_id, 'TECH', target_pct=30.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     add_label_to_instruments(['MSFT'], 'TECH')
 
-    def _edit(labels):
-        by_label = {lt.label: lt for lt in labels}
-        by_label['ARK26'].target_pct = 70.0
-        by_label['TECH'].target_pct = 30.0
-
-    _drive_to_continue(monkeypatch, nicegui_client, account_id, labels_edit=_edit)
+    _drive_the_flow(monkeypatch, nicegui_client, account_id)
 
     assert {row.label: row.target_pct for row in get_managed_labels(account_id)} == {
         'ARK26': 70.0, 'TECH': 30.0}
 
 
-def test_continue_persists_the_symbol_weights_too(monkeypatch, nicegui_client,
-                                                  account_id):
-    from ba2_trade_platform.core.portfolio_allocation_store import get_symbol_weights
+def test_the_run_makes_a_silently_defaulted_symbol_weight_EXPLICIT(
+        monkeypatch, nicegui_client, account_id):
+    """A symbol with no stored row is showing a DEFAULT -- its actual share of the
+    label. The user has just allocated real money with that number, so the run
+    writes it down, and what it writes is what the page was showing."""
+    from ba2_trade_platform.core.portfolio_allocation_store import get_symbol_rows
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    assert get_symbol_rows(account_id, 'ARK26') == {}
 
-    def _edit(labels):
-        by_symbol = {st.symbol: st for st in labels[0].symbols}
-        by_symbol['AAPL'].weight_pct = 80.0
-        by_symbol['MSFT'].weight_pct = 20.0
+    _drive_the_flow(monkeypatch, nicegui_client, account_id,
+                    positions=[_held('AAPL', 10, 600.0, 600.0),
+                               _held('MSFT', 10, 400.0, 400.0)],
+                    prices={'AAPL': 60.0, 'MSFT': 40.0})
 
-    _drive_to_continue(monkeypatch, nicegui_client, account_id, labels_edit=_edit)
+    stored = get_symbol_rows(account_id, 'ARK26')
+    assert {s: row.weight_pct for s, row in stored.items()} == {'AAPL': 60.0,
+                                                                'MSFT': 40.0}
 
-    assert get_symbol_weights(account_id, 'ARK26', ['AAPL', 'MSFT']) == {
-        'AAPL': 80.0, 'MSFT': 20.0}
+
+def test_the_run_does_NOT_consume_a_generation_when_nothing_changed(
+        monkeypatch, nicegui_client, account_id):
+    """``save_allocation_targets`` shifts the previous generation on a CHANGE only.
+    A run launched against numbers the page already stored changes nothing, so
+    "Load last" keeps pointing at the run before it rather than at itself."""
+    from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        get_managed_labels, save_allocation_targets)
+
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    save_allocation_targets(account_id, [LabelTarget(
+        'ARK26', 70.0, [SymbolTarget('AAPL', 100.0)])])
+    assert get_managed_labels(account_id)[0].previous_target_pct == 40.0
+
+    _drive_the_flow(monkeypatch, nicegui_client, account_id)
+
+    assert get_managed_labels(account_id)[0].previous_target_pct == 40.0
 
 
 def test_an_invest_run_persists_the_weights_but_not_the_labels_percentage(
@@ -1465,9 +1525,9 @@ def test_an_invest_run_persists_the_weights_but_not_the_labels_percentage(
         by_symbol['AAPL'].weight_pct = 90.0
         by_symbol['MSFT'].weight_pct = 10.0
 
-    _drive_to_continue(monkeypatch, nicegui_client, account_id, labels_edit=_edit,
-                       mode=ALLOCATION_MODE_INVEST_LABEL, scope_label='ARK26',
-                       amount=1_000.0)
+    _drive_the_flow(monkeypatch, nicegui_client, account_id,
+                    mode=ALLOCATION_MODE_INVEST_LABEL, scope_label='ARK26',
+                    amount=1_000.0, invest_edit=_edit)
 
     assert get_managed_labels(account_id)[0].target_pct == 25.0
     assert get_symbol_weights(account_id, 'ARK26', ['AAPL', 'MSFT']) == {
@@ -1476,10 +1536,14 @@ def test_an_invest_run_persists_the_weights_but_not_the_labels_percentage(
 
 def test_a_label_unmanaged_mid_flight_is_reported_rather_than_dropped_silently(
         monkeypatch, nicegui_client, account_id):
-    """The wizard holds the labels it opened with. If one is unmanaged in another
-    tab meanwhile, ``save_allocation_targets`` refuses to re-create it -- correct,
-    but the user must be told, or they come back tomorrow to numbers they did not
-    choose and no record of why."""
+    """The flow holds the labels it loaded. If one is unmanaged in another tab
+    meanwhile, ``save_allocation_targets`` refuses to re-create it -- correct, but
+    the user must be told, or they come back tomorrow to numbers they did not
+    choose and no record of why.
+
+    The window is narrow now that there is no dialog in the middle of it, so the
+    race is injected at the one point inside it that the flow calls first.
+    """
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
 
@@ -1487,30 +1551,23 @@ def test_a_label_unmanaged_mid_flight_is_reported_rather_than_dropped_silently(
                             positions=[], prices={'AAPL': 100.0})
     _use_account(monkeypatch, account)
     notes = _capture_notifications(monkeypatch)
-    steps, pending = {}, []
     monkeypatch.setattr(page, 'open_allocation_wizard', lambda *a, **kw: None)
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
-    monkeypatch.setattr(page.ui, 'timer',
-                        lambda _delay, callback, once=False: pending.append(callback))
+    # ``_persist_choices`` calls this first; the label goes away underneath it.
+    monkeypatch.setattr(page.svc, 'remember_fractional_choice',
+                        lambda _account_id, _flag: remove_managed_label(
+                            account_id, 'ARK26'))
 
     _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
         account_id, VALUATION_MODE_MARKET, _noop_refresh))
-    # ...and now the label goes away underneath the open dialog.
-    remove_managed_label(account_id, 'ARK26')
-    steps['on_dry_run'](mode=ALLOCATION_MODE_REBALANCE, labels=steps['labels'],
-                        scope_label=None, amount=0.0, allow_fractional=True,
-                        unallocated_pct=0.0)
-    _run_in_client(nicegui_client, pending.pop())
 
     assert any('no longer managed' in text for text, _ in notes), notes
 
 
 def test_a_failed_target_save_does_not_stop_the_dry_run(monkeypatch, nicegui_client,
                                                         account_id):
-    """Persisting is a convenience; SOLVING is what the user pressed Continue for.
+    """Persisting is a convenience; SOLVING is what the user pressed Allocate for.
     A DB error here must be reported and then got out of the way, not turned into
-    "the wizard would not open"."""
+    "the dry run would not open"."""
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     monkeypatch.setattr(page, 'save_allocation_targets',
@@ -1521,20 +1578,11 @@ def test_a_failed_target_save_does_not_stop_the_dry_run(monkeypatch, nicegui_cli
                             positions=[], prices={'AAPL': 100.0})
     _use_account(monkeypatch, account)
     notes = _capture_notifications(monkeypatch)
-    steps, pending = {}, []
     monkeypatch.setattr(page, 'open_allocation_wizard',
                         lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
-    monkeypatch.setattr(page.ui, 'timer',
-                        lambda _delay, callback, once=False: pending.append(callback))
 
     _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
         account_id, VALUATION_MODE_MARKET, _noop_refresh))
-    steps['on_dry_run'](mode=ALLOCATION_MODE_REBALANCE, labels=steps['labels'],
-                        scope_label=None, amount=0.0, allow_fractional=True,
-                        unallocated_pct=0.0)
-    _run_in_client(nicegui_client, pending.pop())
 
     assert [r.symbol for r in opened['plan'].rows] == ['AAPL']
     assert any('disk full' in str(n) for n in notes), notes
@@ -1605,7 +1653,7 @@ def test_the_page_really_does_call_into_the_service():
     assert {'precheck_plan', 'run_allocation', 'build_position_states',
             'fetch_market_hours', 'clear_market_hours_cache'} <= names
     # ...and into the wizard and the view, whose contracts drift the same way.
-    assert {'open_allocation_wizard', 'open_allocation_steps',
+    assert {'open_allocation_wizard', 'open_invest_scope',
             'working_orders_notice', 'evaluate_market_gate'} <= names
 
 
@@ -1649,24 +1697,28 @@ def test_every_page_call_into_the_service_matches_its_real_signature():
 
 def _open_the_wizard(monkeypatch, nicegui_client, account, account_id, *,
                      unallocated_pct=0.0):
-    """Run the Allocate flow up to the dry run and return the wizard's kwargs."""
+    """Run the Allocate flow up to the dry run and return the wizard's kwargs.
+
+    The reserve is STORED, not typed into a dialog on the way past: the box moved
+    onto the page, so the flow reads it back out of the config row.
+    """
+    from ba2_trade_platform.core.portfolio_allocation_store import set_allocation_config
+
     _use_account(monkeypatch, account)
     _capture_notifications(monkeypatch)
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
-    opened, steps, pending = {}, {}, []
+    # A SAVED share. The book here is flat, and an unsaved share now defaults to
+    # the symbol's ACTUAL one -- which on a flat book is a real 0%, so the plan
+    # would correctly buy nothing and there would be no dry run to inspect.
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    if unallocated_pct:
+        set_allocation_config(account_id, unallocated_pct=unallocated_pct)
+    opened = {}
     monkeypatch.setattr(page, 'open_allocation_wizard',
                         lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
-    monkeypatch.setattr(page.ui, 'timer',
-                        lambda _delay, callback, once=False: pending.append(callback))
     _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
         account_id, VALUATION_MODE_COST, _noop_refresh))
-    steps['on_dry_run'](mode=ALLOCATION_MODE_REBALANCE, labels=steps['labels'],
-                        scope_label=None, amount=0.0, allow_fractional=True,
-                        unallocated_pct=unallocated_pct)
-    _run_in_client(nicegui_client, pending.pop())
     return opened
 
 
@@ -1759,9 +1811,12 @@ def test_clearing_the_market_hours_cache_never_takes_a_dry_run_down(monkeypatch,
 # W2: the wizard opens knowing what the last run allocated with.
 # ---------------------------------------------------------------------------
 
-def test_the_wizard_opens_with_the_previous_targets_attached(monkeypatch, account_id):
-    """``_load_flow_inputs`` is the only place these reach the dialog. Without them
-    the Load-last button has nothing to load and no way to know it."""
+def test_the_flow_opens_with_the_previous_generation_attached(monkeypatch, account_id):
+    """``_load_flow_inputs`` still carries it, even though nothing in the flow
+    reads it any more: it travels on the same ``LabelTarget`` the solve uses, and
+    the PAGE's own Load-last reads the identical columns through
+    ``_load_view_payload``. A loader that dropped it here would be the first half
+    of dropping it there."""
     from ba2_trade_platform.core.portfolio_allocation_store import save_allocation_targets
     from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
 
@@ -1776,7 +1831,7 @@ def test_the_wizard_opens_with_the_previous_targets_attached(monkeypatch, accoun
                             positions=[], prices={'AAPL': 100.0, 'MSFT': 100.0})
     _use_account(monkeypatch, account)
 
-    base, labels, allow_fractional, _values, _pos, _reserve = page._load_flow_inputs(
+    _base, labels, _frac, _reserve = page._load_flow_inputs(
         account_id, VALUATION_MODE_MARKET)
 
     assert labels[0].target_pct == 80.0
@@ -1786,26 +1841,30 @@ def test_the_wizard_opens_with_the_previous_targets_attached(monkeypatch, accoun
     assert (by_symbol['MSFT'].weight_pct, by_symbol['MSFT'].previous_weight_pct) == (45.0, 70.0)
 
 
-def test_a_label_with_no_history_opens_with_no_previous_target(monkeypatch, account_id):
-    """NULL reaches the dialog as None, so the button can be disabled rather than
-    offering a number nobody chose."""
+def test_a_label_with_no_history_loads_with_no_previous_target(monkeypatch, account_id):
+    """NULL travels as None, so "never allocated" stays distinguishable from
+    "allocated nothing" all the way to the page's Load-last button."""
     set_managed_label(account_id, 'ARK26', target_pct=60.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     account = _AllocAccount(account_id, {'manual_trading_enabled': True},
                             positions=[], prices={'AAPL': 100.0})
     _use_account(monkeypatch, account)
 
-    _base, labels, _frac, _values, _pos, _reserve = page._load_flow_inputs(
+    _base, labels, _frac, _reserve = page._load_flow_inputs(
         account_id, VALUATION_MODE_MARKET)
 
     assert labels[0].previous_target_pct is None
     assert labels[0].symbols[0].previous_weight_pct is None
 
 
-def test_the_flow_hands_the_wizard_each_symbols_current_value(monkeypatch, account_id):
-    """Step 1 and step 2 show "now $X" beside every target. Under the account's
-    valuation mode, which since W1 is MARKET -- 10 shares at 250 is 2,500, not the
-    1,000 they cost."""
+def test_the_flow_no_longer_computes_the_dialogs_display_only_maps(monkeypatch,
+                                                                   account_id):
+    """``symbol_values`` and ``positions`` existed for the wizard's step-1/step-2
+    captions and had no other consumer. Those captions are on the PAGE now, built
+    from ``_load_view_payload``'s own read, so a display-only value threaded
+    through the SOLVE path is a passenger waiting to be mistaken for an input."""
+    import inspect as _inspect
+
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     account = _AllocAccount(account_id, {'manual_trading_enabled': True},
@@ -1813,44 +1872,11 @@ def test_the_flow_hands_the_wizard_each_symbols_current_value(monkeypatch, accou
                             prices={'AAPL': 250.0})
     _use_account(monkeypatch, account)
 
-    _base, _labels, _frac, symbol_values, _pos, _reserve = page._load_flow_inputs(
-        account_id, VALUATION_MODE_MARKET)
+    loaded = page._load_flow_inputs(account_id, VALUATION_MODE_MARKET)
 
-    assert symbol_values == {'AAPL': 2_500.0}
-
-
-def test_the_flow_values_the_same_book_at_cost_when_that_is_the_mode(monkeypatch,
-                                                                    account_id):
-    set_managed_label(account_id, 'ARK26', target_pct=100.0)
-    add_label_to_instruments(['AAPL'], 'ARK26')
-    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
-                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
-                            prices={'AAPL': 250.0})
-    _use_account(monkeypatch, account)
-
-    _base, _labels, _frac, symbol_values, _pos, _reserve = page._load_flow_inputs(
-        account_id, VALUATION_MODE_COST)
-
-    assert symbol_values == {'AAPL': 1_000.0}
-
-
-def test_the_flow_passes_the_current_values_into_the_steps_dialog(
-        monkeypatch, nicegui_client, account_id):
-    set_managed_label(account_id, 'ARK26', target_pct=100.0)
-    add_label_to_instruments(['AAPL'], 'ARK26')
-    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
-                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
-                            prices={'AAPL': 250.0})
-    _use_account(monkeypatch, account)
-    _capture_notifications(monkeypatch)
-    steps = {}
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
-
-    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
-        account_id, VALUATION_MODE_MARKET, _noop_refresh))
-
-    assert steps['symbol_values'] == {'AAPL': 2_500.0}
+    assert len(loaded) == 4
+    assert 'symbol_values' not in _inspect.getsource(page._load_flow_inputs).split(
+        '"""')[2]
 
 
 # ---------------------------------------------------------------------------
@@ -2339,13 +2365,33 @@ def test_the_symbol_table_shows_a_target_percentage_and_a_target_value(nicegui_c
     assert table.rows[0]['target_value'] == 4_000.0
 
 
-def test_a_symbol_with_no_target_shows_a_blank_rather_than_a_zero(nicegui_client):
+def test_a_symbol_with_no_saved_target_shows_its_ACTUAL_share(nicegui_client):
+    """It used to show a blank, and before that the fair share. The lone member of
+    a label holds all of it."""
     from nicegui import ui
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
 
     positions = positions_by_symbol([_pos('AAPL', 10, 1000.0, 2500.0)])
     view = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
                              positions, {'AAPL': 250.0},
+                             valuation_mode=VALUATION_MODE_MARKET)[0]
+    with nicegui_client:
+        page._render_label_body(1, view, _noop_refresh)
+        table = next(el for el in nicegui_client.layout.descendants()
+                     if isinstance(el, ui.table))
+
+    assert table.rows[0]['weight_pct'] == 100.0
+
+
+def test_an_UNMEASURABLE_symbol_still_shows_a_blank_rather_than_a_zero(nicegui_client):
+    """The blank did not go away, it moved to the case that still needs it: a
+    price outage may not quietly write 0%, which is an instruction to sell out."""
+    from nicegui import ui
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
+
+    positions = positions_by_symbol([_pos('DARK', 10, 1000.0, None)])
+    view = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['DARK']},
+                             positions, {'DARK': None},
                              valuation_mode=VALUATION_MODE_MARKET)[0]
     with nicegui_client:
         page._render_label_body(1, view, _noop_refresh)
@@ -2380,9 +2426,9 @@ def test_the_page_feeds_the_stored_symbol_weights_into_the_view(monkeypatch,
 # W8: the editable reserve, end to end through the page's own glue.
 # ---------------------------------------------------------------------------
 
-def test_the_flow_hands_the_wizard_the_stored_reserve(monkeypatch, account_id):
-    """``_load_flow_inputs`` is the only place it can reach the dialog. Without it
-    the box opens at 0 and the first Continue silently deploys the cash."""
+def test_the_flow_solves_against_the_stored_reserve(monkeypatch, account_id):
+    """``_load_flow_inputs`` is the only place it can reach the solve. Without it
+    every run silently deploys the cash the page is holding back."""
     from ba2_trade_platform.core.portfolio_allocation_store import set_allocation_config
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
@@ -2432,17 +2478,19 @@ def test_solve_plan_in_invest_mode_ignores_the_reserve_entirely(monkeypatch, acc
     assert plan.reserved_pct == 0.0
 
 
-def test_continue_persists_the_reserve_the_user_typed(monkeypatch, nicegui_client,
-                                                     account_id):
-    """CONTINUE is what "last" means on this page, and the reserve is one of the
-    numbers the run was launched with -- so it is written beside the targets and
-    the fractional switch, through the page's own real closures."""
-    from ba2_trade_platform.core.portfolio_allocation_store import get_allocation_config
+def test_the_run_keeps_the_reserve_the_page_saved(monkeypatch, nicegui_client,
+                                                  account_id):
+    """The reserve is one of the numbers the run was launched with, so it is still
+    written beside the targets and the fractional switch -- and since the box is
+    on the page, what it writes is what the page already stored."""
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        get_allocation_config, set_allocation_config)
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
+    set_allocation_config(account_id, unallocated_pct=20.0)
 
-    _drive_to_continue(monkeypatch, nicegui_client, account_id, unallocated_pct=20.0)
+    _drive_the_flow(monkeypatch, nicegui_client, account_id)
 
     assert get_allocation_config(account_id).unallocated_pct == 20.0
 
@@ -2460,33 +2508,32 @@ def test_an_invest_run_never_writes_a_reserve(monkeypatch, nicegui_client, accou
     set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
     set_allocation_config(account_id, unallocated_pct=25.0)
 
-    _drive_to_continue(monkeypatch, nicegui_client, account_id,
-                       mode=ALLOCATION_MODE_INVEST_LABEL, scope_label='ARK26',
-                       amount=500.0, unallocated_pct=0.0)
+    _drive_the_flow(monkeypatch, nicegui_client, account_id,
+                    mode=ALLOCATION_MODE_INVEST_LABEL, scope_label='ARK26',
+                    amount=500.0)
 
     assert get_allocation_config(account_id).unallocated_pct == 25.0
 
 
-def test_the_reserve_the_dialog_opens_with_is_the_stored_one(monkeypatch,
-                                                             nicegui_client, account_id):
-    """Pre-filled, not reset. A box that always opens at 0 makes the very first
-    Continue deploy a reserve the user set yesterday."""
+def test_the_reserve_the_run_solves_with_is_the_stored_one(monkeypatch,
+                                                           nicegui_client, account_id):
+    """Read back at the moment the dry run opens, not carried in a dialog. A run
+    that reset it to 0 would deploy a reserve the user set yesterday."""
     from ba2_trade_platform.core.portfolio_allocation_store import set_allocation_config
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     set_allocation_config(account_id, unallocated_pct=35.0)
 
-    steps = _drive_to_continue(monkeypatch, nicegui_client, account_id,
-                               unallocated_pct=35.0)
+    opened = _drive_the_flow(monkeypatch, nicegui_client, account_id)
 
-    assert steps['unallocated_pct'] == 35.0
+    assert opened['plan'].reserved_pct == 35.0
 
 
 def test_the_dry_run_the_wizard_receives_is_solved_with_the_reserve(
         monkeypatch, nicegui_client, account_id):
-    """The reserve has to survive the hop from the steps dialog into the plan the
-    user reviews. Continue records it on ``state``; ``_run_dry_run`` is the only
+    """The reserve has to survive the hop from the stored config into the plan the
+    user reviews. ``_load_flow_inputs`` reads it; ``_run_dry_run`` is the only
     thing that carries it into ``_solve_plan``."""
     account = _AllocAccount(account_id, {'manual_trading_enabled': True},
                             positions=[], prices={'AAPL': 100.0},
@@ -2517,58 +2564,6 @@ def test_the_wizards_refresh_re_solves_with_the_SAME_reserve(monkeypatch,
     assert plan.reserved_pct == 10.0
     assert plan.reserved_notional == 1_000.0
     assert plan.total_buy_value == 9_000.0
-
-
-# ---------------------------------------------------------------------------
-# Unrealised P&L: the wizard needs the POSITIONS, not just their current value.
-#
-# ``symbol_values`` is measured under the account's valuation mode, and in COST
-# mode that IS the cost basis -- so a P&L derived from it is 0.00 on every row.
-# The flow therefore hands the dialog the position states themselves.
-# ---------------------------------------------------------------------------
-
-def test_the_flow_hands_the_wizard_the_position_states_themselves(monkeypatch,
-                                                                 account_id):
-    """Quantity, cost basis and PRICE, separately -- which is the only shape from
-    which an unrealised P&L can be measured in either valuation mode."""
-    set_managed_label(account_id, 'ARK26', target_pct=100.0)
-    add_label_to_instruments(['AAPL'], 'ARK26')
-    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
-                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
-                            prices={'AAPL': 250.0})
-    _use_account(monkeypatch, account)
-
-    *_rest, positions, _reserve = page._load_flow_inputs(account_id, VALUATION_MODE_COST)
-
-    assert set(positions) == {'AAPL'}
-    assert positions['AAPL'].quantity == 10.0
-    assert positions['AAPL'].cost_basis == 1_000.0
-    # The LIVE quote, present even in COST mode -- without it the P&L would be
-    # blank on exactly the mode that most needs it.
-    assert positions['AAPL'].price == 250.0
-
-
-def test_the_flow_passes_the_positions_into_the_steps_dialog(monkeypatch,
-                                                             nicegui_client,
-                                                             account_id):
-    """The dialog is the only consumer, so an unwired map is an unwired feature."""
-    set_managed_label(account_id, 'ARK26', target_pct=100.0)
-    add_label_to_instruments(['AAPL'], 'ARK26')
-    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
-                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
-                            prices={'AAPL': 250.0})
-    _use_account(monkeypatch, account)
-    _capture_notifications(monkeypatch)
-    steps = {}
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
-
-    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
-        account_id, VALUATION_MODE_MARKET, _noop_refresh))
-
-    assert set(steps['positions']) == {'AAPL'}
-    assert steps['positions']['AAPL'].cost_basis == 1_000.0
-    assert steps['positions']['AAPL'].price == 250.0
 
 
 # ---------------------------------------------------------------------------
@@ -2732,7 +2727,7 @@ def _listener_types(element):
 
 
 def _views(labels, symbols_by_label, *, base=10_000.0, reserve=0.0, weights=None,
-           prices=None, positions=None):
+           prices=None, positions=None, previous_weights=None):
     """Build LabelViews the way ``_load_view_payload`` does, with live prices."""
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
 
@@ -2743,7 +2738,8 @@ def _views(labels, symbols_by_label, *, base=10_000.0, reserve=0.0, weights=None
     return build_label_views(labels, symbols_by_label, positions_by_symbol(book),
                              quotes, valuation_mode=VALUATION_MODE_MARKET,
                              base_notional=base, unallocated_pct=reserve,
-                             symbol_weights=weights)
+                             symbol_weights=weights,
+                             symbol_previous_weights=previous_weights)
 
 
 def _draw(client, account_id, views, *, base=10_000.0, buying_power=1_000.0,
@@ -3706,7 +3702,7 @@ def test_the_totals_footer_accounts_for_the_labels_and_the_reserve(nicegui_clien
                    weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
     root = _draw(nicegui_client, account_id, views, reserve=10.0)
 
-    footer = next(t for t in _texts(root) if 'Label targets total' in t)
+    footer = _marked(root, page.MARKER_ALLOCATION_FOOTER)[0]._text
     assert '100.00% of what the reserve leaves' in footer
     assert '90.00% of base' in footer
     assert '10.00% reserve' in footer
@@ -3722,9 +3718,7 @@ def test_the_totals_footer_turns_red_the_moment_the_labels_pass_100(nicegui_clie
                    weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
     root = _draw(nicegui_client, account_id, views)
 
-    from nicegui import ui
-    footer = next(el for el in root.descendants()
-                  if isinstance(el, ui.label) and 'Label targets total' in (el._text or ''))
+    footer = _marked(root, page.MARKER_ALLOCATION_FOOTER)[0]
     assert 'text-red-400' in footer._classes
 
 
@@ -3736,7 +3730,7 @@ def test_the_totals_footer_follows_an_inline_edit(nicegui_client, account_id):
 
     _drive_value(_target_box(root, 0), 100.0)
 
-    footer = next(t for t in _texts(root) if 'Label targets total' in t)
+    footer = _marked(root, page.MARKER_ALLOCATION_FOOTER)[0]._text
     assert '100.00% of what the reserve leaves' in footer
 
 
@@ -3748,7 +3742,7 @@ def test_the_totals_footer_follows_the_reserve(nicegui_client, account_id):
 
     _drive_value(_reserve_controls(root)[0], 40.0)
 
-    footer = next(t for t in _texts(root) if 'Label targets total' in t)
+    footer = _marked(root, page.MARKER_ALLOCATION_FOOTER)[0]._text
     assert '60.00% of base, + 40.00% reserve = 100.00% of base' in footer
 
 
@@ -4145,19 +4139,23 @@ def test_a_recomputed_target_value_is_rounded_to_cents(nicegui_client, account_i
     assert table.rows[0]['target_value'] == 1233.21          # 33.33% of 3,700
 
 
-def test_a_row_with_no_stored_or_default_weight_keeps_its_blank(nicegui_client,
-                                                                account_id):
+def test_an_unmeasurable_row_keeps_its_blank_through_a_RECOMPUTE(nicegui_client,
+                                                                 account_id):
     """``weight_pct is None`` means "there is no answer", and the recompute must
-    leave it alone rather than writing a 0.00 that reads as a decision."""
+    leave it alone rather than writing a 0.00 that reads as a decision.
+
+    One unpriced member blanks every UNSAVED share in the label -- the label's
+    total is the denominator and nobody knows it -- so editing the measurable one
+    gives it a saved target while its neighbour stays honestly blank.
+    """
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
-    # No ``symbol_weights`` at all, so every row's weight is None.
     views = build_label_views([ManagedLabel('ARK26', 100.0)],
-                              {'ARK26': ['AAPL', 'MSFT']},
+                              {'ARK26': ['AAPL', 'DARK']},
                               positions_by_symbol([_pos('AAPL', 10, 1000.0, 2500.0),
-                                                   _pos('MSFT', 10, 1000.0, 2500.0)]),
-                              {'AAPL': 250.0, 'MSFT': 250.0},
+                                                   _pos('DARK', 10, 1000.0, None)]),
+                              {'AAPL': 250.0, 'DARK': None},
                               valuation_mode=VALUATION_MODE_MARKET,
                               base_notional=10_000.0)
     root = _draw(nicegui_client, account_id, views)
@@ -4166,11 +4164,8 @@ def test_a_row_with_no_stored_or_default_weight_keeps_its_blank(nicegui_client,
 
     _emit(table, 'weightChange', ['AAPL', 60.0])
 
-    # AAPL now has a stored weight. MSFT still has NONE -- it is not silently
-    # zeroed, and it is no longer silently re-derived either: its cell stays blank
-    # until the user (or Fill 100%) puts a number in it.
     assert {r['symbol']: r['weight_pct'] for r in table.rows} == \
-        {'AAPL': 60.0, 'MSFT': None}
+        {'AAPL': 60.0, 'DARK': None}
 
 
 def test_an_edit_touches_the_EDITED_labels_own_map_and_no_others(nicegui_client,
@@ -4924,3 +4919,2026 @@ def test_the_Fill_100_group_keeps_the_LEFT_of_its_row_for_its_siblings(
 
     assert 'justify-end' not in ' '.join(row._classes)
     assert [el for el in row.descendants() if isinstance(el, ui.space)]
+
+
+# ---------------------------------------------------------------------------
+# THE SYMBOL INFO PANEL, WIRED INTO THE PAGE
+#
+# ``ui/components/symbol_info_panel.py`` shipped finished and UNREACHABLE: a
+# 1,000-line component, 83 tests of its own, and not one caller. These are the two
+# entry points that give it one -- an ⓘ on every symbol row, and Compare over a
+# ticked selection -- plus the two guards they share.
+#
+# THE DOUBLE. ``page.open_symbol_info`` is replaced rather than driven for real:
+# the panel fetches from FMP over the network, and no unit test here does that.
+# What the double does NOT relax is the CALL: it binds every one against the real
+# function's ``inspect.signature``, so a renamed keyword, a missing ``as_of`` or a
+# positional/keyword mix-up fails in this file instead of in a browser.
+#
+# THE CLOCK is frozen and is deliberately NOT today's date: ``as_of=date.today()``
+# asserted against ``date.today()`` is a tautology that would survive the page
+# passing any other clock at all.
+# ---------------------------------------------------------------------------
+
+from datetime import date as _date                             # noqa: E402
+
+#: The page's frozen "today". A Tuesday, and pointedly not the day these tests
+#: were written on.
+PANEL_AS_OF = _date(2026, 3, 17)
+
+
+def _panel_calls(monkeypatch):
+    """Record every ``open_symbol_info`` call, CHECKED against the real signature."""
+    import inspect
+    from ba2_trade_platform.ui.components.symbol_info_panel import (
+        open_symbol_info as real_open_symbol_info)
+
+    signature = inspect.signature(real_open_symbol_info)
+    opened = []
+
+    def _record(*args, **kwargs):
+        bound = signature.bind(*args, **kwargs)     # TypeError on a wrong call
+        bound.apply_defaults()
+        opened.append(dict(bound.arguments))
+        return object()
+
+    monkeypatch.setattr(page, 'open_symbol_info', _record)
+    return opened
+
+
+def _fmp_key(monkeypatch, value='FMP-TEST-KEY'):
+    """Answer the page's app-setting read, and record WHICH key it asked for."""
+    asked = []
+
+    def _get(key, default=None):
+        asked.append(key)
+        return value
+
+    monkeypatch.setattr(page, 'get_app_setting', _get)
+    return asked
+
+
+def _freeze_today(monkeypatch, day=PANEL_AS_OF):
+    """Freeze the page's own clock, so ``as_of`` is a value and not a tautology."""
+    class _FrozenDate(_date):
+        @classmethod
+        def today(cls):
+            return day
+
+    monkeypatch.setattr(page, 'date', _FrozenDate)
+    return day
+
+
+def _compare_button(root, index=0):
+    from nicegui import ui
+    buttons = [el for el in root.descendants()
+               if isinstance(el, ui.button) and el._props.get('label') == 'Compare']
+    assert buttons, 'no Compare button was drawn'
+    return buttons[index]
+
+
+def _tick(table, *symbols):
+    """Tick rows in the table's own checkbox selection, in the order given."""
+    by_symbol = {r['symbol']: r for r in table.rows}
+    table.selected = [by_symbol[s] for s in symbols]
+    return table
+
+
+# -- the ⓘ on every symbol row -----------------------------------------------
+
+def test_every_symbol_row_carries_an_info_control(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    table = _tables(root)[0]
+
+    assert 'info' in {c['name'] for c in table.columns}
+    assert 'body-cell-info' in table.slots
+    assert 'symbolInfo' in _listener_types(table)
+
+
+def test_the_info_control_emits_the_symbol_of_the_row_it_sits_in(nicegui_client,
+                                                                  account_id):
+    """``props.row.symbol``, not a value captured when the table was built. The
+    Vue template is the only thing that knows which row was clicked."""
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+
+    assert 'props.row.symbol' in _tables(root)[0].slots['body-cell-info'].template
+
+
+def test_the_info_icon_opens_the_panel_for_ITS_OWN_row(monkeypatch, nicegui_client,
+                                                        account_id):
+    """THE late-binding test. Three rows are drawn and EACH is clicked in turn: a
+    handler that closed over the render loop's variable, or over the label's symbol
+    list, opens the last symbol every time and passes a one-row test."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+    table = _tables(root)[0]
+
+    for symbol in ('AAPL', 'MSFT', 'TSLA'):
+        _emit(table, 'symbolInfo', [symbol])
+
+    assert [call['symbols'] for call in opened] == [['AAPL'], ['MSFT'], ['TSLA']]
+
+
+def test_the_info_control_says_what_it_will_show(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-info'].template
+
+    assert 'Holdings, dividends and total return' in template
+
+
+def test_every_label_gets_its_own_info_column(nicegui_client, account_id):
+    """One table per label, so one wiring per label -- exactly as ``weightChange``
+    and ``commentChange`` are wired."""
+    views = _views([ManagedLabel('A', 50.0), ManagedLabel('B', 50.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT']},
+                   weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
+    root = _draw(nicegui_client, account_id, views)
+
+    assert all('symbolInfo' in _listener_types(t) for t in _tables(root))
+
+
+# -- Compare, over the ticked rows -------------------------------------------
+
+def test_every_label_gets_its_own_Compare_button(nicegui_client, account_id):
+    views = _views([ManagedLabel('A', 50.0), ManagedLabel('B', 50.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT']},
+                   weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
+    root = _draw(nicegui_client, account_id, views)
+
+    from nicegui import ui
+    assert len([el for el in root.descendants()
+                if isinstance(el, ui.button)
+                and el._props.get('label') == 'Compare']) == 2
+
+
+def test_Compare_passes_every_ticked_symbol_IN_ORDER(monkeypatch, nicegui_client,
+                                                      account_id):
+    """All of them, and in the order the table hands them over -- the comparison
+    columns are laid out left to right in exactly that order."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+    _tick(_tables(root)[0], 'TSLA', 'AAPL', 'MSFT')
+
+    _press(_compare_button(root))
+
+    assert [call['symbols'] for call in opened] == [['TSLA', 'AAPL', 'MSFT']]
+
+
+def test_Compare_reads_the_SAME_ticked_rows_the_remove_button_does(
+        monkeypatch, nicegui_client, account_id):
+    """One selection mechanism, not two. The checkbox column already exists
+    (``selection='multiple'``) and "Remove selected from label" already reads it."""
+    from ba2_trade_platform.core.utils import get_symbols_by_label
+    from nicegui import ui
+
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT', 'TSLA'], 'ARK26')
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+    _tick(_tables(root)[0], 'MSFT')
+
+    _press(_compare_button(root))
+    remove = [el for el in root.descendants()
+              if isinstance(el, ui.button)
+              and el._props.get('label') == 'Remove selected from label'][0]
+    _press(remove)
+
+    assert [call['symbols'] for call in opened] == [['MSFT']]
+    assert get_symbols_by_label(['ARK26'])['ARK26'] == ['AAPL', 'TSLA']
+
+
+def test_ONE_reader_of_the_ticked_rows_serves_BOTH_buttons():
+    """Survivor: ``_remove_selected`` going back to its own inline
+    ``table.selected`` read.
+
+    Behaviourally identical today, which is exactly why it needs saying: two
+    readers of one selection is how the two buttons come to disagree about what
+    "selected" means -- an ``or []`` on one side, a ``.get('symbol')`` on the
+    other. There is one reader, and neither caller touches ``table.selected``.
+    """
+    import inspect
+    source = inspect.getsource(page._render_label_body)
+
+    assert source.count('_selected_symbols(') == 2, source.count('_selected_symbols(')
+    assert 'table.selected' not in source
+
+
+def test_Compare_never_reaches_into_ANOTHER_labels_selection(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    """Two labels, two tables, two selections. A Compare wired to "the first table"
+    rather than to its own would open B's tick from A's button."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    sent = _capture_notifications(monkeypatch)
+    views = _views([ManagedLabel('A', 50.0), ManagedLabel('B', 50.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT']},
+                   weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
+    root = _draw(nicegui_client, account_id, views)
+    _tick(_tables(root)[1], 'MSFT')
+
+    _press(_compare_button(root, 0))
+    assert opened == []
+    assert any('at least one symbol' in m.lower() for m, _t in sent)
+
+    _press(_compare_button(root, 1))
+    assert [call['symbols'] for call in opened] == [['MSFT']]
+
+
+def test_Compare_with_nothing_ticked_says_so_and_opens_NOTHING(monkeypatch,
+                                                                nicegui_client,
+                                                                account_id):
+    """A dialog titled "Symbol info — " over an empty comparison is worse than a
+    refusal: it looks like the fetch failed."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+
+    _press(_compare_button(root))
+
+    assert opened == []
+    assert ('Select at least one symbol first', 'warning') in sent
+
+
+def test_Compare_sits_with_the_harmless_buttons_and_not_beside_Remove(
+        nicegui_client, account_id):
+    """The row is "harmless actions | space | the one that deletes things", and it
+    is sized for the wizard's step-2 siblings still to come. Compare is a READ; it
+    belongs on the left of the space, not wedged against the destructive button."""
+    from nicegui import ui
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    row = _fill_button(root).parent_slot.parent
+    children = list(row.default_slot.children)
+    names = [c._props.get('label', type(c).__name__) for c in children]
+    space_at = next(i for i, c in enumerate(children) if isinstance(c, ui.space))
+
+    assert names.index('Compare') < space_at, names
+    assert space_at < names.index('Remove selected from label'), names
+
+
+# -- the two guards, shared by both entry points -----------------------------
+
+def test_a_missing_FMP_key_stops_the_INFO_ICON_and_says_where_to_set_it(
+        monkeypatch, nicegui_client, account_id):
+    """No silent no-op and no crash: the panel's every figure comes from FMP, so
+    with no key there is nothing to show and a reason worth printing."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch, value=None)
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert opened == []
+    assert any('FMP_API_KEY' in m and 'Settings' in m for m, _t in sent), sent
+    assert [t for _m, t in sent] == ['warning']
+
+
+def test_a_missing_FMP_key_stops_COMPARE_too(monkeypatch, nicegui_client, account_id):
+    """ONE helper behind both entry points -- the guards cannot drift apart."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch, value=None)
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+    _tick(_tables(root)[0], 'AAPL')
+
+    _press(_compare_button(root))
+
+    assert opened == []
+    assert any('FMP_API_KEY' in m for m, _t in sent), sent
+
+
+def test_a_BLANK_FMP_key_is_a_missing_one(monkeypatch, nicegui_client, account_id):
+    """The Settings page stores what was typed; an empty box is an empty string,
+    and ``get_app_setting`` returns it rather than None."""
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch, value='')
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert opened == []
+    assert any('FMP_API_KEY' in m for m, _t in sent), sent
+
+
+def test_the_missing_key_is_reported_even_when_nothing_is_ticked(monkeypatch,
+                                                                  nicegui_client,
+                                                                  account_id):
+    """Which is the actionable half: ticking a row would not have helped."""
+    _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch, value=None)
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _press(_compare_button(root))
+
+    assert any('FMP_API_KEY' in m for m, _t in sent), sent
+
+
+# -- what the panel is actually handed ---------------------------------------
+
+def test_the_page_reads_the_key_the_SETTINGS_page_writes(monkeypatch, nicegui_client,
+                                                          account_id):
+    asked = _fmp_key(monkeypatch)
+    _panel_calls(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert asked == ['FMP_API_KEY']
+
+
+def test_the_key_really_comes_from_the_app_settings_ROW(monkeypatch, nicegui_client,
+                                                         account_id):
+    """No stub on ``get_app_setting`` here. The row the Settings page writes is the
+    row this page has to read, and only an unstubbed read proves the two agree."""
+    from ba2_trade_platform.core.db import add_instance
+    from ba2_trade_platform.core.models import AppSetting
+
+    add_instance(AppSetting(key='FMP_API_KEY', value_str='ROW-KEY'))
+    opened = _panel_calls(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert [call['api_key'] for call in opened] == ['ROW-KEY']
+
+
+def test_no_app_settings_row_at_all_is_a_refusal_not_a_crash(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    """Unstubbed again, against an empty settings table."""
+    opened = _panel_calls(monkeypatch)
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert opened == []
+    assert any('FMP_API_KEY' in m for m, _t in sent), sent
+
+
+def test_the_panel_is_given_the_pages_own_clock_and_the_key(monkeypatch,
+                                                             nicegui_client,
+                                                             account_id):
+    """``as_of`` is REQUIRED by the panel and is the only clock it has."""
+    day = _freeze_today(monkeypatch)
+    opened = _panel_calls(monkeypatch)
+    _fmp_key(monkeypatch)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'symbolInfo', ['AAPL'])
+
+    assert opened[0]['as_of'] == day
+    assert opened[0]['api_key'] == 'FMP-TEST-KEY'
+
+
+def test_the_panel_is_NOT_built_while_the_page_renders(monkeypatch, nicegui_client,
+                                                        account_id):
+    """It fetches from FMP -- one round trip per symbol. Building it at render time
+    would put that behind every refresh of this page, for every managed symbol."""
+    opened = _panel_calls(monkeypatch)
+    asked = _fmp_key(monkeypatch)
+
+    _draw(nicegui_client, account_id, _three_symbol_label(account_id))
+
+    assert opened == []
+    assert asked == []          # not even the key is read until something is clicked
+
+
+def test_the_panel_is_imported_directly_and_not_through_the_components_package():
+    """It is deliberately absent from ``ui/components/__init__.py`` so the eager
+    import graph does not grow -- the same convention as ``symbol_chart_data`` and
+    ``echart_theme``. Re-exporting it there would undo that."""
+    import inspect
+    import ba2_trade_platform.ui.components as components
+
+    assert not hasattr(components, 'open_symbol_info')
+    assert ('from ..components.symbol_info_panel import open_symbol_info'
+            in inspect.getsource(page))
+
+
+# ---------------------------------------------------------------------------
+# THE MIGRATION: the Allocate wizard's target-setting step moves onto the page
+#
+# Step 1 ("Rebalance - set targets") is gone. Everything that expresses INTENT is
+# here; the modal keeps only what commits. This section is the page half.
+#
+# GROUP 1: the per-row `last` target and the unrealised P&L. Both were only
+# readable inside the wizard's step 1 / step 2 captions, and once the boxes moved
+# onto the page the wizard was the only screen that could still answer "what did I
+# have here before".
+# ---------------------------------------------------------------------------
+
+def _label_with_history(account_id, *, previous_target=25.0,
+                        previous_weights=None):
+    return _views([ManagedLabel('ARK26', 40.0, previous_target_pct=previous_target)],
+                  {'ARK26': ['AAPL', 'MSFT']},
+                  weights={'ARK26': {'AAPL': 60.0, 'MSFT': 40.0}},
+                  previous_weights={'ARK26': dict(previous_weights or {})})
+
+
+def test_the_label_row_shows_the_target_the_last_run_used(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _label_with_history(account_id))
+    assert 'last 25.00%' in _texts(root)
+
+
+def test_a_label_with_no_history_shows_a_dash_and_never_a_zero(nicegui_client,
+                                                               account_id):
+    """"never allocated" and "last time this got nothing" are different facts."""
+    root = _draw(nicegui_client, account_id,
+                 _label_with_history(account_id, previous_target=None))
+    assert 'last -' in _texts(root)
+    assert 'last 0.00%' not in _texts(root)
+
+
+def test_the_label_row_shows_its_unrealised_pnl_in_money_and_percent(nicegui_client,
+                                                                     account_id):
+    """Two symbols bought for $1,000 each and worth $2,500 each: +$3,000, +150%."""
+    root = _draw(nicegui_client, account_id, _label_with_history(account_id))
+    assert 'P&L +3,000.00 (+150.00%)' in _texts(root)
+
+
+def test_the_label_pnl_is_coloured_as_an_accent_and_not_as_the_message(
+        nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _label_with_history(account_id))
+    pnl = [el for el in _marked(root, page.MARKER_LABEL_PNL)]
+    assert len(pnl) == 1
+    assert 'text-green-500' in ' '.join(pnl[0]._classes)
+
+
+def test_the_symbol_table_shows_the_weight_the_last_run_used(nicegui_client,
+                                                             account_id):
+    root = _draw(nicegui_client, account_id,
+                 _label_with_history(account_id,
+                                     previous_weights={'AAPL': 70.0}))
+    rows = _table_rows(root)
+    assert rows['AAPL']['previous_weight_pct'] == 70.0
+    assert rows['MSFT']['previous_weight_pct'] is None
+
+
+def test_the_symbol_table_carries_a_last_and_a_pnl_column(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _label_with_history(account_id))
+    names = {c['name'] for c in _tables(root)[0].columns}
+    assert 'previous_weight_pct' in names
+    assert 'pnl' in names
+
+
+def test_the_symbol_table_shows_each_rows_pnl_in_money_and_percent(nicegui_client,
+                                                                   account_id):
+    root = _draw(nicegui_client, account_id, _label_with_history(account_id))
+    assert _table_rows(root)['AAPL']['pnl'] == '+1,500.00 (+150.00%)'
+
+
+def test_the_page_reads_the_previous_generation_out_of_the_store(monkeypatch,
+                                                                 account_id):
+    """End to end: the numbers the last RUN was launched with, not the current ones.
+
+    ``save_allocation_targets`` is the only writer of the previous generation, and
+    it shifts on a CHANGE -- so writing 40 over a stored 25 is what puts 25 behind
+    "last".
+    """
+    from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        save_allocation_targets)
+
+    set_managed_label(account_id, 'ARK26', target_pct=25.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=70.0)
+    save_allocation_targets(account_id, [LabelTarget(
+        'ARK26', 40.0, [SymbolTarget('AAPL', 100.0)])])
+    _use_account(monkeypatch, _Account(account_id,
+                                       positions=[_pos('AAPL', 10, 1000.0, 2500.0)],
+                                       prices={'AAPL': 250.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+    view = payload['views'][0]
+    assert view.previous_target_pct == 25.0
+    assert view.rows[0].previous_weight_pct == 70.0
+
+
+def test_the_migrated_last_figure_is_NOT_restated_against_the_gross_base(
+        nicegui_client, account_id):
+    """The wizard's step-1 caption read "now X (Y% of base) - target Z% of base".
+
+    Moving that wording across would reintroduce exactly the confusion the
+    2026-08-25 rework removed: the page treats the INVESTABLE pool as 100% and the
+    of-base figure is the parenthetical "(real N%)". A stored target is typed on
+    the investable basis, so ``last`` needs no restating at all.
+    """
+    root = _draw(nicegui_client, account_id,
+                 _label_with_history(account_id), reserve=10.0)
+    # The LABEL ROW only. The reserve line above it is deliberately still of-base
+    # -- it IS the part held back -- and restating it against what it leaves would
+    # be circular, so a whole-page text search would be asserting the wrong thing.
+    row = ' '.join(_texts(_marked(root, page.MARKER_BAR_ROW)[0]))
+
+    assert 'last 25.00%' in row
+    assert 'of base' not in row
+    assert 'of investable' in ' '.join(_expansion_headers(root))
+
+
+# ---------------------------------------------------------------------------
+# GROUP 2: the LABEL-LEVEL button group -- "Even split" and "Load last"
+#
+# The wizard's step 1 owned these. They are on the page now, above the list they
+# rewrite, and they persist on press like everything else here: this page has no
+# Save button and cannot have one (switching the global account hard-reloads the
+# document).
+# ---------------------------------------------------------------------------
+
+def _marked_buttons(root, marker):
+    from nicegui import ui
+    return [el for el in _marked(root, marker) if isinstance(el, ui.button)]
+
+
+def _label_targets_now(account_id):
+    return {row.label: row.target_pct for row in get_managed_labels(account_id)}
+
+
+def _two_labels(account_id, *, a=70.0, b=30.0, previous=(None, None)):
+    for name, target in (('ARK26', a), ('TECH', b)):
+        set_managed_label(account_id, name, target_pct=target)
+    return _views([ManagedLabel('ARK26', a, previous_target_pct=previous[0]),
+                   ManagedLabel('TECH', b, previous_target_pct=previous[1])],
+                  {'ARK26': ['AAPL'], 'TECH': ['MSFT']},
+                  weights={'ARK26': {'AAPL': 100.0}, 'TECH': {'MSFT': 100.0}})
+
+
+def test_the_page_offers_a_label_level_even_split_and_load_last(nicegui_client,
+                                                                account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    assert len(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)) == 1
+    assert len(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)) == 1
+
+
+def test_the_label_even_split_writes_100_across_every_label_and_persists_it(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 50.0, 'TECH': 50.0}
+
+
+def test_the_label_even_split_uses_the_engines_own_splitter(monkeypatch,
+                                                            nicegui_client,
+                                                            account_id):
+    """Three ways is 33.33 / 33.33 / 33.34, remainder on the LAST label."""
+    _capture_notifications(monkeypatch)
+    for name in ('A', 'B', 'C'):
+        set_managed_label(account_id, name, target_pct=0.0)
+    views = _views([ManagedLabel('A', 0.0), ManagedLabel('B', 0.0),
+                    ManagedLabel('C', 0.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT'], 'C': ['TSLA']},
+                   positions=[], prices={'AAPL': 1.0, 'MSFT': 1.0, 'TSLA': 1.0})
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    stored = _label_targets_now(account_id)
+    assert sum(stored.values()) == 100.0
+    assert stored == {'A': 33.33, 'B': 33.33, 'C': 33.34}
+
+
+def test_the_label_even_split_redraws_the_boxes_rather_than_leaving_them_stale(
+        monkeypatch, nicegui_client, account_id):
+    """A ``ui.number`` does not follow the object it was built from, so a silent
+    model change leaves the user typing over numbers the database does not have."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    assert sorted(n.value for n in _numbers(root)
+                  if n._props.get('label') == 'Portfolio target %') == [50.0, 50.0]
+
+
+def test_the_label_even_split_moves_every_bar_and_the_totals_footer(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    targets = [el._text for el in _marked(root, page.MARKER_BAR_ROW)
+               for el in el.descendants() if (el._text or '').startswith('tgt ')]
+    assert targets == ['tgt 50.0%', 'tgt 50.0%']
+    assert 'Label targets total 100.00%' in ' '.join(_texts(root))
+
+
+def test_the_label_even_split_leaves_the_cash_reserve_alone(monkeypatch,
+                                                            nicegui_client,
+                                                            account_id):
+    """The labels divide what the reserve LEAVES, so an even split of anything but
+    the whole 100 would produce a set the submit gate refuses."""
+    _capture_notifications(monkeypatch)
+    set_allocation_config(account_id, unallocated_pct=10.0)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id), reserve=10.0)
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 50.0, 'TECH': 50.0}
+    assert get_allocation_config(account_id).unallocated_pct == 10.0
+
+
+def test_label_load_last_restores_the_targets_of_the_last_run(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, previous=(60.0, 40.0)))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 60.0, 'TECH': 40.0}
+
+
+def test_label_load_last_reads_the_PREVIOUS_generation_and_not_the_current_one(
+        monkeypatch, nicegui_client, account_id):
+    """Mutation: feed it the live targets. The button then reports success while
+    changing nothing, and the user believes their last allocation is back."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, a=70.0, b=30.0, previous=(10.0, 90.0)))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 10.0, 'TECH': 90.0}
+
+
+def test_label_load_last_leaves_a_label_with_no_history_where_it_is(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, previous=(60.0, None)))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 60.0, 'TECH': 30.0}
+
+
+def test_label_load_last_with_no_history_at_all_says_so_and_writes_nothing(
+        monkeypatch, nicegui_client, account_id):
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 70.0, 'TECH': 30.0}
+    assert any('nothing to load' in m for m, _t in sent)
+
+
+def test_the_label_buttons_never_shift_the_previous_generation(monkeypatch,
+                                                               nicegui_client,
+                                                               account_id):
+    """``save_allocation_targets`` is the ONE writer of the previous generation, and
+    these buttons are not it. A shift here would grind the real history away one
+    press at a time -- and would make Load last un-undoable, since pressing it
+    would immediately overwrite the very numbers it just restored."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, previous=(60.0, 40.0)))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    rows = {row.label: row.previous_target_pct
+            for row in get_managed_labels(account_id)}
+    assert rows == {'ARK26': None, 'TECH': None}
+
+
+def test_the_label_buttons_refuse_to_write_under_a_label_that_is_gone(
+        monkeypatch, nicegui_client, account_id):
+    """``set_managed_label`` CREATES the row it cannot find, so an unguarded write
+    would resurrect a label the user deleted -- holding money."""
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+    remove_managed_label(account_id, 'TECH')
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 50.0}
+    assert any('no longer managed' in m for m, _t in sent)
+
+
+# ---------------------------------------------------------------------------
+# GROUP 3: the PER-LABEL button group -- Even split / Fill rest / Load last / Wipe
+#
+# The wizard's step 2 owned these. They join ``Fill 100%`` and ``Compare`` in the
+# left-aligned group that was deliberately sized for them (346fdabb / cd3e1646),
+# on the harmless side of the ``ui.space()`` that separates them from Remove.
+# ---------------------------------------------------------------------------
+
+def _three_symbols(account_id, label='ARK26', weights=None, previous=None):
+    set_managed_label(account_id, label, target_pct=100.0)
+    return _views([ManagedLabel(label, 100.0)], {label: ['AAPL', 'MSFT', 'TSLA']},
+                  weights={label: dict(weights or {'AAPL': 33.33, 'MSFT': 33.33,
+                                                   'TSLA': 33.34})},
+                  previous_weights={label: dict(previous or {})})
+
+
+def _two_labelled_baskets(account_id, *, a_weights, b_weights):
+    for name in ('ARK26', 'TECH'):
+        set_managed_label(account_id, name, target_pct=50.0)
+    return _views([ManagedLabel('ARK26', 50.0), ManagedLabel('TECH', 50.0)],
+                  {'ARK26': ['AAPL', 'MSFT'], 'TECH': ['NVDA', 'AMD']},
+                  weights={'ARK26': dict(a_weights), 'TECH': dict(b_weights)})
+
+
+def _stored(account_id, label='ARK26', symbols=('AAPL', 'MSFT', 'TSLA')):
+    return get_symbol_weights(account_id, label, list(symbols))
+
+
+def test_every_label_gets_the_four_migrated_buttons(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 50.0, 'MSFT': 50.0},
+                                       b_weights={'NVDA': 50.0, 'AMD': 50.0}))
+
+    for marker in (page.MARKER_EVEN_SPLIT_SYMBOLS, page.MARKER_FILL_REST_SYMBOLS,
+                   page.MARKER_LOAD_LAST_SYMBOLS, page.MARKER_WIPE_SYMBOLS):
+        assert len(_marked_buttons(root, marker)) == 2, marker
+
+
+def test_the_symbol_even_split_writes_an_equal_share_and_persists_it(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 90.0, 'MSFT': 10.0, 'TSLA': 0.0}))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34}
+    assert _table_rows(root)['AAPL']['weight_pct'] == 33.33
+
+
+def test_fill_rest_fills_only_the_empty_slots_and_leaves_the_typed_ones_alone(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 30.0, 'MSFT': 0.0, 'TSLA': 0.0}))
+
+    _press(_marked_buttons(root, page.MARKER_FILL_REST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 30.0, 'MSFT': 35.0, 'TSLA': 35.0}
+
+
+def test_fill_rest_REFUSES_an_over_allocated_label_where_fill_100_scales_it(
+        monkeypatch, nicegui_client, account_id):
+    """The two buttons are not duplicates: one repairs a set, the other only fills
+    the gaps in one. A Fill rest that scaled would rewrite weights the user typed."""
+    sent = _capture_notifications(monkeypatch)
+    over = {'AAPL': 80.0, 'MSFT': 80.0, 'TSLA': 0.0}
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id, weights=over))
+
+    _press(_marked_buttons(root, page.MARKER_FILL_REST_SYMBOLS)[0])
+    assert get_symbol_rows(account_id, 'ARK26') == {}
+    assert any('nothing to fill' in m for m, _t in sent)
+
+    _press(_fill_button(root))
+    assert round(sum(_stored(account_id).values()), 2) == 100.0
+
+
+def test_symbol_load_last_restores_the_shares_of_the_last_run(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 90.0, 'MSFT': 5.0, 'TSLA': 5.0},
+                                previous={'AAPL': 10.0, 'MSFT': 10.0,
+                                          'TSLA': 80.0}))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 10.0, 'MSFT': 10.0, 'TSLA': 80.0}
+
+
+def test_symbol_load_last_reads_the_PREVIOUS_generation_not_the_live_one(
+        monkeypatch, nicegui_client, account_id):
+    """Mutation: hand it ``live['weights']``. The press then reports success and
+    changes nothing, which is the one failure this button cannot have."""
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 90.0, 'MSFT': 5.0, 'TSLA': 5.0},
+                                previous={'AAPL': 33.33, 'MSFT': 33.33,
+                                          'TSLA': 33.34}))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34}
+    assert any('restored' in m.lower() for m, _t in sent)
+
+
+def test_symbol_load_last_with_no_history_says_so_and_writes_nothing(
+        monkeypatch, nicegui_client, account_id):
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_SYMBOLS)[0])
+
+    assert get_symbol_rows(account_id, 'ARK26') == {}
+    assert any('nothing to load' in m for m, _t in sent)
+
+
+def test_wipe_clears_its_own_labels_shares_to_zero(monkeypatch, nicegui_client,
+                                                   account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 0.0, 'MSFT': 0.0, 'TSLA': 0.0}
+
+
+def test_wipe_clears_NOTHING_outside_its_own_label(monkeypatch, nicegui_client,
+                                                   account_id):
+    """The mutation: ``for label in live['weights']`` instead of the one label. The
+    user presses Wipe on one basket and every basket on the page empties."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 60.0, 'MSFT': 40.0},
+                                       b_weights={'NVDA': 70.0, 'AMD': 30.0}))
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+
+    assert _stored(account_id, 'ARK26', ('AAPL', 'MSFT')) == {'AAPL': 0.0,
+                                                              'MSFT': 0.0}
+    assert get_symbol_rows(account_id, 'TECH') == {}
+
+
+def test_each_migrated_button_writes_to_the_label_whose_row_it_sits_in(
+        monkeypatch, nicegui_client, account_id):
+    """The classic NiceGUI closure bug: without a default-argument capture every
+    button on the page rewrites the LAST label drawn."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 90.0, 'MSFT': 10.0},
+                                       b_weights={'NVDA': 70.0, 'AMD': 30.0}))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_SYMBOLS)[0])
+
+    assert _stored(account_id, 'ARK26', ('AAPL', 'MSFT')) == {'AAPL': 50.0,
+                                                              'MSFT': 50.0}
+    assert get_symbol_rows(account_id, 'TECH') == {}
+
+
+def test_the_SECOND_labels_button_writes_to_the_SECOND_label(monkeypatch,
+                                                             nicegui_client,
+                                                             account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 90.0, 'MSFT': 10.0},
+                                       b_weights={'NVDA': 70.0, 'AMD': 30.0}))
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[1])
+
+    assert get_symbol_rows(account_id, 'ARK26') == {}
+    assert _stored(account_id, 'TECH', ('NVDA', 'AMD')) == {'NVDA': 0.0, 'AMD': 0.0}
+
+
+def test_a_wipe_leaves_the_history_so_load_last_is_still_its_undo(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                previous={'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}))
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}
+
+
+def test_the_migrated_buttons_never_touch_the_labels_own_target(monkeypatch,
+                                                                nicegui_client,
+                                                                account_id):
+    """Shares WITHIN a label are a different denominator from the label's share of
+    the investable pool. A button that moved both would be mixing the two."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 100.0}
+
+
+def test_the_migrated_buttons_never_touch_the_cash_reserve(monkeypatch,
+                                                           nicegui_client,
+                                                           account_id):
+    _capture_notifications(monkeypatch)
+    set_allocation_config(account_id, unallocated_pct=15.0)
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id), reserve=15.0)
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_SYMBOLS)[0])
+
+    assert get_allocation_config(account_id).unallocated_pct == 15.0
+
+
+def test_a_migrated_button_refuses_to_write_under_an_unmanaged_label(
+        monkeypatch, nicegui_client, account_id):
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 90.0, 'MSFT': 5.0, 'TSLA': 5.0}))
+    remove_managed_label(account_id, 'ARK26')
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_SYMBOLS)[0])
+
+    assert get_symbol_rows(account_id, 'ARK26') == {}
+    assert any('no longer managed' in m for m, _t in sent)
+
+
+def test_the_migrated_buttons_read_the_SAME_live_map_the_inline_edit_writes(
+        monkeypatch, nicegui_client, account_id):
+    """One source of truth for what is on screen. If a button re-read the store it
+    would be blind to the edit the user just made, and the two would contradict
+    each other on every row."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+
+    _emit(_tables(root)[0], 'weightChange', ['AAPL', 0.0])      # 0 == EMPTY
+    _press(_marked_buttons(root, page.MARKER_FILL_REST_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34}
+
+
+def test_the_four_migrated_buttons_land_LEFT_of_the_space_beside_Fill_100(
+        nicegui_client, account_id):
+    """The group was sized for exactly these four siblings (346fdabb). Everything
+    constructive sits before the ``ui.space()``; only Remove is after it."""
+    from nicegui import ui
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+    row = _fill_button(root).parent_slot.parent
+
+    order = [el for el in row.descendants()
+             if isinstance(el, (ui.button, ui.space))]
+    captions = [el._props.get('label', '<space>') if isinstance(el, ui.button)
+                else '<space>' for el in order]
+    assert captions[:7] == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
+                            'Load current', 'Wipe', 'Compare']
+    assert captions[7] == '<space>'
+    assert captions[8] == 'Remove selected from label'
+
+
+# ---------------------------------------------------------------------------
+# GROUP 5: ONE SOURCE OF TRUTH, and the one execution control that stays
+#
+# The page and the wizard used to derive the same figures independently -- the
+# wizard's "target 13.50% of base" and the page's "tgt 13.5%" were one number
+# computed twice, on two denominators. There is one now, and these are the tests
+# that say so end to end: a target typed on the page is what the dry run solves
+# against, with no re-derivation in between.
+#
+# ``allow fractional shares`` is the ONE control left at the gate, because it
+# changes WHICH ORDERS are produced rather than what is being aimed at -- and
+# toggling it has to recompute the plan, not merely record a preference.
+# ---------------------------------------------------------------------------
+
+def _fractional_account(account_id, *, price=300.0):
+    """A book whose target does not land on a whole share: 100% of a 50,000 base
+    at 300 a share is 166.66 shares fractionally and 166 whole."""
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': price})
+    account.margin = {'AAPL': MarginInfo(symbol='AAPL', fractionable=True,
+                                         bp_factor=1.0)}
+    return account
+
+
+def test_a_target_typed_on_the_page_is_what_the_dry_run_solves_against(
+        monkeypatch, nicegui_client, account_id):
+    """The inline box writes ``portfolio_allocation_label.target_pct``;
+    ``_load_flow_inputs`` reads that same column back when the gate opens. Nothing
+    in between restates it, so 60% typed is 60% solved -- $30,000 of a $50,000
+    base, not the $50,000 an un-read target would have deployed."""
+    set_managed_label(account_id, 'ARK26', target_pct=0.0)
+    set_managed_label(account_id, 'CASHY', target_pct=40.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    add_label_to_instruments(['MSFT'], 'CASHY')
+    # Saved shares: the book here is flat, and an unsaved share now defaults to
+    # the symbol's ACTUAL one, which on a flat book is a real 0%.
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    set_symbol_weight(account_id, 'CASHY', 'MSFT', weight_pct=100.0)
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0, 'MSFT': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 0.0), ManagedLabel('CASHY', 40.0)],
+                        {'ARK26': ['AAPL'], 'CASHY': ['MSFT']},
+                        weights={'ARK26': {'AAPL': 100.0},
+                                 'CASHY': {'MSFT': 100.0}}))
+    # The user types 60 into ARK26's box. Nothing else is touched.
+    box = [n for n in _numbers(root)
+           if n._props.get('label') == 'Portfolio target %'][0]
+    _drive_value(box, 60.0)
+    assert _label_targets_now(account_id)['ARK26'] == 60.0
+
+    opened = _drive_the_flow(monkeypatch, nicegui_client, account_id)
+
+    by_symbol = {r.symbol: r for r in opened['plan'].rows}
+    assert opened['plan'].base_notional == 50_000.0
+    assert by_symbol['AAPL'].target_notional == 30_000.0
+
+
+def test_the_dry_run_does_not_RE_DERIVE_the_target_it_was_given(monkeypatch,
+                                                                nicegui_client,
+                                                                account_id):
+    """The two screens print one number. Whatever the page's own header says the
+    label is aiming at, the plan aims at the same thing."""
+    from ba2_trade_platform.core.portfolio_allocation_store import set_allocation_config
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    set_allocation_config(account_id, unallocated_pct=10.0)
+
+    opened = _drive_the_flow(monkeypatch, nicegui_client, account_id)
+
+    # The page's own pure layer, asked the same question about the same account.
+    views = _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']},
+                   base=opened['plan'].base_notional, reserve=10.0,
+                   weights={'ARK26': {'AAPL': 100.0}})
+    assert views[0].target_value == opened['plan'].investable_notional
+    assert opened['plan'].rows[0].target_notional == views[0].target_value
+
+
+def test_toggling_the_fractional_switch_RE_SOLVES_the_plan(monkeypatch,
+                                                           nicegui_client,
+                                                           account_id):
+    """Not "a handler fired": the QUANTITIES change. 100% of a 50,000 base at 300 a
+    share is 166.66666 fractional shares and 166 whole ones, so the plan the user
+    is about to submit is a different plan."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from nicegui import ui
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    account = _fractional_account(account_id)
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+
+    opened = {}
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(opened['base'], opened['plan'],
+                                      market=opened['market'],
+                                      on_refresh=opened['on_refresh'],
+                                      on_submit=lambda p: None)
+        wizard.open()
+        before = wizard.plan.rows[0].delta_quantity
+        switch = [el for el in nicegui_client.layout.descendants()
+                  if isinstance(el, ui.switch)][0]
+        switch.set_value(False)
+        after = wizard.plan.rows[0].delta_quantity
+
+    assert before != after
+    assert before == pytest.approx(166.6666, abs=1e-3)
+    assert after == 166.0
+
+
+def test_the_re_solved_plan_is_what_SUBMIT_would_send(monkeypatch, nicegui_client,
+                                                      account_id):
+    """A toggle that redrew the table but left ``self.plan`` behind would show the
+    user one plan and submit another."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from nicegui import ui
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    _use_account(monkeypatch, _fractional_account(account_id))
+    _capture_notifications(monkeypatch)
+
+    opened, submitted = {}, []
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(opened['base'], opened['plan'],
+                                      market=opened['market'],
+                                      on_refresh=opened['on_refresh'],
+                                      on_submit=submitted.append)
+        wizard.open()
+        switch = [el for el in nicegui_client.layout.descendants()
+                  if isinstance(el, ui.switch)][0]
+        switch.set_value(False)
+        wizard._submit()
+
+    assert [r.delta_quantity for r in submitted[0].rows] == [166.0]
+
+
+def test_the_fractional_toggle_is_remembered_for_the_next_run(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    """It is the account's answer, not the dialog's. ``_on_refresh`` persists it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from nicegui import ui
+
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    _use_account(monkeypatch, _fractional_account(account_id))
+    _capture_notifications(monkeypatch)
+
+    opened = {}
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(opened['base'], opened['plan'],
+                                      market=opened['market'],
+                                      on_refresh=opened['on_refresh'],
+                                      on_submit=lambda p: None)
+        wizard.open()
+        switch = [el for el in nicegui_client.layout.descendants()
+                  if isinstance(el, ui.switch)][0]
+        switch.set_value(False)
+
+    assert get_allocation_config(account_id).allow_fractional is False
+
+
+def test_a_label_level_press_moves_the_VIEWS_before_it_pushes_the_BOXES(
+        monkeypatch, nicegui_client, account_id):
+    """Survivor of the mutation run: swapping those two loops.
+
+    A programmatic ``set_value`` fires the box's own change handler, and that
+    handler measures the incoming number against the OTHER labels AS THE VIEWS
+    CURRENTLY HOLD THEM. Push first and swapping 10/90 for 90/10 refuses the first
+    write for taking the set to 180%, then reverts the box to 10 over a database
+    that says 90 -- exactly the "a number the database does not have" defect
+    inline editing exists to remove.
+
+    The views move first, so every echo lands on a set that already adds to 100
+    and is absorbed by the compare-against-stored guard. Asserted at the MOMENT of
+    the push, because the echo itself is a coroutine NiceGUI drops without a
+    running loop -- so a test that only read the end state would pass either way.
+    """
+    sent = _capture_notifications(monkeypatch)
+    live_states, pushes = [], []
+    real_new_state, real_restore = page._new_live_state, page._restore_value
+    monkeypatch.setattr(page, '_new_live_state',
+                        lambda **kw: live_states.append(real_new_state(**kw))
+                        or live_states[-1])
+    monkeypatch.setattr(page, '_restore_value',
+                        lambda widget, value: pushes.append(
+                            (page._label_targets(live_states[-1]), value))
+                        or real_restore(widget, value))
+
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, a=10.0, b=90.0, previous=(90.0, 10.0)))
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 90.0, 'TECH': 10.0}
+    # The FIRST box is pushed into a page that already agrees with it.
+    assert pushes and pushes[0][0] == {'ARK26': 90.0, 'TECH': 10.0}
+    assert [value for _targets, value in pushes] == [90.0, 10.0]
+    assert not any('NOT saved' in m for m, _t in sent), sent
+
+
+# ---------------------------------------------------------------------------
+# THE COMMA, END TO END
+#
+# The live page renders share cells as "11,11", and Quasar hands the raw string
+# back on change. Stripping the comma as a grouping mark made "0,5" arrive as 5.0
+# -- in range, silently accepted, ten times what was typed.
+# ---------------------------------------------------------------------------
+
+def test_a_comma_decimal_typed_into_a_share_cell_is_stored_as_typed(
+        nicegui_client, account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'weightChange', ['AAPL', '26,78'])
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].weight_pct == 26.78
+
+
+def test_the_silently_accepted_comma_no_longer_stores_ten_times_the_share(
+        nicegui_client, account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    _emit(_tables(root)[0], 'weightChange', ['AAPL', '0,5'])
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].weight_pct == 0.5
+
+
+def test_the_share_cell_is_the_one_control_that_can_hand_back_a_RAW_string(
+        nicegui_client, account_id):
+    """Which is why the comma is a table-cell problem and not a page-wide one.
+
+    The label target and the reserve are ``ui.number``s: NiceGUI coerces their
+    model value and a comma never reaches the parser through them (a string put
+    into one raises inside ``Number._value_to_model_value``). The share cell is a
+    hand-written Quasar ``q-input`` in a table slot that emits whatever it is
+    holding, so it is the only widget on this page whose handler must survive
+    "26,78" -- and the parse is shared, so fixing it there fixed all three.
+    """
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    assert 'weightChange' in _listener_types(_tables(root)[0])
+    box = [n for n in _numbers(root)
+           if n._props.get('label') == 'Portfolio target %'][0]
+    with pytest.raises(Exception):
+        box.set_value('13,5')
+
+
+# ---------------------------------------------------------------------------
+# THE LABEL-TOTAL CARD, ON THE PAGE
+#
+# It was a sentence under the stat cards that only appeared when the set was
+# wrong. It is a card in the same row now, built from the SAME ``card_classes``
+# as "Managed labels" -- one card component, not two.
+#
+# REAL TIME means the DISPLAYED TOTAL recomputes as you type. It does NOT mean
+# targets recalculate: the user rejected auto-recalculation outright earlier in
+# this project, and nothing about this card may cause a re-solve, a re-plan or a
+# write beyond the one the edited box was already making.
+# ---------------------------------------------------------------------------
+
+def _card_titles(root):
+    return [el._text for el in _marked(root, page.MARKER_SUMMARY_ROW)[0].descendants()
+            if 'text-xs text-secondary-custom' in ' '.join(el._classes)
+            and el._text]
+
+
+def _total_card_texts(root, index=0):
+    """Every text under the "Managed labels" card, which now HOLDS the total bar."""
+    row = _marked(root, page.MARKER_TOTAL_BAR_ROW)[index]
+    return [el._text for el in row.parent_slot.parent.descendants() if el._text]
+
+
+def test_the_label_total_is_a_FILL_BAR_inside_the_managed_labels_card(
+        nicegui_client, account_id):
+    """Not a fourth card beside it: ONE card answering both halves of one question
+    -- how many labels, and how much of the pool they add up to."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=30.0))
+    rows = _marked(root, page.MARKER_TOTAL_BAR_ROW)
+
+    assert len(rows) == 1
+    assert len(_marked(root, page.MARKER_TOTAL_BAR_FILL)) == 1
+    # ...inside the summary row, and inside the card that carries the COUNT.
+    assert rows[0] in list(_marked(root, page.MARKER_SUMMARY_ROW)[0].descendants())
+    texts = _total_card_texts(root)
+    assert 'Managed labels' in texts and '2' in texts
+
+
+def test_the_total_bar_names_its_own_denominator(nicegui_client, account_id):
+    """Three bars on this page divide three different things."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    assert _view_mod().LABEL_TOTAL_BAR_CAPTION in _total_card_texts(root)
+
+
+def test_the_total_bar_FILLS_in_proportion_to_the_total(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=35.0))
+
+    assert _marked(root, page.MARKER_TOTAL_BAR_FILL)[0]._style['width'] == '75.00%'
+
+
+def test_the_summary_row_keeps_ONE_card_style(nicegui_client, account_id):
+    """A forked second style is how the row goes ragged again the next time any of
+    them is touched."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+    summary = _marked(root, page.MARKER_SUMMARY_ROW)[0]
+    cards = [el for el in summary.descendants()
+             if 'stat-card' in ' '.join(el._classes)]
+    styles = {' '.join(sorted(el._classes)) for el in cards}
+
+    assert len(cards) >= 3
+    assert len(styles) == 1, styles
+
+
+def test_the_total_bar_is_the_SAME_component_as_the_other_two(nicegui_client,
+                                                              account_id):
+    """Three scopes of one idea. Three tracks drawn three ways is three things for
+    the user to learn."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=245.50, reserve=10.0)
+
+    tracks = [el.parent_slot.parent for marker in (page.MARKER_TOTAL_BAR_FILL,
+                                                   page.MARKER_SYMBOL_BAR_FILL,
+                                                   page.MARKER_RESERVE_BAR_FILL)
+              for el in _marked(root, marker)]
+    assert len(tracks) == 3
+    assert {page.BAR_TRACK_STYLE.rstrip(';')} == {
+        ';'.join(f'{k}:{v}' for k, v in t._style.items()) for t in tracks}
+
+
+def test_the_total_bar_shows_the_figure_even_when_the_set_is_RIGHT(nicegui_client,
+                                                                    account_id):
+    """The old sentence appeared only when the set was wrong, so the running total
+    was missing at exactly the moment the user was typing towards it."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=30.0))
+
+    assert '100.00%' in _total_card_texts(root)
+
+
+def test_the_total_bar_carries_the_engines_shortfall_sentence(nicegui_client,
+                                                               account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=35.0))
+    texts = _total_card_texts(root)
+
+    assert '75.00%' in texts
+    assert any('under 100%' in t and 'Unallocated box' in t for t in texts)
+
+
+def test_the_total_bar_keeps_the_guidance_reachable_at_every_state(nicegui_client,
+                                                                    account_id):
+    """The "use the Unallocated box" clause rides inside the SHORTFALL sentence, so
+    it vanishes the moment the set is right or over. The tooltip carries it at
+    every state, which is when a user decides to leave a gap on purpose."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=30.0))
+    card = _marked(root, page.MARKER_TOTAL_BAR_ROW)[0].parent_slot.parent
+    tips = _tooltip_texts(card)
+
+    assert len(tips) == 1
+    assert 'Unallocated reserve' in tips[0]
+
+
+def test_the_total_bar_follows_an_inline_target_edit_IN_REAL_TIME(nicegui_client,
+                                                                   account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+    assert '70.00%' in _total_card_texts(root)
+
+    _drive_value(_target_box(root, 0), 70.0)
+
+    assert '100.00%' in _total_card_texts(root)
+    assert '70.00%' not in _total_card_texts(root)
+
+
+def test_the_total_bar_follows_the_label_level_EVEN_SPLIT(monkeypatch,
+                                                           nicegui_client,
+                                                           account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    assert '100.00%' in _total_card_texts(root)
+
+
+def test_the_total_bar_follows_the_label_level_LOAD_LAST(monkeypatch,
+                                                          nicegui_client,
+                                                          account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, a=40.0, b=30.0, previous=(60.0, 40.0)))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert '100.00%' in _total_card_texts(root)
+
+
+def test_the_total_bar_does_NOT_move_for_a_SYMBOL_level_press(monkeypatch,
+                                                               nicegui_client,
+                                                               account_id):
+    """Fill 100% and Wipe rewrite shares WITHIN a label; the label's own target is
+    a different denominator and does not move. The live readout for those is the
+    per-label symbol bar, not this card -- a card that twitched on a symbol edit
+    would be claiming the portfolio split had changed when it had not."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 30.0, 'MSFT': 0.0, 'TSLA': 0.0}))
+    before = _total_card_texts(root)
+
+    _press(_fill_button(root))
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+
+    assert _total_card_texts(root) == before
+
+
+def test_the_total_bars_verdict_is_COLOURED_by_its_severity(nicegui_client,
+                                                              account_id):
+    """Orange short, red over. An over-100 set is not reachable through the inline
+    box -- ``validate_label_target_edit`` refuses the keystroke -- but the DATABASE
+    can already hold one, written by the wizard before the boxes moved here, and
+    the card has to say so before the user presses Allocate."""
+    short = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+    assert 'text-orange-400' in ' '.join(
+        _marked(short, page.MARKER_TOTAL_BAR_DETAIL)[0]._classes)
+
+    over = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=48.0))
+    detail = _marked(over, page.MARKER_TOTAL_BAR_DETAIL)[-1]
+    assert 'text-red-400' in ' '.join(detail._classes)
+    assert '118.00%' in _total_card_texts(over, -1)
+
+
+def test_the_total_bars_verdict_goes_QUIET_once_the_set_is_right(nicegui_client,
+                                                                  account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+    detail = _marked(root, page.MARKER_TOTAL_BAR_DETAIL)[0]
+    assert 'text-orange-400' in ' '.join(detail._classes)
+
+    _drive_value(_target_box(root, 0), 70.0)
+
+    assert 'text-orange-400' not in ' '.join(detail._classes)
+    assert 'text-red-400' not in ' '.join(detail._classes)
+
+
+def test_editing_a_target_NEVER_re_solves_or_re_plans(monkeypatch, nicegui_client,
+                                                      account_id):
+    """The user rejected auto-recalculation. "Real time" is the DISPLAYED total
+    recomputing, not the plan being rebuilt behind them -- a page that quietly
+    solved on every keystroke would also be issuing broker calls per character."""
+    solves, opened = [], []
+    monkeypatch.setattr(page, '_solve_plan',
+                        lambda *a, **kw: solves.append(kw) or pytest.fail(
+                            'the page re-solved on an edit'))
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.append(kw))
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+
+    _drive_value(_target_box(root, 0), 70.0)
+
+    assert solves == [] and opened == []
+    assert '100.00%' in _total_card_texts(root)
+
+
+def test_editing_one_target_leaves_every_SIBLING_target_where_it_was(
+        nicegui_client, account_id):
+    """The other half of "no auto-recalculation": the card recomputes, the numbers
+    do not. Nothing may rebalance the siblings to make the total come out at 100."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
+
+    _drive_value(_target_box(root, 0), 55.0)
+
+    assert _label_targets_now(account_id) == {'ARK26': 55.0, 'TECH': 30.0}
+    assert '85.00%' in _total_card_texts(root)
+
+
+# ---------------------------------------------------------------------------
+# THE SHARE DEFAULT, END TO END: actual, not fair share
+# ---------------------------------------------------------------------------
+
+def test_the_page_defaults_an_unsaved_share_to_the_symbols_ACTUAL_share(
+        monkeypatch, account_id):
+    """The live screen showed nine symbols in one label all reading 11.11 while
+    their real shares were 26.78 / 22.19 / ... -- a target nobody chose, in a box
+    that trades."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT', 'TSLA'], 'ARK26')
+    _use_account(monkeypatch, _Account(
+        account_id,
+        positions=[_pos('AAPL', 10, 500.0, 5000.0), _pos('MSFT', 10, 300.0, 3000.0),
+                   _pos('TSLA', 10, 200.0, 2000.0)],
+        prices={'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert {r.symbol: r.weight_pct for r in payload['views'][0].rows} == {
+        'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}
+
+
+def test_the_page_no_longer_shows_the_FAIR_SHARE_default(monkeypatch, account_id):
+    """The exact number being removed: three unsaved symbols at 33.33 apiece."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT', 'TSLA'], 'ARK26')
+    _use_account(monkeypatch, _Account(
+        account_id,
+        positions=[_pos('AAPL', 10, 500.0, 5000.0), _pos('MSFT', 10, 300.0, 3000.0),
+                   _pos('TSLA', 10, 200.0, 2000.0)],
+        prices={'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert [r.weight_pct for r in payload['views'][0].rows] != [33.33, 33.33, 33.34]
+
+
+def test_a_SAVED_share_still_wins_over_the_actual_one(monkeypatch, account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=90.0)
+    _use_account(monkeypatch, _Account(
+        account_id,
+        positions=[_pos('AAPL', 1, 100.0, 100.0), _pos('MSFT', 10, 900.0, 900.0)],
+        prices={'AAPL': 100.0, 'MSFT': 90.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    by_symbol = {r.symbol: r for r in payload['views'][0].rows}
+    assert by_symbol['AAPL'].weight_pct == 90.0
+    assert by_symbol['AAPL'].weight_source == _view_mod().WEIGHT_SOURCE_SAVED
+    assert by_symbol['MSFT'].weight_source == _view_mod().WEIGHT_SOURCE_ACTUAL
+
+
+def test_a_saved_share_of_ZERO_is_not_mistaken_for_an_absent_row(monkeypatch,
+                                                                 account_id):
+    """The inverse mutation. Reading a stored 0.0 as "unsaved" would default it
+    back to the position's actual share -- buying back something the user sold out
+    of on purpose."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=0.0)
+    _use_account(monkeypatch, _Account(
+        account_id,
+        positions=[_pos('AAPL', 10, 5000.0, 5000.0), _pos('MSFT', 10, 5000.0, 5000.0)],
+        prices={'AAPL': 500.0, 'MSFT': 500.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+    by_symbol = {r.symbol: r for r in payload['views'][0].rows}
+
+    assert by_symbol['AAPL'].weight_pct == 0.0
+    assert by_symbol['AAPL'].weight_source == _view_mod().WEIGHT_SOURCE_SAVED
+
+
+def test_a_price_outage_cannot_quietly_zero_a_labels_targets(monkeypatch, account_id):
+    """The house bug, in the one place it would be most expensive: 0% is "hold
+    none of this" and the plan sells the whole position out."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'DARK'], 'ARK26')
+    _use_account(monkeypatch, _Account(
+        account_id,
+        positions=[_pos('AAPL', 10, 5000.0, 5000.0), _pos('DARK', 10, 1000.0, None)],
+        prices={'AAPL': 500.0, 'DARK': None}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert [r.weight_pct for r in payload['views'][0].rows] == [None, None]
+    assert {r.weight_source for r in payload['views'][0].rows} == {
+        _view_mod().WEIGHT_SOURCE_UNKNOWN}
+
+
+def test_a_symbol_that_is_genuinely_FLAT_defaults_to_a_real_zero(monkeypatch,
+                                                                 account_id):
+    """The inverse of the outage: nothing held is perfectly measurable. It must
+    not be reported as unknown, or the page would cry outage on every new symbol."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'CAS'], 'ARK26')
+    _use_account(monkeypatch, _Account(
+        account_id, positions=[_pos('AAPL', 10, 5000.0, 5000.0)],
+        prices={'AAPL': 500.0, 'CAS': 12.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+    by_symbol = {r.symbol: r for r in payload['views'][0].rows}
+
+    assert by_symbol['CAS'].weight_pct == 0.0
+    assert by_symbol['CAS'].weight_source == _view_mod().WEIGHT_SOURCE_ACTUAL
+
+
+def test_the_page_SAYS_why_a_share_is_showing_zero_rather_than_leaving_it_odd(
+        nicegui_client, account_id):
+    """Under fair share a newly added symbol would have been bought. Under actual
+    it sits at 0 and will not be -- which is correct, and has to be legible."""
+    views = _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL', 'CAS']},
+                   positions=[_pos('AAPL', 10, 5000.0, 5000.0)],
+                   prices={'AAPL': 500.0, 'CAS': 12.0})
+    root = _draw(nicegui_client, account_id, views)
+
+    assert _view_mod().SHARE_DEFAULT_NOTE in _texts(root)
+
+
+def test_the_solve_path_defaults_the_SAME_WAY_the_page_displays(monkeypatch,
+                                                                account_id):
+    """One source of truth, again. A page showing 50/30/20 while the plan solved
+    33.33/33.33/33.34 is the two-screens bug with a fresh coat of paint."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT', 'TSLA'], 'ARK26')
+    account = _AllocAccount(
+        account_id, {'manual_trading_enabled': True},
+        positions=[_held('AAPL', 10, 500.0, 5000.0), _held('MSFT', 10, 300.0, 3000.0),
+                   _held('TSLA', 10, 200.0, 2000.0)],
+        prices={'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0})
+    _use_account(monkeypatch, account)
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+    _base, labels, _frac, _reserve = page._load_flow_inputs(
+        account_id, VALUATION_MODE_MARKET)
+
+    assert {st.symbol: st.weight_pct for st in labels[0].symbols} == \
+        {r.symbol: r.weight_pct for r in payload['views'][0].rows}
+
+
+def test_every_label_gets_a_LOAD_CURRENT_button(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 50.0, 'MSFT': 50.0},
+                                       b_weights={'NVDA': 50.0, 'AMD': 50.0}))
+
+    assert len(_marked_buttons(root, page.MARKER_LOAD_CURRENT_SYMBOLS)) == 2
+
+
+def test_load_current_writes_the_actual_shares_and_persists_them(monkeypatch,
+                                                                 nicegui_client,
+                                                                 account_id):
+    _capture_notifications(monkeypatch)
+    views = _views([ManagedLabel('ARK26', 100.0)],
+                   {'ARK26': ['AAPL', 'MSFT', 'TSLA']},
+                   weights={'ARK26': {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34}},
+                   positions=[_pos('AAPL', 10, 500.0, 5000.0),
+                              _pos('MSFT', 10, 300.0, 3000.0),
+                              _pos('TSLA', 10, 200.0, 2000.0)],
+                   prices={'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0})
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_CURRENT_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}
+
+
+def test_load_current_writes_to_its_OWN_label_and_no_other(monkeypatch,
+                                                           nicegui_client,
+                                                           account_id):
+    """The closure bug and the all-labels bug in one: without the capture it
+    rewrites the LAST basket drawn, and a loop rewrites every one of them."""
+    _capture_notifications(monkeypatch)
+    for name in ('ARK26', 'TECH'):
+        set_managed_label(account_id, name, target_pct=50.0)
+    views = _views([ManagedLabel('ARK26', 50.0), ManagedLabel('TECH', 50.0)],
+                   {'ARK26': ['AAPL', 'MSFT'], 'TECH': ['NVDA', 'AMD']},
+                   weights={'ARK26': {'AAPL': 50.0, 'MSFT': 50.0},
+                            'TECH': {'NVDA': 50.0, 'AMD': 50.0}},
+                   positions=[_pos('AAPL', 10, 800.0, 8000.0),
+                              _pos('MSFT', 10, 200.0, 2000.0),
+                              _pos('NVDA', 10, 700.0, 7000.0),
+                              _pos('AMD', 10, 300.0, 3000.0)],
+                   prices={'AAPL': 800.0, 'MSFT': 200.0, 'NVDA': 700.0,
+                           'AMD': 300.0})
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_CURRENT_SYMBOLS)[0])
+
+    assert _stored(account_id, 'ARK26', ('AAPL', 'MSFT')) == {'AAPL': 80.0,
+                                                              'MSFT': 20.0}
+    assert get_symbol_rows(account_id, 'TECH') == {}
+
+
+def test_load_current_REFUSES_a_label_whose_value_cannot_be_measured(
+        monkeypatch, nicegui_client, account_id):
+    """A price outage may not rewrite real targets."""
+    sent = _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    views = _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL', 'DARK']},
+                   weights={'ARK26': {'AAPL': 60.0, 'DARK': 40.0}},
+                   positions=[_pos('AAPL', 10, 500.0, 5000.0),
+                              _pos('DARK', 10, 100.0, None)],
+                   prices={'AAPL': 500.0, 'DARK': None})
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_CURRENT_SYMBOLS)[0])
+
+    assert get_symbol_rows(account_id, 'ARK26') == {}
+    assert any('no current shares to load' in m for m, _t in sent)
+
+
+def test_load_current_joins_the_group_and_stays_on_the_harmless_side(nicegui_client,
+                                                                     account_id):
+    from nicegui import ui
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+    row = _fill_button(root).parent_slot.parent
+
+    captions = [el._props.get('label', '<space>') if isinstance(el, ui.button)
+                else '<space>' for el in row.descendants()
+                if isinstance(el, (ui.button, ui.space))]
+    assert captions == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
+                        'Load current', 'Wipe', 'Compare', '<space>',
+                        'Remove selected from label']
+
+
+# ---------------------------------------------------------------------------
+# THE TWO NEW BARS: the symbol-share total per label, and the reserve
+#
+# Both are the SAME component as the label header bar -- one track, one fill, one
+# notch, one tolerance band, one over/under vocabulary. Both update as their
+# numbers are edited, and neither recalculates anything.
+#
+# The per-label one is the SYMBOL shares summed within that label. The label's own
+# share of the portfolio already has a bar, in the panel header directly above it;
+# two bars, two denominators, and a caption on each says which.
+# ---------------------------------------------------------------------------
+
+def _bar_geometry(root, fill_marker, notch_marker, index=0):
+    fill = _marked(root, fill_marker)[index]
+    notch = _marked(root, notch_marker)[index]
+    return (fill._style.get('width'), notch._style.get('left'))
+
+
+def test_every_label_panel_gets_a_symbol_share_total_bar(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 50.0, 'MSFT': 50.0},
+                                       b_weights={'NVDA': 50.0, 'AMD': 50.0}))
+
+    assert len(_marked(root, page.MARKER_SYMBOL_BAR_FILL)) == 2
+    assert len(_marked(root, page.MARKER_SYMBOL_BAR_NOTCH)) == 2
+
+
+def test_the_symbol_bar_measures_the_shares_WITHIN_its_own_label(nicegui_client,
+                                                                 account_id):
+    """66.77% of 100, not a share of the portfolio and not a sum across labels."""
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 50.0), ManagedLabel('TECH', 50.0)],
+                        {'ARK26': ['AAPL', 'MSFT'], 'TECH': ['NVDA', 'AMD']},
+                        weights={'ARK26': {'AAPL': 40.0, 'MSFT': 26.77},
+                                 'TECH': {'NVDA': 50.0, 'AMD': 50.0}}))
+
+    assert '66.8%' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+    assert '100.0%' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[1])
+
+
+def test_the_symbol_bar_says_under_when_the_shares_do_not_reach_100(nicegui_client,
+                                                                    account_id):
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL', 'MSFT']},
+                        weights={'ARK26': {'AAPL': 40.0, 'MSFT': 35.0}}))
+
+    assert 'under by 25.0pp' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+
+def test_the_symbol_bar_FOLLOWS_an_inline_share_edit(nicegui_client, account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL', 'MSFT']},
+                        weights={'ARK26': {'AAPL': 40.0, 'MSFT': 35.0}}))
+    assert 'under by 25.0pp' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+    _emit(_tables(root)[0], 'weightChange', ['AAPL', 65.0])
+
+    assert 'on target' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+
+def test_the_symbol_bar_follows_FILL_100_and_WIPE(monkeypatch, nicegui_client,
+                                                  account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 30.0, 'MSFT': 0.0, 'TSLA': 0.0}))
+
+    _press(_fill_button(root))
+    assert 'on target' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+    assert 'under by 100.0pp' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+
+def test_the_symbol_bar_of_ONE_label_does_not_move_when_ANOTHER_is_edited(
+        monkeypatch, nicegui_client, account_id):
+    """Summing across labels instead of within one is the mutation this kills."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 40.0, 'MSFT': 35.0},
+                                       b_weights={'NVDA': 50.0, 'AMD': 50.0}))
+    before = _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[1])
+
+    _emit(_tables(root)[0], 'weightChange', ['AAPL', 65.0])
+
+    assert _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[1]) == before
+
+
+def test_an_unmeasurable_share_leaves_the_symbol_bar_without_a_verdict(
+        nicegui_client, account_id):
+    """A blank share is not a zero, so the total is unknown rather than short."""
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL', 'DARK']},
+                        positions=[_pos('AAPL', 10, 500.0, 5000.0),
+                                   _pos('DARK', 10, 100.0, None)],
+                        prices={'AAPL': 500.0, 'DARK': None}))
+    texts = _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+    assert '—' in texts
+    assert not any('under by' in t for t in texts)
+
+
+def test_the_unallocated_row_gets_a_bar_beside_its_sentence(nicegui_client,
+                                                            account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=245.50, reserve=10.0)
+
+    assert len(_marked(root, page.MARKER_RESERVE_BAR_FILL)) == 1
+    # ...and every word of the row is still there.
+    texts = _texts(root)
+    assert any('Unallocated (free buying power)' in t for t in texts)
+    assert _view_mod().RESERVE_BASIS_NOTE in texts
+
+
+def test_the_reserve_bar_reads_UNDER_when_the_cash_is_short_of_the_target(
+        nicegui_client, account_id):
+    """$245.50 free (4.7% of base) against a 10.00% target. The sub-line already
+    says raising the reserve generates sells; a bar reading "over" here would be
+    contradicting it in the same box."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=245.50, reserve=10.0)
+    texts = _texts(_marked(root, page.MARKER_RESERVE_BAR_ROW)[0])
+
+    assert any(t.startswith('under by ') for t in texts)
+    assert not any(t.startswith('over by ') for t in texts)
+
+
+def test_the_reserve_bar_FOLLOWS_the_reserve_control(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=245.50, reserve=10.0)
+    assert any(t.startswith('under by ')
+               for t in _texts(_marked(root, page.MARKER_RESERVE_BAR_ROW)[0]))
+
+    _drive_value(_reserve_controls(root)[0], 2.0)
+
+    texts = _texts(_marked(root, page.MARKER_RESERVE_BAR_ROW)[0])
+    assert any(t.startswith('over by ') for t in texts)
+
+
+def test_the_reserve_row_is_drawn_without_a_bar_when_there_is_no_base(
+        nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id),
+                 base=0.0, buying_power=None)
+
+    assert _marked(root, page.MARKER_RESERVE_BAR_FILL) == []
+
+
+def test_all_three_bars_share_one_track_style(nicegui_client, account_id):
+    """One component, one visual language. Three tracks drawn three ways is how a
+    page stops reading as one page."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=245.50, reserve=10.0)
+
+    tracks = [el.parent_slot.parent for marker in (page.MARKER_BAR_FILL,
+                                                   page.MARKER_SYMBOL_BAR_FILL,
+                                                   page.MARKER_RESERVE_BAR_FILL)
+              for el in _marked(root, marker)]
+    assert len(tracks) == 3
+    assert {page.BAR_TRACK_STYLE.rstrip(';')} == {
+        ';'.join(f'{k}:{v}' for k, v in t._style.items()) for t in tracks}
+
+
+# ---------------------------------------------------------------------------
+# THE MANAGE-LABELS DIALOG, after the user looked at it
+# ---------------------------------------------------------------------------
+
+def _picker(monkeypatch, nicegui_client, account_id, labels):
+    _capture_notifications(monkeypatch)
+    for name, color in labels.items():
+        set_managed_label(account_id, name, target_pct=0.0, color=color or '')
+        add_label_to_instruments(['AAPL'], name)
+    with nicegui_client:
+        page._open_label_picker(account_id, _noop_refresh)
+    return nicegui_client.layout
+
+
+def test_the_dialog_no_longer_repeats_the_colour_blindness_paragraph(
+        monkeypatch, nicegui_client, account_id):
+    """It was rendered once PER LABEL, so a dozen labels made the dialog mostly
+    that paragraph. The rationale stays in the code, where it explains why the
+    palette is what it is; the behaviour it described -- a hard-to-see colour is
+    flagged, not refused -- is self-evident when the flag appears."""
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_CARS': '#E69F00', 'WHEEL_L1_HR': None})
+    text = ' '.join(_texts(root))
+
+    assert 'Okabe' not in text
+    assert 'colour blindness' not in text
+    assert 'flagged, not' not in text
+
+
+def test_the_flagging_BEHAVIOUR_survives_the_deleted_copy(monkeypatch,
+                                                          nicegui_client,
+                                                          account_id):
+    """The paragraph went; the warning it described did not."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    sent = _capture_notifications(monkeypatch)
+    with nicegui_client:
+        page._render_color_choices(account_id, 'ARK26', None, lambda *_a: None)
+        _drive_value(_marked(nicegui_client.layout, page.MARKER_COLOR_CUSTOM)[0],
+                     '#101010')
+
+    assert get_managed_labels(account_id)[0].color == '#101010'
+    assert any('contrast' in m.lower() and t == 'warning' for m, t in sent)
+
+
+def test_every_label_block_in_the_dialog_starts_at_the_SAME_x(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    """The visible symptom: swatch rows indented differently between labels. A
+    fixed name column is what puts them on one grid."""
+    from nicegui import ui
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_ROBOT': '#E69F00', 'WHEEL_L1_HR': None,
+                    'X': '#0072B2'})
+    names = [el for el in root.descendants()
+             if isinstance(el, ui.label) and el._text in ('BAST_TECH_ROBOT',
+                                                          'WHEEL_L1_HR', 'X')]
+
+    assert len(names) == 3
+    widths = {(el._style or {}).get('width') for el in names}
+    # An explicit width, and the SAME one. Before this the names carried none at
+    # all -- which is also a set of size one, so the assertion has to say that a
+    # width exists or it passes on the broken layout it was written for.
+    assert len(widths) == 1, widths
+    assert widths != {None}
+    assert widths.pop().endswith('ch')
+
+
+def test_the_name_column_fits_the_longest_managed_label(monkeypatch,
+                                                        nicegui_client,
+                                                        account_id):
+    from nicegui import ui
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_ROBOT': None, 'X': None})
+    name = next(el for el in root.descendants()
+                if isinstance(el, ui.label) and el._text == 'BAST_TECH_ROBOT')
+
+    width = int((name._style or {})['width'].removesuffix('ch'))
+    assert width >= len('BAST_TECH_ROBOT')
+
+
+def test_the_dialog_is_wide_enough_for_a_whole_label_block(monkeypatch,
+                                                           nicegui_client,
+                                                           account_id):
+    """At 520px the block wrapped by a different amount per label, which is what
+    made the swatches overlap the next label's row."""
+    from nicegui import ui
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_ROBOT': None})
+    card = next(el for el in root.descendants()
+                if isinstance(el, ui.card) and any(
+                    c.startswith('min-w-[') for c in el._classes))
+    classes = ' '.join(card._classes)
+
+    assert 'min-w-[520px]' not in classes
+    assert 'max-w-[95vw]' in classes
+
+
+def test_the_dialog_lays_the_swatches_and_the_custom_field_on_ONE_line(
+        monkeypatch, nicegui_client, account_id):
+    """Inline in the dialog, stacked in the label row's menu -- the same chooser,
+    because a second one is how the two come to disagree."""
+    from nicegui import ui
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_ROBOT': None})
+    custom = _marked(root, page.MARKER_COLOR_CUSTOM)[0]
+
+    assert isinstance(custom.parent_slot.parent, ui.row)
+    assert 'shrink-0' in ' '.join(custom._classes)
+
+
+def test_the_custom_field_still_shows_a_live_hex(monkeypatch, nicegui_client,
+                                                 account_id):
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_ROBOT': '#F0E442'})
+    custom = _marked(root, page.MARKER_COLOR_CUSTOM)[0]
+
+    assert custom.value == '#F0E442'
+
+
+# -- the tag icon, and the two states that share one grey --------------------
+
+def test_the_label_rows_icon_and_bar_are_written_from_ONE_value(nicegui_client,
+                                                                account_id):
+    """Not two lookups of the same stored colour: one ``LabelBar.color``, painted
+    onto both in the same loop. The reported symptom was a yellow bar beside a
+    grey icon, with no way to tell which was right."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, color='#F0E442'))
+
+    icon_colour = (_row_icon(root)._style or {}).get('color', '')
+    assert _bar_fill(root)._style['background'].upper() in icon_colour.upper()
+
+
+def test_an_uncoloured_label_keeps_the_neutral_grey_on_BOTH(nicegui_client,
+                                                            account_id):
+    """"No colour chosen" is a real state, not a missing one."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    grey = _view_mod().DEFAULT_LABEL_ICON_COLOR
+
+    assert grey.lower() in (_row_icon(root)._style or {}).get('color', '').lower()
+    assert _bar_fill(root)._style['background'].upper() == grey.upper()
+
+
+def test_the_icons_tooltip_separates_NO_COLOUR_from_an_unreadable_one(
+        nicegui_client, account_id):
+    """Both draw the same grey -- the parse decides what reaches a CSS ``style``
+    attribute and that is not negotiable -- so the tooltip carries the difference
+    the pixels cannot. Only one of the two is something the user can fix."""
+    none_tip = _tooltip_texts(
+        _draw(nicegui_client, account_id, _one_label(account_id)))
+    assert any('No colour chosen' in t for t in none_tip)
+
+    broken = _draw(nicegui_client, account_id,
+                   _one_label(account_id, color='rgb(1,2,3)'))
+    assert any('IGNORED' in t for t in _tooltip_texts(broken))

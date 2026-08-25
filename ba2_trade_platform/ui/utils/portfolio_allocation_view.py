@@ -15,10 +15,13 @@ from typing import Any, Dict, List, Optional
 
 from ...core.portfolio_allocation import (
     ERROR_LABEL_TOTAL_FMT, ERROR_LABEL_UNDER_FMT, LABEL_TOTAL_TOLERANCE_PCT,
+    MONEY_EPSILON,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed, PositionState,
-    clamp_unallocated_pct, current_value, effective_target_pct, investable_notional,
+    UnrealisedPnL,
+    clamp_unallocated_pct, current_value, effective_target_pct,
+    format_unrealised_pnl, investable_notional,
     position_sign, reserved_notional_for, scale_pct_to_total, signed_position_values,
-    split_pct_across, validate_unallocated_pct,
+    split_pct_across, unrealised_pnl, validate_unallocated_pct,
 )
 
 # ``position_sign`` / ``signed_position_values`` are IMPORTED, not defined here,
@@ -438,6 +441,58 @@ def resolve_label_icon_color(stored) -> str:
     return '#' + text[1:].upper()
 
 
+#: The Manage-labels dialog's name column, in ``ch`` -- the width of a "0", which
+#: is the closest CSS gets to "this many characters" in a proportional font.
+#:
+#: A FLOOR and a CAP rather than "as wide as the longest name". The floor is what
+#: makes every block start at the same x when the managed set is two short names,
+#: instead of the column jumping the moment a third is added -- and blocks starting
+#: at different offsets is precisely what made the dialog read as broken. The cap
+#: stops one absurd label from pushing the swatches off the edge; that one name
+#: truncates, and it is the only one that does.
+LABEL_COLUMN_MIN_CH = 16
+LABEL_COLUMN_MAX_CH = 32
+
+#: What a label's colour state is CALLED, for the tag icon's tooltip. All three
+#: states below render through ``resolve_label_icon_color``, and two of them render
+#: the SAME neutral grey -- the parse decides what may reach a CSS ``style``
+#: attribute and that is not negotiable. They are still different facts, and only
+#: one of them is something the user can put right, so the tooltip separates what
+#: the pixels cannot.
+LABEL_COLOR_NONE_NOTE = ('No colour chosen — this label draws in the neutral '
+                         'default. Pick a swatch to give it one.')
+LABEL_COLOR_CHOSEN_FMT = '{color} — click to change it, or clear it.'
+LABEL_COLOR_IGNORED_FMT = (
+    '{stored!r} is stored for this label but is not a colour this page will '
+    'render, so it is IGNORED and the neutral default is drawn instead. Pick a '
+    'swatch to replace it.')
+
+
+def label_column_width_ch(labels) -> int:
+    """How wide the dialog's name column has to be, in ``ch``. Pure.
+
+    Bounded by ``LABEL_COLUMN_MIN_CH`` and ``LABEL_COLUMN_MAX_CH``; see those.
+    """
+    longest = max((len(str(name or '')) for name in (labels or [])), default=0)
+    return max(LABEL_COLUMN_MIN_CH, min(LABEL_COLUMN_MAX_CH, longest))
+
+
+def describe_label_color(stored) -> str:
+    """The tag icon's tooltip: which of the three colour states this label is in.
+
+    Pure, and deliberately the ONLY place the "no colour" and "unreadable" cases
+    are told apart on screen: they resolve to the same drawable grey, so without
+    this a row carrying a value the renderer refuses looks identical to one the
+    user deliberately cleared -- and only the first is a thing to fix.
+    """
+    if stored is None or not str(stored).strip():
+        return LABEL_COLOR_NONE_NOTE
+    resolved = resolve_label_icon_color(stored)
+    if resolved == DEFAULT_LABEL_ICON_COLOR and _rgb(str(stored).strip()) is None:
+        return LABEL_COLOR_IGNORED_FMT.format(stored=str(stored).strip())
+    return LABEL_COLOR_CHOSEN_FMT.format(color=resolved)
+
+
 @dataclass
 class ManagedLabel:
     """One managed label as the page reads it out of ``portfolio_allocation_label``.
@@ -446,11 +501,109 @@ class ManagedLabel:
     which is a different fact from a stored default, so it is carried through as
     ``None`` all the way to the render and only turned into a drawable colour there
     (``resolve_label_icon_color``).
+
+    ``previous_target_pct`` is the target the LAST run was launched with, straight
+    off ``portfolio_allocation_label.previous_target_pct``. A PURE CARRIER: it is
+    what the page's "Load last" reads and what the row prints as ``last N%``, and
+    no derived figure on the page may divide by it. ``None`` means the label has
+    never been through ``save_allocation_targets``, which is a different fact from
+    0.0 ("last time this got nothing") and is why it is never coerced.
     """
     label: str
     target_pct: float = 0.0
     comment: Optional[str] = None
     color: Optional[str] = None
+    previous_target_pct: Optional[float] = None
+
+
+# ---------------------------------------------------------------------------
+# WHAT A SYMBOL'S SHARE OF ITS LABEL DEFAULTS TO
+#
+# It used to be the FAIR SHARE -- ``get_symbol_weights`` splits whatever is left
+# of 100 evenly across the symbols with no stored row, so nine symbols in one
+# label all read 11.11 while their real shares were 26.78 / 22.19 / 17.8 / 16.65 /
+# 16.57 / 0 / 0. A default nobody chose, sitting in an editable box, is a target
+# the user never set and the plan will trade towards.
+#
+# The default is now the symbol's ACTUAL share of its label, and a SAVED target
+# always wins over it. Three rules, and each of them is a bug that has been paid
+# for at least once:
+#
+# 1. UNKNOWN IS NOT ZERO. 0% means "hold none of this" and the plan sells the
+#    position out. A symbol whose price is unavailable has no measurable share, so
+#    it gets ``None`` -- a blank box -- and never a number.
+# 2. ONE UNMEASURABLE MEMBER BLANKS THE LABEL'S UNSAVED DEFAULTS. The denominator
+#    is the label's whole value; with one member unpriced that total is unknown,
+#    so no share of it is knowable. Restating the rest against the measured
+#    remainder would overstate every one of them, silently, in a box that trades.
+# 3. A GENUINE ZERO IS A REAL 0%. A symbol the account does not hold has an actual
+#    share of exactly 0 and that is the honest default. It changes what happens to
+#    a newly added symbol -- fair share would have bought it -- so the PAGE has to
+#    say so rather than let it be discovered later.
+#
+# The denominator is the GROSS money at work (``sum(abs(value))``), not the signed
+# sum, for the reason ``UnrealisedPnL.pct`` gives: a hedged label's signed total
+# nets towards zero, which is a division by zero on a label full of real money.
+# ---------------------------------------------------------------------------
+
+WEIGHT_SOURCE_SAVED = 'saved'
+WEIGHT_SOURCE_ACTUAL = 'actual'
+WEIGHT_SOURCE_UNKNOWN = 'unknown'
+
+
+@dataclass
+class ResolvedWeight:
+    """One symbol's share-of-label box, decided. Pure.
+
+    ``weight_pct`` is ``None`` -- a BLANK box -- only for
+    ``WEIGHT_SOURCE_UNKNOWN``. It is never 0.0 there, because 0.0 is a live
+    instruction to sell the position out.
+    """
+    weight_pct: Optional[float]
+    source: str
+
+
+def resolve_symbol_weights(symbols, *, saved, values, unmeasurable):
+    """``{symbol: ResolvedWeight}`` for one label, in the order given. Pure.
+
+    Args:
+        symbols: the label's membership, in display order.
+        saved: ``{symbol: weight_pct}`` -- the STORED rows only, never
+            ``get_symbol_weights``' fair-share-filled answer. A stored 0.0 is an
+            explicit "hold none of this" and wins like any other saved value;
+            reading it as absent would have the default quietly buy back a
+            position the user sold out of on purpose.
+        values: ``{symbol: current value}`` under the account's valuation mode,
+            for the symbols whose value is measurable.
+        unmeasurable: the symbols whose value cannot be measured at all -- held,
+            but with no price. One of these makes the label's TOTAL unknown, so
+            every UNSAVED share in the label goes blank with it.
+
+    Returns:
+        Dict[str, ResolvedWeight]: rounded onto the stored cent grid, because the
+        boxes step by 0.01 and a default carrying four decimals would be refused
+        by nothing and stored as something else.
+    """
+    blind = {s for s in (unmeasurable or [])}
+    saved = saved or {}
+    values = values or {}
+    ordered = list(symbols or [])
+    gross = sum(abs(float(values.get(s) or 0.0)) for s in ordered)
+    out: Dict[str, ResolvedWeight] = {}
+    for symbol in ordered:
+        if symbol in saved:
+            out[symbol] = ResolvedWeight(float(saved[symbol]), WEIGHT_SOURCE_SAVED)
+        elif blind:
+            # Rule 2: not just ``symbol in blind``. The denominator is gone for
+            # the whole label, so nobody's share of it is knowable.
+            out[symbol] = ResolvedWeight(None, WEIGHT_SOURCE_UNKNOWN)
+        elif not gross:
+            out[symbol] = ResolvedWeight(0.0, WEIGHT_SOURCE_ACTUAL)
+        else:
+            out[symbol] = ResolvedWeight(
+                round(float(values.get(symbol) or 0.0) / gross * 100.0, 2),
+                WEIGHT_SOURCE_ACTUAL)
+    return out
 
 
 @dataclass
@@ -470,6 +623,18 @@ class SymbolRow:
     rather than an absence. They are the "target" half of requirement 2 at the
     instrument level; the page previously showed a target exactly once, on the
     group header.
+
+    ``previous_weight_pct`` is the share this symbol carried in the label the LAST
+    time a run was launched, and ``pnl`` is its unrealised profit. Both moved here
+    out of the Allocate wizard's step 2, which was the only screen that could
+    answer either question -- and which is no longer where the weights are typed.
+    ``previous_weight_pct`` is ``None`` (never 0.0) for a symbol with no history:
+    "never allocated" and "allocated nothing" are different facts.
+
+    ``pnl`` is measured on the LIVE quote in BOTH valuation modes, deliberately.
+    In cost mode ``current_value`` IS the cost basis, so a P&L derived from it
+    reads 0.00 on every row -- see ``unrealised_pnl``, which takes no valuation
+    mode for exactly that reason.
     """
     symbol: str
     labels: List[str] = field(default_factory=list)
@@ -482,7 +647,22 @@ class SymbolRow:
     pct_of_total: float = 0.0
     comment: Optional[str] = None
     weight_pct: Optional[float] = None
+    #: WHERE ``weight_pct`` came from -- a saved target, the symbol's actual share,
+    #: or nothing measurable. The page shows it, because a 0% that was chosen and a
+    #: 0% that was derived from an empty holding lead to the same order and need
+    #: very different reactions.
+    weight_source: str = WEIGHT_SOURCE_ACTUAL
+    #: Whether this row's VALUE could be measured at all -- held, but with no
+    #: price, is False. A fact about the HOLDING and deliberately not derivable
+    #: from ``weight_source``: a saved target wins over the default, so a saved
+    #: unmeasurable row reports ``WEIGHT_SOURCE_SAVED`` and would otherwise look
+    #: perfectly measurable to anything reading that field. "Load current" is the
+    #: caller that must not be fooled -- it would restate every share in the label
+    #: against a total nobody knows.
+    measurable: bool = True
     target_value: Optional[float] = None
+    previous_weight_pct: Optional[float] = None
+    pnl: UnrealisedPnL = field(default_factory=UnrealisedPnL)
 
     @property
     def multi_label(self) -> bool:
@@ -513,6 +693,11 @@ class LabelView:
     number. ``pct_of_base`` is the one that IS comparable with the target, and
     ``target_value`` is the target as money. Both are ``None`` when no base notional
     was supplied.
+
+    ``previous_target_pct`` and ``pnl`` carry the wizard's step-1 caption onto the
+    page. The P&L is ONE call over the whole membership rather than a combination
+    of the rows' own figures, which is what makes the percentage money-weighted:
+    the engine sums market value and gross cost first and divides once.
     """
     label: str
     target_pct: float = 0.0
@@ -523,6 +708,8 @@ class LabelView:
     rows: List[SymbolRow] = field(default_factory=list)
     pct_of_base: Optional[float] = None
     target_value: Optional[float] = None
+    previous_target_pct: Optional[float] = None
+    pnl: UnrealisedPnL = field(default_factory=UnrealisedPnL)
     #: The stored palette hex, or ``None`` for "no colour chosen". Carried through
     #: UNRESOLVED so the absence stays readable; the render turns it into something
     #: drawable with ``resolve_label_icon_color``.
@@ -538,6 +725,7 @@ def build_label_views(managed,
                       valuation_mode: str,
                       base_notional: Optional[float] = None,
                       symbol_weights=None,
+                      symbol_previous_weights=None,
                       unallocated_pct: float = 0.0) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
@@ -570,6 +758,11 @@ def build_label_views(managed,
             treated as absent when it is 0.
         symbol_weights: ``{label: {symbol: weight_pct}}`` from ``get_symbol_weights``.
             Optional, on the same terms.
+        symbol_previous_weights: ``{label: {symbol: previous_weight_pct}}`` from
+            ``get_previous_symbol_weights``. Optional, and an absent entry stays
+            ``None`` rather than falling back to the CURRENT weight -- the whole
+            point of the figure is that it may differ from what is on screen, and
+            "there is no last" is what the page's Load-last button reads.
         unallocated_pct: the account's stored cash reserve, 0-100. It scales the
             TARGET money only -- ``target_value`` on the label and on every symbol
             row -- because the label percentages divide what the reserve LEFT.
@@ -596,6 +789,22 @@ def build_label_views(managed,
     # target the solver would not have used.
     investable = None if base is None else investable_notional(base, unallocated_pct)
     weights_by_label = symbol_weights or {}
+    previous_by_label = symbol_previous_weights or {}
+
+    def _pnl_of(sym: str) -> UnrealisedPnL:
+        """One symbol's unrealised P&L, on the LIVE quote in either mode.
+
+        A shallow priced copy for the same reason ``_value_of`` builds one: the
+        page fetches quotes in a single bulk call and does not stamp them onto the
+        states this function is handed. ``unrealised_pnl`` is the engine's, so a
+        row here and a caption anywhere else are the same rule at the same scope.
+        """
+        state = positions.get(sym)
+        if state is None:
+            return unrealised_pnl([])
+        return unrealised_pnl([PositionState(
+            symbol=state.symbol, quantity=state.quantity,
+            cost_basis=state.cost_basis, price=(prices or {}).get(sym))])
 
     def _clean(label: str) -> List[str]:
         seen, out = set(), []
@@ -630,6 +839,21 @@ def build_label_views(managed,
                                cost_basis=state.cost_basis, price=(prices or {}).get(sym))
         return current_value(priced, VALUATION_MODE_MARKET)
 
+    def _is_unmeasurable(sym: str) -> bool:
+        """Held, but with no price -- so its value cannot be measured AT ALL.
+
+        MARKET mode only: in COST mode the value IS the cost basis, which the
+        broker always publishes, so nothing is unmeasurable there. A FLAT symbol is
+        not unmeasurable either -- it is worth exactly nothing and that is a
+        perfectly good measurement.
+        """
+        if valuation_mode != VALUATION_MODE_MARKET:
+            return False
+        state = positions.get(sym)
+        if state is None or not state.quantity:
+            return False
+        return (prices or {}).get(sym) is None
+
     total_value = sum(_value_of(sym) for sym in membership)
 
     views: List[LabelView] = []
@@ -638,7 +862,16 @@ def build_label_views(managed,
         label_value = sum(_value_of(s) for s in symbols)
         label_target_value = (None if investable is None
                               else investable * float(entry.target_pct or 0.0) / 100.0)
-        label_weights = weights_by_label.get(entry.label) or {}
+        label_previous = previous_by_label.get(entry.label) or {}
+        # ``symbol_weights`` is the SAVED set, and only that. The effective share
+        # -- saved, else the symbol's actual share of the label, else blank -- is
+        # decided once, here, so the page and the solve path cannot default
+        # differently. See ``resolve_symbol_weights``.
+        resolved = resolve_symbol_weights(
+            symbols,
+            saved=weights_by_label.get(entry.label) or {},
+            values={s: _value_of(s) for s in symbols},
+            unmeasurable=[s for s in symbols if _is_unmeasurable(s)])
         rows: List[SymbolRow] = []
 
         for sym in symbols:
@@ -665,10 +898,15 @@ def build_label_views(managed,
                 pct_of_label=(row_value / label_value * 100.0) if label_value else 0.0,
                 pct_of_total=(row_value / total_value * 100.0) if total_value else 0.0,
                 comment=comments.get((entry.label, sym)),
-                weight_pct=label_weights.get(sym),
+                weight_pct=resolved[sym].weight_pct,
+                weight_source=resolved[sym].source,
+                measurable=not _is_unmeasurable(sym),
                 target_value=(None if (label_target_value is None
-                                       or sym not in label_weights)
-                              else label_target_value * float(label_weights[sym]) / 100.0),
+                                       or resolved[sym].weight_pct is None)
+                              else label_target_value
+                              * float(resolved[sym].weight_pct) / 100.0),
+                previous_weight_pct=label_previous.get(sym),
+                pnl=_pnl_of(sym),
             ))
 
         rows.sort(key=lambda r: (-r.current_value, r.symbol))
@@ -683,6 +921,16 @@ def build_label_views(managed,
             pct_of_base=(label_value / base * 100.0) if base else None,
             target_value=label_target_value,
             color=entry.color,
+            previous_target_pct=entry.previous_target_pct,
+            # ONE call over the whole membership, deliberately NOT a combination of
+            # the rows' own figures: the engine sums market value and gross cost
+            # first and divides once, which is what makes the percentage
+            # money-weighted rather than a mean of the symbols' percentages.
+            pnl=unrealised_pnl([
+                PositionState(symbol=s, quantity=positions[s].quantity,
+                              cost_basis=positions[s].cost_basis,
+                              price=(prices or {}).get(s))
+                for s in symbols if s in positions]),
         ))
 
     return views
@@ -761,15 +1009,34 @@ def parse_pct(raw) -> TargetEdit:
     * ``nan`` / ``inf`` -- ``nan < 0`` and ``nan > 100`` are BOTH False, so every
       range check waves it through and every derived figure on the page becomes NaN.
 
-    A trailing ``%`` and thousands separators are tolerated: the boxes carry
-    ``suffix='%'`` and Quasar can hand back the raw string it is holding.
+    A trailing ``%`` is tolerated: the boxes carry ``suffix='%'`` and Quasar can
+    hand back the raw string it is holding.
+
+    THE COMMA IS A DECIMAL POINT HERE, and that is a deliberate reading rather
+    than a tolerance. Every box this parses is bounded 0-100, so no legitimate
+    value in one needs a thousands separator -- while a decimal comma is what a
+    large part of the world types, and what the live page was observed rendering
+    back ("11,11"). Stripping it as a grouping mark multiplies the number by a
+    hundred, and the range check only catches HALF of those: "11,11" becomes 1111
+    and is refused, which is visible; "0,5" becomes 5.0, which is in range, is
+    ACCEPTED, and gives the symbol ten times the share that was typed. The silent
+    one is the one that costs money.
+
+    So a LONE comma with no decimal point becomes the decimal point. A comma
+    alongside a dot keeps its grouping meaning -- "1,234.5" is unambiguous
+    wherever it is written that way -- and so does a repeated comma; both are then
+    refused by the range check on their own merits rather than by accident.
     """
     if isinstance(raw, bool):
         return TargetEdit(False, None, EDIT_NOT_A_NUMBER, "")
     if raw is None:
         return TargetEdit(False, None, EDIT_BLANK, "")
     if isinstance(raw, str):
-        text = raw.strip().rstrip('%').strip().replace(',', '')
+        text = raw.strip().rstrip('%').strip()
+        if text.count(',') == 1 and '.' not in text:
+            text = text.replace(',', '.')
+        else:
+            text = text.replace(',', '')
         if not text:
             return TargetEdit(False, None, EDIT_BLANK, "")
         try:
@@ -1316,6 +1583,418 @@ def fill_label_to_100(label: str, weights,
 
 
 # ---------------------------------------------------------------------------
+# THE MIGRATED BUTTON GROUPS
+#
+# The Allocate wizard's step 1 carried "Even split" and "Load last" over the LABEL
+# targets; its step 2 carried "Even split", "Fill rest", "Load last" and "Wipe"
+# over one label's symbol weights. All six are on the page now, because the boxes
+# they operate on are, and a button two screens away from the number it rewrites
+# is a button nobody presses.
+#
+# THE ARITHMETIC IS NOT HERE. Every one of these delegates to the engine's own
+# function -- ``even_split_targets``, ``load_previous_targets``,
+# ``even_split_symbol_weights``, ``fill_remaining_symbol_weights``,
+# ``load_previous_symbol_weights``, ``wipe_symbol_weights`` -- exactly as the
+# wizard did. What lives here is the TRANSLATION between the page's plain
+# ``{name: pct}`` maps and the engine's ``LabelTarget``/``SymbolTarget``, plus the
+# one decision the page needs and the engine does not make: did anything change,
+# and if not, what do we say instead? A copy of the splitting rule here would be a
+# fourth two-decimal rounding rule, and rounding rules drift.
+#
+# NOTHING IS DISABLED. The wizard greyed these buttons out; the page follows its
+# own ``Fill 100%`` convention and always allows the press, reporting the no-op in
+# words. Same principle from the other end -- a control that does nothing when
+# pressed is indistinguishable from a broken one -- and it costs the page a
+# per-keystroke ``set_enabled`` sweep it would otherwise need over every button on
+# every row.
+# ---------------------------------------------------------------------------
+
+TARGETS_NO_LABELS = "NO_LABELS"
+TARGETS_UNCHANGED = "UNCHANGED"
+TARGETS_EVEN_SPLIT = "EVEN_SPLIT"
+TARGETS_NO_PREVIOUS = "NO_PREVIOUS"
+TARGETS_LOADED_LAST = "LOADED_LAST"
+
+TARGETS_MSG_NO_LABELS = ('No labels are managed yet — there is nothing to split. '
+                         'Use "Manage labels" first.')
+TARGETS_MSG_EVEN_SPLIT_FMT = ('Split 100% evenly between {count} label(s). The cash '
+                              'reserve is untouched — the labels divide what it '
+                              'leaves.')
+TARGETS_MSG_ALREADY_EVEN_FMT = ('The {count} labels already hold an even split — '
+                                'nothing was written.')
+TARGETS_MSG_NO_PREVIOUS = ('No label has a previous target — nothing has ever been '
+                           'allocated on this account, so there is nothing to load.')
+TARGETS_MSG_LOADED_LAST_FMT = ('Restored the last run’s targets. {kept} label(s) have '
+                               'no history and kept the target they had.')
+TARGETS_MSG_LAST_UNCHANGED = ('The labels already hold the targets of the last run — '
+                              'nothing was written.')
+
+
+@dataclass
+class TargetsUpdate:
+    """One press of a LABEL-LEVEL button, decided. Pure.
+
+    ``changed is False`` means NOTHING is written and ``targets`` is what was
+    passed in. Both no-change cases still carry a ``message``, on
+    ``FillToHundred``'s terms.
+
+    ``targets`` is the FULL new ``{label: pct}`` map IN THE ORDER GIVEN. The order
+    is load-bearing: the page hands its display order in and writes the result
+    straight back onto the rows, and the engine's splitter puts the rounding
+    remainder on the LAST entry -- so a map that came back re-sorted would move
+    that remainder onto a label other than the one the user is looking at.
+    """
+    changed: bool
+    reason_code: str
+    targets: Dict[str, float]
+    message: str
+
+
+def _label_targets_as_engine(targets, previous=None):
+    """``{label: pct}`` -> the engine's ``[LabelTarget]``, order preserved. Internal.
+
+    ``symbols`` is deliberately left empty: every function these feed touches
+    ``target_pct`` only, and building the symbol list here would invite a caller to
+    read weights back out of a structure that never had them.
+    """
+    history = previous or {}
+    from ...core.portfolio_allocation import LabelTarget
+    return [LabelTarget(label=name, target_pct=float(pct or 0.0),
+                        previous_target_pct=history.get(name))
+            for name, pct in (targets or {}).items()]
+
+
+def _same_pcts(before, after, places: int = 2) -> bool:
+    """True when two ``{name: pct}`` maps agree to the stored precision. Internal.
+
+    Rounded rather than compared exactly: the engine's splitters emit values on the
+    cent grid the boxes store at, and a binary hair between 33.33 and 33.330000001
+    is not a change the user made.
+    """
+    return all(round(float(after.get(k) or 0.0), places)
+               == round(float(v or 0.0), places) for k, v in (before or {}).items())
+
+
+def even_split_label_targets(targets) -> TargetsUpdate:
+    """The label-level "Even split": every label gets an equal share of 100%. Pure.
+
+    ALWAYS 100, independent of the reserve -- the reserve is its own stored field
+    and the labels divide what it LEAVES, so any other total would produce a set
+    ``validate_label_targets`` refuses. That reasoning is the engine's
+    ``even_split_targets``, and so is the arithmetic: the remainder lands on the
+    last label so the set totals exactly 100 in decimal.
+    """
+    from ...core.portfolio_allocation import even_split_targets
+
+    current = {name: float(pct or 0.0) for name, pct in (targets or {}).items()}
+    if not current:
+        return TargetsUpdate(False, TARGETS_NO_LABELS, {}, TARGETS_MSG_NO_LABELS)
+    fresh = {lt.label: lt.target_pct
+             for lt in even_split_targets(_label_targets_as_engine(current))}
+    if _same_pcts(current, fresh):
+        return TargetsUpdate(False, TARGETS_UNCHANGED, current,
+                             TARGETS_MSG_ALREADY_EVEN_FMT.format(count=len(current)))
+    return TargetsUpdate(True, TARGETS_EVEN_SPLIT, fresh,
+                         TARGETS_MSG_EVEN_SPLIT_FMT.format(count=len(current)))
+
+
+def load_last_label_targets(targets, previous) -> TargetsUpdate:
+    """The label-level "Load last": restore the targets the last RUN used. Pure.
+
+    ``previous`` is ``{label: previous_target_pct}`` -- the SEPARATE generation
+    written only by ``save_allocation_targets``, never the live map. Reading the
+    live map instead turns this button into a no-op that still reports success,
+    which is the one failure it cannot be allowed to have.
+
+    A previous of 0.0 IS restored: the engine reads 0 as "hold none of this", so it
+    is a real prior state, and refusing it would refuse to undo the user's last
+    change. ``None`` is the only "no history", and such a label keeps the target it
+    already has -- a partial history is the ordinary state and zeroing those would
+    silently unallocate a real basket.
+    """
+    from ...core.portfolio_allocation import (
+        has_previous_targets, load_previous_targets)
+
+    current = {name: float(pct or 0.0) for name, pct in (targets or {}).items()}
+    if not current:
+        return TargetsUpdate(False, TARGETS_NO_LABELS, {}, TARGETS_MSG_NO_LABELS)
+    items = _label_targets_as_engine(current, previous)
+    if not has_previous_targets(items):
+        return TargetsUpdate(False, TARGETS_NO_PREVIOUS, current,
+                             TARGETS_MSG_NO_PREVIOUS)
+    fresh = {lt.label: lt.target_pct for lt in load_previous_targets(items)}
+    if _same_pcts(current, fresh):
+        return TargetsUpdate(False, TARGETS_UNCHANGED, current,
+                             TARGETS_MSG_LAST_UNCHANGED)
+    kept = sum(1 for lt in items if lt.previous_target_pct is None)
+    return TargetsUpdate(True, TARGETS_LOADED_LAST, fresh,
+                         TARGETS_MSG_LOADED_LAST_FMT.format(kept=kept))
+
+
+WEIGHTS_NO_SYMBOLS = "NO_SYMBOLS"
+WEIGHTS_UNCHANGED = "UNCHANGED"
+WEIGHTS_EVEN_SPLIT = "EVEN_SPLIT"
+WEIGHTS_FILLED_REST = "FILLED_REST"
+WEIGHTS_NOTHING_TO_FILL = "NOTHING_TO_FILL"
+WEIGHTS_NO_PREVIOUS = "NO_PREVIOUS"
+WEIGHTS_LOADED_LAST = "LOADED_LAST"
+WEIGHTS_WIPED = "WIPED"
+WEIGHTS_ALREADY_CLEAR = "ALREADY_CLEAR"
+WEIGHTS_LOADED_CURRENT = "LOADED_CURRENT"
+WEIGHTS_NOTHING_MEASURED = "NOTHING_MEASURED"
+
+WEIGHTS_MSG_NO_SYMBOLS_FMT = ("'{label}' has no symbols with a share — add one "
+                              "before splitting it.")
+WEIGHTS_MSG_EVEN_SPLIT_FMT = ("'{label}': every symbol now holds an equal share of "
+                              "the label's 100%.")
+WEIGHTS_MSG_ALREADY_EVEN_FMT = ("'{label}' is already split evenly — nothing was "
+                                "written.")
+WEIGHTS_MSG_FILLED_REST_FMT = ("'{label}': shared the remaining {remainder:.2f}% "
+                               "between {count} empty symbol(s). The weights you "
+                               "typed were left exactly as typed.")
+#: BOTH halves of ``can_fill_remaining_symbol_weights``' refusal in one sentence,
+#: because the two look identical from the button and have opposite fixes: nothing
+#: is empty (type a 0 into the one you want filled) versus nothing is left (the
+#: label is at or over 100 -- use Fill 100% to scale it, or Wipe to start again).
+WEIGHTS_MSG_NOTHING_TO_FILL_FMT = (
+    "'{label}': nothing to fill. Either every symbol already holds a share, or the "
+    "shares total {total:.2f}% and there is nothing left to hand out — 'Fill 100%' "
+    "scales an over-allocated label, 'Wipe' clears it.")
+WEIGHTS_MSG_NO_PREVIOUS_FMT = ("No symbol in '{label}' has a previous share — this "
+                               "label has never been allocated, so there is nothing "
+                               "to load.")
+WEIGHTS_MSG_LOADED_LAST_FMT = ("'{label}': restored the last run's shares. {kept} "
+                               "symbol(s) have no history and kept the share they "
+                               "had.")
+WEIGHTS_MSG_LAST_UNCHANGED_FMT = ("'{label}' already holds the shares of the last "
+                                  "run — nothing was written.")
+WEIGHTS_MSG_WIPED_FMT = ("'{label}': cleared {count} share(s) to 0%. 'Load last' "
+                         "puts them back — a wipe does not touch the history.")
+WEIGHTS_MSG_ALREADY_CLEAR_FMT = ("'{label}' is already at 0% throughout — there is "
+                                 "nothing to clear.")
+WEIGHTS_MSG_LOADED_CURRENT_FMT = ("'{label}': every share is now the symbol's ACTUAL "
+                                  "share of the label. Nothing has been traded — "
+                                  "these are targets, and the plan will now aim to "
+                                  "keep the label where it already is.")
+#: Both refusals in one sentence, because from the button they look identical and
+#: have opposite fixes: a price outage (wait, or switch to cost basis) versus a
+#: label that genuinely holds nothing (type a share, or use Even split).
+WEIGHTS_MSG_NOTHING_MEASURED_FMT = (
+    "'{label}' has no current shares to load: either it holds nothing at all, or a "
+    "member has no price and the label's total is therefore unknown. Writing 0% "
+    "would mean 'sell it all', which is not what 'no answer' means.")
+
+#: Said under every symbol table. "Default to actual" changes what happens to a
+#: newly added symbol -- the fair share it replaced would have BOUGHT it, an actual
+#: share of 0% will not -- and that has to be legible rather than discovered.
+SHARE_DEFAULT_NOTE = (
+    'A share you have not set shows the symbol\u2019s ACTUAL share of this label, '
+    'not an even split. A symbol the account does not hold therefore sits at 0% '
+    'and will not be bought until you type a share or press Even split, Fill rest '
+    'or Fill 100%. A blank share means the value could not be measured at all \u2014 '
+    'never that it is zero. \u201cLoad current\u201d rewrites every share to what '
+    'is held right now.')
+
+
+@dataclass
+class WeightsUpdate:
+    """One press of a PER-LABEL symbol-share button, decided. Pure.
+
+    Deliberately the same shape as ``FillToHundred`` (``changed``, ``reason_code``,
+    ``weights``, ``message``) so the page can drive all five buttons on the row
+    through one handler. ``changed is False`` means nothing is written and
+    ``weights`` is what came in; the message is never empty.
+
+    ``weights`` preserves the DISPLAY order it was given, for the reason
+    ``TargetsUpdate.targets`` does: the engine's splitter puts the rounding
+    remainder on the last entry.
+    """
+    changed: bool
+    reason_code: str
+    weights: Dict[str, float]
+    message: str
+
+
+def _symbols_as_engine(label: str, weights, previous=None):
+    """``{symbol: pct}`` -> the engine's ``LabelTarget``, order preserved. Internal.
+
+    ``target_pct`` is left at 0.0 and is never read back: every function this feeds
+    touches the symbol weights only, and the label's own target is a share of a
+    different denominator entirely.
+    """
+    history = previous or {}
+    from ...core.portfolio_allocation import LabelTarget, SymbolTarget
+    return LabelTarget(
+        label=label, target_pct=0.0,
+        symbols=[SymbolTarget(symbol=symbol, weight_pct=float(pct or 0.0),
+                              previous_weight_pct=history.get(symbol))
+                 for symbol, pct in (weights or {}).items()])
+
+
+def _weights_of(target) -> Dict[str, float]:
+    """A ``LabelTarget``'s symbol weights back as a plain map. Internal."""
+    return {st.symbol: float(st.weight_pct or 0.0) for st in (target.symbols or [])}
+
+
+def even_split_symbol_shares(label: str, weights) -> WeightsUpdate:
+    """The per-label "Even split": ONE label's symbols share its 100% equally. Pure.
+
+    ``even_split_symbol_weights``, which is ``even_split_pct``, which is what
+    ``build_symbol_targets`` fills an untouched label in with -- so the button and
+    the stored default cannot disagree about the same symbols. The label's own
+    target does not move: this is about shares WITHIN a label.
+
+    Unlike the wizard, a SINGLE-symbol label is not refused. The wizard disabled
+    the button there because "a single symbol already owns the whole 100 by
+    construction" -- which stopped being true when the boxes became editable on the
+    page, where that symbol can sit at 40 and the split is the repair.
+    """
+    from ...core.portfolio_allocation import even_split_symbol_weights
+
+    current = {s: float(pct or 0.0) for s, pct in (weights or {}).items()}
+    if not current:
+        return WeightsUpdate(False, WEIGHTS_NO_SYMBOLS, {},
+                             WEIGHTS_MSG_NO_SYMBOLS_FMT.format(label=label))
+    fresh = _weights_of(even_split_symbol_weights(_symbols_as_engine(label, current)))
+    if _same_pcts(current, fresh):
+        return WeightsUpdate(False, WEIGHTS_UNCHANGED, current,
+                             WEIGHTS_MSG_ALREADY_EVEN_FMT.format(label=label))
+    return WeightsUpdate(True, WEIGHTS_EVEN_SPLIT, fresh,
+                         WEIGHTS_MSG_EVEN_SPLIT_FMT.format(label=label))
+
+
+def fill_rest_symbol_shares(label: str, weights) -> WeightsUpdate:
+    """The per-label "Fill rest": spread what is left over the EMPTY slots. Pure.
+
+    NOT ``fill_label_to_100``, and the difference is the reason both buttons are on
+    the row. This one never SCALES: every non-zero weight survives exactly as
+    typed, and an over-allocated label is refused outright rather than trimmed.
+    ``Fill 100%`` is the repair; this is the "type the two you care about, let the
+    rest sort themselves out" half.
+
+    ``can_fill_remaining_symbol_weights`` is the engine's own predicate and owns
+    both halves of the refusal -- there has to be an empty slot AND something left
+    to put in it -- so the button and the validator underneath cannot disagree.
+    """
+    from ...core.portfolio_allocation import (
+        can_fill_remaining_symbol_weights, fill_remaining_symbol_weights)
+
+    current = {s: float(pct or 0.0) for s, pct in (weights or {}).items()}
+    if not current:
+        return WeightsUpdate(False, WEIGHTS_NO_SYMBOLS, {},
+                             WEIGHTS_MSG_NO_SYMBOLS_FMT.format(label=label))
+    item = _symbols_as_engine(label, current)
+    if not can_fill_remaining_symbol_weights(item):
+        return WeightsUpdate(
+            False, WEIGHTS_NOTHING_TO_FILL, current,
+            WEIGHTS_MSG_NOTHING_TO_FILL_FMT.format(
+                label=label, total=round(sum(current.values()), 2)))
+    fresh = _weights_of(fill_remaining_symbol_weights(item))
+    remainder = round(100.0 - sum(current.values()), 2)
+    empty = sum(1 for pct in current.values() if pct == 0.0)
+    return WeightsUpdate(True, WEIGHTS_FILLED_REST, fresh,
+                         WEIGHTS_MSG_FILLED_REST_FMT.format(
+                             label=label, remainder=remainder, count=empty))
+
+
+def load_last_symbol_shares(label: str, weights, previous) -> WeightsUpdate:
+    """The per-label "Load last": restore ONE label's shares from the last run. Pure.
+
+    ``previous`` is ``get_previous_symbol_weights``' answer, which is a SEPARATE
+    read from ``get_symbol_weights`` on purpose: that one fills an absent row with
+    the even-split default, and there is no default for a share nobody has ever
+    allocated with. Feeding this the live map turns the button into a no-op that
+    still reports success.
+
+    A symbol with no history keeps the share it has, and the label's own target
+    does not move.
+    """
+    from ...core.portfolio_allocation import (
+        has_previous_symbol_weights, load_previous_symbol_weights)
+
+    current = {s: float(pct or 0.0) for s, pct in (weights or {}).items()}
+    if not current:
+        return WeightsUpdate(False, WEIGHTS_NO_SYMBOLS, {},
+                             WEIGHTS_MSG_NO_SYMBOLS_FMT.format(label=label))
+    item = _symbols_as_engine(label, current, previous)
+    if not has_previous_symbol_weights(item):
+        return WeightsUpdate(False, WEIGHTS_NO_PREVIOUS, current,
+                             WEIGHTS_MSG_NO_PREVIOUS_FMT.format(label=label))
+    fresh = _weights_of(load_previous_symbol_weights(item))
+    if _same_pcts(current, fresh):
+        return WeightsUpdate(False, WEIGHTS_UNCHANGED, current,
+                             WEIGHTS_MSG_LAST_UNCHANGED_FMT.format(label=label))
+    kept = sum(1 for st in item.symbols if st.previous_weight_pct is None)
+    return WeightsUpdate(True, WEIGHTS_LOADED_LAST, fresh,
+                         WEIGHTS_MSG_LOADED_LAST_FMT.format(label=label, kept=kept))
+
+
+def load_current_symbol_shares(label: str, weights, values, *,
+                               unmeasurable) -> WeightsUpdate:
+    """The per-label "Load current": rewrite every share to what is HELD. Pure.
+
+    The on-demand form of the default. It differs from the default in one way and
+    it is the point of the button: a SAVED target does NOT win here. The default
+    answers "what should this box show when nobody has said"; this answers "forget
+    what I typed, start from where I actually am".
+
+    REFUSED, rather than applied, when nothing can be measured -- either the label
+    holds nothing at all or a member has no price, which makes the label's total
+    unknown and every share of it a fraction of a number nobody has. Both would
+    otherwise write zeros, and 0% is a live instruction to sell the position out.
+    Wipe is the control for deliberately zeroing a label, one button along.
+
+    The arithmetic is ``resolve_symbol_weights`` with the saved set emptied, so the
+    button and the default cannot compute the same share two ways.
+    """
+    current = {s: float(pct or 0.0) for s, pct in (weights or {}).items()}
+    if not current:
+        return WeightsUpdate(False, WEIGHTS_NO_SYMBOLS, {},
+                             WEIGHTS_MSG_NO_SYMBOLS_FMT.format(label=label))
+    blind = {s for s in (unmeasurable or [])}
+    measured = sum(abs(float((values or {}).get(s) or 0.0)) for s in current)
+    if blind or not measured:
+        return WeightsUpdate(False, WEIGHTS_NOTHING_MEASURED, current,
+                             WEIGHTS_MSG_NOTHING_MEASURED_FMT.format(label=label))
+    fresh = {s: r.weight_pct for s, r in resolve_symbol_weights(
+        list(current), saved={}, values=values, unmeasurable=()).items()}
+    if _same_pcts(current, fresh):
+        return WeightsUpdate(False, WEIGHTS_UNCHANGED, current,
+                             WEIGHTS_MSG_LAST_UNCHANGED_FMT.format(label=label))
+    return WeightsUpdate(True, WEIGHTS_LOADED_CURRENT, fresh,
+                         WEIGHTS_MSG_LOADED_CURRENT_FMT.format(label=label))
+
+
+def wipe_symbol_shares(label: str, weights) -> WeightsUpdate:
+    """The per-label "Wipe": clear ONE label's shares so it can be redone. Pure.
+
+    What makes ``fill_rest_symbol_shares`` coherent: filling treats a 0 as an empty
+    slot, so the honest way to redo a label is to empty it outright, type the
+    handful that matter and fill the rest.
+
+    Writes 0.0, never ``None`` -- every solver does arithmetic on the weight, and
+    0.0 IS "empty" in this model. It is available on exactly the over-allocated set
+    ``fill_rest_symbol_shares`` refuses, so the user is never cornered, and it
+    leaves the previous generation untouched: Load last is its undo.
+    """
+    from ...core.portfolio_allocation import (
+        can_wipe_symbol_weights, wipe_symbol_weights)
+
+    current = {s: float(pct or 0.0) for s, pct in (weights or {}).items()}
+    if not current:
+        return WeightsUpdate(False, WEIGHTS_NO_SYMBOLS, {},
+                             WEIGHTS_MSG_NO_SYMBOLS_FMT.format(label=label))
+    item = _symbols_as_engine(label, current)
+    if not can_wipe_symbol_weights(item):
+        return WeightsUpdate(False, WEIGHTS_ALREADY_CLEAR, current,
+                             WEIGHTS_MSG_ALREADY_CLEAR_FMT.format(label=label))
+    return WeightsUpdate(True, WEIGHTS_WIPED, _weights_of(wipe_symbol_weights(item)),
+                         WEIGHTS_MSG_WIPED_FMT.format(
+                             label=label,
+                             count=sum(1 for pct in current.values() if pct != 0.0)))
+
+
+# ---------------------------------------------------------------------------
 # THE LABEL MINI-BAR ROW
 #
 # One bar per label: the CURRENT share, tinted with that label's own colour, a
@@ -1395,8 +2074,40 @@ _MIN_BAR_SCALE_PCT = 1.0
 LABEL_CURRENT_FMT = '{pct:.1f}%'
 LABEL_CURRENT_UNKNOWN = LABEL_STATUS_NONE
 
+#: Drawn where a percentage would be when there is no previous generation. A dash,
+#: never 0.00%: "this has never been allocated" and "last time this got nothing"
+#: are different facts, and 0.00% is a legitimate value of the second. Spelled the
+#: same way the wizard spelled it, because it is the same fact travelling to a new
+#: screen rather than a new one being invented.
+NO_PREVIOUS_MARK = '-'
+
+#: The previous generation, as a percentage. Two decimals, matching the precision
+#: the boxes store at, so a restored value reads identically to the one that will
+#: be written back.
+LAST_PCT_FMT = '{previous:.2f}%'
+
+#: ...and named, because a bare second percentage on a row that already carries
+#: three of them is unreadable. "last", not "previous target %": the row is terse
+#: by design and ``BASIS_LEGEND`` carries the explanation for the whole page.
+#:
+#: NO denominator clause, deliberately. The wizard's caption said "% of base" and
+#: that is the denominator the 2026-08-25 rework demoted to a parenthetical; a
+#: stored target is typed against the INVESTABLE pool, so ``last`` is directly
+#: comparable with the ``tgt`` beside it and needs no restating.
+LAST_TARGET_FMT = 'last {previous}'
+
+#: The P&L caption. The body comes from the engine's ``format_unrealised_pnl``,
+#: which owns every "may this be shown at all" branch -- blank versus 0.00, a
+#: percentage versus "no cost basis" -- so this string adds a name and nothing else.
+PNL_CAPTION_FMT = 'P&L {pnl}'
+
 LABEL_DELTA_OVER_FMT = 'over by {pct:.1f}pp ({money})'
 LABEL_DELTA_UNDER_FMT = 'under by {pct:.1f}pp ({money})'
+#: The same verdict where there is no money to state -- a sum of shares WITHIN a
+#: label is a pure ratio. Unreachable from the label bars, which set their points
+#: and their money together; a test pins that they cannot take this branch.
+LABEL_DELTA_OVER_PP_FMT = 'over by {pct:.1f}pp'
+LABEL_DELTA_UNDER_PP_FMT = 'under by {pct:.1f}pp'
 #: Inside the tolerance band. NOT "over by 0.0pp ($0.12)", which is noise on a row
 #: that is, for every purpose the user has, exactly where it should be.
 LABEL_DELTA_ON_TARGET = 'on target'
@@ -1404,6 +2115,48 @@ LABEL_DELTA_ON_TARGET = 'on target'
 #: ``LABEL_STATUS_NONE`` uses, for the same reason: a verdict about a decision nobody
 #: made is worse than an admission that there is none.
 LABEL_DELTA_NONE = LABEL_STATUS_NONE
+
+
+def format_last_pct(previous: Optional[float]) -> str:
+    """``60.00%``, or a dash when there is no previous generation. Pure.
+
+    ``None`` is the ONLY dash case. 0.0 formats as ``0.00%`` because a run that
+    allocated nothing to a label really did happen, and hiding it would make an
+    intentional zero indistinguishable from a label that has never run.
+    """
+    if previous is None:
+        return NO_PREVIOUS_MARK
+    return LAST_PCT_FMT.format(previous=float(previous))
+
+
+def format_last_target(previous: Optional[float]) -> str:
+    """``last 60.00%`` / ``last -``. THE one place the pair is spelled. Pure.
+
+    Used by the label row and by the symbol table alike, so the two scopes cannot
+    describe their history in two different ways.
+    """
+    return LAST_TARGET_FMT.format(previous=format_last_pct(previous))
+
+
+def format_pnl_caption(pnl: UnrealisedPnL) -> str:
+    """``P&L +1,500.00 (+150.00%)``. Pure; the arithmetic and the wording are the
+    engine's ``format_unrealised_pnl``, so this adds a name and nothing else."""
+    return PNL_CAPTION_FMT.format(pnl=format_unrealised_pnl(pnl))
+
+
+def pnl_classes(pnl: UnrealisedPnL) -> str:
+    """CSS for a P&L caption. Pure; no ``ui`` call.
+
+    Colour is an ACCENT and never the message: ``format_unrealised_pnl`` signs both
+    numbers, so the caption reads correctly in monochrome, to a colour-blind user
+    and in a screen reader. Grey covers three different things on purpose --
+    nothing measurable, nothing held, and a genuine flat 0.00 -- because none of
+    them is a verdict, and painting "break-even" green or red would invent one.
+    """
+    if pnl is None or pnl.amount is None or abs(pnl.amount) <= MONEY_EPSILON:
+        return 'text-xs text-secondary-custom'
+    return 'text-xs font-medium ' + ('text-green-500' if pnl.amount > 0
+                                     else 'text-red-500')
 
 
 def format_label_delta(*, status: str, delta_pct: Optional[float],
@@ -1416,8 +2169,14 @@ def format_label_delta(*, status: str, delta_pct: Optional[float],
     """
     if status == LABEL_STATUS_OK:
         return LABEL_DELTA_ON_TARGET
-    if status == LABEL_STATUS_NONE or delta_pct is None or delta_value is None:
+    if status == LABEL_STATUS_NONE or delta_pct is None:
         return LABEL_DELTA_NONE
+    if delta_value is None:
+        # A ratio with no money behind it -- the sum of the shares INSIDE a label
+        # is a share of that label and of nothing else. The label bars never reach
+        # here: they set both figures together or neither.
+        return (LABEL_DELTA_OVER_PP_FMT if status == LABEL_STATUS_OVER
+                else LABEL_DELTA_UNDER_PP_FMT).format(pct=abs(delta_pct))
     template = (LABEL_DELTA_OVER_FMT if status == LABEL_STATUS_OVER
                 else LABEL_DELTA_UNDER_FMT)
     return template.format(pct=abs(delta_pct),
@@ -1449,6 +2208,15 @@ class LabelBar:
     ``target_pct`` is what the edit box holds -- the number the user typed.
     ``effective_pct`` is that restated against the gross base, i.e. the derived
     "(real N%)" figure, and is secondary everywhere.
+
+    ``last_text`` and ``pnl_text`` come out of the SAME builder as everything else
+    on the row, which is the point of putting them here rather than rendering them
+    beside it: the header, the notch, the delta, the previous generation and the
+    P&L are one description of one label, and a second writer is how two of them
+    come to disagree. Neither moves when a target box is typed in -- the previous
+    generation only advances on a run, and the P&L is measured off the positions
+    and quotes the render opened with -- but they are rewritten by the same redraw
+    anyway, so nothing has to remember which figures are live.
     """
     label: str
     color: str
@@ -1465,6 +2233,10 @@ class LabelBar:
     current_text: str
     target_text: str
     delta_text: str
+    previous_target_pct: Optional[float] = None
+    last_text: str = ''
+    pnl: UnrealisedPnL = field(default_factory=UnrealisedPnL)
+    pnl_text: str = ''
 
 
 def investable_share_pct(current_value: float, base_notional: Optional[float],
@@ -1583,8 +2355,160 @@ def build_label_bars(views, *, base_notional: Optional[float],
             target_text=TARGET_CELL_PREFIX + format_target_pair(target, unallocated_pct),
             delta_text=format_label_delta(status=status, delta_pct=delta_pct,
                                           delta_value=delta_value),
+            previous_target_pct=view.previous_target_pct,
+            last_text=format_last_target(view.previous_target_pct),
+            pnl=view.pnl,
+            pnl_text=format_pnl_caption(view.pnl),
         ))
     return bars
+
+
+# ---------------------------------------------------------------------------
+# THE SHARE BAR -- ONE bar, three places
+#
+# The label header has carried a current-versus-target bar since the 2026-08-25
+# rework. The same geometry answers two more questions now: how the SYMBOL SHARES
+# inside one label add up against their 100, and how the account's free cash sits
+# against the reserve it is targeting.
+#
+# One builder, one tolerance band, one over/under vocabulary and one set of status
+# classes, so the whole page reads as one visual language -- and so no bar can
+# contradict the sentence printed beside it. That last one is not hypothetical:
+# the reserve row's own sub-line says that RAISING the reserve on a fully invested
+# book generates sells, and a bar that read its two figures the wrong way round
+# would be calling the same account "over" while the sentence called it short.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ShareBar:
+    """One current-versus-target bar. Pure geometry plus a verdict.
+
+    ``fraction`` and ``notch_fraction`` are 0-1 of the SAME track -- that shared
+    scale is what makes "over" and "under" legible by eye rather than a claim the
+    reader has to take on trust.
+
+    ``current_pct`` is ``None`` when there is nothing measurable to divide, which
+    is a different fact from 0.0% and draws a dash. It keeps its SIGN otherwise: a
+    net-short set is genuinely negative and the figure says so, while the bar
+    clamps to empty rather than wrapping round to a full track.
+
+    ``delta_value`` is ``None`` where there is no money behind the ratio -- a sum
+    of shares WITHIN a label is a share of that label and of nothing else -- and
+    ``delta_text`` then states the points alone.
+    """
+    current_pct: Optional[float]
+    target_pct: float
+    delta_pct: Optional[float]
+    delta_value: Optional[float]
+    fraction: float
+    notch_fraction: Optional[float]
+    status: str
+    current_text: str
+    target_text: str
+    delta_text: str
+
+
+def build_share_bar(*, current_pct: Optional[float], target_pct: float,
+                    current_value: Optional[float] = None,
+                    target_value: Optional[float] = None) -> ShareBar:
+    """Build one current-versus-target bar. Pure.
+
+    The track's scale is the LARGEST of 100, the current and the target, so a
+    figure past 100 stretches the track instead of clipping -- the same choice
+    ``bar_scale_pct`` makes for the label rows, and for the same reason: a clipped
+    bar and a full bar look identical and mean different things.
+
+    The tolerance band is ``LABEL_STATUS_TOLERANCE_PCT``, shared with the label
+    rows, so "on target" means one thing on this page.
+    """
+    target = float(target_pct or 0.0)
+    scale = max(_MIN_BAR_SCALE_PCT, 100.0, float(current_pct or 0.0), target)
+    if current_pct is None:
+        return ShareBar(current_pct=None, target_pct=target, delta_pct=None,
+                        delta_value=None, fraction=0.0,
+                        notch_fraction=_bar_fraction(target, scale),
+                        status=LABEL_STATUS_NONE,
+                        current_text=LABEL_CURRENT_UNKNOWN,
+                        target_text=TARGET_CELL_PREFIX + TARGET_PAIR_FMT.format(
+                            target_pct=target),
+                        delta_text=LABEL_DELTA_NONE)
+    delta_pct = float(current_pct) - target
+    delta_value = (None if (current_value is None or target_value is None)
+                   else float(current_value) - float(target_value))
+    if delta_pct > LABEL_STATUS_TOLERANCE_PCT:
+        status = LABEL_STATUS_OVER
+    elif delta_pct < -LABEL_STATUS_TOLERANCE_PCT:
+        status = LABEL_STATUS_UNDER
+    else:
+        status = LABEL_STATUS_OK
+    return ShareBar(
+        current_pct=float(current_pct), target_pct=target, delta_pct=delta_pct,
+        delta_value=delta_value,
+        fraction=_bar_fraction(float(current_pct), scale),
+        notch_fraction=_bar_fraction(target, scale), status=status,
+        current_text=LABEL_CURRENT_FMT.format(pct=float(current_pct)),
+        target_text=TARGET_CELL_PREFIX + TARGET_PAIR_FMT.format(target_pct=target),
+        delta_text=format_label_delta(status=status, delta_pct=delta_pct,
+                                      delta_value=delta_value))
+
+
+#: Said beside the per-label bar. It names the denominator, because the panel
+#: header immediately above carries the OTHER one -- that bar is the label's share
+#: of the investable pool, this one is its symbols' shares of the label.
+SYMBOL_TOTAL_BAR_CAPTION = 'shares of this label'
+
+
+def symbol_total_bar(weights) -> ShareBar:
+    """The per-label bar: the SUM of the symbol shares, against their 100. Pure.
+
+    A SUM and never a mean -- three symbols at 25% total 75%, which is a label 25
+    points short of being fully divided, not one that averages 25.
+
+    A BLANK share (an unmeasurable holding) makes the whole total unknown rather
+    than counting as zero, for the reason it is blank in the first place: nobody
+    knows what it is, and reporting the label as 40 points short would be a claim
+    about a number that does not exist.
+
+    This is deliberately NOT the label's share of the portfolio -- the panel header
+    directly above already carries that bar, on the investable denominator. Two
+    bars, two denominators, and the caption beside each says which.
+    """
+    shares = list((weights or {}).values())
+    if not shares:
+        return build_share_bar(current_pct=None, target_pct=100.0)
+    if any(pct is None for pct in shares):
+        return build_share_bar(current_pct=None, target_pct=100.0)
+    return build_share_bar(current_pct=round(sum(float(p) for p in shares), 2),
+                           target_pct=100.0)
+
+
+def reserve_bar(*, base_notional: Optional[float],
+                available_buying_power: Optional[float],
+                unallocated_pct: float) -> Optional[ShareBar]:
+    """The unallocated row's bar: free cash against the reserve target. Pure.
+
+    Built from ``unallocated_row`` -- the same figures the sentence beside it
+    prints -- so the picture and the words cannot disagree. Both are on the GROSS
+    base, which is the page's one deliberate exception to the investable
+    denominator: the reserve IS the part held back, so restating it against what
+    it leaves would be circular.
+
+    CURRENT is the buying power and TARGET is the reserve, in that order. Read the
+    other way round an under-funded reserve reads "over" -- while the sub-line
+    beside it is explaining that raising the reserve will generate sells.
+
+    ``None`` on a missing or zero base and on an unknown buying power, on exactly
+    ``format_reserve_row``'s terms: there is no denominator, so there is no bar.
+    """
+    if not base_notional or available_buying_power is None:
+        return None
+    row = unallocated_row(base_notional=base_notional,
+                          available_buying_power=available_buying_power,
+                          unallocated_pct=unallocated_pct)
+    return build_share_bar(current_pct=row.pct_of_base, target_pct=row.target_pct,
+                           current_value=row.current_value,
+                           target_value=row.target_value)
 
 
 def sort_label_views(views) -> List["LabelView"]:
@@ -1670,14 +2594,137 @@ def format_label_total_notice(targets,
     """
     if not targets:
         return None
-    total = sum(float(pct or 0.0) for pct in targets.values())
+    _total, severity, sentence = judge_label_total(targets, tolerance)
+    return None if severity == 'ok' else (sentence, severity)
+
+
+# ---------------------------------------------------------------------------
+# THE LABEL-TOTAL READOUT
+#
+# The running total was a sentence under the stat cards that appeared only when
+# the set was WRONG -- so the one moment the user most wanted it, while typing
+# towards 100, was the one moment it said nothing.
+#
+# It is a FILL BAR inside the "Managed labels" card now, under the count, so one
+# card answers both halves of one question: how many labels, and how much of the
+# pool they add up to. It is the same ``build_share_bar`` as the per-label
+# symbol-share bar and the unallocated bar -- three scopes of one idea, and if
+# they looked different the user would have to learn three things.
+#
+# ONE PREDICATE, THREE READOUTS. ``judge_label_total`` is what this, the advisory
+# and the totals footer all ask, so a bar calling 118% fine while the footer calls
+# it an error is not reachable.
+#
+# The denominator is the INVESTABLE POOL, and the reserve does not enter it: the
+# labels divide what the reserve LEAVES, so 100 typed across them is 100 at every
+# reserve. Netting the reserve out here would call a correct set "under by 10".
+# The caption says so out loud, because the three bars have three denominators.
+# ---------------------------------------------------------------------------
+
+LABEL_TOTAL_TITLE = 'Label targets total'
+
+#: Beside the bar, naming ITS denominator. The per-label bar says "shares of this
+#: label" for the same reason: two bars two inches apart on two denominators is
+#: the collision this page has spent its life unpicking.
+LABEL_TOTAL_BAR_CAPTION = 'of the investable pool'
+
+#: Said when the set is right. It states the denominator rather than just ticking,
+#: because "100.00%" alone does not say 100% OF WHAT -- and this page carries three
+#: different denominators within two inches of each other.
+LABEL_TOTAL_ON_TARGET = ('on target — the labels divide the whole investable '
+                              'pool')
+
+#: ...and when there are no labels at all. Not the on-target sentence: nothing has
+#: been asked of an unmanaged account and reporting it as correct is approval of a
+#: decision nobody made.
+LABEL_TOTAL_EMPTY = 'no managed labels yet — nothing is allocated'
+
+#: The card's tooltip, drawn at EVERY state. The shortfall sentence carries the
+#: "use the Unallocated box" guidance only while the set is short, and that is the
+#: one fact a user needs BEFORE they leave a gap on purpose -- so it is repeated
+#: here where it is always readable.
+LABEL_TOTAL_TOOLTIP = (
+    'Every label target is a share of the investable pool — what the cash reserve '
+    'leaves — so they add up to 100%. To hold money back, raise the Unallocated '
+    'reserve rather than leaving a shortfall here: a shortfall and a reserve '
+    'produce the same numbers and only you can tell which one you meant.')
+
+#: Severity -> stylesheet classes for the readout's detail line. Same vocabulary
+#: as ``LABEL_TOTAL_NOTICE_CLASSES`` and ``FOOTER_CLASSES``, plus the 'ok' key
+#: those two express differently, so the readout can always draw something.
+LABEL_TOTAL_CLASSES = {
+    'ok': 'text-xs text-secondary-custom',
+    'warning': 'text-xs text-orange-400',
+    'negative': 'text-xs text-red-400 font-bold',
+}
+
+
+def judge_label_total(targets, tolerance: float = LABEL_TOTAL_TOLERANCE_PCT):
+    """``(total, severity, sentence)`` for one set of label targets. Pure.
+
+    THE predicate. ``format_label_total_notice``, ``label_total_readout`` and (through
+    its own copy of the same band) ``format_allocation_footer`` all reach their
+    verdict here, so the three readouts of one set cannot describe it differently.
+
+    ``total`` is a SUM and never a mean: three labels at 25% total 75%, which is a
+    set that is 25 points short, not one that averages 25.
+
+    The band is the engine's ``LABEL_TOTAL_TOLERANCE_PCT`` (0.01pp), because a
+    two-decimal three-way split really does total 100.01 and refusing the engine's
+    own even split would be absurd.
+    """
+    total = sum(float(pct or 0.0) for pct in (targets or {}).values())
     if total > 100.0 + tolerance:
-        return (ERROR_LABEL_TOTAL_FMT.format(total=total, over=total - 100.0),
-                'negative')
+        return total, 'negative', ERROR_LABEL_TOTAL_FMT.format(
+            total=total, over=total - 100.0)
     if total < 100.0 - tolerance:
-        return (ERROR_LABEL_UNDER_FMT.format(total=total, under=100.0 - total),
-                'warning')
-    return None
+        return total, 'warning', ERROR_LABEL_UNDER_FMT.format(
+            total=total, under=100.0 - total)
+    return total, 'ok', LABEL_TOTAL_ON_TARGET
+
+
+@dataclass
+class LabelTotalReadout:
+    """The 'Label targets total' fill bar, decided. Pure.
+
+    ``text`` is ALWAYS a figure -- that is the whole reason this stopped being a
+    conditional sentence. ``detail`` is the engine's own wording when the set is
+    off and a denominator-naming clause when it is not; ``severity`` keys
+    ``LABEL_TOTAL_CLASSES``.
+
+    ``bar`` comes off the SAME ``build_share_bar`` as the per-label symbol-share
+    bar and the unallocated bar, so the three read as one idea at three scopes
+    rather than as three widgets that happen to be rectangles.
+    """
+    title: str
+    text: str
+    detail: str
+    severity: str
+    bar: ShareBar
+
+
+def label_total_readout(
+        targets,
+        tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> LabelTotalReadout:
+    """Build the label-total readout and its bar. Pure; never raises.
+
+    An account managing NOTHING reports 0.00% at severity 'ok' with its own
+    sentence: there is no set to be wrong, so calling it an error would tell the
+    user off for not having configured a page they have just opened -- and the
+    empty-state banner already says what to do. Its bar carries no verdict either,
+    for the same reason: a full-looking or empty-looking track on an unconfigured
+    account is a claim about a decision nobody has made.
+    """
+    total, severity, sentence = judge_label_total(targets, tolerance)
+    if not targets:
+        return LabelTotalReadout(
+            title=LABEL_TOTAL_TITLE, text='0.00%', detail=LABEL_TOTAL_EMPTY,
+            severity='ok',
+            bar=build_share_bar(current_pct=None, target_pct=100.0))
+    return LabelTotalReadout(
+        title=LABEL_TOTAL_TITLE, text=f'{total:.2f}%', detail=sentence,
+        severity=severity,
+        bar=build_share_bar(current_pct=round(total, 2), target_pct=100.0))
 
 
 def reserve_dollars(base_notional: Optional[float],

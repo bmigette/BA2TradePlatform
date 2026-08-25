@@ -28,6 +28,9 @@ from typing import Any, Dict, List, Optional, Tuple
 # Import the metric-coercion helpers from the lightweight ``metrics_utils`` module, NOT from
 # ``backtest_handler`` (the legacy ML path), which top-imports the tsai/torch/darts training
 # stack (~7s of startup) that the expert backtest never uses. See metrics_utils for details.
+from app.services.backtest.equity_cap import (
+    capped_drawdown_curve, scoring_curve, validate_equity_cap,
+)
 from app.services.backtest.metrics_utils import _safe_float, _safe_duration_days
 from ba2_common.logger import logger
 
@@ -133,7 +136,34 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
          "equity": _finite(s["net_liquidating_value"], "equity_curve point")}
         for s in snaps
     ]
-    drawdown_curve = _drawdown_curve(equity_curve)
+    # Fixed-notional runs are scored on a FIXED denominator: each period's return is
+    # period P&L / cap, compounded. See equity_cap.scoring_curve. The recorded series stays
+    # real; only the scored one is restated.
+    #
+    # ORDER MATTERS: ``capped_drawdown_curve`` takes the REAL curve, so it must be computed
+    # BEFORE ``equity_curve`` is reassigned. Reversing these two lines silently measures
+    # drawdown on the synthetic curve -- the very defect the cap-denominated drawdown exists
+    # to prevent -- and produces a plausible, smaller number.
+    #
+    # ``account_settings`` is read with ``.get`` ONLY because lightweight callers/stubs pass a
+    # bare ``{"initial_capital": ...}`` (test_results_metrics, test_zero_coercion_defects). An
+    # absent block is "no cap configured", never a cap of zero; a cap that IS present is
+    # re-validated here so a bad value cannot silently reach scoring.
+    _account_settings = config.get("account_settings")
+    _cap = validate_equity_cap(
+        _account_settings.get("equity_cap") if _account_settings else None)
+    if _cap is not None:
+        drawdown_curve = capped_drawdown_curve(equity_curve, cap=_cap)
+        equity_curve = scoring_curve(equity_curve, cap=_cap)
+        # THE DENOMINATOR MOVES WITH THE CURVE. The scored series is denominated in the CAP
+        # (it starts at ``_cap``), so every ratio metric built from it must divide by the cap
+        # too. Leaving ``initial`` at the account's starting capital made a $20k cap on a
+        # $100k account report -80% total return for a completely FLAT run -- the account
+        # "losing" the 80,000 the cap withheld, on every single run. A percentage of the cap
+        # over the capital is two different things wearing one label.
+        initial = _cap
+    else:
+        drawdown_curve = _drawdown_curve(equity_curve)
     # Prefer round-trip trades (entry+exit paired with realised P&L) when the account exposes
     # them — that's what makes win_rate/profit_factor/expectancy meaningful. Fall back to the
     # per-fill rows for accounts/stubs that don't implement the pairing.

@@ -1,9 +1,32 @@
-"""Portfolio Allocation wizard: steps, dry-run dialog, income panel, outcome table.
+"""Portfolio Allocation: the REVIEW-AND-COMMIT gate, income panel, outcome table.
 
 Section G owns this module. The allocation PAGE
 (``ui/pages/portfolio_allocation.py``) renders the label/symbol editor and calls
-``open_allocation_steps()``, ``open_allocation_wizard()`` and
+``open_invest_scope()``, ``open_allocation_wizard()`` and
 ``render_income_panel()`` from here.
+
+THIS MODULE SETS NO TARGETS, AND THAT IS THE POINT
+==================================================
+It used to open a three-step dialog whose step 1 was "Rebalance - set targets"
+and whose step 2 was the symbol weights. Both are on the PAGE now -- the label
+target inputs, the symbol share inputs, the cash reserve, the per-row ``last``
+target and P&L, and the six buttons over them (``Even split`` / ``Load last`` at
+label level; ``Even split`` / ``Fill rest`` / ``Load last`` / ``Wipe`` per
+label). Pressing Allocate goes STRAIGHT to the dry run.
+
+Everything that expresses INTENT lives on the page; everything that shapes
+EXECUTION lives at this gate, and there is exactly one of the latter:
+``allow fractional shares``, which stays because it changes WHICH ORDERS are
+produced rather than what is being aimed at -- and toggling it re-solves.
+
+The prize is that the two screens no longer derive the same figures
+independently. The wizard's ``target 13.50% of base`` and the page's
+``tgt 13.5%`` were one number computed twice, on two denominators, and a whole
+class of "these two screens disagree" bug lived in the gap.
+
+``InvestScope`` is the one dialog left with an input, and it is not a target
+editor: an INVEST run spends a specific amount on a single label, so the run has
+to be told which label and how much. Neither is a stored target of anything.
 
 This module only DRAWS. Every decision lives in
 ``ba2_common.core.portfolio_allocation`` (pure) or in
@@ -24,14 +47,23 @@ The Outcome and Weight columns are not decoration. The engine bumps a target
 smaller than one share UP to one share, and moves quantities between a label's
 symbols to keep the label on target; both spend money the typed weights did not ask
 for, and both are only acceptable because these two columns show them.
+
+It stays MODAL. A commit gate for real orders should be a deliberate stop, not
+something reachable by scrolling.
 """
 from typing import Callable, Dict, List, Optional, Tuple
 
 from nicegui import ui
 
+# NOTHING that edits a target is imported here any more, and the absence is
+# enforced by a test that greps this file. The engine's six target-editing
+# helpers and their can-do predicates now reach the user through
+# ``ui/utils/portfolio_allocation_view.py`` and the allocation PAGE. An import is
+# a dependency and a dependency is an invitation: leaving them here would put this
+# module one edit away from having a target editor again. (Their names are
+# deliberately not spelled out in this comment -- the test looks for the strings.)
 from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL,
-    ALLOCATION_MODE_REBALANCE,
     LEVERAGE_LEVERAGED,
     LEVERAGE_NONE,
     LEVERAGE_NOT_APPLICABLE,
@@ -42,40 +74,21 @@ from ...core.portfolio_allocation import (
     AllocationPlan,
     BaseSnapshot,
     LabelTarget,
-    PositionState,
-    SymbolTarget,
-    UnrealisedPnL,
     blocking_messages,
     bump_notice,
-    can_even_split_symbols,
-    can_fill_remaining_symbol_weights,
-    can_wipe_symbol_weights,
     dry_run_rows,
-    effective_target_pct,
-    even_split_symbol_weights,
-    even_split_targets,
-    fill_remaining_symbol_weights,
     filter_plan_rows,
-    format_unrealised_pnl,
     fractional_summary,
     LABEL_TOTAL_TOLERANCE_PCT,
-    has_previous_symbol_weights,
-    has_previous_targets,
     held_no_price_block,
-    load_previous_symbol_weights,
-    load_previous_targets,
     invest_validation_messages,
-    investable_notional,
     is_blocking_message,
     no_order_notice,
     no_order_rows,
     redistribution_notice,
-    steps_validation_messages,
     summarise_plan,
     unconsumed_income_notice,
-    unrealised_pnl,
     whole_share_notice,
-    wipe_symbol_weights,
 )
 from ..utils.portfolio_allocation_view import (
     MARKET_BANNER_CLASSES, MarketGateResult, market_provenance_notice,
@@ -193,21 +206,6 @@ MARKER_PLAN_NOTICE = 'dry-run-plan-notice'
 #: Marker on the income panel's working-orders line, for the same reason.
 MARKER_WORKING_ORDERS = 'income-working-orders'
 
-#: Markers on the step 1 / step 2 percentage boxes, in label then symbol order.
-MARKER_LABEL_PCT = 'steps-label-pct'
-MARKER_SYMBOL_PCT = 'steps-symbol-pct'
-
-#: Marker on the MONEY caption beside step 1's Unallocated box, at the TOP of the
-#: label list. By marker: the sentence is money, which repeats in the rows beneath.
-MARKER_UNALLOCATED = 'steps-unallocated'
-
-#: Marker on step 1's EDITABLE reserve input. Separate from the caption above so a
-#: test can assert the box exists and holds a value without matching on prose.
-MARKER_UNALLOCATED_PCT = 'steps-unallocated-pct'
-
-#: Marker on step 1's live running total.
-MARKER_LABEL_TOTAL = 'steps-label-total'
-
 #: Marker on the dry run's reserve chip.
 MARKER_RESERVED = 'dry-run-reserved'
 
@@ -230,113 +228,23 @@ CASH_VS_RESERVE_FMT = ('Est. cash after {cash:,.2f} vs reserve {reserved:,.2f} '
                        '(buying power + holdings), not a cash balance, so on a '
                        'margin account these two need not meet')
 
-#: The money beside step 1's reserve box. BOTH halves, because the useful question
-#: is not "how much am I holding back" on its own but "...and what is left to
-#: divide" -- the number the label percentages below are shares of. The RESERVE
-#: comes first, and the tests pin that order: the sentence carries two figures that
-#: are meaningless the wrong way round and nothing in the arithmetic would object.
-#:
-#: NOT "held as cash". The reserve is a share of ``base_notional`` -- buying power
-#: PLUS the value of the book -- so what it buys is money left UNDEPLOYED, which on
-#: a margin account is unused buying power and not a cash balance. Only on a cash
-#: account are the two the same thing, and promising the wrong one is how a user
-#: ends up expecting a settled balance the broker never produces.
-UNALLOCATED_FMT = ('= {amount:,.2f} held back (not allocated), leaving '
-                   '{investable:,.2f} for the labels below')
-
-#: Step 1's live running total. The messages list is built below step 3 and can sit
-#: under the fold in a maximized dialog, so the total has to be up where the boxes
-#: are.
-LABEL_TOTAL_FMT = 'Total: {total:.2f}%'
-
-#: The label on step 1's reserve box. Names it "free buying power" for continuity
-#: with the page, and says outright that the labels are unaffected -- that is the
-#: property the user is being asked to trust.
-UNALLOCATED_LABEL = 'Unallocated (free buying power)'
-
 #: The dry run's reserve chip, drawn only when there IS one. A "Reserved: 0.00" on
 #: every fully-allocated plan is noise, and noise is what hides the real case.
 RESERVED_FMT = 'Reserved (not allocated): {amount:,.2f} ({pct:.2f}% of base)'
 
-#: Markers on the step 1 / step 2 "Load last" buttons. Buttons, not labels, so the
-#: tests locate them by marker AND by type -- 'Load last' is short enough to collide
-#: with free text, and the per-label copies are indistinguishable by caption.
-MARKER_LOAD_LAST = 'steps-load-last'
-MARKER_LOAD_LAST_SYMBOLS = 'steps-load-last-symbols'
+#: Marker on the invest dialog's "Continue saves your weights" note. By marker:
+#: the sentence names Cancel, and 'Cancel' is also the label of the button beside
+#: it.
+MARKER_CONTINUE_SAVES = 'invest-continue-saves'
 
-#: Markers on the step 1 / step 2 "Even split" buttons, for exactly the reason the
-#: pair above carries them: step 2 draws one per label, so 'Even split' is no longer
-#: unique in the dialog and a caption match would find whichever came first. The
-#: step 1 marker earns its keep as the guard that the LABEL splitter stays singular.
-MARKER_EVEN_SPLIT = 'steps-even-split'
-MARKER_EVEN_SPLIT_SYMBOLS = 'steps-even-split-symbols'
-
-#: Markers on step 2's "Fill rest" and "Wipe" buttons. Step-2 only: filling what is
-#: left across the empty boxes and clearing them are both about the weights INSIDE
-#: one label, and step 1 has an editable reserve that already owns "what is left"
-#: at the label scale.
-MARKER_FILL_REST_SYMBOLS = 'steps-fill-rest-symbols'
-MARKER_WIPE_SYMBOLS = 'steps-wipe-symbols'
-
-#: Markers on the read-only "now / last" captions beside each percentage box.
-#: ``ui.label``, deliberately NOT a second marked ``ui.number``: the landed suite
-#: indexes positionally into MARKER_LABEL_PCT / MARKER_SYMBOL_PCT, so an extra
-#: numeric widget under either would silently retarget those assertions instead of
-#: failing.
-MARKER_LABEL_CURRENT = 'steps-label-current'
-MARKER_SYMBOL_CURRENT = 'steps-symbol-current'
-
-#: Markers on the UNREALISED P&L captions -- per label in step 1, per symbol in
-#: step 2. A SEPARATE ``ui.label`` from the "now / last" caption beside it, not a
-#: fourth clause inside it, for one reason: this is the only figure on the line
-#: whose sign carries a verdict, so it is the only one that can be coloured, and
-#: NiceGUI colours whole elements. It is still a ``ui.label`` and not a second
-#: marked ``ui.number``, for the reason spelled out on the pair above.
-MARKER_LABEL_PNL = 'steps-label-pnl'
-MARKER_SYMBOL_PNL = 'steps-symbol-pnl'
-
-#: The P&L caption. The body comes from the engine's ``format_unrealised_pnl``,
-#: which owns every "may this be shown at all" branch -- blank versus 0.00, a
-#: percentage versus "no cost basis" -- so this string adds a name and nothing else.
-PNL_CAPTION_FMT = 'P&L {pnl}'
-
-#: Drawn where a percentage would be when there is no last. A dash, never 0.00%:
-#: "this has never run" and "last time this got nothing" are different facts, and
-#: 0.00% is a legitimate value of the second.
-NO_PREVIOUS_MARK = '-'
-
-#: Step 1's caption. Three facts, ALL of them shares of BASE NOTIONAL, because the
-#: page's own label header used to print "% of managed" immediately beside
-#: "target %" and the two are not comparable whenever buying power is non-zero.
-#:
-#: ``target`` is the box's RELATIVE weight restated against the base
-#: (``effective_target_pct``), and it is here because the box alone was NOT
-#: comparable with ``pct``. The label percentages divide the investable remainder,
-#: so under a 10% reserve a box reading 50 targets 45% of the base -- and a caption
-#: saying "50.00% of base" beside a box saying "50" read as perfectly on target on
-#: a row the plan was about to trim by a tenth. It is drawn at EVERY reserve,
-#: including 0 where it simply equals the box: a clause that appears only once the
-#: reserve is non-zero is one the user meets for the first time in the case that
-#: matters. ``previous`` stays the raw stored weight -- it is a "what did I type
-#: last time" figure, and the reserve of that run is not recorded per label.
-LABEL_CURRENT_FMT = ('now {value:,.2f} ({pct:.2f}% of base) · target '
-                     '{target:.2f}% of base · last {previous}')
-
-#: Step 2's caption. No "% of base" here: step 2's numbers are shares of the
-#: LABEL, and mixing the two denominators in one line is the defect above.
-SYMBOL_CURRENT_FMT = 'now {value:,.2f} · last {previous}'
-
-#: Marker on the steps dialog's "Continue saves your targets" note. By marker: the
-#: sentence names Cancel, and 'Cancel' is also the label of the button beside it.
-MARKER_CONTINUE_SAVES = 'steps-continue-saves'
-
-#: Shown above Continue. W0 made Continue a WRITE -- it persists the label targets
-#: and symbol weights so "load last" has something to load -- which removed the old
-#: "nothing here touches the database" guarantee. Cancel still abandons the RUN; it
-#: no longer abandons the NUMBERS.
+#: Shown above Continue. Continue is a WRITE: it persists the chosen label's symbol
+#: weights so "load last" has something to load. It does NOT write a label target
+#: or a reserve -- an invest run spends an explicit amount the user named, so the
+#: label's percentage played no part and restating it would record a choice nobody
+#: made. Cancel abandons the RUN, not the numbers.
 CONTINUE_SAVES_NOTE = (
-    'Continue SAVES these targets for next time, then opens the dry run. Cancel '
-    'abandons the run, not the saved numbers.')
+    'Continue SAVES this label\u2019s symbol weights for next time, then opens the '
+    'dry run. Cancel abandons the run, not the saved numbers.')
 
 #: Marker on the base panel's BLOCKING banner -- today only the market-mode
 #: "a held symbol has no quote" refusal (``held_no_price_block``). Located by
@@ -348,7 +256,12 @@ MARKER_BASE_BLOCK = 'base-block'
 INVEST_SCOPE_NOTE = ('Pre-filled with the unallocated income total. Buys only - '
                      'an INVEST run never sells.')
 
-#: Shown on the fractional switch when the broker does not split shares at all.
+#: Shown beside the dry run's fractional switch when the broker does not split
+#: shares at all. The switch is disabled there rather than hidden: a control that
+#: vanishes is one the user cannot learn exists, and offering a toggle the broker
+#: cannot honour would produce a plan sized on a grid that does not exist -- the
+#: engine silently falls back to whole shares, so the user would see quantities
+#: they never asked for.
 NO_FRACTIONAL_SUPPORT_NOTE = 'This broker does not support fractional shares.'
 
 
@@ -362,19 +275,10 @@ def _shares(quantity: float) -> str:
     return f"{quantity:,.5f}".rstrip('0').rstrip('.') or '0'
 
 
-def _pnl_classes(pnl: UnrealisedPnL) -> str:
-    """CSS for a P&L caption. Pure; no ``ui`` call.
-
-    Colour is an ACCENT and never the message: ``format_unrealised_pnl`` signs both
-    numbers, so the caption reads correctly in monochrome, to a colour-blind user
-    and in a screen reader. Grey covers three different things on purpose --
-    nothing measurable, nothing held, and a genuine flat 0.00 -- because none of
-    them is a verdict, and painting "break-even" green or red would invent one.
-    """
-    if pnl.amount is None or abs(pnl.amount) <= MONEY_EPSILON:
-        return 'text-xs text-secondary-custom'
-    return 'text-xs font-medium ' + ('text-green-500' if pnl.amount > 0
-                                     else 'text-red-500')
+# ``_pnl_classes`` used to live here, beside the step-1/step-2 P&L captions. It
+# moved to ``ui/utils/portfolio_allocation_view.py`` as ``pnl_classes`` with the
+# captions themselves: the P&L is a fact about a label and a symbol, not about a
+# run, so it belongs on the screen the user reads them from.
 
 
 def _leverage_cell(row: Dict) -> Tuple[str, str, str]:
@@ -492,8 +396,22 @@ class AllocationWizard:
             self._banner_container = ui.column().classes('w-full')
             self._render_market_banner()
             self._render_base_panel()
-            ui.switch('Allow fractional shares', value=self.allow_fractional,
-                      on_change=lambda e: self._refresh(bool(e.value)))
+            # THE ONE EXECUTION CONTROL. It stays at the gate because it changes
+            # WHICH ORDERS are produced rather than what is being aimed at -- and
+            # it RE-SOLVES: ``_refresh`` replaces ``self.plan``, so the table, the
+            # totals and what Submit sends all move together. A switch that only
+            # recorded a preference would show one plan and submit another.
+            fractional = ui.switch('Allow fractional shares',
+                                   value=self.allow_fractional,
+                                   on_change=lambda e: self._refresh(bool(e.value)))
+            # The broker's veto, which used to sit on the step-3 panel of the
+            # dialog that is gone. Offering a toggle the broker cannot honour would
+            # size the plan on a grid that does not exist: the engine silently
+            # falls back to whole shares, so the user would see quantities they
+            # never asked for. DISABLED, not hidden, and the reason said out loud.
+            fractional.set_enabled(bool(self.base.supports_fractional))
+            if not self.base.supports_fractional:
+                ui.label(NO_FRACTIONAL_SUPPORT_NOTE).classes('text-xs text-gray-400')
             ui.label(MARKET_ORDER_TIMING_NOTE).classes('text-xs text-orange-400')
             self._notices_container = ui.column().classes('w-full')
             self._rows_container = ui.column().classes('w-full gap-0')
@@ -1025,119 +943,59 @@ def open_allocation_wizard(
     return wizard
 
 
-class AllocationSteps:
-    """Steps 1-3 of the wizard, drawn as three sections in ONE dialog.
+class InvestScope:
+    """"Invest into one label": which label, how much, and what there is to spend.
 
-    This repo uses no ``ui.stepper``, so the three steps are stacked sections
-    with a single validated Continue button; the pure validators decide whether
-    Continue is enabled and their messages are shown verbatim.
+    NOT a target editor, and it never was. The wizard's three-step REBALANCE
+    dialog is gone -- its step 1 ("Rebalance - set targets") and step 2 (symbol
+    weights) now live on the Portfolio Allocation page, beside the numbers they
+    rewrite -- and pressing Allocate goes straight to the dry run. What survives
+    here is the one thing the page cannot express: an INVEST run spends a specific
+    amount on a single label, so the run has to be told which label and how much,
+    and neither is a stored target of anything.
 
-    REBALANCE mode edits label percentages (step 1) and symbol weights (step 2),
-    gated by ``steps_validation_messages``. INVEST_LABEL mode replaces step 1
-    with a label picker plus an amount box and skips the labels-total-100 rule
-    entirely -- the amount is the whole budget (decision: buys only, no sells) --
-    but it is NOT ungated: ``invest_validation_messages`` still holds the chosen
-    label's symbol weights to 100%, because ``compute_label_investment``
-    multiplies them straight through and a 150% set would overspend the budget by
-    half.
+    ``compute_label_investment`` multiplies the chosen label's symbol weights
+    straight through, so a 150% set would overspend the budget by half;
+    ``invest_validation_messages`` still holds them to 100 and gates Continue on
+    it. The weights themselves are typed on the page.
 
-    CONTINUE WRITES (W0). The caller's ``labels`` are still deep-copied on the way
-    in, so nothing is mutated under an open dialog and Cancel abandons the RUN --
-    but ``on_dry_run`` now persists the label targets and the symbol weights before
-    it solves, because "load last" has to answer "what did I actually allocate to",
-    and the fractional switch has been saved from exactly this point since it
-    shipped. A dry run the user reviews and then abandons has therefore already
-    changed stored state, and ``CONTINUE_SAVES_NOTE`` says so on screen. Cancel no
-    longer abandons the NUMBERS.
+    There is no fractional switch here. Exactly ONE execution control exists and
+    it is at the gate (``AllocationWizard``), where toggling it re-solves the plan
+    -- a second copy two dialogs earlier would be a question asked before there
+    was anything to answer it about. The account's remembered choice is carried
+    through untouched.
 
-    Continue hands the edited targets to ``on_dry_run``, which persists them,
-    solves, and opens ``AllocationWizard``.
+    Continue WRITES: ``on_dry_run`` persists the chosen label's symbol weights
+    before it solves, so "load last" has something to load. It does NOT write a
+    label target or a reserve -- an invest run spends an explicit amount, so the
+    label's percentage played no part.
     """
 
     def __init__(self, base: BaseSnapshot, labels: List[LabelTarget], *,
                  on_dry_run: Callable[..., None],
                  allow_fractional: bool,
-                 mode: str = ALLOCATION_MODE_REBALANCE,
-                 invest_amount: float = 0.0,
-                 symbol_values: Optional[Dict[str, float]] = None,
-                 positions: Optional[Dict[str, PositionState]] = None,
-                 unallocated_pct: float = 0.0):
+                 invest_amount: float = 0.0):
         self.base = base
-        # The deep copy carries ``previous_*`` across UNCHANGED. They are what the
-        # Load-last buttons read, and a copy that dropped them would disable the
-        # feature silently on every open.
-        self.labels = [LabelTarget(label=lt.label, target_pct=lt.target_pct,
-                                   symbols=[SymbolTarget(st.symbol, st.weight_pct,
-                                                         st.comment,
-                                                         st.previous_weight_pct)
-                                            for st in lt.symbols],
-                                   comment=lt.comment,
-                                   previous_target_pct=lt.previous_target_pct)
-                       for lt in labels or []]
+        # A SHALLOW copy is enough now. The deep copy this replaced existed
+        # because the dialog edited every target and weight in place and Cancel
+        # had to abandon them; nothing here mutates a LabelTarget at all.
+        self.labels = list(labels or [])
         self.on_dry_run = on_dry_run
-        self.mode = mode
         self.invest_amount = float(invest_amount or 0.0)
-        #: ``{SYMBOL: current value}`` under the account's valuation mode, for the
-        #: read-only "now" captions. ``{}`` when the caller did not supply it, which
-        #: draws 0.00 rather than guessing -- these are display-only and touch no
-        #: target, so a missing map costs a caption and never a number that trades.
-        self.symbol_values = dict(symbol_values or {})
-        #: ``{SYMBOL: PositionState}``, the SAME map the base snapshot was built
-        #: from. It is here and ``symbol_values`` is not enough because the
-        #: unrealised P&L may not be measured on the account's valuation mode: in
-        #: COST mode ``current_value`` IS the cost basis, so a P&L taken from
-        #: ``symbol_values`` is 0.00 on every row. These carry ``price``,
-        #: ``quantity`` and ``cost_basis`` separately, which is the only input from
-        #: which the question has an answer in both modes.
-        #:
-        #: ``{}`` when the caller supplied none, which draws a DASH rather than a
-        #: zero -- no position data is "not measurable", not "break-even".
-        self.positions = dict(positions or {})
-        # The account's REMEMBERED choice (defaults ON), still vetoed by a broker
-        # that cannot do fractional at all. Per-symbol eligibility is the engine's
-        # job -- MarginInfo.fractionable -- not this switch's.
+        # The account's REMEMBERED choice, still vetoed by a broker that cannot
+        # split shares at all. Carried, not offered: the switch is at the gate.
         self.allow_fractional = bool(base.supports_fractional and allow_fractional)
-        #: The account's STORED cash reserve, pre-filled and edited in place. It is
-        #: NOT part of ``labels`` and never enters their total: they are relative
-        #: weights totalling 100, and this says what share of the base they divide.
-        self.unallocated_pct = float(unallocated_pct or 0.0)
         self.scope_label = self.labels[0].label if self.labels else None
         self.dialog = None
         self._errors_container = None
         self._continue_button = None
-        self._fractional_switch = None
-        self._labels_container = None
-        self._unallocated_label = None
-        self._unallocated_input = None
-        self._total_label = None
-        #: ``[(LabelTarget, ui.label)]`` for step 1's read-only captions, in draw
-        #: order. Kept because the caption now states a TARGET as well as a current
-        #: value, so it goes stale on a keystroke in either the label box or the
-        #: reserve box; ``_redraw_derived_row`` refreshes them in place. Empty in
-        #: the invest flow, which draws no label targets at all.
-        self._label_captions = []
-        #: ``{label: column}`` for step 2, so a per-label Load last can redraw just
-        #: that expansion's boxes.
-        self._symbol_containers = {}
-        #: ``{label: (fill_rest, wipe)}`` for step 2. The two buttons whose enabled
-        #: state depends on the WEIGHTS rather than on the label's shape, so they
-        #: have to be reachable from every edit -- see ``_refresh_symbol_buttons``.
-        self._symbol_live_buttons = {}
 
     def open(self):
-        title = ('Rebalance - set targets' if self.mode == ALLOCATION_MODE_REBALANCE
-                 else 'Invest into one label')
         with ui.dialog().props('maximized') as dialog, ui.card().classes('w-full h-full overflow-auto'):
             self.dialog = dialog
-            ui.label(title).classes('text-xl font-bold')
-
-            if self.mode == ALLOCATION_MODE_REBALANCE:
-                self._render_step1_label_targets()
-                self._render_step2_symbol_weights()
-            else:
-                self._render_invest_scope()
-
-            self._render_step3_base_panel()
+            ui.label('Invest into one label').classes('text-xl font-bold')
+            self._render_invest_scope()
+            self._render_base_panel()
             self._errors_container = ui.column().classes('w-full')
             ui.label(CONTINUE_SAVES_NOTE).classes('text-xs text-orange-400 mt-2') \
                 .mark(MARKER_CONTINUE_SAVES)
@@ -1149,227 +1007,7 @@ class AllocationSteps:
         dialog.open()
         return dialog
 
-    # -- steps ------------------------------------------------------------
-    def _render_step1_label_targets(self):
-        ui.label('1. Label targets (must total 100%, split between the labels)') \
-            .classes('text-lg font-bold mt-2')
-        ui.label('These are RELATIVE weights. To hold cash, raise Unallocated below '
-                 '- the labels keep the percentages you typed and simply divide '
-                 'what is left.') \
-            .classes('text-xs text-secondary-custom')
-        with ui.row().classes('items-center gap-2'):
-            ui.button('Even split', icon='balance',
-                      on_click=self._even_split).props('outline dense') \
-                .mark(MARKER_EVEN_SPLIT)
-            # DISABLED, not hidden, when there is no last: the user has to be able
-            # to see the feature exists and learn that this account has never run.
-            last = ui.button('Load last', icon='history',
-                             on_click=self._load_last).props('outline dense') \
-                .mark(MARKER_LOAD_LAST)
-            last.set_enabled(has_previous_targets(self.labels))
-        self._labels_container = ui.column().classes('w-full gap-1')
-        self._draw_label_targets()
-
-    def _unallocated_caption(self) -> str:
-        """The reserve in DOLLARS, and what it leaves the labels to divide.
-
-        Both halves, because "10%" answers neither question the user actually has:
-        how much cash that is, and how much money the percentages below are shares
-        of. The money comes from the engine's own ``investable_notional``, so the
-        figure on screen is the one the plan will be solved with.
-        """
-        base = float(self.base.base_notional or 0.0)
-        investable = investable_notional(base, self.unallocated_pct)
-        return UNALLOCATED_FMT.format(amount=base - investable, investable=investable)
-
-    def _label_current_caption(self, lt: LabelTarget) -> str:
-        """The read-only "now X (Y% of base) · target Z% of base · last W%".
-
-        ONE denominator for the two numbers that are meant to be compared. "Now" is
-        a share of ``base_notional``; the target box is a RELATIVE weight on the
-        investable remainder, so it is restated against the same base through the
-        engine's ``effective_target_pct`` rather than printed as typed. Both of its
-        inputs are live boxes, so ``_redraw_derived_row`` refreshes this line on
-        every keystroke in either -- see the note there.
-
-        ``last`` is deliberately NOT converted: it is the weight the previous run
-        was launched with, and that run's reserve is not stored per label, so
-        restating it would need a number nobody recorded.
-        """
-        value = sum(self.symbol_values.get(st.symbol, 0.0) for st in lt.symbols)
-        base = float(self.base.base_notional or 0.0)
-        previous = (NO_PREVIOUS_MARK if lt.previous_target_pct is None
-                    else f'{float(lt.previous_target_pct):.2f}%')
-        return LABEL_CURRENT_FMT.format(
-            value=value, pct=(value / base * 100.0) if base else 0.0,
-            target=effective_target_pct(lt.target_pct, self.unallocated_pct),
-            previous=previous)
-
-    def _label_pnl(self, lt: LabelTarget) -> UnrealisedPnL:
-        """The label's TOTAL unrealised P&L, over its symbols' summed money.
-
-        ONE call over the whole membership, not a combination of per-symbol
-        results, and that is what makes the percentage money-weighted: the engine
-        sums market value and gross cost first and divides once. Averaging the
-        symbols' own percentages would weight a 1,000 holding exactly as heavily as
-        the 90,000 one beside it.
-        """
-        return unrealised_pnl([self.positions.get(st.symbol) for st in lt.symbols])
-
-    def _symbol_pnl(self, st: SymbolTarget) -> UnrealisedPnL:
-        """One symbol's unrealised P&L -- the same function at a scope of one, so a
-        row and the label above it cannot be measured by two different rules."""
-        return unrealised_pnl([self.positions.get(st.symbol)])
-
-    def _draw_pnl(self, pnl: UnrealisedPnL, marker: str) -> None:
-        """Draw one P&L caption. The arithmetic AND the wording are the engine's."""
-        ui.label(PNL_CAPTION_FMT.format(pnl=format_unrealised_pnl(pnl))) \
-            .classes(_pnl_classes(pnl)).mark(marker)
-
-    def _draw_label_targets(self):
-        self._labels_container.clear()
-        # Rebuilt with the rows: the old ui.label objects have just been discarded,
-        # and writing to a detached element would update nothing on screen.
-        self._label_captions = []
-        with self._labels_container:
-            # FIRST, above the labels: this is the row that says how much of the
-            # book is even in play, and below them it reads as a footnote. Always
-            # drawn, including at 0.00% -- a box that appears only once it is
-            # non-zero is one the user cannot find when the validator tells them to
-            # use it.
-            with ui.row().classes('w-full items-center gap-3'):
-                ui.label(UNALLOCATED_LABEL).classes('w-40 font-medium text-orange-400')
-                self._unallocated_input = ui.number(
-                    value=self.unallocated_pct, min=0, max=100, step=0.01, suffix='%',
-                    on_change=lambda e: self._set_unallocated_pct(e.value)
-                ).props('dense outlined').classes('w-32').mark(MARKER_UNALLOCATED_PCT)
-                self._unallocated_label = ui.label(self._unallocated_caption()) \
-                    .classes('text-sm text-orange-400').mark(MARKER_UNALLOCATED)
-                # The LABEL total, and only the label total. Folding the reserve in
-                # would put the user back to doing the subtraction this box exists
-                # to remove.
-                self._total_label = ui.label(LABEL_TOTAL_FMT.format(
-                    total=sum(float(lt.target_pct or 0.0) for lt in self.labels))) \
-                    .classes('text-xs text-secondary-custom').mark(MARKER_LABEL_TOTAL)
-            for lt in self.labels:
-                with ui.row().classes('w-full items-center gap-3'):
-                    ui.label(lt.label).classes('w-40 font-medium')
-                    # ``t=lt`` is load-bearing: without the default-argument
-                    # capture every box would write to the LAST label.
-                    ui.number(value=lt.target_pct, min=0, max=100, step=0.01, suffix='%',
-                              on_change=lambda e, t=lt: self._set_label_pct(t, e.value)
-                              ).props('dense outlined').classes('w-32').mark(MARKER_LABEL_PCT)
-                    caption = ui.label(self._label_current_caption(lt)) \
-                        .classes('text-xs text-secondary-custom').mark(MARKER_LABEL_CURRENT)
-                    self._label_captions.append((lt, caption))
-                    # NOT in ``_label_captions`` and NOT refreshed by
-                    # ``_redraw_derived_row``: the P&L is measured off the frozen
-                    # positions and prices the dialog opened with, so no keystroke
-                    # in a target or reserve box can move it. It is rebuilt here
-                    # whenever the row is, which is the only time it can change.
-                    self._draw_pnl(self._label_pnl(lt), MARKER_LABEL_PNL)
-
-    def _symbol_current_caption(self, st: SymbolTarget) -> str:
-        previous = (NO_PREVIOUS_MARK if st.previous_weight_pct is None
-                    else f'{float(st.previous_weight_pct):.2f}%')
-        return SYMBOL_CURRENT_FMT.format(
-            value=self.symbol_values.get(st.symbol, 0.0), previous=previous)
-
-    def _render_step2_symbol_weights(self):
-        ui.label('2. Symbol weights within each label (each label must total 100%)') \
-            .classes('text-lg font-bold mt-4')
-        self._symbol_containers = {}
-        self._symbol_live_buttons = {}
-        for lt in self.labels:
-            with ui.expansion(f'{lt.label} - {len(lt.symbols)} symbol(s)').classes('w-full'):
-                # Even split and Load last keep step 1's icons, wording and relative
-                # order, so the label-level and symbol-level controls still read as
-                # one feature at two scopes; Fill rest and Wipe are step-2 only,
-                # because step 1's editable reserve already owns "what is left" at
-                # the label scale.
-                #
-                # Constructive first, destructive last: Even split, Fill rest and
-                # Load last all put numbers in, Wipe is the only one that takes them
-                # out, and it sits at the end of the row where it is hardest to hit
-                # by accident.
-                #
-                # ``t=lt`` is load-bearing in EVERY lambda: without the
-                # default-argument capture every button in step 2 would rewrite the
-                # LAST label's weights.
-                with ui.row().classes('items-center gap-2'):
-                    split = ui.button('Even split', icon='balance',
-                                      on_click=lambda _e=None, t=lt: self._even_split_symbols(t)
-                                      ).props('outline dense').mark(MARKER_EVEN_SPLIT_SYMBOLS)
-                    # DISABLED, not hidden, on the Load-last button's terms: below
-                    # two symbols there is nothing to spread, and a control that
-                    # vanishes is one the user cannot learn exists.
-                    split.set_enabled(can_even_split_symbols(lt))
-                    fill = ui.button('Fill rest', icon='format_color_fill',
-                                     on_click=lambda _e=None, t=lt: self._fill_rest_symbols(t)
-                                     ).props('outline dense').mark(MARKER_FILL_REST_SYMBOLS)
-                    last = ui.button('Load last', icon='history',
-                                     on_click=lambda _e=None, t=lt: self._load_last_symbols(t)
-                                     ).props('outline dense').mark(MARKER_LOAD_LAST_SYMBOLS)
-                    last.set_enabled(has_previous_symbol_weights(lt))
-                    wipe = ui.button('Wipe', icon='clear_all',
-                                     on_click=lambda _e=None, t=lt: self._wipe_symbols(t)
-                                     ).props('outline dense').mark(MARKER_WIPE_SYMBOLS)
-                # These two, and only these two, are recomputed whenever the weights
-                # move: their predicates READ the numbers in the boxes, where
-                # ``can_even_split_symbols`` (a symbol count) and
-                # ``has_previous_symbol_weights`` (last run's figures, never written
-                # by step 2) cannot change while the dialog is open.
-                self._symbol_live_buttons[lt.label] = (fill, wipe)
-                self._refresh_symbol_buttons(lt)
-                if not lt.symbols:
-                    ui.label('No symbols carry this label - it can absorb no allocation.') \
-                        .classes('text-xs text-orange-400')
-                    continue
-                container = ui.column().classes('w-full gap-1')
-                self._symbol_containers[lt.label] = container
-                self._draw_symbol_weights(lt)
-
-    def _refresh_symbol_buttons(self, lt: LabelTarget):
-        """Re-ask whether Fill rest and Wipe still mean anything for ONE label.
-
-        ``set_enabled`` rather than a redraw of the row, and that matters: this runs
-        on every keystroke in a weight box, and rebuilding the row would tear down
-        the ``ui.number`` the change event came from.
-
-        An enabled state that never updates is decoration. Filling a label leaves
-        nothing to fill and wiping one leaves nothing to wipe, so each of these
-        buttons has to be able to grey ITSELF out -- and typing 100 into the last
-        empty box has to grey out Fill rest without anything being pressed at all.
-        """
-        pair = self._symbol_live_buttons.get(lt.label)
-        if pair is None:
-            return
-        fill, wipe = pair
-        fill.set_enabled(can_fill_remaining_symbol_weights(lt))
-        wipe.set_enabled(can_wipe_symbol_weights(lt))
-
-    def _draw_symbol_weights(self, lt: LabelTarget):
-        container = self._symbol_containers.get(lt.label)
-        if container is None:
-            return
-        container.clear()
-        with container:
-            for st in lt.symbols:
-                with ui.row().classes('w-full items-center gap-3'):
-                    ui.label(st.symbol).classes('w-32')
-                    # ``t=st`` AND ``owner=lt``: the first is which weight to write,
-                    # the second is whose Fill rest / Wipe to re-ask. Both are
-                    # default-argument captures for the same reason -- a bare
-                    # closure would make every box in step 2 write to the last
-                    # symbol of the last label.
-                    ui.number(value=st.weight_pct, min=0, max=100, step=0.01, suffix='%',
-                              on_change=lambda e, t=st, owner=lt: self._set_symbol_pct(
-                                  t, e.value, owner)
-                              ).props('dense outlined').classes('w-32').mark(MARKER_SYMBOL_PCT)
-                    ui.label(self._symbol_current_caption(st)) \
-                        .classes('text-xs text-secondary-custom').mark(MARKER_SYMBOL_CURRENT)
-                    self._draw_pnl(self._symbol_pnl(st), MARKER_SYMBOL_PNL)
-
+    # -- rendering ---------------------------------------------------------
     def _render_invest_scope(self):
         ui.label('1. Which label, and how much').classes('text-lg font-bold mt-2')
         with ui.row().classes('w-full items-center gap-3'):
@@ -1379,8 +1017,8 @@ class AllocationSteps:
                       on_change=self._set_amount).props('dense outlined').classes('w-40')
         ui.label(INVEST_SCOPE_NOTE).classes('text-xs text-secondary-custom')
 
-    def _render_step3_base_panel(self):
-        ui.label('3. What there is to allocate').classes('text-lg font-bold mt-4')
+    def _render_base_panel(self):
+        ui.label('2. What there is to allocate').classes('text-lg font-bold mt-4')
         with ui.row().classes('w-full gap-6 items-center'):
             ui.label(f'Buying power: {self.base.available_buying_power:,.2f}')
             ui.label(f'Managed value ({self.base.valuation_mode}): '
@@ -1389,173 +1027,8 @@ class AllocationSteps:
             ui.label(f"as of {self.base.taken_at:%Y-%m-%d %H:%M UTC}").classes('text-xs text-gray-400')
         for warning in self.base.warnings:
             ui.label(warning).classes('text-xs text-orange-400')
-        self._fractional_switch = ui.switch(
-            'Allow fractional shares', value=self.allow_fractional,
-            on_change=lambda e: setattr(self, 'allow_fractional', bool(e.value)))
-        # Offering a toggle the broker cannot honour would produce a plan sized on
-        # a grid that does not exist; the engine silently falls back to whole
-        # shares, so the user would see targets they never asked for.
-        self._fractional_switch.set_enabled(bool(self.base.supports_fractional))
-        if not self.base.supports_fractional:
-            ui.label(NO_FRACTIONAL_SUPPORT_NOTE).classes('text-xs text-gray-400')
 
     # -- state + validation ------------------------------------------------
-    def _even_split(self):
-        """Split the whole 100 among the labels, and leave the reserve alone.
-
-        It briefly split "what is currently allocated", to avoid wiping a reserve
-        that was DERIVED from the label shortfall. The reserve is its own box now,
-        so an even split of anything but 100 would just produce a set the validator
-        refuses.
-        """
-        for edited, fresh in zip(self.labels, even_split_targets(self.labels)):
-            edited.target_pct = fresh.target_pct
-        self._draw_label_targets()
-        self._revalidate()
-
-    def _load_last(self):
-        """Restore the label percentages the last run used.
-
-        Assigns onto the objects the dialog is already editing and then REDRAWS, for
-        the same reason ``_even_split`` does: a ``ui.number`` does not follow the
-        object it was built from, so a silent model change would leave the user
-        typing over numbers that are no longer what Continue will submit.
-
-        A label with no history keeps the target it has -- ``load_previous_targets``
-        owns that rule, so this and the button's enabled state cannot disagree.
-        """
-        for edited, fresh in zip(self.labels, load_previous_targets(self.labels)):
-            edited.target_pct = fresh.target_pct
-        self._draw_label_targets()
-        self._revalidate()
-
-    def _even_split_symbols(self, lt: LabelTarget):
-        """Give every symbol in ONE label an equal share of that label's 100.
-
-        The symbol-level pair to ``_even_split``, and it scopes to ``lt`` on exactly
-        the terms ``_load_last_symbols`` does: no other label's weights move, and
-        the label's own ``target_pct`` does not either -- step 2 is about shares
-        WITHIN a label. The reserve is further up still and is not reachable from
-        here at all.
-
-        The arithmetic is ``even_split_symbol_weights``, which is
-        ``even_split_pct``, which is what ``build_symbol_targets`` fills an
-        untouched label in with. One splitter, so the button and the stored default
-        cannot disagree about the same symbols.
-
-        REDRAWS, then re-validates, for the reason spelled out on ``_load_last``: a
-        ``ui.number`` does not follow the object it was built from, so without the
-        redraw the user would be typing over numbers that are no longer what
-        Continue will submit -- and without the re-validate the live total and the
-        Continue button would still be reporting the set the split just replaced.
-        """
-        for edited, fresh in zip(lt.symbols, even_split_symbol_weights(lt).symbols):
-            edited.weight_pct = fresh.weight_pct
-        self._draw_symbol_weights(lt)
-        self._refresh_symbol_buttons(lt)
-        self._revalidate()
-
-    def _load_last_symbols(self, lt: LabelTarget):
-        """Restore ONE label's symbol weights. The label's own target does not move:
-        step 2 is about shares WITHIN a label."""
-        for edited, fresh in zip(lt.symbols, load_previous_symbol_weights(lt).symbols):
-            edited.weight_pct = fresh.weight_pct
-        self._draw_symbol_weights(lt)
-        self._refresh_symbol_buttons(lt)
-        self._revalidate()
-
-    def _fill_rest_symbols(self, lt: LabelTarget):
-        """Share what is left of ONE label's 100 across the symbols still at zero.
-
-        The "define a few by hand, then fill the rest" half of the pair. Every
-        non-zero weight is left exactly as typed; the empty boxes divide the
-        remainder. Scoped to ``lt`` on exactly the terms ``_even_split_symbols`` is
-        -- no other label's weights move, and neither does this label's own
-        ``target_pct`` or the reserve above it.
-
-        The arithmetic is ``fill_remaining_symbol_weights``, which is
-        ``split_pct_across``, which is what ``even_split_pct`` is -- so filling an
-        untouched label lands on the identical numbers to pressing Even split.
-
-        REDRAWS, refreshes the row's live buttons and re-validates, for the reasons
-        spelled out on ``_load_last`` and ``_refresh_symbol_buttons``: a ``ui.number``
-        does not follow the object it was built from, a filled label has nothing
-        left to fill, and the total chip and Continue are ``_revalidate``'s job.
-        """
-        for edited, fresh in zip(lt.symbols, fill_remaining_symbol_weights(lt).symbols):
-            edited.weight_pct = fresh.weight_pct
-        self._draw_symbol_weights(lt)
-        self._refresh_symbol_buttons(lt)
-        self._revalidate()
-
-    def _wipe_symbols(self, lt: LabelTarget):
-        """Clear ONE label's symbol weights so the user can start it over.
-
-        What makes ``_fill_rest_symbols`` usable: filling treats a 0 as an empty
-        slot, so redoing a label means emptying it first rather than hunting down
-        whichever old weights are still sitting in boxes below the fold.
-
-        NO confirmation, deliberately, and the contrast is with ``_confirm_unmanage``
-        on the allocation page: that one asks because it writes to the database
-        immediately and destroys stored weights and comments with no undo. This edits
-        the dialog's own COPY of the labels, nothing is written until Submit two
-        steps and a dry run later, Cancel discards the lot, and Load last -- whose
-        history the wipe deliberately preserves -- undoes it in one click. Guarding
-        both would train the user through the confirmation that matters.
-        """
-        for edited, fresh in zip(lt.symbols, wipe_symbol_weights(lt).symbols):
-            edited.weight_pct = fresh.weight_pct
-        self._draw_symbol_weights(lt)
-        self._refresh_symbol_buttons(lt)
-        self._revalidate()
-
-    def _set_label_pct(self, target: LabelTarget, value):
-        target.target_pct = float(value or 0.0)
-        # The derived row and the running total are what the user is LOOKING at
-        # while they type; the validator's advisory below step 3 is the safety net,
-        # not the display. Redrawn in place, so the ``ui.number`` the event came
-        # from is not rebuilt underneath the cursor.
-        self._redraw_derived_row()
-        self._revalidate()
-
-    def _set_unallocated_pct(self, value):
-        """The reserve box. Touches NO label percentage, by construction.
-
-        Redraws only the money caption beside it, in place: rebuilding the row
-        would rebuild the ``ui.number`` the event came from, underneath the cursor.
-        """
-        self.unallocated_pct = float(value or 0.0)
-        self._redraw_derived_row()
-        self._revalidate()
-
-    def _redraw_derived_row(self):
-        """Every read-only number in step 1, refreshed IN PLACE.
-
-        In place, never a redraw: rebuilding the row would rebuild the
-        ``ui.number`` the change event came from, underneath the cursor.
-
-        The per-label captions are in here because they now state the target as a
-        share of the base, which moves with BOTH the label box and the reserve box.
-        A caption that lagged either would keep asserting a comparison that had
-        stopped being true -- which is the defect it was added to fix.
-        """
-        if self._unallocated_label is not None:
-            self._unallocated_label.set_text(self._unallocated_caption())
-        if self._total_label is not None:
-            self._total_label.set_text(LABEL_TOTAL_FMT.format(
-                total=sum(float(lt.target_pct or 0.0) for lt in self.labels)))
-        for lt, caption in self._label_captions:
-            caption.set_text(self._label_current_caption(lt))
-
-    def _set_symbol_pct(self, target: SymbolTarget, value, owner: LabelTarget):
-        """One weight box. ``owner`` is the label it belongs to, and it is here so
-        that label's Fill rest and Wipe can follow the number being typed -- both
-        predicates read the boxes, so a 100 typed into the last empty one has to
-        grey out Fill rest without anything being pressed."""
-        target.weight_pct = float(value or 0.0)
-        self._refresh_symbol_buttons(owner)
-        self._revalidate()
-
     def _set_scope(self, event):
         self.scope_label = event.value
         self._revalidate()
@@ -1568,9 +1041,6 @@ class AllocationSteps:
         return next((lt for lt in self.labels if lt.label == self.scope_label), None)
 
     def _problems(self) -> List[str]:
-        if self.mode == ALLOCATION_MODE_REBALANCE:
-            return steps_validation_messages(self.labels,
-                                             unallocated_pct=self.unallocated_pct)
         return invest_validation_messages(
             self._scope_target(), self.invest_amount,
             available_buying_power=self.base.available_buying_power)
@@ -1596,58 +1066,42 @@ class AllocationSteps:
             return
         if self.dialog is not None:
             self.dialog.close()
-        if self.mode == ALLOCATION_MODE_REBALANCE:
-            self.on_dry_run(mode=ALLOCATION_MODE_REBALANCE, labels=self.labels,
-                            scope_label=None, amount=0.0,
-                            allow_fractional=self.allow_fractional,
-                            unallocated_pct=self.unallocated_pct)
-        else:
-            scope = self._scope_target()
-            # 0.0, ALWAYS: an invest run spends a specific amount the user named,
-            # and there is no portfolio base for a reserve to be a share of.
-            self.on_dry_run(mode=ALLOCATION_MODE_INVEST_LABEL,
-                            labels=[scope] if scope else [], scope_label=self.scope_label,
-                            amount=self.invest_amount,
-                            allow_fractional=self.allow_fractional,
-                            unallocated_pct=0.0)
+        scope = self._scope_target()
+        # ``unallocated_pct`` is 0.0, ALWAYS: an invest run spends a specific
+        # amount the user named, and there is no portfolio base for a reserve to
+        # be a share of. The page's stored reserve is deliberately NOT written.
+        self.on_dry_run(mode=ALLOCATION_MODE_INVEST_LABEL,
+                        labels=[scope] if scope else [], scope_label=self.scope_label,
+                        amount=self.invest_amount,
+                        allow_fractional=self.allow_fractional,
+                        unallocated_pct=0.0)
 
 
-def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
-                          on_dry_run: Callable[..., None],
-                          allow_fractional: bool,
-                          mode: str = ALLOCATION_MODE_REBALANCE,
-                          invest_amount: float = 0.0,
-                          symbol_values: Optional[Dict[str, float]] = None,
-                          positions: Optional[Dict[str, PositionState]] = None,
-                          unallocated_pct: float = 0.0
-                          ) -> AllocationSteps:
-    """Open steps 1-3. ``on_dry_run`` is called with keyword arguments
-    ``mode``, ``labels``, ``scope_label``, ``amount``, ``allow_fractional`` and
-    ``unallocated_pct``.
+def open_invest_scope(base: BaseSnapshot, labels: List[LabelTarget], *,
+                      on_dry_run: Callable[..., None],
+                      allow_fractional: bool,
+                      invest_amount: float = 0.0) -> InvestScope:
+    """Open the invest-scope dialog. ``on_dry_run`` is called with keyword
+    arguments ``mode``, ``labels``, ``scope_label``, ``amount``,
+    ``allow_fractional`` and ``unallocated_pct``.
+
+    It replaces ``open_allocation_steps``, which opened a three-step dialog whose
+    first two steps were the target editor. Those steps are on the Portfolio
+    Allocation page now and the REBALANCE flow does not open a dialog at all --
+    Allocate goes straight to the dry run.
 
     ``allow_fractional`` is REQUIRED and has no default: the caller passes
     ``get_allocation_config(account_id).allow_fractional`` (itself defaulting to
-    True), and persists any change through
-    ``portfolio_allocation_service.remember_fractional_choice``. A default here
-    would silently re-answer a question the account has already answered.
-
-    ``unallocated_pct`` DOES default, to 0, and the asymmetry is deliberate: "no
-    reserve" is both the safe answer and the true one for an account that has never
-    set one, whereas there is no fractional answer that is right by omission.
-
-    ``positions`` is ``{SYMBOL: PositionState}`` and drives the UNREALISED P&L
-    captions only. It is optional and defaults to nothing, on the same terms as
-    ``symbol_values``: the figures are display-only, they reach no plan, and a
-    caller without them draws a dash rather than a fabricated 0.00. It is a
-    separate argument from ``symbol_values`` because the P&L may NOT be derived
-    from a mode-aware current value -- see ``AllocationSteps.positions``."""
-    steps = AllocationSteps(base, labels, on_dry_run=on_dry_run,
-                            allow_fractional=allow_fractional, mode=mode,
-                            invest_amount=invest_amount, symbol_values=symbol_values,
-                            positions=positions,
-                            unallocated_pct=unallocated_pct)
-    steps.open()
-    return steps
+    True). It is carried through to ``on_dry_run`` and is not offered as a control
+    here -- the one execution control lives at the gate, where toggling it
+    re-solves the plan. A default here would silently re-answer a question the
+    account has already answered.
+    """
+    scope = InvestScope(base, labels, on_dry_run=on_dry_run,
+                        allow_fractional=allow_fractional,
+                        invest_amount=invest_amount)
+    scope.open()
+    return scope
 
 
 def render_income_panel(events: List[Dict], open_total: float,

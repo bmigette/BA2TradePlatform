@@ -30,6 +30,7 @@ from ba2_common.core.types import is_option_action
 
 from app.models.backtest import Backtest
 from app.models.database import SessionLocal
+from app.services.backtest.equity_cap import validate_equity_cap
 from app.services.task_queue import get_task_queue
 
 logger = logging.getLogger(__name__)
@@ -385,8 +386,18 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     enabled_instruments = _resolve_enabled_instruments(payload, start_date, end_date)
 
     initial_capital = float(payload["initial_capital"])
+    # Optional FIXED-notional equity ceiling. Absent/None = off (every path byte-identical to
+    # before). Validated HERE, at config time, so a bad value fails the run up front instead of
+    # surfacing mid-simulation; a cap above the initial capital is legitimate (the account may
+    # grow into it) and is logged rather than refused.
+    equity_cap = validate_equity_cap(
+        payload.get("equity_cap"),
+        initial_capital=initial_capital,
+        log=logger.info,
+    )
     account_settings = {
         "starting_cash": initial_capital,
+        "equity_cap": equity_cap,
         "commission_per_trade": float(payload["commission"]),
         "slippage_bps": float(payload["slippage"]),
         "fill_model": str(payload["fill_model"]),

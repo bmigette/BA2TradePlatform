@@ -120,6 +120,10 @@ def test_build_config_assembles_account_settings():
         # BacktestAccount._option_half_spread for why options cannot share spread_bps.
         "option_spread_pct": 0.0,
         "option_spread_min_tick": 0.0,
+        # Optional FIXED-notional equity ceiling (2026-08-25). None = OFF, which is what an
+        # absent payload key means — never 0.0, which would make every position unaffordable.
+        # See app/services/backtest/equity_cap.py.
+        "equity_cap": None,
     }
     assert cfg["enabled_instruments"] == ["AAPL"]
     assert cfg["initial_capital"] == 100_000.0

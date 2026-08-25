@@ -78,9 +78,13 @@ def test_the_page_defines_every_wizard_handler():
             "_submit_plan", "_load_income_panel"} <= names
 
 
-def test_the_page_opens_the_steps_dialog_and_the_wizard():
+def test_the_page_opens_the_dry_run_gate_and_the_invest_scope():
+    """No target step in between. ``open_allocation_steps`` was the three-step
+    dialog whose first two steps were the target editor; those are on the page now
+    and Allocate goes straight to the review-and-commit gate."""
     source = _page_source()
-    assert "open_allocation_steps(" in source
+    assert "open_allocation_steps(" not in source
+    assert "open_invest_scope(" in source
     assert "open_allocation_wizard(" in source
     assert "render_income_panel(" in source
     assert "render_outcomes(" in source

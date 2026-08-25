@@ -10,7 +10,11 @@ from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
-from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
+from ...core.cleanup import (
+    preview_cleanup, execute_cleanup, get_cleanup_statistics,
+    preview_trade_action_result_retention, execute_trade_action_result_retention,
+    resolve_trade_action_result_blank_days, resolve_trade_action_result_delete_days,
+)
 from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
 from ...modules.experts import experts
@@ -6029,6 +6033,10 @@ class BatchCleanupTab:
         self.cleanup_stats_container = None
         self.cleanup_preview_container = None
         self.cleanup_execute_button = None
+        # trade_action_result age-based retention (blank payload / delete row)
+        self.tar_blank_days_input = None
+        self.tar_delete_days_input = None
+        self.tar_preview_container = None
         self.render()
     
     def render(self):
@@ -6165,7 +6173,9 @@ class BatchCleanupTab:
                         icon='delete',
                         on_click=self._execute_activity_log_cleanup
                     ).props('color=warning outlined')
-            
+
+            self._render_trade_action_result_retention()
+
             # Preview results container
             with ui.card().classes('w-full mb-4'):
                 ui.label('Preview').classes('text-subtitle2 mb-2')
@@ -6606,6 +6616,174 @@ class BatchCleanupTab:
                 ui.label(f'❌ Error: {str(e)}').classes('text-negative')
             self.cleanup_execute_button.set_enabled(False)
     
+    # -----------------------------------------------------------------
+    # Trade Action Result retention (blank payload / delete row, by age)
+    #
+    # PART OF THIS TOOL, not a parallel one. ``trade_action_result`` is the biggest
+    # table on the live database (12,221 rows / 189.7 MB, of which 188.2 MB is the
+    # ``data`` JSON) and the cleanup above can only reach it THROUGH a deletable
+    # analysis — which it refuses to delete while a transaction is open. So it lives
+    # here, next to the buttons the user already presses for this problem.
+    #
+    # THE ONE THING THAT MUST BE VISIBLE. These two windows deliberately IGNORE the
+    # open-transaction protection the section above honours: a 180-day-old action
+    # record on a still-open position is exactly what needs reclaiming. That is a
+    # decision, not an accident, so the preview names the number of affected rows
+    # rather than leaving the user to discover it afterwards.
+    # -----------------------------------------------------------------
+
+    def _render_trade_action_result_retention(self):
+        """Render the trade_action_result retention card."""
+        with ui.card().classes('w-full mb-4'):
+            ui.label('Trade Action Result Retention').classes('text-subtitle2 mb-2')
+            ui.label(
+                'Trade action results are the largest table in the database, almost '
+                'entirely because of one JSON payload column. Two independent windows: '
+                'blank the payload after a short one (the row, its timestamps and its '
+                'summary fields are kept), delete the row after a long one.'
+            ).classes('text-body2 mb-2')
+            ui.label(
+                '⚠️ Unlike the analysis cleanup above, these windows also apply to rows '
+                'whose transaction is still OPEN. The preview says how many.'
+            ).classes('text-caption text-orange mb-4')
+
+            with ui.row().classes('w-full gap-4'):
+                self.tar_blank_days_input = ui.number(
+                    label='Blank payload after (days)',
+                    value=resolve_trade_action_result_blank_days(),
+                    min=1, max=3650, step=1, format='%.0f',
+                ).classes('flex-1').props('outlined')
+                self.tar_delete_days_input = ui.number(
+                    label='Delete row after (days)',
+                    value=resolve_trade_action_result_delete_days(),
+                    min=1, max=3650, step=1, format='%.0f',
+                ).classes('flex-1').props('outlined')
+
+            self.tar_preview_container = ui.column().classes('w-full mt-2')
+            with self.tar_preview_container:
+                ui.label('Click "Preview Retention" to see what would be blanked and '
+                         'deleted.').classes('text-body2 text-grey')
+
+            with ui.row().classes('w-full gap-2 justify-end mt-2'):
+                ui.button('Preview Retention', icon='visibility',
+                          on_click=self._preview_trade_action_result_retention).props('outlined')
+                ui.button('Apply Retention', icon='cleaning_services',
+                          on_click=self._confirm_trade_action_result_retention
+                          ).props('color=warning')
+
+    def _trade_action_result_windows(self):
+        """The two windows as the user currently has them set."""
+        return (int(self.tar_blank_days_input.value),
+                int(self.tar_delete_days_input.value))
+
+    def _preview_trade_action_result_retention(self):
+        """Dry run: report what an Apply would blank and delete, changing nothing."""
+        self.tar_preview_container.clear()
+        blank_days, delete_days = self._trade_action_result_windows()
+
+        try:
+            preview = preview_trade_action_result_retention(
+                blank_days=blank_days, delete_days=delete_days)
+        except ValueError as e:
+            # An inverted or unusable pair is REFUSED by the core rather than guessed at.
+            logger.warning(f'Trade action result retention preview refused: {e}')
+            with self.tar_preview_container:
+                ui.label(f'❌ {e}').classes('text-negative')
+            return
+
+        if preview['error']:
+            with self.tar_preview_container:
+                ui.label(f"❌ Preview failed: {preview['error']}").classes('text-negative')
+            return
+
+        from ba2_common.core.db_maintenance import format_bytes
+
+        with self.tar_preview_container:
+            with ui.card().classes('w-full p-4').style('border: 2px solid orange'):
+                ui.label(f"Trade action results: {preview['total_rows']} row(s) total"
+                         ).classes('text-body2 mb-2')
+                with ui.grid(columns=2).classes('w-full gap-4'):
+                    with ui.column():
+                        ui.label(f"Will DELETE {preview['rows_to_delete']} row(s) older "
+                                 f"than {preview['delete_days']} days"
+                                 ).classes('text-body1 font-bold text-orange')
+                        ui.label(
+                            f"…of which {preview['rows_to_delete_with_open_transactions']} "
+                            f"belong to a chain whose transaction is still OPEN"
+                        ).classes('text-caption text-orange')
+                    with ui.column():
+                        ui.label(f"Will BLANK {preview['rows_to_blank']} payload(s) older "
+                                 f"than {preview['blank_days']} days"
+                                 ).classes('text-body1 font-bold text-orange')
+                        ui.label(
+                            f"…of which {preview['rows_to_blank_with_open_transactions']} "
+                            f"belong to a chain whose transaction is still OPEN"
+                        ).classes('text-caption text-orange')
+
+                ui.label(
+                    f"Already blanked by a previous run: {preview['rows_already_redacted']} · "
+                    f"No payload to reclaim: {preview['rows_empty_payload']} · "
+                    f"No timestamp, cannot be aged, left untouched: {preview['rows_undated']}"
+                ).classes('text-caption mt-2')
+                ui.label(
+                    f"≈ {format_bytes(preview['payload_bytes_to_free'])} of payload would be "
+                    f"freed. That space goes to the database free list first — the file "
+                    f"itself shrinks on the next start-up VACUUM."
+                ).classes('text-body2 mt-2')
+
+    def _confirm_trade_action_result_retention(self):
+        """Confirmation dialog for applying the two retention windows."""
+        blank_days, delete_days = self._trade_action_result_windows()
+        with ui.dialog() as dialog, ui.card():
+            ui.label('⚠️ Confirm Trade Action Result Retention').classes('text-h6 mb-4')
+            ui.label(f'Payloads older than {blank_days} days will be blanked (rows kept) '
+                     f'and rows older than {delete_days} days will be deleted.'
+                     ).classes('text-body1 mb-2')
+            ui.label('This also affects rows whose transaction is still open. This cannot '
+                     'be undone.').classes('text-body2 text-orange mb-4')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Apply',
+                          on_click=lambda: self._perform_trade_action_result_retention(dialog)
+                          ).props('color=negative')
+        dialog.open()
+
+    def _perform_trade_action_result_retention(self, dialog):
+        """Run the retention windows and report the outcome."""
+        dialog.close()
+        blank_days, delete_days = self._trade_action_result_windows()
+
+        try:
+            result = execute_trade_action_result_retention(
+                blank_days=blank_days, delete_days=delete_days)
+        except ValueError as e:
+            logger.warning(f'Trade action result retention refused: {e}')
+            ui.notify(str(e), type='negative')
+            return
+        except Exception as e:
+            logger.error(f'Trade action result retention failed: {e}', exc_info=True)
+            ui.notify(f'Trade action result retention failed: {e}', type='negative')
+            return
+
+        if result['error']:
+            # A run that FAILED reports zeros. Announcing "0 rows blanked" as a success
+            # is how a broken retention goes unnoticed until the disk fills.
+            ui.notify(f"Trade action result retention FAILED: {result['error']}",
+                      type='negative')
+            return
+
+        from ba2_common.core.db_maintenance import format_bytes
+        ui.notify(
+            f"Blanked {result['rows_blanked']} payload(s) and deleted "
+            f"{result['rows_deleted']} row(s); ≈{format_bytes(result['payload_bytes_freed'])} "
+            f"freed to the database free list (the file shrinks on the next start-up "
+            f"VACUUM).",
+            type='positive')
+        if result['rows_undated']:
+            ui.notify(f"{result['rows_undated']} row(s) have no timestamp, so their age is "
+                      f"unknown and they were left untouched.", type='warning')
+        self._preview_trade_action_result_retention()
+
     def _refresh_activity_log_stats(self):
         """Refresh activity log statistics."""
         from ...core.cleanup import get_activity_log_statistics

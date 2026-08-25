@@ -2887,6 +2887,10 @@ def _cmd_optimize(args) -> int:
                 "option_spread_pct": float(getattr(args, "option_spread_pct", 0.0)),
                 "option_spread_min_tick": float(getattr(args, "option_spread_min_tick", 0.0)),
                 "fill_model": args.fill_model,
+                # RUN-LEVEL, never a gene (see --equity-cap): every individual in the
+                # population must face the same capital, or they are scored against
+                # different denominators. None = off.
+                "equity_cap": getattr(args, "equity_cap", None),
             },
             "warmup_days": derive_warmup_days([expert]),
             "seed": int(args.seed),
@@ -3193,6 +3197,8 @@ def _cmd_optimize_batch(args) -> int:
                     "option_spread_pct": float(getattr(args, "option_spread_pct", 0.0)),
                     "option_spread_min_tick": float(getattr(args, "option_spread_min_tick", 0.0)),
                     "fill_model": args.fill_model,
+                    # RUN-LEVEL, never a gene (see --equity-cap). None = off.
+                    "equity_cap": getattr(args, "equity_cap", None),
                 },
                 "warmup_days": derive_warmup_days([expert]),
                 "seed": int(args.seed),
@@ -3891,6 +3897,12 @@ def main(argv: "list | None" = None) -> int:
                          "plateaued run instead of re-searching from scratch. Default: off "
                          "(fresh random population).")
     op.add_argument("--initial-capital", type=float, default=10000.0)
+    op.add_argument("--equity-cap", type=float, default=None,
+                    help="Optional FIXED equity the risk manager sizes against, in dollars "
+                         "(default: off, i.e. the account compounds). With a cap set, profits "
+                         "above it are not deployed and losses below it are real, so every year "
+                         "faces the same capital -- use this to test whether a setting is stable "
+                         "across years independent of its start date. Run-level, never a gene.")
     op.add_argument("--profit-cap-pct", type=float, default=2000.0,
                     help="Cap each trade's gain at this %% of its cost basis when computing the "
                          "ADJUSTED fitness/return (2000 = a trade can't count as more than 20x its "
@@ -4068,6 +4080,9 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)
+    ob.add_argument("--equity-cap", type=float, default=None,
+                    help="Optional FIXED equity the risk manager sizes against, in dollars "
+                         "(default: off). See `optimize --equity-cap`. Run-level, never a gene.")
     ob.add_argument("--profit-cap-pct", type=float, default=2000.0,
                     help="Cap each trade's gain at this %% of its cost basis for the ADJUSTED "
                          "fitness/return (2000). Default-on; see `optimize --profit-cap-pct`.")

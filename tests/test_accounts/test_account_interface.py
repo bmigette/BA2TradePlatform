@@ -646,6 +646,272 @@ class TestUnreadablePriceIsNotAPass:
         assert account._validate_position_size_limits(small) == []
 
 
+class TestAZeroQuoteIsNotAPrice:
+    """GAP 1: ``if current_price is None`` was too narrow.
+
+    A quote of exactly ``0.0`` is not a price -- it is a broker or feed that answered
+    with nothing usable. It sails through the ``is None`` check, and then EVERY number
+    downstream of it is zero:
+
+        position_value  = current_price * trading_order.quantity  -> 0.0
+        order_value     = current_price * trading_order.quantity  -> 0.0
+
+    so ``0.0 > max_position_value`` and ``0.0 > available_balance`` are both False and
+    BOTH risk gates report "no problems" for an order of any size, on a MARKET order
+    that already carries a transaction_id. The cap is not merely wrong here, it is
+    off.
+
+    The guard is on the PRICE and on nothing else. A zero quantity, a zero position
+    value, a zero cap and a zero equity are all legitimate measured zeros and are
+    pinned below -- widening the guard to any of them is the inverse defect, which is
+    quieter and therefore worse.
+    """
+
+    def _fixture(self, monkeypatch, price, *, max_position_pct=10.0, quantity=400.0):
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=max_position_pct)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        # Patch the SEAM, not ``_prices``: get_instrument_current_price caches any
+        # non-None price in a CLASS-level dict keyed by account id, so a canned 0.0
+        # would outlive the test.
+        monkeypatch.setattr(account, "get_instrument_current_price",
+                            lambda *_a, **_k: price)
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=quantity,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+        return account, order
+
+    def test_a_zero_price_refuses_to_validate(self, monkeypatch):
+        """THE DEFECT: $0.00 x 400 shares = $0.00, which is inside every limit."""
+        errors_logged = _capture_errors(monkeypatch)
+        account, order = self._fixture(monkeypatch, price=0.0)
+
+        errors = account._validate_position_size_limits(order)
+
+        assert errors, "a $0.00 quote is not a price -- neither gate could be priced"
+        assert any("no price" in e.lower() for e in errors), errors
+        # The refusal must NAME the offending value, or an operator reading it cannot
+        # tell a dead feed from a missing symbol.
+        assert any("0.0" in e for e in errors), errors
+        assert errors_logged, "an unrun risk gate must be logged, not silent"
+
+    def test_the_zero_price_refusal_comes_from_the_GUARD_not_the_catch_all(self, monkeypatch):
+        """``assert errors`` alone is satisfied by a crash. A risk control that blew up
+        is not a risk control that ran, and the two must stay distinguishable."""
+        account, order = self._fixture(monkeypatch, price=0.0)
+
+        errors = account._validate_position_size_limits(order)
+
+        assert not any("could not be completed" in e for e in errors), (
+            "the guard must refuse, not fall into the outer except", errors)
+
+    def test_a_zero_price_is_refused_even_when_the_cap_is_generous(self, monkeypatch):
+        """Pins that the refusal is the PRICE guard and not the cap firing by luck: a
+        100% cap and a million-dollar sleeve can reject nothing on their own."""
+        account, order = self._fixture(monkeypatch, price=0.0, max_position_pct=100.0)
+
+        errors = account._validate_position_size_limits(order)
+
+        assert errors, "a generous cap must not make an unpriceable order acceptable"
+        assert not any("exceeds expert's max allowed" in e for e in errors), errors
+
+    def test_a_negative_price_is_refused_too(self, monkeypatch):
+        """Worse than zero: a negative quote makes ``position_value`` NEGATIVE, so the
+        cap comparison is not merely satisfied, it is satisfied by an ever-larger
+        order. Equities and options have no negative quote; this is a broken feed."""
+        errors_logged = _capture_errors(monkeypatch)
+        account, order = self._fixture(monkeypatch, price=-3.0)
+
+        errors = account._validate_position_size_limits(order)
+
+        assert errors, "a negative quote is not a price"
+        assert any("no price" in e.lower() for e in errors), errors
+        assert any("-3.0" in e for e in errors), errors
+        assert errors_logged
+
+    # --- the inverses: legitimate zeros that must NOT be swept up ----------
+
+    @pytest.mark.parametrize("price", [0.01, 0.0001, 1e-6])
+    def test_a_sub_penny_price_is_a_real_quote(self, monkeypatch, price):
+        """THE INVERSE #1: sub-penny tickers exist and this platform trades pennies.
+        The guard must test for zero and NOTHING WIDER -- a ``< 0.01`` guard would
+        refuse to validate every legitimate sub-penny order, and mutation showed that
+        one pinned magnitude only defends the thresholds above it, so the smallest
+        case here is three orders of magnitude below the smallest real US tick."""
+        account, order = self._fixture(monkeypatch, price=price, quantity=1.0)
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_zero_QUANTITY_order_is_not_the_price_guards_business(self, monkeypatch):
+        """THE INVERSE #2: it is the zero PRICE that is unmeasurable. A zero-quantity
+        order has a perfectly measured $0.00 position value, and guarding
+        ``position_value <= 0`` instead would refuse it with a price complaint."""
+        account, order = self._fixture(monkeypatch, price=150.0, quantity=0.0)
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_measured_zero_EQUITY_is_still_an_answer(self, monkeypatch):
+        """THE INVERSE #3: an account measured at $0.00 equity has a $0.00 sleeve and
+        therefore a $0.00 cap -- every order is rejected BY THE CAP, with the ordinary
+        message. Widening the equity guard from ``is None`` to falsy would report a
+        measured empty account as an unrun check."""
+        class _EmptyAccount(MockAccount):
+            def get_account_info(self):
+                return {"balance": 0.0, "equity": 0.0}
+
+        acct_def = create_account_definition()
+        account = _EmptyAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=1.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("exceeds expert's max allowed $0.00" in e for e in errors), errors
+        assert not any("could not" in e.lower() for e in errors), (
+            "a measured $0 account is an answer, not an unrun check", errors)
+
+    def test_the_refusal_STOPS_before_pricing_either_gate(self, monkeypatch):
+        """The guard bare-``return``s for a reason: with no usable price there is
+        nothing for the two gates to compute, and running them anyway means the
+        per-instrument cap divides by the quote (``int(max_additional_value /
+        current_price)``) and the balance gate compares a fabricated $0.00 order
+        value. Dropping the early return leaves the refusal in the list, so nothing
+        below it fails -- this is what notices."""
+        account, order = self._fixture(monkeypatch, price=0.0)
+        reached = []
+        monkeypatch.setattr(account, "_validate_single_position_size",
+                            lambda *a, **k: reached.append("cap") or [])
+        monkeypatch.setattr(account, "_validate_expert_available_balance",
+                            lambda *a, **k: reached.append("balance") or [])
+
+        errors = account._validate_position_size_limits(order)
+
+        assert len(errors) == 1, ("the refusal must be the only thing reported", errors)
+        assert reached == [], (
+            "neither gate can be priced off a $0.00 quote, so neither must be run",
+            reached)
+
+
+class TestTheGatesActuallyStopTheOrder:
+    """The errors these gates append are only worth appending if the caller obeys.
+
+    ``AccountInterface.submit_order`` calls ``_validate_trading_order``, which folds
+    the position-size errors into its own list, and raises ``ValueError`` when the
+    result is not valid. Every gate test above asserts on the RETURNED LIST; nothing
+    pinned that the list is honoured, so a caller that dropped it -- or a
+    ``_validate_trading_order`` that stopped extending ``errors`` with it -- would
+    leave every one of them green while orders went to the broker regardless.
+    """
+
+    class _RealSubmitAccount(MockAccount):
+        """MockAccount WITHOUT its ``submit_order`` override, so the base class's
+        validate-then-refuse path is the one under test."""
+        from ba2_common.core.interfaces.AccountInterface import AccountInterface as _AI
+        submit_order = _AI.submit_order
+        del _AI
+
+        def __init__(self, id_or_definition):
+            super().__init__(id_or_definition)
+            self.impl_calls = []
+
+        def _submit_order_impl(self, trading_order, tp_price=None, sl_price=None,
+                               is_closing_order=False, use_complex_order=False):
+            self.impl_calls.append(trading_order)
+            return super()._submit_order_impl(trading_order, tp_price, sl_price,
+                                              is_closing_order, use_complex_order)
+
+    def _capped_setup(self, monkeypatch, *, price, ordered_qty, fills, add_qty,
+                      max_position_pct=10.0):
+        acct_def = create_account_definition()
+        account = self._RealSubmitAccount(acct_def.id)
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=max_position_pct)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        monkeypatch.setattr(account, "get_instrument_current_price",
+                            lambda *_a, **_k: price)
+        transaction = create_transaction(
+            symbol="AAPL", quantity=ordered_qty, side=OrderDirection.BUY,
+            status=TransactionStatus.OPENED, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        for side, filled in fills:
+            create_trading_order(
+                account_id=acct_def.id, symbol="AAPL", quantity=filled,
+                side=side, status=OrderStatus.FILLED,
+                transaction_id=transaction.id, filled_qty=filled,
+            )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=add_qty,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+        return account, order
+
+    def test_a_zero_priced_order_never_reaches_the_broker(self, monkeypatch):
+        account, order = self._capped_setup(
+            monkeypatch, price=0.0, ordered_qty=10.0,
+            fills=[(OrderDirection.BUY, 10.0)], add_qty=20.0,
+        )
+
+        with pytest.raises(ValueError, match="no price"):
+            account.submit_order(order)
+
+        assert account.impl_calls == [], "nothing may be sent on an unpriceable order"
+
+    def test_an_over_cap_add_never_reaches_the_broker(self, monkeypatch):
+        """The measured holding (60) puts this add over the cap; the ordered
+        quantity (10) would not have."""
+        account, order = self._capped_setup(
+            monkeypatch, price=150.0, ordered_qty=10.0,
+            fills=[(OrderDirection.BUY, 10.0), (OrderDirection.BUY, 50.0)],
+            add_qty=20.0,
+        )
+
+        with pytest.raises(ValueError, match="exceeding expert's max allowed"):
+            account.submit_order(order)
+
+        assert account.impl_calls == []
+
+    def test_an_order_inside_every_limit_IS_submitted(self, monkeypatch):
+        """THE INVERSE: the gates must not have become a blanket refusal."""
+        account, order = self._capped_setup(
+            monkeypatch, price=150.0, ordered_qty=10.0,
+            fills=[(OrderDirection.BUY, 10.0)], add_qty=20.0,
+        )
+
+        result = account.submit_order(order)
+
+        assert result is not None
+        assert len(account.impl_calls) == 1
+
+
 class TestCloseNeverFallsBackToTheOrderedQuantity:
     """``submit_close_order_for_transaction`` must size off what it MEASURED."""
 
@@ -924,6 +1190,551 @@ class TestPerInstrumentCapHonoursItsOwnNumbers:
             order, transaction, expert_instance, current_price=400.0)
 
         assert stub.exclude_calls == [transaction.id]
+
+
+class TestThePerInstrumentCapSizesTheHoldingOffWhatWasMEASURED:
+    """GAP 3: ``_validate_single_position_size`` sized the existing holding off
+    ``transaction.quantity`` -- what was ORDERED -- rather than the measured net.
+
+    Same staleness as the close bug above (``submit_close_order_for_transaction``),
+    applied one gate over. ``transaction.quantity`` is the amount the transaction was
+    opened FOR; after a partial fill, a partial exit, an external close or an
+    assignment it no longer describes anything the account holds. Which way it is
+    wrong depends only on which direction reality drifted:
+
+      * a partially CLOSED position is counted at its full original size, so the cap
+        BLOCKS a top-up that is comfortably inside it; and
+      * a position GROWN past its opening order is counted at the smaller original
+        size, so the cap ADMITS a top-up that takes the real holding over it.
+
+    The second is the money-losing direction and is the one nothing caught.
+
+    ``transaction.get_current_open_qty()`` is the measured net -- exactly what the
+    close path now uses. Note it returns a ``float``, deliberately not an
+    ``Optional[float]`` (that would push ``None`` into arithmetic at ~10 call sites);
+    when a fill is UNMEASURABLE it excludes it and says so loudly, and that log must
+    still reach the operator from here.
+    """
+
+    def _setup(self, monkeypatch, *, ordered_qty, fills, add_qty,
+               max_position_pct=10.0, price=150.0):
+        """A capped expert holding ``fills``, asked to add ``add_qty`` more.
+
+        ``ordered_qty`` is what ``transaction.quantity`` says -- the stale number.
+        """
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = price
+        # $100k account x 100% sleeve; a 10% cap is $10,000 = 66.67 shares at $150.
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=max_position_pct)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=ordered_qty, side=OrderDirection.BUY,
+            status=TransactionStatus.OPENED, open_price=price,
+            expert_id=expert_instance.id,
+        )
+        for side, filled in fills:
+            create_trading_order(
+                account_id=acct_def.id, symbol="AAPL", quantity=filled,
+                side=side, status=OrderStatus.FILLED,
+                transaction_id=transaction.id, filled_qty=filled,
+            )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=add_qty,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+        return account, order, transaction
+
+    def test_a_partially_closed_position_is_sized_at_WHAT_REMAINS(self, monkeypatch):
+        """THE DEFECT, over-strict direction: 100 bought, 60 already sold -> 40 held
+        ($6,000). Adding 20 ($3,000) makes $9,000, inside the $10,000 cap. Counting
+        the ORDERED 100 makes it look like $18,000 and refuses a legitimate add."""
+        account, order, _txn = self._setup(
+            monkeypatch, ordered_qty=100.0,
+            fills=[(OrderDirection.BUY, 100.0), (OrderDirection.SELL, 60.0)],
+            add_qty=20.0,
+        )
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_position_grown_past_its_opening_order_is_capped_on_the_MEASURED_total(self, monkeypatch):
+        """THE DEFECT, money-losing direction: the transaction was opened for 10 but
+        has since been topped up to 60 held ($9,000) -- ``transaction.quantity`` still
+        says 10. Adding 20 more takes the real holding to 80 ($12,000), over the
+        $10,000 cap; sized off the stale 10 the cap sees $4,500 and waves it through."""
+        account, order, _txn = self._setup(
+            monkeypatch, ordered_qty=10.0,
+            fills=[(OrderDirection.BUY, 10.0), (OrderDirection.BUY, 50.0)],
+            add_qty=20.0,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert errors, "the cap must be measured against what is actually held"
+        assert any("exceeding expert's max allowed $10000.00" in e for e in errors), errors
+
+    def test_the_refusal_reports_the_MEASURED_holding_not_the_ordered_one(self, monkeypatch):
+        """The message is the operator's only view of why the order was refused, and
+        it carries its own copy of the number. 'Current position: 10 shares' when 60
+        are held is a lie about money, and it would survive a fix that changed only
+        the arithmetic."""
+        account, order, _txn = self._setup(
+            monkeypatch, ordered_qty=10.0,
+            fills=[(OrderDirection.BUY, 10.0), (OrderDirection.BUY, 50.0)],
+            add_qty=20.0,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("Current position: 60.0 shares ($9000.00)" in e for e in errors), errors
+        # ...and the remaining headroom quoted with it: $10,000 - $9,000 = $1,000 -> 6
+        # shares at $150, not the 33 that the stale 10-share reading implies.
+        assert any("Can add up to 6 more shares" in e for e in errors), errors
+
+    # --- the inverses ------------------------------------------------------
+
+    def test_an_ordinary_untouched_position_is_unchanged(self, monkeypatch):
+        """THE INVERSE #1: when nothing has drifted, ordered == measured and the gate
+        behaves exactly as before. 30 held ($4,500) + 10 ($1,500) = $6,000 < $10,000."""
+        account, order, _txn = self._setup(
+            monkeypatch, ordered_qty=30.0, fills=[(OrderDirection.BUY, 30.0)],
+            add_qty=10.0,
+        )
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_an_ordinary_untouched_position_is_still_capped(self, monkeypatch):
+        """THE INVERSE #2: and it still REFUSES when it should. 60 held ($9,000) + 20
+        ($3,000) = $12,000 > $10,000."""
+        account, order, _txn = self._setup(
+            monkeypatch, ordered_qty=60.0, fills=[(OrderDirection.BUY, 60.0)],
+            add_qty=20.0,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("exceeding expert's max allowed $10000.00" in e for e in errors), errors
+
+    def test_a_fully_closed_transaction_holds_nothing(self, monkeypatch):
+        """THE INVERSE #3: a measured net of ZERO is an ANSWER -- the book is flat --
+        and re-opening into that transaction is capped on the new order alone. The
+        ORDERED 100 would have refused it outright."""
+        account, order, _txn = self._setup(
+            monkeypatch, ordered_qty=100.0,
+            fills=[(OrderDirection.BUY, 100.0), (OrderDirection.SELL, 100.0)],
+            add_qty=20.0,
+        )
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_new_position_branch_is_untouched(self, monkeypatch):
+        """THE INVERSE #4: the else-branch (no matching entry order) never read the
+        transaction quantity at all and must keep sizing on the order alone."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=999.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_fractional_holding_is_measured_as_such(self, monkeypatch):
+        """THE INVERSE #5: Alpaca trades fractional shares. 0.5 held must not be
+        rounded or truncated into 0 (or into the ordered 1)."""
+        account, order, _txn = self._setup(
+            monkeypatch, ordered_qty=1.0,
+            fills=[(OrderDirection.BUY, 66.5), (OrderDirection.SELL, 0.25)],
+            add_qty=0.5, price=150.0,
+        )
+        # 66.25 held = $9,937.50; + 0.5 ($75) = $10,012.50, just over the $10,000 cap.
+        errors = account._validate_position_size_limits(order)
+
+        assert any("exceeding expert's max allowed $10000.00" in e for e in errors), errors
+
+    def test_an_OPPOSITE_side_order_is_not_an_add(self, monkeypatch):
+        """Found by mutation: dropping ``entry_order.side == trading_order.side``
+        survived the WHOLE root suite and packages/common -- nothing anywhere pinned
+        the side test. Without it a SELL against a 60-share long is scored as though
+        it GREW the position to 80 ($12,000 over a $10,000 cap) and is refused. That
+        is a risk-REDUCING order blocked by a risk control; ``is_closing_order=True``
+        only covers the paths that remember to set it."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=60.0, side=OrderDirection.BUY,
+            status=TransactionStatus.OPENED, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=60.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=transaction.id, filled_qty=60.0,
+        )
+        reducing = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=20.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        assert account._validate_position_size_limits(reducing) == []
+
+    def test_a_zero_percent_SLEEVE_gives_this_gate_a_zero_cap(self, monkeypatch):
+        """Found by mutation: ``expert_instance.virtual_equity_pct or 100.0`` here
+        survived this file entirely. It is the fifth clone of the coercion that
+        test_virtual_equity_zero_pct.py killed in four other places, and it lives in
+        the cap's DENOMINATOR: a sleeve allocated 0% would be told it may put the
+        whole account into one instrument."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=100.0,
+                                           virtual_equity_pct=0.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=1.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("exceeds expert's max allowed $0.00" in e for e in errors), errors
+
+    def test_only_EXECUTED_orders_count_as_a_holding(self, monkeypatch):
+        """Found by mutation: nothing in this file distinguished a filled order from
+        a queued one at this gate. A PENDING order is an intention, not a holding --
+        counting it would make the cap refuse a top-up on the strength of shares
+        nobody owns yet (and double-count the order under validation itself).
+
+        The status filter must also run BEFORE the unmeasurable-fill check: a queued
+        order has no ``filled_qty`` because nothing has filled, which is not the same
+        as a broker that filled and would not say how much. Reporting every open
+        order as UNMEASURABLE would bury the real alarm.
+        """
+        errors_logged = _capture_errors(monkeypatch)
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=60.0, side=OrderDirection.BUY,
+            status=TransactionStatus.OPENED, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=30.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=transaction.id, filled_qty=30.0,
+        )
+        # Queued, not owned: 30 more shares the broker has not filled.
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=30.0,
+            side=OrderDirection.BUY, status=OrderStatus.OPEN,
+            transaction_id=transaction.id,
+        )
+        # 30 held ($4,500) + 20 ($3,000) = $7,500, inside the $10,000 cap.
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=20.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        assert account._validate_position_size_limits(order) == []
+        assert not any("UNMEASURABLE" in m for m in errors_logged), (
+            "a queued order is not an unmeasurable fill", errors_logged)
+
+    def test_an_add_that_lands_EXACTLY_on_the_cap_is_allowed(self, monkeypatch):
+        """Found by mutation (``>`` -> ``>=`` survived): the boundary is a real
+        decision and nothing pinned it. A cap is a MAXIMUM -- an add that brings the
+        holding to exactly $10,000.00 of a $10,000.00 cap is inside it, and the
+        new-position branch three lines down already reads ``>``. 60 held ($9,000) +
+        6.666666666666667 ($1,000) = $10,000.00 exactly."""
+        account, order, _txn = self._setup(
+            monkeypatch, ordered_qty=60.0, fills=[(OrderDirection.BUY, 60.0)],
+            add_qty=1_000.0 / 150.0,
+        )
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_an_add_ONE_CENT_over_the_cap_is_refused(self, monkeypatch):
+        """Found by mutation: the only over-cap add pinned here was $2,000 over, so
+        loosening the comparison to ``max_position_value + 1`` survived. A cap that
+        is quietly a dollar wider than it says is a cap nobody can audit."""
+        account, order, _txn = self._setup(
+            monkeypatch, ordered_qty=60.0, fills=[(OrderDirection.BUY, 60.0)],
+            add_qty=1_000.01 / 150.0,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("exceeding expert's max allowed $10000.00" in e for e in errors), errors
+
+    def test_the_headroom_quoted_by_an_over_cap_refusal_is_never_negative(self, monkeypatch):
+        """Found by mutation (``if max_additional_value > 0 else 0`` -> truthiness
+        survived): when the holding is ALREADY over the cap -- the price ran up, or
+        the cap was lowered under a live position -- the headroom is negative, and
+        ``int(-1500/150)`` prints "Can add up to -10 more shares". A refusal that
+        tells the operator to buy a negative number of shares is not an instruction
+        anyone can act on. 80 held = $12,000 against a $10,000 cap."""
+        account, order, _txn = self._setup(
+            monkeypatch, ordered_qty=80.0, fills=[(OrderDirection.BUY, 80.0)],
+            add_qty=10.0,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("Can add up to 0 more shares" in e for e in errors), errors
+        assert not any("-" in e.split("Can add up to")[1] for e in errors
+                       if "Can add up to" in e), errors
+
+    def test_a_SHORT_holding_is_capped_on_its_magnitude(self, monkeypatch):
+        """THE INVERSE #6: ``get_current_open_qty()`` returns a SIGNED net -- negative
+        for a short. Without ``abs()`` a 60-share short reads as -60, so adding 20 more
+        short 'reduces' the total to -40 = -$6,000, which is inside every cap however
+        large the position gets. The exposure is the magnitude."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=60.0, side=OrderDirection.SELL,
+            status=TransactionStatus.OPENED, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=60.0,
+            side=OrderDirection.SELL, status=OrderStatus.FILLED,
+            transaction_id=transaction.id, filled_qty=60.0,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=20.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("exceeding expert's max allowed $10000.00" in e for e in errors), errors
+        assert any("Current position: 60.0 shares" in e for e in errors), errors
+
+    def test_the_measured_net_is_SIGNED(self, monkeypatch):
+        """The contract this fix now depends on, pinned at the source.
+
+        Found by mutation: ``Transaction.get_current_open_qty`` documents "positive
+        for longs, negative for shorts", and wrapping its return in ``abs()`` survived
+        the ENTIRE root suite and packages/common -- every consumer today takes the
+        magnitude, so nothing defends the sign. A caller that starts trusting the
+        docstring (to decide a close's direction, say) would silently turn every short
+        into a long."""
+        from ba2_trade_platform.core.db import get_instance
+        from ba2_trade_platform.core.models import Transaction
+
+        acct_def = create_account_definition()
+        short = create_transaction(
+            symbol="AAPL", quantity=60.0, side=OrderDirection.SELL,
+            status=TransactionStatus.OPENED, open_price=150.0,
+        )
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=60.0,
+            side=OrderDirection.SELL, status=OrderStatus.FILLED,
+            transaction_id=short.id, filled_qty=60.0,
+        )
+        long = create_transaction(
+            symbol="MSFT", quantity=60.0, side=OrderDirection.BUY,
+            status=TransactionStatus.OPENED, open_price=400.0,
+        )
+        create_trading_order(
+            account_id=acct_def.id, symbol="MSFT", quantity=60.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=long.id, filled_qty=60.0,
+        )
+
+        assert get_instance(Transaction, short.id).get_current_open_qty() == -60.0
+        assert get_instance(Transaction, long.id).get_current_open_qty() == 60.0
+
+    # --- the loud log must not be swallowed here ---------------------------
+
+    def test_an_unmeasurable_fill_is_still_reported_loudly_from_this_gate(self, monkeypatch):
+        """``get_current_open_qty`` cannot express "unmeasurable" in its float return
+        (an ``Optional[float]`` would push ``None`` into arithmetic at ~10 call
+        sites), so it EXCLUDES the order and logs at error instead. Reading it from
+        inside a risk control wrapped in a broad ``except Exception`` is exactly where
+        such a log gets lost -- pin that it still reaches the operator, and that the
+        gate does not crash into its catch-all."""
+        errors_logged = _capture_errors(monkeypatch)
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=60.0, side=OrderDirection.BUY,
+            status=TransactionStatus.OPENED, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        # FILLED, but the broker never said how much: UNMEASURABLE, not zero.
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=60.0,
+            side=OrderDirection.BUY, status=OrderStatus.FILLED,
+            transaction_id=transaction.id, filled_qty=None,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=20.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("UNMEASURABLE" in m for m in errors_logged), (
+            "the unmeasurable-fill log must not be swallowed by the risk control",
+            errors_logged)
+        assert not any("could not be completed" in e for e in errors), (
+            "reading the measured net must not crash into the catch-all", errors)
+
+
+class TestTheLimitsAreMaximaNotExclusiveBounds:
+    """Found by mutation: every ``>`` in these two gates could be flipped to ``>=``
+    and nothing noticed. "Max allowed $10,000" either admits an order landing on
+    exactly $10,000 or it does not; both are defensible, only one is what the code
+    does, and an unpinned boundary is one somebody re-decides by accident.
+
+    All four comparisons agree: the limit is a MAXIMUM, so exactly-at-limit passes.
+    """
+
+    def _setup(self, monkeypatch, *, available_balance, max_position_pct, fills=()):
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=max_position_pct)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=available_balance)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING if not fills else TransactionStatus.OPENED,
+            open_price=150.0, expert_id=expert_instance.id,
+        )
+        for side, filled in fills:
+            create_trading_order(
+                account_id=acct_def.id, symbol="AAPL", quantity=filled,
+                side=side, status=OrderStatus.FILLED,
+                transaction_id=transaction.id, filled_qty=filled,
+            )
+        return account, acct_def, transaction
+
+    def _order(self, acct_def, transaction, qty):
+        return TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=qty,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+    def test_a_new_position_landing_exactly_on_the_cap_passes(self, monkeypatch):
+        """$10,000 cap, 66.666... shares at $150 = $10,000.00 exactly."""
+        account, acct_def, txn = self._setup(
+            monkeypatch, available_balance=1_000_000.0, max_position_pct=10.0)
+
+        order = self._order(acct_def, txn, 10_000.0 / 150.0)
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_new_position_one_cent_over_the_cap_is_refused(self, monkeypatch):
+        """The other side of the same boundary, so 'passes' cannot mean 'the gate
+        stopped working'."""
+        account, acct_def, txn = self._setup(
+            monkeypatch, available_balance=1_000_000.0, max_position_pct=10.0)
+
+        order = self._order(acct_def, txn, 10_000.01 / 150.0)
+
+        assert any("exceeds expert's max allowed" in e
+                   for e in account._validate_position_size_limits(order))
+
+    def test_an_order_spending_exactly_the_available_balance_passes(self, monkeypatch):
+        """A sleeve with $1,500.00 free may spend $1,500.00 of it."""
+        account, acct_def, txn = self._setup(
+            monkeypatch, available_balance=1_500.0, max_position_pct=100.0)
+
+        order = self._order(acct_def, txn, 10.0)   # 10 x $150 = $1,500.00
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_top_up_spending_exactly_the_available_balance_passes(self, monkeypatch):
+        """Same boundary on the add-to-position branch, which has its own comparison."""
+        account, acct_def, txn = self._setup(
+            monkeypatch, available_balance=1_500.0, max_position_pct=100.0,
+            fills=[(OrderDirection.BUY, 1.0)])
+
+        order = self._order(acct_def, txn, 10.0)
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_top_up_one_cent_over_the_available_balance_is_refused(self, monkeypatch):
+        account, acct_def, txn = self._setup(
+            monkeypatch, available_balance=1_499.99, max_position_pct=100.0,
+            fills=[(OrderDirection.BUY, 1.0)])
+
+        order = self._order(acct_def, txn, 10.0)
+
+        assert any("exceeds expert's available balance" in e
+                   for e in account._validate_position_size_limits(order))
+
+    def test_a_new_position_one_cent_over_the_available_balance_is_refused(self, monkeypatch):
+        """Found by mutation: the top-up branch had a MODEST overshoot pinned, the
+        new-position branch only a huge one (10x the balance). Widening its ceiling to
+        ``available_balance * 2`` therefore survived -- a doubled sleeve is precisely
+        the kind of off-by-a-factor nobody spots in a message that still reads
+        plausibly."""
+        account, acct_def, txn = self._setup(
+            monkeypatch, available_balance=1_499.99, max_position_pct=100.0)
+
+        order = self._order(acct_def, txn, 10.0)   # $1,500.00
+
+        assert any("exceeds expert's available balance" in e
+                   for e in account._validate_position_size_limits(order))
 
 
 class TestDeferredCloseAuditTrail:

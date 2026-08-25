@@ -1020,8 +1020,28 @@ class AccountInterface(ReadOnlyAccountInterface):
         errors = []
         max_position_value = virtual_equity * (max_position_pct / 100.0)
         
-        # Get current position size from the transaction
-        current_position_qty = abs(transaction.quantity or 0)
+        # SIZE THE EXISTING HOLDING OFF WHAT WE MEASURED, AND NOTHING ELSE.
+        #
+        # This was ``abs(transaction.quantity or 0)`` -- the quantity the transaction
+        # was ORDERED for. After a partial fill, a partial exit, an external close or
+        # an assignment that number no longer describes anything the account holds,
+        # and the per-instrument cap is then wrong in whichever direction reality
+        # drifted: a partially CLOSED position is counted at its full original size so
+        # the cap blocks a legitimate top-up, and a position GROWN past its opening
+        # order is counted at the smaller original size so the cap ADMITS a top-up
+        # that takes the real holding over it. The second direction is the one that
+        # loses money. Same staleness, one gate over, as the close bug fixed in
+        # submit_close_order_for_transaction.
+        #
+        # get_current_open_qty() is the measured net -- the same source the close path
+        # now uses. It returns a float, deliberately not Optional[float] (that would
+        # push None into arithmetic at ~10 call sites); when a fill is UNMEASURABLE it
+        # excludes that order and logs at error, and that log reaches the operator
+        # from here too (test: an unmeasurable fill is still reported loudly).
+        #
+        # The ``or 0`` is not carried over: ``Transaction.quantity`` is NOT NULL, so it
+        # could only ever have fired on a real, measured zero.
+        current_position_qty = abs(transaction.get_current_open_qty())
         current_position_value = current_position_qty * current_price
         
         # Check if this is adding to an existing position
@@ -1256,27 +1276,44 @@ class AccountInterface(ReadOnlyAccountInterface):
             
             # Get current price
             current_price = self.get_instrument_current_price(trading_order.symbol)
-            if current_price is None:
+            if current_price is None or current_price <= 0:
                 # NO PRICE MEANS NEITHER GATE RAN. Both the per-instrument cap and the
                 # expert available-balance check below are priced off this quote, so a
                 # bare ``return errors`` here skipped BOTH of them and reported the order
                 # as validated -- on a MARKET order that already carries a transaction_id,
                 # i.e. one that is about to be sent. Same rule as the equity branch above.
+                #
+                # ``is None`` ALONE WAS TOO NARROW. A quote of exactly 0.0 is not a
+                # price; it is a broker or feed that answered with nothing usable, and
+                # ReadOnlyAccountInterface.get_instrument_current_price passes it
+                # straight through (it only rejects ``None`` before caching). Every
+                # number downstream is then zero -- ``position_value`` AND
+                # ``order_value`` are ``current_price * quantity`` -- so ``0.0 > cap``
+                # and ``0.0 > available_balance`` are both False and BOTH gates pass an
+                # order of any size. A negative quote is worse still: the comparison is
+                # then satisfied *more* the larger the order gets.
+                #
+                # The guard is on the PRICE and on nothing else. A zero quantity, a
+                # zero position value, a zero cap and a measured $0 equity are all
+                # legitimate answers and must keep flowing through to the ordinary
+                # "exceeds" message (tests: TestAZeroQuoteIsNotAPrice inverses).
                 logger.error(
                     f"POSITION SIZE VALIDATION CANNOT RUN for {trading_order.symbol} on "
-                    f"account {self.id}: no current price is available "
-                    f"({self.__class__.__name__}.get_instrument_current_price returned None), "
+                    f"account {self.id}: no usable current price is available "
+                    f"({self.__class__.__name__}.get_instrument_current_price returned "
+                    f"{current_price!r}), "
                     f"so neither the per-instrument cap nor the expert balance check could be "
                     f"priced. Rejecting the order rather than treating an unrun risk check "
                     f"as passed."
                 )
                 errors.append(
                     f"position-size validation could not run: no price for "
-                    f"{trading_order.symbol}. Refusing the order rather than skipping "
+                    f"{trading_order.symbol} that can be used for sizing "
+                    f"(got {current_price!r}). Refusing the order rather than skipping "
                     f"the check."
                 )
                 return errors
-            
+
             # Validate position size limits
             position_size_errors = self._validate_single_position_size(
                 trading_order, transaction, expert_instance,

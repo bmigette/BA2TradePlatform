@@ -165,6 +165,100 @@ def is_defect(exc: BaseException) -> bool:
     return isinstance(exc, _DEFECTS)
 
 
+# --------------------------------------------------------------------------- #
+# Unknown reads as zero
+#
+# The same failure the rest of this module addresses, one layer down: not "a defect wearing a
+# data-shaped exception" but "an absent number wearing a measured one". A 2026-08 audit found 25
+# sites where a value nobody measured became ``0.0`` and was then read as an answer — an unknown
+# option reserve FREEING buying power, ``float(o.strike or 0.0)`` making an unknown strike free
+# money, a peak equity of ``0.0`` disabling a drawdown breaker, a 429 rejection reading as "this
+# symbol has no data".
+#
+# A typed ``Measured[T]``/``Unknown`` sum type was weighed and rejected: SQLModel columns cannot
+# hold one, so every DB boundary would unwrap — which is exactly where the coercions already are.
+# ``or 0.0`` would become ``.unwrap_or(0.0)``.
+#
+# What is left is ergonomics. ``or 0.0`` keeps reappearing because it is the shortest thing to
+# type. So the correct thing is made shorter:
+#
+#     px = must_measure(quote.last, f"{symbol} last price")      # 1 call, raises if absent
+#     px = float(quote.last or 0.0)                              # 1 call, silently wrong
+#
+# and, for a caller that legitimately cannot measure and must say so rather than answer:
+#
+#     return unmeasured("HTTP 429 from the quote endpoint")
+#
+# ``tests/test_no_zero_coercion.py`` is the lint rule that finds the coercions; this is the
+# replacement it points people at.
+# --------------------------------------------------------------------------- #
+
+class UnmeasuredValue(ValueError):
+    """A number was required and the value supplied was not one that had been measured."""
+
+
+class Unmeasured:
+    """The tri-state absence: "I could not measure this", carrying WHY.
+
+    Deliberately NOT a number and NOT ``None``. ``None`` is already overloaded across this
+    codebase ("absent", "not applicable", "not yet computed"), and a float — of any value —
+    can be summed into a total by accident. This can only be tested for, printed, or passed
+    to :func:`must_measure`, which will name the reason in the raise.
+
+    Falsy, so ``if not value:`` guards keep working; un-addable, so a caller that forgets the
+    guard fails at the arithmetic rather than three screens later in a P&L column.
+    """
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return f"Unmeasured({self.reason!r})"
+
+    def __str__(self) -> str:
+        return f"unmeasured: {self.reason}"
+
+
+def unmeasured(reason: str) -> Unmeasured:
+    """Build the tri-state absence for a caller that legitimately could not measure."""
+    return Unmeasured(reason)
+
+
+def must_measure(value, what: str) -> float:
+    """Return *value* as a float, or raise :class:`UnmeasuredValue` naming *what* was unknown.
+
+    Accepts ``str``/``Decimal`` because broker payloads arrive that way and a helper that made
+    you coerce first would lose to ``or 0.0`` on keystrokes. Rejects ``None``, NaN, infinity,
+    an :class:`Unmeasured`, and anything non-numeric.
+
+    A measured ``0.0`` passes. That is the point: zero is an ANSWER (a scratch trade's P&L, a
+    flat book's quantity, a genuinely unreserved debit) and conflating it with absence is the
+    bug this exists to stop, not a shortcut it may take.
+    """
+    if isinstance(value, Unmeasured):
+        raise UnmeasuredValue(f"{what} is unmeasured: {value.reason}")
+    if value is None:
+        raise UnmeasuredValue(f"{what} is unmeasured: value is None")
+    if isinstance(value, bool):
+        raise UnmeasuredValue(f"{what} is unmeasured: got bool {value!r}, not a measurement")
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        raise UnmeasuredValue(
+            f"{what} is unmeasured: {value!r} ({type(value).__name__}) is not a number"
+        ) from None
+    if out != out:                       # NaN
+        raise UnmeasuredValue(f"{what} is unmeasured: value is NaN")
+    if out in (float("inf"), float("-inf")):
+        raise UnmeasuredValue(f"{what} is unmeasured: value is {out}")
+    return out
+
+
 def raise_if_defect(exc: BaseException) -> None:
     """Deprecated: allow-by-default. Use :func:`absorb_if_benign`, which propagates unless the
     call site names the error as expected. Kept so an un-migrated caller still escalates the
