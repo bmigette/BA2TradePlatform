@@ -620,3 +620,38 @@ def test_a_403_on_rest_discovery_names_the_mode_that_works(provider, store, monk
     msg = str(ei.value)
     assert "--discovery synthetic" in msg, msg
     assert "403" in msg and "AAPL" in msg, msg
+
+
+def test_a_bad_symbols_discovery_failure_does_not_abort_the_rest_of_the_run(
+        provider, store, monkeypatch):
+    """Regression for the 2026-08-25 incident: 5 of 8 parallel warm-up workers died within
+    seconds because their symbol chunk happened to contain a hyphenated ticker (BF-B, CIG-C,
+    FITB-PA, MKC-V, PBR-A) that occ_symbol/parse_occ can't round-trip -- an unhandled
+    ValueError from discover() used to propagate straight out of build_plan's `for symbol in
+    symbols:` loop, killing the whole worker process and abandoning every other symbol queued
+    behind the bad one, not just the one that actually failed.
+
+    BADCO is queued FIRST (worst case: everything after it in the loop) with a real, working
+    AAPL right behind it -- proving the failure costs exactly BADCO, not the batch."""
+    real_discover = provider.discover_contracts
+
+    def _flaky(underlying, **kw):
+        if underlying == "BADCO":
+            raise ValueError("not an OCC option symbol: 'BADCO230120C00150000'")
+        return real_discover(underlying, **kw)
+
+    monkeypatch.setattr(provider, "discover_contracts", _flaky)
+    clock = FakeClock()
+    rc = warm.main(
+        ["--symbols", "BADCO,AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+         "--rate-limit", "0", "--discovery", "rest"],
+        provider=provider, store=store, clock=clock,
+        sleep=lambda s: clock.advance(s), log=lambda _l: None)
+
+    assert rc == 0
+    plan = warm.last_plan()
+    assert plan.discovery_failed == {"BADCO": "not an OCC option symbol: 'BADCO230120C00150000'"}
+    assert "BADCO" not in plan.per_symbol
+    assert "AAPL" in plan.per_symbol
+    for e in EXPIRIES:
+        assert store.partition_state("AAPL", e, START, END) is PartitionState.COMPLETE

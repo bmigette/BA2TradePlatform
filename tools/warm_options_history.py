@@ -79,6 +79,13 @@ class Plan:
     units_done: int = 0
     units_empty: int = 0
     per_symbol: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    #: symbols whose CONTRACT DISCOVERY itself raised (not a fetch failure -- a fetch failure
+    #: is a WorkUnit that fails at run_units time and is reported in RunStats.units_failed).
+    #: 2026-08-25: 'BF-B'.upper() failed to round-trip through occ_symbol/parse_occ (the OCC
+    #: root pattern is letters+digits only), an unhandled ValueError that used to propagate
+    #: straight through this loop and kill the ENTIRE worker process -- abandoning every other
+    #: symbol in that worker's chunk, not just the one bad ticker. See discovery_failed below.
+    discovery_failed: Dict[str, str] = field(default_factory=dict)
 
     @property
     def units_pending(self) -> int:
@@ -346,11 +353,23 @@ def _price_range(underlying: str, start: date, end: date):
 
 
 def build_plan(provider, store: OptionHistoryParquetStore, symbols: Sequence[str],
-               start: date, end: date, ns: argparse.Namespace, *, persist: bool) -> Plan:
+               start: date, end: date, ns: argparse.Namespace, *, persist: bool,
+               log: Optional[Callable[[str], None]] = None) -> Plan:
+    log = log or print
     plan = Plan()
     budget = ns.limit if ns.limit and ns.limit > 0 else None
     for symbol in symbols:
-        contracts = discover(provider, store, symbol, start, end, ns, persist)
+        try:
+            contracts = discover(provider, store, symbol, start, end, ns, persist)
+        except Exception as e:
+            # A per-symbol discovery bug (e.g. an underlying occ_symbol/parse_occ can't
+            # round-trip) must cost exactly that symbol, never the rest of the batch --
+            # SystemExit (discover()'s deliberate 403/scope-refusal signal, a systemic
+            # problem every symbol would hit identically) is a BaseException, not an
+            # Exception, so it is NOT caught here and still halts the whole run as intended.
+            plan.discovery_failed[symbol] = str(e)
+            log(f"  [{symbol}] discovery failed, skipping this symbol: {e}")
+            continue
         by_expiry: Dict[date, List[OptionContractMeta]] = {}
         for c in contracts:
             by_expiry.setdefault(c.expiry, []).append(c)
@@ -582,8 +601,11 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
             f"accepting the window would build a cache with silently unusable leading "
             f"months. Use --start {floor} or later.")
 
-    plan = build_plan(provider, store, symbols, start, end, ns, persist=not ns.dry_run)
+    plan = build_plan(provider, store, symbols, start, end, ns, persist=not ns.dry_run, log=log)
     _LAST_PLAN = plan
+    if plan.discovery_failed:
+        log(f"discovery  : {len(plan.discovery_failed)} symbol(s) failed and were skipped: "
+            f"{', '.join(sorted(plan.discovery_failed))}")
 
     if ns.dry_run:
         print_plan(plan, store, symbols, start, end, ns, log)
