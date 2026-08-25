@@ -1061,11 +1061,267 @@ deviations (the properly normalized "how far OTM", which is what OPT-C3 actually
 
 ---
 
-## Pending — R4
+---
 
-- **R4 (fitness):** recommended option-specific fitness. The premise under test is that a
-  consistency-rewarding fitness is precisely what a short-premium strategy games, and that options
-  uniquely permit an **ex-ante** risk denominator because a defined-risk structure's max loss is
-  arithmetic rather than sampled. **Cross-link: OPT-C1** — there is currently no premium-richness
-  entry criterion at all, so the GA is rewarded for selling near-worthless premium. No fitness
-  change fully compensates for a missing entry gate; these two must be fixed together.
+# R4 — option-specific fitness
+
+**Ran partially.** The grounding and all four designs completed; the three judges received only
+Design 1 because the dossier was truncated when the four designs were concatenated into their
+prompt (a defect in the orchestration script, not in the agents). All three judges reported the
+truncation and refused to invent scores for designs they never saw — the right call.
+
+**The comparison is therefore missing, but the judges spent their effort auditing the substrate
+instead, and that turned out to be worth more than the comparison.** Several findings below
+invalidate entire design families outright, which makes re-running the original comparison
+pointless — the design problem itself has changed.
+
+## F1 — CAR has NO term that decreases when a genome takes more risk
+
+This is arithmetic, not opinion, and it is the headline.
+
+Under the equity cap every period return is `period_pnl / cap` (`equity_cap.py:96-104`) and
+drawdown is `(pnl - peak_pnl) / cap` (`equity_cap.py:110-135`). So **doubling contract count
+doubles `base` and doubles `|max_drawdown|` exactly.**
+
+`consistent_annual_return` is `base × dd_guard × consistency × trade_gate`
+(`strategy_fitness.py:753`), where `dd_guard = min(20 / max(dd, 1), 2.0)` (`:724-725`), and
+`consistency` and `trade_gate` are size-invariant ratios. Therefore:
+
+| realised drawdown at size *s* | CAR(2s) / CAR(s) |
+|---|---|
+| dd ≥ 10 % | **1.000 — exactly indifferent to size** |
+| dd = 7 % | 1.43 |
+| dd ≤ 5 % | **2.00 — doubling size doubles the score** |
+
+**CAR strictly rewards leverage up to a 10 %-of-cap drawdown, and is exactly flat above it.**
+
+## F2 — A missing drawdown earns the MAXIMUM risk reward
+
+`strategy_fitness.py:724`:
+
+```python
+dd = abs(float(results.get("max_drawdown") or 0.0))
+dd_guard = min(_CAR_DD_REFERENCE / max(dd, _CAR_DD_FLOOR), _CAR_DD_GUARD_MAX)
+```
+
+`or 0.0` means an **unmeasurable** drawdown becomes `dd = 0` → `dd_guard = 2.0`, the largest
+multiplier the function can produce. The house unknown-as-zero bug, sitting in the fitness
+function itself, handing its best score to a genome whose risk could not be measured.
+
+## F3 — `avg_trades_per_year` counts LEGS, not structures
+
+`get_round_trip_trades` (`backtest_account.py:2211-2232`) keys round trips on
+`(transaction_id, contract_symbol)` — **one row per leg**. An iron condor is 4 trades; a strangle
+is 2.
+
+The `trade_gate` hard floor is 12 trades/yr (below it, `LOW_TRADE_SENTINEL`, disqualified) with a
+linear ramp to full credit at 30/yr (`strategy_fitness.py:679-694`). So:
+
+- **3 iron condors a year clears the hard floor.**
+- **7.5 condors a year earns full credit.**
+
+Every count-based quantity inherits this: `total_trades`, `win_rate`, `expectancy`, `sqn`,
+`profit_factor` and the Monte-Carlo bootstrap all treat a 4-leg condor as four independent
+observations. The inflation is 2–4× and it is **concentrated on exactly the negatively-skewed
+multi-leg credit structures whose means are least estimable**, while the single-leg long-premium
+arm faces a 4× stricter cadence gate.
+
+**Fixing the denominator to count `transaction_id`s is a one-line change that would improve every
+candidate design more than the metric each of them proposes.**
+
+## F4 — There is no out-of-sample split anywhere
+
+`grep -rn "walk_forward|out_of_sample|holdout|in_sample"` over `backend/app/services` and
+`ba2test_launcher.py` returns only an unrelated ML forecasting hit.
+
+The GA selects the maximum of roughly population × generations ≈ 10³ noisy in-sample scores on a
+single window. The expected optimistic bias of that maximum is about `σ·√(2 ln N)` ≈ **3.7 σ**, and
+**no choice of fitness reduces it — only a holdout does.**
+
+Worse, the relationship runs backwards: a more expressive fitness gives the GA more distinct ways
+to fit the window's idiosyncrasies, so a *better-designed* fitness can **increase** the selection
+bias it was built to reduce. One walk-forward fold buys more out-of-sample validity than any metric
+change on this list.
+
+## F5 — Collateral is a run constant by construction, so ROC designs degenerate
+
+`_size_by_reserve` (`packages/common/ba2_common/core/TradeActions.py:2077-2093`) is
+`floor(equity × sizing_pct/100 / reserve_per_contract)`, and for defined-risk credit structures
+`reserve_per_contract` **is** the max loss (`:2649`, `:2755`; CSP at `:2568`).
+
+So `contracts × max_loss ≡ option_sizing % of equity`, **by construction** — and `option_sizing` is
+a hard-coded per-structure constant (15.0 for O_BEARCS/O_BULLPS, 20.0 for O_IC/O_SSTG/O_SSTD) that
+is **not a gene** (see OPT-C-inventory: there is no `option_sizing_optimize` anywhere).
+
+Consequences:
+- Any fitness denominated in collateral-at-risk, max-loss, buying-power reduction or
+  return-on-collateral divides by a near-constant within each structure family and **degenerates to
+  plain return.** The entire capital-efficiency design family is non-viable as things stand.
+- That constant also sets the **buy-arm-vs-sell-arm exchange rate**: halve `option_sizing` and every
+  seller's score doubles relative to every buyer's.
+
+Either `option_sizing` becomes a searched gene, or any design must state explicitly that its risk
+denominator is a run constant.
+
+## F6 — There is no per-position or per-bar collateral series, anywhere
+
+`snapshot_equity` (`backtest_account.py:1087-1126`) records exactly
+`{date, net_liquidating_value, cash_balance, equity_value}`, and `equity_value` is
+`_open_positions_mtm()` — a **mark**, not a reserve.
+
+`maintenance_margin_requirement()` (`:706-773`) can compute a number at any instant but is never
+recorded, and is not collateral-at-risk anyway: it explicitly skips defined-risk combo legs and
+covered calls, so **an iron condor reads as consuming zero collateral.**
+
+The live stack's real per-structure reserve (`order.data['option_reserve']`) **does not exist in the
+test platform at all** — `grep -rn option_reserve testplatform/` finds one launcher comment and
+design docs, zero code.
+
+So a return-on-collateral fitness is not a scoring-layer change: it needs a new field recorded per
+bar by the engine and threaded through `build_results` and four plumbing sites. **Weeks, not days.**
+
+## F7 — Trade rows and the equity curve describe DIFFERENT books after an assignment
+
+Assigned shares are created by `_update_position` with **no order**
+(`backtest_account.py:2820-2823`); the cleanup order gets `transaction_id=None`
+(`_record_stock_liquidation_close`, `:1052-1064`); and `get_round_trip_trades` drops every order
+with no transaction (`:2222-2223`).
+
+**So the assignment's stock P&L is in the curve and absent from the rows.** `total_trades`,
+`win_rate`, `profit_factor`, `expectancy`, `best/worst_trade`, the Monte-Carlo bootstrap,
+`stressed_results` and the profit cap's `excess` all inherit the gap — and
+`adj_final = final - excess` (`results.py:678`) **subtracts a row-derived quantity from a
+curve-derived one.**
+
+Every candidate fitness is built out of trade rows. For the short-premium structures this whole
+exercise is about, **the rows are missing the realised tail.** The fix is small — link the
+liquidation order to the option transaction, or emit a row for the assigned lot — and it should
+precede any fitness work. (Closely related to OPT-B2 in R1.)
+
+## F8 — Nothing records that a book changed shape mid-life
+
+`_exit_reason` (`backtest_account.py:2399-2410`) only ever returns `take_profit` / `stop_loss` /
+`exit`, so an **assignment is indistinguishable from a normal exit**. Rolls, partial closes and
+staggered leg exits are equally invisible.
+
+Any ex-ante design that treats a `transaction_id` group as one fixed payoff over
+`[min(entry_time), max(exit_time)]` therefore mis-prices exactly the wheel — the headline
+premium-income strategy — and mis-prices it in an unpredictable direction, which is the direction a
+GA searches.
+
+## F9 — No risk term ever touches a losing genome
+
+`strategy_fitness.py:696-697`:
+
+```python
+if base <= 0:
+    return base   # unfactored: penalty factors on a negative would flip its sign
+```
+
+Every candidate design is multiplicative on top of CAR, so all of them inherit this. **Risk is only
+priced along the profitable ridge.** Defensible for ranking, but it means no design in this family
+can claim to "charge" for risk in general — only to reorder the winners.
+
+## F10 — The equity cap embeds a hidden volatility penalty that handicaps the buy arm
+
+`scoring_curve` compounds **per recorded point** (`equity_cap.py:96-104`) and the curve is one point
+per daily bar (`snapshot_equity`, `daily_engine.py:788`), so annualised log growth is
+`252 × (μ − σ²/2)` on a fixed denominator.
+
+Measured drag: at $100/day P&L σ on a $20,000 cap, 0.32 %/yr; at **$400/day, 5.04 %/yr**.
+
+A lumpy long-premium book therefore surrenders roughly **4.7 percentage points of `base` per year**
+relative to a smooth short-premium book of identical total P&L — a structural buy/sell handicap of
+20–40 % in relative terms, **built into the return term itself**, invisible to any risk term bolted
+on afterwards. The buy/sell fairness argument is partly lost before a single fitness term runs.
+
+## F11 — Trading is essentially free, so no design can lean on costs to brake churn
+
+`--commission` defaults to **$0.10 per fill** (`ba2test_launcher.py:3959`) and `--slippage` to
+**0.0** (`:3967`), and `tools/run_options_matrix.py` forwards neither. An 8-fill condor round trip
+costs **$0.80** on a $20,000 account. Any fitness term that rewards turnover or trade count is
+exploitable at will.
+
+## F12 — The optimizer is scalar at six independent layers
+
+`creator.create('FitnessMax', base.Fitness, weights=(1.0,))` (`genetic.py:177`);
+`selTournament` (`:217`); `rebuild_population`'s hard-coded `ind.fitness.values = (float(fit),)`
+(`:452`, which is also the **resume** path); `_trial_worker` returning `{'fitness': float(fit)}`
+(`strategy_optimization_handler.py:241-243`); the remote HTTP contract in `distributed_eval.py`;
+and `ga_fitness = Column(Float)` (`backend/app/models/backtest.py:139`).
+
+Any Pareto/multi-objective design pays all six plus a migration, **and breaks mid-generation
+checkpoint/resume.**
+
+## F13 — A pricer exists, but not where a fitness function can reach it
+
+Good news that cuts both ways. `backtest/option_greeks.py:38 bs_price` is pure Black-Scholes with
+no I/O; `:57 implied_volatility` inverts by bisection; and `fetch_options.py:133/171` already calls
+`compute_iv_and_greeks` at **cache-build** time, so the options sqlite carries historical
+per-contract IV and delta. Re-pricing a book under a shock is cheap CPU.
+
+The constraint is the seam: the chain cache is reachable only via `account._options.cache`, which
+exists inside `build_results` (see `_delta_at_entry`, `results.py:249-265`) and **does not exist
+inside `compute_fitness`** — which also runs on the master when re-scoring stored rows
+(`ba2test_launcher.py:3470`) and inside `_maybe_robust`.
+
+**Any shock overlay must be computed at results time and echoed as a key, never computed at fitness
+time.** A design that puts re-pricing inside `compute_fitness` works in-process and silently fails
+or raises on the top-N re-score path.
+
+---
+
+## Current fitness, transcribed (for reference)
+
+`compute_fitness` (`strategy_fitness.py:255-342`). Sentinels, ordered so wiped-out < no-trade <
+too-few-trades < any real score: `ZERO_TRADE_SENTINEL = -1e9`, `LOW_TRADE_SENTINEL = -1e8`,
+`WIPED_OUT_SENTINEL = -2e9`.
+
+`_consistent_annual_return` (`:632-753`) = `base × dd_guard × consistency × trade_gate`:
+
+- **base** — `adjusted_annualized_return` whenever a profit cap is set. `--profit-cap-pct` defaults
+  to **2000** and `--profit-share-cap-pct` to **25**, both DEFAULT-ON since 2026-07-31
+  (`ba2test_launcher.py:3906, :3910`), so on the options grid base is **always** the adjusted
+  figure: per-structure gains clipped at 20× cost basis and at 25 % of net profit.
+- **trade_gate** — `< 12` trades/yr disqualified outright; 12–30 linear ramp 0.4×–1.0×; ≥ 30 → 1.0.
+- **dd_guard** — `min(20 / max(dd, 1), 2.0)`. 1.0 at 20 % dd, capped 2.0 at ≤ 10 %, 0.667 at 30 %.
+- **consistency** — `clamp(worst_year / mean_year, 0.25, 1.0)`; 1.0 if fewer than 2 years. Guarded
+  by a **loud** `raise` if `equity_curve` is missing, naming the ~4× inflation it would cause.
+- **sign guard** — `if base <= 0: return base` unfactored (F9).
+
+Optional and off by default: win-rate factor (`val × 2 × win_rate/100`, silent no-op when win rate
+is missing), trade scale (a structural no-op for CAR, which returns earlier), spread stress
+(re-prices finished trades at a wider spread, takes the min), and robustness (multiplicative
+concentration × Monte-Carlo × spread factors). `sharpe_ratio`, `sortino_ratio` and `win_rate` have
+**no adjusted variant**, so they use raw values even under a profit cap.
+
+---
+
+## Recommended sequence — revised in light of the substrate findings
+
+The design question is now secondary. In dependency order:
+
+1. **`avg_trades_per_year` counts structures, not legs** (F3). One line. Improves every metric
+   downstream and un-breaks the statistical-significance gate on exactly the structures that need it.
+2. **Link the assignment's stock P&L back into the trade rows** (F7). Small, and every row-derived
+   metric is wrong for the wheel until it lands. Pairs with OPT-B2.
+3. **Add one walk-forward fold** (F4). Buys more out-of-sample validity than any metric change here,
+   and nothing else on this list can substitute for it.
+4. **Fix `max_drawdown or 0.0`** (F2). One line; currently hands the maximum risk reward to a genome
+   whose risk is unmeasurable.
+5. **Add a premium-richness entry gate** (OPT-C1) and **wire `iv_rank` as a gene** (R3). The GA
+   cannot select for premium quality with neither the criterion nor the volatility gene available.
+6. **Decide `option_sizing`: gene or declared constant** (F5). Until then no risk-denominated
+   fitness means what it claims.
+7. **Only then** design the fitness term itself — and note that F1 means the minimum viable change
+   is *some* term that decreases with size, which CAR currently lacks entirely.
+
+Two design families are already ruled out by the substrate: **return-on-collateral** (F5, F6) and
+**multi-objective/Pareto** (F12). A **stress overlay** remains viable but must be computed at
+results time (F13).
+
+## Cross-link
+
+**OPT-C1** — there is no premium-richness entry criterion at all, so the GA is rewarded for selling
+near-worthless premium regardless of the fitness. No fitness change fully compensates for a missing
+entry gate; F1 and OPT-C1 must be fixed together.
