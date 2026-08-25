@@ -32,13 +32,13 @@ from .portfolio_allocation import (
 )
 from .TransactionHelper import TransactionHelper
 from .types import (
-    ActivityLogSeverity, ActivityLogType, BrokerOrderErrorReason,
+    ActivityLogSeverity, ActivityLogType, AssetClass, BrokerOrderErrorReason,
     OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
 )
 
 
 def _open_transaction_ids(account_id: int, symbols: List[str]) -> Dict[str, List[int]]:
-    """``{symbol: [transaction_id]}`` for OPENED/CLOSING transactions, oldest first.
+    """``{symbol: [transaction_id]}`` for OPENED/CLOSING EQUITY transactions, oldest first.
 
     Transaction has NO account_id column -- it links to an account only through
     ``TradingOrder.account_id``, hence the join. Ordering is by primary key,
@@ -54,6 +54,30 @@ def _open_transaction_ids(account_id: int, symbols: List[str]) -> Dict[str, List
             Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.CLOSING]),
         ).distinct()
         for txn in session.exec(statement).all():
+            # SEAM 1 / OPT-L2 — an option Transaction's `symbol` is the UNDERLYING ticker
+            # (models.Transaction: "symbol stays the UNDERLYING and must never hold an OCC
+            # contract string"), so without this filter the allocation planner reads a covered
+            # call as a holding of the stock. Every id here is fed to PositionState, and both
+            # submission paths then walk it: `_close_symbol` calls close_transaction on each,
+            # `_adjust_symbol` splits the delta across them FIFO and calls
+            # adjust_quantity_with_tpsl. Those two are now guarded, so the option leg is
+            # REFUSED rather than routed -- but a refusal is not the fix. A "set AAPL to 0%"
+            # run still sells the 100 shares and reports the row `partially_filled`, i.e. it
+            # sells the collateral out from under a short call and leaves it NAKED; and an
+            # ADJUST row still hands the option's CONTRACT count to split_delta_fifo, so the
+            # trim under-sells the equity by that much and can never converge. The option must
+            # not be in the plan at all.
+            #
+            # ALLOW-list, not deny-list: `== EQUITY` rather than `!= OPTION`. This planner
+            # builds bare equity MARKET orders (`_open_symbol`) and exits through the equity
+            # close path, so an asset class it has never heard of must be INVISIBLE here until
+            # someone deliberately teaches it that class -- `!= OPTION` would sweep the next
+            # one in by default. Safe against legacy rows: the column is NOT NULL with
+            # server_default 'EQUITY' (alembic b2f4c81d6a35), so nothing pre-dating options
+            # can fall out. option_lifecycle_service._open_option_transactions already filters
+            # on exactly this column; allocation was the caller that skipped it.
+            if txn.asset_class != AssetClass.EQUITY:
+                continue
             out.setdefault(txn.symbol, []).append(txn.id)
     return {symbol: sorted(ids) for symbol, ids in out.items()}
 

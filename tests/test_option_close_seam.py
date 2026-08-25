@@ -137,3 +137,104 @@ class TestAdjustQuantityRefusesOptions:
         assert get_instance(TradingOrder, leg.id).status == OrderStatus.NEW
         assert result["success"] is False
         assert result["orders_canceled"] == []
+
+
+def _open_equity_and_option(account_id, symbol="AAPL", shares=100.0, contracts=1.0):
+    """A covered call: `shares` of `symbol` plus an option whose symbol IS `symbol`.
+
+    Both transactions reach the account only through their TradingOrder, which is
+    what ``_open_transaction_ids`` joins on, so each needs a filled order.
+    """
+    equity = create_transaction(symbol=symbol, quantity=shares)
+    create_trading_order(account_id=account_id, symbol=symbol, quantity=shares,
+                         transaction_id=equity.id, status=OrderStatus.FILLED,
+                         filled_qty=shares)
+    option = create_transaction(symbol=symbol, quantity=contracts,
+                                side=OrderDirection.SELL,
+                                asset_class=AssetClass.OPTION)
+    create_trading_order(account_id=account_id, symbol=symbol, quantity=contracts,
+                         transaction_id=option.id, side=OrderDirection.SELL,
+                         status=OrderStatus.FILLED, filled_qty=contracts,
+                         asset_class=AssetClass.OPTION,
+                         contract_symbol="AAPL260116C00250000")
+    return equity, option
+
+
+class _FakeAccount:
+    """Duck-typed broker for ``build_position_states``: positions and prices only."""
+
+    def __init__(self, account_id, positions, prices):
+        self.id = account_id
+        self._positions = positions
+        self._prices = prices
+
+    def get_positions(self):
+        return self._positions
+
+    def get_instrument_current_price(self, symbols):
+        return {s: self._prices[s] for s in symbols if s in self._prices}
+
+
+class _FakePosition:
+    def __init__(self, symbol, qty, cost_basis, market_value):
+        self.symbol = symbol
+        self.qty = qty
+        self.cost_basis = cost_basis
+        self.market_value = market_value
+        self.side = None
+
+
+class TestAllocationExcludesOptions:
+    def test_an_option_transaction_is_not_in_the_allocation_plan(self):
+        """An option txn's symbol is the UNDERLYING, so without an asset_class filter the
+        allocator treats a covered call as a holding of the stock and can sell the cover."""
+        from ba2_trade_platform.core.portfolio_allocation_service import _open_transaction_ids
+        acct_def = create_account_definition()
+        equity, option = _open_equity_and_option(acct_def.id)
+
+        ids = _open_transaction_ids(acct_def.id, ["AAPL"]).get("AAPL", [])
+
+        assert equity.id in ids
+        assert option.id not in ids
+
+    def test_the_equity_side_is_untouched(self):
+        """An account holding only equities plans exactly as it did before the filter:
+        every open/closing transaction, grouped by symbol, oldest first."""
+        from ba2_trade_platform.core.portfolio_allocation_service import _open_transaction_ids
+        from ba2_trade_platform.core.types import TransactionStatus
+        acct_def = create_account_definition()
+        first = create_transaction(symbol="AAPL", quantity=20.0)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=20.0,
+                             transaction_id=first.id, status=OrderStatus.FILLED,
+                             filled_qty=20.0)
+        second = create_transaction(symbol="AAPL", quantity=10.0,
+                                    status=TransactionStatus.CLOSING)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+                             transaction_id=second.id, status=OrderStatus.FILLED,
+                             filled_qty=10.0)
+        other = create_transaction(symbol="MSFT", quantity=5.0)
+        create_trading_order(account_id=acct_def.id, symbol="MSFT", quantity=5.0,
+                             transaction_id=other.id, status=OrderStatus.FILLED,
+                             filled_qty=5.0)
+
+        assert _open_transaction_ids(acct_def.id, ["AAPL", "MSFT"]) == {
+            "AAPL": sorted([first.id, second.id]),
+            "MSFT": [other.id],
+        }
+
+    def test_the_option_never_reaches_the_state_the_close_loop_walks(self):
+        """``_close_symbol`` closes every id in ``PositionState.transaction_ids``, so the
+        seam only holds if the covered call is absent THERE, not merely in the query."""
+        from ba2_trade_platform.core import portfolio_allocation_service as svc
+        acct_def = create_account_definition()
+        equity, option = _open_equity_and_option(acct_def.id)
+        account = _FakeAccount(
+            acct_def.id,
+            positions=[_FakePosition("AAPL", 100.0, 15000.0, 16000.0)],
+            prices={"AAPL": 160.0},
+        )
+
+        states = svc.build_position_states(account, ["AAPL"])
+
+        assert states["AAPL"].transaction_ids == [equity.id]
+        assert option.id not in states["AAPL"].transaction_ids
