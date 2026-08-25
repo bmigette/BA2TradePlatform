@@ -2051,6 +2051,11 @@ PNL_CAPTION_FMT = 'P&L {pnl}'
 
 LABEL_DELTA_OVER_FMT = 'over by {pct:.1f}pp ({money})'
 LABEL_DELTA_UNDER_FMT = 'under by {pct:.1f}pp ({money})'
+#: The same verdict where there is no money to state -- a sum of shares WITHIN a
+#: label is a pure ratio. Unreachable from the label bars, which set their points
+#: and their money together; a test pins that they cannot take this branch.
+LABEL_DELTA_OVER_PP_FMT = 'over by {pct:.1f}pp'
+LABEL_DELTA_UNDER_PP_FMT = 'under by {pct:.1f}pp'
 #: Inside the tolerance band. NOT "over by 0.0pp ($0.12)", which is noise on a row
 #: that is, for every purpose the user has, exactly where it should be.
 LABEL_DELTA_ON_TARGET = 'on target'
@@ -2112,8 +2117,14 @@ def format_label_delta(*, status: str, delta_pct: Optional[float],
     """
     if status == LABEL_STATUS_OK:
         return LABEL_DELTA_ON_TARGET
-    if status == LABEL_STATUS_NONE or delta_pct is None or delta_value is None:
+    if status == LABEL_STATUS_NONE or delta_pct is None:
         return LABEL_DELTA_NONE
+    if delta_value is None:
+        # A ratio with no money behind it -- the sum of the shares INSIDE a label
+        # is a share of that label and of nothing else. The label bars never reach
+        # here: they set both figures together or neither.
+        return (LABEL_DELTA_OVER_PP_FMT if status == LABEL_STATUS_OVER
+                else LABEL_DELTA_UNDER_PP_FMT).format(pct=abs(delta_pct))
     template = (LABEL_DELTA_OVER_FMT if status == LABEL_STATUS_OVER
                 else LABEL_DELTA_UNDER_FMT)
     return template.format(pct=abs(delta_pct),
@@ -2298,6 +2309,154 @@ def build_label_bars(views, *, base_notional: Optional[float],
             pnl_text=format_pnl_caption(view.pnl),
         ))
     return bars
+
+
+# ---------------------------------------------------------------------------
+# THE SHARE BAR -- ONE bar, three places
+#
+# The label header has carried a current-versus-target bar since the 2026-08-25
+# rework. The same geometry answers two more questions now: how the SYMBOL SHARES
+# inside one label add up against their 100, and how the account's free cash sits
+# against the reserve it is targeting.
+#
+# One builder, one tolerance band, one over/under vocabulary and one set of status
+# classes, so the whole page reads as one visual language -- and so no bar can
+# contradict the sentence printed beside it. That last one is not hypothetical:
+# the reserve row's own sub-line says that RAISING the reserve on a fully invested
+# book generates sells, and a bar that read its two figures the wrong way round
+# would be calling the same account "over" while the sentence called it short.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ShareBar:
+    """One current-versus-target bar. Pure geometry plus a verdict.
+
+    ``fraction`` and ``notch_fraction`` are 0-1 of the SAME track -- that shared
+    scale is what makes "over" and "under" legible by eye rather than a claim the
+    reader has to take on trust.
+
+    ``current_pct`` is ``None`` when there is nothing measurable to divide, which
+    is a different fact from 0.0% and draws a dash. It keeps its SIGN otherwise: a
+    net-short set is genuinely negative and the figure says so, while the bar
+    clamps to empty rather than wrapping round to a full track.
+
+    ``delta_value`` is ``None`` where there is no money behind the ratio -- a sum
+    of shares WITHIN a label is a share of that label and of nothing else -- and
+    ``delta_text`` then states the points alone.
+    """
+    current_pct: Optional[float]
+    target_pct: float
+    delta_pct: Optional[float]
+    delta_value: Optional[float]
+    fraction: float
+    notch_fraction: Optional[float]
+    status: str
+    current_text: str
+    target_text: str
+    delta_text: str
+
+
+def build_share_bar(*, current_pct: Optional[float], target_pct: float,
+                    current_value: Optional[float] = None,
+                    target_value: Optional[float] = None) -> ShareBar:
+    """Build one current-versus-target bar. Pure.
+
+    The track's scale is the LARGEST of 100, the current and the target, so a
+    figure past 100 stretches the track instead of clipping -- the same choice
+    ``bar_scale_pct`` makes for the label rows, and for the same reason: a clipped
+    bar and a full bar look identical and mean different things.
+
+    The tolerance band is ``LABEL_STATUS_TOLERANCE_PCT``, shared with the label
+    rows, so "on target" means one thing on this page.
+    """
+    target = float(target_pct or 0.0)
+    scale = max(_MIN_BAR_SCALE_PCT, 100.0, float(current_pct or 0.0), target)
+    if current_pct is None:
+        return ShareBar(current_pct=None, target_pct=target, delta_pct=None,
+                        delta_value=None, fraction=0.0,
+                        notch_fraction=_bar_fraction(target, scale),
+                        status=LABEL_STATUS_NONE,
+                        current_text=LABEL_CURRENT_UNKNOWN,
+                        target_text=TARGET_CELL_PREFIX + TARGET_PAIR_FMT.format(
+                            target_pct=target),
+                        delta_text=LABEL_DELTA_NONE)
+    delta_pct = float(current_pct) - target
+    delta_value = (None if (current_value is None or target_value is None)
+                   else float(current_value) - float(target_value))
+    if delta_pct > LABEL_STATUS_TOLERANCE_PCT:
+        status = LABEL_STATUS_OVER
+    elif delta_pct < -LABEL_STATUS_TOLERANCE_PCT:
+        status = LABEL_STATUS_UNDER
+    else:
+        status = LABEL_STATUS_OK
+    return ShareBar(
+        current_pct=float(current_pct), target_pct=target, delta_pct=delta_pct,
+        delta_value=delta_value,
+        fraction=_bar_fraction(float(current_pct), scale),
+        notch_fraction=_bar_fraction(target, scale), status=status,
+        current_text=LABEL_CURRENT_FMT.format(pct=float(current_pct)),
+        target_text=TARGET_CELL_PREFIX + TARGET_PAIR_FMT.format(target_pct=target),
+        delta_text=format_label_delta(status=status, delta_pct=delta_pct,
+                                      delta_value=delta_value))
+
+
+#: Said beside the per-label bar. It names the denominator, because the panel
+#: header immediately above carries the OTHER one -- that bar is the label's share
+#: of the investable pool, this one is its symbols' shares of the label.
+SYMBOL_TOTAL_BAR_CAPTION = 'shares of this label'
+
+
+def symbol_total_bar(weights) -> ShareBar:
+    """The per-label bar: the SUM of the symbol shares, against their 100. Pure.
+
+    A SUM and never a mean -- three symbols at 25% total 75%, which is a label 25
+    points short of being fully divided, not one that averages 25.
+
+    A BLANK share (an unmeasurable holding) makes the whole total unknown rather
+    than counting as zero, for the reason it is blank in the first place: nobody
+    knows what it is, and reporting the label as 40 points short would be a claim
+    about a number that does not exist.
+
+    This is deliberately NOT the label's share of the portfolio -- the panel header
+    directly above already carries that bar, on the investable denominator. Two
+    bars, two denominators, and the caption beside each says which.
+    """
+    shares = list((weights or {}).values())
+    if not shares:
+        return build_share_bar(current_pct=None, target_pct=100.0)
+    if any(pct is None for pct in shares):
+        return build_share_bar(current_pct=None, target_pct=100.0)
+    return build_share_bar(current_pct=round(sum(float(p) for p in shares), 2),
+                           target_pct=100.0)
+
+
+def reserve_bar(*, base_notional: Optional[float],
+                available_buying_power: Optional[float],
+                unallocated_pct: float) -> Optional[ShareBar]:
+    """The unallocated row's bar: free cash against the reserve target. Pure.
+
+    Built from ``unallocated_row`` -- the same figures the sentence beside it
+    prints -- so the picture and the words cannot disagree. Both are on the GROSS
+    base, which is the page's one deliberate exception to the investable
+    denominator: the reserve IS the part held back, so restating it against what
+    it leaves would be circular.
+
+    CURRENT is the buying power and TARGET is the reserve, in that order. Read the
+    other way round an under-funded reserve reads "over" -- while the sub-line
+    beside it is explaining that raising the reserve will generate sells.
+
+    ``None`` on a missing or zero base and on an unknown buying power, on exactly
+    ``format_reserve_row``'s terms: there is no denominator, so there is no bar.
+    """
+    if not base_notional or available_buying_power is None:
+        return None
+    row = unallocated_row(base_notional=base_notional,
+                          available_buying_power=available_buying_power,
+                          unallocated_pct=unallocated_pct)
+    return build_share_bar(current_pct=row.pct_of_base, target_pct=row.target_pct,
+                           current_value=row.current_value,
+                           target_value=row.target_value)
 
 
 def sort_label_views(views) -> List["LabelView"]:

@@ -6586,3 +6586,168 @@ def test_load_current_joins_the_group_and_stays_on_the_harmless_side(nicegui_cli
     assert captions == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
                         'Load current', 'Wipe', 'Compare', '<space>',
                         'Remove selected from label']
+
+
+# ---------------------------------------------------------------------------
+# THE TWO NEW BARS: the symbol-share total per label, and the reserve
+#
+# Both are the SAME component as the label header bar -- one track, one fill, one
+# notch, one tolerance band, one over/under vocabulary. Both update as their
+# numbers are edited, and neither recalculates anything.
+#
+# The per-label one is the SYMBOL shares summed within that label. The label's own
+# share of the portfolio already has a bar, in the panel header directly above it;
+# two bars, two denominators, and a caption on each says which.
+# ---------------------------------------------------------------------------
+
+def _bar_geometry(root, fill_marker, notch_marker, index=0):
+    fill = _marked(root, fill_marker)[index]
+    notch = _marked(root, notch_marker)[index]
+    return (fill._style.get('width'), notch._style.get('left'))
+
+
+def test_every_label_panel_gets_a_symbol_share_total_bar(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 50.0, 'MSFT': 50.0},
+                                       b_weights={'NVDA': 50.0, 'AMD': 50.0}))
+
+    assert len(_marked(root, page.MARKER_SYMBOL_BAR_FILL)) == 2
+    assert len(_marked(root, page.MARKER_SYMBOL_BAR_NOTCH)) == 2
+
+
+def test_the_symbol_bar_measures_the_shares_WITHIN_its_own_label(nicegui_client,
+                                                                 account_id):
+    """66.77% of 100, not a share of the portfolio and not a sum across labels."""
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 50.0), ManagedLabel('TECH', 50.0)],
+                        {'ARK26': ['AAPL', 'MSFT'], 'TECH': ['NVDA', 'AMD']},
+                        weights={'ARK26': {'AAPL': 40.0, 'MSFT': 26.77},
+                                 'TECH': {'NVDA': 50.0, 'AMD': 50.0}}))
+
+    assert '66.8%' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+    assert '100.0%' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[1])
+
+
+def test_the_symbol_bar_says_under_when_the_shares_do_not_reach_100(nicegui_client,
+                                                                    account_id):
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL', 'MSFT']},
+                        weights={'ARK26': {'AAPL': 40.0, 'MSFT': 35.0}}))
+
+    assert 'under by 25.0pp' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+
+def test_the_symbol_bar_FOLLOWS_an_inline_share_edit(nicegui_client, account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL', 'MSFT']},
+                        weights={'ARK26': {'AAPL': 40.0, 'MSFT': 35.0}}))
+    assert 'under by 25.0pp' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+    _emit(_tables(root)[0], 'weightChange', ['AAPL', 65.0])
+
+    assert 'on target' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+
+def test_the_symbol_bar_follows_FILL_100_and_WIPE(monkeypatch, nicegui_client,
+                                                  account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _three_symbols(account_id,
+                                weights={'AAPL': 30.0, 'MSFT': 0.0, 'TSLA': 0.0}))
+
+    _press(_fill_button(root))
+    assert 'on target' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+    _press(_marked_buttons(root, page.MARKER_WIPE_SYMBOLS)[0])
+    assert 'under by 100.0pp' in _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+
+def test_the_symbol_bar_of_ONE_label_does_not_move_when_ANOTHER_is_edited(
+        monkeypatch, nicegui_client, account_id):
+    """Summing across labels instead of within one is the mutation this kills."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 40.0, 'MSFT': 35.0},
+                                       b_weights={'NVDA': 50.0, 'AMD': 50.0}))
+    before = _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[1])
+
+    _emit(_tables(root)[0], 'weightChange', ['AAPL', 65.0])
+
+    assert _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[1]) == before
+
+
+def test_an_unmeasurable_share_leaves_the_symbol_bar_without_a_verdict(
+        nicegui_client, account_id):
+    """A blank share is not a zero, so the total is unknown rather than short."""
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL', 'DARK']},
+                        positions=[_pos('AAPL', 10, 500.0, 5000.0),
+                                   _pos('DARK', 10, 100.0, None)],
+                        prices={'AAPL': 500.0, 'DARK': None}))
+    texts = _texts(_marked(root, page.MARKER_SYMBOL_BAR_ROW)[0])
+
+    assert '—' in texts
+    assert not any('under by' in t for t in texts)
+
+
+def test_the_unallocated_row_gets_a_bar_beside_its_sentence(nicegui_client,
+                                                            account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=245.50, reserve=10.0)
+
+    assert len(_marked(root, page.MARKER_RESERVE_BAR_FILL)) == 1
+    # ...and every word of the row is still there.
+    texts = _texts(root)
+    assert any('Unallocated (free buying power)' in t for t in texts)
+    assert _view_mod().RESERVE_BASIS_NOTE in texts
+
+
+def test_the_reserve_bar_reads_UNDER_when_the_cash_is_short_of_the_target(
+        nicegui_client, account_id):
+    """$245.50 free (4.7% of base) against a 10.00% target. The sub-line already
+    says raising the reserve generates sells; a bar reading "over" here would be
+    contradicting it in the same box."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=245.50, reserve=10.0)
+    texts = _texts(_marked(root, page.MARKER_RESERVE_BAR_ROW)[0])
+
+    assert any(t.startswith('under by ') for t in texts)
+    assert not any(t.startswith('over by ') for t in texts)
+
+
+def test_the_reserve_bar_FOLLOWS_the_reserve_control(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=245.50, reserve=10.0)
+    assert any(t.startswith('under by ')
+               for t in _texts(_marked(root, page.MARKER_RESERVE_BAR_ROW)[0]))
+
+    _drive_value(_reserve_controls(root)[0], 2.0)
+
+    texts = _texts(_marked(root, page.MARKER_RESERVE_BAR_ROW)[0])
+    assert any(t.startswith('over by ') for t in texts)
+
+
+def test_the_reserve_row_is_drawn_without_a_bar_when_there_is_no_base(
+        nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id),
+                 base=0.0, buying_power=None)
+
+    assert _marked(root, page.MARKER_RESERVE_BAR_FILL) == []
+
+
+def test_all_three_bars_share_one_track_style(nicegui_client, account_id):
+    """One component, one visual language. Three tracks drawn three ways is how a
+    page stops reading as one page."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=245.50, reserve=10.0)
+
+    tracks = [el.parent_slot.parent for marker in (page.MARKER_BAR_FILL,
+                                                   page.MARKER_SYMBOL_BAR_FILL,
+                                                   page.MARKER_RESERVE_BAR_FILL)
+              for el in _marked(root, marker)]
+    assert len(tracks) == 3
+    assert {page.BAR_TRACK_STYLE.rstrip(';')} == {
+        ';'.join(f'{k}:{v}' for k, v in t._style.items()) for t in tracks}

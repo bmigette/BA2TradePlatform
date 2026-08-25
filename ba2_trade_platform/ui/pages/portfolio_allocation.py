@@ -124,7 +124,8 @@ from ..account_filter_context import get_selected_account_id
 # does not grow the eager import graph every page already pays for.
 from ..components.symbol_info_panel import open_symbol_info
 from ..utils.portfolio_allocation_view import (
-    BASIS_LEGEND, DEFAULT_MACHINE_LABEL_FAMILIES, GATE_NO_ACCOUNT,
+    BASIS_LEGEND, DEFAULT_LABEL_ICON_COLOR, DEFAULT_MACHINE_LABEL_FAMILIES,
+    GATE_NO_ACCOUNT,
     LABEL_COLOR_PALETTE, LABEL_STATUS_CLASSES, LABEL_TARGET_CAPTION,
     LABEL_TOOLTIP_STYLE, MARKET_SOURCE_UNAVAILABLE,
     NO_LABEL_COLOR, RESERVE_BASIS_NOTE,
@@ -138,7 +139,8 @@ from ..utils.portfolio_allocation_view import (
     format_allocation_footer, format_label_header,
     format_label_target_tooltip,
     format_reserve_caption,
-    format_reserve_row, label_color_contrast_warning, SHARE_DEFAULT_NOTE,
+    format_reserve_row, label_color_contrast_warning, reserve_bar,
+    SHARE_DEFAULT_NOTE, symbol_total_bar, SYMBOL_TOTAL_BAR_CAPTION,
     LABEL_TOTAL_CARD_CLASSES, LABEL_TOTAL_CARD_TITLE, LABEL_TOTAL_CARD_TOOLTIP,
     label_total_card,
     load_last_label_targets,
@@ -652,6 +654,15 @@ TABULAR_NUMS = 'font-variant-numeric: tabular-nums;'
 #: on each that does not depend on document order.
 MARKER_BAR_FILL = 'pf-bar-fill'
 MARKER_BAR_NOTCH = 'pf-bar-notch'
+#: The per-label SYMBOL-SHARE total bar and the UNALLOCATED bar. Same track, same
+#: fill, same notch, same builder as the label header bar above -- three markers
+#: only because a test has to be able to say WHICH bar it is reading.
+MARKER_SYMBOL_BAR_ROW = 'pf-symbol-bar-row'
+MARKER_SYMBOL_BAR_FILL = 'pf-symbol-bar-fill'
+MARKER_SYMBOL_BAR_NOTCH = 'pf-symbol-bar-notch'
+MARKER_RESERVE_BAR_ROW = 'pf-reserve-bar-row'
+MARKER_RESERVE_BAR_FILL = 'pf-reserve-bar-fill'
+MARKER_RESERVE_BAR_NOTCH = 'pf-reserve-bar-notch'
 #: The whole label header row, so a test can assert on the row rather than on a
 #: count of everything that happens to share a style.
 MARKER_BAR_ROW = 'pf-bar-row'
@@ -726,6 +737,41 @@ COLOR_SWATCH_STYLE = ('width:20px;height:20px;border-radius:50%;cursor:pointer;'
 COLOR_DEBOUNCE_MS = 400
 
 
+def _render_mini_bar(*, fill_marker: str, notch_marker: str,
+                     classes: str = 'flex-grow min-w-[80px]') -> Dict[str, Any]:
+    """Draw ONE bar track and hand back its two positioned divs.
+
+    THE bar component. Every bar on this page -- the label header's, the per-label
+    symbol-share total, the unallocated row's -- is this function and is painted by
+    ``_paint_mini_bar``, so they cannot drift into three visual languages. The two
+    divs carry no content at all: the geometry IS the information, which is why
+    they are marked rather than found by text.
+    """
+    with ui.element('div').classes(classes).style(BAR_TRACK_STYLE):
+        fill = ui.element('div').mark(fill_marker)
+        notch = ui.element('div').mark(notch_marker)
+    return {'fill': fill, 'notch': notch}
+
+
+def _paint_mini_bar(widgets: Dict[str, Any], *, fraction: float,
+                    notch_fraction: Optional[float], color: str) -> None:
+    """Put one bar's geometry on screen. In place. THE only writer.
+
+    A notch with nowhere to be is HIDDEN rather than parked at zero: a notch at 0%
+    is a target of zero, which is a statement, and "there is no target to place"
+    is not one.
+    """
+    widgets['fill'].style(replace=(
+        f'position:absolute;left:0;top:0;bottom:0;border-radius:3px;'
+        f'width:{fraction * 100.0:.2f}%;background:{color};'))
+    if notch_fraction is None:
+        widgets['notch'].set_visibility(False)
+    else:
+        widgets['notch'].set_visibility(True)
+        widgets['notch'].style(
+            replace=BAR_NOTCH_STYLE + f'left:{notch_fraction * 100.0:.2f}%;')
+
+
 def _new_live_state(*, base_notional: Optional[float] = None,
                     available_buying_power: Optional[float] = None,
                     unallocated_pct: float = 0.0) -> Dict[str, Any]:
@@ -749,6 +795,8 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         'label_inputs': {},     # label -> the label's target ui.number
         'expansions': {},       # label -> ui.expansion
         'bars': {},             # label -> the mini-bar row's mutable elements
+        'symbol_bars': {},      # label -> the symbol-share total bar's elements
+        'reserve_bar': None,    # the unallocated row's bar
         'reserve_row': None,    # the "Unallocated (free buying power)" line
         'reserve_caption': None,
         'reserve_number': None,
@@ -808,6 +856,9 @@ def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
         value = values.get(symbol)
         row['target_value'] = None if value is None else round(value, 2)
     table.update()
+    # The label's own share-of-100 bar, from the SAME map the cells were written
+    # from -- so the picture and the column cannot disagree about the total.
+    _apply_symbol_bar(live, label)
 
 
 def _apply_bars(live: Dict[str, Any]) -> None:
@@ -824,9 +875,8 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         widgets = live['bars'].get(bar.label)
         if widgets is None:
             continue
-        widgets['fill'].style(replace=(
-            f'position:absolute;left:0;top:0;bottom:0;border-radius:3px;'
-            f'width:{bar.bar_fraction * 100.0:.2f}%;background:{bar.color};'))
+        _paint_mini_bar(widgets, fraction=bar.bar_fraction,
+                        notch_fraction=bar.notch_fraction, color=bar.color)
         # The tag icon is retinted HERE, in the same loop and from the same
         # ``bar.color``, rather than at render time from ``view.color``. That is
         # what makes "the label icon left to the title" and the bar incapable of
@@ -835,12 +885,6 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         icon = widgets.get('icon')
         if icon is not None:
             icon.style(replace=f'color: {bar.color}')
-        if bar.notch_fraction is None:
-            widgets['notch'].set_visibility(False)
-        else:
-            widgets['notch'].set_visibility(True)
-            widgets['notch'].style(
-                replace=BAR_NOTCH_STYLE + f'left:{bar.notch_fraction * 100.0:.2f}%;')
         widgets['value'].set_text(f'${bar.current_value:,.2f}')
         # Every string below is the PURE layer's, not this module's: the
         # denominator rule, the "(real N%)" parenthetical and the over/under
@@ -868,6 +912,53 @@ def _apply_bars(live: Dict[str, Any]) -> None:
                 pct_of_total=live['view_by_label'][bar.label].pct_of_total,
                 delta_text=bar.delta_text,
                 unallocated_pct=live['unallocated_pct']))
+
+
+def _apply_symbol_bar(live: Dict[str, Any], label: str) -> None:
+    """Redraw ONE label's symbol-share total bar. In place.
+
+    Scoped to the label, and that scope is the whole point: this is the sum of the
+    shares INSIDE it, against their own 100. Summing across labels, or reading the
+    label's share of the portfolio here, would be answering the question the panel
+    header above already answers -- on a different denominator.
+
+    Like every other live figure on this page it only REDRAWS. It moves no share
+    and it solves nothing.
+    """
+    widgets = live['symbol_bars'].get(label)
+    if widgets is None:
+        return
+    bar = symbol_total_bar(live['weights'].get(label) or {})
+    _paint_mini_bar(widgets, fraction=bar.fraction,
+                    notch_fraction=bar.notch_fraction, color=widgets['color'])
+    widgets['pct'].set_text(bar.current_text)
+    widgets['delta'].set_text(bar.delta_text)
+    widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+
+
+def _apply_reserve_bar(live: Dict[str, Any]) -> None:
+    """Redraw the unallocated row's bar. In place.
+
+    CURRENT is the free buying power and TARGET is the reserve, in that order and
+    from ``reserve_bar`` -- which reads the same ``unallocated_row`` the sentence
+    beside it prints, so the picture and the words cannot disagree. Swapped, an
+    under-funded reserve would read "over" directly above a line explaining that
+    raising it generates sells.
+    """
+    widgets = live['reserve_bar']
+    if widgets is None:
+        return
+    bar = reserve_bar(base_notional=live['base_notional'],
+                      available_buying_power=live['available_buying_power'],
+                      unallocated_pct=live['unallocated_pct'])
+    if bar is None:
+        return
+    _paint_mini_bar(widgets, fraction=bar.fraction,
+                    notch_fraction=bar.notch_fraction, color=widgets['color'])
+    widgets['pct'].set_text(bar.current_text)
+    widgets['target'].set_text(bar.target_text)
+    widgets['delta'].set_text(bar.delta_text)
+    widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
 
 
 def _apply_total_notice(live: Dict[str, Any]) -> None:
@@ -926,6 +1017,7 @@ def _apply_reserve(live: Dict[str, Any]) -> None:
                                   unallocated_pct=live['unallocated_pct'])
         if text is not None:
             live['reserve_row'].set_text(text)
+    _apply_reserve_bar(live)
     _apply_page_figures(live)
 
 
@@ -1962,6 +2054,23 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     # so a symbol the account does not hold sits at 0% and will not be. That is
     # correct and it is surprising, which is exactly the pair that needs a caption.
     ui.label(SHARE_DEFAULT_NOTE).classes('text-xs text-secondary-custom')
+    # HOW FAR THE SHARES ABOVE GET TO 100. The same component as the panel header's
+    # bar, one denominator down: that one is this label's share of the investable
+    # pool, this one is its symbols' shares of the label. The caption on each says
+    # which, because two bars two inches apart on two denominators is exactly the
+    # collision this page has been unpicking.
+    with ui.row().classes('w-full items-center gap-3 no-wrap').style(TABULAR_NUMS) \
+            .mark(MARKER_SYMBOL_BAR_ROW):
+        ui.label(SYMBOL_TOTAL_BAR_CAPTION).classes('w-40 text-xs text-secondary-custom')
+        symbol_bar_widgets = _render_mini_bar(
+            fill_marker=MARKER_SYMBOL_BAR_FILL, notch_marker=MARKER_SYMBOL_BAR_NOTCH)
+        symbol_bar_widgets['pct'] = ui.label('').classes('w-16 text-right')
+        symbol_bar_widgets['delta'] = ui.label('').classes('w-44')
+        # The LABEL's own colour, resolved through the one helper the icon and the
+        # header bar use, so a recolour reaches all three or none.
+        symbol_bar_widgets['color'] = resolve_label_icon_color(view.color)
+    live['symbol_bars'][view.label] = symbol_bar_widgets
+    _apply_symbol_bar(live, view.label)
     table.add_slot('body-cell-flag', r'''
         <q-td :props="props">
             <span v-if="props.value" :title="'Also in: ' + props.row.labels"
@@ -2216,12 +2325,10 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             widgets['icon'] = icon
             ui.label(view.label).classes('w-48 truncate font-medium')
             widgets['value'] = ui.label('').classes('w-28 text-right')
-            with ui.element('div').classes('flex-grow min-w-[80px]').style(BAR_TRACK_STYLE):
-                # Marked, because the two are otherwise indistinguishable bare divs
-                # whose whole content is an inline style -- and the geometry IS the
-                # information here, so a test has to be able to read it back.
-                widgets['fill'] = ui.element('div').mark(MARKER_BAR_FILL)
-                widgets['notch'] = ui.element('div').mark(MARKER_BAR_NOTCH)
+            # THE bar component, shared with the per-label symbol-share total and
+            # the unallocated row so the three read as one visual language.
+            widgets.update(_render_mini_bar(fill_marker=MARKER_BAR_FILL,
+                                            notch_marker=MARKER_BAR_NOTCH))
             widgets['pct'] = ui.label('').classes('w-16 text-right')
             widgets['target'] = ui.label('').classes('w-36 text-right')
             # THE number that says what to do. It replaced the bare status word --
@@ -2392,6 +2499,20 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
             # investable pool. In identical grammar the two read as one column and
             # sum past 100.
             live['reserve_row'] = ui.label(reserve_text).style(TABULAR_NUMS)
+            # THE SAME bar component as the label rows. Every word of the sentence
+            # above stays; this only draws what it says. Neutral grey, because the
+            # reserve is not a label and has no palette entry of its own.
+            with ui.row().classes('w-full items-center gap-3 no-wrap') \
+                    .style(TABULAR_NUMS).mark(MARKER_RESERVE_BAR_ROW):
+                reserve_bar_widgets = _render_mini_bar(
+                    fill_marker=MARKER_RESERVE_BAR_FILL,
+                    notch_marker=MARKER_RESERVE_BAR_NOTCH)
+                reserve_bar_widgets['pct'] = ui.label('').classes('w-16 text-right')
+                reserve_bar_widgets['target'] = ui.label('').classes('w-28 text-right')
+                reserve_bar_widgets['delta'] = ui.label('').classes('w-52')
+                reserve_bar_widgets['color'] = DEFAULT_LABEL_ICON_COLOR
+            live['reserve_bar'] = reserve_bar_widgets
+            _apply_reserve_bar(live)
             # Said out loud, because it is the counter-intuitive half: a reserve on
             # a fully invested book is funded by SELLING, and the dry run is where
             # that becomes visible. Drawn unconditionally now that the reserve is

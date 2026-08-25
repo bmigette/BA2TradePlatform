@@ -3999,3 +3999,171 @@ def test_a_FLAT_holding_is_measurable_and_an_unpriced_one_is_not():
     assert {r.symbol: r.measurable for r in market[0].rows} == {'FLAT': True,
                                                                 'DARK': False}
     assert all(r.measurable for r in cost[0].rows)
+
+
+# ---------------------------------------------------------------------------
+# THE SHARE BAR -- one bar component, three places
+#
+# The label header has carried a current-versus-target bar since the rework. The
+# same geometry now answers two more questions: how the SYMBOL SHARES inside one
+# label add up against their 100, and how the account's free cash sits against
+# the reserve it is targeting. One builder, one tolerance band, one over/under
+# vocabulary -- so the whole page reads as one visual language and no bar can
+# disagree with the sentence beside it.
+# ---------------------------------------------------------------------------
+
+def _bar(**kw):
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import build_share_bar
+    return build_share_bar(**kw)
+
+
+def test_a_share_bar_puts_the_fill_and_the_notch_on_ONE_scale():
+    """The load-bearing property: if they did not share a scale, "over" and
+    "under" would be a lie no reader could catch by eye."""
+    bar = _bar(current_pct=25.0, target_pct=100.0)
+
+    assert bar.fraction == pytest.approx(0.25)
+    assert bar.notch_fraction == pytest.approx(1.0)
+
+
+def test_a_share_bar_that_is_SHORT_of_its_target_says_under():
+    bar = _bar(current_pct=75.0, target_pct=100.0)
+
+    assert bar.status == LABEL_STATUS_UNDER
+    assert bar.delta_text == 'under by 25.0pp'
+
+
+def test_a_share_bar_that_is_OVER_its_target_says_over():
+    bar = _bar(current_pct=118.0, target_pct=100.0)
+
+    assert bar.status == LABEL_STATUS_OVER
+    assert bar.delta_text == 'over by 18.0pp'
+
+
+def test_a_share_bar_inside_the_tolerance_band_is_on_target():
+    bar = _bar(current_pct=100.0, target_pct=100.0)
+
+    assert bar.status == LABEL_STATUS_OK
+    assert bar.delta_text == 'on target'
+
+
+def test_a_share_bar_over_100_stretches_the_track_rather_than_clipping():
+    """The notch stays visible and the fill stays honest -- the same choice the
+    label bars make, where a margin book legitimately holds more than the pool."""
+    bar = _bar(current_pct=150.0, target_pct=100.0)
+
+    assert bar.fraction == pytest.approx(1.0)
+    assert bar.notch_fraction == pytest.approx(2.0 / 3.0)
+    assert bar.current_text == '150.0%'
+
+
+def test_a_share_bar_states_its_delta_in_MONEY_too_when_there_is_money():
+    """The reserve row has both; a sum of symbol shares has only points."""
+    bar = _bar(current_pct=4.7, target_pct=10.0, current_value=245.50,
+               target_value=526.09)
+
+    assert bar.status == LABEL_STATUS_UNDER
+    assert bar.delta_text == 'under by 5.3pp ($280.59)'
+
+
+def test_a_share_bar_with_no_measurable_current_draws_no_verdict():
+    bar = _bar(current_pct=None, target_pct=100.0)
+
+    assert bar.status == LABEL_STATUS_NONE
+    assert bar.fraction == 0.0
+    assert bar.current_text == LABEL_STATUS_NONE
+    assert bar.delta_text == LABEL_STATUS_NONE
+
+
+def test_a_share_bar_never_renders_a_negative_current_as_a_full_track():
+    """A net-short set is genuinely negative and the figure says so; the bar
+    clamps to empty rather than wrapping round to full."""
+    bar = _bar(current_pct=-30.0, target_pct=100.0)
+
+    assert bar.fraction == 0.0
+    assert bar.current_text == '-30.0%'
+
+
+def test_the_points_only_delta_is_unreachable_from_the_LABEL_bars():
+    """``format_label_delta`` grew a money-less branch for the share bars. The
+    label bars set their two figures together, so they can never take it -- which
+    is what keeps the money out of exactly one of the page's bars by accident."""
+    for reserve in (0.0, 25.0):
+        for view in (_view('A', 4_500.0, 30.0), _view('B', 0.0, 0.0)):
+            bar = build_label_bars([view], base_notional=10_000.0,
+                                   unallocated_pct=reserve)[0]
+            assert (bar.delta_pct is None) == (bar.delta_value is None)
+
+
+def test_the_symbol_total_bar_sums_the_shares_WITHIN_one_label():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import symbol_total_bar
+
+    bar = symbol_total_bar({'AAPL': 26.78, 'MSFT': 22.19, 'TSLA': 17.8})
+
+    assert bar.current_pct == pytest.approx(66.77)
+    assert bar.target_pct == 100.0
+    assert bar.status == LABEL_STATUS_UNDER
+
+
+def test_the_symbol_total_bar_sums_and_never_averages():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import symbol_total_bar
+
+    assert symbol_total_bar({'A': 25.0, 'B': 25.0, 'C': 25.0}).current_pct == 75.0
+
+
+def test_the_symbol_total_bar_leaves_an_UNMEASURABLE_share_out_and_says_so():
+    """A blank share is not a zero. Counting it as 0 would report a label whose
+    total cannot be known as 25 points short of 100."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import symbol_total_bar
+
+    bar = symbol_total_bar({'AAPL': 60.0, 'DARK': None})
+
+    assert bar.current_pct is None
+    assert bar.status == LABEL_STATUS_NONE
+
+
+def test_the_symbol_total_bar_of_a_label_with_no_symbols_is_not_a_verdict():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import symbol_total_bar
+
+    assert symbol_total_bar({}).status == LABEL_STATUS_NONE
+
+
+def test_the_reserve_bar_reads_ACTUAL_against_TARGET_and_not_the_other_way():
+    """$245.50 of free cash (4.7% of base) against a 10.00% target is UNDER. Read
+    the two the wrong way round and the bar says "over" while the sentence beside
+    it says raising the reserve will generate sells."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import reserve_bar
+
+    bar = reserve_bar(base_notional=5_260.9, available_buying_power=245.50,
+                      unallocated_pct=10.0)
+
+    assert bar.current_pct == pytest.approx(4.67, abs=0.01)
+    assert bar.target_pct == 10.0
+    assert bar.status == LABEL_STATUS_UNDER
+    assert bar.delta_text.startswith('under by ')
+
+
+def test_the_reserve_bar_agrees_with_the_row_it_sits_beside():
+    """Same numbers, same source: ``unallocated_row``. A bar built from its own
+    arithmetic is how the picture and the sentence come to disagree."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        reserve_bar, unallocated_row)
+
+    row = unallocated_row(base_notional=5_260.9, available_buying_power=245.50,
+                          unallocated_pct=10.0)
+    bar = reserve_bar(base_notional=5_260.9, available_buying_power=245.50,
+                      unallocated_pct=10.0)
+
+    assert bar.current_pct == row.pct_of_base
+    assert bar.target_pct == row.target_pct
+
+
+def test_the_reserve_bar_is_absent_when_there_is_no_base_to_divide_by():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import reserve_bar
+
+    assert reserve_bar(base_notional=0.0, available_buying_power=100.0,
+                       unallocated_pct=10.0) is None
+    assert reserve_bar(base_notional=None, available_buying_power=100.0,
+                       unallocated_pct=10.0) is None
+    assert reserve_bar(base_notional=1_000.0, available_buying_power=None,
+                       unallocated_pct=10.0) is None
