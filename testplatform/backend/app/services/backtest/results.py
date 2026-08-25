@@ -155,6 +155,13 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     if _cap is not None:
         drawdown_curve = capped_drawdown_curve(equity_curve, cap=_cap)
         equity_curve = scoring_curve(equity_curve, cap=_cap)
+        # THE DENOMINATOR MOVES WITH THE CURVE. The scored series is denominated in the CAP
+        # (it starts at ``_cap``), so every ratio metric built from it must divide by the cap
+        # too. Leaving ``initial`` at the account's starting capital made a $20k cap on a
+        # $100k account report -80% total return for a completely FLAT run -- the account
+        # "losing" the 80,000 the cap withheld, on every single run. A percentage of the cap
+        # over the capital is two different things wearing one label.
+        initial = _cap
     else:
         drawdown_curve = _drawdown_curve(equity_curve)
     # Prefer round-trip trades (entry+exit paired with realised P&L) when the account exposes

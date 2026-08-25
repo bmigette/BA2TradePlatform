@@ -185,6 +185,45 @@ def test_the_capped_drawdown_curve_keeps_its_dates_and_starts_flat():
     assert pts[0]["drawdown"] == pytest.approx(0.0)
 
 
+# --- Cases where the cap and the account's own equity are DIFFERENT numbers ----------------
+# Every test above happens to use a $20,000 cap on a curve that also starts at $20,000, so it
+# cannot tell "denominated in the cap" from "denominated in the starting equity". The mutation
+# run found exactly that hole: three separate mutations swapping one for the other survived.
+def test_the_scoring_curve_starts_at_the_CAP_not_at_the_accounts_own_equity():
+    """A $20k cap on a $100k account. The scored series is denominated in the CAP, so it starts
+    at 20,000 and a $2,000 period reads +10% -- not 100,000 and +2%."""
+    real = [_pt(2020, 100_000), _pt(2021, 102_000)]
+    got = [p["equity"] for p in scoring_curve(real, cap=20_000.0)]
+    assert got == pytest.approx([20_000.0, 22_000.0])
+
+
+def test_the_compounding_base_is_the_cap_too():
+    """Two identical +$2,000 periods on a $20k cap compound off 20,000: 22,000 then 24,200."""
+    real = [_pt(2020, 100_000), _pt(2021, 102_000), _pt(2022, 104_000)]
+    got = [p["equity"] for p in scoring_curve(real, cap=20_000.0)]
+    assert got == pytest.approx([20_000.0, 22_000.0, 24_200.0])
+
+
+def test_the_drawdown_denominator_is_the_CAP_not_the_starting_equity():
+    """A $2,000 trough is 10% of a $20,000 cap and 2% of a $100,000 account. The cap is the
+    denominator, or risk sits on a different scale from return."""
+    real = [_pt(2020, 100_000), _pt(2021, 98_000)]
+    got = [p["drawdown"] for p in capped_drawdown_curve(real, cap=20_000.0)]
+    assert got == pytest.approx([0.0, -10.0])
+
+
+def test_the_capped_drawdown_curve_refuses_a_None_cap_rather_than_inventing_one():
+    """The guard in the signature is load-bearing: silently substituting the starting equity
+    would make an uncapped run's drawdown look cap-denominated."""
+    with pytest.raises(EquityCapError, match="cap=None"):
+        capped_drawdown_curve([_pt(2020, 20_000), _pt(2021, 18_000)], cap=None)
+
+
+def test_an_empty_curve_needs_no_cap_to_stay_empty():
+    """The refusal above is about measuring, not about arriving: nothing to measure, no error."""
+    assert capped_drawdown_curve([], cap=None) == []
+
+
 # ---------------------------------------------------------------------------
 # Task 4 -- the account's money surface
 # ---------------------------------------------------------------------------
@@ -301,6 +340,19 @@ def test_the_account_snapshot_seam_inherits_the_cap(capped_account):
     snapshot = acct.get_account_snapshot()
     assert snapshot.equity == 20_000.0
     assert snapshot.buying_power == 20_000.0
+
+
+def test_EVERY_money_field_on_the_account_info_dict_is_capped(capped_account):
+    """``balance`` and ``cash`` matter as much as ``equity`` and ``buying_power``.
+
+    ``MarketExpertInterface._get_actual_available_balance`` walks
+    ``buying_power -> cash -> cash_balance -> equity_buying_power`` and takes the FIRST one
+    present, so an account that capped only ``buying_power`` would publish the real balance to
+    any reader that looks at a different name -- and the mutation run confirmed nothing caught
+    it."""
+    info = capped_account(cash=40_000.0, cap=20_000.0).get_account_info()
+    assert dict(info) == {"balance": 20_000.0, "cash": 20_000.0,
+                          "equity": 20_000.0, "buying_power": 20_000.0}
 
 
 def test_an_uncapped_account_has_the_cap_attribute_set_to_None(capped_account):
@@ -440,6 +492,54 @@ def test_the_capped_drawdown_is_measured_on_the_REAL_curve_not_the_synthetic_one
                       for p in out["equity_curve"]], cap=20_000.0)]
     assert expected != synthetic, "the fixture no longer distinguishes the two curves"
     assert got == expected, f"drawdown was measured on the SYNTHETIC curve: {got} vs {expected}"
+
+
+def test_a_flat_capped_run_reads_zero_percent_even_when_the_cap_is_below_the_capital():
+    """DEFECT FOUND BY THE MUTATION RUN (not in the plan).
+
+    ``build_results`` scores the CAP-denominated synthetic curve but took its denominator from
+    ``config["initial_capital"]``. With a $20k cap on a $100k account the two are different
+    numbers, so a completely FLAT run reported a total return of -80%: the account "lost"
+    the 80,000 the cap withheld, every single run. That is the textbook two-things-one-label
+    trap -- a percentage of the cap divided by the capital.
+
+    ``--initial-capital 100000 --equity-cap 20000`` is an ordinary CLI invocation, and the
+    feature explicitly allows a cap that differs from the starting capital in either
+    direction, so this is reachable rather than theoretical.
+    """
+    from app.services.backtest import results as R
+
+    flat = [(datetime(2020, 1, 1), 100_000.0), (datetime(2022, 1, 1), 100_000.0),
+            (datetime(2024, 1, 1), 100_000.0)]
+    out = R.build_results(_SnapshotAccount(_snapshots(flat)),
+                          _results_config(initial_capital=100_000.0, equity_cap=20_000.0))
+    assert out["equity_curve"][-1]["equity"] == pytest.approx(20_000.0)
+    assert out["total_return"] == pytest.approx(0.0)
+    assert out["annualized_return"] == pytest.approx(0.0)
+
+
+def test_a_gain_on_a_cap_below_the_capital_is_a_percentage_OF_THE_CAP():
+    """+$2,000 a year on a $20,000 cap is +10% a year, whatever the account's own size."""
+    from app.services.backtest import results as R
+
+    points = [(datetime(2020, 1, 1), 100_000.0), (datetime(2021, 1, 1), 102_000.0),
+              (datetime(2022, 1, 1), 104_000.0)]
+    out = R.build_results(_SnapshotAccount(_snapshots(points)),
+                          _results_config(initial_capital=100_000.0, equity_cap=20_000.0))
+    assert out["equity_curve"][-1]["equity"] == pytest.approx(24_200.0)
+    assert out["total_return"] == pytest.approx(21.0)
+    assert out["annualized_return"] == pytest.approx(10.0, abs=0.05)
+
+
+def test_an_uncapped_run_still_scores_against_the_initial_capital():
+    """The counterpart: with no cap the denominator is unchanged, so nothing moved for the
+    99% of runs that do not use this feature."""
+    from app.services.backtest import results as R
+
+    points = [(datetime(2020, 1, 1), 100_000.0), (datetime(2021, 1, 1), 110_000.0)]
+    out = R.build_results(_SnapshotAccount(_snapshots(points)),
+                          _results_config(initial_capital=100_000.0, equity_cap=None))
+    assert out["total_return"] == pytest.approx(10.0)
 
 
 def test_an_absent_account_settings_block_is_not_a_configured_cap():
