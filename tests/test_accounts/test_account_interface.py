@@ -1775,3 +1775,49 @@ class TestDeferredCloseAuditTrail:
         assert created.quantity == 60.0
         assert created.depends_on_order == blocker.id
         assert [k["quantity"] for k in logged] == [60.0]
+
+
+class TestTheEquityCloseSeamRefusesOptions:
+    """An option Transaction's symbol is the UNDERLYING and its quantity is CONTRACTS.
+    Building an equity order from those two fields submits N shares for N contracts."""
+
+    def test_an_option_transaction_is_refused(self):
+        from ba2_trade_platform.core.types import AssetClass
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        txn = create_transaction(symbol="AAPL", quantity=2.0,
+                                 asset_class=AssetClass.OPTION)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=2.0,
+                             transaction_id=txn.id, status=OrderStatus.FILLED,
+                             filled_qty=2.0, asset_class=AssetClass.OPTION,
+                             contract_symbol="AAPL260116C00250000")
+        with pytest.raises(ValueError) as exc:
+            account.submit_close_order_for_transaction(txn)
+        assert "close_option" in str(exc.value)
+
+    def test_an_equity_transaction_is_still_closed(self):
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        txn = create_transaction(symbol="AAPL", quantity=10.0)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+                             transaction_id=txn.id, status=OrderStatus.FILLED,
+                             filled_qty=10.0)
+        result = account.submit_close_order_for_transaction(txn)
+        assert result["success"] is True
+
+    def test_NO_ORDER_IS_WRITTEN_when_an_option_is_refused(self):
+        """The caller-obeys half: refusing must not leave a half-created equity order."""
+        from ba2_trade_platform.core.types import AssetClass
+        from ba2_common.core.trade_store import orders_where
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        txn = create_transaction(symbol="AAPL", quantity=2.0,
+                                 asset_class=AssetClass.OPTION)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=2.0,
+                             transaction_id=txn.id, status=OrderStatus.FILLED,
+                             filled_qty=2.0, asset_class=AssetClass.OPTION,
+                             contract_symbol="AAPL260116C00250000")
+        before = len(orders_where(account_id=acct_def.id))
+        with pytest.raises(ValueError):
+            account.submit_close_order_for_transaction(txn)
+        assert len(orders_where(account_id=acct_def.id)) == before

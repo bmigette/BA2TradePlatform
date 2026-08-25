@@ -1577,6 +1577,29 @@ class AccountInterface(ReadOnlyAccountInterface):
 
         Returns a dict with keys: success, message, close_order_id.
         """
+        from ba2_common.core.types import AssetClass
+
+        # SEAM 1 — an OPTION transaction must never be closed through the EQUITY path.
+        #
+        # An option Transaction's `symbol` is deliberately the UNDERLYING ticker
+        # (OptionsAccountInterface._record_option_intent_on_transaction), and
+        # get_current_open_qty() returns a CONTRACT count. Building a TradingOrder from
+        # those two fields with asset_class at its EQUITY default therefore submits N
+        # SHARES of the underlying for N CONTRACTS -- a different instrument, off by the
+        # contract multiplier, and it never flattens the option leg.
+        #
+        # We REFUSE rather than route to close_option_position: routing would make the
+        # generic equity path quietly become an option path, hiding the asset class one
+        # layer further up, which is the defect being fixed.
+        if transaction.asset_class == AssetClass.OPTION:
+            raise ValueError(
+                f"Transaction {transaction.id} is an OPTION position (underlying "
+                f"{transaction.symbol}). submit_close_order_for_transaction builds an "
+                f"EQUITY order from transaction.symbol and a CONTRACT count, which would "
+                f"submit shares of {transaction.symbol} and leave the option open. "
+                f"Use close_option_position() / the close_option action instead."
+            )
+
         from ba2_common.core.db import add_instance
         from ba2_common.core.types import OrderDirection, OrderType
 
