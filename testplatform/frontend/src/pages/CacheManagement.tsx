@@ -17,9 +17,11 @@ import {
   AlertCircle,
   ChevronDown,
   ChevronRight,
+  LineChart,
   Play,
 } from 'lucide-react';
 import ConfirmDialog from '../components/ConfirmDialog';
+import OptionChainViewer from '../components/OptionChainViewer';
 import {
   buildOhlcv,
   buildScreenerMetrics,
@@ -80,7 +82,14 @@ const fmtBytes = (b: number): string => {
   return `${n.toFixed(1)} ${units[i]}`;
 };
 
+// Two views over the same caches: what they COST on disk, and what is IN the option
+// cache. The chain viewer is read-only and shares no state with the deletion controls
+// below, so it is a tab here rather than a sibling route — one "Cache" entry in the
+// sidebar, and the destructive controls stay off screen while browsing data.
+type Tab = 'usage' | 'options';
+
 const CacheManagement: React.FC = () => {
+  const [tab, setTab] = useState<Tab>('usage');
   const [usage, setUsage] = useState<Usage>({});
   const [loading, setLoading] = useState(false);
   const [beforeDate, setBeforeDate] = useState('');
@@ -355,10 +364,12 @@ const CacheManagement: React.FC = () => {
             Cache Management
           </h1>
           <p className="text-gray-600 dark:text-gray-400 mt-1">
-            Disk usage per cache type — clean all, by type, or by date. Datasets + trained models are
-            protected from "Clean All".
+            {tab === 'usage'
+              ? 'Disk usage per cache type — clean all, by type, or by date. Datasets + trained models are protected from "Clean All".'
+              : 'Read-only view of the option data the backtest actually has. Nothing here writes to any cache.'}
           </p>
         </div>
+        {tab === 'usage' && (
         <div className="flex items-center gap-2">
           <div>
             <label className="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-0.5">
@@ -389,8 +400,32 @@ const CacheManagement: React.FC = () => {
             Clean All
           </button>
         </div>
+        )}
       </div>
 
+      <div className="mb-4 flex gap-1 border-b border-gray-200 dark:border-gray-700">
+        {([['usage', 'Disk usage', HardDrive], ['options', 'Option chains', LineChart]] as const).map(
+          ([id, label, Icon]) => (
+            <button
+              key={id}
+              onClick={() => setTab(id)}
+              className={`px-4 py-2 text-sm font-medium flex items-center gap-2 border-b-2 -mb-px ${
+                tab === id
+                  ? 'border-blue-600 text-blue-600 dark:text-blue-400'
+                  : 'border-transparent text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200'
+              }`}
+            >
+              <Icon size={16} />
+              {label}
+            </button>
+          ),
+        )}
+      </div>
+
+      {tab === 'options' && <OptionChainViewer />}
+
+      {tab === 'usage' && (
+      <>
       {message && (
         <div className="mb-4 p-4 bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 rounded-md flex items-center gap-2">
           <CheckCircle size={16} />
@@ -683,6 +718,8 @@ const CacheManagement: React.FC = () => {
             );
           })}
         </div>
+      )}
+      </>
       )}
 
       <ConfirmDialog
