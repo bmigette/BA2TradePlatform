@@ -858,6 +858,372 @@ class OptionsAccountInterface(ABC):
         return [o for o in option_orders
                 if o.transaction_id is None or o.transaction_id in live_ids]
 
+    # --- Cover: "are these shares spoken for?" -----------------------------
+    #
+    # Seam 1 stopped the wrong-instrument order — an option transaction can no longer be
+    # routed through the equity close/adjust paths, and options no longer enter the
+    # allocation plan. It did NOT stop the dangerous half: a "set AAPL to 0%" allocation
+    # run still sells the 100 shares collateralising an open short call and leaves that
+    # call NAKED, because nothing anywhere could ask whether those shares were pledged.
+    # These two accessors are that question. They only MEASURE; the refusals that consume
+    # them live at the entry, close and monitoring seams.
+    #
+    # BOTH RETURN ``Optional[int]`` AND BOTH ARE TRI-STATE:
+    #
+    #   * an int, INCLUDING ``0`` — MEASURED. Zero means "nothing is pledged" / "the
+    #     account holds none", and the caller may proceed.
+    #   * ``None`` — UNMEASURABLE. The caller must REFUSE, not assume.
+    #
+    # DO NOT "SIMPLIFY" THE ``None`` AWAY. Returning ``0`` on an unreadable book is what
+    # strips a covered call of its cover during a broker outage, and it is the single most
+    # expensive instance of this codebase's recurring unknown-reads-as-zero defect — the
+    # same shape as ``get_positions()`` returning ``None`` (fetch failed) versus ``[]``
+    # (genuinely flat), which read as one thing on 2026-07-03 and force-closed 8 real open
+    # transactions during a DNS outage.
+
+    #: Types that mean "the world was uncooperative" on the seams below, absorbed into an
+    #: UNMEASURABLE answer rather than propagated. ``OSError`` (the network/filesystem
+    #: family) is already benign everywhere; ``SQLAlchemyError`` is named here because the
+    #: book is a DB read and a locked/failed database is a data condition, not a defect in
+    #: this file.
+    #:
+    #: NOTE THE INVERSION relative to the seam guards. There, absorbing a locked database
+    #: meant "carry on" and was PROVED to cancel protective legs. Here, absorbing means
+    #: returning ``None``, which every caller must treat as a REFUSAL — the fail-CLOSED
+    #: direction. Anything outside this tuple (a ``TypeError`` from a bad row shape, say)
+    #: still propagates under ``BA2_ERROR_MODE=enforce``, because a defect that quietly
+    #: answers "unmeasurable" forever is a gate that has silently stopped working.
+    @staticmethod
+    def _cover_benign_errors() -> Tuple[type, ...]:
+        from sqlalchemy.exc import SQLAlchemyError
+        return (SQLAlchemyError,)
+
+    @staticmethod
+    def _readable_number(raw) -> Optional[float]:
+        """``raw`` as a finite float, or ``None`` when it is not a measurement.
+
+        Rejects ``None``, ``bool`` (``True`` is not a quantity of 1), non-numerics and
+        NaN/inf. A numeric STRING is accepted, for the reason ``must_measure`` accepts
+        one: broker payloads arrive that way and ``"100"`` is not ambiguous. Sign is the
+        CALLER's business — a share count is legitimately negative (a short), a contract
+        multiplier is not.
+        """
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value):
+            return None
+        return value
+
+    @staticmethod
+    def _position_field(pos, name):
+        """One field off a position row, whichever shape the adapter hands back.
+
+        Both shapes are real on this seam and
+        ``ReadOnlyAccountInterface.get_available_position_quantity`` already accepts
+        either; a cover reader that silently saw nothing in a dict book would report a
+        flat account, which is the whole defect being closed here.
+        """
+        return pos.get(name) if isinstance(pos, dict) else getattr(pos, name, None)
+
+    @classmethod
+    def _readable_positive_number(cls, raw) -> Optional[float]:
+        """:meth:`_readable_number`, additionally refusing ``<= 0``.
+
+        Same discipline as ``option_lifecycle.put_assignment_cost``, which refuses a
+        strike of ``0`` on the grounds that no listed option has one, so it is a missing
+        field rather than a free put. A multiplier of ``0`` and a short call of ``0``
+        contracts are missing fields by the same argument.
+        """
+        value = cls._readable_number(raw)
+        if value is None or value <= 0:
+            return None
+        return value
+
+    def shares_pledged_to_short_calls(self, underlying: str) -> Optional[int]:
+        """Shares of ``underlying`` already acting as COVER for open short calls.
+
+        TRI-STATE (see the block comment above): an int including ``0`` is MEASURED and
+        the caller may proceed; ``None`` is UNMEASURABLE and the caller must REFUSE.
+        ``0`` here means "no short call has a claim on these shares"; ``None`` means "we
+        could not find out", and selling on that is how a covered call goes naked.
+
+        Built on ``open_option_orders_book_wide()`` — the same list the reserve pool and
+        the assignment exposure read, so a third view can never disagree with them about
+        what is still open (it already counts ``CLOSING`` as open: a submitted-but-unfilled
+        buy-to-close has released nothing).
+
+        SHORT PUTS ARE EXCLUDED, deliberately. A short put obliges CASH, which is
+        ``short_put_assignment_exposure``'s question; it places no claim on share
+        inventory, and counting it here would refuse to sell shares nothing has a claim
+        on. LONG options pledge nothing at all — only the short side can be called away.
+
+        THE MULTIPLIER IS READ PER CONTRACT AND NEVER ASSUMED TO BE 100 (OPT-L7). An
+        adjusted contract — post-split, post-merger — can deliver a different number of
+        shares, and a hard-coded 100 would under-report the pledge on precisely the
+        contract whose oddity nobody remembers. A contract whose multiplier cannot be read
+        (or whose rows disagree about it) is therefore UNMEASURABLE, not a guess.
+
+        Netted per contract symbol over EXECUTED orders (SELL ``−``, BUY ``+``), the same
+        netting the exposure view and the close paths perform, so a call bought back stops
+        pledging. An unfilled SELL-to-open is added on top WITHOUT netting: it can fill at
+        any moment and can only ever ADD an obligation, whereas an unfilled buy-to-close
+        has closed nothing and must not hand the cover back early.
+
+        WHAT MAKES A ROW UNMEASURABLE — each case is "this row could be a short call on
+        the ticker you asked about, and I cannot rule it out":
+
+        * a SELL with no ``option_type``      — it might be the call;
+        * a SELL CALL with no ``underlying_symbol`` — it might be on this ticker (there is
+          no fallback to ``symbol``: on a leg child that field holds the OCC contract
+          string, which would never match and would report the shares as free);
+        * a SELL CALL with no usable quantity — an obligation of unknown size;
+        * a held short call with no readable multiplier.
+
+        A BUY in any of those states is NOT flagged: failing to recognise a buy-to-close
+        can only fail to RELIEVE a short, which overstates the pledge — the safe
+        direction. Neither is a multi-leg PARENT row, which carries no contract, no right
+        and no size (its legs carry all three, one row each); flagging parents would make
+        every spread in the book permanently unknown.
+
+        ONE unreadable row makes the WHOLE answer ``None``, never "the part we could
+        read": a partial sum is a smaller number that looks exactly like a measured one,
+        and the caller would free the difference.
+        """
+        from ba2_common.core.failure_modes import absorb_if_benign
+        from ba2_common.core.types import OrderDirection, OrderStatus
+        from ba2_common.logger import logger
+
+        wanted = (underlying or "").strip().upper()
+        if not wanted:
+            logger.error(
+                f"Account {self.id}: shares_pledged_to_short_calls({underlying!r}) has no "
+                f"underlying to measure — reporting UNKNOWN rather than 'nothing is "
+                f"pledged', which is what a 0 would be read as")
+            return None
+
+        try:
+            book = self.open_option_orders_book_wide()
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            absorb_if_benign(e, *self._cover_benign_errors())
+            logger.error(
+                f"Account {self.id}: the open option book could not be read ({e}), so how "
+                f"many {wanted} shares are pledged to short calls is UNKNOWN. Every share "
+                f"of {wanted} must be treated as spoken for until it can be read — an "
+                f"unreadable book is not an empty one.", exc_info=True)
+            return None
+        if book is None:
+            logger.error(
+                f"Account {self.id}: the open option book came back as None, so how many "
+                f"{wanted} shares are pledged to short calls is UNKNOWN (None is a FETCH "
+                f"FAILURE, not a flat book).")
+            return None
+
+        executed = OrderStatus.get_executed_statuses()
+        net: dict = {}          # contract -> signed contracts, EXECUTED only (SELL −)
+        pending: dict = {}      # contract -> in-flight SELL contracts, never netted
+        mults: dict = {}        # contract -> set of readable multipliers seen
+        mult_blind: dict = {}   # contract -> a reason its multiplier is unreadable
+        blind: List[str] = []
+
+        for o in book:
+            contract = getattr(o, "contract_symbol", None)
+            if not contract:
+                # A multi-leg PARENT: no contract, no right, no strike. Its legs carry the
+                # identity, one row each. Skipping it is not a gap; flagging it would make
+                # every spread unknown, and counting it would double-count.
+                continue
+            right = getattr(o, "option_type", None)
+            if right is not None and right != OptionRight.CALL:
+                # A put pledges no shares whoever it belongs to — no need to know more.
+                continue
+            is_sell = getattr(o, "side", None) == OrderDirection.SELL
+            row_underlying = (getattr(o, "underlying_symbol", None) or "").strip().upper()
+            if row_underlying and row_underlying != wanted:
+                continue                    # definitively a different ticker
+            if right is None:
+                if is_sell:
+                    blind.append(
+                        f"order {getattr(o, 'id', '?')} ({contract}) is a SHORT option with "
+                        f"no option type recorded — whether it is a CALL that pledges "
+                        f"{wanted} shares is unknown, and unknown must not resolve to 'not "
+                        f"a call'")
+                continue
+            if not row_underlying:
+                if is_sell:
+                    blind.append(
+                        f"order {getattr(o, 'id', '?')} ({contract}) is a SHORT CALL with no "
+                        f"underlying recorded — whether it is written on {wanted} is "
+                        f"unknown, and unknown must not resolve to 'some other ticker'")
+                continue
+
+            raw_qty = o.filled_qty if o.filled_qty else o.quantity
+            qty = self._readable_positive_number(raw_qty)
+            if qty is None:
+                if is_sell:
+                    blind.append(
+                        f"order {getattr(o, 'id', '?')} ({contract}) is a SHORT CALL with no "
+                        f"usable quantity (filled_qty={o.filled_qty!r}, "
+                        f"quantity={o.quantity!r}) — how many {wanted} shares it can call "
+                        f"away is unknown, and unknown is not zero")
+                continue
+
+            raw_mult = getattr(o, "multiplier", None)
+            mult = self._readable_positive_number(raw_mult)
+            if mult is None:
+                # Recorded against the CONTRACT, not raised now: a contract that is flat by
+                # the end of the book pledges nothing, and refusing every share sale over a
+                # closed-out call's damaged row would be a false refusal.
+                mult_blind.setdefault(
+                    contract,
+                    f"order {getattr(o, 'id', '?')} ({contract}) has multiplier "
+                    f"{raw_mult!r} — how many {wanted} shares one contract delivers is "
+                    f"unknown, and it must NOT be assumed to be 100 (an adjusted contract "
+                    f"can deliver a different number, and guessing under-reports the "
+                    f"pledge on exactly that contract)")
+            else:
+                mults.setdefault(contract, set()).add(mult)
+
+            if o.status in executed:
+                net[contract] = net.get(contract, 0.0) + (-qty if is_sell else qty)
+            elif is_sell:
+                pending[contract] = pending.get(contract, 0.0) + qty
+
+        shares = 0.0
+        for contract in sorted(set(net) | set(pending)):
+            held = net.get(contract, 0.0)
+            short_contracts = pending.get(contract, 0.0)
+            if held < -_ASSIGNMENT_EPS:      # net SHORT: those contracts still pledge
+                short_contracts += -held
+            if short_contracts <= _ASSIGNMENT_EPS:
+                continue                     # flat, or net LONG: nothing is pledged
+            if contract in mult_blind:
+                blind.append(mult_blind[contract])
+                continue
+            seen = mults.get(contract, set())
+            if len(seen) != 1:
+                blind.append(
+                    f"contract {contract} is held SHORT but its rows report "
+                    f"{sorted(seen)!r} as the multiplier — one contract cannot deliver two "
+                    f"different share counts, and there is no way to tell which row is "
+                    f"wrong")
+                continue
+            shares += short_contracts * next(iter(seen))
+
+        if blind:
+            logger.error(
+                f"Account {self.id}: how many {wanted} shares are pledged as cover for "
+                f"open short calls is UNKNOWN ({len(blind)} unreadable row(s)), so every "
+                f"{wanted} share must be treated as spoken for until they are repaired. "
+                + "; ".join(blind))
+            return None
+        # Rounded UP (contracts are whole and multipliers are integers, so this only ever
+        # absorbs float-addition dust): under-reporting the pledge by even one share is
+        # the direction that uncovers a call.
+        return int(math.ceil(round(shares, 6)))
+
+    def held_shares_for_cover(self, underlying: str) -> Optional[int]:
+        """Shares of ``underlying`` this ACCOUNT holds, for cover arithmetic.
+
+        TRI-STATE, identically to :meth:`shares_pledged_to_short_calls`: an int including
+        ``0`` is MEASURED (``0`` = the broker confirmed it holds none); ``None`` is
+        UNMEASURABLE and the caller must REFUSE rather than assume either way.
+
+        DELIBERATELY NOT ``_OptionEntryAction._held_equity_shares``, which sums one
+        EXPERT's own filled buys. That scoping is correct for its own question and wrong
+        for this one — see ``HasAssignedSharesCondition``'s docstring, which draws the same
+        line: "coverage and eligibility are different questions". Cover is an
+        ACCOUNT-WIDE fact. Shares bought by a different expert still cover the call,
+        because the broker does not care who bought them, and an expert-scoped reading
+        would report a covered call as naked (and, at the close seam, would let another
+        expert's shares be sold out from under it).
+
+        Read from ``get_positions()``, whose tri-state contract is honoured exactly:
+        ``None`` is the FETCH FAILING (-> ``None`` here), ``[]`` is a genuinely flat
+        account (-> a measured ``0``). Never ``for pos in (positions or [])``: that idiom
+        is what re-conflates the two, and it force-closed 8 real transactions on
+        2026-07-03.
+
+        OPTION ROWS ARE SKIPPED, on the same ``"option" in asset_class`` tell
+        ``AlpacaAccount.get_option_positions`` uses. Not belt-and-braces:
+        ``AlpacaAccount.get_positions`` maps EVERY row ``get_all_positions()`` returns,
+        options included (only TastyTrade filters them). One contract is not one share, so
+        counting one would report a single share of cover against a 100-share obligation.
+        The symbol filter alone would not catch it either, because IBKR builds its
+        ``Position`` from ``ib_pos.contract.symbol`` — the UNDERLYING for an option.
+
+        KNOWN GAP, recorded rather than papered over: that same ``IBKRAccount.get_positions``
+        constructs ``Position`` without ``asset_class`` at all (it is ``None`` — SQLModel
+        ``table=True`` skips validation), so an IBKR-held option WOULD be counted here as
+        equity cover under its underlying's ticker. Nothing in a ``Position`` distinguishes
+        it, so the fix belongs in that adapter — it should filter options the way
+        ``TastyTradeAccount.get_positions`` does — and not in a guess here.
+
+        A SHORT equity position is NEGATIVE cover, and the sign is taken from ``side`` as
+        well as from ``qty`` because the adapters disagree: Alpaca reports a short as a
+        negative ``qty``, TastyTrade as a POSITIVE ``qty`` with ``side=SELL``. Reading the
+        magnitude alone would credit an account that is short 100 shares with 100 shares
+        of cover.
+
+        A row for this symbol that publishes NO readable quantity is UNMEASURABLE, not
+        ``0``: "the broker holds it but will not say how much" is exactly the case where
+        selling the lot could uncover a call. A row for ANOTHER symbol is never inspected,
+        so it cannot poison the answer.
+        """
+        from ba2_common.core.failure_modes import absorb_if_benign
+        from ba2_common.core.types import OrderDirection
+        from ba2_common.logger import logger
+
+        wanted = (underlying or "").strip().upper()
+        if not wanted:
+            logger.error(
+                f"Account {self.id}: held_shares_for_cover({underlying!r}) has no symbol to "
+                f"measure — reporting UNKNOWN rather than 'we hold none'")
+            return None
+
+        try:
+            positions = self.get_positions()
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            absorb_if_benign(e, *self._cover_benign_errors())
+            logger.error(
+                f"Account {self.id}: the position fetch raised ({e}), so how many {wanted} "
+                f"shares this account holds is UNKNOWN — an unverified book is not an "
+                f"empty one.", exc_info=True)
+            return None
+        if positions is None:
+            logger.error(
+                f"Account {self.id}: get_positions() returned None (FETCH FAILURE, not a "
+                f"flat account), so how many {wanted} shares this account holds is "
+                f"UNKNOWN. Nothing may be sold or written against that.")
+            return None
+
+        total = 0.0
+        for pos in positions:
+            field = self._position_field
+            symbol = (field(pos, "symbol") or "").strip().upper()
+            if symbol != wanted:
+                continue
+            if "option" in str(field(pos, "asset_class")).lower():
+                continue
+            raw_qty = field(pos, "qty")
+            quantity = self._readable_number(raw_qty)
+            if quantity is None:
+                logger.error(
+                    f"Account {self.id}: the {wanted} position publishes no readable "
+                    f"quantity (qty={raw_qty!r}), so how many shares are available as "
+                    f"cover is UNKNOWN — and unknown is not zero.")
+                return None
+            # A measured 0 is a real answer (a flat row) and contributes nothing.
+            is_short = quantity < 0 or field(pos, "side") == OrderDirection.SELL
+            total += -abs(quantity) if is_short else quantity
+
+        # Rounded DOWN — the mirror of the pledge's round-up. Here it is OVER-reporting
+        # the cover that would let a call be written naked.
+        return int(math.floor(round(total, 6)))
+
     def reserved_option_buying_power_detail(self) -> "ReservePool":
         """The reserve pool WITH its unknowns named — the honest form of the answer.
 
