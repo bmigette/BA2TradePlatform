@@ -1325,11 +1325,12 @@ def test_solve_plan_in_invest_mode_reaches_the_service_too(monkeypatch, account_
 
 def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
         monkeypatch, nicegui_client, account_id):
-    """Allocate -> steps -> dry run -> Submit, with only the broker faked.
+    """Allocate -> dry run -> Submit, with only the broker faked.
 
-    Drives the page's real closures (``_run_dry_run``, ``_on_dry_run``,
-    ``_do_submit``) rather than re-implementing them, so a drift anywhere between
-    the page, the wizard and the service surfaces here.
+    NO target step in between: it moved onto the page, so pressing Allocate solves
+    at once against what the page last saved. Drives the page's real closures
+    (``_run_dry_run``, ``_do_submit``) rather than re-implementing them, so a drift
+    anywhere between the page, the wizard and the service surfaces here.
     """
     from ba2_trade_platform.core.portfolio_allocation_store import get_recent_runs
 
@@ -1340,14 +1341,12 @@ def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
 
-    # The two dialog openers are captured rather than drawn: what is under test is
-    # the page's glue and the service beneath it, and the wizard's own rendering
+    # The dialog opener is captured rather than drawn: what is under test is the
+    # page's glue and the service beneath it, and the wizard's own rendering
     # already has tests/test_portfolio_allocation_wizard_ui.py.
-    opened, steps, pending = {}, {}, []
+    opened, pending = {}, []
     monkeypatch.setattr(page, 'open_allocation_wizard',
                         lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
     # The page uses ui.timer only to hop off a sync handler; queue the callback
     # instead so the test can await it with the client's slot stack active.
     monkeypatch.setattr(page.ui, 'timer',
@@ -1355,15 +1354,6 @@ def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
 
     _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
         account_id, VALUATION_MODE_COST, _noop_refresh))
-
-    # Step 1-3 opened with the account's real labels.
-    assert [lt.label for lt in steps['labels']] == ['ARK26']
-
-    # The user presses Continue.
-    steps['on_dry_run'](mode=ALLOCATION_MODE_REBALANCE, labels=steps['labels'],
-                        scope_label=None, amount=0.0, allow_fractional=True,
-                        unallocated_pct=0.0)
-    _run_in_client(nicegui_client, pending.pop())
 
     assert opened['market'].allowed is True
     assert [r.symbol for r in opened['plan'].rows] == ['AAPL']
@@ -1377,75 +1367,137 @@ def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
     assert len(runs) == 1 and runs[0].order_ids
 
 
+def test_pressing_allocate_opens_NO_dialog_before_the_dry_run(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    """The guard that step 1 does not come back through the page.
+
+    A second place to type a target is a second answer to "what am I aiming at",
+    and the two screens derived every one of those figures independently.
+    """
+    from nicegui import ui
+
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    opened = {}
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+
+    # The dry run was reached...
+    assert 'plan' in opened
+    # ...and nothing was drawn on the way: no dialog, no percentage box.
+    drawn = list(nicegui_client.layout.descendants())
+    assert [el for el in drawn if isinstance(el, ui.dialog)] == []
+    assert [el for el in drawn if isinstance(el, ui.number)] == []
+    assert not hasattr(page, 'open_allocation_steps')
+
+
 # ---------------------------------------------------------------------------
-# W0: Continue PERSISTS the targets. Until this, the wizard was write-only to
-# memory -- ``_on_dry_run`` saved the fractional switch and nothing else, so
-# every ``target_pct`` stayed at the 0.0 the picker created it with.
+# THE RUN PERSISTS WHAT IT WAS LAUNCHED WITH
+#
+# There is no Continue any more: the target step moved onto the page and pressing
+# Allocate solves at once. The three writes it used to make on Continue happen at
+# the moment the DRY RUN opens instead, which is the same instant for the same
+# reason -- "last" means the numbers the user last chose to allocate with, whether
+# or not they went through with the orders.
+#
+# On a REBALANCE the page has already persisted the targets inline, so these are
+# normally a re-write of what is stored. What the run still earns is the EXPLICIT
+# symbol rows.
 # ---------------------------------------------------------------------------
 
-def _drive_to_continue(monkeypatch, nicegui_client, account_id, *, labels_edit=None,
-                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None, amount=0.0,
-                       unallocated_pct=0.0):
-    """Open the real flow and press Continue, returning the steps' labels."""
+def _drive_the_flow(monkeypatch, nicegui_client, account_id, *,
+                    mode=ALLOCATION_MODE_REBALANCE, scope_label=None, amount=0.0,
+                    valuation_mode=VALUATION_MODE_MARKET, invest_edit=None):
+    """Press Allocate and let the flow run to the dry run. Returns its kwargs.
+
+    A REBALANCE opens no dialog at all. An INVEST run still opens the scope dialog,
+    which is captured rather than drawn and driven through its ``on_dry_run``.
+    """
     account = _AllocAccount(account_id, {'manual_trading_enabled': True},
                             positions=[], prices={'AAPL': 100.0, 'MSFT': 100.0})
     _use_account(monkeypatch, account)
     _capture_notifications(monkeypatch)
 
-    steps, pending = {}, []
-    monkeypatch.setattr(page, 'open_allocation_wizard', lambda *a, **kw: None)
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
+    opened, scope, pending = {}, {}, []
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+    monkeypatch.setattr(page, 'open_invest_scope',
+                        lambda *a, **kw: scope.update(kw, base=a[0], labels=a[1]))
     monkeypatch.setattr(page.ui, 'timer',
                         lambda _delay, callback, once=False: pending.append(callback))
 
     _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
-        account_id, VALUATION_MODE_MARKET, _noop_refresh))
-    if labels_edit is not None:
-        labels_edit(steps['labels'])
-    steps['on_dry_run'](mode=mode, labels=steps['labels'], scope_label=scope_label,
-                        amount=amount, allow_fractional=True,
-                        unallocated_pct=unallocated_pct)
-    _run_in_client(nicegui_client, pending.pop())
-    return steps
+        account_id, valuation_mode, _noop_refresh, mode=mode, invest_amount=amount))
+    if mode == ALLOCATION_MODE_INVEST_LABEL:
+        if invest_edit is not None:
+            invest_edit(scope['labels'])
+        scope['on_dry_run'](mode=mode, labels=scope['labels'],
+                            scope_label=scope_label, amount=amount,
+                            allow_fractional=True, unallocated_pct=0.0)
+        _run_in_client(nicegui_client, pending.pop())
+    return opened
 
 
-def test_continue_persists_the_label_targets_the_user_typed(
-        monkeypatch, nicegui_client, account_id):
+def test_the_run_keeps_the_targets_the_page_saved(monkeypatch, nicegui_client,
+                                                  account_id):
+    """ONE source of truth. The page wrote 70/30; opening the dry run must not
+    restate them as anything else."""
     from ba2_trade_platform.core.portfolio_allocation_store import get_managed_labels
 
-    set_managed_label(account_id, 'ARK26', target_pct=0.0)
-    set_managed_label(account_id, 'TECH', target_pct=0.0)
+    set_managed_label(account_id, 'ARK26', target_pct=70.0)
+    set_managed_label(account_id, 'TECH', target_pct=30.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     add_label_to_instruments(['MSFT'], 'TECH')
 
-    def _edit(labels):
-        by_label = {lt.label: lt for lt in labels}
-        by_label['ARK26'].target_pct = 70.0
-        by_label['TECH'].target_pct = 30.0
-
-    _drive_to_continue(monkeypatch, nicegui_client, account_id, labels_edit=_edit)
+    _drive_the_flow(monkeypatch, nicegui_client, account_id)
 
     assert {row.label: row.target_pct for row in get_managed_labels(account_id)} == {
         'ARK26': 70.0, 'TECH': 30.0}
 
 
-def test_continue_persists_the_symbol_weights_too(monkeypatch, nicegui_client,
-                                                  account_id):
-    from ba2_trade_platform.core.portfolio_allocation_store import get_symbol_weights
+def test_the_run_makes_a_silently_defaulted_symbol_weight_EXPLICIT(
+        monkeypatch, nicegui_client, account_id):
+    """A symbol taking ``get_symbol_weights``' even-split default has no row. The
+    user has just allocated real money with that number, so the run writes it."""
+    from ba2_trade_platform.core.portfolio_allocation_store import get_symbol_rows
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    assert get_symbol_rows(account_id, 'ARK26') == {}
 
-    def _edit(labels):
-        by_symbol = {st.symbol: st for st in labels[0].symbols}
-        by_symbol['AAPL'].weight_pct = 80.0
-        by_symbol['MSFT'].weight_pct = 20.0
+    _drive_the_flow(monkeypatch, nicegui_client, account_id)
 
-    _drive_to_continue(monkeypatch, nicegui_client, account_id, labels_edit=_edit)
+    stored = get_symbol_rows(account_id, 'ARK26')
+    assert {s: row.weight_pct for s, row in stored.items()} == {'AAPL': 50.0,
+                                                                'MSFT': 50.0}
 
-    assert get_symbol_weights(account_id, 'ARK26', ['AAPL', 'MSFT']) == {
-        'AAPL': 80.0, 'MSFT': 20.0}
+
+def test_the_run_does_NOT_consume_a_generation_when_nothing_changed(
+        monkeypatch, nicegui_client, account_id):
+    """``save_allocation_targets`` shifts the previous generation on a CHANGE only.
+    A run launched against numbers the page already stored changes nothing, so
+    "Load last" keeps pointing at the run before it rather than at itself."""
+    from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        get_managed_labels, save_allocation_targets)
+
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    save_allocation_targets(account_id, [LabelTarget(
+        'ARK26', 70.0, [SymbolTarget('AAPL', 100.0)])])
+    assert get_managed_labels(account_id)[0].previous_target_pct == 40.0
+
+    _drive_the_flow(monkeypatch, nicegui_client, account_id)
+
+    assert get_managed_labels(account_id)[0].previous_target_pct == 40.0
 
 
 def test_an_invest_run_persists_the_weights_but_not_the_labels_percentage(
@@ -1465,9 +1517,9 @@ def test_an_invest_run_persists_the_weights_but_not_the_labels_percentage(
         by_symbol['AAPL'].weight_pct = 90.0
         by_symbol['MSFT'].weight_pct = 10.0
 
-    _drive_to_continue(monkeypatch, nicegui_client, account_id, labels_edit=_edit,
-                       mode=ALLOCATION_MODE_INVEST_LABEL, scope_label='ARK26',
-                       amount=1_000.0)
+    _drive_the_flow(monkeypatch, nicegui_client, account_id,
+                    mode=ALLOCATION_MODE_INVEST_LABEL, scope_label='ARK26',
+                    amount=1_000.0, invest_edit=_edit)
 
     assert get_managed_labels(account_id)[0].target_pct == 25.0
     assert get_symbol_weights(account_id, 'ARK26', ['AAPL', 'MSFT']) == {
@@ -1476,10 +1528,14 @@ def test_an_invest_run_persists_the_weights_but_not_the_labels_percentage(
 
 def test_a_label_unmanaged_mid_flight_is_reported_rather_than_dropped_silently(
         monkeypatch, nicegui_client, account_id):
-    """The wizard holds the labels it opened with. If one is unmanaged in another
-    tab meanwhile, ``save_allocation_targets`` refuses to re-create it -- correct,
-    but the user must be told, or they come back tomorrow to numbers they did not
-    choose and no record of why."""
+    """The flow holds the labels it loaded. If one is unmanaged in another tab
+    meanwhile, ``save_allocation_targets`` refuses to re-create it -- correct, but
+    the user must be told, or they come back tomorrow to numbers they did not
+    choose and no record of why.
+
+    The window is narrow now that there is no dialog in the middle of it, so the
+    race is injected at the one point inside it that the flow calls first.
+    """
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
 
@@ -1487,30 +1543,23 @@ def test_a_label_unmanaged_mid_flight_is_reported_rather_than_dropped_silently(
                             positions=[], prices={'AAPL': 100.0})
     _use_account(monkeypatch, account)
     notes = _capture_notifications(monkeypatch)
-    steps, pending = {}, []
     monkeypatch.setattr(page, 'open_allocation_wizard', lambda *a, **kw: None)
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
-    monkeypatch.setattr(page.ui, 'timer',
-                        lambda _delay, callback, once=False: pending.append(callback))
+    # ``_persist_choices`` calls this first; the label goes away underneath it.
+    monkeypatch.setattr(page.svc, 'remember_fractional_choice',
+                        lambda _account_id, _flag: remove_managed_label(
+                            account_id, 'ARK26'))
 
     _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
         account_id, VALUATION_MODE_MARKET, _noop_refresh))
-    # ...and now the label goes away underneath the open dialog.
-    remove_managed_label(account_id, 'ARK26')
-    steps['on_dry_run'](mode=ALLOCATION_MODE_REBALANCE, labels=steps['labels'],
-                        scope_label=None, amount=0.0, allow_fractional=True,
-                        unallocated_pct=0.0)
-    _run_in_client(nicegui_client, pending.pop())
 
     assert any('no longer managed' in text for text, _ in notes), notes
 
 
 def test_a_failed_target_save_does_not_stop_the_dry_run(monkeypatch, nicegui_client,
                                                         account_id):
-    """Persisting is a convenience; SOLVING is what the user pressed Continue for.
+    """Persisting is a convenience; SOLVING is what the user pressed Allocate for.
     A DB error here must be reported and then got out of the way, not turned into
-    "the wizard would not open"."""
+    "the dry run would not open"."""
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     monkeypatch.setattr(page, 'save_allocation_targets',
@@ -1521,20 +1570,11 @@ def test_a_failed_target_save_does_not_stop_the_dry_run(monkeypatch, nicegui_cli
                             positions=[], prices={'AAPL': 100.0})
     _use_account(monkeypatch, account)
     notes = _capture_notifications(monkeypatch)
-    steps, pending = {}, []
     monkeypatch.setattr(page, 'open_allocation_wizard',
                         lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
-    monkeypatch.setattr(page.ui, 'timer',
-                        lambda _delay, callback, once=False: pending.append(callback))
 
     _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
         account_id, VALUATION_MODE_MARKET, _noop_refresh))
-    steps['on_dry_run'](mode=ALLOCATION_MODE_REBALANCE, labels=steps['labels'],
-                        scope_label=None, amount=0.0, allow_fractional=True,
-                        unallocated_pct=0.0)
-    _run_in_client(nicegui_client, pending.pop())
 
     assert [r.symbol for r in opened['plan'].rows] == ['AAPL']
     assert any('disk full' in str(n) for n in notes), notes
@@ -1605,7 +1645,7 @@ def test_the_page_really_does_call_into_the_service():
     assert {'precheck_plan', 'run_allocation', 'build_position_states',
             'fetch_market_hours', 'clear_market_hours_cache'} <= names
     # ...and into the wizard and the view, whose contracts drift the same way.
-    assert {'open_allocation_wizard', 'open_allocation_steps',
+    assert {'open_allocation_wizard', 'open_invest_scope',
             'working_orders_notice', 'evaluate_market_gate'} <= names
 
 
@@ -1649,24 +1689,24 @@ def test_every_page_call_into_the_service_matches_its_real_signature():
 
 def _open_the_wizard(monkeypatch, nicegui_client, account, account_id, *,
                      unallocated_pct=0.0):
-    """Run the Allocate flow up to the dry run and return the wizard's kwargs."""
+    """Run the Allocate flow up to the dry run and return the wizard's kwargs.
+
+    The reserve is STORED, not typed into a dialog on the way past: the box moved
+    onto the page, so the flow reads it back out of the config row.
+    """
+    from ba2_trade_platform.core.portfolio_allocation_store import set_allocation_config
+
     _use_account(monkeypatch, account)
     _capture_notifications(monkeypatch)
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
-    opened, steps, pending = {}, {}, []
+    if unallocated_pct:
+        set_allocation_config(account_id, unallocated_pct=unallocated_pct)
+    opened = {}
     monkeypatch.setattr(page, 'open_allocation_wizard',
                         lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
-    monkeypatch.setattr(page.ui, 'timer',
-                        lambda _delay, callback, once=False: pending.append(callback))
     _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
         account_id, VALUATION_MODE_COST, _noop_refresh))
-    steps['on_dry_run'](mode=ALLOCATION_MODE_REBALANCE, labels=steps['labels'],
-                        scope_label=None, amount=0.0, allow_fractional=True,
-                        unallocated_pct=unallocated_pct)
-    _run_in_client(nicegui_client, pending.pop())
     return opened
 
 
@@ -1759,9 +1799,12 @@ def test_clearing_the_market_hours_cache_never_takes_a_dry_run_down(monkeypatch,
 # W2: the wizard opens knowing what the last run allocated with.
 # ---------------------------------------------------------------------------
 
-def test_the_wizard_opens_with_the_previous_targets_attached(monkeypatch, account_id):
-    """``_load_flow_inputs`` is the only place these reach the dialog. Without them
-    the Load-last button has nothing to load and no way to know it."""
+def test_the_flow_opens_with_the_previous_generation_attached(monkeypatch, account_id):
+    """``_load_flow_inputs`` still carries it, even though nothing in the flow
+    reads it any more: it travels on the same ``LabelTarget`` the solve uses, and
+    the PAGE's own Load-last reads the identical columns through
+    ``_load_view_payload``. A loader that dropped it here would be the first half
+    of dropping it there."""
     from ba2_trade_platform.core.portfolio_allocation_store import save_allocation_targets
     from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
 
@@ -1776,7 +1819,7 @@ def test_the_wizard_opens_with_the_previous_targets_attached(monkeypatch, accoun
                             positions=[], prices={'AAPL': 100.0, 'MSFT': 100.0})
     _use_account(monkeypatch, account)
 
-    base, labels, allow_fractional, _values, _pos, _reserve = page._load_flow_inputs(
+    _base, labels, _frac, _reserve = page._load_flow_inputs(
         account_id, VALUATION_MODE_MARKET)
 
     assert labels[0].target_pct == 80.0
@@ -1786,26 +1829,30 @@ def test_the_wizard_opens_with_the_previous_targets_attached(monkeypatch, accoun
     assert (by_symbol['MSFT'].weight_pct, by_symbol['MSFT'].previous_weight_pct) == (45.0, 70.0)
 
 
-def test_a_label_with_no_history_opens_with_no_previous_target(monkeypatch, account_id):
-    """NULL reaches the dialog as None, so the button can be disabled rather than
-    offering a number nobody chose."""
+def test_a_label_with_no_history_loads_with_no_previous_target(monkeypatch, account_id):
+    """NULL travels as None, so "never allocated" stays distinguishable from
+    "allocated nothing" all the way to the page's Load-last button."""
     set_managed_label(account_id, 'ARK26', target_pct=60.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     account = _AllocAccount(account_id, {'manual_trading_enabled': True},
                             positions=[], prices={'AAPL': 100.0})
     _use_account(monkeypatch, account)
 
-    _base, labels, _frac, _values, _pos, _reserve = page._load_flow_inputs(
+    _base, labels, _frac, _reserve = page._load_flow_inputs(
         account_id, VALUATION_MODE_MARKET)
 
     assert labels[0].previous_target_pct is None
     assert labels[0].symbols[0].previous_weight_pct is None
 
 
-def test_the_flow_hands_the_wizard_each_symbols_current_value(monkeypatch, account_id):
-    """Step 1 and step 2 show "now $X" beside every target. Under the account's
-    valuation mode, which since W1 is MARKET -- 10 shares at 250 is 2,500, not the
-    1,000 they cost."""
+def test_the_flow_no_longer_computes_the_dialogs_display_only_maps(monkeypatch,
+                                                                   account_id):
+    """``symbol_values`` and ``positions`` existed for the wizard's step-1/step-2
+    captions and had no other consumer. Those captions are on the PAGE now, built
+    from ``_load_view_payload``'s own read, so a display-only value threaded
+    through the SOLVE path is a passenger waiting to be mistaken for an input."""
+    import inspect as _inspect
+
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     account = _AllocAccount(account_id, {'manual_trading_enabled': True},
@@ -1813,44 +1860,11 @@ def test_the_flow_hands_the_wizard_each_symbols_current_value(monkeypatch, accou
                             prices={'AAPL': 250.0})
     _use_account(monkeypatch, account)
 
-    _base, _labels, _frac, symbol_values, _pos, _reserve = page._load_flow_inputs(
-        account_id, VALUATION_MODE_MARKET)
+    loaded = page._load_flow_inputs(account_id, VALUATION_MODE_MARKET)
 
-    assert symbol_values == {'AAPL': 2_500.0}
-
-
-def test_the_flow_values_the_same_book_at_cost_when_that_is_the_mode(monkeypatch,
-                                                                    account_id):
-    set_managed_label(account_id, 'ARK26', target_pct=100.0)
-    add_label_to_instruments(['AAPL'], 'ARK26')
-    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
-                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
-                            prices={'AAPL': 250.0})
-    _use_account(monkeypatch, account)
-
-    _base, _labels, _frac, symbol_values, _pos, _reserve = page._load_flow_inputs(
-        account_id, VALUATION_MODE_COST)
-
-    assert symbol_values == {'AAPL': 1_000.0}
-
-
-def test_the_flow_passes_the_current_values_into_the_steps_dialog(
-        monkeypatch, nicegui_client, account_id):
-    set_managed_label(account_id, 'ARK26', target_pct=100.0)
-    add_label_to_instruments(['AAPL'], 'ARK26')
-    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
-                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
-                            prices={'AAPL': 250.0})
-    _use_account(monkeypatch, account)
-    _capture_notifications(monkeypatch)
-    steps = {}
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
-
-    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
-        account_id, VALUATION_MODE_MARKET, _noop_refresh))
-
-    assert steps['symbol_values'] == {'AAPL': 2_500.0}
+    assert len(loaded) == 4
+    assert 'symbol_values' not in _inspect.getsource(page._load_flow_inputs).split(
+        '"""')[2]
 
 
 # ---------------------------------------------------------------------------
@@ -2380,9 +2394,9 @@ def test_the_page_feeds_the_stored_symbol_weights_into_the_view(monkeypatch,
 # W8: the editable reserve, end to end through the page's own glue.
 # ---------------------------------------------------------------------------
 
-def test_the_flow_hands_the_wizard_the_stored_reserve(monkeypatch, account_id):
-    """``_load_flow_inputs`` is the only place it can reach the dialog. Without it
-    the box opens at 0 and the first Continue silently deploys the cash."""
+def test_the_flow_solves_against_the_stored_reserve(monkeypatch, account_id):
+    """``_load_flow_inputs`` is the only place it can reach the solve. Without it
+    every run silently deploys the cash the page is holding back."""
     from ba2_trade_platform.core.portfolio_allocation_store import set_allocation_config
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
@@ -2432,17 +2446,19 @@ def test_solve_plan_in_invest_mode_ignores_the_reserve_entirely(monkeypatch, acc
     assert plan.reserved_pct == 0.0
 
 
-def test_continue_persists_the_reserve_the_user_typed(monkeypatch, nicegui_client,
-                                                     account_id):
-    """CONTINUE is what "last" means on this page, and the reserve is one of the
-    numbers the run was launched with -- so it is written beside the targets and
-    the fractional switch, through the page's own real closures."""
-    from ba2_trade_platform.core.portfolio_allocation_store import get_allocation_config
+def test_the_run_keeps_the_reserve_the_page_saved(monkeypatch, nicegui_client,
+                                                  account_id):
+    """The reserve is one of the numbers the run was launched with, so it is still
+    written beside the targets and the fractional switch -- and since the box is
+    on the page, what it writes is what the page already stored."""
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        get_allocation_config, set_allocation_config)
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
+    set_allocation_config(account_id, unallocated_pct=20.0)
 
-    _drive_to_continue(monkeypatch, nicegui_client, account_id, unallocated_pct=20.0)
+    _drive_the_flow(monkeypatch, nicegui_client, account_id)
 
     assert get_allocation_config(account_id).unallocated_pct == 20.0
 
@@ -2460,33 +2476,32 @@ def test_an_invest_run_never_writes_a_reserve(monkeypatch, nicegui_client, accou
     set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
     set_allocation_config(account_id, unallocated_pct=25.0)
 
-    _drive_to_continue(monkeypatch, nicegui_client, account_id,
-                       mode=ALLOCATION_MODE_INVEST_LABEL, scope_label='ARK26',
-                       amount=500.0, unallocated_pct=0.0)
+    _drive_the_flow(monkeypatch, nicegui_client, account_id,
+                    mode=ALLOCATION_MODE_INVEST_LABEL, scope_label='ARK26',
+                    amount=500.0)
 
     assert get_allocation_config(account_id).unallocated_pct == 25.0
 
 
-def test_the_reserve_the_dialog_opens_with_is_the_stored_one(monkeypatch,
-                                                             nicegui_client, account_id):
-    """Pre-filled, not reset. A box that always opens at 0 makes the very first
-    Continue deploy a reserve the user set yesterday."""
+def test_the_reserve_the_run_solves_with_is_the_stored_one(monkeypatch,
+                                                           nicegui_client, account_id):
+    """Read back at the moment the dry run opens, not carried in a dialog. A run
+    that reset it to 0 would deploy a reserve the user set yesterday."""
     from ba2_trade_platform.core.portfolio_allocation_store import set_allocation_config
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     set_allocation_config(account_id, unallocated_pct=35.0)
 
-    steps = _drive_to_continue(monkeypatch, nicegui_client, account_id,
-                               unallocated_pct=35.0)
+    opened = _drive_the_flow(monkeypatch, nicegui_client, account_id)
 
-    assert steps['unallocated_pct'] == 35.0
+    assert opened['plan'].reserved_pct == 35.0
 
 
 def test_the_dry_run_the_wizard_receives_is_solved_with_the_reserve(
         monkeypatch, nicegui_client, account_id):
-    """The reserve has to survive the hop from the steps dialog into the plan the
-    user reviews. Continue records it on ``state``; ``_run_dry_run`` is the only
+    """The reserve has to survive the hop from the stored config into the plan the
+    user reviews. ``_load_flow_inputs`` reads it; ``_run_dry_run`` is the only
     thing that carries it into ``_solve_plan``."""
     account = _AllocAccount(account_id, {'manual_trading_enabled': True},
                             positions=[], prices={'AAPL': 100.0},
@@ -2517,58 +2532,6 @@ def test_the_wizards_refresh_re_solves_with_the_SAME_reserve(monkeypatch,
     assert plan.reserved_pct == 10.0
     assert plan.reserved_notional == 1_000.0
     assert plan.total_buy_value == 9_000.0
-
-
-# ---------------------------------------------------------------------------
-# Unrealised P&L: the wizard needs the POSITIONS, not just their current value.
-#
-# ``symbol_values`` is measured under the account's valuation mode, and in COST
-# mode that IS the cost basis -- so a P&L derived from it is 0.00 on every row.
-# The flow therefore hands the dialog the position states themselves.
-# ---------------------------------------------------------------------------
-
-def test_the_flow_hands_the_wizard_the_position_states_themselves(monkeypatch,
-                                                                 account_id):
-    """Quantity, cost basis and PRICE, separately -- which is the only shape from
-    which an unrealised P&L can be measured in either valuation mode."""
-    set_managed_label(account_id, 'ARK26', target_pct=100.0)
-    add_label_to_instruments(['AAPL'], 'ARK26')
-    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
-                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
-                            prices={'AAPL': 250.0})
-    _use_account(monkeypatch, account)
-
-    *_rest, positions, _reserve = page._load_flow_inputs(account_id, VALUATION_MODE_COST)
-
-    assert set(positions) == {'AAPL'}
-    assert positions['AAPL'].quantity == 10.0
-    assert positions['AAPL'].cost_basis == 1_000.0
-    # The LIVE quote, present even in COST mode -- without it the P&L would be
-    # blank on exactly the mode that most needs it.
-    assert positions['AAPL'].price == 250.0
-
-
-def test_the_flow_passes_the_positions_into_the_steps_dialog(monkeypatch,
-                                                             nicegui_client,
-                                                             account_id):
-    """The dialog is the only consumer, so an unwired map is an unwired feature."""
-    set_managed_label(account_id, 'ARK26', target_pct=100.0)
-    add_label_to_instruments(['AAPL'], 'ARK26')
-    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
-                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
-                            prices={'AAPL': 250.0})
-    _use_account(monkeypatch, account)
-    _capture_notifications(monkeypatch)
-    steps = {}
-    monkeypatch.setattr(page, 'open_allocation_steps',
-                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
-
-    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
-        account_id, VALUATION_MODE_MARKET, _noop_refresh))
-
-    assert set(steps['positions']) == {'AAPL'}
-    assert steps['positions']['AAPL'].cost_basis == 1_000.0
-    assert steps['positions']['AAPL'].price == 250.0
 
 
 # ---------------------------------------------------------------------------

@@ -685,7 +685,16 @@ def test_a_plan_with_no_cash_balance_says_so_instead_of_guessing(nicegui_client)
 
 
 # ---------------------------------------------------------------------------
-# Task 71: steps 1-3 (rebalance) and the INVEST_LABEL mode.
+# The INVEST_LABEL scope dialog -- what is LEFT of the old three-step dialog.
+#
+# Its steps 1 and 2 were the target editor and they are on the allocation PAGE
+# now; a REBALANCE opens no dialog at all and goes straight to the dry run. An
+# invest run is different in kind: it spends a specific amount on a single label,
+# so the run has to be told which label and how much, and neither of those is a
+# stored target of anything.
+#
+# There is no fractional switch here either. Exactly ONE execution control exists
+# and it is at the gate, where toggling it re-solves the plan.
 # ---------------------------------------------------------------------------
 
 
@@ -696,16 +705,16 @@ def _labels():
     ]
 
 
-def _open_steps(client, wiz, labels=None, **kwargs):
+def _open_scope(client, wiz, labels=None, **kwargs):
     calls = []
     kwargs.setdefault('on_dry_run', lambda **kw: calls.append(kw))
     # These tests predate the remembered choice and were written against a switch
     # that always opened OFF; passing False keeps them meaning what they meant.
     kwargs.setdefault('allow_fractional', False)
     with client:
-        steps = wiz.open_allocation_steps(_base(), labels if labels is not None else _labels(),
-                                          **kwargs)
-    return steps, calls
+        scope = wiz.open_invest_scope(
+            _base(), labels if labels is not None else _labels(), **kwargs)
+    return scope, calls
 
 
 def _numbers(client, wiz, marker):
@@ -713,216 +722,83 @@ def _numbers(client, wiz, marker):
             if marker in getattr(d, '_markers', [])]
 
 
-def test_wizard_module_exposes_the_steps_entry_point():
+def test_wizard_module_exposes_the_invest_scope_entry_point():
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
-    assert callable(wiz.open_allocation_steps)
-    params = inspect.signature(wiz.open_allocation_steps).parameters
+    assert callable(wiz.open_invest_scope)
+    params = inspect.signature(wiz.open_invest_scope).parameters
     assert list(params)[:2] == ["base", "labels"]
     assert "on_dry_run" in params
-    assert "mode" in params
     assert "invest_amount" in params
+    # No ``mode``: there is only one mode left that opens a dialog at all.
+    assert "mode" not in params
 
 
-def test_the_steps_dialog_draws_both_rebalance_steps(nicegui_client):
+def test_the_invest_scope_carries_the_remembered_fractional_choice_without_offering_it():
+    """It reaches ``on_dry_run`` so the first solve is sized on the account's own
+    answer; the CONTROL is at the gate, where changing it re-solves."""
+    from nicegui import ui
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
-    steps, _ = _open_steps(nicegui_client, wiz)
-    texts = _rendered_texts(nicegui_client.layout)
+    client = _fresh_client()
+    try:
+        scope, calls = _open_scope(client, wiz, allow_fractional=True,
+                                   invest_amount=250.0)
+        switches = [d for d in client.layout.descendants()
+                    if isinstance(d, ui.switch)]
+    finally:
+        _drop_client(client)
 
-    for expected in ("Growth", "Income", "Even split", "Continue to dry run", "Cancel"):
-        assert expected in texts
-    assert steps._continue_button.enabled is True
+    assert switches == []
+    # ``_base()`` does not support fractional, so the remembered True is vetoed.
+    assert scope.allow_fractional is False
 
 
-def test_the_steps_dialog_edits_a_copy_so_cancelling_changes_nothing(nicegui_client):
+def test_a_broker_that_CAN_split_shares_keeps_the_remembered_choice():
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    original = _labels()
-    steps, _ = _open_steps(nicegui_client, wiz, labels=original)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(10.0)
-
-    assert steps.labels[0].target_pct == pytest.approx(10.0)
-    assert original[0].target_pct == pytest.approx(60.0)
-    assert original[0].symbols[0].weight_pct == pytest.approx(50.0)
-
-
-def test_each_label_box_edits_its_own_label(nicegui_client):
-    """The classic NiceGUI closure bug: without a default-argument capture every
-    on_change writes to the LAST label in the loop."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _ = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(70.0)
-
-    assert [lt.target_pct for lt in steps.labels] == [70.0, 40.0]
-
-
-def test_each_symbol_box_edits_its_own_symbol(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _ = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)[0].set_value(30.0)
-
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [30.0, 50.0]
-    assert [st.weight_pct for st in steps.labels[1].symbols] == [100.0]
-
-
-def test_a_label_total_ABOVE_100_blocks_continue(nicegui_client):
-    """The only hard rule left on the label totals. ``_labels()`` is 60/40, so
-    pushing the first to 70 makes 110."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(70.0)
-        errors = _rendered_texts(steps._errors_container)
-        assert steps._continue_button.enabled is False
-        steps._continue()
-
-    assert any("over 100% by 10.00%" in t for t in errors), errors
-    assert calls == []
-
-
-def test_a_label_total_BELOW_100_blocks_continue_again(nicegui_client):
-    """THE REVERSAL. Under-allocating was briefly the way to hold cash; the reserve
-    box is now that way, so a shortfall is back to being a mistake -- and it blocks
-    LIVE, on the keystroke, without a dry run."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        # 60/40 -> 30/40, so the set totals 70.
-        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(30.0)
-        messages = _rendered_texts(steps._errors_container)
-        assert steps._continue_button.enabled is False
-        steps._continue()
-
-    assert any("under 100% by 30.00%" in t for t in messages), messages
-    assert calls == []
-
-
-def test_the_shortfall_message_points_at_the_box_that_does_want_a_number(
-        nicegui_client):
-    """Being told off without being told what to do is how a user re-types the same
-    thing. The error names the Unallocated box."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(30.0)
-        messages = _rendered_texts(steps._errors_container)
-
-    assert any("Use the Unallocated box to hold money back." in t for t in messages), messages
-
-
-def test_both_sides_of_the_label_total_rule_are_drawn_as_errors(nicegui_client):
-    """``_revalidate`` prefixes a blocking message with the red cross. Neither half
-    may come back as orange advice -- that is what made the shortfall ambiguous."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz)
-    for value in (30.0, 90.0):        # 70 total, then 130 total
-        with nicegui_client:
-            _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(value)
-            messages = _rendered_texts(steps._errors_container)
-        assert any(t.startswith("\u2716 ") for t in messages), (value, messages)
-        assert not any(t.startswith("\u26a0 ") for t in messages), (value, messages)
-
-
-def test_a_symbol_weight_total_that_is_not_100_blocks_continue(nicegui_client):
-    """Step 2's rule, not just step 1's."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)[0].set_value(30.0)
-        assert steps._continue_button.enabled is False
-        steps._continue()
-
-    assert calls == []
-
-
-def test_even_split_rewrites_the_label_percentages_to_total_exactly_100(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget(name, 0.0, [SymbolTarget(name * 2, 100.0)])
-              for name in ("A", "B", "C")]
-    steps, _ = _open_steps(nicegui_client, wiz, labels=labels)
-    with nicegui_client:
-        steps._even_split()
-
-    assert [lt.target_pct for lt in steps.labels] == [33.33, 33.33, 33.34]
-    assert steps._continue_button.enabled is True
-
-
-def test_continue_hands_the_edited_targets_to_the_dry_run(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        steps._continue()
-
-    assert len(calls) == 1
-    call = calls[0]
-    assert call["mode"] == wiz.ALLOCATION_MODE_REBALANCE
-    assert [lt.label for lt in call["labels"]] == ["Growth", "Income"]
-    assert call["scope_label"] is None
-    assert call["amount"] == 0.0
-    assert call["allow_fractional"] is False
-
-
-def test_fractional_follows_the_caller_and_is_unavailable_without_broker_support(nicegui_client):
-    """The switch opens on the choice the CALLER passes (the account's remembered
-    one), and is only offerable when the broker splits shares at all."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _ = _open_steps(nicegui_client, wiz)
-    assert steps.allow_fractional is False
-    assert steps._fractional_switch.enabled is False   # _base() has no support
 
     base = _base()
     base.supports_fractional = True
-    with nicegui_client:
-        supported = wiz.open_allocation_steps(base, _labels(), on_dry_run=lambda **kw: None,
-                                              allow_fractional=False)
-    assert supported.allow_fractional is False
-    assert supported._fractional_switch.enabled is True
+    client = _fresh_client()
+    try:
+        with client:
+            scope = wiz.open_invest_scope(base, _labels(),
+                                          on_dry_run=lambda **kw: None,
+                                          allow_fractional=True, invest_amount=10.0)
+    finally:
+        _drop_client(client)
+    assert scope.allow_fractional is True
 
-
-# -- INVEST_LABEL -----------------------------------------------------------
 
 
 def test_invest_mode_draws_a_label_picker_and_an_amount(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
-    steps, _ = _open_steps(nicegui_client, wiz, mode=wiz.ALLOCATION_MODE_INVEST_LABEL,
-                           invest_amount=250.0)
+    scope, _ = _open_scope(nicegui_client, wiz, invest_amount=250.0)
     texts = _rendered_texts(nicegui_client.layout)
 
-    assert steps.scope_label == "Growth"
-    assert steps.invest_amount == pytest.approx(250.0)
+    assert scope.scope_label == "Growth"
+    assert scope.invest_amount == pytest.approx(250.0)
     assert "Invest into one label" in texts
-    # Step 1's percentage editor belongs to REBALANCE only: the amount IS the
-    # budget here, so a label's target_pct is meaningless.
-    assert _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT) == []
+    # No percentage editor of any kind. The amount IS the budget here, and the
+    # label targets live on the page.
+    from nicegui import ui as _ui
+    boxes = [d for d in nicegui_client.layout.descendants()
+             if isinstance(d, _ui.number)]
+    assert [b._props.get('label') for b in boxes] == ['Amount']
 
 
 def test_invest_mode_does_not_apply_the_labels_total_100_rule(nicegui_client):
     """A single label at 40% is legitimate on this path."""
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
-    steps, calls = _open_steps(nicegui_client, wiz,
+    scope, calls = _open_scope(nicegui_client, wiz,
                                labels=[LabelTarget("Income", 40.0,
                                                    [SymbolTarget("KO", 100.0)])],
-                               mode=wiz.ALLOCATION_MODE_INVEST_LABEL,
                                invest_amount=250.0)
     with nicegui_client:
-        assert steps._continue_button.enabled is True
-        steps._continue()
+        assert scope._continue_button.enabled is True
+        scope._continue()
 
     assert calls[0]["mode"] == wiz.ALLOCATION_MODE_INVEST_LABEL
     assert [lt.label for lt in calls[0]["labels"]] == ["Income"]
@@ -937,13 +813,12 @@ def test_invest_mode_blocks_a_symbol_weight_set_that_does_not_total_100(nicegui_
 
     labels = [LabelTarget("Income", 40.0, [SymbolTarget("KO", 100.0),
                                            SymbolTarget("PEP", 50.0)])]
-    steps, calls = _open_steps(nicegui_client, wiz, labels=labels,
-                               mode=wiz.ALLOCATION_MODE_INVEST_LABEL,
+    scope, calls = _open_scope(nicegui_client, wiz, labels=labels,
                                invest_amount=250.0)
     with nicegui_client:
-        errors = _rendered_texts(steps._errors_container)
-        assert steps._continue_button.enabled is False
-        steps._continue()
+        errors = _rendered_texts(scope._errors_container)
+        assert scope._continue_button.enabled is False
+        scope._continue()
 
     assert any("150.00" in t for t in errors)
     assert calls == []
@@ -952,12 +827,10 @@ def test_invest_mode_blocks_a_symbol_weight_set_that_does_not_total_100(nicegui_
 def test_invest_mode_blocks_a_zero_amount(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
-    steps, calls = _open_steps(nicegui_client, wiz,
-                               mode=wiz.ALLOCATION_MODE_INVEST_LABEL,
-                               invest_amount=0.0)
+    scope, calls = _open_scope(nicegui_client, wiz, invest_amount=0.0)
     with nicegui_client:
-        assert steps._continue_button.enabled is False
-        steps._continue()
+        assert scope._continue_button.enabled is False
+        scope._continue()
 
     assert calls == []
 
@@ -967,13 +840,11 @@ def test_invest_mode_explains_but_does_not_block_an_amount_above_buying_power(ni
     more useful than refusing to compute it."""
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
-    steps, calls = _open_steps(nicegui_client, wiz,
-                               mode=wiz.ALLOCATION_MODE_INVEST_LABEL,
-                               invest_amount=99_000.0)
+    scope, calls = _open_scope(nicegui_client, wiz, invest_amount=99_000.0)
     with nicegui_client:
-        errors = _rendered_texts(steps._errors_container)
-        assert steps._continue_button.enabled is True
-        steps._continue()
+        errors = _rendered_texts(scope._errors_container)
+        assert scope._continue_button.enabled is True
+        scope._continue()
 
     assert any("exceeds available buying power" in t for t in errors)
     assert len(calls) == 1
@@ -1287,47 +1158,6 @@ def test_the_outcome_table_says_when_a_symbol_is_wash_trade_locked(nicegui_clien
 
     assert notifications[-1][1] == 'warning'
     assert 'wash-trade' in notifications[-1][0]
-
-
-def test_open_allocation_steps_requires_an_explicit_fractional_default():
-    """The hardcoded ``self.allow_fractional = False`` is gone; the caller passes
-    the account's remembered choice, which now defaults ON."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    params = inspect.signature(wiz.open_allocation_steps).parameters
-    assert "allow_fractional" in params
-    assert params["allow_fractional"].default is inspect.Parameter.empty
-
-    init_params = inspect.signature(wiz.AllocationSteps.__init__).parameters
-    assert "allow_fractional" in init_params
-    assert init_params["allow_fractional"].default is inspect.Parameter.empty
-
-
-def test_the_steps_dialog_opens_on_the_remembered_fractional_choice(nicegui_client):
-    """ON when the account remembers ON and the broker can split shares."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    base = _base()
-    base.supports_fractional = True
-    with nicegui_client:
-        steps = wiz.open_allocation_steps(base, _labels(), on_dry_run=lambda **kw: None,
-                                          allow_fractional=True)
-    assert steps.allow_fractional is True
-    assert steps._fractional_switch.value is True
-
-
-def test_a_broker_that_cannot_split_shares_still_vetoes_the_remembered_choice(nicegui_client):
-    """``supports_fractional`` wins: offering a grid the broker does not have would
-    plan orders it cannot accept."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    base = _base()
-    base.supports_fractional = False
-    with nicegui_client:
-        steps = wiz.open_allocation_steps(base, _labels(), on_dry_run=lambda **kw: None,
-                                          allow_fractional=True)
-    assert steps.allow_fractional is False
-    assert steps._fractional_switch.enabled is False
 
 
 # ---------------------------------------------------------------------------
@@ -1877,1011 +1707,48 @@ def test_the_unpriced_holding_block_survives_a_closed_market(nicegui_client):
 
 
 # ---------------------------------------------------------------------------
-# W0: Continue now WRITES, so the dialog has to say so.
+# Continue WRITES, so the invest dialog has to say so.
 #
-# Until W0 nothing on this screen touched the database and "Cancel really
-# cancels" was a guarantee. It is not one any more: Continue persists the label
-# targets and the symbol weights (that is what makes "load last" possible), so a
+# Until the write landed nothing on this screen touched the database and "Cancel
+# really cancels" was a guarantee. It is not one any more: Continue persists the
+# chosen label's symbol weights (that is what makes "load last" possible), so a
 # dry run the user then abandons has already changed stored state.
 # ---------------------------------------------------------------------------
 
-def test_the_steps_dialog_says_that_continue_saves_the_targets(nicegui_client):
+def test_the_invest_dialog_says_that_continue_saves_the_weights(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
-    _open_steps(nicegui_client, wiz)
+    _open_scope(nicegui_client, wiz, invest_amount=250.0)
     drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_CONTINUE_SAVES)
 
     assert len(drawn) == 1
-    assert 'Cancel' in drawn[0]          # names what stopped being true
+    assert 'SAVES' in drawn[0]
+    assert 'Cancel abandons the run' in drawn[0]
 
 
-def test_the_continue_saves_note_is_shown_in_invest_mode_too(nicegui_client):
-    """An INVEST run persists the chosen label's symbol weights, so the same
-    warning applies -- only the label percentage is left alone."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-    from ba2_trade_platform.core.portfolio_allocation import ALLOCATION_MODE_INVEST_LABEL
-
-    _open_steps(nicegui_client, wiz, mode=ALLOCATION_MODE_INVEST_LABEL,
-                invest_amount=1_000.0)
-
-    assert len(_marked_texts(nicegui_client.layout, wiz.MARKER_CONTINUE_SAVES)) == 1
-
-
-def test_the_steps_docstring_no_longer_promises_that_nothing_is_written():
-    """The class docstring said "Nothing is written here ... so Cancel really
-    cancels". After W0 that is false, and a docstring that lies about a write is
-    worse than none."""
+def test_the_continue_note_promises_no_target_and_no_reserve(nicegui_client):
+    """An invest run spends an explicit amount on one label, so the label's own
+    percentage played no part and its reserve is a hard 0 -- writing either would
+    record a choice the user never made."""
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
-    doc = wiz.AllocationSteps.__doc__
-    assert 'Nothing is written here' not in doc
-    assert 'Continue' in doc
-
-
-# ---------------------------------------------------------------------------
-# W2: "Load last", and CURRENT next to TARGET.
-#
-# Every new widget here is a ``ui.label``, never a second marked ``ui.number``.
-# The tests above index positionally into ``_numbers(..., MARKER_LABEL_PCT)`` and
-# ``MARKER_SYMBOL_PCT``, so an extra number under either marker would silently
-# retarget them rather than fail.
-# ---------------------------------------------------------------------------
-
-def _labels_with_history():
-    return [
-        LabelTarget("Growth", 70.0,
-                    [SymbolTarget("AAPL", 60.0, previous_weight_pct=50.0),
-                     SymbolTarget("MSFT", 40.0, previous_weight_pct=50.0)],
-                    previous_target_pct=60.0),
-        LabelTarget("Income", 30.0, [SymbolTarget("KO", 100.0)],
-                    previous_target_pct=40.0),
-    ]
-
-
-def _buttons(client, marker):
-    from nicegui import ui as nicegui_ui
-    return [d for d in client.layout.descendants()
-            if isinstance(d, nicegui_ui.button) and marker in getattr(d, '_markers', [])]
-
-
-def test_step_one_offers_load_last_when_there_is_a_last(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_labels_with_history())
-
-    found = _buttons(nicegui_client, wiz.MARKER_LOAD_LAST)
-    assert len(found) == 1
-    assert found[0].enabled is True
-
-
-def test_step_one_disables_load_last_when_no_label_has_a_history(nicegui_client):
-    """Disabled, not hidden: the user has to be able to see the feature exists and
-    learn that this account has never run an allocation."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz)          # _labels() carries no history
-
-    found = _buttons(nicegui_client, wiz.MARKER_LOAD_LAST)
-    assert len(found) == 1
-    assert found[0].enabled is False
-
-
-def test_pressing_load_last_restores_the_percentages_of_the_last_run(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_labels_with_history())
+    scope, calls = _open_scope(nicegui_client, wiz, invest_amount=250.0)
     with nicegui_client:
-        steps._load_last()
-
-    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
-
-
-def test_load_last_redraws_the_boxes_rather_than_leaving_them_stale(nicegui_client):
-    """``_even_split`` re-draws for exactly this reason: a ``ui.number`` does not
-    follow the object it was built from, so a silent model change leaves the user
-    typing over numbers that are no longer what will be submitted."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_labels_with_history())
-    with nicegui_client:
-        steps._load_last()
-        drawn = [n.value for n in _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)]
-
-    assert drawn == [60.0, 40.0]
-
-
-def test_step_one_shows_the_last_percentage_beside_each_target(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_labels_with_history())
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
-
-    assert len(drawn) == 2
-    assert 'last 60.00%' in drawn[0]
-    assert 'last 40.00%' in drawn[1]
-
-
-def test_a_label_with_no_history_says_so_rather_than_showing_a_number(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz)
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
-
-    assert len(drawn) == 2
-    assert all('last -' in text for text in drawn), drawn
-
-
-def test_step_one_shows_each_labels_current_value_against_the_same_base(nicegui_client):
-    """The percentage beside a target has to be a share of ``base_notional``, the
-    SAME denominator the target itself divides. The page's own header used to put
-    "% of managed" next to "target %" -- two denominators, invited comparison."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    # base_notional is 10,000 (see ``_base``); Growth holds 2,500 of it.
-    _open_steps(nicegui_client, wiz, labels=_labels_with_history(),
-                symbol_values={'AAPL': 1_500.0, 'MSFT': 1_000.0, 'KO': 500.0})
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
-
-    assert 'now 2,500.00' in drawn[0]
-    assert '25.00% of base' in drawn[0]
-    assert 'now 500.00' in drawn[1]
-    assert '5.00% of base' in drawn[1]
-
-
-def _fifty_fifty_labels():
-    """Two labels at 50/50, each holding exactly half of the 10,000 base."""
-    return [LabelTarget("A", 50.0, [SymbolTarget("AAA", 100.0)]),
-            LabelTarget("B", 50.0, [SymbolTarget("BBB", 100.0)])]
-
-
-def test_the_caption_states_the_target_as_a_share_of_base_not_only_as_a_weight(
-        nicegui_client):
-    """THE MISLEADING COMPARISON. Base 10,000 fully held, two labels at 50/50 each
-    holding exactly 5,000, reserve 10%.
-
-    The caption read ``now 5,000.00 (50.00% of base)`` beside a target box reading
-    ``50``, and those two 50s divide DIFFERENT denominators: the caption the gross
-    base, the box the investable remainder. So the row looked perfectly on target
-    while the plan will sell it down to 4,500. The caption now states the target in
-    the caption's OWN denominator -- 50% of what the reserve leaves IS 45% of the
-    base -- so the pair on the line is comparable without arithmetic.
-    """
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_fifty_fifty_labels(),
-                symbol_values={'AAA': 5_000.0, 'BBB': 5_000.0}, unallocated_pct=10.0)
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
-
-    assert 'now 5,000.00 (50.00% of base)' in drawn[0], drawn[0]
-    assert '45.00% of base' in drawn[0], drawn[0]
-
-
-def test_with_no_reserve_the_target_share_of_base_is_the_number_in_the_box(
-        nicegui_client):
-    """The other end of the same statement: at 0% reserve the relative weight and
-    the share of base coincide, and the caption must say so rather than going
-    quiet -- a clause that appears only under a reserve is one the user has to
-    learn about at the worst moment."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_fifty_fifty_labels(),
-                symbol_values={'AAA': 5_000.0, 'BBB': 5_000.0})
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
-
-    assert 'now 5,000.00 (50.00% of base)' in drawn[0], drawn[0]
-    assert '50.00% of base' in drawn[0].split('(50.00% of base)')[1], drawn[0]
-
-
-def test_the_target_share_of_base_follows_the_reserve_box(nicegui_client):
-    """It is derived from TWO live inputs, so a caption drawn once and never
-    refreshed is worse than none: it would keep asserting 50% of base while the
-    reserve the user just typed made it 25%."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_fifty_fifty_labels(),
-                symbol_values={'AAA': 5_000.0, 'BBB': 5_000.0})
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_UNALLOCATED_PCT)[0].set_value(50.0)
-        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
-
-    assert '25.00% of base' in drawn[0], drawn[0]
-    assert '25.00% of base' in drawn[1], drawn[1]
-
-
-def test_the_target_share_of_base_follows_the_label_box(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_fifty_fifty_labels(),
-                symbol_values={'AAA': 5_000.0, 'BBB': 5_000.0}, unallocated_pct=10.0)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(80.0)
-        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
-
-    assert '72.00% of base' in drawn[0], drawn[0]      # 80% of the 90% left
-    assert '45.00% of base' in drawn[1], drawn[1]      # B did not move
-
-
-def test_step_two_offers_a_load_last_per_label(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_labels_with_history())
-
-    found = _buttons(nicegui_client, wiz.MARKER_LOAD_LAST_SYMBOLS)
-    assert len(found) == 2
-    assert [b.enabled for b in found] == [True, False]   # Income has no per-symbol history
-
-
-def test_pressing_a_labels_load_last_restores_only_that_labels_weights(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_labels_with_history())
-    with nicegui_client:
-        steps._load_last_symbols(steps.labels[0])
-
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [50.0, 50.0]
-    assert [st.weight_pct for st in steps.labels[1].symbols] == [100.0]
-    # The label's own target is step 1's business and must not move.
-    assert steps.labels[0].target_pct == 70.0
-
-
-# ---------------------------------------------------------------------------
-# Step 2's per-label "Even split" -- the symbol-level pair to step 1's button.
-# ---------------------------------------------------------------------------
-
-
-def _six_symbol_labels():
-    """One label of SIX symbols, one of two.
-
-    Six is not arbitrary: it is the smallest count at which ``even_split_pct`` and
-    a hand-rolled ``round(100 / n, 2)`` disagree (16.66 with 16.70 on the last slot
-    against 16.67 with 16.65), so a button that re-implemented the split instead of
-    calling the engine fails here and passes at two, three or five.
-    """
-    return [
-        LabelTarget("Growth", 60.0,
-                    [SymbolTarget(f"S{i}", 100.0 / 6.0) for i in range(6)]),
-        LabelTarget("Income", 40.0,
-                    [SymbolTarget("KO", 70.0), SymbolTarget("PEP", 30.0)]),
-    ]
-
-
-def test_step_two_offers_an_even_split_per_label(nicegui_client):
-    """One per label, and DISABLED where it would be meaningless -- Income holds a
-    single symbol, which already owns the whole 100. Disabled, never hidden, on the
-    same terms as the Load-last buttons beside it."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_labels_with_history())
-
-    found = _buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT_SYMBOLS)
-    assert len(found) == 2
-    assert [b.enabled for b in found] == [True, False]
-
-
-def test_step_two_still_draws_a_disabled_even_split_for_a_label_with_no_symbols(nicegui_client):
-    """A label nothing carries draws the button too. Hiding it would make the
-    feature look absent rather than inapplicable."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget("Growth", 100.0, [SymbolTarget("AAPL", 50.0),
-                                            SymbolTarget("MSFT", 50.0)]),
-              LabelTarget("Empty", 0.0, [])]
-    _open_steps(nicegui_client, wiz, labels=labels)
-
-    found = _buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT_SYMBOLS)
-    assert len(found) == 2
-    assert [b.enabled for b in found] == [True, False]
-
-
-def test_pressing_a_labels_even_split_touches_only_that_label(nicegui_client):
-    """The scoping proof, and it goes through the BUTTON rather than the method so
-    the ``t=lt`` default-argument capture is under test too: without it every one of
-    these buttons would re-split the LAST label. Growth's six symbols are re-split;
-    Income's two keep the 70/30 the user typed, and Growth's own target stays
-    step 1's business."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_six_symbol_labels())
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT_SYMBOLS)[0])
-
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [16.66, 16.66, 16.66,
-                                                                 16.66, 16.66, 16.7]
-    assert [st.weight_pct for st in steps.labels[1].symbols] == [70.0, 30.0]
-    assert steps.labels[0].target_pct == 60.0
-    assert steps.labels[1].target_pct == 40.0
-
-
-def test_an_even_split_of_six_symbols_uses_the_engines_own_splitter(nicegui_client):
-    """Byte-identical to ``even_split_pct(6)``, totalling exactly 100. A hand-rolled
-    two-decimal split lands on 16.67 x 5 + 16.65 here and the wizard would then
-    disagree with the stored default for the very same six symbols."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-    from ba2_trade_platform.core.portfolio_allocation import even_split_pct
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_six_symbol_labels())
-    with nicegui_client:
-        steps._even_split_symbols(steps.labels[0])
-
-    weights = [st.weight_pct for st in steps.labels[0].symbols]
-    assert weights == even_split_pct(6)
-    assert sum(weights) == 100.0
-
-
-def test_even_split_symbols_redraws_the_boxes_rather_than_leaving_them_stale(nicegui_client):
-    """A ``ui.number`` does not follow the object it was built from -- the reason
-    ``_even_split`` and ``_load_last_symbols`` both redraw. Without it the user
-    types over numbers that are no longer what Continue will submit."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_six_symbol_labels())
-    with nicegui_client:
-        steps._even_split_symbols(steps.labels[1])
-        drawn = [n.value for n in _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)]
-
-    # Growth's six are untouched; Income's two are the new 50/50.
-    assert drawn[6:] == [50.0, 50.0]
-    assert drawn[:6] == [st.weight_pct for st in steps.labels[0].symbols]
-
-
-def test_even_split_symbols_revalidates_so_continue_follows(nicegui_client):
-    """The live total chip and Continue are driven by ``_revalidate``. Repairing a
-    broken label without it leaves Submit barred on a set that is now legal."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget("Growth", 100.0,
-                          [SymbolTarget("AAPL", 90.0), SymbolTarget("MSFT", 90.0)])]
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
-    assert steps._continue_button.enabled is False       # 180%, blocked
-
-    with nicegui_client:
-        steps._even_split_symbols(steps.labels[0])
-
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [50.0, 50.0]
-    assert steps._continue_button.enabled is True
-
-
-def test_the_symbol_even_split_leaves_the_reserve_and_the_label_total_alone(nicegui_client):
-    """Symbol weights have always been relative to their OWN label. The reserve and
-    the label percentages divide the base above this level, so a split down here
-    must not reach either."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_six_symbol_labels(),
-                                unallocated_pct=25.0)
-    with nicegui_client:
-        steps._even_split_symbols(steps.labels[0])
-
-    assert steps.unallocated_pct == 25.0
-    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
-    assert steps._continue_button.enabled is True
-
-
-def test_step_one_still_has_exactly_one_label_level_even_split(nicegui_client):
-    """Two labels now draw an "Even split" each in step 2. The step 1 button that
-    splits the LABELS must stay singular, and must stay the one that moves them."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_six_symbol_labels())
-
-    found = _buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT)
-    assert len(found) == 1
-    with nicegui_client:
-        _click(found[0])
-
-    assert [lt.target_pct for lt in steps.labels] == [50.0, 50.0]
-
-
-# ---------------------------------------------------------------------------
-# Step 2's per-label "Fill rest" and "Wipe" -- define a few by hand, fill the
-# remainder evenly across what is left; wipe to start the label over.
-# ---------------------------------------------------------------------------
-
-
-def _partly_filled_labels():
-    """Growth: 60 spoken for and three empty slots. Income: fully allocated.
-
-    So Growth's Fill rest is enabled and Income's is not, while BOTH can be wiped
-    -- the two predicates are independent and this fixture separates them.
-    """
-    return [
-        LabelTarget("Growth", 60.0,
-                    [SymbolTarget("MANUAL", 60.0)]
-                    + [SymbolTarget(f"S{i}", 0.0) for i in range(3)]),
-        LabelTarget("Income", 40.0, [SymbolTarget("KO", 70.0), SymbolTarget("PEP", 30.0)]),
-    ]
-
-
-def test_step_two_offers_a_fill_rest_per_label(nicegui_client):
-    """One per label, DISABLED where there is nothing left to fill -- Income's two
-    weights already spend its whole 100. Disabled, never hidden, on the same terms
-    as the Even-split and Load-last buttons beside it."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
-
-    found = _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)
-    assert len(found) == 2
-    assert [b.enabled for b in found] == [True, False]
-
-
-def test_step_two_offers_a_wipe_per_label(nicegui_client):
-    """One per label, DISABLED where every weight is already 0 -- there is nothing
-    to destroy. A label nothing carries draws it too, so the feature reads as
-    inapplicable rather than absent."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget("Growth", 100.0, [SymbolTarget("AAPL", 50.0),
-                                            SymbolTarget("MSFT", 50.0)]),
-              LabelTarget("Blank", 0.0, [SymbolTarget("AAA", 0.0),
-                                         SymbolTarget("BBB", 0.0)]),
-              LabelTarget("Empty", 0.0, [])]
-    _open_steps(nicegui_client, wiz, labels=labels)
-
-    found = _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)
-    assert len(found) == 3
-    assert [b.enabled for b in found] == [True, False, False]
-
-
-def test_pressing_a_labels_fill_rest_touches_only_that_label(nicegui_client):
-    """The scoping proof, through the BUTTON so the ``t=lt`` default-argument
-    capture is under test: without it every one of these would rewrite the LAST
-    label. Growth's three empty slots divide the 40 that is left; the 60 the user
-    typed is untouched, Income keeps its 70/30, and neither label's own target
-    moves."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
-
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [60.0, 13.33, 13.33, 13.34]
-    assert [st.weight_pct for st in steps.labels[1].symbols] == [70.0, 30.0]
-    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
-
-
-def test_pressing_a_labels_wipe_touches_only_that_label(nicegui_client):
-    """The same scoping proof for Wipe: one mis-scoped lambda and a click on
-    Growth's wipe would clear Income."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
-
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [0.0, 0.0, 0.0, 0.0]
-    assert [st.weight_pct for st in steps.labels[1].symbols] == [70.0, 30.0]
-    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
-
-
-def test_filling_an_untouched_label_lands_exactly_on_the_even_split(nicegui_client):
-    """With nothing spoken for, "fill what is left" IS "split the 100 evenly", and
-    SIX is the count that catches a re-implementation: the engine's splitter floors
-    to 16.66 and puts 16.70 on the last slot, a hand-rolled ``round(100 / n, 2)``
-    produces 16.67 x 5 + 16.65. Pressed through both buttons on identical labels,
-    the two must agree symbol for symbol."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-    from ba2_trade_platform.core.portfolio_allocation import even_split_pct
-
-    labels = [LabelTarget("Fill", 50.0, [SymbolTarget(f"S{i}", 0.0) for i in range(6)]),
-              LabelTarget("Split", 50.0, [SymbolTarget(f"S{i}", 0.0) for i in range(6)])]
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
-        _click(_buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT_SYMBOLS)[1])
-
-    filled = [st.weight_pct for st in steps.labels[0].symbols]
-    assert filled == [st.weight_pct for st in steps.labels[1].symbols]
-    assert filled == even_split_pct(6)
-    assert filled == [16.66, 16.66, 16.66, 16.66, 16.66, 16.7]
-    assert sum(filled) == 100.0
-
-
-def test_fill_rest_redraws_the_boxes_rather_than_leaving_them_stale(nicegui_client):
-    """A ``ui.number`` does not follow the object it was built from -- the reason
-    every step-2 control redraws. Without it the user types over numbers that are
-    no longer what Continue will submit."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
-        drawn = [n.value for n in _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)]
-
-    assert drawn[:4] == [60.0, 13.33, 13.33, 13.34]
-    assert drawn[4:] == [70.0, 30.0]
-
-
-def test_wipe_redraws_the_boxes_rather_than_leaving_them_stale(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
-        drawn = [n.value for n in _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)]
-
-    assert drawn[:4] == [0.0, 0.0, 0.0, 0.0]
-    assert drawn[4:] == [70.0, 30.0]
-
-
-def test_fill_rest_revalidates_so_continue_follows(nicegui_client):
-    """The live total chip and Continue are driven by ``_revalidate``. Repairing a
-    broken label without it leaves Continue barred on a set that is now legal."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget("Growth", 100.0, [SymbolTarget("AAPL", 30.0),
-                                            SymbolTarget("MSFT", 0.0)])]
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
-    assert steps._continue_button.enabled is False       # 30%, blocked
-
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
-
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [30.0, 70.0]
-    assert steps._continue_button.enabled is True
-
-
-def test_wipe_revalidates_so_continue_stops_following(nicegui_client):
-    """The re-validate has to run in the DESTRUCTIVE direction too: a wipe takes a
-    legal label to 0% and Continue must go with it. Without it the user submits a
-    label they have just emptied."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget("Growth", 100.0, [SymbolTarget("AAPL", 50.0),
-                                            SymbolTarget("MSFT", 50.0)])]
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
-    assert steps._continue_button.enabled is True
-
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
-
-    assert steps._continue_button.enabled is False
-
-
-def test_fill_rest_and_wipe_leave_the_reserve_and_the_label_total_alone(nicegui_client):
-    """Symbol weights have always been relative to their OWN label. The reserve and
-    the label percentages divide the base above this level, so neither control down
-    here may reach them."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels(),
-                                unallocated_pct=25.0)
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
-        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
-
-    assert steps.unallocated_pct == 25.0
-    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
-    assert steps._continue_button.enabled is True
-
-
-def test_the_wipe_type_fill_workflow_end_to_end(nicegui_client):
-    """The feature as the user described it: wipe the label, type the couple that
-    matter, let the rest share what is left."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget("Growth", 100.0,
-                          [SymbolTarget(f"S{i}", 100.0 / 6.0) for i in range(6)])]
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
-        # Through the boxes the user actually types in -- the wipe has just redrawn
-        # them, so these are the fresh ones.
-        boxes = _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)
-        boxes[0].set_value(25.0)
-        boxes[1].set_value(15.0)
-        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
-
-    # 40 typed, 60 shared four ways.
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [25.0, 15.0, 15.0,
-                                                                 15.0, 15.0, 15.0]
-    assert steps._continue_button.enabled is True
-
-
-def test_fill_rest_disables_itself_once_the_label_is_full(nicegui_client):
-    """The enabled state has to follow the weights or it is decoration. Fill the
-    label and there is nothing left to fill, so the button greys out in place --
-    without a redraw of the row, which would rebuild boxes under the cursor."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
-    fill = _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0]
-    assert fill.enabled is True
-
-    with nicegui_client:
-        _click(fill)
-
-    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0].enabled is False
-    # ... and Wipe, which was already live, stays live.
-    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0].enabled is True
-
-
-def test_wipe_disables_itself_once_the_label_is_clear(nicegui_client):
-    """Symmetrically: nothing left to destroy, and now everything to fill."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
-
-    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0].enabled is False
-    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0].enabled is True
-    # Income's pair is unaffected -- the refresh is per-label like everything else.
-    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[1].enabled is True
-    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[1].enabled is False
-
-
-def test_typing_a_weight_follows_through_to_the_two_new_buttons(nicegui_client):
-    """Both predicates depend on the numbers in the boxes, so typing has to refresh
-    them too -- otherwise a user who types 100 into the last empty box is still
-    offered a Fill rest that can only write zeros.
-
-    Driven through ``set_value`` on the marked box, so the weight box's own
-    per-label capture is under test: a refresh aimed at the wrong label would leave
-    Growth's pair stale and silently retarget Income's.
-    """
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget("Growth", 60.0, [SymbolTarget("AAPL", 0.0),
-                                           SymbolTarget("MSFT", 0.0)]),
-              LabelTarget("Income", 40.0, [SymbolTarget("KO", 70.0),
-                                           SymbolTarget("PEP", 30.0)])]
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
-    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0].enabled is True
-    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0].enabled is False
-
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)[0].set_value(100.0)
-
-    assert steps.labels[0].symbols[0].weight_pct == 100.0
-    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0].enabled is False
-    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0].enabled is True
-    # Income never moved, so its pair reads exactly as it did.
-    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[1].enabled is False
-    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[1].enabled is True
-
-
-def test_an_over_allocated_label_disables_fill_rest_but_never_wipe(nicegui_client):
-    """The escape hatch. 70 + 50 leaves nothing to hand out, so Fill rest is
-    disabled rather than a click that writes zeros or negatives -- and Wipe is
-    enabled in exactly that case, so the user is never cornered into retyping every
-    box by hand."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget("Growth", 100.0, [SymbolTarget("AAPL", 70.0),
-                                            SymbolTarget("MSFT", 50.0),
-                                            SymbolTarget("NVDA", 0.0)])]
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
-
-    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0].enabled is False
-    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0].enabled is True
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
-        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
-
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [33.33, 33.33, 33.34]
-    assert steps._continue_button.enabled is True
-
-
-def test_wipe_does_not_ask_for_confirmation(nicegui_client):
-    """A deliberate NO, and this pins it.
-
-    ``_confirm_unmanage`` on the allocation page asks first because an unmanage
-    writes to the database at once and deletes stored weights and comments with no
-    undo. A wipe is the opposite on every count: it edits the dialog's own COPY of
-    the labels, nothing reaches the database until Submit two steps and a dry run
-    later, Cancel discards the lot, and Load last / Even split / Fill rest sit
-    beside it as one-click undos. Confirming both would teach the user to click
-    through confirmations, which is how the one that matters gets lost.
-    """
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-    from nicegui import ui as nicegui_ui
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
-    before = len([d for d in nicegui_client.layout.descendants()
-                  if isinstance(d, nicegui_ui.dialog)])
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
-
-    after = len([d for d in nicegui_client.layout.descendants()
-                 if isinstance(d, nicegui_ui.dialog)])
-    assert after == before
-    # The weights are gone in the same click, not after an await.
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [0.0, 0.0, 0.0, 0.0]
-
-
-def test_wipe_keeps_load_last_available_as_its_undo(nicegui_client):
-    """The wipe carries ``previous_weight_pct`` across, so the control that undoes
-    it stays enabled. That is a large part of why it needs no confirmation."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=_labels_with_history())
-    with nicegui_client:
-        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [0.0, 0.0]
-
-    last = _buttons(nicegui_client, wiz.MARKER_LOAD_LAST_SYMBOLS)[0]
-    assert last.enabled is True
-    with nicegui_client:
-        _click(last)
-
-    assert [st.weight_pct for st in steps.labels[0].symbols] == [50.0, 50.0]
-
-
-def test_step_two_draws_all_four_controls_for_every_label(nicegui_client):
-    """One row, four buttons, one set per label -- and step 1's own pair stays
-    singular. A marker collision here is how a test starts asserting against the
-    wrong button."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
-
-    for marker in (wiz.MARKER_EVEN_SPLIT_SYMBOLS, wiz.MARKER_FILL_REST_SYMBOLS,
-                   wiz.MARKER_WIPE_SYMBOLS, wiz.MARKER_LOAD_LAST_SYMBOLS):
-        assert len(_buttons(nicegui_client, marker)) == 2, marker
-    assert len(_buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT)) == 1
-    assert len(_buttons(nicegui_client, wiz.MARKER_LOAD_LAST)) == 1
-
-
-def test_step_two_shows_the_last_weight_beside_each_symbol(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_labels_with_history(),
-                symbol_values={'AAPL': 1_500.0, 'MSFT': 1_000.0, 'KO': 500.0})
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_SYMBOL_CURRENT)
-
-    assert len(drawn) == 3
-    assert 'now 1,500.00' in drawn[0] and 'last 50.00%' in drawn[0]
-    assert 'last -' in drawn[2]              # KO has never run
-
-
-def test_the_percentage_boxes_are_still_the_only_marked_numbers(nicegui_client):
-    """The regression this whole section is written around: the landed suite indexes
-    positionally into these two marker sets, so any new numeric widget under either
-    would silently retarget six assertions instead of failing."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, labels=_labels_with_history())
-
-    assert len(_numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)) == 2
-    assert len(_numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)) == 3
-
-
-# ---------------------------------------------------------------------------
-# W8: the Unallocated row is an EDITABLE, STORED reserve.
-#
-# It stays FIRST in the label list, but its percentage is now an input with a live
-# dollar figure beside it. The running total chip reads the LABEL total only -- the
-# reserve is never added into it, or the user is back to doing arithmetic.
-# ---------------------------------------------------------------------------
-
-def test_step_one_draws_the_unallocated_row_as_an_editable_number(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, unallocated_pct=10.0)
-    boxes = _numbers(nicegui_client, wiz, wiz.MARKER_UNALLOCATED_PCT)
-
-    assert len(boxes) == 1
-    assert boxes[0].value == 10.0
-
-
-def test_the_unallocated_row_shows_its_dollar_value_beside_the_box(nicegui_client):
-    """A percentage alone does not tell the user whether they are holding back 300
-    or 30,000."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, unallocated_pct=10.0)
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)
-
-    assert len(drawn) == 1
-    assert '1,000.00' in drawn[0]          # 10% of the 10,000 base
-    assert '9,000.00' in drawn[0]          # ...leaving this to invest
-
-
-def test_the_reserve_caption_says_which_half_is_the_reserve_and_which_is_left(
-        nicegui_client):
-    """The two money halves must not be interchangeable.
-
-    Both numbers appear in one sentence, so ``'1,000.00' in caption and '9,000.00'
-    in caption`` is satisfied just as happily by a caption that has them the wrong
-    way round -- reading a 10% reserve on a 10,000 base as 9,000 held back and
-    1,000 left to invest, which is the exact inverse of the truth. The reserve is
-    named FIRST, and 1,000 != 9,000 on purpose: a fixture where the two halves
-    could be equal cannot pin an ordering at all.
-    """
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, unallocated_pct=10.0)
-    caption = _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)[0]
-
-    assert '1,000.00' in caption and '9,000.00' in caption
-    assert caption.index('1,000.00') < caption.index('9,000.00'), caption
-
-
-def test_the_reserve_caption_does_not_promise_cash_on_a_margin_account(nicegui_client):
-    """"held as cash" is not true of a reserve measured off ``base_notional``.
-
-    The base is buying power PLUS the value of the book, so reserving 10% of it
-    means 10% of the base is left UNDEPLOYED -- on a margin account that is unused
-    buying power, and the cash balance can be lower still (``estimated_cash_after``
-    is reachably negative). The sentence has to be true on both account types.
-    """
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, unallocated_pct=10.0)
-    caption = _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)[0]
-
-    assert 'cash' not in caption.lower(), caption
-
-
-def test_the_dollar_value_follows_every_keystroke_in_the_reserve_box(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        box = _numbers(nicegui_client, wiz, wiz.MARKER_UNALLOCATED_PCT)[0]
-        box.set_value(25.0)
-        assert '2,500.00' in _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)[0]
-        box.set_value(40.0)
-        assert '4,000.00' in _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)[0]
-
-
-def test_editing_the_reserve_records_it_on_the_dialog(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_UNALLOCATED_PCT)[0].set_value(15.0)
-
-    assert steps.unallocated_pct == 15.0
-
-
-def test_the_unallocated_row_is_still_the_first_thing_in_the_label_list(nicegui_client):
-    """At the TOP, because it is the row that says how much of the book is even in
-    play. Below the labels it reads as a footnote."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        texts = _rendered_texts(steps._labels_container)
-
-    assert 'Unallocated' in texts[0], texts[:4]
-
-
-def test_the_reserve_row_is_drawn_at_zero_too(nicegui_client):
-    """A row that appears only when it is non-zero teaches the user nothing about
-    where the number went when it disappears -- and it is the box they need to find
-    when the validator tells them to use it."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz)          # no reserve
-
-    assert len(_numbers(nicegui_client, wiz, wiz.MARKER_UNALLOCATED_PCT)) == 1
-    assert '0.00' in _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)[0]
-
-
-def test_editing_the_reserve_does_NOT_rewrite_a_single_label_percentage(nicegui_client):
-    """THE WHOLE POINT. The label boxes are relative weights; the reserve scales
-    what they divide. Nothing the user typed is ever changed behind them."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_UNALLOCATED_PCT)[0].set_value(35.0)
-        assert steps._continue_button.enabled is True
-        steps._continue()
-
-    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
-    assert [b.value for b in _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)] == [60.0, 40.0]
-    assert calls[0]["unallocated_pct"] == 35.0
-
-
-def test_the_running_total_chip_reads_the_LABEL_total_and_ignores_the_reserve(
-        nicegui_client):
-    """If the reserve were folded into this number the user would be doing the
-    subtraction the whole feature exists to remove."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz, unallocated_pct=30.0)
-    with nicegui_client:
-        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_TOTAL)
-        assert 'Total: 100.00%' in drawn[0]
-        _numbers(nicegui_client, wiz, wiz.MARKER_UNALLOCATED_PCT)[0].set_value(50.0)
-        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_TOTAL)
-
-    assert 'Total: 100.00%' in drawn[0]
-
-
-def test_the_running_total_chip_still_follows_the_label_boxes(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(30.0)
-        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_TOTAL)
-
-    assert 'Total: 70.00%' in drawn[0]
-
-
-def test_a_reserve_outside_zero_to_one_hundred_blocks_continue(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        _numbers(nicegui_client, wiz, wiz.MARKER_UNALLOCATED_PCT)[0].set_value(140.0)
-        messages = _rendered_texts(steps._errors_container)
-        assert steps._continue_button.enabled is False
-        steps._continue()
-
-    assert any('outside 0-100%' in t for t in messages), messages
-    assert calls == []
-
-
-def test_the_step_one_heading_says_the_labels_must_total_one_hundred(nicegui_client):
-    """Both levels again, and the heading has to say so -- it said "up to 100%"
-    while a shortfall was legal."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz)
-    with nicegui_client:
-        texts = _rendered_texts(nicegui_client.layout)
-
-    step1 = next(t for t in texts if t.startswith('1. Label targets'))
-    step2 = next(t for t in texts if t.startswith('2. Symbol weights'))
-    assert 'must total 100%' in step1
-    assert 'up to 100%' not in step1
-    assert 'must total 100%' in step2
-
-
-def test_even_split_always_splits_the_whole_hundred_whatever_the_reserve(nicegui_client):
-    """No longer "split what is currently allocated": the reserve is stored apart,
-    so there is nothing to preserve and any other total is unsubmittable."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget("A", 40.0, [SymbolTarget("AA", 100.0)]),
-              LabelTarget("B", 30.0, [SymbolTarget("BB", 100.0)])]
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels, unallocated_pct=30.0)
-    with nicegui_client:
-        steps._even_split()
-
-    assert [lt.target_pct for lt in steps.labels] == [50.0, 50.0]
-    assert steps.unallocated_pct == 30.0          # untouched by the split
-    assert steps._continue_button.enabled is True
-
-
-def test_even_split_of_an_untouched_book_deploys_the_whole_hundred(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    labels = [LabelTarget(n, 0.0, [SymbolTarget(n * 2, 100.0)]) for n in ("A", "B")]
-    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
-    with nicegui_client:
-        steps._even_split()
-
-    assert [lt.target_pct for lt in steps.labels] == [50.0, 50.0]
-
-
-def test_the_invest_flow_draws_no_reserve_box_at_all(nicegui_client):
-    """An invest run deploys a specific amount the user named. There is no
-    portfolio base to take a share of, so there is nothing to reserve."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, _calls = _open_steps(nicegui_client, wiz,
-                                mode=wiz.ALLOCATION_MODE_INVEST_LABEL, invest_amount=1_000.0,
-                                unallocated_pct=30.0)
-
-    assert _numbers(nicegui_client, wiz, wiz.MARKER_UNALLOCATED_PCT) == []
-
-
-def test_the_invest_flow_hands_over_no_reserve(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    steps, calls = _open_steps(nicegui_client, wiz,
-                               mode=wiz.ALLOCATION_MODE_INVEST_LABEL, invest_amount=1_000.0,
-                               unallocated_pct=30.0)
-    with nicegui_client:
-        steps._continue()
+        scope._continue()
 
     assert calls[0]["unallocated_pct"] == 0.0
+    assert wiz.CONTINUE_SAVES_NOTE.count('target') == 0
+
+
+def test_the_invest_dialog_draws_no_reserve_box_at_all(nicegui_client):
+    """The reserve is a share of the portfolio base; an invest run has a budget,
+    not a base, so there is nothing for a reserve to be a share of."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_scope(nicegui_client, wiz, invest_amount=1_000.0)
+    texts = _rendered_texts(nicegui_client.layout)
+
+    assert not any('Unallocated' in t for t in texts)
 
 
 def _reserved_plan():
@@ -2992,226 +1859,6 @@ def test_the_cash_versus_reserve_line_follows_the_ticked_rows(nicegui_client):
         drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_CASH_VS_RESERVE)
 
     assert '10,000.00' in drawn[0]
-
-
-# ---------------------------------------------------------------------------
-# Unrealised P&L in the steps dialog: per symbol in step 2, per label in step 1.
-#
-# The arithmetic is pinned without NiceGUI in
-# ``packages/common/tests/test_portfolio_allocation_wizard.py``. What is pinned
-# HERE is that the dialog reaches for the mode-independent figure rather than for
-# the ``symbol_values`` map sitting right next to it -- which is the mistake that
-# renders 0.00 on every row in cost mode.
-# ---------------------------------------------------------------------------
-
-
-def _pnl_positions():
-    """One winner, one loser, one profitable short, across the standard labels.
-
-    Growth: AAPL 10 @ cost 1,500 now 1,600 (+100); MSFT 5 @ cost 2,000 now 1,900
-    (-100). Income: KO short 10 @ cost -600 now -500 (+100 on a short).
-    """
-    from ba2_trade_platform.core.portfolio_allocation import PositionState
-
-    return {
-        'AAPL': PositionState(symbol='AAPL', quantity=10.0, cost_basis=1_500.0, price=160.0),
-        'MSFT': PositionState(symbol='MSFT', quantity=5.0, cost_basis=2_000.0, price=380.0),
-        'KO': PositionState(symbol='KO', quantity=-10.0, cost_basis=-600.0, price=50.0),
-    }
-
-
-def _values_for(positions, mode):
-    """``{SYMBOL: current value}`` exactly as ``_load_flow_inputs`` builds it."""
-    from ba2_trade_platform.core.portfolio_allocation import current_value
-
-    return {s: current_value(state, mode) for s, state in positions.items()}
-
-
-def test_step_two_shows_each_symbols_unrealised_pnl_in_money_and_percent(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    positions = _pnl_positions()
-    _open_steps(nicegui_client, wiz,
-                symbol_values=_values_for(positions, 'market'), positions=positions)
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_SYMBOL_PNL)
-
-    assert len(drawn) == 3
-    assert '+100.00' in drawn[0] and '+6.67%' in drawn[0]      # AAPL
-    assert '-100.00' in drawn[1] and '-5.00%' in drawn[1]      # MSFT
-    assert '+100.00' in drawn[2] and '+16.67%' in drawn[2]     # KO, a SHORT
-
-
-def test_step_one_shows_each_labels_TOTAL_unrealised_pnl(nicegui_client):
-    """Growth is +100 on AAPL and -100 on MSFT: zero dollars on 3,500 of cost."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    positions = _pnl_positions()
-    _open_steps(nicegui_client, wiz,
-                symbol_values=_values_for(positions, 'market'), positions=positions)
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_PNL)
-
-    assert len(drawn) == 2
-    assert '+0.00 (+0.00%)' in drawn[0], drawn[0]
-    assert '+100.00 (+16.67%)' in drawn[1], drawn[1]
-
-
-def test_the_pnl_is_IDENTICAL_in_cost_and_market_valuation(nicegui_client):
-    """THE defect this feature is easiest to ship with.
-
-    In cost mode ``current_value`` IS the cost basis, so a P&L taken from the
-    ``symbol_values`` map beside it is exactly 0.00 on every row -- silently
-    useless, and useless in the direction that reads as a fact. The P&L must come
-    from the true market value whichever mode the account is on, and the "now"
-    figures moving between the two runs is what proves the modes really differed.
-    """
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    positions = _pnl_positions()
-    in_mode = {}
-    for mode in ('cost', 'market'):
-        client = _fresh_client()
-        try:
-            _open_steps(client, wiz, symbol_values=_values_for(positions, mode),
-                        positions=positions)
-            in_mode[mode] = (
-                _marked_texts(client.layout, wiz.MARKER_SYMBOL_PNL),
-                _marked_texts(client.layout, wiz.MARKER_LABEL_PNL),
-                _marked_texts(client.layout, wiz.MARKER_SYMBOL_CURRENT),
-            )
-        finally:
-            _drop_client(client)
-
-    assert in_mode['cost'][0] == in_mode['market'][0]      # per symbol
-    assert in_mode['cost'][1] == in_mode['market'][1]      # per label
-    # ...and the modes really were different: "now" is the cost basis in one and
-    # the live value in the other.
-    assert in_mode['cost'][2] != in_mode['market'][2]
-    assert 'now 1,500.00' in in_mode['cost'][2][0]
-    assert 'now 1,600.00' in in_mode['market'][2][0]
-
-
-def test_a_profitable_short_is_not_rendered_as_a_loss(nicegui_client):
-    """Sold KO at 60, now 50: +100 on 600 of basis. Dividing by the SIGNED basis
-    turns that into -16.67% -- a winner painted red."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    positions = _pnl_positions()
-    _open_steps(nicegui_client, wiz,
-                symbol_values=_values_for(positions, 'market'), positions=positions)
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_SYMBOL_PNL)
-
-    assert '+16.67%' in drawn[2], drawn[2]
-    assert '-16.67%' not in drawn[2], drawn[2]
-
-
-def _unpriced_positions():
-    """Growth holds a priced AAPL and an unquotable MSFT; Income holds nothing."""
-    from ba2_trade_platform.core.portfolio_allocation import PositionState
-
-    return {
-        'AAPL': PositionState(symbol='AAPL', quantity=10.0, cost_basis=1_500.0, price=160.0),
-        'MSFT': PositionState(symbol='MSFT', quantity=5.0, cost_basis=2_000.0, price=None),
-    }
-
-
-def test_an_unpriced_holding_renders_BLANK_rather_than_zero(nicegui_client):
-    """A failed quote reading as "flat" or "break-even" has caused real incidents
-    here. The dry run's Value column already draws '-'; this matches it."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    positions = _unpriced_positions()
-    _open_steps(nicegui_client, wiz,
-                symbol_values=_values_for(positions, 'market'), positions=positions)
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_SYMBOL_PNL)
-
-    assert '0.00' not in drawn[1], drawn[1]
-    assert drawn[1].endswith('- (no price)'), drawn[1]
-
-
-def test_an_unpriced_holding_is_excluded_from_its_labels_total_and_COUNTED(
-        nicegui_client):
-    """Exactly the dry-run totals' rule: summing the unpriced row at 0 would report
-    the whole of its 2,000 cost as a loss."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    positions = _unpriced_positions()
-    _open_steps(nicegui_client, wiz,
-                symbol_values=_values_for(positions, 'market'), positions=positions)
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_PNL)
-
-    # +100 on AAPL's 1,500 alone. NOT -1,900, which is what including MSFT at 0 gives.
-    assert '+100.00 (+6.67%, 1 unpriced excluded)' in drawn[0], drawn[0]
-
-
-def test_a_label_that_holds_nothing_shows_a_dash_not_a_zero(nicegui_client):
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, positions=_unpriced_positions())
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_PNL)
-
-    assert drawn[1].endswith('-'), drawn[1]        # Income holds no KO at all
-    assert '0.00' not in drawn[1], drawn[1]
-
-
-def test_a_zero_cost_holding_shows_the_money_and_no_percentage(nicegui_client):
-    """A gifted or fully written-down basis makes the return undefined. The money
-    is still a fact and is still shown; the percentage is not invented."""
-    from ba2_trade_platform.core.portfolio_allocation import PositionState
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    positions = {'KO': PositionState(symbol='KO', quantity=10.0, cost_basis=0.0,
-                                     price=50.0)}
-    _open_steps(nicegui_client, wiz, positions=positions)
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_SYMBOL_PNL)
-
-    assert '+500.00 (no cost basis)' in drawn[2], drawn[2]
-
-
-def test_the_wizard_without_positions_draws_no_pnl_rather_than_a_zero(nicegui_client):
-    """``positions`` is optional and the page is the only caller that has one. A
-    caller that supplies none has no answer, and 0.00 would be a wrong one."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz)
-    for marker in (wiz.MARKER_LABEL_PNL, wiz.MARKER_SYMBOL_PNL):
-        drawn = _marked_texts(nicegui_client.layout, marker)
-        assert drawn, marker
-        assert all('0.00' not in text for text in drawn), (marker, drawn)
-
-
-def test_the_percentage_boxes_are_still_the_only_marked_numbers_with_pnl_drawn(
-        nicegui_client):
-    """The P&L is a ``ui.label``, for the reason the "now" captions are: the landed
-    suite indexes positionally into these two marker sets."""
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    _open_steps(nicegui_client, wiz, positions=_pnl_positions())
-
-    assert len(_numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)) == 2
-    assert len(_numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)) == 3
-
-
-def test_a_labels_percentage_is_money_weighted_not_a_mean_of_its_symbols(nicegui_client):
-    """A doubled 1,000 beside a flat 9,000 is +10% of the label, not +50%.
-
-    Averaging the rows weights the smallest holding exactly as heavily as the one
-    that dominates the label -- and on a label whose winners and losers cancel it
-    reports a return on a P&L of exactly zero dollars.
-    """
-    from ba2_trade_platform.core.portfolio_allocation import PositionState
-    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
-
-    positions = {
-        'AAPL': PositionState(symbol='AAPL', quantity=10.0, cost_basis=1_000.0,
-                              price=200.0),                      # 2,000: +100%
-        'MSFT': PositionState(symbol='MSFT', quantity=90.0, cost_basis=9_000.0,
-                              price=100.0),                      # 9,000: +0%
-    }
-    _open_steps(nicegui_client, wiz, positions=positions)
-    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_PNL)
-
-    assert '+1,000.00 (+10.00%)' in drawn[0], drawn[0]
-    assert '50.00%' not in drawn[0], drawn[0]
 
 
 # ---------------------------------------------------------------------------
@@ -3392,3 +2039,93 @@ def test_the_income_table_is_keyed_on_the_brokers_idempotency_key(nicegui_client
     assert table.row_key == 'external_id'
     keys = [r[table.row_key] for r in table.rows]
     assert len(set(keys)) == len(keys)
+
+
+# ---------------------------------------------------------------------------
+# THE MIGRATION: the wizard is a REVIEW-AND-COMMIT gate and nothing else
+#
+# "Rebalance - set targets" is gone. Every control that expresses INTENT -- the
+# label targets, the symbol shares, the cash reserve, and the six buttons over
+# them -- lives on the Portfolio Allocation page now. What is left here is what
+# COMMITS: the resolved order list, cost versus value, which instruments are
+# leveraged, the precheck warnings, one Submit, and exactly one execution control.
+#
+# The tests below are the guard that step 1 does not come back. A second place to
+# type a target is a second answer to "what am I aiming at", and the two screens
+# derived every one of those figures independently.
+# ---------------------------------------------------------------------------
+
+def _wiz():
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    return wiz
+
+
+def test_the_wizard_no_longer_offers_a_target_setting_STEP_at_all():
+    """Structural, because a renderer nobody calls is one somebody will call."""
+    wiz = _wiz()
+    assert not hasattr(wiz, 'AllocationSteps')
+    assert not hasattr(wiz, 'open_allocation_steps')
+
+
+def test_the_wizard_draws_no_label_target_and_no_symbol_share_box():
+    """The markers are the boxes. Their absence is the absence of the editor."""
+    wiz = _wiz()
+    for gone in ('MARKER_LABEL_PCT', 'MARKER_SYMBOL_PCT', 'MARKER_LABEL_TOTAL',
+                 'MARKER_UNALLOCATED', 'MARKER_UNALLOCATED_PCT'):
+        assert not hasattr(wiz, gone), gone
+
+
+def test_the_wizard_carries_none_of_the_six_migrated_buttons():
+    wiz = _wiz()
+    for gone in ('MARKER_EVEN_SPLIT', 'MARKER_EVEN_SPLIT_SYMBOLS',
+                 'MARKER_LOAD_LAST', 'MARKER_LOAD_LAST_SYMBOLS',
+                 'MARKER_FILL_REST_SYMBOLS', 'MARKER_WIPE_SYMBOLS'):
+        assert not hasattr(wiz, gone), gone
+
+
+def test_the_wizard_imports_none_of_the_engines_target_editing_helpers():
+    """An import is a dependency, and a dependency is an invitation. If the wizard
+    still reached for ``even_split_targets`` it would be one edit away from having
+    a target editor again."""
+    import inspect as _inspect
+    source = _inspect.getsource(_wiz())
+    for gone in ('even_split_targets', 'load_previous_targets',
+                 'even_split_symbol_weights', 'fill_remaining_symbol_weights',
+                 'load_previous_symbol_weights', 'wipe_symbol_weights',
+                 'has_previous_targets', 'has_previous_symbol_weights',
+                 'can_even_split_symbols', 'can_fill_remaining_symbol_weights',
+                 'can_wipe_symbol_weights', 'steps_validation_messages'):
+        assert gone not in source, gone
+
+
+def test_the_wizard_writes_no_target_anywhere():
+    """``save_allocation_targets`` / ``set_managed_label`` / ``set_symbol_weight``
+    are the three target writers. None of them belongs to a commit gate."""
+    import inspect as _inspect
+    source = _inspect.getsource(_wiz())
+    for gone in ('save_allocation_targets', 'set_managed_label',
+                 'set_symbol_weight', 'set_allocation_config'):
+        assert gone not in source, gone
+
+
+def test_the_dry_run_keeps_EXACTLY_ONE_execution_control(nicegui_client):
+    """``allow fractional shares`` stays because it changes WHICH ORDERS are
+    produced rather than what is being aimed at. Nothing else on this dialog may
+    be an input."""
+    from nicegui import ui
+
+    wiz = _wiz()
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _mixed_plan(), market=_open_market(),
+                                      on_refresh=lambda f: (_mixed_plan(),
+                                                            _open_market()),
+                                      on_submit=lambda p: None)
+        wizard.open()
+    switches = [el for el in nicegui_client.layout.descendants()
+                if isinstance(el, ui.switch)]
+    inputs = [el for el in nicegui_client.layout.descendants()
+              if isinstance(el, (ui.number, ui.slider, ui.select))]
+
+    assert [s.text for s in switches] == ['Allow fractional shares']
+    assert inputs == []
+    assert wizard.allow_fractional is True

@@ -6,20 +6,29 @@ lives in the pure, unit-tested module
 ``ba2_trade_platform/ui/utils/portfolio_allocation_view.py``; this file only does
 IO (broker + DB) and draws widgets.
 
-THREE THINGS ARE EDITED INLINE, AND THAT IS THE POINT
-=====================================================
-Each label's PORTFOLIO target, each symbol's SHARE OF ITS LABEL, and the account's
-cash RESERVE. All three used to be reachable only from inside the Allocate wizard,
+EVERY TARGET IS SET HERE, AND THAT IS THE POINT
+===============================================
+Each label's PORTFOLIO target, each symbol's SHARE OF ITS LABEL, the account's
+cash RESERVE, the per-row ``last`` target and P&L, and the six buttons over them:
+``Even split`` / ``Load last`` across the labels, and ``Fill 100%`` /
+``Even split`` / ``Fill rest`` / ``Load last`` / ``Wipe`` within one label. All of
+it used to be reachable only from inside the Allocate wizard's step 1 and step 2,
 which meant that on an account nobody had run the wizard on every label sat at
 ``target_pct = 0`` while the symbol table cheerfully printed a 20% share --
 ``get_symbol_weights``'s even-split default -- resolving to a target value of
 $0.00, because 20% of a 0% label is nothing. The page showed a plausible number
 that meant nothing.
 
-The Allocate button is still here, and it is now for EXECUTING against the saved
-targets: dry run, precheck, submit. Both sides write the same rows, and
-``_load_flow_inputs`` re-reads them at the moment the wizard opens, so a fresh
-inline edit is what the dry run solves with.
+The Allocate button is still here, and it is now purely for EXECUTING against the
+saved targets: it opens the dry run DIRECTLY -- precheck, review, submit. There is
+no target step in front of it any more, because a second place to type a target is
+a second answer to "what am I aiming at", and the two screens derived every one of
+those figures independently. ``_load_flow_inputs`` re-reads the stored rows at the
+moment the dry run opens, so a fresh inline edit is what the plan is solved with.
+
+The one control that stays at the gate is ``allow fractional shares``: it changes
+WHICH ORDERS are produced rather than what is being aimed at, and toggling it
+re-solves the plan.
 
 TWO DIFFERENT THINGS CALLED "TARGET"
 ====================================
@@ -99,7 +108,7 @@ from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
-    compute_base_notional, compute_label_investment, current_value,
+    compute_base_notional, compute_label_investment,
     format_unrealised_pnl, unconsumed_income_notice,
 )
 from ...core.portfolio_allocation_store import (
@@ -138,7 +147,7 @@ from ..utils.portfolio_allocation_view import (
     wipe_symbol_shares, working_orders_notice,
 )
 from .portfolio_allocation_wizard import (
-    open_allocation_steps, open_allocation_wizard, render_income_panel, render_outcomes,
+    open_allocation_wizard, open_invest_scope, render_income_panel, render_outcomes,
 )
 
 #: Quasar debounce (ms) for the comment inputs. Every keystroke used to run a
@@ -314,29 +323,24 @@ def _load_valuation_mode(account_id: int) -> str:
 
 
 def _load_flow_inputs(account_id: int, valuation_mode: str):
-    """Everything the wizard needs to OPEN, in one thread hop. Blocking.
+    """Everything the flow needs to solve, in one thread hop. Blocking.
 
     Returns:
-        Tuple: ``(base, labels, allow_fractional, symbol_values, positions,
-        unallocated_pct)`` -- the frozen base snapshot, the managed labels with
-        their symbol weights AND the previous generation of both, the account's
-        remembered fractional choice, ``{SYMBOL: current value}`` under
-        ``valuation_mode`` for the wizard's read-only "now" captions, the raw
-        ``{SYMBOL: PositionState}`` behind them, and the stored cash reserve that
-        pre-fills the Unallocated box.
+        Tuple: ``(base, labels, allow_fractional, unallocated_pct)`` -- the frozen
+        base snapshot, the managed labels with their symbol weights AND the
+        previous generation of both, the account's remembered fractional choice,
+        and the stored cash reserve the plan is solved against.
 
-        ``symbol_values`` goes through the engine's own ``current_value`` rather
-        than being re-derived, so the caption beside a target and the base that
-        target divides are measured the same way. It is DISPLAY only -- nothing in
-        it reaches a plan.
+        It used to hand back two more maps -- ``symbol_values`` and ``positions``
+        -- purely so the wizard's step-1/step-2 captions could draw a "now" figure
+        and an unrealised P&L. Those captions are on the PAGE now, built from
+        ``_load_view_payload``'s own read, so the two maps had no consumer left. A
+        display-only value threaded through a solve path is exactly the kind of
+        passenger that later gets mistaken for an input.
 
-        ``positions`` is the SAME map ``symbol_values`` and ``base`` were built
-        from, handed over unreduced because the wizard's unrealised P&L may not be
-        measured on a mode-aware current value: in COST mode ``current_value`` IS
-        the cost basis, so a P&L taken from ``symbol_values`` reads 0.00 on every
-        row. Quantity, cost basis and the live ``price`` are needed separately, and
-        ``build_position_states`` fetches quotes in BOTH modes, so the figure is
-        available whichever mode the account is on. Display only, like the values.
+        THE STORED ROWS ARE RE-READ HERE, at the moment the dry run opens. That is
+        what makes a fresh inline edit the thing the plan is solved against: the
+        page persists on change, and this reads the same columns back.
 
     Raises:
         PositionFetchFailed: the broker's position fetch failed. NOT a flat account,
@@ -371,9 +375,8 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
     current = svc.build_position_states(account, symbols)
     base = build_base_snapshot(account.get_account_snapshot(), current, symbols,
                                valuation_mode=valuation_mode)
-    symbol_values = {s: current_value(current.get(s), valuation_mode) for s in symbols}
     config = get_allocation_config(account_id)
-    return (base, labels, bool(config.allow_fractional), symbol_values, current,
+    return (base, labels, bool(config.allow_fractional),
             float(config.unallocated_pct or 0.0))
 
 
@@ -2224,10 +2227,9 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
 
     # The UNALLOCATED group, FIRST and not expandable: it is the row that says how
     # much of the book is even in play, and below the labels it reads as a footnote.
-    # Its target is the STORED reserve; edit it in the Allocate wizard, which is
-    # where the change is validated and where the dry run that acts on it lives.
-    # Omitted entirely when there is no base: better a missing row than one
-    # measured against a guess.
+    # Its target is the STORED reserve, edited in the card directly above it and
+    # validated there. Omitted entirely when there is no base: better a missing row
+    # than one measured against a guess.
     #
     # ``not base_notional``, NOT ``base_notional is None``. A base of exactly 0.0
     # is a real state -- a brand-new or fully-withdrawn account -- and it is not a
@@ -2304,14 +2306,23 @@ def _market_gate_for(hours):
 async def _open_allocation_flow(account_id: int, valuation_mode: str,
                                 refresh, *, mode: str = ALLOCATION_MODE_REBALANCE,
                                 invest_amount: float = 0.0) -> None:
-    """The Allocate button: steps 1-3, then the dry run, then Submit.
+    """The Allocate button: the dry run, then Submit. NO target step any more.
+
+    A REBALANCE goes STRAIGHT to the dry run. The three-step dialog it used to open
+    first was the target editor, and the targets are typed on this page now -- a
+    second place to type them is a second answer to "what am I aiming at".
+    ``_load_flow_inputs`` re-reads the stored rows at this moment, so what the dry
+    run solves against is exactly what the page last persisted.
+
+    An INVEST run still opens ``open_invest_scope`` first, and that is not a target
+    editor: it spends a specific amount on a single label, so the run has to be told
+    which label and how much, and neither is a stored target of anything.
 
     Every blocking call is dispatched through ``asyncio.to_thread``: broker IO on the
     event loop freezes the app for every connected client.
     """
     try:
-        (base, labels, allow_fractional, symbol_values, positions,
-         unallocated_pct) = await asyncio.to_thread(
+        base, labels, allow_fractional, unallocated_pct = await asyncio.to_thread(
             _load_flow_inputs, account_id, valuation_mode)
     except PositionFetchFailed as e:
         logger.error(f"Portfolio allocation: position fetch failed: {e}")
@@ -2335,11 +2346,19 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                          unallocated_pct: float) -> None:
         """Write what this run was launched with. Blocking; one thread hop.
 
-        All three writes happen on CONTINUE, not on Submit, and that is what "last"
-        means here: the numbers the user last chose to allocate with, whether or
-        not they went through with the orders. The fractional switch has been
-        persisted from exactly this point since it shipped
+        All three writes happen when the DRY RUN is opened, not on Submit, and that
+        is what "last" means here: the numbers the user last chose to allocate with,
+        whether or not they went through with the orders. The fractional switch has
+        been persisted from exactly this point since it shipped
         (``remember_fractional_choice``); the targets and the reserve follow it.
+
+        On a REBALANCE the page has already persisted every one of these inline, so
+        this is normally a re-write of what is already stored -- and
+        ``save_allocation_targets`` shifts the previous generation only on a CHANGE,
+        so a run that changes nothing does not consume a generation. What it still
+        earns is the symbol rows: a symbol silently taking the even-split default
+        gets an explicit one, because the user has just allocated real money with
+        that number.
 
         An INVEST_LABEL run passes ``save_label_targets=False`` and does NOT touch
         the reserve: it spends an explicit amount on one label, so that label's
@@ -2454,7 +2473,7 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
 
     def _on_dry_run(*, mode: str, labels, scope_label, amount: float,
                     allow_fractional: bool, unallocated_pct: float) -> None:
-        """Called by the steps dialog (sync). Records the choices, then solves.
+        """Called by the invest-scope dialog (sync). Records the choices, then solves.
 
         The write itself is in ``_run_dry_run``, off the event loop -- unlike the
         fractional switch this is N labels and M symbols, and the page's own rule
@@ -2466,11 +2485,15 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                       'unallocated_pct': float(unallocated_pct or 0.0)})
         ui.timer(0.1, _run_dry_run, once=True)
 
-    open_allocation_steps(base, labels, on_dry_run=_on_dry_run,
+    if mode == ALLOCATION_MODE_INVEST_LABEL:
+        open_invest_scope(base, labels, on_dry_run=_on_dry_run,
                           allow_fractional=allow_fractional,
-                          mode=state['mode'], invest_amount=state['amount'],
-                          symbol_values=symbol_values, positions=positions,
-                          unallocated_pct=unallocated_pct)
+                          invest_amount=state['amount'])
+        return
+    # A REBALANCE opens NO dialog first. The targets, the shares and the reserve
+    # were all typed on this page and are already stored; ``_load_flow_inputs``
+    # read them back a few lines above, so there is nothing left to ask.
+    await _run_dry_run()
 
 
 async def _open_invest_flow(account_id: int, valuation_mode: str, amount: float,
