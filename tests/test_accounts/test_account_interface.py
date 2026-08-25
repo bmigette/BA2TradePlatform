@@ -5,6 +5,7 @@ from tests.factories import (
     create_account_definition, create_expert_instance, create_trading_order,
     create_transaction,
 )
+from ba2_common.core.interfaces.AccountInterface import PLEDGED_COVER_REFUSAL
 from ba2_trade_platform.core.models import ExpertSetting, TradingOrder, Transaction
 from ba2_trade_platform.core.types import (
     AssetClass, OrderStatus, OrderDirection, OrderType, TransactionStatus,
@@ -1961,3 +1962,408 @@ class TestCloseTransactionRefusesOptions:
         result = account.close_transaction(999999)
         assert result["success"] is False
         assert isinstance(result["message"], str) and result["message"]
+
+
+# ===========================================================================
+# OPT-L1, THE EXIT HALF — the equity close refuses to sell pledged cover
+#
+# THE HOLE THIS CLOSES, and it is the half that matters most. Seam 1 stopped
+# the wrong-INSTRUMENT order: an option transaction can no longer be closed or
+# adjusted through the equity path, and options no longer enter the allocation
+# plan. It did NOT stop the dangerous half. A "set AAPL to 0%" allocation run
+# walks the EQUITY transactions for AAPL and closes each one; every one of
+# those is a perfectly valid equity close, so nothing above refuses it — and
+# the 100 shares collateralising an open short call are sold, leaving that call
+# NAKED with every guard reporting success and the option's own legs untouched.
+#
+# Task 5 made "are these shares spoken for?" answerable. This is the first
+# refusal on the EXIT side to consume the answer.
+#
+# BOTH ACCESSORS ARE TRI-STATE AND ``None`` IS A REFUSAL. An unreadable option
+# book is not an empty one, and ``get_positions()`` returning ``None`` is a
+# FETCH FAILURE, not a flat account — the conflation that force-closed 8 real
+# transactions on 2026-07-03. Selling on either unknown is precisely how a
+# covered call goes naked during an outage, so both are pinned here.
+# ===========================================================================
+def _equity_only_account_class():
+    """``MockAccount``'s behaviour WITHOUT the ``OptionsAccountInterface`` base.
+
+    An IBKR/TastyTrade-shaped account: it can trade, it cannot hold options.
+    Built from ``MockAccount``'s own namespace rather than hand-written so the
+    two doubles cannot drift — the ONLY intended difference is the missing
+    mixin, and re-implementing thirty broker methods by hand would make that
+    claim unverifiable.
+
+    Note what this double does NOT get: ``shares_pledged_to_short_calls`` and
+    ``held_shares_for_cover`` come from the mixin, so they are simply absent
+    here. A guard that asked the question without first checking the capability
+    would raise AttributeError rather than quietly pass — the failure is loud.
+    """
+    from ba2_common.core.interfaces.AccountInterface import (
+        AccountInterface as _AI,
+    )
+    skip = {"__dict__", "__weakref__", "__abstractmethods__", "_abc_impl",
+            "__module__", "__qualname__", "__doc__"}
+    body = {k: v for k, v in vars(MockAccount).items() if k not in skip}
+    return type("EquityOnlyAccount", (_AI,), body)
+
+
+class TestTheExitGuardRefusesToSellPledgedCover:
+
+    # -- scaffolding -------------------------------------------------------
+    OCC = "AAPL260116C00150000"
+
+    def _long_equity_txn(self, acct_def, *, shares=100.0):
+        """An ordinary long AAPL equity transaction, fully filled."""
+        txn = create_transaction(symbol="AAPL", quantity=shares,
+                                 side=OrderDirection.BUY,
+                                 status=TransactionStatus.OPENED, open_price=150.0)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=shares,
+                             side=OrderDirection.BUY, status=OrderStatus.FILLED,
+                             transaction_id=txn.id, filled_qty=shares)
+        return txn
+
+    def _short_equity_txn(self, acct_def, *, shares=100.0):
+        """A SHORT AAPL equity transaction — its close is a BUY."""
+        txn = create_transaction(symbol="AAPL", quantity=shares,
+                                 side=OrderDirection.SELL,
+                                 status=TransactionStatus.OPENED, open_price=150.0)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=shares,
+                             side=OrderDirection.SELL, status=OrderStatus.FILLED,
+                             transaction_id=txn.id, filled_qty=shares)
+        return txn
+
+    def _open_short_call(self, acct_def, *, contracts=1.0, multiplier=100,
+                         underlying="AAPL"):
+        """One open, filled SHORT CALL on ``underlying`` — the thing that pledges."""
+        from ba2_trade_platform.core.types import OptionRight
+        txn = create_transaction(symbol=underlying, quantity=contracts,
+                                 side=OrderDirection.SELL,
+                                 asset_class=AssetClass.OPTION)
+        return create_trading_order(
+            account_id=acct_def.id, symbol=self.OCC, quantity=contracts,
+            side=OrderDirection.SELL, status=OrderStatus.FILLED,
+            transaction_id=txn.id, filled_qty=contracts,
+            asset_class=AssetClass.OPTION, multiplier=multiplier,
+            contract_symbol=self.OCC, underlying_symbol=underlying,
+            option_type=OptionRight.CALL, strike=150.0)
+
+    def _holding(self, account, shares, symbol="AAPL"):
+        """What ``get_positions()`` hands back for a long equity lot."""
+        from types import SimpleNamespace
+        account._positions = [SimpleNamespace(
+            symbol=symbol, qty=shares, qty_available=shares,
+            side=OrderDirection.BUY, asset_class="us_equity")]
+
+    def _recording_account(self, acct_def, monkeypatch, *, cls=MockAccount):
+        """An account whose broker submissions are recorded, not performed."""
+        account = cls(acct_def.id)
+        submitted = []
+        monkeypatch.setattr(account, "submit_order",
+                            lambda o, **k: submitted.append(o) or o)
+        return account, submitted
+
+    # -- the refusal -------------------------------------------------------
+    def test_selling_shares_pledged_to_a_short_call_is_refused(self, monkeypatch):
+        """THE HEADLINE. 100 shares held, one short call written against them:
+        selling the lot leaves that call naked, and nothing used to ask."""
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._holding(account, 100.0)
+        self._open_short_call(acct_def)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is False
+        message = result["message"]
+        assert PLEDGED_COVER_REFUSAL in message, message
+        assert "100" in message, "the HELD and PLEDGED counts must be named: " + message
+        assert "pledged" in message, message
+        assert "short by 100" in message, "the SHORTFALL must be named: " + message
+        assert result["close_order_id"] is None
+        assert submitted == [], "the broker was asked to sell the cover"
+
+    def test_the_refusal_names_the_remedy_that_actually_works(self, monkeypatch):
+        """A cover refusal is fixed by releasing the cover, never by funding the
+        account — the opposite of both money refusals, and the reason it carries
+        its own marker rather than the entry seam's."""
+        acct_def = create_account_definition()
+        account, _ = self._recording_account(acct_def, monkeypatch)
+        self._holding(account, 100.0)
+        self._open_short_call(acct_def)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        message = account.submit_close_order_for_transaction(txn)["message"]
+
+        assert "short call" in message.lower(), message
+        assert "NAKED" in message, message
+
+    def test_selling_UNPLEDGED_shares_is_allowed(self, monkeypatch):
+        """THE INVERSE. No short call, so no claim: the everyday close is
+        completely unaffected. A guard that refuses everything is not a guard."""
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._holding(account, 100.0)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(submitted) == 1
+        assert submitted[0].quantity == 100.0
+        assert submitted[0].side == OrderDirection.SELL
+
+    def test_selling_only_the_UNPLEDGED_EXCESS_is_allowed(self, monkeypatch):
+        """150 held, 100 pledged, sell 50: the call keeps its cover and the free
+        shares stay sellable. Refusing this would freeze an account's stock the
+        moment one contract is written against any part of it."""
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._holding(account, 150.0)
+        self._open_short_call(acct_def)
+        txn = self._long_equity_txn(acct_def, shares=50.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(submitted) == 1 and submitted[0].quantity == 50.0
+
+    def test_the_boundary_is_exact(self, monkeypatch):
+        """Leaving EXACTLY the pledged quantity behind is admitted; one share
+        fewer is not. A cap whose boundary nobody pinned drifts by one."""
+        for sell, expect_ok in ((50.0, True), (51.0, False)):
+            acct_def = create_account_definition()
+            account, submitted = self._recording_account(acct_def, monkeypatch)
+            self._holding(account, 150.0)
+            self._open_short_call(acct_def)
+            txn = self._long_equity_txn(acct_def, shares=sell)
+
+            result = account.submit_close_order_for_transaction(txn)
+
+            assert result["success"] is expect_ok, f"selling {sell}: {result['message']}"
+            assert bool(submitted) is expect_ok
+
+    def test_the_multiplier_is_honoured_so_an_adjusted_contract_pledges_its_own_size(
+            self, monkeypatch):
+        """OPT-L7 reaches this seam through the accessor: a contract delivering
+        130 shares pledges 130, and 100 shares no longer cover it."""
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._holding(account, 100.0)
+        self._open_short_call(acct_def, multiplier=130)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is False
+        assert "130" in result["message"], result["message"]
+        assert submitted == []
+
+    def test_a_short_call_on_ANOTHER_underlying_does_not_block_this_one(self, monkeypatch):
+        """Cover is per ticker. An MSFT call has no claim on AAPL shares."""
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._holding(account, 100.0)
+        self._open_short_call(acct_def, underlying="MSFT")
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(submitted) == 1
+
+    # -- UNKNOWN is a refusal, and the two unknowns read differently -------
+    def test_an_UNMEASURABLE_PLEDGE_is_refused_and_names_the_option_book(
+            self, monkeypatch):
+        """A book that cannot be read is not an empty book. The shares may
+        already be spoken for and there is no way to find out."""
+        from sqlalchemy.exc import OperationalError
+
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._holding(account, 100.0)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+        # A LOCKED DATABASE -- benign, so the accessor absorbs it into UNKNOWN
+        # rather than propagating. That is the case the tri-state exists for.
+        monkeypatch.setattr(account, "open_option_orders_book_wide", lambda: (_ for _ in ()).throw(
+            OperationalError("SELECT 1", {}, Exception("database is locked"))))
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is False
+        message = result["message"]
+        assert PLEDGED_COVER_REFUSAL in message, message
+        assert "OPTION BOOK" in message, "send the operator to the option book: " + message
+        assert "position feed" not in message.lower(), (
+            "the position feed was readable — blaming it sends the operator to the "
+            "wrong system: " + message)
+        assert submitted == []
+
+    def test_an_UNMEASURABLE_HOLDING_with_a_pledge_open_is_refused_and_names_the_feed(
+            self, monkeypatch):
+        """``get_positions()`` returning None is a FETCH FAILURE, not a flat
+        account. With a call already written, selling on that is the outage case
+        that strips its cover."""
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._open_short_call(acct_def)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+        monkeypatch.setattr(account, "get_positions", lambda: None)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is False
+        message = result["message"]
+        assert PLEDGED_COVER_REFUSAL in message, message
+        assert "POSITION FEED" in message, "send the operator to the feed: " + message
+        assert "option book" not in message.lower(), (
+            "the option book was readable — blaming it sends the operator to the "
+            "wrong system: " + message)
+        assert submitted == []
+
+    def test_an_unmeasurable_holding_with_NOTHING_pledged_is_never_even_asked(
+            self, monkeypatch):
+        """The position feed is consulted ONLY once a pledge is known to exist.
+
+        Not an optimisation detail: ``held_shares_for_cover`` calls
+        ``get_positions()``, which on a live broker is a network round trip, and
+        an account with no short calls would otherwise pay for one on every
+        single equity close. It is also the difference between "a broker blip
+        blocks nothing" and "a broker blip blocks every exit on the platform".
+        """
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+        calls = []
+
+        def _explode():
+            calls.append(1)
+            return None
+
+        monkeypatch.setattr(account, "get_positions", _explode)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert calls == [], "the position feed was fetched with nothing pledged"
+        assert result["success"] is True, result["message"]
+        assert len(submitted) == 1
+
+    # -- what the guard must NOT touch ------------------------------------
+    def test_a_BUY_side_close_is_unaffected(self, monkeypatch):
+        """Closing a SHORT equity position BUYS shares back, which can only ADD
+        cover. Refusing it would strand a short nobody can flatten — strictly
+        worse than the naked call it does not prevent. Both feeds are broken
+        here on purpose: a BUY must not consult them at all."""
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._open_short_call(acct_def)
+        txn = self._short_equity_txn(acct_def, shares=100.0)
+        monkeypatch.setattr(account, "get_positions", lambda: None)
+        monkeypatch.setattr(account, "open_option_orders_book_wide",
+                            lambda: (_ for _ in ()).throw(AssertionError(
+                                "a BUY-side close must not read the option book")))
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(submitted) == 1 and submitted[0].side == OrderDirection.BUY
+
+    def test_a_NON_OPTIONS_account_is_completely_unaffected(self, monkeypatch):
+        """An account that cannot hold options has nothing pledged, by
+        construction, and must not pay to be told so.
+
+        The double has no cover accessors at all (they live on the mixin), so a
+        guard that asked without checking the capability would raise
+        AttributeError here rather than quietly pass.
+        """
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(
+            acct_def, monkeypatch, cls=_equity_only_account_class())
+        assert not hasattr(account, "shares_pledged_to_short_calls")
+        self._holding(account, 100.0)
+        # A short call IS in the book. An options account would refuse on it;
+        # this one cannot own it, so the row is simply not its business.
+        self._open_short_call(acct_def)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(submitted) == 1 and submitted[0].quantity == 100.0
+
+    def test_an_already_flat_transaction_still_reports_flat_not_pledged(self, monkeypatch):
+        """The guard sits AFTER the flat check, so a transaction with nothing
+        left to sell keeps its own (successful) answer. Refusing a no-op close
+        would make ``close_transaction`` retry a close it must never send."""
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._holding(account, 100.0)
+        self._open_short_call(acct_def)
+        txn = create_transaction(symbol="AAPL", quantity=100.0,
+                                 side=OrderDirection.BUY,
+                                 status=TransactionStatus.OPENED, open_price=150.0)
+        for side in (OrderDirection.BUY, OrderDirection.SELL):
+            create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+                                 side=side, status=OrderStatus.FILLED,
+                                 transaction_id=txn.id, filled_qty=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True
+        assert "flat" in result["message"].lower(), result["message"]
+        assert submitted == []
+
+    # -- nothing is written --------------------------------------------------
+    def test_a_REFUSAL_WRITES_NO_ORDER(self, monkeypatch):
+        """Counted before and after, on both the immediate and the DEFERRED
+        branch. A refusal that leaves a close order behind is worse than the
+        naked call it prevented: the book then claims an exit the broker has
+        never heard of, and the deferred branch writes straight to the DB
+        without going through ``submit_order`` at all.
+        """
+        from ba2_common.core.trade_store import orders_where
+
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._holding(account, 100.0)
+        self._open_short_call(acct_def)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+        blocker = create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, status=OrderStatus.CANCELED,
+            transaction_id=txn.id)
+        before = len(orders_where(account_id=acct_def.id))
+
+        immediate = account.submit_close_order_for_transaction(txn)
+        deferred = account.submit_close_order_for_transaction(
+            txn, last_broker_canceled_order_id=blocker.id)
+
+        assert immediate["success"] is False and deferred["success"] is False
+        assert len(orders_where(account_id=acct_def.id)) == before, \
+            "a refused close left an order row behind"
+        assert submitted == []
+
+    def test_the_refusal_reaches_close_transaction_as_a_failed_result(self, monkeypatch):
+        """The convention this guard chose, end to end.
+
+        ``close_transaction`` copies ``success``/``message`` straight through, so
+        a dict refusal arrives at the allocation runner as a failed row carrying
+        the reason — where a raise would be re-wrapped by that method's outer
+        handler as ``Error: <str>`` with a stack trace, presenting a routine,
+        self-clearing refusal as a crash.
+        """
+        acct_def = create_account_definition()
+        account, submitted = self._recording_account(acct_def, monkeypatch)
+        self._holding(account, 100.0)
+        self._open_short_call(acct_def)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.close_transaction(txn.id)
+
+        assert result["success"] is False
+        assert PLEDGED_COVER_REFUSAL in result["message"], result["message"]
+        assert "Error:" not in result["message"], (
+            "a raise would have been re-wrapped by the outer handler: "
+            + result["message"])
+        assert submitted == []
