@@ -9,9 +9,11 @@ leg while the *equity* leg sells normally, because nothing anywhere could ask
 "are these shares spoken for?".
 
 ``shares_pledged_to_short_calls`` and ``held_shares_for_cover`` are that
-question, made answerable. They only MEASURE; the refusals that consume them
-land in later tasks (entry refuses an uncovered covered call, the close path
-refuses to sell pledged shares, a monitor detects cover leaving).
+question, made answerable. They only MEASURE. The FIRST refusal to consume them
+is at the bottom of this file: ``submit_option_order`` now refuses a
+``covered_call`` whose cover is short or unmeasurable, before it writes a row.
+The remaining two land in later tasks (the close path refuses to sell pledged
+shares; a monitor detects cover leaving).
 
 THE TRI-STATE IS THE WHOLE POINT, and it is what most of this file tests::
 
@@ -30,12 +32,19 @@ WHAT THE DOUBLES ARE. ``FakeOptionsAccount`` controls exactly two seams —
 ``open_option_orders_book_wide()`` and ``get_positions()`` — and everything
 above them is the real code under test. Neither accessor is mocked.
 """
+from datetime import date
 from itertools import count
 from types import SimpleNamespace
 
 import pytest
 
-from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+from ba2_common.core import trade_store as ts
+from ba2_common.core.db import add_instance, update_instance
+from ba2_common.core.interfaces.OptionsAccountInterface import (
+    COVER_REFUSAL, DEFAULT_OPTION_MULTIPLIER, OptionsAccountInterface,
+)
+from ba2_common.core.models import Transaction, TradingOrder
+from ba2_common.core.option_types import OptionLeg
 from ba2_common.core.types import (
     AssetClass, OptionRight, OrderDirection, OrderStatus,
 )
@@ -541,3 +550,399 @@ def test_an_account_with_no_short_calls_has_every_share_free():
                               positions=[equity_position(qty=100.0)])
     assert acct.held_shares_for_cover("AAPL") - \
         acct.shares_pledged_to_short_calls("AAPL") == 100
+
+
+# ===========================================================================
+# THE ENTRY SEAM — ``submit_option_order`` refuses an UNCOVERED covered call
+#
+# The measurement above is only worth having if something REFUSES on it. The
+# first consumer is the submission boundary itself, and it is placed there
+# rather than in ``SellCoveredCallAction`` because that action is not the only
+# caller: ``PremiumSeller.rebalance`` and ``OptionPortfolioManager`` reach
+# ``submit_option_order`` directly, and it validated nothing but leg count and
+# a single expiry. Anything else could write a naked short call under the
+# ``covered_call`` tag with no test in the repo to notice.
+#
+# WHY BOTH ACCESSORS AND NOT JUST ``held``. ``SellCoveredCallAction`` sizes
+# with ``floor(held / 100)`` and consults NO short-call book, so a second
+# covered call written against the SAME 100 shares passes a held-only check
+# — three contracts against one 100-share lot is the documented failure. The
+# free cover is ``held - pledged``; either half UNKNOWN is a refusal, and the
+# two refusals read differently because a broken position feed and a broken
+# option book send the operator to different places.
+# ===========================================================================
+AUG = date(2026, 8, 21)
+
+
+def option_leg(strike=150.0, side=OrderDirection.SELL, right=OptionRight.CALL,
+               underlying="AAPL", intent="sell_to_open", expiry=AUG, **extra):
+    """One ``OptionLeg`` as the entry actions build it, plus any extra attribute.
+
+    ``**extra`` exists for ``multiplier=``: the dataclass carries no such field
+    today, and a leg that DOES publish one must be believed over the platform
+    default (OPT-L7 — an adjusted contract does not deliver 100 shares).
+    """
+    built = OptionLeg(contract_symbol=occ(underlying, right, strike), side=side,
+                      position_intent=intent, option_type=right, strike=strike,
+                      expiry=expiry, underlying=underlying)
+    for name, value in extra.items():
+        setattr(built, name, value)
+    return built
+
+
+class SubmittingAccount(FakeOptionsAccount):
+    """``FakeOptionsAccount`` that can run the REAL ``submit_option_order``.
+
+    Only the broker wire and the transaction factory are stubbed; the guard,
+    the persistence and both cover accessors are the code under test. The book
+    and the position list stay controllable, which is the whole point: the
+    refusals turn on exactly those two seams.
+    """
+
+    def __init__(self, book=(), positions=()):
+        super().__init__(book=book, positions=positions)
+        self.submitted: list = []
+
+    def _create_transaction_for_order(self, trading_order):
+        trading_order.transaction_id = add_instance(Transaction(
+            symbol=trading_order.symbol, quantity=trading_order.quantity,
+            side=trading_order.side, multiplier=100, expert_id=None))
+
+    def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
+        self.submitted.append((trading_order, list(legs)))
+        trading_order.status = OrderStatus.FILLED
+        trading_order.broker_order_id = f"double-{trading_order.id}"
+        update_instance(trading_order)
+        for child in (leg_orders or []):
+            child.status = OrderStatus.FILLED
+            update_instance(child)
+        return trading_order
+
+
+@pytest.fixture
+def store():
+    """A fresh in-RAM order/transaction store per test, so "nothing was written"
+    is an exact statement rather than a hopeful one."""
+    with ts.inmem_trades() as s:
+        yield s
+
+
+def _write(account, legs=None, quantity=1, strategy="covered_call"):
+    return account.submit_option_order(
+        legs if legs is not None else [option_leg()], quantity=quantity,
+        order_type="limit", limit_price=2.5, option_strategy=strategy)
+
+
+class TestTheEntrySeamRefusesAnUncoveredCoveredCall:
+
+    # -- the shortfall ----------------------------------------------------
+    def test_a_covered_call_against_no_shares_at_all_is_refused(self, store):
+        """A MEASURED zero holding is still zero cover. This is the naked write."""
+        acct = SubmittingAccount(book=[], positions=[])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct)
+
+        message = str(excinfo.value)
+        assert COVER_REFUSAL in message, message
+        assert "AAPL" in message, message
+        assert "100 share" in message, "the requirement must be named: " + message
+        assert "short by 100" in message, "the SHORTFALL must be named: " + message
+        assert acct.submitted == [], "the broker saw a naked short call"
+
+    def test_three_contracts_against_one_hundred_shares_is_refused(self, store):
+        """The documented failure: partial cover is not cover."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, quantity=3)
+
+        message = str(excinfo.value)
+        assert "300 share" in message and "short by 200" in message, message
+        assert acct.submitted == []
+
+    def test_exactly_enough_shares_is_admitted(self, store):
+        """The normal covered call must be completely unaffected."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100.0)])
+
+        parent = _write(acct)
+
+        assert parent is not None and parent.status == OrderStatus.FILLED
+        assert len(acct.submitted) == 1, "the broker must be reached exactly once"
+        assert len(store.all(TradingOrder)) == 1
+        assert len(store.all(Transaction)) == 1
+
+    def test_one_share_short_of_the_lot_is_refused(self, store):
+        """99 shares do not cover a 100-share obligation. The boundary is exact."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=99.0)])
+
+        with pytest.raises(ValueError, match="short by 1 "):
+            _write(acct)
+
+    # -- the case a held-only check misses --------------------------------
+    def test_shares_already_pledged_to_another_short_call_cover_nothing(self, store):
+        """100 shares, one short call ALREADY written against them: the second
+        call is naked even though ``held >= contracts * 100`` is satisfied.
+
+        This is precisely what ``SellCoveredCallAction``'s ``floor(held / 100)``
+        cannot see, because it consults no short-call book at all.
+        """
+        acct = SubmittingAccount(book=[short_call(qty=1)],
+                                 positions=[equity_position(qty=100.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct)
+
+        message = str(excinfo.value)
+        assert "100 already pledged" in message, message
+        assert "short by 100" in message, message
+        assert acct.submitted == []
+
+    def test_a_bought_back_call_releases_its_cover_again(self, store):
+        """The pledge nets: a call bought back stops pledging, so the shares
+        are writable again. A refusal that never lifts would be its own bug."""
+        acct = SubmittingAccount(book=[short_call(qty=1), long_call(qty=1)],
+                                 positions=[equity_position(qty=100.0)])
+
+        parent = _write(acct)
+
+        assert parent is not None and len(acct.submitted) == 1
+
+    # -- UNKNOWN is a refusal, and the two unknowns read differently ------
+    def test_an_unmeasurable_holding_is_refused_and_names_the_position_feed(
+            self, store, errors):
+        """``get_positions()`` returning None is a FETCH FAILURE, not a flat
+        account. Writing a covered call on that is how one goes naked."""
+        acct = SubmittingAccount(book=[], positions=None)
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct)
+
+        message = str(excinfo.value)
+        assert COVER_REFUSAL in message, message
+        assert "held_shares_for_cover" in message, message
+        assert "POSITION" in message, "the operator must be sent to the position feed"
+        assert "option book" not in message.lower(), (
+            "the option book was readable — blaming it sends the operator to the "
+            "wrong system: " + message)
+        assert acct.submitted == []
+        assert errors, "the accessor must also log why it could not measure"
+
+    def test_an_unmeasurable_pledge_is_refused_and_names_the_option_book(
+            self, store, errors):
+        """A book that cannot be read is not an empty book. The shares may
+        already be spoken for and there is no way to find out."""
+        acct = SubmittingAccount(book=None, positions=[equity_position(qty=100.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct)
+
+        message = str(excinfo.value)
+        assert COVER_REFUSAL in message, message
+        assert "shares_pledged_to_short_calls" in message, message
+        assert "OPTION BOOK" in message, "the operator must be sent to the option book"
+        assert "position feed" not in message.lower(), (
+            "the position feed was readable — blaming it sends the operator to the "
+            "wrong system: " + message)
+        assert acct.submitted == []
+        assert errors, "the accessor must also log why it could not measure"
+
+    def test_an_unreadable_short_call_row_in_the_book_is_refused(self, store):
+        """The unknown does not have to be a whole-feed outage — one damaged
+        row is enough, because a partial pledge looks exactly like a measured one."""
+        acct = SubmittingAccount(book=[short_call(qty=1, multiplier=None)],
+                                 positions=[equity_position(qty=1000.0)])
+
+        with pytest.raises(ValueError, match="OPTION BOOK"):
+            _write(acct)
+
+    # -- the multiplier is read, never assumed (OPT-L7) --------------------
+    def test_the_requirement_scales_with_a_non_hundred_multiplier(self, store):
+        """An ADJUSTED contract delivering 10 shares needs 30 shares for 3
+        contracts, not 300 — assuming 100 would refuse a perfectly covered call."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=30.0)])
+
+        parent = _write(acct, legs=[option_leg(multiplier=10)], quantity=3)
+
+        assert parent is not None and len(acct.submitted) == 1
+
+    def test_a_larger_multiplier_raises_the_requirement(self, store):
+        """The same scaling in the dangerous direction: a contract delivering
+        500 shares must not be waved through on a 100-share lot."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, legs=[option_leg(multiplier=500)])
+
+        assert "500 share" in str(excinfo.value), str(excinfo.value)
+
+    def test_a_leg_whose_multiplier_is_unreadable_is_refused(self, store):
+        """A leg that publishes the field but not a number is UNKNOWN. It must
+        not fall back to the default — that is the OPT-L7 guess."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100000.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, legs=[option_leg(multiplier=0)])
+
+        message = str(excinfo.value)
+        assert COVER_REFUSAL in message and "multiplier" in message, message
+        assert str(DEFAULT_OPTION_MULTIPLIER) in message, (
+            "say what was NOT assumed: " + message)
+
+    def test_a_leg_carrying_no_multiplier_field_uses_the_platform_default(self, store):
+        """``OptionLeg`` has no ``multiplier`` today, and the rows this very
+        method writes are stamped ``DEFAULT_OPTION_MULTIPLIER``. Absent is not
+        unreadable: refusing it would refuse every covered call on the platform."""
+        assert not hasattr(option_leg(), "multiplier")
+        acct = SubmittingAccount(
+            book=[], positions=[equity_position(qty=float(DEFAULT_OPTION_MULTIPLIER))])
+
+        parent = _write(acct)
+
+        assert parent is not None
+        assert parent.multiplier == DEFAULT_OPTION_MULTIPLIER
+
+    # -- inputs the guard itself cannot read -------------------------------
+    #
+    # Same discipline as the accessors: the obligation's SIZE is as much a part of
+    # the measurement as the cover is, and a covered call whose size cannot be read
+    # is an unknown obligation. Each of these would otherwise silently contribute
+    # nothing to `required` and wave the write through.
+    def test_an_unusable_order_quantity_is_refused(self, store):
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100000.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, quantity=0)
+
+        assert COVER_REFUSAL in str(excinfo.value), str(excinfo.value)
+        assert "quantity" in str(excinfo.value), str(excinfo.value)
+
+    def test_a_short_leg_with_no_option_type_is_refused(self, store):
+        """It might be the CALL. Unknown must not resolve to 'not a call'."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100000.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, legs=[option_leg(right=None)])
+
+        assert "no option type" in str(excinfo.value), str(excinfo.value)
+
+    def test_a_short_call_with_no_underlying_is_refused(self, store):
+        """There is no ticker whose shares could be counted, so nothing can be
+        said about cover — least of all that there is enough."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100000.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, legs=[option_leg(underlying=None)])
+
+        assert "no underlying" in str(excinfo.value), str(excinfo.value)
+
+    def test_a_leg_with_an_unusable_ratio_is_refused(self, store):
+        """``ratio_qty`` sizes the leg (quantity * ratio_qty is how the children are
+        written), so an unreadable one is an obligation of unknown size."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100000.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, legs=[option_leg(ratio_qty=0)])
+
+        assert "ratio_qty" in str(excinfo.value), str(excinfo.value)
+
+    def test_the_ratio_multiplies_the_requirement(self, store):
+        """And when it IS readable it must be honoured: 2 x ratio 3 is 6 contracts,
+        i.e. 600 shares — not 200."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=500.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, legs=[option_leg(ratio_qty=3)], quantity=2)
+
+        assert "600 share" in str(excinfo.value), str(excinfo.value)
+
+    # -- what the guard must NOT touch ------------------------------------
+    def test_a_cash_secured_put_is_unaffected(self, store):
+        """A short put obliges CASH, not shares — that is the assignment-capacity
+        gate's question. Refusing it here would refuse a structure nothing covers.
+
+        BELT AND BRACES, and recorded as such: TWO independent filters keep this
+        write out of the guard (the strategy tag and the CALL-only test), so no
+        single mutation of either can make this test fail. The two tests that DO
+        discriminate them one at a time are ``test_a_bear_call_spread_is_unaffected``
+        (tag) and ``test_a_short_put_riding_along_needs_no_share_cover`` (right).
+        """
+        acct = SubmittingAccount(book=[], positions=[])
+
+        parent = _write(acct, legs=[option_leg(right=OptionRight.PUT)],
+                        strategy="cash_secured_put")
+
+        assert parent is not None and len(acct.submitted) == 1
+
+    def test_a_short_put_riding_along_needs_no_share_cover(self, store):
+        """Even UNDER the covered_call tag, only the CALL leg is covered by shares.
+
+        A short put obliges CASH — that is ``check_assignment_capacity``'s question,
+        and it has its own refusal with its own remedy. Counting it here would
+        demand 200 shares for a structure that can only ever have 100 called away,
+        and the two refusals would then contradict each other about what to fix.
+        """
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100.0)])
+        legs = [option_leg(strike=160.0),
+                option_leg(strike=140.0, right=OptionRight.PUT)]
+
+        parent = _write(acct, legs=legs)
+
+        assert parent is not None and len(acct.submitted) == 1
+
+    def test_a_bear_call_spread_is_unaffected(self, store):
+        """Its short call is covered by a LONG CALL, not by shares. This guard
+        enforces the promise the ``covered_call`` tag makes, and no other."""
+        acct = SubmittingAccount(book=[], positions=[])
+        legs = [option_leg(strike=160.0),
+                option_leg(strike=170.0, side=OrderDirection.BUY, intent="buy_to_open")]
+
+        parent = _write(acct, legs=legs, strategy="bear_call_spread")
+
+        assert parent is not None and len(acct.submitted) == 1
+
+    def test_buying_a_covered_call_back_is_never_refused(self, store):
+        """A BUY leg needs no cover — it RELEASES some. Refusing a close when
+        the feeds are down would strand an open position that cannot be
+        flattened, which is far worse than the entry it prevents."""
+        acct = SubmittingAccount(book=None, positions=None)
+        leg = option_leg(side=OrderDirection.BUY, intent="buy_to_close")
+
+        parent = _write(acct, legs=[leg])
+
+        assert parent is not None and len(acct.submitted) == 1
+
+    def test_the_strategy_tag_is_matched_case_and_whitespace_insensitively(self, store):
+        """``" Covered_Call "`` is the same promise. A tag comparison a caller
+        can slip past by capitalising it is not a guard."""
+        acct = SubmittingAccount(book=[], positions=[])
+
+        with pytest.raises(ValueError, match=COVER_REFUSAL):
+            _write(acct, strategy=" Covered_Call ")
+
+    # -- nothing is half-written ------------------------------------------
+    def test_a_refusal_writes_nothing(self, store):
+        """Counted before and after. A refusal that leaves a parent, a leg or a
+        Transaction behind is worse than the naked call it prevented: the book
+        then claims a position the broker has never heard of."""
+        assert store.all(TradingOrder) == [] and store.all(Transaction) == []
+        orders_before = len(store.all(TradingOrder))
+        txns_before = len(store.all(Transaction))
+        acct = SubmittingAccount(book=[], positions=[])
+
+        with pytest.raises(ValueError, match=COVER_REFUSAL):
+            _write(acct, quantity=2)
+
+        assert len(store.all(TradingOrder)) == orders_before, \
+            "a refused covered call left order rows behind"
+        assert len(store.all(Transaction)) == txns_before, \
+            "a refused covered call left a Transaction behind"
+        assert acct.submitted == []
+
+    def test_a_refusal_on_an_unmeasurable_feed_writes_nothing_either(self, store):
+        """Same property on the UNKNOWN branch, which is the one that fires
+        during an outage — i.e. when half-written rows are hardest to spot."""
+        with pytest.raises(ValueError, match=COVER_REFUSAL):
+            _write(SubmittingAccount(book=None, positions=None))
+
+        assert store.all(TradingOrder) == [] and store.all(Transaction) == []

@@ -32,6 +32,41 @@ ASSIGNMENT_CAPACITY_REFUSAL = "ASSIGNMENT CAPACITY"
 #: eventually be defeated by float addition.
 _ASSIGNMENT_EPS = 1e-9
 
+#: Marker carried by EVERY cover refusal at the submission boundary, so it can be told
+#: apart at a glance — and with one grep — from the two money refusals above.
+#:
+#: THREE REFUSALS, THREE REMEDIES, and conflating them wastes an afternoon each time.
+#: A buying-power refusal frees up by closing any reserving structure. A capacity
+#: refusal needs cash for delivery. This one needs SHARES: buy the missing shares of the
+#: underlying, write fewer contracts, or close a short call to release the cover it
+#: holds. Adding margin does nothing for it, and nothing it asks for helps the others.
+COVER_REFUSAL = "UNCOVERED SHORT CALL"
+
+#: The one strategy tag whose entire promise is "these contracts are covered by shares
+#: this account holds". The cover guard enforces exactly that promise and no other:
+#:
+#: * a ``short_strangle``/``short_put`` is DELIBERATELY undefined-risk and is gated by
+#:   PremiumSeller's ``undefined_risk_max_pct`` rail, not by share inventory;
+#: * a ``bear_call_spread``'s short call is covered by a LONG CALL, not by shares;
+#: * every close path submits under ``"close"`` (``option_lifecycle_service``,
+#:   ``PremiumSeller.portfolio``, ``close_option_position``), so flattening is never
+#:   gated on a cover reading — a refusal there would strand an open position.
+COVERED_CALL_STRATEGY = "covered_call"
+
+#: Shares one contract delivers when nothing says otherwise — and the value this method
+#: stamps on every option row it writes. The cover guard reads it from the LEG when the
+#: leg publishes one (an adjusted contract does not deliver 100 — OPT-L7) and falls back
+#: to this only because ``OptionLeg`` carries no such field yet: the fallback is then not
+#: a guess but the very number being persisted two blocks below.
+DEFAULT_OPTION_MULTIPLIER = 100
+
+#: Sentinel telling "this leg publishes NO multiplier field" apart from "this leg
+#: publishes one and it is unreadable". The first is today's ``OptionLeg`` and takes the
+#: platform default; the second is a damaged input and is a refusal. A plain
+#: ``getattr(leg, "multiplier", None)`` collapses the two, and collapsing them either
+#: refuses every covered call on the platform or accepts a leg whose multiplier is junk.
+_MULTIPLIER_ABSENT = object()
+
 
 @dataclass(frozen=True)
 class ReservePool:
@@ -152,7 +187,9 @@ class OptionsAccountInterface(ABC):
         2-4 legs   -> a parent option order (option_strategy set, no contract_symbol)
                       + leg children linked via parent_order_id.
 
-        Raises ValueError if the legs span more than one expiry (see the guard below).
+        Raises ValueError if the legs span more than one expiry, or if a ``covered_call``
+        is not covered by free shares (see the two guards below). Both refuse BEFORE any
+        row is written, so a refusal leaves nothing half-recorded.
         """
         from ba2_common.core.db import add_instance, get_instance, update_instance
         from ba2_common.core.models import TradingOrder
@@ -192,6 +229,16 @@ class OptionsAccountInterface(ABC):
                 "part of the position. No order or transaction has been created."
             )
 
+        # COVER INVARIANT — same placement and the same reason: BEFORE the parent order,
+        # the leg children and the Transaction are written, and before the try/except that
+        # would turn a refusal into a silent `return None`.
+        #
+        # Being early is not enough on its own; being before EVERY write is the property,
+        # and it is doubly load-bearing here because `shares_pledged_to_short_calls` reads
+        # the open order book: a guard that ran after the parent row existed would see this
+        # very order as a pledge and refuse the covered call it is in the middle of writing.
+        self._refuse_uncovered_covered_call(legs, quantity, option_strategy)
+
         first = legs[0]
         is_multi = len(legs) > 1
         if limit_price is None:
@@ -215,7 +262,7 @@ class OptionsAccountInterface(ABC):
             status=OrderStatus.PENDING,
             limit_price=limit_price,
             asset_class=AssetClass.OPTION,
-            multiplier=100,
+            multiplier=DEFAULT_OPTION_MULTIPLIER,
             option_strategy=option_strategy or ("spread" if is_multi else "single"),
             position_intent=(first.position_intent if not is_multi else None),
             # A MULTI-LEG PARENT HAS NO SINGLE CONTRACT — and says so.
@@ -268,7 +315,7 @@ class OptionsAccountInterface(ABC):
                         CoreOrderType.BUY_LIMIT if leg.side == OrderDirection.BUY else CoreOrderType.SELL_LIMIT)),
                     status=OrderStatus.PENDING,
                     asset_class=AssetClass.OPTION,
-                    multiplier=100,
+                    multiplier=DEFAULT_OPTION_MULTIPLIER,
                     contract_symbol=leg.contract_symbol,
                     option_type=leg.option_type,
                     strike=leg.strike,
@@ -288,6 +335,146 @@ class OptionsAccountInterface(ABC):
             parent.comment = f"{(parent.comment or '')} | option submit error: {str(e)[:200]}"
             update_instance(parent)
             return None
+
+    def _refuse_uncovered_covered_call(self, legs: List[OptionLeg], quantity: int,
+                                       option_strategy: Optional[str]) -> None:
+        """Raise ``ValueError`` if a ``covered_call`` is not actually covered.
+
+        WHY THIS LIVES AT THE SEAM AND NOT IN THE ACTION. ``SellCoveredCallAction``
+        checks cover too, and it stays — but it was the ONLY caller that did.
+        ``submit_option_order`` validated a non-empty leg list, a 4-leg ceiling and a
+        single expiry, so ``PremiumSeller.rebalance``, ``OptionPortfolioManager`` and any
+        future caller could write a naked short call under the ``covered_call`` tag with
+        nothing in the repo to notice. A promise enforced at one of five call sites is a
+        convention, not an invariant.
+
+        WHY BOTH ACCESSORS. The obvious test — ``held >= contracts * 100`` — is the one
+        ``SellCoveredCallAction`` already performs (``floor(held / 100.0)``) and it is
+        NOT SUFFICIENT: it consults no short-call book, so a second covered call written
+        against the SAME 100 shares passes it, and a third passes it again. The free
+        cover is::
+
+            available = held_shares_for_cover(u) - shares_pledged_to_short_calls(u)
+
+        Both are tri-state. ``None`` from EITHER is a refusal, and the two refusals are
+        worded differently on purpose: a broken position feed and a broken option book
+        send the operator to different systems, and telling them the wrong one costs an
+        afternoon. An unknown is never treated as a zero here — that is the whole
+        argument of the accessors' own docstrings.
+
+        WHAT IS *NOT* GUARDED, deliberately. Only the ``covered_call`` tag, because only
+        that tag promises share cover (see ``COVERED_CALL_STRATEGY``). A short strangle is
+        meant to be naked and is rationed by a different rail; a bear call spread is
+        covered by its long call; and every close path submits under ``"close"``, so
+        flattening is never blocked by a cover reading — refusing there would strand an
+        open position that can no longer be exited, which is strictly worse than the
+        entry this refuses. For the same reason a structure with no SHORT CALL leg at all
+        (a buy-to-close mistagged ``covered_call``) needs no cover and never consults the
+        feeds: it RELEASES cover rather than consuming it.
+
+        LONG CALLS ARE NOT NETTED against the requirement. A covered call is by
+        definition one short call against shares, not a spread; if a long call is present
+        the tag is wrong, and over-requiring cover is the direction that fails safe.
+        """
+        from ba2_common.core.types import OrderDirection
+
+        if (option_strategy or "").strip().lower() != COVERED_CALL_STRATEGY:
+            return
+
+        contracts = self._readable_positive_number(quantity)
+        if contracts is None:
+            raise ValueError(
+                f"{COVER_REFUSAL}: this covered_call has no usable size "
+                f"(quantity={quantity!r}), so how many shares it could have called away "
+                f"cannot be worked out — and an obligation of unknown size must not be "
+                f"written. No order, leg or transaction has been created.")
+
+        # Grouped by underlying rather than summed flat: a covered call is one ticker, but
+        # a stray leg on another name must not be covered by the first name's shares.
+        required: dict = {}
+        for leg in legs:
+            if getattr(leg, "side", None) != OrderDirection.SELL:
+                continue           # a LONG leg pledges nothing; a buy-to-close releases
+            contract = getattr(leg, "contract_symbol", None) or "?"
+            right = getattr(leg, "option_type", None)
+            if right is None:
+                raise ValueError(
+                    f"{COVER_REFUSAL}: leg {contract} of this covered_call is a SHORT "
+                    f"option with no option type recorded, so whether it is the CALL that "
+                    f"has to be covered is unknown — and unknown must not resolve to 'not "
+                    f"a call'. No order, leg or transaction has been created.")
+            if right != OptionRight.CALL:
+                continue           # a short put obliges CASH: the capacity gate's question
+            underlying = (getattr(leg, "underlying", None) or "").strip().upper()
+            if not underlying:
+                raise ValueError(
+                    f"{COVER_REFUSAL}: leg {contract} of this covered_call is a SHORT CALL "
+                    f"with no underlying recorded, so there is no ticker whose shares can "
+                    f"be counted as its cover. No order, leg or transaction has been "
+                    f"created.")
+            ratio = self._readable_positive_number(getattr(leg, "ratio_qty", 1))
+            if ratio is None:
+                raise ValueError(
+                    f"{COVER_REFUSAL}: leg {contract} of this covered_call has an "
+                    f"unusable ratio_qty ({getattr(leg, 'ratio_qty', None)!r}), and it is "
+                    f"what sizes the leg (quantity * ratio_qty), so how many {underlying} "
+                    f"shares it can call away is unknown. No order, leg or transaction "
+                    f"has been created.")
+            raw_multiplier = getattr(leg, "multiplier", _MULTIPLIER_ABSENT)
+            if raw_multiplier is _MULTIPLIER_ABSENT:
+                multiplier = float(DEFAULT_OPTION_MULTIPLIER)
+            else:
+                multiplier = self._readable_positive_number(raw_multiplier)
+                if multiplier is None:
+                    raise ValueError(
+                        f"{COVER_REFUSAL}: leg {contract} of this covered_call reports "
+                        f"multiplier {raw_multiplier!r}, so how many {underlying} shares "
+                        f"one contract can call away is unknown — and it must NOT be "
+                        f"assumed to be {DEFAULT_OPTION_MULTIPLIER}, because an ADJUSTED "
+                        f"contract (post-split, post-merger) delivers a different number "
+                        f"and guessing under-states exactly the cover this write needs. "
+                        f"No order, leg or transaction has been created.")
+            required[underlying] = (required.get(underlying, 0.0)
+                                    + contracts * ratio * multiplier)
+
+        for underlying in sorted(required):
+            # Rounded UP, like the pledge itself: under-stating the requirement by one
+            # share is the direction that leaves a contract uncovered.
+            need = int(math.ceil(round(required[underlying], 6)))
+            if need <= 0:
+                continue
+            held = self.held_shares_for_cover(underlying)
+            pledged = self.shares_pledged_to_short_calls(underlying)
+            if held is None:
+                raise ValueError(
+                    f"{COVER_REFUSAL}: how many {underlying} shares this account holds "
+                    f"could not be measured — held_shares_for_cover() returned UNKNOWN, "
+                    f"i.e. the POSITION FEED did not answer (the logged error above names "
+                    f"the fetch or the row that failed). Whether this covered_call would "
+                    f"be covered is therefore unknown, and writing a short call on an "
+                    f"unknown is precisely how one goes naked. No order, leg or "
+                    f"transaction has been created. This is NOT a shortfall: buying more "
+                    f"shares will not clear it, repairing the feed will.")
+            if pledged is None:
+                raise ValueError(
+                    f"{COVER_REFUSAL}: how many {underlying} shares are already pledged "
+                    f"as cover for open short calls could not be measured — "
+                    f"shares_pledged_to_short_calls() returned UNKNOWN, i.e. the OPTION "
+                    f"BOOK did not answer (the logged error above names the unreadable "
+                    f"row). The {held} shares held may already be spoken for and there is "
+                    f"no way to find out, so this covered_call could be the second call "
+                    f"written against the same lot. No order, leg or transaction has been "
+                    f"created. Repair the option order book and retry.")
+            free = held - pledged
+            if free < need:
+                raise ValueError(
+                    f"{COVER_REFUSAL}: this covered_call writes {contracts:g} contract(s) "
+                    f"on {underlying} and needs {need} shares of cover, but only {free} "
+                    f"are free (the account holds {held}, with {pledged} already pledged "
+                    f"to open short calls) — short by {need - free} share(s). No order, "
+                    f"leg or transaction has been created. Buy the missing shares, write "
+                    f"fewer contracts, or close a short call to release the cover it "
+                    f"holds; adding margin does nothing for this one.")
 
     #: Strategy tags that describe what is being DONE, not what the position IS. An order
     #: carrying one of these must never define the transaction's intent: both close paths

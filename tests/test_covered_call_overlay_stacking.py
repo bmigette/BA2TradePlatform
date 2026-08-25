@@ -178,6 +178,14 @@ def _seed_equity_position():
     Returns (account, recommendation, transaction). The Transaction is OPENED and
     its entry order FILLED — exactly what ``_OptionEntryAction._held_equity_shares``
     sums (TradeActions.py) and what ``HasPositionCondition`` checks.
+
+    The same 100 shares are ALSO published on the account's position feed, because
+    the platform's view and the broker's view are two different readings and the
+    covered-call cover guard in ``submit_option_order`` (OPT-L1) deliberately uses
+    the ACCOUNT-WIDE one: shares bought by another expert still cover the call, and
+    an expert-scoped reading would report a covered call as naked. A double that
+    seeded only the order rows made the broker hold nothing, so the write was — quite
+    correctly — refused as uncovered.
     """
     acct_def = create_account_definition()
     account = MockAccount(acct_def.id)
@@ -206,6 +214,8 @@ def _seed_equity_position():
         filled_qty=HELD_SHARES,
         open_price=150.0,
     )
+    account._positions = [{"symbol": SYMBOL, "qty": HELD_SHARES,
+                           "asset_class": "us_equity"}]
     return account, recommendation, txn
 
 

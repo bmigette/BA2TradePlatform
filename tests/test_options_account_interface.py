@@ -85,6 +85,13 @@ def test_single_leg_long_call_persists_order_and_txn(mock_account, sample_recomm
 def test_single_sell_leg_uses_sell_limit_order_type(mock_account, sample_recommendation):
     # Covered-call write / closing a long: a single SELL leg with a POSITIVE premium
     # must yield side=SELL AND order_type=SELL_LIMIT (not BUY_LIMIT).
+    #
+    # The 100 shares are real here, not decoration: submit_option_order refuses a
+    # `covered_call` whose cover it cannot find (OPT-L1), so a naked one no longer
+    # reaches the order-type mapping this test is about. Calling it a covered call
+    # while holding nothing was the state the guard exists to stop.
+    mock_account._positions = [{"symbol": "AAPL", "qty": 100.0,
+                                "asset_class": "us_equity"}]
     leg = _OptionLeg(contract_symbol="AAPL260116C00160000", side=_Dir.SELL,
                      position_intent="sell_to_open", option_type=_Right.CALL,
                      strike=160.0, expiry=_date(2026, 1, 16), underlying="AAPL")
