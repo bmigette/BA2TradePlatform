@@ -33,6 +33,25 @@ CALIBRATION, 2026-08-25, measured against this tree rather than imagined:
     ``NOT_MEASUREMENTS`` veto because a percentage is categorically not a measurement of money.
     ``profit`` and ``capital`` were tried and cut for the same reason (forecast percentages and
     backtest config). ``filled_qty`` was dropped as redundant: ``qty`` already matches it.
+  * That veto then went one step too far, and measuring RECALL is what caught it. Replaying the
+    already-fixed instances of this bug class through the rule showed ``virtual_equity_pct or
+    100.0`` -- the "a 0% sleeve gets the whole account" defect that shipped in FOUR places at
+    once -- being silently vetoed on ``_pct``. Hence ``STOCKS_OF_MONEY``: a percentage OF a
+    stock of money is the money question wearing a "%". Cost, measured: two hits, both settings
+    defaults, both allowlisted. Within minutes of the carve-out landing it flagged a FIFTH,
+    previously unknown clone of that same defect being reintroduced in AccountInterface.
+
+RECALL, measured by replaying 32 reconstructed instances of this bug class through the rule:
+8 are caught (25%) -- below the audit's estimate of 10 of 25. The misses cluster, and the
+pattern is worth knowing before trusting a clean run:
+
+  * a CALL on the left of ``or`` (``self.get_balance() or 0.0``) -- excluded on purpose;
+  * bare truthiness with no literal at all (``and self._peak_equity``, ``if not close_price``)
+    -- the single largest miss category, and it includes one of the audit's four headline bugs;
+  * shapes that are not coercion expressions: ``return 0.0``, a tuple literal, ``x if x is not
+    None else 0.0``, a wrong constant, a cache miss serving an empty frame.
+
+This rule is a ratchet on one specific syntax, not a proof of correctness.
   * Words kept despite finding nothing today -- ``reserve``, ``premium``, ``proceeds``,
     ``payout``, ``credit``, ``debit``, ``margin``, ``nav``, ``p_l``. They cost zero noise and one
     of them names the audit's worst production bug (an unknown option RESERVE freeing buying
@@ -126,6 +145,24 @@ NOT_MEASUREMENTS = (
     "_window",
 )
 
+# ...EXCEPT when the percentage is a percentage OF A STOCK OF MONEY. A share of the equity, the
+# balance or the buying power IS the money question wearing a "%" -- ``virtual_equity_pct or
+# 100.0`` shipped in four places and turned "give this expert nothing" into "give it the entire
+# account", because the column is NOT NULL with a default of 100.0 so the coercion could only
+# ever fire on a real user-entered 0 (``tests/test_virtual_equity_zero_pct.py``).
+#
+# The distinction is stock vs flow. A percentage of a BALANCE is money. A percentage that is a
+# forecast, a price move or a configured tolerance (``expected_profit_percent``,
+# ``price_delta_pct``, ``profit_ratio``) is not, and un-vetoing those is what produced the 47
+# useless hits. Measured cost of this carve-out over the whole tree: two hits.
+STOCKS_OF_MONEY = (
+    "equity",
+    "balance",
+    "cash",
+    "notional",
+    "buying_power",
+)
+
 
 class Violation(NamedTuple):
     path: str            # repo-relative, POSIX
@@ -170,7 +207,8 @@ def _is_money_shaped(name: Optional[str]) -> bool:
         return False
     low = name.lower()
     if any(unit in low for unit in NOT_MEASUREMENTS):
-        return False
+        if not any(stock in low for stock in STOCKS_OF_MONEY):
+            return False
     return any(word in low for word in MONEY_WORDS)
 
 
@@ -338,6 +376,12 @@ ALLOWLIST: dict = {
     "testplatform/backend/app/services/data_build_handler.py:157":
         "screener CONFIG bound: an absent price_min means 'no minimum', which is what 0.0 "
         "expresses; it is not a quote",
+    "packages/experts/ba2_experts/settings_io.py:210":
+        "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
+        "carries the key explicitly, so this only fires on a pre-field export",
+    "packages/common/ba2_common/core/TradeActions.py:1529":
+        "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
+        "SETTING, a configured cap rather than a measurement of anything",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",
@@ -371,7 +415,6 @@ BASELINE: dict = {
     "ba2_trade_platform/modules/accounts/TastyTradeAccount.py": 5,
     "ba2_trade_platform/ui/pages/marketanalysishistory.py": 1,
     "ba2_trade_platform/ui/pages/overview.py": 17,
-    "ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py": 2,
     "ba2_trade_platform/ui/pages/settings.py": 2,
     "ba2_trade_platform/ui/pages/tools.py": 1,
     "ba2_trade_platform/ui/utils/portfolio_allocation_view.py": 3,
@@ -398,7 +441,7 @@ BASELINE: dict = {
     "testplatform/backend/app/services/backtest_handler.py": 1,
     "testplatform/backend/app/services/strategy_optimization_handler.py": 1,
 }
-BASELINE_TOTAL = 178
+BASELINE_TOTAL = 176
 
 
 # =========================================================================== #
@@ -662,6 +705,32 @@ def test_dot_get_with_a_non_numeric_default_is_left_alone():
 def test_a_percentage_is_vetoed_even_though_it_contains_a_money_word():
     """``price_delta_pct``/``expected_profit_percent`` contain "price"/"profit" but measure
     neither. Without the veto these were 47 of the tree's hits and none was a defect."""
+    from tests.test_no_zero_coercion import find_zero_coercions
+
+    assert find_zero_coercions("x = t.get('price_delta_pct', 0)\n", "f.py") == []
+    assert find_zero_coercions("x = rec.expected_profit_percent or 0.0\n", "f.py") == []
+
+
+def test_a_percentage_OF_A_STOCK_OF_MONEY_survives_the_veto():
+    """The veto's one carve-out, and it is not theoretical.
+
+    ``ExpertInstance.virtual_equity_pct`` is NOT NULL with a default of 100.0, so
+    ``pct or 100.0`` can only ever fire on a REAL user-entered 0 -- turning "give this expert
+    nothing" into "give it the entire account". It shipped in four places at once
+    (``tests/test_virtual_equity_zero_pct.py``). The first cut of this rule vetoed it on
+    ``_pct`` and would have let it come back, so a percentage that names a STOCK of money
+    (equity, balance, cash, notional, buying power) is exempt from the veto. Measured cost of
+    the carve-out against the whole tree: two hits, both settings defaults.
+    """
+    from tests.test_no_zero_coercion import find_zero_coercions
+
+    assert len(find_zero_coercions("x = expert.virtual_equity_pct or 100.0\n", "f.py")) == 1
+    assert len(find_zero_coercions("x = d.get('cash_balance_pct', 0)\n", "f.py")) == 1
+
+
+def test_a_percentage_of_a_FLOW_stays_vetoed():
+    """A forecast or a price delta expressed as a percentage is still not a measurement of
+    money, and un-vetoing those is what put 47 useless hits on the board."""
     from tests.test_no_zero_coercion import find_zero_coercions
 
     assert find_zero_coercions("x = t.get('price_delta_pct', 0)\n", "f.py") == []
