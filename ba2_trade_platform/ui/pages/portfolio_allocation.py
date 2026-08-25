@@ -127,12 +127,13 @@ from ..utils.portfolio_allocation_view import (
     BASIS_LEGEND, DEFAULT_LABEL_ICON_COLOR, DEFAULT_MACHINE_LABEL_FAMILIES,
     GATE_NO_ACCOUNT,
     LABEL_COLOR_PALETTE, LABEL_STATUS_CLASSES, LABEL_TARGET_CAPTION,
-    LABEL_TOOLTIP_STYLE, MARKET_SOURCE_UNAVAILABLE,
+    LABEL_TOOLTIP_STYLE, label_column_width_ch, MARKET_SOURCE_UNAVAILABLE,
     NO_LABEL_COLOR, RESERVE_BASIS_NOTE,
     GateResult, ManagedLabel,
     PositionFetchFailed, account_value_card, account_value_from_snapshot,
     build_label_bars, build_label_views,
     collect_managed_symbols, diff_managed_labels,
+    describe_label_color,
     evaluate_gate, evaluate_market_gate, even_split_label_targets,
     even_split_symbol_shares, expert_shortname_families,
     fill_label_to_100, fill_rest_symbol_shares,
@@ -141,8 +142,8 @@ from ..utils.portfolio_allocation_view import (
     format_reserve_caption,
     format_reserve_row, label_color_contrast_warning, reserve_bar,
     SHARE_DEFAULT_NOTE, symbol_total_bar, SYMBOL_TOTAL_BAR_CAPTION,
-    LABEL_TOTAL_CARD_CLASSES, LABEL_TOTAL_CARD_TITLE, LABEL_TOTAL_CARD_TOOLTIP,
-    label_total_card,
+    LABEL_TOTAL_BAR_CAPTION, LABEL_TOTAL_CLASSES, LABEL_TOTAL_TOOLTIP,
+    label_total_readout,
     load_last_label_targets,
     load_current_symbol_shares, load_last_symbol_shares, managed_total_value,
     missing_quote_symbols, picker_options, pnl_classes, positions_by_symbol,
@@ -687,12 +688,15 @@ MARKER_COLOR_CUSTOM = 'pf-color-custom'
 #: The summary stat-card row, and the reserve card that no longer sits inside it.
 MARKER_SUMMARY_ROW = 'pf-summary-row'
 MARKER_RESERVE_CARD = 'pf-reserve-card'
-#: The label-total card and its verdict line. The card was a conditional sentence
-#: under this row; it is a member of it now, built from the same ``card_classes``
-#: as every other card here. The DETAIL is marked separately because its whole
-#: signal is its colour, which a text search cannot read.
-MARKER_TOTAL_CARD = 'pf-total-card'
-MARKER_TOTAL_CARD_DETAIL = 'pf-total-card-detail'
+#: The label-total readout: a FILL BAR inside the "Managed labels" card, under the
+#: count, so one card answers "how many labels" and "how much of the pool" at
+#: once. It was briefly a card of its own beside that one. The DETAIL is marked
+#: separately because its whole signal is its colour, which a text search cannot
+#: read.
+MARKER_TOTAL_BAR_ROW = 'pf-total-bar-row'
+MARKER_TOTAL_BAR_FILL = 'pf-total-bar-fill'
+MARKER_TOTAL_BAR_NOTCH = 'pf-total-bar-notch'
+MARKER_TOTAL_BAR_DETAIL = 'pf-total-bar-detail'
 #: The totals footer under the label list. Marked because the card above it now
 #: opens with the same three words -- "Label targets total" -- so a text search
 #: finds whichever the renderer drew first, which is the card.
@@ -801,7 +805,7 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         'reserve_caption': None,
         'reserve_number': None,
         'reserve_slider': None,
-        'total_card': None,     # {'value':, 'detail':} of the label-total card
+        'total_bar': None,      # the label-total fill bar's mutable elements
         'footer': None,         # the totals line under the list
     }
 
@@ -974,12 +978,15 @@ def _apply_total_notice(live: Dict[str, Any]) -> None:
     make the total come out at 100 would be exactly it, wearing a card.
     """
     targets = _label_targets(live)
-    card = live['total_card']
-    if card is not None:
-        decided = label_total_card(targets)
-        card['value'].set_text(decided.text)
-        card['detail'].set_text(decided.detail)
-        card['detail'].classes(replace=LABEL_TOTAL_CARD_CLASSES[decided.severity])
+    widgets = live['total_bar']
+    if widgets is not None:
+        decided = label_total_readout(targets)
+        _paint_mini_bar(widgets, fraction=decided.bar.fraction,
+                        notch_fraction=decided.bar.notch_fraction,
+                        color=widgets['color'])
+        widgets['value'].set_text(decided.text)
+        widgets['detail'].set_text(decided.detail)
+        widgets['detail'].classes(replace=LABEL_TOTAL_CLASSES[decided.severity])
     footer = live['footer']
     if footer is not None:
         text, severity = format_allocation_footer(targets, live['unallocated_pct'])
@@ -1720,7 +1727,8 @@ async def _save_label_color(account_id: int, label: str, value: str,
         on_saved(resolve_label_icon_color(normalised), normalised)
 
 
-def _render_color_choices(account_id: int, label: str, current, on_saved) -> None:
+def _render_color_choices(account_id: int, label: str, current, on_saved, *,
+                          inline: bool = False) -> None:
     """The colour chooser: seven preset SWATCHES, a clear, and a custom picker.
 
     Drawn by BOTH the Manage-labels dialog and the tag icon on the label row, which
@@ -1731,12 +1739,24 @@ def _render_color_choices(account_id: int, label: str, current, on_saved) -> Non
     SWATCHES, not names. The old control was a ``ui.select`` of "Orange" / "Sky
     blue" / "Bluish green" / "Vermillion", and you cannot see what any of those look
     like -- which was the actual complaint behind "Make a color picker then". The
-    seven are still the Okabe & Ito colour-universal-design set and the reasoning is
-    still shown; they are now one-click presets above a real colour input rather
-    than the only option.
+    seven are still the Okabe & Ito colour-universal-design set; the REASONING for
+    that lives in the comments here and on ``LABEL_COLOR_PALETTE``, and no longer
+    on screen. It was a five-line paragraph rendered once PER LABEL, so a dozen
+    managed labels made the dialog mostly that paragraph -- and the behaviour it
+    described (a hard-to-see custom colour is flagged, not refused) is self-evident
+    the moment the flag appears.
+
+    ``inline`` lays the swatch row and the Custom field on ONE line instead of
+    stacking them under a caption. The dialog uses it so that every label's block
+    -- name, swatches, clear, Custom -- sits on one grid; the menu on the label row
+    keeps the stacked form, where it hangs under an icon and has no siblings to
+    line up with.
     """
-    with ui.column().classes('gap-2 p-2'):
-        ui.label('Label colour').classes('text-xs text-secondary-custom')
+    container = (ui.row().classes('items-center gap-3 no-wrap') if inline
+                 else ui.column().classes('gap-2 p-2'))
+    with container:
+        if not inline:
+            ui.label('Label colour').classes('text-xs text-secondary-custom')
         with ui.row().classes('items-center gap-2 no-wrap'):
             for name, hex_value in LABEL_COLOR_PALETTE:
                 # ``hx=hex_value`` on the handler: without the default-argument
@@ -1754,16 +1774,14 @@ def _render_color_choices(account_id: int, label: str, current, on_saved) -> Non
                 'click.stop',
                 lambda _e=None: _save_label_color(account_id, label,
                                                   NO_LABEL_COLOR, on_saved))
+        # ``w-44`` and NOT shrinking: the field shows a live ``#RRGGBB`` beside its
+        # preview swatch, and a flex row that squeezed it would clip exactly the
+        # six characters the control exists to show.
         ui.color_input(
             label='Custom', value=(current or ''), preview=True,
             on_change=lambda e: _save_label_color(account_id, label, e.value, on_saved)
         ).props(f'dense outlined debounce={COLOR_DEBOUNCE_MS}') \
-            .classes('w-44').mark(MARKER_COLOR_CUSTOM)
-        ui.label('The seven presets are Okabe & Ito’s colour-universal-design set — '
-                 'chosen to stay distinguishable under the common forms of colour '
-                 'blindness and to stay readable on this dark surface. A custom '
-                 'colour is accepted; one that is hard to see is flagged, not '
-                 'refused.').classes('text-xs text-secondary-custom max-w-[22rem]')
+            .classes('w-44 shrink-0').mark(MARKER_COLOR_CUSTOM)
 
 
 async def _persist_managed_labels(account_id: int, current: List[str],
@@ -1818,7 +1836,14 @@ def _open_label_picker(account_id: int, refresh) -> None:
     all_labels = data['all_labels']
     families = data['machine_families']
 
-    with ui.dialog() as dialog, ui.card().classes('min-w-[520px]'):
+    # WIDE ENOUGH FOR ITS CONTENT. At 520px the name column, seven swatches, the
+    # clear toggle and the Custom field did not fit on one line, so each label's
+    # block wrapped by a different amount depending on how long its name was --
+    # which is what made the swatch rows start at different x-offsets and read as
+    # broken. ``max-w-[95vw]`` so the wider dialog still fits a laptop.
+    name_width = label_column_width_ch(current)
+    with ui.dialog() as dialog, \
+            ui.card().classes('min-w-[860px] max-w-[95vw]'):
         ui.label('Managed labels').classes('text-h6')
         ui.label('Machine tags (auto_added, expert_selected, ai_selected, not_found and '
                  'the per-expert <name>-N families) are hidden — a label this account '
@@ -1846,19 +1871,32 @@ def _open_label_picker(account_id: int, refresh) -> None:
                      'it no longer has to be found in here.'
                      ).classes('text-xs text-secondary-custom')
         for label in current:
-            with ui.row().classes('w-full items-center gap-2'):
+            with ui.row().classes('w-full items-center gap-3 no-wrap'):
                 # ``lbl=label`` on BOTH the swatch and the handler: without the
                 # default-argument capture every row would recolour the last label.
-                swatch = ui.icon('label').style(
-                    f'color: {resolve_label_icon_color(colors.get(label))}')
-                ui.label(label).classes('flex-grow truncate')
+                #
+                # ONE resolution, TWO consumers: the icon and the tooltip below are
+                # written from the same ``resolved``, exactly as the label row's
+                # icon and bar are both written from ``LabelBar.color``. Two lookups
+                # of one stored value is how a yellow bar ends up beside a grey
+                # icon with no way to tell which is right.
+                resolved = resolve_label_icon_color(colors.get(label))
+                swatch = ui.icon('label').classes('shrink-0') \
+                    .style(f'color: {resolved}')
+                swatch.tooltip(describe_label_color(colors.get(label)))
+                # A FIXED column, so every block below starts at the same x. See
+                # ``label_column_width_ch``: floored so two short names still line
+                # up, capped so one absurd one cannot push the swatches off screen.
+                ui.label(label).classes('truncate shrink-0') \
+                    .style(f'width: {name_width}ch')
                 # ONE chooser, shared with the label row. ``resolve_label_icon_color``
                 # is the only thing that answers "what colour is this label", here
                 # and on the row and in the bar.
                 _render_color_choices(
                     account_id, label, colors.get(label),
                     lambda hexed, stored, sw=swatch: sw.style(
-                        replace=f'color: {hexed}'))
+                        replace=f'color: {hexed}'),
+                    inline=True)
 
         async def _close() -> None:
             dialog.close()
@@ -2315,8 +2353,15 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # The icon is also the way IN to the colour chooser: clicking it opens
             # the same widget the Manage-labels dialog draws, which is the smallest
             # thing that makes the feature findable.
+            # DRAWN UNCOLOURED, and tinted by ``_apply_bars`` from ``bar.color`` --
+            # the SAME value the fill below is painted with, in the same loop. The
+            # tooltip names which of the three colour states it is in, because "no
+            # colour chosen" and "the stored value is not a colour I will render"
+            # both resolve to the same neutral grey and only the second is
+            # something the user can put right.
             with ui.icon('label').mark(MARKER_LABEL_ICON) \
                     .classes('cursor-pointer') as icon:
+                ui.tooltip(describe_label_color(view.color))
                 with ui.menu().props('auto-close'):
                     _render_color_choices(
                         account_id, view.label, view.color,
@@ -2421,23 +2466,32 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
             ui.label(value_card.text).classes('text-lg font-bold').style(TABULAR_NUMS)
             if value_card.detail:
                 ui.label(value_card.detail).classes('text-xs text-secondary-custom')
-        with ui.column().classes(card_classes):
+        # ONE CARD, BOTH HALVES OF ONE QUESTION: how many labels, and how much of
+        # the investable pool they add up to. The running total was a conditional
+        # sentence under this row -- present only when the set was WRONG, so
+        # missing at exactly the moment the user was typing towards 100 -- and then
+        # briefly a card of its own. It is a fill bar under the count now, on the
+        # SAME ``build_share_bar`` and the same track as the per-label symbol-share
+        # bar and the unallocated bar: three scopes of one idea.
+        with ui.column().classes(card_classes) as labels_card:
             ui.label('Managed labels').classes('text-xs text-secondary-custom')
             ui.label(str(len(views))).classes('text-lg font-bold')
-        # THE RUNNING TOTAL, as a card rather than as the conditional sentence it
-        # used to be under this row. Same ``card_classes`` as the three beside it
-        # -- one card component, because a forked second style is how this row
-        # goes ragged again the next time either is touched. Its figure and its
-        # verdict are rewritten in place by ``_apply_total_notice`` on every edit.
-        with ui.column().classes(card_classes).mark(MARKER_TOTAL_CARD) as total_card:
-            ui.label(LABEL_TOTAL_CARD_TITLE).classes('text-xs text-secondary-custom')
-            total_value = ui.label('').classes('text-lg font-bold').style(TABULAR_NUMS)
-            total_detail = ui.label('').mark(MARKER_TOTAL_CARD_DETAIL)
+            with ui.row().classes('w-full items-center gap-2 no-wrap') \
+                    .style(TABULAR_NUMS).mark(MARKER_TOTAL_BAR_ROW):
+                total_widgets = _render_mini_bar(
+                    fill_marker=MARKER_TOTAL_BAR_FILL,
+                    notch_marker=MARKER_TOTAL_BAR_NOTCH)
+                total_widgets['value'] = ui.label('').classes('text-xs text-right')
+            # The denominator, said out loud: this page carries three of these bars
+            # and they divide three different things.
+            ui.label(LABEL_TOTAL_BAR_CAPTION).classes('text-xs text-secondary-custom')
+            total_widgets['detail'] = ui.label('').mark(MARKER_TOTAL_BAR_DETAIL)
+            total_widgets['color'] = DEFAULT_LABEL_ICON_COLOR
             # At EVERY state, because the "use the Unallocated box" guidance rides
             # inside the SHORTFALL sentence and vanishes the moment the set is
             # right -- which is exactly when a user decides to leave a gap.
-            total_card.tooltip(LABEL_TOTAL_CARD_TOOLTIP)
-        live['total_card'] = {'value': total_value, 'detail': total_detail}
+            labels_card.tooltip(LABEL_TOTAL_TOOLTIP)
+        live['total_bar'] = total_widgets
         if buying_power is not None:
             with ui.column().classes(card_classes):
                 ui.label('Free buying power').classes('text-xs text-secondary-custom')

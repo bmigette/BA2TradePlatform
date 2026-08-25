@@ -441,6 +441,58 @@ def resolve_label_icon_color(stored) -> str:
     return '#' + text[1:].upper()
 
 
+#: The Manage-labels dialog's name column, in ``ch`` -- the width of a "0", which
+#: is the closest CSS gets to "this many characters" in a proportional font.
+#:
+#: A FLOOR and a CAP rather than "as wide as the longest name". The floor is what
+#: makes every block start at the same x when the managed set is two short names,
+#: instead of the column jumping the moment a third is added -- and blocks starting
+#: at different offsets is precisely what made the dialog read as broken. The cap
+#: stops one absurd label from pushing the swatches off the edge; that one name
+#: truncates, and it is the only one that does.
+LABEL_COLUMN_MIN_CH = 16
+LABEL_COLUMN_MAX_CH = 32
+
+#: What a label's colour state is CALLED, for the tag icon's tooltip. All three
+#: states below render through ``resolve_label_icon_color``, and two of them render
+#: the SAME neutral grey -- the parse decides what may reach a CSS ``style``
+#: attribute and that is not negotiable. They are still different facts, and only
+#: one of them is something the user can put right, so the tooltip separates what
+#: the pixels cannot.
+LABEL_COLOR_NONE_NOTE = ('No colour chosen — this label draws in the neutral '
+                         'default. Pick a swatch to give it one.')
+LABEL_COLOR_CHOSEN_FMT = '{color} — click to change it, or clear it.'
+LABEL_COLOR_IGNORED_FMT = (
+    '{stored!r} is stored for this label but is not a colour this page will '
+    'render, so it is IGNORED and the neutral default is drawn instead. Pick a '
+    'swatch to replace it.')
+
+
+def label_column_width_ch(labels) -> int:
+    """How wide the dialog's name column has to be, in ``ch``. Pure.
+
+    Bounded by ``LABEL_COLUMN_MIN_CH`` and ``LABEL_COLUMN_MAX_CH``; see those.
+    """
+    longest = max((len(str(name or '')) for name in (labels or [])), default=0)
+    return max(LABEL_COLUMN_MIN_CH, min(LABEL_COLUMN_MAX_CH, longest))
+
+
+def describe_label_color(stored) -> str:
+    """The tag icon's tooltip: which of the three colour states this label is in.
+
+    Pure, and deliberately the ONLY place the "no colour" and "unreadable" cases
+    are told apart on screen: they resolve to the same drawable grey, so without
+    this a row carrying a value the renderer refuses looks identical to one the
+    user deliberately cleared -- and only the first is a thing to fix.
+    """
+    if stored is None or not str(stored).strip():
+        return LABEL_COLOR_NONE_NOTE
+    resolved = resolve_label_icon_color(stored)
+    if resolved == DEFAULT_LABEL_ICON_COLOR and _rgb(str(stored).strip()) is None:
+        return LABEL_COLOR_IGNORED_FMT.format(stored=str(stored).strip())
+    return LABEL_COLOR_CHOSEN_FMT.format(color=resolved)
+
+
 @dataclass
 class ManagedLabel:
     """One managed label as the page reads it out of ``portfolio_allocation_label``.
@@ -2547,50 +2599,60 @@ def format_label_total_notice(targets,
 
 
 # ---------------------------------------------------------------------------
-# THE LABEL-TOTAL CARD
+# THE LABEL-TOTAL READOUT
 #
 # The running total was a sentence under the stat cards that appeared only when
 # the set was WRONG -- so the one moment the user most wanted it, while typing
-# towards 100, was the one moment it said nothing. It is a card now, in the same
-# row and built from the same ``card_classes`` as "Managed labels": the figure is
-# always there and the verdict rides along as its detail.
+# towards 100, was the one moment it said nothing.
 #
-# ONE PREDICATE, THREE READOUTS. ``judge_label_total`` is what the card, the
-# advisory and the totals footer all ask, so a card calling 118% fine while the
-# footer calls it an error is not reachable.
+# It is a FILL BAR inside the "Managed labels" card now, under the count, so one
+# card answers both halves of one question: how many labels, and how much of the
+# pool they add up to. It is the same ``build_share_bar`` as the per-label
+# symbol-share bar and the unallocated bar -- three scopes of one idea, and if
+# they looked different the user would have to learn three things.
+#
+# ONE PREDICATE, THREE READOUTS. ``judge_label_total`` is what this, the advisory
+# and the totals footer all ask, so a bar calling 118% fine while the footer calls
+# it an error is not reachable.
 #
 # The denominator is the INVESTABLE POOL, and the reserve does not enter it: the
 # labels divide what the reserve LEAVES, so 100 typed across them is 100 at every
 # reserve. Netting the reserve out here would call a correct set "under by 10".
+# The caption says so out loud, because the three bars have three denominators.
 # ---------------------------------------------------------------------------
 
-LABEL_TOTAL_CARD_TITLE = 'Label targets total'
+LABEL_TOTAL_TITLE = 'Label targets total'
+
+#: Beside the bar, naming ITS denominator. The per-label bar says "shares of this
+#: label" for the same reason: two bars two inches apart on two denominators is
+#: the collision this page has spent its life unpicking.
+LABEL_TOTAL_BAR_CAPTION = 'of the investable pool'
 
 #: Said when the set is right. It states the denominator rather than just ticking,
 #: because "100.00%" alone does not say 100% OF WHAT -- and this page carries three
 #: different denominators within two inches of each other.
-LABEL_TOTAL_CARD_ON_TARGET = ('on target — the labels divide the whole investable '
+LABEL_TOTAL_ON_TARGET = ('on target — the labels divide the whole investable '
                               'pool')
 
 #: ...and when there are no labels at all. Not the on-target sentence: nothing has
 #: been asked of an unmanaged account and reporting it as correct is approval of a
 #: decision nobody made.
-LABEL_TOTAL_CARD_EMPTY = 'no managed labels yet — nothing is allocated'
+LABEL_TOTAL_EMPTY = 'no managed labels yet — nothing is allocated'
 
 #: The card's tooltip, drawn at EVERY state. The shortfall sentence carries the
 #: "use the Unallocated box" guidance only while the set is short, and that is the
 #: one fact a user needs BEFORE they leave a gap on purpose -- so it is repeated
 #: here where it is always readable.
-LABEL_TOTAL_CARD_TOOLTIP = (
+LABEL_TOTAL_TOOLTIP = (
     'Every label target is a share of the investable pool — what the cash reserve '
     'leaves — so they add up to 100%. To hold money back, raise the Unallocated '
     'reserve rather than leaving a shortfall here: a shortfall and a reserve '
     'produce the same numbers and only you can tell which one you meant.')
 
-#: Severity -> stylesheet classes for the card's detail line. Same vocabulary as
-#: ``LABEL_TOTAL_NOTICE_CLASSES`` and ``FOOTER_CLASSES``, plus the 'ok' key those
-#: two express differently, so the card can always draw something.
-LABEL_TOTAL_CARD_CLASSES = {
+#: Severity -> stylesheet classes for the readout's detail line. Same vocabulary
+#: as ``LABEL_TOTAL_NOTICE_CLASSES`` and ``FOOTER_CLASSES``, plus the 'ok' key
+#: those two express differently, so the readout can always draw something.
+LABEL_TOTAL_CLASSES = {
     'ok': 'text-xs text-secondary-custom',
     'warning': 'text-xs text-orange-400',
     'negative': 'text-xs text-red-400 font-bold',
@@ -2600,7 +2662,7 @@ LABEL_TOTAL_CARD_CLASSES = {
 def judge_label_total(targets, tolerance: float = LABEL_TOTAL_TOLERANCE_PCT):
     """``(total, severity, sentence)`` for one set of label targets. Pure.
 
-    THE predicate. ``format_label_total_notice``, ``label_total_card`` and (through
+    THE predicate. ``format_label_total_notice``, ``label_total_readout`` and (through
     its own copy of the same band) ``format_allocation_footer`` all reach their
     verdict here, so the three readouts of one set cannot describe it differently.
 
@@ -2618,39 +2680,51 @@ def judge_label_total(targets, tolerance: float = LABEL_TOTAL_TOLERANCE_PCT):
     if total < 100.0 - tolerance:
         return total, 'warning', ERROR_LABEL_UNDER_FMT.format(
             total=total, under=100.0 - total)
-    return total, 'ok', LABEL_TOTAL_CARD_ON_TARGET
+    return total, 'ok', LABEL_TOTAL_ON_TARGET
 
 
 @dataclass
-class LabelTotalCard:
-    """The 'Label targets total' summary card, decided. Pure.
+class LabelTotalReadout:
+    """The 'Label targets total' fill bar, decided. Pure.
 
     ``text`` is ALWAYS a figure -- that is the whole reason this stopped being a
     conditional sentence. ``detail`` is the engine's own wording when the set is
     off and a denominator-naming clause when it is not; ``severity`` keys
-    ``LABEL_TOTAL_CARD_CLASSES``.
+    ``LABEL_TOTAL_CLASSES``.
+
+    ``bar`` comes off the SAME ``build_share_bar`` as the per-label symbol-share
+    bar and the unallocated bar, so the three read as one idea at three scopes
+    rather than as three widgets that happen to be rectangles.
     """
     title: str
     text: str
     detail: str
     severity: str
+    bar: ShareBar
 
 
-def label_total_card(targets,
-                     tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> LabelTotalCard:
-    """Build the label-total card. Pure; never raises.
+def label_total_readout(
+        targets,
+        tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> LabelTotalReadout:
+    """Build the label-total readout and its bar. Pure; never raises.
 
     An account managing NOTHING reports 0.00% at severity 'ok' with its own
     sentence: there is no set to be wrong, so calling it an error would tell the
     user off for not having configured a page they have just opened -- and the
-    empty-state banner already says what to do.
+    empty-state banner already says what to do. Its bar carries no verdict either,
+    for the same reason: a full-looking or empty-looking track on an unconfigured
+    account is a claim about a decision nobody has made.
     """
     total, severity, sentence = judge_label_total(targets, tolerance)
     if not targets:
-        return LabelTotalCard(title=LABEL_TOTAL_CARD_TITLE, text='0.00%',
-                              detail=LABEL_TOTAL_CARD_EMPTY, severity='ok')
-    return LabelTotalCard(title=LABEL_TOTAL_CARD_TITLE, text=f'{total:.2f}%',
-                          detail=sentence, severity=severity)
+        return LabelTotalReadout(
+            title=LABEL_TOTAL_TITLE, text='0.00%', detail=LABEL_TOTAL_EMPTY,
+            severity='ok',
+            bar=build_share_bar(current_pct=None, target_pct=100.0))
+    return LabelTotalReadout(
+        title=LABEL_TOTAL_TITLE, text=f'{total:.2f}%', detail=sentence,
+        severity=severity,
+        bar=build_share_bar(current_pct=round(total, 2), target_pct=100.0))
 
 
 def reserve_dollars(base_notional: Optional[float],

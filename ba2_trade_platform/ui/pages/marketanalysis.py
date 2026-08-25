@@ -357,10 +357,16 @@ class JobMonitoringTab:
                         <q-tooltip>View Analysis Details</q-tooltip>
                     </q-btn>
                     <q-btn v-if="props.row.has_evaluation_data"
-                           flat dense icon="search" 
-                           color="secondary" 
+                           flat dense icon="search"
+                           color="secondary"
                            @click="$parent.$emit('view_rule_evaluation', props.row.id)">
                         <q-tooltip>View Rule Evaluation Details</q-tooltip>
+                    </q-btn>
+                    <q-btn v-if="props.row.evaluation_redacted"
+                           flat dense icon="history"
+                           color="grey"
+                           @click="$parent.$emit('view_rule_evaluation', props.row.id)">
+                        <q-tooltip>Rule evaluation payload reclaimed for age</q-tooltip>
                     </q-btn>
                     <q-btn v-if="props.row.can_cancel" 
                            flat dense icon="cancel" 
@@ -1245,25 +1251,34 @@ class JobMonitoringTab:
             return [], 0
     
     def _populate_evaluation_data_flags(self, paginated_data: List[dict]):
-        """Populate has_evaluation_data flags for current page items only.
-        
+        """Populate has_evaluation_data / evaluation_redacted flags for current page items.
+
         OPTIMIZATION: Uses batch query to check for evaluation data
         instead of N+1 lazy-loading queries for all records.
         Only called for current page (10-25 items), not all cached records.
-        
+
+        TWO FLAGS, NOT ONE. Age-based retention (``core.cleanup``) replaces an old
+        ``TradeActionResult.data`` payload with a redaction sentinel. That sentinel is a
+        non-empty dict without ``evaluation_details``, so a single boolean would report it
+        exactly like an action that never recorded anything — and the magnifying glass
+        would silently vanish with no way to learn why. ``evaluation_redacted`` gets its
+        own icon instead.
+
         Args:
             paginated_data: List of formatted analysis records (current page only)
         """
         if not paginated_data:
             return
-        
+
         try:
+            from ...core.cleanup import describe_redaction, payload_evaluation_details
+
             # Get analysis IDs for current page
             analysis_ids = [item['id'] for item in paginated_data]
-            
+
             with get_db() as session:
                 from ...core.models import TradeActionResult
-                
+
                 # Query: Get market_analysis_id and data for all TradeActionResults
                 # related to recommendations for these analyses
                 stmt = (
@@ -1277,21 +1292,28 @@ class JobMonitoringTab:
                         TradeActionResult.data.isnot(None)
                     )
                 )
-                
-                # Build set of analysis IDs with evaluation data
+
+                # Build sets of analysis IDs with (a) evaluation data and (b) a payload
+                # that USED to hold some and was reclaimed for age.
                 analysis_ids_with_eval = set()
+                analysis_ids_redacted = set()
                 for market_analysis_id, data in session.execute(stmt):
-                    if data and isinstance(data, dict) and 'evaluation_details' in data:
+                    if payload_evaluation_details(data) is not None:
                         analysis_ids_with_eval.add(market_analysis_id)
-            
-            # Update the paginated data in-place
+                    elif describe_redaction(data) is not None:
+                        analysis_ids_redacted.add(market_analysis_id)
+
+            # Update the paginated data in-place. Surviving detail wins over a sibling's
+            # redaction: there is something to show, so show it.
             for item in paginated_data:
-                item['has_evaluation_data'] = item['id'] in analysis_ids_with_eval
-        
+                has_eval = item['id'] in analysis_ids_with_eval
+                item['has_evaluation_data'] = has_eval
+                item['evaluation_redacted'] = (not has_eval) and item['id'] in analysis_ids_redacted
+
         except Exception as e:
             logger.warning(f"Error populating evaluation data flags: {e}")
             # Leave all as False on error
-    
+
     def _format_analysis_records_simple(self, market_analyses, expert_instances=None, account_names=None) -> List[dict]:
         """Format raw market analysis records into displayable data.
         
@@ -1442,6 +1464,7 @@ class JobMonitoringTab:
                     'subtype': subtype_display,
                     'can_cancel': can_cancel,
                     'has_evaluation_data': False,  # Populated later by _populate_evaluation_data_flags()
+                    'evaluation_redacted': False,  # ditto: payload reclaimed by age-based retention
                     'expert_instance_id': analysis.expert_instance_id,
                     'actions': 'actions'
                 })
@@ -1793,29 +1816,34 @@ class JobMonitoringTab:
             
             # Load evaluation details from the analysis
             from ..components.RuleEvaluationDisplay import render_rule_evaluations
-            
+            from ...core.cleanup import summarize_action_result_payloads
+
             with get_db() as session:
                 # Get the analysis with recommendations
                 analysis = session.get(MarketAnalysis, analysis_id)
                 if not analysis:
                     ui.notify('Analysis not found', type='warning')
                     return
-                
-                # Find evaluation details from any recommendation's trade action results
-                evaluation_data = None
-                for rec in analysis.expert_recommendations:
-                    if hasattr(rec, 'trade_action_results') and rec.trade_action_results:
-                        for result in rec.trade_action_results:
-                            if result.data and 'evaluation_details' in result.data:
-                                evaluation_data = result.data['evaluation_details']
-                                break
-                    if evaluation_data:
-                        break
-                
-                if not evaluation_data:
-                    ui.notify('No rule evaluation details found for this analysis', type='warning')
+
+                # Find evaluation details from any recommendation's trade action results.
+                # summarize_action_result_payloads() is what tells "this analysis never
+                # recorded a rule evaluation" from "its payload was reclaimed for age" —
+                # a redaction sentinel looks like the former to a naive membership test.
+                payloads = [result.data
+                            for rec in analysis.expert_recommendations
+                            for result in (getattr(rec, 'trade_action_results', None) or [])]
+                summary = summarize_action_result_payloads(payloads)
+                evaluation_data = summary['evaluation_details']
+
+                if not summary['has_evaluation_details']:
+                    if summary['redaction_note']:
+                        ui.notify(f"Rule evaluation details are no longer stored. "
+                                  f"{summary['redaction_note']}", type='warning')
+                    else:
+                        ui.notify('No rule evaluation details found for this analysis',
+                                  type='warning')
                     return
-                
+
                 # Show dialog with evaluation details
                 with ui.dialog() as eval_dialog, ui.card().classes('w-full max-w-4xl'):
                     ui.label('🔍 Rule Evaluation Details').classes('text-h6 mb-4')
@@ -3939,12 +3967,19 @@ class OrderRecommendationsTab:
                                    @click="$parent.$emit('troubleshoot_ruleset_rec', props.row.analysis_id)">
                                 <q-tooltip>Troubleshoot Ruleset</q-tooltip>
                             </q-btn>
-                            <q-btn v-if="props.row.has_evaluation_data" 
-                                   icon="search" 
-                                   flat 
-                                   dense 
-                                   color="secondary" 
+                            <q-btn v-if="props.row.has_evaluation_data"
+                                   icon="search"
+                                   flat
+                                   dense
+                                   color="secondary"
                                    title="View Rule Evaluation Details"
+                                   @click="$parent.$emit('view_evaluation', props.row.id)" />
+                            <q-btn v-if="props.row.evaluation_redacted"
+                                   icon="history"
+                                   flat
+                                   dense
+                                   color="grey"
+                                   title="Evaluation payload reclaimed for age"
                                    @click="$parent.$emit('view_evaluation', props.row.id)" />
                         </q-td>
                     ''')
@@ -3993,18 +4028,20 @@ class OrderRecommendationsTab:
                     
                     # Check for TradeActionResult with evaluation details
                     from ...core.models import TradeActionResult
+                    from ...core.cleanup import summarize_action_result_payloads
                     action_result_statement = select(TradeActionResult).where(
                         TradeActionResult.expert_recommendation_id == recommendation.id
                     )
                     action_results = session.exec(action_result_statement).all()
-                    
-                    # Check if any action result has evaluation_details in data
-                    has_evaluation_data = False
-                    for result in action_results:
-                        if result.data and 'evaluation_details' in result.data:
-                            has_evaluation_data = True
-                            break
-                    
+
+                    # Two flags, not one: an age-reclaimed payload is a non-empty dict
+                    # WITHOUT evaluation_details, so a single boolean would report it
+                    # identically to an action that never recorded any. See
+                    # core.cleanup.summarize_action_result_payloads.
+                    summary = summarize_action_result_payloads(r.data for r in action_results)
+                    has_evaluation_data = summary['has_evaluation_details']
+                    evaluation_redacted = summary['redaction_note'] is not None
+
                     # Determine order status for this recommendation
                     has_non_pending_order = any(order.status != OrderStatus.PENDING for order in existing_orders)
                     has_pending_order = any(order.status == OrderStatus.PENDING for order in existing_orders)
@@ -4061,6 +4098,7 @@ class OrderRecommendationsTab:
                         'has_pending_order': has_pending_order,
                         'existing_orders_count': len(existing_orders),
                         'has_evaluation_data': has_evaluation_data,  # NEW: Flag for showing magnifying glass icon
+                        'evaluation_redacted': evaluation_redacted,  # payload reclaimed by age-based retention
                         'actions': 'actions'
                     })
                 
@@ -4215,25 +4253,28 @@ class OrderRecommendationsTab:
             # Load TradeActionResult with evaluation details
             from ...core.models import TradeActionResult
             from ..components.RuleEvaluationDisplay import render_rule_evaluations
-            
+            from ...core.cleanup import summarize_action_result_payloads
+
             with get_db() as session:
                 # Get action results for this recommendation
                 statement = select(TradeActionResult).where(
                     TradeActionResult.expert_recommendation_id == recommendation_id
                 )
                 action_results = session.exec(statement).all()
-                
-                # Find the first result with evaluation_details
-                evaluation_data = None
-                for result in action_results:
-                    if result.data and 'evaluation_details' in result.data:
-                        evaluation_data = result.data['evaluation_details']
-                        break
-                
-                if not evaluation_data:
-                    ui.notify('No evaluation details found', type='warning')
+
+                # "Never recorded any" and "reclaimed for age" are different facts and
+                # get different sentences — see core.cleanup.
+                summary = summarize_action_result_payloads(r.data for r in action_results)
+                evaluation_data = summary['evaluation_details']
+
+                if not summary['has_evaluation_details']:
+                    if summary['redaction_note']:
+                        ui.notify(f"Evaluation details are no longer stored. "
+                                  f"{summary['redaction_note']}", type='warning')
+                    else:
+                        ui.notify('No evaluation details found', type='warning')
                     return
-                
+
                 # Show dialog with evaluation details
                 with ui.dialog() as eval_dialog, ui.card().classes('w-full max-w-4xl'):
                     ui.label('🔍 Rule Evaluation Details').classes('text-h6 mb-4')

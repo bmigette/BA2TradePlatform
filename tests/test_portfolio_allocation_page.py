@@ -6189,35 +6189,69 @@ def _card_titles(root):
 
 
 def _total_card_texts(root, index=0):
-    return [el._text for el in
-            _marked(root, page.MARKER_TOTAL_CARD)[index].descendants() if el._text]
+    """Every text under the "Managed labels" card, which now HOLDS the total bar."""
+    row = _marked(root, page.MARKER_TOTAL_BAR_ROW)[index]
+    return [el._text for el in row.parent_slot.parent.descendants() if el._text]
 
 
-def test_the_label_total_is_a_CARD_in_the_top_row(nicegui_client, account_id):
+def test_the_label_total_is_a_FILL_BAR_inside_the_managed_labels_card(
+        nicegui_client, account_id):
+    """Not a fourth card beside it: ONE card answering both halves of one question
+    -- how many labels, and how much of the pool they add up to."""
     root = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=30.0))
-    card = _marked(root, page.MARKER_TOTAL_CARD)
+    rows = _marked(root, page.MARKER_TOTAL_BAR_ROW)
 
-    assert len(card) == 1
-    # ...inside the summary row, beside the other stat cards.
-    assert card[0] in list(_marked(root, page.MARKER_SUMMARY_ROW)[0].descendants())
-    assert _view_mod().LABEL_TOTAL_CARD_TITLE in _total_card_texts(root)
+    assert len(rows) == 1
+    assert len(_marked(root, page.MARKER_TOTAL_BAR_FILL)) == 1
+    # ...inside the summary row, and inside the card that carries the COUNT.
+    assert rows[0] in list(_marked(root, page.MARKER_SUMMARY_ROW)[0].descendants())
+    texts = _total_card_texts(root)
+    assert 'Managed labels' in texts and '2' in texts
 
 
-def test_the_total_card_reuses_the_managed_labels_card_component(nicegui_client,
-                                                                 account_id):
-    """One card style, not two. A forked second style is how the row goes ragged
-    again the next time either is touched."""
+def test_the_total_bar_names_its_own_denominator(nicegui_client, account_id):
+    """Three bars on this page divide three different things."""
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    assert _view_mod().LABEL_TOTAL_BAR_CAPTION in _total_card_texts(root)
+
+
+def test_the_total_bar_FILLS_in_proportion_to_the_total(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=35.0))
+
+    assert _marked(root, page.MARKER_TOTAL_BAR_FILL)[0]._style['width'] == '75.00%'
+
+
+def test_the_summary_row_keeps_ONE_card_style(nicegui_client, account_id):
+    """A forked second style is how the row goes ragged again the next time any of
+    them is touched."""
     root = _draw(nicegui_client, account_id, _two_labels(account_id))
     summary = _marked(root, page.MARKER_SUMMARY_ROW)[0]
     cards = [el for el in summary.descendants()
              if 'stat-card' in ' '.join(el._classes)]
     styles = {' '.join(sorted(el._classes)) for el in cards}
 
-    assert len(cards) >= 4
+    assert len(cards) >= 3
     assert len(styles) == 1, styles
 
 
-def test_the_total_card_shows_the_figure_even_when_the_set_is_RIGHT(nicegui_client,
+def test_the_total_bar_is_the_SAME_component_as_the_other_two(nicegui_client,
+                                                              account_id):
+    """Three scopes of one idea. Three tracks drawn three ways is three things for
+    the user to learn."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=10.0),
+                 base=5_260.9, buying_power=245.50, reserve=10.0)
+
+    tracks = [el.parent_slot.parent for marker in (page.MARKER_TOTAL_BAR_FILL,
+                                                   page.MARKER_SYMBOL_BAR_FILL,
+                                                   page.MARKER_RESERVE_BAR_FILL)
+              for el in _marked(root, marker)]
+    assert len(tracks) == 3
+    assert {page.BAR_TRACK_STYLE.rstrip(';')} == {
+        ';'.join(f'{k}:{v}' for k, v in t._style.items()) for t in tracks}
+
+
+def test_the_total_bar_shows_the_figure_even_when_the_set_is_RIGHT(nicegui_client,
                                                                     account_id):
     """The old sentence appeared only when the set was wrong, so the running total
     was missing at exactly the moment the user was typing towards it."""
@@ -6226,7 +6260,7 @@ def test_the_total_card_shows_the_figure_even_when_the_set_is_RIGHT(nicegui_clie
     assert '100.00%' in _total_card_texts(root)
 
 
-def test_the_total_card_carries_the_engines_shortfall_sentence(nicegui_client,
+def test_the_total_bar_carries_the_engines_shortfall_sentence(nicegui_client,
                                                                account_id):
     root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=35.0))
     texts = _total_card_texts(root)
@@ -6235,19 +6269,20 @@ def test_the_total_card_carries_the_engines_shortfall_sentence(nicegui_client,
     assert any('under 100%' in t and 'Unallocated box' in t for t in texts)
 
 
-def test_the_total_card_keeps_the_guidance_reachable_at_every_state(nicegui_client,
+def test_the_total_bar_keeps_the_guidance_reachable_at_every_state(nicegui_client,
                                                                     account_id):
     """The "use the Unallocated box" clause rides inside the SHORTFALL sentence, so
     it vanishes the moment the set is right or over. The tooltip carries it at
     every state, which is when a user decides to leave a gap on purpose."""
     root = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=30.0))
-    tips = _tooltip_texts(_marked(root, page.MARKER_TOTAL_CARD)[0])
+    card = _marked(root, page.MARKER_TOTAL_BAR_ROW)[0].parent_slot.parent
+    tips = _tooltip_texts(card)
 
     assert len(tips) == 1
     assert 'Unallocated reserve' in tips[0]
 
 
-def test_the_total_card_follows_an_inline_target_edit_IN_REAL_TIME(nicegui_client,
+def test_the_total_bar_follows_an_inline_target_edit_IN_REAL_TIME(nicegui_client,
                                                                    account_id):
     root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
     assert '70.00%' in _total_card_texts(root)
@@ -6258,7 +6293,7 @@ def test_the_total_card_follows_an_inline_target_edit_IN_REAL_TIME(nicegui_clien
     assert '70.00%' not in _total_card_texts(root)
 
 
-def test_the_total_card_follows_the_label_level_EVEN_SPLIT(monkeypatch,
+def test_the_total_bar_follows_the_label_level_EVEN_SPLIT(monkeypatch,
                                                            nicegui_client,
                                                            account_id):
     _capture_notifications(monkeypatch)
@@ -6269,7 +6304,7 @@ def test_the_total_card_follows_the_label_level_EVEN_SPLIT(monkeypatch,
     assert '100.00%' in _total_card_texts(root)
 
 
-def test_the_total_card_follows_the_label_level_LOAD_LAST(monkeypatch,
+def test_the_total_bar_follows_the_label_level_LOAD_LAST(monkeypatch,
                                                           nicegui_client,
                                                           account_id):
     _capture_notifications(monkeypatch)
@@ -6281,7 +6316,7 @@ def test_the_total_card_follows_the_label_level_LOAD_LAST(monkeypatch,
     assert '100.00%' in _total_card_texts(root)
 
 
-def test_the_total_card_does_NOT_move_for_a_SYMBOL_level_press(monkeypatch,
+def test_the_total_bar_does_NOT_move_for_a_SYMBOL_level_press(monkeypatch,
                                                                nicegui_client,
                                                                account_id):
     """Fill 100% and Wipe rewrite shares WITHIN a label; the label's own target is
@@ -6300,7 +6335,7 @@ def test_the_total_card_does_NOT_move_for_a_SYMBOL_level_press(monkeypatch,
     assert _total_card_texts(root) == before
 
 
-def test_the_total_cards_verdict_is_COLOURED_by_its_severity(nicegui_client,
+def test_the_total_bars_verdict_is_COLOURED_by_its_severity(nicegui_client,
                                                               account_id):
     """Orange short, red over. An over-100 set is not reachable through the inline
     box -- ``validate_label_target_edit`` refuses the keystroke -- but the DATABASE
@@ -6308,18 +6343,18 @@ def test_the_total_cards_verdict_is_COLOURED_by_its_severity(nicegui_client,
     the card has to say so before the user presses Allocate."""
     short = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
     assert 'text-orange-400' in ' '.join(
-        _marked(short, page.MARKER_TOTAL_CARD_DETAIL)[0]._classes)
+        _marked(short, page.MARKER_TOTAL_BAR_DETAIL)[0]._classes)
 
     over = _draw(nicegui_client, account_id, _two_labels(account_id, a=70.0, b=48.0))
-    detail = _marked(over, page.MARKER_TOTAL_CARD_DETAIL)[-1]
+    detail = _marked(over, page.MARKER_TOTAL_BAR_DETAIL)[-1]
     assert 'text-red-400' in ' '.join(detail._classes)
     assert '118.00%' in _total_card_texts(over, -1)
 
 
-def test_the_total_cards_verdict_goes_QUIET_once_the_set_is_right(nicegui_client,
+def test_the_total_bars_verdict_goes_QUIET_once_the_set_is_right(nicegui_client,
                                                                   account_id):
     root = _draw(nicegui_client, account_id, _two_labels(account_id, a=40.0, b=30.0))
-    detail = _marked(root, page.MARKER_TOTAL_CARD_DETAIL)[0]
+    detail = _marked(root, page.MARKER_TOTAL_BAR_DETAIL)[0]
     assert 'text-orange-400' in ' '.join(detail._classes)
 
     _drive_value(_target_box(root, 0), 70.0)
@@ -6751,3 +6786,159 @@ def test_all_three_bars_share_one_track_style(nicegui_client, account_id):
     assert len(tracks) == 3
     assert {page.BAR_TRACK_STYLE.rstrip(';')} == {
         ';'.join(f'{k}:{v}' for k, v in t._style.items()) for t in tracks}
+
+
+# ---------------------------------------------------------------------------
+# THE MANAGE-LABELS DIALOG, after the user looked at it
+# ---------------------------------------------------------------------------
+
+def _picker(monkeypatch, nicegui_client, account_id, labels):
+    _capture_notifications(monkeypatch)
+    for name, color in labels.items():
+        set_managed_label(account_id, name, target_pct=0.0, color=color or '')
+        add_label_to_instruments(['AAPL'], name)
+    with nicegui_client:
+        page._open_label_picker(account_id, _noop_refresh)
+    return nicegui_client.layout
+
+
+def test_the_dialog_no_longer_repeats_the_colour_blindness_paragraph(
+        monkeypatch, nicegui_client, account_id):
+    """It was rendered once PER LABEL, so a dozen labels made the dialog mostly
+    that paragraph. The rationale stays in the code, where it explains why the
+    palette is what it is; the behaviour it described -- a hard-to-see colour is
+    flagged, not refused -- is self-evident when the flag appears."""
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_CARS': '#E69F00', 'WHEEL_L1_HR': None})
+    text = ' '.join(_texts(root))
+
+    assert 'Okabe' not in text
+    assert 'colour blindness' not in text
+    assert 'flagged, not' not in text
+
+
+def test_the_flagging_BEHAVIOUR_survives_the_deleted_copy(monkeypatch,
+                                                          nicegui_client,
+                                                          account_id):
+    """The paragraph went; the warning it described did not."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    sent = _capture_notifications(monkeypatch)
+    with nicegui_client:
+        page._render_color_choices(account_id, 'ARK26', None, lambda *_a: None)
+        _drive_value(_marked(nicegui_client.layout, page.MARKER_COLOR_CUSTOM)[0],
+                     '#101010')
+
+    assert get_managed_labels(account_id)[0].color == '#101010'
+    assert any('contrast' in m.lower() and t == 'warning' for m, t in sent)
+
+
+def test_every_label_block_in_the_dialog_starts_at_the_SAME_x(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    """The visible symptom: swatch rows indented differently between labels. A
+    fixed name column is what puts them on one grid."""
+    from nicegui import ui
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_ROBOT': '#E69F00', 'WHEEL_L1_HR': None,
+                    'X': '#0072B2'})
+    names = [el for el in root.descendants()
+             if isinstance(el, ui.label) and el._text in ('BAST_TECH_ROBOT',
+                                                          'WHEEL_L1_HR', 'X')]
+
+    assert len(names) == 3
+    widths = {(el._style or {}).get('width') for el in names}
+    # An explicit width, and the SAME one. Before this the names carried none at
+    # all -- which is also a set of size one, so the assertion has to say that a
+    # width exists or it passes on the broken layout it was written for.
+    assert len(widths) == 1, widths
+    assert widths != {None}
+    assert widths.pop().endswith('ch')
+
+
+def test_the_name_column_fits_the_longest_managed_label(monkeypatch,
+                                                        nicegui_client,
+                                                        account_id):
+    from nicegui import ui
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_ROBOT': None, 'X': None})
+    name = next(el for el in root.descendants()
+                if isinstance(el, ui.label) and el._text == 'BAST_TECH_ROBOT')
+
+    width = int((name._style or {})['width'].removesuffix('ch'))
+    assert width >= len('BAST_TECH_ROBOT')
+
+
+def test_the_dialog_is_wide_enough_for_a_whole_label_block(monkeypatch,
+                                                           nicegui_client,
+                                                           account_id):
+    """At 520px the block wrapped by a different amount per label, which is what
+    made the swatches overlap the next label's row."""
+    from nicegui import ui
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_ROBOT': None})
+    card = next(el for el in root.descendants()
+                if isinstance(el, ui.card) and any(
+                    c.startswith('min-w-[') for c in el._classes))
+    classes = ' '.join(card._classes)
+
+    assert 'min-w-[520px]' not in classes
+    assert 'max-w-[95vw]' in classes
+
+
+def test_the_dialog_lays_the_swatches_and_the_custom_field_on_ONE_line(
+        monkeypatch, nicegui_client, account_id):
+    """Inline in the dialog, stacked in the label row's menu -- the same chooser,
+    because a second one is how the two come to disagree."""
+    from nicegui import ui
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_ROBOT': None})
+    custom = _marked(root, page.MARKER_COLOR_CUSTOM)[0]
+
+    assert isinstance(custom.parent_slot.parent, ui.row)
+    assert 'shrink-0' in ' '.join(custom._classes)
+
+
+def test_the_custom_field_still_shows_a_live_hex(monkeypatch, nicegui_client,
+                                                 account_id):
+    root = _picker(monkeypatch, nicegui_client, account_id,
+                   {'BAST_TECH_ROBOT': '#F0E442'})
+    custom = _marked(root, page.MARKER_COLOR_CUSTOM)[0]
+
+    assert custom.value == '#F0E442'
+
+
+# -- the tag icon, and the two states that share one grey --------------------
+
+def test_the_label_rows_icon_and_bar_are_written_from_ONE_value(nicegui_client,
+                                                                account_id):
+    """Not two lookups of the same stored colour: one ``LabelBar.color``, painted
+    onto both in the same loop. The reported symptom was a yellow bar beside a
+    grey icon, with no way to tell which was right."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, color='#F0E442'))
+
+    icon_colour = (_row_icon(root)._style or {}).get('color', '')
+    assert _bar_fill(root)._style['background'].upper() in icon_colour.upper()
+
+
+def test_an_uncoloured_label_keeps_the_neutral_grey_on_BOTH(nicegui_client,
+                                                            account_id):
+    """"No colour chosen" is a real state, not a missing one."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    grey = _view_mod().DEFAULT_LABEL_ICON_COLOR
+
+    assert grey.lower() in (_row_icon(root)._style or {}).get('color', '').lower()
+    assert _bar_fill(root)._style['background'].upper() == grey.upper()
+
+
+def test_the_icons_tooltip_separates_NO_COLOUR_from_an_unreadable_one(
+        nicegui_client, account_id):
+    """Both draw the same grey -- the parse decides what reaches a CSS ``style``
+    attribute and that is not negotiable -- so the tooltip carries the difference
+    the pixels cannot. Only one of the two is something the user can fix."""
+    none_tip = _tooltip_texts(
+        _draw(nicegui_client, account_id, _one_label(account_id)))
+    assert any('No colour chosen' in t for t in none_tip)
+
+    broken = _draw(nicegui_client, account_id,
+                   _one_label(account_id, color='rgb(1,2,3)'))
+    assert any('IGNORED' in t for t in _tooltip_texts(broken))

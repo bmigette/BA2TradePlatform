@@ -3624,32 +3624,32 @@ def test_a_comma_value_that_is_genuinely_out_of_range_is_still_refused():
 # readouts of one set cannot disagree.
 # ---------------------------------------------------------------------------
 
-def test_the_label_total_card_always_carries_the_figure_even_when_it_is_right():
+def test_the_label_total_readout_always_carries_the_figure_even_when_it_is_right():
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
-        LABEL_TOTAL_CARD_TITLE, label_total_card)
+        LABEL_TOTAL_TITLE, label_total_readout)
 
-    card = label_total_card({'A': 60.0, 'B': 40.0})
+    card = label_total_readout({'A': 60.0, 'B': 40.0})
 
-    assert card.title == LABEL_TOTAL_CARD_TITLE
+    assert card.title == LABEL_TOTAL_TITLE
     assert card.text == '100.00%'
     assert card.severity == 'ok'
     assert card.detail
 
 
-def test_the_label_total_card_sums_and_never_averages():
+def test_the_label_total_readout_sums_and_never_averages():
     """The mutation this exists for. Three labels at 25 total 75, not 25."""
-    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_card
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_readout
 
-    assert label_total_card({'A': 25.0, 'B': 25.0, 'C': 25.0}).text == '75.00%'
+    assert label_total_readout({'A': 25.0, 'B': 25.0, 'C': 25.0}).text == '75.00%'
 
 
-def test_the_label_total_card_speaks_the_engines_own_shortfall_sentence():
+def test_the_label_total_readout_speaks_the_engines_own_shortfall_sentence():
     """Verbatim, so the card, the footer and the submit gate describe one defect
     one way -- and so the "use the Unallocated box" guidance survives the move."""
     from ba2_trade_platform.core.portfolio_allocation import ERROR_LABEL_UNDER_FMT
-    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_card
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_readout
 
-    card = label_total_card({'A': 75.0})
+    card = label_total_readout({'A': 75.0})
 
     assert card.text == '75.00%'
     assert card.severity == 'warning'
@@ -3657,26 +3657,26 @@ def test_the_label_total_card_speaks_the_engines_own_shortfall_sentence():
     assert 'Unallocated box' in card.detail
 
 
-def test_the_label_total_card_speaks_the_engines_own_over_sentence_too():
+def test_the_label_total_readout_speaks_the_engines_own_over_sentence_too():
     from ba2_trade_platform.core.portfolio_allocation import ERROR_LABEL_TOTAL_FMT
-    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_card
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_readout
 
-    card = label_total_card({'A': 70.0, 'B': 48.0})
+    card = label_total_readout({'A': 70.0, 'B': 48.0})
 
     assert card.text == '118.00%'
     assert card.severity == 'negative'
     assert card.detail == ERROR_LABEL_TOTAL_FMT.format(total=118.0, over=18.0)
 
 
-def test_the_label_total_card_agrees_with_the_notice_and_the_footer():
+def test_the_label_total_readout_agrees_with_the_notice_and_the_footer():
     """One predicate, three readouts. A card that called 118% 'ok' while the
     footer called it an error would be the two-screens bug at one screen's
     distance."""
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
-        format_allocation_footer, format_label_total_notice, label_total_card)
+        format_allocation_footer, format_label_total_notice, label_total_readout)
 
     for targets in ({'A': 118.0}, {'A': 75.0}, {'A': 100.0}, {'A': 99.995}):
-        card = label_total_card(targets)
+        card = label_total_readout(targets)
         notice = format_label_total_notice(targets)
         _footer_text, footer_severity = format_allocation_footer(targets, 0.0)
         assert card.severity == footer_severity, targets
@@ -3685,20 +3685,20 @@ def test_the_label_total_card_agrees_with_the_notice_and_the_footer():
             assert notice[0] == card.detail, targets
 
 
-def test_the_label_total_card_measures_the_INVESTABLE_pool_not_the_gross_base():
+def test_the_label_total_readout_measures_the_INVESTABLE_pool_not_the_gross_base():
     """The reserve does not enter it. The labels divide what the reserve LEAVES,
     so 100 typed across them is 100 whatever the reserve says -- an off-by-one
     that netted the reserve out would call a correct set 'under by 10'."""
-    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_card
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_readout
 
     for _reserve in (0.0, 10.0, 90.0):
-        assert label_total_card({'A': 60.0, 'B': 40.0}).text == '100.00%'
+        assert label_total_readout({'A': 60.0, 'B': 40.0}).text == '100.00%'
 
 
-def test_the_label_total_card_of_an_account_managing_nothing_says_so():
-    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_card
+def test_the_label_total_readout_of_an_account_managing_nothing_says_so():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import label_total_readout
 
-    card = label_total_card({})
+    card = label_total_readout({})
 
     assert card.text == '0.00%'
     assert card.severity == 'ok'
@@ -4190,3 +4190,62 @@ def test_the_reserve_bar_is_absent_when_there_is_no_base_to_divide_by():
                        unallocated_pct=10.0) is None
     assert reserve_bar(base_notional=1_000.0, available_buying_power=None,
                        unallocated_pct=10.0) is None
+
+
+# ---------------------------------------------------------------------------
+# THE MANAGE-LABELS DIALOG: its grid, and what a colour state is CALLED
+# ---------------------------------------------------------------------------
+
+def test_the_label_column_is_wide_enough_for_the_longest_name():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        label_column_width_ch)
+
+    assert label_column_width_ch(['BAST_TECH_ROBOT', 'WHEEL_L1_HR']) >= len(
+        'BAST_TECH_ROBOT')
+
+
+def test_the_label_column_has_a_floor_so_short_names_still_line_up():
+    """Every block starts at the same x or the dialog reads as broken -- which is
+    the actual complaint. A column that shrank to the longest of two short names
+    would jump the moment a third was managed."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        LABEL_COLUMN_MIN_CH, label_column_width_ch)
+
+    assert label_column_width_ch(['A', 'B']) == LABEL_COLUMN_MIN_CH
+    assert label_column_width_ch([]) == LABEL_COLUMN_MIN_CH
+    assert label_column_width_ch(None) == LABEL_COLUMN_MIN_CH
+
+
+def test_the_label_column_is_CAPPED_so_one_absurd_name_cannot_blow_the_dialog_out():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        LABEL_COLUMN_MAX_CH, label_column_width_ch)
+
+    assert label_column_width_ch(['X' * 200]) == LABEL_COLUMN_MAX_CH
+
+
+def test_a_label_with_no_colour_is_DESCRIBED_differently_from_an_unreadable_one():
+    """Both render the same neutral grey -- the parse decides what reaches a CSS
+    ``style`` attribute and it is not negotiable -- but they are different facts,
+    and the one the user can act on is the second."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        describe_label_color, resolve_label_icon_color)
+
+    assert resolve_label_icon_color(None) == resolve_label_icon_color('not-a-colour')
+    assert describe_label_color(None) != describe_label_color('not-a-colour')
+
+
+def test_a_chosen_colour_is_described_by_its_own_hex():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        describe_label_color)
+
+    assert '#F0E442' in describe_label_color('#F0E442')
+
+
+def test_an_unreadable_stored_colour_says_it_is_being_IGNORED():
+    """Not "no colour": the row has something in it, the renderer refused it, and
+    the user is the only one who can put it right."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        describe_label_color)
+
+    said = describe_label_color('rgb(1,2,3)')
+    assert 'ignored' in said.lower()

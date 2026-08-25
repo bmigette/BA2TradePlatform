@@ -528,10 +528,12 @@ def _paint(label, icon, tooltip, view: HeaderBalance) -> None:
 # worker thread.
 #
 # WHAT IT PROMISES. Only what the cleanup tool actually does: it removes old
-# market analyses (with their outputs/recommendations) and old activity logs.
-# It does NOT promise a specific saving -- the biggest table on the user's
-# database (trade_action_result, 189.7 MB) only goes when its parent
-# recommendation does.
+# market analyses (with their outputs/recommendations), old activity logs, and
+# -- since the trade_action_result retention windows were added to the same tab
+# -- the JSON payloads of old trade action results (the biggest single thing on
+# the user's database at 188.2 MB) and eventually those rows themselves. It
+# still does NOT promise a specific saving: what any given run reclaims depends
+# entirely on how much of the data is older than the configured windows.
 # ---------------------------------------------------------------------------
 
 DB_SIZE_BANNER_MARKER = 'db-size-banner'
@@ -543,8 +545,8 @@ DB_SIZE_BANNER_CHECK_SECONDS = 0.3
 
 DB_SIZE_BANNER_TEXT_FMT = (
     'Database is {size}, at or over the {threshold} warning threshold. Old market '
-    'analyses and activity logs can be removed in Settings → Cleanup → Batch '
-    'Database Cleanup.')
+    'analyses, activity logs and trade action result payloads can be removed in '
+    'Settings → Cleanup → Batch Database Cleanup.')
 DB_SIZE_BANNER_LINK_TEXT = 'Open Settings → Cleanup'
 DB_SIZE_BANNER_LINK_TARGET = '/settings#cleanup'
 
