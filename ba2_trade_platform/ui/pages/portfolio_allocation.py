@@ -100,7 +100,7 @@ from ...core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
     compute_base_notional, compute_label_investment, current_value,
-    unconsumed_income_notice,
+    format_unrealised_pnl, unconsumed_income_notice,
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
@@ -128,7 +128,7 @@ from ..utils.portfolio_allocation_view import (
     format_label_target_tooltip,
     format_label_total_notice, format_reserve_caption,
     format_reserve_row, label_color_contrast_warning, managed_total_value,
-    missing_quote_symbols, picker_options, positions_by_symbol,
+    missing_quote_symbols, picker_options, pnl_classes, positions_by_symbol,
     resolve_label_icon_color, sort_label_views, store_color_value,
     symbol_target_values,
     validate_label_target_edit, validate_reserve_edit, validate_symbol_weight_edit,
@@ -210,8 +210,12 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
     """
     from ...core.utils import get_account_instance_from_id, get_symbols_by_label
 
+    # ``previous_target_pct`` travels with the label, NULL and all: it is what the
+    # row prints as "last N%" and what the page's Load-last reads, and a ``or 0.0``
+    # anywhere on this path would turn "never allocated" into "allocated nothing".
     managed = [ManagedLabel(label=row.label, target_pct=row.target_pct,
-                            comment=row.comment, color=row.color)
+                            comment=row.comment, color=row.color,
+                            previous_target_pct=row.previous_target_pct)
                for row in get_managed_labels(account_id)]
     symbols_by_label = get_symbols_by_label([m.label for m in managed])
     symbols = collect_managed_symbols(symbols_by_label)
@@ -242,11 +246,17 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
 
     comments: Dict[tuple, str] = {}
     weights: Dict[str, Dict[str, float]] = {}
+    previous_weights: Dict[str, Dict[str, Optional[float]]] = {}
     for entry in managed:
         for symbol, text in get_symbol_comments(account_id, entry.label).items():
             comments[(entry.label, symbol)] = text
-        weights[entry.label] = get_symbol_weights(
-            account_id, entry.label, symbols_by_label.get(entry.label, []))
+        members = symbols_by_label.get(entry.label, [])
+        weights[entry.label] = get_symbol_weights(account_id, entry.label, members)
+        # A SEPARATE reader from ``get_symbol_weights`` on purpose: that one fills
+        # an absent row with the even-split default, and there is no default for a
+        # weight nobody has ever allocated with.
+        previous_weights[entry.label] = get_previous_symbol_weights(
+            account_id, entry.label, members)
 
     buying_power = base_notional = account_value = None
     try:
@@ -282,6 +292,7 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
                                    valuation_mode=valuation_mode,
                                    base_notional=base_notional,
                                    symbol_weights=weights,
+                                   symbol_previous_weights=previous_weights,
                                    unallocated_pct=unallocated_pct),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
@@ -581,6 +592,14 @@ MARKER_BAR_NOTCH = 'pf-bar-notch'
 #: The whole label header row, so a test can assert on the row rather than on a
 #: count of everything that happens to share a style.
 MARKER_BAR_ROW = 'pf-bar-row'
+#: The label row's "last N%" and unrealised-P&L captions, migrated off the Allocate
+#: wizard's step 1. By marker: both are bare percentages/money on a row that
+#: already carries four of each, so a text search could not say which cell it
+#: found. They are SEPARATE elements rather than one caption because the P&L is the
+#: only figure on the line whose sign carries a verdict -- so it is the only one
+#: that can be coloured, and NiceGUI colours whole elements.
+MARKER_LABEL_LAST = 'pf-label-last'
+MARKER_LABEL_PNL = 'pf-label-pnl'
 #: The tag icon LEFT OF THE LABEL NAME. Marked because it is one ``ui.icon`` among
 #: several on the row and its whole content is an inline colour -- and because the
 #: user's complaint was precisely that it disagreed with the bar beside it.
@@ -727,6 +746,13 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         widgets['target'].set_text(bar.target_text)
         widgets['delta'].set_text(bar.delta_text)
         widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+        # Neither of these moves on a keystroke -- the previous generation only
+        # advances on a run, and the P&L is measured off the positions and quotes
+        # this render opened with. They are rewritten in the same loop anyway, so
+        # nothing has to remember which of the row's figures are live.
+        widgets['last'].set_text(bar.last_text)
+        widgets['pnl'].set_text(bar.pnl_text)
+        widgets['pnl'].classes(replace=pnl_classes(bar.pnl))
         widgets['tooltip'].set_text(format_label_target_tooltip(
             target_pct=bar.target_pct, base_notional=live['base_notional'],
             unallocated_pct=live['unallocated_pct']))
@@ -1533,6 +1559,16 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # notional have no target, and 0.00 there would be a claim rather than a gap.
         'weight_pct': None if r.weight_pct is None else round(r.weight_pct, 2),
         'target_value': None if r.target_value is None else round(r.target_value, 2),
+        # The share the LAST run used, and this row's unrealised profit. Both moved
+        # off the Allocate wizard's step 2, which was the only screen that could
+        # answer either question -- and which no longer holds the weight boxes.
+        # ``None``, never 0.0: a symbol that has never been allocated has no last.
+        'previous_weight_pct': (None if r.previous_weight_pct is None
+                                else round(r.previous_weight_pct, 2)),
+        # The ENGINE's wording, formatted here rather than in the browser: every
+        # "may this be shown at all" branch -- blank versus 0.00, a percentage
+        # versus "no cost basis" -- is a decision, and decisions are not Quasar's.
+        'pnl': format_unrealised_pnl(r.pnl),
         # Bumped when an edit is REFUSED, and used as the ``:key`` of the cell's
         # input so the refusal actually puts the typed text back -- see
         # ``_revert_symbol_cell``.
@@ -1564,11 +1600,20 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # too, and that one is a share of the PORTFOLIO. Two different quantities
         # under one word is what made "target 0.0%" over a column of 20s look wrong.
         {'name': 'weight_pct', 'label': 'Share of label %', 'field': 'weight_pct', 'sortable': True, 'align': 'right'},
+        # "Last %", immediately after the box it is the history OF. Its denominator
+        # is the same one -- a share of THIS label -- so it needs no clause of its
+        # own; a blank cell means the symbol has never been allocated.
+        {'name': 'previous_weight_pct', 'label': 'Last %', 'field': 'previous_weight_pct', 'sortable': True, 'align': 'right'},
         {'name': 'target_value', 'label': 'Target value', 'field': 'target_value', 'sortable': True, 'align': 'right'},
         {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'sortable': True, 'align': 'right'},
         {'name': 'cost_basis', 'label': 'Cost basis', 'field': 'cost_basis', 'sortable': True, 'align': 'right'},
         {'name': 'price', 'label': 'Price', 'field': 'price', 'sortable': True, 'align': 'right'},
         {'name': 'market_value', 'label': 'Market value', 'field': 'market_value', 'sortable': True, 'align': 'right'},
+        # Unrealised P&L, money and percent in one pre-formatted string. It is a
+        # STRING and not two numeric columns because half its values are not
+        # numbers at all -- "-", "- (no price)", "no cost basis" -- and rendering
+        # those as 0.00 is the failure mode this platform has actually paid for.
+        {'name': 'pnl', 'label': 'P&L', 'field': 'pnl', 'align': 'right'},
         {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
     ]
 
@@ -1771,6 +1816,13 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             # geometry had not -- and it keeps that word's COLOUR, so the row still
             # scans at a glance without printing the same fact three times.
             widgets['delta'] = ui.label('').classes('w-52')
+            # The wizard's step-1 caption, minus its denominator clause. "last" is
+            # the target the previous RUN used, and it is already on the investable
+            # basis (it is a stored target), so unlike the wizard's "% of base"
+            # wording it needs no restating -- see ``LAST_TARGET_FMT``.
+            widgets['last'] = ui.label('').classes('w-28 text-xs text-secondary-custom') \
+                .mark(MARKER_LABEL_LAST)
+            widgets['pnl'] = ui.label('').classes('w-52').mark(MARKER_LABEL_PNL)
             # The pencil. It OPENS the label and focuses its target box; it never
             # closes one, because "edit this" is not a toggle.
             ui.icon('edit').classes('cursor-pointer text-secondary-custom') \

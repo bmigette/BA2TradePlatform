@@ -2732,7 +2732,7 @@ def _listener_types(element):
 
 
 def _views(labels, symbols_by_label, *, base=10_000.0, reserve=0.0, weights=None,
-           prices=None, positions=None):
+           prices=None, positions=None, previous_weights=None):
     """Build LabelViews the way ``_load_view_payload`` does, with live prices."""
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
 
@@ -2743,7 +2743,8 @@ def _views(labels, symbols_by_label, *, base=10_000.0, reserve=0.0, weights=None
     return build_label_views(labels, symbols_by_label, positions_by_symbol(book),
                              quotes, valuation_mode=VALUATION_MODE_MARKET,
                              base_notional=base, unallocated_pct=reserve,
-                             symbol_weights=weights)
+                             symbol_weights=weights,
+                             symbol_previous_weights=previous_weights)
 
 
 def _draw(client, account_id, views, *, base=10_000.0, buying_power=1_000.0,
@@ -5327,3 +5328,123 @@ def test_the_panel_is_imported_directly_and_not_through_the_components_package()
     assert not hasattr(components, 'open_symbol_info')
     assert ('from ..components.symbol_info_panel import open_symbol_info'
             in inspect.getsource(page))
+
+
+# ---------------------------------------------------------------------------
+# THE MIGRATION: the Allocate wizard's target-setting step moves onto the page
+#
+# Step 1 ("Rebalance - set targets") is gone. Everything that expresses INTENT is
+# here; the modal keeps only what commits. This section is the page half.
+#
+# GROUP 1: the per-row `last` target and the unrealised P&L. Both were only
+# readable inside the wizard's step 1 / step 2 captions, and once the boxes moved
+# onto the page the wizard was the only screen that could still answer "what did I
+# have here before".
+# ---------------------------------------------------------------------------
+
+def _label_with_history(account_id, *, previous_target=25.0,
+                        previous_weights=None):
+    return _views([ManagedLabel('ARK26', 40.0, previous_target_pct=previous_target)],
+                  {'ARK26': ['AAPL', 'MSFT']},
+                  weights={'ARK26': {'AAPL': 60.0, 'MSFT': 40.0}},
+                  previous_weights={'ARK26': dict(previous_weights or {})})
+
+
+def test_the_label_row_shows_the_target_the_last_run_used(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _label_with_history(account_id))
+    assert 'last 25.00%' in _texts(root)
+
+
+def test_a_label_with_no_history_shows_a_dash_and_never_a_zero(nicegui_client,
+                                                               account_id):
+    """"never allocated" and "last time this got nothing" are different facts."""
+    root = _draw(nicegui_client, account_id,
+                 _label_with_history(account_id, previous_target=None))
+    assert 'last -' in _texts(root)
+    assert 'last 0.00%' not in _texts(root)
+
+
+def test_the_label_row_shows_its_unrealised_pnl_in_money_and_percent(nicegui_client,
+                                                                     account_id):
+    """Two symbols bought for $1,000 each and worth $2,500 each: +$3,000, +150%."""
+    root = _draw(nicegui_client, account_id, _label_with_history(account_id))
+    assert 'P&L +3,000.00 (+150.00%)' in _texts(root)
+
+
+def test_the_label_pnl_is_coloured_as_an_accent_and_not_as_the_message(
+        nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _label_with_history(account_id))
+    pnl = [el for el in _marked(root, page.MARKER_LABEL_PNL)]
+    assert len(pnl) == 1
+    assert 'text-green-500' in ' '.join(pnl[0]._classes)
+
+
+def test_the_symbol_table_shows_the_weight_the_last_run_used(nicegui_client,
+                                                             account_id):
+    root = _draw(nicegui_client, account_id,
+                 _label_with_history(account_id,
+                                     previous_weights={'AAPL': 70.0}))
+    rows = _table_rows(root)
+    assert rows['AAPL']['previous_weight_pct'] == 70.0
+    assert rows['MSFT']['previous_weight_pct'] is None
+
+
+def test_the_symbol_table_carries_a_last_and_a_pnl_column(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _label_with_history(account_id))
+    names = {c['name'] for c in _tables(root)[0].columns}
+    assert 'previous_weight_pct' in names
+    assert 'pnl' in names
+
+
+def test_the_symbol_table_shows_each_rows_pnl_in_money_and_percent(nicegui_client,
+                                                                   account_id):
+    root = _draw(nicegui_client, account_id, _label_with_history(account_id))
+    assert _table_rows(root)['AAPL']['pnl'] == '+1,500.00 (+150.00%)'
+
+
+def test_the_page_reads_the_previous_generation_out_of_the_store(monkeypatch,
+                                                                 account_id):
+    """End to end: the numbers the last RUN was launched with, not the current ones.
+
+    ``save_allocation_targets`` is the only writer of the previous generation, and
+    it shifts on a CHANGE -- so writing 40 over a stored 25 is what puts 25 behind
+    "last".
+    """
+    from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        save_allocation_targets)
+
+    set_managed_label(account_id, 'ARK26', target_pct=25.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=70.0)
+    save_allocation_targets(account_id, [LabelTarget(
+        'ARK26', 40.0, [SymbolTarget('AAPL', 100.0)])])
+    _use_account(monkeypatch, _Account(account_id,
+                                       positions=[_pos('AAPL', 10, 1000.0, 2500.0)],
+                                       prices={'AAPL': 250.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+    view = payload['views'][0]
+    assert view.previous_target_pct == 25.0
+    assert view.rows[0].previous_weight_pct == 70.0
+
+
+def test_the_migrated_last_figure_is_NOT_restated_against_the_gross_base(
+        nicegui_client, account_id):
+    """The wizard's step-1 caption read "now X (Y% of base) - target Z% of base".
+
+    Moving that wording across would reintroduce exactly the confusion the
+    2026-08-25 rework removed: the page treats the INVESTABLE pool as 100% and the
+    of-base figure is the parenthetical "(real N%)". A stored target is typed on
+    the investable basis, so ``last`` needs no restating at all.
+    """
+    root = _draw(nicegui_client, account_id,
+                 _label_with_history(account_id), reserve=10.0)
+    # The LABEL ROW only. The reserve line above it is deliberately still of-base
+    # -- it IS the part held back -- and restating it against what it leaves would
+    # be circular, so a whole-page text search would be asserting the wrong thing.
+    row = ' '.join(_texts(_marked(root, page.MARKER_BAR_ROW)[0]))
+
+    assert 'last 25.00%' in row
+    assert 'of base' not in row
+    assert 'of investable' in ' '.join(_expansion_headers(root))

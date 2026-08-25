@@ -15,10 +15,13 @@ from typing import Any, Dict, List, Optional
 
 from ...core.portfolio_allocation import (
     ERROR_LABEL_TOTAL_FMT, ERROR_LABEL_UNDER_FMT, LABEL_TOTAL_TOLERANCE_PCT,
+    MONEY_EPSILON,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed, PositionState,
-    clamp_unallocated_pct, current_value, effective_target_pct, investable_notional,
+    UnrealisedPnL,
+    clamp_unallocated_pct, current_value, effective_target_pct,
+    format_unrealised_pnl, investable_notional,
     position_sign, reserved_notional_for, scale_pct_to_total, signed_position_values,
-    split_pct_across, validate_unallocated_pct,
+    split_pct_across, unrealised_pnl, validate_unallocated_pct,
 )
 
 # ``position_sign`` / ``signed_position_values`` are IMPORTED, not defined here,
@@ -446,11 +449,19 @@ class ManagedLabel:
     which is a different fact from a stored default, so it is carried through as
     ``None`` all the way to the render and only turned into a drawable colour there
     (``resolve_label_icon_color``).
+
+    ``previous_target_pct`` is the target the LAST run was launched with, straight
+    off ``portfolio_allocation_label.previous_target_pct``. A PURE CARRIER: it is
+    what the page's "Load last" reads and what the row prints as ``last N%``, and
+    no derived figure on the page may divide by it. ``None`` means the label has
+    never been through ``save_allocation_targets``, which is a different fact from
+    0.0 ("last time this got nothing") and is why it is never coerced.
     """
     label: str
     target_pct: float = 0.0
     comment: Optional[str] = None
     color: Optional[str] = None
+    previous_target_pct: Optional[float] = None
 
 
 @dataclass
@@ -470,6 +481,18 @@ class SymbolRow:
     rather than an absence. They are the "target" half of requirement 2 at the
     instrument level; the page previously showed a target exactly once, on the
     group header.
+
+    ``previous_weight_pct`` is the share this symbol carried in the label the LAST
+    time a run was launched, and ``pnl`` is its unrealised profit. Both moved here
+    out of the Allocate wizard's step 2, which was the only screen that could
+    answer either question -- and which is no longer where the weights are typed.
+    ``previous_weight_pct`` is ``None`` (never 0.0) for a symbol with no history:
+    "never allocated" and "allocated nothing" are different facts.
+
+    ``pnl`` is measured on the LIVE quote in BOTH valuation modes, deliberately.
+    In cost mode ``current_value`` IS the cost basis, so a P&L derived from it
+    reads 0.00 on every row -- see ``unrealised_pnl``, which takes no valuation
+    mode for exactly that reason.
     """
     symbol: str
     labels: List[str] = field(default_factory=list)
@@ -483,6 +506,8 @@ class SymbolRow:
     comment: Optional[str] = None
     weight_pct: Optional[float] = None
     target_value: Optional[float] = None
+    previous_weight_pct: Optional[float] = None
+    pnl: UnrealisedPnL = field(default_factory=UnrealisedPnL)
 
     @property
     def multi_label(self) -> bool:
@@ -513,6 +538,11 @@ class LabelView:
     number. ``pct_of_base`` is the one that IS comparable with the target, and
     ``target_value`` is the target as money. Both are ``None`` when no base notional
     was supplied.
+
+    ``previous_target_pct`` and ``pnl`` carry the wizard's step-1 caption onto the
+    page. The P&L is ONE call over the whole membership rather than a combination
+    of the rows' own figures, which is what makes the percentage money-weighted:
+    the engine sums market value and gross cost first and divides once.
     """
     label: str
     target_pct: float = 0.0
@@ -523,6 +553,8 @@ class LabelView:
     rows: List[SymbolRow] = field(default_factory=list)
     pct_of_base: Optional[float] = None
     target_value: Optional[float] = None
+    previous_target_pct: Optional[float] = None
+    pnl: UnrealisedPnL = field(default_factory=UnrealisedPnL)
     #: The stored palette hex, or ``None`` for "no colour chosen". Carried through
     #: UNRESOLVED so the absence stays readable; the render turns it into something
     #: drawable with ``resolve_label_icon_color``.
@@ -538,6 +570,7 @@ def build_label_views(managed,
                       valuation_mode: str,
                       base_notional: Optional[float] = None,
                       symbol_weights=None,
+                      symbol_previous_weights=None,
                       unallocated_pct: float = 0.0) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
@@ -570,6 +603,11 @@ def build_label_views(managed,
             treated as absent when it is 0.
         symbol_weights: ``{label: {symbol: weight_pct}}`` from ``get_symbol_weights``.
             Optional, on the same terms.
+        symbol_previous_weights: ``{label: {symbol: previous_weight_pct}}`` from
+            ``get_previous_symbol_weights``. Optional, and an absent entry stays
+            ``None`` rather than falling back to the CURRENT weight -- the whole
+            point of the figure is that it may differ from what is on screen, and
+            "there is no last" is what the page's Load-last button reads.
         unallocated_pct: the account's stored cash reserve, 0-100. It scales the
             TARGET money only -- ``target_value`` on the label and on every symbol
             row -- because the label percentages divide what the reserve LEFT.
@@ -596,6 +634,22 @@ def build_label_views(managed,
     # target the solver would not have used.
     investable = None if base is None else investable_notional(base, unallocated_pct)
     weights_by_label = symbol_weights or {}
+    previous_by_label = symbol_previous_weights or {}
+
+    def _pnl_of(sym: str) -> UnrealisedPnL:
+        """One symbol's unrealised P&L, on the LIVE quote in either mode.
+
+        A shallow priced copy for the same reason ``_value_of`` builds one: the
+        page fetches quotes in a single bulk call and does not stamp them onto the
+        states this function is handed. ``unrealised_pnl`` is the engine's, so a
+        row here and a caption anywhere else are the same rule at the same scope.
+        """
+        state = positions.get(sym)
+        if state is None:
+            return unrealised_pnl([])
+        return unrealised_pnl([PositionState(
+            symbol=state.symbol, quantity=state.quantity,
+            cost_basis=state.cost_basis, price=(prices or {}).get(sym))])
 
     def _clean(label: str) -> List[str]:
         seen, out = set(), []
@@ -639,6 +693,7 @@ def build_label_views(managed,
         label_target_value = (None if investable is None
                               else investable * float(entry.target_pct or 0.0) / 100.0)
         label_weights = weights_by_label.get(entry.label) or {}
+        label_previous = previous_by_label.get(entry.label) or {}
         rows: List[SymbolRow] = []
 
         for sym in symbols:
@@ -669,6 +724,8 @@ def build_label_views(managed,
                 target_value=(None if (label_target_value is None
                                        or sym not in label_weights)
                               else label_target_value * float(label_weights[sym]) / 100.0),
+                previous_weight_pct=label_previous.get(sym),
+                pnl=_pnl_of(sym),
             ))
 
         rows.sort(key=lambda r: (-r.current_value, r.symbol))
@@ -683,6 +740,16 @@ def build_label_views(managed,
             pct_of_base=(label_value / base * 100.0) if base else None,
             target_value=label_target_value,
             color=entry.color,
+            previous_target_pct=entry.previous_target_pct,
+            # ONE call over the whole membership, deliberately NOT a combination of
+            # the rows' own figures: the engine sums market value and gross cost
+            # first and divides once, which is what makes the percentage
+            # money-weighted rather than a mean of the symbols' percentages.
+            pnl=unrealised_pnl([
+                PositionState(symbol=s, quantity=positions[s].quantity,
+                              cost_basis=positions[s].cost_basis,
+                              price=(prices or {}).get(s))
+                for s in symbols if s in positions]),
         ))
 
     return views
@@ -1395,6 +1462,33 @@ _MIN_BAR_SCALE_PCT = 1.0
 LABEL_CURRENT_FMT = '{pct:.1f}%'
 LABEL_CURRENT_UNKNOWN = LABEL_STATUS_NONE
 
+#: Drawn where a percentage would be when there is no previous generation. A dash,
+#: never 0.00%: "this has never been allocated" and "last time this got nothing"
+#: are different facts, and 0.00% is a legitimate value of the second. Spelled the
+#: same way the wizard spelled it, because it is the same fact travelling to a new
+#: screen rather than a new one being invented.
+NO_PREVIOUS_MARK = '-'
+
+#: The previous generation, as a percentage. Two decimals, matching the precision
+#: the boxes store at, so a restored value reads identically to the one that will
+#: be written back.
+LAST_PCT_FMT = '{previous:.2f}%'
+
+#: ...and named, because a bare second percentage on a row that already carries
+#: three of them is unreadable. "last", not "previous target %": the row is terse
+#: by design and ``BASIS_LEGEND`` carries the explanation for the whole page.
+#:
+#: NO denominator clause, deliberately. The wizard's caption said "% of base" and
+#: that is the denominator the 2026-08-25 rework demoted to a parenthetical; a
+#: stored target is typed against the INVESTABLE pool, so ``last`` is directly
+#: comparable with the ``tgt`` beside it and needs no restating.
+LAST_TARGET_FMT = 'last {previous}'
+
+#: The P&L caption. The body comes from the engine's ``format_unrealised_pnl``,
+#: which owns every "may this be shown at all" branch -- blank versus 0.00, a
+#: percentage versus "no cost basis" -- so this string adds a name and nothing else.
+PNL_CAPTION_FMT = 'P&L {pnl}'
+
 LABEL_DELTA_OVER_FMT = 'over by {pct:.1f}pp ({money})'
 LABEL_DELTA_UNDER_FMT = 'under by {pct:.1f}pp ({money})'
 #: Inside the tolerance band. NOT "over by 0.0pp ($0.12)", which is noise on a row
@@ -1404,6 +1498,48 @@ LABEL_DELTA_ON_TARGET = 'on target'
 #: ``LABEL_STATUS_NONE`` uses, for the same reason: a verdict about a decision nobody
 #: made is worse than an admission that there is none.
 LABEL_DELTA_NONE = LABEL_STATUS_NONE
+
+
+def format_last_pct(previous: Optional[float]) -> str:
+    """``60.00%``, or a dash when there is no previous generation. Pure.
+
+    ``None`` is the ONLY dash case. 0.0 formats as ``0.00%`` because a run that
+    allocated nothing to a label really did happen, and hiding it would make an
+    intentional zero indistinguishable from a label that has never run.
+    """
+    if previous is None:
+        return NO_PREVIOUS_MARK
+    return LAST_PCT_FMT.format(previous=float(previous))
+
+
+def format_last_target(previous: Optional[float]) -> str:
+    """``last 60.00%`` / ``last -``. THE one place the pair is spelled. Pure.
+
+    Used by the label row and by the symbol table alike, so the two scopes cannot
+    describe their history in two different ways.
+    """
+    return LAST_TARGET_FMT.format(previous=format_last_pct(previous))
+
+
+def format_pnl_caption(pnl: UnrealisedPnL) -> str:
+    """``P&L +1,500.00 (+150.00%)``. Pure; the arithmetic and the wording are the
+    engine's ``format_unrealised_pnl``, so this adds a name and nothing else."""
+    return PNL_CAPTION_FMT.format(pnl=format_unrealised_pnl(pnl))
+
+
+def pnl_classes(pnl: UnrealisedPnL) -> str:
+    """CSS for a P&L caption. Pure; no ``ui`` call.
+
+    Colour is an ACCENT and never the message: ``format_unrealised_pnl`` signs both
+    numbers, so the caption reads correctly in monochrome, to a colour-blind user
+    and in a screen reader. Grey covers three different things on purpose --
+    nothing measurable, nothing held, and a genuine flat 0.00 -- because none of
+    them is a verdict, and painting "break-even" green or red would invent one.
+    """
+    if pnl is None or pnl.amount is None or abs(pnl.amount) <= MONEY_EPSILON:
+        return 'text-xs text-secondary-custom'
+    return 'text-xs font-medium ' + ('text-green-500' if pnl.amount > 0
+                                     else 'text-red-500')
 
 
 def format_label_delta(*, status: str, delta_pct: Optional[float],
@@ -1449,6 +1585,15 @@ class LabelBar:
     ``target_pct`` is what the edit box holds -- the number the user typed.
     ``effective_pct`` is that restated against the gross base, i.e. the derived
     "(real N%)" figure, and is secondary everywhere.
+
+    ``last_text`` and ``pnl_text`` come out of the SAME builder as everything else
+    on the row, which is the point of putting them here rather than rendering them
+    beside it: the header, the notch, the delta, the previous generation and the
+    P&L are one description of one label, and a second writer is how two of them
+    come to disagree. Neither moves when a target box is typed in -- the previous
+    generation only advances on a run, and the P&L is measured off the positions
+    and quotes the render opened with -- but they are rewritten by the same redraw
+    anyway, so nothing has to remember which figures are live.
     """
     label: str
     color: str
@@ -1465,6 +1610,10 @@ class LabelBar:
     current_text: str
     target_text: str
     delta_text: str
+    previous_target_pct: Optional[float] = None
+    last_text: str = ''
+    pnl: UnrealisedPnL = field(default_factory=UnrealisedPnL)
+    pnl_text: str = ''
 
 
 def investable_share_pct(current_value: float, base_notional: Optional[float],
@@ -1583,6 +1732,10 @@ def build_label_bars(views, *, base_notional: Optional[float],
             target_text=TARGET_CELL_PREFIX + format_target_pair(target, unallocated_pct),
             delta_text=format_label_delta(status=status, delta_pct=delta_pct,
                                           delta_value=delta_value),
+            previous_target_pct=view.previous_target_pct,
+            last_text=format_last_target(view.previous_target_pct),
+            pnl=view.pnl,
+            pnl_text=format_pnl_caption(view.pnl),
         ))
     return bars
 

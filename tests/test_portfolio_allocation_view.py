@@ -3146,3 +3146,150 @@ def test_the_delta_MONEY_can_be_written_either_way_and_lands_on_one_number():
                                unallocated_pct=reserve)[0]
         via_base = 4_500.0 - 10_000.0 * bar.effective_pct / 100.0
         assert bar.delta_value == pytest.approx(via_base)
+
+
+# ---------------------------------------------------------------------------
+# THE `last` GENERATION AND THE UNREALISED P&L, ON THE PAGE
+#
+# Both were trapped in the Allocate wizard's step 1 / step 2 captions. They are
+# facts about a LABEL and a SYMBOL, not about a run, so they belong on the screen
+# the user reads them from -- and once the target boxes moved onto the page, the
+# wizard was the only place left that could answer "what did I have here before".
+#
+# The wizard's own captions are NOT ported. They said "% of base" (see
+# ``LABEL_CURRENT_FMT`` in the wizard module), which is the denominator the page's
+# 2026-08-25 rework deliberately demoted to a parenthetical.
+# ---------------------------------------------------------------------------
+
+def test_a_label_view_carries_the_target_the_last_run_used():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import build_label_views
+
+    views = build_label_views(
+        [ManagedLabel('ARK26', 40.0, previous_target_pct=25.0)],
+        {'ARK26': ['AAPL']}, {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0},
+        valuation_mode=VALUATION_MODE_MARKET, base_notional=10_000.0)
+
+    assert views[0].previous_target_pct == 25.0
+
+
+def test_a_label_that_has_never_run_carries_None_and_not_a_zero():
+    """"never allocated" and "last time this got nothing" are different facts, and
+    0.0 is a legitimate value of the second."""
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {}, {}, valuation_mode=VALUATION_MODE_MARKET)
+    assert views[0].previous_target_pct is None
+
+
+def test_a_symbol_row_carries_the_weight_the_last_run_used():
+    views = build_label_views(
+        [ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL', 'MSFT']},
+        {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0, 'MSFT': 100.0},
+        valuation_mode=VALUATION_MODE_MARKET, base_notional=10_000.0,
+        symbol_weights={'ARK26': {'AAPL': 75.0, 'MSFT': 25.0}},
+        symbol_previous_weights={'ARK26': {'AAPL': 60.0}})
+
+    by_symbol = {r.symbol: r for r in views[0].rows}
+    assert by_symbol['AAPL'].previous_weight_pct == 60.0
+    assert by_symbol['MSFT'].previous_weight_pct is None
+
+
+def test_a_symbol_row_carries_its_unrealised_pnl_in_money_and_percent():
+    """$2,500 of AAPL bought for $1,000 is +$1,500, i.e. +150%."""
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+    pnl = views[0].rows[0].pnl
+    assert pnl.amount == pytest.approx(1_500.0)
+    assert pnl.pct == pytest.approx(150.0)
+
+
+def test_the_pnl_is_the_SAME_in_cost_mode_as_in_market_mode():
+    """The defect this guards: in COST valuation ``current_value`` IS the cost
+    basis, so a P&L derived from it reads 0.00 on every row of the account's
+    default mode. ``unrealised_pnl`` takes no valuation mode for that reason."""
+    args = ([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+            {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0})
+    cost = build_label_views(*args, valuation_mode=VALUATION_MODE_COST)
+    market = build_label_views(*args, valuation_mode=VALUATION_MODE_MARKET)
+
+    assert cost[0].rows[0].pnl.amount == market[0].rows[0].pnl.amount == 1_500.0
+
+
+def test_a_label_view_carries_the_TOTAL_pnl_of_its_symbols():
+    """ONE call over the whole membership, so the percentage is money-weighted --
+    averaging the symbols' own percentages would weight a $1,000 holding as
+    heavily as the $90,000 beside it."""
+    views = build_label_views([ManagedLabel('ARK26', 40.0)],
+                              {'ARK26': ['AAPL', 'MSFT']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0),
+                               'MSFT': _pos('MSFT', 1, 90_000.0)},
+                              {'AAPL': 250.0, 'MSFT': 90_000.0},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    pnl = views[0].pnl
+    assert pnl.amount == pytest.approx(1_500.0)
+    assert pnl.pct == pytest.approx(1_500.0 / 91_000.0 * 100.0)
+
+
+def test_an_unpriced_holding_is_excluded_from_the_pnl_rather_than_valued_at_zero():
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': None},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    pnl = views[0].rows[0].pnl
+    assert pnl.amount is None
+    assert pnl.unpriced == 1
+
+
+def test_the_last_figure_reads_as_a_dash_when_there_is_no_last():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        NO_PREVIOUS_MARK, format_last_pct)
+
+    assert format_last_pct(None) == NO_PREVIOUS_MARK
+    assert format_last_pct(0.0) == '0.00%'
+    assert format_last_pct(60.0) == '60.00%'
+
+
+def test_the_last_caption_names_itself_so_a_bare_percentage_cannot_be_misread():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import format_last_target
+
+    assert format_last_target(60.0) == 'last 60.00%'
+    assert format_last_target(None) == 'last -'
+
+
+def test_the_pnl_caption_carries_the_engines_own_wording_and_nothing_else():
+    from ba2_trade_platform.core.portfolio_allocation import unrealised_pnl
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import format_pnl_caption
+
+    state = _pos('AAPL', 10, 1000.0)
+    state.price = 250.0
+    assert format_pnl_caption(unrealised_pnl([state])) == 'P&L +1,500.00 (+150.00%)'
+
+
+def test_the_pnl_colour_is_an_accent_and_never_the_message():
+    """Grey covers three different things on purpose -- nothing measurable,
+    nothing held, and a genuine flat 0.00 -- because none of them is a verdict."""
+    from ba2_trade_platform.core.portfolio_allocation import UnrealisedPnL
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import pnl_classes
+
+    assert 'green' in pnl_classes(UnrealisedPnL(amount=1.0))
+    assert 'red' in pnl_classes(UnrealisedPnL(amount=-1.0))
+    assert 'green' not in pnl_classes(UnrealisedPnL(amount=0.0))
+    assert 'red' not in pnl_classes(UnrealisedPnL(amount=None))
+
+
+def test_the_label_bar_states_the_last_target_and_the_pnl_beside_the_delta():
+    """One writer for the row: the bar. The header, the notch, the delta, the last
+    generation and the P&L all come out of ``build_label_bars`` together, so no
+    two of them can describe different states of the same label."""
+    view = LabelView(label='A', target_pct=30.0, current_value=4_500.0,
+                     pct_of_total=0.0, previous_target_pct=25.0)
+    bar = build_label_bars([view], base_notional=10_000.0, unallocated_pct=0.0)[0]
+
+    assert bar.last_text == 'last 25.00%'
+    assert bar.pnl_text == 'P&L -'
+
+
+def test_the_label_bars_last_text_is_a_dash_when_the_label_has_no_history():
+    bar = build_label_bars([_view('A', 4_500.0, 30.0)], base_notional=10_000.0,
+                           unallocated_pct=0.0)[0]
+    assert bar.last_text == 'last -'
