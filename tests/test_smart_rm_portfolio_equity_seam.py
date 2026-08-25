@@ -75,7 +75,7 @@ def _capture_warnings(monkeypatch):
     return messages
 
 
-def _run(monkeypatch, account, pct=100.0):
+def _run(monkeypatch, account, pct=100.0, account_resolver=None):
     """Drive one ``_execute_task`` and return (initial_equity, final_equity, job)."""
     import sys
     from ba2_trade_platform.core.SmartRiskManagerQueue import (
@@ -95,7 +95,7 @@ def _run(monkeypatch, account, pct=100.0):
     )
     monkeypatch.setattr(
         "ba2_trade_platform.core.utils.get_account_instance_from_id",
-        lambda account_id, session=None, use_cache=True: account,
+        account_resolver or (lambda account_id, session=None, use_cache=True: account),
     )
     import ba2_trade_platform.core.SmartRiskManagerGraph as _graph
     monkeypatch.setattr(
@@ -246,6 +246,42 @@ class TestAMeasuredZeroEquityRecordsAsZero:
         assert any("equity" in e.lower() for e in errors), errors
         assert len(errors) >= 2, (
             "both the initial and the final read must report the gap", errors)
+        # The two reads bracket the run; a log that does not say WHICH one is missing
+        # cannot tell "we never knew" from "we lost the broker mid-run".
+        assert any(e.lower().startswith("initial") for e in errors), errors
+        assert any(e.lower().startswith("final") for e in errors), errors
+
+    def test_an_unresolvable_account_is_recorded_as_unknown_and_reported(self, monkeypatch):
+        """The other way the equity can be unknown: the account row exists on the task
+        but the instance cannot be built (deleted account, bad credentials). Recording
+        that as 0.0 would tell the risk manager the sleeve is empty."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        errors = _capture_errors(monkeypatch)
+
+        initial, final, job = _run(
+            monkeypatch, account,
+            account_resolver=lambda account_id, session=None, use_cache=True: None)
+
+        assert initial is None and final is None
+        assert any("could not be instantiated" in e for e in errors), errors
+        assert job.status == "COMPLETED"
+
+    def test_a_raising_account_lookup_is_recorded_as_unknown_and_reported(self, monkeypatch):
+        """And if resolving the account RAISES, the equity is unknown -- not zero --
+        and the Smart Risk Manager run still completes."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        errors = _capture_errors(monkeypatch)
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("account registry unavailable")
+
+        initial, final, job = _run(monkeypatch, account, account_resolver=_boom)
+
+        assert initial is None and final is None
+        assert any("Could not read" in e for e in errors), errors
+        assert job.status == "COMPLETED"
 
     def test_an_exploding_broker_is_still_survivable(self, monkeypatch):
         """THE INVERSE #3: the equity read is bookkeeping, not the job. A broker that
@@ -261,6 +297,83 @@ class TestAMeasuredZeroEquityRecordsAsZero:
 
         assert initial is None and final is None
         assert job.status == "COMPLETED", "the run itself succeeded"
+
+
+class TestTheRecordedNumberIsTheEquityItself:
+    """Found by mutation: three ways to record a number that is nearly right."""
+
+    def test_it_is_EQUITY_and_not_net_liquidation(self, monkeypatch):
+        """The snapshot mirrors the two when a broker publishes only one, so most
+        brokers cannot tell these apart. One that publishes BOTH can: net
+        liquidation is the headline total, equity is what the sleeve is a share of,
+        and they diverge whenever there are options or a debit balance."""
+        class _BothAccount(MockAccount):
+            def get_account_info(self):
+                return {"equity": 100_000.0, "net_liquidation": 250_000.0,
+                        "cash": 25_000.0}
+
+        acct_def = create_account_definition()
+        initial, final, _job = _run(monkeypatch, _BothAccount(acct_def.id), pct=100.0)
+
+        assert initial == pytest.approx(100_000.0)
+        assert final == pytest.approx(100_000.0)
+
+    def test_a_NEGATIVE_equity_is_recorded_as_negative(self, monkeypatch):
+        """A margin account can go equity-negative. ``abs()`` anywhere on this path
+        would turn a $5,000 hole into $5,000 of buying room, which is the single
+        worst thing to hand a risk manager."""
+        class _UnderwaterAccount(MockAccount):
+            def get_account_info(self):
+                return {"equity": -5_000.0, "cash": -5_000.0}
+
+        acct_def = create_account_definition()
+        initial, final, _job = _run(monkeypatch, _UnderwaterAccount(acct_def.id),
+                                    pct=100.0)
+
+        assert initial == pytest.approx(-5_000.0)
+        assert final == pytest.approx(-5_000.0)
+
+    def test_the_equity_is_read_from_the_TASKS_ACCOUNT(self, monkeypatch):
+        """Found by mutation: passing ``task.expert_instance_id`` where
+        ``task.account_id`` belongs survived every assertion above, because a test
+        database hands both the id 1. On a real install the two id spaces are
+        unrelated, so the risk manager would size itself off a stranger's account."""
+        acct_def = create_account_definition()
+        account = _IbkrShapedAccount(acct_def.id)
+        # FORCE THE TWO IDS APART. Both sequences start at 1 in a fresh test database,
+        # so with one account and one expert the swap is invisible -- which is exactly
+        # why the mutation survived the first version of this test.
+        for _ in range(3):
+            create_expert_instance(account_id=acct_def.id, expert="MockExpert")
+        asked_for = []
+
+        def _resolver(account_id, session=None, use_cache=True):
+            asked_for.append(account_id)
+            return account
+
+        initial, _final, job = _run(monkeypatch, account, pct=100.0,
+                                    account_resolver=_resolver)
+
+        assert job.expert_instance_id != job.account_id, (
+            "the fixture must make the two id spaces distinguishable",
+            job.expert_instance_id, job.account_id)
+        assert initial == pytest.approx(100_000.0)
+        assert asked_for, "the account must actually be resolved"
+        assert set(asked_for) == {job.account_id}, (
+            "the equity read must use the task's ACCOUNT id", asked_for, job.account_id)
+
+    def test_the_cents_are_not_rounded_away(self, monkeypatch):
+        """It is a money figure the operator reconciles against the broker."""
+        class _PenniesAccount(MockAccount):
+            def get_account_info(self):
+                return {"equity": 100_000.37}
+
+        acct_def = create_account_definition()
+        initial, final, _job = _run(monkeypatch, _PenniesAccount(acct_def.id),
+                                    pct=100.0)
+
+        assert initial == pytest.approx(100_000.37, abs=1e-9)
+        assert final == pytest.approx(100_000.37, abs=1e-9)
 
 
 class TestTheJobRecordIsAnchoredInTime:
