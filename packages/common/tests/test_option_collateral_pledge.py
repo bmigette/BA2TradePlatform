@@ -877,6 +877,11 @@ def option_leg(strike=150.0, side=OrderDirection.SELL, right=OptionRight.CALL,
     return built
 
 
+#: "this leg publishes NO multiplier field at all" — today's ``OptionLeg``. Distinct
+#: from publishing one whose value happens to be the platform default.
+_ABSENT = object()
+
+
 class SubmittingAccount(FakeOptionsAccount):
     """``FakeOptionsAccount`` that can run the REAL ``submit_option_order``.
 
@@ -904,6 +909,22 @@ class SubmittingAccount(FakeOptionsAccount):
             child.status = OrderStatus.FILLED
             update_instance(child)
         return trading_order
+
+
+class RoundTripAccount(SubmittingAccount):
+    """``SubmittingAccount`` whose option book is the ROWS IT HAS WRITTEN.
+
+    ``FakeOptionsAccount`` pins the book to a fixture list, which is what makes
+    the refusal tests above exact — but it also means those tests can never see
+    what the write PERSISTED. This one restores the real
+    ``open_option_orders_book_wide`` (over the in-RAM store the ``store``
+    fixture installs), so a covered call can be written and then re-read through
+    ``shares_pledged_to_short_calls``: the only way to compare the cover the
+    guard demanded with the cover the resulting book reports.
+    """
+
+    def open_option_orders_book_wide(self):
+        return OptionsAccountInterface.open_option_orders_book_wide(self)
 
 
 @pytest.fixture
@@ -1043,29 +1064,99 @@ class TestTheEntrySeamRefusesAnUncoveredCoveredCall:
         with pytest.raises(ValueError, match="OPTION BOOK"):
             _write(acct)
 
-    # -- the multiplier is read, never assumed (OPT-L7) --------------------
-    def test_the_requirement_scales_with_a_non_hundred_multiplier(self, store):
-        """An ADJUSTED contract delivering 10 shares needs 30 shares for 3
-        contracts, not 300 — assuming 100 would refuse a perfectly covered call."""
+    # -- the requirement and the ROWS are the same number (OPT-L7) ---------
+    #
+    # The guard used to prefer a multiplier the LEG published. That is correct
+    # arithmetic against a row this method cannot write: it stamps
+    # DEFAULT_OPTION_MULTIPLIER on the parent AND on every leg child,
+    # unconditionally, and ``shares_pledged_to_short_calls`` reads those rows back.
+    # A leg publishing 10 was therefore validated against 30 shares for 3
+    # contracts, ADMITTED, and the rows it wrote reported 300 pledged — the gate
+    # approved one position and created another. The requirement is now the number
+    # that will be persisted, and a leg claiming any other delivery size is
+    # REFUSED rather than believed (validate a position we cannot record) or
+    # ignored (drop an adjusted contract's delivery size on the floor).
+    def test_a_leg_publishing_a_multiplier_the_rows_cannot_record_is_refused(self, store):
+        """The reviewer's scenario, flipped. 3 contracts x 10 shares against a
+        30-share holding: arithmetically covered, and unwritable."""
         acct = SubmittingAccount(book=[], positions=[equity_position(qty=30.0)])
 
-        parent = _write(acct, legs=[option_leg(multiplier=10)], quantity=3)
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, legs=[option_leg(multiplier=10)], quantity=3)
 
-        assert parent is not None and len(acct.submitted) == 1
+        message = str(excinfo.value)
+        assert COVER_REFUSAL in message, message
+        assert str(DEFAULT_OPTION_MULTIPLIER) in message, (
+            "name the number the rows WILL carry: " + message)
+        assert acct.submitted == []
 
-    def test_a_larger_multiplier_raises_the_requirement(self, store):
-        """The same scaling in the dangerous direction: a contract delivering
-        500 shares must not be waved through on a 100-share lot."""
-        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100.0)])
+    def test_a_shares_rich_account_does_not_rescue_a_divergent_multiplier(self, store):
+        """It is not a shortfall and more shares do not clear it. Refusing only
+        when the cover happens to be short would still write the row whose
+        multiplier is a lie, just with enough shares to hide it."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=1_000_000.0)])
+
+        with pytest.raises(ValueError, match=COVER_REFUSAL):
+            _write(acct, legs=[option_leg(multiplier=10)], quantity=3)
+
+    def test_a_larger_multiplier_is_refused_for_the_same_reason(self, store):
+        """The dangerous direction lands in the same place: a leg claiming 500
+        shares per contract cannot be recorded either, and admitting it against
+        a big holding would write rows that under-report the pledge 5:1."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=1_000_000.0)])
 
         with pytest.raises(ValueError) as excinfo:
             _write(acct, legs=[option_leg(multiplier=500)])
 
-        assert "500 share" in str(excinfo.value), str(excinfo.value)
+        assert "500" in str(excinfo.value), str(excinfo.value)
+
+    @pytest.mark.parametrize("published", [_ABSENT, 100, 100.0, "100", 10, 500, 0, "junk"])
+    def test_a_covered_call_is_admitted_only_when_the_rows_will_pledge_what_it_demanded(
+            self, store, published):
+        """ADMITTED IMPLIES AGREEMENT — for every multiplier a leg can publish.
+
+        The invariant, not a case list: either the write is refused (and pledges
+        nothing at all), or it is admitted and the rows it wrote pledge EXACTLY
+        the cover the guard demanded. Both numbers are measured, neither is
+        asserted from the source: the guard's bar is located behaviourally (it
+        admits at N free shares and refuses at N-1) and N is compared against
+        what a re-read of the persisted rows reports as pledged.
+
+        This is the test the old behaviour fails, in both directions —
+        ``multiplier=10`` was admitted at 30 shares and pledged 300, and
+        ``multiplier=500`` demanded 1,500 and pledged 300.
+        """
+        legs = ([option_leg()] if published is _ABSENT
+                else [option_leg(multiplier=published)])
+        acct = RoundTripAccount(positions=[equity_position(qty=1_000_000.0)])
+
+        if not acct.check_cover_for_covered_call(legs, 3, "covered_call").ok:
+            with pytest.raises(ValueError, match=COVER_REFUSAL):
+                _write(acct, legs=legs, quantity=3)
+            assert acct.shares_pledged_to_short_calls("AAPL") == 0, \
+                "a refused covered call still pledged shares"
+            return
+
+        assert _write(acct, legs=legs, quantity=3) is not None
+        pledged = acct.shares_pledged_to_short_calls("AAPL")
+
+        def admits(shares):
+            return SubmittingAccount(
+                book=[], positions=[equity_position(qty=float(shares))]
+            ).check_cover_for_covered_call(legs, 3, "covered_call").ok
+
+        assert admits(pledged), (
+            f"the rows pledge {pledged} shares, which the guard itself calls too "
+            f"few to write this position")
+        assert not admits(pledged - 1), (
+            f"the rows pledge {pledged} shares but the guard would have written "
+            f"this position against {pledged - 1} — it validated a smaller "
+            f"position than it created")
 
     def test_a_leg_whose_multiplier_is_unreadable_is_refused(self, store):
-        """A leg that publishes the field but not a number is UNKNOWN. It must
-        not fall back to the default — that is the OPT-L7 guess."""
+        """A leg that publishes the field but not a number is UNKNOWN, and reads
+        differently from one that publishes an honest number the rows cannot
+        carry: this one is a damaged input, and the remedy is to repair it."""
         acct = SubmittingAccount(book=[], positions=[equity_position(qty=100000.0)])
 
         with pytest.raises(ValueError) as excinfo:
@@ -1077,10 +1168,19 @@ class TestTheEntrySeamRefusesAnUncoveredCoveredCall:
             "say what was NOT assumed: " + message)
 
     def test_a_leg_carrying_no_multiplier_field_uses_the_platform_default(self, store):
-        """``OptionLeg`` has no ``multiplier`` today, and the rows this very
-        method writes are stamped ``DEFAULT_OPTION_MULTIPLIER``. Absent is not
-        unreadable: refusing it would refuse every covered call on the platform."""
-        assert not hasattr(option_leg(), "multiplier")
+        """``OptionLeg`` has no ``multiplier`` today — and that ABSENCE is what
+        makes the default honest rather than a guess: it is the very number the
+        two row writes below stamp. Refusing an absent field would refuse every
+        covered call on the platform; believing a published one would validate a
+        position those writes cannot record.
+
+        THIS ASSERTION IS A TRIPWIRE. Adding ``multiplier`` to ``OptionLeg`` must
+        change the parent write, the leg-child write and this guard TOGETHER, and
+        it fires here first.
+        """
+        assert not hasattr(option_leg(), "multiplier"), (
+            "OptionLeg now publishes a multiplier: teach submit_option_order's TWO "
+            "row writes to persist it before the cover guard is allowed to believe it")
         acct = SubmittingAccount(
             book=[], positions=[equity_position(qty=float(DEFAULT_OPTION_MULTIPLIER))])
 
@@ -1088,6 +1188,47 @@ class TestTheEntrySeamRefusesAnUncoveredCoveredCall:
 
         assert parent is not None
         assert parent.multiplier == DEFAULT_OPTION_MULTIPLIER
+
+    def test_a_leg_publishing_the_platform_default_is_admitted(self, store):
+        """The field is not banned — the DIVERGENCE is. A leg that says 100 says
+        what the rows say, and agrees by construction."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100.0)])
+
+        parent = _write(acct, legs=[option_leg(multiplier=DEFAULT_OPTION_MULTIPLIER)])
+
+        assert parent is not None and len(acct.submitted) == 1
+
+    # -- the requirement rounds UP ----------------------------------------
+    def test_the_requirement_is_rounded_UP_never_truncated(self, store):
+        """100.5 shares of obligation is a shortfall against 100 held, not a fit.
+
+        Every other requirement in this file is a whole number of shares, so
+        replacing ``math.ceil`` with a plain ``int()`` truncation leaves them all
+        green while under-stating a fractional one — the direction that leaves a
+        contract partly uncovered. ``ratio_qty`` is the only input that can be
+        fractional and nothing writes one today; the guard accepts any readable
+        positive number for it, and this pins which way that rounds.
+        """
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=100.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct, legs=[option_leg(ratio_qty=1.005)])
+
+        message = str(excinfo.value)
+        assert "needs 101 shares" in message, message
+        assert "short by 1 " in message, message
+
+    def test_float_dust_does_not_round_a_whole_requirement_up(self, store):
+        """The other half of the same line: ``round(_, 6)`` before the ceil, so a
+        300.0000000001 built out of float addition stays 300 and an exactly
+        covered call is not refused by one imaginary share."""
+        acct = SubmittingAccount(book=[], positions=[equity_position(qty=300.0)])
+        legs = [option_leg(strike=150.0, ratio_qty=1.0000000001),
+                option_leg(strike=160.0), option_leg(strike=170.0)]
+
+        parent = _write(acct, legs=legs)
+
+        assert parent is not None and len(acct.submitted) == 1
 
     # -- inputs the guard itself cannot read -------------------------------
     #
@@ -1178,8 +1319,14 @@ class TestTheEntrySeamRefusesAnUncoveredCoveredCall:
         assert parent is not None and len(acct.submitted) == 1
 
     def test_a_bear_call_spread_is_unaffected(self, store):
-        """Its short call is covered by a LONG CALL, not by shares. This guard
-        enforces the promise the ``covered_call`` tag makes, and no other."""
+        """Writing one is never REFUSED here: it answers for its short call with
+        a LONG CALL, not with shares, and this guard enforces the promise the
+        ``covered_call`` tag makes and no other.
+
+        Not refused is not "outside the cover ledger" — see
+        ``test_an_open_credit_spread_consumes_cover_on_the_same_ticker`` below,
+        which pins what the spread does to the NEXT write.
+        """
         acct = SubmittingAccount(book=[], positions=[])
         legs = [option_leg(strike=160.0),
                 option_leg(strike=170.0, side=OrderDirection.BUY, intent="buy_to_open")]
@@ -1187,6 +1334,33 @@ class TestTheEntrySeamRefusesAnUncoveredCoveredCall:
         parent = _write(acct, legs=legs, strategy="bear_call_spread")
 
         assert parent is not None and len(acct.submitted) == 1
+
+    def test_an_open_credit_spread_consumes_cover_on_the_same_ticker(self, store):
+        """A covered-call sleeve and a credit-spread sleeve on one ticker will
+        NOT both write, and the docs and the message must say so.
+
+        ``shares_pledged_to_short_calls`` reads the ORDER BOOK, where a bear call
+        spread's short leg is a short call like any other; the long wing beside
+        it is not cover it can verify (nothing guarantees the long is exercised
+        to satisfy an assignment, and it can itself have been sold). So the
+        spread pledges 100 AAPL shares and the genuinely covered call written
+        beside it is refused. That is fail-safe and deliberate — a short 160C
+        really can have 100 shares called away — but it is a real constraint,
+        and the remedy must point at the leg that is actually holding the pledge
+        rather than at shares the operator already owns.
+        """
+        acct = SubmittingAccount(
+            book=[short_call(qty=1, strike=160.0), long_call(qty=1, strike=170.0)],
+            positions=[equity_position(qty=100.0)])
+
+        with pytest.raises(ValueError) as excinfo:
+            _write(acct)
+
+        message = str(excinfo.value)
+        assert "100 already pledged" in message, message
+        assert "credit spread" in message, (
+            "the remedy must name the leg that is holding the pledge, which the "
+            "operator does not think of as consuming shares: " + message)
 
     def test_buying_a_covered_call_back_is_never_refused(self, store):
         """A BUY leg needs no cover — it RELEASES some. Refusing a close when

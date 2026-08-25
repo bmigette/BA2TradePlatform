@@ -37,34 +37,52 @@ _ASSIGNMENT_EPS = 1e-9
 #:
 #: THREE REFUSALS, THREE REMEDIES, and conflating them wastes an afternoon each time.
 #: A buying-power refusal frees up by closing any reserving structure. A capacity
-#: refusal needs cash for delivery. This one needs SHARES: buy the missing shares of the
-#: underlying, write fewer contracts, or close a short call to release the cover it
-#: holds. Adding margin does nothing for it, and nothing it asks for helps the others.
+#: refusal needs cash for delivery. This one needs FREE SHARES: buy the missing shares of
+#: the underlying, write fewer contracts, or close whichever open short call is holding
+#: the pledge — which, because ``shares_pledged_to_short_calls`` counts every short call
+#: in the book, includes the short leg of a credit spread on the same ticker. Adding
+#: margin does nothing for it, and nothing it asks for helps the others.
 COVER_REFUSAL = "UNCOVERED SHORT CALL"
 
 #: The one strategy tag whose entire promise is "these contracts are covered by shares
-#: this account holds". The cover guard enforces exactly that promise and no other:
+#: this account holds". The cover guard REFUSES on exactly that promise and no other:
 #:
 #: * a ``short_strangle``/``short_put`` is DELIBERATELY undefined-risk and is gated by
 #:   PremiumSeller's ``undefined_risk_max_pct`` rail, not by share inventory;
-#: * a ``bear_call_spread``'s short call is covered by a LONG CALL, not by shares;
+#: * a ``bear_call_spread`` answers for its short call with a LONG CALL rather than with
+#:   shares, so it is never refused HERE — but it is not outside the cover ledger either:
+#:   ``shares_pledged_to_short_calls`` counts its short leg as pledging shares like any
+#:   other short call, so an open credit spread does consume cover on that ticker and can
+#:   refuse a genuinely covered call written beside it. Fail-safe and deliberate (that
+#:   short call really can have 100 shares called away), and a real constraint: two such
+#:   sleeves on one ticker will not both write;
 #: * every close path submits under ``"close"`` (``option_lifecycle_service``,
 #:   ``PremiumSeller.portfolio``, ``close_option_position``), so flattening is never
 #:   gated on a cover reading — a refusal there would strand an open position.
 COVERED_CALL_STRATEGY = "covered_call"
 
-#: Shares one contract delivers when nothing says otherwise — and the value this method
-#: stamps on every option row it writes. The cover guard reads it from the LEG when the
-#: leg publishes one (an adjusted contract does not deliver 100 — OPT-L7) and falls back
-#: to this only because ``OptionLeg`` carries no such field yet: the fallback is then not
-#: a guess but the very number being persisted two blocks below.
+#: Shares one contract delivers, and the ONLY value this platform can currently record:
+#: ``submit_option_order`` stamps it on the parent and on every leg child unconditionally,
+#: and ``shares_pledged_to_short_calls`` reads those rows back to price the pledge.
+#:
+#: THE COVER GUARD REQUIRES EXACTLY THIS NUMBER, BECAUSE IT IS THE NUMBER THAT WILL BE
+#: WRITTEN. It used to prefer a multiplier the LEG published (OPT-L7 — an adjusted
+#: contract does not deliver 100), which was correct arithmetic against a row the write
+#: was incapable of producing: a leg publishing 10 was validated against 30 shares for 3
+#: contracts and admitted, and the rows it then wrote reported 300 shares pledged. A gate
+#: that approves one position and creates a different one is worse than no gate, so a leg
+#: publishing anything other than this constant is now REFUSED rather than believed or
+#: ignored (``check_cover_for_covered_call``). ``OptionLeg`` carries no such field, so
+#: nothing on the platform can trip it today; teaching it to must change this constant's
+#: two write sites and the accessor that reads them, together.
 DEFAULT_OPTION_MULTIPLIER = 100
 
 #: Sentinel telling "this leg publishes NO multiplier field" apart from "this leg
-#: publishes one and it is unreadable". The first is today's ``OptionLeg`` and takes the
-#: platform default; the second is a damaged input and is a refusal. A plain
-#: ``getattr(leg, "multiplier", None)`` collapses the two, and collapsing them either
-#: refuses every covered call on the platform or accepts a leg whose multiplier is junk.
+#: publishes one". The first is today's ``OptionLeg`` and takes the platform default,
+#: which is not a guess but the very number being persisted; the second is a claim about
+#: delivery size the rows cannot carry, and is a refusal whether it is readable or junk.
+#: A plain ``getattr(leg, "multiplier", None)`` collapses the two, and collapsing them
+#: refuses every covered call on the platform.
 _MULTIPLIER_ABSENT = object()
 
 
@@ -434,15 +452,29 @@ class OptionsAccountInterface(ABC):
         afternoon. An unknown is never treated as a zero here — that is the whole
         argument of the accessors' own docstrings.
 
-        WHAT IS *NOT* GUARDED, deliberately. Only the ``covered_call`` tag, because only
-        that tag promises share cover (see ``COVERED_CALL_STRATEGY``). A short strangle is
-        meant to be naked and is rationed by a different rail; a bear call spread is
-        covered by its long call; and every close path submits under ``"close"``, so
-        flattening is never blocked by a cover reading — refusing there would strand an
-        open position that can no longer be exited, which is strictly worse than the
-        entry this refuses. For the same reason a structure with no SHORT CALL leg at all
-        (a buy-to-close mistagged ``covered_call``) needs no cover and never consults the
-        feeds: it RELEASES cover rather than consuming it.
+        WHAT IS *NOT* REFUSED, deliberately. Only the ``covered_call`` tag is checked,
+        because only that tag promises share cover (see ``COVERED_CALL_STRATEGY``). A
+        short strangle is meant to be naked and is rationed by a different rail; a bear
+        call spread answers for its short call with a LONG CALL rather than with shares;
+        and every close path submits under ``"close"``, so flattening is never blocked by
+        a cover reading — refusing there would strand an open position that can no longer
+        be exited, which is strictly worse than the entry this refuses. For the same
+        reason a structure with no SHORT CALL leg at all (a buy-to-close mistagged
+        ``covered_call``) needs no cover and never consults the feeds: it RELEASES cover
+        rather than consuming it.
+
+        BUT "NOT REFUSED" IS NOT "OUTSIDE THE COVER LEDGER", and the difference is
+        visible to operators. ``shares_pledged_to_short_calls`` counts EVERY open short
+        call on the ticker, the short leg of a credit spread included — it reads the
+        order book, where that leg is a short call like any other, and a long call
+        standing beside it is not cover it can verify (nothing guarantees the long is
+        exercised to satisfy an assignment; it can itself have been sold). So a bear call
+        spread on AAPL DOES consume 100 shares of AAPL cover here, and a genuinely
+        covered call on AAPL can be refused because of it. That is deliberate and
+        fail-safe — a short 160C really can have 100 shares called away — but it is a
+        REAL constraint, not a technicality: a covered-call sleeve and a credit-spread
+        sleeve on the same ticker will not both write. The shortfall message names the
+        pledge rather than telling the operator to buy shares they may already hold.
 
         LONG CALLS ARE NOT NETTED against the requirement. A covered call is by
         definition one short call against shares, not a spread; if a long call is present
@@ -492,12 +524,16 @@ class OptionsAccountInterface(ABC):
                     f"what sizes the leg (quantity * ratio_qty), so how many {underlying} "
                     f"shares it can call away is unknown. No order, leg or transaction "
                     f"has been created."), underlying=underlying)
+            # THE REQUIREMENT AND THE ROWS ARE THE SAME NUMBER — see the block comment on
+            # DEFAULT_OPTION_MULTIPLIER. Validating against a multiplier the write is
+            # incapable of persisting is how a gate approves one position and creates
+            # another: a leg publishing 10 needed 30 shares for 3 contracts and was
+            # ADMITTED, then the parent and leg rows were stamped 100 and a re-read
+            # through shares_pledged_to_short_calls reported 300 pledged.
             raw_multiplier = getattr(leg, "multiplier", _MULTIPLIER_ABSENT)
-            if raw_multiplier is _MULTIPLIER_ABSENT:
-                multiplier = float(DEFAULT_OPTION_MULTIPLIER)
-            else:
-                multiplier = self._readable_positive_number(raw_multiplier)
-                if multiplier is None:
+            if raw_multiplier is not _MULTIPLIER_ABSENT:
+                published = self._readable_positive_number(raw_multiplier)
+                if published is None:
                     return CoverCapacity(False, (
                         f"{COVER_REFUSAL}: leg {contract} of this covered_call reports "
                         f"multiplier {raw_multiplier!r}, so how many {underlying} shares "
@@ -507,12 +543,38 @@ class OptionsAccountInterface(ABC):
                         f"and guessing under-states exactly the cover this write needs. "
                         f"No order, leg or transaction has been created."),
                         underlying=underlying)
+                if published != float(DEFAULT_OPTION_MULTIPLIER):
+                    # REFUSED rather than silently honoured OR silently ignored. Honouring
+                    # it validates a position the write cannot record; ignoring it
+                    # validates the right number for the wrong reason and drops an
+                    # ADJUSTED contract's delivery size on the floor. Both are OPT-L7
+                    # guesses. The platform simply cannot express this position yet:
+                    # OptionLeg carries no multiplier field, and every option row written
+                    # below is stamped DEFAULT_OPTION_MULTIPLIER unconditionally. Teaching
+                    # it to must start at those two writes and at the pledge accessor that
+                    # reads them back — this refusal is the reminder, exactly as the
+                    # single-expiry guard is the reminder for Transaction.expiry.
+                    return CoverCapacity(False, (
+                        f"{COVER_REFUSAL}: leg {contract} of this covered_call publishes "
+                        f"multiplier {raw_multiplier!r}, but every option row written here "
+                        f"is recorded with multiplier {DEFAULT_OPTION_MULTIPLIER} — so the "
+                        f"{underlying} cover this write would be checked against and the "
+                        f"cover the resulting book would report are two different numbers, "
+                        f"and the smaller one is the check. An adjusted contract cannot be "
+                        f"recorded honestly until OptionLeg carries a multiplier and both "
+                        f"row writes persist it. No order, leg or transaction has been "
+                        f"created."), underlying=underlying)
+            multiplier = float(DEFAULT_OPTION_MULTIPLIER)
             required[underlying] = (required.get(underlying, 0.0)
                                     + contracts * ratio * multiplier)
 
         for underlying in sorted(required):
             # Rounded UP, like the pledge itself: under-stating the requirement by one
-            # share is the direction that leaves a contract uncovered.
+            # share is the direction that leaves a contract uncovered. ``round(_, 6)``
+            # first so float-addition dust cannot turn 300.0000000001 into 301; the
+            # ``ceil`` is what a fractional ``ratio_qty`` lands on, and dropping it for a
+            # plain ``int()`` truncation is pinned by
+            # ``test_the_requirement_is_rounded_UP_never_truncated``.
             need = int(math.ceil(round(required[underlying], 6)))
             if need <= 0:
                 continue
@@ -548,8 +610,10 @@ class OptionsAccountInterface(ABC):
                     f"are free (the account holds {held}, with {pledged} already pledged "
                     f"to open short calls) — short by {need - free} share(s). No order, "
                     f"leg or transaction has been created. Buy the missing shares, write "
-                    f"fewer contracts, or close a short call to release the cover it "
-                    f"holds; adding margin does nothing for this one."),
+                    f"fewer contracts, or close whichever open short call is holding the "
+                    f"pledge — INCLUDING the short leg of a credit spread on "
+                    f"{underlying}, which is counted here even though its own cover is a "
+                    f"long call; adding margin does nothing for this one."),
                     underlying=underlying, required=need, held=held, pledged=pledged)
         return CoverCapacity(True)
 
@@ -1244,6 +1308,15 @@ class OptionsAccountInterface(ABC):
         ``short_put_assignment_exposure``'s question; it places no claim on share
         inventory, and counting it here would refuse to sell shares nothing has a claim
         on. LONG options pledge nothing at all — only the short side can be called away.
+
+        A SPREAD'S SHORT CALL IS COUNTED LIKE ANY OTHER. This reads the ORDER BOOK, where
+        the short leg of a bear call spread is a short call on the ticker; the long wing
+        beside it is not cover this can verify (nothing guarantees the long is exercised
+        to satisfy an assignment, and it can itself have been sold). Netting the two
+        would hand back shares on a promise, so the leg pledges its full share count.
+        Fail-safe and deliberate, with a real consequence the callers must state: an open
+        credit spread consumes cover on its ticker, so ``check_cover_for_covered_call``
+        can refuse a genuinely covered call written beside one.
 
         THE MULTIPLIER IS READ PER CONTRACT AND NEVER ASSUMED TO BE 100 (OPT-L7). An
         adjusted contract — post-split, post-merger — can deliver a different number of
