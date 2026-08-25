@@ -20,6 +20,8 @@ import types
 import numpy as np
 import pytest
 
+import app.services.distributed_eval as de
+from app.models import Worker
 from app.models.database import Base, SessionLocal, engine
 from app.models.strategy import Strategy
 from app.models.strategy_optimization import StrategyOptimization
@@ -233,6 +235,70 @@ def test_handler_completes_and_persists_best(monkeypatch):
     assert 2.0 <= row.best_params["entry:bracket:a1:action_value"] <= 12.0
     assert -6.0 <= row.best_params["entry:bracket:a2:action_value"] <= -1.0
     assert row.all_results and all("fitness" in r for r in row.all_results)
+
+
+def test_handler_completes_remote_only_zero_local_slots(monkeypatch):
+    """End-to-end regression for the remote-only wiring: parallelIndividuals=0 + a configured
+    worker must reach DistributedEvaluator (not the plain sequential path parallel<=1 takes with
+    no workers), and every trial must be attributed to the remote worker -- there is no local
+    pool for anything to silently fall back to."""
+    monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
+    monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
+
+    seen = []
+
+    def fake_run_trial(worker, config, metric, **kw):
+        seen.append(worker["name"])
+        return {"ok": True, "fitness": 9.0, "trades": 5, "error": None}
+
+    monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: True)
+    monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
+    monkeypatch.setattr(de.worker_client, "push_secrets", lambda w, s, **k: {"set": 0})
+    monkeypatch.setattr(de.worker_client, "health", lambda w, **k: {"capacity": 3})
+    monkeypatch.setattr(de.worker_client, "run_trial", fake_run_trial)
+
+    db = SessionLocal()
+    try:
+        w = Worker(name="remote227-test", url="http://x:8100", password="p",
+                   worker_type="remote", is_local=False, is_enabled=True, status="offline")
+        db.add(w)
+        db.commit()
+        db.refresh(w)
+        worker_id = w.id
+    finally:
+        db.close()
+
+    sid = _seed_strategy()
+    # _build_daily_trial_config (only reached via the BATCHED path -- the sequential path this
+    # test must NOT take calls _run_trial_backtest directly and never needs this key) requires
+    # backtest_cfg["experts"]; the sequential-only tests above never exercise it, so _ga_config()'s
+    # default backtest dict doesn't carry one.
+    cfg = _ga_config(parallelIndividuals=0)
+    cfg["backtest"].update(
+        backtest_id=7, experts=[], enabled_instruments=["AAPL"],
+        account_settings={"starting_cash": 100000.0}, warmup_days=30,
+        initial_capital=100000.0,
+    )
+    opt_id = _seed_opt(sid, config=cfg)
+    db = SessionLocal()
+    try:
+        row = db.query(StrategyOptimization).filter(StrategyOptimization.id == opt_id).first()
+        row.worker_ids = [worker_id]
+        db.commit()
+    finally:
+        db.close()
+
+    out = H.handle_strategy_optimization("t-opt-remote-only", {"optimization_id": opt_id})
+
+    assert out["status"] == "completed", out
+    row = _load_opt(opt_id)
+    assert row.status == "completed"
+    assert row.best_fitness == 9.0          # only the fake remote trial ever reports a fitness
+    assert seen, "no trial reached the remote worker -- remote-only dispatch never engaged"
+    # Elitism/memoization mean not every population slot across 4 generations is a fresh
+    # evaluation, so the count isn't a fixed 8x4 -- what matters is EVERY evaluation that did
+    # happen went to the remote worker (no local slot existed to run even one instead).
+    assert set(seen) == {"remote227-test"}
 
 
 def test_completion_return_dict_never_carries_last_gen_full_results(monkeypatch):
@@ -730,6 +796,32 @@ def test_max_remote_slots_for_experts_reads_senate_cap_and_defaults_uncapped():
         {"class": "FMPEarningsDrift", "settings": {}},
     ]}
     assert H._max_remote_slots_for_experts(mixed_cfg) == 3  # tightest cap wins
+
+
+def test_resolve_parallel_individuals_zero_is_not_the_missing_key_default():
+    """``ga.get("parallelIndividuals", 1) or 1`` silently turned an explicit 0 (remote-only: no
+    local trial slots) into 1, because 0 is falsy in Python -- indistinguishable from the key
+    being absent. ``_resolve_parallel_individuals`` must only apply the default-1 when the key
+    is genuinely missing/None, and pass an explicit 0 through unchanged."""
+    assert H._resolve_parallel_individuals({}) == 1                       # key absent -> default
+    assert H._resolve_parallel_individuals({"parallelIndividuals": None}) == 1
+    assert H._resolve_parallel_individuals({"parallelIndividuals": 0}) == 0   # explicit 0 survives
+    assert H._resolve_parallel_individuals({"parallelIndividuals": 4}) == 4
+    assert H._resolve_parallel_individuals({"parallelIndividuals": "3"}) == 3  # still coerces
+
+
+def test_dispatch_engages_gate():
+    """The pooled/distributed machinery (local process pool and/or DistributedEvaluator) must
+    engage whenever there is real concurrency to manage: parallel > 1 locally, OR at least one
+    remote worker configured -- including parallel == 0 (remote-only, no local slots at all).
+    ``if parallel > 1:`` used to gate BOTH cases together, so a remote-only run (parallel <= 1)
+    never reached the code that resolves/dispatches to workers at all."""
+    assert H._dispatch_engages(parallel=0, has_workers=True) is True     # remote-only
+    assert H._dispatch_engages(parallel=1, has_workers=True) is True     # 1 local + remote
+    assert H._dispatch_engages(parallel=4, has_workers=True) is True
+    assert H._dispatch_engages(parallel=4, has_workers=False) is True    # local-only pooled
+    assert H._dispatch_engages(parallel=1, has_workers=False) is False   # plain sequential path
+    assert H._dispatch_engages(parallel=0, has_workers=False) is False
 
 
 def test_build_daily_trial_config_bypass_drops_rm_tp_sl():

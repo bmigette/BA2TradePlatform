@@ -851,6 +851,26 @@ def _resolve_workers(db: Any, worker_ids: Optional[list]) -> list:
     return [{"id": w.id, "name": w.name, "url": w.url, "password": w.password} for w in rows]
 
 
+def _dispatch_engages(parallel: int, has_workers: bool) -> bool:
+    """True when the pooled/distributed machinery (local process pool and/or
+    ``DistributedEvaluator``) should engage at all -- i.e. there is real concurrency to manage:
+    more than one local slot, or at least one remote worker (even with 0 or 1 local slots, the
+    remote-only / mostly-remote case). False means "just run generations sequentially in this
+    process," the pre-existing behaviour for parallel<=1 with no workers configured.
+    """
+    return parallel > 1 or has_workers
+
+
+def _resolve_parallel_individuals(ga: Dict[str, Any]) -> int:
+    """Local trial-slot count from ``ga['parallelIndividuals']``, defaulting to 1 when the key is
+    missing/None -- but NOT when it is explicitly 0 (a remote-only run: no local slots at all).
+    ``ga.get("parallelIndividuals", 1) or 1`` looked equivalent but isn't: 0 is falsy in Python,
+    so an explicit 0 was silently promoted to 1, indistinguishable from the key being absent.
+    """
+    raw = ga.get("parallelIndividuals")
+    return 1 if raw is None else int(raw)
+
+
 class _FatalTrialError(RuntimeError):
     """A trial failed for a reason that will affect EVERY remaining trial (incomplete prewarm,
     missing OHLCV cache). Raised out of the fitness batch to stop the search immediately rather
@@ -1052,7 +1072,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # Parallel trials: ga['parallelIndividuals'] > 1 evaluates the population across a
         # ThreadPoolExecutor. Safe now that each trial isolates its per-run DB on its own
         # thread (ba2_common configure_db_threadlocal) + the OHLCV/FMP caches are lock-guarded.
-        parallel = int(ga.get("parallelIndividuals", 1) or 1)
+        parallel = _resolve_parallel_individuals(ga)
         optimizer = GeneticOptimizer(
             param_ranges=param_space,
             population_size=int(ga["populationSize"]),
@@ -1440,7 +1460,14 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         _pool = None
         batch_fitness = None
         _evaluator = None
-        if parallel > 1:
+        # Resolve workers BEFORE the gate below: a remote-only or mostly-remote run (parallel <= 1
+        # with workers configured) must still reach the distributed path -- see _dispatch_engages.
+        try:
+            _workers = _resolve_workers(db, opt.worker_ids)
+        except Exception as e:  # noqa: BLE001 — distribution is optional; never block a run
+            logger.warning(f"worker resolution failed, running local-only: {e}")
+            _workers = []
+        if _dispatch_engages(parallel, bool(_workers)):
             import multiprocessing as _mp
             from concurrent.futures import ProcessPoolExecutor
 
@@ -1461,20 +1488,22 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             _governor = MemoryGovernor(parallel)
             # Learns trial cost across generations so each batch dispatches longest-first.
             _cost_model = _TrialCostModel()
-            # Resolve the workers BEFORE building the pool: the two paths want different pool
-            # SHAPES. Distributed needs one shared executor (several consumer threads submit into
-            # it concurrently); local-only wants one single-worker pool per slot, so a recycle
-            # never stalls the other slots (see _SlotPools). Building the wrong one first and
-            # discarding it would cost a full spawn+import cycle per job.
-            try:
-                _workers = _resolve_workers(db, opt.worker_ids)
-            except Exception as e:  # noqa: BLE001 — distribution is optional; never block a run
-                logger.warning(f"worker resolution failed, running local-only: {e}")
-                _workers = []
             if _workers:
-                _pool = _make_pool()
-                _pool_kind = "shared executor (distributed)"
+                # Distributed needs one shared executor (several consumer threads submit into it
+                # concurrently) -- UNLESS parallel == 0 (remote-only: no local slots at all), in
+                # which case there is no local pool to build: ProcessPoolExecutor(max_workers=0)
+                # raises, and DistributedEvaluator(n_consumers=0) never touches the pool it's
+                # handed anyway (see distributed_eval.py — no local consumer thread is spawned).
+                if parallel >= 1:
+                    _pool = _make_pool()
+                    _pool_kind = "shared executor (distributed)"
+                else:
+                    _pool = None
+                    _pool_kind = "remote-only (0 local slots)"
             else:
+                # local-only wants one single-worker pool per slot, so a recycle never stalls the
+                # other slots (see _SlotPools). parallel is guaranteed > 1 here (no workers ->
+                # _dispatch_engages only admitted parallel > 1).
                 def _make_one():
                     return ProcessPoolExecutor(
                         max_workers=1,
@@ -1503,16 +1532,17 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 _evaluator = DistributedEvaluator(
                     _pool, opt.fitness_metric, parallel, opt_id,
                     workers=_workers, master_version=_master_version,
-                    pool_factory=_make_pool,
+                    pool_factory=_make_pool if parallel >= 1 else None,
                     max_remote_slots_per_worker=_max_remote_slots,
                     governor=_governor,
                 )
                 _evaluator.start()  # pre-flight: version-match + cache-push each worker
-                batch_fitness = make_batch_fitness(_evaluator.execute_jobs)
                 logger.warning(f"strategy_optimization {opt_id}: DISTRIBUTED across "
-                               f"{len(_workers)} selected worker(s) + local"
+                               f"{len(_workers)} selected worker(s)"
+                               + (" + local" if parallel >= 1 else " (remote-only, 0 local slots)")
                                + (f" (remote slots capped at {_max_remote_slots}/worker)"
                                   if _max_remote_slots else ""))
+                batch_fitness = make_batch_fitness(_evaluator.execute_jobs)
             else:
                 batch_fitness = make_batch_fitness(_local_execute_jobs)
         try:

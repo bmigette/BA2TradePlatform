@@ -308,3 +308,32 @@ def test_remote_repeated_retryable_failures_bench_the_worker(monkeypatch):
         ev.stop()
     assert set(by_idx) == set(range(10))
     assert all(by_idx[i]["ok"] for i in range(10))  # local finished everything
+
+
+def test_zero_local_consumers_dispatches_remote_only(monkeypatch):
+    """n_consumers=0 (a run with no local trial slots) must not be floored to 1, must spawn no
+    local consumer thread, and must never touch the local pool -- passing pool=None here means
+    any code path that DOES touch it fails loudly instead of masking the bug with a working fake.
+    Regression for two bugs: n_consumers=0 silently became 1 (`max(1, n_consumers)`), and
+    execute_jobs' re-admission cadence (`completed % self.n_consumers`) divides by zero once it
+    isn't floored."""
+    monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: True)
+    monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
+    monkeypatch.setattr(de.worker_client, "health", lambda w, **k: {"capacity": 3})
+    monkeypatch.setattr(de.worker_client, "run_trial",
+                        lambda w, config, metric, **kw: {"ok": True, "fitness": _fitness(config),
+                                                          "trades": 1, "error": None})
+
+    workers = [{"id": 1, "name": "remote227", "url": "http://x", "password": "p"}]
+    ev = DistributedEvaluator(None, "sharpe", n_consumers=0, optimization_id="t",
+                              workers=workers, master_version="abc", log=lambda *_: None)
+    assert ev.n_consumers == 0
+    ev.start()
+    try:
+        assert not any(t.name.startswith("local-trial-consumer-") for t in ev._threads)
+        jobs = [(i, {"idx": i}, f"k{i}", {"v": i}) for i in range(10)]
+        by_idx = {i: out for (i, _f, _k, out) in ev.execute_jobs(jobs)}
+    finally:
+        ev.stop()
+    assert set(by_idx) == set(range(10))
+    assert all(by_idx[i]["fitness"] == i * 2.0 for i in range(10))

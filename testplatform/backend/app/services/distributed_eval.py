@@ -148,7 +148,9 @@ class DistributedEvaluator:
         self._parked_logged = set()
         self._pool_lock = threading.Lock()  # guards self.pool reads/recreation across consumers
         self.fitness_metric = fitness_metric
-        self.n_consumers = max(1, n_consumers)
+        # 0 is a legitimate value: a remote-only run with no local trial slots. Only negative
+        # input (a caller bug) gets floored.
+        self.n_consumers = max(0, n_consumers)
         self.optimization_id = optimization_id
         self.workers = workers or []
         self.master_version = master_version
@@ -730,6 +732,9 @@ class DistributedEvaluator:
             trial_map[tid] = (i, flat, key)
         remaining = set(trial_map)
         completed = 0
+        # Re-admission cadence stride: n_consumers with a remote-only run (n_consumers=0) would
+        # divide by zero below, so fall back to checking every completed trial in that case.
+        _recheck_stride = self.n_consumers or 1
         while remaining:
             ready = self.broker.wait_ready(remaining, timeout=2.0)
             if not ready:
@@ -743,7 +748,7 @@ class DistributedEvaluator:
                 completed += 1
                 # Re-admission cadence: every n_consumers individuals, give previously-excluded/
                 # failed workers a chance to rejoin (see _maybe_recheck_async — no-op if none down).
-                if completed % self.n_consumers == 0:
+                if completed % _recheck_stride == 0:
                     self._maybe_recheck_async()
                 yield (i, flat, key, out)
 
