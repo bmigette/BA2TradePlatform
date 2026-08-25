@@ -947,8 +947,31 @@ def test_floating_pl_per_account_marks_a_row_partial_when_a_held_position_has_no
     select_account(manual_account)
     texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
 
-    assert '$100.00 (partial)' in texts
+    # BOTH the row and the total. Marking only one of them leaves a bare
+    # '$100.00' on screen that reads as the whole answer.
+    assert texts.count('$100.00 (partial)') == 2
+    assert '$100.00' not in texts
     assert any('MSFT' in t for t in texts), texts
+
+
+def test_floating_pl_per_account_treats_a_position_the_broker_did_not_price_as_unpriced(
+        nicegui_client, select_account, monkeypatch, manual_account):
+    """A position in the book with ``current_price=None`` has no price.
+
+    Coercing that to 0.0 does not merely lose the leg -- it invents one, and the
+    invented one is catastrophic: a $1,000 holding marked to zero prints a
+    $1,000 loss the account never took.
+    """
+    _open_trade(manual_account, 'AAPL', qty=10.0, open_price=100.0)
+    _use_brokers(monkeypatch, {manual_account: _Broker(
+        [{'symbol': 'AAPL', 'current_price': None}])})
+
+    select_account(manual_account)
+    texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
+
+    assert '-$1,000.00' not in texts
+    assert texts.count('$0.00 (partial)') == 2
+    assert any('AAPL' in t for t in texts), texts
 
 
 def test_floating_pl_per_account_does_not_call_a_pending_order_unpriced(
