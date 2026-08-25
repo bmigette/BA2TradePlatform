@@ -42,6 +42,31 @@ def parse_arguments():
     
     return parser.parse_args()
 
+def startup_db_maintenance():
+    """Trim the activity log, then VACUUM if enough space is actually reclaimable.
+
+    NEVER RAISES — ``run_startup_maintenance`` absorbs and logs every failure, because a
+    housekeeping problem must not stop the platform from trading.
+
+    The purge goes through ``core.cleanup.cleanup_activity_logs``, the SAME function the
+    Settings -> Cleanup tab calls: one implementation of activity-log retention, two
+    callers.
+
+    WHERE THIS MUST RUN, and why it is a module-level function rather than four lines
+    inline: ``VACUUM`` takes an EXCLUSIVE lock on the whole database and cannot run
+    inside a transaction. It has to happen after ``wire_all_seams()`` (which configures
+    the engine) and ``init_db()`` (which guarantees the table exists), and before ANY of
+    the job manager, the worker queue, the Smart-RM queue, the instrument auto-adder or
+    the UI exist to want a write. ``tests/test_startup_db_maintenance.py`` pins that
+    ordering against this file.
+    """
+    from ba2_common.core.db_maintenance import run_startup_maintenance
+    from ba2_trade_platform.core.cleanup import cleanup_activity_logs
+
+    return run_startup_maintenance(
+        lambda days_to_keep: cleanup_activity_logs(days_to_keep=days_to_keep))
+
+
 def initialize_system():
     """Initialize the system components."""
     from ba2_trade_platform.logger import logger
@@ -109,6 +134,19 @@ def initialize_system():
     
     # Initialize database
     init_db()
+
+    # Housekeeping, FIRST and alone. The activity-log purge is cheap; the conditional
+    # VACUUM that follows it takes an EXCLUSIVE lock on the entire database and cannot
+    # run inside a transaction, so it must happen while this process is still
+    # single-threaded with respect to the DB: after wire_all_seams()+init_db() (the
+    # engine exists and the schema is there), and BEFORE force_sync_all_transactions(),
+    # the job manager, the worker queue, the Smart-RM queue, the instrument auto-adder
+    # and the UI -- every one of which writes. Nothing above this line has scheduled
+    # work: the imports above only import, and init_db()'s activity-log worker thread
+    # is idle because nothing has queued an entry yet.
+    logger.info("Running startup database maintenance...")
+    startup_db_maintenance()
+
     # Force sync all transactions based on current order states
     # This ensures transaction states are correct after restart
     logger.info("Force syncing all transactions based on order states...")

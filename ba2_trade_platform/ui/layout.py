@@ -16,6 +16,11 @@ from .account_filter_context import (get_accounts_for_filter, get_selected_accou
 # the money formatting are imported, not restated. Cheap: the module is pure
 # (math/re/dataclasses) and costs ~0.1s.
 from .utils.portfolio_allocation_view import account_value_from_snapshot, format_account_money
+# The size measurement and the 1 GB threshold are the SAME ones the startup
+# maintenance pass uses (main.startup_db_maintenance -> db_maintenance), so the
+# banner cannot come to a different conclusion about the database than the log does.
+from ba2_common.core.db_maintenance import (database_file_size_bytes, format_bytes,
+                                            resolve_db_size_warn_bytes)
 from ..logger import logger
 
 from nicegui import ui, app
@@ -423,6 +428,9 @@ def layout_render(navigation_title: str):
     
     # Main content area with padding
     with ui.column().classes('w-full p-6 text-white'):
+        # Drawn (hidden) before the page body so the warning, if it fires, is the
+        # first thing on the page rather than something below the fold.
+        _render_db_size_banner()
         yield
 
 
@@ -503,6 +511,121 @@ def _paint(label, icon, tooltip, view: HeaderBalance) -> None:
     label.classes(replace=f'text-xs font-medium {colour}')
     icon.classes(replace=colour)
     icon.props(f'name={glyph}')
+
+
+# ---------------------------------------------------------------------------
+# THE "YOUR DATABASE IS HUGE" BANNER
+#
+# Shown ONCE per app start, above 1 GB, naming the tool that can do something
+# about it. Not once per page load: this layout is rebuilt on every navigation,
+# and a warning that reappears on every click is one the reader learns to
+# dismiss without reading.
+#
+# SAME RENDER-PATH DISCIPLINE AS THE BALANCE ABOVE. ``os.path.getsize`` is
+# usually microseconds, but "usually" is doing a lot of work on a network mount
+# or a stalled volume -- and this header is on the path of EVERY page. So the
+# render draws an empty, hidden slot, and a ui.timer fills it afterwards from a
+# worker thread.
+#
+# WHAT IT PROMISES. Only what the cleanup tool actually does: it removes old
+# market analyses (with their outputs/recommendations) and old activity logs.
+# It does NOT promise a specific saving -- the biggest table on the user's
+# database (trade_action_result, 189.7 MB) only goes when its parent
+# recommendation does.
+# ---------------------------------------------------------------------------
+
+DB_SIZE_BANNER_MARKER = 'db-size-banner'
+DB_SIZE_BANNER_TIMER_MARKER = 'db-size-banner-check'
+
+#: How soon after the page is built the size is measured. Non-zero so the HTML
+#: goes out first.
+DB_SIZE_BANNER_CHECK_SECONDS = 0.3
+
+DB_SIZE_BANNER_TEXT_FMT = (
+    'Database is {size}, at or over the {threshold} warning threshold. Old market '
+    'analyses and activity logs can be removed in Settings → Cleanup → Batch '
+    'Database Cleanup.')
+DB_SIZE_BANNER_LINK_TEXT = 'Open Settings → Cleanup'
+DB_SIZE_BANNER_LINK_TARGET = '/settings#cleanup'
+
+#: Fires once per PROCESS. A plain bool behind a lock rather than a per-client
+#: flag: "once per app start" is a property of the app, not of a browser tab.
+_DB_SIZE_BANNER_LOCK = threading.Lock()
+_DB_SIZE_BANNER_CHECKED = False
+
+
+def reset_db_size_banner() -> None:
+    """Re-arm the one-shot. For tests, and for an explicit re-check."""
+    global _DB_SIZE_BANNER_CHECKED
+    with _DB_SIZE_BANNER_LOCK:
+        _DB_SIZE_BANNER_CHECKED = False
+
+
+def _claim_db_size_check() -> bool:
+    """True for the FIRST caller since app start; False for every one after.
+
+    Claimed BEFORE the measurement, not after: two pages opened at once would
+    otherwise both stat the file, and a check that keeps being retried is a
+    check that runs on every navigation.
+    """
+    global _DB_SIZE_BANNER_CHECKED
+    with _DB_SIZE_BANNER_LOCK:
+        if _DB_SIZE_BANNER_CHECKED:
+            return False
+        _DB_SIZE_BANNER_CHECKED = True
+        return True
+
+
+def db_size_banner_text(size_bytes: Optional[int], threshold_bytes: int) -> Optional[str]:
+    """What the banner should say, or ``None`` for "say nothing". Pure.
+
+    ``size_bytes is None`` means the size could not be measured, and that is
+    deliberately SILENT. A size we cannot read is not evidence of a large
+    database; warning on it would fire for every backtest ``:memory:`` engine
+    and would teach the reader to dismiss the banner. The operator hears about
+    it in the log instead.
+
+    The comparison is inclusive, matching the vacuum gate: exactly at the
+    threshold counts as over it.
+    """
+    if size_bytes is None:
+        return None
+    if size_bytes < threshold_bytes:
+        return None
+    return DB_SIZE_BANNER_TEXT_FMT.format(size=format_bytes(size_bytes),
+                                          threshold=format_bytes(threshold_bytes))
+
+
+def _render_db_size_banner() -> None:
+    """Reserve the banner slot and schedule the one check. NO filesystem access here."""
+    container = ui.row().classes(
+        'w-full items-center gap-2 mb-4 p-3 rounded'
+    ).style('background: rgba(255, 167, 38, 0.12); border: 1px solid rgba(255, 167, 38, 0.5)'
+            ).mark(DB_SIZE_BANNER_MARKER)
+    container.set_visibility(False)
+
+    async def _check() -> None:
+        try:
+            if not _claim_db_size_check():
+                return
+            size = await asyncio.to_thread(database_file_size_bytes)
+            text = db_size_banner_text(size, resolve_db_size_warn_bytes())
+            if text is None:
+                if size is None:
+                    logger.warning('Database size banner: the database size could not be '
+                                   'measured, so no size warning can be made')
+                return
+            logger.warning(text)
+            with container:
+                ui.icon('storage', size='sm').classes('text-warning')
+                ui.label(text).classes('text-sm')
+                ui.link(DB_SIZE_BANNER_LINK_TEXT, DB_SIZE_BANNER_LINK_TARGET).classes('text-sm')
+            container.set_visibility(True)
+        except Exception as e:
+            # A housekeeping warning must never cost a page.
+            logger.error(f"Database size banner: the size check failed: {e}", exc_info=True)
+
+    ui.timer(DB_SIZE_BANNER_CHECK_SECONDS, _check, once=True).mark(DB_SIZE_BANNER_TIMER_MARKER)
 
 
 #: The ui.select key standing in for a ``None`` selection. A string, because

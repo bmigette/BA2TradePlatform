@@ -8,6 +8,7 @@ analyses that have linked open transactions.
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Optional
 from sqlmodel import Session, select, func, text
+from sqlalchemy import delete as sa_delete
 from ba2_trade_platform.core.models import (
     MarketAnalysis, 
     AnalysisOutput, 
@@ -479,14 +480,40 @@ def get_cleanup_statistics(expert_instance_id: Optional[int] = None) -> Dict[str
         }
 
 
-def cleanup_activity_logs(days_to_keep: int = 60) -> Dict[str, Any]:
+def cleanup_activity_logs(days_to_keep: int = 60, now: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Delete activity logs older than specified days.
-    
+
+    THE SINGLE implementation of activity-log retention. Two callers: the Settings ->
+    Cleanup tab (manual button) and ``main.startup_db_maintenance()`` (every boot). Do
+    not grow a second one — two functions that both mean "delete activity logs older
+    than N days" will drift, and the one that drifts is the one nobody is watching.
+
+    THE BOUNDARY: strictly ``created_at < now - days_to_keep``. A row whose age is
+    EXACTLY the retention period is KEPT — "keep 60 days" is a closed window.
+
+    BULK DELETE, deliberately. This used to ``select()`` every matching row into ORM
+    objects and ``session.delete()`` them one at a time; on the live database that is
+    24,435 objects materialised and 24,435 statements. Acceptable behind a button a
+    human presses once a year, wrong on the startup path. It is now one ``DELETE ...
+    WHERE``, which also means the returned count comes from the driver's rowcount
+    rather than from a list we had to build anyway.
+
+    ``synchronize_session=False`` because the session is opened here, holds no
+    ActivityLog objects and is closed immediately: there is nothing in memory to keep
+    in step, and the alternative ('fetch') would re-introduce exactly the SELECT of
+    every matching row that this change removes.
+
+    No write mutex is taken. This is a single statement — SQLite serialises it on its
+    own — and taking ``db._db_write_lock`` around a caller-supplied session is the
+    shape that self-deadlocked production twice in 2026-08.
+
     Args:
         days_to_keep: Number of days to keep. Logs older than this will be deleted.
                      Default is 60 days.
-    
+        now: The instant to measure age from. Defaults to the current UTC time;
+             injected by tests so the window logic is not measured against the clock.
+
     Returns:
         Dictionary with cleanup results:
         {
@@ -494,29 +521,31 @@ def cleanup_activity_logs(days_to_keep: int = 60) -> Dict[str, Any]:
             'error': Optional[str]
         }
     """
-    cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_to_keep)
-    
+    if now is None:
+        now = datetime.now(timezone.utc)
+    cutoff_date = now - timedelta(days=days_to_keep)
+
     try:
         with get_db() as session:
-            # Find old activity logs
-            old_logs_query = select(ActivityLog).where(ActivityLog.created_at < cutoff_date)
-            old_logs = session.exec(old_logs_query).all()
-            
-            deleted_count = len(old_logs)
-            
-            # Delete old logs
-            for log in old_logs:
-                session.delete(log)
-            
+            statement = sa_delete(ActivityLog).where(ActivityLog.created_at < cutoff_date)
+            result = session.execute(
+                statement, execution_options={"synchronize_session": False})
+            deleted_count = result.rowcount
             session.commit()
-            
-            logger.info(f"Deleted {deleted_count} activity logs older than {days_to_keep} days")
-            
+
+            if deleted_count is None or deleted_count < 0:
+                # pysqlite always reports a DELETE rowcount; if some driver ever does
+                # not, say so rather than inventing a number.
+                logger.error(f"Activity log cleanup: the database driver did not report "
+                             f"how many rows it deleted (rowcount={deleted_count!r})")
+            else:
+                logger.info(f"Deleted {deleted_count} activity logs older than {days_to_keep} days")
+
             return {
                 'deleted_count': deleted_count,
                 'error': None
             }
-            
+
     except Exception as e:
         logger.error(f"Error cleaning up activity logs: {e}", exc_info=True)
         return {
