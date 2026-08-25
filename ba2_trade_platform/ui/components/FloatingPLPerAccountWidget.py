@@ -12,6 +12,7 @@ from ...core.models import Transaction, AccountDefinition, TradingOrder
 from ...core.types import TransactionStatus, OrderStatus, OrderDirection, OrderType
 from ...core.utils import get_account_instance_from_id
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
+from .account_scope import scope_transactions_to_account
 
 
 class _FloatingPLWidgetBase:
@@ -19,8 +20,15 @@ class _FloatingPLWidgetBase:
 
     Subclasses must define:
         _title: str             - card header text
+        _scope_query()          - narrow the open-transaction query to this widget's subject
         _get_extra_filters()    - additional SQLAlchemy where-clauses for the transaction query
         _group_transactions()   - group raw transactions into {account_id: [(trans, display_name), ...]}
+
+    ``_scope_query`` is the seam that keeps the two subclasses honest. 'Per Expert'
+    is genuinely per-expert and scopes by expert id; 'Per Account' is account-level
+    and scopes by account. The base used to hard-code the EXPERT filter for both,
+    so the per-account widget went blank for an account with no experts and hid
+    hand-placed (``expert_id IS NULL``) trades on the accounts that do have them.
     """
 
     _title: str = ""
@@ -54,6 +62,23 @@ class _FloatingPLWidgetBase:
         Default: no extra filters.
         """
         return []
+
+    def _scope_query(self, query, selected_account_id: Optional[int],
+                     account_expert_ids: Optional[List[int]]):
+        """Narrow *query* to the transactions this widget is about.
+
+        Args:
+            query: the open/waiting ``Transaction`` select built by the base.
+            selected_account_id: the header's account filter, ``None`` for "All".
+            account_expert_ids: that account's expert ids -- ``None`` for "All",
+                and ``[]`` for an account that HAS NO EXPERTS (which is not the
+                same thing as an account with no data).
+
+        Returns:
+            The narrowed query, or ``None`` to mean "nothing can match" so the
+            caller can skip the round trip entirely.
+        """
+        raise NotImplementedError
 
     def _group_transactions(
         self, transactions: List[Transaction], session: Session
@@ -103,13 +128,10 @@ class _FloatingPLWidgetBase:
             for clause in self._get_extra_filters():
                 query = query.where(clause)
 
-            # Apply account filter if selected (filter by expert_id which belongs to account)
-            if account_expert_ids is not None:
-                if account_expert_ids:
-                    query = query.where(Transaction.expert_id.in_(account_expert_ids))
-                else:
-                    # No experts for selected account - return empty
-                    return {}, {}
+            # Apply the header's account filter the way THIS widget means it.
+            query = self._scope_query(query, selected_account_id, account_expert_ids)
+            if query is None:
+                return {}, {}
 
             transactions = session.exec(query).all()
 
@@ -317,10 +339,24 @@ class FloatingPLPerAccountWidget(_FloatingPLWidgetBase):
     _title = '📊 Floating P/L Per Account'
     _show_balance = True
 
+    def _scope_query(self, query, selected_account_id: Optional[int],
+                     account_expert_ids: Optional[List[int]]):
+        """Scope by ACCOUNT. ``account_expert_ids`` is deliberately ignored.
+
+        Every open position in the account counts towards the account's floating
+        P/L, whoever opened it -- an expert, the Smart Risk Manager, or the user by
+        hand. There is no "nothing can match" answer here: an account with no
+        transactions yields no rows on its own.
+        """
+        return scope_transactions_to_account(query, selected_account_id)
+
     def _group_transactions(
         self, transactions: List[Transaction], session: Session
     ) -> Dict[int, List[Tuple[Transaction, str]]]:
-        selected_account_id = get_selected_account_id()
+        # No account filter here: ``_scope_query`` already applied it IN SQL, in one
+        # place. Re-deriving it here also meant calling get_selected_account_id()
+        # from inside the executor thread, where app.storage.user does not exist --
+        # the exact thing _load_data_async captures the filter up-front to avoid.
         account_transactions: Dict[int, List[Tuple[Transaction, str]]] = {}
 
         for trans in transactions:
@@ -332,10 +368,6 @@ class FloatingPLPerAccountWidget(_FloatingPLWidgetBase):
                 ).first()
 
                 if not first_order or not first_order.account_id:
-                    continue
-
-                # If account filter is active, skip transactions from other accounts
-                if selected_account_id is not None and first_order.account_id != selected_account_id:
                     continue
 
                 account_def = session.get(AccountDefinition, first_order.account_id)

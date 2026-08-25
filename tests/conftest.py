@@ -64,6 +64,35 @@ def reset_test_db(test_engine):
     yield
 
 
+@pytest.fixture(autouse=True)
+def reset_account_filter_state():
+    """Reset the UI account-filter module globals, which outlive the database.
+
+    ``reset_test_db`` gives every test an empty schema, but
+    ``ui/account_filter_context.py`` keeps three things in PROCESS globals that no
+    fixture touched: the selected account id (``_last_known_account_id``, the
+    mirror threaded callers read), the 60-second accounts listing cache and the
+    per-account expert-id cache. So a module that selected account 2 left that id
+    behind for the next module, whose fresh database has no account 2 — and ids
+    are handed out from 1 again, so a leaked cache entry can even be answered by a
+    DIFFERENT account with the same id. Stale-by-construction state, not a
+    property of any test.
+
+    Only resets a module that is ALREADY imported: if nothing pulled it in there
+    is nothing to leak, and importing it here would put nicegui in the import path
+    of every non-UI test run.
+    """
+    import sys
+    afc = sys.modules.get('ba2_trade_platform.ui.account_filter_context')
+    if afc is not None:
+        afc._last_known_account_id = None
+        afc._accounts_cache['data'] = None
+        afc._accounts_cache['timestamp'] = 0
+        afc._expert_ids_cache['data'] = {}
+        afc._expert_ids_cache['timestamp'] = 0
+    yield
+
+
 # ---------------------------------------------------------------------------
 # Phase 6 seam wiring (done at conftest import time, BEFORE any test module is
 # collected). The shimmed in-tree experts/interfaces now execute the *package*

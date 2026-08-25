@@ -17,8 +17,8 @@ from ...core.portfolio_allocation import (
     ERROR_LABEL_TOTAL_FMT, ERROR_LABEL_UNDER_FMT, LABEL_TOTAL_TOLERANCE_PCT,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed, PositionState,
     clamp_unallocated_pct, current_value, effective_target_pct, investable_notional,
-    position_sign, reserved_notional_for, signed_position_values,
-    validate_unallocated_pct,
+    position_sign, reserved_notional_for, scale_pct_to_total, signed_position_values,
+    split_pct_across, validate_unallocated_pct,
 )
 
 # ``position_sign`` / ``signed_position_values`` are IMPORTED, not defined here,
@@ -245,6 +245,105 @@ DEFAULT_LABEL_ICON_COLOR = '#9AA0A6'
 
 _PALETTE_BY_HEX = {hex_value.upper(): hex_value for _n, hex_value in LABEL_COLOR_PALETTE}
 
+#: THE parse. A colour is ``#`` and exactly six hex digits -- nothing else, at
+#: either end of the round trip.
+#:
+#: The palette used to be the whole whitelist, and it was the whitelist for a
+#: reason: the value is interpolated into a CSS ``style`` attribute, so an unbounded
+#: one is a place to put something that is not a colour. The user has now asked for
+#: a picker ("Make a color picker then"), so the SET is opened and the PARSE is not.
+#: Six digits and no more:
+#:
+#: * ``#abc`` (3-digit shorthand) is refused -- it is a colour, but accepting two
+#:   spellings of one value means the store holds both and nothing can compare them;
+#: * ``#rrggbbaa`` is refused -- a translucent swatch over a dark surface is exactly
+#:   the unreadable case the palette exists to avoid, and the alpha would silently
+#:   defeat the contrast check;
+#: * ``rgb()``, named colours and anything carrying ``;``, ``!important`` or a
+#:   ``url(...)`` are refused as what they are: not this value.
+#:
+#: ``fullmatch`` semantics via the anchors, so no prefix of a longer string can slip
+#: through -- ``#a1b2c3;background:url(x)`` is the exact attack this closes.
+_HEX_COLOR_RE = re.compile(r'^#[0-9A-Fa-f]{6}$')
+
+#: The page's own surface, at its LIGHTEST. ``styles.css`` paints the body
+#: ``linear-gradient(135deg, #1a1f2e 0%, #0f1419 100%)``, and every palette hue is
+#: lighter than both ends, so the lighter end is the worst case for them and is what
+#: the floor has to be measured against. Naming the darker end would quietly pass a
+#: colour that is unreadable over half the page.
+SURFACE_COLOR = '#1A1F2E'
+
+#: WCAG 2.1 SC 1.4.11 "Non-text Contrast": 3:1 for a graphical object such as an
+#: icon or a bar. The same threshold the palette was chosen against, which is what
+#: makes the warning and the palette one rule rather than two opinions.
+MIN_GRAPHICAL_CONTRAST = 3.0
+
+#: Said about a custom colour that falls below it. A WARNING, never a refusal: the
+#: user asked for a picker after reading the palette argument, and it is their UI.
+#: The measured ratio is named because "poor contrast" alone leaves them unable to
+#: tell a near miss from an invisible swatch.
+LABEL_COLOR_CONTRAST_WARNING_FMT = (
+    '{color} contrasts {ratio:.1f}:1 against the page background — below the '
+    '{floor:.0f}:1 WCAG asks for a graphical object, so this swatch will be hard '
+    'to see. Saved anyway; the seven presets above all clear it.')
+
+
+def _rgb(hex_color: str):
+    """``#RRGGBB`` -> ``(r, g, b)`` 0-255, or ``None`` when it is not one. Pure."""
+    text = str(hex_color or '').strip()
+    if not _HEX_COLOR_RE.match(text):
+        return None
+    return tuple(int(text[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def relative_luminance(hex_color: str) -> Optional[float]:
+    """WCAG relative luminance of a ``#RRGGBB``, or ``None``. Pure.
+
+    The published formula, not an approximation: each channel is linearised
+    (``c/12.92`` below the 0.03928 knee, ``((c+0.055)/1.055) ** 2.4`` above it) and
+    weighted 0.2126 / 0.7152 / 0.0722. A simple average of the channels agrees to
+    within a few percent on greys and is wrong by a factor of three on saturated
+    blue, which is precisely the palette entry sitting closest to the floor.
+    """
+    rgb = _rgb(hex_color)
+    if rgb is None:
+        return None
+    channels = []
+    for value in rgb:
+        c = value / 255.0
+        channels.append(c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def contrast_ratio(first: str, second: str) -> Optional[float]:
+    """WCAG contrast ratio between two ``#RRGGBB`` colours, 1-21. Pure.
+
+    Symmetric by construction (the lighter one is always on top), so a caller cannot
+    get 0.05 by passing the arguments the other way round. ``None`` when either side
+    is not a colour this module accepts.
+    """
+    a, b = relative_luminance(first), relative_luminance(second)
+    if a is None or b is None:
+        return None
+    lighter, darker = max(a, b), min(a, b)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def label_color_contrast_warning(raw) -> Optional[str]:
+    """"this swatch will be hard to see", or ``None``. Pure. Never blocks.
+
+    ``None`` for "no colour" and for anything unparseable as well as for a colour
+    that clears the floor: there is nothing to measure in the first two cases, and
+    the parse refusal is a different message that the caller shows instead. A
+    contrast complaint about a string that is not a colour would send the user off
+    adjusting a hue that was never the problem.
+    """
+    ratio = contrast_ratio(str(raw or '').strip(), SURFACE_COLOR)
+    if ratio is None or ratio >= MIN_GRAPHICAL_CONTRAST:
+        return None
+    return LABEL_COLOR_CONTRAST_WARNING_FMT.format(
+        color=str(raw).strip().upper(), ratio=ratio, floor=MIN_GRAPHICAL_CONTRAST)
+
 
 def label_color_options() -> Dict[str, str]:
     """``{value: caption}`` for the colour picker, "No colour" FIRST.
@@ -260,17 +359,24 @@ def label_color_options() -> Dict[str, str]:
 
 
 def normalise_label_color(raw) -> Optional[str]:
-    """The WRITE path: a palette hex in canonical case, or ``None`` for no colour.
+    """The WRITE path: a hex colour in canonical case, or ``None`` for no colour.
 
     Case-insensitive and whitespace-tolerant, because the value makes a round trip
-    through a widget and a database column.
+    through a widget and a database column. A PALETTE entry comes back in its
+    published spelling; any other accepted value comes back upper-cased, so one
+    colour has exactly one stored form.
+
+    ``#000000`` is a colour like any other and is accepted. It is NOT "no colour" --
+    that is ``''`` / ``None``, which the store maps to SQL NULL, and conflating the
+    two would make a black swatch impossible to distinguish from an unset one.
 
     Raises:
-        ValueError: for anything that is not in ``LABEL_COLOR_PALETTE``. Refusing
-        rather than falling back is the point -- a value that is not a palette entry
-        is either a bug in the caller or an attempt to put something other than a
-        colour into a CSS ``style`` attribute, and silently storing it would make
-        ``resolve_label_icon_color``'s whitelist the only thing standing in the way.
+        ValueError: for anything that is not ``#`` plus exactly six hex digits. The
+        SET is open now (the user asked for a picker); the PARSE is not. The value
+        is interpolated into a CSS ``style`` attribute, so accepting
+        ``#a1b2c3;background:url(x)`` -- or ``rgb()``, or a named colour, or a
+        3-digit shorthand that would give one colour two stored spellings -- is
+        either a bug in the caller or an injection. See ``_HEX_COLOR_RE``.
     """
     if raw is None:
         return None
@@ -278,12 +384,16 @@ def normalise_label_color(raw) -> Optional[str]:
     if not text:
         return None
     canonical = _PALETTE_BY_HEX.get(text.upper())
-    if canonical is None:
+    if canonical is not None:
+        return canonical
+    if not _HEX_COLOR_RE.match(text):
         raise ValueError(
-            f"{raw!r} is not one of the {len(LABEL_COLOR_PALETTE)} palette colours "
-            f"({', '.join(h for _n, h in LABEL_COLOR_PALETTE)}) — the picker is a "
-            f"fixed set on purpose; see LABEL_COLOR_PALETTE")
-    return canonical
+            f"{raw!r} is not a colour — a label colour is '#' followed by exactly "
+            f"six hex digits (e.g. '#E69F00'), or one of the "
+            f"{len(LABEL_COLOR_PALETTE)} presets. Shorthand ('#abc'), alpha "
+            f"('#rrggbbaa'), 'rgb(...)' and named colours are refused: this value "
+            f"is interpolated into a CSS style attribute. See _HEX_COLOR_RE")
+    return '#' + text[1:].upper()
 
 
 def store_color_value(raw) -> str:
@@ -304,14 +414,28 @@ def store_color_value(raw) -> str:
 def resolve_label_icon_color(stored) -> str:
     """The READ path: the hex to draw a label's icon in. Always returns something.
 
+    THE ONE ANSWER to "what colour is this label", and it has three callers by
+    design -- the icon on the label row, the swatch in the Manage-labels dialog and
+    the mini-bar's fill. They cannot disagree, because there is nothing for them to
+    disagree with: none of them looks at ``LabelView.color`` directly.
+
     TOLERANT where ``normalise_label_color`` refuses, and the asymmetry is
     deliberate: a row hand-edited in sqlite must not take the page down, and it must
-    not reach the ``style`` attribute either. Unrecognised values fall back to the
-    neutral grey, so the whitelist -- not the caller -- decides what gets rendered.
+    not reach the ``style`` attribute either. Anything that is not ``#`` plus six hex
+    digits falls back to the neutral grey, so the PARSE -- not the caller, and not
+    the database -- decides what gets rendered. The return value is always a literal
+    ``#`` followed by six upper-case hex digits, which is what makes interpolating it
+    into a CSS ``style`` safe.
     """
     if stored is None:
         return DEFAULT_LABEL_ICON_COLOR
-    return _PALETTE_BY_HEX.get(str(stored).strip().upper(), DEFAULT_LABEL_ICON_COLOR)
+    text = str(stored).strip()
+    canonical = _PALETTE_BY_HEX.get(text.upper())
+    if canonical is not None:
+        return canonical
+    if not _HEX_COLOR_RE.match(text):
+        return DEFAULT_LABEL_ICON_COLOR
+    return '#' + text[1:].upper()
 
 
 @dataclass
@@ -846,39 +970,102 @@ def unallocated_row(*, base_notional: float, available_buying_power: float,
 # nothing). It is deliberately not computed anywhere.
 # ---------------------------------------------------------------------------
 
-#: The label group header. "PORTFOLIO target", said out loud, because two different
-#: quantities were both called "target" and neither stated its denominator: the
-#: label's share of the whole portfolio, and -- in the table directly underneath --
-#: each symbol's share of ITS LABEL. A user looking at "target 0.0%" above a column
-#: of 20s asked, reasonably, which of them was wrong. Neither was.
-#:
-#: The figure printed is the target restated against the GROSS base
-#: (``effective_target_pct``), so it sits on the same scale as the holding beside it
-#: and as the mini-bar's notch. The stored number -- a share of what the reserve
-#: LEFT -- is what the edit box holds, and the tooltip below reconciles the two.
-#:
-#: Short, deliberately. The old line carried ", target N% of what the reserve leaves
-#: = $X, i.e. M% of base" on EVERY row: about a hundred characters, identical eight
-#: times over, and the clause that actually varied was buried in the middle of it.
-LABEL_HEADER_WITH_BASE_FMT = (
-    '{label} — ${current:,.2f} ({pct_of_base:.1f}% of base, portfolio target '
-    '{effective_pct:.1f}%)')
-#: No base notional means no denominator the target could be restated against, so
-#: the line says so instead of printing a share of a number it does not have.
-LABEL_HEADER_NO_BASE_FMT = (
-    '{label} — ${current:,.2f} ({pct_of_total:.1f}% of managed, portfolio target '
-    'unavailable — no base notional)')
+# ---- THE DENOMINATOR RULE --------------------------------------------------
+#
+# THE INVESTABLE POOL IS 100%. The user settled it: "The reserve is really for the
+# tool to make the math but we should assume the available money is 100% for the
+# allocation, for clarity." So every PRIMARY percentage on a label row -- the
+# holding, the target, the delta between them, the bar's fill and its notch --
+# divides ``investable_notional``, and the label targets therefore add to 100.
+#
+# The share of the GROSS base is secondary. It is printed in parentheses and marked
+# "real", never as the headline, because it is a derived restatement of a number the
+# user did not type. ``effective_target_pct`` remains the one conversion.
+#
+# THIS REPLACED A MIXTURE, and the mixture is the defect. ``current`` was a share of
+# the gross base while ``target`` was relative: two different denominators printed
+# with the same '%' sign, side by side, so the DIFFERENCE between them -- the number
+# that says what to do -- meant nothing at any non-zero reserve.
+#
+# ONE EXCEPTION, and it is genuine: the unallocated reserve row. It IS the part held
+# back, so restating it against what it leaves is circular. It stays of-base and
+# says so (``RESERVE_BASIS_NOTE``).
+#
+# The conversion goes through MONEY (``current_value / investable_notional``), never
+# through the inverse ``/(1 - r/100)`` of a share of base. Same singularity, honest
+# handling: at a 100% reserve there is no pool, so the share is ``None`` and the row
+# prints a dash rather than inf, nan or a confident 0.0%.
 
-#: The ⓘ tooltip that took the clause off the header. Everything the line used to
-#: print is still here, plus the sentence that resolves the two "targets".
+#: Said ONCE for the whole page, under the label list, instead of on eight rows. The
+#: rows are terse ("tgt 15.0% (real 13.5%)") precisely because this line exists; the
+#: old header repeated a hundred-character clause per row and the part that varied
+#: was buried in the middle of it.
+BASIS_LEGEND = (
+    'Label percentages divide the INVESTABLE pool — what the cash reserve leaves — '
+    'so the targets add to 100. “(real N%)” restates a target against the gross '
+    'account base. The unallocated row above is the one figure measured against '
+    'that gross base.')
+
+#: Under the label target input. The first sentence used to read "This label's share
+#: of the whole portfolio", which is FALSE whenever a reserve is set -- 15 typed
+#: under a 10% reserve is 13.5% of the portfolio, and the row beside it said so. The
+#: second sentence was right and is kept verbatim: it explains the OTHER denominator,
+#: which is the collision this whole redesign is about.
+LABEL_TARGET_CAPTION = (
+    'This label’s share of the investable pool — what is left after the cash '
+    'reserve — so the labels add up to 100. The “Share of label %” column below '
+    'divides THIS label’s money between its symbols — a different denominator, '
+    'which is why the two can read 0 and 20 at the same time and both be right.')
+
+#: Beside the reserve row, naming the one denominator change on the page.
+RESERVE_BASIS_NOTE = (
+    'This row is the only one measured against the gross account base — it IS the '
+    'part held back, so it cannot be restated against what it leaves. Every label '
+    'below divides that remainder, and raising this on a fully invested account '
+    'will generate sell orders.')
+
+#: The target pair, and the ONE place it is spelled. The row cell and the header
+#: line both render it, so they cannot disagree about which figure leads.
+TARGET_PAIR_FMT = '{target_pct:.1f}%'
+TARGET_PAIR_WITH_REAL_FMT = '{target_pct:.1f}% (real {effective_pct:.1f}%)'
+#: The row cell's prefix. Split out so the header can reuse the pair without
+#: swallowing a "tgt" in the middle of a sentence.
+TARGET_CELL_PREFIX = 'tgt '
+
+#: The label group header -- the expansion's own caption, which is what a screen
+#: reader announces and what a COLLAPSED section shows. It therefore has to be
+#: self-describing where the row can be terse: it names its denominator out loud and
+#: it carries the delta, because a collapsed row that omits the actionable number is
+#: the one place it is missing.
+LABEL_HEADER_WITH_BASE_FMT = (
+    '{label} — ${current:,.2f} ({pct_of_investable:.1f}% of investable, target '
+    '{target} — {delta})')
+#: No investable pool means no denominator for either figure, so the line says so
+#: instead of printing a share of a number it does not have.
+LABEL_HEADER_NO_BASE_FMT = (
+    '{label} — ${current:,.2f} ({pct_of_total:.1f}% of managed, target '
+    'unavailable — no investable base)')
+
+#: The ⓘ tooltip. It carries what the ROW cannot -- the money, and which denominator
+#: the table underneath uses. The "i.e. N% of the base" clause it used to end with
+#: is GONE: the row now prints "(real N%)", and one fact in two places is one fact
+#: that can disagree with itself.
 LABEL_TARGET_TOOLTIP_FMT = (
     'Portfolio target: {target_pct:.1f}% of what the reserve leaves = '
-    '${target_value:,.2f}, i.e. {effective_pct:.1f}% of the base. The table below '
-    'splits that money by each row’s share of the label.')
+    '${target_value:,.2f}. The table below splits that money by each row’s '
+    'share of the label.')
 LABEL_TARGET_TOOLTIP_NO_BASE_FMT = (
     'Portfolio target: {target_pct:.1f}% of what the reserve leaves. The broker '
     'published no base notional, so there is no dollar figure yet. The table below '
     'splits that money by each row’s share of the label.')
+
+#: Applied to the ⓘ tooltip. THE convention, not a second one: it is
+#: ``ExpertDataExportInterface.DETAIL_TOOLTIP_STYLE`` -- ``white-space: pre-line``
+#: with a ``max-width`` -- plus a legible size, which is the complaint here ("The
+#: info text is too small"). A tooltip is HTML, so without the max-width a long
+#: sentence renders as one continuous line wider than the viewport, clipped at both
+#: ends and impossible to scroll, select or copy.
+LABEL_TOOLTIP_STYLE = 'white-space: pre-line; max-width: 28rem; font-size: 0.85rem;'
 
 #: The cash-reserve line above the labels. ``.2f`` on the percentage where the
 #: label headers use ``.1f``, and "of base" said out loud in both, because the two
@@ -897,27 +1084,46 @@ RESERVE_CAPTION_NO_BASE = ('no base notional yet — the broker published no buy
                            'power, so this reserve has no dollar figure')
 
 
-def format_label_header(*, label: str, current_value: float, target_pct: float,
-                        pct_of_base: Optional[float], pct_of_total: float,
-                        base_notional: Optional[float],
-                        unallocated_pct: float) -> str:
-    """The label group header line. Pure.
+def format_target_pair(target_pct: float, unallocated_pct: float) -> str:
+    """``30.0%`` or ``30.0% (real 27.0%)``. THE one place the pair is spelled. Pure.
 
-    ``target_value`` is RECOMPUTED here from ``base_notional`` and the reserve
-    rather than taken from the ``LabelView``: the label box and the reserve slider
-    are both live, so a precomputed figure would be stale the instant either moved
-    -- which is the defect inline editing exists to remove. It lands on exactly
-    ``build_label_views``'s number because both call ``investable_notional``.
+    What the user TYPED leads -- "put something like 15% (real 13.5%) so we know" --
+    and the parenthetical is the DERIVED share of the gross base, marked as derived.
+    Printing them the other way round is the same two numbers reading as though the
+    reserve had inflated the target.
 
-    ``pct_of_base`` is the CURRENT holding as a share of the gross base and does not
-    move with the reserve, so it is passed in; ``None`` selects the no-base branch.
+    At a 0% reserve the two coincide and only ONE is printed. Making the common case
+    noisier in order to explain the uncommon one is the trade this refuses: a page
+    with no reserve would otherwise carry "(real 30.0%)" on every row, saying
+    nothing.
     """
-    if pct_of_base is None:
+    target = float(target_pct or 0.0)
+    effective = effective_target_pct(target, unallocated_pct)
+    if abs(effective - target) < 0.05:      # under the 1dp both are printed at
+        return TARGET_PAIR_FMT.format(target_pct=target)
+    return TARGET_PAIR_WITH_REAL_FMT.format(target_pct=target, effective_pct=effective)
+
+
+def format_label_header(*, label: str, current_value: float, target_pct: float,
+                        pct_of_investable: Optional[float], pct_of_total: float,
+                        delta_text: str, unallocated_pct: float) -> str:
+    """The label group header line -- the expansion's caption. Pure.
+
+    ``pct_of_investable`` is the CURRENT holding as a share of the investable pool
+    (``LabelBar.current_pct``); ``None`` selects the no-basis branch, which is both
+    "the broker published no base" and "the reserve is 100%, so there is no pool".
+
+    ``delta_text`` is ``LabelBar.delta_text``, passed in rather than recomputed: the
+    header and the row must not be able to reach two different verdicts about the
+    same label, and the only way to guarantee that is for there to be one
+    computation with one caller-visible answer.
+    """
+    if pct_of_investable is None:
         return LABEL_HEADER_NO_BASE_FMT.format(label=label, current=current_value,
                                                pct_of_total=pct_of_total)
     return LABEL_HEADER_WITH_BASE_FMT.format(
-        label=label, current=current_value, pct_of_base=pct_of_base,
-        effective_pct=effective_target_pct(target_pct, unallocated_pct))
+        label=label, current=current_value, pct_of_investable=pct_of_investable,
+        target=format_target_pair(target_pct, unallocated_pct), delta=delta_text)
 
 
 def format_label_target_tooltip(*, target_pct: float,
@@ -925,19 +1131,21 @@ def format_label_target_tooltip(*, target_pct: float,
                                 unallocated_pct: float) -> str:
     """The ⓘ beside a label header. Pure.
 
-    Holds the clause the header used to repeat on every row -- the stored target,
-    the money it comes to, and the same figure restated against the gross base --
-    plus the sentence that resolves the naming collision this redesign is about:
-    the header's target is a share of the PORTFOLIO, the table's ``Share of label %``
-    is a share of THE LABEL.
+    Carries what the ROW cannot: the money the target comes to, and the sentence
+    that resolves the naming collision this redesign is about -- the header's target
+    is a share of the investable POOL, the table's ``Share of label %`` is a share of
+    THE LABEL.
+
+    It no longer restates the target against the gross base. The row prints
+    "(real N%)" now, and the same fact in two places is a fact that can disagree with
+    itself.
     """
     if not base_notional:
         return LABEL_TARGET_TOOLTIP_NO_BASE_FMT.format(target_pct=target_pct)
     return LABEL_TARGET_TOOLTIP_FMT.format(
         target_pct=target_pct,
         target_value=(investable_notional(base_notional, unallocated_pct)
-                      * float(target_pct or 0.0) / 100.0),
-        effective_pct=effective_target_pct(target_pct, unallocated_pct))
+                      * float(target_pct or 0.0) / 100.0))
 
 
 def symbol_target_values(weights, *, label_target_pct: float,
@@ -964,10 +1172,162 @@ def symbol_target_values(weights, *, label_target_pct: float,
 
 
 # ---------------------------------------------------------------------------
+# "FILL 100%" -- the deliberate replacement for automatic recalculation
+#
+# Editing one symbol's share used to re-read and redraw the whole label, because
+# ``get_symbol_weights`` resolves a symbol with no stored row to a share of whatever
+# is left of 100: storing one weight changed what every sibling resolved to. The
+# user asked for that to stop -- "do not automatically recalculate when I adjust
+# share of label within label. Do not change other numbers" -- which leaves the set
+# free to stop totalling 100, so there has to be a deliberate way to put it back.
+#
+# "EMPTY" MEANS A SHARE OF ZERO. Not "has no stored row", and the distinction is the
+# hinge the whole feature turns on:
+#
+#   * it is the ENGINE's definition already (``_symbol_weight``: "'Unset' and 0 are
+#     one fact here"), which is what ``fill_remaining_symbol_weights`` fills against,
+#     so the page and the wizard cannot mean different things by an empty box;
+#   * it is the only definition that can AGREE WITH THE NO-RECALC RULE. Once the
+#     recalculation is gone, the number on screen is the only weight there is: the
+#     page holds one resolved map per label, an accepted edit mutates exactly the one
+#     key it edited, and this function reads that same map. "Has no stored row" would
+#     be a fact about the database that nothing on screen reflects -- a symbol with no
+#     row DISPLAYS a number, so calling it empty would make the button fill a slot the
+#     user can see is full.
+#
+# A consequence worth stating: on a FRESH render the resolved map always totals 100
+# (that is how the defaults are computed), so the button correctly reports "already
+# 100%" until an edit puts the set out. That is not the button failing -- it is the
+# button and the no-recalc rule agreeing.
+#
+# The arithmetic is NOT written here. Case 1 is ``split_pct_across`` -- the engine's
+# one splitter, which is also what "Fill rest evenly" and "Even split" use -- and
+# cases 2 and 3 are ``scale_pct_to_total``, its proportional sibling with the same
+# floor-to-the-cent-plus-one-residual rounding rule. A fourth two-decimal rounding
+# rule written in the UI layer is exactly what drifts.
+# ---------------------------------------------------------------------------
+
+FILL_NO_SYMBOLS = "NO_SYMBOLS"
+FILL_ALREADY_100 = "ALREADY_100"
+FILL_FILLED_EMPTY = "FILLED_EMPTY"
+FILL_SCALED_DOWN = "SCALED_DOWN"
+FILL_SCALED_UP = "SCALED_UP"
+
+FILL_MSG_NO_SYMBOLS_FMT = ("'{label}' has no symbols — add one before filling it "
+                           "to 100%.")
+FILL_MSG_ALREADY_100_FMT = ("'{label}' already totals 100.00% — nothing to change.")
+FILL_MSG_FILLED_EMPTY_FMT = ("'{label}': shared the remaining {remainder:.2f}% "
+                             "between {count} empty symbol(s). The weights you typed "
+                             "were left alone.")
+FILL_MSG_SCALED_DOWN_FMT = ("'{label}': scaled every symbol DOWN proportionally, "
+                            "{total:.2f}% → 100.00%.")
+FILL_MSG_SCALED_UP_FMT = ("'{label}': scaled every symbol UP proportionally, "
+                          "{total:.2f}% → 100.00%.")
+
+
+@dataclass
+class FillToHundred:
+    """One press of a label's "Fill 100%" button, decided. Pure.
+
+    ``changed is False`` means NOTHING is written and ``weights`` is what was passed
+    in. Both no-change cases still carry a ``message``: a button that silently does
+    nothing when pressed is indistinguishable from a broken one, which is the same
+    rule ``can_fill_remaining_symbol_weights`` states for the wizard's disabled
+    buttons.
+
+    ``weights`` is the FULL new map for the label, in the order given, and it sums to
+    exactly 100 in decimal whenever ``changed`` is True.
+    """
+    changed: bool
+    reason_code: str
+    weights: Dict[str, float]
+    message: str
+
+
+def fill_label_to_100(label: str, weights,
+                      tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> FillToHundred:
+    """Make one label's symbol shares total exactly 100. Pure. Three cases.
+
+    Args:
+        label: the label's name, for the message only.
+        weights: ``{symbol: share}`` in DISPLAY order — the page's live resolved map,
+            which is the same object the no-recalc edit handler mutates. ``None``
+            reads as 0.0, exactly as the engine's ``_symbol_weight`` does.
+        tolerance: the engine's ``LABEL_TOTAL_TOLERANCE_PCT``. "Already 100" is a
+            BAND, not an equality: 33.33 + 33.33 + 33.34 is exactly 100 in decimal
+            and 99.99999999999999 in binary, and a hard equality here would offer to
+            "fix" the engine's own even split on every press.
+
+    Returns:
+        FillToHundred: the case taken, the new map, and a sentence naming it.
+
+        The cases are ORDERED and the order is load-bearing:
+
+        1. **over 100** → every symbol scaled DOWN proportionally. This is checked
+           BEFORE "has an empty slot", because the alternative on an over-allocated
+           label with an empty box is to fill it out of a negative remainder, and
+           there is no such thing. A zero stays zero: scaling is proportional.
+        2. **under 100 with at least one empty slot** → the shortfall is split
+           between the EMPTY ones only and every typed weight is left exactly as
+           typed. That is the workflow the button exists for.
+        3. **under 100 with nothing empty** → every symbol scaled UP proportionally,
+           because there is no gap to put the shortfall in.
+
+        Every value is rounded to the cent on the way in, which is the page's own
+        stored precision (the boxes step by 0.01). Without it a resolved weight
+        carrying four decimals would make the emitted set miss 100 by a hundredth.
+    """
+    symbols = list(weights or {})
+    if not symbols:
+        return FillToHundred(False, FILL_NO_SYMBOLS, {},
+                             FILL_MSG_NO_SYMBOLS_FMT.format(label=label))
+
+    values = [round(float(weights[s] or 0.0), 2) for s in symbols]
+    total = round(sum(values), 2)
+
+    # ``round(..., 2)`` on the DIFFERENCE, not just on the total: ``abs(100.01 -
+    # 100.0)`` is 0.010000000000005116 in binary, which is greater than a 0.01
+    # tolerance -- so the band would refuse the very sets it exists to accept.
+    if round(abs(total - 100.0), 2) <= tolerance:
+        return FillToHundred(False, FILL_ALREADY_100, dict(zip(symbols, values)),
+                             FILL_MSG_ALREADY_100_FMT.format(label=label))
+
+    empty = [i for i, v in enumerate(values) if v == 0.0]
+
+    if total > 100.0:
+        return FillToHundred(
+            True, FILL_SCALED_DOWN,
+            dict(zip(symbols, scale_pct_to_total(values, 100.0))),
+            FILL_MSG_SCALED_DOWN_FMT.format(label=label, total=total))
+
+    if empty:
+        remainder = round(100.0 - total, 2)
+        out = list(values)
+        for index, share in zip(empty, split_pct_across(remainder, len(empty))):
+            out[index] = share
+        return FillToHundred(
+            True, FILL_FILLED_EMPTY, dict(zip(symbols, out)),
+            FILL_MSG_FILLED_EMPTY_FMT.format(label=label, remainder=remainder,
+                                             count=len(empty)))
+
+    return FillToHundred(
+        True, FILL_SCALED_UP, dict(zip(symbols, scale_pct_to_total(values, 100.0))),
+        FILL_MSG_SCALED_UP_FMT.format(label=label, total=total))
+
+
+# ---------------------------------------------------------------------------
 # THE LABEL MINI-BAR ROW
 #
 # One bar per label: the CURRENT share, tinted with that label's own colour, a
-# NOTCH marking the target, and a status WORD.
+# NOTCH marking the target, and the DELTA between them.
+#
+# THE STATUS WORD IS GONE FROM THE SCREEN and that is deliberate. It said "over"
+# beside a bar whose fill already sat past its notch, next to a delta that now reads
+# "over by 20.0pp ($1,800.00)": three renderings of one fact, two of them content-
+# free. ``LabelBar.status`` survives as the VERDICT -- it still picks the colour
+# (``LABEL_STATUS_CLASSES``) and it is still what the tolerance band decides -- and
+# ``delta_text`` is the single thing rendered from it, so the word, the sign, the
+# money and the notch cannot tell different stories.
 #
 # THE BAR AND THE NOTCH SHARE ONE SCALE, and that is the load-bearing property of
 # this whole section. If they did not, "over" and "under" would be a lie that no
@@ -998,7 +1358,8 @@ LABEL_STATUS_OK = "ok"
 LABEL_STATUS_NONE = "—"
 
 #: How far off target a label may be and still read "ok", in PERCENTAGE POINTS OF
-#: THE BASE. A band, not equality: floating point makes equality meaningless, and
+#: THE INVESTABLE POOL. A band, not equality: floating point makes equality
+#: meaningless, and
 #: the page stores targets to two decimals so a hair of drift is a rounding
 #: artefact rather than a fact.
 #:
@@ -1026,48 +1387,124 @@ LABEL_STATUS_CLASSES = {
 _MIN_BAR_SCALE_PCT = 1.0
 
 
+#: How the delta reads. PERCENTAGE POINTS and MONEY together, because neither alone
+#: tells the user what to do: 20pp of an unknown pool is not an order size, and
+#: $1,800 without the share does not say whether that is a rounding drift or a third
+#: of the label.
+#: The current share beside the bar, and its "there is no pool" reading.
+LABEL_CURRENT_FMT = '{pct:.1f}%'
+LABEL_CURRENT_UNKNOWN = LABEL_STATUS_NONE
+
+LABEL_DELTA_OVER_FMT = 'over by {pct:.1f}pp ({money})'
+LABEL_DELTA_UNDER_FMT = 'under by {pct:.1f}pp ({money})'
+#: Inside the tolerance band. NOT "over by 0.0pp ($0.12)", which is noise on a row
+#: that is, for every purpose the user has, exactly where it should be.
+LABEL_DELTA_ON_TARGET = 'on target'
+#: Nothing held and nothing asked for, or no pool to measure against. The same dash
+#: ``LABEL_STATUS_NONE`` uses, for the same reason: a verdict about a decision nobody
+#: made is worse than an admission that there is none.
+LABEL_DELTA_NONE = LABEL_STATUS_NONE
+
+
+def format_label_delta(*, status: str, delta_pct: Optional[float],
+                       delta_value: Optional[float]) -> str:
+    """The gap from target, in words, points and money. Pure.
+
+    Driven by ``status``, not by the sign of ``delta_pct``, and that is what makes
+    the sentence and the notch incapable of disagreeing: the tolerance band is
+    applied once, in ``build_label_bars``, and this only renders its verdict.
+    """
+    if status == LABEL_STATUS_OK:
+        return LABEL_DELTA_ON_TARGET
+    if status == LABEL_STATUS_NONE or delta_pct is None or delta_value is None:
+        return LABEL_DELTA_NONE
+    template = (LABEL_DELTA_OVER_FMT if status == LABEL_STATUS_OVER
+                else LABEL_DELTA_UNDER_FMT)
+    return template.format(pct=abs(delta_pct),
+                           money=format_account_money(abs(delta_value)))
+
+
 @dataclass
 class LabelBar:
     """One label's row in the mini-bar list. Pure geometry plus a verdict.
 
+    EVERY percentage here divides the INVESTABLE POOL -- see the denominator rule
+    above -- so ``current_pct``, ``target_pct`` and ``delta_pct`` are directly
+    comparable and the delta is their plain difference.
+
     ``bar_fraction`` and ``notch_fraction`` are 0-1 of the SAME track.
-    ``notch_fraction`` is ``None`` only when there is no base to place it against.
+    ``notch_fraction`` is ``None`` only when there is no pool to place it against.
 
     ``current_pct`` keeps its sign: a net-short label is genuinely negative, and the
     figure printed beside the bar says so even though the bar itself clamps to empty
     (a negative width would otherwise render as a full track -- the wrong way round
-    from the truth).
+    from the truth). It is ``None`` when there is no investable pool at all, which is
+    a different fact from 0.0% and is drawn as a dash.
 
-    ``target_pct`` is the EFFECTIVE target, i.e. the stored weight restated against
-    the gross base, which is what makes it comparable with ``current_pct``.
-    ``raw_target_pct`` is what the edit box holds.
+    It is also NOT CLAMPED ABOVE. A margin book legitimately holds more than the
+    pool -- 1.32x the account value on the reporting book -- and 133.3% is a true and
+    useful statement. The TRACK stretches to it instead (the scale is the page
+    maximum), so the bar fills and nothing is clipped or misread.
+
+    ``target_pct`` is what the edit box holds -- the number the user typed.
+    ``effective_pct`` is that restated against the gross base, i.e. the derived
+    "(real N%)" figure, and is secondary everywhere.
     """
     label: str
     color: str
     current_value: float
-    current_pct: float
+    current_pct: Optional[float]
     target_pct: float
-    raw_target_pct: float
+    effective_pct: float
+    target_value: Optional[float]
+    delta_pct: Optional[float]
+    delta_value: Optional[float]
     bar_fraction: float
     notch_fraction: Optional[float]
     status: str
+    current_text: str
+    target_text: str
+    delta_text: str
 
 
-def bar_scale_pct(views, *, unallocated_pct: float) -> float:
+def investable_share_pct(current_value: float, base_notional: Optional[float],
+                         unallocated_pct: float) -> Optional[float]:
+    """A holding as a share of the INVESTABLE pool. ``None`` when there is no pool.
+
+    Computed from MONEY, never as ``pct_of_base / (1 - r/100)``. The two are equal
+    wherever both are defined, but the inverse form hides the singularity: at a 100%
+    reserve it divides by zero, and a 100% reserve is a legitimate setting (allocate
+    nothing this cycle). Dividing money by a pool of 0.00 is the same singularity
+    stated where it can be answered -- there is no pool, so there is no share.
+    """
+    pool = (None if not base_notional
+            else investable_notional(base_notional, unallocated_pct))
+    if not pool:
+        return None
+    return float(current_value or 0.0) / pool * 100.0
+
+
+def bar_scale_pct(views, *, base_notional: Optional[float],
+                  unallocated_pct: float) -> float:
     """What 100% of the mini-bar track represents, in percentage points. Pure.
 
-    The largest of every label's CURRENT share and every label's EFFECTIVE target,
-    floored at ``_MIN_BAR_SCALE_PCT`` so there is always something to divide by.
-    Negative currents (shorts) are excluded from the maximum -- they cannot set the
-    top of a track that starts at zero.
+    The largest of every label's CURRENT share and every label's TARGET, both on the
+    investable basis, floored at ``_MIN_BAR_SCALE_PCT`` so there is always something
+    to divide by. Negative currents (shorts) are excluded from the maximum -- they
+    cannot set the top of a track that starts at zero.
+
+    Because the scale is the page MAXIMUM, a holding above 100% of the pool stretches
+    the track rather than overflowing it: nothing is ever clipped and the printed
+    figure is never clamped. The trade is that the track's meaning changes with the
+    book, which is why the axis is labelled and the percentages are printed beside it.
 
     Computed ONCE for the whole page. Per-row scaling would make the bars
     incomparable, which is the only thing they are for.
     """
     best = _MIN_BAR_SCALE_PCT
     for view in (views or []):
-        best = max(best, float(view.pct_of_base or 0.0),
-                   effective_target_pct(view.target_pct, unallocated_pct))
+        share = investable_share_pct(view.current_value, base_notional, unallocated_pct)
+        best = max(best, float(share or 0.0), float(view.target_pct or 0.0))
     return best
 
 
@@ -1088,13 +1525,21 @@ def build_label_bars(views, *, base_notional: Optional[float],
     The order is the CALLER's -- pair this with ``sort_label_views`` -- because the
     scale spans every row and has to be computed over the whole set either way.
     """
-    scale = bar_scale_pct(views, unallocated_pct=unallocated_pct)
+    scale = bar_scale_pct(views, base_notional=base_notional,
+                          unallocated_pct=unallocated_pct)
+    pool = (None if not base_notional
+            else investable_notional(base_notional, unallocated_pct))
     bars: List[LabelBar] = []
     for view in (views or []):
-        effective = effective_target_pct(view.target_pct, unallocated_pct)
-        has_base = bool(base_notional) and view.pct_of_base is not None
-        current_pct = float(view.pct_of_base or 0.0) if has_base else 0.0
-        if not has_base:
+        target = float(view.target_pct or 0.0)
+        effective = effective_target_pct(target, unallocated_pct)
+        share = investable_share_pct(view.current_value, base_notional, unallocated_pct)
+        target_value = None if pool is None else pool * target / 100.0
+        delta_pct = delta_value = None
+        if share is None:
+            # No pool: no share of it, no notch, no verdict. Distinct from 0.0%,
+            # and reached at a 100% reserve (allocate nothing) as well as on an
+            # account whose broker published no base at all.
             status = LABEL_STATUS_NONE
             notch = None
         else:
@@ -1103,14 +1548,20 @@ def build_label_bars(views, *, base_notional: Optional[float],
             # mutation that put a different scale into the empty branch could not be
             # caught by any test, because an empty label's target is 0 and 0/x is 0
             # whatever x is. Two spellings of one rule, one of them unobservable.
-            notch = _bar_fraction(effective, scale)
-            if not view.target_pct and not view.current_value:
+            notch = _bar_fraction(target, scale)
+            if not target and not view.current_value:
                 status = LABEL_STATUS_NONE
             else:
-                drift = current_pct - effective
-                if drift > LABEL_STATUS_TOLERANCE_PCT:
+                # The plain difference of two numbers on ONE denominator, which is
+                # the whole point of the investable basis. The money is taken as
+                # ``current - target`` rather than as a share of the pool so it
+                # cannot drift from the figures the solver will use; the two agree
+                # exactly, and a test pins that they do.
+                delta_pct = share - target
+                delta_value = float(view.current_value or 0.0) - (target_value or 0.0)
+                if delta_pct > LABEL_STATUS_TOLERANCE_PCT:
                     status = LABEL_STATUS_OVER
-                elif drift < -LABEL_STATUS_TOLERANCE_PCT:
+                elif delta_pct < -LABEL_STATUS_TOLERANCE_PCT:
                     status = LABEL_STATUS_UNDER
                 else:
                     status = LABEL_STATUS_OK
@@ -1118,13 +1569,20 @@ def build_label_bars(views, *, base_notional: Optional[float],
             label=view.label,
             color=resolve_label_icon_color(view.color),
             current_value=view.current_value,
-            current_pct=(float(view.pct_of_base) if view.pct_of_base is not None
-                         else float(view.pct_of_total or 0.0)),
-            target_pct=effective,
-            raw_target_pct=float(view.target_pct or 0.0),
-            bar_fraction=_bar_fraction(current_pct, scale),
+            current_pct=share,
+            target_pct=target,
+            effective_pct=effective,
+            target_value=target_value,
+            delta_pct=delta_pct,
+            delta_value=delta_value,
+            bar_fraction=_bar_fraction(share or 0.0, scale),
             notch_fraction=notch,
             status=status,
+            current_text=(LABEL_CURRENT_UNKNOWN if share is None
+                          else LABEL_CURRENT_FMT.format(pct=share)),
+            target_text=TARGET_CELL_PREFIX + format_target_pair(target, unallocated_pct),
+            delta_text=format_label_delta(status=status, delta_pct=delta_pct,
+                                          delta_value=delta_value),
         ))
     return bars
 
