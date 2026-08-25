@@ -13,6 +13,7 @@ from ba2_trade_platform.core.portfolio_allocation import (
 from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
     ACCOUNT_VALUE_TITLE, ACCOUNT_VALUE_UNAVAILABLE_DETAIL,
     ACCOUNT_VALUE_UNAVAILABLE_TEXT, account_value_card, account_value_from_snapshot,
+    BUYING_POWER_TITLE, BUYING_POWER_UNAVAILABLE_DETAIL, FIGURE_UNKNOWN_TEXT,
     DEFAULT_MACHINE_LABEL_FAMILIES, GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT,
     GATE_OK, LEGACY_MACHINE_LABEL_FAMILIES,
     EDIT_BLANK, EDIT_LABELS_OVER_100, EDIT_NEGATIVE, EDIT_NOT_A_NUMBER, EDIT_OK,
@@ -1976,11 +1977,20 @@ def test_a_label_set_that_totals_100_says_nothing():
 
 
 def test_a_label_set_under_100_is_a_warning_in_the_engines_words():
+    """OUTSIDE the band, which is what the advisory now reports. 90% is a shortfall
+    the card still states in words, but it is close enough not to be shouted about
+    -- see ``within_target_band``."""
     from ba2_trade_platform.core.portfolio_allocation import ERROR_LABEL_UNDER_FMT
 
-    text, severity = format_label_total_notice({'A': 60.0, 'B': 30.0})
-    assert text == ERROR_LABEL_UNDER_FMT.format(total=90.0, under=10.0)
+    text, severity = format_label_total_notice({'A': 60.0, 'B': 10.0})
+    assert text == ERROR_LABEL_UNDER_FMT.format(total=70.0, under=30.0)
     assert severity == 'warning'
+
+
+def test_a_shortfall_INSIDE_the_band_goes_quiet_rather_than_warning():
+    """The reconciliation: the card is green at 90%, so the advisory beside it may
+    not be orange. The figure itself is never hidden -- the card prints it."""
+    assert format_label_total_notice({'A': 60.0, 'B': 30.0}) is None
 
 
 def test_a_label_set_over_100_is_an_error_in_the_engines_words():
@@ -1990,15 +2000,26 @@ def test_a_label_set_over_100_is_an_error_in_the_engines_words():
 
     text, severity = format_label_total_notice({'A': 60.0, 'B': 60.0})
     assert text == ERROR_LABEL_TOTAL_FMT.format(total=120.0, over=20.0)
+    # STILL 'negative'. The band decides the BAR's colour and the shortfall side's
+    # tone; over 100 is a money-safety signal that predates it and keeps its red.
     assert severity == 'negative'
 
 
-def test_the_running_total_uses_the_engines_tolerance():
+def test_the_engines_tolerance_still_chooses_the_SENTENCE():
+    """Two different jobs, kept apart. The engine's 0.01pp tolerance decides which
+    WORDS -- on target versus a shortfall -- and the band decides how alarmed the
+    page looks. 99.00% is inside the band (green, quiet) and is still described in
+    words as being one point short."""
     from ba2_trade_platform.core.portfolio_allocation import LABEL_TOTAL_TOLERANCE_PCT
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        LABEL_TOTAL_ON_TARGET, judge_label_total)
 
     inside = 100.0 - LABEL_TOTAL_TOLERANCE_PCT / 2.0
+    assert judge_label_total({'A': inside})[2] == LABEL_TOTAL_ON_TARGET
+    assert 'under 100%' in judge_label_total({'A': 99.0})[2]
+    # ...and both are quiet, because both are inside the band.
     assert format_label_total_notice({'A': inside}) is None
-    assert format_label_total_notice({'A': 99.0}) is not None
+    assert format_label_total_notice({'A': 99.0}) is None
 
 
 def test_an_account_with_no_managed_labels_is_not_told_it_is_10_percent_short():
@@ -2274,6 +2295,9 @@ def test_the_footer_accounts_for_the_labels_AND_the_reserve():
 
 
 def test_the_footer_turns_red_the_moment_the_labels_pass_100():
+    """Unchanged by the band, and deliberately so: the band governs the shortfall
+    side and the bar's fill. The footer still shares the card's one verdict -- it
+    just no longer computes it a second time."""
     text, severity = format_allocation_footer({'A': 60.0, 'B': 45.0},
                                               unallocated_pct=0.0)
     assert severity == 'negative'
@@ -2284,6 +2308,11 @@ def test_the_footer_flags_a_shortfall_as_well():
     text, severity = format_allocation_footer({'A': 60.0}, unallocated_pct=0.0)
     assert severity == 'warning'
     assert '60.00%' in text
+
+
+def test_the_footer_goes_quiet_inside_the_band_like_everything_else():
+    _text, severity = format_allocation_footer({'A': 90.0}, unallocated_pct=0.0)
+    assert severity == 'ok'
 
 
 def test_the_footer_of_an_account_managing_nothing_says_so_without_crying_wolf():
@@ -4393,3 +4422,389 @@ def test_the_reserve_note_no_longer_points_BELOW_itself():
         RESERVE_BASIS_NOTE)
 
     assert 'below' not in RESERVE_BASIS_NOTE.lower()
+
+
+# ---------------------------------------------------------------------------
+# THE TARGET BAND -- ONE rule, both bars
+#
+# "if we are above or 20% below target, yellow, otherwise green". The label-total
+# bar's "green 80 to 100" is the same rule against a target of 100, which is why
+# there is one predicate and not two: the two bars sit on one screen and a
+# disagreement between them would be obvious and unexplainable.
+#
+# 20 PERCENTAGE POINTS, not 20% relative. That is what makes "80 to 100" against a
+# 100% target come out exactly right; relative would give 80 there but 72 against
+# a 90% target rather than 70.
+#
+# BOTH FIGURES ARE ROUNDED TO THE CENT FIRST, and that is load-bearing rather than
+# tidiness: an even split of three labels is 33.33 + 33.33 + 33.34, which is
+# exactly 100 in decimal and 100.00000000000001 in binary. Comparing raw would
+# paint the engine's own splitter yellow.
+# ---------------------------------------------------------------------------
+
+def _band(value, target=100.0):
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import within_target_band
+    return within_target_band(value, target)
+
+
+def test_exactly_ON_target_is_inside_the_band():
+    assert _band(100.0, 100.0) is True
+    assert _band(90.0, 90.0) is True
+
+
+def test_a_hundredth_ABOVE_target_falls_out_of_the_band():
+    assert _band(100.01, 100.0) is False
+    assert _band(90.01, 90.0) is False
+
+
+def test_exactly_twenty_points_BELOW_target_is_still_inside():
+    assert _band(80.0, 100.0) is True
+    assert _band(70.0, 90.0) is True
+
+
+def test_a_hundredth_below_THAT_falls_out_too():
+    assert _band(79.99, 100.0) is False
+    assert _band(69.99, 90.0) is False
+
+
+def test_the_band_is_twenty_POINTS_and_not_twenty_percent_relative():
+    """Against a 90% target, 20 points is 70 and 20% relative would be 72."""
+    assert _band(70.0, 90.0) is True
+    assert _band(71.0, 90.0) is True
+
+
+def test_the_engines_own_even_split_is_never_painted_off_target():
+    """33.33 + 33.33 + 33.34 is exactly 100 in decimal and a hair over it in
+    binary. Comparing raw would call the splitter's own output off target."""
+    assert _band(33.33 + 33.33 + 33.34, 100.0) is True
+
+
+def test_an_unmeasurable_value_is_not_claimed_to_be_in_the_band():
+    assert _band(None, 100.0) is False
+
+
+def test_the_band_colour_is_green_inside_and_yellow_outside():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        BAND_OFF_COLOR, BAND_OK_COLOR, band_color)
+
+    assert band_color(95.0, 100.0) == BAND_OK_COLOR
+    assert band_color(100.0, 100.0) == BAND_OK_COLOR
+    assert band_color(80.0, 100.0) == BAND_OK_COLOR
+    assert band_color(100.01, 100.0) == BAND_OFF_COLOR
+    assert band_color(79.99, 100.0) == BAND_OFF_COLOR
+    assert BAND_OK_COLOR != BAND_OFF_COLOR
+
+
+def test_an_unmeasurable_bar_is_painted_NEUTRAL_and_not_yellow():
+    """No verdict is not a warning. A yellow bar on an account the broker has not
+    answered for would be reporting a problem the user does not have."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        BAND_OFF_COLOR, NEUTRAL_TEXT_COLOR, band_color)
+
+    assert band_color(None, 100.0) == NEUTRAL_TEXT_COLOR
+    assert band_color(None, 100.0) != BAND_OFF_COLOR
+
+
+def test_the_label_total_severity_follows_the_SAME_band_as_its_colour():
+    """Item 2's "make sure it agrees with the colour". The sentence stays the
+    engine's -- it is the arithmetic -- but how alarmed the page looks on the
+    SHORTFALL side is the band's call, so a GREEN bar can never sit beside orange
+    text. Anywhere the bar is green, the text is quiet."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        BAND_OK_COLOR, band_color, label_total_readout)
+
+    for total in (80.0, 85.0, 100.0):
+        readout = label_total_readout({'A': total})
+        assert readout.severity == 'ok', total
+        assert band_color(readout.bar.current_pct,
+                          readout.bar.target_pct) == BAND_OK_COLOR, total
+    assert label_total_readout({'A': 79.99}).severity == 'warning'
+
+
+def test_over_100_keeps_its_RED_although_the_bar_beside_it_is_yellow():
+    """The one place the band deliberately does NOT drive the words.
+
+    Over-allocating claims more of the pool than exists; the inline boxes refuse it
+    outright and only a wizard-era database row can produce it. Painting it the
+    same yellow as "a little under target" would say the two are equally fine. The
+    bar is yellow (not green), so the pair never contradicts -- the words just
+    carry more weight than the geometry, which is the safe direction."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        BAND_OFF_COLOR, band_color, label_total_readout)
+
+    readout = label_total_readout({'A': 118.0})
+    assert readout.severity == 'negative'
+    assert band_color(readout.bar.current_pct,
+                      readout.bar.target_pct) == BAND_OFF_COLOR
+
+
+def test_the_hundredth_wide_sliver_above_100_stays_QUIET_in_words():
+    """The one seam between the band and the engine's tolerance, pinned.
+
+    The band is exclusive above target; ``LABEL_TOTAL_TOLERANCE_PCT`` is 0.01pp
+    wide, so 100.01 -- reachable from a two-decimal three-way split -- is OUT of the
+    band and INSIDE the tolerance. The bar goes a hair yellow there; the sentence is
+    literally the words "on target" and must not be shouted, because "on target" in
+    warning orange is a sentence arguing with itself."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        BAND_OFF_COLOR, LABEL_TOTAL_ON_TARGET, band_color, label_total_readout)
+
+    readout = label_total_readout({'A': 100.01})
+    assert readout.detail == LABEL_TOTAL_ON_TARGET
+    assert readout.severity == 'ok'
+    assert band_color(readout.bar.current_pct,
+                      readout.bar.target_pct) == BAND_OFF_COLOR
+
+
+def test_the_sentence_still_states_the_arithmetic_inside_the_band():
+    """Green does not mean silent. At 85% the card still says exactly how much of
+    the pool the labels leave undeployed -- the colour says "acceptable", the
+    words say where in the band you are."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        label_total_readout)
+
+    readout = label_total_readout({'A': 85.0})
+    assert readout.severity == 'ok'
+    assert 'under 100%' in readout.detail
+
+
+def test_the_card_the_notice_and_the_footer_still_share_one_verdict():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        format_allocation_footer, format_label_total_notice, label_total_readout)
+
+    for targets in ({'A': 118.0}, {'A': 75.0}, {'A': 100.0}, {'A': 85.0}):
+        readout = label_total_readout(targets)
+        _text, footer_severity = format_allocation_footer(targets, 0.0)
+        notice = format_label_total_notice(targets)
+        assert readout.severity == footer_severity, targets
+        assert (notice is None) == (readout.severity == 'ok'), targets
+
+
+# ---------------------------------------------------------------------------
+# THE MERGED MONEY CARD -- three figures, one box, three states each
+#
+# The three used to be three cards, and the buying-power one was drawn inside an
+# ``if buying_power is not None``: on a broker outage it VANISHED. That is
+# unknown-as-zero in the form a user cannot even notice, because there is nothing
+# on screen to notice. ``summary_figures`` always returns three.
+# ---------------------------------------------------------------------------
+
+def _figures(**kwargs):
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import summary_figures
+
+    defaults = {'managed_value': 4_853.48, 'valuation_mode': VALUATION_MODE_MARKET,
+                'account_value': 2_511.90, 'available_buying_power': 170.31}
+    defaults.update(kwargs)
+    return summary_figures(**defaults)
+
+
+def test_the_money_card_always_has_exactly_three_figures():
+    """Whatever the broker did or did not answer. The count is what makes "the card
+    always renders" structural rather than a rule a renderer has to remember."""
+    for kwargs in ({}, {'account_value': None}, {'available_buying_power': None},
+                   {'managed_value': None},
+                   {'account_value': None, 'available_buying_power': None,
+                    'managed_value': None}):
+        assert len(_figures(**kwargs)) == 3, kwargs
+
+
+def test_buying_power_STATE_ONE_a_real_figure():
+    figure = _figures(available_buying_power=170.31)[2]
+    assert figure.title == BUYING_POWER_TITLE
+    assert figure.available is True
+    assert figure.text == '$170.31'
+
+
+def test_buying_power_STATE_TWO_a_measured_zero_is_printed_as_zero():
+    """Every dollar deployed is a REAL state and it is the reason the next plan
+    will not buy anything. Suppressing it as "unavailable" reports an outage that
+    did not happen -- the inverse of the bug this card is careful about."""
+    figure = _figures(available_buying_power=0.0)[2]
+    assert figure.available is True
+    assert figure.text == '$0.00'
+    assert figure.detail == ''
+
+
+def test_buying_power_STATE_THREE_unknown_says_so_AND_says_why():
+    """The defect being folded in: the card used to disappear here."""
+    figure = _figures(available_buying_power=None)[2]
+    assert figure.available is False
+    assert figure.text == FIGURE_UNKNOWN_TEXT == 'unknown'
+    assert figure.detail == BUYING_POWER_UNAVAILABLE_DETAIL
+    assert figure.detail
+    # The reason may not itself contain the string the line promises never to print.
+    assert '0.00' not in figure.text and '$' not in figure.text
+    assert '0.00' not in figure.detail and '$' not in figure.detail
+
+
+def test_ONE_unreadable_figure_does_not_blank_its_TWO_NEIGHBOURS():
+    """The property the merge has to preserve. A broker that publishes no buying
+    power still publishes a net liquidating value, and the managed value is ours."""
+    managed, account, buying_power = _figures(available_buying_power=None)
+
+    assert buying_power.available is False
+    assert managed.available is True and managed.text == '$4,853.48'
+    assert account.available is True and account.text == '$2,511.90'
+
+
+def test_an_unreadable_ACCOUNT_VALUE_does_not_blank_the_other_two_either():
+    managed, account, buying_power = _figures(account_value=None)
+
+    assert account.available is False and account.text == FIGURE_UNKNOWN_TEXT
+    assert managed.available is True and managed.text == '$4,853.48'
+    assert buying_power.available is True and buying_power.text == '$170.31'
+
+
+def test_every_caption_survives_the_merge_including_the_parentheticals():
+    """They are DEFINITIONS, not decoration. "Managed value" alone does not say
+    whether it is what you paid or what it is worth, and this page carries a
+    Valuation selector two inches away."""
+    market = _figures(valuation_mode=VALUATION_MODE_MARKET)
+    cost = _figures(valuation_mode=VALUATION_MODE_COST)
+
+    assert market[0].title == 'Managed value — market value (qty x price)'
+    assert cost[0].title == 'Managed value — cost basis (what you paid)'
+    assert market[1].title == ACCOUNT_VALUE_TITLE == 'Account value'
+    assert market[2].title == BUYING_POWER_TITLE == 'Free buying power'
+
+
+def test_the_leverage_LINE_survives_the_merge_and_stays_with_its_own_figure():
+    """"managed positions are 2.02x this" is telling the user they are levered, and
+    "this" only means anything directly under the account value."""
+    account = _figures(managed_value=5_073.71, account_value=2_511.90)[1]
+
+    assert '2.02x this' in account.detail
+
+
+def test_a_managed_value_of_zero_is_a_figure_and_not_an_outage():
+    figure = _figures(managed_value=0.0)[0]
+    assert figure.available is True
+    assert figure.text == '$0.00'
+
+
+# ---------------------------------------------------------------------------
+# COLLAPSING THE DRY RUN'S PLAN WARNINGS
+#
+# ``precheck_plan`` asks the broker to price each candidate BUY without sending
+# it; ``apply_order_impacts`` swaps the planner's estimated buying-power cost for
+# the broker's measured one and files ONE warning PER SYMBOL wherever the two
+# differ by over half a cent. On a margin book that is most rows.
+# ---------------------------------------------------------------------------
+
+def _precheck(*symbols):
+    from ba2_trade_platform.core.portfolio_allocation import (
+        WARNING_PRECHECK_DISAGREED_FMT)
+
+    return [WARNING_PRECHECK_DISAGREED_FMT.format(symbol=s) for s in symbols]
+
+
+def test_the_precheck_parse_is_built_FROM_the_engines_own_format_string():
+    """Not from a hand-copied literal. A reworded engine warning must stop matching
+    and fall through as an ordinary line -- visible and odd -- rather than being
+    silently swallowed by a regex that no longer means what it did."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        precheck_resolved_symbols)
+
+    assert precheck_resolved_symbols(_precheck('NLR', 'BWXT')) == ['NLR', 'BWXT']
+    assert precheck_resolved_symbols(
+        ['broker precheck disagreed on NLR - re-solved AND SOMETHING ELSE']) == []
+
+
+def test_eight_precheck_warnings_collapse_to_one_line():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        plan_warning_lines)
+
+    lines = plan_warning_lines(_precheck(*'ABCDEFGH'))
+
+    assert len(lines) == 1
+
+
+def test_the_collapsed_line_is_INFO_when_no_quantity_moved():
+    """A re-solve that does not scale the plan changes nothing the user chose. It
+    is a normal self-correcting step, so it is said once, quietly."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        plan_warning_lines)
+
+    (text, severity), = plan_warning_lines(_precheck('NLR', 'CCJ'))
+
+    assert severity == 'info'
+    assert 'NLR, CCJ' in text
+    assert 'quantities are unchanged' in text
+
+
+def test_the_collapsed_line_ESCALATES_when_the_plan_was_SCALED():
+    """The materially different outcome, which must survive the collapse: the
+    broker's corrected costs go back through the pro-rata buying-power scaler, and
+    when they no longer fit, every buy shrinks."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        plan_warning_lines)
+
+    (text, severity), = plan_warning_lines(_precheck('NLR'), scale_factor=0.62)
+
+    assert severity == 'warning'
+    assert '0.62' in text
+    assert 'smaller than your targets' in text
+    assert 'Reasons' in text
+
+
+def test_a_scale_factor_of_exactly_one_is_NOT_an_escalation():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        plan_warning_lines)
+
+    assert plan_warning_lines(_precheck('NLR'), scale_factor=1.0)[0][1] == 'info'
+
+
+def test_the_collapsed_line_names_no_internal_step():
+    """"broker precheck disagreed on NLR - re-solved" names a step in our own code
+    and reports an outcome the reader cannot act on."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        plan_warning_lines)
+
+    text = plan_warning_lines(_precheck('NLR'))[0][0].lower()
+
+    for jargon in ('precheck', 're-solve', 'disagreed', 'bp_cost', 'impact'):
+        assert jargon not in text, jargon
+
+
+def test_a_LONG_symbol_list_is_summarised_rather_than_run_as_a_paragraph():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        PRECHECK_SYMBOLS_NAMED, plan_warning_lines)
+
+    symbols = [f'SYM{i}' for i in range(25)]
+    text = plan_warning_lines(_precheck(*symbols))[0][0]
+
+    assert 'SYM0' in text
+    assert f'and {25 - PRECHECK_SYMBOLS_NAMED} more' in text
+    assert 'SYM24' not in text
+    assert '25 of these buys' in text      # the COUNT is never summarised away
+
+
+def test_a_duplicate_precheck_warning_names_its_symbol_once():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        precheck_resolved_symbols)
+
+    assert precheck_resolved_symbols(_precheck('NLR', 'NLR', 'CCJ')) == ['NLR', 'CCJ']
+
+
+def test_every_OTHER_warning_survives_verbatim_and_keeps_the_top():
+    """An empty label and an unconverged residual are each about one specific
+    thing. Only the per-symbol repetition is collapsed."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        plan_warning_lines)
+
+    others = ["label 'CRYPTO' has no symbols - its 12.00% weight is unallocated",
+              'residual did not converge']
+    lines = plan_warning_lines(others + _precheck('NLR', 'CCJ'))
+
+    assert [text for text, _s in lines[:2]] == others
+    assert all(severity == 'warning' for _t, severity in lines[:2])
+    assert len(lines) == 3
+
+
+def test_no_warnings_produce_no_lines():
+    """Alpaca has no order-preview endpoint, so none of this ever fires there."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        plan_warning_lines)
+
+    assert plan_warning_lines([]) == []
+    assert plan_warning_lines(None) == []

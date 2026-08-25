@@ -1052,7 +1052,8 @@ def test_content_renders_the_block_message_for_a_non_manual_account(
     text = ' '.join(_texts(nicegui_client.layout))
     assert 'not available for this selection' in text
     assert 'Manually traded account' in text
-    assert 'Allocate' not in _button_labels(nicegui_client.layout)  # no toolbar
+    assert page.REVIEW_BUTTON_LABEL not in _button_labels(
+        nicegui_client.layout)                                      # no toolbar
     assert 'ARK26' not in text                                      # no body
     assert account.quote_requests == []      # and the broker was never asked
 
@@ -2156,12 +2157,12 @@ def test_an_unknown_account_value_renders_n_a_with_a_reason_never_zero(
         texts = _texts(nicegui_client.layout)
 
     joined = ' | '.join(texts)
-    assert 'Account value' in joined            # the card is still drawn
+    assert 'Account value' in joined            # the line is still drawn
     assert '$0.00' not in joined
-    # Read the card's own three lines positionally, so nothing elsewhere on the
+    # Read the figure's own three lines positionally, so nothing elsewhere on the
     # page can satisfy -- or spoil -- the assertion.
     index = texts.index('Account value')
-    assert texts[index + 1] == 'n/a'
+    assert texts[index + 1] == _view_mod().FIGURE_UNKNOWN_TEXT == 'unknown'
     assert '$' not in texts[index + 1]
     assert '0' not in texts[index + 1]
     # ...and it says WHY, rather than leaving a bare "n/a".
@@ -3914,7 +3915,21 @@ def test_the_allocate_button_is_still_there_for_executing_the_saved_targets(
                                        positions=[], prices={}))
     _run_in_client(nicegui_client, page.content)
 
-    assert 'Allocate' in _button_labels(nicegui_client.layout)
+    assert page.REVIEW_BUTTON_LABEL in _button_labels(nicegui_client.layout)
+
+
+def test_the_toolbar_button_no_longer_CLAIMS_to_allocate(monkeypatch,
+                                                         nicegui_client, account_id):
+    """It opens a review gate; nothing is ordered until Submit is pressed inside it.
+    The old caption named an action the button stopped taking when the target steps
+    moved onto this page."""
+    monkeypatch.setattr(page, 'get_selected_account_id', lambda: account_id)
+    _use_account(monkeypatch, _Account(account_id, {'manual_trading_enabled': True},
+                                       positions=[], prices={}))
+    _run_in_client(nicegui_client, page.content)
+
+    assert page.REVIEW_BUTTON_LABEL == 'Review and Submit'
+    assert 'Allocate' not in _button_labels(nicegui_client.layout)
 
 
 # -- the mini-bar's rendered geometry, not just its arithmetic ---------------
@@ -6031,14 +6046,18 @@ def test_the_total_bar_FILLS_in_proportion_to_the_total(nicegui_client, account_
 
 def test_the_summary_row_keeps_ONE_card_style(nicegui_client, account_id):
     """A forked second style is how the row goes ragged again the next time any of
-    them is touched."""
+    them is touched.
+
+    TWO cards now, not four: the three money figures share one box (see
+    ``summary_figures``). The invariant is unchanged -- whatever is in the row is
+    the same box."""
     root = _draw(nicegui_client, account_id, _two_labels(account_id))
     summary = _marked(root, page.MARKER_SUMMARY_ROW)[0]
     cards = [el for el in summary.descendants()
              if 'stat-card' in ' '.join(el._classes)]
     styles = {' '.join(sorted(el._classes)) for el in cards}
 
-    assert len(cards) >= 3
+    assert len(cards) >= 2
     assert len(styles) == 1, styles
 
 
@@ -7024,3 +7043,270 @@ def test_the_managed_labels_bar_says_what_it_IS(nicegui_client, account_id):
     assert _view_mod().LABEL_TOTAL_BAR_LEGEND in texts
     # ...and the denominator caption is still doing its own, different job.
     assert _view_mod().LABEL_TOTAL_BAR_CAPTION in texts
+
+
+# ---------------------------------------------------------------------------
+# BOTH BARS ARE COLOURED BY ONE BAND RULE
+#
+# "above target, or more than 20 points below it" -> yellow, otherwise green. The
+# label-total bar's "green 80 to 100" is that rule against a target of 100.
+# Verified in the RENDERED style rather than by trusting a class name -- the
+# stylesheet has eaten class-based colour on this page before.
+# ---------------------------------------------------------------------------
+
+def _fill_colour(root, marker, index=0):
+    return _marked(root, marker)[index]._style.get('background', '')
+
+
+def _totals(account_id, a, b):
+    for name, target in (('ARK26', a), ('TECH', b)):
+        set_managed_label(account_id, name, target_pct=target)
+    return _views([ManagedLabel('ARK26', a), ManagedLabel('TECH', b)],
+                  {'ARK26': ['AAPL'], 'TECH': ['MSFT']},
+                  weights={'ARK26': {'AAPL': 100.0}, 'TECH': {'MSFT': 100.0}})
+
+
+def test_the_total_bar_is_GREEN_exactly_on_100(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _totals(account_id, 70.0, 30.0))
+    assert _fill_colour(root, page.MARKER_TOTAL_BAR_FILL) == \
+        _view_mod().BAND_OK_COLOR
+
+
+def test_the_total_bar_is_GREEN_exactly_on_80(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _totals(account_id, 50.0, 30.0))
+    assert _fill_colour(root, page.MARKER_TOTAL_BAR_FILL) == \
+        _view_mod().BAND_OK_COLOR
+
+
+def test_the_total_bar_is_YELLOW_a_hundredth_below_80(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _totals(account_id, 49.99, 30.0))
+    assert _fill_colour(root, page.MARKER_TOTAL_BAR_FILL) == \
+        _view_mod().BAND_OFF_COLOR
+
+
+def test_the_total_bar_is_YELLOW_a_hundredth_above_100(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _totals(account_id, 70.01, 30.0))
+    assert _fill_colour(root, page.MARKER_TOTAL_BAR_FILL) == \
+        _view_mod().BAND_OFF_COLOR
+
+
+def test_the_total_bars_COLOUR_and_its_TEXT_never_disagree(nicegui_client,
+                                                           account_id):
+    """A green bar beside orange text is worse than no colour at all."""
+    green = _draw(nicegui_client, account_id, _totals(account_id, 55.0, 30.0))
+    assert _fill_colour(green, page.MARKER_TOTAL_BAR_FILL) == \
+        _view_mod().BAND_OK_COLOR
+    assert 'text-orange-400' not in ' '.join(
+        _marked(green, page.MARKER_TOTAL_BAR_DETAIL)[0]._classes)
+
+    yellow = _draw(nicegui_client, account_id, _totals(account_id, 40.0, 30.0))
+    assert _fill_colour(yellow, page.MARKER_TOTAL_BAR_FILL, -1) == \
+        _view_mod().BAND_OFF_COLOR
+    assert 'text-orange-400' in ' '.join(
+        _marked(yellow, page.MARKER_TOTAL_BAR_DETAIL)[-1]._classes)
+
+
+def _reserve_page(nicegui_client, account_id, *, buying_power, reserve):
+    return _draw(nicegui_client, account_id, _one_label(account_id, reserve=reserve),
+                 base=1_000.0, buying_power=buying_power, reserve=reserve)
+
+
+def test_the_allocation_bar_is_GREEN_exactly_on_its_target(nicegui_client,
+                                                           account_id):
+    """A 10% reserve is a 90% allocated target; $100 free of $1,000 is exactly 90%
+    allocated."""
+    root = _reserve_page(nicegui_client, account_id, buying_power=100.0, reserve=10.0)
+    assert _fill_colour(root, page.MARKER_RESERVE_BAR_FILL) == \
+        _view_mod().BAND_OK_COLOR
+
+
+def test_the_allocation_bar_is_YELLOW_a_hundredth_ABOVE_target(nicegui_client,
+                                                               account_id):
+    root = _reserve_page(nicegui_client, account_id, buying_power=99.9, reserve=10.0)
+    assert _fill_colour(root, page.MARKER_RESERVE_BAR_FILL) == \
+        _view_mod().BAND_OFF_COLOR
+
+
+def test_the_allocation_bar_is_GREEN_exactly_twenty_points_below_target(
+        nicegui_client, account_id):
+    """Target 90% allocated, slack 20pp, so 70% allocated -- $300 of $1,000 free."""
+    root = _reserve_page(nicegui_client, account_id, buying_power=300.0, reserve=10.0)
+    assert _fill_colour(root, page.MARKER_RESERVE_BAR_FILL) == \
+        _view_mod().BAND_OK_COLOR
+
+
+def test_the_allocation_bar_is_YELLOW_a_hundredth_below_THAT(nicegui_client,
+                                                             account_id):
+    root = _reserve_page(nicegui_client, account_id, buying_power=300.1, reserve=10.0)
+    assert _fill_colour(root, page.MARKER_RESERVE_BAR_FILL) == \
+        _view_mod().BAND_OFF_COLOR
+
+
+def test_the_allocation_bar_RE_COLOURS_when_the_reserve_moves(nicegui_client,
+                                                              account_id):
+    """The target moves with the slider, so the band moves with it."""
+    root = _reserve_page(nicegui_client, account_id, buying_power=100.0, reserve=10.0)
+    assert _fill_colour(root, page.MARKER_RESERVE_BAR_FILL) == \
+        _view_mod().BAND_OK_COLOR
+
+    _drive_value(_reserve_controls(root)[0], 40.0)
+
+    # 90% allocated against a 60% target is above it -- out of the band.
+    assert _fill_colour(root, page.MARKER_RESERVE_BAR_FILL) == \
+        _view_mod().BAND_OFF_COLOR
+
+
+def test_an_unmeasurable_bar_is_NEUTRAL_rather_than_yellow(nicegui_client,
+                                                           account_id):
+    """No verdict is not a warning.
+
+    The broker published no buying power, so the reserve bar has NOTHING to divide
+    -- ``allocation_bar`` returns None and the fill is never painted. What matters
+    is the colour it is not: yellow there would be reporting a problem the user
+    does not have, on an account nobody has measured."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id),
+                 base=10_000.0, buying_power=None)
+    fill = _marked(root, page.MARKER_RESERVE_BAR_FILL)[0]._style.get('background', '')
+
+    assert fill != _view_mod().BAND_OFF_COLOR
+    assert fill != _view_mod().BAND_OK_COLOR
+
+
+# ---------------------------------------------------------------------------
+# THE MERGED MONEY CARD, ON THE PAGE
+#
+# One box for managed value, account value and free buying power. The last of the
+# three used to be drawn inside ``if buying_power is not None`` and DISAPPEARED on
+# a broker outage -- unknown-as-zero in the form a user cannot notice, because
+# there is nothing on screen to notice. The card is unconditional now and so is
+# every line in it.
+# ---------------------------------------------------------------------------
+
+def _money_card(root):
+    return _marked(root, page.MARKER_MONEY_CARD)[0]
+
+
+def _money_figures(root):
+    """The three figure texts, in reading order."""
+    return [el._text for el in _marked(root, page.MARKER_MONEY_FIGURE)]
+
+
+def test_the_three_money_figures_share_ONE_card(nicegui_client, account_id):
+    """Three boxes each sized to its own caption put the three figures a reader
+    compares left to right at three different heights."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id),
+                 buying_power=1_000.0)
+
+    cards = _marked(root, page.MARKER_MONEY_CARD)
+    assert len(cards) == 1
+    texts = _texts(cards[0])
+    assert 'Managed value — market value (qty x price)' in texts
+    assert 'Account value' in texts
+    assert 'Free buying power' in texts
+
+
+def test_the_money_card_renders_with_a_REAL_buying_power(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id),
+                 buying_power=1_234.56)
+
+    assert '$1,234.56' in _money_figures(root)
+
+
+def test_the_money_card_renders_a_MEASURED_ZERO_buying_power(nicegui_client,
+                                                             account_id):
+    """Every dollar deployed is a real state, and it is exactly why the next plan
+    will buy nothing. It is a figure, not an outage."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id),
+                 buying_power=0.0)
+    texts = _texts(_money_card(root))
+    index = texts.index('Free buying power')
+
+    assert texts[index + 1] == '$0.00'
+    assert _view_mod().BUYING_POWER_UNAVAILABLE_DETAIL not in texts
+
+
+def test_the_money_card_STILL_RENDERS_when_the_broker_will_not_answer(
+        nicegui_client, account_id):
+    """THE folded-in defect. The buying-power card used to vanish here, and a user
+    who cannot see the widget cannot tell the figure is missing."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id),
+                 buying_power=None)
+    texts = _texts(_money_card(root))
+    index = texts.index('Free buying power')
+
+    assert texts[index + 1] == _view_mod().FIGURE_UNKNOWN_TEXT == 'unknown'
+    assert texts[index + 2] == _view_mod().BUYING_POWER_UNAVAILABLE_DETAIL
+    assert '$0.00' not in texts[index + 1]
+
+
+def test_an_UNREADABLE_buying_power_does_not_blank_its_two_NEIGHBOURS(
+        nicegui_client, account_id):
+    """The property the merge had to preserve: three figures in one box, three
+    independent states. A shared box must not become a shared failure."""
+    views = _views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                   positions=[_pos('AAPL', 10, 1000.0, 4_853.48)],
+                   prices={'AAPL': 485.348})
+    with nicegui_client:
+        page._render_labels(account_id,
+                            _payload(views, VALUATION_MODE_MARKET,
+                                     base_notional=10_000.0,
+                                     available_buying_power=None,
+                                     account_value=2_511.90),
+                            _noop_refresh)
+    figures = _money_figures(nicegui_client.layout)
+
+    assert figures == ['$4,853.48', '$2,511.90', 'unknown']
+
+
+def test_an_UNKNOWN_figure_is_painted_NEUTRAL_and_not_as_a_number(
+        nicegui_client, account_id):
+    """Verified in the rendered STYLE, and with ``!important``: this page's own
+    stylesheet has silently eaten class-based colour before, so a colour that is
+    merely set is not a colour that paints."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id),
+                 buying_power=None)
+    figures = _marked(root, page.MARKER_MONEY_FIGURE)
+    unknown = [el for el in figures if el._text == 'unknown']
+    measured = [el for el in figures if el._text != 'unknown']
+
+    # This fixture publishes neither an account value nor a buying power, so BOTH
+    # are unknown -- and the managed value beside them is not.
+    assert len(unknown) == 2 and len(measured) == 1
+    for element in unknown:
+        assert element._style['color'] == \
+            f'{_view_mod().NEUTRAL_TEXT_COLOR} !important'
+    # ...and a MEASURED figure keeps the money styling: the grey is the signal, so
+    # painting it on everything would be no signal at all.
+    assert 'color' not in measured[0]._style
+
+
+def test_the_managed_value_caption_still_names_WHICH_valuation(nicegui_client,
+                                                               account_id):
+    """The parenthetical is a definition, not decoration -- the Valuation selector
+    sits two inches away and changes what the figure means."""
+    views = _views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']})
+    with nicegui_client:
+        page._render_labels(account_id, _payload(views, VALUATION_MODE_COST),
+                            _noop_refresh)
+
+    assert 'Managed value — cost basis (what you paid)' in \
+        _texts(_money_card(nicegui_client.layout))
+
+
+def test_the_leverage_line_still_sits_under_the_account_value(nicegui_client,
+                                                              account_id):
+    """"managed positions are 2.02x this" is what tells the user they are levered,
+    and "this" only means anything directly beneath the figure it divides by."""
+    views = _views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                   positions=[_pos('AAPL', 10, 1000.0, 5_073.71)],
+                   prices={'AAPL': 507.371})
+    with nicegui_client:
+        page._render_labels(account_id,
+                            _payload(views, VALUATION_MODE_MARKET,
+                                     account_value=2_511.90),
+                            _noop_refresh)
+    texts = _texts(_money_card(nicegui_client.layout))
+    index = texts.index('Account value')
+
+    assert texts[index + 1] == '$2,511.90'
+    assert texts[index + 2] == 'managed positions are 2.02x this'

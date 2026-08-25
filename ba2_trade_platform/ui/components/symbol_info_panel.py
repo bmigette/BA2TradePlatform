@@ -646,7 +646,15 @@ def build_comparison_chart_options(infos: Sequence[SymbolInfo]) -> Dict[str, Any
                     "backgroundColor": "rgba(37, 43, 59, 0.95)",
                     "borderColor": "rgba(255, 255, 255, 0.1)",
                     "textStyle": {"color": "#ffffff"}},
+        # ``type: scroll`` and NOT the default. A plain horizontal legend WRAPS
+        # onto a second row when the items do not fit, and ``grid.top`` is a fixed
+        # 60px -- so the second row lands on top of the plot. That was survivable
+        # while this dialog was full-screen; it is not now that Compare is a
+        # ~1200px box (``PANEL_WIDTH_COMPARE``), where eight or nine tickers are
+        # enough to wrap. Scrolling PAGES the legend instead, so every series stays
+        # reachable and none of them is drawn over the chart.
         "legend": {"data": [s["name"] for s in series],
+                   "type": "scroll",
                    "textStyle": {"color": "#a0aec0"}},
         "grid": {"left": 60, "right": 40, "top": 60, "bottom": 50,
                  "containLabel": True},
@@ -931,21 +939,83 @@ def render_chart(infos: Sequence[SymbolInfo]) -> None:
 
 def render_comparison(infos: Mapping[str, SymbolInfo], symbols: Sequence[str]) -> None:
     """The side-by-side table. Every requested symbol gets a column, including
-    the ones that failed — see :func:`build_comparison`."""
+    the ones that failed — see :func:`build_comparison`.
+
+    THE ``overflow-x-auto`` WRAPPER IS A SAFETY VALVE, not the normal path. The
+    grid stays ``w-full`` and FITS, because a comparison is read by looking across
+    the columns and a table you have to scroll sideways to compare is not one. The
+    wrapper is there for the case ``w-full`` cannot honour -- a dozen symbols in a
+    950px dialog, where the cells' own min-content width wins -- and it turns that
+    into a scroll instead of columns disappearing off the edge.
+
+    Neither of those is what fixed the chart, and the distinction matters if this
+    is ever revisited: the chart was overflowing because ``ui.scroll_area()``'s
+    content box is ``position: absolute; width: auto; min-width: 100%``, so every
+    percentage width inside it resolved against a box the content itself was
+    setting. See ``SymbolInfoPanel._build`` -- the container is a plain
+    ``overflow-y-auto`` div now, with a definite width, and nothing inside it can
+    push the chart past the dialog again.
+    """
     table = build_comparison(infos, symbols)
     with ui.card().classes("w-full"):
         ui.label("Comparison").classes("text-base font-bold")
-        with ui.grid(columns=len(table.columns) + 1).classes("w-full gap-x-4 gap-y-1"):
-            ui.label("").classes("text-xs")
-            for column in table.columns:
-                heading = ui.label(column.symbol).classes("text-xs font-bold")
-                if column.failed:
-                    heading.style(_UNKNOWN_STYLE)
-                    heading.tooltip(column.reason)
-            for label, cells in table.rows:
-                ui.label(label).classes("text-sm").style(_MUTED)
-                for cell in cells:
-                    render_cell(cell)
+        with ui.element("div").classes("w-full overflow-x-auto"):
+            with ui.grid(columns=len(table.columns) + 1).classes(
+                    "w-full gap-x-4 gap-y-1"):
+                ui.label("").classes("text-xs")
+                for column in table.columns:
+                    heading = ui.label(column.symbol).classes("text-xs font-bold")
+                    if column.failed:
+                        heading.style(_UNKNOWN_STYLE)
+                        heading.tooltip(column.reason)
+                for label, cells in table.rows:
+                    ui.label(label).classes("text-sm").style(_MUTED)
+                    for cell in cells:
+                        render_cell(cell)
+
+
+# ---------------------------------------------------------------------------
+# HOW BIG THE DIALOG IS
+#
+# It was ``full-width maximized``, i.e. the whole screen, for a panel of cards
+# that is a column of label/value pairs. Sized like the Manage-labels dialog
+# instead: a fixed sensible width, capped at the viewport, with the CONTENT
+# scrolling rather than the box growing.
+#
+# EVERY ONE OF THESE IS AN INLINE STYLE AND NOT A TAILWIND CLASS, which is the
+# only part of this that is not taste. Quasar sizes a dialog with
+# ``.q-dialog__inner--minimized > div { max-width: 560px }`` -- two selectors, so
+# it outranks Tailwind's single-class ``max-w-[900px]`` and the dialog silently
+# stays 560px wide however carefully the class is applied. An inline declaration
+# beats both. This is the same cascade trap ``important_color_style`` exists for
+# on the allocation page, in its width-shaped form.
+# ---------------------------------------------------------------------------
+
+#: One symbol: a column of cards and a single chart. Wide enough for the 5-column
+#: returns grid to keep its headings on one line.
+PANEL_WIDTH_SINGLE = 900
+
+#: Compare: the same cards PLUS an N-column comparison grid and a chart carrying
+#: one line per symbol, so it needs the extra room to keep the columns readable.
+PANEL_WIDTH_COMPARE = 1200
+
+#: Never taller than the screen, and never edge to edge on a laptop.
+PANEL_MAX_HEIGHT_VH = 90
+PANEL_MAX_WIDTH_VW = 95
+
+
+def panel_width_px(symbol_count: int) -> int:
+    """How wide the dialog is for this many symbols. Pure."""
+    return PANEL_WIDTH_COMPARE if symbol_count > 1 else PANEL_WIDTH_SINGLE
+
+
+def panel_card_style(symbol_count: int) -> str:
+    """The dialog card's inline geometry. Pure. See the block comment above for
+    why this is inline and not a class."""
+    return (f"width: {panel_width_px(symbol_count)}px; "
+            f"max-width: {PANEL_MAX_WIDTH_VW}vw; "
+            f"max-height: {PANEL_MAX_HEIGHT_VH}vh; "
+            f"background: #1a1f2e;")
 
 
 class SymbolInfoPanel:
@@ -955,6 +1025,14 @@ class SymbolInfoPanel:
     data-layer call on a worker thread (``asyncio.to_thread``) so fetching six
     symbols does not freeze the browser. Re-loading rebuilds the body with
     ``container.clear()`` — no ``ui.refreshable``.
+
+    It is a SIZED box, not a full screen: ``panel_card_style`` fixes the width and
+    caps the height, and the body scrolls inside it. The chart is built at
+    :meth:`render` time -- after the dialog is open and therefore already at its
+    final size -- so it initialises into the box it will live in rather than into
+    a full screen it then has to shrink out of; NiceGUI's ``ui.echart`` carries a
+    ``ResizeObserver`` on top of that, which is what makes a window resize reflow
+    it instead of clipping the axis.
     """
 
     def __init__(self, symbols: Sequence[str], *, api_key: str, as_of: date,
@@ -973,17 +1051,40 @@ class SymbolInfoPanel:
         self._build()
 
     def _build(self) -> None:
+        # No ``full-width maximized``: this is a panel, not a screen.
         self.dialog = ui.dialog().props(
-            'full-width maximized transition-show="slide-up" '
-            'transition-hide="slide-down"')
+            'transition-show="slide-up" transition-hide="slide-down"')
         with self.dialog:
-            with ui.card().classes("w-full h-full flex flex-col").style(
-                    "max-width: 100%; background: #1a1f2e;"):
-                with ui.row().classes("w-full items-center justify-between p-2"):
+            # ``min-h-0`` is what lets the scroll area below actually scroll -- a
+            # flex child's implicit ``min-height: auto`` otherwise refuses to
+            # shrink past its content and the card grows through the cap instead.
+            with ui.card().classes(
+                    "flex flex-col flex-nowrap min-h-0 overflow-hidden").style(
+                        panel_card_style(len(self.symbols))):
+                with ui.row().classes(
+                        "w-full items-center justify-between p-2 shrink-0"):
                     ui.label(f"Symbol info — {', '.join(self.symbols)}").classes(
                         "text-lg font-bold")
                     ui.button(icon="close", on_click=self.close).props("flat round")
-                with ui.scroll_area().classes("flex-grow w-full"):
+                # THE CONTENT SCROLLS, not the dialog. ``min-h-0`` again, for the
+                # same reason, and this is the element the cap actually bites on.
+                #
+                # A PLAIN OVERFLOW CONTAINER AND NOT ``ui.scroll_area()``, which is
+                # what this was. Quasar's ``.q-scrollarea__content`` is
+                # ``position: absolute; width: auto; min-width: 100%`` -- a
+                # shrink-to-fit box that grows to its widest child -- so every
+                # ``w-full`` inside it resolved against a width that the content
+                # itself was setting. The nine-column comparison grid widened that
+                # box and the chart, at ``width: 100%``, obediently followed it 140px
+                # past the right-hand edge of the dialog, with Quasar's horizontal
+                # thumb hidden so it could not even be scrolled to. Measured, not
+                # guessed: a 1084px canvas in a 1045px card at a 1100px window.
+                #
+                # A normal ``overflow-y-auto`` div takes its width from the flex
+                # parent, so it is DEFINITE, and every percentage inside it is bounded
+                # by the dialog. ``styles.css`` already themes the native scrollbar.
+                with ui.column().classes(
+                        "flex-grow w-full min-h-0 overflow-y-auto overflow-x-hidden"):
                     self.body = ui.column().classes("w-full gap-3 p-2")
         with self.body:
             ui.spinner(size="lg")

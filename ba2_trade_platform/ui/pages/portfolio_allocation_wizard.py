@@ -91,7 +91,9 @@ from ...core.portfolio_allocation import (
     whole_share_notice,
 )
 from ..utils.portfolio_allocation_view import (
-    MARKET_BANNER_CLASSES, MarketGateResult, market_provenance_notice,
+    MARKET_BANNER_CLASSES, PLAN_WARNING_CLASSES, PLAN_WARNING_COLORS,
+    STATUS_OVER_COLOR, MarketGateResult, important_color_style,
+    market_provenance_notice, plan_warning_lines,
 )
 from ...core.portfolio_allocation_service import (
     OUTCOME_FAILED,
@@ -202,6 +204,23 @@ BP_IS_A_CHARGE_NOTE_FMT = (
 #: reasons column, so a text search cannot tell whether the banner was drawn.
 MARKER_MARKET_BANNER = 'dry-run-market-banner'
 MARKER_PLAN_NOTICE = 'dry-run-plan-notice'
+#: One line of ``plan_warning_lines`` -- the empty-label / residual warnings and
+#: the ONE collapsed broker-precheck line that replaced eight identical ones.
+#: Marked, not text-matched: the collapsed line names symbols that also appear in
+#: the table three inches below it.
+MARKER_PLAN_WARNING = 'dry-run-plan-warning'
+#: The scrolling block the notices and warnings live in, and the "N of them"
+#: header that tells the reader there is more than fits. Both marked so a test can
+#: prove the compression exists without depending on how many notices a fixture
+#: happens to produce.
+MARKER_NOTICE_BLOCK = 'dry-run-notice-block'
+MARKER_NOTICE_COUNT = 'dry-run-notice-count'
+#: The scrolling viewport the order table lives in. The table is the most
+#: important content in this dialog and had the least room in it; this container
+#: is what holds it to at least 60% of the dialog height.
+MARKER_ROWS_VIEWPORT = 'dry-run-rows-viewport'
+#: The order table's sticky header row.
+MARKER_TABLE_HEAD = 'dry-run-table-head'
 
 #: Marker on the income panel's working-orders line, for the same reason.
 MARKER_WORKING_ORDERS = 'income-working-orders'
@@ -263,6 +282,134 @@ INVEST_SCOPE_NOTE = ('Pre-filled with the unallocated income total. Buys only - 
 #: engine silently falls back to whole shares, so the user would see quantities
 #: they never asked for.
 NO_FRACTIONAL_SUPPORT_NOTE = 'This broker does not support fractional shares.'
+
+
+# ---------------------------------------------------------------------------
+# HOW THE DIALOG DIVIDES ITS HEIGHT
+#
+# The order table is the reason this dialog exists and it had the least room in
+# it: a roughly two-row viewport with its own scrollbar, wedged between a tall
+# notice stack and the totals. The card is a FLEX COLUMN now and the table is the
+# only child that grows, with a floor of 60% of the dialog. Everything else is
+# capped and scrolls inside its own cap, so no amount of notices can squeeze it.
+#
+# ``vh`` and not ``%``: the dialog is ``maximized``, so the card IS the viewport
+# height, and a percentage would depend on every ancestor having a definite height
+# -- which is exactly the kind of thing that quietly stops being true.
+#
+# THE 60% IS A CONSEQUENCE OF THE CAPS, NOT A MINIMUM ON THE TABLE, and the
+# difference is a bug found in a real browser rather than in a test. A
+# ``min-h-[60vh]`` on the table competes with the caps instead of cooperating with
+# them: flexbox honours the minimum, the column overflows the card, ``overflow:
+# hidden`` clips the bottom -- and what is at the bottom is the SUBMIT BUTTON.
+# Measured at 1600x1000 it sat 23px below the fold, unreachable, on a dialog whose
+# entire job is to be the gate in front of real orders.
+#
+# So the table has NO floor of its own: it is the only ``flex-grow`` child, with
+# ``min-h-0`` so it can also shrink, and it gets exactly what the capped siblings
+# leave. Holding those caps low is what guarantees the share:
+#
+#     head 18vh + totals 7vh + fixed chrome (title, buttons, padding, gaps)
+#
+# The chrome is the part that does NOT scale, so it is the binding constraint on a
+# short window. Measured in a real browser, the table gets 64.6% at 1920x1080,
+# 63.8% at 1600x1000, 62.7% at 1440x900, 61.3% at 1280x800 and 60.8% at 1024x720,
+# with the Submit button on screen at every one of them. Below roughly 650px of
+# viewport it degrades under 60% rather than hiding the buttons, which is the
+# right way round.
+# ---------------------------------------------------------------------------
+
+#: The card: a flex column that fills the maximized dialog and CLIPS rather than
+#: growing. ``min-h-0`` is what lets its children shrink below their content size,
+#: without which a flex child's implicit ``min-height:auto`` defeats every cap.
+#: ``p-2`` rather than NiceGUI's default padding: the chrome is the part of the
+#: budget that does NOT scale with the viewport, so every pixel of it is one the
+#: table does not get on a small screen.
+DIALOG_CARD_CLASSES = ('w-full h-full flex flex-col flex-nowrap '
+                       'overflow-hidden min-h-0 gap-1 p-2')
+
+#: Everything above the table -- banner, base panel, the fractional switch and the
+#: notices. Capped and scrollable: it is context, and context may not crowd out
+#: the thing it is context FOR.
+DIALOG_HEAD_CLASSES = 'w-full shrink-0 overflow-y-auto max-h-[18vh]'
+
+#: The table's viewport. THE point of the whole rearrangement. No minimum -- see
+#: the block comment above for why a minimum is what clipped the Submit button.
+DIALOG_ROWS_CLASSES = 'w-full gap-0 flex-grow min-h-0 overflow-auto relative'
+
+#: The totals footer, compressed the same way.
+DIALOG_TOTALS_CLASSES = 'w-full shrink-0 overflow-y-auto max-h-[7vh]'
+
+#: What the two caps must leave. Asserted in the tests rather than merely
+#: intended: these two numbers ARE the 60% guarantee now, so a well-meaning "just
+#: a bit more room for the notices" has to fail a test rather than quietly take
+#: the table back down to two rows.
+DIALOG_SIDE_CAP_BUDGET_VH = 25.0
+
+#: The notices' own inner cap, inside the head block. Small enough that the head
+#: usually fits its 18vh without scrolling at all, big enough for three lines.
+NOTICE_BLOCK_CLASSES = 'w-full overflow-y-auto max-h-[5rem]'
+
+#: Said above the block when there is more in it than fits. A scrollbar on a dark
+#: theme is nearly invisible, and a notice nobody knows to scroll to is a notice
+#: that was not shown.
+#:
+#: "scroll to read them" rather than "scroll for the rest": on a tall stack the
+#: whole block can sit below the head's own 18vh cap, so promising "the rest"
+#: would imply some of them are already visible when none of them is.
+NOTICE_COUNT_FMT = '{count} notices about this plan — scroll to read them'
+
+#: Rows drawn UNDER a sticky header need the header to be opaque and above them.
+#: The look itself -- the dark bar, the uppercase grey caption, the row separator,
+#: the hover -- is ``styles.css``'s ``.q-table`` treatment, applied to these
+#: hand-rolled rows through ``.pf-grid-head`` / ``.pf-grid-row`` so the dry run and
+#: the symbol tables in the label panels are literally the same rules. Eighteen
+#: columns in a real ``ui.table`` would need eighteen cell slots with per-row
+#: colour and tooltips, which is why these rows stay hand-rolled.
+GRID_HEAD_CLASSES = 'pf-grid-head w-full min-w-max text-xs py-1 px-1'
+GRID_ROW_CLASSES = 'pf-grid-row w-full min-w-max text-sm items-center py-1 px-1'
+
+#: The order table's columns, ONCE. Header text, width, and whether the column is
+#: numeric -- ``(name, header, width, numeric)``. The header row and the cell row
+#: were two separate literal tuples that had to be kept in the same order by hand;
+#: right-aligning the money made that a third thing to keep in step, so they read
+#: it from here instead.
+DRY_RUN_COLUMNS = (
+    ('tick', '', 'w-10', False),
+    ('symbol', 'Symbol', 'w-24', False),
+    # WHERE THE ROW STARTS -- the basis being traded against.
+    ('held', 'Held', 'w-20', True),
+    ('cost', 'Cost', 'w-24', True),
+    ('value', 'Value', 'w-24', True),
+    ('side', 'Side', 'w-16', False),
+    ('qty', 'Qty', 'w-24', True),
+    ('order', 'Order', 'w-24', False),
+    ('sizing', 'Sizing', 'w-20', False),
+    ('outcome', 'Outcome', 'w-28', False),
+    ('estimated_value', 'Est. value', 'w-24', True),
+    ('target', 'Target', 'w-24', True),
+    ('projected', 'Projected ({mode})', 'w-32', True),
+    ('weight', 'Weight', 'w-32', False),
+    ('bp_cost', 'BP cost', 'w-24', True),
+    ('bp_ratio', 'BP ×', 'w-20', True),
+    ('bp_pct', 'BP %', 'w-16', True),
+    ('reasons', 'Reasons', 'flex-1 min-w-64', False),
+)
+
+_COLUMN_CLASSES = {
+    name: width + (' text-right' if numeric else '')
+    for name, _header, width, numeric in DRY_RUN_COLUMNS
+}
+
+
+def _col(name: str, extra: str = '') -> str:
+    """The width + alignment classes of one dry-run column. Pure.
+
+    A KeyError here is the intended failure: a cell drawn for a column the header
+    does not declare is a column that will not line up, and finding that out at
+    render time beats finding it out by eye in a money table.
+    """
+    return (_COLUMN_CLASSES[name] + ' ' + extra).strip()
 
 
 def _shares(quantity: float) -> str:
@@ -388,40 +535,49 @@ class AllocationWizard:
 
     # -- public -----------------------------------------------------------
     def open(self):
-        with ui.dialog().props('maximized') as dialog, ui.card().classes('w-full h-full overflow-auto'):
+        with ui.dialog().props('maximized') as dialog, \
+                ui.card().classes(DIALOG_CARD_CLASSES):
             self.dialog = dialog
-            ui.label(self.title).classes('text-xl font-bold')
-            # A CONTAINER, not a bare render: Refresh re-reads the clock, and a
-            # banner drawn straight into the card could never be taken down again.
-            self._banner_container = ui.column().classes('w-full')
-            self._render_market_banner()
-            self._render_base_panel()
-            # THE ONE EXECUTION CONTROL. It stays at the gate because it changes
-            # WHICH ORDERS are produced rather than what is being aimed at -- and
-            # it RE-SOLVES: ``_refresh`` replaces ``self.plan``, so the table, the
-            # totals and what Submit sends all move together. A switch that only
-            # recorded a preference would show one plan and submit another.
-            fractional = ui.switch('Allow fractional shares',
-                                   value=self.allow_fractional,
-                                   on_change=lambda e: self._refresh(bool(e.value)))
-            # The broker's veto, which used to sit on the step-3 panel of the
-            # dialog that is gone. Offering a toggle the broker cannot honour would
-            # size the plan on a grid that does not exist: the engine silently
-            # falls back to whole shares, so the user would see quantities they
-            # never asked for. DISABLED, not hidden, and the reason said out loud.
-            fractional.set_enabled(bool(self.base.supports_fractional))
-            if not self.base.supports_fractional:
-                ui.label(NO_FRACTIONAL_SUPPORT_NOTE).classes('text-xs text-gray-400')
-            ui.label(MARKET_ORDER_TIMING_NOTE).classes('text-xs text-orange-400')
-            self._notices_container = ui.column().classes('w-full')
-            self._rows_container = ui.column().classes('w-full gap-0')
-            self._no_order_container = ui.column().classes('w-full')
-            self._totals_container = ui.column().classes('w-full')
+            ui.label(self.title).classes('text-lg font-bold shrink-0')
+            # EVERYTHING ABOVE THE TABLE, in one capped, scrolling block. It is all
+            # context -- the clock, the base, the switch, the notices -- and the
+            # table it is context for used to get whatever was left, which on a
+            # plan with eight warnings was about two rows.
+            with ui.column().classes(DIALOG_HEAD_CLASSES):
+                # A CONTAINER, not a bare render: Refresh re-reads the clock, and a
+                # banner drawn straight into the card could never be taken down
+                # again.
+                self._banner_container = ui.column().classes('w-full')
+                self._render_market_banner()
+                self._render_base_panel()
+                # THE ONE EXECUTION CONTROL. It stays at the gate because it changes
+                # WHICH ORDERS are produced rather than what is being aimed at -- and
+                # it RE-SOLVES: ``_refresh`` replaces ``self.plan``, so the table, the
+                # totals and what Submit sends all move together. A switch that only
+                # recorded a preference would show one plan and submit another.
+                fractional = ui.switch('Allow fractional shares',
+                                       value=self.allow_fractional,
+                                       on_change=lambda e: self._refresh(bool(e.value)))
+                # The broker's veto, which used to sit on the step-3 panel of the
+                # dialog that is gone. Offering a toggle the broker cannot honour
+                # would size the plan on a grid that does not exist: the engine
+                # silently falls back to whole shares, so the user would see
+                # quantities they never asked for. DISABLED, not hidden, and the
+                # reason said out loud.
+                fractional.set_enabled(bool(self.base.supports_fractional))
+                if not self.base.supports_fractional:
+                    ui.label(NO_FRACTIONAL_SUPPORT_NOTE).classes('text-xs text-gray-400')
+                ui.label(MARKET_ORDER_TIMING_NOTE).classes('text-xs text-orange-400')
+                self._notices_container = ui.column().classes('w-full')
+            self._rows_container = ui.column().classes(DIALOG_ROWS_CLASSES) \
+                .mark(MARKER_ROWS_VIEWPORT)
+            self._no_order_container = ui.column().classes('w-full shrink-0')
+            self._totals_container = ui.column().classes(DIALOG_TOTALS_CLASSES)
             self._render_notices()
             self._render_rows()
             self._render_no_order_rows()
             self._render_totals()
-            with ui.row().classes('w-full justify-end gap-2 mt-4'):
+            with ui.row().classes('w-full justify-end gap-2 shrink-0'):
                 ui.button('Refresh', on_click=lambda: self._refresh(self.allow_fractional)).props('outline')
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 self._submit_button = ui.button('Submit', on_click=self._submit) \
@@ -512,22 +668,66 @@ class AllocationWizard:
             self._submit_tooltip.set_visibility(blocked)
 
     def _render_notices(self):
-        """The four plan-level sentences, up top.
+        """The plan-level sentences and the plan's own warnings, COMPRESSED.
 
         About a quarter of this book cannot trade fractionally, some rows were
         bumped UP to a whole share and some had their weight moved to keep a label
         on target. Every one of those is the plan doing something the user did not
-        type, so none of them is a footnote.
+        type, so none of them is deleted and none of them is hidden behind a
+        disclosure the user has to know to open.
+
+        What changed is the SHAPE. Each was a padded ``alert-banner`` div with a
+        ``mt-2``, so four of them plus a column of warnings was most of the screen
+        above a two-row table. They are dense single lines in one scrolling block
+        now, with a count above it when there is more than fits -- a dark-theme
+        scrollbar is nearly invisible, and a notice nobody knows to scroll to has
+        not been shown.
+
+        THE PLAN'S WARNINGS MOVED HERE, out of ``_render_base_panel``, and that is
+        a fix rather than tidying: the base panel is drawn ONCE and ``_refresh``
+        never redraws it, so after a Refresh the dialog was showing the PREVIOUS
+        solve's warnings above the new plan's table. This container is rebuilt on
+        every refresh. They also go through ``plan_warning_lines``, which is what
+        collapses the eight identical per-symbol broker-precheck lines into one.
         """
         self._notices_container.clear()
         summary = fractional_summary(self.plan)
+        notices = [text for text in (whole_share_notice(summary),
+                                     bump_notice(summary),
+                                     no_order_notice(summary),
+                                     redistribution_notice(summary)) if text]
+        warnings = plan_warning_lines(self.plan.warnings,
+                                      scale_factor=self.plan.scale_factor)
+        if not notices and not warnings:
+            return
+        # EVERY COLOUR HERE IS PAINTED INLINE, and that is not habit. Checked in a
+        # real browser: this build ships no Tailwind sheet for the -400/-500
+        # palette and ``styles.css`` defines ``.text-orange-400`` nowhere, so a
+        # ``<div class="text-orange-400">`` computes to plain WHITE. These lines
+        # replaced padded ``alert-banner`` divs, which DID paint -- so leaving them
+        # class-only would have quietly turned every plan notice from an orange
+        # callout into indistinguishable white text. The classes stay because they
+        # are what the DOM reads as and what several tests locate.
         with self._notices_container:
-            for text in (whole_share_notice(summary), bump_notice(summary),
-                         no_order_notice(summary), redistribution_notice(summary)):
-                if not text:
-                    continue
-                with ui.element('div').classes('alert-banner warning w-full p-2 mt-2'):
-                    ui.label(text).classes('text-sm').mark(MARKER_PLAN_NOTICE)
+            if len(notices) + len(warnings) > 2:
+                ui.label(NOTICE_COUNT_FMT.format(
+                    count=len(notices) + len(warnings))) \
+                    .classes('text-xs text-orange-400 mt-1') \
+                    .style(important_color_style(STATUS_OVER_COLOR)) \
+                    .mark(MARKER_NOTICE_COUNT)
+            with ui.column().classes(NOTICE_BLOCK_CLASSES) \
+                    .mark(MARKER_NOTICE_BLOCK):
+                for text in notices:
+                    with ui.row().classes('w-full items-start gap-2 no-wrap'):
+                        ui.icon('warning').classes('text-orange-400 text-sm shrink-0') \
+                            .style(important_color_style(STATUS_OVER_COLOR))
+                        ui.label(text).classes('text-xs text-orange-400') \
+                            .style(important_color_style(STATUS_OVER_COLOR)) \
+                            .mark(MARKER_PLAN_NOTICE)
+                for text, severity in warnings:
+                    ui.label(text).classes(PLAN_WARNING_CLASSES[severity]) \
+                        .style(important_color_style(PLAN_WARNING_COLORS[severity])) \
+                        .mark(MARKER_PLAN_WARNING)
 
     def _render_no_order_rows(self):
         """Symbols the plan wanted to trade and could not, with their money.
@@ -544,24 +744,32 @@ class AllocationWizard:
         total = sum(r['unmet_notional'] for r in dropped)
         with self._no_order_container:
             with ui.expansion(f'Not traded ({len(dropped)}) - {total:,.2f} unallocated') \
-                    .classes('w-full mt-2'):
-                with ui.row().classes('w-full text-xs font-bold border-b py-1'):
-                    for header, width in (('Symbol', 'w-24'), ('Price', 'w-28'),
-                                          ('Outcome', 'w-32'), ('Target', 'w-28'),
-                                          ('Projected', 'w-28'), ('Unallocated', 'w-28'),
+                    .classes('w-full mt-1'):
+                # THE SAME grid treatment as the order table two inches above --
+                # header bar, separators, right-aligned money. Two tables in one
+                # dialog drawn two ways is a second look to learn for no reason.
+                with ui.row().classes(GRID_HEAD_CLASSES):
+                    for header, width in (('Symbol', 'w-24'),
+                                          ('Price', 'w-28 text-right'),
+                                          ('Outcome', 'w-32'),
+                                          ('Target', 'w-28 text-right'),
+                                          ('Projected', 'w-28 text-right'),
+                                          ('Unallocated', 'w-28 text-right'),
                                           ('Why', 'flex-1')):
                         ui.label(header).classes(width)
                 for row in dropped:
-                    with ui.row().classes('w-full text-sm items-center border-b py-1'):
+                    with ui.row().classes(GRID_ROW_CLASSES):
                         ui.label(row['symbol']).classes('w-24 font-medium')
                         ui.label('-' if row['price'] is None
-                                 else f"{row['price']:,.2f}").classes('w-28')
+                                 else f"{row['price']:,.2f}").classes('w-28 text-right')
                         ui.label(row['outcome']).classes('w-32 text-xs text-orange-400')
-                        ui.label(f"{row['target_notional']:,.2f}").classes('w-28')
+                        ui.label(f"{row['target_notional']:,.2f}") \
+                            .classes('w-28 text-right')
                         projected = row['projected_notional']
                         ui.label('-' if projected is None
-                                 else f"{projected:,.2f}").classes('w-28')
-                        ui.label(f"{row['unmet_notional']:,.2f}").classes('w-28 text-orange-400')
+                                 else f"{projected:,.2f}").classes('w-28 text-right')
+                        ui.label(f"{row['unmet_notional']:,.2f}") \
+                            .classes('w-28 text-right text-orange-400')
                         ui.label(row['reasons']).classes('flex-1 text-xs text-gray-400')
 
     @staticmethod
@@ -597,9 +805,11 @@ class AllocationWizard:
                 with ui.row().classes('items-center gap-2'):
                     ui.icon('price_change')
                     ui.label(base_block).classes('text-sm').mark(MARKER_BASE_BLOCK)
+        # The BASE's warnings only. The PLAN's moved into ``_render_notices``:
+        # this panel is drawn once and Refresh never redraws it, so a plan warning
+        # here went stale the moment the user pressed Refresh -- the previous
+        # solve's complaint sitting above the new solve's table.
         for warning in self.base.warnings:
-            ui.label(warning).classes('text-xs text-orange-400')
-        for warning in self.plan.warnings:
             ui.label(warning).classes('text-xs text-orange-400')
 
     def _render_rows(self):
@@ -617,9 +827,18 @@ class AllocationWizard:
         the flex row squeeze -- silently truncates money figures, which is the one
         failure mode a dry run may not have. ``classes()`` de-duplicates, so
         re-applying it on every refresh is a no-op.
+
+        It reads as a TABLE now rather than as a stack of rows: the header, the row
+        separators and the hover are ``styles.css``'s own ``.q-table`` rules,
+        reached through ``.pf-grid-head`` / ``.pf-grid-row`` so this grid and the
+        symbol tables in the label panels are one look and not two. The header is
+        STICKY, which is what makes the taller viewport usable -- eighteen columns
+        whose names have scrolled away are eighteen anonymous numbers.
+
+        The columns come from ``DRY_RUN_COLUMNS`` and so do the cells below, so a
+        right-aligned money column cannot line up under a left-aligned heading.
         """
         self._rows_container.clear()
-        self._rows_container.classes('overflow-x-auto')
         rows = dry_run_rows(self.plan)
         with self._rows_container:
             if not rows:
@@ -627,23 +846,12 @@ class AllocationWizard:
                     .classes('text-sm text-gray-400')
                 return
             if any(r['fractional'] and not r['suppressed'] for r in rows):
-                ui.label(FRACTIONAL_IS_MARKET_ONLY_NOTE).classes('text-xs text-orange-400')
-            with ui.row().classes('w-full min-w-max text-xs font-bold border-b py-1'):
-                for header, width in (('', 'w-10'), ('Symbol', 'w-24'),
-                                      # WHERE THE ROW STARTS -- the basis being
-                                      # traded against, which the table never had.
-                                      ('Held', 'w-20'), ('Cost', 'w-24'),
-                                      ('Value', 'w-24'),
-                                      ('Side', 'w-16'),
-                                      ('Qty', 'w-24'), ('Order', 'w-24'),
-                                      ('Sizing', 'w-20'), ('Outcome', 'w-28'),
-                                      ('Est. value', 'w-24'), ('Target', 'w-24'),
-                                      (f'Projected ({self.plan.valuation_mode})', 'w-32'),
-                                      ('Weight', 'w-32'),
-                                      ('BP cost', 'w-24'), ('BP ×', 'w-20'),
-                                      ('BP %', 'w-16'),
-                                      ('Reasons', 'flex-1 min-w-64')):
-                    ui.label(header).classes(width)
+                ui.label(FRACTIONAL_IS_MARKET_ONLY_NOTE) \
+                    .classes('text-xs text-orange-400 shrink-0')
+            with ui.row().classes(GRID_HEAD_CLASSES).mark(MARKER_TABLE_HEAD):
+                for name, header, _width, _numeric in DRY_RUN_COLUMNS:
+                    ui.label(header.format(mode=self.plan.valuation_mode)) \
+                        .classes(_col(name))
             for row in rows:
                 self._render_row(row)
 
@@ -664,56 +872,58 @@ class AllocationWizard:
         worthless.
         """
         blocked = row['suppressed'] or row['skipped']
-        with ui.row().classes('w-full min-w-max text-sm items-center border-b py-1'
+        with ui.row().classes(GRID_ROW_CLASSES
                               + (' opacity-60' if blocked else '')):
             checkbox = ui.checkbox(
                 value=row['symbol'] in self.selected,
                 on_change=lambda e, s=row['symbol']: self._toggle(s, bool(e.value)),
-            ).classes('w-10').mark(MARKER_ROW_TICK)
+            ).classes(_col('tick')).mark(MARKER_ROW_TICK)
             # A suppressed row has no order to submit, so it must not be tickable
             # -- greying it is not enough, the box would still be clickable.
             checkbox.set_enabled(not blocked)
-            ui.label(row['symbol']).classes('w-24 font-medium')
+            ui.label(row['symbol']).classes(_col('symbol', 'font-medium'))
             # THE BASIS THIS ROW IS TRADING AGAINST.
-            ui.label(_shares(row['current_quantity'])).classes('w-20 text-gray-400') \
-                .mark(MARKER_ROW_HELD)
-            ui.label(f"{row['current_cost_basis']:,.2f}").classes('w-24 text-gray-400') \
-                .mark(MARKER_ROW_COST)
+            ui.label(_shares(row['current_quantity'])) \
+                .classes(_col('held', 'text-gray-400')).mark(MARKER_ROW_HELD)
+            ui.label(f"{row['current_cost_basis']:,.2f}") \
+                .classes(_col('cost', 'text-gray-400')).mark(MARKER_ROW_COST)
             value = row['current_value']
             # '-', never 0.00: no price is "not measurable", not "worthless".
             ui.label('-' if value is None else f"{value:,.2f}") \
-                .classes('w-24 text-gray-400').mark(MARKER_ROW_VALUE)
-            ui.label(row['side'] or '-').classes(
-                'w-16 ' + ('text-green-500' if row['side'] == 'BUY'
-                           else 'text-red-500' if row['side'] == 'SELL'
-                           else 'text-gray-400'))
-            ui.label(_shares(row['quantity'])).classes('w-24')
+                .classes(_col('value', 'text-gray-400')).mark(MARKER_ROW_VALUE)
+            ui.label(row['side'] or '-').classes(_col(
+                'side', 'text-green-500' if row['side'] == 'BUY'
+                else 'text-red-500' if row['side'] == 'SELL' else 'text-gray-400'))
+            ui.label(_shares(row['quantity'])).classes(_col('qty'))
             if row['suppressed']:
                 order_kind, order_class = 'no order', 'text-orange-400'
             elif row['fractional']:
                 order_kind, order_class = 'fractional', 'text-blue-400'
             else:
                 order_kind, order_class = 'whole shares', 'text-gray-400'
-            ui.label(order_kind).classes('w-24 text-xs ' + order_class) \
+            ui.label(order_kind).classes(_col('order', 'text-xs ' + order_class)) \
                 .mark(MARKER_ORDER_KIND)
             # The GRID the row was sized on, which is the column to scan when a
             # quarter of the book cannot trade fractionally at all.
-            ui.label(row['sizing']).classes(
-                'w-20 text-xs ' + ('text-blue-400' if row['sizing'] == 'fractional'
-                                   else 'text-orange-400'))
+            ui.label(row['sizing']).classes(_col(
+                'sizing', 'text-xs ' + ('text-blue-400'
+                                        if row['sizing'] == 'fractional'
+                                        else 'text-orange-400')))
             # WHICH RULE produced the quantity. A bumped row holds MORE than the
             # weights asked for, and that must never be silent.
-            ui.label(row['outcome']).classes(
-                'w-28 text-xs ' + ('text-orange-400' if row['outcome'] != 'normal'
-                                   else 'text-gray-400'))
-            ui.label(f"{row['estimated_value']:,.2f}").classes('w-24')
-            ui.label(f"{row['target_notional']:,.2f}").classes('w-24')
+            ui.label(row['outcome']).classes(_col(
+                'outcome', 'text-xs ' + ('text-orange-400'
+                                         if row['outcome'] != 'normal'
+                                         else 'text-gray-400')))
+            ui.label(f"{row['estimated_value']:,.2f}").classes(_col('estimated_value'))
+            ui.label(f"{row['target_notional']:,.2f}").classes(_col('target'))
             projected = row['projected_notional']
             # The header names the mode this figure is in; the tooltip carries the
             # OTHER one, so cost and value are one hover apart instead of one
             # page-level toggle and a re-solve apart.
             projected_label = ui.label('-' if projected is None
-                                       else f"{projected:,.2f}").classes('w-32')
+                                       else f"{projected:,.2f}") \
+                .classes(_col('projected'))
             other = ('projected_cost' if self.plan.valuation_mode == VALUATION_MODE_MARKET
                      else 'projected_market')
             if row[other] is not None:
@@ -723,19 +933,21 @@ class AllocationWizard:
             # redistribution moved this row, and hiding that would be rewriting the
             # user's weights behind their back.
             ui.label(f"{row['weight_pct']:.2f}% → {row['projected_weight_pct']:.2f}%") \
-                .classes('w-32 text-xs ' + ('text-orange-400' if row['redistributed']
-                                            else 'text-gray-400'))
-            ui.label(f"{row['bp_cost']:,.2f}").classes('w-24')
+                .classes(_col('weight', 'text-xs '
+                              + ('text-orange-400' if row['redistributed']
+                                 else 'text-gray-400')))
+            ui.label(f"{row['bp_cost']:,.2f}").classes(_col('bp_cost'))
             # Immediately beside BP cost ON PURPOSE: the x IS the explanation of why
             # that figure is not the Est. value, which is the misreading requirement
             # 1b is about.
             text, css, tip = _leverage_cell(row)
-            with ui.label(text).classes('w-20 text-xs ' + css).mark(MARKER_LEVERAGE):
+            with ui.label(text).classes(_col('bp_ratio', 'text-xs ' + css)) \
+                    .mark(MARKER_LEVERAGE):
                 ui.tooltip(tip)
-            ui.label(f"{row['bp_usage_pct']:.1f}%").classes('w-16')
-            ui.label(row['reasons']).classes(
-                'flex-1 min-w-64 text-xs ' + ('text-orange-400' if row['suppressed']
-                                              else 'text-gray-400'))
+            ui.label(f"{row['bp_usage_pct']:.1f}%").classes(_col('bp_pct'))
+            ui.label(row['reasons']).classes(_col(
+                'reasons', 'text-xs ' + ('text-orange-400' if row['suppressed']
+                                         else 'text-gray-400')))
 
     def _render_totals(self):
         """The footer, over the TICKED rows only.

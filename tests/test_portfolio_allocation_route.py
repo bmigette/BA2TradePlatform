@@ -91,9 +91,14 @@ def test_the_page_opens_the_dry_run_gate_and_the_invest_scope():
 
 
 def test_the_allocate_button_exists_and_calls_the_flow():
-    """The entry point. Everything else in this chunk is unreachable without it."""
+    """The entry point. Everything else in this chunk is unreachable without it.
+
+    Keyed on the CAPTION CONSTANT and on the caption itself: the button is called
+    ``Review and Submit`` now (it opens a review gate and orders nothing), and a
+    grep for the old word would have gone green on a page with no button at all."""
     source = _page_source()
-    assert "'Allocate'" in source
+    assert "REVIEW_BUTTON_LABEL = 'Review and Submit'" in source
+    assert "ui.button(REVIEW_BUTTON_LABEL" in source
     assert "_open_allocation_flow(" in source
 
 
