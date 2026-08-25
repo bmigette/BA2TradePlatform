@@ -650,9 +650,18 @@ def test_no_LIVE_account_class_can_reach_the_equity_cap():
     kind of claim that stops being true."""
     from ba2_common.core.interfaces.AccountInterface import AccountInterface
     from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
-    from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
-    from ba2_trade_platform.modules.accounts.IBKRAccount import IBKRAccount
-    from ba2_trade_platform.modules.accounts.TastyTradeAccount import TastyTradeAccount
+    try:
+        from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
+        from ba2_trade_platform.modules.accounts.IBKRAccount import IBKRAccount
+        from ba2_trade_platform.modules.accounts.TastyTradeAccount import TastyTradeAccount
+    except ModuleNotFoundError:
+        # ba2_trade_platform (the live trade app) is not installed in this test venv --
+        # parity-and-coverage.yml deliberately installs only packages/{common,providers,experts}
+        # + testplatform/backend/requirements.txt, never the live app itself (same reasoning as
+        # settings.py's _trade_db_path). This still runs for real, live-account-class included,
+        # in a full local dev checkout where ba2_trade_platform IS importable.
+        pytest.skip("ba2_trade_platform not installed in this venv "
+                    "(expected in the parity-and-coverage CI job)")
 
     for cls in (AccountInterface, ReadOnlyAccountInterface, AlpacaAccount, IBKRAccount,
                 TastyTradeAccount):
