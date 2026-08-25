@@ -646,6 +646,153 @@ class TestUnreadablePriceIsNotAPass:
         assert account._validate_position_size_limits(small) == []
 
 
+class TestAZeroQuoteIsNotAPrice:
+    """GAP 1: ``if current_price is None`` was too narrow.
+
+    A quote of exactly ``0.0`` is not a price -- it is a broker or feed that answered
+    with nothing usable. It sails through the ``is None`` check, and then EVERY number
+    downstream of it is zero:
+
+        position_value  = current_price * trading_order.quantity  -> 0.0
+        order_value     = current_price * trading_order.quantity  -> 0.0
+
+    so ``0.0 > max_position_value`` and ``0.0 > available_balance`` are both False and
+    BOTH risk gates report "no problems" for an order of any size, on a MARKET order
+    that already carries a transaction_id. The cap is not merely wrong here, it is
+    off.
+
+    The guard is on the PRICE and on nothing else. A zero quantity, a zero position
+    value, a zero cap and a zero equity are all legitimate measured zeros and are
+    pinned below -- widening the guard to any of them is the inverse defect, which is
+    quieter and therefore worse.
+    """
+
+    def _fixture(self, monkeypatch, price, *, max_position_pct=10.0, quantity=400.0):
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=max_position_pct)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        # Patch the SEAM, not ``_prices``: get_instrument_current_price caches any
+        # non-None price in a CLASS-level dict keyed by account id, so a canned 0.0
+        # would outlive the test.
+        monkeypatch.setattr(account, "get_instrument_current_price",
+                            lambda *_a, **_k: price)
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=quantity,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+        return account, order
+
+    def test_a_zero_price_refuses_to_validate(self, monkeypatch):
+        """THE DEFECT: $0.00 x 400 shares = $0.00, which is inside every limit."""
+        errors_logged = _capture_errors(monkeypatch)
+        account, order = self._fixture(monkeypatch, price=0.0)
+
+        errors = account._validate_position_size_limits(order)
+
+        assert errors, "a $0.00 quote is not a price -- neither gate could be priced"
+        assert any("no price" in e.lower() for e in errors), errors
+        # The refusal must NAME the offending value, or an operator reading it cannot
+        # tell a dead feed from a missing symbol.
+        assert any("0.0" in e for e in errors), errors
+        assert errors_logged, "an unrun risk gate must be logged, not silent"
+
+    def test_the_zero_price_refusal_comes_from_the_GUARD_not_the_catch_all(self, monkeypatch):
+        """``assert errors`` alone is satisfied by a crash. A risk control that blew up
+        is not a risk control that ran, and the two must stay distinguishable."""
+        account, order = self._fixture(monkeypatch, price=0.0)
+
+        errors = account._validate_position_size_limits(order)
+
+        assert not any("could not be completed" in e for e in errors), (
+            "the guard must refuse, not fall into the outer except", errors)
+
+    def test_a_zero_price_is_refused_even_when_the_cap_is_generous(self, monkeypatch):
+        """Pins that the refusal is the PRICE guard and not the cap firing by luck: a
+        100% cap and a million-dollar sleeve can reject nothing on their own."""
+        account, order = self._fixture(monkeypatch, price=0.0, max_position_pct=100.0)
+
+        errors = account._validate_position_size_limits(order)
+
+        assert errors, "a generous cap must not make an unpriceable order acceptable"
+        assert not any("exceeds expert's max allowed" in e for e in errors), errors
+
+    def test_a_negative_price_is_refused_too(self, monkeypatch):
+        """Worse than zero: a negative quote makes ``position_value`` NEGATIVE, so the
+        cap comparison is not merely satisfied, it is satisfied by an ever-larger
+        order. Equities and options have no negative quote; this is a broken feed."""
+        errors_logged = _capture_errors(monkeypatch)
+        account, order = self._fixture(monkeypatch, price=-3.0)
+
+        errors = account._validate_position_size_limits(order)
+
+        assert errors, "a negative quote is not a price"
+        assert any("no price" in e.lower() for e in errors), errors
+        assert any("-3.0" in e for e in errors), errors
+        assert errors_logged
+
+    # --- the inverses: legitimate zeros that must NOT be swept up ----------
+
+    def test_a_sub_penny_price_is_a_real_quote(self, monkeypatch):
+        """THE INVERSE #1: sub-penny tickers exist and this platform trades pennies.
+        The guard must test for zero and nothing wider -- a ``< 0.01`` guard would
+        refuse to validate every legitimate sub-penny order."""
+        account, order = self._fixture(monkeypatch, price=0.0001, quantity=1.0)
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_zero_QUANTITY_order_is_not_the_price_guards_business(self, monkeypatch):
+        """THE INVERSE #2: it is the zero PRICE that is unmeasurable. A zero-quantity
+        order has a perfectly measured $0.00 position value, and guarding
+        ``position_value <= 0`` instead would refuse it with a price complaint."""
+        account, order = self._fixture(monkeypatch, price=150.0, quantity=0.0)
+
+        assert account._validate_position_size_limits(order) == []
+
+    def test_a_measured_zero_EQUITY_is_still_an_answer(self, monkeypatch):
+        """THE INVERSE #3: an account measured at $0.00 equity has a $0.00 sleeve and
+        therefore a $0.00 cap -- every order is rejected BY THE CAP, with the ordinary
+        message. Widening the equity guard from ``is None`` to falsy would report a
+        measured empty account as an unrun check."""
+        class _EmptyAccount(MockAccount):
+            def get_account_info(self):
+                return {"balance": 0.0, "equity": 0.0}
+
+        acct_def = create_account_definition()
+        account = _EmptyAccount(acct_def.id)
+        account._prices["AAPL"] = 150.0
+        expert_instance = _expert_with_cap(acct_def.id, max_position_pct=10.0)
+        monkeypatch.setattr(
+            "ba2_common.core.instance_resolver._resolver",
+            _StubExpertResolver(_StubExpertInterface(available_balance=1_000_000.0)),
+        )
+        transaction = create_transaction(
+            symbol="AAPL", quantity=0.0, side=OrderDirection.BUY,
+            status=TransactionStatus.WAITING, open_price=150.0,
+            expert_id=expert_instance.id,
+        )
+        order = TradingOrder(
+            account_id=acct_def.id, symbol="AAPL", quantity=1.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=transaction.id,
+        )
+
+        errors = account._validate_position_size_limits(order)
+
+        assert any("exceeds expert's max allowed $0.00" in e for e in errors), errors
+        assert not any("could not" in e.lower() for e in errors), (
+            "a measured $0 account is an answer, not an unrun check", errors)
+
+
 class TestCloseNeverFallsBackToTheOrderedQuantity:
     """``submit_close_order_for_transaction`` must size off what it MEASURED."""
 
