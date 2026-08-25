@@ -703,12 +703,21 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             else:
                 return self._format_past_earnings_markdown(result)
         
+        except FMPError:
+            # A genuine FMP failure (e.g. rate-limit/quota exhaustion) must fail the caller
+            # loud, exactly like every other FMP-backed fetch in this provider -- swallowing
+            # it here into an {"error": ...} dict let callers that only check for the
+            # "earnings" key (e.g. FMPEarningsDrift._gather) silently read it as "no earnings
+            # data" and report a false HOLD instead of failing the analysis. See
+            # packages/experts/tests/test_earnings_drift_calendar_shortcut.py and
+            # packages/providers/tests/test_fmp_past_earnings_error_propagation.py.
+            raise
         except Exception as e:
             logger.error(f"Error retrieving past earnings for {symbol}: {e}")
             if format_type == "dict":
                 return {"error": str(e), "symbol": symbol}
             return f"Error retrieving past earnings for {symbol}: {str(e)}"
-    
+
     def get_earnings_estimates(
         self,
         symbol: str,

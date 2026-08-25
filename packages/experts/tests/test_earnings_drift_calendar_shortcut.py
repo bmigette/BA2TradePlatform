@@ -14,6 +14,7 @@ import pandas as pd
 import pytest
 
 from ba2_experts.FMPEarningsDrift import FMPEarningsDrift
+from ba2_providers.fmp_common import FMPError
 
 # ba2_experts/__init__.py does `from .FMPEarningsDrift import FMPEarningsDrift`, which shadows
 # the `ba2_experts.FMPEarningsDrift` ATTRIBUTE with the class -- `import ... as mod` would
@@ -183,6 +184,32 @@ def test_backtest_path_never_touches_calendar(monkeypatch):
     assert calls["n"] == 0
     assert details.detail_fetch_called is True
     assert bundle["latest_earnings"] == per_symbol_row
+
+
+def test_quota_exhaustion_on_both_paths_propagates_not_silently_hold(monkeypatch):
+    """Regression for the 2026-08-24 incident: FMP rate-limited BOTH the bulk calendar call
+    AND the per-symbol fallback in the same scan cycle. FMPRating (a different expert, same
+    root cause) correctly failed the job; FMPEarningsDrift instead reported
+    'HOLD (no earnings data)' -- indistinguishable from a symbol that genuinely has no
+    earnings in the window. The calendar shortcut is allowed to swallow its own failure
+    (best-effort, it has a working fallback) but the fallback itself must not also swallow
+    a genuine FMP failure into a fake empty result."""
+    def broken_calendar(apikey, from_date, to_date):
+        raise RuntimeError("FMP rate limit")  # the shortcut's own best-effort catch absorbs this
+
+    monkeypatch.setattr(mod.fmpsdk, "earning_calendar", broken_calendar)
+
+    class QuotaExhaustedDetails(FakeFMPDetails):
+        def get_past_earnings(self, *a, **kw):
+            self.detail_fetch_called = True
+            raise FMPError("FMP historical_earning_calendar error for AAPL after 4 attempts "
+                           "(last: HTTP 429)")
+
+    details = QuotaExhaustedDetails()
+    e = _expert()
+    with pytest.raises(FMPError):
+        e._gather(_provider_bundle(details), as_of=None)
+    assert details.detail_fetch_called is True
 
 
 def test_non_fmp_provider_falls_back_to_detail_fetch(monkeypatch):

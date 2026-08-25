@@ -41,7 +41,7 @@ from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin
 from ba2_experts.earnings_surprise import surprise_percent as _surprise_percent
 from ba2_providers.cache.cached_get import past_earnings_get
-from ba2_providers.fmp_common import TTLCache
+from ba2_providers.fmp_common import TTLCache, fmp_list_call
 from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
 
 # 4h TTL: long enough that every symbol in one scheduled scan cycle (all analyzed within
@@ -57,7 +57,17 @@ def _fetch_earnings_calendar_by_symbol(api_key: str, from_date: str, to_date: st
     symbol, keyed upper-case. ONE API call regardless of universe size — no symbol list, so
     no chunking is needed (unlike e.g. a batch quote/profile endpoint)."""
     def _do_fetch() -> Dict[str, dict]:
-        rows = fmpsdk.earning_calendar(apikey=api_key, from_date=from_date, to_date=to_date) or []
+        # Routed through fmp_list_call (retry + normalize) rather than called directly: a
+        # rate-limited/quota-exhausted response from this endpoint comes back as a raw string,
+        # not the {"Error Message": ...} dict shape other FMP endpoints use, and iterating that
+        # string as rows previously surfaced as a misleading "'str' object has no attribute
+        # 'get'" -- masking the real cause (FMP quota) behind an unrelated-looking bug. This
+        # still falls through to the per-symbol path below via _gather's except (best-effort),
+        # it just fails with an honest, retried FMPError instead of a confusing one.
+        rows = fmp_list_call(
+            lambda: fmpsdk.earning_calendar(apikey=api_key, from_date=from_date, to_date=to_date),
+            endpoint="earning_calendar",
+        )
         by_symbol: Dict[str, dict] = {}
         for row in rows:
             sym = (row.get("symbol") or "").upper()
