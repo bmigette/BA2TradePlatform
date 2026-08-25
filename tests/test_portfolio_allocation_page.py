@@ -1340,6 +1340,7 @@ def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
     _capture_notifications(monkeypatch)
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
 
     # The dialog opener is captured rather than drawn: what is under test is the
     # page's glue and the service beneath it, and the wizard's own rendering
@@ -1383,6 +1384,7 @@ def test_pressing_allocate_opens_NO_dialog_before_the_dry_run(monkeypatch,
     _capture_notifications(monkeypatch)
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
     opened = {}
     monkeypatch.setattr(page, 'open_allocation_wizard',
                         lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
@@ -1415,14 +1417,16 @@ def test_pressing_allocate_opens_NO_dialog_before_the_dry_run(monkeypatch,
 
 def _drive_the_flow(monkeypatch, nicegui_client, account_id, *,
                     mode=ALLOCATION_MODE_REBALANCE, scope_label=None, amount=0.0,
-                    valuation_mode=VALUATION_MODE_MARKET, invest_edit=None):
+                    valuation_mode=VALUATION_MODE_MARKET, invest_edit=None,
+                    positions=None, prices=None):
     """Press Allocate and let the flow run to the dry run. Returns its kwargs.
 
     A REBALANCE opens no dialog at all. An INVEST run still opens the scope dialog,
     which is captured rather than drawn and driven through its ``on_dry_run``.
     """
     account = _AllocAccount(account_id, {'manual_trading_enabled': True},
-                            positions=[], prices={'AAPL': 100.0, 'MSFT': 100.0})
+                            positions=list(positions or []),
+                            prices=dict(prices or {'AAPL': 100.0, 'MSFT': 100.0}))
     _use_account(monkeypatch, account)
     _capture_notifications(monkeypatch)
 
@@ -1465,19 +1469,23 @@ def test_the_run_keeps_the_targets_the_page_saved(monkeypatch, nicegui_client,
 
 def test_the_run_makes_a_silently_defaulted_symbol_weight_EXPLICIT(
         monkeypatch, nicegui_client, account_id):
-    """A symbol taking ``get_symbol_weights``' even-split default has no row. The
-    user has just allocated real money with that number, so the run writes it."""
+    """A symbol with no stored row is showing a DEFAULT -- its actual share of the
+    label. The user has just allocated real money with that number, so the run
+    writes it down, and what it writes is what the page was showing."""
     from ba2_trade_platform.core.portfolio_allocation_store import get_symbol_rows
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
     assert get_symbol_rows(account_id, 'ARK26') == {}
 
-    _drive_the_flow(monkeypatch, nicegui_client, account_id)
+    _drive_the_flow(monkeypatch, nicegui_client, account_id,
+                    positions=[_held('AAPL', 10, 600.0, 600.0),
+                               _held('MSFT', 10, 400.0, 400.0)],
+                    prices={'AAPL': 60.0, 'MSFT': 40.0})
 
     stored = get_symbol_rows(account_id, 'ARK26')
-    assert {s: row.weight_pct for s, row in stored.items()} == {'AAPL': 50.0,
-                                                                'MSFT': 50.0}
+    assert {s: row.weight_pct for s, row in stored.items()} == {'AAPL': 60.0,
+                                                                'MSFT': 40.0}
 
 
 def test_the_run_does_NOT_consume_a_generation_when_nothing_changed(
@@ -1700,6 +1708,10 @@ def _open_the_wizard(monkeypatch, nicegui_client, account, account_id, *,
     _capture_notifications(monkeypatch)
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
+    # A SAVED share. The book here is flat, and an unsaved share now defaults to
+    # the symbol's ACTUAL one -- which on a flat book is a real 0%, so the plan
+    # would correctly buy nothing and there would be no dry run to inspect.
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
     if unallocated_pct:
         set_allocation_config(account_id, unallocated_pct=unallocated_pct)
     opened = {}
@@ -2353,13 +2365,33 @@ def test_the_symbol_table_shows_a_target_percentage_and_a_target_value(nicegui_c
     assert table.rows[0]['target_value'] == 4_000.0
 
 
-def test_a_symbol_with_no_target_shows_a_blank_rather_than_a_zero(nicegui_client):
+def test_a_symbol_with_no_saved_target_shows_its_ACTUAL_share(nicegui_client):
+    """It used to show a blank, and before that the fair share. The lone member of
+    a label holds all of it."""
     from nicegui import ui
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
 
     positions = positions_by_symbol([_pos('AAPL', 10, 1000.0, 2500.0)])
     view = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
                              positions, {'AAPL': 250.0},
+                             valuation_mode=VALUATION_MODE_MARKET)[0]
+    with nicegui_client:
+        page._render_label_body(1, view, _noop_refresh)
+        table = next(el for el in nicegui_client.layout.descendants()
+                     if isinstance(el, ui.table))
+
+    assert table.rows[0]['weight_pct'] == 100.0
+
+
+def test_an_UNMEASURABLE_symbol_still_shows_a_blank_rather_than_a_zero(nicegui_client):
+    """The blank did not go away, it moved to the case that still needs it: a
+    price outage may not quietly write 0%, which is an instruction to sell out."""
+    from nicegui import ui
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
+
+    positions = positions_by_symbol([_pos('DARK', 10, 1000.0, None)])
+    view = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['DARK']},
+                             positions, {'DARK': None},
                              valuation_mode=VALUATION_MODE_MARKET)[0]
     with nicegui_client:
         page._render_label_body(1, view, _noop_refresh)
@@ -4107,19 +4139,23 @@ def test_a_recomputed_target_value_is_rounded_to_cents(nicegui_client, account_i
     assert table.rows[0]['target_value'] == 1233.21          # 33.33% of 3,700
 
 
-def test_a_row_with_no_stored_or_default_weight_keeps_its_blank(nicegui_client,
-                                                                account_id):
+def test_an_unmeasurable_row_keeps_its_blank_through_a_RECOMPUTE(nicegui_client,
+                                                                 account_id):
     """``weight_pct is None`` means "there is no answer", and the recompute must
-    leave it alone rather than writing a 0.00 that reads as a decision."""
+    leave it alone rather than writing a 0.00 that reads as a decision.
+
+    One unpriced member blanks every UNSAVED share in the label -- the label's
+    total is the denominator and nobody knows it -- so editing the measurable one
+    gives it a saved target while its neighbour stays honestly blank.
+    """
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
-    # No ``symbol_weights`` at all, so every row's weight is None.
     views = build_label_views([ManagedLabel('ARK26', 100.0)],
-                              {'ARK26': ['AAPL', 'MSFT']},
+                              {'ARK26': ['AAPL', 'DARK']},
                               positions_by_symbol([_pos('AAPL', 10, 1000.0, 2500.0),
-                                                   _pos('MSFT', 10, 1000.0, 2500.0)]),
-                              {'AAPL': 250.0, 'MSFT': 250.0},
+                                                   _pos('DARK', 10, 1000.0, None)]),
+                              {'AAPL': 250.0, 'DARK': None},
                               valuation_mode=VALUATION_MODE_MARKET,
                               base_notional=10_000.0)
     root = _draw(nicegui_client, account_id, views)
@@ -4128,11 +4164,8 @@ def test_a_row_with_no_stored_or_default_weight_keeps_its_blank(nicegui_client,
 
     _emit(table, 'weightChange', ['AAPL', 60.0])
 
-    # AAPL now has a stored weight. MSFT still has NONE -- it is not silently
-    # zeroed, and it is no longer silently re-derived either: its cell stays blank
-    # until the user (or Fill 100%) puts a number in it.
     assert {r['symbol']: r['weight_pct'] for r in table.rows} == \
-        {'AAPL': 60.0, 'MSFT': None}
+        {'AAPL': 60.0, 'DARK': None}
 
 
 def test_an_edit_touches_the_EDITED_labels_own_map_and_no_others(nicegui_client,
@@ -5856,10 +5889,10 @@ def test_the_four_migrated_buttons_land_LEFT_of_the_space_beside_Fill_100(
              if isinstance(el, (ui.button, ui.space))]
     captions = [el._props.get('label', '<space>') if isinstance(el, ui.button)
                 else '<space>' for el in order]
-    assert captions[:6] == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
-                            'Wipe', 'Compare']
-    assert captions[6] == '<space>'
-    assert captions[7] == 'Remove selected from label'
+    assert captions[:7] == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
+                            'Load current', 'Wipe', 'Compare']
+    assert captions[7] == '<space>'
+    assert captions[8] == 'Remove selected from label'
 
 
 # ---------------------------------------------------------------------------
@@ -5896,6 +5929,10 @@ def test_a_target_typed_on_the_page_is_what_the_dry_run_solves_against(
     set_managed_label(account_id, 'CASHY', target_pct=40.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
     add_label_to_instruments(['MSFT'], 'CASHY')
+    # Saved shares: the book here is flat, and an unsaved share now defaults to
+    # the symbol's ACTUAL one, which on a flat book is a real 0%.
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    set_symbol_weight(account_id, 'CASHY', 'MSFT', weight_pct=100.0)
     account = _AllocAccount(account_id, {'manual_trading_enabled': True},
                             positions=[], prices={'AAPL': 100.0, 'MSFT': 100.0})
     _use_account(monkeypatch, account)
@@ -5928,6 +5965,7 @@ def test_the_dry_run_does_not_RE_DERIVE_the_target_it_was_given(monkeypatch,
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
     set_allocation_config(account_id, unallocated_pct=10.0)
 
     opened = _drive_the_flow(monkeypatch, nicegui_client, account_id)
@@ -5951,6 +5989,7 @@ def test_toggling_the_fractional_switch_RE_SOLVES_the_plan(monkeypatch,
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
     account = _fractional_account(account_id)
     _use_account(monkeypatch, account)
     _capture_notifications(monkeypatch)
@@ -5987,6 +6026,7 @@ def test_the_re_solved_plan_is_what_SUBMIT_would_send(monkeypatch, nicegui_clien
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
     _use_account(monkeypatch, _fractional_account(account_id))
     _capture_notifications(monkeypatch)
 
@@ -6019,6 +6059,7 @@ def test_the_fractional_toggle_is_remembered_for_the_next_run(monkeypatch,
 
     set_managed_label(account_id, 'ARK26', target_pct=100.0)
     add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
     _use_account(monkeypatch, _fractional_account(account_id))
     _capture_notifications(monkeypatch)
 
@@ -6316,3 +6357,232 @@ def test_editing_one_target_leaves_every_SIBLING_target_where_it_was(
 
     assert _label_targets_now(account_id) == {'ARK26': 55.0, 'TECH': 30.0}
     assert '85.00%' in _total_card_texts(root)
+
+
+# ---------------------------------------------------------------------------
+# THE SHARE DEFAULT, END TO END: actual, not fair share
+# ---------------------------------------------------------------------------
+
+def test_the_page_defaults_an_unsaved_share_to_the_symbols_ACTUAL_share(
+        monkeypatch, account_id):
+    """The live screen showed nine symbols in one label all reading 11.11 while
+    their real shares were 26.78 / 22.19 / ... -- a target nobody chose, in a box
+    that trades."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT', 'TSLA'], 'ARK26')
+    _use_account(monkeypatch, _Account(
+        account_id,
+        positions=[_pos('AAPL', 10, 500.0, 5000.0), _pos('MSFT', 10, 300.0, 3000.0),
+                   _pos('TSLA', 10, 200.0, 2000.0)],
+        prices={'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert {r.symbol: r.weight_pct for r in payload['views'][0].rows} == {
+        'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}
+
+
+def test_the_page_no_longer_shows_the_FAIR_SHARE_default(monkeypatch, account_id):
+    """The exact number being removed: three unsaved symbols at 33.33 apiece."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT', 'TSLA'], 'ARK26')
+    _use_account(monkeypatch, _Account(
+        account_id,
+        positions=[_pos('AAPL', 10, 500.0, 5000.0), _pos('MSFT', 10, 300.0, 3000.0),
+                   _pos('TSLA', 10, 200.0, 2000.0)],
+        prices={'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert [r.weight_pct for r in payload['views'][0].rows] != [33.33, 33.33, 33.34]
+
+
+def test_a_SAVED_share_still_wins_over_the_actual_one(monkeypatch, account_id):
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=90.0)
+    _use_account(monkeypatch, _Account(
+        account_id,
+        positions=[_pos('AAPL', 1, 100.0, 100.0), _pos('MSFT', 10, 900.0, 900.0)],
+        prices={'AAPL': 100.0, 'MSFT': 90.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    by_symbol = {r.symbol: r for r in payload['views'][0].rows}
+    assert by_symbol['AAPL'].weight_pct == 90.0
+    assert by_symbol['AAPL'].weight_source == _view_mod().WEIGHT_SOURCE_SAVED
+    assert by_symbol['MSFT'].weight_source == _view_mod().WEIGHT_SOURCE_ACTUAL
+
+
+def test_a_saved_share_of_ZERO_is_not_mistaken_for_an_absent_row(monkeypatch,
+                                                                 account_id):
+    """The inverse mutation. Reading a stored 0.0 as "unsaved" would default it
+    back to the position's actual share -- buying back something the user sold out
+    of on purpose."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=0.0)
+    _use_account(monkeypatch, _Account(
+        account_id,
+        positions=[_pos('AAPL', 10, 5000.0, 5000.0), _pos('MSFT', 10, 5000.0, 5000.0)],
+        prices={'AAPL': 500.0, 'MSFT': 500.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+    by_symbol = {r.symbol: r for r in payload['views'][0].rows}
+
+    assert by_symbol['AAPL'].weight_pct == 0.0
+    assert by_symbol['AAPL'].weight_source == _view_mod().WEIGHT_SOURCE_SAVED
+
+
+def test_a_price_outage_cannot_quietly_zero_a_labels_targets(monkeypatch, account_id):
+    """The house bug, in the one place it would be most expensive: 0% is "hold
+    none of this" and the plan sells the whole position out."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'DARK'], 'ARK26')
+    _use_account(monkeypatch, _Account(
+        account_id,
+        positions=[_pos('AAPL', 10, 5000.0, 5000.0), _pos('DARK', 10, 1000.0, None)],
+        prices={'AAPL': 500.0, 'DARK': None}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert [r.weight_pct for r in payload['views'][0].rows] == [None, None]
+    assert {r.weight_source for r in payload['views'][0].rows} == {
+        _view_mod().WEIGHT_SOURCE_UNKNOWN}
+
+
+def test_a_symbol_that_is_genuinely_FLAT_defaults_to_a_real_zero(monkeypatch,
+                                                                 account_id):
+    """The inverse of the outage: nothing held is perfectly measurable. It must
+    not be reported as unknown, or the page would cry outage on every new symbol."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'CAS'], 'ARK26')
+    _use_account(monkeypatch, _Account(
+        account_id, positions=[_pos('AAPL', 10, 5000.0, 5000.0)],
+        prices={'AAPL': 500.0, 'CAS': 12.0}))
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+    by_symbol = {r.symbol: r for r in payload['views'][0].rows}
+
+    assert by_symbol['CAS'].weight_pct == 0.0
+    assert by_symbol['CAS'].weight_source == _view_mod().WEIGHT_SOURCE_ACTUAL
+
+
+def test_the_page_SAYS_why_a_share_is_showing_zero_rather_than_leaving_it_odd(
+        nicegui_client, account_id):
+    """Under fair share a newly added symbol would have been bought. Under actual
+    it sits at 0 and will not be -- which is correct, and has to be legible."""
+    views = _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL', 'CAS']},
+                   positions=[_pos('AAPL', 10, 5000.0, 5000.0)],
+                   prices={'AAPL': 500.0, 'CAS': 12.0})
+    root = _draw(nicegui_client, account_id, views)
+
+    assert _view_mod().SHARE_DEFAULT_NOTE in _texts(root)
+
+
+def test_the_solve_path_defaults_the_SAME_WAY_the_page_displays(monkeypatch,
+                                                                account_id):
+    """One source of truth, again. A page showing 50/30/20 while the plan solved
+    33.33/33.33/33.34 is the two-screens bug with a fresh coat of paint."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL', 'MSFT', 'TSLA'], 'ARK26')
+    account = _AllocAccount(
+        account_id, {'manual_trading_enabled': True},
+        positions=[_held('AAPL', 10, 500.0, 5000.0), _held('MSFT', 10, 300.0, 3000.0),
+                   _held('TSLA', 10, 200.0, 2000.0)],
+        prices={'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0})
+    _use_account(monkeypatch, account)
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+    _base, labels, _frac, _reserve = page._load_flow_inputs(
+        account_id, VALUATION_MODE_MARKET)
+
+    assert {st.symbol: st.weight_pct for st in labels[0].symbols} == \
+        {r.symbol: r.weight_pct for r in payload['views'][0].rows}
+
+
+def test_every_label_gets_a_LOAD_CURRENT_button(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id,
+                 _two_labelled_baskets(account_id,
+                                       a_weights={'AAPL': 50.0, 'MSFT': 50.0},
+                                       b_weights={'NVDA': 50.0, 'AMD': 50.0}))
+
+    assert len(_marked_buttons(root, page.MARKER_LOAD_CURRENT_SYMBOLS)) == 2
+
+
+def test_load_current_writes_the_actual_shares_and_persists_them(monkeypatch,
+                                                                 nicegui_client,
+                                                                 account_id):
+    _capture_notifications(monkeypatch)
+    views = _views([ManagedLabel('ARK26', 100.0)],
+                   {'ARK26': ['AAPL', 'MSFT', 'TSLA']},
+                   weights={'ARK26': {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34}},
+                   positions=[_pos('AAPL', 10, 500.0, 5000.0),
+                              _pos('MSFT', 10, 300.0, 3000.0),
+                              _pos('TSLA', 10, 200.0, 2000.0)],
+                   prices={'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0})
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_CURRENT_SYMBOLS)[0])
+
+    assert _stored(account_id) == {'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}
+
+
+def test_load_current_writes_to_its_OWN_label_and_no_other(monkeypatch,
+                                                           nicegui_client,
+                                                           account_id):
+    """The closure bug and the all-labels bug in one: without the capture it
+    rewrites the LAST basket drawn, and a loop rewrites every one of them."""
+    _capture_notifications(monkeypatch)
+    for name in ('ARK26', 'TECH'):
+        set_managed_label(account_id, name, target_pct=50.0)
+    views = _views([ManagedLabel('ARK26', 50.0), ManagedLabel('TECH', 50.0)],
+                   {'ARK26': ['AAPL', 'MSFT'], 'TECH': ['NVDA', 'AMD']},
+                   weights={'ARK26': {'AAPL': 50.0, 'MSFT': 50.0},
+                            'TECH': {'NVDA': 50.0, 'AMD': 50.0}},
+                   positions=[_pos('AAPL', 10, 800.0, 8000.0),
+                              _pos('MSFT', 10, 200.0, 2000.0),
+                              _pos('NVDA', 10, 700.0, 7000.0),
+                              _pos('AMD', 10, 300.0, 3000.0)],
+                   prices={'AAPL': 800.0, 'MSFT': 200.0, 'NVDA': 700.0,
+                           'AMD': 300.0})
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_CURRENT_SYMBOLS)[0])
+
+    assert _stored(account_id, 'ARK26', ('AAPL', 'MSFT')) == {'AAPL': 80.0,
+                                                              'MSFT': 20.0}
+    assert get_symbol_rows(account_id, 'TECH') == {}
+
+
+def test_load_current_REFUSES_a_label_whose_value_cannot_be_measured(
+        monkeypatch, nicegui_client, account_id):
+    """A price outage may not rewrite real targets."""
+    sent = _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    views = _views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL', 'DARK']},
+                   weights={'ARK26': {'AAPL': 60.0, 'DARK': 40.0}},
+                   positions=[_pos('AAPL', 10, 500.0, 5000.0),
+                              _pos('DARK', 10, 100.0, None)],
+                   prices={'AAPL': 500.0, 'DARK': None})
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_CURRENT_SYMBOLS)[0])
+
+    assert get_symbol_rows(account_id, 'ARK26') == {}
+    assert any('no current shares to load' in m for m, _t in sent)
+
+
+def test_load_current_joins_the_group_and_stays_on_the_harmless_side(nicegui_client,
+                                                                     account_id):
+    from nicegui import ui
+    root = _draw(nicegui_client, account_id, _three_symbols(account_id))
+    row = _fill_button(root).parent_slot.parent
+
+    captions = [el._props.get('label', '<space>') if isinstance(el, ui.button)
+                else '<space>' for el in row.descendants()
+                if isinstance(el, (ui.button, ui.space))]
+    assert captions == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
+                        'Load current', 'Wipe', 'Compare', '<space>',
+                        'Remove selected from label']

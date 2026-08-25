@@ -1253,13 +1253,21 @@ def test_a_symbol_row_carries_its_target_weight_and_the_money_that_implies():
     assert by_symbol['MSFT'].target_value == 1_000.0
 
 
-def test_a_symbol_row_without_stored_weights_reports_none():
+def test_a_symbol_row_without_a_stored_weight_falls_back_to_its_ACTUAL_share():
+    """It used to report ``None`` here, and before that the fair share. The lone
+    member of a label holds all of it, so its actual share is 100%."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_ACTUAL)
+
     views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
                               {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0},
                               valuation_mode=VALUATION_MODE_MARKET,
                               base_notional=10_000.0)
-    assert views[0].rows[0].weight_pct is None
-    assert views[0].rows[0].target_value is None
+    row = views[0].rows[0]
+    assert row.weight_pct == 100.0
+    assert row.weight_source == WEIGHT_SOURCE_ACTUAL
+    # 40% of 10,000 is 4,000 for the label, and this row is the whole of it.
+    assert row.target_value == 4_000.0
 
 
 def test_the_unallocated_row_shows_the_STORED_reserve_in_percent_and_dollars():
@@ -3695,3 +3703,299 @@ def test_the_label_total_card_of_an_account_managing_nothing_says_so():
     assert card.text == '0.00%'
     assert card.severity == 'ok'
     assert card.detail
+
+
+# ---------------------------------------------------------------------------
+# THE SHARE-OF-LABEL DEFAULT IS THE SYMBOL'S ACTUAL SHARE
+#
+# The column used to default every symbol to FAIR SHARE -- nine symbols in one
+# label all reading 11.11 while their real shares were 26.78 / 22.19 / 17.8 /
+# 16.65 / 16.57 / 0 / 0 / ... A default nobody chose, sitting in an editable box,
+# is a target the user never set and the plan will trade towards.
+#
+# A SAVED target always wins. The actual share is only a default.
+#
+# UNKNOWN IS NOT ZERO. A symbol whose price is unavailable has an UNMEASURABLE
+# share, and 0% means "hold none of this" -- the plan sells the position. Worse,
+# one unpriced member makes the LABEL's total unknown, so every unsaved share in
+# it is a fraction of a denominator nobody has. The whole label's unsaved
+# defaults go blank rather than being quietly restated against a smaller total.
+#
+# A GENUINE ZERO IS A REAL 0%. A symbol the account does not hold has an actual
+# share of exactly 0, and that is the honest default -- it just has to be
+# visible, because the old fair-share default would have bought it.
+# ---------------------------------------------------------------------------
+
+def test_the_default_share_is_the_symbols_ACTUAL_share_of_its_label():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_ACTUAL, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'MSFT', 'TSLA'], saved={},
+                                      values={'AAPL': 500.0, 'MSFT': 300.0,
+                                              'TSLA': 200.0},
+                                      unmeasurable=())
+
+    assert {s: r.weight_pct for s, r in resolved.items()} == {'AAPL': 50.0,
+                                                              'MSFT': 30.0,
+                                                              'TSLA': 20.0}
+    assert {r.source for r in resolved.values()} == {WEIGHT_SOURCE_ACTUAL}
+
+
+def test_the_default_is_NOT_the_fair_share_it_replaces():
+    """The exact behaviour being removed: nine symbols all reading 11.11."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['A', 'B', 'C'], saved={},
+                                      values={'A': 800.0, 'B': 100.0, 'C': 100.0},
+                                      unmeasurable=())
+
+    assert resolved['A'].weight_pct == 80.0
+    assert resolved['A'].weight_pct != pytest.approx(100.0 / 3.0, abs=0.01)
+
+
+def test_a_SAVED_target_wins_over_the_actual_share():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_ACTUAL, WEIGHT_SOURCE_SAVED, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'MSFT'], saved={'AAPL': 90.0},
+                                      values={'AAPL': 100.0, 'MSFT': 900.0},
+                                      unmeasurable=())
+
+    assert (resolved['AAPL'].weight_pct, resolved['AAPL'].source) == (
+        90.0, WEIGHT_SOURCE_SAVED)
+    assert (resolved['MSFT'].weight_pct, resolved['MSFT'].source) == (
+        90.0, WEIGHT_SOURCE_ACTUAL)
+
+
+def test_a_saved_target_of_ZERO_still_wins():
+    """0 is an explicit "hold none of this", not an absent row. Reading it as
+    absent would have the default quietly buy back a position the user sold out
+    of on purpose."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_SAVED, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL'], saved={'AAPL': 0.0},
+                                      values={'AAPL': 5_000.0}, unmeasurable=())
+
+    assert (resolved['AAPL'].weight_pct, resolved['AAPL'].source) == (
+        0.0, WEIGHT_SOURCE_SAVED)
+
+
+def test_a_symbol_the_account_does_not_hold_defaults_to_a_REAL_zero():
+    """CAS and GIAX hold nothing, so their actual share IS 0% -- and they will not
+    be bought. That is the correct reading of "default to actual"."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_ACTUAL, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'CAS'], saved={},
+                                      values={'AAPL': 1_000.0, 'CAS': 0.0},
+                                      unmeasurable=())
+
+    assert (resolved['CAS'].weight_pct, resolved['CAS'].source) == (
+        0.0, WEIGHT_SOURCE_ACTUAL)
+    assert resolved['AAPL'].weight_pct == 100.0
+
+
+def test_an_UNMEASURABLE_symbol_is_blank_and_never_zero():
+    """A price outage may not quietly zero a target: 0% means SELL IT ALL."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_UNKNOWN, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'DARK'], saved={},
+                                      values={'AAPL': 1_000.0},
+                                      unmeasurable=['DARK'])
+
+    assert resolved['DARK'].weight_pct is None
+    assert resolved['DARK'].source == WEIGHT_SOURCE_UNKNOWN
+
+
+def test_ONE_unmeasurable_member_makes_every_unsaved_share_in_the_label_unknown():
+    """The denominator is the label's whole value. With one member unpriced, that
+    total is unknown -- so no share OF it is knowable, and restating the others
+    against the measured remainder would overstate every one of them."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_UNKNOWN, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'MSFT', 'DARK'], saved={},
+                                      values={'AAPL': 600.0, 'MSFT': 400.0},
+                                      unmeasurable=['DARK'])
+
+    assert [r.weight_pct for r in resolved.values()] == [None, None, None]
+    assert {r.source for r in resolved.values()} == {WEIGHT_SOURCE_UNKNOWN}
+
+
+def test_a_SAVED_target_survives_an_unmeasurable_neighbour():
+    """It was never derived from the denominator, so losing the denominator cannot
+    take it away."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_SAVED, WEIGHT_SOURCE_UNKNOWN, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['AAPL', 'DARK'], saved={'AAPL': 60.0},
+                                      values={'AAPL': 600.0},
+                                      unmeasurable=['DARK'])
+
+    assert (resolved['AAPL'].weight_pct, resolved['AAPL'].source) == (
+        60.0, WEIGHT_SOURCE_SAVED)
+    assert resolved['DARK'].source == WEIGHT_SOURCE_UNKNOWN
+
+
+def test_a_label_that_holds_NOTHING_defaults_every_symbol_to_zero():
+    """Not unknown: nothing is held, which is perfectly measurable. It means the
+    label will buy nothing until a share is typed or a fill button is pressed --
+    which the page has to make visible rather than surprising."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_ACTUAL, resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['A', 'B'], saved={},
+                                      values={'A': 0.0, 'B': 0.0}, unmeasurable=())
+
+    assert [r.weight_pct for r in resolved.values()] == [0.0, 0.0]
+    assert {r.source for r in resolved.values()} == {WEIGHT_SOURCE_ACTUAL}
+
+
+def test_the_actual_shares_are_rounded_onto_the_stored_cent_grid():
+    """The boxes step by 0.01 and the store keeps two places; a default carrying
+    four would be refused by nothing and stored as something else."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['A', 'B', 'C'], saved={},
+                                      values={'A': 1.0, 'B': 1.0, 'C': 1.0},
+                                      unmeasurable=())
+
+    assert [r.weight_pct for r in resolved.values()] == [33.33, 33.33, 33.33]
+
+
+def test_a_SHORT_leg_keeps_its_sign_out_of_the_denominator():
+    """A net-short member makes the label's signed total smaller than its parts,
+    so a share of it can exceed 100 or flip sign. The denominator is the GROSS
+    money at work, which is the same choice ``UnrealisedPnL.pct`` makes."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        resolve_symbol_weights)
+
+    resolved = resolve_symbol_weights(['LONG', 'SHORT'], saved={},
+                                      values={'LONG': 900.0, 'SHORT': -100.0},
+                                      unmeasurable=())
+
+    assert resolved['LONG'].weight_pct == 90.0
+    assert resolved['SHORT'].weight_pct == -10.0
+
+
+def test_the_page_names_what_an_unsaved_share_is_showing():
+    """"Default to actual" changes what happens to a newly added symbol: fair
+    share would have bought it, an actual share of 0% will not. That is correct
+    and it has to be legible, or it is discovered later and by surprise."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        SHARE_DEFAULT_NOTE)
+
+    assert 'actual' in SHARE_DEFAULT_NOTE.lower()
+    assert '0%' in SHARE_DEFAULT_NOTE
+    assert 'Load current' in SHARE_DEFAULT_NOTE
+
+
+def test_load_current_replaces_every_unmeasurable_free_share_with_the_actual_one():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHTS_LOADED_CURRENT, load_current_symbol_shares)
+
+    result = load_current_symbol_shares(
+        'ARK26', {'AAPL': 33.33, 'MSFT': 33.33, 'TSLA': 33.34},
+        {'AAPL': 500.0, 'MSFT': 300.0, 'TSLA': 200.0}, unmeasurable=())
+
+    assert result.changed is True
+    assert result.reason_code == WEIGHTS_LOADED_CURRENT
+    assert result.weights == {'AAPL': 50.0, 'MSFT': 30.0, 'TSLA': 20.0}
+
+
+def test_load_current_overwrites_a_SAVED_share_because_that_is_what_it_is_for():
+    """Unlike the DEFAULT, where a saved target wins. This is the button that says
+    "forget what I typed, start from where I actually am"."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        load_current_symbol_shares)
+
+    result = load_current_symbol_shares('ARK26', {'AAPL': 90.0, 'MSFT': 10.0},
+                                        {'AAPL': 200.0, 'MSFT': 800.0},
+                                        unmeasurable=())
+
+    assert result.weights == {'AAPL': 20.0, 'MSFT': 80.0}
+
+
+def test_load_current_refuses_a_label_whose_value_cannot_be_measured():
+    """There is no "current" to load. Writing 0 for the unpriced one and a
+    restated share for the rest would be a price outage rewriting real targets."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHTS_NOTHING_MEASURED, load_current_symbol_shares)
+
+    result = load_current_symbol_shares('ARK26', {'AAPL': 60.0, 'DARK': 40.0},
+                                        {'AAPL': 600.0}, unmeasurable=['DARK'])
+
+    assert result.changed is False
+    assert result.reason_code == WEIGHTS_NOTHING_MEASURED
+    assert result.weights == {'AAPL': 60.0, 'DARK': 40.0}
+    assert result.message
+
+
+def test_load_current_on_a_label_that_holds_nothing_says_so_rather_than_zeroing_it():
+    """Every actual share is a genuine 0 here, so the button would wipe the label.
+    Wipe is the control for that, and it is one button along."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHTS_NOTHING_MEASURED, load_current_symbol_shares)
+
+    result = load_current_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0},
+                                        {'AAPL': 0.0, 'MSFT': 0.0}, unmeasurable=())
+
+    assert result.changed is False
+    assert result.reason_code == WEIGHTS_NOTHING_MEASURED
+    assert result.weights == {'AAPL': 60.0, 'MSFT': 40.0}
+
+
+def test_load_current_that_would_change_nothing_reports_it_rather_than_writing():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHTS_UNCHANGED, load_current_symbol_shares)
+
+    result = load_current_symbol_shares('ARK26', {'AAPL': 60.0, 'MSFT': 40.0},
+                                        {'AAPL': 600.0, 'MSFT': 400.0},
+                                        unmeasurable=())
+
+    assert result.changed is False
+    assert result.reason_code == WEIGHTS_UNCHANGED
+
+
+def test_a_SAVED_target_does_not_mask_an_unmeasurable_holding():
+    """The trap ``SymbolRow.measurable`` exists for. "Saved wins" short-circuits
+    ``weight_source``, so a saved row with no price reports SAVED and looks
+    perfectly measurable -- and "Load current" would then restate every share in
+    the label against a total nobody knows."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        WEIGHT_SOURCE_SAVED)
+
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL', 'DARK']},
+                              {'AAPL': _pos('AAPL', 10, 500.0),
+                               'DARK': _pos('DARK', 10, 100.0)},
+                              {'AAPL': 500.0, 'DARK': None},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              symbol_weights={'ARK26': {'AAPL': 60.0,
+                                                        'DARK': 40.0}})
+    by_symbol = {r.symbol: r for r in views[0].rows}
+
+    assert by_symbol['DARK'].weight_source == WEIGHT_SOURCE_SAVED
+    assert by_symbol['DARK'].measurable is False
+    assert by_symbol['AAPL'].measurable is True
+
+
+def test_a_FLAT_holding_is_measurable_and_an_unpriced_one_is_not():
+    """Nothing held is worth exactly nothing, which is a measurement. Only a
+    holding with no price is unmeasurable, and only in MARKET mode -- the cost
+    basis is always published."""
+    args = ({'ARK26': ['FLAT', 'DARK']},
+            {'DARK': _pos('DARK', 10, 100.0)},
+            {'FLAT': 12.0, 'DARK': None})
+    market = build_label_views([ManagedLabel('ARK26', 100.0)], *args,
+                               valuation_mode=VALUATION_MODE_MARKET)
+    cost = build_label_views([ManagedLabel('ARK26', 100.0)], *args,
+                             valuation_mode=VALUATION_MODE_COST)
+
+    assert {r.symbol: r.measurable for r in market[0].rows} == {'FLAT': True,
+                                                                'DARK': False}
+    assert all(r.measurable for r in cost[0].rows)

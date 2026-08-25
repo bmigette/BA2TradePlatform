@@ -464,6 +464,96 @@ class ManagedLabel:
     previous_target_pct: Optional[float] = None
 
 
+# ---------------------------------------------------------------------------
+# WHAT A SYMBOL'S SHARE OF ITS LABEL DEFAULTS TO
+#
+# It used to be the FAIR SHARE -- ``get_symbol_weights`` splits whatever is left
+# of 100 evenly across the symbols with no stored row, so nine symbols in one
+# label all read 11.11 while their real shares were 26.78 / 22.19 / 17.8 / 16.65 /
+# 16.57 / 0 / 0. A default nobody chose, sitting in an editable box, is a target
+# the user never set and the plan will trade towards.
+#
+# The default is now the symbol's ACTUAL share of its label, and a SAVED target
+# always wins over it. Three rules, and each of them is a bug that has been paid
+# for at least once:
+#
+# 1. UNKNOWN IS NOT ZERO. 0% means "hold none of this" and the plan sells the
+#    position out. A symbol whose price is unavailable has no measurable share, so
+#    it gets ``None`` -- a blank box -- and never a number.
+# 2. ONE UNMEASURABLE MEMBER BLANKS THE LABEL'S UNSAVED DEFAULTS. The denominator
+#    is the label's whole value; with one member unpriced that total is unknown,
+#    so no share of it is knowable. Restating the rest against the measured
+#    remainder would overstate every one of them, silently, in a box that trades.
+# 3. A GENUINE ZERO IS A REAL 0%. A symbol the account does not hold has an actual
+#    share of exactly 0 and that is the honest default. It changes what happens to
+#    a newly added symbol -- fair share would have bought it -- so the PAGE has to
+#    say so rather than let it be discovered later.
+#
+# The denominator is the GROSS money at work (``sum(abs(value))``), not the signed
+# sum, for the reason ``UnrealisedPnL.pct`` gives: a hedged label's signed total
+# nets towards zero, which is a division by zero on a label full of real money.
+# ---------------------------------------------------------------------------
+
+WEIGHT_SOURCE_SAVED = 'saved'
+WEIGHT_SOURCE_ACTUAL = 'actual'
+WEIGHT_SOURCE_UNKNOWN = 'unknown'
+
+
+@dataclass
+class ResolvedWeight:
+    """One symbol's share-of-label box, decided. Pure.
+
+    ``weight_pct`` is ``None`` -- a BLANK box -- only for
+    ``WEIGHT_SOURCE_UNKNOWN``. It is never 0.0 there, because 0.0 is a live
+    instruction to sell the position out.
+    """
+    weight_pct: Optional[float]
+    source: str
+
+
+def resolve_symbol_weights(symbols, *, saved, values, unmeasurable):
+    """``{symbol: ResolvedWeight}`` for one label, in the order given. Pure.
+
+    Args:
+        symbols: the label's membership, in display order.
+        saved: ``{symbol: weight_pct}`` -- the STORED rows only, never
+            ``get_symbol_weights``' fair-share-filled answer. A stored 0.0 is an
+            explicit "hold none of this" and wins like any other saved value;
+            reading it as absent would have the default quietly buy back a
+            position the user sold out of on purpose.
+        values: ``{symbol: current value}`` under the account's valuation mode,
+            for the symbols whose value is measurable.
+        unmeasurable: the symbols whose value cannot be measured at all -- held,
+            but with no price. One of these makes the label's TOTAL unknown, so
+            every UNSAVED share in the label goes blank with it.
+
+    Returns:
+        Dict[str, ResolvedWeight]: rounded onto the stored cent grid, because the
+        boxes step by 0.01 and a default carrying four decimals would be refused
+        by nothing and stored as something else.
+    """
+    blind = {s for s in (unmeasurable or [])}
+    saved = saved or {}
+    values = values or {}
+    ordered = list(symbols or [])
+    gross = sum(abs(float(values.get(s) or 0.0)) for s in ordered)
+    out: Dict[str, ResolvedWeight] = {}
+    for symbol in ordered:
+        if symbol in saved:
+            out[symbol] = ResolvedWeight(float(saved[symbol]), WEIGHT_SOURCE_SAVED)
+        elif blind:
+            # Rule 2: not just ``symbol in blind``. The denominator is gone for
+            # the whole label, so nobody's share of it is knowable.
+            out[symbol] = ResolvedWeight(None, WEIGHT_SOURCE_UNKNOWN)
+        elif not gross:
+            out[symbol] = ResolvedWeight(0.0, WEIGHT_SOURCE_ACTUAL)
+        else:
+            out[symbol] = ResolvedWeight(
+                round(float(values.get(symbol) or 0.0) / gross * 100.0, 2),
+                WEIGHT_SOURCE_ACTUAL)
+    return out
+
+
 @dataclass
 class SymbolRow:
     """One symbol's line in the default view.
@@ -505,6 +595,19 @@ class SymbolRow:
     pct_of_total: float = 0.0
     comment: Optional[str] = None
     weight_pct: Optional[float] = None
+    #: WHERE ``weight_pct`` came from -- a saved target, the symbol's actual share,
+    #: or nothing measurable. The page shows it, because a 0% that was chosen and a
+    #: 0% that was derived from an empty holding lead to the same order and need
+    #: very different reactions.
+    weight_source: str = WEIGHT_SOURCE_ACTUAL
+    #: Whether this row's VALUE could be measured at all -- held, but with no
+    #: price, is False. A fact about the HOLDING and deliberately not derivable
+    #: from ``weight_source``: a saved target wins over the default, so a saved
+    #: unmeasurable row reports ``WEIGHT_SOURCE_SAVED`` and would otherwise look
+    #: perfectly measurable to anything reading that field. "Load current" is the
+    #: caller that must not be fooled -- it would restate every share in the label
+    #: against a total nobody knows.
+    measurable: bool = True
     target_value: Optional[float] = None
     previous_weight_pct: Optional[float] = None
     pnl: UnrealisedPnL = field(default_factory=UnrealisedPnL)
@@ -684,6 +787,21 @@ def build_label_views(managed,
                                cost_basis=state.cost_basis, price=(prices or {}).get(sym))
         return current_value(priced, VALUATION_MODE_MARKET)
 
+    def _is_unmeasurable(sym: str) -> bool:
+        """Held, but with no price -- so its value cannot be measured AT ALL.
+
+        MARKET mode only: in COST mode the value IS the cost basis, which the
+        broker always publishes, so nothing is unmeasurable there. A FLAT symbol is
+        not unmeasurable either -- it is worth exactly nothing and that is a
+        perfectly good measurement.
+        """
+        if valuation_mode != VALUATION_MODE_MARKET:
+            return False
+        state = positions.get(sym)
+        if state is None or not state.quantity:
+            return False
+        return (prices or {}).get(sym) is None
+
     total_value = sum(_value_of(sym) for sym in membership)
 
     views: List[LabelView] = []
@@ -692,8 +810,16 @@ def build_label_views(managed,
         label_value = sum(_value_of(s) for s in symbols)
         label_target_value = (None if investable is None
                               else investable * float(entry.target_pct or 0.0) / 100.0)
-        label_weights = weights_by_label.get(entry.label) or {}
         label_previous = previous_by_label.get(entry.label) or {}
+        # ``symbol_weights`` is the SAVED set, and only that. The effective share
+        # -- saved, else the symbol's actual share of the label, else blank -- is
+        # decided once, here, so the page and the solve path cannot default
+        # differently. See ``resolve_symbol_weights``.
+        resolved = resolve_symbol_weights(
+            symbols,
+            saved=weights_by_label.get(entry.label) or {},
+            values={s: _value_of(s) for s in symbols},
+            unmeasurable=[s for s in symbols if _is_unmeasurable(s)])
         rows: List[SymbolRow] = []
 
         for sym in symbols:
@@ -720,10 +846,13 @@ def build_label_views(managed,
                 pct_of_label=(row_value / label_value * 100.0) if label_value else 0.0,
                 pct_of_total=(row_value / total_value * 100.0) if total_value else 0.0,
                 comment=comments.get((entry.label, sym)),
-                weight_pct=label_weights.get(sym),
+                weight_pct=resolved[sym].weight_pct,
+                weight_source=resolved[sym].source,
+                measurable=not _is_unmeasurable(sym),
                 target_value=(None if (label_target_value is None
-                                       or sym not in label_weights)
-                              else label_target_value * float(label_weights[sym]) / 100.0),
+                                       or resolved[sym].weight_pct is None)
+                              else label_target_value
+                              * float(resolved[sym].weight_pct) / 100.0),
                 previous_weight_pct=label_previous.get(sym),
                 pnl=_pnl_of(sym),
             ))
@@ -1559,6 +1688,8 @@ WEIGHTS_NO_PREVIOUS = "NO_PREVIOUS"
 WEIGHTS_LOADED_LAST = "LOADED_LAST"
 WEIGHTS_WIPED = "WIPED"
 WEIGHTS_ALREADY_CLEAR = "ALREADY_CLEAR"
+WEIGHTS_LOADED_CURRENT = "LOADED_CURRENT"
+WEIGHTS_NOTHING_MEASURED = "NOTHING_MEASURED"
 
 WEIGHTS_MSG_NO_SYMBOLS_FMT = ("'{label}' has no symbols with a share — add one "
                               "before splitting it.")
@@ -1589,6 +1720,28 @@ WEIGHTS_MSG_WIPED_FMT = ("'{label}': cleared {count} share(s) to 0%. 'Load last'
                          "puts them back — a wipe does not touch the history.")
 WEIGHTS_MSG_ALREADY_CLEAR_FMT = ("'{label}' is already at 0% throughout — there is "
                                  "nothing to clear.")
+WEIGHTS_MSG_LOADED_CURRENT_FMT = ("'{label}': every share is now the symbol's ACTUAL "
+                                  "share of the label. Nothing has been traded — "
+                                  "these are targets, and the plan will now aim to "
+                                  "keep the label where it already is.")
+#: Both refusals in one sentence, because from the button they look identical and
+#: have opposite fixes: a price outage (wait, or switch to cost basis) versus a
+#: label that genuinely holds nothing (type a share, or use Even split).
+WEIGHTS_MSG_NOTHING_MEASURED_FMT = (
+    "'{label}' has no current shares to load: either it holds nothing at all, or a "
+    "member has no price and the label's total is therefore unknown. Writing 0% "
+    "would mean 'sell it all', which is not what 'no answer' means.")
+
+#: Said under every symbol table. "Default to actual" changes what happens to a
+#: newly added symbol -- the fair share it replaced would have BOUGHT it, an actual
+#: share of 0% will not -- and that has to be legible rather than discovered.
+SHARE_DEFAULT_NOTE = (
+    'A share you have not set shows the symbol\u2019s ACTUAL share of this label, '
+    'not an even split. A symbol the account does not hold therefore sits at 0% '
+    'and will not be bought until you type a share or press Even split, Fill rest '
+    'or Fill 100%. A blank share means the value could not be measured at all \u2014 '
+    'never that it is zero. \u201cLoad current\u201d rewrites every share to what '
+    'is held right now.')
 
 
 @dataclass
@@ -1722,6 +1875,42 @@ def load_last_symbol_shares(label: str, weights, previous) -> WeightsUpdate:
     kept = sum(1 for st in item.symbols if st.previous_weight_pct is None)
     return WeightsUpdate(True, WEIGHTS_LOADED_LAST, fresh,
                          WEIGHTS_MSG_LOADED_LAST_FMT.format(label=label, kept=kept))
+
+
+def load_current_symbol_shares(label: str, weights, values, *,
+                               unmeasurable) -> WeightsUpdate:
+    """The per-label "Load current": rewrite every share to what is HELD. Pure.
+
+    The on-demand form of the default. It differs from the default in one way and
+    it is the point of the button: a SAVED target does NOT win here. The default
+    answers "what should this box show when nobody has said"; this answers "forget
+    what I typed, start from where I actually am".
+
+    REFUSED, rather than applied, when nothing can be measured -- either the label
+    holds nothing at all or a member has no price, which makes the label's total
+    unknown and every share of it a fraction of a number nobody has. Both would
+    otherwise write zeros, and 0% is a live instruction to sell the position out.
+    Wipe is the control for deliberately zeroing a label, one button along.
+
+    The arithmetic is ``resolve_symbol_weights`` with the saved set emptied, so the
+    button and the default cannot compute the same share two ways.
+    """
+    current = {s: float(pct or 0.0) for s, pct in (weights or {}).items()}
+    if not current:
+        return WeightsUpdate(False, WEIGHTS_NO_SYMBOLS, {},
+                             WEIGHTS_MSG_NO_SYMBOLS_FMT.format(label=label))
+    blind = {s for s in (unmeasurable or [])}
+    measured = sum(abs(float((values or {}).get(s) or 0.0)) for s in current)
+    if blind or not measured:
+        return WeightsUpdate(False, WEIGHTS_NOTHING_MEASURED, current,
+                             WEIGHTS_MSG_NOTHING_MEASURED_FMT.format(label=label))
+    fresh = {s: r.weight_pct for s, r in resolve_symbol_weights(
+        list(current), saved={}, values=values, unmeasurable=()).items()}
+    if _same_pcts(current, fresh):
+        return WeightsUpdate(False, WEIGHTS_UNCHANGED, current,
+                             WEIGHTS_MSG_LAST_UNCHANGED_FMT.format(label=label))
+    return WeightsUpdate(True, WEIGHTS_LOADED_CURRENT, fresh,
+                         WEIGHTS_MSG_LOADED_CURRENT_FMT.format(label=label))
 
 
 def wipe_symbol_shares(label: str, weights) -> WeightsUpdate:

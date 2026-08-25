@@ -108,7 +108,7 @@ from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
-    compute_base_notional, compute_label_investment,
+    compute_base_notional, compute_label_investment, current_value,
     format_unrealised_pnl, unconsumed_income_notice,
 )
 from ...core.portfolio_allocation_store import (
@@ -138,13 +138,14 @@ from ..utils.portfolio_allocation_view import (
     format_allocation_footer, format_label_header,
     format_label_target_tooltip,
     format_reserve_caption,
-    format_reserve_row, label_color_contrast_warning,
+    format_reserve_row, label_color_contrast_warning, SHARE_DEFAULT_NOTE,
     LABEL_TOTAL_CARD_CLASSES, LABEL_TOTAL_CARD_TITLE, LABEL_TOTAL_CARD_TOOLTIP,
     label_total_card,
     load_last_label_targets,
-    load_last_symbol_shares, managed_total_value,
+    load_current_symbol_shares, load_last_symbol_shares, managed_total_value,
     missing_quote_symbols, picker_options, pnl_classes, positions_by_symbol,
-    resolve_label_icon_color, sort_label_views, store_color_value,
+    resolve_label_icon_color, resolve_symbol_weights,
+    sort_label_views, store_color_value,
     symbol_target_values,
     validate_label_target_edit, validate_reserve_edit, validate_symbol_weight_edit,
     wipe_symbol_shares, working_orders_notice,
@@ -266,7 +267,16 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
         for symbol, text in get_symbol_comments(account_id, entry.label).items():
             comments[(entry.label, symbol)] = text
         members = symbols_by_label.get(entry.label, [])
-        weights[entry.label] = get_symbol_weights(account_id, entry.label, members)
+        # THE SAVED ROWS ONLY -- ``get_symbol_rows``, not ``get_symbol_weights``.
+        # That one fills an absent row with the FAIR SHARE, which is precisely the
+        # default being removed: nine symbols in a label all reading 11.11 while
+        # their real shares were 26.78 / 22.19 / ... The effective share is decided
+        # in ``resolve_symbol_weights`` (saved wins, else the actual share, else
+        # blank), and it needs to be told which rows are genuinely saved.
+        weights[entry.label] = {symbol: float(row.weight_pct)
+                                for symbol, row
+                                in get_symbol_rows(account_id, entry.label).items()
+                                if symbol in members}
         # A SEPARATE reader from ``get_symbol_weights`` on purpose: that one fills
         # an absent row with the even-split default, and there is no default for a
         # weight nobody has ever allocated with.
@@ -320,6 +330,24 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
     }
 
 
+def _is_unmeasurable_holding(state, valuation_mode: str) -> bool:
+    """Held, but with no price -- so its value cannot be measured AT ALL.
+
+    The page's own copy of this lives inside ``build_label_views`` (which is handed
+    a separate price map rather than priced states); this one is for the SOLVE
+    path, where ``build_position_states`` has already stamped the quote onto the
+    state. Both answer the same question the same way, and both matter: an
+    unmeasurable holding has no knowable share of its label, and 0% is not the
+    answer -- 0% means sell it all.
+
+    MARKET mode only. In COST mode the value IS the cost basis, which the broker
+    always publishes. A FLAT symbol is measurable too: it is worth exactly nothing.
+    """
+    if valuation_mode != VALUATION_MODE_MARKET or state is None:
+        return False
+    return bool(state.quantity) and state.price is None
+
+
 def _load_valuation_mode(account_id: int) -> str:
     """The account's stored valuation mode, creating the config row on first use."""
     return get_allocation_config(account_id).valuation_mode
@@ -360,22 +388,48 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
     symbols_by_label = get_symbols_by_label([row.label for row in managed])
     symbols = collect_managed_symbols(symbols_by_label)
 
+    # THE BOOK FIRST: the solve path resolves an unsaved share the same way the
+    # page displays it -- saved wins, else the symbol's ACTUAL share of its label
+    # -- and that needs the positions and their prices, so they are read before
+    # the labels rather than after.
+    current = svc.build_position_states(account, symbols)
+
     labels = []
     for row in managed:
         members = symbols_by_label.get(row.label, [])
-        weights = get_symbol_weights(account_id, row.label, members)
+        saved = {symbol: float(stored.weight_pct)
+                 for symbol, stored in get_symbol_rows(account_id, row.label).items()
+                 if symbol in members}
+        # THE SAME resolver the page's table is built from, so the number on
+        # screen and the number the plan solves against cannot be two different
+        # defaults. ``fair_share`` is the last resort and only reachable for an
+        # UNMEASURABLE symbol -- see below.
+        resolved = resolve_symbol_weights(
+            members, saved=saved,
+            values={s: current_value(current.get(s), valuation_mode) for s in members},
+            unmeasurable=[s for s in members
+                          if _is_unmeasurable_holding(current.get(s), valuation_mode)])
+        # ``SymbolTarget.weight_pct`` is a float and the engine reads 0 as "hold
+        # none of this", so an UNKNOWN share may not travel as 0 -- that would sell
+        # the position out. It falls back to the historical fair share instead,
+        # which is what this path did for every unsaved symbol until now; and the
+        # only way to reach it is a held symbol with no price, which
+        # ``held_no_price_block`` already refuses to SUBMIT against.
+        fair_share = get_symbol_weights(account_id, row.label, members)
         # NULL stays None all the way to the dialog: "there is no last" is what
         # disables the Load-last button, and it is a different fact from 0.0.
         previous_weights = get_previous_symbol_weights(account_id, row.label, members)
         labels.append(LabelTarget(
             label=row.label, target_pct=float(row.target_pct or 0.0),
-            symbols=[SymbolTarget(symbol=s, weight_pct=float(weights.get(s, 0.0)),
-                                  previous_weight_pct=previous_weights.get(s))
-                     for s in members],
+            symbols=[SymbolTarget(
+                symbol=s,
+                weight_pct=(float(fair_share.get(s, 0.0))
+                            if resolved[s].weight_pct is None
+                            else float(resolved[s].weight_pct)),
+                previous_weight_pct=previous_weights.get(s)) for s in members],
             comment=row.comment,
             previous_target_pct=row.previous_target_pct))
 
-    current = svc.build_position_states(account, symbols)
     base = build_base_snapshot(account.get_account_snapshot(), current, symbols,
                                valuation_mode=valuation_mode)
     config = get_allocation_config(account_id)
@@ -649,6 +703,7 @@ MARKER_FILL_100 = 'pf-fill-100'
 MARKER_EVEN_SPLIT_SYMBOLS = 'pf-even-split-symbols'
 MARKER_FILL_REST_SYMBOLS = 'pf-fill-rest-symbols'
 MARKER_LOAD_LAST_SYMBOLS = 'pf-load-last-symbols'
+MARKER_LOAD_CURRENT_SYMBOLS = 'pf-load-current-symbols'
 MARKER_WIPE_SYMBOLS = 'pf-wipe-symbols'
 
 #: The mini-bar track. Height and radius only -- the FILL's colour comes from the
@@ -984,6 +1039,34 @@ def _write_symbol_weights(account_id: int, label: str, weights) -> bool:
     return True
 
 
+def _symbol_values(live: Dict[str, Any], label: str) -> Dict[str, float]:
+    """``{symbol: current value}`` for one label, off the rendered view.
+
+    The SAME figures the table's "Current value" column shows, so "Load current"
+    cannot load something the user is not looking at.
+    """
+    view = live['view_by_label'].get(label)
+    if view is None:
+        return {}
+    return {row.symbol: row.current_value for row in view.rows}
+
+
+def _unmeasurable_symbols(live: Dict[str, Any], label: str) -> List[str]:
+    """The label's members whose value could not be measured at all.
+
+    Read off ``SymbolRow.measurable`` and NOT off ``weight_source``. A saved target
+    wins over the default, so a saved row whose price is missing reports
+    ``WEIGHT_SOURCE_SAVED`` and would look perfectly measurable -- and "Load
+    current" would then restate every share in the label against a total nobody
+    knows. Measurability is a fact about the HOLDING, not about where its target
+    came from.
+    """
+    view = live['view_by_label'].get(label)
+    if view is None:
+        return []
+    return [row.symbol for row in view.rows if not row.measurable]
+
+
 def _previous_symbol_weights(live: Dict[str, Any], label: str):
     """``{symbol: previous_weight_pct}`` for one label -- what "Load last" reads.
 
@@ -1087,6 +1170,23 @@ async def _load_last_symbols(account_id: int, live: Dict[str, Any],
         load_last_symbol_shares(label, live['weights'].get(label) or {},
                                 _previous_symbol_weights(live, label)),
         what='Load last')
+
+
+async def _load_current_symbols(account_id: int, live: Dict[str, Any],
+                                label: str) -> None:
+    """Rewrite ONE label's shares to what is held right now.
+
+    The on-demand form of the default, and it differs from it in one way that is
+    the whole point of the button: a SAVED target does not win here. It is
+    refused outright when nothing can be measured, because writing 0% there would
+    be a price outage instructing the plan to sell.
+    """
+    await _run_symbol_weights_button(
+        account_id, live, label,
+        load_current_symbol_shares(label, live['weights'].get(label) or {},
+                                   _symbol_values(live, label),
+                                   unmeasurable=_unmeasurable_symbols(live, label)),
+        what='Load current')
 
 
 async def _wipe_symbols(account_id: int, live: Dict[str, Any], label: str) -> None:
@@ -1857,6 +1957,11 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     table = ui.table(columns=columns, rows=rows, row_key='symbol',
                      selection='multiple').classes('w-full dark-pagination')
     live['tables'][view.label] = table
+    # WHAT AN UNSET SHARE IS SHOWING. The default used to be the fair share, which
+    # would have BOUGHT a newly added symbol; it is the symbol's actual share now,
+    # so a symbol the account does not hold sits at 0% and will not be. That is
+    # correct and it is surprising, which is exactly the pair that needs a caption.
+    ui.label(SHARE_DEFAULT_NOTE).classes('text-xs text-secondary-custom')
     table.add_slot('body-cell-flag', r'''
         <q-td :props="props">
             <span v-if="props.value" :title="'Also in: ' + props.row.labels"
@@ -1965,6 +2070,13 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                   ).props('outline dense').mark(MARKER_LOAD_LAST_SYMBOLS) \
             .tooltip('Put back the shares the last allocation run used. A symbol '
                      'that has never run keeps the share it has.')
+        ui.button('Load current', icon='sync_alt',
+                  on_click=lambda lbl=view.label: _load_current_symbols(
+                      account_id, live, lbl)
+                  ).props('outline dense').mark(MARKER_LOAD_CURRENT_SYMBOLS) \
+            .tooltip('Set every share to the symbol\u2019s ACTUAL share of this '
+                     'label right now. Unlike the default, this overwrites the '
+                     'shares you have already saved.')
         ui.button('Wipe', icon='clear_all',
                   on_click=lambda lbl=view.label: _wipe_symbols(
                       account_id, live, lbl)
