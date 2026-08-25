@@ -4,11 +4,13 @@ from datetime import datetime, timezone
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, Transaction, ExpertRecommendation, ExpertInstance
 from ba2_common.core.types import (
-    OrderOpenType, OrderDirection, OrderType, OrderStatus, TransactionStatus, BrokerOrderErrorReason,
+    AssetClass, OrderOpenType, OrderDirection, OrderType, OrderStatus, TransactionStatus,
+    BrokerOrderErrorReason,
 )
 from ba2_common.core.account_types import OrderImpact
 from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
-from ba2_common.core.db import add_instance, get_db, get_instance, update_instance
+from ba2_common.core.db import add_instance, get_db, get_instance, update_instance, InstanceNotFound
+from ba2_common.core.failure_modes import absorb_if_benign
 
 
 class AccountInterface(ReadOnlyAccountInterface):
@@ -1577,9 +1579,7 @@ class AccountInterface(ReadOnlyAccountInterface):
 
         Returns a dict with keys: success, message, close_order_id.
         """
-        from ba2_common.core.types import AssetClass
-
-        # SEAM 1 — an OPTION transaction must never be closed through the EQUITY path.
+        # SEAM 1 / OPT-L3 — an OPTION transaction must never be closed through the EQUITY path.
         #
         # An option Transaction's `symbol` is deliberately the UNDERLYING ticker
         # (OptionsAccountInterface._record_option_intent_on_transaction), and
@@ -1597,6 +1597,7 @@ class AccountInterface(ReadOnlyAccountInterface):
                 f"{transaction.symbol}). submit_close_order_for_transaction builds an "
                 f"EQUITY order from transaction.symbol and a CONTRACT count, which would "
                 f"submit shares of {transaction.symbol} and leave the option open. "
+                f"No close order was created. "
                 f"Use close_option_position() / the close_option action instead."
             )
 
@@ -1721,9 +1722,7 @@ class AccountInterface(ReadOnlyAccountInterface):
                 - deleted_count: int (orders deleted)
                 - close_order_id: int (closing order ID if created/retried)
         """
-        from ba2_common.core.types import AssetClass
-
-        # SEAM 1 — refuse an OPTION transaction before ANYTHING is canceled or deleted.
+        # SEAM 1 / OPT-L3 — refuse an OPTION transaction before ANYTHING is canceled or deleted.
         #
         # See submit_close_order_for_transaction for the full reasoning (an option
         # Transaction's `symbol` is the UNDERLYING and its quantity is a CONTRACT count).
@@ -1737,18 +1736,34 @@ class AccountInterface(ReadOnlyAccountInterface):
         # contract. That is also why the lookup is wrapped: get_instance RAISES
         # InstanceNotFound for a missing row (it never returns None), so an unresolvable
         # transaction_id read HERE -- outside the method's try/except -- would escape as an
-        # exception where it used to come back as a result dict. Swallow it and fall
+        # exception where it used to come back as a result dict. Absorb THAT and fall
         # through: the body below re-reads the transaction inside its own try/except and
-        # reports the missing/unreadable row exactly as it did before this guard existed.
+        # reports the missing row exactly as it did before this guard existed.
+        #
+        # ONLY that. A bare `except Exception: _txn = None` would reinstate the very bug this
+        # guard exists to prevent: a transient OperationalError ("database is locked") would
+        # read as "not an option, carry on", the re-read below would then succeed and hand the
+        # equity path the OPTION transaction anyway -- status flipped to CLOSING, protective
+        # legs cancelled at the broker. A DB hiccup must not be able to unlock the equity path
+        # on an option, so anything that is not InstanceNotFound propagates, per the house
+        # `absorb_if_benign` discipline (and matching the sibling seam in
+        # OptionsAccountInterface._record_option_intent_on_transaction).
         try:
             _txn = get_instance(Transaction, transaction_id)
-        except Exception:
+        except Exception as e:
+            absorb_if_benign(e, InstanceNotFound)
             _txn = None
         if _txn is not None and _txn.asset_class == AssetClass.OPTION:
+            # NOT "would submit shares": since the submit_close_order_for_transaction guard
+            # landed, that path raises before anything is sent. THIS guard's hazard is the
+            # damage close_transaction does on the WAY there, which is what the operator
+            # needs told.
             msg = (
                 f"Transaction {transaction_id} is an OPTION position (underlying "
                 f"{_txn.symbol}) and cannot be closed through the equity path — that "
-                f"would submit shares of {_txn.symbol} and leave the option open. "
+                f"would cancel the position's protective TP/SL legs at the broker and leave "
+                f"the transaction stuck in CLOSING with the option still open and now "
+                f"unprotected. Nothing was canceled. "
                 f"Use close_option_position() / the close_option action instead."
             )
             logger.error(f"close_transaction: {msg}")

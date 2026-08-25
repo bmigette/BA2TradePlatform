@@ -5,9 +5,11 @@ from tests.factories import (
     create_account_definition, create_expert_instance, create_trading_order,
     create_transaction,
 )
-from ba2_trade_platform.core.models import ExpertSetting, TradingOrder
-from ba2_trade_platform.core.types import OrderStatus, OrderDirection, OrderType, TransactionStatus
-from ba2_trade_platform.core.db import add_instance
+from ba2_trade_platform.core.models import ExpertSetting, TradingOrder, Transaction
+from ba2_trade_platform.core.types import (
+    AssetClass, OrderStatus, OrderDirection, OrderType, TransactionStatus,
+)
+from ba2_trade_platform.core.db import add_instance, get_instance
 
 
 class TestMockAccountBasics:
@@ -1781,19 +1783,25 @@ class TestTheEquityCloseSeamRefusesOptions:
     """An option Transaction's symbol is the UNDERLYING and its quantity is CONTRACTS.
     Building an equity order from those two fields submits N shares for N contracts."""
 
+    def _option_txn(self, acct_def, *, contracts=2.0):
+        """An OPTION transaction holding one FILLED option leg on the underlying AAPL."""
+        txn = create_transaction(symbol="AAPL", quantity=contracts,
+                                 asset_class=AssetClass.OPTION)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=contracts,
+                             transaction_id=txn.id, status=OrderStatus.FILLED,
+                             filled_qty=contracts, asset_class=AssetClass.OPTION,
+                             contract_symbol="AAPL260116C00250000")
+        return txn
+
     def test_an_option_transaction_is_refused(self):
-        from ba2_trade_platform.core.types import AssetClass
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
-        txn = create_transaction(symbol="AAPL", quantity=2.0,
-                                 asset_class=AssetClass.OPTION)
-        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=2.0,
-                             transaction_id=txn.id, status=OrderStatus.FILLED,
-                             filled_qty=2.0, asset_class=AssetClass.OPTION,
-                             contract_symbol="AAPL260116C00250000")
+        txn = self._option_txn(acct_def)
         with pytest.raises(ValueError) as exc:
             account.submit_close_order_for_transaction(txn)
         assert "close_option" in str(exc.value)
+        # The refusal has to say the position was left alone, not merely that it refused.
+        assert "No close order was created" in str(exc.value)
 
     def test_an_equity_transaction_is_still_closed(self):
         acct_def = create_account_definition()
@@ -1806,17 +1814,11 @@ class TestTheEquityCloseSeamRefusesOptions:
         assert result["success"] is True
 
     def test_NO_ORDER_IS_WRITTEN_when_an_option_is_refused(self):
-        """The caller-obeys half: refusing must not leave a half-created equity order."""
-        from ba2_trade_platform.core.types import AssetClass
+        """Refusing must not leave a half-created equity order behind."""
         from ba2_common.core.trade_store import orders_where
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
-        txn = create_transaction(symbol="AAPL", quantity=2.0,
-                                 asset_class=AssetClass.OPTION)
-        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=2.0,
-                             transaction_id=txn.id, status=OrderStatus.FILLED,
-                             filled_qty=2.0, asset_class=AssetClass.OPTION,
-                             contract_symbol="AAPL260116C00250000")
+        txn = self._option_txn(acct_def)
         before = len(orders_where(account_id=acct_def.id))
         with pytest.raises(ValueError):
             account.submit_close_order_for_transaction(txn)
@@ -1824,8 +1826,46 @@ class TestTheEquityCloseSeamRefusesOptions:
 
 
 class TestCloseTransactionRefusesOptions:
+    """``close_transaction`` cancels working orders at the broker and rewrites order rows
+    on its way to building the close, so refusing at the bottom would already have stripped
+    an option position of its protective legs. The refusal must land BEFORE any of that."""
+
+    def _option_txn_with_working_orders(self, acct_def):
+        """An OPTION transaction carrying the two order shapes ``close_transaction`` acts on.
+
+        ``at_broker`` is NEW — in ``get_unfilled_statuses()`` but NOT in
+        ``get_unsent_statuses()`` — and carries a broker id, so the unguarded path reaches
+        ``self.cancel_order(broker_order_id)``. ``unsent`` is PENDING, which IS in the unsent
+        set, so the unguarded path rewrites its DB status to CLOSED. One of each is what
+        makes both halves of "nothing happened" discriminating rather than vacuous.
+        """
+        txn = create_transaction(symbol="AAPL", quantity=1.0,
+                                 asset_class=AssetClass.OPTION)
+        at_broker = create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=1.0,
+            transaction_id=txn.id, status=OrderStatus.NEW,
+            broker_order_id="BRK-OPT-1",
+            asset_class=AssetClass.OPTION, contract_symbol="AAPL260116C00250000")
+        unsent = create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=1.0,
+            transaction_id=txn.id, status=OrderStatus.PENDING,
+            asset_class=AssetClass.OPTION, contract_symbol="AAPL260116C00250000")
+        return txn, at_broker, unsent
+
+    def _spy_on_cancel(self, monkeypatch, account):
+        """Record every broker id handed to ``cancel_order``; return the list.
+
+        A spy, not the real ``MockAccount.cancel_order``: production calls
+        ``cancel_order(order.broker_order_id)`` with a STRING while the mock does
+        ``order.status = ...``, so a genuine call raises AttributeError, is swallowed by
+        the surrounding ``except``, and leaves ``canceled_count`` at 0 whether the guard
+        fired or not. Recording the argument makes "nothing was canceled" an observation.
+        """
+        canceled: list = []
+        monkeypatch.setattr(account, "cancel_order", canceled.append)
+        return canceled
+
     def test_close_transaction_refuses_an_option(self):
-        from ba2_trade_platform.core.types import AssetClass
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
         txn = create_transaction(symbol="AAPL", quantity=1.0,
@@ -1833,6 +1873,12 @@ class TestCloseTransactionRefusesOptions:
         result = account.close_transaction(txn.id)
         assert result["success"] is False
         assert "close_option" in result["message"]
+        # The message must name THIS seam's hazard. "would submit shares of AAPL" is
+        # submit_close_order_for_transaction's, and that path now raises before submitting
+        # anything; what this caller actually risks is losing the protective legs and
+        # stranding the transaction in CLOSING.
+        assert "protective" in result["message"] and "CLOSING" in result["message"]
+        assert "shares" not in result["message"]
 
     def test_close_transaction_still_closes_an_equity(self):
         acct_def = create_account_definition()
@@ -1844,30 +1890,72 @@ class TestCloseTransactionRefusesOptions:
         result = account.close_transaction(txn.id)
         assert result["success"] is True
 
-    def test_an_option_close_CANCELS_NOTHING(self):
-        """Caller-obeys: the refusal happens before any order is canceled or deleted."""
-        from ba2_trade_platform.core.types import AssetClass
+    def test_an_option_close_CANCELS_NOTHING(self, monkeypatch):
+        """The headline property: no broker cancellation, no order-status rewrite, and the
+        transaction is not even moved to CLOSING."""
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
-        txn = create_transaction(symbol="AAPL", quantity=1.0,
-                                 asset_class=AssetClass.OPTION)
-        order = create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=1.0,
-                                     transaction_id=txn.id, status=OrderStatus.NEW,
-                                     asset_class=AssetClass.OPTION,
-                                     contract_symbol="AAPL260116C00250000")
+        txn, at_broker, unsent = self._option_txn_with_working_orders(acct_def)
+        canceled = self._spy_on_cancel(monkeypatch, account)
+
         result = account.close_transaction(txn.id)
+
+        assert canceled == []            # nothing reached the broker
         assert result["success"] is False
-        assert result.get("canceled_count", 0) == 0
-        from ba2_common.core.db import get_instance
-        from ba2_trade_platform.core.models import TradingOrder as TO, Transaction as TX
-        assert get_instance(TO, order.id).status == OrderStatus.NEW
-        # ...and the transaction itself is not even moved to CLOSING.
-        assert get_instance(TX, txn.id).status == TransactionStatus.OPENED
+        assert result["canceled_count"] == 0
+        assert result["deleted_count"] == 0
+        assert get_instance(TradingOrder, at_broker.id).status == OrderStatus.NEW
+        assert get_instance(TradingOrder, unsent.id).status == OrderStatus.PENDING
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
+
+    def test_a_LOCKED_DATABASE_is_not_read_as_NOT_AN_OPTION(self, monkeypatch):
+        """The guard's lookup absorbs InstanceNotFound and NOTHING else.
+
+        A bare ``except Exception: _txn = None`` reinstates the bug the guard exists to
+        prevent: a transient "database is locked" reads as "not an option, carry on", the
+        re-read inside the body then succeeds, and the equity path runs over the OPTION
+        anyway. ``absorb_if_benign(e, InstanceNotFound)`` propagates a non-benign exception
+        under the default ``enforce`` mode, so the close fails loudly instead of quietly
+        doing the damage. The failure is what we assert: no cancel, no status change.
+        """
+        import importlib
+        from sqlalchemy.exc import OperationalError
+
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        txn, at_broker, unsent = self._option_txn_with_working_orders(acct_def)
+        canceled = self._spy_on_cancel(monkeypatch, account)
+
+        # The package module, not the class the interfaces package re-exports under the
+        # same name; the in-tree shim aliases to this very object.
+        ai_mod = importlib.import_module("ba2_common.core.interfaces.AccountInterface")
+        real_get_instance = ai_mod.get_instance
+        calls = {"n": 0}
+
+        def flaky_get_instance(model_class, instance_id, *args, **kwargs):
+            # TRANSIENT, like real lock contention: only the guard's own read fails, so a
+            # swallowed error genuinely would fall through to a successful re-read.
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OperationalError("SELECT 1", {}, Exception("database is locked"))
+            return real_get_instance(model_class, instance_id, *args, **kwargs)
+
+        monkeypatch.setattr(ai_mod, "get_instance", flaky_get_instance)
+
+        with pytest.raises(OperationalError):
+            account.close_transaction(txn.id)
+
+        assert canceled == []
+        assert get_instance(TradingOrder, at_broker.id).status == OrderStatus.NEW
+        assert get_instance(TradingOrder, unsent.id).status == OrderStatus.PENDING
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
 
     def test_an_unresolvable_transaction_id_still_returns_a_result_dict(self):
-        """The guard reads the transaction up front, but get_instance RAISES
-        InstanceNotFound (it never returns None). A missing id must keep falling through
-        to the existing handling and come back as a result dict, not as an exception."""
+        """The other side of the narrowing: InstanceNotFound IS named as benign.
+
+        The guard reads the transaction up front and get_instance RAISES InstanceNotFound
+        for a missing row (it never returns None). That one condition must keep falling
+        through to the existing handling and come back as a result dict, not an exception."""
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
         result = account.close_transaction(999999)
