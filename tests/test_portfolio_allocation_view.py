@@ -3293,3 +3293,119 @@ def test_the_label_bars_last_text_is_a_dash_when_the_label_has_no_history():
     bar = build_label_bars([_view('A', 4_500.0, 30.0)], base_notional=10_000.0,
                            unallocated_pct=0.0)[0]
     assert bar.last_text == 'last -'
+
+
+# ---------------------------------------------------------------------------
+# THE MIGRATED BUTTON GROUPS -- the DECISION half
+#
+# The Allocate wizard's step 1 carried "Even split" and "Load last" over the
+# LABEL targets; its step 2 carried "Even split", "Fill rest", "Load last" and
+# "Wipe" over one label's symbol weights. All six move onto the page, and the
+# arithmetic stays exactly where it was -- in the ENGINE
+# (``even_split_targets``, ``load_previous_targets``, ``even_split_symbol_weights``,
+# ``fill_remaining_symbol_weights``, ``load_previous_symbol_weights``,
+# ``wipe_symbol_weights``). These wrappers exist to translate between the page's
+# plain ``{name: pct}`` maps and the engine's ``LabelTarget``, and to decide
+# whether anything actually changed; they do no arithmetic of their own.
+# ---------------------------------------------------------------------------
+
+def _pure():
+    from ba2_trade_platform.ui.utils import portfolio_allocation_view as v
+    return v
+
+
+def test_an_even_split_of_the_labels_uses_the_engines_own_splitter():
+    """Three ways is 33.33 / 33.33 / 33.34 -- the remainder on the LAST label, so
+    the set totals exactly 100. A hand-rolled ``round(100/n, 2)`` agrees at n=3
+    and parts company at n=6, producing a set the submit gate refuses."""
+    result = _pure().even_split_label_targets({'A': 10.0, 'B': 20.0, 'C': 0.0})
+
+    assert result.changed is True
+    assert result.targets == {'A': 33.33, 'B': 33.33, 'C': 33.34}
+    assert sum(result.targets.values()) == 100.0
+
+
+def test_an_even_split_of_an_already_even_set_writes_NOTHING_and_says_so():
+    """A button that silently does nothing when pressed is indistinguishable from
+    a broken one."""
+    result = _pure().even_split_label_targets({'A': 50.0, 'B': 50.0})
+
+    assert result.changed is False
+    assert result.targets == {'A': 50.0, 'B': 50.0}
+    assert result.message
+
+
+def test_an_even_split_with_no_labels_at_all_is_refused_rather_than_dividing_by_zero():
+    result = _pure().even_split_label_targets({})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().TARGETS_NO_LABELS
+    assert result.targets == {}
+
+
+def test_an_even_split_always_splits_the_WHOLE_hundred_whatever_the_reserve():
+    """The reserve is its own stored field and the labels divide what it leaves,
+    so any total but 100 here would produce a set the validator refuses."""
+    result = _pure().even_split_label_targets({'A': 0.0, 'B': 0.0})
+    assert result.targets == {'A': 50.0, 'B': 50.0}
+
+
+def test_load_last_restores_the_targets_the_previous_run_used():
+    result = _pure().load_last_label_targets({'A': 70.0, 'B': 30.0},
+                                             {'A': 60.0, 'B': 40.0})
+
+    assert result.changed is True
+    assert result.targets == {'A': 60.0, 'B': 40.0}
+
+
+def test_load_last_reads_the_PREVIOUS_generation_and_never_the_current_one():
+    """The mutation this exists for: swapping ``previous`` for the live map turns
+    Load last into a no-op that still reports success, and the user believes their
+    last allocation has been restored when nothing moved."""
+    result = _pure().load_last_label_targets({'A': 70.0, 'B': 30.0},
+                                             {'A': 10.0, 'B': 90.0})
+    assert result.targets == {'A': 10.0, 'B': 90.0}
+
+
+def test_a_label_with_no_history_keeps_the_target_it_already_has():
+    """A partial history is the ORDINARY state -- a label added yesterday has none
+    -- and zeroing those would silently unallocate a real basket."""
+    result = _pure().load_last_label_targets({'A': 70.0, 'B': 30.0},
+                                             {'A': 60.0, 'B': None})
+
+    assert result.targets == {'A': 60.0, 'B': 30.0}
+
+
+def test_a_previous_target_of_zero_is_restored_and_not_read_as_no_history():
+    """0.0 is a real prior state -- the engine reads it as "hold none of this" --
+    and refusing to restore it would be refusing to undo the user's last change."""
+    result = _pure().load_last_label_targets({'A': 70.0}, {'A': 0.0})
+
+    assert result.changed is True
+    assert result.targets == {'A': 0.0}
+
+
+def test_load_last_with_no_history_anywhere_writes_nothing_and_says_why():
+    result = _pure().load_last_label_targets({'A': 70.0, 'B': 30.0},
+                                             {'A': None, 'B': None})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().TARGETS_NO_PREVIOUS
+    assert result.targets == {'A': 70.0, 'B': 30.0}
+    assert result.message
+
+
+def test_load_last_that_would_change_nothing_reports_it_rather_than_writing():
+    result = _pure().load_last_label_targets({'A': 60.0}, {'A': 60.0})
+
+    assert result.changed is False
+    assert result.reason_code == _pure().TARGETS_UNCHANGED
+
+
+def test_the_label_target_helpers_preserve_the_order_they_were_given():
+    """The page hands these its DISPLAY order and writes the result straight back
+    onto the rows; a dict that came back re-sorted would move the remainder onto a
+    different label from the one the user is looking at."""
+    result = _pure().even_split_label_targets({'Z': 0.0, 'A': 0.0, 'M': 0.0})
+    assert list(result.targets) == ['Z', 'A', 'M']
+    assert result.targets['M'] == 33.34

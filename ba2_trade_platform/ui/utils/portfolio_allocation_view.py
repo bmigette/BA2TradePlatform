@@ -1383,6 +1383,155 @@ def fill_label_to_100(label: str, weights,
 
 
 # ---------------------------------------------------------------------------
+# THE MIGRATED BUTTON GROUPS
+#
+# The Allocate wizard's step 1 carried "Even split" and "Load last" over the LABEL
+# targets; its step 2 carried "Even split", "Fill rest", "Load last" and "Wipe"
+# over one label's symbol weights. All six are on the page now, because the boxes
+# they operate on are, and a button two screens away from the number it rewrites
+# is a button nobody presses.
+#
+# THE ARITHMETIC IS NOT HERE. Every one of these delegates to the engine's own
+# function -- ``even_split_targets``, ``load_previous_targets``,
+# ``even_split_symbol_weights``, ``fill_remaining_symbol_weights``,
+# ``load_previous_symbol_weights``, ``wipe_symbol_weights`` -- exactly as the
+# wizard did. What lives here is the TRANSLATION between the page's plain
+# ``{name: pct}`` maps and the engine's ``LabelTarget``/``SymbolTarget``, plus the
+# one decision the page needs and the engine does not make: did anything change,
+# and if not, what do we say instead? A copy of the splitting rule here would be a
+# fourth two-decimal rounding rule, and rounding rules drift.
+#
+# NOTHING IS DISABLED. The wizard greyed these buttons out; the page follows its
+# own ``Fill 100%`` convention and always allows the press, reporting the no-op in
+# words. Same principle from the other end -- a control that does nothing when
+# pressed is indistinguishable from a broken one -- and it costs the page a
+# per-keystroke ``set_enabled`` sweep it would otherwise need over every button on
+# every row.
+# ---------------------------------------------------------------------------
+
+TARGETS_NO_LABELS = "NO_LABELS"
+TARGETS_UNCHANGED = "UNCHANGED"
+TARGETS_EVEN_SPLIT = "EVEN_SPLIT"
+TARGETS_NO_PREVIOUS = "NO_PREVIOUS"
+TARGETS_LOADED_LAST = "LOADED_LAST"
+
+TARGETS_MSG_NO_LABELS = ('No labels are managed yet — there is nothing to split. '
+                         'Use "Manage labels" first.')
+TARGETS_MSG_EVEN_SPLIT_FMT = ('Split 100% evenly between {count} label(s). The cash '
+                              'reserve is untouched — the labels divide what it '
+                              'leaves.')
+TARGETS_MSG_ALREADY_EVEN_FMT = ('The {count} labels already hold an even split — '
+                                'nothing was written.')
+TARGETS_MSG_NO_PREVIOUS = ('No label has a previous target — nothing has ever been '
+                           'allocated on this account, so there is nothing to load.')
+TARGETS_MSG_LOADED_LAST_FMT = ('Restored the last run’s targets. {kept} label(s) have '
+                               'no history and kept the target they had.')
+TARGETS_MSG_LAST_UNCHANGED = ('The labels already hold the targets of the last run — '
+                              'nothing was written.')
+
+
+@dataclass
+class TargetsUpdate:
+    """One press of a LABEL-LEVEL button, decided. Pure.
+
+    ``changed is False`` means NOTHING is written and ``targets`` is what was
+    passed in. Both no-change cases still carry a ``message``, on
+    ``FillToHundred``'s terms.
+
+    ``targets`` is the FULL new ``{label: pct}`` map IN THE ORDER GIVEN. The order
+    is load-bearing: the page hands its display order in and writes the result
+    straight back onto the rows, and the engine's splitter puts the rounding
+    remainder on the LAST entry -- so a map that came back re-sorted would move
+    that remainder onto a label other than the one the user is looking at.
+    """
+    changed: bool
+    reason_code: str
+    targets: Dict[str, float]
+    message: str
+
+
+def _label_targets_as_engine(targets, previous=None):
+    """``{label: pct}`` -> the engine's ``[LabelTarget]``, order preserved. Internal.
+
+    ``symbols`` is deliberately left empty: every function these feed touches
+    ``target_pct`` only, and building the symbol list here would invite a caller to
+    read weights back out of a structure that never had them.
+    """
+    history = previous or {}
+    from ...core.portfolio_allocation import LabelTarget
+    return [LabelTarget(label=name, target_pct=float(pct or 0.0),
+                        previous_target_pct=history.get(name))
+            for name, pct in (targets or {}).items()]
+
+
+def _same_pcts(before, after, places: int = 2) -> bool:
+    """True when two ``{name: pct}`` maps agree to the stored precision. Internal.
+
+    Rounded rather than compared exactly: the engine's splitters emit values on the
+    cent grid the boxes store at, and a binary hair between 33.33 and 33.330000001
+    is not a change the user made.
+    """
+    return all(round(float(after.get(k) or 0.0), places)
+               == round(float(v or 0.0), places) for k, v in (before or {}).items())
+
+
+def even_split_label_targets(targets) -> TargetsUpdate:
+    """The label-level "Even split": every label gets an equal share of 100%. Pure.
+
+    ALWAYS 100, independent of the reserve -- the reserve is its own stored field
+    and the labels divide what it LEAVES, so any other total would produce a set
+    ``validate_label_targets`` refuses. That reasoning is the engine's
+    ``even_split_targets``, and so is the arithmetic: the remainder lands on the
+    last label so the set totals exactly 100 in decimal.
+    """
+    from ...core.portfolio_allocation import even_split_targets
+
+    current = {name: float(pct or 0.0) for name, pct in (targets or {}).items()}
+    if not current:
+        return TargetsUpdate(False, TARGETS_NO_LABELS, {}, TARGETS_MSG_NO_LABELS)
+    fresh = {lt.label: lt.target_pct
+             for lt in even_split_targets(_label_targets_as_engine(current))}
+    if _same_pcts(current, fresh):
+        return TargetsUpdate(False, TARGETS_UNCHANGED, current,
+                             TARGETS_MSG_ALREADY_EVEN_FMT.format(count=len(current)))
+    return TargetsUpdate(True, TARGETS_EVEN_SPLIT, fresh,
+                         TARGETS_MSG_EVEN_SPLIT_FMT.format(count=len(current)))
+
+
+def load_last_label_targets(targets, previous) -> TargetsUpdate:
+    """The label-level "Load last": restore the targets the last RUN used. Pure.
+
+    ``previous`` is ``{label: previous_target_pct}`` -- the SEPARATE generation
+    written only by ``save_allocation_targets``, never the live map. Reading the
+    live map instead turns this button into a no-op that still reports success,
+    which is the one failure it cannot be allowed to have.
+
+    A previous of 0.0 IS restored: the engine reads 0 as "hold none of this", so it
+    is a real prior state, and refusing it would refuse to undo the user's last
+    change. ``None`` is the only "no history", and such a label keeps the target it
+    already has -- a partial history is the ordinary state and zeroing those would
+    silently unallocate a real basket.
+    """
+    from ...core.portfolio_allocation import (
+        has_previous_targets, load_previous_targets)
+
+    current = {name: float(pct or 0.0) for name, pct in (targets or {}).items()}
+    if not current:
+        return TargetsUpdate(False, TARGETS_NO_LABELS, {}, TARGETS_MSG_NO_LABELS)
+    items = _label_targets_as_engine(current, previous)
+    if not has_previous_targets(items):
+        return TargetsUpdate(False, TARGETS_NO_PREVIOUS, current,
+                             TARGETS_MSG_NO_PREVIOUS)
+    fresh = {lt.label: lt.target_pct for lt in load_previous_targets(items)}
+    if _same_pcts(current, fresh):
+        return TargetsUpdate(False, TARGETS_UNCHANGED, current,
+                             TARGETS_MSG_LAST_UNCHANGED)
+    kept = sum(1 for lt in items if lt.previous_target_pct is None)
+    return TargetsUpdate(True, TARGETS_LOADED_LAST, fresh,
+                         TARGETS_MSG_LOADED_LAST_FMT.format(kept=kept))
+
+
+# ---------------------------------------------------------------------------
 # THE LABEL MINI-BAR ROW
 #
 # One bar per label: the CURRENT share, tinted with that label's own colour, a

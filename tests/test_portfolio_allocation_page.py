@@ -5448,3 +5448,188 @@ def test_the_migrated_last_figure_is_NOT_restated_against_the_gross_base(
     assert 'last 25.00%' in row
     assert 'of base' not in row
     assert 'of investable' in ' '.join(_expansion_headers(root))
+
+
+# ---------------------------------------------------------------------------
+# GROUP 2: the LABEL-LEVEL button group -- "Even split" and "Load last"
+#
+# The wizard's step 1 owned these. They are on the page now, above the list they
+# rewrite, and they persist on press like everything else here: this page has no
+# Save button and cannot have one (switching the global account hard-reloads the
+# document).
+# ---------------------------------------------------------------------------
+
+def _marked_buttons(root, marker):
+    from nicegui import ui
+    return [el for el in _marked(root, marker) if isinstance(el, ui.button)]
+
+
+def _label_targets_now(account_id):
+    return {row.label: row.target_pct for row in get_managed_labels(account_id)}
+
+
+def _two_labels(account_id, *, a=70.0, b=30.0, previous=(None, None)):
+    for name, target in (('ARK26', a), ('TECH', b)):
+        set_managed_label(account_id, name, target_pct=target)
+    return _views([ManagedLabel('ARK26', a, previous_target_pct=previous[0]),
+                   ManagedLabel('TECH', b, previous_target_pct=previous[1])],
+                  {'ARK26': ['AAPL'], 'TECH': ['MSFT']},
+                  weights={'ARK26': {'AAPL': 100.0}, 'TECH': {'MSFT': 100.0}})
+
+
+def test_the_page_offers_a_label_level_even_split_and_load_last(nicegui_client,
+                                                                account_id):
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    assert len(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)) == 1
+    assert len(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)) == 1
+
+
+def test_the_label_even_split_writes_100_across_every_label_and_persists_it(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 50.0, 'TECH': 50.0}
+
+
+def test_the_label_even_split_uses_the_engines_own_splitter(monkeypatch,
+                                                            nicegui_client,
+                                                            account_id):
+    """Three ways is 33.33 / 33.33 / 33.34, remainder on the LAST label."""
+    _capture_notifications(monkeypatch)
+    for name in ('A', 'B', 'C'):
+        set_managed_label(account_id, name, target_pct=0.0)
+    views = _views([ManagedLabel('A', 0.0), ManagedLabel('B', 0.0),
+                    ManagedLabel('C', 0.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT'], 'C': ['TSLA']},
+                   positions=[], prices={'AAPL': 1.0, 'MSFT': 1.0, 'TSLA': 1.0})
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    stored = _label_targets_now(account_id)
+    assert sum(stored.values()) == 100.0
+    assert stored == {'A': 33.33, 'B': 33.33, 'C': 33.34}
+
+
+def test_the_label_even_split_redraws_the_boxes_rather_than_leaving_them_stale(
+        monkeypatch, nicegui_client, account_id):
+    """A ``ui.number`` does not follow the object it was built from, so a silent
+    model change leaves the user typing over numbers the database does not have."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    assert sorted(n.value for n in _numbers(root)
+                  if n._props.get('label') == 'Portfolio target %') == [50.0, 50.0]
+
+
+def test_the_label_even_split_moves_every_bar_and_the_totals_footer(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    targets = [el._text for el in _marked(root, page.MARKER_BAR_ROW)
+               for el in el.descendants() if (el._text or '').startswith('tgt ')]
+    assert targets == ['tgt 50.0%', 'tgt 50.0%']
+    assert 'Label targets total 100.00%' in ' '.join(_texts(root))
+
+
+def test_the_label_even_split_leaves_the_cash_reserve_alone(monkeypatch,
+                                                            nicegui_client,
+                                                            account_id):
+    """The labels divide what the reserve LEAVES, so an even split of anything but
+    the whole 100 would produce a set the submit gate refuses."""
+    _capture_notifications(monkeypatch)
+    set_allocation_config(account_id, unallocated_pct=10.0)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id), reserve=10.0)
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 50.0, 'TECH': 50.0}
+    assert get_allocation_config(account_id).unallocated_pct == 10.0
+
+
+def test_label_load_last_restores_the_targets_of_the_last_run(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, previous=(60.0, 40.0)))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 60.0, 'TECH': 40.0}
+
+
+def test_label_load_last_reads_the_PREVIOUS_generation_and_not_the_current_one(
+        monkeypatch, nicegui_client, account_id):
+    """Mutation: feed it the live targets. The button then reports success while
+    changing nothing, and the user believes their last allocation is back."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, a=70.0, b=30.0, previous=(10.0, 90.0)))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 10.0, 'TECH': 90.0}
+
+
+def test_label_load_last_leaves_a_label_with_no_history_where_it_is(
+        monkeypatch, nicegui_client, account_id):
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, previous=(60.0, None)))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 60.0, 'TECH': 30.0}
+
+
+def test_label_load_last_with_no_history_at_all_says_so_and_writes_nothing(
+        monkeypatch, nicegui_client, account_id):
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+
+    _press(_marked_buttons(root, page.MARKER_LOAD_LAST_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 70.0, 'TECH': 30.0}
+    assert any('nothing to load' in m for m, _t in sent)
+
+
+def test_the_label_buttons_never_shift_the_previous_generation(monkeypatch,
+                                                               nicegui_client,
+                                                               account_id):
+    """``save_allocation_targets`` is the ONE writer of the previous generation, and
+    these buttons are not it. A shift here would grind the real history away one
+    press at a time -- and would make Load last un-undoable, since pressing it
+    would immediately overwrite the very numbers it just restored."""
+    _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id,
+                 _two_labels(account_id, previous=(60.0, 40.0)))
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    rows = {row.label: row.previous_target_pct
+            for row in get_managed_labels(account_id)}
+    assert rows == {'ARK26': None, 'TECH': None}
+
+
+def test_the_label_buttons_refuse_to_write_under_a_label_that_is_gone(
+        monkeypatch, nicegui_client, account_id):
+    """``set_managed_label`` CREATES the row it cannot find, so an unguarded write
+    would resurrect a label the user deleted -- holding money."""
+    sent = _capture_notifications(monkeypatch)
+    root = _draw(nicegui_client, account_id, _two_labels(account_id))
+    remove_managed_label(account_id, 'TECH')
+
+    _press(_marked_buttons(root, page.MARKER_EVEN_SPLIT_LABELS)[0])
+
+    assert _label_targets_now(account_id) == {'ARK26': 50.0}
+    assert any('no longer managed' in m for m, _t in sent)

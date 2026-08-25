@@ -123,11 +123,13 @@ from ..utils.portfolio_allocation_view import (
     PositionFetchFailed, account_value_card, account_value_from_snapshot,
     build_label_bars, build_label_views,
     collect_managed_symbols, diff_managed_labels,
-    evaluate_gate, evaluate_market_gate, expert_shortname_families,
+    evaluate_gate, evaluate_market_gate, even_split_label_targets,
+    expert_shortname_families,
     fill_label_to_100, format_allocation_footer, format_label_header,
     format_label_target_tooltip,
     format_label_total_notice, format_reserve_caption,
-    format_reserve_row, label_color_contrast_warning, managed_total_value,
+    format_reserve_row, label_color_contrast_warning, load_last_label_targets,
+    managed_total_value,
     missing_quote_symbols, picker_options, pnl_classes, positions_by_symbol,
     resolve_label_icon_color, sort_label_views, store_color_value,
     symbol_target_values,
@@ -614,6 +616,24 @@ MARKER_COLOR_CUSTOM = 'pf-color-custom'
 MARKER_SUMMARY_ROW = 'pf-summary-row'
 MARKER_RESERVE_CARD = 'pf-reserve-card'
 
+# ---- the migrated button groups --------------------------------------------
+#
+# Located by MARKER and never by caption. "Even split" and "Load last" exist at
+# BOTH scopes now -- once over the labels, once per label over its symbols -- so a
+# caption match would find whichever the renderer happened to draw first, which is
+# precisely the mis-aimed-write bug these markers make testable.
+
+#: The row holding the label-level group, above the list it rewrites.
+MARKER_LABEL_TOOLS = 'pf-label-tools'
+MARKER_EVEN_SPLIT_LABELS = 'pf-even-split-labels'
+MARKER_LOAD_LAST_LABELS = 'pf-load-last-labels'
+#: The per-label group, in the row that already held Fill 100% and Compare.
+MARKER_FILL_100 = 'pf-fill-100'
+MARKER_EVEN_SPLIT_SYMBOLS = 'pf-even-split-symbols'
+MARKER_FILL_REST_SYMBOLS = 'pf-fill-rest-symbols'
+MARKER_LOAD_LAST_SYMBOLS = 'pf-load-last-symbols'
+MARKER_WIPE_SYMBOLS = 'pf-wipe-symbols'
+
 #: The mini-bar track. Height and radius only -- the FILL's colour comes from the
 #: label's own palette entry, which is what makes the bars tell labels apart.
 BAR_TRACK_STYLE = ('position:relative;height:10px;border-radius:3px;'
@@ -676,6 +696,17 @@ def _register_view(live: Dict[str, Any], view) -> None:
 def _label_targets(live: Dict[str, Any]) -> Dict[str, float]:
     """``{label: target_pct}`` as it stands right now. Derived, never stored twice."""
     return {v.label: float(v.target_pct or 0.0) for v in live['views']}
+
+
+def _previous_label_targets(live: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    """``{label: previous_target_pct}`` -- the generation "Load last" restores.
+
+    Derived off the same ``LabelView`` list as ``_label_targets``, and NULL is
+    carried through as ``None``: "this label has never been allocated" is what
+    disables the restore, and it is a different fact from a previous target of 0.
+    A parallel dict beside the views is how the two would come to disagree.
+    """
+    return {v.label: v.previous_target_pct for v in live['views']}
 
 
 def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
@@ -1021,6 +1052,108 @@ async def _save_label_target(account_id: int, live: Dict[str, Any], label: str,
     if view is not None:
         view.target_pct = edit.value
     _apply_page_figures(live)
+
+
+# ---------------------------------------------------------------------------
+# THE LABEL-LEVEL BUTTON GROUP -- "Even split" and "Load last"
+#
+# Migrated off the Allocate wizard's step 1. They write through
+# ``set_managed_label``, i.e. the SAME column the inline box writes, and
+# deliberately NOT through ``save_allocation_targets``: that function is the one
+# writer of the previous generation, and a shift here would grind the real history
+# away one press at a time -- and would make Load last un-undoable, because
+# pressing it would immediately overwrite the very numbers it just restored.
+# ---------------------------------------------------------------------------
+
+def _write_label_targets(account_id: int, targets) -> List[str]:
+    """Persist a whole set of label targets. Blocking. Returns the SKIPPED labels.
+
+    Guarded exactly as ``_write_label_target`` is, and for the same reason:
+    ``set_managed_label`` CREATES the row it cannot find, so a write aimed at a
+    label unmanaged in another tab would resurrect it -- as a label the user did
+    not choose to manage, holding money.
+
+    A skip does NOT abort the rest. The set was decided over the labels on screen,
+    and refusing every one of them because one is stale would make the button
+    unusable on exactly the page that most needs a refresh.
+    """
+    managed = {row.label for row in get_managed_labels(account_id)}
+    skipped = [label for label in (targets or {}) if label not in managed]
+    for label, pct in (targets or {}).items():
+        if label in managed:
+            set_managed_label(account_id, label, target_pct=float(pct))
+    return skipped
+
+
+def _apply_label_targets(live: Dict[str, Any], targets) -> None:
+    """Put a new set of label targets on screen. In place.
+
+    The VIEWS move first and the boxes follow, and that order is load-bearing: a
+    programmatic ``set_value`` fires the box's own change handler, which compares
+    the incoming number against the stored one and returns on a match. Pushing the
+    widgets first would make every one of those echoes a real edit, re-validating
+    and re-persisting a set that is only half applied.
+    """
+    for label, pct in (targets or {}).items():
+        view = live['view_by_label'].get(label)
+        if view is not None:
+            view.target_pct = float(pct)
+    _apply_page_figures(live)
+    for label, pct in (targets or {}).items():
+        _restore_value(live['label_inputs'].get(label), float(pct))
+
+
+async def _run_label_target_button(account_id: int, live: Dict[str, Any],
+                                   result) -> None:
+    """Persist and draw one decided label-level press. THE handler, for both buttons.
+
+    ``result`` is a ``TargetsUpdate`` from the pure layer, which has already made
+    every decision -- what the new set is, whether it differs from the current one,
+    and what to say when it does not. This does the IO and the redraw.
+    """
+    if not result.changed:
+        # Said out loud. A button that does nothing when pressed is
+        # indistinguishable from a broken one.
+        ui.notify(result.message, type='info')
+        return
+    try:
+        skipped = await asyncio.to_thread(_write_label_targets, account_id,
+                                          result.targets)
+    except Exception as e:
+        logger.error(f"Saving the label targets failed: {e}", exc_info=True)
+        ui.notify(f'Could not save the targets: {e}', type='negative')
+        return
+    stale = set(skipped)
+    _apply_label_targets(live, {label: pct for label, pct in result.targets.items()
+                                if label not in stale})
+    if skipped:
+        logger.warning(f"Label target(s) for {sorted(skipped)} ignored: no longer "
+                       f"managed by account {account_id}")
+        ui.notify(f"{', '.join(sorted(skipped))} is no longer managed — refresh "
+                  f"the page", type='warning')
+        return
+    ui.notify(result.message, type='positive')
+
+
+async def _even_split_labels(account_id: int, live: Dict[str, Any]) -> None:
+    """Give every managed label an equal share of the whole 100%.
+
+    The reserve is not reachable from here by construction: it is a separate stored
+    field and the labels divide what it LEAVES, so the split is always of 100.
+    """
+    await _run_label_target_button(
+        account_id, live, even_split_label_targets(_label_targets(live)))
+
+
+async def _load_last_labels(account_id: int, live: Dict[str, Any]) -> None:
+    """Restore the label targets the LAST run was launched with.
+
+    ``_previous_label_targets`` and not ``_label_targets``: reading the live map
+    would make this a no-op that still reports success.
+    """
+    await _run_label_target_button(
+        account_id, live,
+        load_last_label_targets(_label_targets(live), _previous_label_targets(live)))
 
 
 async def _save_reserve(account_id: int, live: Dict[str, Any], raw, *, echo_to) -> None:
@@ -1745,6 +1878,33 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
         ).classes('text-xs text-secondary-custom').style(TABULAR_NUMS)
 
 
+def _render_label_tools(account_id: int, live: Dict[str, Any]) -> None:
+    """The LABEL-LEVEL button group, directly above the list it rewrites.
+
+    Migrated off the Allocate wizard's step 1, where it sat above the same boxes.
+    It is a row of its own rather than a member of the toolbar at the top of the
+    page: the toolbar's buttons are page-wide actions (allocate, refresh, manage
+    labels) and these two rewrite the targets of every label underneath them, so
+    they belong next to what they change.
+
+    Neither is DISABLED when it has nothing to do -- see the note on the pure
+    layer's button section. The press is always allowed and the no-op is reported
+    in words, which is the convention ``Fill 100%`` already set on this page.
+    """
+    with ui.row().classes('w-full items-center gap-2').mark(MARKER_LABEL_TOOLS):
+        ui.label('All labels').classes('text-xs text-secondary-custom')
+        ui.button('Even split', icon='balance',
+                  on_click=lambda: _even_split_labels(account_id, live)
+                  ).props('outline dense').mark(MARKER_EVEN_SPLIT_LABELS) \
+            .tooltip('Give every label an equal share of the whole 100%. The cash '
+                     'reserve is untouched — the labels divide what it leaves.')
+        ui.button('Load last', icon='history',
+                  on_click=lambda: _load_last_labels(account_id, live)
+                  ).props('outline dense').mark(MARKER_LOAD_LAST_LABELS) \
+            .tooltip('Put back the targets the last allocation run was launched '
+                     'with. A label that has never run keeps the target it has.')
+
+
 def _recolour_label(live: Dict[str, Any], label: str, stored: str) -> None:
     """A colour was saved from the label row: put it in the registry and redraw.
 
@@ -1976,6 +2136,10 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
             # editable in place -- a caption that appears only above 0% is one the
             # user never reads before moving the slider.
             ui.label(RESERVE_BASIS_NOTE).classes('text-xs text-secondary-custom')
+
+    # The label-level group, between the reserve and the labels: it rewrites every
+    # target in the list below and nothing above it.
+    _render_label_tools(account_id, live)
 
     for view in views:
         # Registered by ``_render_label_body`` inside the row, not here: two calls
