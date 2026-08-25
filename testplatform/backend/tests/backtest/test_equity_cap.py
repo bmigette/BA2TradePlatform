@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from app.services.backtest.equity_cap import (
-    EquityCapError, validate_equity_cap,
+    EquityCapError, deployed_equity, validate_equity_cap,
 )
 
 
@@ -62,3 +62,44 @@ def test_a_cap_at_or_below_the_initial_capital_logs_nothing():
     validate_equity_cap(20_000, initial_capital=20_000, log=msgs.append)
     validate_equity_cap(5_000, initial_capital=20_000, log=msgs.append)
     assert msgs == []
+
+
+# ---------------------------------------------------------------------------
+# Task 2 -- deployed equity
+# ---------------------------------------------------------------------------
+def test_with_no_cap_the_real_equity_passes_through():
+    assert deployed_equity(37_412.55, cap=None) == 37_412.55
+
+
+def test_above_the_cap_only_the_cap_is_deployed():
+    assert deployed_equity(40_000.0, cap=20_000.0) == 20_000.0
+
+
+def test_below_the_cap_the_real_equity_is_deployed():
+    """'except if account value goes below' -- a drawdown genuinely shrinks what can be deployed."""
+    assert deployed_equity(15_000.0, cap=20_000.0) == 15_000.0
+
+
+def test_exactly_at_the_cap():
+    assert deployed_equity(20_000.0, cap=20_000.0) == 20_000.0
+
+
+def test_recovery_climbs_back_to_the_cap_and_stops():
+    assert deployed_equity(18_000.0, cap=20_000.0) == 18_000.0
+    assert deployed_equity(20_000.0, cap=20_000.0) == 20_000.0
+    assert deployed_equity(25_000.0, cap=20_000.0) == 20_000.0
+
+
+def test_a_wiped_out_account_deploys_nothing_not_the_cap():
+    assert deployed_equity(0.0, cap=20_000.0) == 0.0
+
+
+def test_negative_equity_is_not_raised_to_zero_here():
+    """The caller decides what a negative account means; this function does not invent a floor."""
+    assert deployed_equity(-500.0, cap=20_000.0) == -500.0
+
+
+def test_unmeasurable_equity_is_unmeasurable_not_zero():
+    """None in means None out. A broker/engine that cannot state equity has not stated zero."""
+    assert deployed_equity(None, cap=20_000.0) is None
+    assert deployed_equity(None, cap=None) is None

@@ -54,3 +54,19 @@ def validate_equity_cap(
             log(f"equity_cap {cap:,.2f} is above the initial capital "
                 f"{float(initial_capital):,.2f}, so it cannot bind until the account grows to it.")
     return cap
+
+
+def deployed_equity(real_equity: Optional[float],
+                    *, cap: Optional[float]) -> Optional[float]:
+    """The equity the SIZER may see: ``min(cap, real_equity)``.
+
+    ``real_equity`` includes unrealised marks, deliberately: an open position that is down
+    genuinely leaves less to deploy, and one that is up is exactly the excess the cap withholds.
+
+    ``None`` in, ``None`` out -- an engine that cannot state its equity has not stated zero.
+    """
+    if real_equity is None:
+        return None
+    if cap is None:
+        return real_equity
+    return min(float(cap), float(real_equity))
