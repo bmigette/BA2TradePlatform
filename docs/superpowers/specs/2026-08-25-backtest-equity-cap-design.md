@@ -152,7 +152,34 @@ proves nothing was broken that a test already covered; the golden run proves not
 
 ## Testing
 
-Beyond the golden comparison:
+### End-to-end is mandatory, not optional
+
+Unit tests on the two conversions are necessary and **not sufficient**. The entire feature is a
+number flowing correctly through the whole engine — sizer, buying-power gate, margin check, rails,
+equity recorder, metric builder — and every previous defect of this shape in this codebase was a
+seam that each side tested correctly in isolation. Existing harnesses to extend rather than
+replace:
+
+| harness | use for |
+|---|---|
+| `testplatform/backend/tests/backtest/test_engine_golden_regression.py` | the cap-off byte-identical golden run |
+| `testplatform/backend/tests/backtest/test_daily_engine_e2e.py` | a full capped single backtest |
+| `testplatform/backend/tests/test_options_optimization_ga_e2e.py` | the GA path, cap as a run-level parameter |
+
+The e2e runs must assert on **real engine output**, not on mocked intermediate values:
+
+- A full capped run where deployed equity is sampled at every bar and **never exceeds the cap**,
+  including after a large gain.
+- The **same strategy, same data, started in year 3 versus year 1, scores the same.** This is the
+  feature's entire reason to exist and it can only be shown end to end.
+- A capped run produces **visibly smaller positions** than an uncapped run on identical data —
+  proving the cap reached the sizer rather than only the metrics.
+- The buying-power gate and margin check refuse a trade the *real* balance would have permitted,
+  proving the cap reached them too and did not stop at the risk manager.
+- A GA run completes with the cap set, every individual scored against the same denominator, and
+  the cap absent from the gene space.
+
+### Unit level, beyond the golden comparison:
 
 - $5,000 a year on a $20,000 cap reads 25% every year and CAGR 25% — the headline case, asserted
   on the actual numbers.
