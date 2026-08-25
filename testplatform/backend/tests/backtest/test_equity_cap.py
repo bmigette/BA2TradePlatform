@@ -457,3 +457,73 @@ def test_a_bad_cap_in_the_results_config_is_refused_not_ignored():
     with pytest.raises(EquityCapError, match="greater than zero"):
         R.build_results(_SnapshotAccount(_snapshots(_FIVE_K_A_YEAR)),
                         _results_config(initial_capital=20_000.0, equity_cap=0.0))
+
+
+# ---------------------------------------------------------------------------
+# Task 6 -- config plumbing (daily_backtest_handler._build_config)
+# ---------------------------------------------------------------------------
+def _handler_payload(**over):
+    """The minimum ``_build_config`` accepts.
+
+    The key set is copied verbatim from ``test_daily_backtest_handler._payload`` (the module
+    that already pins ``_build_config``'s contract) rather than guessed from the source.
+    """
+    p = {
+        "backtest_id": 1,
+        "name": "equity-cap-test",
+        "enabled_instruments": ["AAPL"],
+        "experts": ["FMPEarningsDrift"],
+        "start_date": "2024-01-02",
+        "end_date": "2024-01-08",
+        "initial_capital": 20_000.0,
+        "commission": 1.0,
+        "slippage": 0.0,
+        "fill_model": "next_bar_open",
+        "seed": 42,
+    }
+    p.update(over)
+    return p
+
+
+def test_the_config_carries_the_cap_into_account_settings():
+    from app.services.backtest.daily_backtest_handler import _build_config
+
+    cfg = _build_config(_handler_payload(equity_cap=20_000.0))
+    assert cfg["account_settings"]["equity_cap"] == 20_000.0
+
+
+def test_an_absent_cap_is_None_not_zero():
+    from app.services.backtest.daily_backtest_handler import _build_config
+
+    cfg = _build_config(_handler_payload())
+    assert cfg["account_settings"]["equity_cap"] is None
+
+
+def test_a_bad_cap_is_refused_at_CONFIG_time_not_mid_run():
+    from app.services.backtest.daily_backtest_handler import _build_config
+
+    with pytest.raises(EquityCapError, match="greater than zero"):
+        _build_config(_handler_payload(equity_cap=0))
+
+
+def test_a_cap_above_the_initial_capital_builds_a_config_and_logs():
+    """Not an error: the account may grow into it. The INFO line is the whole point of the
+    branch, so it is asserted here on the handler's real logger."""
+    from app.services.backtest import daily_backtest_handler as H
+
+    seen = []
+    original = H.logger.info
+    H.logger.info = lambda msg, *a, **k: (seen.append(str(msg)), original(msg, *a, **k))[1]
+    try:
+        cfg = H._build_config(_handler_payload(equity_cap=50_000.0))
+    finally:
+        H.logger.info = original
+    assert cfg["account_settings"]["equity_cap"] == 50_000.0
+    assert any("cannot bind" in m for m in seen), seen
+
+
+def test_the_cap_is_normalised_to_a_float_by_the_config():
+    from app.services.backtest.daily_backtest_handler import _build_config
+
+    cfg = _build_config(_handler_payload(equity_cap=15_000))
+    assert isinstance(cfg["account_settings"]["equity_cap"], float)
