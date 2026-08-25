@@ -48,6 +48,10 @@ class FakeProvider:
     fetched: List[date] = field(default_factory=list)
     discovered: List[str] = field(default_factory=list)
     raise_on: Set[date] = field(default_factory=set)
+    #: expiry -> the exact exception to raise, for testing transient-vs-permanent handling.
+    #: raise_on always raises StreamInterrupted("socket dropped"), which stays a transient
+    #: case; this lets a test inject something that must NOT be retried.
+    raise_exc: Dict[date, Exception] = field(default_factory=dict)
     name = "tastytrade"
 
     def history_floor(self):
@@ -62,6 +66,8 @@ class FakeProvider:
         contracts = list(contracts)
         exp = contracts[0].expiry
         self.fetched.append(exp)
+        if exp in self.raise_exc:
+            raise self.raise_exc[exp]
         if exp in self.raise_on:
             raise StreamInterrupted("socket dropped")
         canned = self.batches.get(exp)
@@ -354,6 +360,58 @@ def test_an_exception_from_the_stream_is_retried_with_exponential_backoff(provid
               sleep=lambda s: (slept.append(s), clock.advance(s))[0], log=lambda _l: None)
     backoffs = [s for s in slept if s > 0]
     assert backoffs == [2.0, 4.0, 8.0], f"expected doubling backoff, got {backoffs}"
+
+
+def test_a_429_is_recognised_as_transient_and_retried_with_backoff(provider, store):
+    """Mirrors fetch_options.py's _is_transient, which explicitly names "429"/"TooManyRequests"
+    -- a rate-limit response must back off and retry, not be treated as a dead end. raise_exc
+    never self-clears (matching raise_on's existing pattern), so this asserts the retry/backoff
+    SEQUENCE happens, the same shape as test_an_exception_from_the_stream_is_retried_with_..."""
+    slept: List[float] = []
+    clock = FakeClock()
+    provider.raise_exc = {EXPIRIES[1]: RuntimeError("429 Too Many Requests")}
+    warm.main(["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+              "--rate-limit", "0", "--discovery", "rest", "--max-retries", "4", "--backoff", "2"],
+             provider=provider, store=store, clock=clock,
+             sleep=lambda s: (slept.append(s), clock.advance(s))[0], log=lambda _l: None)
+    backoffs = [s for s in slept if s > 0]
+    assert backoffs == [2.0, 4.0, 8.0], f"a 429 must retry with the same doubling backoff, got {backoffs}"
+
+
+def test_a_permanent_error_is_not_retried_and_the_unit_fails_immediately(provider, store):
+    """THE GAP THIS CLOSES. Every exception used to be treated as transient (a blanket
+    'except Exception: retry'), so an auth/scope failure -- e.g. TastyTrade's own
+    "Token has insufficient scopes for this request", the exact 403 this cache hit on
+    2026-08-25 -- burned through every retry's backoff on EVERY unit before giving up, instead
+    of failing that unit at once. Isolation is preserved: it is still just THIS unit that
+    fails, not the whole run (matches test_a_failing_unit_does_not_abort_the_rest_of_the_run)."""
+    bad = EXPIRIES[1]
+    slept: List[float] = []
+    clock = FakeClock()
+    provider.raise_exc = {bad: RuntimeError("403: Token has insufficient scopes for this request")}
+    warm.main(["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+              "--rate-limit", "0", "--discovery", "rest", "--max-retries", "4", "--backoff", "2"],
+             provider=provider, store=store, clock=clock,
+             sleep=lambda s: (slept.append(s), clock.advance(s))[0], log=lambda _l: None)
+    assert not any(s > 0 for s in slept), "a permanent error must not sleep/back off at all"
+    assert store.partition_state("AAPL", bad, START, END) is PartitionState.MISSING
+    assert store.partition_state("AAPL", EXPIRIES[0], START, END) is PartitionState.COMPLETE
+    assert store.partition_state("AAPL", EXPIRIES[2], START, END) is PartitionState.COMPLETE
+
+
+def test_a_permanent_error_is_logged_as_non_transient(provider, store):
+    bad = EXPIRIES[1]
+    provider.raise_exc = {bad: RuntimeError("401 Unauthorized")}
+    lines: List[str] = []
+    warm.main(["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+              "--rate-limit", "0", "--discovery", "rest", "--max-retries", "4"],
+             provider=provider, store=store, clock=FakeClock(),
+             sleep=lambda s: None, log=lines.append)
+    attempt_lines = [ln for ln in lines if "] attempt" in ln]
+    assert len(attempt_lines) == 1, \
+        f"a permanent error must be tried exactly once, not retried: {attempt_lines}"
+    assert "permanent" in attempt_lines[0].lower(), \
+        f"the single attempt must say WHY it is not retrying: {attempt_lines[0]!r}"
 
 
 def test_a_failing_unit_does_not_abort_the_rest_of_the_run(provider, store):
