@@ -1721,6 +1721,45 @@ class AccountInterface(ReadOnlyAccountInterface):
                 - deleted_count: int (orders deleted)
                 - close_order_id: int (closing order ID if created/retried)
         """
+        from ba2_common.core.types import AssetClass
+
+        # SEAM 1 — refuse an OPTION transaction before ANYTHING is canceled or deleted.
+        #
+        # See submit_close_order_for_transaction for the full reasoning (an option
+        # Transaction's `symbol` is the UNDERLYING and its quantity is a CONTRACT count).
+        # The guard has to live HERE too, not only in that helper: by the time
+        # close_transaction reaches it, this method has already flipped the transaction to
+        # CLOSING and worked through cancelling/closing every other order on it. Refusing
+        # only at the bottom would leave an option position stripped of its working orders.
+        #
+        # This returns a dict rather than raising because close_transaction's contract is a
+        # result dict and its callers branch on ["success"]; raising here would change that
+        # contract. That is also why the lookup is wrapped: get_instance RAISES
+        # InstanceNotFound for a missing row (it never returns None), so an unresolvable
+        # transaction_id read HERE -- outside the method's try/except -- would escape as an
+        # exception where it used to come back as a result dict. Swallow it and fall
+        # through: the body below re-reads the transaction inside its own try/except and
+        # reports the missing/unreadable row exactly as it did before this guard existed.
+        try:
+            _txn = get_instance(Transaction, transaction_id)
+        except Exception:
+            _txn = None
+        if _txn is not None and _txn.asset_class == AssetClass.OPTION:
+            msg = (
+                f"Transaction {transaction_id} is an OPTION position (underlying "
+                f"{_txn.symbol}) and cannot be closed through the equity path — that "
+                f"would submit shares of {_txn.symbol} and leave the option open. "
+                f"Use close_option_position() / the close_option action instead."
+            )
+            logger.error(f"close_transaction: {msg}")
+            return {
+                'success': False,
+                'message': msg,
+                'canceled_count': 0,
+                'deleted_count': 0,
+                'close_order_id': None,
+            }
+
         from contextlib import nullcontext
         from datetime import datetime, timezone
         from sqlmodel import select, Session

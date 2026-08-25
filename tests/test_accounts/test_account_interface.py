@@ -1821,3 +1821,55 @@ class TestTheEquityCloseSeamRefusesOptions:
         with pytest.raises(ValueError):
             account.submit_close_order_for_transaction(txn)
         assert len(orders_where(account_id=acct_def.id)) == before
+
+
+class TestCloseTransactionRefusesOptions:
+    def test_close_transaction_refuses_an_option(self):
+        from ba2_trade_platform.core.types import AssetClass
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        txn = create_transaction(symbol="AAPL", quantity=1.0,
+                                 asset_class=AssetClass.OPTION)
+        result = account.close_transaction(txn.id)
+        assert result["success"] is False
+        assert "close_option" in result["message"]
+
+    def test_close_transaction_still_closes_an_equity(self):
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        txn = create_transaction(symbol="AAPL", quantity=10.0)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=10.0,
+                             transaction_id=txn.id, status=OrderStatus.FILLED,
+                             filled_qty=10.0)
+        result = account.close_transaction(txn.id)
+        assert result["success"] is True
+
+    def test_an_option_close_CANCELS_NOTHING(self):
+        """Caller-obeys: the refusal happens before any order is canceled or deleted."""
+        from ba2_trade_platform.core.types import AssetClass
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        txn = create_transaction(symbol="AAPL", quantity=1.0,
+                                 asset_class=AssetClass.OPTION)
+        order = create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=1.0,
+                                     transaction_id=txn.id, status=OrderStatus.NEW,
+                                     asset_class=AssetClass.OPTION,
+                                     contract_symbol="AAPL260116C00250000")
+        result = account.close_transaction(txn.id)
+        assert result["success"] is False
+        assert result.get("canceled_count", 0) == 0
+        from ba2_common.core.db import get_instance
+        from ba2_trade_platform.core.models import TradingOrder as TO, Transaction as TX
+        assert get_instance(TO, order.id).status == OrderStatus.NEW
+        # ...and the transaction itself is not even moved to CLOSING.
+        assert get_instance(TX, txn.id).status == TransactionStatus.OPENED
+
+    def test_an_unresolvable_transaction_id_still_returns_a_result_dict(self):
+        """The guard reads the transaction up front, but get_instance RAISES
+        InstanceNotFound (it never returns None). A missing id must keep falling through
+        to the existing handling and come back as a result dict, not as an exception."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        result = account.close_transaction(999999)
+        assert result["success"] is False
+        assert isinstance(result["message"], str) and result["message"]
