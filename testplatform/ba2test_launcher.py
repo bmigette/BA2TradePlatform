@@ -2364,7 +2364,12 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    gate independently enabled at p=0.5, roughly 75% of every generation will score the
 #    zero-trade sentinel, and a plain (non-optimize) option backtest will trade nothing at all.
 #    The search recovers once the data lands; until then the run is mostly burning CPU on
-#    -1e9. TastyTrade collection was in progress on another machine — confirm it finished.
+#    -1e9. TastyTrade collection was in progress on another machine — confirm it finished,
+#    AND that it is readable by the backtest (see precondition 1: it lands in a store nothing
+#    on the backtest path reads).
+#    Sharper since 2026-08-26: `_compute_atm_iv` no longer falls back to the frozen
+#    chain-snapshot row, so where a stale row used to supply a number it now honestly supplies
+#    None. That removes a lookahead, and it also removes the last thing masking this gap.
 #
 # 3. THE ARC RICHNESS GATE IS ENFORCED AND SEARCHED.  ** CLOSED 2026-08-26 **
 #    All eight credit builders in `ba2_common.core.TradeActions` now call
@@ -2378,11 +2383,17 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    grid to measure), so re-centre the ceilings after the first run; and the gate is a no-op
 #    for every debit structure and for O_CC/O_PP, which post no collateral.
 #
-# Also outstanding, lower stakes: `options_provider._compute_atm_iv` falls back to the
-# chain-snapshot row whose IV has no as-of guarantee (OPT-C8 lookahead) — which matters MORE now
-# that iv_rank is searched; and `_option_consistent_annual_return` reads `avg_trades_per_year`
-# directly, so it still needs the structures-not-legs substitution `_trades_per_year` applies to
-# CAR, or three iron condors a year clears its 12/yr floor exactly as they used to clear CAR's.
+# Also outstanding, lower stakes: `_option_consistent_annual_return` reads
+# `avg_trades_per_year` directly, so it still needs the structures-not-legs substitution
+# `_trades_per_year` applies to CAR, or three iron condors a year clears its 12/yr floor
+# exactly as they used to clear CAR's.
+#
+# CLOSED 2026-08-26: `options_provider._compute_atm_iv` no longer falls back to the
+# chain-snapshot row (OPT-C8). That row's IV had no as-of guarantee and, in the case where the
+# fallback actually fired, was inverted from a future price by construction — which mattered
+# more once iv_rank became a searched gene. It now reads only the as-of-clamped bar and
+# returns None otherwise. See precondition 2: this makes the missing greeks MORE visible, not
+# less, which is the point.
 #
 # ==============================================================================================
 

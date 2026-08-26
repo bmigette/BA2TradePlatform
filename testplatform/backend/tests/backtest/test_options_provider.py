@@ -233,6 +233,24 @@ def _seed_skewed_chain(db):
         # near-ATM PUT in-window — excluded (calls only, for determinism)
         {"occ_symbol":"AAPL240405P00100000","option_type":"put","strike":100.0,"expiry":"2024-04-05",
          "iv":0.99,"delta":-0.48,"gamma":0.01,"theta":-0.03,"vega":0.1}])
+    # The SAME skew on as-of-clamped BARS. Required since 2026-08-26 (OPT-C8): _compute_atm_iv
+    # no longer falls back to the chain-snapshot row's iv/delta, because that row records no
+    # trace of the date its IV was inverted from. Mirroring the values keeps these tests about
+    # the B7 SELECTION rule (near-ATM call, DTE-windowed, calls only) rather than about the
+    # source; the no-fallback property is pinned in test_atm_iv_no_lookahead.py.
+    c.write_bar_rows([
+        {"occ_symbol": occ, "date": "2024-03-01", "open": 3.0, "high": 3.1, "low": 2.9,
+         "close": 3.0, "volume": 100, "underlying": "AAPL", "option_type": otype,
+         "strike": strike, "expiry": expiry, "iv": iv, "delta": delta,
+         "gamma": 0.01, "theta": -0.03, "vega": 0.1}
+        for occ, otype, strike, expiry, iv, delta in (
+            ("AAPL240405C00100000", "call", 100.0, "2024-04-05", 0.30, 0.52),
+            ("AAPL240405C00050000", "call", 50.0, "2024-04-05", 0.60, 0.99),
+            ("AAPL240405C00150000", "call", 150.0, "2024-04-05", 0.90, 0.05),
+            ("AAPL240311C00100000", "call", 100.0, "2024-03-11", 0.05, 0.50),
+            ("AAPL240405P00100000", "put", 100.0, "2024-04-05", 0.99, -0.48),
+        )
+    ])
     return c
 
 def test_atm_iv_picks_near_atm_call_not_chain_mean(tmp_path):
