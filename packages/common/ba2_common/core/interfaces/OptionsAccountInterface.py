@@ -2367,6 +2367,61 @@ class OptionsAccountInterface(ABC):
             return AssignmentExposure(None, contracts, tuple(blind))
         return AssignmentExposure(cost, contracts, ())
 
+    def cash_available_for_delivery(self) -> Optional[float]:
+        """SPENDABLE CASH, or ``None`` when it cannot be read. NOT total equity.
+
+        ``assignment_capacity`` read ``get_balance()`` and called the result "cash" in its
+        own refusal text. On the only options-capable live adapter ``get_balance()`` returns
+        ``TradeAccount.equity`` — cash PLUS every position marked to market — so a
+        $100,000-equity / $3,000-cash account was admitted to a $20,000 delivery obligation.
+        The cash-secured put, the one structure the platform advertises as unlevered, was
+        margin-secured and nothing said so.
+
+        The correct figure was already being fetched and discarded:
+        ``AccountSnapshot.cash``. ``get_account_snapshot()`` is the broker-agnostic seam for
+        exactly this — Alpaca and TastyTrade override it, and the base implementation on
+        ``ReadOnlyAccountInterface`` reads ``get_account_info()`` tolerantly for everyone
+        else — and its contract already says every field is ``None`` when unknown and never
+        a fabricated number.
+
+        THIS IS ALSO A LIVE/BACKTEST PARITY FIX. ``BacktestAccount.get_balance`` returns
+        ``self._cash``, so one expression meant cash in the simulator and equity in
+        production: the gate that admitted the trade in a grid run was not the gate that
+        admitted it with real money. The backtest publishes ``cash`` in its
+        ``get_account_info()``, so both engines now read the same quantity.
+
+        NO FALLBACK TO ``get_balance()``. A broker that does not publish cash is
+        UNMEASURABLE, and this method returns ``None`` for the caller to refuse on. Falling
+        back would restore the entire defect on precisely the accounts whose cash we cannot
+        see, which is the worst possible place for it to survive.
+
+        Only the benign world-was-uncooperative errors are absorbed. A ``ProgrammingError``
+        propagates: a gate that answers "unmeasurable" for ever because of a schema defect
+        is a gate that has silently stopped working while wearing the face of a safety
+        measure.
+        """
+        from ba2_common.core.failure_modes import absorb_if_benign
+        from ba2_common.logger import logger
+
+        try:
+            snapshot = self.get_account_snapshot()
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            absorb_if_benign(e, *self._cover_benign_errors())
+            logger.error(
+                f"Account {self.id}: the account snapshot could not be read ({e}), so the "
+                f"CASH available to take delivery on an assignment is UNKNOWN. Reporting "
+                f"unmeasurable — total equity is not a substitute.", exc_info=True)
+            return None
+
+        cash = self._readable_number(getattr(snapshot, "cash", None))
+        if cash is None:
+            logger.error(
+                f"Account {self.id}: the broker did not publish a readable CASH figure "
+                f"(cash={getattr(snapshot, 'cash', None)!r}), so whether it could take "
+                f"delivery on an assignment is UNKNOWN. Equity is deliberately NOT used "
+                f"in its place — that substitution is the defect this accessor exists for.")
+        return cash
+
     def assignment_capacity(self, additional_cost: float) -> "AssignmentCapacity":
         """Could this account still take delivery after adding ``additional_cost``?
 
@@ -2404,14 +2459,15 @@ class OptionsAccountInterface(ABC):
                 + "; ".join(exposure.unmeasurable),
                 candidate_cost=additional_cost,
                 unmeasurable=exposure.unmeasurable)
-        cash = self.get_balance()
+        cash = self.cash_available_for_delivery()
         if cash is None:
             return AssignmentCapacity(
                 False,
-                f"{ASSIGNMENT_CAPACITY_REFUSAL}: the account balance could not be read, "
+                f"{ASSIGNMENT_CAPACITY_REFUSAL}: the account's CASH could not be read, "
                 f"so the cash available to take delivery on "
                 f"{exposure.contracts:g} open short put contract(s) "
-                f"(costing {exposure.cost:,.2f}) is unknown.",
+                f"(costing {exposure.cost:,.2f}) is unknown. Total equity is NOT a "
+                f"substitute here — that is the reading this gate exists to refuse.",
                 held_cost=exposure.cost,
                 candidate_cost=additional_cost)
         ok = exposure.cost + additional_cost <= cash

@@ -197,7 +197,13 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
         return self._balance
 
     def get_account_info(self):
-        return {"balance": self._balance, "equity": self._balance}
+        # ``cash`` completed for OPT-L5. The mock's single ``_balance`` IS its cash — it
+        # holds no marked-to-market stock — and the option delivery gate reads
+        # ``AccountSnapshot.cash`` (built from this dict by
+        # ``ReadOnlyAccountInterface.get_account_snapshot``) precisely so it can no longer
+        # be handed total equity. Omitting the key made cash UNMEASURABLE, which the gate
+        # correctly refuses on; the fixture was incomplete, not the guard.
+        return {"balance": self._balance, "cash": self._balance, "equity": self._balance}
 
     def get_positions(self):
         return self._positions
