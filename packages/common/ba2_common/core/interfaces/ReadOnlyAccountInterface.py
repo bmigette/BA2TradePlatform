@@ -1159,18 +1159,41 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                             logger.debug(f"Transaction {transaction.id} has filled OCO leg: {dep_order.id} ({dep_order.comment})")
                             break
 
-                    # ONE LEG SETTLING IS NOT THE STRUCTURE CLOSING (OPT-S3 live,
-                    # OPT-S8 backtest — one branch, both engines).
+                    # ONE LEG SETTLING IS NOT THE STRUCTURE CLOSING. THIS ARM FIXES
+                    # OPT-S8, THE BACKTEST DEFECT. It is NOT the OPT-S3 live fix, and the
+                    # commit that introduced it (de4f0f0f) claimed both. Read the next
+                    # paragraph before relying on this guard for anything live.
                     #
-                    # ``filled_closing_orders`` is "some DEPENDENT order on this
-                    # transaction is FILLED", and on a multi-leg option structure exactly
-                    # one leg can produce that on its own: an ASSIGNMENT, an EXPIRY
-                    # SETTLEMENT (``_record_option_expiry_close`` links its synthetic close
-                    # to the entry via ``depends_on_order``, which is what makes it
-                    # dependent), or a ONE-LEG MARGIN LIQUIDATION. The branch below then
-                    # closed the WHOLE transaction as "tp_sl_filled", pre-empting the
-                    # per-contract ``position_balanced`` computed above, which is the only
-                    # thing here that actually knows whether the STRUCTURE is flat.
+                    # WHERE THE LIVE DOOR ACTUALLY IS. A live assignment / exercise /
+                    # expiry arrives as a broker ACTIVITY and is applied by
+                    # ``AlpacaAccount._apply_option_activity``, which calls ``_close_txn``
+                    # — and ``_close_txn`` sets ``Transaction.status = CLOSED`` on the row
+                    # and persists it directly. It never passes through
+                    # ``refresh_transactions``, so nothing on this line can see it, let
+                    # alone hold it back. de4f0f0f does not touch ``AlpacaAccount.py`` at
+                    # all. OPT-S3 is fixed at that door, in ``_apply_option_activity``,
+                    # by refusing to close a structure while any of its contracts is
+                    # still open.
+                    #
+                    # WHAT THIS ARM IS, THEN. The BACKTEST fix, and — for live —
+                    # DEFENCE IN DEPTH. In the backtest engine the settlement really does
+                    # arrive as a FILLED dependent OPTION order
+                    # (``_record_option_expiry_close`` links its synthetic close to the
+                    # entry via ``depends_on_order``, which is what makes it dependent),
+                    # so this branch is the one that fired and this guard is the fix.
+                    # Live, no code path writes a FILLED dependent OPTION order onto a
+                    # multi-leg option transaction, so the guarded arm is currently
+                    # UNREACHABLE for a live structure: it costs nothing, and it is
+                    # already correct for the day a live path starts producing that shape.
+                    #
+                    # THE BRANCH AS IT STOOD. ``filled_closing_orders`` is "some DEPENDENT
+                    # order on this transaction is FILLED", and on a multi-leg option
+                    # structure exactly one leg can produce that on its own: an expiry
+                    # settlement as above, or a ONE-LEG MARGIN LIQUIDATION. The branch
+                    # below then closed the WHOLE transaction as "tp_sl_filled",
+                    # pre-empting the per-contract ``position_balanced`` computed above,
+                    # which is the only thing here that actually knows whether the
+                    # STRUCTURE is flat.
                     #
                     # What that cost: the surviving legs — INCLUDING the protective long of
                     # a spread — disappear from ``get_option_positions`` and

@@ -200,17 +200,26 @@ class TestHasPendingClosingOrder:
 
 
 # ===========================================================================
-# OPT-S3 (live) / OPT-S8 (backtest) — ONE LEG SETTLING IS NOT THE STRUCTURE
-# CLOSING. One branch, both engines.
+# ONE LEG SETTLING IS NOT THE STRUCTURE CLOSING — the SHARED
+# ``refresh_transactions`` arm, which is the OPT-S8 (BACKTEST) fix.
 #
-# ``refresh_transactions``' "OPENED -> CLOSED: filled closing order (TP/SL)"
-# arm fires on ANY filled DEPENDENT order. On a multi-leg option structure a
-# single leg produces one by itself — an assignment, an expiry settlement (the
-# backtest's ``_record_option_expiry_close`` links its synthetic close to the
-# entry via ``depends_on_order``), or a one-leg margin liquidation — and the
-# whole transaction was closed as ``tp_sl_filled``, pre-empting the
-# per-contract ``position_balanced`` that is the only thing here that knows
-# whether the STRUCTURE is flat.
+# THIS CLASS DOES NOT COVER OPT-S3. A live assignment / exercise / expiry never
+# reaches ``refresh_transactions`` at all: it arrives as a broker activity and
+# ``AlpacaAccount._apply_option_activity`` -> ``_close_txn`` sets
+# ``Transaction.status = CLOSED`` on the row directly. That is the live door,
+# and it is fixed there (see ``tests/test_option_multileg_settlement.py``); the
+# guard exercised here is DEFENCE IN DEPTH for live, not the live fix.
+#
+# WHAT THIS CLASS THEREFORE PINS: the shared arm, against a row shape live does
+# not yet produce. ``refresh_transactions``' "OPENED -> CLOSED: filled closing
+# order (TP/SL)" arm fires on ANY filled DEPENDENT order. In the BACKTEST a
+# single leg produces one by itself — an expiry settlement
+# (``_record_option_expiry_close`` links its synthetic close to the entry via
+# ``depends_on_order``) or a one-leg margin liquidation — and the whole
+# transaction was closed as ``tp_sl_filled``, pre-empting the per-contract
+# ``position_balanced`` that is the only thing here that knows whether the
+# STRUCTURE is flat. No LIVE path writes that shape onto a multi-leg option
+# transaction, so the fixtures below build it by hand.
 #
 # The surviving legs — INCLUDING the protective long of a spread — then vanish
 # from ``get_option_positions`` and ``_option_transaction_for_contract`` (both
@@ -223,6 +232,10 @@ class TestHasPendingClosingOrder:
 # against a real ``get_option_positions``.
 # ===========================================================================
 class TestOneLegSettlingDoesNotCloseTheStructure:
+    """Pins the SHARED ``refresh_transactions`` arm (the OPT-S8 backtest fix)
+    against a row shape the LIVE platform does not yet produce. The live
+    assignment door is ``AlpacaAccount._apply_option_activity`` -> ``_close_txn``
+    and is not exercised here."""
 
     CALL = "AAPL260116C00210000"
     PUT = "AAPL260116P00180000"
@@ -250,10 +263,12 @@ class TestOneLegSettlingDoesNotCloseTheStructure:
         return txn, parent
 
     def _settle_leg(self, acct_def, txn, parent, occ, *, contracts=1.0):
-        """One leg bought back, recorded the way every one-leg settlement is:
-        a standalone contract-carrying order (NO ``parent_order_id`` — it is not
-        part of the entry combo) linked to the entry by ``depends_on_order``,
-        which is exactly what puts it in ``filled_closing_orders``."""
+        """One leg bought back, recorded the way the BACKTEST records a one-leg
+        settlement: a standalone contract-carrying order (NO ``parent_order_id``
+        — it is not part of the entry combo) linked to the entry by
+        ``depends_on_order``, which is exactly what puts it in
+        ``filled_closing_orders``. No LIVE path writes this shape onto a
+        multi-leg option transaction, which is why it is built by hand here."""
         return create_trading_order(
             account_id=acct_def.id, symbol=occ, quantity=contracts,
             side=OrderDirection.BUY, order_type=OrderType.MARKET,
@@ -381,19 +396,20 @@ class TestOneLegSettlingDoesNotCloseTheStructure:
         position_balanced``. The two tests above close their position in FULL, so
         ``position_balanced`` is True in both and the whole expression is False
         WHATEVER the first conjunct says. Dropping ``bool(multi_leg_parent_ids)``
-        therefore passes them, and OPT-S3 — a rule about multi-leg OPTION structures —
-        silently starts governing every equity transaction in the book. (Measured: that
-        edit survives the entire live and backtest option suite without it.)
+        therefore passes them, and the guard — a rule about multi-leg OPTION
+        structures — silently starts governing every equity transaction in the book.
+        (Measured: that edit survives the entire live and backtest option suite
+        without it.)
 
         Here the sale is PARTIAL, 40 of 100 shares, so ``position_balanced`` is False
         and ONLY ``bool(multi_leg_parent_ids)`` can keep this branch reachable.
 
         WHAT THIS DOES NOT SAY. Marking the transaction CLOSED with 60 shares still
         held, on the strength of one filled dependent order, is this branch's
-        PRE-EXISTING behaviour and is not endorsed here — it long predates OPT-S3 and is
-        a separate question. What is asserted is only that OPT-S3 did not change it, in
-        either direction: an equity transaction carries no OPTION orders and so no
-        net-only parent, and the guard must never reach it.
+        PRE-EXISTING behaviour and is not endorsed here — it long predates this guard
+        and is a separate question. What is asserted is only that the guard did not
+        change it, in either direction: an equity transaction carries no OPTION orders
+        and so no net-only parent, and the guard must never reach it.
         """
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
@@ -417,5 +433,5 @@ class TestOneLegSettlingDoesNotCloseTheStructure:
             "the fixture is only interesting while the position is UNBALANCED")
         assert fresh.status == TransactionStatus.CLOSED
         assert fresh.close_reason == "tp_sl_filled", (
-            "the OPT-S3 guard has reached an EQUITY transaction — it must key on "
+            "the one-leg-settling guard has reached an EQUITY transaction — it must key on "
             "multi_leg_parent_ids, which an equity transaction can never have")
