@@ -92,8 +92,8 @@ from ...core.portfolio_allocation import (
 )
 from ..utils.portfolio_allocation_view import (
     MARKET_BANNER_CLASSES, PLAN_WARNING_CLASSES, PLAN_WARNING_COLORS,
-    STATUS_OVER_COLOR, MarketGateResult, important_color_style,
-    market_provenance_notice, plan_warning_lines,
+    STATUS_OVER_COLOR, MarketGateResult, class_color_style,
+    important_color_style, market_provenance_notice, plan_warning_lines,
 )
 from ...core.portfolio_allocation_service import (
     OUTCOME_FAILED,
@@ -429,6 +429,37 @@ def _shares(quantity: float) -> str:
 # run, so it belongs on the screen the user reads them from.
 
 
+def _paint(element, classes: str, *, color: Optional[str] = None):
+    """Give one element its classes AND the inline colour they cannot paint.
+
+    THE ONLY DOOR. Every coloured element in the dry-run dialog goes through this
+    (or through ``_label`` below), because the alternative -- remembering to add a
+    ``.style()`` beside each ``.classes()`` -- is precisely what was not
+    remembered: BUY, SELL, the leverage verdicts, the off-target residual and
+    every orange notice in this dialog carried a colour class that paints nothing
+    on this build and rendered white from the day each was written. See
+    ``class_color_style``.
+
+    The classes STAY. They are what the DOM reads as and what a dozen tests locate
+    cells by; what changes is that they are no longer relied on to paint.
+
+    ``color`` overrides the class's own hex for the two places this module
+    deliberately paints a class in something other than its Tailwind value --
+    ``PLAN_WARNING_COLORS`` greys the informational collapse to the page's
+    ``NEUTRAL_TEXT_COLOR`` rather than the stylesheet's ``.text-gray-400``.
+    """
+    element.classes(classes)
+    style = important_color_style(color) if color else class_color_style(classes)
+    if style:
+        element.style(style)
+    return element
+
+
+def _label(text: str, classes: str = '', *, color: Optional[str] = None):
+    """``ui.label`` that paints its colour class instead of only wearing it."""
+    return _paint(ui.label(text), classes, color=color)
+
+
 def _leverage_cell(row: Dict) -> Tuple[str, str, str]:
     """The dry run's ``BP ×`` cell: ``(text, css, tooltip)``. Pure; no ``ui`` call.
 
@@ -567,8 +598,8 @@ class AllocationWizard:
                 # reason said out loud.
                 fractional.set_enabled(bool(self.base.supports_fractional))
                 if not self.base.supports_fractional:
-                    ui.label(NO_FRACTIONAL_SUPPORT_NOTE).classes('text-xs text-gray-400')
-                ui.label(MARKET_ORDER_TIMING_NOTE).classes('text-xs text-orange-400')
+                    _label(NO_FRACTIONAL_SUPPORT_NOTE, 'text-xs text-gray-400')
+                _label(MARKET_ORDER_TIMING_NOTE, 'text-xs text-orange-400')
                 self._notices_container = ui.column().classes('w-full')
             self._rows_container = ui.column().classes(DIALOG_ROWS_CLASSES) \
                 .mark(MARKER_ROWS_VIEWPORT)
@@ -701,33 +732,27 @@ class AllocationWizard:
                                       scale_factor=self.plan.scale_factor)
         if not notices and not warnings:
             return
-        # EVERY COLOUR HERE IS PAINTED INLINE, and that is not habit. Checked in a
-        # real browser: this build ships no Tailwind sheet for the -400/-500
-        # palette and ``styles.css`` defines ``.text-orange-400`` nowhere, so a
-        # ``<div class="text-orange-400">`` computes to plain WHITE. These lines
-        # replaced padded ``alert-banner`` divs, which DID paint -- so leaving them
-        # class-only would have quietly turned every plan notice from an orange
-        # callout into indistinguishable white text. The classes stay because they
-        # are what the DOM reads as and what several tests locate.
+        # Painted through ``_paint`` / ``_label`` like the rest of the dialog: on
+        # this build a bare ``text-orange-400`` renders WHITE, and these lines
+        # replaced padded ``alert-banner`` divs, which did paint -- so class-only
+        # would have quietly turned every plan notice from an orange callout into
+        # indistinguishable body text.
         with self._notices_container:
             if len(notices) + len(warnings) > 2:
-                ui.label(NOTICE_COUNT_FMT.format(
-                    count=len(notices) + len(warnings))) \
-                    .classes('text-xs text-orange-400 mt-1') \
-                    .style(important_color_style(STATUS_OVER_COLOR)) \
-                    .mark(MARKER_NOTICE_COUNT)
+                _label(NOTICE_COUNT_FMT.format(count=len(notices) + len(warnings)),
+                       'text-xs text-orange-400 mt-1').mark(MARKER_NOTICE_COUNT)
             with ui.column().classes(NOTICE_BLOCK_CLASSES) \
                     .mark(MARKER_NOTICE_BLOCK):
                 for text in notices:
                     with ui.row().classes('w-full items-start gap-2 no-wrap'):
-                        ui.icon('warning').classes('text-orange-400 text-sm shrink-0') \
-                            .style(important_color_style(STATUS_OVER_COLOR))
-                        ui.label(text).classes('text-xs text-orange-400') \
-                            .style(important_color_style(STATUS_OVER_COLOR)) \
-                            .mark(MARKER_PLAN_NOTICE)
+                        _paint(ui.icon('warning'), 'text-orange-400 text-sm shrink-0')
+                        _label(text, 'text-xs text-orange-400').mark(MARKER_PLAN_NOTICE)
                 for text, severity in warnings:
-                    ui.label(text).classes(PLAN_WARNING_CLASSES[severity]) \
-                        .style(important_color_style(PLAN_WARNING_COLORS[severity])) \
+                    # ``color=`` on purpose: 'info' is classed ``text-gray-400``,
+                    # which the stylesheet DOES paint -- in #b0bec5, not the page's
+                    # own ``NEUTRAL_TEXT_COLOR``. The severity's declared hex wins.
+                    _label(text, PLAN_WARNING_CLASSES[severity],
+                           color=PLAN_WARNING_COLORS[severity]) \
                         .mark(MARKER_PLAN_WARNING)
 
     def _render_no_order_rows(self):
@@ -763,15 +788,15 @@ class AllocationWizard:
                         ui.label(row['symbol']).classes('w-24 font-medium')
                         ui.label('-' if row['price'] is None
                                  else f"{row['price']:,.2f}").classes('w-28 text-right')
-                        ui.label(row['outcome']).classes('w-32 text-xs text-orange-400')
+                        _label(row['outcome'], 'w-32 text-xs text-orange-400')
                         ui.label(f"{row['target_notional']:,.2f}") \
                             .classes('w-28 text-right')
                         projected = row['projected_notional']
                         ui.label('-' if projected is None
                                  else f"{projected:,.2f}").classes('w-28 text-right')
-                        ui.label(f"{row['unmet_notional']:,.2f}") \
-                            .classes('w-28 text-right text-orange-400')
-                        ui.label(row['reasons']).classes('flex-1 text-xs text-gray-400')
+                        _label(f"{row['unmet_notional']:,.2f}",
+                               'w-28 text-right text-orange-400')
+                        _label(row['reasons'], 'flex-1 text-xs text-gray-400')
 
     @staticmethod
     def _default_selection(plan: AllocationPlan) -> set:
@@ -791,13 +816,14 @@ class AllocationWizard:
             ui.label(f'Managed value ({self.base.valuation_mode}): '
                      f'{self.base.managed_value:,.2f}')
             ui.label(f'Base notional: {self.base.base_notional:,.2f}').classes('font-bold')
-            ui.label(f"as of {self.base.taken_at:%Y-%m-%d %H:%M UTC}").classes('text-xs text-gray-400')
+            _label(f"as of {self.base.taken_at:%Y-%m-%d %H:%M UTC}",
+                   'text-xs text-gray-400')
             # Only when there IS one: a "Reserved: 0.00" chip on every fully
             # allocated plan is noise, and noise is what hides the real case.
             if self.plan.reserved_pct > LABEL_TOTAL_TOLERANCE_PCT:
-                ui.label(RESERVED_FMT.format(amount=self.plan.reserved_notional,
-                                             pct=self.plan.reserved_pct)) \
-                    .classes('text-orange-400').mark(MARKER_RESERVED)
+                _label(RESERVED_FMT.format(amount=self.plan.reserved_notional,
+                                           pct=self.plan.reserved_pct),
+                       'text-orange-400').mark(MARKER_RESERVED)
         # DANGER, not warning, and above the warnings: this one does not merely
         # qualify the numbers below it, it says they are wrong and Submit is off.
         base_block = self._base_block()
@@ -811,7 +837,7 @@ class AllocationWizard:
         # here went stale the moment the user pressed Refresh -- the previous
         # solve's complaint sitting above the new solve's table.
         for warning in self.base.warnings:
-            ui.label(warning).classes('text-xs text-orange-400')
+            _label(warning, 'text-xs text-orange-400')
 
     def _render_rows(self):
         """The dry-run table, left to right: what you HOLD, what will be DONE,
@@ -843,12 +869,12 @@ class AllocationWizard:
         rows = dry_run_rows(self.plan)
         with self._rows_container:
             if not rows:
-                ui.label('No orders required - the account already matches its targets.') \
-                    .classes('text-sm text-gray-400')
+                _label('No orders required - the account already matches its targets.',
+                       'text-sm text-gray-400')
                 return
             if any(r['fractional'] and not r['suppressed'] for r in rows):
-                ui.label(FRACTIONAL_IS_MARKET_ONLY_NOTE) \
-                    .classes('text-xs text-orange-400 shrink-0')
+                _label(FRACTIONAL_IS_MARKET_ONLY_NOTE,
+                       'text-xs text-orange-400 shrink-0')
             with ui.row().classes(GRID_HEAD_CLASSES).mark(MARKER_TABLE_HEAD):
                 for name, header, _width, _numeric in DRY_RUN_COLUMNS:
                     ui.label(header.format(mode=self.plan.valuation_mode)) \
@@ -884,15 +910,18 @@ class AllocationWizard:
             checkbox.set_enabled(not blocked)
             ui.label(row['symbol']).classes(_col('symbol', 'font-medium'))
             # THE BASIS THIS ROW IS TRADING AGAINST.
-            ui.label(_shares(row['current_quantity'])) \
-                .classes(_col('held', 'text-gray-400')).mark(MARKER_ROW_HELD)
-            ui.label(f"{row['current_cost_basis']:,.2f}") \
-                .classes(_col('cost', 'text-gray-400')).mark(MARKER_ROW_COST)
+            _label(_shares(row['current_quantity']),
+                   _col('held', 'text-gray-400')).mark(MARKER_ROW_HELD)
+            _label(f"{row['current_cost_basis']:,.2f}",
+                   _col('cost', 'text-gray-400')).mark(MARKER_ROW_COST)
             value = row['current_value']
             # '-', never 0.00: no price is "not measurable", not "worthless".
-            ui.label('-' if value is None else f"{value:,.2f}") \
-                .classes(_col('value', 'text-gray-400')).mark(MARKER_ROW_VALUE)
-            ui.label(row['side'] or '-').classes(_col(
+            _label('-' if value is None else f"{value:,.2f}",
+                   _col('value', 'text-gray-400')).mark(MARKER_ROW_VALUE)
+            # Green BUY, red SELL -- and PAINTED, which they never were: both
+            # classes render white on this build, so the column that says which
+            # way real money is about to move has always read as plain text.
+            _label(row['side'] or '-', _col(
                 'side', 'text-green-500' if row['side'] == 'BUY'
                 else 'text-red-500' if row['side'] == 'SELL' else 'text-gray-400'))
             ui.label(_shares(row['quantity'])).classes(_col('qty'))
@@ -902,17 +931,17 @@ class AllocationWizard:
                 order_kind, order_class = 'fractional', 'text-blue-400'
             else:
                 order_kind, order_class = 'whole shares', 'text-gray-400'
-            ui.label(order_kind).classes(_col('order', 'text-xs ' + order_class)) \
+            _label(order_kind, _col('order', 'text-xs ' + order_class)) \
                 .mark(MARKER_ORDER_KIND)
             # The GRID the row was sized on, which is the column to scan when a
             # quarter of the book cannot trade fractionally at all.
-            ui.label(row['sizing']).classes(_col(
+            _label(row['sizing'], _col(
                 'sizing', 'text-xs ' + ('text-blue-400'
                                         if row['sizing'] == 'fractional'
                                         else 'text-orange-400')))
             # WHICH RULE produced the quantity. A bumped row holds MORE than the
             # weights asked for, and that must never be silent.
-            ui.label(row['outcome']).classes(_col(
+            _label(row['outcome'], _col(
                 'outcome', 'text-xs ' + ('text-orange-400'
                                          if row['outcome'] != 'normal'
                                          else 'text-gray-400')))
@@ -933,20 +962,20 @@ class AllocationWizard:
             # ASKED -> ACTUAL. They differ whenever the grid, a bump or the label
             # redistribution moved this row, and hiding that would be rewriting the
             # user's weights behind their back.
-            ui.label(f"{row['weight_pct']:.2f}% → {row['projected_weight_pct']:.2f}%") \
-                .classes(_col('weight', 'text-xs '
-                              + ('text-orange-400' if row['redistributed']
-                                 else 'text-gray-400')))
+            _label(f"{row['weight_pct']:.2f}% → {row['projected_weight_pct']:.2f}%",
+                   _col('weight', 'text-xs '
+                        + ('text-orange-400' if row['redistributed']
+                           else 'text-gray-400')))
             ui.label(f"{row['bp_cost']:,.2f}").classes(_col('bp_cost'))
             # Immediately beside BP cost ON PURPOSE: the x IS the explanation of why
             # that figure is not the Est. value, which is the misreading requirement
             # 1b is about.
             text, css, tip = _leverage_cell(row)
-            with ui.label(text).classes(_col('bp_ratio', 'text-xs ' + css)) \
+            with _label(text, _col('bp_ratio', 'text-xs ' + css)) \
                     .mark(MARKER_LEVERAGE):
                 ui.tooltip(tip)
             ui.label(f"{row['bp_usage_pct']:.1f}%").classes(_col('bp_pct'))
-            ui.label(row['reasons']).classes(_col(
+            _label(row['reasons'], _col(
                 'reasons', 'text-xs ' + ('text-orange-400' if row['suppressed']
                                          else 'text-gray-400')))
 
@@ -992,8 +1021,8 @@ class AllocationWizard:
                 if totals is not None:
                     ui.label(f"Est. cash after: {totals['estimated_cash_after']:,.2f}")
                 else:
-                    ui.label('Est. cash after: unknown (broker published no cash balance)') \
-                        .classes('text-orange-400')
+                    _label('Est. cash after: unknown (broker published no cash balance)',
+                           'text-orange-400')
             # Only when a reserve was actually asked for, and only when the broker
             # gave a cash balance to compare it against -- there is no fallback for
             # a balance.
@@ -1001,42 +1030,42 @@ class AllocationWizard:
                 cash_after = totals['estimated_cash_after']
                 reserved = selected_plan.reserved_notional
                 with ui.row().classes('w-full text-sm'):
-                    ui.label(CASH_VS_RESERVE_FMT.format(
+                    _label(CASH_VS_RESERVE_FMT.format(
                         cash=cash_after, reserved=reserved,
-                        delta=cash_after - reserved)) \
-                        .classes('text-orange-400' if cash_after < reserved else '') \
+                        delta=cash_after - reserved),
+                        'text-orange-400' if cash_after < reserved else '') \
                         .mark(MARKER_CASH_VS_RESERVE)
             with ui.row().classes('w-full gap-6 text-sm'):
-                ui.label(f"Held cost: {held_cost:,.2f}").classes('text-gray-400')
-                ui.label(f"Held value: {sum(priced):,.2f}"
-                         + ('' if len(priced) == len(shown)
-                            else f" ({len(shown) - len(priced)} unpriced, excluded)")) \
-                    .classes('text-gray-400')
+                _label(f"Held cost: {held_cost:,.2f}", 'text-gray-400')
+                _label(f"Held value: {sum(priced):,.2f}"
+                       + ('' if len(priced) == len(shown)
+                          else f" ({len(shown) - len(priced)} unpriced, excluded)"),
+                       'text-gray-400')
                 if fees:
-                    ui.label(f"Est. fees: {sum(fees):,.2f}").classes('text-gray-400')
+                    _label(f"Est. fees: {sum(fees):,.2f}", 'text-gray-400')
             # Requirement 1b. Only when there is a charge to explain -- a sell-only
             # plan reserves nothing and the sentence would be noise.
             if buy_value > MONEY_EPSILON:
-                ui.label(BP_IS_A_CHARGE_NOTE_FMT.format(
+                _label(BP_IS_A_CHARGE_NOTE_FMT.format(
                     buy_value=buy_value, required=required,
-                    ratio=required / buy_value)).classes('text-xs text-gray-400') \
+                    ratio=required / buy_value), 'text-xs text-gray-400') \
                     .mark(MARKER_BP_NOTE)
             with ui.row().classes('w-full gap-6 text-sm'):
                 # SIGNED: a bump's over-allocation nets against a rounding shortfall,
                 # which is what "how far off target will I be" actually means.
-                ui.label(f"Off target after rounding: {summary['residual_notional']:,.2f} "
-                         f"({summary['residual_pct']:.2f}% of base)") \
-                    .classes('text-orange-400' if abs(summary['residual_pct']) >= 1.0 else '')
+                _label(f"Off target after rounding: {summary['residual_notional']:,.2f} "
+                       f"({summary['residual_pct']:.2f}% of base)",
+                       'text-orange-400' if abs(summary['residual_pct']) >= 1.0 else '')
                 ui.label(f"Fractional: {summary['fractional_rows']} / "
                          f"whole shares: {summary['whole_share_rows']}"
                          + (f" / eligibility unknown: {summary['unknown_rows']}"
                             if summary['unknown_rows'] else ''))
                 if summary['bumped_rows']:
-                    ui.label(f"Bumped to 1 share: {summary['bumped_rows']} "
-                             f"(+{summary['bumped_notional']:,.2f})").classes('text-orange-400')
+                    _label(f"Bumped to 1 share: {summary['bumped_rows']} "
+                           f"(+{summary['bumped_notional']:,.2f})", 'text-orange-400')
             if selected_plan.required_buying_power > selected_plan.available_buying_power:
-                ui.label('Required buying power exceeds available - the smallest buys will be '
-                         'truncated as buying power runs out.').classes('text-xs text-orange-400')
+                _label('Required buying power exceeds available - the smallest buys will be '
+                       'truncated as buying power runs out.', 'text-xs text-orange-400')
 
     def _toggle(self, symbol: str, checked: bool):
         if checked:
@@ -1359,14 +1388,14 @@ def render_income_panel(events: List[Dict], open_total: float,
         with ui.row().classes('w-full items-center justify-between'):
             ui.label('Income (last 30 days)').classes('text-lg font-bold')
             with ui.row().classes('gap-2 items-center'):
-                ui.label(f'Unallocated: {open_total:,.2f}').classes('font-bold text-green-500')
+                _label(f'Unallocated: {open_total:,.2f}', 'font-bold text-green-500')
                 ui.button('Refresh', on_click=on_sync).props('outline dense')
                 # Nothing to invest is not a run worth opening the wizard for.
                 ui.button('Invest', on_click=lambda: on_invest(open_total)) \
                     .props('color=primary dense').set_enabled(open_total > 0)
         if not events:
-            ui.label('No deposits or dividends in the last 30 days.') \
-                .classes('text-sm text-gray-400')
+            _label('No deposits or dividends in the last 30 days.',
+                   'text-sm text-gray-400')
             return
         # A real ``ui.table``, like every other table on this page. It was hand-rolled
         # out of ``ui.row()`` + ``ui.label()`` with hardcoded widths, so it had none of

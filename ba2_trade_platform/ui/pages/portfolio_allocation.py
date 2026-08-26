@@ -148,7 +148,7 @@ from ..utils.portfolio_allocation_view import (
     ALLOCATION_BAR_LEGEND, allocation_bar, band_color, RESERVE_SELL_WARNING,
     SHARE_DEFAULT_NOTE, symbol_total_bar, SYMBOL_TOTAL_BAR_CAPTION,
     LABEL_TOTAL_BAR_CAPTION, LABEL_TOTAL_BAR_LEGEND, LABEL_TOTAL_CLASSES,
-    LABEL_TOTAL_TOOLTIP,
+    LABEL_TOTAL_COLORS, LABEL_TOTAL_TOOLTIP, class_color_style,
     label_total_readout,
     load_current_symbol_shares, load_last_symbol_shares, managed_total_value,
     important_color_style,
@@ -655,6 +655,11 @@ def _validate_symbols(account_id: int, symbols: List[str]):
 #: Severity -> stylesheet classes for the totals footer. Red the moment the label
 #: targets pass 100, which is the existing validation surfaced BEFORE the user
 #: presses Allocate rather than inside the dry run.
+#:
+#: The COLOUR comes from ``LABEL_TOTAL_COLORS``, not from these class names --
+#: neither ``.text-orange-400`` nor ``.text-red-400`` exists on this build, so the
+#: footer's whole warning has been rendering in ordinary white. The classes stay:
+#: they are what the DOM reads as and what the tests locate this line by.
 FOOTER_CLASSES = {
     'ok': 'text-xs text-secondary-custom',
     'warning': 'text-xs text-orange-400',
@@ -969,6 +974,12 @@ def _apply_symbol_bar(live: Dict[str, Any], label: str) -> None:
     widgets['pct'].set_text(bar.current_text)
     widgets['delta'].set_text(bar.delta_text)
     widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+    # PAINTED, like the label row's delta and the reserve row's -- and this one was
+    # the odd bar out: it wore the status class and nothing painted it, so its
+    # verdict rendered in plain white while the two identical readouts either side
+    # of it were coloured.
+    widgets['delta'].style(replace=important_color_style(
+        label_status_color(bar.status)))
 
 
 def _apply_reserve_row(live: Dict[str, Any]) -> None:
@@ -1045,11 +1056,19 @@ def _apply_total_notice(live: Dict[str, Any]) -> None:
         widgets['value'].set_text(decided.text)
         widgets['detail'].set_text(decided.detail)
         widgets['detail'].classes(replace=LABEL_TOTAL_CLASSES[decided.severity])
+        widgets['detail'].style(replace=important_color_style(
+            LABEL_TOTAL_COLORS[decided.severity]))
     footer = live['footer']
     if footer is not None:
         text, severity = format_allocation_footer(targets, live['unallocated_pct'])
         footer.set_text(text)
         footer.classes(replace=FOOTER_CLASSES[severity])
+        # ADDED, not ``replace=``: the footer also carries ``TABULAR_NUMS``, and
+        # wiping that would unalign the percentages it exists to line up. Every
+        # severity has a colour (including 'ok') precisely because this is
+        # rewritten in place -- an omitted declaration would leave the previous
+        # severity's orange behind when the total comes back to 100.
+        footer.style(important_color_style(LABEL_TOTAL_COLORS[severity]))
 
 
 def _apply_page_figures(live: Dict[str, Any]) -> None:
@@ -2226,7 +2245,12 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
                                                        echo_to=slider))
         # The consequence, kept NEXT TO THE SLIDER that causes it rather than in a
         # caption: it is the one sentence saying that dragging this up is not free.
-        ui.label(RESERVE_SELL_WARNING).classes('text-xs text-orange-400')
+        # PAINTED, not merely classed: ``.text-orange-400`` is not in
+        # ``styles.css`` and nothing on this build generates it, so the one
+        # sentence warning that dragging this slider up SELLS has always been
+        # rendering in the same white as the captions around it.
+        ui.label(RESERVE_SELL_WARNING).classes('text-xs text-orange-400') \
+            .style(class_color_style('text-orange-400'))
         live['reserve_caption'] = ui.label(
             format_reserve_caption(live['base_notional'], live['unallocated_pct'])
         ).classes('text-xs text-secondary-custom').style(TABULAR_NUMS)
@@ -2822,7 +2846,8 @@ async def content() -> None:
                     logger.error(f"Income panel failed to load: {e}", exc_info=True)
                     events, open_total, working_note = [], 0.0, None
                     ui.label(f'Income could not be loaded: {e}') \
-                        .classes('text-xs text-orange-400')
+                        .classes('text-xs text-orange-400') \
+                        .style(class_color_style('text-orange-400'))
                 render_income_panel(
                     events, open_total, working_note=working_note,
                     on_sync=lambda: ui.timer(0.1, _refresh, once=True),

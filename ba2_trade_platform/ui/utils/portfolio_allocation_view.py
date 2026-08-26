@@ -2126,6 +2126,10 @@ NEUTRAL_TEXT_COLOR = '#A0AEC0'
 #: always carried so the appearance is the one that was intended all along.
 STATUS_OVER_COLOR = '#FB923C'
 
+#: Tailwind's ``text-red-400`` -- the "these targets do not add up" red the totals
+#: footer and the label-total readout have always been classed with.
+STATUS_NEGATIVE_COLOR = '#F87171'
+
 #: Tailwind's ``text-green-500`` / ``text-red-500``, on the same terms.
 PNL_POSITIVE_COLOR = '#22C55E'
 PNL_NEGATIVE_COLOR = '#EF4444'
@@ -2230,6 +2234,91 @@ def pnl_color(pnl) -> str:
     if pnl is None or pnl.amount is None or abs(pnl.amount) <= MONEY_EPSILON:
         return NEUTRAL_TEXT_COLOR
     return PNL_POSITIVE_COLOR if pnl.amount > 0 else PNL_NEGATIVE_COLOR
+
+
+# ---------------------------------------------------------------------------
+# WHICH COLOUR CLASSES ACTUALLY PAINT ON THIS BUILD
+#
+# The section above says why a class is not trusted to paint. This says exactly
+# which ones do, because "not trusted" turned out to be "does not, at all".
+#
+# ``ui/static/styles.css`` hand-writes a SHORT list of Tailwind-shaped colour
+# classes for the dark theme (``.text-gray-400``, ``.text-orange-600``, ...) and
+# nothing generates the rest. NiceGUI 3.8 does ship a Tailwind 4 browser build,
+# which is why this looked safe for so long, but that build only compiles a
+# ``<style type="text/tailwindcss">`` source block and this app has none -- so it
+# emits no utilities at all. With no rule anywhere, ``styles.css``'s own
+# ``p, span, div, label, ... { color: #ffffff }`` is the last thing standing, and
+# every unlisted colour class computes to PLAIN WHITE.
+#
+# Measured in headless Chrome against the real page head, not reasoned about:
+# ``text-orange-400``, ``text-red-400``, ``text-red-500``, ``text-green-500``,
+# ``text-blue-400``, ``text-sky-400``, ``text-yellow-500`` -- all
+# ``rgb(255,255,255)``. Three separate attempts to fix this class of bug looked
+# right in Python and did not paint, which is why the two collections below exist
+# instead of a convention: a class is either in the stylesheet's list or it has a
+# hex here, and ``tests/test_ui_colour_classes_paint.py`` fails if a screen uses
+# one that is in neither.
+# ---------------------------------------------------------------------------
+
+#: The colour classes ``ui/static/styles.css`` DEFINES, and therefore the only
+#: ones that paint without help. Pinned against the stylesheet itself by a test,
+#: so deleting a rule there cannot silently turn a screen white.
+#:
+#: Their hexes are the dark theme's own, NOT Tailwind's -- ``.text-gray-400`` is
+#: ``#b0bec5`` here -- which is why they are deliberately left to the stylesheet
+#: rather than restated below: restating them would fork the theme.
+STYLESHEET_COLOR_CLASSES = frozenset({
+    'text-gray-400', 'text-gray-500', 'text-gray-600', 'text-gray-700',
+    'text-blue-600', 'text-green-600', 'text-red-600', 'text-orange-600',
+    'text-yellow-600',
+})
+
+#: Every OTHER colour class these screens use, with the hex it was always meant
+#: to be -- Tailwind's own value for that name, so the appearance is the one the
+#: source has been claiming since it was written.
+#:
+#: The four that already had a constant reuse it rather than repeating a literal:
+#: one verdict, one hex, wherever it is spelled.
+UNPAINTED_CLASS_COLORS = {
+    'text-orange-400': STATUS_OVER_COLOR,     # #FB923C
+    'text-green-500': PNL_POSITIVE_COLOR,     # #22C55E
+    'text-red-500': PNL_NEGATIVE_COLOR,       # #EF4444
+    'text-yellow-500': BAND_OFF_COLOR,        # #FACC15 -- the bar's own off-band
+    'text-red-400': STATUS_NEGATIVE_COLOR,    # #F87171
+    'text-blue-400': '#60A5FA',
+    'text-sky-400': '#38BDF8',
+}
+
+#: Matches a Tailwind-shaped colour class anywhere in a class string.
+_COLOR_CLASS_RE = re.compile(r'\btext-[a-z]+-\d+\b')
+
+
+def color_classes(classes: Optional[str]):
+    """Every Tailwind-shaped colour class in a class string, in order. Pure."""
+    return _COLOR_CLASS_RE.findall(classes or '')
+
+
+def class_color_style(classes: Optional[str]) -> str:
+    """The inline declaration a class string needs in order to paint. Pure.
+
+    ``''`` when it needs none -- either it carries no colour class at all, or the
+    one it carries is in ``STYLESHEET_COLOR_CLASSES`` and the stylesheet paints it
+    (in the dark theme's own hue, which is the point of deferring).
+
+    Raises:
+        KeyError: the class string names a colour class that neither the
+            stylesheet defines nor ``UNPAINTED_CLASS_COLORS`` has a hex for. That
+            is the failure worth having: the alternative is the element rendering
+            white, which is exactly the defect this exists to end, and a white
+            label in a money table is indistinguishable from an ordinary one.
+    """
+    for name in color_classes(classes):
+        if name in STYLESHEET_COLOR_CLASSES:
+            continue
+        return important_color_style(UNPAINTED_CLASS_COLORS[name])
+    return ''
+
 
 #: Never let the track's denominator be 0. Every label at zero with no target is a
 #: real state (a brand-new account), and the bars are then simply empty.
@@ -2839,6 +2928,24 @@ LABEL_TOTAL_CLASSES = {
     'ok': 'text-xs text-secondary-custom',
     'warning': 'text-xs text-orange-400',
     'negative': 'text-xs text-red-400 font-bold',
+}
+
+#: ...and the SAME severities as hex, because the classes above do not paint --
+#: ``.text-orange-400`` and ``.text-red-400`` are both absent from ``styles.css``
+#: and nothing generates them, so a set of targets adding to 118% has always been
+#: reported in ordinary white. Same convention as ``PLAN_WARNING_CLASSES`` /
+#: ``PLAN_WARNING_COLORS``.
+#:
+#: 'ok' is a real entry rather than an omission: these readouts are rewritten IN
+#: PLACE as the user types, so a severity dropping back to 'ok' has to actively
+#: repaint. An absent colour would leave the previous orange on screen.
+#:
+#: Shared with the page's ``FOOTER_CLASSES``, which is the same three severities
+#: of the same judgement -- ``judge_label_total``'s.
+LABEL_TOTAL_COLORS = {
+    'ok': NEUTRAL_TEXT_COLOR,
+    'warning': STATUS_OVER_COLOR,
+    'negative': STATUS_NEGATIVE_COLOR,
 }
 
 
