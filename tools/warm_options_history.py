@@ -606,11 +606,19 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
 
     # The tastytrade SDK sets its OWN logger to DEBUG at import time (tastytrade/__init__.py) and
     # streamer.py logs every raw websocket frame at that level -- one record per contract per
-    # candle. Whatever picks that up (this process's own handler setup, or a parent's) turns a
-    # single busy expiry into thousands of lines; over a multi-day run across 8 workers that is
-    # where the multi-GB-per-worker logs actually came from, not this tool's own (sparse)
-    # progress/retry lines. Cap it unconditionally -- this is a strict verbosity win with no
-    # downside, independent of where --log-file (or stdout) output ends up.
+    # candle. That import-time setLevel(DEBUG) runs exactly ONCE per process, the first time
+    # anything does `import tastytrade` -- and our own provider wrapper does that LAZILY, deep
+    # inside the streaming call (ba2_providers/options/tastytrade.py's `from tastytrade import
+    # DXLinkStreamer`, only reached once a unit actually opens a socket). A setLevel(WARNING)
+    # placed here alone runs BEFORE that lazy import ever fires, so the SDK's own DEBUG setting
+    # -- applied later, on first stream -- silently overwrites it (confirmed live: DEBUG spam
+    # kept flowing after the "fix" that didn't force this ordering). Import the SDK ourselves
+    # FIRST so its one-time init has already happened, then cap it -- guaranteeing our override
+    # is the one that sticks, regardless of when streaming actually starts.
+    try:
+        import tastytrade as _tastytrade_sdk  # noqa: F401 -- imported only to force its __init__
+    except ImportError:  # pragma: no cover - sdk not installed; nothing to cap
+        pass
     logging.getLogger("tastytrade").setLevel(logging.WARNING)
 
     if log is None:

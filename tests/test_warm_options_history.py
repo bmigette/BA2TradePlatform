@@ -700,3 +700,36 @@ def test_the_vendor_debug_logger_is_capped_regardless_of_log_file(provider, stor
     rc, _lines = _run(provider, store)
     assert rc == 0
     assert logging.getLogger("tastytrade").level == logging.WARNING
+
+
+def test_the_vendor_debug_cap_survives_the_sdks_own_lazy_import(provider, store):
+    """Regression for the 2026-08-26 fix-that-didn't-fix-it: a live relaunch with the FIRST
+    version of this cap kept emitting DEBUG spam, because tastytrade/__init__.py's
+    logger.setLevel(DEBUG) runs the first time ANYTHING imports the package -- and our own
+    provider wrapper does that LAZILY, deep inside the actual streaming call (only reached once
+    a unit opens a socket), i.e. AFTER a setLevel(WARNING) placed early in main() had already
+    run. That later, SDK-owned setLevel(DEBUG) silently overwrote the early cap.
+
+    First prove the mechanism is real (cap-then-import loses); then prove main()'s own ordering
+    (import-then-cap) survives a later re-import exactly the way the real streaming call would
+    trigger it."""
+    import logging
+    import sys
+
+    sys.modules.pop("tastytrade", None)  # simulate: never yet imported in this process
+
+    # The FIRST (broken) fix: cap before the SDK's own (lazy, later) import ever runs.
+    logging.getLogger("tastytrade").setLevel(logging.WARNING)
+    import tastytrade  # noqa: F401 -- exactly what ba2_providers' lazy `from tastytrade import
+    # DXLinkStreamer` does the first time a unit actually streams
+    assert logging.getLogger("tastytrade").level == logging.DEBUG, (
+        "if this fails, the SDK no longer sets DEBUG at import time and the ordering bug this "
+        "test guards no longer applies -- the fix in main() could be simplified")
+
+    # main()'s actual ordering: import the SDK itself FIRST (forcing its one-time init to run
+    # now), cap SECOND. A later re-import (this test's own `import tastytrade` above, or the
+    # real streaming call) is then a sys.modules cache hit -- __init__.py does not re-run, so
+    # the cap sticks for the rest of the process.
+    rc, _lines = _run(provider, store)
+    assert rc == 0
+    assert logging.getLogger("tastytrade").level == logging.WARNING
