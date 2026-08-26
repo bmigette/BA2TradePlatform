@@ -320,8 +320,15 @@ def test_sells_are_never_scaled_down():
     assert by["SELLME"].delta_quantity == -500.0
     assert by["SELLME"].estimated_value == 50_000.0
     assert not any("scaled" in r for r in by["SELLME"].reasons)
-    assert by["BUYME"].delta_quantity == 10.0
     assert plan.total_sell_value == 50_000.0
+    # ...and what the sell FREES funds the buy. This used to read 10 shares: the
+    # scaler measured the 50,000 buy against the 1,000 of published buying power
+    # and cut it by 98%, on a plan whose own sell hands back 50,000 before the buy
+    # is ever sent. See test_portfolio_allocation_sell_releases_bp.py.
+    assert by["SELLME"].bp_released == 50_000.0
+    assert by["BUYME"].delta_quantity == 500.0
+    assert plan.scale_factor == 1.0
+    assert plan.total_buying_power == 51_000.0
 
 
 def test_zero_buying_power_skips_every_buy():
