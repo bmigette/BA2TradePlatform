@@ -163,12 +163,26 @@ def test_close_option_action_through_the_real_seam_rides_the_transaction(
 
 
 def _capture_errors(monkeypatch):
-    """``logger.error`` from the AlpacaAccount module. NOT caplog — ba2_trade_platform's
-    logger installs its own handler with ``propagate = False``."""
-    import sys
-    module = sys.modules["ba2_trade_platform.modules.accounts.AlpacaAccount"]
+    """``logger.error`` as seen BY ``close_option_position`` itself. NOT caplog —
+    ba2_trade_platform's logger installs its own handler with ``propagate = False``.
+
+    Patched in the function's own ``__globals__`` rather than via ``sys.modules``: that is
+    by definition the namespace the code under test resolves ``logger`` in, so it cannot be
+    defeated by a re-import, by the package ``__init__`` rebinding the module name to the
+    class, or by another test holding a different logger object of the same name.
+    """
+    module_globals = AlpacaAccount.close_option_position.__globals__
+    real = module_globals["logger"]
     messages = []
-    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
+
+    class _Tee:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def error(self, msg, *a, **k):
+            messages.append(str(msg))
+
+    monkeypatch.setitem(module_globals, "logger", _Tee())
     return messages
 
 

@@ -392,10 +392,75 @@ class OptionsAccountInterface(ABC):
             return self._submit_option_order_impl(parent, legs, leg_orders or None)
         except Exception as e:
             logger.error(f"Option order submission failed for {parent.symbol}: {e}", exc_info=True)
-            parent.status = OrderStatus.ERROR
-            parent.comment = f"{(parent.comment or '')} | option submit error: {str(e)[:200]}"
-            update_instance(parent)
+            self._unwind_failed_option_submission(parent, leg_orders, e)
             return None
+
+    def _unwind_failed_option_submission(self, parent, leg_orders, error) -> None:
+        """Terminalise the rows a FAILED submission left behind — but only if nothing
+        reached the broker.
+
+        THE PARENT WAS NEVER THE WHOLE ORDER. A combo persists a parent plus one child per
+        leg BEFORE the broker is called, and this except used to mark only the parent ERROR.
+        The N children kept ``status=PENDING`` and ``broker_order_id=None``, and nothing in
+        the platform can clear that state: ``refresh_orders`` sweeps only rows that HAVE a
+        broker id, ``refresh_transactions``' ``never_opened`` cleanup requires EVERY order on
+        the transaction to be terminal, ``_fail_unsent_entry`` is equity-only, and
+        ``clean_pending_orders`` is a manual UI button.
+
+        The cost is not cosmetic. ``open_option_orders_book_wide`` keeps every non-terminal
+        option order whose transaction is not CLOSED/FAILED, so a stranded SHORT PUT child is
+        counted as live delivery obligation for ever — measured at $24,000 on a 2-lot 120-strike
+        bull put spread the broker had REJECTED — and ``_refuse_if_cannot_take_delivery`` then
+        refuses bear put spread, bull put spread, cash-secured put, short straddle, short
+        strangle, iron condor, jade lizard and put ratio spread, account-wide across every
+        expert, until someone repairs it by hand.
+
+        THE ASYMMETRY THAT MAKES THIS SAFE. This same ``except`` catches two very different
+        events. A rejection (approval tier, buying power, a malformed request) or a network
+        failure before the request went out leaves NOTHING at the broker, and those rows must
+        vanish from the book. A failure while writing the broker's RESPONSE back leaves the
+        contracts genuinely LIVE, and terminalising those rows would hide a real short put
+        from the assignment gate — the exact inverse of the harm above, and the more expensive
+        direction. The two are told apart by ``broker_order_id``, which the live adapter
+        persists the instant ``submit_order`` returns and before any response mapping, so the
+        window in which an accepted order looks unsent is a single DB write wide.
+
+        Deliberately NOT touched: the Transaction. Terminalising all of its orders re-arms
+        ``refresh_transactions``' own ``never_opened`` cleanup, which deletes the stub row
+        (cascading to its orders) with an activity-log entry naming every order error. Writing
+        a second, competing cleanup here would race it.
+        """
+        from ba2_common.core.db import update_instance
+        from ba2_common.core.types import OrderStatus
+        from ba2_common.logger import logger
+
+        why = str(error)[:200]
+        parent.comment = f"{(parent.comment or '')} | option submit error: {why}"
+
+        if parent.broker_order_id:
+            # ACCEPTED, then something failed writing the response back. The contracts are
+            # live: leave every row non-terminal so the position keeps counting against the
+            # reserve and the assignment gate, and so refresh_orders can adopt it by its id.
+            update_instance(parent)
+            logger.error(
+                f"Option order {parent.id} ({parent.symbol}) was ACCEPTED by the broker "
+                f"(broker_order_id={parent.broker_order_id}) but processing its response "
+                f"failed: {why}. The order and its {len(leg_orders or [])} leg(s) are LEFT "
+                f"OPEN — the contracts exist at the broker and refresh_orders will reconcile "
+                f"them. Do NOT clear these rows by hand without checking the broker first.")
+            return
+
+        parent.status = OrderStatus.ERROR
+        update_instance(parent)
+        for child in (leg_orders or []):
+            child.status = OrderStatus.ERROR
+            child.comment = f"{(child.comment or '')} | option submit error: {why}"
+            update_instance(child)
+        if leg_orders:
+            logger.error(
+                f"Option order {parent.id} ({parent.symbol}) never reached the broker: {why}. "
+                f"Its {len(leg_orders)} leg order(s) have been marked ERROR too — left PENDING "
+                f"they would be counted as an open position by every option gate for ever.")
 
     def _refuse_uncovered_covered_call(self, legs: List[OptionLeg], quantity: int,
                                        option_strategy: Optional[str]) -> None:

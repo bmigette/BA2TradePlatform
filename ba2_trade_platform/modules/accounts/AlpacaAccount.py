@@ -6023,6 +6023,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             f"broker_order_id={alpaca_order.id}, legs={len(legs)}"
         )
 
+        # PERSIST THE BROKER ID BEFORE ANYTHING ELSE CAN RAISE.
+        # The wrapper's except block decides whether to terminalise this order and its leg
+        # children by asking whether the broker has it (OPT-S1), and every line below —
+        # cache invalidation, response mapping, per-leg matching — can throw. Written here
+        # the "accepted but not yet recorded" window is one DB write wide instead of the
+        # whole write-back; without it, a live combo could be marked ERROR and vanish from
+        # the reserve and assignment gates while its contracts sit at the broker.
+        trading_order.broker_order_id = str(alpaca_order.id) if alpaca_order.id else None
+        if trading_order.broker_order_id:
+            update_instance(trading_order)
+
         # Invalidate balance cache - a submitted order changes buying power.
         self.invalidate_balance_cache()
 
