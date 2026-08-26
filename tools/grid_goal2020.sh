@@ -90,14 +90,72 @@ INTERVAL="${INTERVAL:-5min}"
 # two years -- silently, because preload treats "cache exists but has no rows in this sub-range"
 # as a legitimate gap (recent IPO / holiday) rather than an error.
 #
-# The cache health tool ALREADY had a period-coverage check; it was simply never asked the right
-# question. Its defaults are --ohlcv-interval 1d --start 2022-01-01, and daily has deep history,
-# so running it with defaults reports everything healthy. It MUST be given the job's OWN interval
-# and start date -- which is the entire point of this block. (Its symbol sample was also the
-# alphabetical head, now a seeded random sample, which is the other reason this slipped through.)
+# SWITCHED to check_window_coverage.py (2026-08-26), matching grid_goal2020_matrix3.sh -- the
+# original cache_health_check.py-based version here produced a false FATAL on a genuinely
+# complete cache: its "INDICATOR WARMUP dependency" check demands 375 CALENDAR DAYS of history
+# BEFORE $START for indicator lead-in, which nobody fetches when the download scope is stated as
+# "$START -> $END" (verified directly: AA/AAP/AAON's 5min cache runs exactly 2020-01-02 ->
+# 2026-06-30 -- a deliberate, COMPLETE download of the stated window; the tool's threshold, not
+# the data, was wrong). It also exits 0 regardless of what it finds and is far too slow at 5min
+# (~321s for 8 symbols measured -- see check_window_coverage.py's own header).
+#
+# UNIVERSE SCOPE: unlike matrix3 (one fixed --universe file), this grid is screener-driven with a
+# DIFFERENT disjoint cap-band universe per job. check_window_coverage.py with --symbols omitted
+# samples the WHOLE cache (7,048 5min / 18,731 1d files -- delisted tickers, ETFs, symbols no
+# expert will ever touch) and measures something nobody cares about: verified 71%/63% cache-wide
+# on this exact cache, matching matrix3's own comment ("72%/66% cache-wide versus 97%/95% on the
+# Senate universe"). So each band's actual screened union is derived here the SAME way the real
+# optimize run does it (ba2test_launcher.py's `_loosest` pattern): the union of every symbol
+# `screened_symbol_union` could EVER select over [START, END] under the loosest end of every
+# screener gene for that band (most-admitting thresholds + max_stocks at its ceiling) -- the
+# correct superset a run actually touches, not the raw store or the whole cache.
 echo
-echo "=== PREFLIGHT cache coverage: interval=${INTERVAL} window ${START} -> ${END}"
-if ! "$PY" tools/cache_health_check.py       --ohlcv-interval "$INTERVAL" --start "$START" --end "$END"       --skip-workers --skip-gaps --validity-symbols 60; then
+echo "=== PREFLIGHT: deriving each cap-band's screened universe (loosest gene bound)"
+_UNIV_DIR="$(mktemp -d)"
+"$PY" - "$STORE" "$START" "$END" "$_UNIV_DIR" <<'EOF'
+import sys
+from ba2_providers.screener import metric_store as ms
+
+store, start, end, outdir = sys.argv[1:5]
+store_df = ms.load_store(store)
+if store_df.empty:
+    sys.exit(f"FATAL: metric store empty at {store}")
+
+# Mirrors _SCREENER_CAP_BANDS in ba2test_launcher.py -- keep the two in sync if the bands change.
+BANDS = {
+    "small": {"min": 5e7,  "cap_max": 2e9},
+    "mid":   {"min": 2e9,  "cap_max": 1e10},
+    "large": {"min": 1e10, "cap_max": None},
+}
+for band, b in BANDS.items():
+    loosest = {
+        "market_cap_min": b["min"],
+        "relative_volume_min": 0.0,
+        "price_drop_pct": 0.0,
+        "weinstein_stage2_only": 0,
+        "max_stocks": 50,   # screener_max_stocks's ceiling (_SCREENER_OPT)
+    }
+    if b["cap_max"] is not None:
+        loosest["market_cap_max"] = b["cap_max"]
+    union = ms.screened_symbol_union(store_df, start, end, loosest)
+    path = f"{outdir}/{band}.txt"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(union))
+    print(f"  {band}: {len(union)} symbol(s) ever screened-in -> {path}")
+EOF
+echo "=== PREFLIGHT cache coverage: window ${START} -> ${END}"
+# Checks BOTH intervals (the 5min bars the engine PRICES with, and the 1d bars the indicators and
+# the screener metric store read) for EACH band's own universe.
+_cov_fail=0
+for _band in small mid large; do
+  _ufile="$_UNIV_DIR/${_band}.txt"
+  for _iv in "$INTERVAL" 1d; do
+    echo "--- coverage: band=${_band} interval=${_iv}"
+    "$PY" tools/check_window_coverage.py --interval "$_iv" --start "$START" \
+        --symbols "@$_ufile" --sample 150 --min-covered-pct 75 || _cov_fail=1
+  done
+done
+if [ "$_cov_fail" = "1" ]; then
   echo "=== PREFLIGHT FAILED: the cache does not cover this window at this interval."
   echo "===   Backfill first, e.g.:"
   echo "===   ba2-test fetch-cache --provider fmp --timeframes ${INTERVAL} \\"
