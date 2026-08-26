@@ -1034,22 +1034,19 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # (the B10 orphan-leg defect, run 760's BABA/C/MRVL puts). The
                     # structure-quantity rewrite is likewise skipped (mixed-unit garbage);
                     # the parent + the engine's own sync own the structures count.
+                    #
+                    # The arithmetic itself lives in ``ba2_common.core.utils`` because the
+                    # LIVE settlement door (``AlpacaAccount._apply_option_activity``) has
+                    # to answer the same question about the same rows, and two copies of
+                    # it are how the two doors would come to disagree about one structure.
+                    # Computed for EVERY transaction (it is empty for an equity one) so
+                    # the closing arm below can read it too.
+                    from ba2_common.core.utils import (
+                        every_option_contract_is_flat, option_contract_net,
+                        option_structure_is_flat)
+                    option_net = option_contract_net(orders)
                     if multi_leg_parent_ids:
-                        contract_net: Dict[str, float] = {}
-                        for order in orders:
-                            if getattr(order, "asset_class", None) != AssetClass.OPTION:
-                                continue
-                            contract = getattr(order, "contract_symbol", None)
-                            if not contract:
-                                continue  # net-only parent, not a contract position
-                            o_filled = order.filled_qty or 0
-                            if order.status in executed_statuses or o_filled > 0:
-                                qty = float(o_filled if o_filled else order.quantity or 0)
-                                if qty:
-                                    contract_net[contract] = contract_net.get(contract, 0.0) + (
-                                        qty if order.side == OrderDirection.BUY else -qty)
-                        position_balanced = bool(contract_net) and all(
-                            abs(v) < 0.0001 for v in contract_net.values())
+                        position_balanced = option_structure_is_flat(option_net)
                         calculated_quantity = 0.0
 
                     # Update transaction quantity if different
@@ -1175,16 +1172,20 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # by refusing to close a structure while any of its contracts is
                     # still open.
                     #
-                    # WHAT THIS ARM IS, THEN. The BACKTEST fix, and — for live —
-                    # DEFENCE IN DEPTH. In the backtest engine the settlement really does
-                    # arrive as a FILLED dependent OPTION order
+                    # WHAT THIS ARM IS, THEN. The BACKTEST fix — and, since the OPT-S3
+                    # fix landed, a LIVE arm that really does fire. In the backtest engine
+                    # the settlement arrives as a FILLED dependent OPTION order
                     # (``_record_option_expiry_close`` links its synthetic close to the
                     # entry via ``depends_on_order``, which is what makes it dependent),
                     # so this branch is the one that fired and this guard is the fix.
-                    # Live, no code path writes a FILLED dependent OPTION order onto a
-                    # multi-leg option transaction, so the guarded arm is currently
-                    # UNREACHABLE for a live structure: it costs nothing, and it is
-                    # already correct for the day a live path starts producing that shape.
+                    # NO LIVE PATH PRODUCED THAT SHAPE UNTIL OPT-S3: recording a settled
+                    # leg (``AlpacaAccount._record_option_settlement_order``) writes
+                    # exactly such a row onto a still-OPENED structure, so from the next
+                    # refresh pass onward this guard is the only thing stopping the live
+                    # structure being re-orphaned through THIS door instead. The two
+                    # readings share one ``option_contract_net`` so they cannot drift;
+                    # ``tests/test_option_multileg_settlement.py::
+                    # test_the_REFRESH_pass_does_not_undo_it`` pins them together.
                     #
                     # THE BRANCH AS IT STOOD. ``filled_closing_orders`` is "some DEPENDENT
                     # order on this transaction is FILLED", and on a multi-leg option
@@ -1205,19 +1206,25 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # in through the mixed-unit balance sums (fixed by the per-contract
                     # ``contract_net`` above), this one walks straight past that fix.
                     #
-                    # NO NEW LINKAGE IS NEEDED to tell the cases apart. ``multi_leg_parent_ids``
-                    # is non-empty exactly when this transaction carries an MLEG net-only
-                    # PARENT (an OPTION order with no ``contract_symbol`` and no
-                    # ``parent_order_id``) — i.e. when the legs are joined by
-                    # ``parent_order_id`` at all — and ``position_balanced`` has already been
-                    # recomputed per CONTRACT for precisely that case.
+                    # NO NEW LINKAGE IS NEEDED to tell the cases apart, and the test is ONE
+                    # condition, not two: does any OPTION CONTRACT on this transaction
+                    # still net open? That is a fact about the rows themselves, so it needs
+                    # no parent, no strategy tag and no leg count.
                     #
-                    # A SINGLE-LEG option is NOT held back: it writes one contract-carrying
-                    # order and no parent, so ``multi_leg_parent_ids`` is empty and it still
-                    # closes on its own closing fill. It has no sibling to wait on, and
-                    # stranding it OPENED would be the mirror of the bug. An EQUITY
-                    # transaction has no OPTION orders at all and is untouched.
-                    one_leg_of_many_settled = bool(multi_leg_parent_ids) and not position_balanced
+                    # A SINGLE-LEG option is NOT held back when it settles in FULL: its one
+                    # contract nets to zero and it closes on its own closing fill exactly
+                    # as before. It IS held back while a contract remains — a 1-of-2
+                    # partial assignment — because a short contract belonging to a CLOSED
+                    # transaction is the same orphan as a stranded spread leg, only
+                    # smaller; the live door
+                    # (``AlpacaAccount._settle_option_leg``) leaves it OPENED for exactly
+                    # that reason, and this arm would otherwise close it one pass later.
+                    #
+                    # An EQUITY transaction has no OPTION contract rows at all, so its net
+                    # is empty, ``every_option_contract_is_flat`` reads that as "nothing
+                    # open" and the everyday TP/SL close is untouched — including the
+                    # partial-sale case, whose pre-existing behaviour this must not change.
+                    option_contracts_still_open = not every_option_contract_is_flat(option_net)
 
                     if oco_leg_filled and transaction.status == TransactionStatus.OPENED:
                         filled_oco_legs = [
@@ -1244,13 +1251,13 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                         has_changes = True
 
                     # OPENED -> CLOSED: If we have a filled closing order (TP/SL) — unless
-                    # it is one leg of a multi-leg structure whose other legs are still
-                    # open (see ``one_leg_of_many_settled`` above). When every contract IS
-                    # flat this still fires, so a fully closed structure closes here as
-                    # before.
+                    # an option contract on this transaction is still open (see
+                    # ``option_contracts_still_open`` above). When every contract IS flat
+                    # this still fires, so a fully closed structure — and every equity
+                    # transaction — closes here as before.
                     elif (filled_closing_orders
                           and transaction.status == TransactionStatus.OPENED
-                          and not one_leg_of_many_settled):
+                          and not option_contracts_still_open):
                         from ba2_common.core.utils import close_transaction_with_logging
                         close_transaction_with_logging(
                             transaction=transaction,

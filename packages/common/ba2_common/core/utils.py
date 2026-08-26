@@ -396,6 +396,94 @@ def calculate_transaction_pnl(transaction: Transaction) -> Optional[float]:
         return (transaction.open_price - transaction.close_price) * transaction.quantity * multiplier
 
 
+#: Contract counts are whole numbers, but they are summed as floats over order rows,
+#: so "this contract is flat" is a tolerance rather than an exact ``0.0``. Same value
+#: the balance sums in ``refresh_transactions`` have always used.
+OPTION_CONTRACT_EPS = 0.0001
+
+
+def option_contract_net(orders) -> Dict[str, float]:
+    """``{OCC contract symbol: signed open contracts}`` over a transaction's OPTION orders.
+
+    THE ONE PLACE THAT KNOWS WHETHER AN OPTION STRUCTURE IS STILL HOLDING SOMETHING,
+    and it must stay one place. Two engines ask it, at two different doors:
+
+      * ``ReadOnlyAccountInterface.refresh_transactions``, deciding both whether the
+        transaction's position is balanced and whether a filled dependent order may
+        close it;
+      * ``AlpacaAccount._apply_option_activity``, deciding whether a broker
+        assignment / exercise / expiry on ONE leg may close the whole transaction.
+
+    A second implementation of this arithmetic is how the two doors would come to
+    disagree about the same structure, which is exactly the failure both fixes exist
+    to prevent.
+
+    PER CONTRACT, never a single sum. The parent row of a multi-leg structure counts
+    STRUCTURES and each leg counts CONTRACTS, so one sum over all of them mixes units
+    and reports a structure flat as soon as any one leg closes (the B10 orphan-leg
+    defect). Rows with no ``contract_symbol`` — the MLEG net-only parent — are
+    therefore skipped: they are not a contract position.
+
+    What counts: every OPTION order that has EXECUTED (``filled_qty > 0``, or a status
+    in ``OrderStatus.get_executed_statuses()``), signed BUY positive / SELL negative,
+    at its ``filled_qty`` when it has one and at its ``quantity`` otherwise. A
+    CANCELED order with a partial fill counts for the part that really traded — the
+    same rule the surrounding quantity sums use.
+
+    An empty result means "no executed contract rows on this transaction", which is
+    NOT the same fact as "every contract is flat"; the two callers read that case
+    differently and deliberately (see the two predicates below).
+    """
+    from ba2_common.core.types import AssetClass
+    executed_statuses = OrderStatus.get_executed_statuses()
+    contract_net: Dict[str, float] = {}
+    for order in orders or []:
+        if getattr(order, "asset_class", None) != AssetClass.OPTION:
+            continue
+        contract = getattr(order, "contract_symbol", None)
+        if not contract:
+            continue  # net-only parent, not a contract position
+        filled = order.filled_qty or 0
+        if order.status in executed_statuses or filled > 0:
+            qty = float(filled if filled else order.quantity or 0)
+            if qty:
+                contract_net[contract] = contract_net.get(contract, 0.0) + (
+                    qty if order.side == OrderDirection.BUY else -qty)
+    return contract_net
+
+
+def every_option_contract_is_flat(contract_net: Dict[str, float]) -> bool:
+    """Is every contract in a net flat? An EMPTY net answers True — NOTHING IS OPEN.
+
+    "No option contract on this transaction nets open" is the literal reading, and it
+    is what both settlement doors need: a transaction with no open contract has no
+    surviving leg to protect, so closing it is safe and is the pre-existing behaviour.
+    An EQUITY transaction lands here too (it has no option rows at all) and must stay
+    untouched by anything that reasons about contracts.
+
+    The fail-safe direction matters at the live door in particular. Holding a
+    transaction OPEN on the strength of a ledger that records nothing would strand it
+    forever: the broker activity that would have closed it is already marked processed
+    and never returns.
+    """
+    return all(abs(v) < OPTION_CONTRACT_EPS for v in contract_net.values())
+
+
+def option_structure_is_flat(contract_net: Dict[str, float]) -> bool:
+    """Does this option ledger show every contract flat AND some contract recorded?
+
+    The stricter reading, and the one ``refresh_transactions`` uses for a MULTI-LEG
+    structure's ``position_balanced`` — which that method turns into "CLOSE this
+    transaction" on its own, for every non-terminal transaction on the account, every
+    pass. An empty net there means "nothing has executed yet", and reading that as
+    balanced would close a structure that has not even opened.
+
+    So the two predicates differ on exactly one input, the empty net, and they differ
+    on purpose. Anything that makes them agree breaks one door or the other.
+    """
+    return bool(contract_net) and every_option_contract_is_flat(contract_net)
+
+
 def close_transaction_with_logging(
     transaction: Transaction,
     account_id: int,

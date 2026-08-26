@@ -208,18 +208,20 @@ class TestHasPendingClosingOrder:
 # ``AlpacaAccount._apply_option_activity`` -> ``_close_txn`` sets
 # ``Transaction.status = CLOSED`` on the row directly. That is the live door,
 # and it is fixed there (see ``tests/test_option_multileg_settlement.py``); the
-# guard exercised here is DEFENCE IN DEPTH for live, not the live fix.
+# guard exercised here is the SECOND door, not the live fix.
 #
-# WHAT THIS CLASS THEREFORE PINS: the shared arm, against a row shape live does
-# not yet produce. ``refresh_transactions``' "OPENED -> CLOSED: filled closing
-# order (TP/SL)" arm fires on ANY filled DEPENDENT order. In the BACKTEST a
-# single leg produces one by itself — an expiry settlement
-# (``_record_option_expiry_close`` links its synthetic close to the entry via
-# ``depends_on_order``) or a one-leg margin liquidation — and the whole
-# transaction was closed as ``tp_sl_filled``, pre-empting the per-contract
-# ``position_balanced`` that is the only thing here that knows whether the
-# STRUCTURE is flat. No LIVE path writes that shape onto a multi-leg option
-# transaction, so the fixtures below build it by hand.
+# WHAT THIS CLASS THEREFORE PINS: the shared arm on its own.
+# ``refresh_transactions``' "OPENED -> CLOSED: filled closing order (TP/SL)" arm
+# fires on ANY filled DEPENDENT order. In the BACKTEST a single leg produces one
+# by itself — an expiry settlement (``_record_option_expiry_close`` links its
+# synthetic close to the entry via ``depends_on_order``) or a one-leg margin
+# liquidation — and the whole transaction was closed as ``tp_sl_filled``,
+# pre-empting the per-contract ``position_balanced`` that is the only thing here
+# that knows whether the STRUCTURE is flat. No LIVE path wrote that shape when
+# this guard landed, so the fixtures below build it by hand; the OPT-S3 fix has
+# since made it a live shape too (a recorded settled leg IS a filled dependent
+# option order), and the two doors are pinned together by
+# ``test_option_multileg_settlement.py::test_the_REFRESH_pass_does_not_undo_it``.
 #
 # The surviving legs — INCLUDING the protective long of a spread — then vanish
 # from ``get_option_positions`` and ``_option_transaction_for_contract`` (both
@@ -232,10 +234,10 @@ class TestHasPendingClosingOrder:
 # against a real ``get_option_positions``.
 # ===========================================================================
 class TestOneLegSettlingDoesNotCloseTheStructure:
-    """Pins the SHARED ``refresh_transactions`` arm (the OPT-S8 backtest fix)
-    against a row shape the LIVE platform does not yet produce. The live
-    assignment door is ``AlpacaAccount._apply_option_activity`` -> ``_close_txn``
-    and is not exercised here."""
+    """Pins the SHARED ``refresh_transactions`` arm (the OPT-S8 backtest fix) on
+    its own. The live assignment door is
+    ``AlpacaAccount._apply_option_activity`` -> ``_close_txn`` and is not
+    exercised here; see ``tests/test_option_multileg_settlement.py``."""
 
     CALL = "AAPL260116C00210000"
     PUT = "AAPL260116P00180000"
@@ -392,24 +394,23 @@ class TestOneLegSettlingDoesNotCloseTheStructure:
     def test_an_EQUITY_transaction_is_unaffected_even_when_it_is_UNBALANCED(self):
         """THE SCOPE OF THE GUARD — and the conjunct every balanced fixture hides.
 
-        ``one_leg_of_many_settled`` is ``bool(multi_leg_parent_ids) and not
-        position_balanced``. The two tests above close their position in FULL, so
-        ``position_balanced`` is True in both and the whole expression is False
-        WHATEVER the first conjunct says. Dropping ``bool(multi_leg_parent_ids)``
-        therefore passes them, and the guard — a rule about multi-leg OPTION
-        structures — silently starts governing every equity transaction in the book.
-        (Measured: that edit survives the entire live and backtest option suite
-        without it.)
+        ``option_contracts_still_open`` is ``not every_option_contract_is_flat(
+        option_net)``, and an EQUITY transaction's option net is EMPTY. The two tests
+        above close their position in FULL, so the ordinary balance arm would close
+        them anyway and they cannot see this guard at all.
 
-        Here the sale is PARTIAL, 40 of 100 shares, so ``position_balanced`` is False
-        and ONLY ``bool(multi_leg_parent_ids)`` can keep this branch reachable.
+        Here the sale is PARTIAL, 40 of 100 shares, so nothing else closes the
+        transaction and this branch is the only one that can — which makes it the
+        fixture that fails the moment the guard starts reading an empty net as "a
+        contract is still open" (i.e. the moment the two predicates in
+        ``ba2_common.core.utils`` are collapsed into one).
 
         WHAT THIS DOES NOT SAY. Marking the transaction CLOSED with 60 shares still
         held, on the strength of one filled dependent order, is this branch's
         PRE-EXISTING behaviour and is not endorsed here — it long predates this guard
         and is a separate question. What is asserted is only that the guard did not
-        change it, in either direction: an equity transaction carries no OPTION orders
-        and so no net-only parent, and the guard must never reach it.
+        change it, in either direction: an equity transaction carries no OPTION
+        contract rows, so the guard has nothing to measure and must never reach it.
         """
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
@@ -433,5 +434,5 @@ class TestOneLegSettlingDoesNotCloseTheStructure:
             "the fixture is only interesting while the position is UNBALANCED")
         assert fresh.status == TransactionStatus.CLOSED
         assert fresh.close_reason == "tp_sl_filled", (
-            "the one-leg-settling guard has reached an EQUITY transaction — it must key on "
-            "multi_leg_parent_ids, which an equity transaction can never have")
+            "the one-leg-settling guard has reached an EQUITY transaction — it must key "
+            "on OPTION CONTRACT rows, which an equity transaction can never have")

@@ -422,9 +422,15 @@ BASELINE: dict = {
     "packages/common/ba2_common/core/TradeConditions.py": 5,
     "packages/common/ba2_common/core/TransactionHelper.py": 4,
     "packages/common/ba2_common/core/interfaces/OptionsAccountInterface.py": 1,
-    "packages/common/ba2_common/core/interfaces/ReadOnlyAccountInterface.py": 3,
+    "packages/common/ba2_common/core/interfaces/ReadOnlyAccountInterface.py": 1,
     "packages/common/ba2_common/core/models.py": 2,
     "packages/common/ba2_common/core/portfolio_allocation.py": 39,
+    # 2 MOVED here, not added, and the total below is unchanged: the per-contract
+    # option balance was lifted out of ReadOnlyAccountInterface.refresh_transactions
+    # (3 -> 1) into ``option_contract_net`` so the LIVE settlement door
+    # (AlpacaAccount._apply_option_activity) can call the same arithmetic instead of
+    # growing a second copy of it. The two coercions travelled verbatim.
+    "packages/common/ba2_common/core/utils.py": 2,
     "packages/common/ba2_common/core/position_sizing.py": 2,
     "packages/experts/ba2_experts/DeterministicScorer/__init__.py": 3,
     "packages/experts/ba2_experts/FMPRating.py": 1,

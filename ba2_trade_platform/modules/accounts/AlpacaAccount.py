@@ -30,7 +30,7 @@ from ...core.account_types import (
 import pytz
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance
-from sqlmodel import Session, select
+from sqlmodel import Session, select, or_
 
 # Namespace of the external_id get_cash_transfers() mints for dividends, whether
 # from the broker's own DIV activity id or from the symbol/date fallback. Keeps the
@@ -6133,7 +6133,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
     def _find_option_order_for_contract(self, occ: str) -> "Optional[TradingOrder]":
         """Most recent filled/open OPTION TradingOrder for this contract on this
-        account, used to attribute the activity to its originating expert."""
+        account, used to attribute the activity to its originating expert.
+
+        SYNTHETIC SETTLEMENT ROWS ARE EXCLUDED (``open_type == EXTERNAL``). Those are
+        book-keeping this class mints for something the OCC did TO us
+        (``_record_option_settlement_order``), never an order that ORIGINATED a
+        position — which is the only thing this lookup is for. Including them would
+        break the very next activity on the same contract: a partial assignment writes
+        a synthetic BUY-to-close, and the second OPASN would read that row's side as
+        the position's, decide the leg is LONG and refuse itself as "OPASN on non-short
+        option". EXTERNAL is minted nowhere else in the platform.
+        """
         from ...core.types import AssetClass
         with get_db() as session:
             stmt = (
@@ -6141,6 +6151,11 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 .where(TradingOrder.account_id == self.id)
                 .where(TradingOrder.asset_class == AssetClass.OPTION)
                 .where(TradingOrder.contract_symbol == occ)
+                # NULL-safe: a legacy row with no ``open_type`` is not a synthetic
+                # settlement row, and a bare ``!=`` would drop it (SQL NULL compares to
+                # nothing).
+                .where(or_(TradingOrder.open_type.is_(None),
+                           TradingOrder.open_type != OrderOpenType.EXTERNAL))
                 .order_by(TradingOrder.id.desc())
             )
             return session.exec(stmt).first()
@@ -6389,24 +6404,35 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                     side=OrderDirection.BUY, shares=share_qty, price=strike,
                     contract=symbol, activity_id=activity_id, created_at=now,
                     origin=TXN_ORIGIN_CSP_ASSIGNMENT)
-                self._close_txn(opt_txn, close_reason="assigned")
+                leg_note = self._settle_option_leg(
+                    opt_txn, contract=symbol, contracts=contracts,
+                    close_reason="assigned", activity_id=activity_id,
+                    underlying=underlying, right=right, strike=strike, expiry=expiry,
+                    closed_note="closed short put txn",
+                    open_note="settled the short put LEG; structure still OPEN")
                 return (f"csp_assignment: opened equity long {underlying} "
-                        f"{share_qty}@{strike}; closed short put txn")
+                        f"{share_qty}@{strike}; {leg_note}")
 
             if right == OptionRight.CALL and is_short:
                 # Short call assigned -> shares called away. The held equity long is
                 # SPLIT when it is bigger than the assignment (see _settle_called_away),
                 # never erased.
                 held = self._find_open_equity_long(underlying, expert_id)
-                self._close_txn(opt_txn, close_reason="assigned")
+                leg_note = self._settle_option_leg(
+                    opt_txn, contract=symbol, contracts=contracts,
+                    close_reason="assigned", activity_id=activity_id,
+                    underlying=underlying, right=right, strike=strike, expiry=expiry,
+                    closed_note="closed short call txn",
+                    open_note="settled the short call LEG; structure still OPEN")
                 if held is not None:
                     return self._settle_called_away(
                         held=held, underlying=underlying, contracts=contracts,
-                        strike=strike, contract=symbol, activity_id=activity_id)
+                        strike=strike, contract=symbol, activity_id=activity_id,
+                        leg_note=leg_note)
                 logger.warning(
                     f"[Account {self.id}] Short CALL {symbol} assigned but no OPENED "
                     f"equity long found for {underlying} (expert {expert_id}).")
-                return "called_away_no_long: closed short call txn, no equity long to close"
+                return f"called_away_no_long: {leg_note}, no equity long to close"
 
             # Long option assigned is not a normal flow; record + log.
             logger.warning(
@@ -6417,20 +6443,200 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # --- OPEXP: expiry ---
         if atype == "OPEXP":
             if opt_txn is not None:
-                self._close_txn(opt_txn, close_reason="expired", close_price=0.0)
-                return "expired: closed option txn"
+                return "expired: " + self._settle_option_leg(
+                    opt_txn, contract=symbol, contracts=contracts,
+                    close_reason="expired", close_price=0.0, activity_id=activity_id,
+                    underlying=underlying, right=right, strike=strike, expiry=expiry,
+                    closed_note="closed option txn",
+                    open_note="settled the expiring LEG; structure still OPEN")
             return "unhandled: expiry with no matching option txn"
 
         # --- OPEXC: exercise ---
         if atype == "OPEXC":
             if opt_txn is not None:
-                self._close_txn(opt_txn, close_reason="exercised")
                 # Equity-leg handling for exercise is best-effort/minimal for now.
-                return "exercised: closed option txn (equity leg not reconciled)"
+                return "exercised: " + self._settle_option_leg(
+                    opt_txn, contract=symbol, contracts=contracts,
+                    close_reason="exercised", activity_id=activity_id,
+                    underlying=underlying, right=right, strike=strike, expiry=expiry,
+                    closed_note="closed option txn (equity leg not reconciled)",
+                    open_note=("settled the exercised LEG; structure still OPEN "
+                               "(equity leg not reconciled)"))
             return "unhandled: exercise with no matching option txn"
 
         # --- OPCSH / anything else: no specific handler ---
         return f"unhandled: no handler for activity_type {atype!r}"
+
+    def _settle_option_leg(self, opt_txn, *, contract: str, contracts, close_reason: str,
+                           activity_id: str, underlying: str, right, strike, expiry,
+                           closed_note: str, open_note: str, close_price=None) -> str:
+        """Record ONE option leg's settlement, and close the transaction only when EVERY
+        contract on it is accounted for. Returns ``closed_note`` or ``open_note``.
+
+        OPT-S3, AND THIS IS ITS DOOR. Every one of the four settlement branches above
+        used to call ``_close_txn(opt_txn, ...)`` directly, which sets
+        ``Transaction.status = CLOSED`` on the row and persists it. On a MULTI-LEG
+        structure the OCC settles ONE contract — the assigned put of a strangle, the
+        expiring short call of a vertical — and the transaction that got closed was the
+        whole structure's. The surviving legs, INCLUDING the protective long of a
+        spread, then belong to a CLOSED transaction: ``OptionsAccountInterface``'s
+        ledger accessors, the lifecycle pass and every exit rule reach an option
+        position only through an OPENED transaction, so nothing could see, manage or
+        close them again. Real money, no detection, no way back — the ledger and the
+        broker simply disagreed from then on.
+
+        Nothing here needs new linkage. The legs are already joined by
+        ``parent_order_id`` (``OptionsAccountInterface.submit_option_order``) and share
+        one ``transaction_id``, and the per-contract arithmetic that reads them is
+        ``ba2_common.core.utils.option_contract_net`` — the SAME function
+        ``refresh_transactions`` uses for the backtest half of this defect. One
+        implementation, two doors: a second copy is how the two would come to disagree
+        about one structure.
+
+        TWO THINGS HAPPEN, IN THIS ORDER.
+
+        1. THE SETTLED LEG IS RECORDED, as a synthetic FILLED closing OPTION order for
+           that contract (see ``_record_option_settlement_order``). Without it the leg
+           is still short in the ledger forever: the structure stays OPENED, the next
+           pass sees an obligation the broker has already extinguished, and the cover
+           arithmetic keeps charging shares to a call that no longer exists. It is the
+           exact mirror of why an assignment's EQUITY rows must exist.
+        2. THE TRANSACTION CLOSES ONLY IF NOTHING IS LEFT. The leg's settlement is
+           applied to the per-contract net; if any contract on the transaction is still
+           open — a sibling leg, or the unsettled remainder of a PARTIAL assignment —
+           the transaction stays OPENED and only the leg is recorded.
+
+        A SINGLE-LEG option is NOT stranded by this, and that is the case to keep
+        checking: its one contract nets to zero the moment it settles, so the
+        transaction closes exactly as it always did, with the same ``close_reason`` and
+        the same ``close_price``.
+
+        AN UNREADABLE LEDGER CLOSES, and the polarity is deliberate. If no executed
+        contract row for this transaction nets open — nothing recorded, or the entry
+        order not yet marked FILLED — there is no evidence of a surviving sibling, and
+        the fail-safe answer is the pre-existing one. Holding the transaction OPEN on
+        that would strand it permanently: the ``OptionActivity(account_id, activity_id)``
+        audit row means this activity is already processed and never comes back.
+        """
+        from ba2_common.core.utils import (OPTION_CONTRACT_EPS,
+                                           every_option_contract_is_flat,
+                                           option_contract_net)
+        if opt_txn is None:
+            return closed_note
+
+        with get_db() as session:
+            orders = session.exec(
+                select(TradingOrder).where(TradingOrder.transaction_id == opt_txn.id)
+            ).all()
+        contract_net = option_contract_net(orders)
+        open_qty = contract_net.get(contract, 0.0)
+
+        if abs(open_qty) > OPTION_CONTRACT_EPS:
+            # The broker's count when it gave one (OPASN), the whole open leg when it
+            # did not (OPEXP/OPEXC never publish a quantity). Capped at what the leg
+            # actually holds: an uncapped settlement would drive the contract net
+            # through zero into a phantom position on the other side, which is the same
+            # class of damage as the over-assignment `_settle_called_away` refuses.
+            reported = abs(float(contracts)) if contracts is not None else abs(open_qty)
+            settled = min(reported, abs(open_qty))
+            if reported - abs(open_qty) > OPTION_CONTRACT_EPS:
+                logger.error(
+                    f"[Account {self.id}] Option settlement OVER-SETTLEMENT on {contract}: "
+                    f"the broker reports {reported:g} contract(s) but transaction "
+                    f"{opt_txn.id} holds only {abs(open_qty):g}. Recording {settled:g}; "
+                    f"the excess belongs to no leg this account knows about.")
+            # BUY closes a short leg, SELL closes a long one.
+            side = OrderDirection.BUY if open_qty < 0 else OrderDirection.SELL
+            if settled > 0:
+                self._record_option_settlement_order(
+                    transaction_id=opt_txn.id, contract=contract, underlying=underlying,
+                    side=side, contracts=settled, right=right, strike=strike,
+                    expiry=expiry, close_reason=close_reason, activity_id=activity_id)
+                # The decision is taken on this in-memory net rather than on a re-read.
+                # They agree whenever the row was written, and when it was NOT (the
+                # insert is best-effort and logs its own error) re-reading would silently
+                # report the leg still open and freeze the transaction on a failed write.
+                contract_net[contract] = open_qty + (settled if side == OrderDirection.BUY
+                                                     else -settled)
+
+        if every_option_contract_is_flat(contract_net):
+            self._close_txn(opt_txn, close_reason=close_reason, close_price=close_price)
+            return closed_note
+
+        still_open = sorted(c for c, v in contract_net.items()
+                            if abs(v) > OPTION_CONTRACT_EPS)
+        logger.info(
+            f"[Account {self.id}] {close_reason} on {contract} settled ONE leg of "
+            f"transaction {opt_txn.id}; it stays OPENED because "
+            f"{len(still_open)} contract(s) are still open: {', '.join(still_open)}.")
+        return open_note
+
+    def _record_option_settlement_order(self, *, transaction_id: int, contract: str,
+                                        underlying: str, side, contracts: float, right,
+                                        strike, expiry, close_reason: str,
+                                        activity_id: str) -> "Optional[int]":
+        """Persist the synthetic OPTION ``TradingOrder`` that closes a SETTLED leg.
+
+        The option-side mirror of ``_record_assignment_equity_order``, and it exists for
+        the same reason: contract counts are read off ORDER rows, so a leg the OCC has
+        extinguished with no closing row stays short in the ledger forever. It carries
+        the same honesty markers — ``open_type = EXTERNAL`` (the platform placed no
+        order), ``broker_order_id = None`` (there is none to point at), ``status =
+        FILLED`` with ``filled_qty = quantity`` (a settlement is complete the instant it
+        is reported) — plus two specific to options:
+
+          * ``open_price = 0.0`` — a MEASURED zero, not a missing price. Assignment,
+            exercise and expiry all extinguish the contract without a premium changing
+            hands; whatever value it had moved to the equity leg at the STRIKE, which is
+            where the equity rows record it.
+          * the full leg identity (``contract_symbol``/``option_type``/``strike``/
+            ``expiry``/``multiplier``), because a contract row that cannot say which
+            contract it is cannot net against the leg it settles.
+
+        ``depends_on_order`` is the transaction's entry order, so this can never be
+        mistaken for an entry by the oldest-first resolution in ``TradeManager`` /
+        ``has_pending_closing_order``.
+
+        IDEMPOTENCY is the caller's, exactly as for the equity rows: this runs inside
+        ``reconcile_option_assignments``' ``OptionActivity(account_id, activity_id)``
+        guard. Returns the new order id, or None if the insert failed (logged, never
+        raised — one bad row must not abort the reconcile batch).
+        """
+        from ...core.interfaces.OptionsAccountInterface import DEFAULT_OPTION_MULTIPLIER
+
+        try:
+            return add_instance(TradingOrder(
+                account_id=self.id,
+                symbol=contract,
+                underlying_symbol=underlying,
+                quantity=abs(float(contracts)),
+                filled_qty=abs(float(contracts)),
+                side=side,
+                order_type=CoreOrderType.MARKET,
+                status=OrderStatus.FILLED,
+                open_price=0.0,
+                transaction_id=transaction_id,
+                depends_on_order=self._entry_order_id_for_transaction(transaction_id),
+                asset_class=CoreAssetClass.OPTION,
+                contract_symbol=contract,
+                option_type=right,
+                strike=strike,
+                expiry=expiry,
+                multiplier=DEFAULT_OPTION_MULTIPLIER,
+                open_type=OrderOpenType.EXTERNAL,
+                broker_order_id=None,
+                comment=(f"{close_reason}: option leg {contract} settled by the broker "
+                         f"(activity {activity_id}) — synthetic fill, no broker order "
+                         f"exists"),
+                created_at=datetime.now(timezone.utc),
+            ))
+        except Exception as e:
+            logger.error(
+                f"[Account {self.id}] Failed to record the {close_reason} settlement "
+                f"order for option leg {contract} on transaction {transaction_id} "
+                f"(activity {activity_id}): {e}. The leg still reads as OPEN in the "
+                f"ledger.", exc_info=True)
+            return None
 
     # Share quantities are floats (Alpaca trades fractional stock), so lot arithmetic is
     # compared against a tolerance rather than to 0.0 exactly. Well below any tradeable
@@ -6438,7 +6644,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     _SHARE_EPS = 1e-9
 
     def _settle_called_away(self, *, held, underlying: str, contracts: float,
-                            strike: float, contract: str, activity_id: str) -> str:
+                            strike: float, contract: str, activity_id: str,
+                            leg_note: str = "closed short call txn") -> str:
         """Take the called-away shares off ONE equity lot, SPLITTING it when the lot is
         larger than the assignment.
 
@@ -6484,6 +6691,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         rather than a price with no order behind it. An assignment-origin lot never has
         them (``_record_assignment_equity_order`` mints only the entry), but a lot bought
         outright — which ``_find_open_equity_long`` will fall back to — can.
+
+        ``leg_note`` is the OPTION side's outcome, already decided by
+        ``_settle_option_leg`` before this runs (the short call's transaction closes only
+        once EVERY contract on it is settled — one leg of a structure being called away
+        does not close the structure). It is quoted verbatim so the two halves of one
+        assignment can never describe themselves inconsistently.
 
         Returns the audit string recorded on the ``OptionActivity`` row.
         """
@@ -6542,9 +6755,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         if remainder_id is not None:
             return (f"called_away: {exit_qty:g} of {held_qty:g} {underlying} left at "
                     f"{strike} (transaction {held.id} closed); {remainder_qty:g} shares "
-                    f"stay open as transaction {remainder_id}; closed short call txn")
+                    f"stay open as transaction {remainder_id}; {leg_note}")
         return (f"called_away: closed equity long {underlying} @ {strike}; "
-                f"closed short call txn")
+                f"{leg_note}")
 
     def _open_called_away_remainder(self, *, held, underlying: str, remainder_qty: float,
                                     exit_qty: float, contract: str,
