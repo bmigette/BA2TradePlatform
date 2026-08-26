@@ -4265,16 +4265,80 @@ def test_a_colour_this_page_paints_is_written_so_the_stylesheet_cannot_win():
     assert important_color_style('#56B4E9') == 'color: #56B4E9 !important'
 
 
-def test_over_is_ORANGE_and_the_other_verdicts_stay_neutral():
-    """Item 4: "over by ..." is the actionable warning state. "under" is left
-    neutral deliberately -- the user asked about over only."""
+def test_over_is_ORANGE_and_a_row_inside_the_band_stays_neutral():
+    """"over by ..." is the actionable warning state at any distance. A row that
+    is merely a little SHORT is drift, not a decision, and stays neutral."""
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
         NEUTRAL_TEXT_COLOR, label_status_color)
 
-    assert label_status_color(LABEL_STATUS_OVER) != NEUTRAL_TEXT_COLOR
-    assert 'F' in label_status_color(LABEL_STATUS_OVER).upper()   # a real hex
+    over = label_status_color(LABEL_STATUS_OVER, value_pct=61.0, target_pct=60.0)
+    assert over != NEUTRAL_TEXT_COLOR
+    assert 'F' in over.upper()   # a real hex
     for quiet in (LABEL_STATUS_UNDER, LABEL_STATUS_OK, LABEL_STATUS_NONE):
-        assert label_status_color(quiet) == NEUTRAL_TEXT_COLOR
+        assert label_status_color(quiet, value_pct=59.0,
+                                  target_pct=60.0) == NEUTRAL_TEXT_COLOR
+
+
+def test_a_row_that_has_fallen_out_of_the_target_band_reads_ORANGE():
+    """"under by 20pp or more" is the second coloured state, and it is the BAR's
+    own threshold rather than a second copy of 20: the sentence goes orange in the
+    same step the track beside it goes yellow."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        STATUS_OVER_COLOR, band_color, label_status_color, within_target_band)
+
+    assert label_status_color(LABEL_STATUS_UNDER, value_pct=39.0,
+                              target_pct=60.0) == STATUS_OVER_COLOR
+    # ...and it really is the same predicate, asked of the same two figures.
+    assert not within_target_band(39.0, 60.0)
+    assert band_color(39.0, 60.0) != band_color(45.0, 60.0)
+
+
+@pytest.mark.parametrize('value_pct,orange', [
+    (60.00, False),   # exactly on target
+    (59.99, False),   # one hundredth under
+    (40.00, False),   # exactly 20pp under -- the band is INCLUSIVE at this edge
+    (39.99, True),    # one hundredth beyond it: the first orange
+])
+def test_the_under_threshold_is_pinned_at_both_of_its_edges(value_pct, orange):
+    """Four boundaries, because a band that quietly moves by a hundredth is a band
+    nobody can rely on -- and because the inclusive edge is what makes "green from
+    80 to 100" come out exactly right against a target of 100."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        BAND_OFF_COLOR, NEUTRAL_TEXT_COLOR, STATUS_OVER_COLOR, band_color,
+        label_status_color)
+
+    status = (LABEL_STATUS_UNDER if value_pct < 60.0 - LABEL_STATUS_TOLERANCE_PCT
+              else LABEL_STATUS_OK)
+    expected = STATUS_OVER_COLOR if orange else NEUTRAL_TEXT_COLOR
+    assert label_status_color(status, value_pct=value_pct,
+                              target_pct=60.0) == expected
+    # The bar changes colour at exactly the same hundredth.
+    assert (band_color(value_pct, 60.0) == BAND_OFF_COLOR) is orange
+
+
+def test_an_unmeasurable_figure_is_neither_orange_nor_green():
+    """The distinction the whole page turns on. ``None`` is not 0.0% and not a
+    shortfall: an account the broker has not answered for has no gap to be 20
+    points short of, and painting one would report a problem nobody has."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        NEUTRAL_TEXT_COLOR, band_color, label_status_color)
+
+    assert label_status_color(LABEL_STATUS_NONE, value_pct=None,
+                              target_pct=60.0) == NEUTRAL_TEXT_COLOR
+    assert label_status_color(LABEL_STATUS_UNDER, value_pct=None,
+                              target_pct=60.0) == NEUTRAL_TEXT_COLOR
+    # ...exactly as the bar already refuses to judge one.
+    assert band_color(None, 60.0) == NEUTRAL_TEXT_COLOR
+
+
+def test_the_two_figures_are_required_so_a_call_site_cannot_forget_them():
+    """No default, deliberately. A default would let a renderer keep the old
+    status-only behaviour silently, which is how a paint goes missing."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        label_status_color)
+
+    with pytest.raises(TypeError):
+        label_status_color(LABEL_STATUS_UNDER)
 
 
 def test_the_pnl_colour_is_green_up_red_down_and_neutral_in_the_band():

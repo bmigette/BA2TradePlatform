@@ -925,11 +925,14 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         widgets['target'].set_text(bar.target_text)
         widgets['delta'].set_text(bar.delta_text)
         # The CLASS stays -- it is what the DOM reads as and what several tests
-        # locate this by -- but the inline colour is what paints. "over" is the
-        # actionable warning and is the only verdict given a colour.
+        # locate this by -- but the inline colour is what paints. Orange for
+        # "over by" at any distance and for an "under by" that has left the target
+        # band; the figures are handed over so ``label_status_color`` can ask the
+        # BAR's own predicate rather than carry a second copy of the threshold.
         widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
         widgets['delta'].style(replace=important_color_style(
-            label_status_color(bar.status)))
+            label_status_color(bar.status, value_pct=bar.current_pct,
+                               target_pct=bar.target_pct)))
         # Neither of these moves on a keystroke -- the previous generation only
         # advances on a run, and the P&L is measured off the positions and quotes
         # this render opened with. They are rewritten in the same loop anyway, so
@@ -979,7 +982,8 @@ def _apply_symbol_bar(live: Dict[str, Any], label: str) -> None:
     # verdict rendered in plain white while the two identical readouts either side
     # of it were coloured.
     widgets['delta'].style(replace=important_color_style(
-        label_status_color(bar.status)))
+        label_status_color(bar.status, value_pct=bar.current_pct,
+                           target_pct=bar.target_pct)))
 
 
 def _apply_reserve_row(live: Dict[str, Any]) -> None:
@@ -1025,8 +1029,12 @@ def _apply_reserve_bar(live: Dict[str, Any]) -> None:
     widgets['target'].set_text(bar.target_text)
     widgets['delta'].set_text(bar.delta_text)
     widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+    # The SAME two figures the fill above was just coloured from, so the sentence
+    # and the bar cannot disagree: this text goes orange in the same step the
+    # track goes yellow.
     widgets['delta'].style(replace=important_color_style(
-        label_status_color(bar.status)))
+        label_status_color(bar.status, value_pct=bar.current_pct,
+                           target_pct=bar.target_pct)))
 
 
 def _apply_total_notice(live: Dict[str, Any]) -> None:

@@ -2085,6 +2085,10 @@ LABEL_STATUS_TOLERANCE_PCT = 0.5
 #: Status -> stylesheet classes. The WORD is the signal and the colour only backs it
 #: up: over/under encoded as red/green alone is unreadable to exactly the users the
 #: Okabe-Ito palette above was chosen for.
+#:
+#: These are NOT what paints -- see ``label_status_color``, which is the writer and
+#: which needs the DISTANCE as well as the status, so 'under' comes out neutral
+#: inside the target band and orange outside it while wearing one class either way.
 LABEL_STATUS_CLASSES = {
     LABEL_STATUS_OVER: 'text-orange-400',
     LABEL_STATUS_UNDER: 'text-sky-400',
@@ -2213,15 +2217,44 @@ def important_color_style(color: str) -> str:
     return IMPORTANT_COLOR_FMT.format(color=color)
 
 
-def label_status_color(status: str) -> str:
+def label_status_color(status: str, *, value_pct: Optional[float],
+                       target_pct: Optional[float]) -> str:
     """The colour an over/under verdict is painted in. Pure.
 
-    ONLY "over" is coloured. It is the actionable warning state -- the label is
-    holding more than it was told to and the plan will sell -- and the user asked
-    for that one. "under", "on target" and "no verdict" stay neutral, so the one
-    row that wants attention is the one row that gets it.
+    Two states are coloured and they are one rule apart:
+
+    * OVER at any distance. Over-allocating spends money that was meant to be
+      kept, so it has no slack -- the same asymmetry ``within_target_band`` is
+      built on.
+    * UNDER, but only once the row has fallen OUT OF THE TARGET BAND, i.e. more
+      than ``TARGET_BAND_SLACK_PP`` (20) points below target. A row a point or two
+      short is drift, not a decision, and colouring it would leave the page
+      permanently amber.
+
+    ``within_target_band`` IS the threshold -- not a second copy of 20. The bar
+    beside this sentence is filled by ``band_color``, which asks the same
+    predicate, so THE TEXT TURNS ORANGE EXACTLY WHERE THE BAR TURNS YELLOW. Two
+    "20"s on one screen would drift apart, and the two readouts sitting inches
+    from each other is where that would show.
+
+    That predicate is inclusive at its lower edge, so exactly 20.00pp under is
+    still inside the band and still neutral; 20.01pp under is the first orange.
+    Both edges are pinned by a test.
+
+    ``value_pct`` and ``target_pct`` are REQUIRED keywords with no default. A
+    default would let a call site keep the old status-only behaviour silently,
+    which is precisely how a paint goes missing -- the failure mode this whole
+    batch is about. ``value_pct=None`` means UNMEASURABLE and stays neutral:
+    no verdict is not a warning, and an account the broker has not answered for
+    has no gap to be 20 points short of.
     """
-    return STATUS_OVER_COLOR if status == LABEL_STATUS_OVER else NEUTRAL_TEXT_COLOR
+    if status == LABEL_STATUS_OVER:
+        return STATUS_OVER_COLOR
+    if (status == LABEL_STATUS_UNDER and value_pct is not None
+            and target_pct is not None
+            and not within_target_band(value_pct, target_pct)):
+        return STATUS_OVER_COLOR
+    return NEUTRAL_TEXT_COLOR
 
 
 def pnl_color(pnl) -> str:

@@ -4505,6 +4505,78 @@ def test_the_delta_keeps_the_status_COLOUR_so_the_row_still_scans(nicegui_client
     assert page.LABEL_STATUS_CLASSES['over'] in ' '.join(element._classes)
 
 
+def _delta_paint(root, text):
+    """The inline colour of the delta sentence rendering exactly ``text``.
+
+    By the WHOLE sentence, never by a prefix: three deltas are drawn on one page
+    -- the label row's, its symbol-share bar's and the reserve card's -- and they
+    share a vocabulary, so 'under by ' finds whichever came first.
+    """
+    element = next(el for el in root.descendants() if el._text == text)
+    return element._style.get('color')
+
+
+def test_a_label_far_below_target_reads_ORANGE_like_the_bar_beside_it(
+        nicegui_client, account_id):
+    """The threshold is the BAR's -- ``within_target_band``, 20 percentage points
+    -- so the sentence and the track change together. One holding of $2,500 against
+    a 60% target of a $10,000 pool is 35 points short, well outside the band."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import STATUS_OVER_COLOR
+
+    views = _views([ManagedLabel('A', 60.0)], {'A': ['AAPL']},
+                   weights={'A': {'AAPL': 100.0}})
+    root = _draw(nicegui_client, account_id, views)
+
+    assert _delta_paint(root, 'under by 35.0pp ($3,500.00)') == \
+        f'{STATUS_OVER_COLOR} !important'
+
+
+def test_a_label_only_a_little_short_is_left_alone(nicegui_client, account_id):
+    """Inside the band. $2,500 held against a 30% target of a $10,000 pool is 5
+    points short -- drift, not a decision, and colouring it would leave the page
+    permanently amber."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import NEUTRAL_TEXT_COLOR
+
+    views = _views([ManagedLabel('A', 30.0)], {'A': ['AAPL']},
+                   weights={'A': {'AAPL': 100.0}})
+    root = _draw(nicegui_client, account_id, views)
+
+    assert _delta_paint(root, 'under by 5.0pp ($500.00)') == \
+        f'{NEUTRAL_TEXT_COLOR} !important'
+
+
+def test_a_label_with_no_measurable_share_is_neither_orange_nor_green(
+        nicegui_client, account_id):
+    """No base notional means no pool, so no share, no gap and no verdict. The
+    distinction is load-bearing across this page -- 'unknown' is not 'short' -- and
+    a whole page of orange on an account the broker did not answer for would be
+    reporting a problem the user does not have."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        LABEL_DELTA_NONE, NEUTRAL_TEXT_COLOR,
+    )
+    views = _views([ManagedLabel('A', 60.0)], {'A': ['AAPL']}, base=None)
+    with nicegui_client:
+        page._render_labels(account_id,
+                            _payload(views, VALUATION_MODE_MARKET,
+                                     base_notional=None,
+                                     available_buying_power=None), _noop_refresh)
+    root = nicegui_client.layout
+
+    # BY CLASS, not by text: the dash is also what the current-share cell beside
+    # it prints, and that one is deliberately unpainted.
+    deltas = [el for el in root.descendants()
+              if el._text == LABEL_DELTA_NONE and 'text-xs' in el._classes]
+    assert deltas, 'the label row drew no verdict at all'
+    assert {el._style.get('color') for el in deltas} == \
+        {f'{NEUTRAL_TEXT_COLOR} !important'}
+    # No share is measurable, so no row may claim a gap in either direction. (The
+    # label-total readout is still allowed its own orange: "these targets do not
+    # add up to 100" is a judgement about the TYPED numbers and needs no pool.)
+    verdicts = [el._style.get('color') for el in root.descendants()
+                if (el._text or '').startswith(('under by ', 'over by '))]
+    assert verdicts == []
+
+
 def test_the_delta_follows_a_label_target_edit(nicegui_client, account_id):
     set_managed_label(account_id, 'A', target_pct=10.0)
     views = _views([ManagedLabel('A', 10.0)], {'A': ['AAPL']},
@@ -6935,14 +7007,18 @@ def test_OVER_BY_is_painted_ORANGE(nicegui_client, account_id):
     assert _view_mod().STATUS_OVER_COLOR in (delta._style or {}).get('color', '')
 
 
-def test_UNDER_BY_is_left_NEUTRAL_for_now(nicegui_client, account_id):
-    """Deliberate: the user asked about "over" only. The two now differ, which is
-    reported rather than assumed."""
+def test_UNDER_BY_is_ORANGE_once_it_leaves_the_target_band(nicegui_client,
+                                                           account_id):
+    """It used to be neutral at any distance -- the user asked about "over" only,
+    and that was reported rather than assumed. They then asked for the other half:
+    a label 20 percentage points or more BELOW its target is a decision too, and
+    the threshold is the bar's own (``within_target_band``) so the sentence and the
+    track change colour together. This row is 85 points short."""
     root = _draw(nicegui_client, account_id, _two_verdicts(account_id))
     _pnl, delta = _pnl_and_delta(root, 1)
 
-    assert delta._text.startswith('under by ')
-    assert _view_mod().NEUTRAL_TEXT_COLOR in (delta._style or {}).get('color', '')
+    assert delta._text.startswith('under by 85.0pp')
+    assert _view_mod().STATUS_OVER_COLOR in (delta._style or {}).get('color', '')
 
 
 def test_every_painted_verdict_carries_the_IMPORTANT(nicegui_client, account_id):
