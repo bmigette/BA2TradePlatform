@@ -1135,6 +1135,17 @@ _EXPERT_OPT = {
             # numerically identical to 'static', so the GA can freely discover either.
             "expected_profit_mode": {"optimize": True, "type": "choice", "choices": ["static", "dynamic"]},
             "dynamic_scale": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
+            # 2026-08-26 addition: a real earnings beat against a near-zero/negative analyst
+            # estimate (surprise_pct's denominator) produces a mathematically-correct but
+            # meaningless surprise -- e.g. reported 0.76 vs estimated -0.04 is a genuine beat,
+            # but "2000% surprise" is not a number 'dynamic' mode should scale a price target
+            # from. Hit live 2026-08-26 (instance 6, SA): expected_profit_percent=3977%,
+            # unreachable and distorting order-priority scoring against every other candidate
+            # (TradeRiskManagement.compute_order_priority_score is weighted by it directly).
+            # Range 20-500: below the GA's own expected_profit_percent ceiling (20) the cap
+            # would silently override 'static' mode's own tuned value, which defeats the point.
+            "max_expected_profit_percent": {"optimize": True, "min": 20.0, "max": 500.0,
+                                            "step": 20.0, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },

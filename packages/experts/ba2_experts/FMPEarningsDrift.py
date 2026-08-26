@@ -223,6 +223,23 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
                                "expected_profit = expected_profit_percent + dynamic_scale * "
                                "max(0, surprise_pct - surprise_min_pct). Ignored in 'static' mode.",
             },
+            "max_expected_profit_percent": {
+                "type": "float", "required": False, "default": 100.0,
+                "description": "Hard ceiling on expected_profit_percent, applied after "
+                               "static/dynamic computation either way. Exists because "
+                               "surprise_pct's denominator is the CONSENSUS ESTIMATE, and a "
+                               "real earnings beat against a near-zero (or negative) estimate "
+                               "produces a mathematically-correct but meaningless surprise -- "
+                               "e.g. reported 0.76 vs estimated -0.04 is a genuine beat, but "
+                               "'2000% surprise' is not a number 'dynamic' mode should be free "
+                               "to scale a price target from. Without this cap that 2026-08-26 "
+                               "case reached a 3977% expected_profit_percent live (instance 6, "
+                               "SA) -- expected_profit_percent feeds both the expert's own "
+                               "target price (TradeActions/TradeConditions) and order-priority "
+                               "scoring (TradeRiskManagement.compute_order_priority_score), so "
+                               "an uncapped blowup distorts capital allocation across every "
+                               "other candidate too, not just this symbol's unreachable TP.",
+            },
         }
 
     # ------------------------------------------------------------------
@@ -233,7 +250,7 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
     # code path; with as_of=None the fetch is byte-identical to the live path.
     # ------------------------------------------------------------------
     _SETTING_KEYS = ("surprise_min_pct", "max_days_since_report", "expected_profit_percent",
-                      "expected_profit_mode", "dynamic_scale")
+                      "expected_profit_mode", "dynamic_scale", "max_expected_profit_percent")
 
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         symbol = self._gather_symbol
@@ -291,6 +308,7 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
         # them, unlike the required settings above which fail loud on a missing key.
         expected_profit_mode = str(settings.get("expected_profit_mode", "static"))
         dynamic_scale = float(settings.get("dynamic_scale", 0.0))
+        max_expected_profit = float(settings.get("max_expected_profit_percent", 100.0))
         result = evaluate_earnings_drift(data_bundle["latest_earnings"], now, surprise_min, max_days)
 
         if result["is_signal"]:
@@ -301,6 +319,12 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
                 expected_profit = expected_profit_base + dynamic_scale * excess_surprise
             else:
                 expected_profit = expected_profit_base
+            # HARD CEILING, both modes. surprise_pct's denominator is the analyst estimate, and a
+            # genuine beat against a near-zero/negative estimate produces a mathematically-correct
+            # but meaningless surprise (see max_expected_profit_percent's own docstring for the
+            # live incident this guards against) -- 'dynamic' must not be free to scale a price
+            # target off that number, and a misconfigured flat 'static' value is capped too.
+            expected_profit = min(expected_profit, max_expected_profit)
             signal, confidence, expected = OrderRecommendation.BUY, result["confidence"], expected_profit
         else:
             signal, confidence, expected = OrderRecommendation.HOLD, 10.0, 0.0

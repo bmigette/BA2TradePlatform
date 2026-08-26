@@ -113,6 +113,94 @@ def test_process_dynamic_mode_hold_still_zero():
     assert rec.expected_profit_percent == 0.0
 
 
+def test_process_dynamic_mode_caps_expected_profit_on_near_zero_estimate_blowup():
+    """Regression for the 2026-08-26 live incident (instance 6, SA): reported 0.76 vs estimated
+    -0.04 is a genuine earnings beat, but the near-zero/negative estimate denominator makes
+    surprise_pct a mathematically-correct but meaningless 2000% -- 'dynamic' mode must not be
+    free to scale a price target off that number. Fixture mirrors the exact real numbers:
+    base=3.0, dynamic_scale=2.0, surprise_min_pct=13.0 -> uncapped would be 3.0 + 2.0*(2000-13)
+    = 3977.0, exactly what went live. The default cap (100.0, unset in settings here) must
+    clamp it."""
+    class BlowupDetails:
+        def get_past_earnings(self, symbol, frequency, end_date, lookback_periods, format_type, **kw):
+            return {"earnings": [{"report_date": "2026-06-10", "reported_eps": 0.76,
+                                  "estimated_eps": -0.04, "surprise_percent": 2000.0}]}
+
+    e = _expert()
+    settings = {"surprise_min_pct": 13.0, "max_days_since_report": 30,
+               "expected_profit_percent": 3.0, "expected_profit_mode": "dynamic",
+               "dynamic_scale": 2.0}
+    bundle = e._gather(
+        LiveProviderBundle(lambda c, n, **k: BlowupDetails() if c == "fundamentals_details" else FakeOHLCV()),
+        as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.signal == OrderRecommendation.BUY
+    assert rec.expected_profit_percent == 100.0  # capped, not 3977.0
+
+
+def test_process_dynamic_mode_explicit_cap_below_default():
+    """max_expected_profit_percent is itself GA-tunable (20-500) -- a value below the 100.0
+    default must be honoured, not just the default."""
+    class BlowupDetails:
+        def get_past_earnings(self, symbol, frequency, end_date, lookback_periods, format_type, **kw):
+            return {"earnings": [{"report_date": "2026-06-10", "reported_eps": 0.76,
+                                  "estimated_eps": -0.04, "surprise_percent": 2000.0}]}
+
+    e = _expert()
+    settings = {"surprise_min_pct": 13.0, "max_days_since_report": 30,
+               "expected_profit_percent": 3.0, "expected_profit_mode": "dynamic",
+               "dynamic_scale": 2.0, "max_expected_profit_percent": 50.0}
+    bundle = e._gather(
+        LiveProviderBundle(lambda c, n, **k: BlowupDetails() if c == "fundamentals_details" else FakeOHLCV()),
+        as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.expected_profit_percent == 50.0
+
+
+def test_process_cap_is_a_noop_below_the_ceiling():
+    """The ordinary case (this file's existing fixture, well under any sane cap) must be
+    completely unaffected -- proven by the pre-existing dynamic-mode test's own expected value,
+    re-asserted here with the cap setting explicitly present."""
+    e = _expert()
+    settings = {**SETTINGS, "expected_profit_mode": "dynamic", "dynamic_scale": 0.5,
+               "max_expected_profit_percent": 100.0}
+    bundle = e._gather(LiveProviderBundle(_get_provider), as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.expected_profit_percent == 8.0 + 0.5 * (20.0 - 5.0)  # == 15.5, unchanged
+
+
+def test_process_static_mode_also_capped():
+    """A misconfigured flat 'static' expected_profit_percent above the ceiling is capped too --
+    the ceiling is a safety backstop, not a dynamic-mode-only feature."""
+    e = _expert()
+    settings = {**SETTINGS, "expected_profit_percent": 250.0, "expected_profit_mode": "static",
+               "max_expected_profit_percent": 100.0}
+    bundle = e._gather(LiveProviderBundle(_get_provider), as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.expected_profit_percent == 100.0
+
+
+def test_process_missing_cap_setting_defaults_to_100():
+    """Existing deployed instances (e.g. instance 6, pre-fix) have no
+    max_expected_profit_percent key in their settings row at all -- must fall back to the
+    class default (100.0), not raise KeyError. This IS the fix for the live incident: no
+    settings migration required, the very next analysis run is capped."""
+    class BlowupDetails:
+        def get_past_earnings(self, symbol, frequency, end_date, lookback_periods, format_type, **kw):
+            return {"earnings": [{"report_date": "2026-06-10", "reported_eps": 0.76,
+                                  "estimated_eps": -0.04, "surprise_percent": 2000.0}]}
+
+    e = _expert()
+    settings = {"surprise_min_pct": 13.0, "max_days_since_report": 30,
+               "expected_profit_percent": 3.0, "expected_profit_mode": "dynamic",
+               "dynamic_scale": 2.0}  # no max_expected_profit_percent key at all
+    bundle = e._gather(
+        LiveProviderBundle(lambda c, n, **k: BlowupDetails() if c == "fundamentals_details" else FakeOHLCV()),
+        as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.expected_profit_percent == 100.0
+
+
 def test_process_missing_mode_and_scale_default_to_static():
     """Settings dicts built without the new (optional) keys -- e.g. older/hand-built configs,
     existing tests/fixtures -- must fall back to 'static' behaviour, not raise KeyError."""
