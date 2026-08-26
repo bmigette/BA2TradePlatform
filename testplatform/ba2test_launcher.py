@@ -2330,14 +2330,32 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 # ragged edges left by the option work of 2026-08-25/26, recorded here because this is where
 # somebody stands when they decide to press go.
 #
-# 1. THE OPTION HISTORY FLOOR CONTRADICTS THE GRID WINDOW.  ** BLOCKING **
-#    `backend/app/services/backtest/fetch_options.py` carries
-#    `_OPTIONS_HISTORY_FLOOR = date(2024, 1, 18)`, and the grid window below starts 2023-01-01.
-#    Every pure-option job therefore RAISES before it runs. Resolve it one way or the other —
-#    either the floor drops to the real TastyTrade floor (if the data goes back that far), or
-#    the window starts in 2024 (if it does not). Do not "fix" it by widening the floor without
-#    checking the cache actually holds the bars: a floor that lies produces a backtest that
-#    silently trades on nothing.
+# 1. THE BACKTEST READS AN ALPACA STORE, SO 2023 IS STILL REFUSED.  ** BLOCKING **
+#    The floor is no longer global: `ba2_providers.options.options_history_floor` answers PER
+#    VENDOR (Alpaca 2024-01-18 measured; dxfeed/TastyTrade 2022-10-01, env-overridable), and
+#    `daily_backtest_handler.validate_options_window` consults the floor of the vendor serving
+#    the store the run actually reads. That much is fixed. The window below still starts
+#    2023-01-01 and every pure-option job STILL raises, because that vendor is Alpaca:
+#
+#      * the backtest builds exactly ONE option reader, `HistoricalOptionsProvider`, over an
+#        `OptionsHistoryCache` sqlite;
+#      * the only writer of that schema is `fetch_options.build_cache`, hard-wired to Alpaca;
+#      * TastyTrade history lands in a SEPARATE parquet tree
+#        (`CACHE_FOLDER/TastyTradeOptionsProvider/`) that nothing on the backtest path reads —
+#        only the read-only chain viewer does.
+#
+#    So no run can span both vendors, and FINISHING THE TASTYTRADE DOWNLOAD DOES NOT BY ITSELF
+#    UNBLOCK THE GRID. What unblocks it is wiring that parquet store into
+#    `HistoricalOptionsProvider` and moving `backtest_options_provider()` in the same change.
+#    Do NOT instead lower the Alpaca number: measured on the shared 10.9 GB cache (2026-08-26)
+#    it holds 0 bars before 2024-01-18, its earliest bar is 2024-02-01, and its only three
+#    chain snapshots are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it, and a
+#    floor that lies produces a backtest that trades on nothing and reports it as a result —
+#    strictly worse than this refusal.
+#
+#    (Noted in passing: even Alpaca's 2024-01-18 is ~2 weeks optimistic against that store,
+#    whose first chain snapshot is 2024-02-01. A vendor floor bounds what COULD have been
+#    fetched, not what was.)
 #
 # 2. THE GREEKS ARE NOT IN THE CACHE YET.  ** WASTES THE RUN **
 #    `iv_rank` and `iv_to_realized_vol` became live genes on 2026-08-26 (OPT-C1, OPT-C3). Both

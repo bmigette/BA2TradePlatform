@@ -114,15 +114,17 @@ def main() -> int:
     # INSIDE it. ba2test_launcher._assert_option_window_excludes_holdout is the rail that stops
     # a pure-option job reaching past the boundary whatever is passed here.
     #
-    # NOTE ON THE START: the backtest still enforces Alpaca's measured options-history floor,
-    # `_OPTIONS_HISTORY_FLOOR = date(2024, 1, 18)` in
-    # testplatform/backend/app/services/backtest/fetch_options.py, via
-    # daily_backtest_handler.validate_options_window. Until that constant is lowered to the
-    # TastyTrade cache's own floor, an option job starting 2023-01-01 raises
-    # "Options backtests require start >= 2024-01-18" before it runs.
+    # NOTE ON THE START: daily_backtest_handler.validate_options_window enforces the
+    # options-history floor of the VENDOR SERVING THE RUN'S STORE (see
+    # ba2_providers.options.options_history_floor -- Alpaca 2024-01-18 measured, TastyTrade
+    # 2022-10-01). The store the backtest reads is the Alpaca-built OptionsHistoryCache sqlite,
+    # so an option job starting 2023-01-01 raises "Options backtests served by 'alpaca' require
+    # start >= 2024-01-18" before it runs. That changes when the TastyTrade parquet store is
+    # wired into HistoricalOptionsProvider and backtest_options_provider() moves with it --
+    # NOT by lowering the Alpaca number, which would admit a window the sqlite is empty for.
     ap.add_argument("--start", default="2023-01-01",
                     help="Backtest start (default 2023-01-01; requires the options cache -- "
-                         "and fetch_options._OPTIONS_HISTORY_FLOOR -- to reach that far back).")
+                         "and the serving vendor's history floor -- to reach that far back).")
     ap.add_argument("--end", default="2025-12-31",
                     help="Backtest end (default 2025-12-31: 2026 is the reserved "
                          "walk-forward holdout and the launcher refuses to search into it).")
