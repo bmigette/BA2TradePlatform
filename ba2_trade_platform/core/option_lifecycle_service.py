@@ -13,8 +13,10 @@ What the pass does, in order, for ONE expert sleeve:
 3. fetch one option chain per (underlying, expiry) and index it by contract symbol;
 4. total the sleeve (``book_totals``) and ratchet/test the drawdown breaker
    (``update_breaker``), feeding its EDGE into the decision via ``breaker_signal``;
-5. ask ``option_lifecycle.decide`` for exactly one decision per structure;
-6. submit a close for every ``should_close``, each one guarded by
+5. measure the shares still covering every ``covered_call`` (``held_shares_for_cover``),
+   one position read per ticker;
+6. ask ``option_lifecycle.decide`` for exactly one decision per structure;
+7. submit a close for every ``should_close``, each one guarded by
    ``has_pending_closing_order``.
 
 
@@ -45,6 +47,38 @@ Collapsing "we cannot measure this" into "this is fine" is what hid a dead roll-
 an entire GA campaign.
 
 
+The continuous cover monitor
+----------------------------
+Every ``covered_call`` in the sleeve is re-checked against the shares that actually
+cover it, on every pass. The entry seam (``check_cover_for_covered_call``) refuses to
+WRITE an uncovered one and the exit seam refuses to SELL shares pledged to one; neither
+can see the case that actually happens, which is that a broker-side risk-manager stop —
+submitted as an OCO leg by ``TradeRiskManagement`` — fills at 3am. The shares are gone,
+no platform code ran, and the short call is naked until somebody looks. This pass is
+what looks, and because it runs ahead of OPEN_POSITIONS (``JobManager``), a cover lost
+overnight is acted on before any new entry is considered that cycle.
+
+Two things it deliberately does NOT do:
+
+* it does not consult ``shares_pledged_to_short_calls``. That accessor counts EVERY open
+  short call on the ticker — including this very structure's own — so ``held - pledged``
+  is 0 for a perfectly covered call, and the "free cover" figure the ENTRY guard needs
+  would liquidate every healthy covered call here. It would also count the short leg of
+  a credit spread on the same ticker, whose cover is a long call; refusing an entry over
+  that is fail-safe, closing a position over it is not;
+* it does not treat an UNMEASURABLE cover as a lost one. ``held_shares_for_cover`` is
+  tri-state and ``None`` means the POSITION FEED did not answer. Nothing is closed on
+  that, and it is logged at ERROR naming the transaction and saying so, because an
+  operator seeing no action must be able to tell "the cover is fine" from "I could not
+  tell". ``LifecyclePassResult.cover_unmeasurable`` carries the same fact in code.
+
+Cover is allocated oldest-transaction-first when one ticker carries several covered
+calls, so 200 shares held as two lots against two calls report one naked structure when
+one lot is sold rather than two comfortable ones. KNOWN GAP, stated rather than hidden:
+the allocation only sees THIS sleeve's structures, so a covered call written by another
+expert on the same ticker is not charged against the shares here.
+
+
 A stand-down suppresses ENTRIES, not EXITS
 ------------------------------------------
 ``OptionPortfolioManager.manage_open`` returned ``[]`` on every bar while ``self._halted``,
@@ -66,6 +100,11 @@ so the latch suppressed *exits*. That is the wrong half, and it is a real hole:
 
 So this pass runs its exit rules on **every** evaluation regardless of ``halted``, and
 ``LifecyclePassResult.breaker`` carries the stand-down out to whatever opens positions.
+``cover_lost`` obeys the same rule and for the same reason: it suppresses ENTRIES (the
+entry seam already refuses to write a covered call whose cover it cannot find), never
+EXITS. A book that has lost its cover must above all still be able to CLOSE, so a
+cover-lost structure is submitted for closing like any other, an unmeasurable cover
+stops nothing on any OTHER structure, and neither ever aborts the pass.
 ``packages/experts/.../PremiumSeller`` still pins the opposite in
 ``test_circuit_breaker_flattens_and_halts``; that expert is deleted in Task 12 and its
 behaviour is deliberately NOT treated as a specification here.
@@ -82,6 +121,7 @@ rather than hidden. ``rearm_breaker`` is the operator override.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
@@ -90,7 +130,8 @@ from ba2_common.core.option_book import (
     BookTotals, BreakerState, book_totals, breaker_signal, rearm, update_breaker,
 )
 from ba2_common.core.option_lifecycle import (
-    LIFECYCLE_UNKNOWN, LifecycleDecision, LifecycleLeg, OptionStructure, decide,
+    COVERED_CALL_STRATEGY, LIFECYCLE_COVER_LOST, LIFECYCLE_UNKNOWN, LifecycleDecision,
+    LifecycleLeg, OptionStructure, decide,
 )
 from ba2_common.core.option_types import OptionContract, OptionLeg
 
@@ -154,6 +195,16 @@ class LifecyclePassResult:
     failed: List[int] = field(default_factory=list)
     #: Transactions that could not be turned into a structure at all (no legs on record).
     unbuildable: List[int] = field(default_factory=list)
+    #: Decisions whose reason is LIFECYCLE_COVER_LOST: a ``covered_call`` whose shares are
+    #: MEASURABLY gone, i.e. a naked short call. A subset of ``decisions``, surfaced
+    #: separately because it is an incident and not merely another exit — and because it
+    #: is the fact a caller has to see to stand down from writing more of them.
+    cover_lost: List[LifecycleDecision] = field(default_factory=list)
+    #: Transactions whose cover could NOT be measured, so the cover rule closed nothing
+    #: for them (another rule still might). Kept apart from ``cover_lost`` on purpose:
+    #: "the cover is gone" and "I could not tell" are different facts, and an operator
+    #: seeing no action needs to know which one he is looking at.
+    cover_unmeasurable: List[int] = field(default_factory=list)
     book: Optional[BookTotals] = None
     breaker: BreakerState = field(default_factory=BreakerState)
 
@@ -301,19 +352,28 @@ def run_option_lifecycle_pass(expert_instance_id: int,
     if not structures:
         return result
 
-    # 6. One decision per structure. The breaker reaches LIFECYCLE_BREAKER through the
+    # 6. The shares each covered_call is written against. Measured from the structures
+    #    already built plus ONE position read per ticker — the continuous half of the
+    #    cover guard, and the only thing in the platform that can notice a broker-side
+    #    stop taking the cover away overnight.
+    cover_required, cover_held = _cover_inputs(account, structures, expert_instance_id,
+                                               result)
+
+    # 7. One decision per structure. The breaker reaches LIFECYCLE_BREAKER through the
     #    state key option_lifecycle itself exports, so producer and consumer cannot drift.
     decide_settings = dict(settings)
     decide_settings.update(breaker_signal(result.breaker))
     try:
-        result.decisions = decide(structures, chain_by_symbol, decide_settings, as_of)
+        result.decisions = decide(structures, chain_by_symbol, decide_settings, as_of,
+                                  cover_shares_required=cover_required,
+                                  cover_shares_held=cover_held)
     except KeyError as e:
         return _abort(result,
                       f"expert {expert_instance_id} does not declare a threshold one of its "
                       f"{len(structures)} open option structure(s) needs ({e}) — refusing to "
                       f"substitute a default. These positions are NOT being managed.")
 
-    # 7. Act.
+    # 8. Act.
     by_id = {s.transaction_id: s for s in structures}
     txn_by_id = {t.id: t for t in transactions}
     for decision in result.decisions:
@@ -324,6 +384,16 @@ def run_option_lifecycle_pass(expert_instance_id: int,
                 f"Option lifecycle: transaction {decision.transaction_id} is UNKNOWN — the "
                 f"decision could not be made and this is NOT a hold: {decision.detail}")
             continue
+        if decision.reason == LIFECYCLE_COVER_LOST:
+            # An incident, not merely another exit: a short call on this account is NAKED
+            # right now. Recorded before the close is attempted, so it is reported whether
+            # or not the broker takes the order.
+            result.cover_lost.append(decision)
+            logger.error(
+                f"Option lifecycle: transaction {decision.transaction_id} "
+                f"({by_id[decision.transaction_id].underlying}) has LOST ITS COVER — "
+                f"{decision.detail}. Closing it. Nothing in this platform sold those "
+                f"shares this pass, so check for a broker-side stop or a manual sale.")
         if not decision.should_close:
             continue
         _close(account, txn_by_id[decision.transaction_id], by_id[decision.transaction_id],
@@ -332,7 +402,9 @@ def run_option_lifecycle_pass(expert_instance_id: int,
     logger.info(
         f"Option lifecycle for expert {expert_instance_id}: {len(structures)} structure(s), "
         f"{len(result.submitted)} closed, {len(result.skipped_pending_close)} already "
-        f"closing, {len(result.failed)} failed, {len(result.unknown)} unknown")
+        f"closing, {len(result.failed)} failed, {len(result.unknown)} unknown, "
+        f"{len(result.cover_lost)} cover-lost, {len(result.cover_unmeasurable)} with an "
+        f"unmeasurable cover")
     return result
 
 
@@ -528,6 +600,155 @@ def _entry_net_premium(txn) -> Optional[float]:
         return None
     premium = abs(float(txn.open_price))
     return premium if txn.side == OrderDirection.BUY else -premium
+
+
+# ---------------------------------------------------------------------------
+# the cover a covered_call is written against
+# ---------------------------------------------------------------------------
+def _cover_required(structure: OptionStructure) -> Optional[int]:
+    """Shares this structure's SHORT CALLS can have called away, or ``None``.
+
+    Derived from the NETTED legs the pass has already built rather than from the
+    transaction's contract count, because the two disagree in the case that matters: a
+    covered call whose short call has been bought back holds nothing that can be called
+    away, and charging it for cover it no longer needs would report a flat structure as
+    naked every time the shares were later sold.
+
+    ``None`` is UNMEASURABLE — a short leg whose ``option_type`` was never recorded might
+    BE the call, and a structure with no usable multiplier has an obligation of unknown
+    size. Neither may quietly become "needs nothing". ``0`` is a real answer: no short
+    call is held, so no share count can make this structure naked.
+
+    Rounded UP, like ``shares_pledged_to_short_calls`` and the entry guard: under-stating
+    an obligation by a share is the direction that leaves a contract uncovered.
+    """
+    from ba2_common.core.types import OptionRight
+
+    multiplier = structure.multiplier
+    if not multiplier or multiplier <= 0:
+        return None
+    contracts = 0.0
+    for leg in structure.held_legs:
+        if not leg.is_short:
+            continue                     # a LONG leg calls nothing away
+        if leg.option_type is None:
+            return None                  # it might be the call
+        if leg.option_type != OptionRight.CALL:
+            continue                     # a short put obliges CASH, not shares
+        contracts += abs(leg.net_qty)
+    return int(math.ceil(round(contracts * multiplier, 6)))
+
+
+def _held_cover(account, underlying: str, cache: Dict[str, Optional[int]],
+                expert_instance_id: int) -> Optional[int]:
+    """``held_shares_for_cover``, asked ONCE per ticker per pass. Tri-state, ``None`` = unknown.
+
+    Cached because three covered calls on one ticker are one question, and the accessor
+    re-reads ``get_positions()`` each time it is asked. It is still the accessor that is
+    asked, rather than the list ``_broker_can_answer`` already fetched: that method owns
+    the option-row skip, the short-side sign and the tri-state contract, and a second
+    implementation of those here is exactly how two views of one book come to disagree.
+    """
+    if underlying in cache:
+        return cache[underlying]
+    try:
+        held = account.held_shares_for_cover(underlying)
+    except Exception as e:  # noqa: BLE001 — same treatment as `_sleeve_equity`
+        # UNMEASURABLE, and deliberately not fatal: the rest of the sleeve still gets
+        # managed, and an unmeasured cover closes nothing (see `_cover_lost`).
+        logger.error(f"Option lifecycle: how many {underlying} shares expert "
+                     f"{expert_instance_id} holds as cover could not be read ({e}) — the "
+                     f"cover for its {underlying} covered call(s) is UNKNOWN this pass",
+                     exc_info=True)
+        held = None
+    cache[underlying] = held
+    return held
+
+
+#: What a covered_call's requirement is set to when the ledger cannot size it. It has to
+#: be a value that is neither ``None`` (which ``decide`` reads as "this caller is not
+#: measuring cover for that structure", skipping the rule) nor a number (which would be a
+#: fabricated obligation). ``decide`` reads anything unreadable as UNMEASURABLE and
+#: reports ``LIFECYCLE_UNKNOWN`` naming it.
+COVER_REQUIREMENT_UNMEASURABLE = "unmeasurable"
+
+
+def _cover_inputs(account, structures: Sequence[OptionStructure], expert_instance_id: int,
+                  result: LifecyclePassResult) -> Tuple[Dict[int, Any],
+                                                        Dict[int, Optional[int]]]:
+    """``({txn: shares required}, {txn: shares available})`` for this sleeve's covered calls.
+
+    Only ``covered_call`` transactions appear in either map; ``decide`` does not evaluate
+    the cover rule for a transaction the maps omit, so every other structure is untouched.
+
+    Shares are allocated OLDEST TRANSACTION FIRST. The account holds one pool per ticker
+    and two covered calls on that ticker are two claims on it, so comparing each against
+    the raw holding would report 200 shares as covering 200 shares twice over — and the
+    multi-lot case ("30 shares held as 20 + 10" is modelled explicitly elsewhere in this
+    codebase) is precisely how half a cover disappears overnight. First written, first
+    covered.
+
+    Nothing here refuses, closes or aborts: it MEASURES. Every unmeasurable answer is
+    logged and recorded in ``result.cover_unmeasurable`` and then handed to ``decide`` as
+    ``None``, which produces ``LIFECYCLE_UNKNOWN`` and closes nothing.
+    """
+    required_by_txn: Dict[int, Any] = {}
+    available_by_txn: Dict[int, Optional[int]] = {}
+    held_cache: Dict[str, Optional[int]] = {}
+    claimed: Dict[str, int] = {}
+
+    for structure in sorted(structures, key=lambda s: s.transaction_id):
+        if (structure.strategy or "").strip().lower() != COVERED_CALL_STRATEGY:
+            continue
+        txn_id = structure.transaction_id
+        underlying = (structure.underlying or "").strip().upper()
+        required = _cover_required(structure)
+
+        if not underlying or required is None:
+            # An obligation we cannot size, or one with no ticker whose shares could
+            # cover it. Reported, and passed on as unknown — never as "needs nothing".
+            result.cover_unmeasurable.append(txn_id)
+            logger.error(
+                f"Option lifecycle: transaction {txn_id} is tagged covered_call but how "
+                f"many shares it could have called away is UNKNOWN "
+                f"(underlying={structure.underlying!r}, multiplier={structure.multiplier!r}, "
+                f"legs={[l.contract_symbol for l in structure.held_legs]}) — its cover "
+                f"cannot be checked, so NOTHING is being closed on account of it. This is "
+                f"NOT 'the cover is fine': the short call may be naked and this pass "
+                f"cannot tell. Repair the leg's option_type / the transaction's "
+                f"multiplier.")
+            # The sentinel, not a number and not None: None would mean "this caller is
+            # not measuring cover here" and would skip the rule silently, while any
+            # figure would be a fabrication. `decide` reads it as UNREADABLE and says so.
+            required_by_txn[txn_id] = COVER_REQUIREMENT_UNMEASURABLE
+            available_by_txn[txn_id] = None
+            continue
+
+        required_by_txn[txn_id] = required
+        if required <= 0:
+            continue                           # nothing to cover; `decide` skips the rule
+
+        held = _held_cover(account, underlying, held_cache, expert_instance_id)
+        if held is None:
+            result.cover_unmeasurable.append(txn_id)
+            logger.error(
+                f"Option lifecycle: transaction {txn_id} is a covered_call needing "
+                f"{required} {underlying} share(s) of cover, but how many this account "
+                f"holds is UNKNOWN — the POSITION FEED did not answer (the account logged "
+                f"which fetch or row failed). NOTHING is being closed on the strength of "
+                f"it: an unmeasured cover is not a lost one, and liquidating a healthy "
+                f"structure over a feed hiccup is a self-inflicted loss. Equally, this is "
+                f"NOT 'the cover is fine' — the short call may be NAKED and this pass "
+                f"cannot tell. Repair the position feed.")
+            available_by_txn[txn_id] = None
+            continue
+
+        # Clamped at 0: an over-claimed pool leaves later structures nothing, not a
+        # negative holding that would read as a debt in the decision's detail.
+        available_by_txn[txn_id] = max(0, held - claimed.get(underlying, 0))
+        claimed[underlying] = claimed.get(underlying, 0) + required
+
+    return required_by_txn, available_by_txn
 
 
 # ---------------------------------------------------------------------------
