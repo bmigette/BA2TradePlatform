@@ -12,7 +12,13 @@
 set -u
 cd "$(dirname "$0")/.."
 
-LOG=grid_goal2020.log
+# The grid may run under a per-matrix wrapper (e.g. grid_goal2020_matrix3.sh) writing to its OWN
+# log (grid_goal2020_matrix3.log). The plain grid_goal2020.log then stays frozen while the live
+# run logs elsewhere — hardcoding it made every line below it stale fiction (seen 2026-08-18:
+# reported job/gen/dist from a run that had ended 2 days earlier, and flagged the alive wrapper
+# as GONE). Use the most recently written grid_goal2020*.log as the live signal.
+LOG=$(ls -1t grid_goal2020*.log 2>/dev/null | head -1)
+LOG="${LOG:-grid_goal2020.log}"
 TESTDB="$HOME/Documents/ba2/test/dl_forecasting.db"
 PY=.venv/Scripts/python.exe
 
@@ -32,8 +38,11 @@ echo "=================== goal2020 grid status  $(date) ==================="
 #     anchored on the path being LAST, so any documented passthrough launch reported
 #     "PARTIAL — wrapper GONE" on a perfectly healthy grid. That false alarm invites a restart
 #     of a multi-day run, which is far more expensive than the noise it was guarding against.
+#   - the `grid_goal2020*.sh` wildcard covers per-matrix wrapper copies (grid_goal2020_matrix3.sh,
+#     2026-08-18): the literal `grid_goal2020.sh` pattern does NOT match them, so a healthy
+#     matrix wrapper reported "PARTIAL — wrapper GONE".
 read -r N_SH N_DRV <<<"$(powershell -NoProfile -Command "
-  \$sh  = @(Get-CimInstance Win32_Process | Where-Object { \$_.Name -eq 'bash.exe' -and \$_.CommandLine -like '* tools/grid_goal2020.sh*' })
+  \$sh  = @(Get-CimInstance Win32_Process | Where-Object { \$_.Name -eq 'bash.exe' -and \$_.CommandLine -like '* tools/grid_goal2020*.sh*' })
   \$drv = @(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -like '*run_screener_capband_matrix*' })
   '{0} {1}' -f \$sh.Count, \$drv.Count" 2>/dev/null)"
 
@@ -72,7 +81,25 @@ powershell -NoProfile -Command "
 # --- 2. distributed or local-only? -------------------------------------------------------------
 if [ -f "$LOG" ]; then
   if grep -q "DISTRIBUTED across" "$LOG"; then
+    SUMMARY_LINE_NO=$(grep -n 'distributed evaluator (opt' "$LOG" | tail -1 | cut -d: -f1)
     echo "DIST    $(grep -h 'distributed evaluator' "$LOG" | tail -1 | sed 's/.*distributed evaluator/distributed evaluator/')"
+    # The line above is a ONE-TIME summary printed at job START; it is NEVER updated by a
+    # later re-admission/exclusion for the SAME job, so it goes stale the moment a worker
+    # recovers or drops out mid-run. Seen for real (2026-08-26): opt 358 read "0 local + 0
+    # remote slot(s) across 0 worker(s)" -- the only configured worker had just been excluded
+    # at pre-flight (mid self-update-restart) -- while minutes later that worker was fully
+    # busy on all 24 slots, with nothing here to say so. Rather than try to silently
+    # reconstruct a live count (fragile: the summary line never names which worker(s) its Y/Z
+    # cover, so a full per-worker state machine would have to guess), just surface whatever
+    # happened AFTER the summary so this line is never read alone as current truth.
+    if [ -n "$SUMMARY_LINE_NO" ]; then
+      SINCE=$(tail -n "+$((SUMMARY_LINE_NO + 1))" "$LOG" \
+              | grep -E "worker \S+ (recovered; re-admitted|pre-flight failed|pool resized)" | tail -3)
+      if [ -n "$SINCE" ]; then
+        echo "        since that summary:"
+        echo "$SINCE" | sed 's/^.*WARNING:[^:]*:/          /'
+      fi
+    fi
   elif grep -qE "gen [0-9]+/" "$LOG"; then
     echo "!! LOCAL-ONLY: trials are running but no 'DISTRIBUTED across' line was ever logged."
     echo "   The remote worker is NOT helping (~2.5x slower). Stop, check WORKERS, relaunch."
@@ -82,7 +109,12 @@ if [ -f "$LOG" ]; then
   # [^)]* so the optional ", stress +N" suffix is captured too, not treated as a non-match:
   # the wrapper gained STRESS_SPREAD_MULT on 2026-08-12 and the old pattern anchored on
   # "round-trip)" being the end, so this line silently went blank on every stressed run.
-  echo "SPREAD  $(grep -hoE '\(spread [0-9.]+ bps round-trip[^)]*\)' "$LOG" | tail -1)"
+  # 2026-08-18: matrix wrappers log it as `spread N bps, stress +X` (no parens, no
+  # "round-trip") — try the parenthesized form first, then fall back to that, so this
+  # line does not silently blank out just because the log moved format.
+  SP=$(grep -hoE '\(spread [0-9.]+ bps round-trip[^)]*\)' "$LOG" | tail -1)
+  [ -z "$SP" ] && SP=$(grep -hoE 'spread [0-9.]+ bps, stress \+[0-9.]+' "$LOG" | tail -1)
+  echo "SPREAD  ${SP:-(no spread line in $LOG)}"
 fi
 
 # --- 3. current position ------------------------------------------------------------------------
