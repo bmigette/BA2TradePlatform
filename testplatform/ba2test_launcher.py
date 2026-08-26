@@ -28,7 +28,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import date as _date, datetime, timedelta, timedelta as _timedelta
 
 
 def _parse_symbols_arg(raw: str) -> list:
@@ -2321,6 +2321,41 @@ _PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS)
 _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 
 
+# --- the 2026 walk-forward holdout ----------------------------------------------------------
+#
+# The option grid searches 2023-01-01 .. 2025-12-31. 2026 is RESERVED: walk-forward validation
+# on it is a separate exercise, and it is only worth anything if the search never saw the data.
+# A grid run that quietly extends past the boundary spends the answer key on the exam.
+#
+# This is a RAIL, not a setting. There is no flag to switch it off: the walk-forward exercise
+# will move this constant deliberately, as a reviewed change, rather than as an argument
+# someone can paste into a shell script and forget.
+#
+# Scoped to PURE-OPTION jobs. Non-option backtests are running against 2026 windows right now
+# and must not be disturbed by an option-grid policy.
+_OPTION_HOLDOUT_START = _date(2026, 1, 1)
+
+
+def _assert_option_window_excludes_holdout(strat_kinds, end) -> None:
+    """Refuse a pure-option optimize job whose window reaches into the reserved 2026 holdout."""
+    option_kinds = sorted(set(strat_kinds) & _PURE_OPTION_STRATEGIES)
+    if not option_kinds:
+        return
+    try:
+        last = _date.fromisoformat(str(end)[:10])
+    except (TypeError, ValueError):
+        sys.exit(f"ba2-test: --end {end!r} is not an ISO date")
+    if last >= _OPTION_HOLDOUT_START:
+        sys.exit(
+            f"ba2-test: --end {last.isoformat()} reaches into the reserved walk-forward "
+            f"holdout (everything from {_OPTION_HOLDOUT_START.isoformat()}). The option grid "
+            f"must stop at {(_OPTION_HOLDOUT_START - _timedelta(days=1)).isoformat()} or the "
+            f"validation set is spent on the search. Affected strategies: "
+            f"{', '.join(option_kinds)}. If you are deliberately running the walk-forward "
+            f"exercise, move _OPTION_HOLDOUT_START in ba2test_launcher.py as a reviewed "
+            f"change -- there is no flag for this.")
+
+
 def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: str) -> str:
     """Effective fitness metric for an optimize job. An explicit --fitness always wins.
     Otherwise PURE-OPTION kinds (O_* except the equity-entry O_CC/O_PP/O_STK, and the
@@ -3099,6 +3134,7 @@ def _cmd_optimize(args) -> int:
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
                                "consistent_annual_return" if spec.get("options") else "sharpe_ratio")
+    _assert_option_window_excludes_holdout([args.strategy], args.end)
     universe = [s.strip().upper() for s in args.universe.split(",") if s.strip()]
     if not universe:
         sys.exit("ba2-test: --universe must list at least one symbol")
@@ -3421,6 +3457,7 @@ def _cmd_optimize_batch(args) -> int:
                               ("monday", "tuesday", "wednesday", "thursday", "friday",
                                "saturday", "sunday")},
                      "times": ["09:30"]}
+    _assert_option_window_excludes_holdout([k for _e, k in jobs], args.end)
     init_db()
     tq = get_task_queue()
     print(f"optimize-batch: {len(jobs)} job(s) {jobs} x {len(universe)} syms, "
