@@ -49,7 +49,7 @@ import os
 import random
 import sys
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 
 _BACKEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                              "testplatform", "backend")
@@ -603,6 +603,167 @@ def check_senate_skill_score_coverage(cache_folder: str, start: str, end: str) -
     }
 
 
+def _default_options_universe_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "options_universe_large_cap.txt")
+
+
+def _read_symbol_list(path: str) -> List[str]:
+    if not os.path.isfile(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [ln.strip().upper() for ln in f if ln.strip() and not ln.startswith("#")]
+
+
+def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15,
+                         shallow_expiries_threshold: int = 3) -> dict:
+    """Coverage + non-triviality of the TastyTrade options parquet store
+    (``tools/warm_options_history.py``'s target, ``CACHE_FOLDER/TastyTradeOptionsProvider``).
+
+    Three things, none of which the other checks in this file touch (options data is entirely
+    outside push_cache's OHLCV/metric_store sync and outside the fmp_history warm-cache checks):
+
+    1. UNIVERSE COVERAGE: for each symbol in the target universe (default
+       ``tools/options_universe_large_cap.txt``, the same list ``run_option_warmup_parallel.py``
+       warms), whether it has at least one COMPLETED (underlying, expiry) manifest -- NOT just a
+       directory. A directory alone is created the moment a symbol's chunk starts, before
+       anything actually finishes, so counting it as "present" would call a symbol whose worker
+       died mid-first-fetch "covered". Separately reports symbols the store has data for that
+       AREN'T in the current universe file (harmless -- e.g. a symbol dropped from the universe
+       after already being warmed, like the punctuation-ticker cleanup in warm_options_history.py)
+       so that never reads as a coverage gap.
+
+    2. PER-SYMBOL DEPTH: symbols WITH at least one completed partition but very few of them -- a
+       stalled/interrupted worker chunk (see ``run_option_warmup_parallel.py``'s crash/reboot
+       recovery) or a symbol that genuinely has a thin chain, indistinguishable from a directory
+       listing alone. Symbols with ZERO completed partitions are reported separately (as
+       "started, nothing finished yet"), not folded into this bucket -- they're a different
+       situation (in flight or dead) from "finished a few, needs more".
+
+    3. IV/OPEN_INTEREST NON-NULL RATE (sampled, from symbols that actually have data): the entire
+       reason this store exists over the incumbent options_history.sqlite is that
+       ``imp_volatility``/``open_interest`` were NULL across all 6,757,055 of ITS rows (see
+       parquet_store.py's COLUMNS docstring and warm_options_history.py's module docstring). A
+       silently-regressed fetch that stopped populating these two fields would pass every other
+       check here (files exist, non-empty, right shape) while quietly reproducing the exact
+       defect this pipeline was built to fix.
+
+    Returns ``{universe_size, covered, zero_partitions: [...], never_started: [...],
+    extra_not_in_universe: [...], shallow: {symbol: n_expiries}, total_partitions,
+    iv_sample: {...}}``.
+    """
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    store = OptionHistoryParquetStore()
+    universe_path = universe_path or _default_options_universe_path()
+    universe = set(_read_symbol_list(universe_path))
+    present_dirs = set(store.underlyings())
+
+    # completed_expiries() is the ground truth ("has real data"), not underlyings() ("has a
+    # directory") -- computed once per present symbol and reused for every category below.
+    per_symbol_expiries = {sym: len(store.completed_expiries(sym)) for sym in sorted(present_dirs)}
+    with_data = {sym for sym, n in per_symbol_expiries.items() if n > 0}
+    total_partitions = sum(per_symbol_expiries.values())
+
+    covered = sorted(universe & with_data) if universe else sorted(with_data)
+    zero_partitions = sorted(universe & (present_dirs - with_data)) if universe else []
+    never_started = sorted(universe - present_dirs) if universe else []
+    extra_not_in_universe = sorted(present_dirs - universe) if universe else []
+    shallow = {sym: n for sym in (universe & with_data if universe else with_data)
+              if (n := per_symbol_expiries[sym]) < shallow_expiries_threshold}
+
+    # IV/open_interest non-null rate, sampled from symbols that actually HAVE data -- sampling
+    # from present_dirs would waste slots on the zero-partition case above (nothing to read).
+    # Reading every symbol's full history here would be as slow as the fetch itself; a random
+    # sample (seeded, so a re-run is comparable) is enough to catch a systemic regression (every
+    # row null) vs. normal sparse-quote NaNs.
+    iv_res = {"sampled": 0, "rows": 0, "iv_nonnull_pct": None, "oi_nonnull_pct": None,
+              "unreadable": []}
+    pool = sorted(with_data)
+    sample_syms = pool if len(pool) <= iv_sample else random.Random(1337).sample(pool, iv_sample)
+    iv_nonnull = oi_nonnull = rows = 0
+    for sym in sample_syms:
+        try:
+            df = store.read_underlying(sym)
+        except Exception:  # noqa: BLE001 — an unreadable partition is itself a finding
+            iv_res["unreadable"].append(sym)
+            continue
+        if df is None or df.empty:
+            continue
+        iv_res["sampled"] += 1
+        rows += len(df)
+        iv_nonnull += int(df["iv"].notna().sum())
+        oi_nonnull += int(df["open_interest"].notna().sum())
+    iv_res["rows"] = rows
+    if rows:
+        iv_res["iv_nonnull_pct"] = round(iv_nonnull / rows * 100.0, 1)
+        iv_res["oi_nonnull_pct"] = round(oi_nonnull / rows * 100.0, 1)
+
+    return {
+        "universe_size": len(universe), "covered": covered,
+        "zero_partitions": zero_partitions, "never_started": never_started,
+        "extra_not_in_universe": extra_not_in_universe,
+        "total_partitions": total_partitions, "shallow": shallow, "iv_sample": iv_res,
+        "store_root": store.root, "disk_bytes": store.disk_bytes(),
+    }
+
+
+def print_options_cache_report(universe_path: Optional[str], iv_sample: int) -> bool:
+    """Runs check_options_cache and prints a report. Returns True if nothing looks broken."""
+    print("\n=== options cache (TastyTradeOptionsProvider) ===")
+    res = check_options_cache(universe_path, iv_sample)
+    ok = True
+
+    print(f"  store root: {res['store_root']}  ({res['disk_bytes'] / (1 << 30):.2f} GB on disk)")
+    print(f"  universe coverage: {len(res['covered'])}/{res['universe_size']} symbol(s) have "
+          f"at least one COMPLETED partition; {res['total_partitions']} completed "
+          f"(underlying, expiry) partition(s) total")
+
+    if res["zero_partitions"]:
+        n = len(res["zero_partitions"])
+        print(f"  STARTED, NOTHING FINISHED YET ({n}) -- in flight, or a dead/interrupted "
+              f"chunk: {res['zero_partitions'][:15]}{' ...' if n > 15 else ''}")
+        ok = False
+
+    if res["never_started"]:
+        n = len(res["never_started"])
+        print(f"  NEVER STARTED ({n}): {res['never_started'][:15]}"
+              f"{' ...' if n > 15 else ''}")
+        ok = False
+
+    if res["extra_not_in_universe"]:
+        n = len(res["extra_not_in_universe"])
+        print(f"  ({n} symbol(s) cached but not in the current universe file -- harmless, e.g. "
+              f"dropped from the universe after being warmed: {res['extra_not_in_universe'][:10]}"
+              f"{' ...' if n > 10 else ''})")
+
+    if res["shallow"]:
+        print(f"  shallow ({len(res['shallow'])} symbol(s) with < a handful of completed "
+              f"expiries -- likely still in progress or an interrupted chunk):")
+        for sym, n in sorted(res["shallow"].items(), key=lambda kv: kv[1])[:15]:
+            print(f"    [{sym}] {n} expiries")
+    else:
+        print("  no shallow symbols (every present symbol has a reasonable expiry count).")
+
+    iv = res["iv_sample"]
+    print(f"  IV/open_interest non-null rate (sampled {iv['sampled']} symbol(s), "
+          f"{iv['rows']} row(s)):")
+    if iv["rows"]:
+        print(f"    iv: {iv['iv_nonnull_pct']}%   open_interest: {iv['oi_nonnull_pct']}%")
+        # A near-total null rate on a REAL sample is exactly the incumbent-cache defect this
+        # store exists to fix -- fail loud, don't just note it.
+        if iv["iv_nonnull_pct"] < 5.0 and iv["oi_nonnull_pct"] < 5.0:
+            print("    <-- both near-zero: this looks like the exact defect this store was "
+                  "built to avoid (see module docstring). Check the fetch path, not just data.")
+            ok = False
+    else:
+        print("    no readable rows sampled -- store may be empty or still warming up.")
+    if iv["unreadable"]:
+        print(f"    unreadable: {iv['unreadable']}")
+        ok = False
+
+    return ok
+
+
 # Expert -> max indicator lookback in trading BARS, and the bars->calendar-days conversion.
 # MIRRORS ``daily_backtest_handler._EXPERT_WARMUP_BARS`` / ``derive_warmup_days`` (kept as a
 # local copy rather than an import so this tool stays runnable without the backtest package on
@@ -843,6 +1004,16 @@ def main() -> int:
     ap.add_argument("--skip-validity", action="store_true", help="Skip the period validity check (metric_store column NaN rates + OHLCV per-month coverage + expert warm-cache existence).")
     ap.add_argument("--validity-symbols", type=int, default=25, help="How many OHLCV symbols to sample for the per-month coverage check (default 25).")
     ap.add_argument("--nan-threshold", type=float, default=0.5, help="Flag a metric_store column if its NaN rate for a month exceeds this fraction (default 0.5 = 50%%).")
+    ap.add_argument("--check-options", action="store_true",
+                    help="Also check the TastyTrade options parquet store (universe coverage, "
+                         "per-symbol partition depth, IV/open_interest non-null rate). Off by "
+                         "default -- separate from the equity-grid checks above and can be slow "
+                         "on a large store.")
+    ap.add_argument("--options-universe", default=None,
+                    help="Symbol list to check options coverage against (default: "
+                         "tools/options_universe_large_cap.txt).")
+    ap.add_argument("--options-iv-sample", type=int, default=15,
+                    help="How many symbols to sample for the IV/open_interest non-null check (default 15).")
     args = ap.parse_args()
 
     overall_ok = True
@@ -866,6 +1037,10 @@ def main() -> int:
         if start and end:
             if not check_period_validity(start, end, args.nan_threshold, args.validity_symbols, args.ohlcv_interval):
                 overall_ok = False
+
+    if args.check_options:
+        if not print_options_cache_report(args.options_universe, args.options_iv_sample):
+            overall_ok = False
 
     if args.skip_workers:
         print()
