@@ -2816,11 +2816,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # 3. Exercise/assignment -> create the resulting SHARE position settled at the STRIKE (NOT
         #    the market — the option holder transacts stock at the strike). The share cost basis is
         #    therefore the strike; the position then marks-to-market at the underlying close so an
-        #    ITM assignment loss is real and PERSISTS.
+        #    ITM assignment loss is real and PERSISTS. ``_book_assignment_share_leg`` also writes
+        #    the delivery to the ORDER/TRANSACTION tables (OPT-B2/F7) — the ledger alone is not the
+        #    book.
         if share_side is not None and shares and share_price is not None:
             signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
             self._cash -= signed * float(share_price)  # buy debits, sell credits — at strike.
-            self._update_position(position.underlying, signed, float(share_price))
+            self._book_assignment_share_leg(
+                position.underlying, signed, float(share_price), expert_id=txn.expert_id)
 
         # 4. Close the SHARED transaction only once every option leg on it has resolved. For a
         #    single-leg option this is immediate; for a multi-leg spread the transaction stays
@@ -2837,6 +2840,117 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
             update_instance(txn)
         return True
+
+    def _book_assignment_share_leg(
+        self, symbol: str, signed: float, price: float, *, expert_id: Optional[int] = None
+    ) -> None:
+        """Apply an assignment's SHARE delivery to the ledger AND to the order/transaction book.
+
+        ``_update_position`` alone (what this used to be) mutates only the in-memory
+        ``self._positions`` dict, so an assignment was invisible to everything that reads
+        transactions. That is OPT-B2 and F7:
+
+          * CALLED AWAY. The 100 long shares netted to zero while their equity Transaction
+            stayed OPENED with a FILLED BUY and no SELL, so ``_held_equity_shares`` reported
+            100 phantom shares forever — the covered-call overlay wrote another, NAKED, call
+            every cycle, and a later equity exit sold shares that did not exist, opening a
+            real short from ``qty=0``. ``process_pending_assignment_liquidations`` could not
+            catch it: it short-circuits on ``held <= 0`` and the netted position IS zero.
+          * PUT TO US / ASSIGNED SHORT. The new stock lot had no order and no transaction, so
+            the next-bar liquidation order resolved to ``transaction_id=None`` and
+            ``get_round_trip_trades`` dropped it — the realised stock P&L reached the equity
+            CURVE and never the trade ROWS every fitness metric is built from.
+
+        The delivery is therefore split at the ledger boundary:
+
+          * the part that OFFSETS an existing lot is booked as a closing fill AT THE STRIKE on
+            that lot's transaction (``_record_stock_liquidation_close`` resolves and links it;
+            ``refresh_transactions`` then closes the transaction on the filled dependent leg);
+          * the part that OPENS a new lot gets its own equity Transaction + FILLED entry order
+            at the strike, tagged ``origin=csp_assignment`` exactly as the live door does
+            (``AlpacaAccount._apply_option_activity``), and only THAT part is scheduled for
+            the next-bar orphan liquidation — scheduling the full assignment would sell down
+            an unrelated lot the strategy still owns.
+
+        Cash has already moved in the caller; this moves no cash of its own.
+        """
+        pos = self._positions.get(symbol)
+        held = float(pos.qty) if pos is not None else 0.0
+        # The offsetting part (opposite sign to what is held) closes; the rest opens.
+        closing = 0.0
+        if held and (held > 0) != (signed > 0):
+            closing = min(abs(signed), abs(held))
+        opening = abs(signed) - closing
+
+        self._update_position(symbol, signed, price)
+
+        if closing > 0:
+            self._record_stock_liquidation_close(
+                symbol, closing, was_long=(held > 0), px=price, comment="option_assignment")
+        if opening > 0:
+            self._open_assigned_stock_transaction(
+                symbol, opening, is_long=(signed > 0), price=price, expert_id=expert_id)
+            # Only the newly-orphaned lot is unmanaged; schedule THAT for the next bar.
+            self._pending_assignment_sells[symbol] = (
+                self._pending_assignment_sells.get(symbol, 0.0)
+                + (opening if signed > 0 else -opening)
+            )
+
+    def _open_assigned_stock_transaction(
+        self, symbol: str, qty: float, *, is_long: bool, price: float,
+        expert_id: Optional[int] = None,
+    ) -> None:
+        """Persist the equity Transaction + FILLED entry order for an assignment-created lot.
+
+        Mirrors the live ``csp_assignment`` shape (``AlpacaAccount._apply_option_activity``):
+        an OPENED equity transaction at the STRIKE carrying ``meta_data.origin =
+        csp_assignment``, with one synthetic FILLED order underneath. The ``expert_id`` is
+        carried over from the settling OPTION transaction so the shares are visible to the
+        expert that wrote the contract — the wheel's covered call is sized off exactly these
+        shares — and so ``has_assigned_shares`` can see them.
+
+        Written as an ENTRY (no ``depends_on_order``): the next-bar liquidation's closing leg
+        is what resolves against it, and ``refresh_transactions`` closes the transaction then.
+        """
+        from ba2_common.core.types import TXN_ORIGIN_CSP_ASSIGNMENT
+
+        as_of = self._price.now()
+        side = OrderDirection.BUY if is_long else OrderDirection.SELL
+        txn = Transaction(
+            symbol=symbol,
+            quantity=abs(float(qty)),
+            side=side,
+            open_price=float(price),
+            open_date=as_of,
+            status=TransactionStatus.OPENED,
+            asset_class=AssetClass.EQUITY,
+            expert_id=expert_id,
+            meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT},
+        )
+        txn_id = add_instance(txn)
+        if txn_id is None:
+            return
+        # open_date is already the SIM clock — keep refresh_transactions' re-stamp pass off it.
+        self._stamped_open_ids.add(txn_id)
+        order = TradingOrder(
+            account_id=self.id,
+            symbol=symbol,
+            quantity=abs(float(qty)),
+            filled_qty=abs(float(qty)),
+            side=side,
+            order_type=OrderType.MARKET,
+            status=OrderStatus.FILLED,
+            open_price=float(price),
+            transaction_id=txn_id,
+            open_type=OrderOpenType.AUTOMATIC,
+            broker_order_id=self._next_broker_id(),
+            comment="option_assignment",
+            created_at=as_of,
+        )
+        new_id = add_instance(order)
+        if new_id is not None:
+            self._fill_dates[new_id] = as_of
+        self.invalidate_order_cache()
 
     def settle_single_leg_expiry(self, position: OptionPosition, spot: float) -> bool:
         """Expiry settlement POLICY for a SINGLE-LEG (non-defined-risk-combo) option position.
@@ -2883,13 +2997,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 share_side=share_side, shares=shares, share_price=strike,
             )
             if ok:
-                # The assigned stock (long from a short put, short from a naked call) is an
-                # unmanaged orphan in a backtest: schedule its FULL liquidation at the next
-                # bar's open. Signed: +shares to SELL (long) / -shares to BUY back (short).
-                signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
-                self._pending_assignment_sells[position.underlying] = (
-                    self._pending_assignment_sells.get(position.underlying, 0.0) + signed
-                )
+                # The stock the assignment ORPHANS (long from a short put, short from a naked
+                # call) is unmanaged in a backtest and is scheduled for next-bar liquidation by
+                # ``_book_assignment_share_leg`` — which schedules only the part that actually
+                # opened a new lot. A COVERED call delivers shares the account already held:
+                # that part is booked as a closing fill on the lot's own transaction and there
+                # is nothing left to liquidate (scheduling it would sell down an unrelated lot).
                 logger.warning(
                     "[backtest] short-%s assignment of %d x %s at strike %.2f — scheduling "
                     "assignment_liquidation of the assigned stock at the next bar's open "

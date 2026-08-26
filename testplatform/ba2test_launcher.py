@@ -2654,6 +2654,51 @@ def _with_round_lot_entry(s, lot: int = 100):
     return s
 
 
+def _insert_option_overlay(exit_rules, guard, overlay):
+    """Splice an option OVERLAY pair (guard + overlay) into an exit list so it is REACHABLE.
+
+    The engine evaluates an OPEN_POSITIONS ruleset FIRST-MATCH: ``TradeActionEvaluator``
+    breaks out of the rule loop as soon as one rule's conditions are met, unless that rule
+    sets ``continue_processing`` (default False). S2's list ends with ``exit_stoploss``,
+    conditioned only on ``has_position`` — which is true for every position the manage pass
+    is invoked for — so an overlay APPENDED after it could NEVER run (OPT-B1). The GA could
+    not route around it either: ``exit_stoploss`` declares no ``toggle_optimize``, so
+    ``collect_param_space`` emits no ``exit:exit_stoploss:enabled`` gene and the shadow was
+    unconditional in every genome. Every O_CC / O_PP number ever produced is therefore a
+    mislabelled plain-equity run, and the two jobs were byte-identical to each other.
+
+    Placement: AFTER the closing rules, BEFORE the first stop-adjusting rule.
+
+      * a matched CLOSE still breaks first, so no option is written against shares that are
+        being sold on that same bar (that would leave a naked short call);
+      * the overlay carries ``continue_processing=True``, so the adjust rules behind it keep
+        their own first-match priority intact — ``exit_belock``'s tighter break-even stop
+        still beats the ``exit_stoploss`` floor, which it would not if the overlay let both
+        run and the later (looser) one overwrote it (``adjust_sl`` overwrites, it does not
+        ratchet);
+      * the guard's ``stop_processing`` halts the chain while an overlay is already open,
+        which is also what stops the stop-adjust rules re-arming a stop that would sell the
+        shares out from under a live short call. The bracket levels already recorded on the
+        transaction keep firing regardless — ``_apply_bracket_exits`` reads them directly,
+        not through the rule chain.
+
+    Fails loud when no stop-adjusting rule exists: the insertion point would then be a
+    guess, and guessing is how the overlay got appended past the floor stop in the first
+    place.
+    """
+    rules = list(exit_rules or [])
+    for idx, rule in enumerate(rules):
+        actions = [str(a.get("action_type") or a.get("action") or "")
+                   for a in (rule.get("actions") or [])]
+        if any(a.startswith("adjust_") for a in actions):
+            return rules[:idx] + [guard, overlay] + rules[idx:]
+    raise ValueError(
+        "_insert_option_overlay: no adjust_* exit rule to anchor the overlay against; "
+        f"got rule ids {[r.get('id') for r in rules]}. The overlay must sit after the "
+        "closing rules and before the stop-adjusting rules — see this function's docstring."
+    )
+
+
 def _build_strategy_covered_call(kind: str):
     """O_CC — equity entry (the S2 baseline) + a ``sell_covered_call`` OPEN_POSITIONS overlay rule
     (sell a ~5% OTM call against the held shares). Equity-entry, so NO entry_action.
@@ -2662,10 +2707,15 @@ def _build_strategy_covered_call(kind: str):
     order, so a ``stop_processing`` guard rule ahead of it — the codebase's negation idiom
     (test_files/setup_option_rulesets.py; rules_documentation.py: "require NOT
     has_covered_call before sell_covered_call") — halts the ruleset whenever a covered call
-    is ALREADY open, and ``cc_sell`` only fires while the held shares have no overlay."""
+    is ALREADY open, and ``cc_sell`` only fires while the held shares have no overlay.
+
+    The pair is SPLICED into the exit list by ``_insert_option_overlay`` (after the closes,
+    before the stop adjusts) rather than appended — appended, it sat behind S2's
+    always-matching floor stop and could never fire at all (OPT-B1)."""
     from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
     s = _with_round_lot_entry(_build_strategy_S2(kind))  # equity entry in 100-share lots
-    s.exit_rules = list(s.exit_rules or []) + [
+    s.exit_rules = _insert_option_overlay(
+        s.exit_rules,
         {"id": "cc_guard",
          "conditions": {"type": "AND", "conditions": [
              {"id": "cc_guard_has_cc", "field": "has_covered_call"}]},
@@ -2676,7 +2726,9 @@ def _build_strategy_covered_call(kind: str):
          "actions": [_option_overlay_action(
              "sell_covered_call", strike_param=5.0,
              strike_min=2.0, strike_max=12.0, strike_step=2.0)],
-         "continue_processing": False}]
+         # Writing the call must NOT consume the bar's single first-match slot: the exit
+         # rules behind it (the break-even lock, the floor stop) still have to run.
+         "continue_processing": True})
     return s
 
 
@@ -2693,10 +2745,12 @@ def _build_strategy_protective_put(kind: str):
     entry_action. The overlay carries the same anti-stacking guard as O_CC (bug B2): a
     ``stop_processing`` guard rule on ``has_protective_put`` (a dedicated condition —
     TradeConditions.py ``HasProtectivePutCondition``) ahead of the overlay halts the ruleset
-    once a protective put is already open."""
+    once a protective put is already open. The pair is spliced in by
+    ``_insert_option_overlay`` for the same reason O_CC's is (OPT-B1)."""
     from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
     s = _with_round_lot_entry(_build_strategy_S2(kind))  # equity entry in 100-share lots
-    s.exit_rules = list(s.exit_rules or []) + [
+    s.exit_rules = _insert_option_overlay(
+        s.exit_rules,
         {"id": "pp_guard",
          "conditions": {"type": "AND", "conditions": [
              {"id": "pp_guard_has_pp", "field": "has_protective_put"}]},
@@ -2707,7 +2761,8 @@ def _build_strategy_protective_put(kind: str):
          "actions": [_option_overlay_action(
              "buy_protective_put", strike_param=8.0,
              strike_min=3.0, strike_max=15.0, strike_step=3.0)],
-         "continue_processing": False}]
+         # See cc_sell: buying the hedge must not consume the bar's first-match slot.
+         "continue_processing": True})
     return s
 
 
