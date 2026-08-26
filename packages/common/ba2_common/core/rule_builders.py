@@ -220,6 +220,12 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("max_spread_pct", ("option_max_spread_pct", "option_max_spread")),
     ("min_volume", ("option_min_volume", "option_min_vol")),
     ("wing_width_pct", ("option_wing_width_pct", "option_wing_width")),
+    # PREMIUM-RICHNESS floor: the minimum per-contract annualised return on collateral a
+    # CREDIT structure must offer to be opened (a FRACTION, 0.15 == 15 %/yr). See
+    # ``option_economics``. Absent means no floor -- today's behaviour, where a credit
+    # structure is admitted on ``net_credit > 0`` alone -- so it must stay absent rather than
+    # defaulting to 0.0, which would be a configured gate that refuses every unmeasurable ARC.
+    ("min_arc", ("option_min_arc",)),
 )
 
 
