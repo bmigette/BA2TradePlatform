@@ -1,21 +1,101 @@
 # Option lifecycle & structures — review findings
 
-**Status:** living document. Started 2026-08-25. Nothing here is fixed yet.
+**Status:** living document. Reviews run 2026-08-25. **Track A (live safety) fixed 2026-08-26** —
+see the fix status below. Everything else remains open.
 
 This tracks the findings from a set of read-only reviews of the option stack. It exists so the
 findings survive past the conversation that produced them. Each finding has a stable ID; use the
-ID in commit messages when one is fixed, and update the Status column here.
+ID in commit messages when one is fixed, and update the fix status below.
 
-| Review | Scope | State |
+| Review | Scope | Result |
 |---|---|---|
-| **R1 — covered call & wheel** | share coverage, stock acquisition, assignment/exercise/expiry, the 100× multiplier, backtest-vs-live parity | **complete** — 27 agents, 18 findings raised, 13 survived adversarial refutation, 5 refuted |
-| **R2 — all other structures** | combo-vs-legged margin, strike/expiry validity invariants, per-structure collateral, long-option-as-collateral, entry gating, exit completeness | running |
-| **R3 — condition optimizability** | domain bounds vs GA gene ranges, cross-symbol coherence, dead/unregistered genes, data quality, missing normalized conditions, grid & fitness | running |
-| **R4 — option fitness design panel** | 4 independent fitness designs, judged on gameability / implementability / statistical soundness | running |
+| **R1 — covered call & wheel** | share coverage, stock acquisition, assignment/exercise/expiry, the 100× multiplier, backtest-vs-live parity | 18 findings raised, **13 survived** refutation, 5 refuted |
+| **R2 — all other structures** | combo-vs-legged margin, strike/expiry validity invariants, per-structure collateral, long-option-as-collateral, entry gating, exit completeness | 18 raised, **17 survived**, 1 refuted |
+| **R3 — condition optimizability** | domain bounds vs GA gene ranges, cross-symbol coherence, dead/unregistered genes, data quality, missing normalized conditions, grid & fitness | 33 conditions inventoried, 18 raised, **15 survived**, 3 refuted |
+| **R4 — option fitness design panel** | 4 independent fitness designs, judged on gameability / implementability / statistical soundness | judging failed (dossier truncated); **13 substrate findings** produced instead |
 
 Method for all four: independent finders per lens, then **every** finding handed to a separate
 agent instructed to *refute* it by default and to verify the cited code actually exists. Only
 survivors are recorded below. Refuted claims are listed at the end so they are not resurrected.
+
+---
+
+## Fix status — updated 2026-08-26
+
+**Track A (live safety, seams 1–3) is complete.** 24 commits, every task spec-reviewed *and*
+quality-reviewed, 67 mutations in the final hardening pass with the no-op control surviving in all
+seven batches.
+
+### Closed
+
+| ID | Closed by | Note |
+|---|---|---|
+| `OPT-L1` | `42998b31` `02ca35af` `6cc1079d` `828e65a9` `0e4ee7a7` `66365227` `893fac29` | entry, exit and continuous monitor. The exit half took four commits: the first covered one lot, the second netted closes already in flight, the third stopped the trim seam excluding its own prior staged sales |
+| `OPT-L2` | `e6edb266` `2b484131` | the filter, plus making the silence it introduced loud |
+| `OPT-L3` | `df718f27` `17d0a243` `ebcde94c` `9da007e1` | all three equity paths refuse an option |
+| `OPT-S3` | **`a2c6ff28`** | **not** `de4f0f0f`, which claimed it — see below |
+| `OPT-S8` | `de4f0f0f` | the shared close-decision branch |
+
+### Still open — the eight independents from the Seam 1 spec
+
+`OPT-S5` · `OPT-S1` · `OPT-L5`/`OPT-S6` · `OPT-L6` · `OPT-S2` · `OPT-L4` · `OPT-S4` · `OPT-L7`.
+Always scoped as a separate plan; untouched by Track A.
+
+### Still open — Tracks B, C and D
+
+Every `OPT-B*`, the remaining `OPT-S*`, all `OPT-C*` and all `F*`.
+
+### A correction worth keeping
+
+`de4f0f0f` was committed as "(OPT-S3, OPT-S8)". Review established only OPT-S8 was fixed: the live
+door is `AlpacaAccount._apply_option_activity` → `_close_txn`, which sets `Transaction.status =
+CLOSED` directly and never passes through `refresh_transactions`, where that guard lives. The
+guarded arm was in fact **unreachable** in the live engine. `5b876e8b` corrected the claim;
+`a2c6ff28` then actually fixed it.
+
+This is the defect class no test can catch — the code did exactly what it said. The claim about
+*which* bug it fixed was false.
+
+### Found during Track A, absent from the original reviews
+
+**Fixed:**
+
+- A partially filled sell-to-open pledged only its **filled** part: 3 contracts with 1 filled
+  reported 100 shares of cover instead of 300. The same defect in `short_put_assignment_exposure`
+  was worse — **the first fill made the book read $45,000 *less* exposed** (`aeea3b33`).
+- Allocation could **never converge** on a symbol carrying an option transaction, because
+  `split_delta_fifo` consumed the option's *contract count* as if it were shares (`e6edb266`).
+- Two lots of one ticker each passed a cover check the other invalidated — deterministically on the
+  deferred branch, where nothing reaches the broker to decrement the holding (`828e65a9`).
+- The entry guard could validate a 30-share position and create a 300-share one, and a test asserted
+  that admission was correct (`3092cb8b`).
+- Nothing recorded a settled option leg at all — no order row, no metadata — so the per-contract
+  balance OPT-S3's fix needs had to be created first (`a2c6ff28`).
+- `_submit_row`'s action dispatch *ended* in `return _open_symbol(...)`, so an unrecognised action
+  placed a MARKET BUY (`2b484131`).
+
+**Open, recorded, not fixed:**
+
+- **`qty` vs `qty_available`.** Shares committed to a resting SELL_STOP still count as full cover, at
+  **both** the entry and exit seams. Counting resting legs was tried and reverted: `close_transaction`
+  cancels legs at the broker without terminalising the DB rows, so every later exit then refused on
+  phantom orders. `qty_available` is the field that would answer it, and `IBKRAccount.get_positions`
+  never populates it — the adapters come first. Pinned by two named tests.
+- **A trim cancels the previous trim's staged sale.** `is_tpsl_order` treats any order carrying
+  `depends_on_order` as a protective leg, so the transaction is written down for shares that then
+  never sell. Live position drift, independent of the cover guard.
+- **`cancel_order` has two incompatible signatures.** IBKR takes a `TradingOrder`; the interface,
+  Alpaca and TastyTrade take an id. On IBKR a partial close can never work, and the increase path
+  grows a position while leaving its old TP/SL legs live.
+- **A broker position with no tracked transactions at all** still reports "nothing to do" on a sell —
+  the same silence as `OPT-L2`'s, from a different cause.
+
+### One behaviour change to know about
+
+A covered-call sleeve and a credit-spread sleeve **on the same ticker will not both write**.
+`shares_pledged_to_short_calls` counts the spread's short leg as consuming 100 shares, so it refuses
+a genuinely covered call beside it. Fail-safe and deliberate — a short 160C really can call away 100
+shares between 160 and 170 — and pinned by `test_an_open_credit_spread_consumes_cover_on_the_same_ticker`.
 
 ---
 
