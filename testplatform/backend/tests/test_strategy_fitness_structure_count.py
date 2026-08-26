@@ -17,6 +17,11 @@ Consequences before this file existed:
 the CONSUMING end: ``strategy_fitness`` re-derives the rate from ``results["trades"]``, which
 ``build_results`` always publishes, using the same "option legs sharing a transaction_id are
 ONE economic bet" partition ``results._cap_groups`` already uses for the profit cap.
+
+SECTION 4 IS THE OPTION METRIC. ``_option_consistent_annual_return`` was written in a
+different worktree and read ``avg_trades_per_year`` directly, so it kept the whole defect
+above while its equity twin was fixed -- and it is the DEFAULT metric for pure-option grids,
+i.e. the one place where four-leg structures are not the exception but the entire population.
 """
 import pytest
 
@@ -174,3 +179,94 @@ def test_fitness_trade_scale_also_counts_structures():
     r["total_return"] = 100.0
     # 20 legs -> 5 structures. Scale must be 5/100, not 20/100.
     assert compute_fitness("total_return", r) == pytest.approx(100.0 * (5.0 / 100.0))
+
+
+# ---------------------------------------------------------------------------
+# 4. The OPTION metric, which reads the same rate
+# ---------------------------------------------------------------------------
+# ``option_consistent_annual_return`` is a deliberate near-copy of ``consistent_annual_return``
+# differing in one term (a superlinear drawdown penalty). The copy was made in another
+# worktree and kept the LEG rate, so every assertion in section 2 was false for it -- on the
+# metric that is the DEFAULT for pure-option grids, where multi-leg structures are the whole
+# population rather than an edge case.
+#
+# At the -20% reference the option penalty is (20/20)**2 == 1.0, exactly where the linear
+# guard is 1.0, so these mirror section 2's numbers term for term.
+OCAR = "option_consistent_annual_return"
+
+
+def test_three_condors_a_year_is_disqualified_by_the_option_metric():
+    """THE headline case on the metric that actually scores option grids. 3 condors = 12
+    legs, which clears the 12/yr hard floor exactly."""
+    assert compute_fitness(OCAR, _r(_condors(3))) == LOW_TRADE_SENTINEL
+
+
+def test_thirty_legs_of_condors_do_not_earn_full_option_credit():
+    r = _r(_condors(8))
+    assert r["avg_trades_per_year"] == 32.0     # FULL credit on the leg count
+    assert compute_fitness(OCAR, r) == LOW_TRADE_SENTINEL
+
+
+def test_the_option_ramp_is_measured_in_structures():
+    r = _r(_condors(20))
+    assert r["avg_trades_per_year"] == 80.0
+    assert compute_fitness(OCAR, r) == pytest.approx(30.0 * (20.0 / 30.0))
+
+
+def test_thirty_condors_a_year_still_earns_full_option_credit():
+    """DISCRIMINATOR: the fix must not make the option gate unreachable for a genuinely
+    active option genome -- which is the failure mode that matters most here, since EVERY
+    genome this metric scores is a multi-leg one."""
+    assert compute_fitness(OCAR, _r(_condors(30))) == pytest.approx(30.0)
+
+
+def test_an_option_results_blob_with_no_trades_list_keeps_the_leg_rate():
+    """A re-scored DB row has no ``trades``; degraded, not broken, exactly as for CAR."""
+    r = {"total_trades": 20, "avg_trades_per_year": 20.0, "annualized_return": 30.0,
+         "max_drawdown": -20.0}
+    assert compute_fitness(OCAR, r) == pytest.approx(30.0 * (20.0 / 30.0))
+
+
+def test_the_option_metric_still_disqualifies_with_no_rate_at_all():
+    """``_trades_per_year`` returns None when nothing can be derived (no rate, no trades, no
+    curve). That must stay a disqualification -- not a crash, and not a zero rate that would
+    read as "traded nothing" and score.
+
+    Asserted on the metric FUNCTION: ``compute_fitness`` rewrites both sentinels to
+    ZERO_TRADE_SENTINEL on its way out, for the equity twin too, so going through it would
+    hide which branch fired."""
+    from app.services.strategy_fitness import (
+        _consistent_annual_return, _option_consistent_annual_return,
+    )
+
+    thin = {"annualized_return": 30.0, "max_drawdown": -20.0}
+    assert _option_consistent_annual_return(dict(thin)) == LOW_TRADE_SENTINEL
+    assert _consistent_annual_return(dict(thin)) == LOW_TRADE_SENTINEL
+
+
+def test_the_two_metrics_agree_on_the_trade_gate():
+    """The metrics differ in the DRAWDOWN term and nothing else. At the -20% reference both
+    penalties are 1.0, so any disagreement here is a disagreement about trade frequency --
+    which is what let the option copy drift in the first place."""
+    for n in (3, 8, 12, 20, 30):
+        r = _r(_condors(n))
+        assert compute_fitness(OCAR, r) == compute_fitness("consistent_annual_return", r), n
+
+
+def test_no_reader_of_the_published_leg_rate_survives_outside_the_helper():
+    """DRIFT GUARD, and the one that would have prevented this. ``_trades_per_year`` is the
+    single place allowed to read ``avg_trades_per_year``; any other read is a consumer that
+    silently counts legs. A future third copy of the metric fails here rather than in a grid.
+    """
+    import inspect
+
+    from app.services import strategy_fitness as sf
+
+    src = inspect.getsource(sf)
+    helper = inspect.getsource(sf._trades_per_year)
+    outside = src.replace(helper, "")
+    # Comments and docstrings legitimately name the key; code must not READ it.
+    reads = [line.strip() for line in outside.splitlines()
+             if 'results.get("avg_trades_per_year")' in line
+             or "results.get('avg_trades_per_year')" in line]
+    assert reads == [], reads

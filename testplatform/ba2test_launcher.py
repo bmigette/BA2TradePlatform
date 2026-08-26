@@ -2383,10 +2383,14 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    grid to measure), so re-centre the ceilings after the first run; and the gate is a no-op
 #    for every debit structure and for O_CC/O_PP, which post no collateral.
 #
-# Also outstanding, lower stakes: `_option_consistent_annual_return` reads
-# `avg_trades_per_year` directly, so it still needs the structures-not-legs substitution
-# `_trades_per_year` applies to CAR, or three iron condors a year clears its 12/yr floor
-# exactly as they used to clear CAR's.
+# CLOSED 2026-08-26: `_option_consistent_annual_return` -- the DEFAULT fitness for pure-option
+# grids -- now takes its trade frequency from `_trades_per_year` (STRUCTURES) instead of
+# `avg_trades_per_year` (LEGS), the substitution Track C already applied to CAR. Three iron
+# condors a year no longer clears the 12/yr disqualification floor, and the ramp is measured in
+# bets rather than legs. If you are comparing against results banked before this date, note
+# that thin multi-leg genomes ranked higher then than they will now. The equity metric is
+# unchanged (the 798-literal frozen corpus is green), and a drift guard now refuses any read of
+# `avg_trades_per_year` outside `_trades_per_year`.
 #
 # CLOSED 2026-08-26: `options_provider._compute_atm_iv` no longer falls back to the
 # chain-snapshot row (OPT-C8). That row's IV had no as-of guarantee and, in the case where the

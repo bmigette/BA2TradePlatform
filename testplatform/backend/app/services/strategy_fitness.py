@@ -930,6 +930,16 @@ def _option_consistent_annual_return(results: dict) -> float:
     to stay bit-identical -- see tests/test_strategy_fitness_equity_frozen.py. Fold the two
     together when no grid is running.
 
+    AND HERE IS WHAT THAT COSTS, so the next person can price it. The two were written in
+    different worktrees and the copy silently missed a fix: the trade gate read
+    ``avg_trades_per_year`` (the LEG rate) for weeks after its twin had been switched to
+    ``_trades_per_year`` (STRUCTURES), so three iron condors a year cleared the 12/yr floor on
+    the one metric whose whole population is multi-leg. The ratio test in
+    ``test_strategy_fitness_option_car.py`` did not catch it because it varies the drawdown,
+    and ``test_strategy_fitness_structure_count.py`` only exercised the equity twin. Both gaps
+    are now closed -- the latter asserts the two metrics agree on the trade gate, and a drift
+    guard there refuses ANY read of ``avg_trades_per_year`` outside ``_trades_per_year``.
+
     Scores from this metric are NOT comparable with plain ``consistent_annual_return`` scores.
 
     NOTE ON THE DRAWDOWN READ. ``_consistent_annual_return`` uses
@@ -958,11 +968,18 @@ def _option_consistent_annual_return(results: dict) -> float:
     base = float(base)
 
     # --- trade gate: proportional ramp, hard floor below it -----------------------------------
-    tpy = results.get("avg_trades_per_year")
-    if tpy is None:
-        years = _years_spanned_by_curve(results.get("equity_curve"))
-        total = int(results.get("total_trades", 0) or 0)
-        tpy = (total / years) if years > 0 else None
+    # STRUCTURES per year, not legs (see _trades_per_year, which also carries the fallback to
+    # the equity-curve-derived rate this used to inline). Until 2026-08-26 this read
+    # ``avg_trades_per_year`` directly -- the LEG rate, since the round-trip recorder emits one
+    # row per leg and an iron condor is four. Three condors a year therefore cleared the 12/yr
+    # disqualification floor and 7.5 a year earned full credit: the same defect Track C fixed
+    # in ``_consistent_annual_return``, still live here only because this near-copy was written
+    # in a different worktree and never got the substitution.
+    #
+    # It matters MORE here than there. This is the DEFAULT metric for pure-option grids
+    # (``_resolve_fitness``), where multi-leg structures are not an edge case but the entire
+    # population, so the inflation applied to essentially every genome being ranked.
+    tpy = _trades_per_year(results)
     if tpy is None:
         return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
     _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
