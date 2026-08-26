@@ -204,6 +204,12 @@ _OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10
 _OPTION_SPREAD_LIQUID_VOLUME = 100.0   # at/above this daily volume, no thin-widening
 _OPTION_SPREAD_THIN_MULT = 2.0         # multiplier applied below that volume
 
+#: Slack, in premium dollars per share, when comparing a multi-leg combo's achieved net
+#: against the order's net limit (OPT-S7). The net is a sum of per-leg products, so a limit
+#: set FROM those same quotes can miss itself by a float ulp; a broker would fill that. Well
+#: below the $0.01 minimum option tick, so it can never let a genuinely worse net through.
+_NET_LIMIT_TOLERANCE = 1e-9
+
 
 class BacktestAccount(AccountInterface, OptionsAccountInterface):
     """Simulated broker for daily multi-asset backtests.
@@ -1883,6 +1889,19 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         ratio); all-ratio-1 shapes (verticals/condors) are unchanged. The parent moves NO
         cash (it already moved per leg). If ANY leg lacks a price, NOTHING fills this bar
         (retry next).
+
+        NET LIMIT (OPT-S7). The combo's limit price lives on the PARENT — the children are
+        built with no ``limit_price`` of their own, so ``_option_fill_price``'s two limit
+        branches cannot fire for them and every leg prices market-style. Nothing then
+        compared the achieved net against ``parent.limit_price``, so the simulator filled
+        combos THROUGH their net limit, which live Alpaca cannot do. The invented fills are
+        by construction the ones WORSE than the limit, so mean credit was understated while
+        the trade COUNT was inflated — it changed which trades exist. Enforced here in the
+        one sign convention the whole option stack uses (+debit / -credit): the achieved net
+        must be no worse than the limit, i.e. ``net <= limit`` on BOTH sides — a 3.00 debit
+        fails a 2.00 debit limit, and a 1.50 credit (net -1.50) fails a 2.00 credit limit
+        (-2.00). A rejected combo does not fill this bar and retries the next, the same
+        no-fill idiom the arb and liquidity guards use.
         """
         legs = self._child_legs(parent)
         if not legs:
@@ -1894,6 +1913,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 return  # all-or-none: one leg can't price -> fill none this bar
             priced.append((leg, px))
 
+        structures = abs(float(parent.quantity or 0.0))
+        if structures <= 0:
+            return
+
+        # --- NET LIMIT (OPT-S7) ------------------------------------------------------
+        # Per-share net PER STRUCTURE, in the parent's own +debit / -credit convention.
+        net_per_share = 0.0
+        for leg, px in priced:
+            ratio = abs(float(leg.quantity or 0.0)) / structures
+            net_per_share += (px if leg.side == OrderDirection.BUY else -px) * ratio
+        limit = getattr(parent, "limit_price", None)
+        if limit is not None and net_per_share > float(limit) + _NET_LIMIT_TOLERANCE:
+            logger.warning(
+                "[backtest] multi-leg %s NOT filled: achieved net %+.4f/share per structure "
+                "is worse than the order's net limit %+.4f (+debit/-credit). The order stays "
+                "pending and retries the next bar.",
+                getattr(parent, "option_strategy", None), net_per_share, float(limit),
+            )
+            return
+
         # CASH-SECURED guard for DEBIT combos (defense-in-depth, the debit analog of the
         # margin-call liquidation for credit shorts). Options are sized from ANALYSIS-time quotes
         # but fill at the sparse cache's next-bar premiums, which can diverge sharply upward, so a
@@ -1903,10 +1942,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # scale together by the capped count (respecting each leg's ratio) so the combo stays
         # balanced/defined-risk. A CREDIT combo (net premium <= 0 -> cash inflow) is left alone
         # (its risk is bounded by the margin path, not cash spend).
-        structures = abs(float(parent.quantity or 0.0))
-        if structures <= 0:
-            return
+        #
+        # A CLOSE IS EXEMPT (OPT-B3), exactly as the single-leg sibling
+        # ``_cap_single_leg_option_entry`` has always exempted one. This guard exists to stop
+        # an ENTRY buying more debit than the account holds; closing a credit structure is
+        # also a net debit, and refusing it leaves the short leg — and its assignment risk —
+        # open because the account ran out of money, which no broker does. The rescale branch
+        # was worse than the outright refusal: it wrote the number of structures CLOSED over
+        # ``Transaction.quantity`` (the divisor for ``spread_pnl_percent``), and a 2-of-3 cap
+        # then let the next close attempt read the ENTRY parent's filled_qty=3 and over-close,
+        # flipping the position by 2.
         commission = float(self._cfg["commission_per_trade"])
+        if self._multi_leg_is_closing(parent, [leg for leg, _ in priced]):
+            self._apply_multi_leg_fill(parent, priced, as_of)
+            return
         debit_per_structure = 0.0
         for leg, px in priced:
             ratio = abs(float(leg.quantity or 0.0)) / structures if structures else 0.0
@@ -1954,9 +2003,39 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # Keep the shared Transaction row (created at the pre-cap STRUCTURE count) in sync.
             self._sync_transaction_quantity(parent.transaction_id, float(capped))
 
+        self._apply_multi_leg_fill(parent, priced, as_of)
+
+    @staticmethod
+    def _multi_leg_is_closing(parent, legs) -> bool:
+        """True when this multi-leg parent CLOSES a structure rather than opening one.
+
+        The parent's own ``position_intent`` is deliberately None for a multi-leg
+        (``OptionsAccountInterface.submit_option_order``: four legs have four intents), so
+        the answer lives on the CHILDREN — ``build_closing_legs`` stamps every reversed leg
+        ``buy_to_close``/``sell_to_close``.
+
+        Reads as a close only on positive evidence, and never guesses: a single leg naming
+        an OPEN intent makes the whole order an open (the cash guard then applies, which is
+        the safe direction), and when NO leg names an intent at all the parent's
+        ``option_strategy == "close"`` is the remaining evidence. Unknown falls through to
+        "not a close" — an unknown must not buy an exemption.
+        """
+        intents = [str(getattr(leg, "position_intent", None) or "").lower() for leg in legs]
+        named = [i for i in intents if i]
+        if named:
+            if any("open" in i for i in named):
+                return False
+            return all("close" in i for i in named)
+        return str(getattr(parent, "option_strategy", None) or "").lower() == "close"
+
+    def _apply_multi_leg_fill(self, parent, priced, as_of: datetime) -> None:
+        """Fill every leg of a multi-leg parent and mark the parent FILLED at the net.
+
+        ``priced`` is the ``[(leg, premium)]`` list the caller resolved. Leg ratio = leg
+        contracts / structures, read AFTER any cash-cap rescale (legs and ``parent.quantity``
+        are rescaled together, so the ratio is preserved).
+        """
         net = 0.0
-        # Leg ratio = leg contracts / structures, computed AFTER any cash-cap rescale above
-        # (legs and parent.quantity were rescaled together, so the ratio is preserved).
         struct_qty = abs(float(parent.quantity or 0.0))
         for leg, px in priced:
             self._apply_option_fill(leg, px, as_of)  # reuse single-leg per-leg lot+cash math

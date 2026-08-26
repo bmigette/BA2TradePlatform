@@ -498,7 +498,11 @@ def test_multi_leg_round_trip_cost_is_unchanged_by_this_fix(e2e_account):
                   strike=190.0, expiry=date(2024, 3, 15), underlying="AAPL"),
     ]
     parent = acct.submit_option_order(legs=legs, quantity=1, order_type="limit",
-                                      limit_price=2.0,
+                                      # 2.6375 is the net these legs actually reach once each
+                                      # crosses its own spread; since OPT-S7 the engine will
+                                      # not fill a combo through a tighter net limit, and the
+                                      # subject here is the per-leg COST, not the limit.
+                                      limit_price=2.6375,
                                       option_strategy="bull_call_spread")
     acct.refresh_orders()
 

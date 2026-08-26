@@ -301,7 +301,10 @@ def test_multi_leg_spread_fills_all_legs_at_net_debit(options_account, tmp_path)
         legs=[long_leg, short_leg],
         quantity=1,
         order_type="limit",
-        limit_price=2.0,
+        # The net limit must be reachable: since OPT-S7 the engine refuses to fill a combo
+        # THROUGH its net limit (this used to say 2.0 and fill at 2.5 anyway). The subject
+        # here is the per-leg fill and the net arithmetic, not the limit.
+        limit_price=2.5,
         option_strategy="bull_call_spread",
     )
     assert parent is not None
@@ -338,7 +341,10 @@ def test_multi_leg_spread_is_all_or_none_when_one_leg_lacks_a_bar(options_accoun
         legs=[long_leg, short_leg],
         quantity=1,
         order_type="limit",
-        limit_price=2.0,
+        # Reachable net limit (see the sibling test): the ONLY reason this must not fill is
+        # the missing short-leg bar. A limit the net could never clear would pass this test
+        # for the wrong reason.
+        limit_price=2.5,
         option_strategy="bull_call_spread",
     )
 
