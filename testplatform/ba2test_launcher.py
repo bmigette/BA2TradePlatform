@@ -2324,16 +2324,27 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: str) -> str:
     """Effective fitness metric for an optimize job. An explicit --fitness always wins.
     Otherwise PURE-OPTION kinds (O_* except the equity-entry O_CC/O_PP/O_STK, and the
-    OS1-OS4 groups) default to consistent_annual_return — the ~30%/yr goal metric
-    (annualized return x drawdown guard x worst-year/mean-year consistency x >=30
-    trades/yr gate). Calmar/sharpe on option books rewards barely-trading low-drawdown
-    configs (v6 OS runs on calmar: 2-27 trades, TR 3.6-18%). STOCK kinds (and the
-    equity-entry option overlays) keep the command's historical default (``stock_default``)
-    so equity tuning is untouched.
+    OS1-OS4 groups) default to ``option_consistent_annual_return`` — the option-specific
+    variant of the ~30%/yr goal metric (annualized return x drawdown guard x
+    worst-year/mean-year consistency x trade-frequency gate). Calmar/sharpe on option books
+    rewards barely-trading low-drawdown configs (v6 OS runs on calmar: 2-27 trades, TR
+    3.6-18%). STOCK kinds (and the equity-entry option overlays) keep the command's
+    historical default (``stock_default``) so equity tuning is untouched.
+
+    WHY A SEPARATE METRIC RATHER THAN A FLAG INSIDE ``consistent_annual_return``. There are
+    non-option backtests running against the equity metric right now, and their scores must
+    not move. A metric that is not SELECTED is never called; a flag inside a shared metric has
+    to be read correctly on every path, and can be read wrongly. So the option grid points at
+    its own metric and ``_consistent_annual_return`` is left bit-for-bit alone.
+
+    ``option_consistent_annual_return`` (aliases ``option_car`` / ``ocar``) is registered in
+    ``strategy_fitness.py`` on the ``option-fitness`` branch; this returns its NAME, and
+    ``compute_fitness`` resolves it once that branch is merged.
     """
     if cli_fitness:
         return cli_fitness
-    return "consistent_annual_return" if strat_kind in _PURE_OPTION_STRATEGIES else stock_default
+    return ("option_consistent_annual_return" if strat_kind in _PURE_OPTION_STRATEGIES
+            else stock_default)
 
 
 # Minimum DAILY TRADED VOLUME a contract must show to be SELECTABLE (2026-07-25).

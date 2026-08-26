@@ -207,7 +207,7 @@ def main() -> int:
         if args.fitness:
             # Explicit override forces this metric uniformly; omitted (default) lets
             # ba2test_launcher's _resolve_fitness() pick per-strategy-kind (pure-option ->
-            # consistent_annual_return, O_CC/O_PP/O_STK -> sharpe_ratio).
+            # option_consistent_annual_return, O_CC/O_PP/O_STK -> sharpe_ratio).
             cmd += ["--fitness", args.fitness]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
