@@ -57,6 +57,11 @@ DAYS_PER_YEAR = 365.0
 #: rather than approximately right. See the module docstring.
 RESERVE_TABLE_MULTIPLIER = 100.0
 
+#: Stable phrase carried by every ARC refusal, so a caller (and a test) can tell this one apart
+#: from the buying-power, assignment-capacity and share-cover refusals that decline the same
+#: entry path with three different remedies. Mirrors ``ASSIGNMENT_CAPACITY_REFUSAL``.
+ARC_FLOOR_REFUSAL = "return on collateral below the configured floor"
+
 
 def applies_to(strategy: str) -> bool:
     """True when ``strategy`` posts collateral, i.e. when an ARC floor is meaningful.

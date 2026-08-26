@@ -18,6 +18,9 @@ from ba2_common.core.types import (
     OptionRight, AssetClass, TransactionStatus,
 )
 from ba2_common.core.db import get_db, add_instance, update_instance, get_instance
+from ba2_common.core.option_economics import (
+    ARC_FLOOR_REFUSAL, admits_credit_structure, annualized_return_on_collateral,
+)
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selector import (
     select_single, select_vertical_spread, select_wing, passes_liquidity,
@@ -1888,6 +1891,7 @@ class _OptionEntryAction(TradeAction):
                  max_spread_pct: Optional[float] = None,
                  min_volume: Optional[int] = None,
                  wing_width_pct: Optional[float] = None,
+                 min_arc: Optional[float] = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
@@ -1904,6 +1908,13 @@ class _OptionEntryAction(TradeAction):
         # too-thin contract yields an order that can never fill.
         self.min_volume = min_volume
         self.wing_width_pct = wing_width_pct
+        # PREMIUM-RICHNESS floor: the minimum per-contract annualised return on collateral a
+        # CREDIT structure must offer to be opened, as a FRACTION (0.15 == 15 %/yr). Opt-in
+        # (None = no floor = today's "any positive net credit will do"). Read only by the
+        # credit builders, via _refuse_if_arc_below_floor -- a debit structure posts no
+        # collateral, so its return ON collateral is undefined rather than zero, and gating
+        # it here would refuse every long option ever opened. See core.option_economics.
+        self.min_arc = min_arc
 
     # --- helpers ----------------------------------------------------------
     def _action_type_value(self) -> str:
@@ -2221,6 +2232,58 @@ class _OptionEntryAction(TradeAction):
              "assignment_held_cost": verdict.held_cost,
              "assignment_candidate_cost": verdict.candidate_cost,
              "assignment_cash": verdict.cash})
+
+    def _refuse_if_arc_below_floor(self, option_strategy: str, *,
+                                   net_credit: Optional[float],
+                                   expiry: Optional[date],
+                                   **reserve_kwargs) -> Optional[Dict[str, Any]]:
+        """ENFORCING premium-richness gate. Returns a refusal, or None to proceed.
+
+        THE CRITERION THAT DID NOT EXIST (OPT-C1). Every credit builder admitted its
+        structure on ``net_credit > 0`` alone: no minimum credit, no credit-as-a-fraction
+        of width, no return floor. Selling far-OTM options for a nickel expires worthless
+        roughly 97 % of the time, so on any win-rate- or Sharpe-flavoured fitness a search
+        is ACTIVELY REWARDED for doing it. ``option_economics`` prices the alternative --
+        annualised return on collateral, PER CONTRACT, so the ratio is invariant to size --
+        and this is the one call that makes it bite.
+
+        A VERDICT, NOT A RAISE. This is an operational refusal (the structure on offer is
+        not rich enough today), the same category as buying power and assignment capacity,
+        so it comes back as a failed ``TradeActionResult`` the caller can record. Raising
+        is reserved for caller errors -- five legs, two expiries, an inverted DTE window.
+
+        Placed beside each builder's ``net_credit <= 0`` check, as soon as the collateral
+        inputs are known and always BEFORE sizing/submission: an entry the pre-existing
+        checks already decline keeps the message it has always had, and this refusal only
+        ever appears where something genuinely new is being caught.
+
+        ``reserve_kwargs`` are the sizing inputs that structure's reserve branch prices
+        with (``strike`` / ``spread_width`` / ``spot`` / ``option_type``) -- the same ones
+        the builder passes to ``option_reserve_required`` two lines later, so collateral is
+        never derived twice.
+
+        No floor configured (the default) short-circuits to None: the gate is off, exactly
+        as it was, and no ARC is computed. A floor that is configured but UNMEASURABLE
+        against refuses -- an unmeasurable entry criterion is not a satisfied one.
+        """
+        if self.min_arc is None:
+            return None
+        dte = (expiry - self._today()).days if expiry is not None else None
+        arc = annualized_return_on_collateral(
+            strategy=option_strategy, net_credit=net_credit, days_to_expiry=dte,
+            **reserve_kwargs)
+        if admits_credit_structure(arc, self.min_arc):
+            return None
+        measured = "unmeasurable" if arc is None else f"{arc * 100:.2f}%/yr"
+        logger.warning(f"{self._action_type_value()} for {self.instrument_name}: "
+                       f"{option_strategy} REFUSED — {ARC_FLOOR_REFUSAL} "
+                       f"({measured} vs {self.min_arc})")
+        return self._result(
+            False,
+            f"{option_strategy} on {self.instrument_name}: {ARC_FLOOR_REFUSAL} "
+            f"(measured {measured}, floor {self.min_arc}). Refusing the entry.",
+            {"option_strategy": option_strategy, "arc": arc, "min_arc": self.min_arc,
+             "net_credit": net_credit, "days_to_expiry": dte})
 
     def _refuse_if_cover_is_short(self, legs: List[OptionLeg], quantity: int,
                                   option_strategy: str) -> Optional[Dict[str, Any]]:
@@ -2662,6 +2725,12 @@ class SellCashSecuredPutAction(_OptionEntryAction):
             return self._result(False, f"No bid price for {contract.symbol}")
         if contract.strike is None or contract.strike <= 0:
             return self._result(False, f"No strike for {contract.symbol}")
+        # PREMIUM RICHNESS (OPT-C1): a positive bid is not a reason to tie up strike*100.
+        refusal = self._refuse_if_arc_below_floor(
+            "cash_secured_put", net_credit=contract.bid, expiry=contract.expiry,
+            strike=contract.strike)
+        if refusal is not None:
+            return refusal
         # Sizing: budget by the cash that must be reserved (strike*100), not the premium.
         # Routed through the shared _size_by_reserve() (not inlined) so it also gets capped by
         # max_virtual_equity_per_instrument_percent, same as every other structure.
@@ -2750,6 +2819,13 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
         if per_spread_reserve <= 0:
             return self._result(False,
                                 f"Non-positive max-loss reserve for {self.instrument_name} bear call spread")
+        # PREMIUM RICHNESS (OPT-C1). Placed here rather than at the net_credit check two lines
+        # up because the collateral is (width - credit), so the width has to be known first.
+        refusal = self._refuse_if_arc_below_floor(
+            "bear_call_spread", net_credit=net_credit, expiry=short_c.expiry,
+            spread_width=width)
+        if refusal is not None:
+            return refusal
         # Routed through the shared _size_by_reserve() (not inlined) so it also gets capped by
         # max_virtual_equity_per_instrument_percent, same as every other structure.
         quantity = self._size_by_reserve(per_spread_reserve, self.sizing)
@@ -2855,6 +2931,13 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
         if per_spread_reserve <= 0:
             return self._result(False,
                                 f"Non-positive max-loss reserve for {self.instrument_name} bull put spread")
+        # PREMIUM RICHNESS (OPT-C1) — see the bear-call twin: collateral is (width - credit),
+        # so this sits after the width rather than beside the net_credit check.
+        refusal = self._refuse_if_arc_below_floor(
+            "bull_put_spread", net_credit=net_credit, expiry=short_c.expiry,
+            spread_width=width)
+        if refusal is not None:
+            return refusal
         # Routed through the shared _size_by_reserve() (not inlined) so it also gets capped by
         # max_virtual_equity_per_instrument_percent, same as every other structure.
         quantity = self._size_by_reserve(per_spread_reserve, self.sizing)
@@ -3049,6 +3132,14 @@ class OpenShortStraddleAction(_OptionEntryAction):
         net_credit = round(call_c.bid + put_c.bid, 4)        # sell both at BID
         if net_credit <= 0:
             return self._result(False, f"Non-positive credit for {self.instrument_name} short straddle")
+        # PREMIUM RICHNESS (OPT-C1). Reserve is the Reg-T naked bracket, so the collateral is
+        # much smaller than the delivery bill and the ARC correspondingly larger — which is
+        # why the floor for a naked structure is not the floor for a defined-risk one.
+        refusal = self._refuse_if_arc_below_floor(
+            "short_straddle", net_credit=net_credit, expiry=call_c.expiry,
+            strike=call_c.strike, spot=spot)
+        if refusal is not None:
+            return refusal
         # NAKED both sides: reserve Reg-T naked margin (not full strike*100 cash) so the
         # structure is sizeable on a realistic account. Both legs share the strike; a
         # straddle is margined at the GREATER of the two legs -> worst case over both rights.
@@ -3127,6 +3218,13 @@ class OpenShortStrangleAction(_OptionEntryAction):
         net_credit = round(call_c.bid + put_c.bid, 4)
         if net_credit <= 0:
             return self._result(False, f"Non-positive credit for {self.instrument_name} short strangle")
+        # PREMIUM RICHNESS (OPT-C1). Reserved on the PUT side's Reg-T bracket, matching the
+        # option_reserve_required call below — collateral must be the same number twice.
+        refusal = self._refuse_if_arc_below_floor(
+            "short_strangle", net_credit=net_credit, expiry=put_c.expiry,
+            strike=put_c.strike, spot=spot, option_type=OptionRight.PUT)
+        if refusal is not None:
+            return refusal
         # NAKED both sides: reserve Reg-T naked margin on the (richer) put side, not full
         # strike*100 cash, so the structure is sizeable on a realistic account.
         per_contract_reserve = self.account.naked_margin_per_contract(
@@ -3203,6 +3301,12 @@ class OpenIronCondorAction(_OptionEntryAction):
         if net_credit <= 0:
             return self._result(False, f"Non-positive credit for {self.instrument_name} iron condor")
         width = max(lc.strike - sc.strike, sp.strike - lp.strike)
+        # PREMIUM RICHNESS (OPT-C1). After the width, for the same reason as the verticals:
+        # a condor's collateral is (wing width - credit).
+        refusal = self._refuse_if_arc_below_floor(
+            "iron_condor", net_credit=net_credit, expiry=sc.expiry, spread_width=width)
+        if refusal is not None:
+            return refusal
         max_loss = max(0.0, width - net_credit)
         per_contract_reserve = max_loss * 100.0
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing) if per_contract_reserve > 0 else 0
@@ -3286,6 +3390,13 @@ class OpenJadeLizardAction(_OptionEntryAction):
         # reserve off the SAME conservative formula so quantity and the persisted reserve agree
         # with what the broker will actually charge.
         call_wing_width = lc.strike - sc.strike
+        # PREMIUM RICHNESS (OPT-C1). Same inputs the reserve is priced from immediately
+        # below, so the gate and the sizing agree on the collateral by construction.
+        refusal = self._refuse_if_arc_below_floor(
+            "jade_lizard", net_credit=net_credit, expiry=sp.expiry,
+            strike=sp.strike, spread_width=call_wing_width)
+        if refusal is not None:
+            return refusal
         per_contract_reserve = self.account.option_reserve_required(
             "jade_lizard", 1, strike=sp.strike, spread_width=call_wing_width, net_credit=net_credit)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
@@ -3428,6 +3539,16 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         # branch). net_credit is expressed as a positive amount; net>=0 (a net debit, no credit
         # to net against) reserves the full short-strike notional with no discount.
         net_credit = max(0.0, -net)
+        # PREMIUM RICHNESS (OPT-C1). This is the structure the gate matters most for: it is
+        # "typically a small credit/even" against a full short-strike notional, so a
+        # near-zero credit here is the pennies-in-front-of-a-steamroller shape by default.
+        # A net DEBIT arrives as net_credit == 0.0, which is a MEASURED 0 %/yr and is refused
+        # on its merits by any positive floor rather than for going missing.
+        refusal = self._refuse_if_arc_below_floor(
+            "put_ratio_spread", net_credit=net_credit, expiry=short_p.expiry,
+            strike=short_p.strike)
+        if refusal is not None:
+            return refusal
         per_contract_reserve = self.account.option_reserve_required(
             "put_ratio_spread", 1, strike=short_p.strike, net_credit=net_credit)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)

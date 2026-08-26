@@ -36,6 +36,8 @@ Namespacing:
   exit:<rid>:a<i>:option_dte       option DTE window center
   exit:<rid>:a<i>:option_wing_width  option wing width %
   exit:<rid>:a<i>:option_sizing    option position size (% of equity per structure)
+  exit:<rid>:a<i>:option_min_arc   minimum annualised return on collateral a CREDIT
+                                   structure must offer (fraction; credit actions only)
   schedule:<day>                   ON/OFF toggle for that weekday's entry scan
   screener:<setting>               screener settings
 
@@ -255,6 +257,16 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
             action.get("option_sizing_min"),
             action.get("option_sizing_max"),
             action.get("option_sizing_step"), is_int=False,
+        )
+    # PREMIUM RICHNESS (OPT-C1): the minimum per-contract annualised return on collateral a
+    # CREDIT structure must offer, as a FRACTION (0.15 == 15 %/yr). The producer emits this
+    # ONLY for structures that post collateral -- a debit structure has no denominator, so a
+    # configured floor would turn its unmeasurable ARC into a blanket refusal.
+    if action.get("option_min_arc_optimize"):
+        out[f"{prefix}:option_min_arc"] = _range_entry(
+            action.get("option_min_arc_min"),
+            action.get("option_min_arc_max"),
+            action.get("option_min_arc_step"), is_int=False,
         )
 
 
@@ -510,6 +522,8 @@ def _decode_rule_list(rules, ns: str,
                 action["option_wing_width_pct"] = agenes["option_wing_width"]
             if "option_sizing" in agenes:
                 action["option_sizing"] = agenes["option_sizing"]
+            if "option_min_arc" in agenes:
+                action["option_min_arc"] = agenes["option_min_arc"]
             actions.append(action)
         rule["actions"] = actions
         if rule.get("conditions"):

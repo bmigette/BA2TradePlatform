@@ -9,7 +9,7 @@ from ...core.db import get_db, get_all_instances, delete_instance, add_instance,
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_arc_floor, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
     preview_trade_action_result_retention, execute_trade_action_result_retention,
@@ -5069,12 +5069,13 @@ class TradeSettingsTab:
                 min_oi_input = None
                 max_spread_input = None
                 wing_width_input = None
+                min_arc_input = None
 
                 def update_action_inputs():
                     nonlocal value_input, reference_select, target_percent_input
                     nonlocal strike_method_select, strike_param_input, dte_min_input
                     nonlocal dte_max_input, sizing_input, min_oi_input, max_spread_input
-                    nonlocal wing_width_input
+                    nonlocal wing_width_input, min_arc_input
 
                     action_value_container.clear()
                     # clear() deletes the widgets; these names must forget them too. The save
@@ -5091,6 +5092,7 @@ class TradeSettingsTab:
                     strike_method_select = strike_param_input = None
                     dte_min_input = dte_max_input = sizing_input = None
                     min_oi_input = max_spread_input = wing_width_input = None
+                    min_arc_input = None
 
                     selected_type = action_select.value
 
@@ -5209,6 +5211,30 @@ class TradeSettingsTab:
                                         step=0.5,
                                         format='%.1f'
                                     ).classes('w-28').props('dense')
+                                # Min ARC: the premium-richness floor, as a PERCENT per year
+                                # on the collateral the structure ties up. Offered only for
+                                # the CREDIT structures, which are the only ones that post
+                                # collateral and the only ones whose builder consults it --
+                                # on a debit structure the ratio has no denominator, so any
+                                # value at all would refuse the entry rather than tune it.
+                                #
+                                # BLANK BY DEFAULT, and that is load-bearing: an absent floor
+                                # means "no richness requirement", which is the behaviour
+                                # every existing live rule has today. A pre-filled 0 would NOT
+                                # be the same thing -- a configured 0 is still a gate, and it
+                                # refuses every structure whose ARC cannot be measured.
+                                if uses_arc_floor(selected_type):
+                                    _arc = action_config.get('min_arc') if action_config else None
+                                    min_arc_input = ui.number(
+                                        label='Min Return on Collateral %/yr',
+                                        value=(float(_arc) * 100.0) if _arc is not None else None,
+                                        min=0.0,
+                                        step=1.0,
+                                        format='%.1f'
+                                    ).classes('w-52').props('dense clearable').tooltip(
+                                        'Minimum annualised return on the collateral this '
+                                        'structure reserves, per contract. Leave blank for '
+                                        'no floor (any positive net credit is accepted).')
                             else:
                                 ui.label('Closes the held option position (no parameters).').classes('text-sm text-gray-500')
 
@@ -5230,7 +5256,8 @@ class TradeSettingsTab:
                     'sizing_input': lambda: sizing_input,
                     'min_oi_input': lambda: min_oi_input,
                     'max_spread_input': lambda: max_spread_input,
-                    'wing_width_input': lambda: wing_width_input
+                    'wing_width_input': lambda: wing_width_input,
+                    'min_arc_input': lambda: min_arc_input
                 }
     
     def _remove_action_row(self, action_id, action_card):
@@ -5317,6 +5344,7 @@ class TradeSettingsTab:
                         moi = action_refs['min_oi_input']()
                         msp = action_refs['max_spread_input']()
                         wwp = action_refs['wing_width_input']()
+                        maf = action_refs['min_arc_input']()
 
                         # THE SECOND RAIL, and it is not redundant (OPT-S2). The widget is
                         # only rendered for actions that read strike_method, so `sm` is
@@ -5350,6 +5378,14 @@ class TradeSettingsTab:
                             action_config['max_spread_pct'] = float(msp.value)
                         if wwp and wwp.value is not None:
                             action_config['wing_width_pct'] = float(wwp.value)
+                        # Percent on screen, FRACTION on the wire: option_economics works in
+                        # fractions (0.15 == 15 %/yr) and so does the gene. Only persisted
+                        # when the user actually entered one -- a blank field must leave the
+                        # key ABSENT (no floor), not write a 0.0, which is a configured gate
+                        # that refuses every unmeasurable ARC. Keyed on the ACTION as well as
+                        # on the widget, for the reason spelled out at strike_method above.
+                        if uses_arc_floor(action_type) and maf and maf.value is not None:
+                            action_config['min_arc'] = float(maf.value) / 100.0
                         # NOTE: min_volume is deliberately NOT offered here. AlpacaAccount's
                         # chain comes from the option SNAPSHOT endpoint, whose payload
                         # (alpaca.data.models.snapshots.OptionsSnapshot) carries no bar at

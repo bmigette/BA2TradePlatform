@@ -649,6 +649,40 @@ def uses_wing_width(action_value):
     return action_value in get_wing_width_action_values()
 
 
+def get_arc_floor_action_values():
+    """Option action types whose builder reads ``min_arc`` (the premium-richness floor).
+
+    These EIGHT are the CREDIT structures -- the ones that post collateral, so that
+    "annualised return on collateral" has a denominator at all. They are exactly the reserve
+    table's ``RESERVING_STRATEGIES`` that have a builder of their own (``credit_spread`` /
+    ``naked_put`` / ``debit_spread`` are pricing aliases with no action), and each calls
+    ``_refuse_if_arc_below_floor`` beside its ``net_credit <= 0`` check.
+
+    Every OTHER option action is in ``ZERO_RESERVE_STRATEGIES`` and reserves nothing -- a
+    long call, a butterfly, and notably a COVERED CALL, which collects a credit but is
+    collateralised by SHARES. For those the ratio is undefined, ``option_economics`` returns
+    None, and a configured floor turns None into a REFUSAL. So offering the field there
+    would not merely be a decoy (the ``wing_width_pct`` failure mode) -- it would be a field
+    whose every value silently deletes the structure. Kept next to the action enum, not in
+    the UI, so a producer renders it for exactly the actions that consume it.
+    """
+    return [
+        ExpertActionType.SELL_CASH_SECURED_PUT.value,
+        ExpertActionType.OPEN_BEAR_CALL_SPREAD.value,
+        ExpertActionType.OPEN_BULL_PUT_SPREAD.value,
+        ExpertActionType.OPEN_SHORT_STRADDLE.value,
+        ExpertActionType.OPEN_SHORT_STRANGLE.value,
+        ExpertActionType.OPEN_IRON_CONDOR.value,
+        ExpertActionType.OPEN_JADE_LIZARD.value,
+        ExpertActionType.OPEN_PUT_RATIO_SPREAD.value,
+    ]
+
+
+def uses_arc_floor(action_value):
+    """Check whether an option action type reads ``min_arc``."""
+    return action_value in get_arc_floor_action_values()
+
+
 def get_strike_method_action_values():
     """Option action types whose builder actually READS ``strike_method``.
 

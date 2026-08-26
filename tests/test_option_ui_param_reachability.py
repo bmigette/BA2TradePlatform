@@ -37,7 +37,9 @@ import pytest
 from ba2_common.core.TradeActionEvaluator import _OPTION_ENTRY_PARAM_KEYS
 from ba2_common.core.types import (
     ExpertActionType,
+    get_arc_floor_action_values,
     get_wing_width_action_values,
+    uses_arc_floor,
     uses_wing_width,
 )
 
@@ -254,6 +256,7 @@ def test_the_editor_persists_every_param_it_is_expected_to(editor):
     """Compare what the editor can actually produce with what the action really consumes."""
     editor.add_row(WING_ACTION)
     editor.widget('strike_param_input').value = '0.30'   # blank by default, so nothing saves
+    editor.widget('min_arc_input').value = 150.0         # ditto -- an absent floor is not 0
     saved = editor.save()
 
     persisted = set(saved) - {'action_type'}
@@ -281,6 +284,7 @@ def test_the_editor_persists_every_param_for_a_structure_that_reads_the_strike_m
 
     editor.add_row(_AT.SELL_CASH_SECURED_PUT.value)
     editor.widget('strike_param_input').value = '0.30'
+    editor.widget('min_arc_input').value = 15.0
     saved = editor.save()
 
     persisted = set(saved) - {'action_type'}
@@ -299,6 +303,7 @@ def test_every_persisted_param_survives_the_trip_into_the_action(editor):
 
     editor.add_row(WING_ACTION)
     editor.widget('strike_param_input').value = '0.30'
+    editor.widget('min_arc_input').value = 150.0
     saved = editor.save()
 
     kwargs = {k: v for k, v in saved.items() if k in _OPTION_ENTRY_PARAM_KEYS}
@@ -458,3 +463,95 @@ def test_the_strike_param_says_what_it_means_where_the_method_is_fixed(editor):
     assert '0.30' not in placeholder, (
         f"the placeholder still suggests a delta on a structure that cannot use one: "
         f"{placeholder!r}")
+
+
+# --------------------------------------------------------------------------- #
+# min_arc: the premium-richness floor (OPT-C1)
+# --------------------------------------------------------------------------- #
+def test_an_absent_arc_floor_stays_absent(editor):
+    """THE DEFAULT MATTERS MORE THAN THE FIELD. An unset floor means "no richness
+    requirement", which is what every live rule has today. A pre-filled 0 would NOT be the
+    same thing: ``admits_credit_structure`` treats a configured 0.0 as a gate that still
+    refuses every UNMEASURABLE ARC, so a blank field that saved as 0 would quietly start
+    declining structures nobody asked it to decline."""
+    saved = editor.add_row(WING_ACTION).save()
+    assert 'min_arc' not in saved, saved
+
+
+def test_the_persisted_arc_floor_is_the_one_the_user_typed_converted_to_a_fraction(editor):
+    """Percent on screen, FRACTION on the wire -- ``option_economics`` and the GA gene both
+    work in fractions, and 150 %/yr read as a 150x floor would refuse everything."""
+    editor.add_row(WING_ACTION)
+    editor.widget('min_arc_input').value = 150.0
+    assert editor.save()['min_arc'] == pytest.approx(1.5)
+
+
+def test_an_existing_rules_arc_floor_is_loaded_back_into_the_editor(editor):
+    """The EDIT path, in the same units: a stored 0.25 must show as 25 %/yr and round-trip
+    unchanged, or opening a rule and saving it would silently divide the floor by 100."""
+    saved = editor.add_row(WING_ACTION, min_arc=0.25).save()
+    assert editor.widget('min_arc_input').value == pytest.approx(25.0)
+    assert saved['min_arc'] == pytest.approx(0.25)
+
+
+def test_the_arc_floor_is_offered_for_exactly_the_actions_that_read_it(settings_module,
+                                                                       nicegui_client,
+                                                                       monkeypatch):
+    """Both directions, by RUNNING each action type. Offering it on a DEBIT structure is
+    worse than the wing-width decoy: a debit structure posts no collateral, so its ARC is
+    None and any floor at all refuses the entry outright."""
+    for action_type in get_arc_floor_action_values():
+        with nicegui_client:
+            ed = _Editor(settings_module, monkeypatch).add_row(action_type)
+            assert ed.widget('min_arc_input') is not None, action_type
+            ed.widget('min_arc_input').value = 20.0
+            assert 'min_arc' in ed.save(), action_type
+
+    non_credit = [a.value for a in ExpertActionType
+                  if settings_module.is_option_action(a.value)
+                  and not uses_arc_floor(a.value)
+                  and a is not ExpertActionType.CLOSE_OPTION]
+    assert non_credit, "no non-credit option action to check against"
+    for action_type in non_credit:
+        with nicegui_client:
+            ed = _Editor(settings_module, monkeypatch).add_row(action_type)
+            assert ed.widget('min_arc_input') is None, action_type
+            assert 'min_arc' not in ed.save(), action_type
+
+
+def test_switching_off_a_credit_structure_stops_persisting_an_arc_floor(editor):
+    """THE STALE CLOSURE again -- ``min_arc_input`` is the row's second conditionally
+    created widget, and the first one (wing width) is on record for outliving its row. Pick
+    an iron condor, set a floor, change your mind to a long call: the floor must not follow.
+    On a debit structure it would not merely be inert, it would be read by nothing at all,
+    but the stored rule would claim a criterion it does not have."""
+    editor.add_row(WING_ACTION)
+    editor.widget('min_arc_input').value = 150.0
+    editor.choose(PLAIN_OPTION_ACTION)
+    assert editor.widget('min_arc_input') is None
+    saved = editor.save()
+    assert saved['action_type'] == PLAIN_OPTION_ACTION
+    assert 'min_arc' not in saved, saved
+
+
+def test_the_arc_action_list_matches_the_builders_that_consult_the_gate():
+    """The list must track ``TradeActions``, not just agree with itself: a ninth credit
+    builder that calls the gate but is missing here would be unreachable from a live rule,
+    and a name here whose builder does not call it would be an inert field."""
+    import inspect
+
+    from ba2_common.core import TradeActions as TA
+
+    by_value = {
+        ExpertActionType.SELL_CASH_SECURED_PUT.value: TA.SellCashSecuredPutAction,
+        ExpertActionType.OPEN_BEAR_CALL_SPREAD.value: TA.OpenBearCallSpreadAction,
+        ExpertActionType.OPEN_BULL_PUT_SPREAD.value: TA.OpenBullPutSpreadAction,
+        ExpertActionType.OPEN_SHORT_STRADDLE.value: TA.OpenShortStraddleAction,
+        ExpertActionType.OPEN_SHORT_STRANGLE.value: TA.OpenShortStrangleAction,
+        ExpertActionType.OPEN_IRON_CONDOR.value: TA.OpenIronCondorAction,
+        ExpertActionType.OPEN_JADE_LIZARD.value: TA.OpenJadeLizardAction,
+        ExpertActionType.OPEN_PUT_RATIO_SPREAD.value: TA.OpenPutRatioSpreadAction,
+    }
+    assert set(get_arc_floor_action_values()) == set(by_value)
+    for value, cls in by_value.items():
+        assert "_refuse_if_arc_below_floor" in inspect.getsource(cls), value
