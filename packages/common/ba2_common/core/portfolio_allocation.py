@@ -10,9 +10,20 @@ Turns target percentages into per-symbol share deltas:
                       valuation mode (see ``compute_allocation``)
     target_quantity = current_quantity + delta_quantity          (POST-TRADE)
     bp_cost         = |delta_notional| * bp_factor(symbol)       (buys only)
+    bp_released     = |delta_notional| * bp_factor(symbol)       (sells only)
 
-When ``sum(bp_cost of buys) > available_buying_power`` every BUY scales down
-pro-rata and the plan records ``scale_factor``. Sells never scale.
+A SELL FREES BUYING POWER AND THE PLAN MAY SPEND IT. The scaling budget is
+``available_buying_power + sum(bp_released of sells)``; when the buys still do not
+fit it, every BUY scales down pro-rata and the plan records ``scale_factor``.
+Sells never scale. ``bp_released`` is the exact mirror of ``bp_cost`` -- the same
+notional at the same ``bp_factor`` -- because buying a position and selling it
+back must move the budget by the same amount in both directions.
+
+Submission sends every sell BEFORE any buy (decision 13), which is what makes the
+freed money real by the time a buy needs it. A sell the broker refuses can leave a
+buy short of room; that buy is rejected on its own row rather than silently
+overspending, and un-ticking a sell in the dry run re-measures the budget before
+anything is sent (``filter_plan_rows``).
 
 THE RESERVE IS A SEPARATE, STORED NUMBER -- ``unallocated_pct``, held on
 ``PortfolioAllocationConfig``. Label targets are RELATIVE weights that always total
@@ -85,6 +96,7 @@ __all__ = [
     "QUANTITY_EPSILON", "MONEY_EPSILON", "BUMP_TO_ONE_SHARE_MAX_MULTIPLE",
     # per-row sizing outcomes (D1)
     "SIZING_OUTCOME_NORMAL", "SIZING_OUTCOME_BUMPED", "SIZING_OUTCOME_SKIPPED_TOO_LARGE",
+    "SIZING_OUTCOME_BUMPED_DROPPED",
     # what a plan's target_notional MEANS, and the residual loop's bound (D2)
     "ALLOCATION_BASIS_POSITION", "ALLOCATION_BASIS_BUDGET", "REDISTRIBUTION_MAX_PASSES",
     # reason / warning / error strings
@@ -133,6 +145,7 @@ __all__ = [
     "fractional_summary", "no_order_rows", "whole_share_notice", "no_order_notice",
     "bump_notice", "redistribution_notice",
     "WHOLE_SHARE_NOTICE_FMT", "WHOLE_SHARE_NOTICE_OFF_FMT", "NO_ORDER_NOTICE_FMT",
+    "NO_ORDER_NOTICE_MIXED_FMT",
     "BUMP_NOTICE_FMT", "REDISTRIBUTION_NOTICE_FMT",
     # submission
     "ACTION_ADJUST", "ACTION_CLOSE", "ACTION_NEW", "ACTION_SKIP",
@@ -236,6 +249,14 @@ BUMP_TO_ONE_SHARE_MAX_MULTIPLE = 1.5
 SIZING_OUTCOME_NORMAL = "normal"                        #: ordinary grid rounding
 SIZING_OUTCOME_BUMPED = "bumped-to-1"                   #: under one unit, bumped UP
 SIZING_OUTCOME_SKIPPED_TOO_LARGE = "skipped-too-large"  #: under one unit, one unit too big
+#: The bump was taken and then UNDONE by a later step -- the buying-power scaler
+#: cut the row back under one unit, or a broker precheck refused it. The row ends
+#: with NO ORDER, so it may not keep saying ``bumped-to-1``: that outcome claims a
+#: deliberate OVER-allocation and this row holds nothing. Emphatically NOT
+#: ``skipped-too-large``, which means the bump was never taken because one unit
+#: would have overshot the target; here one unit was perfectly acceptable and the
+#: money ran out. See ``_reconcile_sizing_outcomes``.
+SIZING_OUTCOME_BUMPED_DROPPED = "bumped-then-dropped"
 
 #: The bump happened: the whole intended position was smaller than one tradeable
 #: unit and one unit was inside BUMP_TO_ONE_SHARE_MAX_MULTIPLE, so the symbol is
@@ -589,9 +610,11 @@ class AllocationRow:
     ``current_quantity + delta_quantity``, what the account owns if this row
     executes -- and NOT an ideal share count the rounding may never reach; it is
     the same measure in both valuation modes, so it compares across rows.
-    ``estimated_value`` and ``bp_cost`` are always POSITIVE
-    magnitudes. ``bp_cost`` is 0.0 for sells -- sells free buying power and never
-    scale. ``fractional`` records the SIZING MODE: True when this row was rounded
+    ``estimated_value``, ``bp_cost`` and ``bp_released`` are always POSITIVE
+    magnitudes and the two buying-power fields are MUTUALLY EXCLUSIVE: a buy
+    charges (``bp_cost``), a sell frees (``bp_released``), and neither is ever the
+    other's negative. Read ``bp_effect`` when what is wanted is the SIGNED change.
+    Sells never scale. ``fractional`` records the SIZING MODE: True when this row was rounded
     on the fractional grid (toggle on AND the broker calls the symbol
     fractionable), not merely when the resulting quantity has a decimal part.
 
@@ -611,6 +634,16 @@ class AllocationRow:
     side: Optional[OrderDirection] = None
     estimated_value: float = 0.0
     bp_cost: float = 0.0
+    #: Buying power this row FREES, as a POSITIVE magnitude. Non-zero on SELLS
+    #: only, and the exact mirror of ``bp_cost`` on a buy of the same notional:
+    #: ``estimated_value * bp_factor``. Any other rate would make buying a
+    #: position and selling it back move the plan's budget by different amounts.
+    #:
+    #: It is CREDITED to the scaling budget (``_apply_bp_scaling``), which is the
+    #: whole point: a rebalance that sells 2,112 to buy 1,187 is not short of
+    #: buying power, and reporting one used to shrink every buy to a third of what
+    #: the weights asked for.
+    bp_released: float = 0.0
     bp_factor: float = 1.0
     #: Copied verbatim from this symbol's ``MarginInfo``, and CARRIED rather than
     #: re-derived because the dry run cannot otherwise tell a broker-stated margin
@@ -661,6 +694,17 @@ class AllocationRow:
     def is_sell(self) -> bool:
         return self.side == OrderDirection.SELL and not self.skipped
 
+    @property
+    def bp_effect(self) -> float:
+        """SIGNED change in buying power: NEGATIVE for a buy, POSITIVE for a sell.
+
+        The sign convention is the broker's own -- TastyTrade's
+        ``BuyingPowerEffect.change_in_buying_power`` is negative for a buy (see
+        ``OrderImpact``) -- so the dry run's column and the broker's precheck read
+        the same way round. 0.0 on a row with no order, in both directions.
+        """
+        return float(self.bp_released or 0.0) - float(self.bp_cost or 0.0)
+
     def to_dict(self) -> Dict[str, Any]:
         """JSON-safe dict for ``portfolio_allocation_run.plan_json``."""
         return {
@@ -675,6 +719,11 @@ class AllocationRow:
             "side": self.side.value if self.side is not None else None,
             "estimated_value": self.estimated_value,
             "bp_cost": self.bp_cost,
+            "bp_released": self.bp_released,
+            # Derived, but written out: a stored plan is read by things that have
+            # no engine to re-derive it with, and getting the sign wrong there
+            # turns a release into a charge.
+            "bp_effect": self.bp_effect,
             "bp_factor": self.bp_factor,
             "marginable": self.marginable,
             "initial_margin_rate": self.initial_margin_rate,
@@ -694,9 +743,17 @@ class AllocationPlan:
     """A full dry-run: one AllocationRow per symbol plus plan-level totals.
 
     ``scale_factor`` < 1.0 means every BUY was scaled down pro-rata because
-    ``sum(bp_cost of buys) > available_buying_power``. Sells never scale.
+    ``sum(bp_cost of buys) > total_buying_power``. Sells never scale.
     ``required_buying_power`` is the POST-scaling figure -- what the plan as
     displayed actually needs.
+
+    THREE buying-power numbers, and mixing them up is what produced the defect
+    this note exists for. ``available_buying_power`` is what the BROKER published
+    before anything is sent; ``released_buying_power`` is what this plan's own
+    SELLS give back; ``total_buying_power`` is their sum and is THE BUDGET -- what
+    the scaler measures against and what ``bp_usage_pct`` divides. A live plan
+    selling 2,112 to buy 1,187 measured itself against the 394 it started with,
+    called itself 91% used and scaled every buy to a third.
 
     TWO kinds of money end up idle, and they are deliberately separate fields.
     ``unallocatable_pct`` is the share of the GROSS BASE that no label COULD absorb
@@ -735,6 +792,11 @@ class AllocationPlan:
     rows: List[AllocationRow] = field(default_factory=list)
     base_notional: float = 0.0
     available_buying_power: float = 0.0
+    #: What this plan's own SELLS free, summed from ``AllocationRow.bp_released``.
+    #: Added to ``available_buying_power`` to make the budget the buys are sized
+    #: against. Recomputed by ``filter_plan_rows``, so un-ticking the sell that
+    #: funds a rebalance takes its money straight back out of the footer.
+    released_buying_power: float = 0.0
     required_buying_power: float = 0.0
     bp_usage_pct: float = 0.0
     scale_factor: float = 1.0
@@ -786,6 +848,21 @@ class AllocationPlan:
         return self.base_notional - self.reserved_notional
 
     @property
+    def total_buying_power(self) -> float:
+        """THE BUDGET: what the broker published PLUS what this plan's sells free.
+
+        A derived PROPERTY for the same reason ``investable_notional`` is one --
+        the three figures must always agree and the only way to guarantee that is
+        to keep two and add. Every "does this plan fit?" question divides this:
+        ``_apply_bp_scaling``, ``bp_usage_pct``, the per-row ``BP %`` and the dry
+        run's footer.
+        """
+        # No ``or 0.0``: both are non-Optional ``float`` fields, so the coercion
+        # could never fire and ``tests/test_no_zero_coercion.py`` is a ratchet on
+        # adding ones that look like it could. Same as ``investable_notional``.
+        return float(self.available_buying_power) + float(self.released_buying_power)
+
+    @property
     def buy_rows(self) -> List[AllocationRow]:
         """Buys, DESCENDING by estimated value -- the submission order (a
         shortfall then truncates the smallest positions)."""
@@ -809,6 +886,10 @@ class AllocationPlan:
             "rows": [r.to_dict() for r in self.rows],
             "base_notional": self.base_notional,
             "available_buying_power": self.available_buying_power,
+            "released_buying_power": self.released_buying_power,
+            # Derived, but written out, like ``investable_notional`` below: a
+            # reader that adds the wrong pair reports the wrong budget.
+            "total_buying_power": self.total_buying_power,
             "required_buying_power": self.required_buying_power,
             "bp_usage_pct": self.bp_usage_pct,
             "scale_factor": self.scale_factor,
@@ -1669,13 +1750,52 @@ def round_quantity(target_notional: float, price: float, margin: Optional[Margin
     return qty
 
 
+def _reconcile_sizing_outcomes(rows: List[AllocationRow]) -> None:
+    """Make every ``sizing_outcome`` describe the row's FINAL state.
+
+    THE ONE DOOR, and it is at the END of the solve on purpose. ``sizing_outcome``
+    is stamped by the sizing rules and then several later steps can take the order
+    away again -- the buying-power scaler, a broker precheck refusal -- and neither
+    of them was revisiting the stamp. A live row rendered ``SIDE -``, ``QTY 0``,
+    ``ORDER no order`` and ``OUTCOME bumped-to-1`` at the same time, and the notice
+    above the table dutifully reported that it "over-allocates them by 0.00".
+
+    ``SIZING_OUTCOME_BUMPED`` is the only outcome that makes a claim a later step
+    can falsify: it says the row deliberately holds MORE than its weight asked for.
+    A row with no order holds nothing, so it becomes
+    ``SIZING_OUTCOME_BUMPED_DROPPED`` -- which keeps both halves of the story (the
+    position was wanted; it could not be had) without pretending an order exists.
+    ``normal`` claims nothing and ``skipped-too-large`` already means "no order",
+    so neither is touched.
+
+    Put here rather than inside ``_apply_bp_scaling`` because the scaler is only
+    one of the paths: ``apply_order_impacts`` zeroes a refused row without going
+    near it, and a future step that zeroes a row will not have to remember either.
+    """
+    for row in rows:
+        # ``delta_quantity`` is a non-Optional float; no ``or 0.0`` (see
+        # ``tests/test_no_zero_coercion.py`` -- the rule is a ratchet).
+        if (row.sizing_outcome == SIZING_OUTCOME_BUMPED
+                and abs(float(row.delta_quantity)) <= QUANTITY_EPSILON):
+            row.sizing_outcome = SIZING_OUTCOME_BUMPED_DROPPED
+
+
 def _finalise_totals(plan: AllocationPlan) -> None:
-    """Fill the plan-level money totals from its rows."""
+    """Fill the plan-level money totals from its rows, and settle their outcomes.
+
+    Called at the end of BOTH solvers and of ``apply_order_impacts``, which is
+    exactly the set of places where the rows have stopped moving -- so it is also
+    where ``_reconcile_sizing_outcomes`` belongs.
+    """
+    _reconcile_sizing_outcomes(plan.rows)
     plan.total_buy_value = sum(r.estimated_value for r in plan.rows if r.is_buy)
     plan.total_sell_value = sum(r.estimated_value for r in plan.rows if r.is_sell)
     plan.required_buying_power = sum(r.bp_cost for r in plan.rows if r.is_buy)
-    plan.bp_usage_pct = (plan.required_buying_power / plan.available_buying_power * 100.0
-                         if plan.available_buying_power > 0 else 0.0)
+    plan.released_buying_power = sum(r.bp_released for r in plan.rows if r.is_sell)
+    # Against the BUDGET -- broker buying power plus what this plan's own sells
+    # free -- and never against the pre-sell figure alone. See AllocationPlan.
+    plan.bp_usage_pct = (plan.required_buying_power / plan.total_buying_power * 100.0
+                         if plan.total_buying_power > 0 else 0.0)
 
 
 def _carry_margin_facts(row: AllocationRow, margin: Optional[MarginInfo]) -> None:
@@ -1707,9 +1827,18 @@ def _carry_margin_facts(row: AllocationRow, margin: Optional[MarginInfo]) -> Non
 def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, *,
                       allow_fractional: bool,
                       margin: Optional[Dict[str, MarginInfo]] = None) -> float:
-    """Scale every BUY pro-rata until the plan fits available buying power.
+    """Scale every BUY pro-rata until the plan fits the buying-power BUDGET.
 
-    SELLS NEVER SCALE -- they free buying power. The re-rounded quantity is fed
+    THE BUDGET IS ``available_buying_power`` PLUS WHAT THE SELLS FREE, not the
+    published figure alone. Sells go to the broker first (decision 13), so their
+    ``bp_released`` is real money by the time a buy needs it -- and measuring
+    against the pre-sell figure told a plan that sold 2,112 to buy 1,187 that it
+    was 91% used and cut every buy to a third of itself. A sell the broker then
+    REFUSES leaves a buy short of room and the broker rejects that one row
+    (``_submit_row`` reports it); the dry run can see the same thing coming,
+    because un-ticking a sell re-measures the budget through ``filter_plan_rows``.
+
+    SELLS NEVER SCALE -- they only ever free. The re-rounded quantity is fed
     back through ``round_quantity`` (so increments and min order sizes still
     hold) and each row's ``bp_cost`` is scaled by the SAME quantity ratio rather
     than recomputed, which preserves a broker-precheck cost when one has been
@@ -1725,7 +1854,10 @@ def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, 
     """
     buys = [r for r in rows if r.is_buy]
     required = sum(r.bp_cost for r in buys)
-    avail = float(available_buying_power or 0.0)
+    # ``is_sell`` and not the raw side: a sell a precheck refused is skipped, and
+    # a refused close frees nothing.
+    avail = (float(available_buying_power or 0.0)
+             + sum(r.bp_released for r in rows if r.is_sell))
     if not buys or required <= avail:
         return 1.0
     scale = (avail / required) if required > 0 else 0.0
@@ -2038,7 +2170,11 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         elif delta < 0:
             row.side = OrderDirection.SELL
         row.estimated_value = abs(delta) * row.price
+        # MUTUALLY EXCLUSIVE, and the same rate in both directions: a buy charges,
+        # a sell frees, and selling a position back must give up exactly what
+        # buying it consumed.
         row.bp_cost = row.estimated_value * row.bp_factor if delta > 0 else 0.0
+        row.bp_released = row.estimated_value * row.bp_factor if delta < 0 else 0.0
         plan.rows.append(row)
 
     # D2, BEFORE the buying-power pass: the label's own arithmetic first, the
@@ -2275,6 +2411,10 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
             row.target_quantity = row.current_quantity
             row.estimated_value = 0.0
             row.bp_cost = 0.0
+            # A close the broker refused frees NOTHING, so its release has to come
+            # straight back out of the budget the buys were sized against -- which
+            # the re-scale below then acts on.
+            row.bp_released = 0.0
             row.reasons.extend(impact.errors)
             continue
         row.estimated_fees = impact.estimated_fees
@@ -2664,7 +2804,10 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
     against this" is ``initial_margin_rate < 1.0``, which is a DIFFERENT statement
     from ``bp_ratio > 1.0`` and frequently the opposite one.
     """
-    available = float(plan.available_buying_power or 0.0)
+    # THE BUDGET, not the published figure: ``bp_usage_pct`` sits three inches
+    # under a footer that divides the same thing, and two denominators there is
+    # two answers to one question.
+    available = float(plan.total_buying_power or 0.0)
     base = float(plan.base_notional or 0.0)
     mode = plan.valuation_mode
     basis = plan.allocation_basis
@@ -2694,7 +2837,17 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
             # never "free" -- there is no fallback for a number nobody published.
             "estimated_fees": row.estimated_fees,
             "bp_cost": round(row.bp_cost, 2),
-            "bp_usage_pct": (round(row.bp_cost / available * 100.0, 2)
+            # Both POSITIVE magnitudes and mutually exclusive; ``bp_effect`` is
+            # the SIGNED one and is what the table's single column draws. A sell
+            # showing a bare 0.00 under a "BP cost" heading was the display half
+            # of the budget defect -- it reads as "this trade does nothing to your
+            # buying power", which is the opposite of what a sale does.
+            "bp_released": round(row.bp_released, 2),
+            "bp_effect": round(row.bp_effect, 2),
+            # SIGNED too, and over the same denominator as the footer: negative
+            # is the share of the budget this row consumes, positive the share it
+            # hands back.
+            "bp_usage_pct": (round(row.bp_effect / available * 100.0, 2)
                              if available > 0 else 0.0),
             # Per-symbol leverage. See bp_leverage: the ratio is the REALISED
             # charge, bp_factor is what the solver assumed, and after a precheck
@@ -2771,14 +2924,20 @@ def filter_plan_rows(plan: "AllocationPlan", selected_symbols: List[str]) -> "Al
     buy_value = sum(r.estimated_value for r in rows if r.is_buy)
     sell_value = sum(r.estimated_value for r in rows if r.is_sell)
     required = sum(r.bp_cost for r in rows if r.is_buy)
-    available = float(plan.available_buying_power or 0.0)
+    # RECOMPUTED from the ticked rows, exactly like ``required``. Un-ticking the
+    # sell that funds a rebalance takes its money back out of the budget, and the
+    # footer says the plan no longer fits BEFORE anything is submitted -- which is
+    # the dry run's own answer to "what if that close does not happen?".
+    released = sum(r.bp_released for r in rows if r.is_sell)
+    budget = float(plan.available_buying_power or 0.0) + released
 
     return AllocationPlan(
         rows=rows,
         base_notional=plan.base_notional,
         available_buying_power=plan.available_buying_power,
+        released_buying_power=released,
         required_buying_power=required,
-        bp_usage_pct=(required / available * 100.0) if available > 0 else 0.0,
+        bp_usage_pct=(required / budget * 100.0) if budget > 0 else 0.0,
         scale_factor=plan.scale_factor,
         # Not recomputed: it is a property of the BASE (labels that could absorb
         # nothing), which un-ticking a row does not alter. Dropping it would
@@ -3527,8 +3686,16 @@ def _absorption_unit_money(row: "AllocationRow", valuation_mode: str,
 
 
 def _buying_power_headroom(plan: "AllocationPlan") -> float:
-    """Buying power the plan is NOT already spending. Recomputed after every move."""
+    """Buying power the plan is NOT already spending. Recomputed after every move.
+
+    Reads the same BUDGET ``_apply_bp_scaling`` does -- published buying power
+    plus what the plan's sells free -- so redistribution and the scaler cannot
+    disagree about how much room there is. ``plan.total_buying_power`` is not used
+    here because it is only refreshed by ``_finalise_totals``, which has not run
+    yet while redistribution is still moving rows.
+    """
     return (float(plan.available_buying_power or 0.0)
+            + sum(r.bp_released for r in plan.rows if r.is_sell)
             - sum(r.bp_cost for r in plan.rows if r.is_buy))
 
 
@@ -3620,7 +3787,12 @@ def _apply_absorption(row: "AllocationRow", move: float, label: str,
     row.delta_quantity = after
     row.target_quantity = float(row.current_quantity or 0.0) + after
     row.estimated_value = abs(after) * float(row.price)
-    row.bp_cost = row.estimated_value * float(row.bp_factor or 1.0) if after > 0 else 0.0
+    factor = float(row.bp_factor or 1.0)
+    # BOTH, because an absorption can flip a row's side: a buy trimmed past zero
+    # becomes a sell, and a stale ``bp_released`` on a row that is now buying
+    # would credit the budget with money nobody is freeing.
+    row.bp_cost = row.estimated_value * factor if after > 0 else 0.0
+    row.bp_released = row.estimated_value * factor if after < 0 else 0.0
     row.side = (OrderDirection.BUY if after > 0
                 else OrderDirection.SELL if after < 0 else None)
     row.redistributed = True
@@ -3804,11 +3976,21 @@ BUMP_NOTICE_FMT = (
     "{count} symbol(s) had a target smaller than one whole share and were BUMPED UP "
     "to one, so they get a position at all - that over-allocates them by {total:,.2f} "
     "in total. Marked 'bumped-to-1' in the Outcome column.")
-#: Shown when at least one symbol gets no order at all.
+#: Shown when at least one symbol gets no order at all AND the BUMP BOUND is why
+#: for every one of them -- one whole share would have overshot the target.
 NO_ORDER_NOTICE_FMT = (
     "{count} symbol(s) get NO order at all, leaving {total:,.2f} unallocated - see "
     "'Not traded' below. One whole share of each would be more than {limit:.0f}% of "
     "its target, so buying one is a different trade, not a rounding fix.")
+#: The same headline WITHOUT the cause, for the mixed case. A row buying power
+#: took away, a row under a broker minimum and a row the precheck refused all end
+#: up here too, and the sentence above is simply false about them: one share of a
+#: buying-power casualty was 109% of its target and perfectly acceptable. The
+#: per-row reason is in the 'Not traded' table, which is where a plan with several
+#: different causes has to send the reader anyway.
+NO_ORDER_NOTICE_MIXED_FMT = (
+    "{count} symbol(s) get NO order at all, leaving {total:,.2f} unallocated - see "
+    "'Not traded' below, which gives the reason for each.")
 #: Shown when redistribution moved a row off the quantity the weights implied.
 REDISTRIBUTION_NOTICE_FMT = (
     "{count} symbol(s) had their share count adjusted so their label still hits its "
@@ -3849,6 +4031,11 @@ def fractional_summary(plan: "AllocationPlan") -> Dict[str, Any]:
     unknown = [r for r in priced if REASON_FRACTIONAL_UNKNOWN in r.reasons]
     bumped = [r for r in priced if r.sizing_outcome == SIZING_OUTCOME_BUMPED]
     too_large = [r for r in priced if r.sizing_outcome == SIZING_OUTCOME_SKIPPED_TOO_LARGE]
+    # A bump a later step UNDID. Counted separately and NOT in ``bumped``: it
+    # spends nothing, so folding it in is what made the bump notice report an
+    # over-allocation of 0.00. See ``_reconcile_sizing_outcomes``.
+    bumped_dropped = [r for r in priced
+                      if r.sizing_outcome == SIZING_OUTCOME_BUMPED_DROPPED]
 
     target_total = sum(float(r.target_notional or 0.0) for r in priced)
     projected_total = 0.0
@@ -3878,9 +4065,17 @@ def fractional_summary(plan: "AllocationPlan") -> Dict[str, Any]:
         "residual_notional": residual,
         "residual_pct": (residual / base * 100.0) if base > 0 else 0.0,
         "no_order_rows": len(dropped),
+        # How many of those the BUMP BOUND refused, which is a different cause
+        # from every other way a row loses its order (the grid, a broker minimum,
+        # buying power, a precheck refusal). The notice used to assert the bound
+        # for all of them; it may only do so when it is true of all of them.
+        "no_order_rows_over_bump_limit": len(
+            [r for r in dropped
+             if r.sizing_outcome == SIZING_OUTCOME_SKIPPED_TOO_LARGE]),
         "no_order_notional": sum(float(r.unmet_notional or 0.0) for r in dropped),
         "bumped_rows": len(bumped),
         "bumped_notional": bumped_over,
+        "bumped_dropped_rows": len(bumped_dropped),
         "skipped_too_large_rows": len(too_large),
         "redistributed_rows": len([r for r in plan.rows if r.redistributed]),
     }
@@ -3955,12 +4150,24 @@ def bump_notice(summary: Dict[str, Any]) -> Optional[str]:
 
 
 def no_order_notice(summary: Dict[str, Any]) -> Optional[str]:
-    """The "some symbols get nothing" warning, or ``None`` when every row trades."""
-    if summary["no_order_rows"] <= 0:
+    """The "some symbols get nothing" warning, or ``None`` when every row trades.
+
+    NAMES THE CAUSE ONLY WHEN IT IS THE CAUSE OF ALL OF THEM. The bump bound is
+    one of several ways a row loses its order and this sentence used to assert it
+    for every one -- so a row the buying-power scaler took away was explained as
+    "one whole share would be more than 150% of its target" when one whole share
+    had been 109% of its target and entirely acceptable. Mixed causes send the
+    reader to the per-row reasons instead of picking one and stating it as fact.
+    """
+    count = summary["no_order_rows"]
+    if count <= 0:
         return None
-    return NO_ORDER_NOTICE_FMT.format(count=summary["no_order_rows"],
-                                      total=summary["no_order_notional"],
-                                      limit=BUMP_TO_ONE_SHARE_MAX_MULTIPLE * 100.0)
+    if summary["no_order_rows_over_bump_limit"] == count:
+        return NO_ORDER_NOTICE_FMT.format(
+            count=count, total=summary["no_order_notional"],
+            limit=BUMP_TO_ONE_SHARE_MAX_MULTIPLE * 100.0)
+    return NO_ORDER_NOTICE_MIXED_FMT.format(count=count,
+                                            total=summary["no_order_notional"])
 
 
 def redistribution_notice(summary: Dict[str, Any]) -> Optional[str]:

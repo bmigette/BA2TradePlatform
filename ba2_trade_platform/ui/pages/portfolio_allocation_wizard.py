@@ -48,6 +48,13 @@ smaller than one share UP to one share, and moves quantities between a label's
 symbols to keep the label on target; both spend money the typed weights did not ask
 for, and both are only acceptable because these two columns show them.
 
+TWO TABS: the order table on one, the notices and the totals on the other. The
+user, looking at it live: "better to make 2 tabs here as it's unreadable, one tab
+with table and one with the text etc." Submit, Cancel and Refresh -- and the two
+banners that say Submit is OFF -- stay OUTSIDE both, because a control or a refusal
+behind an unopened tab has not been shown. See the block comment above
+``DIALOG_CARD_CLASSES``.
+
 It stays MODAL. A commit gate for real orders should be a deliberate stop, not
 something reachable by scrolling.
 """
@@ -177,10 +184,13 @@ LEVERAGE_TOOLTIP_UNKNOWN_FMT = (
     'flagged either way. Brokers commonly publish nothing for a symbol you do not '
     'already hold.')
 
-#: Tooltip on a sell's (empty) leverage cell.
+#: Tooltip on a sell's (empty) leverage cell. This column is about the CHARGE, and
+#: a sell makes none; how much it FREES is the BP effect column two cells left,
+#: which is where the reader is sent rather than being told the fact does not
+#: exist.
 LEVERAGE_TOOLTIP_SELL = (
-    'A sell FREES buying power rather than charging it, so there is no ratio to '
-    'state.')
+    'A sell FREES buying power rather than charging it, so there is no charge '
+    'ratio to state - the BP effect column says how much it frees.')
 
 #: Tooltip on a neutral ×1.00, so the column never reads as "nothing measured".
 LEVERAGE_TOOLTIP_NEUTRAL_FMT = (
@@ -199,6 +209,48 @@ BP_IS_A_CHARGE_NOTE_FMT = (
     '({ratio:.2f}x). Only the {buy_value:,.2f} is invested - the ratio moves no '
     'target and buys no extra share.')
 
+#: The footer's buying-power line, and the marker that finds it.
+#:
+#: THE DENOMINATOR IS THE BUDGET, not the figure the broker published. It used to
+#: read "Required BP: 359.26 / 394.87 (91.0%)" on a plan that was selling 2,112.58
+#: -- a plan with 2,507 to spend, describing itself as 91% used, on the strength of
+#: money it was about to hand back. ``AllocationPlan.total_buying_power`` is the
+#: sum and this line shows BOTH halves of it, because a total the user cannot find
+#: on any other screen is a number they have to take on trust.
+MARKER_BP_BUDGET = 'dry-run-bp-budget'
+BP_BUDGET_FMT = 'Required BP: {required:,.2f} / {budget:,.2f} ({pct:.1f}%)'
+#: Appended only when the plan HAS sells. "1,000.00 on hand + 0.00 freed" on every
+#: buy-only plan is noise, and noise is what hides the real case.
+BP_BUDGET_BREAKDOWN_FMT = (' — {available:,.2f} on hand + {released:,.2f} freed by '
+                           'this plan’s sells')
+
+#: Shown when the plan does not fit even the full budget. Names the sells, because
+#: un-ticking one is the commonest way to get here from a plan that DID fit.
+BP_OVER_BUDGET_NOTE = (
+    'Required buying power exceeds the budget (what the broker published plus what '
+    'this plan’s sells free) - the smallest buys will be truncated as buying '
+    'power runs out.')
+
+#: Marker on the dry-run table's ``BP effect`` cell.
+MARKER_BP_EFFECT = 'dry-run-bp-effect'
+
+#: The ``BP effect`` cell's tooltips. SIGNED is the whole point of the column:
+#: negative is buying power consumed, positive is buying power handed back. The
+#: sign convention is the broker's own -- TastyTrade's
+#: ``change_in_buying_power`` is negative for a buy -- so the dry run and a
+#: precheck read the same way round. Every branch has a tooltip: a bare signed
+#: figure in a money column is a question the user cannot answer from the screen,
+#: and getting this one backwards is expensive.
+BP_EFFECT_TOOLTIP_CHARGE_FMT = (
+    '{symbol} charges {amount:,.2f} against buying power ({value:,.2f} of stock at '
+    '{ratio:.2f}x). It is RESERVED, not spent.')
+BP_EFFECT_TOOLTIP_RELEASE_FMT = (
+    '{symbol} frees {amount:,.2f} of buying power - a sale returns what the '
+    'position was reserving ({value:,.2f} at {ratio:.2f}x). Sells go to the broker '
+    'before any buy, so this plan’s buys are sized with it counted in.')
+BP_EFFECT_TOOLTIP_NONE = (
+    'No order on this row, so it moves no buying power in either direction.')
+
 #: NiceGUI marker on the market-hours banner's sentence, and on each of the four
 #: plan notices. Located by marker, not by text: the gate's message is ALSO the
 #: Submit button's tooltip, and every notice quotes wording that recurs in the
@@ -210,18 +262,19 @@ MARKER_PLAN_NOTICE = 'dry-run-plan-notice'
 #: Marked, not text-matched: the collapsed line names symbols that also appear in
 #: the table three inches below it.
 MARKER_PLAN_WARNING = 'dry-run-plan-warning'
-#: The scrolling block the notices and warnings live in, and the "N of them"
-#: header that tells the reader there is more than fits. Both marked so a test can
-#: prove the compression exists without depending on how many notices a fixture
-#: happens to produce.
+#: The block the notices and warnings live in, and the BADGE on the notices TAB
+#: that says how many are in it. Both marked so a test can prove the count exists
+#: without depending on how many notices a fixture happens to produce.
 MARKER_NOTICE_BLOCK = 'dry-run-notice-block'
 MARKER_NOTICE_COUNT = 'dry-run-notice-count'
-#: The scrolling viewport the order table lives in. The table is the most
-#: important content in this dialog and had the least room in it; this container
-#: is what holds it to at least 60% of the dialog height.
+#: The scrolling viewport the order table lives in, now filling its own tab.
 MARKER_ROWS_VIEWPORT = 'dry-run-rows-viewport'
 #: The order table's sticky header row.
 MARKER_TABLE_HEAD = 'dry-run-table-head'
+#: The free-text Reasons cell, on the order table and on the 'Not traded' table.
+#: By marker: every word in it also appears in a notice above, so a text search
+#: cannot tell which of the two drew it.
+MARKER_ROW_REASONS = 'dry-run-row-reasons'
 
 #: Marker on the income panel's working-orders line, for the same reason.
 MARKER_WORKING_ORDERS = 'income-working-orders'
@@ -286,38 +339,40 @@ NO_FRACTIONAL_SUPPORT_NOTE = 'This broker does not support fractional shares.'
 
 
 # ---------------------------------------------------------------------------
-# HOW THE DIALOG DIVIDES ITS HEIGHT
+# HOW THE DIALOG DIVIDES ITS HEIGHT: TWO TABS
 #
-# The order table is the reason this dialog exists and it had the least room in
-# it: a roughly two-row viewport with its own scrollbar, wedged between a tall
-# notice stack and the totals. The card is a FLEX COLUMN now and the table is the
-# only child that grows, with a floor of 60% of the dialog. Everything else is
-# capped and scrolls inside its own cap, so no amount of notices can squeeze it.
+# The user, looking at it live: "better to make 2 tabs here as it's unreadable,
+# one tab with table and one with the text etc."
 #
-# ``vh`` and not ``%``: the dialog is ``maximized``, so the card IS the viewport
-# height, and a percentage would depend on every ancestor having a definite height
-# -- which is exactly the kind of thing that quietly stops being true.
+# Before this, the table -- the reason the dialog exists -- was a band in the
+# middle. Notices, the fractional switch, the market-order caveat and six warnings
+# stacked above it and the totals sat below, and the previous attempt to protect
+# it CAPPED the two stacks (18vh + 7vh) so they could not grow. That worked and it
+# was still the wrong shape: the caps mean the context is permanently squinting
+# through a 5rem scroll box, and the table still only got ~60%.
 #
-# THE 60% IS A CONSEQUENCE OF THE CAPS, NOT A MINIMUM ON THE TABLE, and the
-# difference is a bug found in a real browser rather than in a test. A
-# ``min-h-[60vh]`` on the table competes with the caps instead of cooperating with
-# them: flexbox honours the minimum, the column overflows the card, ``overflow:
-# hidden`` clips the bottom -- and what is at the bottom is the SUBMIT BUTTON.
-# Measured at 1600x1000 it sat 23px below the fold, unreachable, on a dialog whose
-# entire job is to be the gate in front of real orders.
+# Tabs make it a choice instead of a compromise. The order table gets the WHOLE
+# panel; the notices and the totals get the whole panel; neither is capped and
+# neither can squeeze the other, so both stacks are readable at the size they
+# actually are.
 #
-# So the table has NO floor of its own: it is the only ``flex-grow`` child, with
-# ``min-h-0`` so it can also shrink, and it gets exactly what the capped siblings
-# leave. Holding those caps low is what guarantees the share:
+# WHAT IS NOT IN A TAB, and it is a short list on purpose:
 #
-#     head 18vh + totals 7vh + fixed chrome (title, buttons, padding, gaps)
+#   * Submit / Cancel / Refresh. They are the point of the dialog and are drawn as
+#     SIBLINGS of the panels, so no tab can hide them and there is exactly one of
+#     each to press.
+#   * The market-hours banner and the ``held symbol has no quote`` block. Those two
+#     do not qualify the numbers, they say SUBMIT IS OFF. A refusal behind an
+#     unopened tab is a refusal that was not shown.
 #
-# The chrome is the part that does NOT scale, so it is the binding constraint on a
-# short window. Measured in a real browser, the table gets 64.6% at 1920x1080,
-# 63.8% at 1600x1000, 62.7% at 1440x900, 61.3% at 1280x800 and 60.8% at 1024x720,
-# with the Submit button on screen at every one of them. Below roughly 650px of
-# viewport it degrades under 60% rather than hiding the buttons, which is the
-# right way round.
+# The fractional switch IS in a tab -- the ORDERS one -- because it re-solves, and
+# what it visibly changes is the table. On the notices tab the user would have to
+# change tabs to see what they had just done.
+#
+# ``vh``/``%`` sizing is gone with the caps; the panels take what the flex column
+# leaves. The card still CLIPS (``overflow-hidden``) rather than growing past the
+# viewport: what is at the bottom of it is the Submit button, and a card that
+# overflows is a card whose Submit button is 23px below the fold, measured.
 # ---------------------------------------------------------------------------
 
 #: The card: a flex column that fills the maximized dialog and CLIPS rather than
@@ -329,36 +384,41 @@ NO_FRACTIONAL_SUPPORT_NOTE = 'This broker does not support fractional shares.'
 DIALOG_CARD_CLASSES = ('w-full h-full flex flex-col flex-nowrap '
                        'overflow-hidden min-h-0 gap-1 p-2')
 
-#: Everything above the table -- banner, base panel, the fractional switch and the
-#: notices. Capped and scrollable: it is context, and context may not crowd out
-#: the thing it is context FOR.
-DIALOG_HEAD_CLASSES = 'w-full shrink-0 overflow-y-auto max-h-[18vh]'
+#: ``ui.tab`` names. Constants because three call sites use them and a typo in one
+#: silently produces a panel no tab can reach.
+TAB_ORDERS = 'orders'
+TAB_NOTICES = 'notices'
+TAB_ORDERS_LABEL = 'Orders'
+TAB_NOTICES_LABEL = 'Notices & totals'
 
-#: The table's viewport. THE point of the whole rearrangement. No minimum -- see
-#: the block comment above for why a minimum is what clipped the Submit button.
+#: The panel host: the ONE growing child of the card. ``p-0`` because each panel
+#: does its own padding, and Quasar's default would be counted twice.
+DIALOG_PANELS_CLASSES = 'w-full flex-grow min-h-0 overflow-hidden p-0'
+
+#: One panel. A flex column of its own so the table inside can be the growing
+#: child in turn, and ``min-h-0`` at both levels so nothing's implicit
+#: ``min-height:auto`` re-inflates the card.
+TAB_PANEL_CLASSES = ('w-full h-full flex flex-col flex-nowrap min-h-0 '
+                     'overflow-hidden gap-1 p-1')
+
+#: The table's viewport: the growing child of the ORDERS panel, and no minimum of
+#: its own -- a ``min-h-[...]`` competes with its siblings instead of cooperating
+#: with them, overflows the card, and what gets clipped is the Submit button.
 DIALOG_ROWS_CLASSES = 'w-full gap-0 flex-grow min-h-0 overflow-auto relative'
 
-#: The totals footer, compressed the same way.
-DIALOG_TOTALS_CLASSES = 'w-full shrink-0 overflow-y-auto max-h-[7vh]'
+#: The notices panel scrolls as a whole. No inner cap any more: the whole point of
+#: giving it a tab is that it no longer has to fit above something else.
+DIALOG_NOTICES_CLASSES = 'w-full h-full min-h-0 overflow-y-auto gap-1'
 
-#: What the two caps must leave. Asserted in the tests rather than merely
-#: intended: these two numbers ARE the 60% guarantee now, so a well-meaning "just
-#: a bit more room for the notices" has to fail a test rather than quietly take
-#: the table back down to two rows.
-DIALOG_SIDE_CAP_BUDGET_VH = 25.0
+#: The notices/warnings stack inside that panel.
+NOTICE_BLOCK_CLASSES = 'w-full'
 
-#: The notices' own inner cap, inside the head block. Small enough that the head
-#: usually fits its 18vh without scrolling at all, big enough for three lines.
-NOTICE_BLOCK_CLASSES = 'w-full overflow-y-auto max-h-[5rem]'
-
-#: Said above the block when there is more in it than fits. A scrollbar on a dark
-#: theme is nearly invisible, and a notice nobody knows to scroll to is a notice
-#: that was not shown.
-#:
-#: "scroll to read them" rather than "scroll for the rest": on a tall stack the
-#: whole block can sit below the head's own 18vh cap, so promising "the rest"
-#: would imply some of them are already visible when none of them is.
-NOTICE_COUNT_FMT = '{count} notices about this plan — scroll to read them'
+#: The BADGE on the notices tab, and its tooltip. A tab is a place things hide, and
+#: six warnings behind an unopened tab have not been shown; the badge is what says
+#: they are there without the tab being opened. Its TEXT is the bare count -- a
+#: sentence on a tab is unreadable -- and the sentence is one hover away.
+NOTICE_COUNT_FMT = '{count} notice(s) about this plan'
+NOTICE_BADGE_CLASSES = 'ml-2'
 
 #: Rows drawn UNDER a sticky header need the header to be opaque and above them.
 #: The look itself -- the dark bar, the uppercase grey caption, the row separator,
@@ -391,7 +451,10 @@ DRY_RUN_COLUMNS = (
     ('target', 'Target', 'w-24', True),
     ('projected', 'Projected ({mode})', 'w-32', True),
     ('weight', 'Weight', 'w-32', False),
-    ('bp_cost', 'BP cost', 'w-24', True),
+    # SIGNED, and no longer called a cost: a sale FREES buying power, and a sell
+    # row reading "BP cost 0.00" said the opposite -- that a sale does nothing to
+    # your buying power at all.
+    ('bp_effect', 'BP effect', 'w-28', True),
     ('bp_ratio', 'BP ×', 'w-20', True),
     ('bp_pct', 'BP %', 'w-16', True),
     ('reasons', 'Reasons', 'flex-1 min-w-64', False),
@@ -401,6 +464,35 @@ _COLUMN_CLASSES = {
     name: width + (' text-right' if numeric else '')
     for name, _header, width, numeric in DRY_RUN_COLUMNS
 }
+
+#: THE REASONS CELL, in inline CSS rather than Tailwind classes.
+#:
+#: THE WIDTH BOUND IS THE ACTUAL FIX. Every row is ``min-w-max``, deliberately, so
+#: money figures are never squeezed and truncated -- which also means the Reasons
+#: cell simply grew to fit the longest reason on the plan and took the table off
+#: the right-hand edge of the screen with it. Measured in headless Chrome at
+#: 1600x1000: the longest reason on a realistic plan renders 1,178px wide
+#: unwrapped, against the 448px this cap allows, and the table's own horizontal
+#: scroll width drops from ~3,030px to 2,300px.
+#:
+#: Clamped to three lines rather than left to wrap freely: a four-line reason on
+#: every row is a table nobody can scan. ``-webkit-line-clamp`` gives a visible
+#: ellipsis, so the truncation announces itself, and the FULL text is on the
+#: tooltip -- losing the explanation is not an option, it is the column's whole
+#: purpose. Both the prefixed and the standard ``line-clamp`` are set.
+#:
+#: INLINE rather than ``max-w-[28rem] whitespace-normal line-clamp-3``. Measured in
+#: the same run: Tailwind's LAYOUT utilities do reach this build (``w-24`` computes
+#: to 96px, ``min-w-64`` to 256px) but its COLOUR utilities do not
+#: (``text-orange-400`` computes to white -- see
+#: ``tests/test_ui_colour_classes_paint.py``). So a class WOULD have worked here;
+#: it is written inline because this is the one rule in the dialog whose failure is
+#: invisible -- an uncapped cell just looks like a wide table -- and because
+#: ``line-clamp`` needs the ``-webkit-`` pair, which is not a utility.
+REASONS_CELL_STYLE = (
+    'white-space: normal; overflow-wrap: anywhere; max-width: 28rem; '
+    'display: -webkit-box; -webkit-box-orient: vertical; '
+    '-webkit-line-clamp: 3; line-clamp: 3; overflow: hidden;')
 
 
 def _col(name: str, extra: str = '') -> str:
@@ -458,6 +550,30 @@ def _paint(element, classes: str, *, color: Optional[str] = None):
 def _label(text: str, classes: str = '', *, color: Optional[str] = None):
     """``ui.label`` that paints its colour class instead of only wearing it."""
     return _paint(ui.label(text), classes, color=color)
+
+
+def _reasons_cell(text: str, classes: str):
+    """A Reasons cell: WRAPPED, clamped, and with the whole text one hover away.
+
+    THE ONE DOOR for the free-text column, used by both tables in this dialog --
+    they sit two inches apart and a reader should not have to learn two behaviours
+    for the same column.
+
+    ``REASONS_CELL_STYLE`` is applied INLINE, on top of whatever ``_paint`` sets,
+    because Tailwind emits nothing on this build; see the constant for why the
+    max-width is the part that actually stops the table running off the screen.
+
+    NO TOOLTIP ON AN EMPTY CELL. Most rows on a healthy plan have no reason at
+    all, and a tooltip that opens onto nothing is worse than none.
+    """
+    cell = _paint(ui.label(text), classes).mark(MARKER_ROW_REASONS)
+    # MERGED, not replaced: ``_paint`` has already put the inline colour on this
+    # element and NiceGUI's ``style()`` adds to what is there.
+    cell.style(REASONS_CELL_STYLE)
+    if text:
+        with cell:
+            ui.tooltip(text)
+    return cell
 
 
 def _leverage_cell(row: Dict) -> Tuple[str, str, str]:
@@ -555,6 +671,7 @@ class AllocationWizard:
         self.dialog = None
         self._banner_container = None
         self._notices_container = None
+        self._badge_container = None
         self._rows_container = None
         self._no_order_container = None
         self._totals_container = None
@@ -571,40 +688,56 @@ class AllocationWizard:
                 ui.card().classes(DIALOG_CARD_CLASSES):
             self.dialog = dialog
             ui.label(self.title).classes('text-lg font-bold shrink-0')
-            # EVERYTHING ABOVE THE TABLE, in one capped, scrolling block. It is all
-            # context -- the clock, the base, the switch, the notices -- and the
-            # table it is context for used to get whatever was left, which on a
-            # plan with eight warnings was about two rows.
-            with ui.column().classes(DIALOG_HEAD_CLASSES):
-                # A CONTAINER, not a bare render: Refresh re-reads the clock, and a
-                # banner drawn straight into the card could never be taken down
-                # again.
-                self._banner_container = ui.column().classes('w-full')
-                self._render_market_banner()
-                self._render_base_panel()
-                # THE ONE EXECUTION CONTROL. It stays at the gate because it changes
-                # WHICH ORDERS are produced rather than what is being aimed at -- and
-                # it RE-SOLVES: ``_refresh`` replaces ``self.plan``, so the table, the
-                # totals and what Submit sends all move together. A switch that only
-                # recorded a preference would show one plan and submit another.
-                fractional = ui.switch('Allow fractional shares',
-                                       value=self.allow_fractional,
-                                       on_change=lambda e: self._refresh(bool(e.value)))
-                # The broker's veto, which used to sit on the step-3 panel of the
-                # dialog that is gone. Offering a toggle the broker cannot honour
-                # would size the plan on a grid that does not exist: the engine
-                # silently falls back to whole shares, so the user would see
-                # quantities they never asked for. DISABLED, not hidden, and the
-                # reason said out loud.
-                fractional.set_enabled(bool(self.base.supports_fractional))
-                if not self.base.supports_fractional:
-                    _label(NO_FRACTIONAL_SUPPORT_NOTE, 'text-xs text-gray-400')
-                _label(MARKET_ORDER_TIMING_NOTE, 'text-xs text-orange-400')
-                self._notices_container = ui.column().classes('w-full')
-            self._rows_container = ui.column().classes(DIALOG_ROWS_CLASSES) \
-                .mark(MARKER_ROWS_VIEWPORT)
-            self._no_order_container = ui.column().classes('w-full shrink-0')
-            self._totals_container = ui.column().classes(DIALOG_TOTALS_CLASSES)
+            # ABOVE THE TABS, and deliberately so: these two do not qualify the
+            # numbers, they say SUBMIT IS OFF. A refusal behind an unopened tab is
+            # a refusal that was not shown.
+            #
+            # A CONTAINER for the banner, not a bare render: Refresh re-reads the
+            # clock, and a banner drawn straight into the card could never be
+            # taken down again. The base block is drawn once because it is derived
+            # from the frozen base, which Refresh does not replace (see
+            # ``_base_block``).
+            self._banner_container = ui.column().classes('w-full shrink-0')
+            self._render_market_banner()
+            self._render_base_block()
+            with ui.tabs().classes('w-full shrink-0') as tabs:
+                ui.tab(TAB_ORDERS, label=TAB_ORDERS_LABEL)
+                with ui.tab(TAB_NOTICES, label=TAB_NOTICES_LABEL):
+                    # Rebuilt by ``_render_notices`` along with the notices it
+                    # counts, so the badge can never describe the previous solve.
+                    self._badge_container = ui.row().classes('gap-0')
+            with ui.tab_panels(tabs, value=TAB_ORDERS) \
+                    .classes(DIALOG_PANELS_CLASSES):
+                with ui.tab_panel(TAB_ORDERS).classes(TAB_PANEL_CLASSES):
+                    # THE ONE EXECUTION CONTROL, on the tab it visibly changes. It
+                    # stays at the gate because it changes WHICH ORDERS are produced
+                    # rather than what is being aimed at -- and it RE-SOLVES:
+                    # ``_refresh`` replaces ``self.plan``, so the table, the totals
+                    # and what Submit sends all move together. A switch that only
+                    # recorded a preference would show one plan and submit another.
+                    with ui.row().classes('w-full items-center gap-3 shrink-0'):
+                        fractional = ui.switch(
+                            'Allow fractional shares', value=self.allow_fractional,
+                            on_change=lambda e: self._refresh(bool(e.value)))
+                        # The broker's veto, which used to sit on the step-3 panel
+                        # of the dialog that is gone. Offering a toggle the broker
+                        # cannot honour would size the plan on a grid that does not
+                        # exist: the engine silently falls back to whole shares, so
+                        # the user would see quantities they never asked for.
+                        # DISABLED, not hidden, and the reason said out loud.
+                        fractional.set_enabled(bool(self.base.supports_fractional))
+                        if not self.base.supports_fractional:
+                            _label(NO_FRACTIONAL_SUPPORT_NOTE,
+                                   'text-xs text-gray-400')
+                    self._rows_container = ui.column().classes(DIALOG_ROWS_CLASSES) \
+                        .mark(MARKER_ROWS_VIEWPORT)
+                    self._no_order_container = ui.column().classes('w-full shrink-0')
+                with ui.tab_panel(TAB_NOTICES).classes(TAB_PANEL_CLASSES):
+                    with ui.column().classes(DIALOG_NOTICES_CLASSES):
+                        self._render_base_figures()
+                        _label(MARKET_ORDER_TIMING_NOTE, 'text-xs text-orange-400')
+                        self._notices_container = ui.column().classes('w-full')
+                        self._totals_container = ui.column().classes('w-full')
             self._render_notices()
             self._render_rows()
             self._render_no_order_rows()
@@ -710,19 +843,24 @@ class AllocationWizard:
 
         What changed is the SHAPE. Each was a padded ``alert-banner`` div with a
         ``mt-2``, so four of them plus a column of warnings was most of the screen
-        above a two-row table. They are dense single lines in one scrolling block
-        now, with a count above it when there is more than fits -- a dark-theme
-        scrollbar is nearly invisible, and a notice nobody knows to scroll to has
-        not been shown.
+        above a two-row table. They are dense single lines on their own TAB now,
+        which is what stopped them and the table competing for the same pixels.
 
-        THE PLAN'S WARNINGS MOVED HERE, out of ``_render_base_panel``, and that is
-        a fix rather than tidying: the base panel is drawn ONCE and ``_refresh``
-        never redraws it, so after a Refresh the dialog was showing the PREVIOUS
-        solve's warnings above the new plan's table. This container is rebuilt on
-        every refresh. They also go through ``plan_warning_lines``, which is what
-        collapses the eight identical per-symbol broker-precheck lines into one.
+        THE BADGE IS DRAWN HERE, from the same two lists, and that is the point: a
+        tab is a place things hide, and a count assembled anywhere else could
+        describe a different set of notices from the ones behind it. Both
+        containers are rebuilt on every refresh.
+
+        THE PLAN'S WARNINGS MOVED HERE, out of the base panel, and that is a fix
+        rather than tidying: the base panel is drawn ONCE and ``_refresh`` never
+        redraws it, so after a Refresh the dialog was showing the PREVIOUS solve's
+        warnings against the new plan. They also go through ``plan_warning_lines``,
+        which is what collapses the eight identical per-symbol broker-precheck
+        lines into one.
         """
         self._notices_container.clear()
+        if self._badge_container is not None:
+            self._badge_container.clear()
         summary = fractional_summary(self.plan)
         notices = [text for text in (whole_share_notice(summary),
                                      bump_notice(summary),
@@ -732,15 +870,22 @@ class AllocationWizard:
                                       scale_factor=self.plan.scale_factor)
         if not notices and not warnings:
             return
+        # A bare count, not a sentence: this rides on a tab. The sentence is the
+        # tooltip. No badge at all when there is nothing to announce -- a "0" on
+        # the tab is noise, and noise is what hides the real case.
+        total = len(notices) + len(warnings)
+        if self._badge_container is not None:
+            with self._badge_container:
+                badge = ui.badge(str(total)).props('color=orange') \
+                    .classes(NOTICE_BADGE_CLASSES).mark(MARKER_NOTICE_COUNT)
+                with badge:
+                    ui.tooltip(NOTICE_COUNT_FMT.format(count=total))
         # Painted through ``_paint`` / ``_label`` like the rest of the dialog: on
         # this build a bare ``text-orange-400`` renders WHITE, and these lines
         # replaced padded ``alert-banner`` divs, which did paint -- so class-only
         # would have quietly turned every plan notice from an orange callout into
         # indistinguishable body text.
         with self._notices_container:
-            if len(notices) + len(warnings) > 2:
-                _label(NOTICE_COUNT_FMT.format(count=len(notices) + len(warnings)),
-                       'text-xs text-orange-400 mt-1').mark(MARKER_NOTICE_COUNT)
             with ui.column().classes(NOTICE_BLOCK_CLASSES) \
                     .mark(MARKER_NOTICE_BLOCK):
                 for text in notices:
@@ -796,7 +941,10 @@ class AllocationWizard:
                                  else f"{projected:,.2f}").classes('w-28 text-right')
                         _label(f"{row['unmet_notional']:,.2f}",
                                'w-28 text-right text-orange-400')
-                        _label(row['reasons'], 'flex-1 text-xs text-gray-400')
+                        # The SAME treatment as the column two inches above: these
+                        # are the longest strings in the dialog and used to run
+                        # straight off the right-hand edge.
+                        _reasons_cell(row['reasons'], 'flex-1 text-xs text-gray-400')
 
     @staticmethod
     def _default_selection(plan: AllocationPlan) -> set:
@@ -810,7 +958,25 @@ class AllocationWizard:
         return {r['symbol'] for r in dry_run_rows(plan)
                 if not r['skipped'] and not r['suppressed']}
 
-    def _render_base_panel(self):
+    def _render_base_block(self):
+        """The one banner that says the whole plan may not be submitted.
+
+        DANGER, and drawn ABOVE THE TABS rather than inside one. It does not
+        merely qualify the numbers below it -- it says they are wrong and Submit
+        is off -- so it may not be behind a tab the user has not opened.
+
+        Drawn ONCE. ``_base_block`` reads the frozen base, which ``_refresh`` does
+        not replace; see its docstring for why that errs the safe way.
+        """
+        base_block = self._base_block()
+        if base_block is None:
+            return
+        with ui.element('div').classes('alert-banner danger w-full p-3 shrink-0'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon('price_change')
+                ui.label(base_block).classes('text-sm').mark(MARKER_BASE_BLOCK)
+
+    def _render_base_figures(self):
         with ui.row().classes('w-full gap-6 items-center'):
             ui.label(f'Buying power: {self.base.available_buying_power:,.2f}')
             ui.label(f'Managed value ({self.base.valuation_mode}): '
@@ -824,14 +990,10 @@ class AllocationWizard:
                 _label(RESERVED_FMT.format(amount=self.plan.reserved_notional,
                                            pct=self.plan.reserved_pct),
                        'text-orange-400').mark(MARKER_RESERVED)
-        # DANGER, not warning, and above the warnings: this one does not merely
-        # qualify the numbers below it, it says they are wrong and Submit is off.
-        base_block = self._base_block()
-        if base_block is not None:
-            with ui.element('div').classes('alert-banner danger w-full p-3'):
-                with ui.row().classes('items-center gap-2'):
-                    ui.icon('price_change')
-                    ui.label(base_block).classes('text-sm').mark(MARKER_BASE_BLOCK)
+        # The submit-blocking banner is NOT here: it is drawn above the tabs by
+        # ``_render_base_block``, because a refusal the user has to open a tab to
+        # find is a refusal that was not shown.
+        #
         # The BASE's warnings only. The PLAN's moved into ``_render_notices``:
         # this panel is drawn once and Refresh never redraws it, so a plan warning
         # here went stale the moment the user pressed Refresh -- the previous
@@ -966,18 +1128,55 @@ class AllocationWizard:
                    _col('weight', 'text-xs '
                         + ('text-orange-400' if row['redistributed']
                            else 'text-gray-400')))
-            ui.label(f"{row['bp_cost']:,.2f}").classes(_col('bp_cost'))
-            # Immediately beside BP cost ON PURPOSE: the x IS the explanation of why
-            # that figure is not the Est. value, which is the misreading requirement
-            # 1b is about.
+            self._render_bp_effect(row)
+            # Immediately beside BP effect ON PURPOSE: the x IS the explanation of
+            # why that figure is not the Est. value, which is the misreading
+            # requirement 1b is about.
             text, css, tip = _leverage_cell(row)
             with _label(text, _col('bp_ratio', 'text-xs ' + css)) \
                     .mark(MARKER_LEVERAGE):
                 ui.tooltip(tip)
             ui.label(f"{row['bp_usage_pct']:.1f}%").classes(_col('bp_pct'))
-            _label(row['reasons'], _col(
+            _reasons_cell(row['reasons'], _col(
                 'reasons', 'text-xs ' + ('text-orange-400' if row['suppressed']
                                          else 'text-gray-400')))
+
+    @staticmethod
+    def _render_bp_effect(row: Dict):
+        """The ``BP effect`` cell: SIGNED, and the sign is the whole message.
+
+        A sale FREES buying power. This column reported ``BP cost 0.00`` for one,
+        which does not read as "nothing to say about a sale" -- it reads as "this
+        trade does nothing to your buying power", the exact opposite of the truth,
+        on the column a user checks before pressing Submit.
+
+        Negative for a charge and positive for a release, which is the BROKER's own
+        convention (``OrderImpact.change_in_buying_power``), so the dry run and a
+        precheck cannot be read opposite ways round. Exactly ``0.00`` -- unsigned
+        -- on a row with no order: a ``+0.00`` there would claim a direction.
+
+        Only the RELEASE is painted. Green is a cue that this row hands money back;
+        painting the charge as well would put a colour on nearly every row of an
+        ordinary plan, which is not a signal.
+        """
+        effect = row['bp_effect']
+        if abs(effect) < 0.005:
+            with ui.label('0.00').classes(_col('bp_effect')) \
+                    .mark(MARKER_BP_EFFECT):
+                ui.tooltip(BP_EFFECT_TOOLTIP_NONE)
+            return
+        freeing = effect > 0
+        amount = abs(effect)
+        value = row['estimated_value']
+        ratio = (amount / value) if value else float(row['bp_factor'])
+        tip = (BP_EFFECT_TOOLTIP_RELEASE_FMT if freeing
+               else BP_EFFECT_TOOLTIP_CHARGE_FMT).format(
+            symbol=row['symbol'], amount=amount, value=value, ratio=ratio)
+        cell = _label(f'{effect:+,.2f}',
+                      _col('bp_effect', 'text-green-500 font-medium' if freeing
+                           else '')).mark(MARKER_BP_EFFECT)
+        with cell:
+            ui.tooltip(tip)
 
     def _render_totals(self):
         """The footer, over the TICKED rows only.
@@ -995,6 +1194,12 @@ class AllocationWizard:
         arithmetic moved to make it true -- ``bp_factor`` never touched a target or
         a quantity -- but the pairing on screen was misleading, and a labelling
         defect in a money table is still a defect.
+
+        THE BUYING-POWER LINE DIVIDES THE BUDGET, not the published figure. Over
+        the TICKED rows, which is what makes it live: un-tick the sell that funds a
+        rebalance and ``filter_plan_rows`` takes its release straight back out, the
+        budget drops to what the broker published, and the over-budget note appears
+        -- before anything has been sent.
         """
         self._totals_container.clear()
         selected_plan = filter_plan_rows(self.plan, sorted(self.selected))
@@ -1011,13 +1216,20 @@ class AllocationWizard:
         fees = [r['estimated_fees'] for r in shown if r['estimated_fees'] is not None]
         buy_value = selected_plan.total_buy_value
         required = selected_plan.required_buying_power
+        released = selected_plan.released_buying_power
+        budget = selected_plan.total_buying_power
+        bp_line = BP_BUDGET_FMT.format(required=required, budget=budget,
+                                       pct=selected_plan.bp_usage_pct)
+        # Only when the sells actually free something: "+ 0.00 freed" on every
+        # buy-only plan is noise.
+        if released > MONEY_EPSILON:
+            bp_line += BP_BUDGET_BREAKDOWN_FMT.format(
+                available=selected_plan.available_buying_power, released=released)
         with self._totals_container:
             with ui.row().classes('w-full gap-6 mt-2 text-sm'):
                 ui.label(f"Sell value: {selected_plan.total_sell_value:,.2f}")
                 ui.label(f"Buy value: {buy_value:,.2f}")
-                ui.label(f"Required BP: {required:,.2f} "
-                         f"/ {selected_plan.available_buying_power:,.2f} "
-                         f"({selected_plan.bp_usage_pct:.1f}%)")
+                ui.label(bp_line).mark(MARKER_BP_BUDGET)
                 if totals is not None:
                     ui.label(f"Est. cash after: {totals['estimated_cash_after']:,.2f}")
                 else:
@@ -1063,9 +1275,17 @@ class AllocationWizard:
                 if summary['bumped_rows']:
                     _label(f"Bumped to 1 share: {summary['bumped_rows']} "
                            f"(+{summary['bumped_notional']:,.2f})", 'text-orange-400')
-            if selected_plan.required_buying_power > selected_plan.available_buying_power:
-                _label('Required buying power exceeds available - the smallest buys will be '
-                       'truncated as buying power runs out.', 'text-xs text-orange-400')
+                # ``summary['bumped_dropped_rows']`` is deliberately NOT drawn
+                # here. This footer measures the TICKED rows, and a bump a later
+                # step took away has no order, so it is never tickable and the
+                # count would be a permanent 0. It reaches the user where it
+                # belongs instead: the Outcome column, the 'Not traded' table and
+                # ``no_order_notice``. What matters at this level is that it is no
+                # longer folded into "Bumped to 1 share" above -- that is what made
+                # this line announce an over-allocation of 0.00.
+            # Against the BUDGET, the same denominator the line above divides.
+            if required > budget:
+                _label(BP_OVER_BUDGET_NOTE, 'text-xs text-orange-400')
 
     def _toggle(self, symbol: str, checked: bool):
         if checked:

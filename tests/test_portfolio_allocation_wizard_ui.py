@@ -2371,7 +2371,16 @@ def test_the_plan_warnings_are_REDRAWN_by_refresh(nicegui_client):
 
 
 # ---------------------------------------------------------------------------
-# ITEM 4 -- THE ORDER TABLE GETS AT LEAST 60% OF THE DIALOG
+# ITEM 4 -- THE ORDER TABLE GETS A TAB TO ITSELF
+#
+# It used to be a band in the middle of the dialog. The first fix CAPPED the
+# stacks above and below it (18vh + 7vh) so they could not grow, which bought the
+# table ~60% and left the notices squinting through a 5rem scroll box. The dialog
+# is TWO TABS now (see tests/test_portfolio_allocation_dry_run_tabs.py), so the
+# table gets a whole panel, the notices get a whole panel, and neither has to be
+# capped to protect the other. What survives from the old shape is the part that
+# was never about the split: the card still CLIPS rather than growing past the
+# viewport, because what is at the bottom of it is the Submit button.
 # ---------------------------------------------------------------------------
 
 def _classes(element) -> str:
@@ -2384,15 +2393,15 @@ def _only(root, marker):
     return hits[0]
 
 
-def test_the_order_table_viewport_TAKES_WHAT_THE_CAPS_LEAVE(nicegui_client):
+def test_the_order_table_viewport_FILLS_its_panel(nicegui_client):
     """It was a ~2-row viewport with its own scrollbar, wedged between a tall
     notice stack and the totals -- the most important content with the least room.
 
-    It is the ONLY growing child now, and it deliberately has no minimum of its
-    own: a ``min-h-[60vh]`` competes with the caps rather than cooperating with
-    them, overflows the card and gets the SUBMIT BUTTON clipped off the bottom.
-    Measured in a real browser at 1600x1000, that is exactly what happened. The
-    60% comes from holding the siblings down instead -- see the next test."""
+    It is the growing child of its own tab panel now, and it deliberately has no
+    minimum of its own: a ``min-h-[60vh]`` competes with its siblings rather than
+    cooperating with them, overflows the card and gets the SUBMIT BUTTON clipped
+    off the bottom. Measured in a real browser at 1600x1000, that is exactly what
+    happened."""
     wiz = _wiz()
     root = _draw_wizard(nicegui_client, _plan_with_warnings(_precheck_warnings(*EIGHT)))
     viewport = _classes(_only(root, wiz.MARKER_ROWS_VIEWPORT))
@@ -2405,8 +2414,8 @@ def test_the_order_table_viewport_TAKES_WHAT_THE_CAPS_LEAVE(nicegui_client):
 
 def test_the_dialog_CLIPS_rather_than_growing_past_the_viewport(nicegui_client):
     """"Do not solve it by making the dialog taller than the viewport." The card is
-    a flex column that fills the maximized dialog and hides its own overflow; every
-    section inside it scrolls within its own cap instead."""
+    a flex column that fills the maximized dialog and hides its own overflow; the
+    panels scroll inside it instead."""
     from nicegui import ui
 
     wiz = _wiz()
@@ -2416,69 +2425,75 @@ def test_the_dialog_CLIPS_rather_than_growing_past_the_viewport(nicegui_client):
     assert 'h-full' in _classes(card)
     assert 'flex-col' in _classes(card)
     assert 'overflow-hidden' in _classes(card)
-    # Without ``min-h-0`` a flex child's implicit ``min-height:auto`` defeats every
-    # cap below and the card grows anyway.
+    # Without ``min-h-0`` a flex child's implicit ``min-height:auto`` defeats the
+    # panel sizing below and the card grows anyway.
     assert 'min-h-0' in _classes(card)
 
 
-def test_the_notices_and_the_totals_are_BOTH_capped_and_scroll(nicegui_client):
-    """What pays for the table's 60%: the two stacks that used to grow without
-    limit are capped and scroll inside their caps."""
+def test_the_panels_are_the_ONE_growing_child_and_can_still_shrink(nicegui_client):
+    """The chain that has to hold all the way down for the table to fill its tab:
+    card -> tab_panels -> tab_panel -> rows viewport. A missing ``min-h-0`` at any
+    link puts the Submit button under the fold, which is the one failure this
+    dialog may not have."""
+    from nicegui import ui
+
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _plan_with_warnings([]))
+    panels = [el for el in root.descendants() if isinstance(el, ui.tab_panels)][0]
+
+    assert 'flex-grow' in _classes(panels) and 'min-h-0' in _classes(panels)
+    for panel in (el for el in root.descendants() if isinstance(el, ui.tab_panel)):
+        assert 'h-full' in _classes(panel), panel._props.get('name')
+        assert 'flex-col' in _classes(panel), panel._props.get('name')
+        assert 'min-h-0' in _classes(panel), panel._props.get('name')
+
+
+def test_the_notices_are_NO_LONGER_squeezed_into_a_scroll_box(nicegui_client):
+    """The caps were the price of sharing one column with the table. They are not
+    the price of having a tab, and a five-rem window onto twenty warnings is its
+    own unreadable."""
     wiz = _wiz()
     root = _draw_wizard(nicegui_client, _plan_with_warnings(_precheck_warnings(*EIGHT)))
-
-    assert 'max-h-' in wiz.DIALOG_HEAD_CLASSES
-    assert 'overflow-y-auto' in wiz.DIALOG_HEAD_CLASSES
-    assert 'max-h-' in wiz.DIALOG_TOTALS_CLASSES
-    assert 'overflow-y-auto' in wiz.DIALOG_TOTALS_CLASSES
     block = _classes(_only(root, wiz.MARKER_NOTICE_BLOCK))
-    assert 'max-h-' in block and 'overflow-y-auto' in block
 
-
-def test_the_CAPS_are_what_guarantee_the_60_percent():
-    """These two numbers ARE the guarantee now, so they get a test of their own.
-
-    head + totals <= 25vh leaves 75vh; the fixed chrome (title, buttons, card
-    padding, flex gaps) does not scale with the viewport and is what actually
-    binds. Measured in a real browser the table gets 64.6% at 1920x1080, 63.8% at
-    1600x1000, 61.3% at 1280x800 and 60.8% at 1024x720 -- and NOTHING is clipped,
-    which the previous shape could not say. A well-meaning "just a bit more room
-    for the notices" now fails here instead of quietly taking the table back down
-    to two rows."""
-    import re
-
-    wiz = _wiz()
-
-    def _vh(classes, prefix):
-        return float(re.search(prefix + r'\[(\d+(?:\.\d+)?)vh\]', classes).group(1))
-
-    head = _vh(wiz.DIALOG_HEAD_CLASSES, 'max-h-')
-    totals = _vh(wiz.DIALOG_TOTALS_CLASSES, 'max-h-')
-
-    assert head + totals <= wiz.DIALOG_SIDE_CAP_BUDGET_VH
-    assert wiz.DIALOG_SIDE_CAP_BUDGET_VH <= 25.0
-    # ...and the card CLIPS, so an overrun would hide the Submit button rather
-    # than scroll to it. That is why the budget is the test and not a comment.
-    assert 'overflow-hidden' in wiz.DIALOG_CARD_CLASSES
+    assert 'max-h-' not in block
+    # The PANEL scrolls instead, as one piece.
+    assert 'overflow-y-auto' in wiz.DIALOG_NOTICES_CLASSES
+    assert not hasattr(wiz, 'DIALOG_HEAD_CLASSES')
+    assert not hasattr(wiz, 'DIALOG_TOTALS_CLASSES')
 
 
 def test_a_MOUNTAIN_of_notices_still_cannot_squeeze_the_table(nicegui_client):
     """The failure mode being fixed: the notices grew and the table paid for it.
-    They are in a capped block now, so twenty of them cost the same as two."""
+    They are on a different tab now, so twenty of them cost the table nothing at
+    all -- and none of them is dropped."""
+    from nicegui import ui
+
     wiz = _wiz()
     root = _draw_wizard(nicegui_client,
                         _plan_with_warnings(
                             [f"label 'L{i}' has no symbols - its 1.00% weight "
                              f"is unallocated" for i in range(20)]))
-    head = wiz.DIALOG_HEAD_CLASSES
+    viewport = _only(root, wiz.MARKER_ROWS_VIEWPORT)
+    block = _only(root, wiz.MARKER_NOTICE_BLOCK)
 
-    assert 'max-h-[18vh]' in head and 'overflow-y-auto' in head
     assert len(_marked_texts(root, wiz.MARKER_PLAN_WARNING)) == 20   # none dropped
+    # ...and they are not even in the same panel as the table.
+    def _panel(el):
+        while el is not None:
+            if isinstance(el, ui.tab_panel):
+                return el._props.get('name')
+            el = el.parent_slot.parent if el.parent_slot else None
+        return None
+
+    assert _panel(viewport) == wiz.TAB_ORDERS
+    assert _panel(block) == wiz.TAB_NOTICES
 
 
-def test_the_reader_is_TOLD_there_is_more_to_scroll_to(nicegui_client):
-    """A dark-theme scrollbar is nearly invisible, and a notice nobody knows to
-    scroll to has not been shown."""
+def test_the_reader_is_TOLD_how_many_notices_are_behind_the_tab(nicegui_client):
+    """A tab is a place things hide, so the count moved onto the tab itself. The
+    number is what is ACTUALLY in the block, warnings and notices alike --
+    announcing six over a block of seven would be its own small lie."""
     wiz = _wiz()
     root = _draw_wizard(nicegui_client,
                         _plan_with_warnings(
@@ -2487,17 +2502,23 @@ def test_the_reader_is_TOLD_there_is_more_to_scroll_to(nicegui_client):
              + len(_marked_texts(root, wiz.MARKER_PLAN_NOTICE)))
 
     assert drawn >= 6
-    # The count is what is ACTUALLY in the block, warnings and notices alike --
-    # announcing six above a block of seven would be its own small lie.
-    assert _marked_texts(root, wiz.MARKER_NOTICE_COUNT) == [
+    badge = _only(root, wiz.MARKER_NOTICE_COUNT)
+    assert badge.text == str(drawn)
+    # A bare number on a tab needs its noun somewhere.
+    assert [d.text for d in badge.descendants() if getattr(d, 'text', None)] == [
         wiz.NOTICE_COUNT_FMT.format(count=drawn)]
 
 
-def test_two_notices_are_not_announced_as_a_pile(nicegui_client):
+def test_two_notices_ARE_still_counted(nicegui_client):
+    """The old line only appeared above three, because it was a "there is more
+    below the fold" hint. A badge is not that hint -- it answers "is there
+    anything on that tab?", and for two there is."""
     wiz = _wiz()
     root = _draw_wizard(nicegui_client, _plan_with_warnings(["label 'A' has none"]))
+    drawn = (len(_marked_texts(root, wiz.MARKER_PLAN_WARNING))
+             + len(_marked_texts(root, wiz.MARKER_PLAN_NOTICE)))
 
-    assert _marked_texts(root, wiz.MARKER_NOTICE_COUNT) == []
+    assert _marked_texts(root, wiz.MARKER_NOTICE_COUNT) == [str(drawn)]
 
 
 # ---------------------------------------------------------------------------
@@ -2570,7 +2591,7 @@ def test_the_numeric_columns_are_RIGHT_ALIGNED_in_the_header_AND_the_cells(
                if getattr(el, 'text', None)}
 
     for numeric in ('Held', 'Cost', 'Value', 'Qty', 'Est. value', 'Target',
-                    'BP cost', 'BP %'):
+                    'BP effect', 'BP %'):
         assert 'text-right' in headers[numeric], numeric
     for textual in ('Symbol', 'Side', 'Order', 'Sizing', 'Outcome', 'Reasons'):
         assert 'text-right' not in headers[textual], textual
