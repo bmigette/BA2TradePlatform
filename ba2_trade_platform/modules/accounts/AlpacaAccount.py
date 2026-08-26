@@ -5892,17 +5892,38 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return float(value) if value is not None else None
 
     @alpaca_api_retry
-    def get_option_positions(self) -> List["OptionPosition"]:
+    def get_option_positions(self) -> Optional[List["OptionPosition"]]:
         """Return all held option positions as broker-agnostic OptionPosition
         objects. Equity (and any non-option) positions are filtered out.
 
         Malformed OCC symbols are logged and skipped rather than crashing the
         whole call.
+
+        TRI-STATE, mirroring ``get_positions()``: ``[]`` means the broker CONFIRMED an
+        empty option book, ``None`` means the fetch FAILED. This used to be
+        ``self.client.get_all_positions() or []``, which turned an unreadable book into a
+        confirmed-flat one — the same conflation that, on the equity side during the
+        2026-07-03 DNS outage, force-closed 8 real open transactions. It acquired teeth
+        with OPT-S4: ``reconcile_externally_closed_option_transactions`` now CLOSES
+        transactions whose contracts this call does not report, and on a spread it would
+        cancel the protective long on the way out.
         """
         from ...core.option_types import OptionPosition
         from ...core.types import OrderDirection
 
-        raw_positions = self.client.get_all_positions() or []
+        try:
+            raw_positions = self.client.get_all_positions()
+        except Exception as e:  # noqa: BLE001 — a failed fetch is UNKNOWN, never "flat"
+            logger.error(
+                f"[Account {self.id}] get_option_positions: could not fetch broker "
+                f"positions ({e}). Reporting None (UNKNOWN) — callers must not read this "
+                f"as an empty option book.", exc_info=True)
+            return None
+        if raw_positions is None:
+            logger.error(
+                f"[Account {self.id}] get_option_positions: the broker returned no "
+                f"position payload at all. Reporting None (UNKNOWN), not an empty book.")
+            return None
         positions: List[OptionPosition] = []
 
         for pos in raw_positions:

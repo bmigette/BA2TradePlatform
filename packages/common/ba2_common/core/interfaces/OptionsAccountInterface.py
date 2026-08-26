@@ -213,8 +213,15 @@ class OptionsAccountInterface(ABC):
 
     # --- Positions ---------------------------------------------------------
     @abstractmethod
-    def get_option_positions(self) -> List[OptionPosition]:
-        """All currently-held option positions."""
+    def get_option_positions(self) -> Optional[List[OptionPosition]]:
+        """All currently-held option positions. TRI-STATE, like ``get_positions()``.
+
+        ``[]`` means the broker CONFIRMED an empty option book. ``None`` means the fetch
+        FAILED and the book is unknown. They must never be collapsed: as of OPT-S4 a
+        reconciler CLOSES transactions whose contracts the broker no longer reports, and
+        reading an outage as "flat" is the 2026-07-03 incident that force-closed 8 real
+        open transactions — here it would also cancel the protective long of a spread.
+        """
         ...
 
     # --- Orders ------------------------------------------------------------
@@ -1382,6 +1389,158 @@ class OptionsAccountInterface(ABC):
         }
         return [o for o in option_orders
                 if o.transaction_id is None or o.transaction_id in live_ids]
+
+    # --- Reconciliation: does the broker still hold what our ledger says? ---
+
+    def reconcile_externally_closed_option_transactions(
+            self, grace_period_minutes: int = 5) -> int:
+        """Close option transactions whose contracts the BROKER no longer holds.
+
+        THE OPTION HALF OF ``reconcile_externally_closed_transactions``, which deliberately
+        SKIPS every transaction carrying an option order ("get_positions() reports EQUITY
+        positions only") and delegates option lifecycle to
+        ``TradeManager._reconcile_account_option_activities`` — which reads only
+        OPASN/OPEXC/OPEXP/OPCSH over a 7-day window. Anything outside that activity feed
+        was invisible: a manual close in the broker's UI, a broker risk action, a position
+        that is simply no longer there.
+
+        Four seams were each checked and none catches it. ``refresh_orders`` only updates
+        orders already in the local DB. ``refresh_transactions`` derives state purely from
+        local orders. ``refresh_positions`` only logs a count. ``option_lifecycle_service``
+        builds its book from local OPENED transactions and its only broker call is a
+        liveness check on EQUITY positions. ``get_option_positions()`` — the one call that
+        could answer the question — had ZERO production callers. So a broker-side close
+        leaked the ledger position AND its buying-power reserve permanently, because FILLED
+        is not a terminal transaction status.
+
+        MATCHED PER CONTRACT, not per symbol. An option transaction's ``symbol`` is the
+        UNDERLYING by design, so the equity reconciler's symbol comparison could never work
+        here; identity is the OCC contract string. What the platform believes it still holds
+        comes from ``option_contract_net`` — the single definition of "is this structure
+        still holding something", shared with ``refresh_transactions`` and
+        ``_apply_option_activity`` so the three doors cannot come to disagree.
+
+        EVERY UNKNOWN MEANS DO NOTHING. This method closes transactions and cancels their
+        resting orders, so the fail-safe direction is the whole design:
+
+          * a raise, or a ``None`` book (fetch FAILED), reconciles nothing — ``[]`` is a
+            confirmed-empty book and ``None`` is an outage, and collapsing them is the
+            2026-07-03 incident that force-closed 8 real open transactions;
+          * a position whose quantity cannot be read counts as STILL HELD — a broker
+            reporting a position but not its size is saying the position EXISTS;
+          * a structure only PARTLY absent is left alone, mirroring the equity rule that
+            only a ZERO position closes. Closing on one missing leg would strand the
+            survivor — including the protective long of a spread — with nothing able to
+            manage or flatten it;
+          * a transaction whose own contracts already net FLAT is left to
+            ``refresh_transactions``: the platform closed that one itself, and stamping
+            ``position_not_at_broker`` on it would put the wrong reason in the ledger;
+          * a freshly-opened structure is inside the grace period, because a just-filled
+            entry may not have settled into a reported broker position yet.
+
+        Returns the number of transactions closed.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from ba2_common.core.db import get_db, update_instance
+        from ba2_common.core.models import Transaction, TradingOrder
+        from ba2_common.core.trade_store import orders_where, transactions_where
+        from ba2_common.core.types import AssetClass, OrderStatus, TransactionStatus
+        from ba2_common.core.utils import (
+            OPTION_CONTRACT_EPS, close_transaction_with_logging,
+            every_option_contract_is_flat, option_contract_net,
+        )
+        from ba2_common.logger import logger
+
+        try:
+            positions = self.get_option_positions()
+        except Exception as e:  # noqa: BLE001 — an outage must never close the book
+            logger.warning(
+                f"[Account {self.id}] option reconcile: could not fetch the broker's option "
+                f"positions ({e}); reconciling nothing this pass")
+            return 0
+        if positions is None:
+            logger.warning(
+                f"[Account {self.id}] option reconcile: the broker's option book came back "
+                f"as None (FETCH FAILURE, not an empty book); reconciling nothing this pass")
+            return 0
+
+        broker_contracts = set()
+        for pos in positions:
+            contract = self._position_field(pos, "contract_symbol")
+            raw_qty = self._position_field(pos, "quantity")
+            qty = self._readable_number(raw_qty)
+            if qty is None:
+                logger.error(
+                    f"[Account {self.id}] option reconcile: broker position for "
+                    f"{contract!r} reports an UNREADABLE quantity ({raw_qty!r}). Treating "
+                    f"it as STILL HELD — an unmeasurable size must never read as 'flat' "
+                    f"and force-close the transaction.")
+                held = True
+            else:
+                held = abs(qty) > OPTION_CONTRACT_EPS
+            if contract and held:
+                broker_contracts.add(contract)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=grace_period_minutes)
+        terminal = OrderStatus.get_terminal_statuses()
+        closed_count = 0
+
+        open_txns = transactions_where(
+            statuses=(TransactionStatus.OPENED, TransactionStatus.CLOSING))
+        for txn in open_txns:
+            orders = orders_where(account_id=self.id, transaction_id=txn.id)
+            if not orders:
+                continue                        # not this account's transaction
+            if not any(getattr(o, "asset_class", None) == AssetClass.OPTION for o in orders):
+                continue                        # equity — the other reconciler owns it
+
+            net = option_contract_net(orders)
+            if not net or every_option_contract_is_flat(net):
+                # Nothing open per OUR ledger. Either already balanced by our own orders
+                # (refresh_transactions' job, with its own close_reason) or a structure with
+                # no executed contract rows at all. Not an external close either way.
+                continue
+
+            open_contracts = {c for c, q in net.items() if abs(q) > OPTION_CONTRACT_EPS}
+            still_at_broker = open_contracts & broker_contracts
+            if still_at_broker:
+                if still_at_broker != open_contracts:
+                    logger.warning(
+                        f"[Account {self.id}] option reconcile: transaction {txn.id} is "
+                        f"PARTLY absent at the broker — still held "
+                        f"{sorted(still_at_broker)}, missing "
+                        f"{sorted(open_contracts - still_at_broker)}. Leaving it OPEN: "
+                        f"closing it here would strand the surviving leg(s).")
+                continue
+
+            open_date = txn.open_date
+            if open_date is not None:
+                if open_date.tzinfo is None:
+                    open_date = open_date.replace(tzinfo=timezone.utc)
+                if open_date > cutoff:
+                    continue
+
+            for o in orders:
+                if o.status not in terminal:
+                    o.status = OrderStatus.CANCELED
+                    o.comment = (f"{(o.comment or '')} | cancelled: the broker no longer "
+                                 f"holds this option position")
+                    update_instance(o)
+
+            logger.info(
+                f"[Account {self.id}] option reconcile: none of {sorted(open_contracts)} is "
+                f"held at the broker — closing transaction {txn.id} (external close). Its "
+                f"buying-power reserve and short-put assignment exposure are released with it.")
+            close_transaction_with_logging(
+                transaction=txn,
+                account_id=self.id,
+                close_reason="position_not_at_broker",
+            )
+            update_instance(txn)
+            closed_count += 1
+
+        return closed_count
 
     # --- Cover: "are these shares spoken for?" -----------------------------
     #
