@@ -1150,20 +1150,37 @@ class OptionsAccountInterface(ABC):
     #: unknown capital requirement and a zero capital requirement are not the same
     #: fact, and collapsing them let every unrecognised structure pass every
     #: buying-power gate.
+    #: ``call_butterfly`` belongs HERE, not in ``RESERVING_STRATEGIES``. A 1-2-1 fly is
+    #: bought for a net DEBIT and its maximum loss is that debit, already paid at entry —
+    #: the design spec classes it as a debit structure and every other debit structure is
+    #: on this list. It was mis-listed as reserving while ``OpenCallButterflyAction``,
+    #: alone among the 17 entry builders, submitted it with no ``option_reserve=``. One
+    #: open fly therefore made ``reserved_option_buying_power_detail`` UNMEASURABLE, so
+    #: ``available_option_buying_power()`` returned ``None`` and
+    #: ``check_option_buying_power(>0)`` returned False for all EIGHT credit structures,
+    #: account-wide across every expert, until the order was closed by hand. It failed
+    #: CLOSED — no capital was at risk — and it told the operator to repair a reserve that
+    #: should never have existed.
     ZERO_RESERVE_STRATEGIES = frozenset({
         "long_call", "long_put", "bull_call_spread", "bear_put_spread",
         "straddle", "strangle", "covered_call", "protective_put",
+        "call_butterfly",
     })
 
     #: Strategies ``option_reserve_required`` prices with a branch of its own. Kept in
-    #: lockstep with those branches by ``test_the_two_strategy_lists_match_the_branches``.
+    #: lockstep with those branches by ``test_the_two_strategy_lists_match_the_branches``
+    #: — which is list-vs-BRANCH only, and therefore could never have caught the butterfly,
+    #: whose branch existed and priced fine. The relationship that was actually broken is
+    #: list-vs-BUILDER, and it is pinned by ``test_option_reserve_lockstep.py``: every
+    #: name here must arrive from its builder carrying a reserve, and every name in
+    #: ``ZERO_RESERVE_STRATEGIES`` must arrive without one.
     RESERVING_STRATEGIES = frozenset({
         "cash_secured_put",
         "bear_call_spread", "bull_put_spread", "credit_spread",
         "short_straddle", "short_strangle", "naked_put",
         "put_ratio_spread",
         "jade_lizard",
-        "iron_condor", "call_butterfly", "debit_spread",
+        "iron_condor", "debit_spread",
     })
 
     @classmethod
@@ -1290,7 +1307,10 @@ class OptionsAccountInterface(ABC):
             credit = net_credit if net_credit is not None else 0.0
             per_contract = strike * 100.0 + spread_width * 100.0 - credit * 100.0
             return max(0.0, per_contract) * quantity
-        if strategy in ("iron_condor", "call_butterfly", "debit_spread"):
+        # ``call_butterfly`` used to be priced here. It is a DEBIT structure and now
+        # answers 0.0 by name from ZERO_RESERVE_STRATEGIES above; leaving it in this tuple
+        # would be dead code asserting the opposite of the list.
+        if strategy in ("iron_condor", "debit_spread"):
             _require(spread_width=spread_width)
             credit = net_credit if net_credit is not None else 0.0
             return max(0.0, (spread_width - credit)) * 100.0 * quantity
