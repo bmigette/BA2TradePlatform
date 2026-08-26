@@ -655,3 +655,48 @@ def test_a_bad_symbols_discovery_failure_does_not_abort_the_rest_of_the_run(
     assert "AAPL" in plan.per_symbol
     for e in EXPIRIES:
         assert store.partition_state("AAPL", e, START, END) is PartitionState.COMPLETE
+
+
+# --------------------------------------------------------------------------- #
+# --log-file (2026-08-26: worker logs hit 1-1.7 GB each within a day -- almost entirely the
+# tastytrade SDK's own DEBUG wire-trace, not this tool's own progress lines)
+# --------------------------------------------------------------------------- #
+def test_log_file_receives_this_tools_own_progress_lines(provider, store, tmp_path):
+    import logging
+
+    log_path = str(tmp_path / "worker_0.log")
+    clock = FakeClock()
+    rc = warm.main(
+        ["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+         "--rate-limit", "0", "--discovery", "rest", "--log-file", log_path],
+        provider=provider, store=store, clock=clock, sleep=lambda s: clock.advance(s))
+    assert rc == 0
+    assert os.path.exists(log_path)
+    with open(log_path, encoding="utf-8") as f:
+        content = f.read()
+    assert "done:" in content  # the final summary line, via the injected log()
+
+    # The handler created for this run must not linger and keep writing into a closed test
+    # temp dir on the NEXT test that reuses the same logger name / file path.
+    logging.getLogger(f"warm_options_history.{log_path}").handlers.clear()
+
+
+def test_no_log_file_falls_back_to_the_injected_log_or_print(provider, store):
+    """Explicit ``log=`` (what every other test in this file relies on) must still win over
+    stdout even when --log-file is not passed -- CLI-only behaviour is opt-in, not forced."""
+    rc, lines = _run(provider, store)
+    assert rc == 0
+    assert any("done:" in l for l in lines)
+
+
+def test_the_vendor_debug_logger_is_capped_regardless_of_log_file(provider, store):
+    """tastytrade/__init__.py sets its OWN logger to DEBUG at import time; streamer.py then logs
+    every raw websocket frame at that level. Left alone, a single busy expiry emits thousands of
+    records -- the actual source of the multi-GB/day worker logs, not this tool's own (sparse)
+    progress/retry lines. This must be capped on every run, not just when --log-file is used."""
+    import logging
+
+    logging.getLogger("tastytrade").setLevel(logging.DEBUG)  # simulate the SDK's import-time set
+    rc, _lines = _run(provider, store)
+    assert rc == 0
+    assert logging.getLogger("tastytrade").level == logging.WARNING
