@@ -16,8 +16,10 @@ from datetime import date, datetime, timezone
 import pytest
 
 from ba2_common.core.option_lifecycle import (
+    COVERED_CALL_STRATEGY,
     LIFECYCLE_BREAKER,
     LIFECYCLE_CLOSING_REASONS,
+    LIFECYCLE_COVER_LOST,
     LIFECYCLE_CREDIT_STOP,
     LIFECYCLE_HOLD,
     LIFECYCLE_PROFIT_CAPTURE,
@@ -639,6 +641,255 @@ def test_several_missing_inputs_are_all_named_in_one_detail():
     # A fixed order (P&L, then greeks, then the calendar): the detail is compared
     # verbatim by the live/backtest parity test, so it cannot wobble.
     assert d.detail.index("delta") < d.detail.index("expiry")
+
+
+# --------------------------------------------------------------------------
+# cover_lost -- the covered call whose shares left overnight (OPT-L1)
+# --------------------------------------------------------------------------
+# The case neither cover seam can see. The entry seam refuses to WRITE an uncovered
+# covered call and the exit seam refuses to SELL shares pledged to one, but a
+# broker-side risk-manager stop (submitted as an OCO leg) fills at 3am: the shares are
+# gone, no platform code ran, and the short call is naked until somebody looks. This
+# rule is the thing that looks.
+#
+# Its false positive is expensive -- liquidating a healthy structure -- so the whole
+# section turns on ONE distinction: a MEASURED shortfall closes; an UNMEASURABLE cover
+# never does.
+def covered_call(*, txn_id=1, credit=2.00, qty=1, expiry=FAR_EXPIRY,
+                 strategy="covered_call"):
+    """Short the 110 call against shares held elsewhere. Entry = a 2.00 credit."""
+    legs = [LifecycleLeg("XYZ_C110", net_qty=-1.0 * qty, strike=110.0,
+                         option_type=OptionRight.CALL, expiry=expiry, underlying="XYZ")]
+    return OptionStructure(
+        transaction_id=txn_id, underlying="XYZ", strategy=strategy, legs=legs,
+        quantity=qty, multiplier=100, entry_net_premium=-abs(credit), expiry=expiry)
+
+
+def call_chain(*, ask=1.50, bid=1.40, delta=0.20):
+    """Default: 1.50 to close a 2.00 credit -> +25%. Healthy, and clear of every rail."""
+    return {"XYZ_C110": contract("XYZ_C110", bid=bid, ask=ask, delta=delta, strike=110.0,
+                                 right=OptionRight.CALL)}
+
+
+def test_a_covered_call_whose_shares_are_gone_is_closed():
+    """The 3am stop: 100 shares required, the broker now reports 0. NAKED."""
+    st = covered_call()
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=100, cover_shares_held=0))
+    assert d.reason == LIFECYCLE_COVER_LOST
+    assert d.should_close is True
+    assert "NAKED" in d.detail
+    assert "100" in d.detail
+    # Priced like every other decision -- the outcome table has to know what the
+    # emergency exit banked, not merely that it happened.
+    assert d.pnl_pct == pytest.approx(25.0)
+
+
+def test_a_partially_stripped_cover_is_still_lost():
+    """One 100-share lot of two sold away leaves a 2-contract call 100 short. A rule
+    that only fired on zero would miss the multi-lot case the codebase models."""
+    st = covered_call(qty=2)
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=200, cover_shares_held=100))
+    assert d.reason == LIFECYCLE_COVER_LOST
+    assert "short by 100" in d.detail
+
+
+def test_a_covered_call_whose_shares_are_still_there_is_left_alone():
+    st = covered_call()
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=100, cover_shares_held=100))
+    assert d.reason != LIFECYCLE_COVER_LOST
+    assert d.reason == LIFECYCLE_HOLD
+    assert d.should_close is False
+
+
+def test_exactly_enough_cover_is_covered():
+    """`held >= required`, not `>`. A call covered to the share is covered."""
+    st = covered_call(qty=3)
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=300, cover_shares_held=300))
+    assert d.reason == LIFECYCLE_HOLD
+
+
+def test_one_share_short_is_short():
+    st = covered_call(qty=3)
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=300, cover_shares_held=299))
+    assert d.reason == LIFECYCLE_COVER_LOST
+
+
+def test_an_unmeasurable_cover_is_never_read_as_a_lost_one():
+    """THE rule of this task. `None` is the POSITION FEED failing to answer, not the
+    shares leaving. Firing cover_lost on it liquidates a healthy structure over a feed
+    hiccup -- a self-inflicted loss, and the exact conflation this project has spent
+    five incidents separating. It must alarm, not act."""
+    st = covered_call()
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=100, cover_shares_held=None))
+    assert d.reason != LIFECYCLE_COVER_LOST
+    assert d.should_close is False
+    # ...and it is NOT a hold either: the unknown marker is set, naming the input.
+    assert d.reason == LIFECYCLE_UNKNOWN
+    assert d.reason != LIFECYCLE_HOLD
+    assert "cover" in d.detail and "UNKNOWN" in d.detail
+    assert "XYZ" in d.detail
+
+
+def test_an_unreadable_cover_requirement_is_unknown_not_uncovered():
+    """A requirement we cannot read is a question we cannot answer, in either
+    direction: neither 'naked' nor 'fine'."""
+    st = covered_call()
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required="lots", cover_shares_held=0))
+    assert d.reason == LIFECYCLE_UNKNOWN
+    assert "unreadable" in d.detail
+
+
+def test_the_cover_alarm_leads_the_unknown_detail():
+    """Several blind inputs at once: the one that can hide a naked short call is the
+    sentence the operator has to read first."""
+    st = covered_call(expiry=None)
+    chain = call_chain(delta=None)
+    d = only(decide([st], chain, settings(), AS_OF,
+                    cover_shares_required=100, cover_shares_held=None))
+    assert d.reason == LIFECYCLE_UNKNOWN
+    assert d.detail.index("cover") < d.detail.index("delta") < d.detail.index("expiry")
+
+
+def test_a_structure_that_is_not_a_covered_call_is_untouched_by_the_cover_rule():
+    """Only the covered_call tag promises SHARE cover -- the same line the entry guard
+    draws. A short strangle is MEANT to be naked, and closing it on a share count it
+    never claimed would be a liquidation with no cause."""
+    st = put_credit_spread()
+    d = only(decide([st], spread_chain(), settings(), AS_OF,
+                    cover_shares_required=100, cover_shares_held=0))
+    assert d.reason != LIFECYCLE_COVER_LOST
+    assert d.reason == LIFECYCLE_HOLD
+
+
+def test_the_strategy_tag_is_matched_case_and_space_insensitively():
+    st = covered_call(strategy="  Covered_Call ")
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=100, cover_shares_held=0))
+    assert d.reason == LIFECYCLE_COVER_LOST
+
+
+def test_a_caller_that_measures_no_cover_is_completely_unaffected():
+    """The default. Every pre-existing caller passes neither argument, and a covered
+    call must then decide exactly as it did before -- not become permanently UNKNOWN
+    because nobody supplied a share count."""
+    st = covered_call()
+    d = only(decide([st], call_chain(), settings(), AS_OF))
+    assert d.reason == LIFECYCLE_HOLD
+    assert d.pnl_pct == pytest.approx(25.0)
+
+
+def test_the_cover_arithmetic_rounds_the_way_the_two_accessors_do():
+    """A REQUIREMENT rounds up and a HOLDING rounds down — the directions
+    ``shares_pledged_to_short_calls`` and ``held_shares_for_cover`` already use, so the
+    dust falls the same way at both ends of the cover ledger. 99.5 against 99.5 is 99
+    shares against 100 required: short."""
+    st = covered_call()
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=99.5, cover_shares_held=99.5))
+    assert d.reason == LIFECYCLE_COVER_LOST
+    assert "99 XYZ share(s)" in d.detail and "100 required" in d.detail
+
+
+def test_a_covered_call_needing_no_cover_is_never_lost():
+    """The short call has been bought back: nothing can be called away, so no share
+    count can make this structure naked. Without the `required <= 0` skip an empty
+    position feed would 'close' a flat structure forever."""
+    st = covered_call()
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=0, cover_shares_held=0))
+    assert d.reason == LIFECYCLE_HOLD
+    # ...and a cover we cannot measure is not even worth mentioning when none is needed.
+    d2 = only(decide([st], call_chain(), settings(), AS_OF,
+                     cover_shares_required=0, cover_shares_held=None))
+    assert d2.reason == LIFECYCLE_HOLD
+
+
+def test_cover_lost_outranks_profit_capture():
+    """Both close, so only the RECORDED REASON differs -- and the reason is the alarm.
+    Filing a naked short call under 'profit_capture' hides the incident inside a
+    winner, and the sleeve's attribution then shows a strategy closing winners early
+    for no cause anyone can find."""
+    st = covered_call(credit=2.00)
+    chain = call_chain(ask=0.90, bid=0.80)          # 0.90 to close -> +55%
+    plain = only(decide([st], chain, settings(), AS_OF))
+    assert plain.reason == LIFECYCLE_PROFIT_CAPTURE  # precondition: it WOULD capture
+    d = only(decide([st], chain, settings(), AS_OF,
+                    cover_shares_required=100, cover_shares_held=0))
+    assert d.reason == LIFECYCLE_COVER_LOST
+    assert d.pnl_pct == pytest.approx(55.0)
+
+
+def test_cover_lost_outranks_the_credit_stop_and_the_roll_window():
+    st = covered_call(credit=2.00, expiry=date(2026, 3, 20))     # 18 DTE, would roll
+    chain = call_chain(ask=6.60, bid=6.50)                        # -230%, would stop
+    d = only(decide([st], chain, settings(), AS_OF,
+                    cover_shares_required=100, cover_shares_held=0))
+    assert d.reason == LIFECYCLE_COVER_LOST
+
+
+def test_the_circuit_breaker_still_outranks_cover_lost():
+    """Both flatten the position; the breaker is the book-level fact and stays first."""
+    st = covered_call()
+    d = only(decide([st], call_chain(), settings(circuit_breaker_tripped=True), AS_OF,
+                    cover_shares_required=100, cover_shares_held=0))
+    assert d.reason == LIFECYCLE_BREAKER
+
+
+def test_a_definite_close_outranks_an_unmeasurable_cover():
+    """UNKNOWN replaces a silent hold, never a decision we CAN make: an 18-DTE
+    structure still rolls while its cover is unreadable."""
+    st = covered_call(expiry=date(2026, 3, 20))                   # 18 DTE
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=100, cover_shares_held=None))
+    assert d.reason == LIFECYCLE_ROLL_DTE
+
+
+def test_cover_is_supplied_per_transaction_over_a_book():
+    """A pass manages several structures at once, so the figures arrive keyed by
+    transaction. One naked call must not tar the healthy ones, and a transaction the
+    mapping omits is simply not being measured for cover."""
+    naked = covered_call(txn_id=1)
+    covered = covered_call(txn_id=2)
+    unmeasured = covered_call(txn_id=3)
+    out = decide([naked, covered, unmeasured], call_chain(), settings(), AS_OF,
+                 cover_shares_required={1: 100, 2: 100},
+                 cover_shares_held={1: 0, 2: 100})
+    assert [d.reason for d in out] == [LIFECYCLE_COVER_LOST, LIFECYCLE_HOLD,
+                                       LIFECYCLE_HOLD]
+
+
+def test_a_transaction_whose_held_count_is_missing_from_the_mapping_is_unknown():
+    """An omitted HELD entry is not 'zero shares': the caller has a requirement for
+    this structure and could not answer it, which is the unmeasurable case."""
+    st = covered_call(txn_id=4)
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required={4: 100}, cover_shares_held={}))
+    assert d.reason == LIFECYCLE_UNKNOWN
+    assert d.reason != LIFECYCLE_COVER_LOST
+
+
+def test_cover_lost_is_a_closing_reason_and_a_distinct_one():
+    assert LIFECYCLE_COVER_LOST in LIFECYCLE_CLOSING_REASONS
+    assert LIFECYCLE_COVER_LOST == "cover_lost"
+    assert LifecycleDecision(1, LIFECYCLE_COVER_LOST, "d").should_close is True
+    assert LIFECYCLE_COVER_LOST not in (LIFECYCLE_HOLD, LIFECYCLE_UNKNOWN)
+
+
+def test_the_covered_call_tag_is_the_one_the_entry_guard_polices():
+    """Two halves of one promise: the entry seam refuses to WRITE this tag uncovered,
+    this module CLOSES it once the cover leaves. They must agree on the string. The
+    interface cannot be imported by the pure module (the leak gate forbids it), so the
+    equality is pinned here instead of by an import."""
+    from ba2_common.core.interfaces.OptionsAccountInterface import COVERED_CALL_STRATEGY as GUARD_TAG
+
+    assert COVERED_CALL_STRATEGY == GUARD_TAG
 
 
 # --------------------------------------------------------------------------

@@ -39,12 +39,20 @@ Precedence
 Exactly one decision per structure, from the first rule that fires:
 
 1. ``LIFECYCLE_BREAKER``     — the sleeve circuit breaker (a book-level state signal)
-2. ``LIFECYCLE_PROFIT_CAPTURE``
-3. ``LIFECYCLE_CREDIT_STOP``
-4. ``LIFECYCLE_TESTED``
-5. ``LIFECYCLE_ROLL_DTE``
-6. ``LIFECYCLE_UNKNOWN``     — nothing fired, but some input could not be measured
-7. ``LIFECYCLE_HOLD``        — nothing fired, and everything was measurable
+2. ``LIFECYCLE_COVER_LOST``  — a ``covered_call`` whose shares are gone
+3. ``LIFECYCLE_PROFIT_CAPTURE``
+4. ``LIFECYCLE_CREDIT_STOP``
+5. ``LIFECYCLE_TESTED``
+6. ``LIFECYCLE_ROLL_DTE``
+7. ``LIFECYCLE_UNKNOWN``     — nothing fired, but some input could not be measured
+8. ``LIFECYCLE_HOLD``        — nothing fired, and everything was measurable
+
+**Why cover_lost outranks the premium rules.** A covered call that has lost its shares
+is a NAKED short call, and that is true whether it is up 60% or down 200%. Ranking it
+below profit capture would still close the position, but it would file the exit under
+the reason the position *happened* to be at, and the sleeve's attribution would then
+show a strategy quietly closing winners for no recorded cause — the same blindness
+that hid the dead roll gene. The reason is the alarm.
 
 **Why profit capture outranks the roll window** (the interesting case: a structure can
 easily be at +60% *and* inside its 21-DTE window at once). The *action* is identical —
@@ -64,13 +72,30 @@ reorders the branches.
 silent *hold*, not a decision we can actually make: a structure at 18 DTE still rolls
 even if its greeks are missing. Unknown only surfaces once every closing rule has
 declined.
+
+
+Cover that we cannot see is not cover that is gone
+--------------------------------------------------
+``cover_lost`` is the one rule here whose input comes from outside the option book
+entirely — the SHARES a ``covered_call`` is written against, which no chain row and no
+leg can report. The case it exists for is the one no other guard can see: a broker-side
+stop fills at 3am, the shares leave, no platform code runs, and the short call is naked
+until somebody looks.
+
+It is therefore also the rule with the most expensive false positive, and the rule
+obeys this module's central discipline exactly. ``cover_shares_held is None`` is
+UNMEASURABLE — the position feed did not answer — and it NEVER fires ``cover_lost``. It
+raises ``LIFECYCLE_UNKNOWN`` naming the missing input, like every other blind input
+here. Liquidating a healthy covered call because a position feed hiccuped is a
+self-inflicted loss, and "we could not measure the cover" and "the cover is gone" are
+the two facts this codebase spends most of its effort keeping apart.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 from ba2_common.core.option_types import OptionContract
 from ba2_common.core.types import OptionRight
@@ -81,13 +106,31 @@ LIFECYCLE_CREDIT_STOP = "credit_stop"
 LIFECYCLE_ROLL_DTE = "roll_dte"
 LIFECYCLE_TESTED = "tested"
 LIFECYCLE_BREAKER = "circuit_breaker"
+#: A ``covered_call`` whose shares are no longer there: the short call is NAKED. Only a
+#: MEASURED shortfall fires it -- see the module docstring, and ``_cover_lost`` below.
+LIFECYCLE_COVER_LOST = "cover_lost"
 #: The decision could not be made: a missing expiry, greek or price. NOT a hold --
 #: "we don't know" and "it's fine" are different facts, and collapsing them is the
 #: mistake that hid the dead roll-DTE gene for an entire GA campaign.
 LIFECYCLE_UNKNOWN = "unknown"
 
 LIFECYCLE_CLOSING_REASONS = (LIFECYCLE_PROFIT_CAPTURE, LIFECYCLE_CREDIT_STOP,
-                             LIFECYCLE_ROLL_DTE, LIFECYCLE_TESTED, LIFECYCLE_BREAKER)
+                             LIFECYCLE_ROLL_DTE, LIFECYCLE_TESTED, LIFECYCLE_BREAKER,
+                             LIFECYCLE_COVER_LOST)
+
+#: The ONE strategy tag that promises SHARE cover, and so the only one ``cover_lost``
+#: polices. It must stay equal to ``OptionsAccountInterface.COVERED_CALL_STRATEGY`` --
+#: the entry guard refuses to WRITE this tag uncovered and this module closes it once
+#: the cover leaves, so a drift between the two strings would leave one half of the
+#: promise unenforced. That module cannot be imported here (this one is pure; the
+#: import-leak gate forbids ``core.interfaces``), so the equality is pinned by a test
+#: instead: ``test_the_covered_call_tag_is_the_one_the_entry_guard_polices``.
+COVERED_CALL_STRATEGY = "covered_call"
+
+#: A share count ``decide`` is given per structure: one value for the whole call, or a
+#: ``{transaction_id: value}`` mapping (what a pass over a BOOK has to supply). ``None``
+#: — including a transaction a mapping omits — is UNMEASURABLE / not measured, never 0.
+CoverInput = Optional[Union[int, float, Mapping[int, Optional[int]]]]
 
 #: Strategies whose loss stop is the *undefined-risk* multiple (``ur_stop_*``).
 #: Everything else uses ``dr_stop_*``. Promoted verbatim from ``_should_close``:
@@ -447,12 +490,112 @@ def _dte(structure: OptionStructure, as_of: date) -> Tuple[Optional[int], str]:
 
 
 # ---------------------------------------------------------------------------
+# the cover a covered_call is written against
+# ---------------------------------------------------------------------------
+def _cover_input(supplied, transaction_id: int):
+    """One structure's share of a cover argument.
+
+    ``decide`` manages a BOOK, so each cover figure may arrive either as a per-structure
+    ``{transaction_id: value}`` mapping (what a live pass over several structures has to
+    supply) or as a single value, which then applies to every structure — the form a
+    caller with exactly one structure naturally writes. A transaction absent from a
+    mapping is simply not being tracked for cover, which is the same as ``None``.
+    """
+    if isinstance(supplied, Mapping):
+        return supplied.get(transaction_id)
+    return supplied
+
+
+def _share_count(raw, *, round_up: bool) -> Optional[int]:
+    """A whole number of shares, or ``None`` when the value cannot be read.
+
+    Never coerces to ``0``: an unreadable share count is the UNMEASURABLE case, and a
+    zero here would read as "the account holds nothing", which is the exact confusion
+    ``cover_lost`` must not make. ``bool`` is refused because ``True`` is not one share.
+
+    ``round_up`` picks the direction, the same way the two accessors that produce these
+    numbers do: a REQUIREMENT is rounded up (``check_cover_for_covered_call`` and
+    ``shares_pledged_to_short_calls`` both ceil — under-stating an obligation by a share
+    is what leaves a contract uncovered) and a HOLDING is rounded down
+    (``held_shares_for_cover`` floors — a fraction of a share covers nothing). Both
+    inputs are already integral in practice; this only decides which way the dust falls,
+    and it falls the same way at both ends of the cover ledger.
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    return int(math.ceil(value) if round_up else math.floor(value))
+
+
+def _cover_lost(structure: OptionStructure,
+                required_raw, held_raw) -> Tuple[bool, str, str]:
+    """(the cover is gone, why, why it is unmeasurable) for ONE structure.
+
+    Returns ``(False, "", "")`` — nothing to say — for everything this rule does not
+    police, and that list is deliberate:
+
+    * a structure that is not tagged ``covered_call``. Only that tag promises SHARE
+      cover (the same line ``check_cover_for_covered_call`` draws at the entry seam): a
+      short strangle is meant to be naked, and a bear call spread answers for its short
+      call with a long call, so closing either of those on a share count would be a
+      liquidation with no cause;
+    * a caller that supplied no requirement for this structure (``required is None``).
+      Cover is an input this module cannot derive — no chain row and no leg reports the
+      shares — so a caller that does not measure it is not asking the question, and
+      every pre-existing caller falls here and is unaffected;
+    * a requirement of ``0``: the short call has been bought back and nothing can be
+      called away, so no share count can make this structure naked. Same ``need <= 0``
+      skip the entry guard performs, and it is what stops a flat structure from being
+      "closed" forever on the strength of an empty position feed.
+
+    ``held is None`` is UNMEASURABLE and comes back as the third element (an alarm), NOT
+    as the first. That is the whole point of the rule — see the module docstring.
+    """
+    if (structure.strategy or "").strip().lower() != COVERED_CALL_STRATEGY:
+        return False, "", ""
+    if required_raw is None:
+        return False, "", ""
+
+    required = _share_count(required_raw, round_up=True)
+    if required is None:
+        return False, "", (
+            f"the cover this covered_call needs is unreadable ({required_raw!r}) — "
+            f"whether its short call is still covered by {structure.underlying} shares "
+            f"cannot be evaluated")
+    if required <= 0:
+        return False, "", ""
+
+    held = _share_count(held_raw, round_up=False)
+    if held is None:
+        # UNKNOWN, never cover_lost. A position feed that did not answer is not a
+        # position that is gone, and closing on it would be a self-inflicted loss.
+        return False, "", (
+            f"how many {structure.underlying} shares cover this covered_call could not "
+            f"be measured — its {required}-share cover is UNKNOWN, which is NOT the "
+            f"same as gone, so nothing is being closed on the strength of it")
+    if held >= required:
+        return False, "", ""
+    return True, (
+        f"covered_call cover is GONE: {held} {structure.underlying} share(s) available "
+        f"against {required} required — short by {required - held}, so the short call "
+        f"is NAKED"), ""
+
+
+# ---------------------------------------------------------------------------
 # the decision
 # ---------------------------------------------------------------------------
 def decide(structures: Iterable[OptionStructure],
            chain_by_symbol: Mapping[str, OptionContract],
            settings: Mapping[str, Any],
-           as_of) -> List[LifecycleDecision]:
+           as_of,
+           *,
+           cover_shares_held: CoverInput = None,
+           cover_shares_required: CoverInput = None) -> List[LifecycleDecision]:
     """One decision per structure, in a deterministic order.
 
     :param structures:      the open structures, as values (see ``OptionStructure``).
@@ -469,6 +612,18 @@ def decide(structures: Iterable[OptionStructure],
                             signal, not a threshold; absent means "not tripped".
     :param as_of:           the evaluation instant (``datetime`` or ``date``). This
                             function never reads a clock.
+    :param cover_shares_required: shares a ``covered_call`` can have called away, and so
+                            the cover it needs. Either one value or a
+                            ``{transaction_id: value}`` mapping. ``None`` — the default,
+                            and every transaction a mapping omits — means the caller is
+                            not measuring cover for that structure, so ``cover_lost`` is
+                            not evaluated for it at all. Existing callers are unaffected.
+    :param cover_shares_held: shares AVAILABLE to cover that structure, in the same two
+                            shapes. TRI-STATE, exactly as the accessor that produces it:
+                            an int including ``0`` is MEASURED (``0`` = the broker
+                            confirmed there are none, i.e. the call is naked); ``None``
+                            is UNMEASURABLE and produces ``LIFECYCLE_UNKNOWN``, NEVER a
+                            ``cover_lost`` close.
 
     Output is sorted by ``transaction_id``, so the same book produces the same list
     whatever order the caller iterated its holdings in.
@@ -477,7 +632,9 @@ def decide(structures: Iterable[OptionStructure],
     breaker = bool(settings[SETTING_BREAKER_TRIPPED]) if SETTING_BREAKER_TRIPPED in settings else False
 
     ordered = sorted(structures, key=lambda s: s.transaction_id)
-    return [_decide_one(s, chain_by_symbol, settings, as_of_date, breaker)
+    return [_decide_one(s, chain_by_symbol, settings, as_of_date, breaker,
+                        _cover_input(cover_shares_required, s.transaction_id),
+                        _cover_input(cover_shares_held, s.transaction_id))
             for s in ordered]
 
 
@@ -485,7 +642,9 @@ def _decide_one(structure: OptionStructure,
                 chain_by_symbol: Mapping[str, OptionContract],
                 settings: Mapping[str, Any],
                 as_of: date,
-                breaker_tripped: bool) -> LifecycleDecision:
+                breaker_tripped: bool,
+                cover_required=None,
+                cover_held=None) -> LifecycleDecision:
     txn = structure.transaction_id
     # Priced first, and priced once: every decision carries the P&L at the moment it
     # was taken, whatever the reason -- that is what the outcome table reads back.
@@ -499,7 +658,14 @@ def _decide_one(structure: OptionStructure,
                                  "sleeve circuit breaker tripped — flattening the book",
                                  pnl_pct)
 
-    # 2. profit capture.
+    # 2. the cover is gone: this covered_call's short call is naked. Ahead of every
+    #    premium rule, because a structure that has lost its cover must close whether it
+    #    is winning or losing, and the RECORDED REASON is the alarm.
+    lost, cover_detail, cover_blind = _cover_lost(structure, cover_required, cover_held)
+    if lost:
+        return LifecycleDecision(txn, LIFECYCLE_COVER_LOST, cover_detail, pnl_pct)
+
+    # 3. profit capture.
     if structure.strategy == "short_strangle":
         capture_key, capture = "strangle_capture_pct", float(_require(settings, "strangle_capture_pct"))
     else:
@@ -509,7 +675,7 @@ def _decide_one(structure: OptionStructure,
             txn, LIFECYCLE_PROFIT_CAPTURE,
             f"P&L {pnl_pct:.2f}% >= {capture_key} {capture:g}%", pnl_pct)
 
-    # 3. the credit-multiple stop. Undefined-risk strategies use ur_stop_*, everything
+    # 4. the credit-multiple stop. Undefined-risk strategies use ur_stop_*, everything
     #    else dr_stop_* -- and the if/elif is deliberate: with ur_stop disabled a naked
     #    structure has NO stop even when dr_stop is on. Promoted verbatim, pinned by a
     #    test so the surprise is at least a recorded one.
@@ -527,7 +693,7 @@ def _decide_one(structure: OptionStructure,
                     f"P&L {pnl_pct:.2f}% <= {label} {mult:g}x credit ({limit:.2f}%)",
                     pnl_pct)
 
-    # 4. the tested short.
+    # 5. the tested short.
     tested, tested_detail, tested_blind = (False, "", "")
     if _require(settings, "tested_delta_enabled"):
         tested, tested_detail, tested_blind = _tested(
@@ -535,20 +701,22 @@ def _decide_one(structure: OptionStructure,
         if tested:
             return LifecycleDecision(txn, LIFECYCLE_TESTED, tested_detail, pnl_pct)
 
-    # 5. the time stop / roll.
+    # 6. the time stop / roll.
     roll_dte = int(_require(settings, "roll_dte"))
     dte, dte_blind = _dte(structure, as_of)
     if dte is not None and dte <= roll_dte:
         return LifecycleDecision(txn, LIFECYCLE_ROLL_DTE,
                                  f"{dte} DTE <= roll_dte {roll_dte}", pnl_pct)
 
-    # 6. nothing fired. If anything we needed was unmeasurable, say so -- loudly, and
+    # 7. nothing fired. If anything we needed was unmeasurable, say so -- loudly, and
     #    naming the input. A hold here would be a guess wearing a decision's clothes.
-    blind = [b for b in (pnl_blind, tested_blind, dte_blind) if b]
+    #    Cover leads the list: it is the only input here whose absence can hide a NAKED
+    #    short call, so it is the sentence an operator has to read first.
+    blind = [b for b in (cover_blind, pnl_blind, tested_blind, dte_blind) if b]
     if blind:
         return LifecycleDecision(txn, LIFECYCLE_UNKNOWN, "; ".join(blind), pnl_pct)
 
-    # 7. genuinely healthy, and every input was measurable.
+    # 8. genuinely healthy, and every input was measurable.
     return LifecycleDecision(
         txn, LIFECYCLE_HOLD,
         f"P&L {pnl_pct:.2f}%, {dte} DTE — no exit rule fired", pnl_pct)
