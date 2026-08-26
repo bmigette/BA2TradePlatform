@@ -1996,7 +1996,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 return  # all-or-none: one leg can't price -> fill none this bar
             priced.append((leg, px))
 
-        structures = abs(float(parent.quantity or 0.0))
+        # An ABSENT structure count and a count of ZERO both stop the fill, but they are
+        # not the same event and must not read the same in the log. Zero structures is a
+        # measured "there is nothing to fill". A missing quantity is a data defect: the
+        # order will be re-examined every bar and can never fill, silently, forever.
+        if parent.quantity is None:
+            logger.error(
+                "[backtest] multi-leg %s NOT filled: the parent order carries no structure "
+                "count, so its per-structure net cannot be computed. This is a DEFECT in the "
+                "order, not a market condition -- it will retry every bar and never fill.",
+                getattr(parent, "option_strategy", None))
+            return
+        structures = abs(float(parent.quantity))
         if structures <= 0:
             return
 
