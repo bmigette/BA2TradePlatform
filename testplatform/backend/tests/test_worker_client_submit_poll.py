@@ -187,6 +187,27 @@ def test_advancing_bars_are_never_treated_as_stalled(monkeypatch):
     assert out == {"ok": True, "fitness": 1.0}
 
 
+def test_generic_poll_failure_still_releases_the_workers_slot(monkeypatch):
+    """A raw connection/HTTP error mid-poll (not a 404 job-lost, not a detected stall) must still
+    tell the worker to abandon the job. Without this the master requeues the trial and moves on
+    (correct from the master's side) while the ORIGINAL job keeps running/queued on the worker,
+    invisibly holding a pool slot until it finishes on its own or the 6h orphan sweep reaps it --
+    exactly the gap that let the very next dispatch (goal2020 opt 361/362's top-N persist step)
+    collide with a saturated-looking pool moments after the GA itself reported done."""
+    cancelled = []
+    monkeypatch.setattr(worker_client, "cancel_job", lambda w, j, **k: cancelled.append(j))
+    patcher, mock_client = _patched_client(
+        post_response=_resp(json_body={"job_id": "job-flaky"}),
+        get_responses=[_resp(json_body={"status": "running"}), RuntimeError("connection reset")],
+    )
+    try:
+        with pytest.raises(RuntimeError, match="connection reset"):
+            worker_client.run_trial(WORKER, {"cfg": 1}, "sharpe")
+    finally:
+        patcher.stop()
+    assert cancelled == ["job-flaky"], "the original exception must not swallow the worker's slot"
+
+
 def test_worker_too_old_to_report_bars_keeps_the_old_behaviour(monkeypatch):
     """A version-skewed worker omits `bars` entirely. It must never be failed for that —
     absence of the field means 'no heartbeat available', not 'no progress'."""

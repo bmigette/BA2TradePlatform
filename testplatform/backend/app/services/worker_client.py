@@ -206,40 +206,52 @@ def _submit_and_poll(worker: dict, submit_path: str, payload: dict, timeout: flo
     last_bars_at = started_at
     with httpx.Client(timeout=call_timeout) as c:
         while True:
-            now = time.monotonic()
-            if now >= deadline:
-                # Abandon it on the worker too, or it runs to completion for nobody and keeps
-                # its slot for up to 6h -- see cancel_job.
-                cancel_job(worker, job_id)
-                raise TimeoutError(f"worker {worker.get('name')} job {job_id} did not "
-                                   f"complete within {timeout:.0f}s")
-            r = c.get(status_url, headers=_headers(worker))
-            if r.status_code == 404:
-                raise WorkerJobLost(f"worker {worker.get('name')} job {job_id} unknown "
-                                    f"(worker likely restarted mid-job)")
-            r.raise_for_status()
-            body = r.json()
-            if body["status"] == "done":
-                return body["result"]
+            # Any failure below means the caller is about to give up on this job (timeout,
+            # detected stall, or a raw connection/HTTP error mid-poll) and requeue the trial
+            # elsewhere. Without telling the worker too, the ORIGINAL job keeps running/queued
+            # there, invisibly holding a pool slot until it finishes on its own or the 6h orphan
+            # sweep reaps it -- see cancel_job's docstring. The two named cases (timeout, stall)
+            # used to call cancel_job individually at their raise site; a bare network blip mid
+            # -poll took neither path and leaked the slot silently -- that gap is what let a
+            # job's own persist-top-N step collide with a "saturated" pool moments after the GA
+            # itself had just reported done (goal2020 opt 361/362). WorkerJobLost (404) is exempt:
+            # the worker already has no record of the job, so there is nothing left to cancel.
+            try:
+                now = time.monotonic()
+                if now >= deadline:
+                    raise TimeoutError(f"worker {worker.get('name')} job {job_id} did not "
+                                       f"complete within {timeout:.0f}s")
+                r = c.get(status_url, headers=_headers(worker))
+                if r.status_code == 404:
+                    raise WorkerJobLost(f"worker {worker.get('name')} job {job_id} unknown "
+                                        f"(worker likely restarted mid-job)")
+                r.raise_for_status()
+                body = r.json()
+                if body["status"] == "done":
+                    return body["result"]
 
-            # HEARTBEAT CHECK. `bars` is the trial's own per-bar progress counter (see
-            # strategy_optimization_handler._cancel_progress_cb). A worker too old to report it
-            # omits the key entirely -> bars is None -> both checks are skipped and behaviour is
-            # exactly as before, so a version-skewed worker is never failed for our new field.
-            bars = body.get("bars")
-            if isinstance(bars, int) and bars >= 0:
-                if bars > last_bars:
-                    last_bars, last_bars_at = bars, now
-                elif bars == 0 and (now - started_at) >= _NEVER_STARTED_GRACE:
-                    cancel_job(worker, job_id)
-                    raise WorkerJobStalled(
-                        f"worker {worker.get('name')} job {job_id} accepted but never started "
-                        f"({now - started_at:.0f}s, no bars) — pool likely saturated")
-                elif bars > 0 and (now - last_bars_at) >= _NO_PROGRESS_TIMEOUT:
-                    cancel_job(worker, job_id)
-                    raise WorkerJobStalled(
-                        f"worker {worker.get('name')} job {job_id} stalled at bar {bars} "
-                        f"for {now - last_bars_at:.0f}s")
+                # HEARTBEAT CHECK. `bars` is the trial's own per-bar progress counter (see
+                # strategy_optimization_handler._cancel_progress_cb). A worker too old to report
+                # it omits the key entirely -> bars is None -> both checks are skipped and
+                # behaviour is exactly as before, so a version-skewed worker is never failed for
+                # our new field.
+                bars = body.get("bars")
+                if isinstance(bars, int) and bars >= 0:
+                    if bars > last_bars:
+                        last_bars, last_bars_at = bars, now
+                    elif bars == 0 and (now - started_at) >= _NEVER_STARTED_GRACE:
+                        raise WorkerJobStalled(
+                            f"worker {worker.get('name')} job {job_id} accepted but never started "
+                            f"({now - started_at:.0f}s, no bars) — pool likely saturated")
+                    elif bars > 0 and (now - last_bars_at) >= _NO_PROGRESS_TIMEOUT:
+                        raise WorkerJobStalled(
+                            f"worker {worker.get('name')} job {job_id} stalled at bar {bars} "
+                            f"for {now - last_bars_at:.0f}s")
+            except WorkerJobLost:
+                raise
+            except Exception:
+                cancel_job(worker, job_id)
+                raise
             time.sleep(poll_interval)
 
 
