@@ -391,26 +391,21 @@ class TestOneLegSettlingDoesNotCloseTheStructure:
         assert fresh.close_reason == "tp_sl_filled"
         assert fresh.close_price == 12.0
 
-    def test_an_EQUITY_transaction_is_unaffected_even_when_it_is_UNBALANCED(self):
-        """THE SCOPE OF THE GUARD — and the conjunct every balanced fixture hides.
+    def test_an_UNBALANCED_equity_transaction_is_no_longer_closed_by_a_partial_fill(self):
+        """UPDATED. This test used to assert the PARTIAL-DELIVERY DEFECT as behaviour.
 
-        ``option_contracts_still_open`` is ``not every_option_contract_is_flat(
-        option_net)``, and an EQUITY transaction's option net is EMPTY. The two tests
-        above close their position in FULL, so the ordinary balance arm would close
-        them anyway and they cannot see this guard at all.
+        It was written as a scope test for the one-leg-settling guard, on the reasoning
+        that a balanced fixture could not see that guard at all. Its own docstring recorded
+        the outcome it pinned — CLOSED with 60 of 100 shares still held, on the strength of
+        one filled dependent order — as "this branch's PRE-EXISTING behaviour and is not
+        endorsed here ... a separate question".
 
-        Here the sale is PARTIAL, 40 of 100 shares, so nothing else closes the
-        transaction and this branch is the only one that can — which makes it the
-        fixture that fails the moment the guard starts reading an empty net as "a
-        contract is still open" (i.e. the moment the two predicates in
-        ``ba2_common.core.utils`` are collapsed into one).
+        That separate question is now answered: the ``tp_sl_filled`` arm also requires the
+        SHARES to balance, so 60 held shares keep the transaction OPEN. See
+        ``tests/test_refresh_transactions_partial_delivery.py``.
 
-        WHAT THIS DOES NOT SAY. Marking the transaction CLOSED with 60 shares still
-        held, on the strength of one filled dependent order, is this branch's
-        PRE-EXISTING behaviour and is not endorsed here — it long predates this guard
-        and is a separate question. What is asserted is only that the guard did not
-        change it, in either direction: an equity transaction carries no OPTION
-        contract rows, so the guard has nothing to measure and must never reach it.
+        The guard-scope property this test existed for moves to the balanced fixture below,
+        where the REASON discriminates even though the status does not.
         """
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
@@ -432,6 +427,40 @@ class TestOneLegSettlingDoesNotCloseTheStructure:
         fresh = get_instance(Transaction, txn.id)
         assert fresh.quantity == 60.0, (
             "the fixture is only interesting while the position is UNBALANCED")
+        assert fresh.status == TransactionStatus.OPENED, (
+            "60 shares are still held; closing the row makes them an untracked position")
+
+    def test_a_BALANCED_equity_transaction_still_closes_as_tp_sl_filled(self):
+        """THE SCOPE OF THE ONE-LEG-SETTLING GUARD, on a fixture that can still see it.
+
+        ``option_contracts_still_open`` is ``not every_option_contract_is_flat(option_net)``
+        and an EQUITY transaction's option net is EMPTY, so the guard must never divert this
+        close. The discriminator is the REASON, not the status: were the guard to read an
+        empty net as "a contract is still open", the ``tp_sl_filled`` arm would be skipped
+        and the transaction would fall through to the ``position_balanced`` arm two elifs
+        later and close under THAT name instead.
+
+        That is what makes a balanced fixture usable for the property now, and it is why
+        collapsing the two predicates in ``ba2_common.core.utils`` into one still fails.
+        """
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        txn = create_transaction(symbol="NNE", quantity=100.0,
+                                 side=OrderDirection.BUY)
+        entry = create_trading_order(
+            account_id=acct_def.id, symbol="NNE", quantity=100.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.FILLED, filled_qty=100.0, transaction_id=txn.id,
+            open_price=10.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="NNE", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.FILLED, filled_qty=100.0, transaction_id=txn.id,
+            depends_on_order=entry.id, open_price=12.0)
+
+        account.refresh_transactions()
+
+        fresh = get_instance(Transaction, txn.id)
         assert fresh.status == TransactionStatus.CLOSED
         assert fresh.close_reason == "tp_sl_filled", (
             "the one-leg-settling guard has reached an EQUITY transaction — it must key "

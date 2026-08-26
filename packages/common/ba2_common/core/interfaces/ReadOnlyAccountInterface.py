@@ -1045,7 +1045,49 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                         every_option_contract_is_flat, option_contract_net,
                         option_structure_is_flat)
                     option_net = option_contract_net(orders)
+
+                    # HOW MUCH IS STILL HELD — captured HERE, read by the closing arm below.
+                    #
+                    # The ``tp_sl_filled`` arm fired on "SOME dependent order is FILLED",
+                    # with no quantity anywhere in the test, so a PARTIAL closing fill
+                    # closed the WHOLE row. Measured: a 100-share closing fill on a
+                    # 300-share transaction marked all 300 CLOSED, leaving 200 shares as an
+                    # untracked position — the ledger flat, the broker still holding them.
+                    # The concrete producer is a partial assignment: a covered call written
+                    # against part of a larger multi-lot holding.
+                    #
+                    # NOT the defect the option guard below covers. That one is a multi-LEG
+                    # OPTION structure closed by ONE leg settling, and it keys on option
+                    # CONTRACT nets — which are empty, and therefore inert, for an equity
+                    # transaction. Same branch, different axis.
+                    #
+                    # ``<= eps``, not ``abs(...) < eps``: a delivery LARGER than the ledger
+                    # recorded is a mismatch, not a reason to stay open — holding that row
+                    # OPEN would strand one that is certainly flat (or short) at the broker.
+                    # Read off ``calculated_quantity`` because that is already side-aware
+                    # (a SHORT partially covered is still short), and taken NOW because the
+                    # block below abs()es a negative in place and the option branch
+                    # overwrites it with 0.0.
+                    equity_position_is_flat = calculated_quantity <= 0.0001
+
                     if multi_leg_parent_ids:
+                        # A MULTI-LEG STRUCTURE IS MEASURED PER CONTRACT, NEVER BY THIS
+                        # NUMBER. ``calculated_quantity`` mixes units here — the parent
+                        # counts STRUCTURES and the legs count CONTRACTS — which is the
+                        # mixed-unit garbage described above and the reason
+                        # ``position_balanced`` is overwritten on the next line. The option
+                        # axis has its own guard (``option_contracts_still_open``), so the
+                        # equity one steps aside rather than gating on a number with no
+                        # meaning for this shape.
+                        #
+                        # HONEST SCOPE: this line changes no behaviour today. On every
+                        # structure currently buildable the mixed number comes out <= 0 and
+                        # the equity test passes anyway — but by an accident of sign, not by
+                        # a property, and no fixture distinguishes the two. It is a scoping
+                        # statement so a future shape cannot come to depend on that accident.
+                        # It is NOT a rail: no test fails if it is removed, and it was not
+                        # counted as one.
+                        equity_position_is_flat = True
                         position_balanced = option_structure_is_flat(option_net)
                         calculated_quantity = 0.0
 
@@ -1250,14 +1292,24 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                         new_status = TransactionStatus.CLOSED
                         has_changes = True
 
-                    # OPENED -> CLOSED: If we have a filled closing order (TP/SL) — unless
-                    # an option contract on this transaction is still open (see
-                    # ``option_contracts_still_open`` above). When every contract IS flat
-                    # this still fires, so a fully closed structure — and every equity
-                    # transaction — closes here as before.
+                    # OPENED -> CLOSED: a filled closing order (TP/SL) that leaves NOTHING
+                    # open — on EITHER axis.
+                    #
+                    #   * ``option_contracts_still_open``: no option contract on this
+                    #     transaction still nets open (one leg settling is not the structure
+                    #     closing);
+                    #   * ``equity_position_is_flat``: the shares actually balance. Without
+                    #     it the arm closed a 300-share row on a 100-share fill, because
+                    #     ``filled_closing_orders`` is a membership test with no quantity in
+                    #     it. The option guard cannot cover this — an equity transaction has
+                    #     no contract rows, so its net is empty and reads as "nothing open".
+                    #
+                    # A FULL close still fires here, so the everyday TP/SL path — and a
+                    # structure whose every contract is flat — is untouched.
                     elif (filled_closing_orders
                           and transaction.status == TransactionStatus.OPENED
-                          and not option_contracts_still_open):
+                          and not option_contracts_still_open
+                          and equity_position_is_flat):
                         from ba2_common.core.utils import close_transaction_with_logging
                         close_transaction_with_logging(
                             transaction=transaction,
