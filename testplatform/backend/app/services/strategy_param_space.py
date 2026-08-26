@@ -144,6 +144,35 @@ def _walk_condition_nodes(cond: Optional[Dict[str, Any]], out: Dict[str, Any]) -
         out[f"cond:{cid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
 
 
+def _validate_value_offsets(tree: Optional[Dict[str, Any]], where: str) -> None:
+    """Fail EARLY (once per job, at gene collection) on a dangling ``value_offset_from``.
+
+    Without this the dangling reference only surfaces per-trial inside ``_apply_to_tree``,
+    i.e. as N identical crashed trials rather than one actionable message.
+    """
+    known: Dict[str, Any] = {}
+    _collect_authored_values(tree, known)
+    refs: Dict[str, str] = {}
+
+    def _walk(node):
+        if not isinstance(node, dict):
+            return
+        for child in (node.get("conditions") or []):
+            _walk(child)
+        base = node.get("value_offset_from")
+        if base is not None:
+            refs[str(node.get("id"))] = str(base)
+
+    _walk(tree)
+    bad = {cid: base for cid, base in refs.items() if base not in known}
+    if bad:
+        raise ValueError(
+            f"{where}: value_offset_from references no threshold-carrying leaf in the same "
+            f"condition tree: {bad}. A relative threshold with an unresolvable base is "
+            f"unmeasurable, not zero."
+        )
+
+
 def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
                           out: Dict[str, Any]) -> None:
     """Genes for ONE action of a rule: value, per-action toggle, and option selection params."""
@@ -189,6 +218,7 @@ def _collect_rule_list(rules, ns: str, out: Dict[str, Any]) -> None:
             for idx, action in enumerate(a for a in (rule.get("actions") or [])
                                          if isinstance(a, dict)):
                 _collect_action_genes(ns, rid, idx, action, out)
+        _validate_value_offsets(rule.get("conditions"), f"{ns} rule {rid!r}")
         _walk_condition_nodes(rule.get("conditions"), out)
 
 
@@ -243,13 +273,62 @@ def collect_param_space(
     return space
 
 
+def _collect_authored_values(tree: Optional[Dict[str, Any]], out: Dict[str, Any]) -> None:
+    """Map node id -> its AUTHORED (template) ``value``, for ``value_offset_from`` resolution."""
+    if not isinstance(tree, dict):
+        return
+    for child in (tree.get("conditions") or []):
+        _collect_authored_values(child, out)
+    cid = tree.get("id")
+    if cid is not None and "value" in tree:
+        out[cid] = tree["value"]
+
+
 def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, Any]]
                    ) -> Optional[Dict[str, Any]]:
     """Deep-copy a condition tree, substituting value/confirmation_bars by node id and
-    dropping toggle-disabled nodes. The input tree is never mutated."""
+    dropping toggle-disabled nodes. The input tree is never mutated.
+
+    ``value_offset_from`` — RELATIVE thresholds (see OPT-C5)
+    -------------------------------------------------------
+    A leaf may declare ``"value_offset_from": "<other leaf id>"``, in which case its
+    ``cond:<id>:value`` gene is a **width above that leaf's threshold**, not an absolute
+    threshold: the decoded value is ``resolved(other) + gene``.
+
+    This exists because two leaves testing the SAME field with opposing operators
+    (``x > a`` AND ``x < b``) are an interval, and as two INDEPENDENT absolute genes roughly
+    half their joint grid is ``b <= a`` — an empty conjunction that guarantees zero trades for
+    every symbol on every bar, scoring the identical zero-trade sentinel. Measured on the
+    built ``O_LC`` entry rule before this change: **25.8 % of the four price-vs-target gates'
+    joint gene space was guaranteed-empty, including the authored all-zero default** that
+    warm-start and every hand-seeded individual begins from. Re-parameterising the upper bound
+    as (lower bound + width >= step) makes every point in the grid a live interval, with no
+    loss of expressiveness — each bound still has its own independent ON/OFF gene, so
+    lower-only, upper-only and band patterns all remain reachable.
+
+    The AUTHORED ``value`` on an offset leaf stays ABSOLUTE (so an un-decoded template still
+    seeds a correct ruleset); only ``value_min/max/step`` — which nothing but the gene
+    collector reads — describe the width.
+
+    A dangling reference RAISES rather than defaulting the base to 0: silently treating an
+    unresolvable base as zero would turn a width gene back into an absolute threshold and
+    quietly reintroduce exactly the empty conjunctions this mechanism removes.
+    """
     if tree is None:
         return None
     new = copy.deepcopy(tree)
+    authored: Dict[str, Any] = {}
+    _collect_authored_values(new, authored)
+
+    def _resolved(cid: str) -> Any:
+        """The other leaf's EFFECTIVE threshold: its decoded gene when it has one, else its
+        authored value. Read from the gene map (not from the tree) so resolution does not
+        depend on recursion order, and so a base leaf dropped by its own ON/OFF gene still
+        anchors the offset."""
+        sub = by_id.get(cid)
+        if sub is not None and "value" in sub:
+            return sub["value"]
+        return authored.get(cid)
 
     def _recurse(node):
         if not isinstance(node, dict):
@@ -269,7 +348,19 @@ def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, An
         if cid and cid in by_id:
             sub = by_id[cid]
             if "value" in sub:
-                node["value"] = sub["value"]
+                base_id = node.get("value_offset_from")
+                if base_id is None:
+                    node["value"] = sub["value"]
+                else:
+                    base = _resolved(base_id)
+                    if base is None:
+                        raise ValueError(
+                            f"condition {cid!r} declares value_offset_from="
+                            f"{base_id!r}, which resolves to no value (no such leaf, or "
+                            f"that leaf carries no threshold). A relative threshold with "
+                            f"an unresolvable base is unmeasurable, not zero."
+                        )
+                    node["value"] = float(base) + float(sub["value"])
             if "confirmation_bars" in sub:
                 node["confirmation_bars"] = sub["confirmation_bars"]
 

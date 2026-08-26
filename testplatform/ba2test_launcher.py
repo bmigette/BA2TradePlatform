@@ -2552,6 +2552,75 @@ def _build_strategy_option(kind: str):
     return s
 
 
+# --- price-vs-analyst-target entry gates ---------------------------------------------------
+#
+# Two BANDS, one per analyst-target line, each expressed as a FLOOR gene plus a strictly
+# positive WIDTH gene (``value_offset_from``, decoded in strategy_param_space._apply_to_tree).
+#
+# WHY NOT FOUR INDEPENDENT ABSOLUTE THRESHOLDS (the shape before 2026-08-26, OPT-C5). The four
+# gates are two pairs, and each pair tests the SAME field with opposing operators, i.e. an
+# interval. As independent absolute genes on one shared -20..+20 step-5 grid, ~half of each
+# pair's joint values put the ceiling at or below the floor — an EMPTY conjunction that
+# guarantees zero trades for every symbol on every bar and scores the identical zero-trade
+# sentinel, so selection gets no gradient from it. Measured exhaustively on the built O_LC
+# rule over all 16 toggle combinations x 9^4 values: 27,135 / 104,976 = **25.8 % of the joint
+# gene space was guaranteed-empty** — and the AUTHORED DEFAULT (all four gates on, every
+# threshold 0.0 -> "low% < 0 AND low% > 0") was itself one of them, which is precisely where
+# warm-start and every hand-seeded individual begins.
+#
+# With the width parameterisation every point of the grid is a live interval. Expressiveness is
+# unchanged: each bound keeps its own independent ON/OFF gene, so floor-only ("already above
+# the low estimate"), ceiling-only ("still below the low estimate"), band, and the cross-field
+# "inside the analyst range" (low floor + high ceiling) all remain reachable.
+#
+# Residual (deliberate): a cross-field pair — a floor on the LOW line against a ceiling on the
+# HIGH line — can still be empty, but only for symbols whose target_high/target_low ratio is
+# tight enough. That is a symbol-dependent FILTER carrying real information, not a
+# symbol-independent guaranteed zero, so it is left searchable.
+#
+# WINDOWS (OPT-C12). ``price_vs_target_high_percent`` — how far spot sits above the analyst
+# HIGH target — has a ~-31 % median across the universe, so the original shared -20..+20 window
+# put ~77 % of symbols outside the searchable range and the two high gates were inert on them.
+# The high floor therefore gets its own -50..+10 window, which brackets the median; the low
+# line keeps -20..+20, which the review did not flag.
+_PRICE_GATE_LOW_FLOOR = {"value": -20.0, "value_min": -20.0, "value_max": 20.0,
+                         "value_step": 5.0}
+_PRICE_GATE_HIGH_FLOOR = {"value": -50.0, "value_min": -50.0, "value_max": 10.0,
+                          "value_step": 5.0}
+#: Band WIDTH above the paired floor. Strictly positive (min == step), which is what makes the
+#: interval non-empty for every combination the GA can sample.
+_PRICE_GATE_WIDTH = {"value_min": 5.0, "value_max": 45.0, "value_step": 5.0}
+
+
+def _price_target_gates(m: str) -> list:
+    """The four price-vs-analyst-target entry gates for member prefix ``m`` (see above).
+
+    Authored defaults are the PERMISSIVE end of each band (floor at its minimum, width at its
+    maximum), so the seeded individual behaves like the rating-only strategy the grid has
+    always intended — instead of the guaranteed-zero-trade conjunction the all-zero default
+    used to be.
+    """
+    low_floor = _PRICE_GATE_LOW_FLOOR
+    high_floor = _PRICE_GATE_HIGH_FLOOR
+    w = _PRICE_GATE_WIDTH
+    return [
+        # FLOORS (">"): the band's lower edge, an absolute % vs the target line.
+        {"id": f"{m}-price_low_above", "field": "price_vs_target_low_percent", "op": ">",
+         "optimize": True, "toggle_optimize": True, **low_floor},
+        {"id": f"{m}-price_high_above", "field": "price_vs_target_high_percent", "op": ">",
+         "optimize": True, "toggle_optimize": True, **high_floor},
+        # CEILINGS ("<"): the band's upper edge, decoded as floor + width. ``value`` stays the
+        # ABSOLUTE authored threshold (an un-decoded template must still seed a valid rule);
+        # value_min/max/step describe the WIDTH the GA searches.
+        {"id": f"{m}-price_low_below", "field": "price_vs_target_low_percent", "op": "<",
+         "value": low_floor["value"] + w["value_max"], "optimize": True,
+         "toggle_optimize": True, "value_offset_from": f"{m}-price_low_above", **w},
+        {"id": f"{m}-price_high_below", "field": "price_vs_target_high_percent", "op": "<",
+         "value": high_floor["value"] + w["value_max"], "optimize": True,
+         "toggle_optimize": True, "value_offset_from": f"{m}-price_high_above", **w},
+    ]
+
+
 def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
     (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
@@ -2572,22 +2641,13 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     behavior, all four price gates OFF), price-only (signal gate OFF, e.g. "put even though
     the rating still says buy" via price_high_above alone), any combination of the four price
     gates together, or every gate off entirely.
+
+    The two SAME-FIELD pairs are parameterised as (floor, width>0) rather than two independent
+    absolute thresholds -- see ``_price_target_gates``, which is where the 25.8 % of
+    guaranteed-empty gene space (OPT-C5) and the inert high-target window (OPT-C12) were fixed.
     """
     m = member.lower()
-    price_target_conditions = [
-        {"id": f"{m}-price_low_below", "field": "price_vs_target_low_percent", "op": "<",
-         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
-         "value_step": 5.0, "toggle_optimize": True},
-        {"id": f"{m}-price_high_above", "field": "price_vs_target_high_percent", "op": ">",
-         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
-         "value_step": 5.0, "toggle_optimize": True},
-        {"id": f"{m}-price_low_above", "field": "price_vs_target_low_percent", "op": ">",
-         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
-         "value_step": 5.0, "toggle_optimize": True},
-        {"id": f"{m}-price_high_below", "field": "price_vs_target_high_percent", "op": "<",
-         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
-         "value_step": 5.0, "toggle_optimize": True},
-    ]
+    price_target_conditions = _price_target_gates(m)
     rule = {
         "id": f"{m}-entry",
         "name": f"{member}-entry",
