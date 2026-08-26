@@ -1159,6 +1159,43 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                             logger.debug(f"Transaction {transaction.id} has filled OCO leg: {dep_order.id} ({dep_order.comment})")
                             break
 
+                    # ONE LEG SETTLING IS NOT THE STRUCTURE CLOSING (OPT-S3 live,
+                    # OPT-S8 backtest — one branch, both engines).
+                    #
+                    # ``filled_closing_orders`` is "some DEPENDENT order on this
+                    # transaction is FILLED", and on a multi-leg option structure exactly
+                    # one leg can produce that on its own: an ASSIGNMENT, an EXPIRY
+                    # SETTLEMENT (``_record_option_expiry_close`` links its synthetic close
+                    # to the entry via ``depends_on_order``, which is what makes it
+                    # dependent), or a ONE-LEG MARGIN LIQUIDATION. The branch below then
+                    # closed the WHOLE transaction as "tp_sl_filled", pre-empting the
+                    # per-contract ``position_balanced`` computed above, which is the only
+                    # thing here that actually knows whether the STRUCTURE is flat.
+                    #
+                    # What that cost: the surviving legs — INCLUDING the protective long of
+                    # a spread — disappear from ``get_option_positions`` and
+                    # ``_option_transaction_for_contract``, both of which filter
+                    # ``TransactionStatus.OPENED``, so nothing can see, manage, expire or
+                    # close them again; in the backtest their ``_OptionLot`` stays in the
+                    # ledger and keeps being charged maintenance margin. It is the same
+                    # orphaning as the B10 defect, reached through the other door: B10 came
+                    # in through the mixed-unit balance sums (fixed by the per-contract
+                    # ``contract_net`` above), this one walks straight past that fix.
+                    #
+                    # NO NEW LINKAGE IS NEEDED to tell the cases apart. ``multi_leg_parent_ids``
+                    # is non-empty exactly when this transaction carries an MLEG net-only
+                    # PARENT (an OPTION order with no ``contract_symbol`` and no
+                    # ``parent_order_id``) — i.e. when the legs are joined by
+                    # ``parent_order_id`` at all — and ``position_balanced`` has already been
+                    # recomputed per CONTRACT for precisely that case.
+                    #
+                    # A SINGLE-LEG option is NOT held back: it writes one contract-carrying
+                    # order and no parent, so ``multi_leg_parent_ids`` is empty and it still
+                    # closes on its own closing fill. It has no sibling to wait on, and
+                    # stranding it OPENED would be the mirror of the bug. An EQUITY
+                    # transaction has no OPTION orders at all and is untouched.
+                    one_leg_of_many_settled = bool(multi_leg_parent_ids) and not position_balanced
+
                     if oco_leg_filled and transaction.status == TransactionStatus.OPENED:
                         filled_oco_legs = [
                             o for o in dependent_orders
@@ -1183,8 +1220,14 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                         new_status = TransactionStatus.CLOSED
                         has_changes = True
 
-                    # OPENED -> CLOSED: If we have a filled closing order (TP/SL)
-                    elif filled_closing_orders and transaction.status == TransactionStatus.OPENED:
+                    # OPENED -> CLOSED: If we have a filled closing order (TP/SL) — unless
+                    # it is one leg of a multi-leg structure whose other legs are still
+                    # open (see ``one_leg_of_many_settled`` above). When every contract IS
+                    # flat this still fires, so a fully closed structure closes here as
+                    # before.
+                    elif (filled_closing_orders
+                          and transaction.status == TransactionStatus.OPENED
+                          and not one_leg_of_many_settled):
                         from ba2_common.core.utils import close_transaction_with_logging
                         close_transaction_with_logging(
                             transaction=transaction,

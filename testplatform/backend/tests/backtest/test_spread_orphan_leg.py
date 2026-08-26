@@ -188,3 +188,62 @@ def test_individual_leg_close_does_not_orphan_sibling(engine_with_strangle):
     # Both legs resolved -> the shared transaction is now closed exactly once.
     txn = get_instance(Transaction, txn.id)
     assert txn.status == TransactionStatus.CLOSED
+
+
+def test_a_leg_settled_as_a_DEPENDENT_close_does_not_orphan_its_sibling(
+        engine_with_strangle):
+    """OPT-S8: the SAME orphaning, through the other door in ``refresh_transactions``.
+
+    B10 (above) came in via the mixed-unit balance sums, and the per-contract
+    ``contract_net`` recompute closed it. This one walks straight past that fix.
+
+    A one-leg MARGIN LIQUIDATION records its buy-back through
+    ``_record_option_expiry_close``, which links the synthetic close to the
+    transaction's ENTRY via ``depends_on_order`` (deliberately — so the sim-dated
+    row is never mistaken for the entry). That makes it a DEPENDENT order, and
+    ``refresh_transactions``' "OPENED -> CLOSED: filled closing order (TP/SL)"
+    arm fires on any filled dependent order, BEFORE the ``position_balanced``
+    arm is ever consulted. The whole strangle was closed as ``tp_sl_filled`` and
+    the surviving put became invisible to ``get_option_positions`` and
+    ``_option_transaction_for_contract`` — while its ``_OptionLot`` stayed in the
+    ledger, still charged maintenance margin every bar.
+
+    An expiry settlement and an assignment take the same shape and reached the
+    same end; the liquidation is used here because it is the one path that
+    settles ONE leg of a live structure on a bar of its own choosing.
+    """
+    engine, acct, ps = engine_with_strangle
+
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import Transaction
+    from ba2_common.core.trade_store import transactions_where
+
+    txn = transactions_where(status=TransactionStatus.OPENED)[0]
+
+    ps.set_clock(datetime(2024, 3, 7))
+    call_lot = acct._option_positions[_CALL]
+    assert call_lot.qty < 0                       # the short call, still held
+
+    assert acct._liquidate_option_lot(call_lot) is True
+    acct.refresh_transactions()
+
+    fresh = get_instance(Transaction, txn.id)
+    assert fresh.status == TransactionStatus.OPENED, (
+        f"the strangle was closed by ONE leg's settlement fill (close_reason="
+        f"{fresh.close_reason!r}) — the short put is orphaned, unmanageable, and "
+        f"its lot keeps accruing maintenance margin"
+    )
+
+    held = [p.contract_symbol for p in acct.get_option_positions()]
+    assert held == [_PUT], (
+        "the surviving put must still be a held position — get_option_positions "
+        "only ever finds legs through an OPENED transaction"
+    )
+    assert acct._option_transaction_for_contract(_PUT) is not None
+
+    # ...and the survivor still settles at expiry, closing the structure once.
+    ps.set_clock(datetime(2024, 3, 15))
+    engine._apply_option_expiry(datetime(2024, 3, 15))
+
+    assert acct.get_option_positions() == []
+    assert get_instance(Transaction, txn.id).status == TransactionStatus.CLOSED

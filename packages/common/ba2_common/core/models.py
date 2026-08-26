@@ -467,9 +467,18 @@ class TradingOrder(SQLModel, table=True):
     # Upstream AccountInterface uses this to look up and insert the leg orders into database
     legs_broker_ids: list[str] | None = Field(sa_column=Column(JSON), default=None, description="Broker order IDs of OCO leg orders (TP and SL) for upstream processing")
     
-    # Parent OCO order ID - set when this order is a leg (TP/SL) of an OCO order
-    # Links leg orders back to their parent OCO order
-    parent_order_id: int | None = Field(default=None, foreign_key="tradingorder.id", description="ID of parent OCO order if this is a leg")
+    # Parent order ID - set when this order is a LEG of a composite parent order.
+    # Two kinds of parent use it, and the name is kept for both because renaming the
+    # column would break every migration and query that references it:
+    #   * an OCO bracket - the TP and SL legs point at their OCO parent;
+    #   * a MULTI-LEG OPTION STRUCTURE (spread/strangle/condor/...) - each contract-
+    #     carrying child leg points at the net-only parent written by
+    #     OptionsAccountInterface.submit_option_order (that parent has an OPTION
+    #     asset_class, NO contract_symbol and NO parent_order_id of its own, which is
+    #     how refresh_transactions recognises a structure).
+    # This is the ONLY link between the legs of a structure, so nothing that decides
+    # whether a position is flat may reason about one leg without it.
+    parent_order_id: int | None = Field(default=None, foreign_key="tradingorder.id", description="ID of the parent order this order is a leg of - an OCO bracket parent, or the net-only parent of a multi-leg option structure")
     
     # Self-referencing relationship for OCO parent-child - uses parent_order_id FK
     oco_child_orders: List["TradingOrder"] = Relationship(
