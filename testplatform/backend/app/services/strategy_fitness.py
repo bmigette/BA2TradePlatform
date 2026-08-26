@@ -334,7 +334,9 @@ def compute_fitness(fitness_metric: str, results: dict,
     if results.get("fitness_trade_scale") and val > 0:
         cap = float(results.get("fitness_trade_scale_cap") or 100.0)
         target = float(results.get("fitness_trade_scale_target") or 100.0)
-        tpy = results.get("avg_trades_per_year") or 0.0
+        # STRUCTURES per year, for the same reason the CAR trade_gate uses it: on the leg rate
+        # a 4-leg structure bought 4x the frequency credit it earned.
+        tpy = _trades_per_year(results) or 0.0
         val *= min(float(tpy), cap) / target
     return _maybe_robust(
         _min_with_stressed(_apply_win_rate_factor(val, results),
@@ -383,6 +385,77 @@ def _apply_win_rate_factor(val: float, results: dict) -> float:
     if win_rate is None:
         return val
     return val * (2.0 * (float(win_rate) / 100.0))
+
+
+# ---------------------------------------------------------------------------
+# Trade FREQUENCY: structures, not legs
+# ---------------------------------------------------------------------------
+def _structure_count(trades) -> Optional[int]:
+    """How many independent BETS a trade list represents, or None when it is absent.
+
+    ``BacktestAccount.get_round_trip_trades`` keys on ``(transaction_id, contract_symbol)`` --
+    ONE ROW PER LEG -- so an iron condor is 4 rows and a vertical is 2. Every count-based
+    quantity built on that row count is inflated by the structure's leg count, and the
+    inflation lands hardest on exactly the multi-leg credit structures whose per-bet means are
+    least estimable.
+
+    The partition is the one ``results._cap_groups`` already uses for the profit cap: option
+    legs (marked by ``contract_symbol``) that share a ``transaction_id`` are ONE bet;
+    everything else -- equity, and any option leg with no transaction id -- is its own. The
+    equity carve-out is deliberate and matches ``_cap_groups``: a covered call books shares and
+    a short call under one transaction, but the shares are a separate cost basis, so folding
+    them in would UNDER-count the equity side.
+
+    A missing ``transaction_id`` is UNKNOWN structure identity, not a shared one. Merging on
+    ``None`` would join unrelated legs into a single fabricated bet and could disqualify an
+    active genome outright, so unknowns stay separate.
+
+    Returns None (never 0) when there is no trade list at all -- the caller must fall back to
+    the published rate rather than read "no data" as "no trades".
+    """
+    if trades is None:
+        return None
+    slots = set()
+    n = 0
+    for t in trades:
+        if not isinstance(t, dict):
+            n += 1
+            continue
+        txn = t.get("transaction_id")
+        if t.get("contract_symbol") and txn is not None:
+            if txn in slots:
+                continue
+            slots.add(txn)
+        n += 1
+    return n
+
+
+def _trades_per_year(results: dict) -> Optional[float]:
+    """The run's trade frequency in STRUCTURES per year, or None when underivable.
+
+    ``results["avg_trades_per_year"]`` is ``len(trades) / years`` computed in
+    ``services/backtest/results.py`` -- the LEG rate. Rather than re-deriving a calendar
+    denominator here (which would silently disagree with the equity cap's year span), the leg
+    rate is rescaled by the structures/legs ratio, so the denominator is untouched and an
+    equity-only run is bit-for-bit unchanged (every equity trade is its own structure).
+
+    Falls back to the published leg rate when ``results`` carries no ``trades`` list -- the
+    signature of a re-scored DB row, since ``backtests.results`` stores the trade list in its
+    own column. Degraded (today's inflated behaviour), not broken.
+    """
+    tpy = results.get("avg_trades_per_year")
+    if tpy is None:
+        years = _years_spanned_by_curve(results.get("equity_curve"))
+        total = int(results.get("total_trades", 0) or 0)
+        tpy = (total / years) if years > 0 else None
+    if tpy is None:
+        return None
+    tpy = float(tpy)
+    trades = results.get("trades")
+    structures = _structure_count(trades)
+    if structures is None or not trades:
+        return tpy
+    return tpy * (float(structures) / float(len(trades)))
 
 
 # ---------------------------------------------------------------------------
@@ -677,11 +750,10 @@ def _consistent_annual_return(results: dict) -> float:
     base = float(base)
 
     # --- trade gate: proportional ramp toward 30 trades/yr (no hard cliff) --------------------
-    tpy = results.get("avg_trades_per_year")
-    if tpy is None:
-        years = _years_spanned_by_curve(results.get("equity_curve"))
-        total = int(results.get("total_trades", 0) or 0)
-        tpy = (total / years) if years > 0 else None
+    # STRUCTURES per year, not legs (see _trades_per_year): an iron condor is one bet the
+    # round-trip recorder emits as four rows, so the leg rate let three condors a year clear
+    # the 12/yr disqualification floor and 7.5 a year earn full credit.
+    tpy = _trades_per_year(results)
     if tpy is None:
         return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
     # Per-run objective, defaulting to the module constants. run_daily_backtest stamps these from
