@@ -1119,7 +1119,11 @@ def test_the_outcome_colour_map_covers_every_outcome_the_service_can_produce():
     assert set(wiz.OUTCOME_COLOURS) == {
         svc.OUTCOME_SUBMITTED, svc.OUTCOME_PARTIAL, svc.OUTCOME_SKIPPED,
         svc.OUTCOME_FAILED, svc.OUTCOME_WASHTRADE_LOCKED,
+        svc.OUTCOME_UNACTIONABLE,
     }
+    # ...and it must not be drawn in the grey the run uses for "nothing to do".
+    assert wiz.OUTCOME_COLOURS[svc.OUTCOME_UNACTIONABLE] != \
+        wiz.OUTCOME_COLOURS[svc.OUTCOME_SKIPPED]
 
 
 def test_the_outcome_table_warns_when_a_row_failed(nicegui_client, notifications):
@@ -1158,6 +1162,49 @@ def test_the_outcome_table_says_when_a_symbol_is_wash_trade_locked(nicegui_clien
 
     assert notifications[-1][1] == 'warning'
     assert 'wash-trade' in notifications[-1][0]
+
+
+def _unactionable_outcome():
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+    return svc.RowOutcome(
+        symbol="AAPL", action=svc.ACTION_UNACTIONABLE,
+        status=svc.OUTCOME_UNACTIONABLE, quantity=100.0, transaction_ids=[41],
+        message=svc.UNACTIONABLE_OPTION_HOLDING_FMT.format(
+            quantity=100.0, symbol="AAPL", ids="41"))
+
+
+def test_the_outcome_table_does_not_congratulate_a_run_that_could_not_act(
+        nicegui_client, notifications):
+    """Nothing failed and nothing was refused, so the old chain fell straight
+    through to the green "Allocation run submitted" -- for a run whose only row
+    was a position it could not reach. The toast is what most people read before
+    closing the dialog."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_outcomes([_unactionable_outcome()], run_id=31)
+
+    assert notifications[-1][1] == 'warning'
+    assert notifications[-1][1] != 'positive'
+    assert 'could NOT be acted on' in notifications[-1][0]
+
+
+def test_the_outcome_table_spells_out_why_a_row_could_not_be_acted_on(nicegui_client,
+                                                                     notifications):
+    """The Detail cell has to name the shares and the transaction ids: a status of
+    "unactionable" on its own sends the operator hunting."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+    with nicegui_client:
+        wiz.render_outcomes([_unactionable_outcome()], run_id=31)
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert svc.OUTCOME_UNACTIONABLE in texts
+    assert any('100 share(s) of AAPL' in t for t in texts)
+    assert any('transaction 41' in t for t in texts)
+    assert not any('nothing to do' in t for t in texts)
 
 
 # ---------------------------------------------------------------------------

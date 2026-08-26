@@ -13,6 +13,7 @@ from ba2_common.core.portfolio_allocation import (
     ACTION_CLOSE,
     ACTION_NEW,
     ACTION_SKIP,
+    ACTION_UNACTIONABLE,
     FRACTIONAL_PATH_FRACTIONAL,
     FRACTIONAL_PATH_WHOLE,
     ERROR_INVEST_AMOUNT_FMT,
@@ -1352,6 +1353,107 @@ def test_decide_symbol_action_a_suppressed_row_is_skipped_not_closed():
         reasons=[REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT.format(value=1.95, minimum=5)])
     state = PositionState(symbol="SCHD", quantity=3.0, transaction_ids=[1])
     assert decide_symbol_action(row, state) == ACTION_SKIP
+
+
+# ---------------------------------------------------------------------------
+# ACTION_UNACTIONABLE: held, and every transaction behind it is one this planner
+# will not act on. "Skipped / nothing to do" is what a symbol ALREADY at target
+# says, so an exit that CANNOT happen must not borrow those words.
+# ---------------------------------------------------------------------------
+
+def test_decide_symbol_action_a_close_of_an_option_only_holding_is_unactionable():
+    """The shares are at the broker and the user asked to exit them, but every open
+    transaction for the symbol was filtered out of ``transaction_ids`` -- an assigned
+    wheel is exactly this shape. ACTION_SKIP here reports "nothing to do" for a
+    position the run cannot touch."""
+    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-100.0,
+                        side=OrderDirection.SELL, target_quantity=0.0)
+    state = PositionState(symbol="AAPL", quantity=100.0, transaction_ids=[],
+                          unactionable_transaction_ids=[41, 42])
+    assert decide_symbol_action(row, state) == ACTION_UNACTIONABLE
+
+
+def test_decide_symbol_action_a_TRIM_of_an_option_only_holding_is_unactionable_too():
+    """Same gate, other path. A partial reduction (target still > 0) leaves ``held``
+    False in exactly the same way, so the trim went just as quiet as the close."""
+    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-40.0,
+                        side=OrderDirection.SELL, target_quantity=60.0)
+    state = PositionState(symbol="AAPL", quantity=100.0, transaction_ids=[],
+                          unactionable_transaction_ids=[41])
+    assert decide_symbol_action(row, state) == ACTION_UNACTIONABLE
+
+
+def test_decide_symbol_action_an_untracked_broker_position_is_still_a_plain_skip():
+    """DISCRIMINATOR for the ``unactionable_transaction_ids`` condition. Shares at
+    the broker with no transactions of ours AT ALL is the pre-existing long-only
+    refusal, not a filtered holding: there is nothing to name and nothing to look
+    at, so it keeps the words it had."""
+    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-100.0,
+                        side=OrderDirection.SELL, target_quantity=0.0)
+    state = PositionState(symbol="AAPL", quantity=100.0, transaction_ids=[],
+                          unactionable_transaction_ids=[])
+    assert decide_symbol_action(row, state) == ACTION_SKIP
+
+
+def test_decide_symbol_action_a_filtered_transaction_with_no_shares_held_is_a_skip():
+    """DISCRIMINATOR for the ``quantity > 0`` condition, and a real position: a
+    cash-secured put on a stock the account does not own has an open option
+    transaction and zero shares. There is no holding to be unable to sell."""
+    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-100.0,
+                        side=OrderDirection.SELL, target_quantity=0.0)
+    state = PositionState(symbol="AAPL", quantity=0.0, transaction_ids=[],
+                          unactionable_transaction_ids=[41])
+    assert decide_symbol_action(row, state) == ACTION_SKIP
+
+
+def test_decide_symbol_action_a_BUY_into_an_option_only_holding_still_opens():
+    """DISCRIMINATOR for the SELL condition. The BUY side was never broken: it
+    submits ``delta_quantity`` through a fresh equity transaction, which tops the
+    holding up correctly and cannot double-buy. Turning it into a refusal would
+    break a working path in the name of reporting."""
+    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=25.0,
+                        side=OrderDirection.BUY, target_quantity=125.0)
+    state = PositionState(symbol="AAPL", quantity=100.0, transaction_ids=[],
+                          unactionable_transaction_ids=[41])
+    assert decide_symbol_action(row, state) == ACTION_NEW
+
+
+def test_decide_symbol_action_one_equity_transaction_beside_the_options_still_trades():
+    """DISCRIMINATOR for precedence: ``held`` must win. A covered call has BOTH an
+    equity transaction and an option one, and the equity leg is perfectly
+    actionable -- routing it to the refusal would stop a rebalance that works."""
+    close = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-100.0,
+                          side=OrderDirection.SELL, target_quantity=0.0)
+    trim = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-40.0,
+                         side=OrderDirection.SELL, target_quantity=60.0)
+    state = PositionState(symbol="AAPL", quantity=100.0, transaction_ids=[7],
+                          unactionable_transaction_ids=[41])
+    assert decide_symbol_action(close, state) == ACTION_CLOSE
+    assert decide_symbol_action(trim, state) == ACTION_ADJUST
+
+
+def test_decide_symbol_action_an_already_skipped_row_keeps_its_own_reason():
+    """DISCRIMINATOR for the early return. A row the engine skipped for a REAL
+    reason -- no price, precheck refusal, a suppressed sub-minimum trim -- already
+    has something to say, and the refusal must not overwrite it with a story about
+    option transactions."""
+    state = PositionState(symbol="AAPL", quantity=100.0, transaction_ids=[],
+                          unactionable_transaction_ids=[41])
+    unpriced = AllocationRow(symbol="AAPL", price=None, delta_quantity=-100.0,
+                             side=OrderDirection.SELL, target_quantity=0.0,
+                             skipped=True, reasons=["no price - skipped"])
+    zero_delta = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=0.0,
+                               side=OrderDirection.SELL, target_quantity=100.0)
+    assert decide_symbol_action(unpriced, state) == ACTION_SKIP
+    assert decide_symbol_action(zero_delta, state) == ACTION_SKIP
+
+
+def test_the_four_submission_actions_are_distinct_strings():
+    """They are dispatched on by value in the live service and stored in the run's
+    activity JSON. Two of them collapsing onto one string would route a refusal
+    into a submission path."""
+    assert len({ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP,
+                ACTION_UNACTIONABLE}) == 5
 
 
 # ---------------------------------------------------------------------------

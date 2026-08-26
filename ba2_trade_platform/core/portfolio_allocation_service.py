@@ -23,7 +23,8 @@ from ..logger import logger
 from .db import InstanceNotFound, add_instance, get_db, get_instance, log_activity
 from .models import Transaction, TradingOrder
 from .portfolio_allocation import (
-    ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP, FRACTIONAL_PATH_WHOLE,
+    ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP, ACTION_UNACTIONABLE,
+    FRACTIONAL_PATH_WHOLE,
     AllocationPlan, BaseSnapshot, FilledTotals, MarginInfo, OrderFill,
     PositionFetchFailed, PositionState,
     apply_order_impacts, decide_symbol_action, held_no_price_block,
@@ -43,10 +44,38 @@ def _open_transaction_ids(account_id: int, symbols: List[str]) -> Dict[str, List
     Transaction has NO account_id column -- it links to an account only through
     ``TradingOrder.account_id``, hence the join. Ordering is by primary key,
     which is creation order, so submission can consume them FIFO.
+
+    The ELIGIBLE half of ``_partition_open_transaction_ids``; see there for the
+    filter and for why the rejected half is kept rather than dropped.
+    """
+    return _partition_open_transaction_ids(account_id, symbols)[0]
+
+
+def _partition_open_transaction_ids(
+        account_id: int, symbols: List[str]) -> Tuple[Dict[str, List[int]], Dict[str, List[int]]]:
+    """Split this account's open transactions into the ones the equity planner may
+    act on and the ones it may not.
+
+    Returns:
+        Tuple[Dict[str, List[int]], Dict[str, List[int]]]: ``(eligible,
+        unactionable)``, each ``{symbol: [transaction_id]}`` oldest first, each
+        holding only the symbols that have any. Together they are every
+        OPENED/CLOSING transaction the query found, so a symbol missing from BOTH
+        really has none.
+
+    The second dict exists ONLY so a filtered-out holding can still be described.
+    Nothing downstream may trade from it: ``build_position_states`` puts it on
+    ``PositionState.unactionable_transaction_ids``, which no submission path
+    walks. Dropping it on the floor is what made a symbol whose only transactions
+    are option-classed report "nothing to do" for shares the user had asked to
+    sell -- ``decide_symbol_action`` gates "held" on the ELIGIBLE list, so the
+    filter changed the ACTION and not merely the ids, and ACTION_SKIP's message
+    is the one an untouched symbol gets.
     """
     if not symbols:
-        return {}
+        return {}, {}
     out: Dict[str, List[int]] = {}
+    rejected: Dict[str, List[int]] = {}
     with get_db() as session:
         statement = select(Transaction).join(TradingOrder).where(
             TradingOrder.account_id == account_id,
@@ -77,9 +106,14 @@ def _open_transaction_ids(account_id: int, symbols: List[str]) -> Dict[str, List
             # can fall out. option_lifecycle_service._open_option_transactions already filters
             # on exactly this column; allocation was the caller that skipped it.
             if txn.asset_class != AssetClass.EQUITY:
+                # Remembered, never routed. The row is a real position in this
+                # symbol and the operator has to be able to see WHY the equity
+                # planner did nothing about it.
+                rejected.setdefault(txn.symbol, []).append(txn.id)
                 continue
             out.setdefault(txn.symbol, []).append(txn.id)
-    return {symbol: sorted(ids) for symbol, ids in out.items()}
+    return ({symbol: sorted(ids) for symbol, ids in out.items()},
+            {symbol: sorted(ids) for symbol, ids in rejected.items()})
 
 
 def build_position_states(account, symbols: List[str]) -> Dict[str, PositionState]:
@@ -88,6 +122,12 @@ def build_position_states(account, symbols: List[str]) -> Dict[str, PositionStat
     A managed symbol with no position is returned FLAT (quantity 0) but priced,
     so the wizard can open a position in it. A symbol with no price keeps
     ``price=None`` and the engine will skip it with a reason.
+
+    ``transaction_ids`` carries only what this planner may act on;
+    ``unactionable_transaction_ids`` carries what the equity filter held back
+    (see ``_partition_open_transaction_ids``). Both are populated from ONE query,
+    so a symbol can never appear to have no transactions merely because the
+    second read raced the first.
 
     **Shorts come back signed negative**, via the pure engine's
     ``signed_position_values`` -- the SAME call the page's
@@ -128,7 +168,7 @@ def build_position_states(account, symbols: List[str]) -> Dict[str, PositionStat
     prices = account.get_instrument_current_price(wanted) if wanted else {}
     if not isinstance(prices, dict):
         prices = {}
-    txn_ids = _open_transaction_ids(account.id, wanted)
+    txn_ids, unactionable_ids = _partition_open_transaction_ids(account.id, wanted)
 
     states: Dict[str, PositionState] = {}
     for symbol in wanted:
@@ -146,6 +186,7 @@ def build_position_states(account, symbols: List[str]) -> Dict[str, PositionStat
             price=prices.get(symbol),
             market_value=market_value,
             transaction_ids=list(txn_ids.get(symbol, [])),
+            unactionable_transaction_ids=list(unactionable_ids.get(symbol, [])),
         )
     return states
 
@@ -243,6 +284,45 @@ OUTCOME_PARTIAL = "partially_filled"
 OUTCOME_SKIPPED = "skipped"
 OUTCOME_FAILED = "failed"
 OUTCOME_WASHTRADE_LOCKED = "washtrade_locked"
+
+#: The account holds the shares, the user asked to sell them, and this planner
+#: has no route to them: every open transaction behind the position is one it
+#: does not act on (live: option-classed). Its own status rather than
+#: OUTCOME_SKIPPED, and that distinction is the whole point -- "skipped /
+#: nothing to do" is what a symbol ALREADY at target says, so an exit that
+#: cannot happen and an exit that does not need to happen read identically. It
+#: is not OUTCOME_FAILED either: nothing was refused, nothing was sent, and no
+#: retry will help. A human has to look.
+OUTCOME_UNACTIONABLE = "unactionable"
+
+#: The whole of an unactionable row's Detail cell. Names the share count, the
+#: reason and the transaction ids, because "unactionable" alone sends the
+#: operator looking through the transactions list for something to notice.
+UNACTIONABLE_OPTION_HOLDING_FMT = (
+    "{quantity:g} share(s) of {symbol} are held at the broker, but every open "
+    "transaction for the symbol is an OPTION (transaction {ids}). The equity "
+    "allocation planner does not act on option transactions, so NOTHING was "
+    "submitted and the position is unchanged. Unwind those transaction(s) by "
+    "hand, or re-run once they are closed.")
+
+#: Appended to a CLOSE or ADJUST row that DID trade, when some of the symbol's
+#: open transactions were filtered out of it. Before the equity filter those
+#: legs were in the list and failed loudly; now they are simply absent, so a
+#: "set AAPL to 0%" run over a covered call reported a clean green ``submitted``
+#: with an empty Detail. The shares moved and the option did not, and that is
+#: exactly the fact the row stopped mentioning.
+UNACTED_OPTION_LEGS_FMT = (
+    "note: {count} open OPTION transaction(s) on {symbol} (transaction {ids}) "
+    "were NOT part of this row - the equity planner leaves them alone, so "
+    "anything these shares were covering is still open")
+
+
+def _txn_id_list(ids: List[int]) -> str:
+    """``[41, 42]`` -> ``"41, 42"``. Never an empty string: both callers are
+    guarded on a non-empty list, and a message that named no ids would be the
+    silence this whole path exists to remove."""
+    return ", ".join(str(i) for i in ids)
+
 
 #: Statuses that mean the broker took the order and is NOT going to work it any
 #: further. The adapter returning an OBJECT is not the same as the broker
@@ -451,18 +531,76 @@ def _submit_row(account, row, state, *, run_tag: str, allow_fractional: bool,
         if action == ACTION_SKIP:
             return RowOutcome(symbol=row.symbol, action=ACTION_SKIP, status=OUTCOME_SKIPPED,
                               message="; ".join(row.reasons) or "nothing to do")
+        if action == ACTION_UNACTIONABLE:
+            return _unactionable_row(row, state)
         if action == ACTION_CLOSE:
-            return _close_symbol(account, row, state, on_order_id=on_order_id)
+            return _note_unacted_legs(
+                _close_symbol(account, row, state, on_order_id=on_order_id), state)
         if action == ACTION_ADJUST:
-            return _adjust_symbol(account, row, state, on_order_id=on_order_id)
-        return _open_symbol(account, row, run_tag=run_tag,
-                            allow_fractional=allow_fractional, on_order_id=on_order_id)
+            return _note_unacted_legs(
+                _adjust_symbol(account, row, state, on_order_id=on_order_id), state)
+        if action == ACTION_NEW:
+            return _open_symbol(account, row, run_tag=run_tag,
+                                allow_fractional=allow_fractional, on_order_id=on_order_id)
+        # An action this function does not recognise must NOT fall through to
+        # _open_symbol, which BUYS. The backstop below turns this into a FAILED
+        # row, which is the right answer for "the engine asked for something we
+        # cannot do".
+        raise ValueError(f"unknown allocation action {action!r} for {row.symbol}")
     except Exception as e:
         # Backstop only -- every branch below catches its own IO per unit of work,
         # so that one dead transaction does not abandon the rest of the symbol.
         logger.error(f"Allocation submission failed for {row.symbol}: {e}", exc_info=True)
         return RowOutcome(symbol=row.symbol, action=action, status=OUTCOME_FAILED,
                           message=str(e) or e.__class__.__name__)
+
+
+def _unactionable_row(row, state) -> RowOutcome:
+    """The loud outcome for a holding this planner has no route to.
+
+    ``quantity`` is the shares the BROKER reports, not what was sent -- nothing
+    was sent -- because the size of the thing that did not happen is the first
+    question anyone reading the table asks. ``transaction_ids`` carries the
+    option ids so the run's activity-log JSON keeps them too, not just the
+    sentence.
+
+    ``float(state.quantity)`` with NO ``or 0.0``: ``decide_symbol_action`` only
+    reaches this branch once it has established the quantity is a number greater
+    than zero, and a message whose whole job is to name the size of an
+    unreachable holding must not be able to say "0 share(s)".
+    """
+    ids = list(state.unactionable_transaction_ids)
+    shares = abs(float(state.quantity))
+    logger.warning(
+        f"Allocation: {row.symbol} is held ({shares}) but every open transaction "
+        f"for it is one the equity planner does not act on "
+        f"(transaction {_txn_id_list(ids)}); NOTHING was submitted for this row"
+    )
+    return RowOutcome(
+        symbol=row.symbol, action=ACTION_UNACTIONABLE, status=OUTCOME_UNACTIONABLE,
+        quantity=shares,
+        transaction_ids=ids,
+        message=UNACTIONABLE_OPTION_HOLDING_FMT.format(
+            quantity=shares, symbol=row.symbol, ids=_txn_id_list(ids)),
+    )
+
+
+def _note_unacted_legs(outcome: RowOutcome, state) -> RowOutcome:
+    """Append the "and these were left alone" note to a row that DID trade.
+
+    The status is deliberately untouched. The equity sale really was submitted,
+    and calling that a partial failure would make every ordinary rebalance of a
+    covered-call symbol look broken; what was missing was the SENTENCE. Mutated
+    in place rather than rebuilt so no field of the real outcome can be lost in
+    a copy.
+    """
+    ids = list(getattr(state, "unactionable_transaction_ids", None) or [])
+    if not ids:
+        return outcome
+    note = UNACTED_OPTION_LEGS_FMT.format(count=len(ids), symbol=outcome.symbol,
+                                          ids=_txn_id_list(ids))
+    outcome.message = f"{outcome.message}; {note}" if outcome.message else note
+    return outcome
 
 
 def _leg_status(succeeded: float, failed: int) -> str:
@@ -1050,7 +1188,7 @@ def get_open_income_total(account_id: int) -> float:
 RUN_ACTIVITY_FMT = (
     "Portfolio allocation run {run_id} ({scope}): {submitted} submitted, "
     "{partial} partially filled, {locked} wash-trade locked, {failed} failed, "
-    "{skipped} skipped")
+    "{unactionable} unactionable, {skipped} skipped")
 
 #: What the run really MOVED, appended to the line above. Submitted counts say
 #: how many orders went out; only this says how much money did.
@@ -1497,14 +1635,16 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
 
     counts = {status: sum(1 for o in outcomes if o.status == status)
               for status in (OUTCOME_SUBMITTED, OUTCOME_PARTIAL, OUTCOME_WASHTRADE_LOCKED,
-                             OUTCOME_FAILED, OUTCOME_SKIPPED)}
+                             OUTCOME_FAILED, OUTCOME_UNACTIONABLE, OUTCOME_SKIPPED)}
     failed = counts[OUTCOME_FAILED]
     reached_the_broker = counts[OUTCOME_SUBMITTED] + counts[OUTCOME_PARTIAL]
     # A PARTIAL row is not a success even with nothing FAILED beside it: a close
     # where 2 of 3 transactions went out, or an order the broker part-filled,
     # leaves the account somewhere the user never approved. The one-line summary
     # is all most people read, and SUCCESS on it would end the conversation.
-    if not failed and not counts[OUTCOME_PARTIAL]:
+    # An UNACTIONABLE row is on the same side of that line: the user asked to
+    # exit a position and the run had no route to it.
+    if not failed and not counts[OUTCOME_PARTIAL] and not counts[OUTCOME_UNACTIONABLE]:
         severity = ActivityLogSeverity.SUCCESS
     elif reached_the_broker:
         severity = ActivityLogSeverity.WARNING
@@ -1519,6 +1659,7 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
         partial=counts[OUTCOME_PARTIAL],
         locked=counts[OUTCOME_WASHTRADE_LOCKED],
         failed=failed,
+        unactionable=counts[OUTCOME_UNACTIONABLE],
         skipped=counts[OUTCOME_SKIPPED])
     description += RUN_FILLED_FMT.format(buys=totals.buy_value, sells=totals.sell_value)
     if not refreshed:

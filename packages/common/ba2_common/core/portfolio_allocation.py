@@ -136,6 +136,7 @@ __all__ = [
     "BUMP_NOTICE_FMT", "REDISTRIBUTION_NOTICE_FMT",
     # submission
     "ACTION_ADJUST", "ACTION_CLOSE", "ACTION_NEW", "ACTION_SKIP",
+    "ACTION_UNACTIONABLE",
     "decide_symbol_action", "split_delta_fifo",
     "FRACTIONAL_PATH_FRACTIONAL", "FRACTIONAL_PATH_WHOLE", "plan_quantity_attempts",
 ]
@@ -444,6 +445,17 @@ class PositionState:
 
     ``transaction_ids`` are the OPEN Transaction ids for the symbol, oldest
     first -- submission consumes them FIFO.
+
+    ``unactionable_transaction_ids`` are the open Transaction ids the caller
+    DELIBERATELY left out of ``transaction_ids``: real positions in this symbol
+    that this planner will not act on. Live, that is the option-classed ones
+    (``portfolio_allocation_service._open_transaction_ids`` keeps EQUITY only,
+    because an option Transaction's ``symbol`` is the UNDERLYING ticker and the
+    equity planner would otherwise read a covered call as a holding of the
+    stock). They are carried rather than discarded because an EMPTY
+    ``transaction_ids`` has two completely different meanings -- "we hold nothing
+    of ours here" and "everything we hold here is invisible to this planner" --
+    and the second one has to be able to speak. See ``decide_symbol_action``.
     """
     symbol: str
     quantity: float = 0.0
@@ -451,6 +463,7 @@ class PositionState:
     price: Optional[float] = None
     market_value: Optional[float] = None
     transaction_ids: List[int] = field(default_factory=list)
+    unactionable_transaction_ids: List[int] = field(default_factory=list)
 
 
 #: ``Position.side`` spellings meaning "this is a SHORT". ``OrderDirection`` is a
@@ -3224,10 +3237,14 @@ ACTION_ADJUST = "adjust"   # held, target > 0, delta != 0 -> adjust_quantity_wit
 ACTION_CLOSE = "close"     # held, target == 0            -> close_transaction
 ACTION_NEW = "new"         # not held, target > 0         -> new TradingOrder
 ACTION_SKIP = "skip"       # nothing to do (or nothing we are willing to do)
+#: Held at the broker, and every open transaction behind it is one this planner
+#: does not act on -- so the SELL cannot be routed at all. NOT a skip: see
+#: ``decide_symbol_action``.
+ACTION_UNACTIONABLE = "unactionable"
 
 
 def decide_symbol_action(row: "AllocationRow", state: Optional["PositionState"]) -> str:
-    """Which of the three submission paths this row takes (decision 14). Pure.
+    """Which of the four submission paths this row takes (decision 14). Pure.
 
     Long-only: a SELL on a symbol we do not hold would open a short, so it is
     skipped rather than submitted. A row that the engine already marked
@@ -3239,13 +3256,38 @@ def decide_symbol_action(row: "AllocationRow", state: Optional["PositionState"])
     be adjusted, because the adjust path resizes a transaction. A BUY there opens
     a fresh transaction; a SELL is refused rather than trimming a position this
     platform does not track.
+
+    ``ACTION_UNACTIONABLE`` splits that last refusal in two. A SELL on a symbol
+    with an EMPTY ``transaction_ids`` used to be one case -- "we do not track
+    this position" -- and it now has a second, created by the caller's own
+    filtering: the transactions exist, we DO track them, and they were held back
+    because this planner will not act on them (live: option-classed, per
+    ``PositionState.unactionable_transaction_ids``). An assigned wheel is exactly
+    that shape, so it is not a corner case. Reporting it as ACTION_SKIP told the
+    operator "nothing to do" about shares they had just asked to sell -- the same
+    words a symbol already at target gets. The caller must say something else.
+
+    BUY is deliberately untouched by it: topping a holding up submits
+    ``row.delta_quantity`` through a brand new equity transaction, which is
+    correct and cannot double-buy. Only the SELL side has nowhere to go.
+
+    ``held`` still wins over it, so a symbol with one equity transaction and one
+    option transaction closes or trims the equity exactly as before.
     """
     if row.skipped or row.side is None or row.delta_quantity == 0:
         return ACTION_SKIP
 
-    held = state is not None and (state.quantity or 0.0) > 0 and bool(state.transaction_ids)
+    # ONE reading of "there is a position here", shared by both tests below, so
+    # they can never come to disagree about what that means.
+    at_the_broker = state is not None and (state.quantity or 0.0) > 0
+
+    held = at_the_broker and bool(state.transaction_ids)
     if held:
         return ACTION_CLOSE if row.target_quantity <= 0 else ACTION_ADJUST
+
+    if (row.side == OrderDirection.SELL and at_the_broker
+            and bool(state.unactionable_transaction_ids)):
+        return ACTION_UNACTIONABLE
 
     return ACTION_NEW if row.side == OrderDirection.BUY else ACTION_SKIP
 

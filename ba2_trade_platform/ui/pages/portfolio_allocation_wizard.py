@@ -98,6 +98,7 @@ from ...core.portfolio_allocation_service import (
     OUTCOME_PARTIAL,
     OUTCOME_SKIPPED,
     OUTCOME_SUBMITTED,
+    OUTCOME_UNACTIONABLE,
     OUTCOME_WASHTRADE_LOCKED,
 )
 from ...logger import logger
@@ -1203,6 +1204,9 @@ OUTCOME_COLOURS = {
     OUTCOME_PARTIAL: 'text-yellow-500',
     OUTCOME_SKIPPED: 'text-gray-400',
     OUTCOME_WASHTRADE_LOCKED: 'text-orange-400',
+    # NOT the grey of SKIPPED, which is the whole reason this status exists: the
+    # position is held, the user asked to exit it and the run had no route to it.
+    OUTCOME_UNACTIONABLE: 'text-red-400',
     OUTCOME_FAILED: 'text-red-500',
 }
 
@@ -1248,9 +1252,17 @@ def render_outcomes(outcomes: List, *, run_id: Optional[int] = None) -> None:
     dialog.open()
 
     failed = sum(1 for o in outcomes if o.status == OUTCOME_FAILED)
+    unactionable = sum(1 for o in outcomes if o.status == OUTCOME_UNACTIONABLE)
     locked = sum(1 for o in outcomes if o.status == OUTCOME_WASHTRADE_LOCKED)
     if failed:
         ui.notify(f'{failed} row(s) failed - see the results table', type='warning')
+    elif unactionable:
+        # Ahead of the lock and, above all, ahead of the positive toast. Nothing
+        # was refused and nothing was sent, so without this the user closes a
+        # dialog full of grey rows on a green "submitted" while the position they
+        # asked to exit is untouched.
+        ui.notify(f'{unactionable} row(s) could NOT be acted on - the position is '
+                  f'still open; see the results table', type='warning')
     elif locked:
         # Not a failure: the order is PENDING at our end and is retried once the
         # blocker clears. Saying nothing would leave the user believing it traded.

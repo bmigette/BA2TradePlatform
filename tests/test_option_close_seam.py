@@ -246,8 +246,12 @@ class TestAllocationExcludesOptions:
         import inspect
         from ba2_trade_platform.core import portfolio_allocation_service as svc
 
+        # ``_partition_open_transaction_ids``, not ``_open_transaction_ids``: the
+        # latter is now the thin "eligible half" accessor and carries no comparison
+        # at all, so reading it would leave this tripwire matching an empty string.
         code = "\n".join(
-            line for line in inspect.getsource(svc._open_transaction_ids).splitlines()
+            line for line in
+            inspect.getsource(svc._partition_open_transaction_ids).splitlines()
             if not line.strip().startswith("#"))
 
         assert "txn.asset_class != AssetClass.EQUITY" in code, (
@@ -275,6 +279,125 @@ class TestAllocationExcludesOptions:
 
         assert states["AAPL"].transaction_ids == [equity.id]
         assert option.id not in states["AAPL"].transaction_ids
+
+    def test_the_filtered_option_is_carried_so_the_row_can_still_describe_it(self):
+        """Excluded from the PLAN, not from the REPORT. ``transaction_ids`` and
+        ``unactionable_transaction_ids`` come from one query and are disjoint, so a
+        row that could not act can still name what stopped it."""
+        from ba2_trade_platform.core import portfolio_allocation_service as svc
+        acct_def = create_account_definition()
+        equity, option = _open_equity_and_option(acct_def.id)
+        account = _FakeAccount(
+            acct_def.id,
+            positions=[_FakePosition("AAPL", 100.0, 15000.0, 16000.0)],
+            prices={"AAPL": 160.0},
+        )
+
+        states = svc.build_position_states(account, ["AAPL"])
+
+        assert states["AAPL"].transaction_ids == [equity.id]
+        assert states["AAPL"].unactionable_transaction_ids == [option.id]
+
+    def test_a_symbol_with_only_equity_carries_no_unactionable_ids(self):
+        """DISCRIMINATOR: the second list must stay EMPTY for an ordinary holding,
+        or every equity close would grow a note about options it does not have."""
+        from ba2_trade_platform.core import portfolio_allocation_service as svc
+        acct_def = create_account_definition()
+        equity = create_transaction(symbol="AAPL", quantity=100.0)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+                             transaction_id=equity.id, status=OrderStatus.FILLED,
+                             filled_qty=100.0)
+        account = _FakeAccount(
+            acct_def.id,
+            positions=[_FakePosition("AAPL", 100.0, 15000.0, 16000.0)],
+            prices={"AAPL": 160.0},
+        )
+
+        states = svc.build_position_states(account, ["AAPL"])
+
+        assert states["AAPL"].transaction_ids == [equity.id]
+        assert states["AAPL"].unactionable_transaction_ids == []
+
+
+class TestAnAssignedWheelIsNotNothingToDo:
+    """OPT-L2, the reporting half.
+
+    The equity filter is right and stays. What it also did was make a whole class
+    of holding INVISIBLE: ``decide_symbol_action`` gates "held" on the eligible
+    list, so a symbol whose only transactions are option-classed stopped being
+    held, took the SKIP path, and reported ``skipped: nothing to do`` for shares
+    the user had just asked to sell. The migration that introduced the column
+    documents the shape (alembic b2f4c81d6a35: "ANY OPTION LEG WINS ... an
+    assigned wheel, once the equity fill that settles an exercised short put is
+    recorded under the same transaction, is OPTION"), and the live database holds
+    20 such transactions, 13 of them open.
+    """
+
+    @staticmethod
+    def _assigned_wheel(account_id, symbol="AAPL", shares=100.0):
+        """One OPTION-classed transaction holding `shares` of the underlying.
+
+        No equity transaction at all: the equity fill that settled the exercised
+        short put was recorded under the option transaction, so the whole holding
+        is invisible to the equity planner.
+        """
+        txn = create_transaction(symbol=symbol, quantity=shares,
+                                 side=OrderDirection.SELL,
+                                 asset_class=AssetClass.OPTION)
+        create_trading_order(account_id=account_id, symbol=symbol, quantity=shares,
+                             transaction_id=txn.id, side=OrderDirection.SELL,
+                             status=OrderStatus.FILLED, filled_qty=shares,
+                             asset_class=AssetClass.OPTION,
+                             contract_symbol="AAPL260116P00250000")
+        return txn
+
+    def _state(self, acct_def):
+        from ba2_trade_platform.core import portfolio_allocation_service as svc
+        account = _FakeAccount(
+            acct_def.id,
+            positions=[_FakePosition("AAPL", 100.0, 15000.0, 16000.0)],
+            prices={"AAPL": 160.0},
+        )
+        return svc.build_position_states(account, ["AAPL"])["AAPL"]
+
+    def test_the_holding_is_invisible_to_the_plan_but_not_to_the_report(self):
+        acct_def = create_account_definition()
+        wheel = self._assigned_wheel(acct_def.id)
+
+        state = self._state(acct_def)
+
+        # The broker's 100 shares are real and the planner still sizes against
+        # them; it simply has no transaction it may route them through.
+        assert state.quantity == 100.0
+        assert state.transaction_ids == []
+        assert state.unactionable_transaction_ids == [wheel.id]
+
+    def test_setting_it_to_zero_percent_reports_the_refusal_not_nothing_to_do(self):
+        """End to end, from the real rows: DB -> build_position_states ->
+        submit_plan. The run must not tell the operator "nothing to do" about 100
+        shares it cannot reach."""
+        from ba2_trade_platform.core import portfolio_allocation_service as svc
+        from ba2_trade_platform.core.portfolio_allocation import (
+            AllocationPlan, AllocationRow,
+        )
+        acct_def = create_account_definition()
+        wheel = self._assigned_wheel(acct_def.id)
+        account = MockAccount(acct_def.id)
+        submitted, canceled = _record_broker_calls(account)
+        exit_row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-100.0,
+                                 side=OrderDirection.SELL, estimated_value=16000.0,
+                                 target_quantity=0.0)
+        plan = AllocationPlan(rows=[exit_row], available_buying_power=10_000.0)
+
+        outcomes = svc.submit_plan(account, plan, {"AAPL": self._state(acct_def)},
+                                   run_tag="opt-l2", allow_fractional=False)
+
+        assert submitted == [] and canceled == []
+        assert outcomes[0].status == svc.OUTCOME_UNACTIONABLE
+        assert outcomes[0].status != svc.OUTCOME_SKIPPED
+        assert "nothing to do" not in outcomes[0].message
+        assert "100 share(s) of AAPL" in outcomes[0].message
+        assert str(wheel.id) in outcomes[0].message
 
 
 # ===========================================================================

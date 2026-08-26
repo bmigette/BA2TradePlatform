@@ -1442,6 +1442,266 @@ def test_submit_plan_refuses_a_plan_solved_on_a_different_fractional_setting():
 
 
 # ---------------------------------------------------------------------------
+# submit_plan -- the UNACTIONABLE branch
+#
+# The equity filter (OPT-L2) keeps option transactions out of
+# ``PositionState.transaction_ids``, and ``decide_symbol_action`` gates "held" on
+# that list -- so for a symbol whose only transactions are option-classed the
+# filter changed the ACTION, not merely the ids walked. The run then had nothing
+# to do AND said "nothing to do", which is what a symbol already at target says.
+# An assigned wheel is exactly that shape: 20 such transactions in the live DB,
+# 13 of them open.
+# ---------------------------------------------------------------------------
+
+def _option_only_state(symbol="AAPL", shares=100.0, price=160.0, option_ids=(41, 42)):
+    """100 shares at the broker, and every transaction behind them filtered out.
+
+    ``transaction_ids`` EMPTY is what ``build_position_states`` produces for an
+    assigned wheel once the equity filter has run.
+    """
+    return PositionState(symbol=symbol, quantity=shares, price=price,
+                         transaction_ids=[],
+                         unactionable_transaction_ids=list(option_ids))
+
+
+def _exit_row(symbol="AAPL", delta=-100.0, target=0.0, price=160.0):
+    row = make_row(symbol, OrderDirection.SELL, delta, abs(delta) * price, 0.0,
+                   price=price)
+    row.target_quantity = target
+    return row
+
+
+def test_submit_plan_an_exit_the_equity_planner_cannot_route_is_not_nothing_to_do():
+    """The account holds the shares, the user set the label to 0%, and every open
+    transaction for the symbol is one this planner does not act on. Reporting that
+    as "skipped: nothing to do" is the unknown-reads-as-zero pattern wearing a UI
+    label -- the run cannot act, and says what it would say if there were nothing
+    to act on."""
+    account = FakeAccount(account_id=700)
+    account.positions = [FakePosition("AAPL", 100.0, 15_000.0, 16_000.0)]
+    plan = AllocationPlan(rows=[_exit_row()], available_buying_power=10_000.0)
+
+    outcomes = svc.submit_plan(account, plan, {"AAPL": _option_only_state()},
+                               run_tag="701", allow_fractional=False)
+
+    assert account.submitted == [] and account.closed == [] and account.events == []
+    assert outcomes[0].status == svc.OUTCOME_UNACTIONABLE
+    assert outcomes[0].status != svc.OUTCOME_SKIPPED
+    assert outcomes[0].action == svc.ACTION_UNACTIONABLE
+    # The size of the thing that did not happen, and the ids to go and look at.
+    assert outcomes[0].quantity == pytest.approx(100.0)
+    assert outcomes[0].transaction_ids == [41, 42]
+    message = outcomes[0].message
+    assert "nothing to do" not in message
+    assert "100 share(s) of AAPL" in message
+    assert "OPTION" in message
+    assert "41, 42" in message
+
+
+def test_submit_plan_the_same_exit_without_the_filtered_ids_is_the_OLD_silence():
+    """The BEFORE, pinned. Identical broker shares, identical row, identical empty
+    ``transaction_ids`` -- the ONLY difference is that the filtered-out ids were
+    thrown away instead of carried. That one field is what separated "the account
+    holds 100 shares this run cannot reach" from "nothing to do", and dropping it
+    again brings the silence straight back."""
+    account = FakeAccount(account_id=702)
+    account.positions = [FakePosition("AAPL", 100.0, 15_000.0, 16_000.0)]
+    plan = AllocationPlan(rows=[_exit_row()], available_buying_power=10_000.0)
+    forgotten = PositionState(symbol="AAPL", quantity=100.0, price=160.0,
+                              transaction_ids=[], unactionable_transaction_ids=[])
+
+    outcomes = svc.submit_plan(account, plan, {"AAPL": forgotten},
+                               run_tag="703", allow_fractional=False)
+
+    assert outcomes[0].status == svc.OUTCOME_SKIPPED
+    assert outcomes[0].message == "nothing to do"
+
+
+def test_submit_plan_a_TRIM_of_an_option_only_holding_is_unactionable_too():
+    """The trim path shares the defect, because it shares the gate: ``held`` is
+    False for the same reason, so "reduce AAPL to 60%" went just as quiet as "set
+    AAPL to 0%". ``target_quantity`` is what tells the two apart, and neither of
+    them can be routed."""
+    account = FakeAccount(account_id=704)
+    account.positions = [FakePosition("AAPL", 100.0, 15_000.0, 16_000.0)]
+    row = _exit_row(delta=-40.0, target=60.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    outcomes = svc.submit_plan(account, plan, {"AAPL": _option_only_state()},
+                               run_tag="705", allow_fractional=False)
+
+    assert account.submitted == [] and account.closed == []
+    assert outcomes[0].status == svc.OUTCOME_UNACTIONABLE
+    assert "100 share(s) of AAPL" in outcomes[0].message
+
+
+def test_submit_plan_a_row_already_at_target_stays_quiet_even_with_options_behind_it():
+    """DISCRIMINATOR. A row at target has a zero delta and no side, and there is
+    nothing wrong with it -- even on a symbol that DOES carry filtered-out option
+    transactions. Turning every such row loud would bury the one that matters."""
+    account = FakeAccount(account_id=706)
+    account.positions = [FakePosition("AAPL", 100.0, 15_000.0, 16_000.0)]
+    at_target = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=0.0,
+                              side=None, current_quantity=100.0, target_quantity=100.0)
+    plan = AllocationPlan(rows=[at_target], available_buying_power=10_000.0)
+
+    outcomes = svc.submit_plan(account, plan, {"AAPL": _option_only_state()},
+                               run_tag="707", allow_fractional=False)
+
+    assert outcomes[0].status == svc.OUTCOME_SKIPPED
+    assert outcomes[0].message == "no delta"
+
+
+def test_submit_plan_a_genuine_nothing_to_do_still_reads_as_nothing_to_do():
+    """DISCRIMINATOR, and the exact sentence the loud path must not borrow. A SELL
+    on a symbol the account is FLAT in reaches ``_submit_row``, decides SKIP and
+    has no reason of its own -- there is genuinely nothing to sell and nothing to
+    look at, so "nothing to do" is the truth here and must stay."""
+    account = FakeAccount(account_id=720)
+    account.positions = []
+    plan = AllocationPlan(rows=[_exit_row()], available_buying_power=10_000.0)
+    flat = PositionState(symbol="AAPL", quantity=0.0, price=160.0)
+
+    outcomes = svc.submit_plan(account, plan, {"AAPL": flat}, run_tag="721",
+                               allow_fractional=False)
+
+    assert account.submitted == [] and account.closed == []
+    assert outcomes[0].status == svc.OUTCOME_SKIPPED
+    assert outcomes[0].message == "nothing to do"
+
+
+def test_submit_plan_a_normal_equity_close_says_nothing_about_options():
+    """DISCRIMINATOR. No transaction was filtered out, so there is nothing to
+    mention: the row keeps the clean empty Detail it has always had. A note that
+    appeared on every close would stop being read by the second run."""
+    account = FakeAccount(account_id=708)
+    account.positions = [FakePosition("AAPL", 100.0, 15_000.0, 16_000.0)]
+    txn_id = make_open_transaction(708, "AAPL", 100.0)
+    plan = AllocationPlan(rows=[_exit_row()], available_buying_power=10_000.0)
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=100.0, price=160.0,
+                                     transaction_ids=[txn_id])}
+
+    outcomes = svc.submit_plan(account, plan, current, run_tag="709",
+                               allow_fractional=False)
+
+    assert account.closed == [txn_id]
+    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    assert outcomes[0].message == ""
+
+
+def test_submit_plan_a_close_that_leaves_option_legs_behind_says_so():
+    """The covered-call tell, restored. Before the equity filter this row reported
+    ``partially_filled`` with the option refusal spelled out; after it, a clean
+    green ``submitted`` with an empty Detail, because the leg was no longer in the
+    list to fail on. The shares moved and the option did not, and that is the fact
+    the row stopped mentioning. The STATUS is untouched -- the equity sale really
+    was submitted."""
+    account = FakeAccount(account_id=710)
+    account.positions = [FakePosition("AAPL", 100.0, 15_000.0, 16_000.0)]
+    txn_id = make_open_transaction(710, "AAPL", 100.0)
+    plan = AllocationPlan(rows=[_exit_row()], available_buying_power=10_000.0)
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=100.0, price=160.0,
+                                     transaction_ids=[txn_id],
+                                     unactionable_transaction_ids=[41])}
+
+    outcomes = svc.submit_plan(account, plan, current, run_tag="711",
+                               allow_fractional=False)
+
+    assert account.closed == [txn_id]
+    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    assert "1 open OPTION transaction(s) on AAPL" in outcomes[0].message
+    assert "41" in outcomes[0].message
+    assert "still open" in outcomes[0].message
+
+
+def test_submit_plan_a_TRIM_that_leaves_option_legs_behind_says_so_as_well():
+    """Same note on the ADJUST path: a partial reduction of a covered-call symbol
+    sells part of the cover and leaves the option exactly where it was."""
+    account = FakeAccount(account_id=712)
+    account.positions = [FakePosition("AAPL", 100.0, 15_000.0, 16_000.0)]
+    txn_id = make_open_transaction(712, "AAPL", 100.0)
+    row = _exit_row(delta=-40.0, target=60.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=100.0, price=160.0,
+                                     transaction_ids=[txn_id],
+                                     unactionable_transaction_ids=[41])}
+
+    outcomes = svc.submit_plan(account, plan, current, run_tag="713",
+                               allow_fractional=False)
+
+    assert outcomes[0].action == ACTION_ADJUST
+    assert "1 open OPTION transaction(s) on AAPL" in outcomes[0].message
+
+
+def test_submit_plan_a_BUY_into_an_option_only_holding_still_opens():
+    """DISCRIMINATOR. Only the SELL side had nowhere to go: a top-up submits
+    ``delta_quantity`` through a brand new equity transaction, which is correct
+    and cannot double-buy. Refusing it would break a working path for the sake of
+    a message."""
+    account = FakeAccount(account_id=714)
+    account.positions = [FakePosition("AAPL", 100.0, 15_000.0, 16_000.0)]
+    buy = make_row("AAPL", OrderDirection.BUY, 25.0, 4_000.0, 4_000.0, price=160.0)
+    buy.target_quantity = 125.0
+    plan = AllocationPlan(rows=[buy], available_buying_power=10_000.0)
+
+    outcomes = svc.submit_plan(account, plan, {"AAPL": _option_only_state()},
+                               run_tag="715", allow_fractional=False)
+
+    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    assert outcomes[0].action == ACTION_NEW
+    assert [(s, q) for s, _side, q, _c in account.submitted] == [("AAPL", 25.0)]
+
+
+def test_submit_row_never_falls_through_to_a_BUY_on_an_action_it_does_not_know(
+        monkeypatch):
+    """The dispatch used to END in ``return _open_symbol(...)``, so any action the
+    chain did not recognise placed a MARKET BUY. With a fourth action now in the
+    vocabulary that fall-through is a live hazard, not a hypothetical."""
+    account = FakeAccount(account_id=716)
+    account.positions = []
+    monkeypatch.setattr(svc, "decide_symbol_action", lambda row, state: "banana")
+    plan = AllocationPlan(rows=[_exit_row()], available_buying_power=10_000.0)
+
+    outcomes = svc.submit_plan(account, plan, {"AAPL": _option_only_state()},
+                               run_tag="717", allow_fractional=False)
+
+    assert account.submitted == []
+    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert "banana" in outcomes[0].message
+
+
+def test_run_allocation_names_an_unactionable_row_in_the_one_line_summary(activity):
+    """The activity line is all most people read, and it names every outcome the
+    vocabulary has for exactly this reason. A run whose only row could not be
+    acted on is not a SUCCESS either -- nothing reached the broker."""
+    account = FakeAccount(account_id=718)
+    account.positions = [FakePosition("AAPL", 100.0, 15_000.0, 16_000.0)]
+    plan = AllocationPlan(rows=[_exit_row()], available_buying_power=10_000.0)
+
+    svc.run_allocation(account, plan, {"AAPL": _option_only_state()}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert "1 unactionable" in activity[0]["description"]
+    assert activity[0]["severity"] != ActivityLogSeverity.SUCCESS
+    assert activity[0]["data"]["rows"][0]["status"] == svc.OUTCOME_UNACTIONABLE
+    assert activity[0]["data"]["rows"][0]["transaction_ids"] == [41, 42]
+
+
+def test_run_allocation_still_calls_a_clean_run_a_success(activity):
+    """DISCRIMINATOR for the severity change: an unactionable count of ZERO must
+    not demote an ordinary run."""
+    account = FakeAccount(account_id=719)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+
+    svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert activity[0]["severity"] == ActivityLogSeverity.SUCCESS
+    assert "0 unactionable" in activity[0]["description"]
+
+
+# ---------------------------------------------------------------------------
 # Task 73: fractional shares with a one-shot whole-share fallback
 # ---------------------------------------------------------------------------
 
