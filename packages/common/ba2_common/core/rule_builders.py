@@ -58,6 +58,10 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     "percent_below_recent_high": ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH,
     "percent_above_recent_low": ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW,
     "iv_rank": ExpertEventType.N_IV_RANK,
+    # Volume / volatility entry gates. Both are UNEVALUABLE (never a plausible-looking
+    # default) when the underlying measurement is missing -- see their condition classes.
+    "relative_volume": ExpertEventType.N_RELATIVE_VOLUME,
+    "iv_to_realized_vol": ExpertEventType.N_IV_TO_REALIZED_VOL,
     "days_to_earnings": ExpertEventType.N_DAYS_TO_EARNINGS,
 }
 

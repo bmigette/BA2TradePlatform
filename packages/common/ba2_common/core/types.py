@@ -419,6 +419,17 @@ class ExpertEventType(str, Enum):
     N_PERCENT_BELOW_RECENT_HIGH = "percent_below_recent_high"  # Percent the current price is below the recent high
     N_PERCENT_ABOVE_RECENT_LOW = "percent_above_recent_low"    # Percent the current price is above the recent low
     N_IV_RANK = "iv_rank"                                      # Implied volatility rank (0-100)
+    # The UNDERLYING's current-bar volume as a multiple of its own trailing average
+    # (1.0 == normal). The underlying, deliberately, not a contract: most individual contracts
+    # print zero on most days, so a contract-level ratio is undefined far more often than it
+    # is informative. UNEVALUABLE (never 1.0) on insufficient history or a zero-volume
+    # average -- "normal" is the one wrong default that looks right.
+    N_RELATIVE_VOLUME = "relative_volume"
+    # ATM implied volatility divided by the underlying's REALISED volatility. The variance
+    # risk premium made explicit, and the actual edge in premium selling: you are paid implied
+    # and you pay out realised. Distinct from iv_rank, which compares a symbol's IV to its OWN
+    # history and says nothing about whether the stock is earning that IV.
+    N_IV_TO_REALIZED_VOL = "iv_to_realized_vol"
     N_DAYS_TO_EARNINGS = "days_to_earnings"                    # Calendar days until the next earnings announcement
     # Calendar days of option life REMAINING (expiry - the evaluation date). The complement of
     # N_DAYS_OPENED, which counts days ELAPSED: with the entry DTE window itself a tuned gene,
@@ -549,6 +560,8 @@ def get_numeric_event_values():
         ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH.value,
         ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW.value,
         ExpertEventType.N_IV_RANK.value,
+        ExpertEventType.N_RELATIVE_VOLUME.value,
+        ExpertEventType.N_IV_TO_REALIZED_VOL.value,
         ExpertEventType.N_DAYS_TO_EARNINGS.value,
         ExpertEventType.N_DAYS_TO_EXPIRY.value
     ]

@@ -283,6 +283,36 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Buy calls only in cheap volatility: iv_rank <= 30"
         },
+        ExpertEventType.N_RELATIVE_VOLUME.value: {
+            "name": "Relative Volume",
+            "description": (
+                "The UNDERLYING's volume on the current bar as a multiple of its own trailing "
+                "20-bar average, with the current bar EXCLUDED from that average (1.0 = normal, "
+                "2.0 = twice the recent pace). Use it to require real participation behind an "
+                "entry, or to catch unusual activity. The underlying's volume, not a contract's: "
+                "most individual option contracts print zero on most days, so a contract-level "
+                "ratio is undefined far more often than it is informative. With too little "
+                "history, or a zero-volume average, the value is UNKNOWN and the condition does "
+                "not fire -- it never defaults to 1.0."
+            ),
+            "type": "numeric",
+            "example": "Require participation behind the entry: relative_volume > 1.5"
+        },
+        ExpertEventType.N_IV_TO_REALIZED_VOL.value: {
+            "name": "IV / Realised Volatility",
+            "description": (
+                "Current ATM implied volatility divided by the underlying's realised volatility "
+                "(annualised stdev of the last 20 daily log returns). This is the variance risk "
+                "premium: above 1.0 options are priced richer than the stock has actually been "
+                "moving, which is the premium SELLER's edge; below 1.0 they are cheap relative "
+                "to the realised move, which is the BUYER's. Different from iv_rank, which "
+                "compares a symbol's IV only to its own history and says nothing about whether "
+                "the stock is earning that IV. Missing IV, too little price history, or a flat "
+                "tape leaves it UNKNOWN and the condition does not fire."
+            ),
+            "type": "numeric",
+            "example": "Sell premium only when it is genuinely rich: iv_to_realized_vol > 1.2"
+        },
         ExpertEventType.N_DAYS_TO_EARNINGS.value: {
             "name": "Days to Earnings",
             "description": "Calendar days until the underlying's next earnings announcement (best-effort, FMP-backed). Lower values mean earnings are imminent. Use it to TIME long-volatility entries just before earnings (straddle/strangle) or to AVOID opening positions that would straddle the event. If no upcoming earnings date is available the condition does not fire. Used with numeric comparisons.",

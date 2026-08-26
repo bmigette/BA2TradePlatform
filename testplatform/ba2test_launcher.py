@@ -2781,6 +2781,44 @@ def _iv_rank_gate(m: str, member: str) -> dict:
             "value_step": _IV_RANK_STEP, "toggle_optimize": True}
 
 
+# --- volume / volatility entry gates --------------------------------------------------------
+#
+# RELATIVE VOLUME. The UNDERLYING's volume over its own trailing 20-bar average (current bar
+# excluded). One direction for both halves -- real participation behind the signal is a
+# confirmation whether you are buying or selling premium -- so the searched threshold is the
+# only per-half difference, and there is none. 0.5..3.0 brackets both "any liquidity at all"
+# and "genuinely unusual"; the authored default sits at the permissive end.
+#
+# Not volume/OPEN INTEREST, which would be the better CONTRACT-level unusual-activity signal:
+# `open_interest` is NULL on every cached option row (see option_selector.passes_liquidity), so
+# it is not computable here today.
+_RELATIVE_VOLUME_GATE = {"value": 0.5, "value_min": 0.5, "value_max": 3.0, "value_step": 0.25}
+
+# IV / REALISED VOL -- the variance risk premium, i.e. the actual edge in premium selling: you
+# are paid implied and you pay out realised. OPPOSITE PER HALF for the same reason as iv_rank
+# (the gene space never searches an operator): a seller wants the ratio HIGH, a buyer wants it
+# LOW. The window brackets 1.0 on both sides so either half can express "no edge here".
+_IV_RV_GATE = {
+    True:  {"op": "<", "value": 1.6},   # debit: buy premium only when it is cheap vs realised
+    False: {"op": ">", "value": 0.8},   # credit: sell premium only when it is genuinely rich
+}
+_IV_RV_RANGE = {"value_min": 0.8, "value_max": 1.6, "value_step": 0.1}
+
+
+def _relative_volume_gate(m: str) -> dict:
+    """The relative-volume entry gate leaf for member prefix ``m``."""
+    return {"id": f"{m}-rel_volume", "field": "relative_volume", "op": ">",
+            "optimize": True, "toggle_optimize": True, **_RELATIVE_VOLUME_GATE}
+
+
+def _iv_rv_gate(m: str, member: str) -> dict:
+    """The IV/realised-vol entry gate leaf for member prefix ``m``."""
+    spec = _IV_RV_GATE[member in _DEBIT_OPTION_MEMBERS]
+    return {"id": f"{m}-iv_rv", "field": "iv_to_realized_vol", "op": spec["op"],
+            "value": spec["value"], "optimize": True, "toggle_optimize": True,
+            **_IV_RV_RANGE}
+
+
 def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
     (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
@@ -2819,6 +2857,8 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
              "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
              "toggle_optimize": True},
             _iv_rank_gate(m, member),
+            _relative_volume_gate(m),
+            _iv_rv_gate(m, member),
             *price_target_conditions,
         ]},
         "actions": [_option_entry_action_for(member)],

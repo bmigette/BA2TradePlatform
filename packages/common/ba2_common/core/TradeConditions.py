@@ -54,6 +54,22 @@ def get_provider_resolver():
     return _provider_resolver
 
 
+def _is_missing(value) -> bool:
+    """True for None and for NaN, without importing pandas/numpy into ba2_common.
+
+    ``x != x`` is the NaN identity and holds for float('nan'), numpy scalars and pandas NA
+    alike. Written out because ``if not value`` would also swallow a legitimate 0 -- and a
+    zero VOLUME is a real measurement (the name did not trade), which the callers must be able
+    to tell apart from a missing one.
+    """
+    if value is None:
+        return True
+    try:
+        return bool(value != value)
+    except Exception:  # noqa: BLE001 - an exotic type that cannot be compared is not a number
+        return True
+
+
 def _get_provider(category, name, **kwargs):
     """Resolve a provider via the injected resolver; raise if not configured."""
     if _provider_resolver is None:
@@ -2430,6 +2446,238 @@ class IVRankCondition(CompareCondition):
         return f"{self.calculated_value:.1f}"
 
 
+class RelativeVolumeCondition(CompareCondition):
+    """Current bar volume as a MULTIPLE of its own trailing average (1.0 == normal).
+
+    ``calculated_value = volume[as-of bar] / mean(volume over the BASELINE_WINDOW bars BEFORE
+    it)``. 2.0 means the name is trading at twice its recent pace — the classic unusual-
+    activity / participation confirmation for an entry.
+
+    THE UNDERLYING'S VOLUME, NOT A CONTRACT'S. Most individual option contracts print zero on
+    most days (measured over 13.7M cached bars: p10=1, p25=3, p50=14 contracts/day, and that
+    is only the rows that exist), so a contract-level ratio is undefined far more often than it
+    is informative. The underlying always prints. (The contract-level equivalent worth having
+    is volume / OPEN INTEREST, which this codebase cannot compute today: ``open_interest`` is
+    NULL on every cached option row — see ``option_selector.passes_liquidity``.)
+
+    THREE PROPERTIES THIS CONDITION MUST HAVE, each of which is a bug if lost:
+
+    1. **The baseline EXCLUDES the current bar.** Include it and the average absorbs the very
+       spike the gate exists to detect: a 10x day against a 20-bar window that contains it
+       computes 10 / ((19 x 1 + 10) / 20) = 6.9, and the distortion grows exactly as the
+       signal does. The slice is ``[-(W+1):-1]``.
+    2. **The baseline does NOT reach forward.** The fetch is clamped to the evaluation bar via
+       ``_as_of_fetch_end`` — the backtest's memoized provider DISCARDS ``lookback_days`` and
+       would otherwise return the whole run window, i.e. an average computed from the
+       simulated future. That exact lookahead was already found in
+       ``percent_below_recent_high``.
+    3. **Insufficient history or a zero-volume average is UNKNOWN, never 1.0.** Defaulting to
+       "normal" makes the gate silently free-passing on every newly-listed symbol and on every
+       symbol whose feed dropped out — and 1.0 is plausible enough that nobody would look.
+       ``calculated_value`` stays None and ``evaluate()`` returns False for every operator.
+    """
+
+    #: Trailing bars averaged for the baseline (the current bar is NOT one of them).
+    BASELINE_WINDOW = 20
+
+    def evaluate(self) -> bool:
+        try:
+            # CLAMP THE FETCH TO THE EVALUATION BAR — see PercentBelowRecentHighCondition.
+            end_date, clock_ok = self._as_of_fetch_end()
+            if not clock_ok:
+                self.calculated_value = None
+                return False
+
+            df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
+                self.instrument_name, interval="1d", end_date=end_date,
+                lookback_days=self.BASELINE_WINDOW * 2 + 10)
+            if df is None or df.empty or "Volume" not in df:
+                logger.warning(f"No OHLCV volume data for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+
+            volumes = df["Volume"]
+            # W baseline bars PLUS the current one. A shorter history is UNKNOWN: averaging
+            # whatever is there would compare a spike against two quiet days and call it 10x.
+            if len(volumes) < self.BASELINE_WINDOW + 1:
+                logger.warning(
+                    f"Only {len(volumes)} bars for {self.instrument_name}; "
+                    f"relative volume needs {self.BASELINE_WINDOW + 1}")
+                self.calculated_value = None
+                return False
+
+            current = volumes.iloc[-1]
+            baseline = list(volumes.iloc[-(self.BASELINE_WINDOW + 1):-1])
+            # A NaN anywhere in the window is UNKNOWN, not something to skip past: pandas'
+            # mean() drops NaNs silently, so a window with 18 of 20 bars missing would average
+            # the surviving two and report a confident ratio against them.
+            if _is_missing(current) or any(_is_missing(v) for v in baseline):
+                logger.warning(f"Missing volume bar(s) for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+            current = float(current)
+            average = sum(float(v) for v in baseline) / len(baseline)
+            # A zero (or negative) average is not "normal volume", it is no measurement at all:
+            # a halted/unlisted name, or a feed that zero-filled the column.
+            if average <= 0 or current < 0:
+                logger.warning(
+                    f"Unusable volume for {self.instrument_name}: current={current}, "
+                    f"{self.BASELINE_WINDOW}-bar average={average}")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = current / average
+
+            logger.info(
+                f"Relative volume for {self.instrument_name}: current={current:,.0f}, "
+                f"{self.BASELINE_WINDOW}-bar average={average:,.0f}, "
+                f"ratio={self.calculated_value:.2f}x")
+
+            return self.operator_func(self.calculated_value, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating relative volume condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if {self.instrument_name} volume is {self.operator_str} "
+                f"{self.value}x its trailing {self.BASELINE_WINDOW}-bar average")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.2f}x"
+
+
+class IVToRealizedVolCondition(CompareCondition):
+    """ATM implied volatility divided by the underlying's REALISED volatility.
+
+    ``calculated_value = atm_iv / realized_vol``, both annualised fractions. This is the
+    variance risk premium made explicit, and it is the actual edge in premium selling: you are
+    paid IMPLIED and you pay out REALISED. A ratio of 1.3 means options are priced 30 % above
+    what the stock has actually been doing; below 1.0 the options are cheap relative to the
+    realised move, which is the long-premium case.
+
+    Distinct from ``iv_rank``, which compares a symbol's IV to its OWN history: a name can sit
+    at IV rank 90 and still be fairly priced if it is genuinely moving, and at rank 20 while
+    still paying a fat premium over a dead tape.
+
+    Realised vol is the annualised sample stdev of daily log returns over the
+    ``REALIZED_WINDOW`` bars ending at the evaluation bar (the fetch is clamped by
+    ``_as_of_fetch_end``, so it can never reach into the simulated future).
+
+    UNKNOWN IS NEVER A NUMBER HERE, in either direction:
+
+    * a non-options account, or no ATM IV, or an IV outside
+      ``OptionsAccountInterface.plausible_atm_iv``'s 1 %-500 % band (the shared definition, so
+      live and backtest cannot fork on it),
+    * fewer than ``REALIZED_WINDOW + 1`` closes, or a non-positive close,
+    * a realised vol below ``MIN_MEASURABLE_REALIZED_VOL``,
+
+    all leave ``calculated_value`` None and make ``evaluate()`` False for every operator. The
+    last one matters most: a near-zero denominator does not mean "options are infinitely rich",
+    it means the tape was flat or the feed repeated a close, and dividing by it would hand a
+    ``>`` gate a spectacular pass on exactly the names with no usable data.
+    """
+
+    #: Trading days of returns in the realised-vol estimate.
+    REALIZED_WINDOW = 20
+    #: Trading days per year, for annualising the daily stdev.
+    TRADING_DAYS_PER_YEAR = 252
+    #: Floor on a realised vol that can be a DENOMINATOR. Same reasoning (and same 1 %
+    #: threshold) as MIN_PLAUSIBLE_ATM_IV: below this the number is a flat tape or a repeated
+    #: close, not a measurement, and the ratio it produces is unbounded noise.
+    MIN_MEASURABLE_REALIZED_VOL = 0.01
+
+    def _atm_iv(self) -> Optional[float]:
+        """The account's current ATM IV, validated by the SHARED plausibility bound."""
+        from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+
+        if not isinstance(self.account, OptionsAccountInterface):
+            logger.warning(
+                f"Account does not support options; cannot compute IV/realised vol for "
+                f"{self.instrument_name}")
+            return None
+        return OptionsAccountInterface.plausible_atm_iv(
+            self.account.get_atm_implied_volatility(self.instrument_name))
+
+    def _realized_vol(self) -> Optional[float]:
+        """Annualised realised volatility over the window ENDING at the evaluation bar."""
+        import math as _math
+
+        end_date, clock_ok = self._as_of_fetch_end()
+        if not clock_ok:
+            return None
+        df = _get_provider("ohlcv", "yfinance").get_ohlcv_data(
+            self.instrument_name, interval="1d", end_date=end_date,
+            lookback_days=self.REALIZED_WINDOW * 2 + 10)
+        if df is None or df.empty or "Close" not in df:
+            logger.warning(f"No OHLCV close data for {self.instrument_name}")
+            return None
+        closes = df["Close"].iloc[-(self.REALIZED_WINDOW + 1):]
+        # N returns need N+1 closes. Fewer is UNKNOWN, not a stdev over whatever exists:
+        # a 3-bar sample's stdev is noise wearing a volatility's units.
+        if len(closes) < self.REALIZED_WINDOW + 1:
+            logger.warning(
+                f"Only {len(closes)} closes for {self.instrument_name}; realised vol needs "
+                f"{self.REALIZED_WINDOW + 1}")
+            return None
+        values = [float(c) for c in closes]
+        if any(_is_missing(c) or c <= 0 for c in values):
+            logger.warning(f"Non-positive or missing close for {self.instrument_name}")
+            return None
+        rets = [_math.log(values[i] / values[i - 1]) for i in range(1, len(values))]
+        n = len(rets)
+        mean = sum(rets) / n
+        var = sum((r - mean) ** 2 for r in rets) / (n - 1)   # sample stdev (ddof=1)
+        return _math.sqrt(var) * _math.sqrt(self.TRADING_DAYS_PER_YEAR)
+
+    def evaluate(self) -> bool:
+        try:
+            iv = self._atm_iv()
+            if iv is None:
+                logger.warning(f"ATM IV unavailable for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+
+            rv = self._realized_vol()
+            if rv is None:
+                self.calculated_value = None
+                return False
+            if rv < self.MIN_MEASURABLE_REALIZED_VOL:
+                logger.warning(
+                    f"Realised vol {rv:.4f} for {self.instrument_name} is below the "
+                    f"{self.MIN_MEASURABLE_REALIZED_VOL} measurable floor; IV/RV is unknown, "
+                    f"not infinite")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = iv / rv
+
+            logger.info(
+                f"IV/realised vol for {self.instrument_name}: iv={iv:.3f}, rv={rv:.3f}, "
+                f"ratio={self.calculated_value:.2f}")
+
+            return self.operator_func(self.calculated_value, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating IV/realised vol condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if {self.instrument_name} implied/realised volatility is "
+                f"{self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.2f}"
+
+
 class DaysToEarningsCondition(CompareCondition):
     """Compare the number of calendar days until the underlying's next earnings.
 
@@ -3040,6 +3288,8 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH: PercentBelowRecentHighCondition,
     ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW: PercentAboveRecentLowCondition,
     ExpertEventType.N_IV_RANK: IVRankCondition,
+    ExpertEventType.N_RELATIVE_VOLUME: RelativeVolumeCondition,
+    ExpertEventType.N_IV_TO_REALIZED_VOL: IVToRealizedVolCondition,
     ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
     ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
     ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
