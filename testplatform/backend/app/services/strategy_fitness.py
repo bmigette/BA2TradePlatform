@@ -66,6 +66,58 @@ _CAR_CONSISTENCY_FLOOR = 0.25     # worst_year/mean_year clamp lower bound
 _CAR_PARTIAL_YEAR_MIN_DAYS = 182.62  # ~6 months: shorter partial start/end years merge into neighbor
 _CAR_ALIASES = ("consistent_annual_return", "car", "goal")
 
+# --- option_consistent_annual_return metric constants ------------------------------------------
+# An OPTION-ONLY variant of consistent_annual_return. Every term is identical EXCEPT the drawdown
+# factor, which is SUPERLINEAR here.
+#
+# WHY A SEPARATE METRIC AND NOT A FLAG ON THE EXISTING ONE. Non-option grids were mid-run when
+# this landed, and re-ranking a search already in progress silently invalidates every result
+# already banked. A flag that must be read correctly is a flag that can be read wrongly; a metric
+# that an equity run never NAMES is a code path an equity run cannot reach. The equity path is
+# frozen bit-for-bit by tests/test_strategy_fitness_equity_frozen.py, and
+# _consistent_annual_return below is deliberately untouched -- not one line.
+#
+# THE DEFECT. Under the equity cap, doubling contract count doubles the annualised return AND the
+# max drawdown. The linear guard (20/dd, capped at 2.0) shrinks as 1/dd, so the two cancel
+# EXACTLY. Measured on the live metric at base 7.5%/yr and 5% dd for one unit of size:
+#
+#     size    1s      2s      4s      8s     16s
+#     dd      5%     10%     20%     40%     80%
+#     score  15.0    30.0    30.0    30.0    30.0
+#
+# i.e. leverage was REWARDED below a 10% drawdown and FREE above it. No amount of risk-taking
+# ever made a genome score worse, which is the opposite of what the metric is for.
+#
+# THE SHAPE. penalty = (REFERENCE / max(|dd|, FLOOR)) ** 2. Squaring is the minimum that works:
+# the score at k times the size is k * base * P(k*dd), so P must decay strictly FASTER than 1/dd
+# or leverage keeps paying. At exponent 2 the same table becomes 120 / 60 / 30 / 15 / 7.5 --
+# every doubling of size at double the drawdown now halves the score exactly.
+#
+# A closed form on the measured drawdown, NOT a sampled tail statistic (CVaR and friends). At
+# realistic option trade counts -- tens per year -- a 5% quantile is estimated from about two
+# observations, so a tail measure would contribute mostly estimator noise to the ranking. This
+# term is deterministic and zero-variance.
+_OCAR_DD_REFERENCE = 20.0   # % drawdown scoring exactly 1.0 -- the same risk budget as CAR
+_OCAR_DD_EXPONENT = 2.0     # > 1 is what breaks the cancellation; 2 makes each doubling halve
+# THE FLOOR IS THE ONLY BOUND, AND IT REPLACES THE 2.0 MULTIPLICATIVE CAP.
+#
+# Any bounded penalty is flat somewhere, and inside a flat region doubling size doubles the score
+# outright -- worse than the indifference being fixed. So the flat region cannot be removed, only
+# MOVED, and the whole design question is where to put it. The equity metric's 2.0 cap put it at
+# 0-10%, INSIDE the observed 8.5-34% drawdown range, which is precisely why its table above shows
+# 5% -> 10% doubling. Keeping a 2.0 cap here would be worse still: under the square it binds at
+# 20/sqrt(2) = 14.1%, even further inside the range.
+#
+# So the cap is REMOVED and the floor is raised from CAR's 1.0 to 5.0, which bounds the reward at
+# (20/5)^2 = 16x while sitting below the observed range, where it should not bind on a real
+# config. CAR's 1% rail cannot be reused: squared, it would pay 400x, and the search would be
+# a drawdown-minimisation contest with return as a tiebreaker.
+#
+# The residual, stated plainly: below 5% drawdown this metric stops rewarding safety and leverage
+# pays again. That region is unreachable for a genome trading enough to clear the 12/yr floor.
+_OCAR_DD_FLOOR = 5.0
+_OCAR_ALIASES = ("option_consistent_annual_return", "option_car", "ocar")
+
 # fitness_metric (lower-cased) -> results-dict key. max_drawdown is handled
 # specially (negated) and is therefore NOT in this map.
 _FITNESS_KEYS = {
@@ -157,9 +209,10 @@ _CATALOG_META = {
     },
 }
 
-# Canonical key for the two specials (handled outside _FITNESS_KEYS in compute_fitness).
+# Canonical key for the specials (handled outside _FITNESS_KEYS in compute_fitness).
 _MAX_DRAWDOWN_KEY = "max_drawdown"
 _CAR_KEY = _CAR_ALIASES[0]  # "consistent_annual_return"
+_OCAR_KEY = _OCAR_ALIASES[0]  # "option_consistent_annual_return"
 
 _SPECIAL_META = {
     _MAX_DRAWDOWN_KEY: {
@@ -176,6 +229,16 @@ _SPECIAL_META = {
                        "trade-rate gate replaces the trade-scale multiplier; win rate isn't part "
                        "of the CAR formula, so the optional win-rate factor still applies.",
         # Early-return in compute_fitness: fitness_trade_scale is a structural no-op here.
+        "supports_trade_scale": False,
+        "supports_win_rate_factor": True,
+        "uses_adjusted_under_caps": True,
+    },
+    _OCAR_KEY: {
+        "label": "Consistent Annual Return (Option)",
+        "description": "Consistent Annual Return with a SUPERLINEAR drawdown penalty "
+                       "((20/dd)^2 instead of 20/dd), so doubling position size at double the "
+                       "drawdown scores strictly WORSE instead of scoring the same. For OPTION "
+                       "grids: scores are NOT comparable with the plain metric.",
         "supports_trade_scale": False,
         "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
@@ -216,8 +279,9 @@ def _build_metrics_catalog() -> list:
     special_aliases = {
         _MAX_DRAWDOWN_KEY: ["drawdown", "max_dd"],
         _CAR_KEY: sorted(a for a in _CAR_ALIASES if a != _CAR_KEY),
+        _OCAR_KEY: sorted(a for a in _OCAR_ALIASES if a != _OCAR_KEY),
     }
-    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY):
+    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY):
         meta = _SPECIAL_META.get(special)
         if meta is None:
             raise KeyError(f"strategy_fitness METRICS_CATALOG drift: no metadata for {special!r}.")
@@ -246,7 +310,8 @@ def assert_catalog_complete() -> None:
     not covered). Called from the unit test; safe to call anywhere.
     """
     accepted = catalog_accepted_metrics()  # raises if any canonical/special lacks metadata
-    expected = set(_FITNESS_KEYS) | {_MAX_DRAWDOWN_KEY} | set(_CAR_ALIASES)
+    expected = (set(_FITNESS_KEYS) | {_MAX_DRAWDOWN_KEY} | set(_CAR_ALIASES)
+                | set(_OCAR_ALIASES))
     missing = expected - accepted
     if missing:
         raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
@@ -297,11 +362,21 @@ def compute_fitness(fitness_metric: str, results: dict,
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
             fitness_metric, results, stress_spread_bps, robust)
 
+    if metric in _OCAR_ALIASES:
+        # OPTION-ONLY variant. Same wrappers as CAR above (win-rate factor, spread stress,
+        # robustness) so --robust-fitness / --stress-spread behave identically on an option
+        # grid; only the drawdown term inside differs. Reached ONLY by an explicit option
+        # metric name, which is what keeps a running equity grid out of this code path.
+        _fit = _apply_win_rate_factor(_option_consistent_annual_return(results), results)
+        return _maybe_robust(
+            _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
+            fitness_metric, results, stress_spread_bps, robust)
+
     key = _FITNESS_KEYS.get(metric)
     if key is None:
         raise ValueError(
             f"Unknown fitness_metric: {fitness_metric!r}. "
-            f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'} | set(_CAR_ALIASES))}"
+            f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'} | set(_CAR_ALIASES) | set(_OCAR_ALIASES))}"
         )
     # Profit-cap-aware: when EITHER cap was applied (per-trade basis cap ``profit_cap_pct`` or
     # portfolio-share cap ``profit_share_cap_pct``), the GA must rank on the ADJUSTED return-based
@@ -751,6 +826,116 @@ def _consistent_annual_return(results: dict) -> float:
         )
     consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
     return base * dd_guard * consistency * trade_gate
+
+
+def _option_dd_penalty(dd: float) -> float:
+    """The SUPERLINEAR drawdown factor: ``(REFERENCE / max(|dd|, FLOOR)) ** EXPONENT``.
+
+    Reads the MAGNITUDE: ``max_drawdown`` is recorded negative (``results._drawdown_curve``),
+    but a positive spelling must score identically rather than inverting the penalty.
+
+    Exactly 1.0 at the 20% reference, 16.0 at or below the 5% floor, 0.444 at 30%, 0.25 at 40%.
+    Non-increasing everywhere and strictly decreasing above the floor. See the constants above
+    for why the shape is a closed form on the measured drawdown and why the floor, not a
+    multiplicative cap, is what bounds it.
+    """
+    return (_OCAR_DD_REFERENCE / max(abs(float(dd)), _OCAR_DD_FLOOR)) ** _OCAR_DD_EXPONENT
+
+
+def _option_consistent_annual_return(results: dict) -> float:
+    """OPTION-ONLY goal metric: ``base x dd_penalty x consistency x trade_gate``.
+
+    A near-copy of ``_consistent_annual_return`` differing in exactly ONE term -- the drawdown
+    factor is ``_option_dd_penalty`` (superlinear) rather than the linear, capped ``dd_guard``.
+    Every other term (the adjusted-base switch under profit caps, the proportional trade gate
+    and its hard floor, the per-run cadence overrides, the calendar-year consistency factor and
+    its missing-curve guard, the unfactored negative-base early return) is intentionally
+    identical, and ``test_strategy_fitness_option_car.py`` pins that with a ratio test so the
+    two cannot drift apart on a term nobody meant to touch.
+
+    IT IS A COPY, NOT A REFACTOR, ON PURPOSE. Factoring the shared body out would have edited
+    ``_consistent_annual_return`` while non-option grids were mid-run, and the equity path had
+    to stay bit-identical -- see tests/test_strategy_fitness_equity_frozen.py. Fold the two
+    together when no grid is running.
+
+    Scores from this metric are NOT comparable with plain ``consistent_annual_return`` scores.
+
+    NOTE ON THE DRAWDOWN READ. ``_consistent_annual_return`` uses
+    ``abs(float(results.get("max_drawdown") or 0.0))``, whose ``or 0.0`` would turn an
+    unmeasurable drawdown into the MAXIMUM reward. That branch was traced and is unreachable:
+    ``results._compute_metrics`` emits ``max_drawdown`` unconditionally through ``_finite``,
+    which RAISES on None/NaN rather than coercing, and every path into ``compute_fitness``
+    (the GA trial worker, the in-process fitness_function, the launcher top-N re-score, the
+    remote /submit-trial-full round trip, and ``stressed_results``, whose
+    ``monte_carlo._path_metrics`` always returns the key) goes through it. So the equity metric
+    is not silently defective and no guard was added there. This metric nonetheless RAISES
+    rather than defaulting, because a caller that manages to produce an absent, None or
+    non-finite drawdown is passing something no live producer emits and that this metric --
+    whose whole purpose is pricing drawdown -- cannot honestly score. A measured 0.0 is a real
+    value and is scored via the floor, not treated as missing.
+    """
+    # --- base: (adjusted) annualized return, %/yr ---------------------------------------------
+    if results.get("profit_cap_pct") or results.get("profit_share_cap_pct"):
+        base = results.get("adjusted_annualized_return")
+        if base is None:
+            base = results.get("annualized_return")
+    else:
+        base = results.get("annualized_return")
+    if base is None or (isinstance(base, float) and (math.isnan(base) or math.isinf(base))):
+        return ZERO_TRADE_SENTINEL
+    base = float(base)
+
+    # --- trade gate: proportional ramp, hard floor below it -----------------------------------
+    tpy = results.get("avg_trades_per_year")
+    if tpy is None:
+        years = _years_spanned_by_curve(results.get("equity_curve"))
+        total = int(results.get("total_trades", 0) or 0)
+        tpy = (total / years) if years > 0 else None
+    if tpy is None:
+        return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
+    _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
+    _ramp = float(results.get("car_min_trades_per_year") or _CAR_MIN_TRADES_PER_YEAR)
+    if float(tpy) < _floor:
+        return LOW_TRADE_SENTINEL          # disqualified: too few trades to evidence anything
+    trade_gate = min(max(float(tpy) / _ramp, 0.0), 1.0)
+
+    if base <= 0:
+        return base  # unfactored: penalty factors on a negative would flip its sign
+
+    # --- superlinear drawdown penalty ---------------------------------------------------------
+    dd_raw = results.get("max_drawdown")
+    if dd_raw is None:
+        raise ValueError(
+            "option_consistent_annual_return requires results['max_drawdown'] and it is "
+            "absent or None. An unmeasurable drawdown is not a zero drawdown: defaulting it "
+            "would hand this genome the largest multiplier the metric can produce."
+        )
+    try:
+        dd = abs(float(dd_raw))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"option_consistent_annual_return: max_drawdown is not numeric: {dd_raw!r}"
+        ) from e
+    if not math.isfinite(dd):
+        raise ValueError(
+            f"option_consistent_annual_return: max_drawdown is not finite ({dd_raw!r}). The "
+            f"run produced nonsense and is rejected rather than scored as risk-free."
+        )
+    dd_penalty = _option_dd_penalty(dd)
+
+    # --- yearly consistency -------------------------------------------------------------------
+    # Same loud guard as CAR: re-scoring a stored Backtest whose equity_curve column was not
+    # restored silently inflates this factor to 1.0 (measured 4x overstatement).
+    if results.get("trades") and "equity_curve" not in results:
+        raise ValueError(
+            "option_consistent_annual_return requires results['equity_curve'] to measure the "
+            "consistency factor, and the key is absent. If you are re-scoring a stored "
+            "Backtest, note that `results` excludes the curve -- restore it from the "
+            "equity_curve column first, or the score is silently inflated (~4x when the run "
+            "has an uneven year)."
+        )
+    consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
+    return base * dd_penalty * consistency * trade_gate
 
 
 def _consistency_factor(year_returns: list) -> float:
