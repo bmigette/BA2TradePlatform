@@ -96,6 +96,17 @@ class ConditionLeaf(BaseModel):
     value_min: Optional[float] = Field(default=None, validation_alias=AliasChoices("value_min", "valueMin"))
     value_max: Optional[float] = Field(default=None, validation_alias=AliasChoices("value_max", "valueMax"))
     value_step: Optional[float] = Field(default=None, validation_alias=AliasChoices("value_step", "valueStep"))
+    #: RELATIVE threshold: the id of another leaf in the SAME condition tree whose threshold
+    #: this leaf's optimizer gene is measured FROM (decoded value = that leaf's value + gene;
+    #: see strategy_param_space._apply_to_tree). Lets an interval on ONE field be expressed as
+    #: (floor, width > 0) instead of two independent absolute bounds, roughly half of whose
+    #: joint grid is an empty conjunction that can never fire. ``value`` itself stays ABSOLUTE
+    #: so an un-decoded template still seeds a correct ruleset; only value_min/max/step
+    #: describe the width.
+    #: MUST be a DECLARED field: extra='allow' keeps unknown keys on the model, but
+    #: to_canonical_dict rebuilds the dict from declared fields only, so an undeclared key is
+    #: silently dropped by normalize_trade_rules and the gene reverts to an absolute threshold.
+    value_offset_from: Optional[str] = Field(default=None, validation_alias=AliasChoices("value_offset_from", "valueOffsetFrom"))
     toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggle_optimize", "toggleOptimize"))
     confirmation_bars: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmation_bars", "confirmationBars"))
     confirmation_bars_min: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmation_bars_min", "confirmationBarsMin"))
@@ -133,6 +144,9 @@ class ConditionLeaf(BaseModel):
         if self.value_step is not None:
             out["valueStep"] = self.value_step
             out["value_step"] = self.value_step
+        if self.value_offset_from is not None:
+            out["valueOffsetFrom"] = self.value_offset_from
+            out["value_offset_from"] = self.value_offset_from
         if self.toggle_optimize is not None:
             out["toggleOptimize"] = self.toggle_optimize
             out["toggle_optimize"] = self.toggle_optimize

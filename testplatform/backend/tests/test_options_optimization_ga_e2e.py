@@ -5,7 +5,7 @@ per-trial config build -> fitness -> persist) over a REAL ``Strategy`` whose exi
 OPTION action with the option selection-param genes turned on. It proves the three things the
 options-optimization path must hold:
 
-  1. the option genes (``exit:<id>:option_delta`` / ``exit:<id>:option_dte``) appear in the
+  1. the option genes (``exit:<id>:option_strike_param`` / ``exit:<id>:option_dte``) appear in the
      run's param space;
   2. EVERY per-trial config the optimizer builds carries a non-None ``options_cache_db`` (the
      HistoricalOptionsProvider injection seam) — i.e. each trial runs as an OPTIONS backtest;
@@ -178,7 +178,7 @@ def test_ga_options_run_injects_provider_and_optimizes_option_genes(monkeypatch)
 
     # 1. The option genes appear in the run's param space.
     assert row.parameter_ranges, "expected a non-empty param space"
-    assert "exit:o1:a0:option_delta" in row.parameter_ranges
+    assert "exit:o1:a0:option_strike_param" in row.parameter_ranges
     assert "exit:o1:a0:option_dte" in row.parameter_ranges
 
     # 2. EVERY per-trial config carried the options provider (non-None options_cache_db) — each
@@ -191,9 +191,9 @@ def test_ga_options_run_injects_provider_and_optimizes_option_genes(monkeypatch)
     # 3. The run completed with >0 trials and best_params includes the option genes.
     assert row.all_results and len(row.all_results) > 0
     assert row.best_params is not None
-    assert "exit:o1:a0:option_delta" in row.best_params
+    assert "exit:o1:a0:option_strike_param" in row.best_params
     assert "exit:o1:a0:option_dte" in row.best_params
     # And the GA climbed toward the deterministic peak (delta 0.35, dte 30).
-    assert 0.2 <= row.best_params["exit:o1:a0:option_delta"] <= 0.5
+    assert 0.2 <= row.best_params["exit:o1:a0:option_strike_param"] <= 0.5
     assert 20 <= row.best_params["exit:o1:a0:option_dte"] <= 45
     assert row.best_fitness is not None

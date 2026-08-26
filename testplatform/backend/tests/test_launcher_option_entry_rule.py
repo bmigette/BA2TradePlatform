@@ -43,7 +43,14 @@ def test_price_target_gates_present_and_optimizable_with_correct_directions():
     assert low_below["op"] == "<"
     assert low_below["toggle_optimize"] is True
     assert low_below["optimize"] is True
-    assert low_below["value_min"] < 0 < low_below["value_max"]
+    # The two SAME-FIELD gates are now (floor, width>0), not two independent absolute
+    # thresholds -- see _price_target_gates / OPT-C5. So this gate's searched range is a band
+    # WIDTH, which must be strictly positive (that is what makes the interval never empty);
+    # a range straddling zero, as it used to be, is exactly the defect.
+    # Non-emptiness across the whole grid is proved in
+    # test_launcher_option_price_gates_never_empty.py.
+    assert low_below["value_offset_from"] == "o_lc-price_low_above"
+    assert 0 < low_below["value_min"] < low_below["value_max"]
 
     high_above = _find_cond(rule, "o_lc-price_high_above")
     assert high_above["field"] == "price_vs_target_high_percent"

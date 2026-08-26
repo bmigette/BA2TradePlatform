@@ -1,6 +1,6 @@
 """OPTIONS OPTIMIZATION wiring: the genetic optimizer's per-trial configs must inject the
 options provider when the strategy uses option actions, so the option selection-param genes
-(``exit:<id>:option_delta`` / ``option_dte``) actually drive REAL options backtests across
+(``exit:<id>:option_strike_param`` / ``option_dte``) actually drive REAL options backtests across
 trials.
 
 THE GAP this proves closed: the single-run path (``daily_backtest_handler._build_config``)
@@ -130,7 +130,7 @@ def _strategy(exit_rules):
 
 
 def test_option_genes_emitted_and_decode_to_trial_rule():
-    """collect_param_space emits exit:<id>:option_delta/option_dte AND decode_params writes
+    """collect_param_space emits exit:<id>:option_strike_param/option_dte AND decode_params writes
     them back onto the exit rule (option_strike_param, and a DTE *window* centered on the
     tuned value). The option_dte gene tunes the window CENTER; the decoded [min, max] must
     span >= 14 days so it covers a real (weekly) expiry instead of a single impossible day
@@ -140,11 +140,11 @@ def test_option_genes_emitted_and_decode_to_trial_rule():
     strategy = _strategy([copy.deepcopy(_OPTION_EXIT)])
 
     space = collect_param_space(strategy)
-    assert "exit:o1:a0:option_delta" in space
+    assert "exit:o1:a0:option_strike_param" in space
     assert "exit:o1:a0:option_dte" in space
 
     decoded = decode_params(
-        strategy, {"exit:o1:a0:option_delta": 0.35, "exit:o1:a0:option_dte": 30}
+        strategy, {"exit:o1:a0:option_strike_param": 0.35, "exit:o1:a0:option_dte": 30}
     )
     action = decoded["exit_rules"][0]["actions"][0]
     assert action["option_strike_param"] == 0.35
@@ -158,7 +158,7 @@ def test_decoded_option_rule_drives_options_cache_in_trial_config():
     import copy
     strategy = _strategy([copy.deepcopy(_OPTION_EXIT)])
     decoded = decode_params(
-        strategy, {"exit:o1:a0:option_delta": 0.35, "exit:o1:a0:option_dte": 30}
+        strategy, {"exit:o1:a0:option_strike_param": 0.35, "exit:o1:a0:option_dte": 30}
     )
     cfg = H._build_daily_trial_config(_backtest_cfg(), decoded)
     assert cfg["options_cache_db"] is not None

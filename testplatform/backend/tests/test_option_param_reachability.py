@@ -48,7 +48,7 @@ def test_every_structure_can_search_its_dte_window(kind):
 
 @pytest.mark.parametrize("kind", sorted(set(ALL_OPTION_KINDS) - ATM_BY_CONSTRUCTION))
 def test_every_non_atm_structure_can_search_its_strike(kind):
-    assert _suffixes(kind, ":option_delta"), f"{kind} strike_param is frozen"
+    assert _suffixes(kind, ":option_strike_param"), f"{kind} strike_param is frozen"
 
 
 @pytest.mark.parametrize("kind", sorted(WING_STRUCTURES))
@@ -59,7 +59,7 @@ def test_every_winged_structure_can_search_its_wing_width(kind):
 @pytest.mark.parametrize("kind", sorted(ATM_BY_CONSTRUCTION))
 def test_the_atm_structures_still_expose_no_strike_gene(kind):
     """Guard against 'fixing' this one by adding a gene the action throws away."""
-    assert not _suffixes(kind, ":option_delta")
+    assert not _suffixes(kind, ":option_strike_param")
 
 
 # --------------------------------------------------------------------------- #
@@ -86,5 +86,5 @@ def test_the_equity_overlays_carry_the_same_min_volume_floor(kind):
 def test_the_equity_overlays_are_searchable_too(kind):
     build = {"O_CC": L._build_strategy_covered_call, "O_PP": L._build_strategy_protective_put}
     genes = set(collect_param_space(build[kind](kind)))
-    assert {g for g in genes if g.endswith(":option_delta")}, f"{kind} overlay strike frozen"
+    assert {g for g in genes if g.endswith(":option_strike_param")}, f"{kind} overlay strike frozen"
     assert {g for g in genes if g.endswith(":option_dte")}, f"{kind} overlay DTE frozen"

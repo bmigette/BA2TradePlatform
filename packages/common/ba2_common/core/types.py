@@ -419,6 +419,17 @@ class ExpertEventType(str, Enum):
     N_PERCENT_BELOW_RECENT_HIGH = "percent_below_recent_high"  # Percent the current price is below the recent high
     N_PERCENT_ABOVE_RECENT_LOW = "percent_above_recent_low"    # Percent the current price is above the recent low
     N_IV_RANK = "iv_rank"                                      # Implied volatility rank (0-100)
+    # The UNDERLYING's current-bar volume as a multiple of its own trailing average
+    # (1.0 == normal). The underlying, deliberately, not a contract: most individual contracts
+    # print zero on most days, so a contract-level ratio is undefined far more often than it
+    # is informative. UNEVALUABLE (never 1.0) on insufficient history or a zero-volume
+    # average -- "normal" is the one wrong default that looks right.
+    N_RELATIVE_VOLUME = "relative_volume"
+    # ATM implied volatility divided by the underlying's REALISED volatility. The variance
+    # risk premium made explicit, and the actual edge in premium selling: you are paid implied
+    # and you pay out realised. Distinct from iv_rank, which compares a symbol's IV to its OWN
+    # history and says nothing about whether the stock is earning that IV.
+    N_IV_TO_REALIZED_VOL = "iv_to_realized_vol"
     N_DAYS_TO_EARNINGS = "days_to_earnings"                    # Calendar days until the next earnings announcement
     # Calendar days of option life REMAINING (expiry - the evaluation date). The complement of
     # N_DAYS_OPENED, which counts days ELAPSED: with the entry DTE window itself a tuned gene,
@@ -549,6 +560,8 @@ def get_numeric_event_values():
         ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH.value,
         ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW.value,
         ExpertEventType.N_IV_RANK.value,
+        ExpertEventType.N_RELATIVE_VOLUME.value,
+        ExpertEventType.N_IV_TO_REALIZED_VOL.value,
         ExpertEventType.N_DAYS_TO_EARNINGS.value,
         ExpertEventType.N_DAYS_TO_EXPIRY.value
     ]
@@ -639,29 +652,36 @@ def uses_wing_width(action_value):
 def get_strike_method_action_values():
     """Option action types whose builder actually READS ``strike_method``.
 
-    These nine pass ``method=self.strike_method`` into the selector. The other eight entry
-    actions -- straddle, strangle, short straddle, short strangle, iron condor, jade
-    lizard, call butterfly, put ratio spread -- hard-code ``method="percent_otm"`` at every
-    selection site, so ``self.strike_method`` is set on the shared base and then never
-    read: a dead attribute.
+    These NINE of the seventeen ``_OptionEntryAction`` subclasses pass
+    ``method=self.strike_method`` into the selector. The other eight -- straddle, strangle,
+    short straddle, short strangle, iron condor, jade lizard, call butterfly, put ratio
+    spread -- hard-code ``method="percent_otm"`` at every selection site, so
+    ``strike_method`` is set on the shared base and then never read: a dead attribute.
 
-    THIS IS A LIVE TRAP, not a curiosity, which is why the answer is a REFUSAL. The rule
-    editor rendered the Strike Method select for every non-close option action, DEFAULTED
-    IT TO ``delta``, placeholdered Strike Param as ``0.30``, and persisted the choice
-    unconditionally. A user configuring an iron condor saw "delta", typed ``0.30``
-    expecting a 30-delta short, and got a strike 0.30 % out of the money -- effectively at
-    the money, on the leg that carries the risk. Nothing anywhere warned.
+    THIS IS A LIVE TRAP, not a curiosity (OPT-S2). The rule editor rendered the Strike
+    Method select for every non-close option action, DEFAULTED IT TO ``delta``,
+    placeholdered Strike Param as ``0.30``, and persisted the choice unconditionally. A user
+    configuring an iron condor saw "delta", typed ``0.30`` expecting a 30-delta short, and
+    got a strike 0.30 PERCENT out of the money -- effectively at the money, on the leg that
+    carries the risk. Nothing anywhere warned.
 
-    So the editor must not OFFER or PERSIST a ``strike_method`` the selected action
-    ignores. Refusal, NOT fallback: teaching those eight builders to honour delta depends
-    on whether delta is computable from the chain data, which is separate work. Until then
-    the honest interface is "this structure selects by % OTM", said out loud.
+    So a producer -- the rule editor, or the GA's strike-method gene -- must offer the choice
+    for exactly the actions that honour it. Offering it everywhere is that trap; offering it
+    nowhere is what left ``percent_otm`` the only strike gene in all 16 option grids
+    (OPT-C3). Refusal, NOT fallback: teaching those eight builders to honour delta depends on
+    whether delta is computable from the chain data, which is separate work. Until then the
+    honest interface is "this structure selects by % OTM", said out loud.
 
     Kept next to the action enum rather than in the UI for the same reason as
-    ``get_wing_width_action_values``: a producer must render exactly the fields its
-    consumer reads. Pinned against the BUILDERS by
-    ``packages/common/tests/test_option_strike_method_honoured.py``, which runs each one
-    and watches which method the selector was actually handed.
+    ``get_wing_width_action_values``: a producer must render exactly the fields its consumer
+    reads. Two independent drift guards, written against different consumers and arriving by
+    different routes, agree on this same set of nine --
+    ``packages/common/tests/test_option_strike_method_honoured.py`` runs each builder and
+    watches which method the selector was actually handed, and
+    ``packages/common/tests/test_strike_method_registry.py`` derives the set from the action
+    classes' own source. Either alone would catch a builder being fixed or broken; both
+    existing is a cross-check, not duplication, and they were written without knowledge of
+    each other.
     """
     return [
         ExpertActionType.BUY_CALL.value,
@@ -677,7 +697,7 @@ def get_strike_method_action_values():
 
 
 def honours_strike_method(action_value):
-    """Check whether an option action type reads ``strike_method``."""
+    """Check whether an option action type's builder reads ``strike_method`` at all."""
     return action_value in get_strike_method_action_values()
 
 

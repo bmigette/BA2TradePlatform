@@ -28,7 +28,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import date as _date, datetime, timedelta, timedelta as _timedelta
 
 
 def _parse_symbols_arg(raw: str) -> list:
@@ -2321,19 +2321,65 @@ _PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS)
 _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 
 
+# --- the 2026 walk-forward holdout ----------------------------------------------------------
+#
+# The option grid searches 2023-01-01 .. 2025-12-31. 2026 is RESERVED: walk-forward validation
+# on it is a separate exercise, and it is only worth anything if the search never saw the data.
+# A grid run that quietly extends past the boundary spends the answer key on the exam.
+#
+# This is a RAIL, not a setting. There is no flag to switch it off: the walk-forward exercise
+# will move this constant deliberately, as a reviewed change, rather than as an argument
+# someone can paste into a shell script and forget.
+#
+# Scoped to PURE-OPTION jobs. Non-option backtests are running against 2026 windows right now
+# and must not be disturbed by an option-grid policy.
+_OPTION_HOLDOUT_START = _date(2026, 1, 1)
+
+
+def _assert_option_window_excludes_holdout(strat_kinds, end) -> None:
+    """Refuse a pure-option optimize job whose window reaches into the reserved 2026 holdout."""
+    option_kinds = sorted(set(strat_kinds) & _PURE_OPTION_STRATEGIES)
+    if not option_kinds:
+        return
+    try:
+        last = _date.fromisoformat(str(end)[:10])
+    except (TypeError, ValueError):
+        sys.exit(f"ba2-test: --end {end!r} is not an ISO date")
+    if last >= _OPTION_HOLDOUT_START:
+        sys.exit(
+            f"ba2-test: --end {last.isoformat()} reaches into the reserved walk-forward "
+            f"holdout (everything from {_OPTION_HOLDOUT_START.isoformat()}). The option grid "
+            f"must stop at {(_OPTION_HOLDOUT_START - _timedelta(days=1)).isoformat()} or the "
+            f"validation set is spent on the search. Affected strategies: "
+            f"{', '.join(option_kinds)}. If you are deliberately running the walk-forward "
+            f"exercise, move _OPTION_HOLDOUT_START in ba2test_launcher.py as a reviewed "
+            f"change -- there is no flag for this.")
+
+
 def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: str) -> str:
     """Effective fitness metric for an optimize job. An explicit --fitness always wins.
     Otherwise PURE-OPTION kinds (O_* except the equity-entry O_CC/O_PP/O_STK, and the
-    OS1-OS4 groups) default to consistent_annual_return — the ~30%/yr goal metric
-    (annualized return x drawdown guard x worst-year/mean-year consistency x >=30
-    trades/yr gate). Calmar/sharpe on option books rewards barely-trading low-drawdown
-    configs (v6 OS runs on calmar: 2-27 trades, TR 3.6-18%). STOCK kinds (and the
-    equity-entry option overlays) keep the command's historical default (``stock_default``)
-    so equity tuning is untouched.
+    OS1-OS4 groups) default to ``option_consistent_annual_return`` — the option-specific
+    variant of the ~30%/yr goal metric (annualized return x drawdown guard x
+    worst-year/mean-year consistency x trade-frequency gate). Calmar/sharpe on option books
+    rewards barely-trading low-drawdown configs (v6 OS runs on calmar: 2-27 trades, TR
+    3.6-18%). STOCK kinds (and the equity-entry option overlays) keep the command's
+    historical default (``stock_default``) so equity tuning is untouched.
+
+    WHY A SEPARATE METRIC RATHER THAN A FLAG INSIDE ``consistent_annual_return``. There are
+    non-option backtests running against the equity metric right now, and their scores must
+    not move. A metric that is not SELECTED is never called; a flag inside a shared metric has
+    to be read correctly on every path, and can be read wrongly. So the option grid points at
+    its own metric and ``_consistent_annual_return`` is left bit-for-bit alone.
+
+    ``option_consistent_annual_return`` (aliases ``option_car`` / ``ocar``) is registered in
+    ``strategy_fitness.py`` on the ``option-fitness`` branch; this returns its NAME, and
+    ``compute_fitness`` resolves it once that branch is merged.
     """
     if cli_fitness:
         return cli_fitness
-    return "consistent_annual_return" if strat_kind in _PURE_OPTION_STRATEGIES else stock_default
+    return ("option_consistent_annual_return" if strat_kind in _PURE_OPTION_STRATEGIES
+            else stock_default)
 
 
 # Minimum DAILY TRADED VOLUME a contract must show to be SELECTABLE (2026-07-25).
@@ -2371,6 +2417,98 @@ def _option_entry_action_for(kind: str) -> dict:
     """
     cfg = dict(_OPTION_STRATS[kind])
     _apply_option_min_volume(cfg)
+    _apply_option_strike_method_gene(cfg)
+    _apply_option_sizing_gene(cfg)
+    return cfg
+
+
+# --- position SIZE as a gene (OPT-C6) -------------------------------------------------------
+#
+# ``option_sizing`` (% of equity committed per structure) is bounded, symbol-comparable and
+# exactly the same category of knob as %OTM / DTE / wing width -- and it was a per-structure
+# CONSTANT the GA could not touch: 0 sizing genes across all 19 built option strategies.
+#
+# It also GATES the fitness work: contracts x max_loss IS ``option_sizing`` % of equity by
+# construction, so any return-on-collateral measure divides by a constant while sizing is
+# frozen and collapses back into plain return.
+#
+# The band is keyed on the structure's AUTHORED size rather than shared, because 20 % of equity
+# in a defined-risk condor and 20 % in a long call are not the same risk -- a single global
+# window would either starve the credit structures or let the debit ones bet the account. The
+# table must be TOTAL over the authored values (asserted below): a structure whose size is not
+# covered would silently keep a frozen size while every sibling searched one.
+_OPTION_SIZING_BANDS = {
+    #  authored: (min, max, step)
+    5.0:  (1.0, 10.0, 1.0),    # long premium: floor at 1% (a real 1-contract bet), cap at 2x
+    8.0:  (2.0, 16.0, 2.0),    # butterfly
+    15.0: (5.0, 30.0, 2.5),    # defined-risk / skewed credit
+    20.0: (5.0, 40.0, 5.0),    # neutral credit + full-notional
+}
+_missing_sizings = sorted({cfg["option_sizing"] for cfg in _OPTION_STRATS.values()
+                           if cfg.get("option_sizing") is not None}
+                          - set(_OPTION_SIZING_BANDS))
+if _missing_sizings:
+    raise RuntimeError(
+        f"_OPTION_SIZING_BANDS has no band for authored option_sizing {_missing_sizings}; "
+        f"those structures would keep a frozen size while their siblings search one.")
+
+
+def _apply_option_sizing_gene(cfg: dict) -> dict:
+    """Make ``option_sizing`` searchable, in place. No-op when the action does not size off it
+    (O_CC / O_PP size off the HELD share count -- one contract per round lot -- so a sizing
+    gene there would be inert)."""
+    sizing = cfg.get("option_sizing")
+    if sizing is None:
+        return cfg
+    lo, hi, step = _OPTION_SIZING_BANDS[float(sizing)]
+    cfg.setdefault("option_sizing_optimize", True)
+    cfg.setdefault("option_sizing_min", lo)
+    cfg.setdefault("option_sizing_max", hi)
+    cfg.setdefault("option_sizing_step", step)
+    return cfg
+
+
+# --- delta-based strike selection (OPT-C3) --------------------------------------------------
+#
+# ``percent_otm`` was the ONLY strike gene in all 16 option grids, and it is volatility-BLIND:
+# 5 % OTM on a 15-vol utility and on a 90-vol biotech are not remotely the same proposition, so
+# a threshold that is right for one symbol is wrong for the next and the GA cannot converge on
+# a portable number. Delta IS normalised across symbols (and across vol regimes), is
+# implemented in ``option_selector._pick_by``, is supported by the backtest chain, and is the
+# LIVE default -- and was never searched.
+#
+# The METHOD is a categorical gene so the GA chooses per structure; the two parameters are
+# SEPARATE genes because they are separate quantities on separate scales (that conflation is
+# precisely the OPT-C3 naming bug). ``strategy_param_space._apply_option_strike`` writes
+# whichever one matches the decoded method.
+#
+# ONLY where the builder honours it. Eight of the seventeen ``_OptionEntryAction`` subclasses
+# hard-code ``method="percent_otm"`` and leave ``strike_method`` a dead attribute (OPT-S2), so
+# offering the choice there would be a gene the simulation cannot see -- the exact defect this
+# whole track is fixing. ``types.honours_strike_method`` is the registry, drift-guarded against
+# the builders' own source by packages/common/tests/test_strike_method_registry.py.
+_OPTION_DELTA_RANGE = {"option_strike_delta": 0.30, "option_strike_delta_optimize": True,
+                       "option_strike_delta_min": 0.05, "option_strike_delta_max": 0.50,
+                       "option_strike_delta_step": 0.05}
+
+
+def _apply_option_strike_method_gene(cfg: dict) -> dict:
+    """Make the strike METHOD searchable (percent_otm | delta) on actions that honour it.
+
+    A no-op for the eight builders that ignore ``strike_method``, and for an action whose
+    percent param is not itself optimizable (there would be nothing to switch between).
+    """
+    from ba2_common.core.types import honours_strike_method
+
+    at = str(cfg.get("action_type") or "")
+    if not honours_strike_method(at):
+        return cfg
+    if not cfg.get("option_strike_param_optimize"):
+        return cfg
+    cfg.setdefault("option_strike_method_optimize", True)
+    cfg.setdefault("option_strike_method_choices", ["percent_otm", "delta"])
+    for k, v in _OPTION_DELTA_RANGE.items():
+        cfg.setdefault(k, v)
     return cfg
 
 
@@ -2400,7 +2538,7 @@ def _option_overlay_action(action_type: str, *, strike_param: float,
     touch while the same knobs were searched on every pure-option key. Sizing genuinely is
     not a knob here -- both actions size off the HELD share count (1 contract per 100
     shares), not option_sizing."""
-    return _apply_option_min_volume({
+    return _apply_option_strike_method_gene(_apply_option_min_volume({
         "action_type": action_type,
         "option_strike_method": "percent_otm", "option_strike_param": strike_param,
         "option_dte_min": dte_min, "option_dte_max": dte_max,
@@ -2408,7 +2546,7 @@ def _option_overlay_action(action_type: str, *, strike_param: float,
         "option_strike_param_max": strike_max, "option_strike_param_step": strike_step,
         "option_dte_optimize": True, "option_dte_min_range": dte_min_range,
         "option_dte_max_range": dte_max_range, "option_dte_step": dte_step,
-    })
+    }))
 
 
 def _screener_gate_base_for_strategy(kind: str) -> dict:
@@ -2466,6 +2604,16 @@ def _screener_gate_opt_block(args, strategy_key: str) -> "dict | None":
 # profile (see _option_exit_rules).
 _DEBIT_OPTION_KINDS = {"O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS", "O_STRD", "O_STRG",
                        "OS1", "OS4"}
+
+# The same split at MEMBER granularity (the group keys removed). Entry gates are authored per
+# MEMBER -- a group's rules are one per member -- so a set that mixes members and group keys
+# cannot answer "is THIS structure long or short premium?".
+_DEBIT_OPTION_MEMBERS = _DEBIT_OPTION_KINDS & set(_OPTION_STRATS)
+_CREDIT_OPTION_MEMBERS = set(_OPTION_STRATS) - _DEBIT_OPTION_MEMBERS
+# Every member must land on exactly one side: an unclassified structure would silently get the
+# credit half's iv_rank gate (the wrong thesis) with nothing to notice it.
+if _DEBIT_OPTION_MEMBERS | _CREDIT_OPTION_MEMBERS != set(_OPTION_STRATS):
+    raise RuntimeError("option members are not partitioned into debit/credit halves")
 
 
 def _option_exit_rules(kind: str):
@@ -2552,6 +2700,160 @@ def _build_strategy_option(kind: str):
     return s
 
 
+# --- price-vs-analyst-target entry gates ---------------------------------------------------
+#
+# Two BANDS, one per analyst-target line, each expressed as a FLOOR gene plus a strictly
+# positive WIDTH gene (``value_offset_from``, decoded in strategy_param_space._apply_to_tree).
+#
+# WHY NOT FOUR INDEPENDENT ABSOLUTE THRESHOLDS (the shape before 2026-08-26, OPT-C5). The four
+# gates are two pairs, and each pair tests the SAME field with opposing operators, i.e. an
+# interval. As independent absolute genes on one shared -20..+20 step-5 grid, ~half of each
+# pair's joint values put the ceiling at or below the floor — an EMPTY conjunction that
+# guarantees zero trades for every symbol on every bar and scores the identical zero-trade
+# sentinel, so selection gets no gradient from it. Measured exhaustively on the built O_LC
+# rule over all 16 toggle combinations x 9^4 values: 27,135 / 104,976 = **25.8 % of the joint
+# gene space was guaranteed-empty** — and the AUTHORED DEFAULT (all four gates on, every
+# threshold 0.0 -> "low% < 0 AND low% > 0") was itself one of them, which is precisely where
+# warm-start and every hand-seeded individual begins.
+#
+# With the width parameterisation every point of the grid is a live interval. Expressiveness is
+# unchanged: each bound keeps its own independent ON/OFF gene, so floor-only ("already above
+# the low estimate"), ceiling-only ("still below the low estimate"), band, and the cross-field
+# "inside the analyst range" (low floor + high ceiling) all remain reachable.
+#
+# Residual (deliberate): a cross-field pair — a floor on the LOW line against a ceiling on the
+# HIGH line — can still be empty, but only for symbols whose target_high/target_low ratio is
+# tight enough. That is a symbol-dependent FILTER carrying real information, not a
+# symbol-independent guaranteed zero, so it is left searchable.
+#
+# WINDOWS (OPT-C12). ``price_vs_target_high_percent`` — how far spot sits above the analyst
+# HIGH target — has a ~-31 % median across the universe, so the original shared -20..+20 window
+# put ~77 % of symbols outside the searchable range and the two high gates were inert on them.
+# The high floor therefore gets its own -50..+10 window, which brackets the median; the low
+# line keeps -20..+20, which the review did not flag.
+_PRICE_GATE_LOW_FLOOR = {"value": -20.0, "value_min": -20.0, "value_max": 20.0,
+                         "value_step": 5.0}
+_PRICE_GATE_HIGH_FLOOR = {"value": -50.0, "value_min": -50.0, "value_max": 10.0,
+                          "value_step": 5.0}
+#: Band WIDTH above the paired floor. Strictly positive (min == step), which is what makes the
+#: interval non-empty for every combination the GA can sample.
+_PRICE_GATE_WIDTH = {"value_min": 5.0, "value_max": 45.0, "value_step": 5.0}
+
+
+def _price_target_gates(m: str) -> list:
+    """The four price-vs-analyst-target entry gates for member prefix ``m`` (see above).
+
+    Authored defaults are the PERMISSIVE end of each band (floor at its minimum, width at its
+    maximum), so the seeded individual behaves like the rating-only strategy the grid has
+    always intended — instead of the guaranteed-zero-trade conjunction the all-zero default
+    used to be.
+    """
+    low_floor = _PRICE_GATE_LOW_FLOOR
+    high_floor = _PRICE_GATE_HIGH_FLOOR
+    w = _PRICE_GATE_WIDTH
+    return [
+        # FLOORS (">"): the band's lower edge, an absolute % vs the target line.
+        {"id": f"{m}-price_low_above", "field": "price_vs_target_low_percent", "op": ">",
+         "optimize": True, "toggle_optimize": True, **low_floor},
+        {"id": f"{m}-price_high_above", "field": "price_vs_target_high_percent", "op": ">",
+         "optimize": True, "toggle_optimize": True, **high_floor},
+        # CEILINGS ("<"): the band's upper edge, decoded as floor + width. ``value`` stays the
+        # ABSOLUTE authored threshold (an un-decoded template must still seed a valid rule);
+        # value_min/max/step describe the WIDTH the GA searches.
+        {"id": f"{m}-price_low_below", "field": "price_vs_target_low_percent", "op": "<",
+         "value": low_floor["value"] + w["value_max"], "optimize": True,
+         "toggle_optimize": True, "value_offset_from": f"{m}-price_low_above", **w},
+        {"id": f"{m}-price_high_below", "field": "price_vs_target_high_percent", "op": "<",
+         "value": high_floor["value"] + w["value_max"], "optimize": True,
+         "toggle_optimize": True, "value_offset_from": f"{m}-price_high_above", **w},
+    ]
+
+
+# --- implied-volatility-rank entry gate (OPT-C1 / OPT-C4-of-R3) -----------------------------
+#
+# `iv_rank` is the one genuinely BOUNDED (0-100), symbol-COMPARABLE option quantity the
+# platform owns. It is fully implemented (TradeConditions.IVRankCondition,
+# BacktestAccount.get_iv_rank, OptionsAccountInterface._iv_rank_from_series), registered in
+# every condition registry (ExpertEventType.N_IV_RANK, get_numeric_event_values, CONDITION_MAP,
+# rule_builders.FIELD_EVENT, rules_export_import._FIELD_ABBR) -- and until now NO GRID BUILT A
+# LEAF FOR IT. Measured across all 19 built option strategies before this change: 256 condition
+# leaves, 499 genes, ZERO iv_rank leaves and ZERO iv_rank genes.
+#
+# THE TWO HALVES MUST ASK FOR OPPOSITE THINGS (OPT-C4). A premium SELLER wants implied vol
+# expensive; a premium BUYER wants it cheap. The GA's gene space never searches a condition's
+# OPERATOR -- only its threshold and its ON/OFF flag -- so a single shared gate could only ever
+# express ONE of those theses, and the other half would be gated on the opposite of what it
+# wants. The operator is therefore SET PER HALF, from the same debit/credit split the exit
+# bands already use, and each half gets its own searched window:
+#
+#     debit  (long premium)  iv_rank <  V   V in 10..60   "only buy vol when it is cheap"
+#     credit (short premium) iv_rank >  V   V in 20..70   "only sell vol when it is expensive"
+#
+# matching the documented recipes in rules_documentation.py ("Buy calls only in cheap
+# volatility: iv_rank <= 30", "Sell premium when iv_rank is high").
+#
+# FAIL-CLOSED, and that is deliberate. `IVRankCondition` returns False for EVERY operator when
+# the rank is unavailable (fewer than IV_RANK_MIN_SAMPLES=5 usable ATM-IV points -- the case on
+# any options cache built before the greeks columns existed). So an individual that switches
+# this gate ON against a cache with no IV trades NOTHING and scores the zero-trade sentinel.
+# That is the correct reading of "we cannot measure the entry criterion", not a bug: the
+# alternative (treat unknown IV as passing) would let the GA collect the gate's credit while
+# never actually applying it. The gate carries its own ``toggle_optimize`` gene, so the search
+# can and will switch it off where the data is not there.
+_IV_RANK_GATE = {
+    True:  {"op": "<", "value": 30.0, "value_min": 10.0, "value_max": 60.0},   # debit
+    False: {"op": ">", "value": 60.0, "value_min": 20.0, "value_max": 70.0},   # credit
+}
+_IV_RANK_STEP = 5.0
+
+
+def _iv_rank_gate(m: str, member: str) -> dict:
+    """The iv_rank entry gate leaf for member prefix ``m`` (see above)."""
+    spec = _IV_RANK_GATE[member in _DEBIT_OPTION_MEMBERS]
+    return {"id": f"{m}-iv_rank", "field": "iv_rank", "op": spec["op"],
+            "value": spec["value"], "optimize": True,
+            "value_min": spec["value_min"], "value_max": spec["value_max"],
+            "value_step": _IV_RANK_STEP, "toggle_optimize": True}
+
+
+# --- volume / volatility entry gates --------------------------------------------------------
+#
+# RELATIVE VOLUME. The UNDERLYING's volume over its own trailing 20-bar average (current bar
+# excluded). One direction for both halves -- real participation behind the signal is a
+# confirmation whether you are buying or selling premium -- so the searched threshold is the
+# only per-half difference, and there is none. 0.5..3.0 brackets both "any liquidity at all"
+# and "genuinely unusual"; the authored default sits at the permissive end.
+#
+# Not volume/OPEN INTEREST, which would be the better CONTRACT-level unusual-activity signal:
+# `open_interest` is NULL on every cached option row (see option_selector.passes_liquidity), so
+# it is not computable here today.
+_RELATIVE_VOLUME_GATE = {"value": 0.5, "value_min": 0.5, "value_max": 3.0, "value_step": 0.25}
+
+# IV / REALISED VOL -- the variance risk premium, i.e. the actual edge in premium selling: you
+# are paid implied and you pay out realised. OPPOSITE PER HALF for the same reason as iv_rank
+# (the gene space never searches an operator): a seller wants the ratio HIGH, a buyer wants it
+# LOW. The window brackets 1.0 on both sides so either half can express "no edge here".
+_IV_RV_GATE = {
+    True:  {"op": "<", "value": 1.6},   # debit: buy premium only when it is cheap vs realised
+    False: {"op": ">", "value": 0.8},   # credit: sell premium only when it is genuinely rich
+}
+_IV_RV_RANGE = {"value_min": 0.8, "value_max": 1.6, "value_step": 0.1}
+
+
+def _relative_volume_gate(m: str) -> dict:
+    """The relative-volume entry gate leaf for member prefix ``m``."""
+    return {"id": f"{m}-rel_volume", "field": "relative_volume", "op": ">",
+            "optimize": True, "toggle_optimize": True, **_RELATIVE_VOLUME_GATE}
+
+
+def _iv_rv_gate(m: str, member: str) -> dict:
+    """The IV/realised-vol entry gate leaf for member prefix ``m``."""
+    spec = _IV_RV_GATE[member in _DEBIT_OPTION_MEMBERS]
+    return {"id": f"{m}-iv_rv", "field": "iv_to_realized_vol", "op": spec["op"],
+            "value": spec["value"], "optimize": True, "toggle_optimize": True,
+            **_IV_RV_RANGE}
+
+
 def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
     (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
@@ -2572,22 +2874,13 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     behavior, all four price gates OFF), price-only (signal gate OFF, e.g. "put even though
     the rating still says buy" via price_high_above alone), any combination of the four price
     gates together, or every gate off entirely.
+
+    The two SAME-FIELD pairs are parameterised as (floor, width>0) rather than two independent
+    absolute thresholds -- see ``_price_target_gates``, which is where the 25.8 % of
+    guaranteed-empty gene space (OPT-C5) and the inert high-target window (OPT-C12) were fixed.
     """
     m = member.lower()
-    price_target_conditions = [
-        {"id": f"{m}-price_low_below", "field": "price_vs_target_low_percent", "op": "<",
-         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
-         "value_step": 5.0, "toggle_optimize": True},
-        {"id": f"{m}-price_high_above", "field": "price_vs_target_high_percent", "op": ">",
-         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
-         "value_step": 5.0, "toggle_optimize": True},
-        {"id": f"{m}-price_low_above", "field": "price_vs_target_low_percent", "op": ">",
-         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
-         "value_step": 5.0, "toggle_optimize": True},
-        {"id": f"{m}-price_high_below", "field": "price_vs_target_high_percent", "op": "<",
-         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
-         "value_step": 5.0, "toggle_optimize": True},
-    ]
+    price_target_conditions = _price_target_gates(m)
     rule = {
         "id": f"{m}-entry",
         "name": f"{member}-entry",
@@ -2598,6 +2891,9 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
             {"id": f"{m}-gate_confidence", "field": "confidence", "op": ">", "value": 50,
              "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
              "toggle_optimize": True},
+            _iv_rank_gate(m, member),
+            _relative_volume_gate(m),
+            _iv_rv_gate(m, member),
             *price_target_conditions,
         ]},
         "actions": [_option_entry_action_for(member)],
@@ -2893,6 +3189,7 @@ def _cmd_optimize(args) -> int:
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
                                "consistent_annual_return" if spec.get("options") else "sharpe_ratio")
+    _assert_option_window_excludes_holdout([args.strategy], args.end)
     universe = [s.strip().upper() for s in args.universe.split(",") if s.strip()]
     if not universe:
         sys.exit("ba2-test: --universe must list at least one symbol")
@@ -3215,6 +3512,7 @@ def _cmd_optimize_batch(args) -> int:
                               ("monday", "tuesday", "wednesday", "thursday", "friday",
                                "saturday", "sunday")},
                      "times": ["09:30"]}
+    _assert_option_window_excludes_holdout([k for _e, k in jobs], args.end)
     init_db()
     tq = get_task_queue()
     print(f"optimize-batch: {len(jobs)} job(s) {jobs} x {len(universe)} syms, "

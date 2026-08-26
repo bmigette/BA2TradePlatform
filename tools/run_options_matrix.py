@@ -30,7 +30,7 @@ prewarm for the expert signals.
 Usage (test venv; FMP_API_KEY/DB_FILE in env):
     ba2-venvs/test/Scripts/python.exe tools/run_options_matrix.py \
         [--strategies OS1,OS2,OS3,O_CC,O_STK] [--experts FMPRating] \
-        [--start 2024-04-01] [--end 2026-06-30] [--population 40] [--generations 8] \
+        [--start 2023-01-01] [--end 2025-12-31] [--population 40] [--generations 8] \
         [--fitness <override>] [--initial-capital 20000] [--dry-run]
 """
 import argparse
@@ -107,10 +107,25 @@ def main() -> int:
                          "O_BEARCS,O_STRD,O_STRG,O_CC,O_PP,O_STK). OS1=directional debit, "
                          "OS2=neutral credit, OS3=skewed credit, OS4=volatility debit "
                          "(non-directional).")
-    ap.add_argument("--start", default="2024-04-01",
-                    help="Backtest start (options cache floor 2024-02-01 + expert warmup; "
-                         "default 2024-04-01).")
-    ap.add_argument("--end", default="2026-06-30")
+    # THE GRID WINDOW: 2023-01-01 .. 2025-12-31 (set 2026-08-26).
+    #
+    # 2026 is the RESERVED walk-forward holdout -- a separate exercise, worth nothing if the
+    # search has already seen the data. The previous default ended 2026-06-30, i.e. six months
+    # INSIDE it. ba2test_launcher._assert_option_window_excludes_holdout is the rail that stops
+    # a pure-option job reaching past the boundary whatever is passed here.
+    #
+    # NOTE ON THE START: the backtest still enforces Alpaca's measured options-history floor,
+    # `_OPTIONS_HISTORY_FLOOR = date(2024, 1, 18)` in
+    # testplatform/backend/app/services/backtest/fetch_options.py, via
+    # daily_backtest_handler.validate_options_window. Until that constant is lowered to the
+    # TastyTrade cache's own floor, an option job starting 2023-01-01 raises
+    # "Options backtests require start >= 2024-01-18" before it runs.
+    ap.add_argument("--start", default="2023-01-01",
+                    help="Backtest start (default 2023-01-01; requires the options cache -- "
+                         "and fetch_options._OPTIONS_HISTORY_FLOOR -- to reach that far back).")
+    ap.add_argument("--end", default="2025-12-31",
+                    help="Backtest end (default 2025-12-31: 2026 is the reserved "
+                         "walk-forward holdout and the launcher refuses to search into it).")
     ap.add_argument("--population", type=int, default=40)
     ap.add_argument("--generations", type=int, default=8)
     ap.add_argument("--mutation-prob", type=float, default=None,
@@ -207,7 +222,7 @@ def main() -> int:
         if args.fitness:
             # Explicit override forces this metric uniformly; omitted (default) lets
             # ba2test_launcher's _resolve_fitness() pick per-strategy-kind (pure-option ->
-            # consistent_annual_return, O_CC/O_PP/O_STK -> sharpe_ratio).
+            # option_consistent_annual_return, O_CC/O_PP/O_STK -> sharpe_ratio).
             cmd += ["--fitness", args.fitness]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]

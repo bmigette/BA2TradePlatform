@@ -29,9 +29,13 @@ Namespacing:
   exit:<rid>:enabled               exit rule ON/OFF toggle
   exit:<rid>:a<i>:action_value     exit rule action i's value
   exit:<rid>:a<i>:enabled          exit rule action i's ON/OFF toggle
-  exit:<rid>:a<i>:option_delta     option strike delta (option actions)
+  exit:<rid>:a<i>:option_strike_param  option strike PERCENT-OTM (option actions; was
+                                       misnamed option_delta, still accepted on decode)
+  exit:<rid>:a<i>:option_strike_method strike selection method (choice: percent_otm | delta)
+  exit:<rid>:a<i>:option_strike_delta  option strike DELTA (used when the method is delta)
   exit:<rid>:a<i>:option_dte       option DTE window center
   exit:<rid>:a<i>:option_wing_width  option wing width %
+  exit:<rid>:a<i>:option_sizing    option position size (% of equity per structure)
   schedule:<day>                   ON/OFF toggle for that weekday's entry scan
   screener:<setting>               screener settings
 
@@ -144,6 +148,35 @@ def _walk_condition_nodes(cond: Optional[Dict[str, Any]], out: Dict[str, Any]) -
         out[f"cond:{cid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
 
 
+def _validate_value_offsets(tree: Optional[Dict[str, Any]], where: str) -> None:
+    """Fail EARLY (once per job, at gene collection) on a dangling ``value_offset_from``.
+
+    Without this the dangling reference only surfaces per-trial inside ``_apply_to_tree``,
+    i.e. as N identical crashed trials rather than one actionable message.
+    """
+    known: Dict[str, Any] = {}
+    _collect_authored_values(tree, known)
+    refs: Dict[str, str] = {}
+
+    def _walk(node):
+        if not isinstance(node, dict):
+            return
+        for child in (node.get("conditions") or []):
+            _walk(child)
+        base = node.get("value_offset_from")
+        if base is not None:
+            refs[str(node.get("id"))] = str(base)
+
+    _walk(tree)
+    bad = {cid: base for cid, base in refs.items() if base not in known}
+    if bad:
+        raise ValueError(
+            f"{where}: value_offset_from references no threshold-carrying leaf in the same "
+            f"condition tree: {bad}. A relative threshold with an unresolvable base is "
+            f"unmeasurable, not zero."
+        )
+
+
 def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
                           out: Dict[str, Any]) -> None:
     """Genes for ONE action of a rule: value, per-action toggle, and option selection params."""
@@ -156,12 +189,49 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
     at = str(action.get("action_type") or action.get("action") or "")
     if action.get("toggle_optimize") and at not in _UNDROPPABLE_ACTIONS:
         out[f"{prefix}:enabled"] = _range_entry(0, 1, 1, is_int=True)
-    # OPTION action selection params: strike delta / DTE window center / wing width.
+    # OPTION action selection params: strike param / strike method / delta / DTE / wing width.
+    #
+    # NAMING (OPT-C3). This gene used to be emitted as ``option_delta`` while carrying
+    # PERCENT-OTM values in every range the grid declared -- two quantities, one name. It is
+    # now ``option_strike_param``, which is the field it actually writes; the real delta is
+    # ``option_strike_delta``. ``option_delta`` is still ACCEPTED on decode (see
+    # _decode_rule_list) as the legacy spelling of the percent param, so a persisted
+    # best-params blob or a warm start from an older optimization still applies -- silently
+    # re-reading it as a delta would turn a "6" into a 6-delta lookup, i.e. deep ITM.
     if action.get("option_strike_param_optimize"):
-        out[f"{prefix}:option_delta"] = _range_entry(
+        out[f"{prefix}:option_strike_param"] = _range_entry(
             action.get("option_strike_param_min"),
             action.get("option_strike_param_max"),
             action.get("option_strike_param_step"), is_int=False,
+        )
+    # STRIKE METHOD as a categorical gene (percent_otm | delta | ...). percent_otm is
+    # volatility-BLIND -- 5 % OTM on a 15-vol utility and on a 90-vol biotech are not the same
+    # proposition -- while delta is normalised across symbols and is the live default. Emitted
+    # only where the producer asked for it; the producer is responsible for asking only on
+    # actions whose builder actually reads strike_method (types.honours_strike_method), since
+    # eight of the seventeen builders hard-code percent_otm and would make this gene inert.
+    if action.get("option_strike_method_optimize"):
+        choices = list(action["option_strike_method_choices"])
+        if len(choices) < 2:
+            raise ValueError(
+                f"{prefix}: option_strike_method_optimize needs >= 2 choices, got {choices}")
+        # A delta choice is meaningless without a delta-scaled parameter to go with it: the
+        # percent range (e.g. 0..8) read as a delta target picks the deepest-ITM contract on
+        # the chain. Fail here rather than silently mis-select for a whole campaign.
+        if "delta" in choices and action.get("option_strike_delta_min") is None:
+            raise ValueError(
+                f"{prefix}: option_strike_method_choices offers 'delta' but the action "
+                f"declares no option_strike_delta_min/_max/_step, so the percent-OTM range "
+                f"would be used as a delta target")
+        out[f"{prefix}:option_strike_method"] = {
+            "type": "choice", "choices": choices,
+            "min": 0, "max": len(choices) - 1, "step": 1,
+        }
+    if action.get("option_strike_delta_optimize"):
+        out[f"{prefix}:option_strike_delta"] = _range_entry(
+            action.get("option_strike_delta_min"),
+            action.get("option_strike_delta_max"),
+            action.get("option_strike_delta_step"), is_int=False,
         )
     if action.get("option_dte_optimize"):
         out[f"{prefix}:option_dte"] = _range_entry(
@@ -174,6 +244,17 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
             action.get("option_wing_width_min"),
             action.get("option_wing_width_max"),
             action.get("option_wing_width_step"), is_int=False,
+        )
+    # POSITION SIZE (% of equity per structure). Bounded and symbol-comparable -- the same
+    # category as the other option genes -- but it was a per-structure CONSTANT the GA could
+    # not touch. It also gates any return-on-collateral fitness: contracts x max_loss IS
+    # option_sizing % of equity by construction, so with sizing frozen that ratio divides by a
+    # constant and degenerates back into plain return.
+    if action.get("option_sizing_optimize"):
+        out[f"{prefix}:option_sizing"] = _range_entry(
+            action.get("option_sizing_min"),
+            action.get("option_sizing_max"),
+            action.get("option_sizing_step"), is_int=False,
         )
 
 
@@ -189,6 +270,7 @@ def _collect_rule_list(rules, ns: str, out: Dict[str, Any]) -> None:
             for idx, action in enumerate(a for a in (rule.get("actions") or [])
                                          if isinstance(a, dict)):
                 _collect_action_genes(ns, rid, idx, action, out)
+        _validate_value_offsets(rule.get("conditions"), f"{ns} rule {rid!r}")
         _walk_condition_nodes(rule.get("conditions"), out)
 
 
@@ -243,13 +325,62 @@ def collect_param_space(
     return space
 
 
+def _collect_authored_values(tree: Optional[Dict[str, Any]], out: Dict[str, Any]) -> None:
+    """Map node id -> its AUTHORED (template) ``value``, for ``value_offset_from`` resolution."""
+    if not isinstance(tree, dict):
+        return
+    for child in (tree.get("conditions") or []):
+        _collect_authored_values(child, out)
+    cid = tree.get("id")
+    if cid is not None and "value" in tree:
+        out[cid] = tree["value"]
+
+
 def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, Any]]
                    ) -> Optional[Dict[str, Any]]:
     """Deep-copy a condition tree, substituting value/confirmation_bars by node id and
-    dropping toggle-disabled nodes. The input tree is never mutated."""
+    dropping toggle-disabled nodes. The input tree is never mutated.
+
+    ``value_offset_from`` — RELATIVE thresholds (see OPT-C5)
+    -------------------------------------------------------
+    A leaf may declare ``"value_offset_from": "<other leaf id>"``, in which case its
+    ``cond:<id>:value`` gene is a **width above that leaf's threshold**, not an absolute
+    threshold: the decoded value is ``resolved(other) + gene``.
+
+    This exists because two leaves testing the SAME field with opposing operators
+    (``x > a`` AND ``x < b``) are an interval, and as two INDEPENDENT absolute genes roughly
+    half their joint grid is ``b <= a`` — an empty conjunction that guarantees zero trades for
+    every symbol on every bar, scoring the identical zero-trade sentinel. Measured on the
+    built ``O_LC`` entry rule before this change: **25.8 % of the four price-vs-target gates'
+    joint gene space was guaranteed-empty, including the authored all-zero default** that
+    warm-start and every hand-seeded individual begins from. Re-parameterising the upper bound
+    as (lower bound + width >= step) makes every point in the grid a live interval, with no
+    loss of expressiveness — each bound still has its own independent ON/OFF gene, so
+    lower-only, upper-only and band patterns all remain reachable.
+
+    The AUTHORED ``value`` on an offset leaf stays ABSOLUTE (so an un-decoded template still
+    seeds a correct ruleset); only ``value_min/max/step`` — which nothing but the gene
+    collector reads — describe the width.
+
+    A dangling reference RAISES rather than defaulting the base to 0: silently treating an
+    unresolvable base as zero would turn a width gene back into an absolute threshold and
+    quietly reintroduce exactly the empty conjunctions this mechanism removes.
+    """
     if tree is None:
         return None
     new = copy.deepcopy(tree)
+    authored: Dict[str, Any] = {}
+    _collect_authored_values(new, authored)
+
+    def _resolved(cid: str) -> Any:
+        """The other leaf's EFFECTIVE threshold: its decoded gene when it has one, else its
+        authored value. Read from the gene map (not from the tree) so resolution does not
+        depend on recursion order, and so a base leaf dropped by its own ON/OFF gene still
+        anchors the offset."""
+        sub = by_id.get(cid)
+        if sub is not None and "value" in sub:
+            return sub["value"]
+        return authored.get(cid)
 
     def _recurse(node):
         if not isinstance(node, dict):
@@ -269,7 +400,19 @@ def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, An
         if cid and cid in by_id:
             sub = by_id[cid]
             if "value" in sub:
-                node["value"] = sub["value"]
+                base_id = node.get("value_offset_from")
+                if base_id is None:
+                    node["value"] = sub["value"]
+                else:
+                    base = _resolved(base_id)
+                    if base is None:
+                        raise ValueError(
+                            f"condition {cid!r} declares value_offset_from="
+                            f"{base_id!r}, which resolves to no value (no such leaf, or "
+                            f"that leaf carries no threshold). A relative threshold with "
+                            f"an unresolvable base is unmeasurable, not zero."
+                        )
+                    node["value"] = float(base) + float(sub["value"])
             if "confirmation_bars" in sub:
                 node["confirmation_bars"] = sub["confirmation_bars"]
 
@@ -292,6 +435,47 @@ def _apply_option_dte(action: Dict[str, Any], center_val: Any) -> None:
     hw = max(base_hw, 7)  # at least +/-7 days so a weekly expiry falls in-window
     action["option_dte_min"] = max(0, center - hw)
     action["option_dte_max"] = center + hw
+
+
+def _apply_option_strike(action: Dict[str, Any], agenes: Dict[str, Any]) -> None:
+    """Write the decoded strike METHOD and the matching strike PARAM onto an option action.
+
+    ``option_strike_param`` (percent OTM) and ``option_strike_delta`` are two different
+    quantities on two different scales, and the action carries exactly one
+    ``option_strike_param`` field that the selector interprets ACCORDING TO the method. So the
+    param that lands on the action must be the one belonging to the EFFECTIVE method -- the
+    decoded ``option_strike_method`` gene when there is one, else the action's authored method.
+    Writing the percent value under a ``delta`` method targets a 6-delta contract when 6 % OTM
+    was meant (deep ITM); writing the delta under ``percent_otm`` targets 0.3 % OTM when a
+    0.30 delta was meant (at the money). Both mis-selections are silent.
+
+    ``option_delta`` is the LEGACY gene name for the percent param (it never carried a delta,
+    despite the name -- OPT-C3). Accepted so persisted best-params blobs and warm starts from
+    older optimizations still decode to what they meant.
+    """
+    method = agenes.get("option_strike_method")
+    if method is not None:
+        action["option_strike_method"] = method
+    effective = str(method if method is not None
+                    else (action.get("option_strike_method") or "percent_otm"))
+    if effective == "delta":
+        if "option_strike_delta" in agenes:
+            action["option_strike_param"] = agenes["option_strike_delta"]
+        elif action.get("option_strike_delta") is not None:
+            # The method gene chose delta but the delta itself is not searched: use the
+            # action's authored delta rather than leaving the percent value in place.
+            action["option_strike_param"] = action["option_strike_delta"]
+        elif "option_strike_param" in agenes or "option_delta" in agenes:
+            raise ValueError(
+                f"option action {action.get('action_type')!r} decoded to strike_method="
+                f"'delta' but carries no delta to select with; the percent-OTM gene would be "
+                f"read as a delta target"
+            )
+        return
+    if "option_strike_param" in agenes:
+        action["option_strike_param"] = agenes["option_strike_param"]
+    elif "option_delta" in agenes:  # legacy spelling of the percent param
+        action["option_strike_param"] = agenes["option_delta"]
 
 
 def _decode_rule_list(rules, ns: str,
@@ -319,12 +503,13 @@ def _decode_rule_list(rules, ns: str,
             if "action_value" in agenes:
                 action["action_value"] = agenes["action_value"]
                 action["value"] = agenes["action_value"]
-            if "option_delta" in agenes:
-                action["option_strike_param"] = agenes["option_delta"]
+            _apply_option_strike(action, agenes)
             if "option_dte" in agenes:
                 _apply_option_dte(action, agenes["option_dte"])
             if "option_wing_width" in agenes:
                 action["option_wing_width_pct"] = agenes["option_wing_width"]
+            if "option_sizing" in agenes:
+                action["option_sizing"] = agenes["option_sizing"]
             actions.append(action)
         rule["actions"] = actions
         if rule.get("conditions"):

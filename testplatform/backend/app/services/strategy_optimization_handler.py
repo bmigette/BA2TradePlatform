@@ -1990,7 +1990,7 @@ def _build_daily_trial_config(
         "enable_short": bool(backtest_cfg.get("enable_short")),
         # OPTIONS seam: a non-None path here flags an options trial — run_daily_backtest builds
         # the HistoricalOptionsProvider from it and injects it into the BacktestAccount so the
-        # option exit rule (and its option_delta/option_dte genes) can fetch a chain. None for an
+        # option exit rule (and its option_strike_param/option_dte genes) can fetch a chain. None for an
         # equity-only trial (byte-identical to the prior behaviour).
         "options_cache_db": options_cache_db,
         # SCREENER seam: the per-individual effective screener settings + store path the engine

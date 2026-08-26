@@ -165,7 +165,7 @@ def test_its_genes_are_emitted_standalone():
     from app.services.strategy_param_space import collect_param_space
 
     space = collect_param_space(mod._build_strategy_option(KIND))
-    assert f"entry:{RID}:a0:option_delta" in space
+    assert f"entry:{RID}:a0:option_strike_param" in space
     assert f"entry:{RID}:a0:option_dte" in space
     assert f"cond:{RID.replace('-entry', '')}-gate_confidence:value" in space
 
@@ -177,7 +177,7 @@ def test_its_genes_are_emitted_inside_the_OS3_group():
 
     space = collect_param_space(mod._build_strategy_option_group("OS3"))
     assert f"entry:{RID}:enabled" in space
-    assert f"entry:{RID}:a0:option_delta" in space
+    assert f"entry:{RID}:a0:option_strike_param" in space
     assert f"entry:{RID}:a0:option_dte" in space
 
 
