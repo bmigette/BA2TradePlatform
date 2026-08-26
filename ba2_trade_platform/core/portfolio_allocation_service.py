@@ -482,12 +482,21 @@ def submit_plan(account, plan: AllocationPlan, current: Dict[str, PositionState]
     turns any unexpected raise into an outcome with an EMPTY id list, and a run
     that then dies has no other record of the orders it really sent.
 
-    A sell that FAILS does not abandon the buys. ``_apply_bp_scaling`` sized the
-    buys against the buying power the account had BEFORE any sell, so a refused
-    close cannot make them overspend, and stopping half way would leave the
-    account further from target than doing nothing while the outcome table said
-    nothing about the rows never attempted. Partial failure is normal: each row
-    reports its own outcome and nothing is rolled back.
+    A sell that FAILS does not abandon the buys. Stopping half way would leave the
+    account further from target than doing nothing, while the outcome table said
+    nothing at all about the rows never attempted. Partial failure is normal: each
+    row reports its own outcome and nothing is rolled back.
+
+    THE SELLS-FIRST ORDER IS LOAD-BEARING NOW, not merely tidy. ``_apply_bp_scaling``
+    sizes the buys against ``available_buying_power`` PLUS what this plan's own
+    sells free, so the freed money has to be at the broker before a buy asks for
+    it. It used to size them against the pre-sell figure alone -- which meant a
+    refused close could not make the buys overspend, and also meant a rebalance
+    that sold 2,112 to buy 1,187 scaled every buy to a third of itself for no
+    reason. A refused close can now leave a buy short of room; the broker rejects
+    that one buy and ``_submit_row`` reports it on its own row, which is the same
+    containment every other per-row failure gets. The dry run can see it coming:
+    un-ticking a sell there re-measures the budget through ``filter_plan_rows``.
 
     Raises:
         ValueError: when ``allow_fractional`` disagrees with
