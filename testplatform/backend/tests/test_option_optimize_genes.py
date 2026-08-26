@@ -5,7 +5,7 @@ should be able to tune:
   - option_strike_param (delta), via option_strike_param_optimize/_min/_max/_step
   - DTE, via option_dte_optimize/_min_range/_max_range/_step
 
-collect_param_space must emit exit:<rid>:a<i>:option_delta and exit:<rid>:a<i>:option_dte;
+collect_param_space must emit exit:<rid>:a<i>:option_strike_param and exit:<rid>:a<i>:option_dte;
 decode_params must write them back onto the ACTION (option_strike_param, and a DTE *window*
 [option_dte_min, option_dte_max] centered on the tuned value).
 
@@ -46,7 +46,7 @@ def _option_rule(**action_overrides):
 
 def test_option_selection_params_become_genes():
     space = collect_param_space(_strategy(exit_rules=[_option_rule()]))
-    assert space["exit:o1:a0:option_delta"] == {"type": "float", "min": 0.2, "max": 0.4,
+    assert space["exit:o1:a0:option_strike_param"] == {"type": "float", "min": 0.2, "max": 0.4,
                                                 "step": 0.05}
     assert space["exit:o1:a0:option_dte"] == {"type": "int", "min": 20, "max": 45, "step": 5}
 
@@ -59,13 +59,13 @@ def test_option_genes_absent_when_not_optimized():
         action_value_max=3.0, action_value_step=0.5,
     )
     space = collect_param_space(_strategy(exit_rules=[rule]))
-    assert "exit:o1:a0:option_delta" not in space
+    assert "exit:o1:a0:option_strike_param" not in space
     assert "exit:o1:a0:option_dte" not in space
 
 
 def test_option_selection_params_decode_roundtrip():
     s = _strategy(exit_rules=[_option_rule()])
-    decoded = decode_params(s, {"exit:o1:a0:option_delta": 0.35,
+    decoded = decode_params(s, {"exit:o1:a0:option_strike_param": 0.35,
                                 "exit:o1:a0:option_dte": 30})
     action = decoded["exit_rules"][0]["actions"][0]
     assert action["option_strike_param"] == 0.35

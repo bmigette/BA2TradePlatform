@@ -9,7 +9,7 @@ decode_params must write the chosen value back onto the ACTION as option_wing_wi
 the key rule_builders._OPTION_ACTION_PARAM_KEYS reads (mapping wing_width_pct <-
 ("option_wing_width_pct", "option_wing_width")).
 
-The wing is a plain float param (mirrors option_strike_param / option_delta); unlike
+The wing is a plain float param (mirrors option_strike_param); unlike
 option_dte it does NOT decode to a window — the chosen value is applied directly.
 """
 import types

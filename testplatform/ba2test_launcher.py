@@ -2371,6 +2371,51 @@ def _option_entry_action_for(kind: str) -> dict:
     """
     cfg = dict(_OPTION_STRATS[kind])
     _apply_option_min_volume(cfg)
+    _apply_option_strike_method_gene(cfg)
+    return cfg
+
+
+# --- delta-based strike selection (OPT-C3) --------------------------------------------------
+#
+# ``percent_otm`` was the ONLY strike gene in all 16 option grids, and it is volatility-BLIND:
+# 5 % OTM on a 15-vol utility and on a 90-vol biotech are not remotely the same proposition, so
+# a threshold that is right for one symbol is wrong for the next and the GA cannot converge on
+# a portable number. Delta IS normalised across symbols (and across vol regimes), is
+# implemented in ``option_selector._pick_by``, is supported by the backtest chain, and is the
+# LIVE default -- and was never searched.
+#
+# The METHOD is a categorical gene so the GA chooses per structure; the two parameters are
+# SEPARATE genes because they are separate quantities on separate scales (that conflation is
+# precisely the OPT-C3 naming bug). ``strategy_param_space._apply_option_strike`` writes
+# whichever one matches the decoded method.
+#
+# ONLY where the builder honours it. Eight of the seventeen ``_OptionEntryAction`` subclasses
+# hard-code ``method="percent_otm"`` and leave ``strike_method`` a dead attribute (OPT-S2), so
+# offering the choice there would be a gene the simulation cannot see -- the exact defect this
+# whole track is fixing. ``types.honours_strike_method`` is the registry, drift-guarded against
+# the builders' own source by packages/common/tests/test_strike_method_registry.py.
+_OPTION_DELTA_RANGE = {"option_strike_delta": 0.30, "option_strike_delta_optimize": True,
+                       "option_strike_delta_min": 0.05, "option_strike_delta_max": 0.50,
+                       "option_strike_delta_step": 0.05}
+
+
+def _apply_option_strike_method_gene(cfg: dict) -> dict:
+    """Make the strike METHOD searchable (percent_otm | delta) on actions that honour it.
+
+    A no-op for the eight builders that ignore ``strike_method``, and for an action whose
+    percent param is not itself optimizable (there would be nothing to switch between).
+    """
+    from ba2_common.core.types import honours_strike_method
+
+    at = str(cfg.get("action_type") or "")
+    if not honours_strike_method(at):
+        return cfg
+    if not cfg.get("option_strike_param_optimize"):
+        return cfg
+    cfg.setdefault("option_strike_method_optimize", True)
+    cfg.setdefault("option_strike_method_choices", ["percent_otm", "delta"])
+    for k, v in _OPTION_DELTA_RANGE.items():
+        cfg.setdefault(k, v)
     return cfg
 
 
@@ -2400,7 +2445,7 @@ def _option_overlay_action(action_type: str, *, strike_param: float,
     touch while the same knobs were searched on every pure-option key. Sizing genuinely is
     not a knob here -- both actions size off the HELD share count (1 contract per 100
     shares), not option_sizing."""
-    return _apply_option_min_volume({
+    return _apply_option_strike_method_gene(_apply_option_min_volume({
         "action_type": action_type,
         "option_strike_method": "percent_otm", "option_strike_param": strike_param,
         "option_dte_min": dte_min, "option_dte_max": dte_max,
@@ -2408,7 +2453,7 @@ def _option_overlay_action(action_type: str, *, strike_param: float,
         "option_strike_param_max": strike_max, "option_strike_param_step": strike_step,
         "option_dte_optimize": True, "option_dte_min_range": dte_min_range,
         "option_dte_max_range": dte_max_range, "option_dte_step": dte_step,
-    })
+    }))
 
 
 def _screener_gate_base_for_strategy(kind: str) -> dict:

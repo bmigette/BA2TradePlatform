@@ -636,6 +636,43 @@ def uses_wing_width(action_value):
     return action_value in get_wing_width_action_values()
 
 
+def get_strike_method_aware_action_values():
+    """Option action types whose builder actually READS ``strike_method``.
+
+    Sibling of :func:`get_wing_width_action_values`, and for the same reason. Only NINE of the
+    seventeen ``_OptionEntryAction`` subclasses pass ``method=self.strike_method`` to the
+    selector; the other eight hard-code ``method="percent_otm"`` and leave ``strike_method`` a
+    dead attribute set on the shared base (OPT-S2). So on those eight, asking for ``delta``
+    changes nothing: a user (or an optimizer) that selects a 0.30 delta silently gets a strike
+    0.30 PERCENT out of the money -- effectively at the money.
+
+    This list exists so a producer -- the rule editor, or the GA's strike-method gene -- can
+    offer the choice for exactly the actions that honour it. Offering it everywhere is the
+    live trap OPT-S2 describes; offering it nowhere is what left ``percent_otm`` the only
+    strike gene in all 16 option grids (OPT-C3).
+
+    Drift guard: ``packages/common/tests/test_strike_method_registry.py`` derives the same set
+    from the action classes' own source and fails if the two disagree -- so if a builder is
+    fixed to honour ``strike_method`` (or one stops), this list cannot silently lag.
+    """
+    return [
+        ExpertActionType.BUY_CALL.value,
+        ExpertActionType.OPEN_BULL_CALL_SPREAD.value,
+        ExpertActionType.BUY_PUT.value,
+        ExpertActionType.OPEN_BEAR_PUT_SPREAD.value,
+        ExpertActionType.SELL_COVERED_CALL.value,
+        ExpertActionType.BUY_PROTECTIVE_PUT.value,
+        ExpertActionType.SELL_CASH_SECURED_PUT.value,
+        ExpertActionType.OPEN_BEAR_CALL_SPREAD.value,
+        ExpertActionType.OPEN_BULL_PUT_SPREAD.value,
+    ]
+
+
+def honours_strike_method(action_value):
+    """Check whether an option action type's builder reads ``strike_method`` at all."""
+    return action_value in get_strike_method_aware_action_values()
+
+
 def get_action_type_display_label(action_value):
     """
     Get user-friendly display label for an ExpertActionType value.

@@ -29,7 +29,10 @@ Namespacing:
   exit:<rid>:enabled               exit rule ON/OFF toggle
   exit:<rid>:a<i>:action_value     exit rule action i's value
   exit:<rid>:a<i>:enabled          exit rule action i's ON/OFF toggle
-  exit:<rid>:a<i>:option_delta     option strike delta (option actions)
+  exit:<rid>:a<i>:option_strike_param  option strike PERCENT-OTM (option actions; was
+                                       misnamed option_delta, still accepted on decode)
+  exit:<rid>:a<i>:option_strike_method strike selection method (choice: percent_otm | delta)
+  exit:<rid>:a<i>:option_strike_delta  option strike DELTA (used when the method is delta)
   exit:<rid>:a<i>:option_dte       option DTE window center
   exit:<rid>:a<i>:option_wing_width  option wing width %
   schedule:<day>                   ON/OFF toggle for that weekday's entry scan
@@ -185,12 +188,49 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
     at = str(action.get("action_type") or action.get("action") or "")
     if action.get("toggle_optimize") and at not in _UNDROPPABLE_ACTIONS:
         out[f"{prefix}:enabled"] = _range_entry(0, 1, 1, is_int=True)
-    # OPTION action selection params: strike delta / DTE window center / wing width.
+    # OPTION action selection params: strike param / strike method / delta / DTE / wing width.
+    #
+    # NAMING (OPT-C3). This gene used to be emitted as ``option_delta`` while carrying
+    # PERCENT-OTM values in every range the grid declared -- two quantities, one name. It is
+    # now ``option_strike_param``, which is the field it actually writes; the real delta is
+    # ``option_strike_delta``. ``option_delta`` is still ACCEPTED on decode (see
+    # _decode_rule_list) as the legacy spelling of the percent param, so a persisted
+    # best-params blob or a warm start from an older optimization still applies -- silently
+    # re-reading it as a delta would turn a "6" into a 6-delta lookup, i.e. deep ITM.
     if action.get("option_strike_param_optimize"):
-        out[f"{prefix}:option_delta"] = _range_entry(
+        out[f"{prefix}:option_strike_param"] = _range_entry(
             action.get("option_strike_param_min"),
             action.get("option_strike_param_max"),
             action.get("option_strike_param_step"), is_int=False,
+        )
+    # STRIKE METHOD as a categorical gene (percent_otm | delta | ...). percent_otm is
+    # volatility-BLIND -- 5 % OTM on a 15-vol utility and on a 90-vol biotech are not the same
+    # proposition -- while delta is normalised across symbols and is the live default. Emitted
+    # only where the producer asked for it; the producer is responsible for asking only on
+    # actions whose builder actually reads strike_method (types.honours_strike_method), since
+    # eight of the seventeen builders hard-code percent_otm and would make this gene inert.
+    if action.get("option_strike_method_optimize"):
+        choices = list(action["option_strike_method_choices"])
+        if len(choices) < 2:
+            raise ValueError(
+                f"{prefix}: option_strike_method_optimize needs >= 2 choices, got {choices}")
+        # A delta choice is meaningless without a delta-scaled parameter to go with it: the
+        # percent range (e.g. 0..8) read as a delta target picks the deepest-ITM contract on
+        # the chain. Fail here rather than silently mis-select for a whole campaign.
+        if "delta" in choices and action.get("option_strike_delta_min") is None:
+            raise ValueError(
+                f"{prefix}: option_strike_method_choices offers 'delta' but the action "
+                f"declares no option_strike_delta_min/_max/_step, so the percent-OTM range "
+                f"would be used as a delta target")
+        out[f"{prefix}:option_strike_method"] = {
+            "type": "choice", "choices": choices,
+            "min": 0, "max": len(choices) - 1, "step": 1,
+        }
+    if action.get("option_strike_delta_optimize"):
+        out[f"{prefix}:option_strike_delta"] = _range_entry(
+            action.get("option_strike_delta_min"),
+            action.get("option_strike_delta_max"),
+            action.get("option_strike_delta_step"), is_int=False,
         )
     if action.get("option_dte_optimize"):
         out[f"{prefix}:option_dte"] = _range_entry(
@@ -385,6 +425,47 @@ def _apply_option_dte(action: Dict[str, Any], center_val: Any) -> None:
     action["option_dte_max"] = center + hw
 
 
+def _apply_option_strike(action: Dict[str, Any], agenes: Dict[str, Any]) -> None:
+    """Write the decoded strike METHOD and the matching strike PARAM onto an option action.
+
+    ``option_strike_param`` (percent OTM) and ``option_strike_delta`` are two different
+    quantities on two different scales, and the action carries exactly one
+    ``option_strike_param`` field that the selector interprets ACCORDING TO the method. So the
+    param that lands on the action must be the one belonging to the EFFECTIVE method -- the
+    decoded ``option_strike_method`` gene when there is one, else the action's authored method.
+    Writing the percent value under a ``delta`` method targets a 6-delta contract when 6 % OTM
+    was meant (deep ITM); writing the delta under ``percent_otm`` targets 0.3 % OTM when a
+    0.30 delta was meant (at the money). Both mis-selections are silent.
+
+    ``option_delta`` is the LEGACY gene name for the percent param (it never carried a delta,
+    despite the name -- OPT-C3). Accepted so persisted best-params blobs and warm starts from
+    older optimizations still decode to what they meant.
+    """
+    method = agenes.get("option_strike_method")
+    if method is not None:
+        action["option_strike_method"] = method
+    effective = str(method if method is not None
+                    else (action.get("option_strike_method") or "percent_otm"))
+    if effective == "delta":
+        if "option_strike_delta" in agenes:
+            action["option_strike_param"] = agenes["option_strike_delta"]
+        elif action.get("option_strike_delta") is not None:
+            # The method gene chose delta but the delta itself is not searched: use the
+            # action's authored delta rather than leaving the percent value in place.
+            action["option_strike_param"] = action["option_strike_delta"]
+        elif "option_strike_param" in agenes or "option_delta" in agenes:
+            raise ValueError(
+                f"option action {action.get('action_type')!r} decoded to strike_method="
+                f"'delta' but carries no delta to select with; the percent-OTM gene would be "
+                f"read as a delta target"
+            )
+        return
+    if "option_strike_param" in agenes:
+        action["option_strike_param"] = agenes["option_strike_param"]
+    elif "option_delta" in agenes:  # legacy spelling of the percent param
+        action["option_strike_param"] = agenes["option_delta"]
+
+
 def _decode_rule_list(rules, ns: str,
                       rule_genes: Dict[str, Dict[str, Any]],
                       cond_by_id: Dict[str, Dict[str, Any]]):
@@ -410,8 +491,7 @@ def _decode_rule_list(rules, ns: str,
             if "action_value" in agenes:
                 action["action_value"] = agenes["action_value"]
                 action["value"] = agenes["action_value"]
-            if "option_delta" in agenes:
-                action["option_strike_param"] = agenes["option_delta"]
+            _apply_option_strike(action, agenes)
             if "option_dte" in agenes:
                 _apply_option_dte(action, agenes["option_dte"])
             if "option_wing_width" in agenes:
