@@ -2372,6 +2372,53 @@ def _option_entry_action_for(kind: str) -> dict:
     cfg = dict(_OPTION_STRATS[kind])
     _apply_option_min_volume(cfg)
     _apply_option_strike_method_gene(cfg)
+    _apply_option_sizing_gene(cfg)
+    return cfg
+
+
+# --- position SIZE as a gene (OPT-C6) -------------------------------------------------------
+#
+# ``option_sizing`` (% of equity committed per structure) is bounded, symbol-comparable and
+# exactly the same category of knob as %OTM / DTE / wing width -- and it was a per-structure
+# CONSTANT the GA could not touch: 0 sizing genes across all 19 built option strategies.
+#
+# It also GATES the fitness work: contracts x max_loss IS ``option_sizing`` % of equity by
+# construction, so any return-on-collateral measure divides by a constant while sizing is
+# frozen and collapses back into plain return.
+#
+# The band is keyed on the structure's AUTHORED size rather than shared, because 20 % of equity
+# in a defined-risk condor and 20 % in a long call are not the same risk -- a single global
+# window would either starve the credit structures or let the debit ones bet the account. The
+# table must be TOTAL over the authored values (asserted below): a structure whose size is not
+# covered would silently keep a frozen size while every sibling searched one.
+_OPTION_SIZING_BANDS = {
+    #  authored: (min, max, step)
+    5.0:  (1.0, 10.0, 1.0),    # long premium: floor at 1% (a real 1-contract bet), cap at 2x
+    8.0:  (2.0, 16.0, 2.0),    # butterfly
+    15.0: (5.0, 30.0, 2.5),    # defined-risk / skewed credit
+    20.0: (5.0, 40.0, 5.0),    # neutral credit + full-notional
+}
+_missing_sizings = sorted({cfg["option_sizing"] for cfg in _OPTION_STRATS.values()
+                           if cfg.get("option_sizing") is not None}
+                          - set(_OPTION_SIZING_BANDS))
+if _missing_sizings:
+    raise RuntimeError(
+        f"_OPTION_SIZING_BANDS has no band for authored option_sizing {_missing_sizings}; "
+        f"those structures would keep a frozen size while their siblings search one.")
+
+
+def _apply_option_sizing_gene(cfg: dict) -> dict:
+    """Make ``option_sizing`` searchable, in place. No-op when the action does not size off it
+    (O_CC / O_PP size off the HELD share count -- one contract per round lot -- so a sizing
+    gene there would be inert)."""
+    sizing = cfg.get("option_sizing")
+    if sizing is None:
+        return cfg
+    lo, hi, step = _OPTION_SIZING_BANDS[float(sizing)]
+    cfg.setdefault("option_sizing_optimize", True)
+    cfg.setdefault("option_sizing_min", lo)
+    cfg.setdefault("option_sizing_max", hi)
+    cfg.setdefault("option_sizing_step", step)
     return cfg
 
 

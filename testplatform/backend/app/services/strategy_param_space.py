@@ -35,6 +35,7 @@ Namespacing:
   exit:<rid>:a<i>:option_strike_delta  option strike DELTA (used when the method is delta)
   exit:<rid>:a<i>:option_dte       option DTE window center
   exit:<rid>:a<i>:option_wing_width  option wing width %
+  exit:<rid>:a<i>:option_sizing    option position size (% of equity per structure)
   schedule:<day>                   ON/OFF toggle for that weekday's entry scan
   screener:<setting>               screener settings
 
@@ -243,6 +244,17 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
             action.get("option_wing_width_min"),
             action.get("option_wing_width_max"),
             action.get("option_wing_width_step"), is_int=False,
+        )
+    # POSITION SIZE (% of equity per structure). Bounded and symbol-comparable -- the same
+    # category as the other option genes -- but it was a per-structure CONSTANT the GA could
+    # not touch. It also gates any return-on-collateral fitness: contracts x max_loss IS
+    # option_sizing % of equity by construction, so with sizing frozen that ratio divides by a
+    # constant and degenerates back into plain return.
+    if action.get("option_sizing_optimize"):
+        out[f"{prefix}:option_sizing"] = _range_entry(
+            action.get("option_sizing_min"),
+            action.get("option_sizing_max"),
+            action.get("option_sizing_step"), is_int=False,
         )
 
 
@@ -496,6 +508,8 @@ def _decode_rule_list(rules, ns: str,
                 _apply_option_dte(action, agenes["option_dte"])
             if "option_wing_width" in agenes:
                 action["option_wing_width_pct"] = agenes["option_wing_width"]
+            if "option_sizing" in agenes:
+                action["option_sizing"] = agenes["option_sizing"]
             actions.append(action)
         rule["actions"] = actions
         if rule.get("conditions"):
