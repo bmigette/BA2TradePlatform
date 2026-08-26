@@ -1698,8 +1698,8 @@ class OptionsAccountInterface(ABC):
         reads ``qty``, the FULL holding, NOT ``qty_available`` ("total shares minus open
         orders"). Shares already committed to a resting SELL_STOP therefore still count as
         cover, so writing the equity stop first and the covered call second — the normal
-        ordering — lets :meth:`cover_capacity_for` admit a call against shares the stop can
-        sell. Pinned by
+        ordering — lets :meth:`check_cover_for_covered_call` admit a call against shares the
+        stop can sell. Pinned by
         ``test_a_RESTING_STOP_does_not_reduce_the_cover_a_WRITE_sees__a_recorded_gap``.
         """
         from ba2_common.core.failure_modes import absorb_if_benign
@@ -1803,7 +1803,7 @@ class OptionsAccountInterface(ABC):
           finding that prompted this accessor is about closes the run itself authorised.
           ``MARKET`` is therefore the test for "a sale already decided".
         * THE ENTRY face, in :meth:`held_shares_for_cover` and so in
-          :meth:`cover_capacity_for`. ``held`` is read from the position row's ``qty``,
+          :meth:`check_cover_for_covered_call`. ``held`` is read from the position row's ``qty``,
           which is the full holding — shares already committed to a resting SELL_STOP
           included. Write the equity stop FIRST and the covered call SECOND (the normal
           ordering, since equity positions here are routinely opened with TP/SL) and the

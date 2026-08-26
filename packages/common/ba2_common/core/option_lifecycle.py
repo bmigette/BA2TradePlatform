@@ -127,10 +127,41 @@ LIFECYCLE_CLOSING_REASONS = (LIFECYCLE_PROFIT_CAPTURE, LIFECYCLE_CREDIT_STOP,
 #: instead: ``test_the_covered_call_tag_is_the_one_the_entry_guard_polices``.
 COVERED_CALL_STRATEGY = "covered_call"
 
-#: A share count ``decide`` is given per structure: one value for the whole call, or a
-#: ``{transaction_id: value}`` mapping (what a pass over a BOOK has to supply). ``None``
-#: — including a transaction a mapping omits — is UNMEASURABLE / not measured, never 0.
-CoverInput = Optional[Union[int, float, Mapping[int, Optional[int]]]]
+#: What a covered_call's REQUIREMENT is set to when the ledger cannot size it. It lives
+#: here, in the pure module, because it is part of ``decide``'s input contract and not a
+#: private detail of the caller that happens to send it (``option_lifecycle_service``
+#: re-exports this name rather than defining its own). Same treatment as
+#: ``COVERED_CALL_STRATEGY``, and for the same reason: a value one side invents and the
+#: other side only recognises by accident is a contract that exists nowhere.
+#:
+#: It has to be a value that is neither ``None`` (which ``decide`` reads as "this caller
+#: is not measuring cover for that structure", skipping the rule silently) nor a number
+#: (which would be a fabricated obligation). ``_share_count`` cannot read it, so
+#: ``_cover_lost`` reports ``LIFECYCLE_UNKNOWN`` naming it — the alarm, not a close and
+#: not a hold. Pinned by ``test_the_unmeasurable_cover_sentinel_reaches_the_alarm_branch``.
+COVER_REQUIREMENT_UNMEASURABLE = "unmeasurable"
+
+#: One structure's share count as ``decide`` receives it. THREE kinds of value, and they
+#: are three different facts that this module spends most of its effort keeping apart:
+#:
+#:   * an int/float — MEASURED, ``0`` included (``0`` held = the broker confirmed there
+#:     are none, i.e. the call is naked);
+#:   * ``None`` — NOT ASKED on the ``cover_shares_required`` side: the caller is not
+#:     measuring cover for that structure, so ``cover_lost`` is not evaluated for it at
+#:     all, and a transaction a mapping omits says exactly the same thing. On the
+#:     ``cover_shares_held`` side the caller IS asking and the position feed did not
+#:     answer, which is UNMEASURABLE and produces ``LIFECYCLE_UNKNOWN``. Never ``0``
+#:     either way. The two ``decide`` docstrings state each side; this alias covers both
+#:     and must not collapse them;
+#:   * ``COVER_REQUIREMENT_UNMEASURABLE`` — ASKED, AND THE OBLIGATION COULD NOT BE SIZED.
+#:     The one case a ``None`` requirement cannot express, which is why the sentinel is
+#:     a ``str`` and why ``str`` is admitted here.
+CoverValue = Union[int, float, str, None]
+
+#: A share count ``decide`` is given per structure: one ``CoverValue`` for the whole
+#: call, or a ``{transaction_id: CoverValue}`` mapping (what a pass over a BOOK has to
+#: supply).
+CoverInput = Optional[Union[int, float, str, Mapping[int, CoverValue]]]
 
 #: Strategies whose loss stop is the *undefined-risk* multiple (``ur_stop_*``).
 #: Everything else uses ``dr_stop_*``. Promoted verbatim from ``_should_close``:

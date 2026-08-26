@@ -2571,7 +2571,7 @@ class TestTheExitGuardNetsSalesAlreadyInFlight:
           * HERE, at the EXIT: it is not counted as "already committed to sell",
             so a close is not charged for it.
           * At the ENTRY, in ``held_shares_for_cover`` and so in
-            ``cover_capacity_for``: ``held`` is the position row's ``qty``, the
+            ``check_cover_for_covered_call``: ``held`` is the position row's ``qty``, the
             FULL holding, so those same shares are still offered as cover to a
             NEW covered call. Pinned by
             ``test_a_RESTING_STOP_does_not_reduce_the_cover_a_WRITE_sees__a_recorded_gap``.
@@ -2620,7 +2620,7 @@ class TestTheExitGuardNetsSalesAlreadyInFlight:
         THE ORDERING THAT REACHES IT IS THE NORMAL ONE. Equity positions on this
         platform are routinely opened WITH protective legs, so the stop exists
         before any call is written: 100 shares held, all 100 already committed to
-        a resting SELL_STOP, and ``cover_capacity_for`` still reports one
+        a resting SELL_STOP, and ``check_cover_for_covered_call`` still reports one
         contract of cover available because ``held_shares_for_cover`` reads
         ``qty`` (the full holding) and not ``qty_available`` (holding minus open
         orders). Nothing objects; the call is written against shares the stop can

@@ -130,8 +130,8 @@ from ba2_common.core.option_book import (
     BookTotals, BreakerState, book_totals, breaker_signal, rearm, update_breaker,
 )
 from ba2_common.core.option_lifecycle import (
-    COVERED_CALL_STRATEGY, LIFECYCLE_COVER_LOST, LIFECYCLE_UNKNOWN, LifecycleDecision,
-    LifecycleLeg, OptionStructure, decide,
+    COVER_REQUIREMENT_UNMEASURABLE, COVERED_CALL_STRATEGY, LIFECYCLE_COVER_LOST,
+    LIFECYCLE_UNKNOWN, LifecycleDecision, LifecycleLeg, OptionStructure, decide,
 )
 from ba2_common.core.option_types import OptionContract, OptionLeg
 
@@ -665,12 +665,12 @@ def _held_cover(account, underlying: str, cache: Dict[str, Optional[int]],
     return held
 
 
-#: What a covered_call's requirement is set to when the ledger cannot size it. It has to
-#: be a value that is neither ``None`` (which ``decide`` reads as "this caller is not
-#: measuring cover for that structure", skipping the rule) nor a number (which would be a
-#: fabricated obligation). ``decide`` reads anything unreadable as UNMEASURABLE and
-#: reports ``LIFECYCLE_UNKNOWN`` naming it.
-COVER_REQUIREMENT_UNMEASURABLE = "unmeasurable"
+# ``COVER_REQUIREMENT_UNMEASURABLE`` is IMPORTED at the top of this module, not defined
+# here. It belongs to ``decide``'s input contract and now lives in the pure module beside
+# ``CoverInput`` (which admits it) — read its comment there for what the value means. It
+# used to be defined at this spot, so the value one side sent and the shape the other side
+# accepted were two independent facts that happened to line up; a sentinel like that drifts
+# the first time anyone edits either end.
 
 
 def _cover_inputs(account, structures: Sequence[OptionStructure], expert_instance_id: int,
@@ -688,6 +688,26 @@ def _cover_inputs(account, structures: Sequence[OptionStructure], expert_instanc
     codebase) is precisely how half a cover disappears overnight. First written, first
     covered.
 
+    AN UNSIZEABLE CLAIM IS CHARGED TO THE POOL, and the only honest way to charge an
+    unknown amount is to make the REMAINDER unknown: once one covered call on a ticker
+    cannot say how many shares it could have called away, every YOUNGER covered call on
+    that ticker is handed ``None`` instead of a figure. Skipping it — which is what used
+    to happen — measured the next call against the WHOLE pool while the unsizeable one
+    was quietly eating the same shares, and reported it comfortably covered. That is
+    fail-OPEN, the one direction this file must never fail in.
+
+    It cannot cause a spurious liquidation, which is what makes the choice safe as well
+    as honest: ``None`` available is UNMEASURABLE and ``_cover_lost`` never fires on it
+    (it raises ``LIFECYCLE_UNKNOWN``). All that is lost is a "covered" reading nobody
+    could justify. Only YOUNGER calls are affected, because allocation is oldest-first:
+    an older call's claim on the pool was already settled before the unsizeable one was
+    reached.
+
+    THE CROSS-EXPERT GAP IS STILL OPEN and is recorded rather than papered over: this
+    pool is walked per SLEEVE, so two experts writing covered calls on the same ticker
+    each see the whole holding. Closing that means allocating cover account-wide, which
+    is a different pass from this one.
+
     Nothing here refuses, closes or aborts: it MEASURES. Every unmeasurable answer is
     logged and recorded in ``result.cover_unmeasurable`` and then handed to ``decide`` as
     ``None``, which produces ``LIFECYCLE_UNKNOWN`` and closes nothing.
@@ -696,6 +716,9 @@ def _cover_inputs(account, structures: Sequence[OptionStructure], expert_instanc
     available_by_txn: Dict[int, Optional[int]] = {}
     held_cache: Dict[str, Optional[int]] = {}
     claimed: Dict[str, int] = {}
+    # Tickers where some covered call's requirement could not be sized, so the FREE part
+    # of the pool is no longer a number anyone can state (see the docstring).
+    unsizeable_claim: set = set()
 
     for structure in sorted(structures, key=lambda s: s.transaction_id):
         if (structure.strategy or "").strip().lower() != COVERED_CALL_STRATEGY:
@@ -720,13 +743,35 @@ def _cover_inputs(account, structures: Sequence[OptionStructure], expert_instanc
             # The sentinel, not a number and not None: None would mean "this caller is
             # not measuring cover here" and would skip the rule silently, while any
             # figure would be a fabrication. `decide` reads it as UNREADABLE and says so.
+            # It is `decide`'s own constant (see ba2_common.core.option_lifecycle), not a
+            # string invented here, so the two ends cannot drift.
             required_by_txn[txn_id] = COVER_REQUIREMENT_UNMEASURABLE
             available_by_txn[txn_id] = None
+            # CHARGED to the pool, as far as an unknown amount can be: this claim takes
+            # an unknown number of the ticker's shares, so what is LEFT for a younger
+            # covered call is unknown too (see the docstring).
+            if underlying:
+                unsizeable_claim.add(underlying)
             continue
 
         required_by_txn[txn_id] = required
         if required <= 0:
             continue                           # nothing to cover; `decide` skips the rule
+
+        if underlying in unsizeable_claim:
+            result.cover_unmeasurable.append(txn_id)
+            logger.error(
+                f"Option lifecycle: transaction {txn_id} is a covered_call needing "
+                f"{required} {underlying} share(s) of cover, but an OLDER covered_call on "
+                f"the same ticker has an obligation of UNKNOWN size (logged above), so how "
+                f"much of the {underlying} pool is LEFT for this one cannot be stated. "
+                f"Reported as UNKNOWN rather than measured against the whole holding — the "
+                f"older claim is eating the same shares, and calling this one covered would "
+                f"be counting them twice. NOTHING is being closed on account of it. Repair "
+                f"the older structure's leg option_type / multiplier and this clears "
+                f"itself.")
+            available_by_txn[txn_id] = None
+            continue
 
         held = _held_cover(account, underlying, held_cache, expert_instance_id)
         if held is None:

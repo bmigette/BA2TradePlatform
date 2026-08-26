@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 import pytest
 
 from ba2_common.core.option_lifecycle import (
+    COVER_REQUIREMENT_UNMEASURABLE,
     COVERED_CALL_STRATEGY,
     LIFECYCLE_BREAKER,
     LIFECYCLE_CLOSING_REASONS,
@@ -744,6 +745,54 @@ def test_an_unreadable_cover_requirement_is_unknown_not_uncovered():
                     cover_shares_required="lots", cover_shares_held=0))
     assert d.reason == LIFECYCLE_UNKNOWN
     assert "unreadable" in d.detail
+
+
+def test_the_unmeasurable_cover_sentinel_reaches_the_alarm_branch():
+    """THE SENTINEL IS PART OF THIS MODULE'S INPUT CONTRACT, not a private string the
+    caller happens to send.
+
+    ``option_lifecycle_service`` sets a covered_call's requirement to
+    ``COVER_REQUIREMENT_UNMEASURABLE`` when the ledger cannot size the obligation. It
+    reaches the alarm only because ``_share_count``'s ``float()`` raises — which worked
+    by luck for as long as the value was declared at the other end and the contract
+    lived implicitly inside an ``except (TypeError, ValueError)``. Stated here instead:
+    it is neither of the two things ``decide`` DOES understand (``None`` = this caller
+    is not measuring cover here, which skips the rule silently; a number = a fabricated
+    obligation), and it lands on the alarm.
+
+    The alarm is UNKNOWN, never a close: an obligation of unknown size is not a
+    measured shortfall, and liquidating on it would be the false positive this whole
+    section exists to avoid."""
+    assert COVER_REQUIREMENT_UNMEASURABLE is not None
+    assert not isinstance(COVER_REQUIREMENT_UNMEASURABLE, (int, float))
+
+    st = covered_call()
+    d = only(decide([st], call_chain(), settings(), AS_OF,
+                    cover_shares_required=COVER_REQUIREMENT_UNMEASURABLE,
+                    cover_shares_held=0))
+    assert d.reason == LIFECYCLE_UNKNOWN
+    assert d.reason != LIFECYCLE_COVER_LOST
+    assert d.should_close is False
+    assert "unreadable" in d.detail
+    assert COVER_REQUIREMENT_UNMEASURABLE in d.detail, (
+        "the alarm must name the value it could not read")
+
+    # ...and it is NOT the 'not asked' case, which skips the rule and says nothing.
+    silent = only(decide([st], call_chain(), settings(), AS_OF,
+                         cover_shares_required=None, cover_shares_held=0))
+    assert silent.reason != LIFECYCLE_UNKNOWN
+
+
+def test_the_service_sends_the_sentinel_this_module_declares():
+    """The other half of the pin, and the reason the constant moved here: the SENDER's
+    value and the RECEIVER's contract must be ONE fact. The service used to define its
+    own copy, so the two lined up by coincidence. Same treatment as
+    ``COVERED_CALL_STRATEGY`` above, for the same reason."""
+    from ba2_trade_platform.core.option_lifecycle_service import (
+        COVER_REQUIREMENT_UNMEASURABLE as SERVICE_SENTINEL,
+    )
+
+    assert SERVICE_SENTINEL == COVER_REQUIREMENT_UNMEASURABLE
 
 
 def test_the_cover_alarm_leads_the_unknown_detail():

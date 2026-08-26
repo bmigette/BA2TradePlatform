@@ -524,3 +524,100 @@ def test_a_LONG_call_beside_the_short_one_charges_no_share_cover():
     structure = _cover_structure(_netted(CC_CALL, -1.0, OptionRight.CALL),
                                  _netted(CC_FAR_CALL, +1.0, OptionRight.CALL))
     assert svc._cover_required(structure) == 100
+
+
+# ===========================================================================
+# THE POOL: two covered calls on ONE ticker are two claims on the SAME shares
+#
+# ``_cover_inputs`` allocates OLDEST TRANSACTION FIRST for that reason. The tests
+# below drive it directly, because the interesting cases need two structures on one
+# ticker and a controllable holding — a shape ``_build_structure`` cannot produce
+# from the doubles above.
+# ===========================================================================
+def _pool_account(held):
+    """The one thing ``_cover_inputs`` asks an account: how many shares are held.
+    Tri-state, exactly as ``held_shares_for_cover`` is (``None`` = UNKNOWN)."""
+    return SimpleNamespace(held_shares_for_cover=lambda underlying: held)
+
+
+def _pool_result():
+    return svc.LifecyclePassResult(expert_instance_id=1, as_of=FROZEN_NOW)
+
+
+def _cc(txn_id, *legs, multiplier=100, underlying=UNDERLYING):
+    from ba2_common.core.option_lifecycle import OptionStructure
+    return OptionStructure(transaction_id=txn_id, underlying=underlying,
+                           strategy="covered_call", legs=legs, quantity=1.0,
+                           multiplier=multiplier)
+
+
+def test_the_pool_is_allocated_OLDEST_FIRST_and_the_younger_call_sees_the_remainder():
+    """The baseline this section rests on: 150 shares, two one-contract covered calls.
+    The older gets 100, the younger sees the 50 that are left — not 150 twice."""
+    older = _cc(1, _netted(CC_CALL, -1.0, OptionRight.CALL))
+    younger = _cc(2, _netted(CC_FAR_CALL, -1.0, OptionRight.CALL))
+
+    required, available = svc._cover_inputs(
+        _pool_account(150), [younger, older], 1, _pool_result())
+
+    assert required == {1: 100, 2: 100}
+    assert available == {1: 150, 2: 50}
+
+
+def test_an_UNSIZEABLE_claim_makes_the_REST_of_the_pool_unmeasurable_too():
+    """FAIL-OPEN, CLOSED. The older covered call's obligation cannot be sized (its
+    multiplier is unusable), so it was skipped without charging the pool — and the
+    younger call on the SAME ticker was then measured against the WHOLE 200 shares
+    and reported comfortably covered, while the unsizeable one was eating the same
+    inventory.
+
+    An unknown claim can only be charged one way: what is LEFT becomes unknown.
+    ``None`` available is UNMEASURABLE, so ``decide`` reports LIFECYCLE_UNKNOWN and
+    closes nothing — the reading that disappears is a "covered" one nobody could
+    justify, and no liquidation can result from it."""
+    unsizeable = _cc(1, _netted(CC_CALL, -1.0, OptionRight.CALL), multiplier=0)
+    younger = _cc(2, _netted(CC_FAR_CALL, -1.0, OptionRight.CALL))
+    result = _pool_result()
+
+    required, available = svc._cover_inputs(
+        _pool_account(200), [unsizeable, younger], 1, result)
+
+    assert required[1] == svc.COVER_REQUIREMENT_UNMEASURABLE
+    assert available[1] is None
+    assert available[2] is None, (
+        "the younger call was measured against a pool an unsizeable claim is already "
+        "eating — that is the fail-open this closes")
+    assert available[2] != 200
+    assert sorted(result.cover_unmeasurable) == [1, 2], (
+        "both are unmeasurable this pass, and both must be reported as such")
+
+
+def test_an_unsizeable_claim_on_ANOTHER_ticker_leaves_this_pool_alone():
+    """THE SCOPE. Cover is per TICKER: an unknown claim on ACN says nothing about the
+    MSFT pool, and poisoning every ticker would make one broken leg blind the whole
+    sleeve."""
+    other = _cc(1, _netted(occ("MSFT", EXPIRY_FAR, "C", 400.0), -1.0, OptionRight.CALL),
+                multiplier=0, underlying="MSFT")
+    here = _cc(2, _netted(CC_CALL, -1.0, OptionRight.CALL))
+
+    required, available = svc._cover_inputs(
+        _pool_account(200), [other, here], 1, _pool_result())
+
+    assert required[1] == svc.COVER_REQUIREMENT_UNMEASURABLE
+    assert available[2] == 200, "an unrelated ticker's unknown must not blind this one"
+
+
+def test_an_OLDER_call_is_not_retroactively_blinded_by_a_YOUNGER_unsizeable_one():
+    """Allocation is oldest-first, so the older call's claim on the pool was already
+    settled before the unsizeable one was reached. Blinding it too would report a
+    healthy, fully measured covered call as UNKNOWN for a fault that is not its
+    own."""
+    older = _cc(1, _netted(CC_CALL, -1.0, OptionRight.CALL))
+    unsizeable = _cc(2, _netted(CC_FAR_CALL, -1.0, OptionRight.CALL), multiplier=0)
+
+    required, available = svc._cover_inputs(
+        _pool_account(200), [unsizeable, older], 1, _pool_result())
+
+    assert available[1] == 200
+    assert required[2] == svc.COVER_REQUIREMENT_UNMEASURABLE
+    assert available[2] is None

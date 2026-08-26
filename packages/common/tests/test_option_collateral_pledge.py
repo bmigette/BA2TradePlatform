@@ -1659,3 +1659,32 @@ class TestTheCoverVerdictAndItsBackstop:
 
         assert store.all(TradingOrder) == [] and store.all(Transaction) == []
         assert acct.submitted == []
+
+
+def test_every_meth_pointer_in_the_cover_docstrings_RESOLVES():
+    """A GAP RECORD THAT NAMES NOTHING IS NOT A RECORD.
+
+    The two cover accessors carry long "KNOWN GAP" notes whose whole job is to send a
+    maintainer to the seam that would have to change. `0e4ee7a7` pointed four of them
+    at ``cover_capacity_for``, a method that has never existed anywhere in this repo —
+    the real seam is ``check_cover_for_covered_call`` — so the record read as
+    authoritative and led nowhere. Nothing caught it because prose is not executed.
+
+    This does execute it: every ``:meth:`name``` in the module (they are all
+    unqualified, i.e. all claims about THIS class) must resolve on it.
+    """
+    import inspect
+    import re
+
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+
+    referenced = sorted(set(re.findall(
+        r":meth:`([A-Za-z_][A-Za-z0-9_.]*)`",
+        inspect.getsource(OptionsAccountInterface))))
+    assert referenced, "the scan found no :meth: pointers at all — it has stopped looking"
+
+    dangling = [name for name in referenced
+                if "." not in name and not hasattr(OptionsAccountInterface, name)]
+    assert not dangling, (
+        f"OptionsAccountInterface docstrings point at method(s) that do not exist: "
+        f"{dangling}. A gap record has to name the thing a maintainer can find.")
