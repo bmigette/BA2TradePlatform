@@ -2321,6 +2321,50 @@ _PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS)
 _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 
 
+# ==============================================================================================
+# BEFORE YOU LAUNCH AN OPTION GRID — READ THIS
+# ==============================================================================================
+#
+# Three preconditions, as of 2026-08-26 (dev @ 4ac7cc48). Two of them will stop a run dead; the
+# third will let it run and waste the compute. None is a defect in this file — they are the
+# ragged edges left by the option work of 2026-08-25/26, recorded here because this is where
+# somebody stands when they decide to press go.
+#
+# 1. THE OPTION HISTORY FLOOR CONTRADICTS THE GRID WINDOW.  ** BLOCKING **
+#    `backend/app/services/backtest/fetch_options.py` carries
+#    `_OPTIONS_HISTORY_FLOOR = date(2024, 1, 18)`, and the grid window below starts 2023-01-01.
+#    Every pure-option job therefore RAISES before it runs. Resolve it one way or the other —
+#    either the floor drops to the real TastyTrade floor (if the data goes back that far), or
+#    the window starts in 2024 (if it does not). Do not "fix" it by widening the floor without
+#    checking the cache actually holds the bars: a floor that lies produces a backtest that
+#    silently trades on nothing.
+#
+# 2. THE GREEKS ARE NOT IN THE CACHE YET.  ** WASTES THE RUN **
+#    `iv_rank` and `iv_to_realized_vol` became live genes on 2026-08-26 (OPT-C1, OPT-C3). Both
+#    fail CLOSED when implied volatility cannot be measured, which is correct — but the current
+#    option cache carries no greeks at all, so `get_atm_iv` returns None on every bar. With each
+#    gate independently enabled at p=0.5, roughly 75% of every generation will score the
+#    zero-trade sentinel, and a plain (non-optimize) option backtest will trade nothing at all.
+#    The search recovers once the data lands; until then the run is mostly burning CPU on
+#    -1e9. TastyTrade collection was in progress on another machine — confirm it finished.
+#
+# 3. THE ARC RICHNESS GATE IS BUILT BUT NOT ENFORCED.
+#    `ba2_common.core.option_economics` computes per-contract annualised return on collateral
+#    and is fully tested, and `rule_builders` forwards `option_min_arc` — but no credit builder
+#    consults it yet and no gene is emitted, because enforcement belongs in `TradeActions.py`.
+#    So a grid launched today still admits a credit structure on `net_credit > 0` alone: it can
+#    still learn to sell near-worthless premium, which is the behaviour the gate exists to stop.
+#    A test fails the moment enforcement lands, as the signal to emit the gene here.
+#
+# Also outstanding, lower stakes: `options_provider._compute_atm_iv` falls back to the
+# chain-snapshot row whose IV has no as-of guarantee (OPT-C8 lookahead) — which matters MORE now
+# that iv_rank is searched; and `_option_consistent_annual_return` reads `avg_trades_per_year`
+# directly, so it still needs the structures-not-legs substitution `_trades_per_year` applies to
+# CAR, or three iron condors a year clears its 12/yr floor exactly as they used to clear CAR's.
+#
+# ==============================================================================================
+
+
 # --- the 2026 walk-forward holdout ----------------------------------------------------------
 #
 # The option grid searches 2023-01-01 .. 2025-12-31. 2026 is RESERVED: walk-forward validation
@@ -2333,6 +2377,10 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #
 # Scoped to PURE-OPTION jobs. Non-option backtests are running against 2026 windows right now
 # and must not be disturbed by an option-grid policy.
+#
+# NOTE the interaction with precondition 1 above: this rail guards the END of the window, and
+# the history floor guards the START. They currently disagree about whether 2023 exists. The
+# rail is right; the disagreement is what needs resolving.
 _OPTION_HOLDOUT_START = _date(2026, 1, 1)
 
 
