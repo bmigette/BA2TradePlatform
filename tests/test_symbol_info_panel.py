@@ -1036,3 +1036,156 @@ def test_a_symbol_missing_from_the_batch_gets_EXPLAINED_cells_not_blank_ones():
         assert cells[1].unknown is True, label
         assert cells[1].text == panel.UNKNOWN_TEXT, label
         assert "GONE" in cells[1].reason, label
+
+
+# ===========================================================================
+# HOW BIG THE DIALOG IS
+#
+# It used to be ``full-width maximized`` -- the whole screen -- for a column of
+# label/value cards. It is a sized box now, on the Manage-labels dialog's terms:
+# a fixed width, capped at the viewport, with the CONTENT scrolling.
+# ===========================================================================
+
+def _dialog_card(client):
+    from nicegui import ui as nicegui_ui
+    cards = [el for el in client.elements.values()
+             if isinstance(el, nicegui_ui.card)]
+    assert cards, "the panel drew no card"
+    return cards[0]
+
+
+def test_the_panel_is_no_longer_a_FULL_SCREEN_dialog(nicegui_client,
+                                                     to_thread_inline):
+    opened = _open(nicegui_client, ["XLK"], {"XLK": make_info()})
+    props = opened.dialog._props
+
+    assert 'maximized' not in props
+    assert 'full-width' not in props
+
+
+def test_ONE_symbol_gets_the_narrower_panel(nicegui_client, to_thread_inline):
+    opened = _open(nicegui_client, ["XLK"], {"XLK": make_info()})
+    style = _dialog_card(nicegui_client)._style
+
+    assert style['width'] == f'{panel.PANEL_WIDTH_SINGLE}px'
+    assert opened.dialog is not None
+
+
+def test_COMPARE_gets_the_wider_one_because_it_carries_more_series(
+        nicegui_client, to_thread_inline):
+    _open(nicegui_client, ["XLK", "SPY", "QQQ"],
+          {s: make_info(symbol=s) for s in ("XLK", "SPY", "QQQ")})
+    style = _dialog_card(nicegui_client)._style
+
+    assert style['width'] == f'{panel.PANEL_WIDTH_COMPARE}px'
+    assert panel.PANEL_WIDTH_COMPARE > panel.PANEL_WIDTH_SINGLE
+
+
+def test_the_panel_is_CAPPED_at_the_viewport_in_both_directions(
+        nicegui_client, to_thread_inline):
+    """A fixed 1200px box on a 1024px laptop is a dialog with its right-hand
+    column off the screen."""
+    _open(nicegui_client, ["XLK", "SPY"],
+          {s: make_info(symbol=s) for s in ("XLK", "SPY")})
+    style = _dialog_card(nicegui_client)._style
+
+    assert style['max-width'] == f'{panel.PANEL_MAX_WIDTH_VW}vw'
+    assert style['max-height'] == f'{panel.PANEL_MAX_HEIGHT_VH}vh'
+    assert panel.PANEL_MAX_HEIGHT_VH <= 90
+
+
+def test_the_geometry_is_INLINE_because_quasar_outranks_a_class(
+        nicegui_client, to_thread_inline):
+    """THE reason this is a style and not ``max-w-[1200px]``.
+
+    Quasar sizes a dialog with ``.q-dialog__inner--minimized > div { max-width:
+    560px }`` -- two selectors, so it beats Tailwind's single-class arbitrary
+    value and the dialog silently stays 560px wide however carefully the class was
+    applied. An inline declaration outranks both. Same cascade trap as
+    ``important_color_style`` on the allocation page, in its width-shaped form."""
+    _open(nicegui_client, ["XLK"], {"XLK": make_info()})
+    card = _dialog_card(nicegui_client)
+
+    assert 'width' in card._style and 'max-width' in card._style
+    joined = ' '.join(card._classes)
+    assert 'max-w-[' not in joined
+    assert 'w-[' not in joined
+
+
+def test_the_CONTENT_scrolls_rather_than_the_dialog_growing(nicegui_client,
+                                                            to_thread_inline):
+    """The cap is only a cap if something inside it can shrink. A flex child's
+    implicit ``min-height: auto`` refuses to, which is why ``min-h-0`` is on both
+    the card and the scrolling container.
+
+    And it is a PLAIN ``overflow-y-auto`` container, not ``ui.scroll_area()``.
+    Quasar's ``.q-scrollarea__content`` is ``position: absolute; width: auto;
+    min-width: 100%`` -- a shrink-to-fit box that grows to its widest child -- so
+    every ``w-full`` inside it resolved against a width the content was itself
+    setting. Measured in a real browser at a 1100px window: the nine-column
+    comparison grid widened that box and the chart, at ``width: 100%``, followed it
+    to a 1084px canvas inside a 1045px card, past the right-hand edge, with
+    Quasar's horizontal thumb hidden so it could not even be scrolled to. A normal
+    overflow div takes a DEFINITE width from its flex parent and nothing inside it
+    can do that."""
+    from nicegui import ui as nicegui_ui
+
+    _open(nicegui_client, ["XLK"], {"XLK": make_info()})
+    card = _dialog_card(nicegui_client)
+
+    assert 'min-h-0' in card._classes
+    assert 'overflow-hidden' in card._classes
+    assert not [el for el in nicegui_client.elements.values()
+                if isinstance(el, nicegui_ui.scroll_area)]
+    scrollers = [el for el in nicegui_client.elements.values()
+                 if 'overflow-y-auto' in getattr(el, '_classes', [])]
+    assert len(scrollers) == 1
+    assert 'flex-grow' in scrollers[0]._classes
+    assert 'min-h-0' in scrollers[0]._classes
+
+
+def test_the_chart_is_built_at_RENDER_and_therefore_inside_the_sized_box(
+        nicegui_client, to_thread_inline):
+    """A chart sized at BUILD time to a full screen does not reflow into a
+    constrained container -- it overflows or clips its axis. This one is created
+    by ``render()``, after the dialog is open and already at its final width, so
+    it initialises into the box it will live in. ``ui.echart``'s own
+    ``ResizeObserver`` covers the window-resize case on top of that."""
+    from nicegui import ui as nicegui_ui
+
+    opened = _open(nicegui_client, ["XLK"], {"XLK": make_info()})
+    charts = [el for el in nicegui_client.elements.values()
+              if isinstance(el, nicegui_ui.echart)]
+
+    assert len(charts) == 1
+    # Inside the BODY, which is what ``render()`` fills -- not inside the dialog
+    # shell that ``_build`` draws before anything has been fetched.
+    assert charts[0] in list(opened.body.descendants())
+    assert 'width: 100%' in charts[0]._style.get('width', '100%') or \
+        charts[0]._style.get('width') == '100%'
+
+
+def test_the_COMPARE_legend_pages_instead_of_wrapping_over_the_plot():
+    """``grid.top`` is a fixed 60px, so a legend that wraps to a second row is
+    drawn on top of the chart. At the narrower Compare width eight or nine tickers
+    are enough to wrap, so the legend scrolls."""
+    infos = [make_info(symbol=s) for s in
+             ("XLK", "SPY", "QQQ", "IWM", "DIA", "VTI", "ARKK", "SMH", "SOXX")]
+    options = panel.build_comparison_chart_options(infos)
+
+    assert options["legend"]["type"] == "scroll"
+    assert len(options["legend"]["data"]) == 9
+    assert options["grid"]["top"] == 60
+
+
+def test_every_compare_series_still_gets_its_own_colour_up_to_the_palette():
+    """"Confirm Compare's series are still distinguishable at the narrower
+    width". They are, until the palette runs out -- which it does at nine."""
+    symbols = [f"S{i}" for i in range(len(panel.COMPARE_COLORS) + 1)]
+    options = panel.build_comparison_chart_options(
+        [make_info(symbol=s) for s in symbols])
+    colours = [s["color"] for s in options["series"]]
+
+    assert len(set(colours[:len(panel.COMPARE_COLORS)])) == len(panel.COMPARE_COLORS)
+    # ...and the ninth repeats the first. Documented, not fixed here.
+    assert colours[len(panel.COMPARE_COLORS)] == colours[0]

@@ -25,12 +25,20 @@ import os
 import shutil
 import tarfile
 import threading
+import time
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional
+from typing import Callable, Iterable, Iterator, List, Optional
 
 from ba2_common.config import CACHE_FOLDER
+from ba2_common.core.db_maintenance import format_bytes
 
 logger = logging.getLogger(__name__)
+
+# How often extract_tar logs progress, in seconds. Time-based (not per-file or per-N-bytes) so
+# it scales the same way whether the tar is a thousand small parquet files or one huge sqlite --
+# either way an operator sees a heartbeat at a predictable cadence instead of either silence or
+# log spam.
+_PROGRESS_LOG_INTERVAL_S = 15.0
 
 # Transient / in-use sidecar files that must never be synced (they are machine-local and would
 # corrupt a fresh sqlite open on the worker). The main ``.sqlite`` IS synced; the worker opens
@@ -194,18 +202,25 @@ def iter_tar(rel_paths: Iterable[str], root: Optional[str] = None,
         t.join()
 
 
-def extract_tar(fileobj, dest: Optional[str] = None) -> dict:
+def extract_tar(fileobj, dest: Optional[str] = None,
+                log: Callable[[str], None] = logger.info) -> dict:
     """Extract a tar STREAM (*fileobj*, a binary readable) into *dest* (default ``CACHE_FOLDER``).
 
     Streaming read (``mode='r|'``). Every member path is traversal-guarded via ``safe_resolve``
     (a malicious ``../`` member is skipped, not written outside the cache). Atomic temp+rename per
     file. Returns ``{extracted, bytes, skipped}``.
+
+    Progress: a push can run into the tens of GB (module docstring) and take a while on a slow
+    disk, so *log* is called at most every ``_PROGRESS_LOG_INTERVAL_S`` seconds while extracting
+    -- an operator tailing this worker's log then sees a heartbeat instead of a long silent gap
+    that looks indistinguishable from a hang.
     """
     dest_root = cache_root(dest)
     dest_root.mkdir(parents=True, exist_ok=True)
     extracted = 0
     total = 0
     skipped = 0
+    last_log = time.monotonic()
     with tarfile.open(fileobj=fileobj, mode="r|") as tar:
         for member in tar:
             if not member.isfile():
@@ -229,6 +244,11 @@ def extract_tar(fileobj, dest: Optional[str] = None) -> dict:
                 raise
             extracted += 1
             total += member.size
+            now = time.monotonic()
+            if now - last_log >= _PROGRESS_LOG_INTERVAL_S:
+                log(f"cache extract: {extracted} file(s), {format_bytes(total)} so far "
+                    f"(last: {member.name})")
+                last_log = now
     return {"extracted": extracted, "bytes": total, "skipped": skipped}
 
 

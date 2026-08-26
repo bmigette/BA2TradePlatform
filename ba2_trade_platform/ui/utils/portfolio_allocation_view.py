@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional
 
 from ...core.portfolio_allocation import (
     ERROR_LABEL_TOTAL_FMT, ERROR_LABEL_UNDER_FMT, LABEL_TOTAL_TOLERANCE_PCT,
-    MONEY_EPSILON,
+    MONEY_EPSILON, WARNING_PRECHECK_DISAGREED_FMT,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed, PositionState,
     UnrealisedPnL,
     clamp_unallocated_pct, current_value, effective_target_pct,
@@ -2132,6 +2132,71 @@ PNL_NEGATIVE_COLOR = '#EF4444'
 
 IMPORTANT_COLOR_FMT = 'color: {color} !important'
 
+# ---------------------------------------------------------------------------
+# THE TARGET BAND -- ONE rule, and both bars ask it
+#
+# The user, of the reserve bar: "if we are above or 20% below target, yellow,
+# otherwise green". The label-total bar's "green 80 to 100" is that same rule
+# against a target of 100, which is why this is one predicate and not two: the two
+# bars sit on one screen, and a disagreement between them would be obvious and
+# impossible to explain.
+#
+#     green   when  target - 20pp  <=  value  <=  target
+#     yellow  otherwise
+#
+# TWENTY PERCENTAGE POINTS, not twenty percent relative. That reading is what
+# makes "80 to 100" against a 100% target come out exactly right; relative would
+# also give 80 there, but 72 rather than 70 against a 90% target.
+#
+# BOTH FIGURES ARE ROUNDED TO THE CENT BEFORE COMPARING, and that is load-bearing
+# rather than tidiness: an even split of three labels is 33.33 + 33.33 + 33.34,
+# which is exactly 100 in decimal and 100.00000000000001 in binary. A raw
+# comparison would paint the engine's own splitter yellow -- the same class of
+# rounding trap ``LABEL_TOTAL_TOLERANCE_PCT`` exists for, solved here by comparing
+# at the precision the boxes actually store.
+# ---------------------------------------------------------------------------
+
+#: How far BELOW target still counts as on target, in percentage points.
+TARGET_BAND_SLACK_PP = 20.0
+
+#: Tailwind's ``green-500`` and ``yellow-400``. Green is the same hex the P&L uses
+#: for a gain, deliberately: "this is fine" should be one colour on this page.
+BAND_OK_COLOR = '#22C55E'
+BAND_OFF_COLOR = '#FACC15'
+
+
+def within_target_band(value_pct: Optional[float], target_pct: float,
+                       *, slack_pp: float = TARGET_BAND_SLACK_PP) -> bool:
+    """Is this figure close enough to its target to read as fine? Pure.
+
+    Inclusive at BOTH ends: exactly on target and exactly ``slack_pp`` below it are
+    both inside. Above target is outside at any distance -- over-allocating is the
+    direction that spends money you meant to keep, so it has no slack at all.
+
+    ``None`` is NOT in the band and NOT out of it either; callers that paint should
+    ask ``band_color``, which keeps "no measurement" neutral rather than alarming.
+    """
+    if value_pct is None:
+        return False
+    value = round(float(value_pct), 2)
+    target = round(float(target_pct or 0.0), 2)
+    return target - slack_pp <= value <= target
+
+
+def band_color(value_pct: Optional[float], target_pct: float,
+               *, slack_pp: float = TARGET_BAND_SLACK_PP) -> str:
+    """The colour a bar is filled with. Pure. Green inside the band, yellow out.
+
+    An UNMEASURABLE figure is neutral, not yellow. No verdict is not a warning, and
+    a yellow bar on an account the broker has not answered for would be reporting a
+    problem the user does not have.
+    """
+    if value_pct is None:
+        return NEUTRAL_TEXT_COLOR
+    return (BAND_OK_COLOR if within_target_band(value_pct, target_pct,
+                                                slack_pp=slack_pp)
+            else BAND_OFF_COLOR)
+
 
 def important_color_style(color: str) -> str:
     """``color: #RRGGBB !important`` -- an inline declaration nothing can outrank.
@@ -2672,11 +2737,9 @@ def format_allocation_footer(targets, unallocated_pct: float,
     effective = effective_target_pct(total, unallocated_pct)
     text = ALLOCATION_FOOTER_FMT.format(total=total, effective=effective,
                                         reserve=reserved, grand=effective + reserved)
-    if total > 100.0 + tolerance:
-        return text, 'negative'
-    if total < 100.0 - tolerance:
-        return text, 'warning'
-    return text, 'ok'
+    # ``judge_label_total``'s verdict, not a second copy of it -- the caption above
+    # the list, the card in the summary row and this line are one opinion.
+    return text, judge_label_total(targets, tolerance)[1]
 
 
 #: Severity -> stylesheet classes for the running label-total advisory. Same
@@ -2794,12 +2857,38 @@ def judge_label_total(targets, tolerance: float = LABEL_TOTAL_TOLERANCE_PCT):
     own even split would be absurd.
     """
     total = sum(float(pct or 0.0) for pct in (targets or {}).values())
+    # WHICH SENTENCE is the engine's arithmetic, on its own tolerance -- the wording
+    # is ``validate_label_targets``' and stays verbatim.
+    #
+    # HOW ALARMED the page looks is the BAND's call on the SHORTFALL side, which is
+    # what stops the bar's colour and the sentence beside it from disagreeing: at
+    # 85% the bar is GREEN, so the sentence may not be orange -- it goes quiet and
+    # still states, in neutral type, exactly how much of the pool the labels leave
+    # undeployed. A green bar beside "10.00% under 100%" in warning orange is the
+    # exact contradiction item 2 exists to remove.
+    #
+    # OVER 100 KEEPS ITS RED, and that is deliberately NOT symmetric. The band is a
+    # rule about COLOURING A BAR; the red here is a money-safety signal that
+    # predates it -- the set is claiming more of the pool than exists, which the
+    # inline boxes refuse outright and only a wizard-era database row can produce.
+    # Down-grading it to the same yellow as "a bit under" would tell the user the
+    # two states are equally fine. The bar is still yellow there, so the pair reads
+    # "not OK" (bar) and "not OK, and this one is serious" (text) -- more intensity
+    # in the words than in the geometry, never less, and never the reverse.
     if total > 100.0 + tolerance:
         return total, 'negative', ERROR_LABEL_TOTAL_FMT.format(
             total=total, over=total - 100.0)
     if total < 100.0 - tolerance:
-        return total, 'warning', ERROR_LABEL_UNDER_FMT.format(
-            total=total, under=100.0 - total)
+        # The ONE place the band speaks: how loudly a shortfall is reported.
+        return (total, 'ok' if within_target_band(total, 100.0) else 'warning',
+                ERROR_LABEL_UNDER_FMT.format(total=total, under=100.0 - total))
+    # ...and the one place it deliberately does not. Inside the engine's own
+    # tolerance the sentence is literally the words "on target", and the band is
+    # HALF A HUNDREDTH tighter than that tolerance on the upper edge -- 100.01 is
+    # out of the band and inside the tolerance. Asking the band here would print
+    # "on target" in warning orange, which is a sentence arguing with its own
+    # colour. The bar is a hair yellow in that sliver and the words stay quiet:
+    # geometry more cautious than the text, never the reverse.
     return total, 'ok', LABEL_TOTAL_ON_TARGET
 
 
@@ -2935,10 +3024,20 @@ def managed_total_value(views) -> float:
 #: hold three other denominators in mind.
 ACCOUNT_VALUE_TITLE = 'Account value'
 
-#: What the money line reads when the figure is UNKNOWN. Deliberately not a
-#: number and deliberately not blank: ``$0.00`` under this caption reads as an
-#: account with nothing in it, and an empty card reads as a rendering bug.
-ACCOUNT_VALUE_UNAVAILABLE_TEXT = 'n/a'
+#: What a money line reads when the figure is UNKNOWN. Deliberately not a number
+#: and deliberately not blank: ``$0.00`` under any of these captions reads as an
+#: account with nothing in it, and an empty line reads as a rendering bug.
+#:
+#: The word is ``unknown`` and not ``n/a``. The three figures now share ONE card, so
+#: they have to share one vocabulary -- and ``n/a`` is read as "not applicable" as
+#: often as "not available", which are opposite claims: the first says the question
+#: is meaningless here, the second says the broker did not answer. Only the second
+#: is ever true of these three.
+FIGURE_UNKNOWN_TEXT = 'unknown'
+
+#: Kept as its own name because it is the account-value card's published contract
+#: and several tests speak it; it is the shared word above.
+ACCOUNT_VALUE_UNAVAILABLE_TEXT = FIGURE_UNKNOWN_TEXT
 
 #: ...and why, in the manner of the expert cards' ``Confidence: n/a — <reason>``.
 #: A bare "n/a" leaves the reader unable to tell an outage from a setting. The
@@ -3067,6 +3166,135 @@ def account_value_card(*, account_value: Optional[float],
     return AccountValueCard(title=ACCOUNT_VALUE_TITLE,
                             text=format_account_money(value),
                             detail=detail, available=True, leverage=leverage)
+
+
+# ---------------------------------------------------------------------------
+# THE MONEY CARD -- three figures, ONE box, and it ALWAYS renders
+#
+# ``Managed value``, ``Account value`` and ``Free buying power`` were three cards
+# side by side, and being three cards cost two things.
+#
+# COSMETIC: each box sized itself to its OWN caption, so the money lines sat at
+# three different heights across a row that is read left to right as one sentence.
+#
+# NOT COSMETIC: the buying-power card was drawn inside ``if buying_power is not
+# None`` and simply VANISHED when the broker would not answer. That is the
+# unknown-as-zero bug in its worst form -- not a wrong number the user can argue
+# with, but no widget at all, which is indistinguishable from a page that never had
+# one. A reader cannot notice the absence of something they have never seen.
+#
+# So: one card, three figures, each INDEPENDENTLY in exactly one of three states --
+# a measured value, a measured ``$0.00``, or ``unknown`` with the reason -- and the
+# card itself is unconditional. One unreadable figure costs its own line and
+# nothing else's, which is the property ``summary_figures`` exists to make
+# structural rather than remembered.
+# ---------------------------------------------------------------------------
+
+#: The managed-value caption. The parenthetical is a DEFINITION, not decoration:
+#: this page carries a Valuation selector, so "managed value" alone does not say
+#: whether it is what you paid or what it is worth.
+MANAGED_VALUE_TITLE_FMT = 'Managed value — {mode}'
+
+#: The two readings the Valuation selector chooses between, in the words the
+#: caption states them in. Owned here rather than in the renderer: which of the two
+#: a mode means is a decision, and the page must not be able to answer it
+#: differently from the card.
+VALUATION_CAPTION_COST = 'cost basis (what you paid)'
+VALUATION_CAPTION_MARKET = 'market value (qty x price)'
+
+#: Why the managed value could not be measured. Not reachable from the page today
+#: -- ``managed_total_value`` sums what it can and an unpriced holding gets its own
+#: danger banner -- but the figure travels the same three-state road as its two
+#: neighbours so that a future caller cannot re-introduce the zero.
+MANAGED_VALUE_UNAVAILABLE_DETAIL = (
+    'the managed positions could not be valued — unknown, not zero')
+
+BUYING_POWER_TITLE = 'Free buying power'
+
+#: ...and its reason. Same shape and same closing clause as
+#: ``ACCOUNT_VALUE_UNAVAILABLE_DETAIL``: the sentence must not itself contain the
+#: string the line is promising never to print.
+BUYING_POWER_UNAVAILABLE_DETAIL = (
+    'the broker published no buying power — unknown, not zero')
+
+
+@dataclass
+class SummaryFigure:
+    """One money line of the merged card, decided. Pure.
+
+    ``available is False`` means the broker did not answer: ``text`` is
+    ``unknown`` and ``detail`` says why. It is NOT the same as a measured
+    ``$0.00``, which is ``available=True`` -- a fully withdrawn account, or an
+    account with every dollar deployed, is a real state and reporting it as an
+    outage is the inverse of the bug this card is careful about.
+
+    ``detail`` is '' when there is nothing to add; the renderer draws no line for
+    it rather than an empty one.
+    """
+    title: str
+    text: str
+    detail: str
+    available: bool
+
+
+def valuation_caption(valuation_mode: str) -> str:
+    """The Valuation selector's mode, in the words the caption uses. Pure."""
+    return (VALUATION_CAPTION_COST if valuation_mode == VALUATION_MODE_COST
+            else VALUATION_CAPTION_MARKET)
+
+
+def managed_value_figure(managed_value: Optional[float], *,
+                         valuation_mode: str) -> SummaryFigure:
+    """The managed positions' worth, under the mode that measured it. Pure."""
+    title = MANAGED_VALUE_TITLE_FMT.format(mode=valuation_caption(valuation_mode))
+    if managed_value is None:
+        return SummaryFigure(title=title, text=FIGURE_UNKNOWN_TEXT,
+                             detail=MANAGED_VALUE_UNAVAILABLE_DETAIL,
+                             available=False)
+    return SummaryFigure(title=title,
+                         text=format_account_money(float(managed_value)),
+                         detail='', available=True)
+
+
+def buying_power_figure(available_buying_power: Optional[float]) -> SummaryFigure:
+    """Free buying power, or ``unknown`` and why. Pure. NEVER omitted.
+
+    ``0.00`` is a MEASURED state and one the user needs badly -- it is the reason
+    the plan will not buy anything -- so it prints as a figure. ``None`` is the
+    broker not answering, and this line is the whole reason the figure can no
+    longer disappear off the page when that happens.
+    """
+    if available_buying_power is None:
+        return SummaryFigure(title=BUYING_POWER_TITLE, text=FIGURE_UNKNOWN_TEXT,
+                             detail=BUYING_POWER_UNAVAILABLE_DETAIL,
+                             available=False)
+    return SummaryFigure(title=BUYING_POWER_TITLE,
+                         text=format_account_money(float(available_buying_power)),
+                         detail='', available=True)
+
+
+def summary_figures(*, managed_value: Optional[float], valuation_mode: str,
+                    account_value: Optional[float],
+                    available_buying_power: Optional[float]) -> List[SummaryFigure]:
+    """The merged card's three lines, in reading order. Pure; never raises.
+
+    THE point of returning a list of three rather than three separate calls at the
+    render site: the renderer loops, so it has no branch in which a figure can be
+    skipped. "One unreadable figure must not blank its neighbours" stops being a
+    rule someone has to remember and becomes the only thing the code can do.
+
+    ``Account value``'s leverage clause rides in its ``detail`` -- it is the line
+    that tells the user they are levered, and it is derived from the figure
+    immediately above it, so the two travel together.
+    """
+    card = account_value_card(account_value=account_value,
+                              managed_value=float(managed_value or 0.0))
+    return [
+        managed_value_figure(managed_value, valuation_mode=valuation_mode),
+        SummaryFigure(title=card.title, text=card.text, detail=card.detail,
+                      available=card.available),
+        buying_power_figure(available_buying_power),
+    ]
 
 
 def missing_quote_symbols(views) -> List[str]:
@@ -3282,6 +3510,154 @@ MARKET_BANNER_CLASSES = {
     "warning": "alert-banner warning",
     "negative": "alert-banner danger",
     "info": "alert-banner info",
+}
+
+
+# ---------------------------------------------------------------------------
+# THE DRY RUN'S PLAN WARNINGS -- and the eight identical lines above the fold
+#
+# WHAT THE BROKER PRECHECK ACTUALLY IS. Before the dry run is drawn,
+# ``precheck_plan`` builds each candidate BUY as a real order object and asks the
+# broker to price it WITHOUT sending it (TastyTrade's ``place_order(dry_run=True)``;
+# Alpaca has no such endpoint and returns nothing, so on Alpaca none of this
+# happens at all). What comes back is the broker's own ``bp_cost`` -- how much
+# BUYING POWER that order would tie up. ``apply_order_impacts`` compares it to the
+# planner's estimate (``estimated_value x bp_factor``, a per-symbol margin rate),
+# and where the two differ by more than half a cent it takes the BROKER's figure
+# and files ``WARNING_PRECHECK_DISAGREED_FMT`` for that symbol. On a margin book
+# the two estimates differ on most rows, which is why the user saw eight identical
+# lines: one per buy.
+#
+# WHAT IT MEANS FOR THE USER: on its own, nothing. Replacing an estimate with a
+# measurement changes no quantity and no target; it is bookkeeping, and it happens
+# on nearly every run. The old line named an internal step ("precheck", "re-solved")
+# and reported an outcome the user cannot act on, eight times, above the fold.
+#
+# WHAT IT CAN LEAD TO, AND WHAT MUST THEREFORE SURVIVE: the corrected costs are fed
+# straight back into ``_apply_bp_scaling``. If they no longer fit the available
+# buying power EVERY buy is scaled down pro-rata, ``plan.scale_factor`` drops below
+# 1.0 and the quantities really are smaller than the user's targets implied. That
+# is the materially different outcome, so the collapsed line ESCALATES -- in
+# wording, and from grey to orange -- whenever the plan is scaled, and points at
+# the Reasons column where the per-row ``scaled x N`` already says which rows paid.
+# ---------------------------------------------------------------------------
+
+#: Built FROM the engine's own format string, so the parse cannot drift from the
+#: producer. A renamed or reworded warning stops matching here and the line falls
+#: through to the pass-through branch -- visible and wrong-looking, rather than
+#: silently swallowed.
+_PRECHECK_WARNING_RE = re.compile(
+    '^' + re.escape(WARNING_PRECHECK_DISAGREED_FMT).replace(
+        r'\{symbol\}', '(?P<symbol>.+?)') + '$')
+
+#: How many symbols are named before the list is summarised. Ten fits a line; a
+#: sixty-symbol rebalance would otherwise put a paragraph of tickers above the
+#: table this dialog exists to show.
+PRECHECK_SYMBOLS_NAMED = 10
+
+#: The normal case: the broker re-priced some buys, nothing the user chose moved.
+#: One line, in plain words, naming the symbols -- and it says the quantities are
+#: untouched, because that is the question "the broker disagreed" leaves hanging.
+PRECHECK_NOTICE_FMT = (
+    'Checked with the broker before showing you this: it priced {count} of these '
+    'buys differently from our own estimate ({symbols}), so the buying-power '
+    'figures below are the broker\'s rather than ours. Nothing you asked for '
+    'moved — the quantities are unchanged.')
+
+#: ...and the case that DID cost the user something.
+PRECHECK_NOTICE_SCALED_FMT = (
+    'Checked with the broker before showing you this: it priced {count} of these '
+    'buys differently from our own estimate ({symbols}), so the buying-power '
+    'figures below are the broker\'s rather than ours. This plan is ALSO scaled '
+    '×{factor:.2f} to fit your buying power, so the quantities below are smaller '
+    'than your targets asked for — the Reasons column names every row that paid '
+    'for it.')
+
+
+def _name_symbols(symbols: List[str]) -> str:
+    """``'A, B, C'``, or ``'A, ... , J and 7 more'`` past the cap. Pure."""
+    named = list(symbols)
+    if len(named) <= PRECHECK_SYMBOLS_NAMED:
+        return ', '.join(named)
+    return (', '.join(named[:PRECHECK_SYMBOLS_NAMED])
+            + f' and {len(named) - PRECHECK_SYMBOLS_NAMED} more')
+
+
+def precheck_resolved_symbols(warnings) -> List[str]:
+    """Which symbols the broker re-priced, in plan order. Pure; no duplicates."""
+    out: List[str] = []
+    for warning in (warnings or []):
+        match = _PRECHECK_WARNING_RE.match(str(warning))
+        if match is not None and match.group('symbol') not in out:
+            out.append(match.group('symbol'))
+    return out
+
+
+def plan_warning_lines(warnings, *, scale_factor: float = 1.0):
+    """``[(text, severity)]`` for the dry run's plan warnings. Pure; never raises.
+
+    Every warning the collapse does not recognise passes through UNCHANGED at
+    ``'warning'``: empty labels and unconverged residuals are each about one
+    specific thing and each deserve their own line.
+
+    The per-symbol precheck lines collapse into exactly ONE, appended last so the
+    warnings that name a real problem keep the top. Its severity is the whole
+    judgement:
+
+    * ``'info'`` when the plan was not scaled -- a normal self-correcting step, said
+      once, in grey, out of the way of the things the user can act on;
+    * ``'warning'`` when it was, because then the re-solve is standing next to
+      quantities that are smaller than the targets implied.
+
+    ``scale_factor`` is the plan's COMPOUNDED factor, so a plan already scaled
+    before the precheck also reads as scaled. That is deliberate: the sentence says
+    "this plan is also scaled", which is true either way, rather than claiming the
+    precheck alone caused it -- ``apply_order_impacts`` multiplies the two passes
+    together and does not keep them apart.
+    """
+    resolved = precheck_resolved_symbols(warnings)
+    lines = [(str(w), 'warning') for w in (warnings or [])
+             if _PRECHECK_WARNING_RE.match(str(w)) is None]
+    if not resolved:
+        return lines
+    factor = float(scale_factor if scale_factor is not None else 1.0)
+    if factor < 1.0:
+        lines.append((PRECHECK_NOTICE_SCALED_FMT.format(
+            count=len(resolved), symbols=_name_symbols(resolved), factor=factor),
+            'warning'))
+    else:
+        lines.append((PRECHECK_NOTICE_FMT.format(
+            count=len(resolved), symbols=_name_symbols(resolved)), 'info'))
+    return lines
+
+
+#: Severity -> stylesheet classes for one plan-warning line. Grey for the
+#: informational collapse and orange for everything else: the dry run had a dozen
+#: orange lines above the table, which is the same as having none.
+PLAN_WARNING_CLASSES = {
+    'info': 'text-xs text-gray-400',
+    'warning': 'text-xs text-orange-400',
+}
+
+#: ...and the SAME two severities as hex, because the classes above do not paint.
+#:
+#: Verified in a real browser rather than reasoned about, which is the only way
+#: this is findable: ``styles.css`` defines ``.text-gray-400`` and
+#: ``.text-orange-600`` but NOT ``.text-orange-400``, and this build ships no
+#: Tailwind sheet that generates the -400/-500 palette -- a synthetic
+#: ``<div class="text-orange-400">`` computes to ``rgb(255,255,255)``. Every
+#: ``text-orange-400`` / ``text-red-400`` / ``text-green-500`` in the dry-run
+#: dialog has therefore always rendered WHITE. That is a pre-existing condition
+#: across that whole dialog and is deliberately NOT repainted wholesale here; what
+#: IS fixed is the severity this batch introduced, because a distinction nobody
+#: can see is not a distinction. The classes are kept alongside: they are what the
+#: DOM reads as, and several tests locate lines by them.
+#:
+#: Orange is ``STATUS_OVER_COLOR``, the hex the label rows already paint "over by"
+#: in, so the two scopes cannot drift to two oranges.
+PLAN_WARNING_COLORS = {
+    'info': NEUTRAL_TEXT_COLOR,
+    'warning': STATUS_OVER_COLOR,
 }
 
 MARKET_MSG_CLOSED_FMT = (

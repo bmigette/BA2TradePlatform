@@ -2219,3 +2219,374 @@ def test_a_broker_that_CAN_split_shares_leaves_the_gates_switch_alone(nicegui_cl
 
     assert switch.enabled is True
     assert wiz.NO_FRACTIONAL_SUPPORT_NOTE not in _rendered_texts(nicegui_client.layout)
+
+
+# ---------------------------------------------------------------------------
+# ITEM 5 -- THE "BROKER PRECHECK DISAGREED" LINES
+#
+# What the step actually is: ``precheck_plan`` asks the broker to price each
+# candidate BUY without sending it, ``apply_order_impacts`` swaps the planner's
+# estimated buying-power cost for the broker's measured one, and files one warning
+# PER SYMBOL where the two differ by over half a cent. On a margin book that is
+# most rows, which is why the user saw eight identical lines naming an internal
+# step and reporting nothing they could act on.
+#
+# What must survive: the corrected costs go straight back through the pro-rata
+# buying-power scaler, and if they no longer fit, every buy shrinks. THAT is a
+# materially different quantity, and the collapsed line escalates when it happens.
+# ---------------------------------------------------------------------------
+
+def _precheck_warnings(*symbols):
+    from ba2_trade_platform.core.portfolio_allocation import (
+        WARNING_PRECHECK_DISAGREED_FMT)
+
+    return [WARNING_PRECHECK_DISAGREED_FMT.format(symbol=s) for s in symbols]
+
+
+EIGHT = ('NLR', 'NUKZ', 'URA', 'CCJ', 'LEU', 'SMR', 'OKLO', 'BWXT')
+
+
+def _plan_with_warnings(warnings, *, scale_factor=1.0):
+    plan = _mixed_plan()
+    plan.warnings = list(warnings)
+    plan.scale_factor = scale_factor
+    return plan
+
+
+def _draw_wizard(client, plan):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with client:
+        wiz.AllocationWizard(_base(), plan, market=_open_market(),
+                             on_refresh=lambda f: (plan, _open_market()),
+                             on_submit=lambda p: None).open()
+    return client.layout
+
+
+def test_EIGHT_precheck_lines_become_ONE(nicegui_client):
+    """The complaint, verbatim: eight identical lines above the fold."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _plan_with_warnings(_precheck_warnings(*EIGHT)))
+    lines = _marked_texts(root, wiz.MARKER_PLAN_WARNING)
+
+    assert len(lines) == 1
+
+
+def test_the_ONE_line_NAMES_the_symbols(nicegui_client):
+    """Collapsing may not cost the reader the "which ones"."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _plan_with_warnings(_precheck_warnings(*EIGHT)))
+    line = _marked_texts(root, wiz.MARKER_PLAN_WARNING)[0]
+
+    for symbol in EIGHT:
+        assert symbol in line, symbol
+    assert '8' in line
+
+
+def test_the_ONE_line_names_NO_INTERNAL_STEP(nicegui_client):
+    """"broker precheck disagreed ... re-solved" named a step in our own code and
+    told the reader nothing. The user: "don't even know what is it"."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _plan_with_warnings(_precheck_warnings(*EIGHT)))
+    line = _marked_texts(root, wiz.MARKER_PLAN_WARNING)[0].lower()
+
+    assert 'precheck' not in line
+    assert 're-solved' not in line
+    assert 'disagreed' not in line
+
+
+def test_an_UNSCALED_re_solve_says_the_quantities_did_not_move(nicegui_client):
+    """The honest answer to "what should I do differently?": nothing. Replacing an
+    estimate with a measurement changes no quantity, so the line says so and is
+    drawn in grey, out of the way of the notices that ARE actionable."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client,
+                        _plan_with_warnings(_precheck_warnings(*EIGHT)))
+    line = [el for el in root.descendants()
+            if wiz.MARKER_PLAN_WARNING in getattr(el, '_markers', [])][0]
+
+    assert 'quantities are unchanged' in line.text
+    assert 'text-gray-400' in ' '.join(line._classes)
+    assert 'text-orange-400' not in ' '.join(line._classes)
+
+
+def test_a_re_solve_that_SHRANK_the_plan_says_THAT_and_turns_orange(nicegui_client):
+    """The information that must not be deleted. The broker's corrected costs feed
+    the buying-power scaler; when they no longer fit, every buy is cut and the
+    quantities really are smaller than the targets implied."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client,
+                        _plan_with_warnings(_precheck_warnings(*EIGHT),
+                                            scale_factor=0.87))
+    line = [el for el in root.descendants()
+            if wiz.MARKER_PLAN_WARNING in getattr(el, '_markers', [])][0]
+
+    assert '0.87' in line.text
+    assert 'smaller than your targets' in line.text
+    assert 'Reasons' in line.text          # ...and where the per-row detail is
+    assert 'text-orange-400' in ' '.join(line._classes)
+
+
+def test_a_warning_that_is_NOT_a_precheck_line_passes_through_untouched(
+        nicegui_client):
+    """An empty label is about one specific thing and keeps its own line."""
+    wiz = _wiz()
+    empty = "label 'CRYPTO' has no symbols - its 12.00% weight is unallocated"
+    root = _draw_wizard(nicegui_client,
+                        _plan_with_warnings([empty] + _precheck_warnings(*EIGHT)))
+    lines = _marked_texts(root, wiz.MARKER_PLAN_WARNING)
+
+    assert lines[0] == empty               # ...and it keeps the TOP
+    assert len(lines) == 2
+
+
+def test_a_plan_the_broker_never_prechecked_says_nothing_at_all(nicegui_client):
+    """Alpaca has no order-preview endpoint, so on Alpaca this never fires. A line
+    reading "0 buys were re-priced" would be pure noise."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _plan_with_warnings([]))
+
+    assert _marked_texts(root, wiz.MARKER_PLAN_WARNING) == []
+
+
+def test_the_plan_warnings_are_REDRAWN_by_refresh(nicegui_client):
+    """They used to be drawn in the base panel, which ``_refresh`` never rebuilds
+    -- so after a Refresh the dialog showed the PREVIOUS solve's warnings above the
+    new solve's table."""
+    wiz = _wiz()
+    first = _plan_with_warnings(_precheck_warnings('NLR'))
+    second = _plan_with_warnings(_precheck_warnings('CCJ', 'URA'))
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), first, market=_open_market(),
+            on_refresh=lambda f: (second, _open_market()),
+            on_submit=lambda p: None)
+        wizard.open()
+        wizard._refresh(False)
+        lines = _marked_texts(nicegui_client.layout, wiz.MARKER_PLAN_WARNING)
+
+    assert len(lines) == 1
+    assert 'CCJ' in lines[0] and 'URA' in lines[0]
+    assert 'NLR' not in lines[0]
+
+
+# ---------------------------------------------------------------------------
+# ITEM 4 -- THE ORDER TABLE GETS AT LEAST 60% OF THE DIALOG
+# ---------------------------------------------------------------------------
+
+def _classes(element) -> str:
+    return ' '.join(element._classes)
+
+
+def _only(root, marker):
+    hits = [el for el in root.descendants() if marker in getattr(el, '_markers', [])]
+    assert len(hits) == 1, f'{marker}: {len(hits)}'
+    return hits[0]
+
+
+def test_the_order_table_viewport_TAKES_WHAT_THE_CAPS_LEAVE(nicegui_client):
+    """It was a ~2-row viewport with its own scrollbar, wedged between a tall
+    notice stack and the totals -- the most important content with the least room.
+
+    It is the ONLY growing child now, and it deliberately has no minimum of its
+    own: a ``min-h-[60vh]`` competes with the caps rather than cooperating with
+    them, overflows the card and gets the SUBMIT BUTTON clipped off the bottom.
+    Measured in a real browser at 1600x1000, that is exactly what happened. The
+    60% comes from holding the siblings down instead -- see the next test."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _plan_with_warnings(_precheck_warnings(*EIGHT)))
+    viewport = _classes(_only(root, wiz.MARKER_ROWS_VIEWPORT))
+
+    assert 'flex-grow' in viewport         # takes everything left over...
+    assert 'min-h-0' in viewport           # ...and can still shrink, so nothing clips
+    assert 'min-h-[' not in viewport.replace('min-h-0', '')
+    assert 'overflow-auto' in viewport
+
+
+def test_the_dialog_CLIPS_rather_than_growing_past_the_viewport(nicegui_client):
+    """"Do not solve it by making the dialog taller than the viewport." The card is
+    a flex column that fills the maximized dialog and hides its own overflow; every
+    section inside it scrolls within its own cap instead."""
+    from nicegui import ui
+
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _plan_with_warnings([]))
+    card = [el for el in root.descendants() if isinstance(el, ui.card)][0]
+
+    assert 'h-full' in _classes(card)
+    assert 'flex-col' in _classes(card)
+    assert 'overflow-hidden' in _classes(card)
+    # Without ``min-h-0`` a flex child's implicit ``min-height:auto`` defeats every
+    # cap below and the card grows anyway.
+    assert 'min-h-0' in _classes(card)
+
+
+def test_the_notices_and_the_totals_are_BOTH_capped_and_scroll(nicegui_client):
+    """What pays for the table's 60%: the two stacks that used to grow without
+    limit are capped and scroll inside their caps."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _plan_with_warnings(_precheck_warnings(*EIGHT)))
+
+    assert 'max-h-' in wiz.DIALOG_HEAD_CLASSES
+    assert 'overflow-y-auto' in wiz.DIALOG_HEAD_CLASSES
+    assert 'max-h-' in wiz.DIALOG_TOTALS_CLASSES
+    assert 'overflow-y-auto' in wiz.DIALOG_TOTALS_CLASSES
+    block = _classes(_only(root, wiz.MARKER_NOTICE_BLOCK))
+    assert 'max-h-' in block and 'overflow-y-auto' in block
+
+
+def test_the_CAPS_are_what_guarantee_the_60_percent():
+    """These two numbers ARE the guarantee now, so they get a test of their own.
+
+    head + totals <= 25vh leaves 75vh; the fixed chrome (title, buttons, card
+    padding, flex gaps) does not scale with the viewport and is what actually
+    binds. Measured in a real browser the table gets 64.6% at 1920x1080, 63.8% at
+    1600x1000, 61.3% at 1280x800 and 60.8% at 1024x720 -- and NOTHING is clipped,
+    which the previous shape could not say. A well-meaning "just a bit more room
+    for the notices" now fails here instead of quietly taking the table back down
+    to two rows."""
+    import re
+
+    wiz = _wiz()
+
+    def _vh(classes, prefix):
+        return float(re.search(prefix + r'\[(\d+(?:\.\d+)?)vh\]', classes).group(1))
+
+    head = _vh(wiz.DIALOG_HEAD_CLASSES, 'max-h-')
+    totals = _vh(wiz.DIALOG_TOTALS_CLASSES, 'max-h-')
+
+    assert head + totals <= wiz.DIALOG_SIDE_CAP_BUDGET_VH
+    assert wiz.DIALOG_SIDE_CAP_BUDGET_VH <= 25.0
+    # ...and the card CLIPS, so an overrun would hide the Submit button rather
+    # than scroll to it. That is why the budget is the test and not a comment.
+    assert 'overflow-hidden' in wiz.DIALOG_CARD_CLASSES
+
+
+def test_a_MOUNTAIN_of_notices_still_cannot_squeeze_the_table(nicegui_client):
+    """The failure mode being fixed: the notices grew and the table paid for it.
+    They are in a capped block now, so twenty of them cost the same as two."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client,
+                        _plan_with_warnings(
+                            [f"label 'L{i}' has no symbols - its 1.00% weight "
+                             f"is unallocated" for i in range(20)]))
+    head = wiz.DIALOG_HEAD_CLASSES
+
+    assert 'max-h-[18vh]' in head and 'overflow-y-auto' in head
+    assert len(_marked_texts(root, wiz.MARKER_PLAN_WARNING)) == 20   # none dropped
+
+
+def test_the_reader_is_TOLD_there_is_more_to_scroll_to(nicegui_client):
+    """A dark-theme scrollbar is nearly invisible, and a notice nobody knows to
+    scroll to has not been shown."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client,
+                        _plan_with_warnings(
+                            [f"label 'L{i}' has no symbols" for i in range(6)]))
+    drawn = (len(_marked_texts(root, wiz.MARKER_PLAN_WARNING))
+             + len(_marked_texts(root, wiz.MARKER_PLAN_NOTICE)))
+
+    assert drawn >= 6
+    # The count is what is ACTUALLY in the block, warnings and notices alike --
+    # announcing six above a block of seven would be its own small lie.
+    assert _marked_texts(root, wiz.MARKER_NOTICE_COUNT) == [
+        wiz.NOTICE_COUNT_FMT.format(count=drawn)]
+
+
+def test_two_notices_are_not_announced_as_a_pile(nicegui_client):
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _plan_with_warnings(["label 'A' has none"]))
+
+    assert _marked_texts(root, wiz.MARKER_NOTICE_COUNT) == []
+
+
+# ---------------------------------------------------------------------------
+# ITEM 6 -- IT IS A TABLE
+# ---------------------------------------------------------------------------
+
+def test_the_order_grid_uses_the_SHARED_table_look(nicegui_client):
+    """``.pf-grid-head`` / ``.pf-grid-row`` are attached to ``styles.css``'s own
+    ``.q-table`` rules -- the same selectors, so the theme cannot be changed for
+    one and not the other. A second hand-rolled look is exactly what item 6 says
+    not to invent."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _mixed_plan())
+
+    assert 'pf-grid-head' in _classes(_only(root, wiz.MARKER_TABLE_HEAD))
+    rows = [el for el in root.descendants()
+            if 'pf-grid-row' in getattr(el, '_classes', [])]
+    assert len(rows) >= 5                  # one per plan row
+
+
+def test_the_shared_look_is_ONE_stylesheet_rule_and_not_a_copy():
+    """Read out of the stylesheet, because that is the only place it is true."""
+    from pathlib import Path
+
+    import ba2_trade_platform.ui as ui_pkg
+
+    css = (Path(ui_pkg.__file__).parent / 'static' / 'styles.css').read_text()
+
+    assert '.q-table thead tr, .q-table thead th, .pf-grid-head {' in css
+    assert '.q-table tbody tr, .pf-grid-row {' in css
+    assert '.q-table tbody tr:hover, .pf-grid-row:hover {' in css
+
+
+def test_the_table_header_is_STICKY():
+    """Eighteen columns whose names have scrolled off the top are eighteen
+    anonymous numbers -- and the viewport is deliberately tall now."""
+    from pathlib import Path
+
+    import ba2_trade_platform.ui as ui_pkg
+
+    css = (Path(ui_pkg.__file__).parent / 'static' / 'styles.css').read_text()
+    # The STANDALONE block, not the shared selector list above it -- a bare split
+    # on the class name finds the theme rule and passes for the wrong reason.
+    sticky = css.split('\n.pf-grid-head {')[1].split('}')[0]
+
+    assert 'position: sticky' in sticky
+    assert 'top: 0' in sticky
+    assert 'z-index' in sticky             # ...or the rows scroll over it
+
+
+def test_every_ROW_SEPARATOR_comes_from_the_shared_rule_too():
+    from pathlib import Path
+
+    import ba2_trade_platform.ui as ui_pkg
+
+    css = (Path(ui_pkg.__file__).parent / 'static' / 'styles.css').read_text()
+    row = css.split('\n.pf-grid-row {')[1].split('}')[0]
+
+    assert 'border-bottom' in row
+
+
+def test_the_numeric_columns_are_RIGHT_ALIGNED_in_the_header_AND_the_cells(
+        nicegui_client):
+    """Money that is not right-aligned cannot be compared down a column, and a
+    right-aligned cell under a left-aligned heading is worse than neither."""
+    wiz = _wiz()
+    root = _draw_wizard(nicegui_client, _mixed_plan())
+    head = _only(root, wiz.MARKER_TABLE_HEAD)
+    headers = {el.text: _classes(el) for el in head.descendants()
+               if getattr(el, 'text', None)}
+
+    for numeric in ('Held', 'Cost', 'Value', 'Qty', 'Est. value', 'Target',
+                    'BP cost', 'BP %'):
+        assert 'text-right' in headers[numeric], numeric
+    for textual in ('Symbol', 'Side', 'Order', 'Sizing', 'Outcome', 'Reasons'):
+        assert 'text-right' not in headers[textual], textual
+    # ...and the CELLS carry exactly the header's classes, because both read the
+    # same column spec.
+    assert 'text-right' in _classes(
+        [el for el in root.descendants()
+         if wiz.MARKER_ROW_HELD in getattr(el, '_markers', [])][0])
+
+
+def test_the_header_and_the_cells_cannot_DRIFT_out_of_step():
+    """One column spec, read by both. They were two literal tuples that had to be
+    kept in the same order by hand."""
+    wiz = _wiz()
+    names = [name for name, _h, _w, _n in wiz.DRY_RUN_COLUMNS]
+
+    assert len(names) == len(set(names)) == 18
+    with pytest.raises(KeyError):
+        wiz._col('a-column-the-header-does-not-declare')

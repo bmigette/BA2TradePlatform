@@ -52,7 +52,7 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
     background: transparent !important;
     background-color: transparent !important;
 }
-.q-table thead tr, .q-table thead th {
+.q-table thead tr, .q-table thead th, .pf-grid-head {
     background: rgba(26, 31, 46, 0.9) !important;
     color: #a0aec0 !important;
     font-weight: 600 !important;
@@ -60,12 +60,36 @@ p, span, div, label, h1, h2, h3, h4, h5, h6, li, td, th, a {
     font-size: 0.75rem !important;
     letter-spacing: 0.05em !important;
 }
-.q-table tbody tr {
+.q-table tbody tr, .pf-grid-row {
     background: rgba(37, 43, 59, 0.5) !important;
     transition: all 0.2s ease !important;
 }
-.q-table tbody tr:hover {
+.q-table tbody tr:hover, .pf-grid-row:hover {
     background: rgba(0, 212, 170, 0.1) !important;
+}
+
+/* Hand-rolled grids that must read as a q-table.
+ *
+ * The allocation dry run draws eighteen columns with a per-row checkbox, per-cell
+ * colour and a tooltip on three of them; as a real ``ui.table`` that is eighteen
+ * Vue cell slots, so the rows stay flex rows. They must still LOOK like every
+ * other table in the app, so they borrow the rules above by class rather than
+ * growing a second visual language -- the selectors are shared deliberately, so a
+ * change to the table theme reaches both.
+ *
+ * The two things a flex grid needs that a q-table gets for free: a separator
+ * under each row, and a header that survives scrolling. The header is sticky
+ * because the dry-run table now owns most of the dialog's height (see
+ * DIALOG_ROWS_CLASSES): eighteen columns whose names have scrolled off the top
+ * are eighteen anonymous numbers, in a dialog that places real orders. */
+.pf-grid-head {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+}
+.pf-grid-row {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
 }
 .q-table td, .q-table th {
     border-color: rgba(255, 255, 255, 0.05) !important;

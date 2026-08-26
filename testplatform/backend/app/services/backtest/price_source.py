@@ -28,6 +28,7 @@ from __future__ import annotations
 import bisect
 import logging
 import os
+import time
 from array import array
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
@@ -37,6 +38,44 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _worker_log(msg: str) -> None:
+    """Write *msg* both to stdout AND durably to this process's own dedicated log file --
+    ``LOGS_DIR/worker_child_<pid>.log`` -- retrievable afterwards through worker_server.py's
+    EXISTING ``/logs`` and ``/logs/list`` endpoints with zero changes there (they already
+    list/tail every file under ``LOGS_DIR``).
+
+    WHY NOT ``logger.info``/``logger.warning``: this runs inside a spawned trial-pool child
+    (local slot pools AND remote worker pools alike go through ``_worker_init``), which installs
+    a process-GLOBAL ``logging.disable(logging.ERROR)`` -- any stdlib ``logging`` call from this
+    point on in this process is silently dropped, regardless of logger name or handlers. A bare
+    ``print()`` alone isn't enough either: it only reaches wherever this process's inherited
+    stdout happens to go, which is durable when the whole worker daemon was itself launched with
+    shell-level redirection, but is otherwise lost, and is NEVER what the ``/logs`` endpoint
+    serves (that only tails files a ``RotatingFileHandler`` wrote to, and the one this worker
+    installs is attached only in the long-lived SERVER process, never re-attached inside each
+    spawned child).
+
+    WHY A DEDICATED PER-PID FILE, NOT THE SHARED ``app.log`` HANDLER: ``_worker_init`` disables
+    file logging in every spawned child specifically to dodge the multi-process rollover race
+    (Windows WinError 32) a handler SHARED across processes hits — see its own comment. A file
+    unique to this pid has no peer to race with, and a raw file write bypasses
+    ``logging.disable()`` entirely since it never goes through the ``logging`` module at all.
+
+    Best-effort: a failure here (disk full, permissions, LOGS_DIR unavailable) must never break
+    the trial it's reporting on.
+    """
+    print(msg, flush=True)
+    try:
+        import os as _os
+
+        from ba2_common.logger import LOGS_DIR
+        path = _os.path.join(LOGS_DIR, f"worker_child_{_os.getpid()}.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:  # noqa: BLE001 — logging must never break the trial it's reporting on
+        pass
 
 
 class BacktestCacheMiss(Exception):
@@ -73,6 +112,16 @@ _WORKER_BAR_CACHE: "OrderedDict[Any, Any]" = OrderedDict()
 # memory-constrained worker host can lower it (at the cost of within-band re-parses on the
 # symbols beyond the cap; eviction is result-neutral).
 _WORKER_BAR_CACHE_MAX = int(os.getenv("BT_BAR_CACHE_MAX", "1500"))
+
+# TIMING (2026-08-25). preload() runs once per INDIVIDUAL -- thousands of times over a GA run --
+# and almost all of those calls hit a warm _WORKER_BAR_CACHE (fast, nothing worth reporting).
+# Logging every call would be exactly the per-file-read noise this constant exists to suppress;
+# logging NONE would hide the one case that actually matters -- a BULK, mostly-cold-cache load
+# (a worker's first individual after spawn/recycle, or a fresh cap-band screener universe), which
+# is precisely where a slow disk turns into an unexplained stall. Gated on the COUNT of symbols
+# not already cached for this exact window, checked BEFORE loading (cheap dict lookups, no I/O),
+# so only a genuine bulk/cold call prints anything at all -- see preload()'s _bulk check.
+_PRELOAD_BULK_LOG_MIN = int(os.getenv("BT_PRELOAD_BULK_LOG_MIN", "20"))
 
 # How many uncached symbols preload tolerates before failing the run. BOTH bounds must hold, so
 # neither a big universe nor a small one gets the wrong behaviour:
@@ -489,12 +538,30 @@ class AsOfPriceSource:
         _TRIAL_SEQ += 1
         if _WORKER_BAR_CACHE_TRIALS <= 0:
             _flush_bar_cache_for_new_individual()   # bound the PEAK: free A before allocating B
+        # TIMING (2026-08-25), BULK/COLD ONLY -- see _PRELOAD_BULK_LOG_MIN and _worker_log's own
+        # docstring for why this goes through _worker_log rather than print()/logger directly.
+        # The pre-scan (dict lookups only, no I/O) is taken AFTER the flush decision above so it
+        # reflects the cache state the loop below will actually see (the default
+        # BT_BAR_CACHE_TRIALS=0 flushes the whole cache every individual -- scanning before the
+        # flush would see stale hits and wrongly call a fully-cold load "warm"). Only when the
+        # estimate crosses the threshold does anything get logged at all, so the steady-state
+        # warm-cache case (nearly every individual, once a worker is past its first one) stays
+        # completely silent.
+        _to_load_estimate = sum(1 for sym in symbols if (sym, *win) not in _WORKER_BAR_CACHE)
+        _bulk = _to_load_estimate >= _PRELOAD_BULK_LOG_MIN
+        _t0 = time.monotonic()
+        if _bulk:
+            _worker_log(f">> preload starting: {len(symbols)} symbol(s), "
+                       f"~{_to_load_estimate} to load from disk, {self._interval} "
+                       f"{fetch_start.date()}..{end.date()} (pid {os.getpid()})")
         missing: List[str] = []  # symbols with NO cached series anywhere (hermetic mode)
+        _hits = _loaded = 0
         for sym in symbols:
             # Worker-persistent reuse: a prior individual in this worker already parsed this
             # symbol's bar index for the same window -> adopt it (no re-fetch, no re-parse).
             cached = _WORKER_BAR_CACHE.get((sym, *win))
             if cached is not None:
+                _hits += 1
                 _WORKER_BAR_CACHE.move_to_end((sym, *win))  # LRU: mark most-recently-used
                 # Stamp only entries that actually exist in the cache: a symbol that turns out to
                 # be a hermetic MISS below never gets stored, and stamping it here would leave a
@@ -524,6 +591,7 @@ class AsOfPriceSource:
             except BacktestCacheMiss:
                 missing.append(sym)
                 continue
+            _loaded += 1
             self.load_bars_df(sym, df)  # vectorized columnar build (no per-bar dict)
             _WORKER_BAR_CACHE[(sym, *win)] = (
                 self._keys[sym], self._o[sym], self._h[sym],
@@ -536,6 +604,11 @@ class AsOfPriceSource:
             while len(_WORKER_BAR_CACHE) > _WORKER_BAR_CACHE_MAX:
                 k, _ = _WORKER_BAR_CACHE.popitem(last=False)
                 _BAR_CACHE_LAST_USED.pop(k, None)
+
+        if _bulk:
+            _worker_log(f">> preload done: {_hits} cached, {_loaded} loaded from disk, "
+                       f"{len(missing)} missing, {time.monotonic() - _t0:.2f}s "
+                       f"(pid {os.getpid()})")
 
         # PRIMARY bound: drop series no individual in the last N has touched. Runs after the loop
         # so the current individual's series are all stamped and safe.

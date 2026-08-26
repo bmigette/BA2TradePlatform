@@ -13,9 +13,38 @@ from typing import Callable, Optional
 
 import httpx
 
+from ba2_common.core.db_maintenance import format_bytes
+
 from app.services import cache_sync, self_update
 
 logger = logging.getLogger(__name__)
+
+# Matches cache_sync._PROGRESS_LOG_INTERVAL_S (the worker's extraction-side cadence) so an
+# operator watching both ends sees updates at a consistent rhythm rather than one side going
+# quiet while the other chatters.
+_PUSH_PROGRESS_LOG_INTERVAL_S = 15.0
+
+
+def _iter_with_progress(chunks, total_bytes: int, worker_name: str,
+                        log: Callable[[str], None]):
+    """Pass *chunks* through unchanged, logging upload progress at most every
+    ``_PUSH_PROGRESS_LOG_INTERVAL_S`` seconds.
+
+    A push to a remote worker reachable only over the internet (not a LAN) can run for a long
+    time on a slow link, and ``push_cache`` previously logged once before the transfer and once
+    after -- silent for the whole duration in between, indistinguishable in the log from a hang.
+    """
+    sent = 0
+    last_log = time.monotonic()
+    for chunk in chunks:
+        sent += len(chunk)
+        now = time.monotonic()
+        if now - last_log >= _PUSH_PROGRESS_LOG_INTERVAL_S:
+            pct = (sent / total_bytes * 100.0) if total_bytes else 100.0
+            log(f"cache push -> {worker_name}: {format_bytes(sent)}/{format_bytes(total_bytes)} "
+                f"({pct:.1f}%)")
+            last_log = now
+        yield chunk
 
 
 def _base(worker: dict) -> str:
@@ -260,8 +289,12 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
     if not missing:
         log(f"cache push -> {worker['name']}: already in sync ({local['count']} files)")
     else:
-        log(f"cache push -> {worker['name']}: streaming {len(missing)} file(s)...")
-        stream = cache_sync.iter_tar(missing, local["root"])
+        missing_set = set(missing)
+        missing_bytes = sum(f["size"] for f in local["files"] if f["rel_path"] in missing_set)
+        log(f"cache push -> {worker['name']}: streaming {len(missing)} file(s), "
+            f"{format_bytes(missing_bytes)}...")
+        stream = _iter_with_progress(
+            cache_sync.iter_tar(missing, local["root"]), missing_bytes, worker["name"], log)
         with httpx.Client(timeout=None) as c:  # large upload: no read timeout
             r = c.post(f"{base}/cache/push", headers=headers, content=stream)
             r.raise_for_status()

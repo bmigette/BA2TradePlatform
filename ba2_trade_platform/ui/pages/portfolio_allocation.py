@@ -19,9 +19,11 @@ which meant that on an account nobody had run the wizard on every label sat at
 $0.00, because 20% of a 0% label is nothing. The page showed a plausible number
 that meant nothing.
 
-The Allocate button is still here, and it is now purely for EXECUTING against the
-saved targets: it opens the dry run DIRECTLY -- precheck, review, submit. There is
-no target step in front of it any more, because a second place to type a target is
+The main toolbar button is still here, and it is now purely for EXECUTING against
+the saved targets: it opens the dry run DIRECTLY -- precheck, review, submit. It is
+called ``Review and Submit`` (``REVIEW_BUTTON_LABEL``) rather than ``Allocate``
+because that is now literally what it does: nothing is ordered until Submit is
+pressed inside the gate. There is no target step in front of it any more, because a second place to type a target is
 a second answer to "what am I aiming at", and the two screens derived every one of
 those figures independently. ``_load_flow_inputs`` re-reads the stored rows at the
 moment the dry run opens, so a fresh inline edit is what the plan is solved with.
@@ -129,10 +131,11 @@ from ..utils.portfolio_allocation_view import (
     LABEL_COLOR_PALETTE, LABEL_STATUS_CLASSES, LABEL_TARGET_CAPTION,
     LABEL_TOOLTIP_STYLE, label_column_width_ch, label_status_color,
     MARKET_SOURCE_UNAVAILABLE,
+    NEUTRAL_TEXT_COLOR,
     NO_LABEL_COLOR, RESERVE_BASIS_NOTE,
     GateResult, ManagedLabel,
-    PositionFetchFailed, account_value_card, account_value_from_snapshot,
-    build_label_bars, build_label_views,
+    PositionFetchFailed, account_value_from_snapshot,
+    build_label_bars, build_label_views, summary_figures,
     collect_managed_symbols, diff_managed_labels,
     describe_label_color,
     evaluate_gate, evaluate_market_gate,
@@ -142,7 +145,7 @@ from ..utils.portfolio_allocation_view import (
     format_label_target_tooltip,
     format_reserve_caption,
     format_reserve_row, label_color_contrast_warning,
-    ALLOCATION_BAR_LEGEND, allocation_bar, RESERVE_SELL_WARNING,
+    ALLOCATION_BAR_LEGEND, allocation_bar, band_color, RESERVE_SELL_WARNING,
     SHARE_DEFAULT_NOTE, symbol_total_bar, SYMBOL_TOTAL_BAR_CAPTION,
     LABEL_TOTAL_BAR_CAPTION, LABEL_TOTAL_BAR_LEGEND, LABEL_TOTAL_CLASSES,
     LABEL_TOTAL_TOOLTIP,
@@ -160,6 +163,15 @@ from ..utils.portfolio_allocation_view import (
 from .portfolio_allocation_wizard import (
     open_allocation_wizard, open_invest_scope, render_income_panel, render_outcomes,
 )
+
+#: The toolbar's main button. It was called ``Allocate``, and that name outlived
+#: what it does: the three-step wizard behind it was the TARGET EDITOR, so pressing
+#: it really was the act of allocating. Every one of those steps is on this page
+#: now and the button opens the dry run -- a review-and-commit gate where nothing
+#: is written until Submit. "Allocate" promised an action the button no longer
+#: takes, which is the worst thing a button caption can do on a page that spends
+#: real money.
+REVIEW_BUTTON_LABEL = 'Review and Submit'
 
 #: Quasar debounce (ms) for the comment inputs. Every keystroke used to run a
 #: SELECT + UPDATE + commit + refresh on the NiceGUI event loop; the page's own
@@ -695,6 +707,13 @@ MARKER_COLOR_CUSTOM = 'pf-color-custom'
 #: The summary stat-card row, and the reserve card that no longer sits inside it.
 MARKER_SUMMARY_ROW = 'pf-summary-row'
 MARKER_RESERVE_CARD = 'pf-reserve-card'
+#: The MERGED money card -- managed value, account value and free buying power --
+#: and each of its three figures. Marked because the card must be provable to exist
+#: whatever the broker answered, and because "$0.00" and "unknown" both appear
+#: elsewhere on the page, so a text search cannot say which line it found. Rendered
+#: in the order ``summary_figures`` returns, which is the order they are read in.
+MARKER_MONEY_CARD = 'pf-money-card'
+MARKER_MONEY_FIGURE = 'pf-money-figure'
 #: The label-total readout: a FILL BAR inside the "Managed labels" card, under the
 #: count, so one card answers "how many labels" and "how much of the pool" at
 #: once. It was briefly a card of its own beside that one. The DETAIL is marked
@@ -984,8 +1003,13 @@ def _apply_reserve_bar(live: Dict[str, Any]) -> None:
                          unallocated_pct=live['unallocated_pct'])
     if bar is None:
         return
+    # GREEN inside the band, YELLOW out -- the same ``band_color`` the label-total
+    # bar asks, against this bar's own target. "Above target, or more than 20
+    # points below it" is one rule at two scopes; two copies would drift, and
+    # these two bars sit on one screen where that would be unexplainable.
     _paint_mini_bar(widgets, fraction=bar.fraction,
-                    notch_fraction=bar.notch_fraction, color=widgets['color'])
+                    notch_fraction=bar.notch_fraction,
+                    color=band_color(bar.current_pct, bar.target_pct))
     widgets['pct'].set_text(bar.current_text)
     widgets['target'].set_text(bar.target_text)
     widgets['delta'].set_text(bar.delta_text)
@@ -1010,9 +1034,14 @@ def _apply_total_notice(live: Dict[str, Any]) -> None:
     widgets = live['total_bar']
     if widgets is not None:
         decided = label_total_readout(targets)
+        # The SAME band rule as the reserve bar, against a target of 100: green
+        # from 80 to 100 inclusive, yellow outside. ``decided.severity`` is driven
+        # by that same predicate, so the bar's colour and the sentence under it
+        # cannot disagree.
         _paint_mini_bar(widgets, fraction=decided.bar.fraction,
                         notch_fraction=decided.bar.notch_fraction,
-                        color=widgets['color'])
+                        color=band_color(decided.bar.current_pct,
+                                         decided.bar.target_pct))
         widgets['value'].set_text(decided.text)
         widgets['detail'].set_text(decided.detail)
         widgets['detail'].classes(replace=LABEL_TOTAL_CLASSES[decided.severity])
@@ -2350,19 +2379,19 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     live = _new_live_state(base_notional=base_notional,
                            available_buying_power=buying_power,
                            unallocated_pct=payload['unallocated_pct'])
-    mode_label = ('cost basis (what you paid)' if mode == VALUATION_MODE_COST
-                  else 'market value (qty x price)')
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)
-    # Every decision here -- which snapshot field, what an unknown reads as,
-    # whether the leverage clause can be stated -- is in the pure module. This
-    # draws three labels.
-    value_card = account_value_card(account_value=payload['account_value'],
-                                    managed_value=total)
-    # FOUR read-only cards, EQUAL HEIGHT, and they WRAP.
+    # THE THREE MONEY FIGURES, decided together in the pure module: which snapshot
+    # field, what an unknown reads as, whether the leverage clause can be stated,
+    # and -- new -- that there are always exactly three of them. The loop below has
+    # no branch that can skip one.
+    figures = summary_figures(managed_value=total, valuation_mode=mode,
+                              account_value=payload['account_value'],
+                              available_buying_power=buying_power)
+    # TWO cards now, EQUAL HEIGHT, and they WRAP.
     #
-    # ``items-stretch`` rather than ``items-start``: the account-value card carries a
+    # ``items-stretch`` rather than ``items-start``: the money card carries a
     # leverage caption and the reserve card carried a slider, so the row rendered as
     # a ragged set of different-height boxes rather than as one row of cards.
     # ``flex-wrap`` with ``flex-1 min-w-[11rem]`` on each: five cards no longer fit
@@ -2374,19 +2403,36 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     card_classes = 'stat-card p-3 flex-1 min-w-[11rem] justify-between'
     with ui.row().classes('w-full gap-4 items-stretch flex-wrap') \
             .mark(MARKER_SUMMARY_ROW):
-        with ui.column().classes(card_classes):
-            ui.label(f'Managed value — {mode_label}').classes('text-xs text-secondary-custom')
-            ui.label(f'${total:,.2f}').classes('text-lg font-bold').style(TABULAR_NUMS)
-        # SECOND, immediately beside the managed value, because the pair is the
-        # point: on a margin account the first exceeds this one and the page used
-        # to show only the first. Drawn UNCONDITIONALLY, unlike the buying-power
-        # card below -- a card that vanishes when the broker will not answer is
-        # indistinguishable from a page that never had one.
-        with ui.column().classes(card_classes):
-            ui.label(value_card.title).classes('text-xs text-secondary-custom')
-            ui.label(value_card.text).classes('text-lg font-bold').style(TABULAR_NUMS)
-            if value_card.detail:
-                ui.label(value_card.detail).classes('text-xs text-secondary-custom')
+        # ONE CARD FOR THE MONEY. Managed value, account value and free buying
+        # power were three boxes; each sized itself to its own caption, so the
+        # three figures a reader compares left to right sat at three different
+        # heights. Worse, the buying-power box was drawn inside an ``if`` and
+        # DISAPPEARED when the broker would not answer -- unknown-as-zero in the
+        # form the user cannot even notice, because there is nothing on screen to
+        # notice. This card is unconditional and so is every line in it.
+        with ui.column().classes(card_classes).mark(MARKER_MONEY_CARD):
+            for figure in figures:
+                # EACH FIGURE IN ITS OWN TIGHT GROUP. The card carries
+                # ``justify-between`` (that is what keeps the row of cards on one
+                # baseline), and without this the three captions would be pushed
+                # away from the three figures they name -- a caption belongs to the
+                # number under it, not to the whitespace.
+                with ui.column().classes('gap-0'):
+                    ui.label(figure.title).classes('text-xs text-secondary-custom')
+                    # UNKNOWN is drawn in the same neutral grey the captions use
+                    # rather than in the money's white: "no answer" is not a
+                    # number, and setting it in the numeral style invites the eye
+                    # to read it as one. Painted with ``important_color_style``
+                    # because ``styles.css`` has eaten plain inline colour on this
+                    # page before -- three separate "fixes" looked right in Python
+                    # and never reached the screen.
+                    value = ui.label(figure.text).classes('text-lg font-bold') \
+                        .style(TABULAR_NUMS).mark(MARKER_MONEY_FIGURE)
+                    if not figure.available:
+                        value.style(add=important_color_style(NEUTRAL_TEXT_COLOR))
+                    if figure.detail:
+                        ui.label(figure.detail).classes(
+                            'text-xs text-secondary-custom')
         # ONE CARD, BOTH HALVES OF ONE QUESTION: how many labels, and how much of
         # the investable pool they add up to. The running total was a conditional
         # sentence under this row -- present only when the set was WRONG, so
@@ -2417,11 +2463,6 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
             # right -- which is exactly when a user decides to leave a gap.
             labels_card.tooltip(LABEL_TOTAL_TOOLTIP)
         live['total_bar'] = total_widgets
-        if buying_power is not None:
-            with ui.column().classes(card_classes):
-                ui.label('Free buying power').classes('text-xs text-secondary-custom')
-                ui.label(f'${buying_power:,.2f}').classes('text-lg font-bold') \
-                    .style(TABULAR_NUMS)
 
     # DANGER, not warning, since market became the default (W1). This is no longer
     # "your percentages are slightly off": those positions contribute 0 to the
@@ -2513,7 +2554,7 @@ def _market_gate_for(hours):
 async def _open_allocation_flow(account_id: int, valuation_mode: str,
                                 refresh, *, mode: str = ALLOCATION_MODE_REBALANCE,
                                 invest_amount: float = 0.0) -> None:
-    """The Allocate button: the dry run, then Submit. NO target step any more.
+    """The Review-and-Submit button: the dry run, then Submit. NO target step any more.
 
     A REBALANCE goes STRAIGHT to the dry run. The three-step dialog it used to open
     first was the target editor, and the targets are typed on this page now -- a
@@ -2807,10 +2848,12 @@ async def content() -> None:
             await _refresh()
 
         with toolbar:
-            ui.button('Allocate', icon='account_balance',
+            ui.button(REVIEW_BUTTON_LABEL, icon='fact_check',
                       on_click=lambda: _open_allocation_flow(
                           account_id, mode_state['value'], _refresh)) \
-                .props('color=primary')
+                .props('color=primary') \
+                .tooltip('Solve the plan against the broker and show it for review. '
+                         'Nothing is ordered until you press Submit in the dry run.')
             ui.select({VALUATION_MODE_COST: 'Cost basis',
                        VALUATION_MODE_MARKET: 'Market value'},
                       value=mode_state['value'], label='Valuation',

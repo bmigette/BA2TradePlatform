@@ -409,6 +409,34 @@ def test_sync_optimization_resolves_parent_strategy_id(client, monkeypatch, tmp_
         s.close()
 
 
+def test_auth_failures_log_the_source_ip(client, caplog):
+    """The whole point of the source-IP log line: a fail2ban filter on the remote worker's log
+    file bans the offending IP, so every failure mode must name it, and the bearer TOKEN must
+    never appear in the log (it would defeat the point of a secret password)."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="app.worker_server"):
+        assert client.get("/health").status_code == 401
+        assert client.get("/health", headers={"Authorization": "Bearer wrong-password"}).status_code == 403
+        assert client.get("/health", headers={"Authorization": "not-bearer-shaped"}).status_code == 401
+
+    messages = [r.message for r in caplog.records]
+    assert any("auth failed from testclient" in m and "missing Authorization header" in m
+              for m in messages), messages
+    assert any("auth failed from testclient" in m and "invalid worker password" in m
+              for m in messages), messages
+    assert any("auth failed from testclient" in m and "malformed Authorization header" in m
+              for m in messages), messages
+    assert not any("wrong-password" in m for m in messages), \
+        "the submitted token must never be logged"
+
+
+def test_a_successful_auth_logs_nothing(client, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="app.worker_server"):
+        assert client.get("/health", headers=H).status_code == 200
+    assert not any("auth failed" in r.message for r in caplog.records)
+
+
 def test_sync_endpoints_require_auth(client):
     assert client.post("/sync/strategy", json={"name": "x", "created_at": "2026-01-01T00:00:00"}).status_code == 401
     assert client.post("/sync/optimization", json={"name": "x", "created_at": "2026-01-01T00:00:00"}).status_code == 401
