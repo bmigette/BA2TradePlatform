@@ -636,6 +636,51 @@ def uses_wing_width(action_value):
     return action_value in get_wing_width_action_values()
 
 
+def get_strike_method_action_values():
+    """Option action types whose builder actually READS ``strike_method``.
+
+    These nine pass ``method=self.strike_method`` into the selector. The other eight entry
+    actions -- straddle, strangle, short straddle, short strangle, iron condor, jade
+    lizard, call butterfly, put ratio spread -- hard-code ``method="percent_otm"`` at every
+    selection site, so ``self.strike_method`` is set on the shared base and then never
+    read: a dead attribute.
+
+    THIS IS A LIVE TRAP, not a curiosity, which is why the answer is a REFUSAL. The rule
+    editor rendered the Strike Method select for every non-close option action, DEFAULTED
+    IT TO ``delta``, placeholdered Strike Param as ``0.30``, and persisted the choice
+    unconditionally. A user configuring an iron condor saw "delta", typed ``0.30``
+    expecting a 30-delta short, and got a strike 0.30 % out of the money -- effectively at
+    the money, on the leg that carries the risk. Nothing anywhere warned.
+
+    So the editor must not OFFER or PERSIST a ``strike_method`` the selected action
+    ignores. Refusal, NOT fallback: teaching those eight builders to honour delta depends
+    on whether delta is computable from the chain data, which is separate work. Until then
+    the honest interface is "this structure selects by % OTM", said out loud.
+
+    Kept next to the action enum rather than in the UI for the same reason as
+    ``get_wing_width_action_values``: a producer must render exactly the fields its
+    consumer reads. Pinned against the BUILDERS by
+    ``packages/common/tests/test_option_strike_method_honoured.py``, which runs each one
+    and watches which method the selector was actually handed.
+    """
+    return [
+        ExpertActionType.BUY_CALL.value,
+        ExpertActionType.OPEN_BULL_CALL_SPREAD.value,
+        ExpertActionType.BUY_PUT.value,
+        ExpertActionType.OPEN_BEAR_PUT_SPREAD.value,
+        ExpertActionType.SELL_COVERED_CALL.value,
+        ExpertActionType.BUY_PROTECTIVE_PUT.value,
+        ExpertActionType.SELL_CASH_SECURED_PUT.value,
+        ExpertActionType.OPEN_BEAR_CALL_SPREAD.value,
+        ExpertActionType.OPEN_BULL_PUT_SPREAD.value,
+    ]
+
+
+def honours_strike_method(action_value):
+    """Check whether an option action type reads ``strike_method``."""
+    return action_value in get_strike_method_action_values()
+
+
 def get_action_type_display_label(action_value):
     """
     Get user-friendly display label for an ExpertActionType value.

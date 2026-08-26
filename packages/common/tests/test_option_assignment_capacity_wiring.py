@@ -125,6 +125,16 @@ class FakeAccount(OptionsAccountInterface):
     def get_balance(self):
         return self._balance
 
+    def get_account_snapshot(self):
+        """The double's balance IS its CASH — the intent this file has always tested.
+
+        Completed for OPT-L5: ``cash_available_for_delivery`` reads
+        ``AccountSnapshot.cash`` and must never fall back to total equity, so a double
+        that published only ``get_balance()`` left the delivery gate unmeasurable.
+        """
+        from ba2_common.core.account_types import AccountSnapshot
+        return AccountSnapshot(cash=self._balance, equity=self._balance, net_liquidation=self._balance)
+
     def hold(self, rows):
         self.book.extend(rows)
 

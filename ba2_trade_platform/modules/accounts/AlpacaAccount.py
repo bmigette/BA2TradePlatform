@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 import math
+import re
 import time
 import threading
 import functools
@@ -5676,6 +5677,65 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         return meta
 
+    #: Standard OCC option symbol: 1-6 char alphabetic root, 6-digit date, C/P, 8-digit
+    #: strike. A corporate-action ADJUSTED contract carries a non-standard root
+    #: ("AAPL1260116C00150000", "1SPY..."). Same rule the two historical providers already
+    #: apply (``ba2_providers/options/alpaca.py``, ``tastytrade.py``).
+    _STANDARD_OCC_RE = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
+
+    def _is_standard_deliverable(self, occ_symbol: str, meta, underlying: str) -> bool:
+        """Does this contract deliver the 100 shares every money site assumes? (OPT-L7)
+
+        Two independent checks, because neither alone is sufficient:
+
+        * ``meta.size`` is the AUTHORITATIVE shares-per-contract when the broker publishes
+          it. An UNREADABLE value is refused rather than assumed to be 100 — assuming the
+          standard size is the entire defect, one field further in. A value the broker
+          simply does not send (``None``) falls through to the root check, because refusing
+          the whole live chain over one optional field would be worse than the risk.
+        * the OCC ROOT catches the adjusted contracts whose deliverable is not expressible
+          as a share count at all — shares plus cash, or a different security — where a
+          published ``size`` of 100 would be actively misleading.
+        """
+        from ...core.interfaces.OptionsAccountInterface import DEFAULT_OPTION_MULTIPLIER
+
+        size_raw = getattr(meta, "size", None)
+        if size_raw is not None:
+            try:
+                size = float(size_raw)
+                if not math.isfinite(size):
+                    raise ValueError("not finite")
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Dropping option contract {occ_symbol}: its deliverable size is "
+                    f"UNREADABLE ({size_raw!r}) and must not be assumed to be 100 — every "
+                    f"sizing, reserve and assignment calculation would use the wrong "
+                    f"multiplier.")
+                return False
+            if abs(size - DEFAULT_OPTION_MULTIPLIER) > 1e-9:
+                logger.warning(
+                    f"Dropping option contract {occ_symbol}: it delivers {size_raw} shares "
+                    f"per contract, not {DEFAULT_OPTION_MULTIPLIER}. Every money site in "
+                    f"the platform prices a contract at {DEFAULT_OPTION_MULTIPLIER} shares, "
+                    f"so a 'covered' call written against it would be partly naked.")
+                return False
+
+        root = getattr(meta, "root_symbol", None)
+        if root and str(root).upper() != str(underlying).upper():
+            logger.warning(
+                f"Dropping option contract {occ_symbol}: its root {root!r} is not the "
+                f"underlying {underlying!r}, which marks a corporate-action ADJUSTED "
+                f"contract whose deliverable is not {DEFAULT_OPTION_MULTIPLIER} ordinary "
+                f"shares.")
+            return False
+        if not self._STANDARD_OCC_RE.match(occ_symbol or ""):
+            logger.warning(
+                f"Dropping option contract {occ_symbol}: non-standard OCC root, which marks "
+                f"a corporate-action ADJUSTED contract. Both historical providers filter "
+                f"the same class.")
+            return False
+        return True
+
     @alpaca_api_retry
     def get_option_chain(self, underlying: str, expiry_min, expiry_max,
                          option_type=None, strike_min=None, strike_max=None) -> List[Any]:
@@ -5684,6 +5744,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         Joins live snapshot data (OptionHistoricalDataClient.get_option_chain) with
         contract metadata (TradingClient.get_option_contracts) on the OCC symbol.
+
+        Contracts whose DELIVERABLE is not the standard 100 shares are dropped — see
+        ``_is_standard_deliverable`` (OPT-L7).
         """
         from alpaca.data.requests import OptionChainRequest
         from ...core.option_types import OptionContract
@@ -5726,6 +5789,23 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
             strike = getattr(meta, "strike_price", None)
             expiry = getattr(meta, "expiration_date", None)
+
+            # DELIVERABLE SIZE (OPT-L7). Every money site in the platform hardcodes 100
+            # shares per contract — `floor(held / 100)` sizes a covered call, `strike * 100`
+            # reserves a CSP, `put_assignment_cost` prices delivery — and this loop used to
+            # drop both fields that say whether that is true. A corporate-action ADJUSTED
+            # contract can deliver 150 shares, or shares plus cash, or another security, and
+            # it entered the chain looking exactly like an ordinary one. Writing one
+            # "covered" call against 100 held shares when the contract obliges 150 is a
+            # 50-share naked short that no gate downstream can see.
+            #
+            # REFUSED, not adjusted: this is the rule both HISTORICAL providers already
+            # apply (`ba2_providers/options/alpaca.py`'s standard-OCC-root regex,
+            # `tastytrade.py`'s `shares-per-contract != 100`), the live chain was the single
+            # un-plugged hole, and a %OTM/delta selection never wants an adjusted contract
+            # anyway. Making the whole stack multiplier-aware is a much larger change.
+            if not self._is_standard_deliverable(occ_symbol, meta, underlying):
+                continue
 
             # Defensive filtering (the API already filters, but enforce anyway).
             if option_type is not None and row_type is not None and row_type != option_type:
@@ -5892,17 +5972,38 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return float(value) if value is not None else None
 
     @alpaca_api_retry
-    def get_option_positions(self) -> List["OptionPosition"]:
+    def get_option_positions(self) -> Optional[List["OptionPosition"]]:
         """Return all held option positions as broker-agnostic OptionPosition
         objects. Equity (and any non-option) positions are filtered out.
 
         Malformed OCC symbols are logged and skipped rather than crashing the
         whole call.
+
+        TRI-STATE, mirroring ``get_positions()``: ``[]`` means the broker CONFIRMED an
+        empty option book, ``None`` means the fetch FAILED. This used to be
+        ``self.client.get_all_positions() or []``, which turned an unreadable book into a
+        confirmed-flat one — the same conflation that, on the equity side during the
+        2026-07-03 DNS outage, force-closed 8 real open transactions. It acquired teeth
+        with OPT-S4: ``reconcile_externally_closed_option_transactions`` now CLOSES
+        transactions whose contracts this call does not report, and on a spread it would
+        cancel the protective long on the way out.
         """
         from ...core.option_types import OptionPosition
         from ...core.types import OrderDirection
 
-        raw_positions = self.client.get_all_positions() or []
+        try:
+            raw_positions = self.client.get_all_positions()
+        except Exception as e:  # noqa: BLE001 — a failed fetch is UNKNOWN, never "flat"
+            logger.error(
+                f"[Account {self.id}] get_option_positions: could not fetch broker "
+                f"positions ({e}). Reporting None (UNKNOWN) — callers must not read this "
+                f"as an empty option book.", exc_info=True)
+            return None
+        if raw_positions is None:
+            logger.error(
+                f"[Account {self.id}] get_option_positions: the broker returned no "
+                f"position payload at all. Reporting None (UNKNOWN), not an empty book.")
+            return None
         positions: List[OptionPosition] = []
 
         for pos in raw_positions:
@@ -6023,6 +6124,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             f"broker_order_id={alpaca_order.id}, legs={len(legs)}"
         )
 
+        # PERSIST THE BROKER ID BEFORE ANYTHING ELSE CAN RAISE.
+        # The wrapper's except block decides whether to terminalise this order and its leg
+        # children by asking whether the broker has it (OPT-S1), and every line below —
+        # cache invalidation, response mapping, per-leg matching — can throw. Written here
+        # the "accepted but not yet recorded" window is one DB write wide instead of the
+        # whole write-back; without it, a live combo could be marked ERROR and vanish from
+        # the reserve and assignment gates while its contracts sit at the broker.
+        trading_order.broker_order_id = str(alpaca_order.id) if alpaca_order.id else None
+        if trading_order.broker_order_id:
+            update_instance(trading_order)
+
         # Invalidate balance cache - a submitted order changes buying power.
         self.invalidate_balance_cache()
 
@@ -6079,7 +6191,28 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         return trading_order
 
-    def close_option_position(self, position, order_type="limit", limit_price=None):
+    def close_option_position(self, position, order_type="limit", limit_price=None,
+                              transaction_id=None):
+        """Submit a single-leg closing order that RIDES the open position's transaction.
+
+        The ``transaction_id=`` was previously omitted (the call was positional and stopped
+        at ``limit_price``), so ``submit_option_order`` minted a BRAND NEW Transaction for
+        every exit: the original position never reached CLOSED, so the exit condition that
+        decided to close it stayed true and re-submitted on every following pass, and the
+        buying-power reserve plus the short-put assignment exposure were never released
+        (``open_option_orders_book_wide`` holds an order until its transaction is
+        CLOSED/FAILED, and FILLED is not a terminal transaction status).
+
+        The id is resolved HERE rather than demanded from the caller because this method is
+        reachable from ``CloseOptionAction``, from operator scripts and from anything added
+        later; an explicit ``transaction_id`` from a caller that has one still wins.
+
+        An UNRESOLVED link does not block the exit. Flattening a real position matters more
+        than the ledger link, and refusing here would strand a position that can no longer
+        be closed — the same argument the cover guard makes for exempting ``"close"``. It is
+        logged as an error rather than passed over in silence, because the resulting orphan
+        transaction is exactly the state an operator has to repair by hand.
+        """
         from ba2_trade_platform.core.option_types import OptionLeg
         from ba2_trade_platform.core.types import OrderDirection
         close_side = OrderDirection.SELL if position.side == OrderDirection.BUY else OrderDirection.BUY
@@ -6089,8 +6222,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             option_type=position.option_type, strike=position.strike, expiry=position.expiry,
             underlying=position.underlying,
         )
+        if transaction_id is None:
+            transaction_id = self.open_option_transaction_id_for_contract(
+                position.contract_symbol)
+        if transaction_id is None:
+            logger.error(
+                f"Closing {position.contract_symbol} but no OPEN transaction holding it "
+                f"could be found — the close will be booked on a NEW transaction and the "
+                f"original position (if any) will not reach CLOSED. Submitting anyway: "
+                f"flattening the position at the broker takes priority over the ledger link.")
         return self.submit_option_order(
-            [leg], int(position.quantity), order_type, limit_price, option_strategy="close")
+            [leg], int(position.quantity), order_type, limit_price,
+            option_strategy="close", transaction_id=transaction_id)
 
     # ------------------------------------------------------------------
     # Option assignment / exercise / expiry reconciliation (Phase C2)

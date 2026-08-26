@@ -11,7 +11,7 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ba2_common.core.option_types import OptionContract, OptionQuote, OptionLeg, OptionPosition
 from ba2_common.core.types import OptionRight
@@ -213,8 +213,15 @@ class OptionsAccountInterface(ABC):
 
     # --- Positions ---------------------------------------------------------
     @abstractmethod
-    def get_option_positions(self) -> List[OptionPosition]:
-        """All currently-held option positions."""
+    def get_option_positions(self) -> Optional[List[OptionPosition]]:
+        """All currently-held option positions. TRI-STATE, like ``get_positions()``.
+
+        ``[]`` means the broker CONFIRMED an empty option book. ``None`` means the fetch
+        FAILED and the book is unknown. They must never be collapsed: as of OPT-S4 a
+        reconciler CLOSES transactions whose contracts the broker no longer reports, and
+        reading an outage as "flat" is the 2026-07-03 incident that force-closed 8 real
+        open transactions — here it would also cancel the protective long of a spread.
+        """
         ...
 
     # --- Orders ------------------------------------------------------------
@@ -392,10 +399,75 @@ class OptionsAccountInterface(ABC):
             return self._submit_option_order_impl(parent, legs, leg_orders or None)
         except Exception as e:
             logger.error(f"Option order submission failed for {parent.symbol}: {e}", exc_info=True)
-            parent.status = OrderStatus.ERROR
-            parent.comment = f"{(parent.comment or '')} | option submit error: {str(e)[:200]}"
-            update_instance(parent)
+            self._unwind_failed_option_submission(parent, leg_orders, e)
             return None
+
+    def _unwind_failed_option_submission(self, parent, leg_orders, error) -> None:
+        """Terminalise the rows a FAILED submission left behind — but only if nothing
+        reached the broker.
+
+        THE PARENT WAS NEVER THE WHOLE ORDER. A combo persists a parent plus one child per
+        leg BEFORE the broker is called, and this except used to mark only the parent ERROR.
+        The N children kept ``status=PENDING`` and ``broker_order_id=None``, and nothing in
+        the platform can clear that state: ``refresh_orders`` sweeps only rows that HAVE a
+        broker id, ``refresh_transactions``' ``never_opened`` cleanup requires EVERY order on
+        the transaction to be terminal, ``_fail_unsent_entry`` is equity-only, and
+        ``clean_pending_orders`` is a manual UI button.
+
+        The cost is not cosmetic. ``open_option_orders_book_wide`` keeps every non-terminal
+        option order whose transaction is not CLOSED/FAILED, so a stranded SHORT PUT child is
+        counted as live delivery obligation for ever — measured at $24,000 on a 2-lot 120-strike
+        bull put spread the broker had REJECTED — and ``_refuse_if_cannot_take_delivery`` then
+        refuses bear put spread, bull put spread, cash-secured put, short straddle, short
+        strangle, iron condor, jade lizard and put ratio spread, account-wide across every
+        expert, until someone repairs it by hand.
+
+        THE ASYMMETRY THAT MAKES THIS SAFE. This same ``except`` catches two very different
+        events. A rejection (approval tier, buying power, a malformed request) or a network
+        failure before the request went out leaves NOTHING at the broker, and those rows must
+        vanish from the book. A failure while writing the broker's RESPONSE back leaves the
+        contracts genuinely LIVE, and terminalising those rows would hide a real short put
+        from the assignment gate — the exact inverse of the harm above, and the more expensive
+        direction. The two are told apart by ``broker_order_id``, which the live adapter
+        persists the instant ``submit_order`` returns and before any response mapping, so the
+        window in which an accepted order looks unsent is a single DB write wide.
+
+        Deliberately NOT touched: the Transaction. Terminalising all of its orders re-arms
+        ``refresh_transactions``' own ``never_opened`` cleanup, which deletes the stub row
+        (cascading to its orders) with an activity-log entry naming every order error. Writing
+        a second, competing cleanup here would race it.
+        """
+        from ba2_common.core.db import update_instance
+        from ba2_common.core.types import OrderStatus
+        from ba2_common.logger import logger
+
+        why = str(error)[:200]
+        parent.comment = f"{(parent.comment or '')} | option submit error: {why}"
+
+        if parent.broker_order_id:
+            # ACCEPTED, then something failed writing the response back. The contracts are
+            # live: leave every row non-terminal so the position keeps counting against the
+            # reserve and the assignment gate, and so refresh_orders can adopt it by its id.
+            update_instance(parent)
+            logger.error(
+                f"Option order {parent.id} ({parent.symbol}) was ACCEPTED by the broker "
+                f"(broker_order_id={parent.broker_order_id}) but processing its response "
+                f"failed: {why}. The order and its {len(leg_orders or [])} leg(s) are LEFT "
+                f"OPEN — the contracts exist at the broker and refresh_orders will reconcile "
+                f"them. Do NOT clear these rows by hand without checking the broker first.")
+            return
+
+        parent.status = OrderStatus.ERROR
+        update_instance(parent)
+        for child in (leg_orders or []):
+            child.status = OrderStatus.ERROR
+            child.comment = f"{(child.comment or '')} | option submit error: {why}"
+            update_instance(child)
+        if leg_orders:
+            logger.error(
+                f"Option order {parent.id} ({parent.symbol}) never reached the broker: {why}. "
+                f"Its {len(leg_orders)} leg order(s) have been marked ERROR too — left PENDING "
+                f"they would be counted as an open position by every option gate for ever.")
 
     def _refuse_uncovered_covered_call(self, legs: List[OptionLeg], quantity: int,
                                        option_strategy: Optional[str]) -> None:
@@ -685,11 +757,99 @@ class OptionsAccountInterface(ABC):
         if changed:
             update_instance(txn)
 
+    def open_option_transaction_id_for_contract(self, contract_symbol: str) -> Optional[int]:
+        """The id of the OPEN transaction still HOLDING ``contract_symbol``, or ``None``.
+
+        A CLOSE MUST RIDE THE TRANSACTION IT IS CLOSING. ``submit_option_order`` creates a
+        brand-new Transaction whenever ``transaction_id`` is omitted
+        (``_create_transaction_for_order`` constructs one unconditionally — it never looks
+        for an existing open position), so a closing leg submitted without the id books the
+        exit as a fresh OPENING position of the opposite side. The original then never
+        reaches CLOSED, the exit condition that decided to close it is still true on the
+        next pass and submits again — forever — and neither the buying-power reserve nor
+        the short-put assignment exposure is ever released, because
+        ``open_option_orders_book_wide`` keeps every order whose transaction is not
+        CLOSED/FAILED and FILLED is not a terminal transaction state.
+
+        This lives at the SEAM rather than at the call sites for the reason the rest of
+        this file gives: ``close_option_position`` is reachable from ``CloseOptionAction``,
+        from operator scripts and from any future caller, and a link maintained at one of
+        those is a convention rather than an invariant.
+
+        MATCHING. Both shapes are covered: the single-leg entry, where the transaction's
+        own option order IS the contract, and the multi-leg entry, where the contract is
+        carried by a leg CHILD of the parent. Both rows carry ``transaction_id``, so one
+        scan over this account's option orders answers it.
+
+        NET, NOT PRESENCE. A contract whose buys and sells already offset is FLAT, and
+        re-attaching a second close to it would reduce a position that no longer exists.
+        Only a transaction with a non-zero net for the contract is returned. Ties break on
+        the LOWEST transaction id — FIFO, the convention used everywhere else here.
+
+        UNKNOWN IS NOT "NO TRANSACTION": an unreadable book returns ``None`` exactly as a
+        genuinely absent one does, so the caller must treat ``None`` as "could not link"
+        and say so loudly rather than pretending it linked. Only the benign
+        world-was-uncooperative errors are absorbed (see ``_cover_benign_errors``); a
+        ``ProgrammingError`` still propagates, because a lookup that answers "not found"
+        forever is a lookup that has quietly stopped working.
+        """
+        from ba2_common.core.trade_store import orders_where, transactions_where
+        from ba2_common.core.types import (
+            AssetClass, OrderDirection, OrderStatus, TransactionStatus)
+        from ba2_common.logger import logger
+
+        if not contract_symbol:
+            return None
+        try:
+            executed = OrderStatus.get_executed_statuses()
+            rows = [o for o in orders_where(account_id=self.id)
+                    if o.asset_class == AssetClass.OPTION
+                    and o.contract_symbol == contract_symbol
+                    and o.transaction_id is not None
+                    and (o.status in executed or self._traded_something(o))]
+            if not rows:
+                return None
+            live_ids = {t.id for t in transactions_where(
+                not_statuses=(TransactionStatus.CLOSED, TransactionStatus.FAILED))}
+            net: Dict[int, float] = {}
+            for o in rows:
+                if o.transaction_id not in live_ids:
+                    continue
+                qty = self._readable_number(o.filled_qty)
+                if qty is None:
+                    qty = self._readable_number(o.quantity)
+                if qty is None:
+                    continue
+                signed = qty if o.side == OrderDirection.BUY else -qty
+                net[o.transaction_id] = net.get(o.transaction_id, 0.0) + signed
+            holding = sorted(tid for tid, n in net.items() if abs(n) > 1e-9)
+            if not holding:
+                return None
+            if len(holding) > 1:
+                logger.warning(
+                    f"{len(holding)} open transactions hold {contract_symbol} "
+                    f"({holding}) — attaching the close to the oldest, {holding[0]}")
+            return holding[0]
+        except Exception as e:
+            if not isinstance(e, self._cover_benign_errors()):
+                raise
+            logger.error(
+                f"Could not read the option book to find the open transaction holding "
+                f"{contract_symbol}: {e}", exc_info=True)
+            return None
+
     @abstractmethod
     def close_option_position(self, position: OptionPosition,
                               order_type: str = "limit",
-                              limit_price: Optional[float] = None) -> Any:
-        """Submit a closing order for a held option position (opposite intent)."""
+                              limit_price: Optional[float] = None,
+                              transaction_id: Optional[int] = None) -> Any:
+        """Submit a closing order for a held option position (opposite intent).
+
+        ``transaction_id`` is the OPEN position's transaction — the one the close must
+        reduce. An implementation not given one must resolve it itself via
+        :meth:`open_option_transaction_id_for_contract`; submitting without it books the
+        exit as a NEW opening position (see that method for the full consequence).
+        """
         ...
 
     # --- IV rank (self-computed from stored ATM-IV history) ----------------
@@ -997,20 +1157,37 @@ class OptionsAccountInterface(ABC):
     #: unknown capital requirement and a zero capital requirement are not the same
     #: fact, and collapsing them let every unrecognised structure pass every
     #: buying-power gate.
+    #: ``call_butterfly`` belongs HERE, not in ``RESERVING_STRATEGIES``. A 1-2-1 fly is
+    #: bought for a net DEBIT and its maximum loss is that debit, already paid at entry —
+    #: the design spec classes it as a debit structure and every other debit structure is
+    #: on this list. It was mis-listed as reserving while ``OpenCallButterflyAction``,
+    #: alone among the 17 entry builders, submitted it with no ``option_reserve=``. One
+    #: open fly therefore made ``reserved_option_buying_power_detail`` UNMEASURABLE, so
+    #: ``available_option_buying_power()`` returned ``None`` and
+    #: ``check_option_buying_power(>0)`` returned False for all EIGHT credit structures,
+    #: account-wide across every expert, until the order was closed by hand. It failed
+    #: CLOSED — no capital was at risk — and it told the operator to repair a reserve that
+    #: should never have existed.
     ZERO_RESERVE_STRATEGIES = frozenset({
         "long_call", "long_put", "bull_call_spread", "bear_put_spread",
         "straddle", "strangle", "covered_call", "protective_put",
+        "call_butterfly",
     })
 
     #: Strategies ``option_reserve_required`` prices with a branch of its own. Kept in
-    #: lockstep with those branches by ``test_the_two_strategy_lists_match_the_branches``.
+    #: lockstep with those branches by ``test_the_two_strategy_lists_match_the_branches``
+    #: — which is list-vs-BRANCH only, and therefore could never have caught the butterfly,
+    #: whose branch existed and priced fine. The relationship that was actually broken is
+    #: list-vs-BUILDER, and it is pinned by ``test_option_reserve_lockstep.py``: every
+    #: name here must arrive from its builder carrying a reserve, and every name in
+    #: ``ZERO_RESERVE_STRATEGIES`` must arrive without one.
     RESERVING_STRATEGIES = frozenset({
         "cash_secured_put",
         "bear_call_spread", "bull_put_spread", "credit_spread",
         "short_straddle", "short_strangle", "naked_put",
         "put_ratio_spread",
         "jade_lizard",
-        "iron_condor", "call_butterfly", "debit_spread",
+        "iron_condor", "debit_spread",
     })
 
     @classmethod
@@ -1137,7 +1314,10 @@ class OptionsAccountInterface(ABC):
             credit = net_credit if net_credit is not None else 0.0
             per_contract = strike * 100.0 + spread_width * 100.0 - credit * 100.0
             return max(0.0, per_contract) * quantity
-        if strategy in ("iron_condor", "call_butterfly", "debit_spread"):
+        # ``call_butterfly`` used to be priced here. It is a DEBIT structure and now
+        # answers 0.0 by name from ZERO_RESERVE_STRATEGIES above; leaving it in this tuple
+        # would be dead code asserting the opposite of the list.
+        if strategy in ("iron_condor", "debit_spread"):
             _require(spread_width=spread_width)
             credit = net_credit if net_credit is not None else 0.0
             return max(0.0, (spread_width - credit)) * 100.0 * quantity
@@ -1209,6 +1389,158 @@ class OptionsAccountInterface(ABC):
         }
         return [o for o in option_orders
                 if o.transaction_id is None or o.transaction_id in live_ids]
+
+    # --- Reconciliation: does the broker still hold what our ledger says? ---
+
+    def reconcile_externally_closed_option_transactions(
+            self, grace_period_minutes: int = 5) -> int:
+        """Close option transactions whose contracts the BROKER no longer holds.
+
+        THE OPTION HALF OF ``reconcile_externally_closed_transactions``, which deliberately
+        SKIPS every transaction carrying an option order ("get_positions() reports EQUITY
+        positions only") and delegates option lifecycle to
+        ``TradeManager._reconcile_account_option_activities`` — which reads only
+        OPASN/OPEXC/OPEXP/OPCSH over a 7-day window. Anything outside that activity feed
+        was invisible: a manual close in the broker's UI, a broker risk action, a position
+        that is simply no longer there.
+
+        Four seams were each checked and none catches it. ``refresh_orders`` only updates
+        orders already in the local DB. ``refresh_transactions`` derives state purely from
+        local orders. ``refresh_positions`` only logs a count. ``option_lifecycle_service``
+        builds its book from local OPENED transactions and its only broker call is a
+        liveness check on EQUITY positions. ``get_option_positions()`` — the one call that
+        could answer the question — had ZERO production callers. So a broker-side close
+        leaked the ledger position AND its buying-power reserve permanently, because FILLED
+        is not a terminal transaction status.
+
+        MATCHED PER CONTRACT, not per symbol. An option transaction's ``symbol`` is the
+        UNDERLYING by design, so the equity reconciler's symbol comparison could never work
+        here; identity is the OCC contract string. What the platform believes it still holds
+        comes from ``option_contract_net`` — the single definition of "is this structure
+        still holding something", shared with ``refresh_transactions`` and
+        ``_apply_option_activity`` so the three doors cannot come to disagree.
+
+        EVERY UNKNOWN MEANS DO NOTHING. This method closes transactions and cancels their
+        resting orders, so the fail-safe direction is the whole design:
+
+          * a raise, or a ``None`` book (fetch FAILED), reconciles nothing — ``[]`` is a
+            confirmed-empty book and ``None`` is an outage, and collapsing them is the
+            2026-07-03 incident that force-closed 8 real open transactions;
+          * a position whose quantity cannot be read counts as STILL HELD — a broker
+            reporting a position but not its size is saying the position EXISTS;
+          * a structure only PARTLY absent is left alone, mirroring the equity rule that
+            only a ZERO position closes. Closing on one missing leg would strand the
+            survivor — including the protective long of a spread — with nothing able to
+            manage or flatten it;
+          * a transaction whose own contracts already net FLAT is left to
+            ``refresh_transactions``: the platform closed that one itself, and stamping
+            ``position_not_at_broker`` on it would put the wrong reason in the ledger;
+          * a freshly-opened structure is inside the grace period, because a just-filled
+            entry may not have settled into a reported broker position yet.
+
+        Returns the number of transactions closed.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from ba2_common.core.db import get_db, update_instance
+        from ba2_common.core.models import Transaction, TradingOrder
+        from ba2_common.core.trade_store import orders_where, transactions_where
+        from ba2_common.core.types import AssetClass, OrderStatus, TransactionStatus
+        from ba2_common.core.utils import (
+            OPTION_CONTRACT_EPS, close_transaction_with_logging,
+            every_option_contract_is_flat, option_contract_net,
+        )
+        from ba2_common.logger import logger
+
+        try:
+            positions = self.get_option_positions()
+        except Exception as e:  # noqa: BLE001 — an outage must never close the book
+            logger.warning(
+                f"[Account {self.id}] option reconcile: could not fetch the broker's option "
+                f"positions ({e}); reconciling nothing this pass")
+            return 0
+        if positions is None:
+            logger.warning(
+                f"[Account {self.id}] option reconcile: the broker's option book came back "
+                f"as None (FETCH FAILURE, not an empty book); reconciling nothing this pass")
+            return 0
+
+        broker_contracts = set()
+        for pos in positions:
+            contract = self._position_field(pos, "contract_symbol")
+            raw_qty = self._position_field(pos, "quantity")
+            qty = self._readable_number(raw_qty)
+            if qty is None:
+                logger.error(
+                    f"[Account {self.id}] option reconcile: broker position for "
+                    f"{contract!r} reports an UNREADABLE quantity ({raw_qty!r}). Treating "
+                    f"it as STILL HELD — an unmeasurable size must never read as 'flat' "
+                    f"and force-close the transaction.")
+                held = True
+            else:
+                held = abs(qty) > OPTION_CONTRACT_EPS
+            if contract and held:
+                broker_contracts.add(contract)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=grace_period_minutes)
+        terminal = OrderStatus.get_terminal_statuses()
+        closed_count = 0
+
+        open_txns = transactions_where(
+            statuses=(TransactionStatus.OPENED, TransactionStatus.CLOSING))
+        for txn in open_txns:
+            orders = orders_where(account_id=self.id, transaction_id=txn.id)
+            if not orders:
+                continue                        # not this account's transaction
+            if not any(getattr(o, "asset_class", None) == AssetClass.OPTION for o in orders):
+                continue                        # equity — the other reconciler owns it
+
+            net = option_contract_net(orders)
+            if not net or every_option_contract_is_flat(net):
+                # Nothing open per OUR ledger. Either already balanced by our own orders
+                # (refresh_transactions' job, with its own close_reason) or a structure with
+                # no executed contract rows at all. Not an external close either way.
+                continue
+
+            open_contracts = {c for c, q in net.items() if abs(q) > OPTION_CONTRACT_EPS}
+            still_at_broker = open_contracts & broker_contracts
+            if still_at_broker:
+                if still_at_broker != open_contracts:
+                    logger.warning(
+                        f"[Account {self.id}] option reconcile: transaction {txn.id} is "
+                        f"PARTLY absent at the broker — still held "
+                        f"{sorted(still_at_broker)}, missing "
+                        f"{sorted(open_contracts - still_at_broker)}. Leaving it OPEN: "
+                        f"closing it here would strand the surviving leg(s).")
+                continue
+
+            open_date = txn.open_date
+            if open_date is not None:
+                if open_date.tzinfo is None:
+                    open_date = open_date.replace(tzinfo=timezone.utc)
+                if open_date > cutoff:
+                    continue
+
+            for o in orders:
+                if o.status not in terminal:
+                    o.status = OrderStatus.CANCELED
+                    o.comment = (f"{(o.comment or '')} | cancelled: the broker no longer "
+                                 f"holds this option position")
+                    update_instance(o)
+
+            logger.info(
+                f"[Account {self.id}] option reconcile: none of {sorted(open_contracts)} is "
+                f"held at the broker — closing transaction {txn.id} (external close). Its "
+                f"buying-power reserve and short-put assignment exposure are released with it.")
+            close_transaction_with_logging(
+                transaction=txn,
+                account_id=self.id,
+                close_reason="position_not_at_broker",
+            )
+            update_instance(txn)
+            closed_count += 1
+
+        return closed_count
 
     # --- Cover: "are these shares spoken for?" -----------------------------
     #
@@ -2214,6 +2546,61 @@ class OptionsAccountInterface(ABC):
             return AssignmentExposure(None, contracts, tuple(blind))
         return AssignmentExposure(cost, contracts, ())
 
+    def cash_available_for_delivery(self) -> Optional[float]:
+        """SPENDABLE CASH, or ``None`` when it cannot be read. NOT total equity.
+
+        ``assignment_capacity`` read ``get_balance()`` and called the result "cash" in its
+        own refusal text. On the only options-capable live adapter ``get_balance()`` returns
+        ``TradeAccount.equity`` — cash PLUS every position marked to market — so a
+        $100,000-equity / $3,000-cash account was admitted to a $20,000 delivery obligation.
+        The cash-secured put, the one structure the platform advertises as unlevered, was
+        margin-secured and nothing said so.
+
+        The correct figure was already being fetched and discarded:
+        ``AccountSnapshot.cash``. ``get_account_snapshot()`` is the broker-agnostic seam for
+        exactly this — Alpaca and TastyTrade override it, and the base implementation on
+        ``ReadOnlyAccountInterface`` reads ``get_account_info()`` tolerantly for everyone
+        else — and its contract already says every field is ``None`` when unknown and never
+        a fabricated number.
+
+        THIS IS ALSO A LIVE/BACKTEST PARITY FIX. ``BacktestAccount.get_balance`` returns
+        ``self._cash``, so one expression meant cash in the simulator and equity in
+        production: the gate that admitted the trade in a grid run was not the gate that
+        admitted it with real money. The backtest publishes ``cash`` in its
+        ``get_account_info()``, so both engines now read the same quantity.
+
+        NO FALLBACK TO ``get_balance()``. A broker that does not publish cash is
+        UNMEASURABLE, and this method returns ``None`` for the caller to refuse on. Falling
+        back would restore the entire defect on precisely the accounts whose cash we cannot
+        see, which is the worst possible place for it to survive.
+
+        Only the benign world-was-uncooperative errors are absorbed. A ``ProgrammingError``
+        propagates: a gate that answers "unmeasurable" for ever because of a schema defect
+        is a gate that has silently stopped working while wearing the face of a safety
+        measure.
+        """
+        from ba2_common.core.failure_modes import absorb_if_benign
+        from ba2_common.logger import logger
+
+        try:
+            snapshot = self.get_account_snapshot()
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            absorb_if_benign(e, *self._cover_benign_errors())
+            logger.error(
+                f"Account {self.id}: the account snapshot could not be read ({e}), so the "
+                f"CASH available to take delivery on an assignment is UNKNOWN. Reporting "
+                f"unmeasurable — total equity is not a substitute.", exc_info=True)
+            return None
+
+        cash = self._readable_number(getattr(snapshot, "cash", None))
+        if cash is None:
+            logger.error(
+                f"Account {self.id}: the broker did not publish a readable CASH figure "
+                f"(cash={getattr(snapshot, 'cash', None)!r}), so whether it could take "
+                f"delivery on an assignment is UNKNOWN. Equity is deliberately NOT used "
+                f"in its place — that substitution is the defect this accessor exists for.")
+        return cash
+
     def assignment_capacity(self, additional_cost: float) -> "AssignmentCapacity":
         """Could this account still take delivery after adding ``additional_cost``?
 
@@ -2251,14 +2638,15 @@ class OptionsAccountInterface(ABC):
                 + "; ".join(exposure.unmeasurable),
                 candidate_cost=additional_cost,
                 unmeasurable=exposure.unmeasurable)
-        cash = self.get_balance()
+        cash = self.cash_available_for_delivery()
         if cash is None:
             return AssignmentCapacity(
                 False,
-                f"{ASSIGNMENT_CAPACITY_REFUSAL}: the account balance could not be read, "
+                f"{ASSIGNMENT_CAPACITY_REFUSAL}: the account's CASH could not be read, "
                 f"so the cash available to take delivery on "
                 f"{exposure.contracts:g} open short put contract(s) "
-                f"(costing {exposure.cost:,.2f}) is unknown.",
+                f"(costing {exposure.cost:,.2f}) is unknown. Total equity is NOT a "
+                f"substitute here — that is the reading this gate exists to refuse.",
                 held_cost=exposure.cost,
                 candidate_cost=additional_cost)
         ok = exposure.cost + additional_cost <= cash

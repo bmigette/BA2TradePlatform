@@ -33,6 +33,16 @@ class FakeAccount(OptionsAccountInterface):
         return date(2024, 6, 1)
     def get_balance(self):
         return 100_000.0
+
+    def get_account_snapshot(self):
+        """The double's balance IS its CASH — the intent this file has always tested.
+
+        Completed for OPT-L5: ``cash_available_for_delivery`` reads
+        ``AccountSnapshot.cash`` and must never fall back to total equity, so a double
+        that published only ``get_balance()`` left the delivery gate unmeasurable.
+        """
+        from ba2_common.core.account_types import AccountSnapshot
+        return AccountSnapshot(cash=100_000.0, equity=100_000.0, net_liquidation=100_000.0)
     def get_instrument_current_price(self, symbol, price_type=None):
         return self._spot
     def get_current_price(self, symbol=None):
@@ -493,7 +503,11 @@ MISSING_SIZING_INPUT = [
     ("jade_lizard", dict(strike=None, spread_width=5.0, net_credit=1.0), "strike"),
     ("jade_lizard", dict(strike=100.0, spread_width=None, net_credit=1.0), "spread_width"),
     ("iron_condor", dict(spread_width=None, net_credit=1.0), "spread_width"),
-    ("call_butterfly", dict(spread_width=None, net_credit=1.0), "spread_width"),
+    # ``call_butterfly`` was here. It moved to ZERO_RESERVE_STRATEGIES (OPT-L6): it is a
+    # DEBIT structure whose max loss is the premium already paid, so it answers 0.0 by
+    # name and no longer has a priced branch that could be missing a sizing input. Its
+    # reserve behaviour is pinned instead by test_option_reserve_lockstep.py, which checks
+    # the list against what the BUILDER persists — the relationship that was broken.
     ("debit_spread", dict(spread_width=None, net_credit=1.0), "spread_width"),
 ]
 

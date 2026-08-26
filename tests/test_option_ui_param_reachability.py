@@ -261,11 +261,35 @@ def test_the_editor_persists_every_param_it_is_expected_to(editor):
     # min_volume is the ONE deliberate omission: AlpacaAccount builds its chain from the
     # option SNAPSHOT endpoint, whose payload has no bar, so OptionContract.volume is always
     # None on the live path and the gate could only ever raise. See the note at the save site.
-    expected = consumed - {'min_volume'}
+    #
+    # strike_method is not omitted, it is PER-ACTION: WING_ACTION (iron condor) hard-codes
+    # percent_otm at every selection site, so offering the field there is the OPT-S2 trap.
+    # Its reachability on the nine actions that DO read it is asserted immediately below,
+    # so this exclusion cannot hide the field disappearing everywhere.
+    expected = consumed - {'min_volume', 'strike_method'}
     assert expected <= persisted, f"live rules cannot set: {sorted(expected - persisted)}"
     assert 'min_volume' not in persisted
+    assert 'strike_method' not in persisted
     assert persisted <= consumed, (
         f"the editor writes keys no option action reads: {sorted(persisted - consumed)}")
+
+
+def test_the_editor_persists_every_param_for_a_structure_that_reads_the_strike_method(
+        editor):
+    """The other half: on an action that DOES read strike_method, nothing is missing."""
+    from ba2_common.core.types import ExpertActionType as _AT
+
+    editor.add_row(_AT.SELL_CASH_SECURED_PUT.value)
+    editor.widget('strike_param_input').value = '0.30'
+    saved = editor.save()
+
+    persisted = set(saved) - {'action_type'}
+    consumed = set(_OPTION_ENTRY_PARAM_KEYS)
+    # wing_width_pct is the per-action omission here, mirroring strike_method above.
+    expected = consumed - {'min_volume', 'wing_width_pct'}
+    assert expected <= persisted, f"live rules cannot set: {sorted(expected - persisted)}"
+    assert 'strike_method' in persisted
+    assert persisted <= consumed
 
 
 def test_every_persisted_param_survives_the_trip_into_the_action(editor):
@@ -293,3 +317,144 @@ def test_the_deliberate_omission_is_documented_where_someone_would_add_it(settin
     assert "min_volume" in src[start:end], (
         "the reason min_volume has no widget must live next to the other params, or the "
         "next person will 'fix' the gap and ship a field that can only error")
+
+
+# --------------------------------------------------------------------------- #
+# OPT-S2: strike_method — the editor must not OFFER what the builder ignores
+# --------------------------------------------------------------------------- #
+# Eight of the seventeen entry builders hard-code ``method="percent_otm"`` at every
+# selection site, so ``self.strike_method`` is a dead attribute on them. The editor
+# nevertheless rendered the Strike Method select for EVERY non-close option action,
+# DEFAULTED it to ``delta``, placeholdered Strike Param as ``0.30``, and persisted the
+# choice unconditionally. A user configuring an iron condor saw "delta", typed 0.30
+# expecting a 30-delta short, and got a strike 0.30 % out of the money — effectively at
+# the money, on the leg carrying the risk.
+#
+# The decision is REFUSAL AT CONFIG TIME, not a fallback: honouring delta in those eight
+# depends on whether delta is computable from the chain, which is separate work. Until
+# then the field must not be offered and must not be persisted, and the param must say
+# what it really means.
+IGNORES_STRIKE_METHOD = ExpertActionType.OPEN_IRON_CONDOR.value
+HONOURS_STRIKE_METHOD = ExpertActionType.SELL_CASH_SECURED_PUT.value
+
+
+def test_a_structure_that_ignores_strike_method_is_not_offered_one(editor):
+    editor.add_row(IGNORES_STRIKE_METHOD)
+    assert editor.widget('strike_method_select') is None, (
+        f"{IGNORES_STRIKE_METHOD} hard-codes percent_otm at every selection site, but the "
+        f"editor still offers a Strike Method — and it defaults to 'delta'")
+
+
+def test_a_structure_that_ignores_strike_method_never_persists_one(editor):
+    saved = editor.add_row(IGNORES_STRIKE_METHOD).save()
+    assert 'strike_method' not in saved, (
+        f"the editor persisted strike_method={saved.get('strike_method')!r} onto "
+        f"{IGNORES_STRIKE_METHOD}, which never reads it: {sorted(saved)}")
+
+
+def test_a_structure_that_honours_strike_method_still_gets_one(editor):
+    """Refusal must not become "remove the feature": the nine that read it keep it."""
+    editor.add_row(HONOURS_STRIKE_METHOD)
+    assert editor.widget('strike_method_select') is not None
+    saved = editor.save()
+    assert saved['strike_method'] == 'delta'
+
+
+def test_strike_method_is_offered_for_exactly_the_actions_that_read_it(
+        settings_module, nicegui_client, monkeypatch):
+    """Both directions, by RUNNING every entry action through the editor."""
+    from ba2_common.core.types import (
+        get_strike_method_action_values, honours_strike_method,
+    )
+
+    entries = [a.value for a in ExpertActionType
+               if settings_module.is_option_action(a.value)
+               and a is not ExpertActionType.CLOSE_OPTION]
+    assert len(entries) == 17, entries
+
+    for action_type in entries:
+        with nicegui_client:
+            saved = _Editor(settings_module, monkeypatch).add_row(action_type).save()
+        if honours_strike_method(action_type):
+            assert 'strike_method' in saved, (
+                f"{action_type} reads strike_method but no live rule can set it")
+        else:
+            assert 'strike_method' not in saved, (
+                f"{action_type} ignores strike_method, yet the editor persisted "
+                f"{saved.get('strike_method')!r}")
+    assert set(get_strike_method_action_values()) <= set(entries)
+
+
+def test_switching_onto_a_structure_that_ignores_it_drops_a_stale_strike_method(editor):
+    """The stale-closure shape that already bit ``wing_width_pct``.
+
+    Configure a CSP with a delta, change your mind and pick an iron condor: the row is
+    redrawn without the select, and the deleted widget's closure must not write ``delta``
+    onto a structure that will silently read it as a percentage.
+    """
+    editor.add_row(HONOURS_STRIKE_METHOD).choose(IGNORES_STRIKE_METHOD)
+    assert editor.widget('strike_method_select') is None
+    saved = editor.save()
+    assert saved['action_type'] == IGNORES_STRIKE_METHOD
+    assert 'strike_method' not in saved, saved
+
+
+def test_switching_onto_a_structure_that_honours_it_offers_it_again(editor):
+    editor.add_row(IGNORES_STRIKE_METHOD).choose(HONOURS_STRIKE_METHOD)
+    assert editor.widget('strike_method_select') is not None
+    assert 'strike_method' in editor.save()
+
+
+def test_an_existing_rules_strike_method_is_loaded_back_for_an_action_that_reads_it(editor):
+    saved = editor.add_row(HONOURS_STRIKE_METHOD, strike_method='percent_otm').save()
+    assert editor.widget('strike_method_select').value == 'percent_otm'
+    assert saved['strike_method'] == 'percent_otm'
+
+
+def test_an_existing_rule_carrying_a_dead_strike_method_is_cleaned_on_save(editor):
+    """A rule saved BEFORE this fix carries a strike_method the builder ignores.
+
+    Re-saving it must not carry the key forward — otherwise the trap survives every edit
+    of the rule that introduced it.
+    """
+    saved = editor.add_row(IGNORES_STRIKE_METHOD, strike_method='delta').save()
+    assert 'strike_method' not in saved, (
+        f"a dead strike_method survived a re-save of {IGNORES_STRIKE_METHOD}: {saved}")
+
+
+def test_the_save_path_refuses_a_strike_method_widget_that_should_not_exist(editor):
+    """The SECOND rail, exercised — otherwise it is untestable and therefore not a rail.
+
+    Not hypothetical: ``wing_width_pct`` is the row's other conditional widget and its
+    closure OUTLIVED the row, so a value from a previously-selected action type was
+    persisted onto a structure with no such field (see the stale-closure test above).
+    ``strike_method`` escapes that today only because the rebuild happens to reset its
+    name. Here the widget is forced to exist for a structure that ignores the setting —
+    exactly what a future refactor reusing the widget would produce — and the save must
+    still refuse, because the guard is keyed on the ACTION and not on the widget.
+    """
+    editor.add_row(IGNORES_STRIKE_METHOD)
+    assert editor.widget('strike_method_select') is None
+    editor.tab.actions['a0']['strike_method_select'] = (
+        lambda: SimpleNamespace(value='delta'))
+    saved = editor.save()
+    assert 'strike_method' not in saved, (
+        f"a stray Strike Method widget was enough to persist {saved.get('strike_method')!r} "
+        f"onto {IGNORES_STRIKE_METHOD}, which reads it as a percentage")
+
+
+def test_the_strike_param_says_what_it_means_where_the_method_is_fixed(editor):
+    """With no method to choose, the param's label and placeholder must not imply delta.
+
+    ``0.30`` under a label that says nothing is exactly how "30-delta" became "0.30 % OTM".
+    """
+    editor.add_row(IGNORES_STRIKE_METHOD)
+    widget = editor.widget('strike_param_input')
+    assert widget is not None
+    label = (widget.props.get('label') or '')
+    placeholder = (widget.props.get('placeholder') or '')
+    assert '%' in label or 'OTM' in label.upper(), (
+        f"the strike param for a percent-OTM-only structure is labelled {label!r}")
+    assert '0.30' not in placeholder, (
+        f"the placeholder still suggests a delta on a structure that cannot use one: "
+        f"{placeholder!r}")

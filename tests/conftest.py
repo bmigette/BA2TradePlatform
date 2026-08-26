@@ -197,7 +197,13 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
         return self._balance
 
     def get_account_info(self):
-        return {"balance": self._balance, "equity": self._balance}
+        # ``cash`` completed for OPT-L5. The mock's single ``_balance`` IS its cash — it
+        # holds no marked-to-market stock — and the option delivery gate reads
+        # ``AccountSnapshot.cash`` (built from this dict by
+        # ``ReadOnlyAccountInterface.get_account_snapshot``) precisely so it can no longer
+        # be handed total equity. Omitting the key made cash UNMEASURABLE, which the gate
+        # correctly refuses on; the fixture was incomplete, not the guard.
+        return {"balance": self._balance, "cash": self._balance, "equity": self._balance}
 
     def get_positions(self):
         return self._positions
@@ -338,7 +344,11 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
         self._submitted_option_orders.append(trading_order)
         return trading_order
 
-    def close_option_position(self, position, order_type="limit", limit_price=None):
+    def close_option_position(self, position, order_type="limit", limit_price=None,
+                              transaction_id=None):
+        # RIDES the open position's transaction, like the live and backtest adapters.
+        # This double previously mirrored the pre-OPT-S5 live shape (transaction_id omitted),
+        # so it minted a fresh Transaction per close and could never have exposed the defect.
         from ba2_trade_platform.core.option_types import OptionLeg
         from ba2_trade_platform.core.types import OrderDirection
         close_side = OrderDirection.SELL if position.side == OrderDirection.BUY else OrderDirection.BUY
@@ -346,8 +356,11 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
         leg = OptionLeg(contract_symbol=position.contract_symbol, side=close_side,
                         position_intent=intent, option_type=position.option_type,
                         strike=position.strike, expiry=position.expiry, underlying=position.underlying)
+        if transaction_id is None:
+            transaction_id = self.open_option_transaction_id_for_contract(
+                position.contract_symbol)
         return self.submit_option_order([leg], int(position.quantity), order_type, limit_price,
-                                        option_strategy="close")
+                                        option_strategy="close", transaction_id=transaction_id)
 
 
 # ---------------------------------------------------------------------------

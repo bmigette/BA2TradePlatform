@@ -296,6 +296,30 @@ class TradeManager:
                                 exc_info=True,
                             )
 
+                    # The OPTION half of the same question (OPT-S4). The reconciler above
+                    # SKIPS every option transaction -- get_positions() is equity-only --
+                    # and the activity reconciler below sees only assignment/exercise/
+                    # expiry over a 7-day window. A manual close in the broker's own UI, or
+                    # a broker risk action, matched NEITHER, so the ledger position and its
+                    # buying-power reserve leaked permanently (FILLED is not a terminal
+                    # transaction status). Matches per OCC contract, and does nothing at all
+                    # on a fetch failure, an unreadable size, or a structure only partly
+                    # gone. No-op for non-options accounts.
+                    if hasattr(account, 'reconcile_externally_closed_option_transactions'):
+                        try:
+                            closed = account.reconcile_externally_closed_option_transactions()
+                            if closed:
+                                self.logger.info(
+                                    f"Reconciled {closed} externally-closed OPTION transaction(s) "
+                                    f"for {account_def.name}"
+                                )
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error reconciling externally-closed option transactions for "
+                                f"{account_def.name}: {e}",
+                                exc_info=True,
+                            )
+
                     # Reconcile option assignment/exercise/expiry events from the
                     # broker (no-op for non-options accounts). Idempotent.
                     self._reconcile_account_option_activities(account)
