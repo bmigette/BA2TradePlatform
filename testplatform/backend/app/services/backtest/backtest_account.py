@@ -579,8 +579,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             The widest adjacent gap is usually the BODY ``k3-k2``, which is not risk (both
             short strikes sit inside it) and made the bound ~2x too loose.
           * 2-strike verticals (bull_call/bear_put/bear_call/bull_put spread): the single gap.
-          * ``call_butterfly`` (3 strikes k1<k2<k3): ``min(k2-k1, k3-k2)`` — the binding wing
-            of a (possibly broken-wing) fly; equal wings unchanged.
+          * ``call_butterfly`` (3 strikes k1<k2<k3): ``k2-k1`` — the LOWER gap. A long 1-2-1
+            fly reaches its maximum expiry payoff at spot == k2, where the lower long is
+            worth k2-k1 and the other two legs are worthless; the upper wing does not cap it.
+            This was ``min(gaps)``, which is strictly BELOW the attainable payoff whenever
+            the upper wing is the narrower one — and the clamp runs immediately before
+            ``self._cash += net_payoff``, so it destroyed real simulated cash rather than
+            merely mis-marking (OPT-S13). That orientation is produced deterministically, not
+            by chance: the lower-wing picker tie-breaks to the FARTHER strike while
+            ``select_wing`` breaks to the NEARER one, so on a $5 grid with a $100 body the
+            GA's 7.5% wing yields 90/100/105 (a 50% truncation) and 12.5% yields 85/100/110
+            (33%) — both widths are in the searched grid. Widening it lets nothing impossible
+            through: above k3 the fly pays ``(k2-k1) - (k3-k2)``, whose magnitude can exceed
+            k2-k1 only when the upper wing is more than TWICE the lower, and in that
+            orientation ``min(gaps)`` and ``gaps[0]`` are the same number. Equal wings
+            unchanged.
           * any other shape/strategy: the widest adjacent gap (defensive fallback — the
             pre-strategy-aware rule, looser but never tighter than a known shape's risk).
 
@@ -593,7 +606,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if strategy == "iron_condor" and len(uniq) == 4:
             return max(gaps[0], gaps[2])
         if strategy == "call_butterfly" and len(uniq) == 3:
-            return min(gaps)
+            return gaps[0]
         if len(uniq) == 2:
             return gaps[0]
         return max(gaps)

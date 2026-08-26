@@ -2,7 +2,8 @@
 
   F1  strategy-aware defined-risk widths: an iron condor's bound is the wider WING
       (max(k2-k1, k4-k3)), not the widest adjacent gap (usually the body); a
-      broken-wing butterfly binds on its NARROWER wing (min gap).
+      broken-wing butterfly binds on its LOWER gap (its max payoff — corrected from
+      min(gaps) by OPT-S13; see test_butterfly_broken_wing_bound.py).
   F2  a short CALL fully covered by long underlying shares carries ~zero classic
       maintenance — exempt from the requirement AND the liquidation candidates.
   F3  the combo expiry safety bound scales by the PARENT order's structure count
@@ -127,7 +128,10 @@ def test_width_per_structure_strategy_aware():
     assert w("iron_condor", [90, 95, 105, 110]) == 5.0     # wings 5/5; body 10 is NOT risk
     assert w("iron_condor", [90, 95, 105, 112]) == 7.0     # the WIDER wing binds
     assert w("call_butterfly", [170, 180, 190]) == 10.0    # equal wings unchanged
-    assert w("call_butterfly", [170, 180, 205]) == 10.0    # broken wing: min gap binds
+    # Broken wing: a long fly's max payoff is the LOWER gap (see OPT-S13 and
+    # tests/backtest/test_butterfly_broken_wing_bound.py). Here the lower gap IS the
+    # smaller one, so this case reads the same either way — it does not pin the rule.
+    assert w("call_butterfly", [170, 180, 205]) == 10.0
     assert w("bull_call_spread", [100, 110]) == 10.0       # vertical: the single gap
     assert w("short_strangle", [90, 95, 105, 110]) == 10.0  # unknown shape -> widest gap
     assert w("iron_condor", [100]) is None                 # < 2 strikes: unboundable
