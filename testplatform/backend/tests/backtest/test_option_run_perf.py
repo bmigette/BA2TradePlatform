@@ -175,6 +175,14 @@ def _build_perf_engine():
     # Held EQUITY long (filled entry + OPENED txn) so the engine steps every bar (no flat-skip)
     # AND _manage_open_positions has a position to evaluate the buy_call rule against.
     _seed_held_equity_position(account, expert_id, qty=100, entry_px=180.0, open_date=_START)
+    # ...and put it in the LEDGER too. `_seed_held_equity_position` writes DB rows only, and
+    # `DailyBacktestEngine._has_activity` reads the ledger — so without this the run's density
+    # came entirely from option orders RESTING unfilled bar after bar. Once those age out as
+    # DAY orders (OPT-B4) the loop fast-forwards to the Thursday cadence bars and the window
+    # collapses to 7 bars, which is below this test's own meaningfulness floor. The fixture
+    # header always claimed the held long was what kept the engine on every weekday bar; this
+    # makes that true instead of incidental.
+    account._update_position("AAPL", 100.0, 180.0)
 
     expert = _CadencedHoldExpert(expert_id)
     resolver.register_expert(expert_id, expert)

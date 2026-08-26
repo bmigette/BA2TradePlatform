@@ -204,6 +204,12 @@ _OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10
 _OPTION_SPREAD_LIQUID_VOLUME = 100.0   # at/above this daily volume, no thin-widening
 _OPTION_SPREAD_THIN_MULT = 2.0         # multiplier applied below that volume
 
+#: Slack, in premium dollars per share, when comparing a multi-leg combo's achieved net
+#: against the order's net limit (OPT-S7). The net is a sum of per-leg products, so a limit
+#: set FROM those same quotes can miss itself by a float ulp; a broker would fill that. Well
+#: below the $0.01 minimum option tick, so it can never let a genuinely worse net through.
+_NET_LIMIT_TOLERANCE = 1e-9
+
 
 class BacktestAccount(AccountInterface, OptionsAccountInterface):
     """Simulated broker for daily multi-asset backtests.
@@ -318,6 +324,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # stock, so process_pending_assignment_liquidations closes ALL of it at the NEXT
         # bar's open (broker post-assignment liquidation; no orphaned stock in backtests).
         self._pending_assignment_sells: Dict[str, float] = {}
+        # OPT-B4 (option TIF DAY): order id -> the SIMULATED calendar date the option order
+        # was staged on. ``TradingOrder.created_at`` is stamped with the WALL clock by the ORM
+        # and is therefore useless for ageing in a backtest. Read only by
+        # ``_expire_stale_option_limits``; entries are dropped as they expire.
+        self._option_order_day: Dict[int, Any] = {}
         # Count of option fills REJECTED by the no-arbitrage guard (_arb_fill_reject_reason)
         # — junk indicative premium prints the run skipped instead of filling at.
         self.rejected_arb_fills: int = 0
@@ -573,8 +584,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             The widest adjacent gap is usually the BODY ``k3-k2``, which is not risk (both
             short strikes sit inside it) and made the bound ~2x too loose.
           * 2-strike verticals (bull_call/bear_put/bear_call/bull_put spread): the single gap.
-          * ``call_butterfly`` (3 strikes k1<k2<k3): ``min(k2-k1, k3-k2)`` — the binding wing
-            of a (possibly broken-wing) fly; equal wings unchanged.
+          * ``call_butterfly`` (3 strikes k1<k2<k3): ``k2-k1`` — the LOWER gap. A long 1-2-1
+            fly reaches its maximum expiry payoff at spot == k2, where the lower long is
+            worth k2-k1 and the other two legs are worthless; the upper wing does not cap it.
+            This was ``min(gaps)``, which is strictly BELOW the attainable payoff whenever
+            the upper wing is the narrower one — and the clamp runs immediately before
+            ``self._cash += net_payoff``, so it destroyed real simulated cash rather than
+            merely mis-marking (OPT-S13). That orientation is produced deterministically, not
+            by chance: the lower-wing picker tie-breaks to the FARTHER strike while
+            ``select_wing`` breaks to the NEARER one, so on a $5 grid with a $100 body the
+            GA's 7.5% wing yields 90/100/105 (a 50% truncation) and 12.5% yields 85/100/110
+            (33%) — both widths are in the searched grid. Widening it lets nothing impossible
+            through: above k3 the fly pays ``(k2-k1) - (k3-k2)``, whose magnitude can exceed
+            k2-k1 only when the upper wing is more than TWICE the lower, and in that
+            orientation ``min(gaps)`` and ``gaps[0]`` are the same number. Equal wings
+            unchanged.
           * any other shape/strategy: the widest adjacent gap (defensive fallback — the
             pre-strategy-aware rule, looser but never tighter than a known shape's risk).
 
@@ -587,7 +611,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if strategy == "iron_condor" and len(uniq) == 4:
             return max(gaps[0], gaps[2])
         if strategy == "call_butterfly" and len(uniq) == 3:
-            return min(gaps)
+            return gaps[0]
         if len(uniq) == 2:
             return gaps[0]
         return max(gaps)
@@ -1441,11 +1465,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         MARKET entry) can be evaluated against the next bar on the following call — never
         on the entry bar (no look-ahead within a bar).
 
+        Step 0 is the OPTION DAY-ORDER sweep (``_expire_stale_option_limits``), which runs
+        BEFORE the fill loop so an aged-out limit cannot trade on the bar it dies.
+
         Returns whether ANY order filled this bar. The engine uses this to skip the
         transaction roll + bracket attach on no-fill bars (both are no-ops there), which is
         the common case on a fine fill clock (5-minute) and a large share of per-bar runtime.
         """
         as_of = self._price.now()
+        self._expire_stale_option_limits(as_of)
 
         active = OrderStatus.get_active_statuses()
         # Working orders: entries (MARKET/LIMIT/STOP), plain exit sells, and option legs. TP/SL
@@ -1505,6 +1533,67 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if self._apply_bracket_exits(as_of):
             filled = True
         return filled
+
+    def _expire_stale_option_limits(self, as_of) -> None:
+        """TIME-IN-FORCE DAY for option LIMIT orders (OPT-B4).
+
+        Live forces ``TimeInForce.DAY`` on every option order (``AlpacaAccount``), and all 17
+        option entry builders submit ``order_type="limit"``. The simulator had no TIF and no
+        age handling at all, so a limit the premium never crossed stayed working for the whole
+        life of the contract: it kept its ``option_reserve`` charged against buying power, it
+        held its parent Transaction WAITING — which locks the symbol out of the rest of the run
+        via the engine's dup gate — and it could still fill weeks later at a price the strategy
+        quoted on a different bar. That let the GA quote aggressively and never pay for the
+        misses, which changes WHICH TRADES EXIST.
+
+        An option limit therefore gets exactly the session it was placed in. ``refresh_orders``
+        runs after the bar's analysis pass, so the order placed on bar N is attempted within
+        that same call; the first pass on a LATER calendar date terminalises it as EXPIRED. The
+        sweep runs BEFORE the fill loop so an aged-out order cannot trade on the bar it dies.
+        Multiple passes on one intraday date leave it alone — the boundary is the DATE, not the
+        call.
+
+        SCOPE, deliberately narrow:
+          * MARKET option orders are NOT aged out. One that did not fill here did not meet a
+            market refusal, it met a MISSING PREMIUM BAR; terminalising it would turn a data
+            gap into a cancelled trade — a different, invented fact.
+          * EQUITY orders are untouched. This is the option TIF, not a global one.
+          * An option order whose submission bar is UNKNOWN (no ``_option_order_day`` entry —
+            no current path produces one, since every option order is staged through
+            ``_submit_option_order_impl``) is left working. An unknown age must not be read as
+            an old one.
+
+        A partially filled row keeps its ``filled_qty``: the contracts that traded are real, and
+        ``reserved_option_buying_power_detail`` pro-rates a terminal row to exactly that part.
+        """
+        if not self._option_order_day:
+            return
+        today = as_of.date() if hasattr(as_of, "date") else as_of
+        day_limits = (OrderType.BUY_LIMIT, OrderType.SELL_LIMIT)
+        expired_any = False
+        for o in self._orders_filtered(statuses=OrderStatus.get_active_statuses()):
+            if getattr(o, "asset_class", None) != AssetClass.OPTION:
+                continue
+            if o.order_type not in day_limits:
+                continue
+            placed = self._option_order_day.get(o.id)
+            if placed is None or placed >= today:
+                continue
+            o.status = OrderStatus.EXPIRED
+            o.comment = f"{(o.comment or '')} | day order expired {placed}".strip(" |")
+            update_instance(o)
+            self._option_order_day.pop(o.id, None)
+            expired_any = True
+            logger.warning(
+                "[backtest] option DAY order expired unfilled: %s %s limit %s placed %s, "
+                "now %s (live forces TimeInForce.DAY).",
+                getattr(o, "side", None),
+                getattr(o, "contract_symbol", None) or getattr(o, "option_strategy", None),
+                getattr(o, "limit_price", None), placed, today,
+            )
+        if expired_any:
+            self.invalidate_order_cache()
+            self._option_memo_gen += 1
 
     def _is_single_leg_option(self, order) -> bool:
         """True for an OPTION order that fills *independently* against a premium bar.
@@ -1883,6 +1972,19 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         ratio); all-ratio-1 shapes (verticals/condors) are unchanged. The parent moves NO
         cash (it already moved per leg). If ANY leg lacks a price, NOTHING fills this bar
         (retry next).
+
+        NET LIMIT (OPT-S7). The combo's limit price lives on the PARENT — the children are
+        built with no ``limit_price`` of their own, so ``_option_fill_price``'s two limit
+        branches cannot fire for them and every leg prices market-style. Nothing then
+        compared the achieved net against ``parent.limit_price``, so the simulator filled
+        combos THROUGH their net limit, which live Alpaca cannot do. The invented fills are
+        by construction the ones WORSE than the limit, so mean credit was understated while
+        the trade COUNT was inflated — it changed which trades exist. Enforced here in the
+        one sign convention the whole option stack uses (+debit / -credit): the achieved net
+        must be no worse than the limit, i.e. ``net <= limit`` on BOTH sides — a 3.00 debit
+        fails a 2.00 debit limit, and a 1.50 credit (net -1.50) fails a 2.00 credit limit
+        (-2.00). A rejected combo does not fill this bar and retries the next, the same
+        no-fill idiom the arb and liquidity guards use.
         """
         legs = self._child_legs(parent)
         if not legs:
@@ -1894,6 +1996,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 return  # all-or-none: one leg can't price -> fill none this bar
             priced.append((leg, px))
 
+        structures = abs(float(parent.quantity or 0.0))
+        if structures <= 0:
+            return
+
+        # --- NET LIMIT (OPT-S7) ------------------------------------------------------
+        # Per-share net PER STRUCTURE, in the parent's own +debit / -credit convention.
+        net_per_share = 0.0
+        for leg, px in priced:
+            ratio = abs(float(leg.quantity or 0.0)) / structures
+            net_per_share += (px if leg.side == OrderDirection.BUY else -px) * ratio
+        limit = getattr(parent, "limit_price", None)
+        if limit is not None and net_per_share > float(limit) + _NET_LIMIT_TOLERANCE:
+            logger.warning(
+                "[backtest] multi-leg %s NOT filled: achieved net %+.4f/share per structure "
+                "is worse than the order's net limit %+.4f (+debit/-credit). The order stays "
+                "pending and retries the next bar.",
+                getattr(parent, "option_strategy", None), net_per_share, float(limit),
+            )
+            return
+
         # CASH-SECURED guard for DEBIT combos (defense-in-depth, the debit analog of the
         # margin-call liquidation for credit shorts). Options are sized from ANALYSIS-time quotes
         # but fill at the sparse cache's next-bar premiums, which can diverge sharply upward, so a
@@ -1903,10 +2025,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # scale together by the capped count (respecting each leg's ratio) so the combo stays
         # balanced/defined-risk. A CREDIT combo (net premium <= 0 -> cash inflow) is left alone
         # (its risk is bounded by the margin path, not cash spend).
-        structures = abs(float(parent.quantity or 0.0))
-        if structures <= 0:
-            return
+        #
+        # A CLOSE IS EXEMPT (OPT-B3), exactly as the single-leg sibling
+        # ``_cap_single_leg_option_entry`` has always exempted one. This guard exists to stop
+        # an ENTRY buying more debit than the account holds; closing a credit structure is
+        # also a net debit, and refusing it leaves the short leg — and its assignment risk —
+        # open because the account ran out of money, which no broker does. The rescale branch
+        # was worse than the outright refusal: it wrote the number of structures CLOSED over
+        # ``Transaction.quantity`` (the divisor for ``spread_pnl_percent``), and a 2-of-3 cap
+        # then let the next close attempt read the ENTRY parent's filled_qty=3 and over-close,
+        # flipping the position by 2.
         commission = float(self._cfg["commission_per_trade"])
+        if self._multi_leg_is_closing(parent, [leg for leg, _ in priced]):
+            self._apply_multi_leg_fill(parent, priced, as_of)
+            return
         debit_per_structure = 0.0
         for leg, px in priced:
             ratio = abs(float(leg.quantity or 0.0)) / structures if structures else 0.0
@@ -1954,9 +2086,39 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # Keep the shared Transaction row (created at the pre-cap STRUCTURE count) in sync.
             self._sync_transaction_quantity(parent.transaction_id, float(capped))
 
+        self._apply_multi_leg_fill(parent, priced, as_of)
+
+    @staticmethod
+    def _multi_leg_is_closing(parent, legs) -> bool:
+        """True when this multi-leg parent CLOSES a structure rather than opening one.
+
+        The parent's own ``position_intent`` is deliberately None for a multi-leg
+        (``OptionsAccountInterface.submit_option_order``: four legs have four intents), so
+        the answer lives on the CHILDREN — ``build_closing_legs`` stamps every reversed leg
+        ``buy_to_close``/``sell_to_close``.
+
+        Reads as a close only on positive evidence, and never guesses: a single leg naming
+        an OPEN intent makes the whole order an open (the cash guard then applies, which is
+        the safe direction), and when NO leg names an intent at all the parent's
+        ``option_strategy == "close"`` is the remaining evidence. Unknown falls through to
+        "not a close" — an unknown must not buy an exemption.
+        """
+        intents = [str(getattr(leg, "position_intent", None) or "").lower() for leg in legs]
+        named = [i for i in intents if i]
+        if named:
+            if any("open" in i for i in named):
+                return False
+            return all("close" in i for i in named)
+        return str(getattr(parent, "option_strategy", None) or "").lower() == "close"
+
+    def _apply_multi_leg_fill(self, parent, priced, as_of: datetime) -> None:
+        """Fill every leg of a multi-leg parent and mark the parent FILLED at the net.
+
+        ``priced`` is the ``[(leg, premium)]`` list the caller resolved. Leg ratio = leg
+        contracts / structures, read AFTER any cash-cap rescale (legs and ``parent.quantity``
+        are rescaled together, so the ratio is preserved).
+        """
         net = 0.0
-        # Leg ratio = leg contracts / structures, computed AFTER any cash-cap rescale above
-        # (legs and parent.quantity were rescaled together, so the ratio is preserved).
         struct_qty = abs(float(parent.quantity or 0.0))
         for leg, px in priced:
             self._apply_option_fill(leg, px, as_of)  # reuse single-leg per-leg lot+cash math
@@ -2710,17 +2872,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         multi-leg : the child leg orders carry the contracts that fill; the parent has no
                     ``contract_symbol`` and only tracks the net — it stays working (non-terminal)
                     but is not itself directly fillable.
+
+        The SIMULATED submission bar is recorded per row in ``_option_order_day``; that is what
+        ``_expire_stale_option_limits`` ages a DAY order against. ``TradingOrder.created_at``
+        cannot be used for it — the ORM stamps it with the WALL clock, which in a backtest is
+        years away from the simulated one.
         """
         fillable = OrderStatus.ACCEPTED  # matches the equity working status (_submit_order_impl)
-        if leg_orders:
-            for child in leg_orders:
-                child.status = fillable
-                update_instance(child)
-            trading_order.status = fillable
-            update_instance(trading_order)
-        else:
-            trading_order.status = fillable
-            update_instance(trading_order)
+        placed_on = self._as_of_date()
+        rows = list(leg_orders or []) + [trading_order]
+        for row in rows:
+            row.status = fillable
+            update_instance(row)
+            if row.id is not None:
+                self._option_order_day[row.id] = placed_on
         return trading_order
 
     def close_option_position(self, position, order_type="limit", limit_price=None):
@@ -2816,11 +2981,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # 3. Exercise/assignment -> create the resulting SHARE position settled at the STRIKE (NOT
         #    the market — the option holder transacts stock at the strike). The share cost basis is
         #    therefore the strike; the position then marks-to-market at the underlying close so an
-        #    ITM assignment loss is real and PERSISTS.
+        #    ITM assignment loss is real and PERSISTS. ``_book_assignment_share_leg`` also writes
+        #    the delivery to the ORDER/TRANSACTION tables (OPT-B2/F7) — the ledger alone is not the
+        #    book.
         if share_side is not None and shares and share_price is not None:
             signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
             self._cash -= signed * float(share_price)  # buy debits, sell credits — at strike.
-            self._update_position(position.underlying, signed, float(share_price))
+            self._book_assignment_share_leg(
+                position.underlying, signed, float(share_price), expert_id=txn.expert_id)
 
         # 4. Close the SHARED transaction only once every option leg on it has resolved. For a
         #    single-leg option this is immediate; for a multi-leg spread the transaction stays
@@ -2837,6 +3005,117 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
             update_instance(txn)
         return True
+
+    def _book_assignment_share_leg(
+        self, symbol: str, signed: float, price: float, *, expert_id: Optional[int] = None
+    ) -> None:
+        """Apply an assignment's SHARE delivery to the ledger AND to the order/transaction book.
+
+        ``_update_position`` alone (what this used to be) mutates only the in-memory
+        ``self._positions`` dict, so an assignment was invisible to everything that reads
+        transactions. That is OPT-B2 and F7:
+
+          * CALLED AWAY. The 100 long shares netted to zero while their equity Transaction
+            stayed OPENED with a FILLED BUY and no SELL, so ``_held_equity_shares`` reported
+            100 phantom shares forever — the covered-call overlay wrote another, NAKED, call
+            every cycle, and a later equity exit sold shares that did not exist, opening a
+            real short from ``qty=0``. ``process_pending_assignment_liquidations`` could not
+            catch it: it short-circuits on ``held <= 0`` and the netted position IS zero.
+          * PUT TO US / ASSIGNED SHORT. The new stock lot had no order and no transaction, so
+            the next-bar liquidation order resolved to ``transaction_id=None`` and
+            ``get_round_trip_trades`` dropped it — the realised stock P&L reached the equity
+            CURVE and never the trade ROWS every fitness metric is built from.
+
+        The delivery is therefore split at the ledger boundary:
+
+          * the part that OFFSETS an existing lot is booked as a closing fill AT THE STRIKE on
+            that lot's transaction (``_record_stock_liquidation_close`` resolves and links it;
+            ``refresh_transactions`` then closes the transaction on the filled dependent leg);
+          * the part that OPENS a new lot gets its own equity Transaction + FILLED entry order
+            at the strike, tagged ``origin=csp_assignment`` exactly as the live door does
+            (``AlpacaAccount._apply_option_activity``), and only THAT part is scheduled for
+            the next-bar orphan liquidation — scheduling the full assignment would sell down
+            an unrelated lot the strategy still owns.
+
+        Cash has already moved in the caller; this moves no cash of its own.
+        """
+        pos = self._positions.get(symbol)
+        held = float(pos.qty) if pos is not None else 0.0
+        # The offsetting part (opposite sign to what is held) closes; the rest opens.
+        closing = 0.0
+        if held and (held > 0) != (signed > 0):
+            closing = min(abs(signed), abs(held))
+        opening = abs(signed) - closing
+
+        self._update_position(symbol, signed, price)
+
+        if closing > 0:
+            self._record_stock_liquidation_close(
+                symbol, closing, was_long=(held > 0), px=price, comment="option_assignment")
+        if opening > 0:
+            self._open_assigned_stock_transaction(
+                symbol, opening, is_long=(signed > 0), price=price, expert_id=expert_id)
+            # Only the newly-orphaned lot is unmanaged; schedule THAT for the next bar.
+            self._pending_assignment_sells[symbol] = (
+                self._pending_assignment_sells.get(symbol, 0.0)
+                + (opening if signed > 0 else -opening)
+            )
+
+    def _open_assigned_stock_transaction(
+        self, symbol: str, qty: float, *, is_long: bool, price: float,
+        expert_id: Optional[int] = None,
+    ) -> None:
+        """Persist the equity Transaction + FILLED entry order for an assignment-created lot.
+
+        Mirrors the live ``csp_assignment`` shape (``AlpacaAccount._apply_option_activity``):
+        an OPENED equity transaction at the STRIKE carrying ``meta_data.origin =
+        csp_assignment``, with one synthetic FILLED order underneath. The ``expert_id`` is
+        carried over from the settling OPTION transaction so the shares are visible to the
+        expert that wrote the contract — the wheel's covered call is sized off exactly these
+        shares — and so ``has_assigned_shares`` can see them.
+
+        Written as an ENTRY (no ``depends_on_order``): the next-bar liquidation's closing leg
+        is what resolves against it, and ``refresh_transactions`` closes the transaction then.
+        """
+        from ba2_common.core.types import TXN_ORIGIN_CSP_ASSIGNMENT
+
+        as_of = self._price.now()
+        side = OrderDirection.BUY if is_long else OrderDirection.SELL
+        txn = Transaction(
+            symbol=symbol,
+            quantity=abs(float(qty)),
+            side=side,
+            open_price=float(price),
+            open_date=as_of,
+            status=TransactionStatus.OPENED,
+            asset_class=AssetClass.EQUITY,
+            expert_id=expert_id,
+            meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT},
+        )
+        txn_id = add_instance(txn)
+        if txn_id is None:
+            return
+        # open_date is already the SIM clock — keep refresh_transactions' re-stamp pass off it.
+        self._stamped_open_ids.add(txn_id)
+        order = TradingOrder(
+            account_id=self.id,
+            symbol=symbol,
+            quantity=abs(float(qty)),
+            filled_qty=abs(float(qty)),
+            side=side,
+            order_type=OrderType.MARKET,
+            status=OrderStatus.FILLED,
+            open_price=float(price),
+            transaction_id=txn_id,
+            open_type=OrderOpenType.AUTOMATIC,
+            broker_order_id=self._next_broker_id(),
+            comment="option_assignment",
+            created_at=as_of,
+        )
+        new_id = add_instance(order)
+        if new_id is not None:
+            self._fill_dates[new_id] = as_of
+        self.invalidate_order_cache()
 
     def settle_single_leg_expiry(self, position: OptionPosition, spot: float) -> bool:
         """Expiry settlement POLICY for a SINGLE-LEG (non-defined-risk-combo) option position.
@@ -2883,13 +3162,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 share_side=share_side, shares=shares, share_price=strike,
             )
             if ok:
-                # The assigned stock (long from a short put, short from a naked call) is an
-                # unmanaged orphan in a backtest: schedule its FULL liquidation at the next
-                # bar's open. Signed: +shares to SELL (long) / -shares to BUY back (short).
-                signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
-                self._pending_assignment_sells[position.underlying] = (
-                    self._pending_assignment_sells.get(position.underlying, 0.0) + signed
-                )
+                # The stock the assignment ORPHANS (long from a short put, short from a naked
+                # call) is unmanaged in a backtest and is scheduled for next-bar liquidation by
+                # ``_book_assignment_share_leg`` — which schedules only the part that actually
+                # opened a new lot. A COVERED call delivers shares the account already held:
+                # that part is booked as a closing fill on the lot's own transaction and there
+                # is nothing left to liquidate (scheduling it would sell down an unrelated lot).
                 logger.warning(
                     "[backtest] short-%s assignment of %d x %s at strike %.2f — scheduling "
                     "assignment_liquidation of the assigned stock at the next bar's open "

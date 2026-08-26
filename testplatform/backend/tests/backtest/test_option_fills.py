@@ -301,7 +301,10 @@ def test_multi_leg_spread_fills_all_legs_at_net_debit(options_account, tmp_path)
         legs=[long_leg, short_leg],
         quantity=1,
         order_type="limit",
-        limit_price=2.0,
+        # The net limit must be reachable: since OPT-S7 the engine refuses to fill a combo
+        # THROUGH its net limit (this used to say 2.0 and fill at 2.5 anyway). The subject
+        # here is the per-leg fill and the net arithmetic, not the limit.
+        limit_price=2.5,
         option_strategy="bull_call_spread",
     )
     assert parent is not None
@@ -338,7 +341,10 @@ def test_multi_leg_spread_is_all_or_none_when_one_leg_lacks_a_bar(options_accoun
         legs=[long_leg, short_leg],
         quantity=1,
         order_type="limit",
-        limit_price=2.0,
+        # Reachable net limit (see the sibling test): the ONLY reason this must not fill is
+        # the missing short-leg bar. A limit the net could never clear would pass this test
+        # for the wrong reason.
+        limit_price=2.5,
         option_strategy="bull_call_spread",
     )
 
@@ -504,7 +510,13 @@ def _extend_to_0307(ps, db_path, option_open_0307):
 
 def test_limit_buy_above_market_does_not_fill_then_fills_on_cross(options_account, tmp_path):
     """BUY_LIMIT 3.0 vs bar open 4.0: NO fill (stays working, cash untouched). When the
-    next fill bar opens at 3.0 (<= limit), it fills AT THE BAR PRICE (never worse)."""
+    premium comes down to 3.0 (<= limit), the SAME limit fills AT THE BAR PRICE (never worse).
+
+    The order is RE-QUOTED on the second session rather than left resting: an option limit is
+    a DAY order (OPT-B4 — live forces TimeInForce.DAY) and no longer survives its own session,
+    which is also what the live engine does (each manage cycle re-submits). The property under
+    test is the CROSS, and it is unchanged.
+    """
     acct, ps = options_account
     cache_db = str(tmp_path / "options_cache.sqlite")
     order = _submit_limit_buy_call(acct, 3.0)
@@ -522,9 +534,11 @@ def test_limit_buy_above_market_does_not_fill_then_fills_on_cross(options_accoun
     # 3.0 — a lower print would be junk the no-arbitrage guard rejects.)
     _extend_to_0307(ps, cache_db, 3.0)
     ps.set_clock(datetime(2024, 3, 6))
+    requote = _submit_limit_buy_call(acct, 3.0)
     acct.refresh_orders()
     acct.refresh_transactions()
-    filled = acct.get_order(order.id)
+    assert acct.get_order(order.id).status == OrderStatus.EXPIRED   # yesterday's DAY order
+    filled = acct.get_order(requote.id)
     assert filled.status == OrderStatus.FILLED
     assert filled.open_price == pytest.approx(3.0)
     commission = CFG["commission_per_trade"]
@@ -556,11 +570,18 @@ def test_limit_sell_below_market_does_not_fill_then_fills_on_cross(options_accou
     assert acct.get_balance() == pytest.approx(cash_before)
 
     # Next bar opens at 5.5 >= 5.0 -> crosses -> fills at 5.5 (credit at the bar price).
+    # Re-quoted, not rested: an option limit is a DAY order (OPT-B4). See the buy sibling.
     _extend_to_0307(ps, cache_db, 5.5)
     ps.set_clock(datetime(2024, 3, 6))
+    requote = acct.submit_option_order(
+        legs=[OptionLeg(contract_symbol=_OCC, side=OrderDirection.SELL,
+                        position_intent="sell_to_open", underlying="AAPL")],
+        quantity=1, order_type="limit", limit_price=5.0, option_strategy="naked_call",
+    )
     acct.refresh_orders()
     acct.refresh_transactions()
-    filled = acct.get_order(order.id)
+    assert acct.get_order(order.id).status == OrderStatus.EXPIRED   # yesterday's DAY order
+    filled = acct.get_order(requote.id)
     assert filled.status == OrderStatus.FILLED
     assert filled.open_price == pytest.approx(5.5)
     commission = CFG["commission_per_trade"]
