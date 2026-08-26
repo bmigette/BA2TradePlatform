@@ -310,6 +310,44 @@ def test_remote_repeated_retryable_failures_bench_the_worker(monkeypatch):
     assert all(by_idx[i]["ok"] for i in range(10))  # local finished everything
 
 
+def test_zero_consumers_worker_excluded_at_preflight_still_recovers(monkeypatch):
+    """Regression for a real deadlock: a remote-only run (n_consumers=0) whose ONLY worker is
+    excluded at pre-flight has NO local consumer to ever drive execute_jobs' completion-based
+    re-admission cadence (nothing can complete -> nothing calls _maybe_recheck_async -> the
+    healthy worker is never re-tried). Hit for real: opt 357 (goal2020 matrix1/2 on remote227,
+    parallel=0) sat at "0 local + 0 remote slot(s) across 0 worker(s)" forever after remote227's
+    self-update restart made its pre-flight lose the race, even though the worker came back
+    within seconds. Needs an independent TIMER, not a completion-driven one."""
+    monkeypatch.setattr(de, "_DOWN_WORKER_RECHECK_S", 0.05)   # fast for the test
+    synced = {"ok": False}
+    seen = []
+
+    monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: synced["ok"])
+    monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
+    monkeypatch.setattr(de.worker_client, "push_secrets", lambda w, s, **k: {"set": 0})
+    monkeypatch.setattr(de.worker_client, "health", lambda w, **k: {"capacity": 2})
+    monkeypatch.setattr(de.worker_client, "run_trial",
+                        lambda w, config, metric, **kw: seen.append(w["name"]) or
+                        {"ok": True, "fitness": _fitness(config), "trades": 1, "error": None})
+
+    workers = [{"id": 1, "name": "remote227", "url": "http://x", "password": "p"}]
+    ev = DistributedEvaluator(None, "sharpe", n_consumers=0, optimization_id="t",
+                              workers=workers, master_version="abc", log=lambda *_: None)
+    ev.start()
+    assert ev._down_workers and not ev._active_workers   # excluded at pre-flight, as it was live
+    try:
+        # "The worker comes back" a moment after start() -- nothing local or remote is running
+        # yet to notice on its own; only the independent timer can pick this up.
+        synced["ok"] = True
+        jobs = [(i, {"idx": i}, f"k{i}", {"v": i}) for i in range(10)]
+        by_idx = {i: out for (i, _f, _k, out) in ev.execute_jobs(jobs)}
+    finally:
+        ev.stop()
+    assert set(by_idx) == set(range(10))
+    assert seen, "the recovered worker never ran a single trial -- still deadlocked"
+    assert ev._active_workers and not ev._down_workers
+
+
 def test_zero_local_consumers_dispatches_remote_only(monkeypatch):
     """n_consumers=0 (a run with no local trial slots) must not be floored to 1, must spawn no
     local consumer thread, and must never touch the local pool -- passing pool=None here means

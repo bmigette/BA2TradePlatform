@@ -62,6 +62,14 @@ _REMOTE_SETTLE_S = float(_os.getenv('BT_REMOTE_SETTLE_S', '180'))
 _REMOTE_MEM_POLL_S = float(_os.getenv('BT_REMOTE_MEM_POLL_S', '60'))
 _REMOTE_MEM_FLOOR_PCT = float(_os.getenv('BT_REMOTE_MEM_FLOOR_PCT', '10'))
 
+# Down-worker re-admission poll interval. execute_jobs' own re-admission cadence
+# (completed % n_consumers) needs a trial to actually COMPLETE to ever fire -- which never
+# happens on a remote-only run (n_consumers=0) whose only worker was excluded at pre-flight:
+# there is no local consumer either, so nothing can ever complete, and a healthy worker sits
+# unused forever. This independent timer is the only thing that can recover that case; see
+# _down_worker_recheck_loop.
+_DOWN_WORKER_RECHECK_S = float(_os.getenv('BT_DOWN_WORKER_RECHECK_S', '45'))
+
 
 def _log_memory_diagnostics(log, context: str) -> None:
     """Best-effort process/system memory snapshot, logged when a local trial dies unexpectedly
@@ -240,6 +248,25 @@ class DistributedEvaluator:
         # Timer-driven memory control loop for the remotes (see _remote_memory_watchdog).
         if self._active_workers:
             self._spawn(self._remote_memory_watchdog, "remote-memory-watchdog")
+        # Timer-driven down-worker re-admission (see _down_worker_recheck_loop) -- spawned
+        # whenever ANY worker is configured, regardless of n_consumers or how many are active
+        # right now. Deliberately NOT gated on self._active_workers like the memory watchdog
+        # above: that gate is exactly what leaves a remote-only run (n_consumers=0) whose only
+        # worker was excluded at pre-flight with no path back in at all.
+        if self.workers:
+            self._spawn(self._down_worker_recheck_loop, "down-worker-recheck")
+
+    def _down_worker_recheck_loop(self) -> None:
+        """Periodically retry down/excluded workers, independent of trial completions.
+
+        execute_jobs' own re-admission cadence (``completed % n_consumers``) requires a trial to
+        actually complete before it ever fires. On a remote-only run (n_consumers=0) whose only
+        worker was excluded at pre-flight, nothing can complete -- no local consumer exists
+        either -- so that cadence never runs even once, and a worker that is healthy again sits
+        unused for the rest of the job. This plain timer is the only thing that can recover that
+        case; it costs nothing when there is nothing down (_maybe_recheck_async no-ops)."""
+        while not self._stop.wait(_DOWN_WORKER_RECHECK_S):
+            self._maybe_recheck_async()
 
     def _resolve_master_secrets(self) -> dict:
         """Read the credential app-settings to mirror onto workers from the MASTER's DB. Keys absent
