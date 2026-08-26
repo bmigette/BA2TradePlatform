@@ -324,6 +324,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # stock, so process_pending_assignment_liquidations closes ALL of it at the NEXT
         # bar's open (broker post-assignment liquidation; no orphaned stock in backtests).
         self._pending_assignment_sells: Dict[str, float] = {}
+        # OPT-B4 (option TIF DAY): order id -> the SIMULATED calendar date the option order
+        # was staged on. ``TradingOrder.created_at`` is stamped with the WALL clock by the ORM
+        # and is therefore useless for ageing in a backtest. Read only by
+        # ``_expire_stale_option_limits``; entries are dropped as they expire.
+        self._option_order_day: Dict[int, Any] = {}
         # Count of option fills REJECTED by the no-arbitrage guard (_arb_fill_reject_reason)
         # — junk indicative premium prints the run skipped instead of filling at.
         self.rejected_arb_fills: int = 0
@@ -1460,11 +1465,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         MARKET entry) can be evaluated against the next bar on the following call — never
         on the entry bar (no look-ahead within a bar).
 
+        Step 0 is the OPTION DAY-ORDER sweep (``_expire_stale_option_limits``), which runs
+        BEFORE the fill loop so an aged-out limit cannot trade on the bar it dies.
+
         Returns whether ANY order filled this bar. The engine uses this to skip the
         transaction roll + bracket attach on no-fill bars (both are no-ops there), which is
         the common case on a fine fill clock (5-minute) and a large share of per-bar runtime.
         """
         as_of = self._price.now()
+        self._expire_stale_option_limits(as_of)
 
         active = OrderStatus.get_active_statuses()
         # Working orders: entries (MARKET/LIMIT/STOP), plain exit sells, and option legs. TP/SL
@@ -1524,6 +1533,67 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if self._apply_bracket_exits(as_of):
             filled = True
         return filled
+
+    def _expire_stale_option_limits(self, as_of) -> None:
+        """TIME-IN-FORCE DAY for option LIMIT orders (OPT-B4).
+
+        Live forces ``TimeInForce.DAY`` on every option order (``AlpacaAccount``), and all 17
+        option entry builders submit ``order_type="limit"``. The simulator had no TIF and no
+        age handling at all, so a limit the premium never crossed stayed working for the whole
+        life of the contract: it kept its ``option_reserve`` charged against buying power, it
+        held its parent Transaction WAITING — which locks the symbol out of the rest of the run
+        via the engine's dup gate — and it could still fill weeks later at a price the strategy
+        quoted on a different bar. That let the GA quote aggressively and never pay for the
+        misses, which changes WHICH TRADES EXIST.
+
+        An option limit therefore gets exactly the session it was placed in. ``refresh_orders``
+        runs after the bar's analysis pass, so the order placed on bar N is attempted within
+        that same call; the first pass on a LATER calendar date terminalises it as EXPIRED. The
+        sweep runs BEFORE the fill loop so an aged-out order cannot trade on the bar it dies.
+        Multiple passes on one intraday date leave it alone — the boundary is the DATE, not the
+        call.
+
+        SCOPE, deliberately narrow:
+          * MARKET option orders are NOT aged out. One that did not fill here did not meet a
+            market refusal, it met a MISSING PREMIUM BAR; terminalising it would turn a data
+            gap into a cancelled trade — a different, invented fact.
+          * EQUITY orders are untouched. This is the option TIF, not a global one.
+          * An option order whose submission bar is UNKNOWN (no ``_option_order_day`` entry —
+            no current path produces one, since every option order is staged through
+            ``_submit_option_order_impl``) is left working. An unknown age must not be read as
+            an old one.
+
+        A partially filled row keeps its ``filled_qty``: the contracts that traded are real, and
+        ``reserved_option_buying_power_detail`` pro-rates a terminal row to exactly that part.
+        """
+        if not self._option_order_day:
+            return
+        today = as_of.date() if hasattr(as_of, "date") else as_of
+        day_limits = (OrderType.BUY_LIMIT, OrderType.SELL_LIMIT)
+        expired_any = False
+        for o in self._orders_filtered(statuses=OrderStatus.get_active_statuses()):
+            if getattr(o, "asset_class", None) != AssetClass.OPTION:
+                continue
+            if o.order_type not in day_limits:
+                continue
+            placed = self._option_order_day.get(o.id)
+            if placed is None or placed >= today:
+                continue
+            o.status = OrderStatus.EXPIRED
+            o.comment = f"{(o.comment or '')} | day order expired {placed}".strip(" |")
+            update_instance(o)
+            self._option_order_day.pop(o.id, None)
+            expired_any = True
+            logger.warning(
+                "[backtest] option DAY order expired unfilled: %s %s limit %s placed %s, "
+                "now %s (live forces TimeInForce.DAY).",
+                getattr(o, "side", None),
+                getattr(o, "contract_symbol", None) or getattr(o, "option_strategy", None),
+                getattr(o, "limit_price", None), placed, today,
+            )
+        if expired_any:
+            self.invalidate_order_cache()
+            self._option_memo_gen += 1
 
     def _is_single_leg_option(self, order) -> bool:
         """True for an OPTION order that fills *independently* against a premium bar.
@@ -2802,17 +2872,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         multi-leg : the child leg orders carry the contracts that fill; the parent has no
                     ``contract_symbol`` and only tracks the net — it stays working (non-terminal)
                     but is not itself directly fillable.
+
+        The SIMULATED submission bar is recorded per row in ``_option_order_day``; that is what
+        ``_expire_stale_option_limits`` ages a DAY order against. ``TradingOrder.created_at``
+        cannot be used for it — the ORM stamps it with the WALL clock, which in a backtest is
+        years away from the simulated one.
         """
         fillable = OrderStatus.ACCEPTED  # matches the equity working status (_submit_order_impl)
-        if leg_orders:
-            for child in leg_orders:
-                child.status = fillable
-                update_instance(child)
-            trading_order.status = fillable
-            update_instance(trading_order)
-        else:
-            trading_order.status = fillable
-            update_instance(trading_order)
+        placed_on = self._as_of_date()
+        rows = list(leg_orders or []) + [trading_order]
+        for row in rows:
+            row.status = fillable
+            update_instance(row)
+            if row.id is not None:
+                self._option_order_day[row.id] = placed_on
         return trading_order
 
     def close_option_position(self, position, order_type="limit", limit_price=None):
