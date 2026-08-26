@@ -856,6 +856,31 @@ class TransactionHelper:
                 # Only on a SELL close: trimming a SHORT position BUYS shares back, which
                 # can only ADD cover.
                 #
+                # NO ``except_transaction_id``, and that is the difference from the CLOSE
+                # seam — the one exclusion the shared decision offers is wrong here. It
+                # exists so a close being RETRIED does not refuse itself: a close disposes
+                # of the WHOLE net open quantity, so its own staged row and the row it is
+                # about to write are two readings of the SAME inventory. A TRIM is never a
+                # retry of itself. Every trim writes an ADDITIONAL partial sale and writes
+                # ``transaction.quantity`` DOWN, so the next trim measures its own slice
+                # against the already-reduced size and knows nothing about the slice
+                # before it. Excluding this transaction therefore hides exactly the rows
+                # that make the difference: 150 held with 100 pledged, trimmed -50 twice,
+                # admitted BOTH times (the second one saw working=0 instead of 50) and
+                # committed 100 of the 150 shares to be sold — 50 left against a 100-share
+                # pledge, i.e. NAKED, from the guard whose whole purpose is to prevent it.
+                #
+                # Step 2 below does not make that safe. It cancels
+                # ``get_active_tpsl_orders``, whose business is TP/SL/OCO legs; a partial
+                # close submitted with no protective leg to trigger off carries no
+                # ``depends_on_order`` and is not in that list at all. (One that DID get a
+                # trigger is swept up incidentally, because ``is_tpsl_order`` answers True
+                # to any ``depends_on_order`` — a separate defect, pinned by
+                # ``test_a_WAITING_TRIGGER_trim_CANCELS_the_previous_one__recorded_here``.
+                # It cannot be leaned on here either way: this guard runs BEFORE step 2, so
+                # at the moment of the decision the earlier sale is outstanding, and the
+                # sweep cannot reach one that has already filled.)
+                #
                 # A result dict, never a raise, for this method's own stated reason (see
                 # the OPT-L3 guard above): all four call sites index result["success"], and
                 # the whole body sits inside a try whose handler would flatten a raise into
@@ -865,7 +890,7 @@ class TransactionHelper:
                         symbol, close_qty,
                         action=(f"trimming transaction {transaction.id} by "
                                 f"{close_qty:g} share(s)"),
-                        except_transaction_id=transaction.id,
+                        except_transaction_id=None,
                         order_noun="order")
                     if refusal:
                         logger.error(f"adjust_quantity_with_tpsl: {refusal}")

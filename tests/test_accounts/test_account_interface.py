@@ -2564,18 +2564,38 @@ class TestTheExitGuardNetsSalesAlreadyInFlight:
     def test_a_RESTING_PROTECTIVE_LEG_is_not_netted__a_recorded_gap(self, monkeypatch):
         """DELIBERATE, and pinned so that changing it is a decision.
 
-        A stop-loss on the covering shares really can strip a call, and counting
-        it here was tried. It cannot stay: ``close_transaction`` cancels a
-        transaction's legs AT THE BROKER without terminalising the DB rows (they
-        clear on the next ``refresh_orders``), so every later exit on the ticker
-        refused on the strength of orders that no longer existed — a guard that
-        blocks every exit is its own incident. ``MARKET`` is therefore the test
-        for "a sale already decided", which every close path on this platform
-        satisfies and no protective leg ever does.
+        THE EXIT FACE of a gap that has TWO. A resting SELL_STOP on the covering
+        shares really can strip a call, and it is invisible to the cover
+        arithmetic in BOTH directions:
 
-        Charging a stop against the cover it can strip belongs where the stop is
-        WRITTEN. If that is ever built here instead, this test is the one to
-        delete, on purpose, with the stale-cancel problem solved first.
+          * HERE, at the EXIT: it is not counted as "already committed to sell",
+            so a close is not charged for it.
+          * At the ENTRY, in ``held_shares_for_cover`` and so in
+            ``cover_capacity_for``: ``held`` is the position row's ``qty``, the
+            FULL holding, so those same shares are still offered as cover to a
+            NEW covered call. Pinned by
+            ``test_a_RESTING_STOP_does_not_reduce_the_cover_a_WRITE_sees__a_recorded_gap``.
+
+        Counting the legs here was tried and reverted (828e65a9):
+        ``close_transaction`` cancels a transaction's legs AT THE BROKER without
+        terminalising the DB rows (they clear on the next ``refresh_orders``), so
+        every later exit on the ticker refused on the strength of orders that no
+        longer existed — a guard that blocks every exit is its own incident.
+        ``MARKET`` is therefore the test for "a sale already decided", which
+        every close path on this platform satisfies and no protective leg does.
+
+        THE FIELD THAT WOULD ANSWER BOTH FACES is ``qty_available`` ("total
+        shares minus open orders", ``models.Position.qty_available``): live
+        broker state rather than DB rows the platform is known to leave stale,
+        which is exactly what made counting the legs unworkable here. It is not
+        used because ``IBKRAccount.get_positions`` never populates it and a
+        tri-state accessor must not read an unset field as "nothing available" —
+        so closing this properly starts in the adapters. Saying the remedy
+        "belongs where the stop is WRITTEN" only ever addressed the ordering in
+        which the call is written first; it does not reach the entry face.
+
+        If either face is ever closed, the matching test is the one to delete, on
+        purpose, with the stale-cancel problem solved first.
         """
         acct_def = create_account_definition()
         account, sent = self._accepting_account(acct_def, monkeypatch)
@@ -2593,6 +2613,61 @@ class TestTheExitGuardNetsSalesAlreadyInFlight:
 
         assert result["success"] is True, result["message"]
         assert len(sent) == 1
+
+    def test_a_RESTING_STOP_does_not_reduce_the_cover_a_WRITE_sees__a_recorded_gap(self):
+        """THE ENTRY FACE of the same gap — see the test above for the whole story.
+
+        THE ORDERING THAT REACHES IT IS THE NORMAL ONE. Equity positions on this
+        platform are routinely opened WITH protective legs, so the stop exists
+        before any call is written: 100 shares held, all 100 already committed to
+        a resting SELL_STOP, and ``cover_capacity_for`` still reports one
+        contract of cover available because ``held_shares_for_cover`` reads
+        ``qty`` (the full holding) and not ``qty_available`` (holding minus open
+        orders). Nothing objects; the call is written against shares the stop can
+        sell out from under it.
+
+        The exit-face remedy does not cover this. "Charge the stop where the stop
+        is WRITTEN" only fires when the CALL is written first and the stop
+        second; in this ordering the stop-writing seam is never reached with an
+        open short call to charge.
+
+        RECORDED, NOT FIXED, on purpose: making the write see the committed
+        shares means reading ``qty_available``, and ``IBKRAccount.get_positions``
+        does not publish it (an unset field must not be read as "nothing is
+        available" by a tri-state accessor). The adapters come first.
+        """
+        from types import SimpleNamespace
+        from ba2_common.core.option_types import OptionLeg
+        from ba2_trade_platform.core.types import OptionRight
+        from datetime import date
+
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        # qty_available is 0 — every share is spoken for by the resting stop —
+        # while qty, the field actually read, still says 100.
+        account._positions = [SimpleNamespace(
+            symbol="AAPL", qty=100.0, qty_available=0.0,
+            side=OrderDirection.BUY, asset_class="us_equity")]
+        stopped = self._long_equity_txn(acct_def, shares=100.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.SELL_STOP,
+            status=OrderStatus.NEW, stop_price=140.0,
+            transaction_id=stopped.id, broker_order_id="bkr-stop")
+
+        verdict = account.check_cover_for_covered_call(
+            [OptionLeg(contract_symbol=self.OCC, side=OrderDirection.SELL,
+                       position_intent="sell_to_open",
+                       option_type=OptionRight.CALL, strike=150.0,
+                       expiry=date(2026, 1, 16), underlying="AAPL")],
+            quantity=1, option_strategy="covered_call")
+
+        assert verdict.ok is True, (
+            "the recorded gap has been closed — if that is deliberate, delete "
+            f"this test and its exit-face sibling: {verdict.reason}")
+        assert account.held_shares_for_cover("AAPL") == 100, (
+            "held_shares_for_cover reads qty (100), not qty_available (0) — "
+            "that read IS the gap")
 
     def test_a_working_close_on_ANOTHER_SYMBOL_is_not_netted(self, monkeypatch):
         """Cover is per ticker and so is the supply against it."""

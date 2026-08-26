@@ -1692,6 +1692,15 @@ class OptionsAccountInterface(ABC):
         ``0``: "the broker holds it but will not say how much" is exactly the case where
         selling the lot could uncover a call. A row for ANOTHER symbol is never inspected,
         so it cannot poison the answer.
+
+        KNOWN GAP, the ENTRY face of the one recorded in
+        :meth:`equity_shares_working_to_sell` — read that one for the whole story. This
+        reads ``qty``, the FULL holding, NOT ``qty_available`` ("total shares minus open
+        orders"). Shares already committed to a resting SELL_STOP therefore still count as
+        cover, so writing the equity stop first and the covered call second — the normal
+        ordering — lets :meth:`cover_capacity_for` admit a call against shares the stop can
+        sell. Pinned by
+        ``test_a_RESTING_STOP_does_not_reduce_the_cover_a_WRITE_sees__a_recorded_gap``.
         """
         from ba2_common.core.failure_modes import absorb_if_benign
         from ba2_common.core.types import OrderDirection
@@ -1782,32 +1791,66 @@ class OptionsAccountInterface(ABC):
         a protective leg is never one (a TP is ``SELL_LIMIT``, an SL ``SELL_STOP``, both
         together an ``OCO``).
 
-        KNOWN GAP, recorded rather than papered over: a RESTING PROTECTIVE LEG can also
-        uncover a call, and it is not counted here. It was tried and reverted, because
-        ``close_transaction`` cancels a transaction's legs AT THE BROKER without
-        terminalising the DB rows (they clear on the next ``refresh_orders``), so counting
-        them made every subsequent exit on the ticker refuse on the strength of orders
-        that no longer existed — a guard that blocks every exit is its own incident, and
-        the finding that prompted this accessor is about closes the run itself authorised.
-        Charging a stop-loss against the cover it can strip is a real and separate
-        question, and it belongs where the stop is WRITTEN, not where a close is refused.
+        KNOWN GAP — A RESTING PROTECTIVE LEG IS INVISIBLE TO THE COVER ARITHMETIC IN BOTH
+        DIRECTIONS. Recorded rather than papered over, and it is ONE gap with two faces:
+
+        * THE EXIT face, here. A stop-loss on the covering shares can strip a call, and it
+          is not counted as "already committed to sell". It WAS counted, and was reverted
+          (828e65a9): ``close_transaction`` cancels a transaction's legs AT THE BROKER
+          without terminalising the DB rows (they clear on the next ``refresh_orders``),
+          so every later exit on the ticker refused on the strength of orders that no
+          longer existed — a guard that blocks every exit is its own incident, and the
+          finding that prompted this accessor is about closes the run itself authorised.
+          ``MARKET`` is therefore the test for "a sale already decided".
+        * THE ENTRY face, in :meth:`held_shares_for_cover` and so in
+          :meth:`cover_capacity_for`. ``held`` is read from the position row's ``qty``,
+          which is the full holding — shares already committed to a resting SELL_STOP
+          included. Write the equity stop FIRST and the covered call SECOND (the normal
+          ordering, since equity positions here are routinely opened with TP/SL) and the
+          write is admitted against shares the stop can sell out from under it. Naming the
+          remedy as belonging "where the stop is WRITTEN" does not cover this: that ordering
+          never reaches the stop-writing seam with the call already open.
+
+        ``qty_available`` IS THE FIELD THAT WOULD ANSWER BOTH — "total shares minus open
+        orders", the number Alpaca actually enforces (``models.Position.qty_available``;
+        ``AlpacaAccount.get_positions`` populates it, ``TastyTradeAccount`` mirrors ``qty``
+        into it, ``IBKRAccount`` leaves it unset). Reading it instead of ``qty`` would
+        subtract a resting leg at the source, on live broker state rather than on DB rows
+        the platform is known to leave stale — which is what made counting the legs
+        unworkable at the exit face. It is not done here because a tri-state accessor
+        cannot treat an adapter that does not publish the field as "nothing is available",
+        and closing that properly means fixing the adapters first. Until then the gap is
+        tracked, in both directions, by
+        ``test_a_RESTING_PROTECTIVE_LEG_is_not_netted__a_recorded_gap`` and
+        ``test_a_RESTING_STOP_does_not_reduce_the_cover_a_WRITE_sees__a_recorded_gap``.
 
         ACCOUNT-WIDE, not per transaction, for the same reason cover itself is account-
         wide (see :meth:`held_shares_for_cover`): the broker does not care which
         transaction sells the share, and a per-transaction reading would let two lots each
         believe the other's shares are still there.
 
-        ``except_transaction_id`` EXISTS TO PREVENT A DOUBLE COUNT, and it is the one
-        exclusion. A caller asking "may I sell THIS transaction's shares?" is proposing an
-        alternative disposition of the very shares its own staged sale would take, not an
-        additional one: a close being RETRIED, or a partial close already sitting on that
-        transaction, is the same inventory read twice. Both exit seams also cancel that
-        transaction's own working rows on the way (that is what
-        ``last_broker_canceled_order_id`` is for, and what ``adjust_quantity_with_tpsl``'s
-        step 2 does). Counted, a retried close would refuse itself for as long as the
-        earlier row stayed unfilled, with no action that could clear it. Other
-        transactions' working sells stay counted: those dispose of shares this one does
-        not.
+        ``except_transaction_id`` EXISTS TO PREVENT A DOUBLE COUNT ON A RE-ISSUED CLOSE,
+        and it is the one exclusion — and it belongs to the CLOSE seam alone. A caller
+        asking "may I close THIS transaction?" proposes an alternative disposition of the
+        very shares its own staged close would take, not an additional one: a close covers
+        the WHOLE net open quantity, so a second one is the same inventory read twice, and
+        ``close_transaction`` cancels that transaction's own legs on the way (that is what
+        ``last_broker_canceled_order_id`` is for). Counted, a retried close would refuse
+        itself for as long as the earlier row stayed unfilled, with no action that could
+        clear it.
+
+        IT IS WRONG FOR A PARTIAL TRIM, which is why ``adjust_quantity_with_tpsl`` passes
+        ``None``. Every trim stages an ADDITIONAL slice and writes ``transaction.quantity``
+        DOWN, so the next trim sizes itself against the reduced figure and its own earlier
+        slices are exactly the rows the netting needs; and the trim's cancel step clears
+        ``get_active_tpsl_orders`` — TP/SL/OCO legs — not a partial-close MARKET row (one
+        submitted with no protective leg to trigger off carries no ``depends_on_order`` and
+        is not in that list at all). Excluded, two −50 trims of a 150-share holding with
+        100 pledged were BOTH admitted — the second saw working = 0 instead of 50 — and
+        committed 100 shares to be sold, leaving 50 against a 100-share pledge.
+
+        Other transactions' working sells stay counted in every case: those dispose of
+        shares this one does not.
 
         OPTION ROWS ARE SKIPPED on the ``asset_class`` field: one contract is not one
         share, and an option SELL order counted here would subtract contracts from a share

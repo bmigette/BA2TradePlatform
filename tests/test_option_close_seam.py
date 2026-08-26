@@ -422,10 +422,18 @@ class TestAdjustQuantityRefusesToTrimPledgedCover:
 
         assert result["success"] is True, result["message"]
 
-    def test_the_trim_shares_ONE_decision_with_the_close_path(self):
+    def test_the_trim_shares_ONE_decision_with_the_close_path__and_no_exclusion(self):
         """Both seams call the same function, so neither can drift from the other
         about the same account state — the defect being fixed is precisely that
-        one of them had never been taught to ask."""
+        one of them had never been taught to ask.
+
+        THE SAME FUNCTION, NOT THE SAME ARGUMENTS. ``except_transaction_id`` is
+        the close seam's alone: a close disposes of the whole net open quantity,
+        so a re-issued one would otherwise refuse itself over its own staged row.
+        A trim is never a retry of itself — each one stages an ADDITIONAL slice
+        and writes ``transaction.quantity`` down — so it must pass no exclusion,
+        or its own earlier slices go unseen. See
+        ``TestTwoTrimsOnOneTransactionCannotBothPass`` for what that cost."""
         from ba2_common.core.TransactionHelper import TransactionHelper
         acct_def = create_account_definition()
         account = MockAccount(acct_def.id)
@@ -444,6 +452,293 @@ class TestAdjustQuantityRefusesToTrimPledgedCover:
         TransactionHelper.adjust_quantity_with_tpsl(
             account=account, transaction=txn, qty_change=-50.0)
 
-        assert asked == [("AAPL", 50.0, txn.id)], (
-            "the trim must ask about the shares IT is selling, and exclude its own "
-            f"transaction's working legs: {asked}")
+        assert asked == [("AAPL", 50.0, None)], (
+            "the trim must ask about the shares IT is selling, through the shared "
+            "decision, and must NOT exclude its own transaction — every trim is an "
+            f"additional sale, never a retry of the last one: {asked}")
+
+
+# ===========================================================================
+# TWO TRIMS OF ONE TRANSACTION, AND THE EXCLUSION THAT HID THE FIRST FROM THE
+# SECOND.
+#
+# ``cover_refusal_for_equity_sale`` offers ``except_transaction_id`` so a
+# RE-ISSUED CLOSE does not refuse itself: a close disposes of the transaction's
+# whole net open quantity, so its own staged row and the row it is about to
+# write are the same inventory read twice. The trim seam passed it too, and
+# there the reasoning does not hold — a trim is never a retry of itself. Every
+# trim stages an ADDITIONAL slice and writes ``transaction.quantity`` DOWN, so
+# the next one sizes itself against the reduced figure and, with the exclusion,
+# cannot see the slice before it. Measured on the doubles before the fix, 150
+# held with 100 pledged and two -50 trims:
+#
+#   R1 (-50): True   -> order 4: AAPL SELL 50 MARKET WAITING_TRIGGER, txn 150 -> 100
+#   R2 (-50): True   -> order 6: AAPL SELL 50 MARKET WAITING_TRIGGER, txn 100 ->  50
+#   equity_shares_working_to_sell("AAPL")                        = 50
+#   equity_shares_working_to_sell("AAPL", except_transaction_id) =  0  <- the guard
+#
+# 100 of the 150 shares committed to be sold against a 100-share pledge. The
+# arithmetic the guard SHOULD have done at R2 is 150 - 50 - 50 = 50 < 100.
+# ===========================================================================
+class TestTwoTrimsOnOneTransactionCannotBothPass:
+
+    OCC = TestAdjustQuantityRefusesToTrimPledgedCover.OCC
+    _short_call = TestAdjustQuantityRefusesToTrimPledgedCover._short_call
+    _holding = TestAdjustQuantityRefusesToTrimPledgedCover._holding
+
+    def _protected_lot(self, acct_def, *, shares=150.0, protected=True):
+        """A long AAPL lot, optionally with the live OCO leg that puts the trim
+        on the WAITING_TRIGGER branch (and the TP/SL scalars it re-arms from)."""
+        from tests.factories import create_transaction as _txn
+        txn = _txn(symbol="AAPL", quantity=shares,
+                   take_profit=180.0 if protected else None,
+                   stop_loss=140.0 if protected else None)
+        entry = create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=shares,
+            transaction_id=txn.id, status=OrderStatus.FILLED, filled_qty=shares)
+        if protected:
+            create_trading_order(
+                account_id=acct_def.id, symbol="AAPL", quantity=shares,
+                transaction_id=txn.id, side=OrderDirection.SELL,
+                order_type=OrderType.OCO, status=OrderStatus.NEW,
+                limit_price=180.0, stop_price=140.0, depends_on_order=entry.id)
+        return txn
+
+    def _cancels_by_id(self, account):
+        """``adjust_quantity_with_tpsl`` cancels by ORDER ID, not by object.
+
+        The shared double's ``cancel_order`` takes an object, so without this the
+        cancel raises, the WAITING_TRIGGER chain is declared dead and the trim
+        aborts before it can demonstrate anything.
+        """
+        from ba2_common.core.db import get_instance, update_instance
+        from ba2_trade_platform.core.models import TradingOrder
+
+        def _cancel(order_or_id):
+            oid = order_or_id if isinstance(order_or_id, int) else order_or_id.id
+            row = get_instance(TradingOrder, oid)
+            row.status = OrderStatus.CANCELED
+            update_instance(row)
+            return True
+
+        account.cancel_order = _cancel
+
+    def _working_sells(self, account):
+        from ba2_common.core.trade_store import orders_where
+        from ba2_trade_platform.core.types import OrderStatus as _OS
+        return [o for o in orders_where(account_id=account.id,
+                                        statuses=_OS.get_active_statuses())
+                if o.side == OrderDirection.SELL
+                and o.order_type == OrderType.MARKET]
+
+    def test_the_SECOND_trim_sees_the_FIRST_trims_staged_sale(self):
+        """THE REGRESSION, on the deterministic WAITING_TRIGGER branch.
+
+        A live protective leg means the partial close is written
+        WAITING_TRIGGER and the only broker traffic is the CANCEL of that leg —
+        nothing sells, so ``get_positions()`` CANNOT decrement between the two
+        trims however slowly they run. The first trim's staged 50 is therefore
+        durable, readable state by the time the second one asks, and the second
+        must be refused: 150 held − 50 already committed − 50 more = 50 left
+        against a 100-share pledge.
+        """
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        from ba2_common.core.db import get_instance
+        from ba2_common.core.interfaces.AccountInterface import PLEDGED_COVER_REFUSAL
+        from ba2_trade_platform.core.models import Transaction
+
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        self._cancels_by_id(account)
+        self._holding(account, 150.0)
+        self._short_call(acct_def)                      # pledges 100
+        txn = self._protected_lot(acct_def, shares=150.0)
+
+        first = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+        assert first["success"] is True, first["message"]
+        assert get_instance(Transaction, txn.id).quantity == 100.0
+        assert account.equity_shares_working_to_sell("AAPL") == 50, (
+            "the first trim's staged sale must be visible account-wide")
+
+        second = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=get_instance(Transaction, txn.id),
+            qty_change=-50.0)
+
+        assert second["success"] is False, (
+            "the second trim sold into the cover: 150 held, 100 pledged, "
+            "50 already committed by the first trim")
+        message = second["message"]
+        assert PLEDGED_COVER_REFUSAL in message, message
+        assert "already committed" in message, (
+            "the refusal must name the first trim's shares: " + message)
+        assert "short by 50" in message, "the SHORTFALL must be named: " + message
+        assert second["orders_created"] == []
+        assert get_instance(Transaction, txn.id).quantity == 100.0, (
+            "a refused trim wrote the transaction down anyway")
+
+    def test_the_first_trims_staged_sale_SURVIVES_the_refusal(self):
+        """The refusal must not cost the trim that WAS legitimate.
+
+        Refusing the second trim leaves exactly 50 shares committed against a
+        150-share holding — 100 left, precisely the pledge — and the first
+        trim's order row untouched and still working.
+        """
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        from ba2_common.core.db import get_instance
+        from ba2_trade_platform.core.models import Transaction
+
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        self._cancels_by_id(account)
+        self._holding(account, 150.0)
+        self._short_call(acct_def)
+        txn = self._protected_lot(acct_def, shares=150.0)
+
+        TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+        staged = self._working_sells(account)
+        TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=get_instance(Transaction, txn.id),
+            qty_change=-50.0)
+
+        still_working = self._working_sells(account)
+        assert [o.id for o in still_working] == [o.id for o in staged]
+        assert sum(o.quantity for o in still_working) == 50.0
+        assert account.held_shares_for_cover("AAPL") - 50 == 100 == \
+            account.shares_pledged_to_short_calls("AAPL")
+
+    def test_an_UNPROTECTED_first_trim_is_seen_too(self):
+        """THE OTHER BRANCH, and the one the old comment's second claim was
+        wrong about. With no protective leg the partial close is written PENDING
+        and submitted straight out, carrying NO ``depends_on_order`` — so it is
+        not in ``get_active_tpsl_orders`` and the next trim's cancel step never
+        touches it. It is live at the broker and simply has not printed yet;
+        the second trim must be charged for it."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        from ba2_common.core.db import get_instance, update_instance
+        from ba2_common.core.interfaces.AccountInterface import PLEDGED_COVER_REFUSAL
+        from ba2_trade_platform.core.models import Transaction
+
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        self._holding(account, 150.0)
+        self._short_call(acct_def)
+        txn = self._protected_lot(acct_def, shares=150.0, protected=False)
+
+        def _accepts_and_works(order, **kwargs):
+            """A broker that ACCEPTED the sell and has not printed it yet — the
+            honest state between submission and fill, and the only one in which
+            the shares are both still held and already spoken for."""
+            order.status = OrderStatus.NEW
+            order.broker_order_id = "bkr-1"
+            update_instance(order)
+            return order
+
+        account.submit_order = _accepts_and_works
+
+        first = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+        assert first["success"] is True, first["message"]
+        staged = self._working_sells(account)
+        assert [o.depends_on_order for o in staged] == [None], (
+            "the unprotected partial close must carry no dependency — that is "
+            "why the next trim's TP/SL cancel step cannot reach it")
+
+        second = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=get_instance(Transaction, txn.id),
+            qty_change=-50.0)
+
+        assert second["success"] is False, second["message"]
+        assert PLEDGED_COVER_REFUSAL in second["message"], second["message"]
+
+    def test_TWO_trims_that_BOTH_fit_are_BOTH_allowed(self):
+        """THE INVERSE, and the proof this is netting rather than a one-trim
+        quota. 200 held with 100 pledged leaves 100 free: two -50 trims spend
+        exactly that and both must go through. A guard that refuses the second
+        trim on principle is a freeze, not a guard.
+
+        Run on the UNPROTECTED branch so the two staged sales genuinely
+        accumulate — see ``test_a_WAITING_TRIGGER_trim_CANCELS_the_previous_one``
+        for why the protected branch cannot show a running total."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        from ba2_common.core.db import get_instance, update_instance
+        from ba2_trade_platform.core.models import Transaction
+
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        self._holding(account, 200.0)
+        self._short_call(acct_def)                      # pledges 100
+        txn = self._protected_lot(acct_def, shares=200.0, protected=False)
+
+        def _accepts_and_works(order, **kwargs):
+            order.status = OrderStatus.NEW
+            update_instance(order)
+            return order
+
+        account.submit_order = _accepts_and_works
+
+        first = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+        second = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=get_instance(Transaction, txn.id),
+            qty_change=-50.0)
+
+        assert first["success"] is True, first["message"]
+        assert second["success"] is True, second["message"]
+        assert get_instance(Transaction, txn.id).quantity == 100.0
+        assert account.equity_shares_working_to_sell("AAPL") == 100
+
+        # ...and the very next share is over the line.
+        third = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=get_instance(Transaction, txn.id),
+            qty_change=-1.0)
+        assert third["success"] is False, third["message"]
+
+    def test_a_WAITING_TRIGGER_trim_CANCELS_the_previous_one__recorded_here(self):
+        """OBSERVED WHILE MEASURING THE ABOVE, and recorded because it is what
+        makes the WAITING_TRIGGER branch's running total NOT accumulate — it is
+        NOT what keeps the cover safe.
+
+        ``TransactionHelper.is_tpsl_order`` answers True for ANY order carrying
+        ``depends_on_order``, and a WAITING_TRIGGER partial close carries one (it
+        triggers off the cancel of the leg it replaced). So the NEXT trim's step
+        2 — "cancel existing TP/SL orders" — sweeps up the PREVIOUS trim's
+        staged sale along with the real OCO, and the earlier trim's 50 shares
+        silently never sell even though the transaction was already written down
+        for them.
+
+        This is a separate defect, deliberately out of scope here. It must not
+        be mistaken for cover protection: the cover guard runs BEFORE step 2 (it
+        has to — step 2 strips the position of its protective legs), so at the
+        moment of the decision both sales are outstanding; and the sweep cannot
+        reach a close already FILLED or one written with no dependency at all.
+        Cover safety comes from the guard seeing the earlier row, not from an
+        incidental cancel.
+        """
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        from ba2_common.core.db import get_instance
+        from ba2_trade_platform.core.models import Transaction
+
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        self._cancels_by_id(account)
+        self._holding(account, 400.0)          # far above any pledge: not the subject
+        self._short_call(acct_def)
+        txn = self._protected_lot(acct_def, shares=400.0)
+
+        TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+        first_close = self._working_sells(account)[0]
+        TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=get_instance(Transaction, txn.id),
+            qty_change=-50.0)
+
+        from ba2_trade_platform.core.models import TradingOrder
+        assert get_instance(TradingOrder, first_close.id).status == \
+            OrderStatus.CANCELED
+        assert account.equity_shares_working_to_sell("AAPL") == 50, (
+            "only the newest trim is left working — the running total does not "
+            "accumulate on this branch")
+        assert get_instance(Transaction, txn.id).quantity == 300.0, (
+            "...yet the transaction was written down for BOTH trims")

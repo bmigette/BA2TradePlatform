@@ -1638,13 +1638,29 @@ class AccountInterface(ReadOnlyAccountInterface):
         and ``_adjust_symbol`` and kept in step between them — the same duplication this
         function exists to remove.
 
-        ``except_transaction_id`` is the caller's OWN transaction, and leaving its working
-        rows out is what stops the netting from double-counting: a sale already staged on
-        that transaction and the sale being proposed dispose of the SAME shares, and both
-        exit seams cancel its legs on the way. See :meth:`OptionsAccountInterface.
-        equity_shares_working_to_sell` for what counts, what does not (a resting
-        protective leg — a recorded gap, with its reason), and why nothing else is
-        excluded.
+        ``except_transaction_id`` IS FOR THE CLOSE SEAM ONLY, and the TRIM SEAM MUST NOT
+        PASS IT. A CLOSE disposes of the transaction's WHOLE net open quantity, so a sale
+        already staged on it and the sale being proposed are two readings of the SAME
+        inventory: the second is a RETRY, not an addition, and counting the first would
+        make a re-issued close refuse itself for as long as the earlier row stayed
+        unfilled, with no action an operator could take to clear it. ``close_transaction``
+        also cancels that transaction's own legs on the way (that is what
+        ``last_broker_canceled_order_id`` is for).
+
+        None of that holds for ``TransactionHelper.adjust_quantity_with_tpsl``. Every trim
+        stages an ADDITIONAL partial sale and writes ``transaction.quantity`` DOWN, so the
+        next trim sizes itself against the reduced figure and its own earlier slices are
+        the very rows the netting needs to see; and the trim's cancel step touches
+        ``get_active_tpsl_orders`` — TP/SL/OCO legs — not a partial-close MARKET row it
+        submitted with no leg to trigger off. Excluding there let two −50 trims of a
+        150-share holding with 100 pledged BOTH through (the second saw working = 0
+        instead of 50) and committed 100 shares to be sold, leaving 50 against a 100-share
+        pledge: NAKED, by the guard meant to prevent it. The trim therefore passes
+        ``except_transaction_id=None``.
+
+        See :meth:`OptionsAccountInterface.equity_shares_working_to_sell` for what counts,
+        what does not (a resting protective leg — a recorded gap, with its reason), and
+        why nothing else is excluded.
 
         THREE TRI-STATE INPUTS, AND EVERY ``None`` IS A REFUSAL. An unreadable option book
         is not an empty one; ``get_positions()`` returning ``None`` is a FETCH FAILURE and
