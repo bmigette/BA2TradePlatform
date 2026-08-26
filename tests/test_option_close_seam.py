@@ -222,6 +222,43 @@ class TestAllocationExcludesOptions:
             "MSFT": [other.id],
         }
 
+    def test_the_filter_is_an_ALLOW_list_so_an_UNKNOWN_class_stays_out(self):
+        """``!= EQUITY``, never ``== OPTION`` — and today only the SOURCE can say which.
+
+        NO FIXTURE CAN TELL THE TWO APART, and that is the finding. ``AssetClass`` has
+        exactly two members, and the column is NOT NULL with ``server_default 'EQUITY'``
+        (alembic b2f4c81d6a35) — measured: ``create_transaction(asset_class=None)``
+        round-trips as ``AssetClass.EQUITY``. So every value that can reach the filter
+        is EQUITY or OPTION, the allow-list and a ``== AssetClass.OPTION`` deny-list are
+        behaviourally identical, and rewriting one as the other passes this whole suite.
+
+        What the allow-list buys is therefore entirely about the NEXT member. This
+        planner builds bare equity MARKET orders (``_open_symbol``) and exits through
+        the equity close path, so a class it has never heard of must be INVISIBLE here
+        until someone deliberately teaches it that class; a deny-list sweeps the next
+        one straight into the plan, and the first sign would be a market order for the
+        wrong instrument. The intent lives only in how the comparison is written, so
+        that is what is pinned — a tripwire for whoever adds the third member.
+
+        The last assertion retires this test: once ``AssetClass`` grows, the difference
+        becomes observable and belongs in a behavioural test instead of this one.
+        """
+        import inspect
+        from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+        code = "\n".join(
+            line for line in inspect.getsource(svc._open_transaction_ids).splitlines()
+            if not line.strip().startswith("#"))
+
+        assert "txn.asset_class != AssetClass.EQUITY" in code, (
+            "the allocation planner must ALLOW-list EQUITY — see this test's docstring")
+        assert "AssetClass.OPTION" not in code, (
+            "deny-listing OPTION admits every asset class nobody has thought of yet")
+        assert set(AssetClass) == {AssetClass.EQUITY, AssetClass.OPTION}, (
+            "AssetClass grew a member: the allow-list is now testable BEHAVIOURALLY "
+            "(open a transaction in the new class and assert it is not in the plan) — "
+            "write that test and delete this source check")
+
     def test_the_option_never_reaches_the_state_the_close_loop_walks(self):
         """``_close_symbol`` closes every id in ``PositionState.transaction_ids``, so the
         seam only holds if the covered call is absent THERE, not merely in the query."""

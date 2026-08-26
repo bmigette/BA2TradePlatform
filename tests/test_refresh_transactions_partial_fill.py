@@ -373,3 +373,49 @@ class TestOneLegSettlingDoesNotCloseTheStructure:
         assert fresh.status == TransactionStatus.CLOSED
         assert fresh.close_reason == "tp_sl_filled"
         assert fresh.close_price == 12.0
+
+    def test_an_EQUITY_transaction_is_unaffected_even_when_it_is_UNBALANCED(self):
+        """THE SCOPE OF THE GUARD — and the conjunct every balanced fixture hides.
+
+        ``one_leg_of_many_settled`` is ``bool(multi_leg_parent_ids) and not
+        position_balanced``. The two tests above close their position in FULL, so
+        ``position_balanced`` is True in both and the whole expression is False
+        WHATEVER the first conjunct says. Dropping ``bool(multi_leg_parent_ids)``
+        therefore passes them, and OPT-S3 — a rule about multi-leg OPTION structures —
+        silently starts governing every equity transaction in the book. (Measured: that
+        edit survives the entire live and backtest option suite without it.)
+
+        Here the sale is PARTIAL, 40 of 100 shares, so ``position_balanced`` is False
+        and ONLY ``bool(multi_leg_parent_ids)`` can keep this branch reachable.
+
+        WHAT THIS DOES NOT SAY. Marking the transaction CLOSED with 60 shares still
+        held, on the strength of one filled dependent order, is this branch's
+        PRE-EXISTING behaviour and is not endorsed here — it long predates OPT-S3 and is
+        a separate question. What is asserted is only that OPT-S3 did not change it, in
+        either direction: an equity transaction carries no OPTION orders and so no
+        net-only parent, and the guard must never reach it.
+        """
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        txn = create_transaction(symbol="NNE", quantity=100.0,
+                                 side=OrderDirection.BUY)
+        entry = create_trading_order(
+            account_id=acct_def.id, symbol="NNE", quantity=100.0,
+            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+            status=OrderStatus.FILLED, filled_qty=100.0, transaction_id=txn.id,
+            open_price=10.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="NNE", quantity=40.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.FILLED, filled_qty=40.0, transaction_id=txn.id,
+            depends_on_order=entry.id, open_price=12.0)
+
+        account.refresh_transactions()
+
+        fresh = get_instance(Transaction, txn.id)
+        assert fresh.quantity == 60.0, (
+            "the fixture is only interesting while the position is UNBALANCED")
+        assert fresh.status == TransactionStatus.CLOSED
+        assert fresh.close_reason == "tp_sl_filled", (
+            "the OPT-S3 guard has reached an EQUITY transaction — it must key on "
+            "multi_leg_parent_ids, which an equity transaction can never have")

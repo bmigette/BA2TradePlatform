@@ -865,6 +865,66 @@ def test_a_blank_symbol_argument_is_unmeasurable():
 
 
 # ===========================================================================
+# WHICH WAY THE DUST FALLS -- the rounding DIRECTION of all three accessors
+#
+# Every other test in this file feeds whole numbers, so ``floor`` and ``ceil``
+# agree and neither can be shown to be the one that was chosen. The direction is
+# not decoration: it is the same fail-safe rule at three places, stated in each
+# accessor's own comment, and swapping any one of them silently frees a share.
+#
+#   held_shares_for_cover        floor -- rounding a holding UP invents cover
+#   shares_pledged_to_short_calls ceil -- rounding a pledge DOWN releases cover
+#   equity_shares_working_to_sell ceil -- rounding what is already leaving DOWN
+#                                         hides a share that is on its way out
+#
+# FRACTIONS ARE NOT HYPOTHETICAL on the two equity-side accessors: this platform
+# trades fractional shares (``AlpacaAccount``'s fractional pre-check, and
+# ``split_delta_fifo`` sizes in fractions), so a 10.5-share lot and a 10.5-share
+# working sell are both ordinary rows. On the option side whole contracts times
+# an integer multiplier is the normal case and the ``ceil`` is there for
+# float-addition dust -- but the direction it falls is the same decision, and a
+# damaged row publishing a fractional size is exactly when it is load-bearing.
+# ===========================================================================
+def test_a_FRACTIONAL_holding_is_rounded_DOWN_never_up():
+    """10.5 shares cover 10, not 11. Rounding a holding UP is inventing cover
+    the broker cannot deliver, which is how the last contract goes naked."""
+    acct = FakeOptionsAccount(positions=[equity_position(qty=10.5)])
+    assert acct.held_shares_for_cover("AAPL") == 10
+
+
+def test_a_FRACTIONAL_short_holding_is_still_rounded_DOWN_never_toward_zero():
+    """-10.5 floors to -11, not -10. A short is NEGATIVE cover, so the same
+    "never over-report" rule sends the dust the other way in absolute terms."""
+    acct = FakeOptionsAccount(
+        positions=[equity_position(qty=-10.5, side=OrderDirection.SELL)])
+    assert acct.held_shares_for_cover("AAPL") == -11
+
+
+def test_a_FRACTIONAL_pledge_is_rounded_UP_never_truncated():
+    """A contract that delivers 100.5 shares pledges 101, not 100. Under-reporting
+    a pledge by one share is the direction that uncovers a call, so the dust falls
+    the opposite way from the holding above -- deliberately, so the two can never
+    meet in the middle and free a share between them."""
+    acct = FakeOptionsAccount(book=[short_call(qty=1, multiplier=100.5)])
+    assert acct.shares_pledged_to_short_calls("AAPL") == 101
+
+
+def test_a_FRACTIONAL_working_sell_is_rounded_UP_never_truncated(store):
+    """10.5 shares already committed to be sold count as 11. This one is a plain
+    fractional equity order -- nothing exotic -- and rounding it down would let
+    the exit guard believe half a share more is still there to cover a call."""
+    from ba2_common.core.types import OrderType
+
+    acct = FakeOptionsAccount()
+    add_instance(TradingOrder(
+        account_id=acct.id, symbol="AAPL", quantity=10.5, filled_qty=None,
+        side=OrderDirection.SELL, order_type=OrderType.MARKET,
+        status=OrderStatus.NEW, asset_class=AssetClass.EQUITY))
+
+    assert acct.equity_shares_working_to_sell("AAPL") == 11
+
+
+# ===========================================================================
 # the two together -- the scenario that motivated the pair
 # ===========================================================================
 def test_the_allocation_run_can_now_see_that_the_shares_are_spoken_for():

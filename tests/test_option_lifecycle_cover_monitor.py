@@ -452,3 +452,75 @@ def test_a_short_leg_with_no_option_type_is_unmeasurable_not_uncovered(wired, mo
     assert reasons(result) == [LIFECYCLE_UNKNOWN]
     assert any("UNKNOWN" in m and str(cc.id) in m for m in errors), \
         f"an unsizeable obligation must be logged at ERROR; got {errors!r}"
+
+
+# ===========================================================================
+# _cover_required itself — what a covered_call's SHORT CALLS can call away
+#
+# Every test above reaches this function through ``_build_structure``, which only
+# ever hands it a covered_call's single short call and a whole positive multiplier
+# (``int(txn.multiplier or 100)``). Three of its decisions are therefore invisible
+# from up there, and each one has a fail-safe direction that a mutation can flip
+# without a single test above noticing. They are exercised directly, as the pure
+# function they are.
+# ===========================================================================
+CC_CALL = occ(UNDERLYING, EXPIRY_FAR, "C", STRIKE)
+CC_PUT = occ(UNDERLYING, EXPIRY_FAR, "P", STRIKE)
+CC_FAR_CALL = occ(UNDERLYING, EXPIRY_FAR, "C", STRIKE + 10.0)
+
+
+def _cover_structure(*legs, multiplier=100):
+    from ba2_common.core.option_lifecycle import OptionStructure
+    return OptionStructure(transaction_id=1, underlying=UNDERLYING,
+                           strategy="covered_call", legs=legs, quantity=1.0,
+                           multiplier=multiplier)
+
+
+def _netted(contract, net_qty, right):
+    from ba2_common.core.option_lifecycle import LifecycleLeg
+    return LifecycleLeg(contract_symbol=contract, net_qty=net_qty,
+                        option_type=right, underlying=UNDERLYING)
+
+
+def test_a_structure_with_an_unusable_multiplier_is_UNMEASURABLE_not_a_guessed_100():
+    """``None``, never a number. How many shares one contract delivers is the whole
+    obligation, and OPT-L7's rule is that it must not be assumed to be 100 — an
+    ADJUSTED contract delivers a different count, and the guess under-states exactly
+    the structure whose oddity nobody remembers.
+
+    ``0`` is how this arrives in practice, not by anyone storing a zero:
+    ``_build_structure`` writes ``int(txn.multiplier or 100)``, so any recorded
+    multiplier BELOW ONE — a fractional deliverable on a post-split contract — is
+    truncated to 0 right there and lands here.
+
+    ``decide`` reads the ``None`` as "this caller is not measuring cover for that
+    structure" only when the mapping omits the transaction; ``_cover_inputs``
+    substitutes ``COVER_REQUIREMENT_UNMEASURABLE`` instead, which is what turns it
+    into LIFECYCLE_UNKNOWN rather than a silent skip."""
+    structure = _cover_structure(_netted(CC_CALL, -1.0, OptionRight.CALL),
+                                 multiplier=0)
+    assert svc._cover_required(structure) is None
+
+    negative = _cover_structure(_netted(CC_CALL, -1.0, OptionRight.CALL),
+                                multiplier=-100)
+    assert svc._cover_required(negative) is None
+
+
+def test_a_short_PUT_beside_the_call_charges_no_SHARE_cover():
+    """A short put obliges CASH — ``short_put_assignment_exposure``'s question — and
+    places no claim on share inventory. Charging it here would report a
+    covered_call+short_put as needing 200 shares, and the monitor would then close a
+    perfectly covered call as ``cover_lost`` every time the account held exactly its
+    100. Same line the pledge accessor and the entry guard both draw."""
+    structure = _cover_structure(_netted(CC_CALL, -1.0, OptionRight.CALL),
+                                 _netted(CC_PUT, -1.0, OptionRight.PUT))
+    assert svc._cover_required(structure) == 100
+
+
+def test_a_LONG_call_beside_the_short_one_charges_no_share_cover():
+    """A leg you OWN calls nothing away — only the short side can be assigned. A
+    structure mid-roll holds both, and counting the long would double the
+    requirement and liquidate the position for a shortfall that does not exist."""
+    structure = _cover_structure(_netted(CC_CALL, -1.0, OptionRight.CALL),
+                                 _netted(CC_FAR_CALL, +1.0, OptionRight.CALL))
+    assert svc._cover_required(structure) == 100
