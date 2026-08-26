@@ -2092,8 +2092,36 @@ class _OptionEntryAction(TradeAction):
             budget = min(budget, cap)
         return int(math.floor(budget / reserve_per_contract))
 
-    def _held_equity_shares(self) -> float:
-        """Sum filled equity BUY quantity across this expert's OPENED transactions for the symbol."""
+    def _held_equity_shares(self) -> Optional[float]:
+        """Net filled equity shares across this expert's OPENED transactions for the symbol.
+
+        TRI-STATE. A float (INCLUDING ``0.0``) is a MEASUREMENT; ``None`` means the count
+        is UNMEASURABLE and the caller must refuse. This is what SIZES a covered call and a
+        protective put (``floor(held / 100)``), so a wrong number here is contracts, and on
+        the short side it is NAKED contracts.
+
+        A CANCEL DOES NOT UN-TRADE A SHARE. The loop used to skip anything not in
+        ``get_executed_statuses()``, and ``CANCELED`` is not in it — but a cancel-and-replace
+        that races a fill leaves the SELL ``CANCELED`` with ``filled_qty=100``, and those
+        100 shares are genuinely gone. ``reconcile_canceled_partial_fill`` repairs
+        ``Transaction.quantity`` and writes no compensating order row, so this loop counted
+        the full 200 and wrote 2 contracts against 100 held. The codebase already applies
+        exactly this compensation in ``ReadOnlyAccountInterface``'s transaction
+        recalculation (``if order.status in executed_statuses or filled_qty > 0``); the
+        sizer was the one place that did not. It applies on BOTH sides: a cancelled BUY that
+        filled 100 really does hold 100.
+
+        AN UNKNOWN FILL IS NOT A ZERO FILL. ``if not qty: continue`` folded ``None`` — the
+        broker said it executed and never said how much — into ``0.0``, a measurement. On a
+        SELL that reads as "sold nothing", so shares that may already be gone keep counting
+        as cover: an asymmetric fail-OPEN with a concrete live write path. ``Transaction.
+        get_current_open_qty`` refuses to make that collapse and logs it; this does the
+        same, and because a share count cannot carry a tri-state in a float, the refusal is
+        the ``None`` return.
+
+        Note ``0.0`` for a missing expert instance and for no open transactions stays a
+        MEASUREMENT, not an unknown: there is genuinely nothing held under that scope.
+        """
         instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
         if not instance_id:
             return 0.0
@@ -2109,18 +2137,26 @@ class _OptionEntryAction(TradeAction):
         if not txn_ids:
             return 0.0
         orders = orders_where(transaction_ids=txn_ids)
+        executed = OrderStatus.get_executed_statuses()
         for o in orders:
             if o.asset_class == AssetClass.OPTION:
                 continue
-            if o.status not in OrderStatus.get_executed_statuses():
+            filled = o.filled_qty
+            traded = (filled is not None and filled > 0)
+            if o.status not in executed and not traded:
                 continue
-            qty = o.filled_qty
-            if not qty:
-                continue
+            if filled is None:
+                logger.error(
+                    f"_held_equity_shares({self.instrument_name}): order {o.id} "
+                    f"({o.symbol} {o.side}) is {o.status} but carries NO filled_qty — how "
+                    f"many shares traded is UNMEASURABLE, not zero. Reporting the share "
+                    f"count as unknown so the covered call / protective put refuses rather "
+                    f"than sizing off a number that may already be wrong.")
+                return None
             if o.side == OrderDirection.BUY:
-                total += abs(float(qty))
+                total += abs(float(filled))
             else:
-                total -= abs(float(qty))
+                total -= abs(float(filled))
         return total
 
     def _consensus_target(self) -> Optional[float]:
@@ -2498,6 +2534,16 @@ class SellCoveredCallAction(_OptionEntryAction):
 
     def _build_and_submit(self) -> Dict[str, Any]:
         held = self._held_equity_shares()
+        if held is None:
+            # UNMEASURABLE, not zero (OPT-L4). An executed order with no filled_qty means
+            # the broker did not say how many shares moved; sizing a SHORT CALL off a count
+            # that may already be wrong is how a naked contract gets written. FIRST, before
+            # any chain fetch — nothing downstream can improve an unknown share count.
+            return self._result(False,
+                                f"Share count for {self.instrument_name} is UNMEASURABLE — an executed "
+                                f"equity order carries no filled_qty, so how many shares are held cannot "
+                                f"be measured and a covered call written against them could be naked. "
+                                f"Repair the order's filled_qty; unknown is not zero.")
         quantity = int(math.floor(held / 100.0)) if held > 0 else 0
         if quantity < 1:
             return self._result(False,
@@ -2547,6 +2593,14 @@ class BuyProtectivePutAction(_OptionEntryAction):
 
     def _build_and_submit(self) -> Dict[str, Any]:
         held = self._held_equity_shares()
+        if held is None:
+            # Same accessor, same refusal (OPT-L4). Over-buying protection is not the naked
+            # risk the covered call carries, but it is still real money spent against a
+            # position whose size nobody can state.
+            return self._result(False,
+                                f"Share count for {self.instrument_name} is UNMEASURABLE — an executed "
+                                f"equity order carries no filled_qty, so how many shares need protecting "
+                                f"cannot be measured. Repair the order's filled_qty; unknown is not zero.")
         quantity = int(math.floor(held / 100.0)) if held > 0 else 0
         if quantity < 1:
             return self._result(False,
