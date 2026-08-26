@@ -238,3 +238,212 @@ class TestAllocationExcludesOptions:
 
         assert states["AAPL"].transaction_ids == [equity.id]
         assert option.id not in states["AAPL"].transaction_ids
+
+
+# ===========================================================================
+# OPT-L1, THE EXIT HALF -- the TRIM path asks the same question as the close
+#
+# ``adjust_quantity_with_tpsl`` sells equity too and carried only the OPT-L3
+# asset-class guard. A "set AAPL to 50%" allocation run reaches it through
+# ``_adjust_symbol``, so the exit half was only half done: the close path refused
+# to sell pledged cover and the trim path sold it. Measured before the fix, 100
+# shares held with one short call written against them:
+#
+#   success: True
+#   message: Created triggered order chain for partial close of 50.0 shares...
+#   sent to broker: [('AAPL', 'SELL', 50.0)]
+#
+# Half a cover is no cover: that call could still have 100 shares called away.
+# ===========================================================================
+class TestAdjustQuantityRefusesToTrimPledgedCover:
+
+    OCC = "AAPL260116C00150000"
+
+    def _short_call(self, acct_def, *, contracts=1.0, multiplier=100,
+                    underlying="AAPL"):
+        from ba2_trade_platform.core.types import OptionRight
+        txn = create_transaction(symbol=underlying, quantity=contracts,
+                                 side=OrderDirection.SELL,
+                                 asset_class=AssetClass.OPTION)
+        return create_trading_order(
+            account_id=acct_def.id, symbol=self.OCC, quantity=contracts,
+            side=OrderDirection.SELL, status=OrderStatus.FILLED,
+            transaction_id=txn.id, filled_qty=contracts,
+            asset_class=AssetClass.OPTION, multiplier=multiplier,
+            contract_symbol=self.OCC, underlying_symbol=underlying,
+            option_type=OptionRight.CALL, strike=150.0)
+
+    def _long_lot(self, acct_def, *, shares=100.0):
+        txn = create_transaction(symbol="AAPL", quantity=shares)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=shares,
+                             transaction_id=txn.id, status=OrderStatus.FILLED,
+                             filled_qty=shares)
+        return txn
+
+    def _holding(self, account, shares):
+        from types import SimpleNamespace
+        account._positions = [SimpleNamespace(
+            symbol="AAPL", qty=shares, qty_available=shares,
+            side=OrderDirection.BUY, asset_class="us_equity")]
+
+    def test_trimming_into_the_cover_is_refused(self):
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        from ba2_common.core.interfaces.AccountInterface import PLEDGED_COVER_REFUSAL
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        submitted, canceled = _record_broker_calls(account)
+        self._holding(account, 100.0)
+        self._short_call(acct_def)
+        txn = self._long_lot(acct_def, shares=100.0)
+
+        result = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+
+        assert result["success"] is False
+        message = result["message"]
+        assert PLEDGED_COVER_REFUSAL in message, message
+        assert "short by 50" in message, "the SHORTFALL must be named: " + message
+        assert "NAKED" in message, message
+        assert submitted == [], "the broker was asked to sell the cover"
+        assert result["orders_created"] == []
+
+    def test_trimming_only_the_UNPLEDGED_EXCESS_is_allowed(self):
+        """THE INVERSE. 150 held, 100 pledged, trim 50: the call keeps its cover
+        and the free shares stay sellable. A guard that refuses every trim on a
+        ticker with one written call is not a guard, it is a freeze."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        from ba2_common.core.db import get_instance
+        from ba2_trade_platform.core.models import Transaction
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        self._holding(account, 150.0)
+        self._short_call(acct_def)
+        txn = self._long_lot(acct_def, shares=150.0)
+
+        result = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+
+        assert result["success"] is True, result["message"]
+        assert get_instance(Transaction, txn.id).quantity == 100.0
+
+    def test_the_refusal_lands_before_any_order_or_cancel(self):
+        """Caller-obeys. The trim persists its close order as the very next
+        statement and cancels the position's real TP/SL the statement after, so a
+        refusal any further down would leave the shares unprotected on their way
+        to being refused — and write the transaction down to a size the account
+        never reached."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        from ba2_common.core.db import get_instance
+        from ba2_common.core.trade_store import orders_where
+        from ba2_trade_platform.core.models import Transaction, TradingOrder
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        submitted, canceled = _record_broker_calls(account)
+        self._holding(account, 100.0)
+        self._short_call(acct_def)
+        txn = self._long_lot(acct_def, shares=100.0)
+        entry = orders_where(transaction_id=txn.id)[0]
+        leg = create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            transaction_id=txn.id, side=OrderDirection.SELL,
+            order_type=OrderType.OCO, status=OrderStatus.NEW,
+            limit_price=180.0, stop_price=140.0, depends_on_order=entry.id)
+        before = len(orders_where(transaction_id=txn.id))
+
+        result = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+
+        assert result["success"] is False
+        assert canceled == [], "the position's protective leg was canceled by a refusal"
+        assert get_instance(TradingOrder, leg.id).status == OrderStatus.NEW
+        assert submitted == []
+        assert len(orders_where(transaction_id=txn.id)) == before, \
+            "a refused trim left an order row behind"
+        assert get_instance(Transaction, txn.id).quantity == 100.0
+
+    def test_ADDING_to_a_position_is_never_refused(self):
+        """A BUY can only ADD cover. Refusing it would block the one action that
+        FIXES a shortfall — and every accessor is broken here on purpose to prove
+        the question is not even asked."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        self._holding(account, 100.0)
+        self._short_call(acct_def)
+        txn = self._long_lot(acct_def, shares=100.0)
+        account.get_positions = lambda: (_ for _ in ()).throw(
+            AssertionError("an add-to-position must not read the position feed"))
+        account.open_option_orders_book_wide = lambda: (_ for _ in ()).throw(
+            AssertionError("an add-to-position must not read the option book"))
+
+        result = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=+50.0)
+
+        assert result["success"] is True, result["message"]
+
+    def test_trimming_a_SHORT_position_is_never_refused(self):
+        """Closing part of a SHORT equity position BUYS shares back, which can
+        only ADD cover; refusing it would strand a short nobody can flatten."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        self._short_call(acct_def)
+        txn = create_transaction(symbol="AAPL", quantity=100.0,
+                                 side=OrderDirection.SELL)
+        create_trading_order(account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+                             transaction_id=txn.id, side=OrderDirection.SELL,
+                             status=OrderStatus.FILLED, filled_qty=100.0)
+        account.get_positions = lambda: (_ for _ in ()).throw(
+            AssertionError("a BUY-side trim must not read the position feed"))
+
+        result = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+
+        assert result["success"] is True, result["message"]
+
+    def test_a_NON_OPTIONS_account_is_completely_unaffected(self):
+        """An account that cannot hold options has nothing pledged by
+        construction. The double has no cover accessors at all (they live on the
+        mixin), so a guard that asked without checking the capability would
+        AttributeError here rather than quietly pass."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        from tests.test_accounts.test_account_interface import (
+            _equity_only_account_class,
+        )
+        acct_def = create_account_definition()
+        account = _equity_only_account_class()(acct_def.id)
+        assert not hasattr(account, "shares_pledged_to_short_calls")
+        self._holding(account, 100.0)
+        self._short_call(acct_def)          # in the book; not this account's business
+        txn = self._long_lot(acct_def, shares=100.0)
+
+        result = TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+
+        assert result["success"] is True, result["message"]
+
+    def test_the_trim_shares_ONE_decision_with_the_close_path(self):
+        """Both seams call the same function, so neither can drift from the other
+        about the same account state — the defect being fixed is precisely that
+        one of them had never been taught to ask."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        self._holding(account, 100.0)
+        self._short_call(acct_def)
+        txn = self._long_lot(acct_def, shares=100.0)
+        asked = []
+        real = account.cover_refusal_for_equity_sale
+
+        def _spy(symbol, quantity, **kwargs):
+            asked.append((symbol, quantity, kwargs.get("except_transaction_id")))
+            return real(symbol, quantity, **kwargs)
+
+        account.cover_refusal_for_equity_sale = _spy
+
+        TransactionHelper.adjust_quantity_with_tpsl(
+            account=account, transaction=txn, qty_change=-50.0)
+
+        assert asked == [("AAPL", 50.0, txn.id)], (
+            "the trim must ask about the shares IT is selling, and exclude its own "
+            f"transaction's working legs: {asked}")

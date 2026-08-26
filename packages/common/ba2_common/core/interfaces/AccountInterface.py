@@ -13,8 +13,10 @@ from ba2_common.core.db import add_instance, get_db, get_instance, update_instan
 from ba2_common.core.failure_modes import absorb_if_benign
 
 #: Marker carried by every refusal to sell shares that are acting as COVER for an open
-#: short call — the EXIT half of OPT-L1, raised only by
-#: ``submit_close_order_for_transaction`` below.
+#: short call — the EXIT half of OPT-L1, produced by exactly one function,
+#: ``AccountInterface.cover_refusal_for_equity_sale`` below, which both equity exit seams
+#: (``submit_close_order_for_transaction`` and
+#: ``TransactionHelper.adjust_quantity_with_tpsl``) consult.
 #:
 #: DELIBERATELY NOT ``OptionsAccountInterface.COVER_REFUSAL``, whose own docstring scopes
 #: it to the SUBMISSION boundary and whose remedy is the opposite of this one. That refusal
@@ -23,9 +25,8 @@ from ba2_common.core.failure_modes import absorb_if_benign
 #: them". Giving the two one marker would send an operator to buy the very shares a run has
 #: just been stopped from selling.
 #:
-#: It lives here rather than beside the other option markers because this is the only site
-#: that produces it and the question it answers — "may this EQUITY order go out?" — is this
-#: file's, not the options mixin's.
+#: It lives here rather than beside the other option markers because the question it
+#: answers — "may this EQUITY order go out?" — is this file's, not the options mixin's.
 PLEDGED_COVER_REFUSAL = "PLEDGED COVER"
 
 
@@ -1595,6 +1596,139 @@ class AccountInterface(ReadOnlyAccountInterface):
         )
         return isinstance(self, OptionsAccountInterface)
 
+    def cover_refusal_for_equity_sale(
+        self, symbol: str, quantity: float, *, action: str,
+        except_transaction_id: Optional[int] = None,
+        order_noun: str = "close order",
+    ) -> Optional[str]:
+        """Why selling ``quantity`` shares of ``symbol`` must not happen — or ``None``.
+
+        SEAM 1 / OPT-L1, THE EXIT HALF, and the single place that decides it. Seam 1
+        stopped the wrong-INSTRUMENT order: an OPTION transaction can no longer be closed
+        or adjusted through the equity path, and options no longer enter the allocation
+        plan. It did NOT stop this. A "set AAPL to 0%" allocation run walks the EQUITY
+        transactions for AAPL and closes each one; every one of those is a perfectly valid
+        equity close, so nothing else refuses it — and the shares collateralising an open
+        short call are sold, leaving that call NAKED with the option's own legs untouched
+        and every guard reporting success. A "set AAPL to 50%" run reaches the same damage
+        through ``TransactionHelper.adjust_quantity_with_tpsl``.
+
+        ONE FUNCTION FOR BOTH SEAMS. The close path and the trim path ask an identical
+        question about identical state, and two copies of this comparison would drift —
+        which is how the trim path came to be the unguarded one in the first place. The
+        callers differ only in the words: ``action`` names what is being attempted
+        ("closing transaction 42") and ``order_noun`` what will not now be written.
+
+        THE ARITHMETIC, and the netting that was missing. ``held`` is what the broker
+        reports RIGHT NOW; ``working`` is what this account has already committed to sell
+        and not yet sold; ``pledged`` is what open short calls can call away:
+
+            held − working − quantity  <  pledged   ->  REFUSE
+
+        Without ``working``, each leg of a multi-lot close compared its own size against
+        the same untouched ``held``: 200 shares held as two 100-share lots with 100
+        pledged admitted BOTH closes, and on the DEFERRED branch (a cancelled TP/SL, so
+        the close is written PENDING and nothing reaches the broker) that is deterministic
+        rather than a race — ``get_positions()`` cannot decrement between iterations.
+        Netting it in at the SEAM rather than tallying it through the loop is what makes
+        the answer right for every caller rather than for one: the UI close button,
+        TradeManager, Smart-RM and a second allocation runner all see the same committed
+        sells, and so does a close left PENDING by an EARLIER run, which no per-run tally
+        could know about. A tally would also have to be threaded through ``_close_symbol``
+        and ``_adjust_symbol`` and kept in step between them — the same duplication this
+        function exists to remove.
+
+        ``except_transaction_id`` is the caller's OWN transaction, and leaving its working
+        rows out is what stops the netting from double-counting: a sale already staged on
+        that transaction and the sale being proposed dispose of the SAME shares, and both
+        exit seams cancel its legs on the way. See :meth:`OptionsAccountInterface.
+        equity_shares_working_to_sell` for what counts, what does not (a resting
+        protective leg — a recorded gap, with its reason), and why nothing else is
+        excluded.
+
+        THREE TRI-STATE INPUTS, AND EVERY ``None`` IS A REFUSAL. An unreadable option book
+        is not an empty one; ``get_positions()`` returning ``None`` is a FETCH FAILURE and
+        not a flat account (the conflation that force-closed 8 real transactions on
+        2026-07-03); an order row that will not say how many shares it will sell is not a
+        row selling none. Each unknown names a DIFFERENT system to repair — the OPTION
+        BOOK, the POSITION FEED, the WORKING ORDER BOOK — because sending an operator to
+        the wrong one costs an afternoon.
+
+        A RESULT STRING, NOT A RAISE. Both callers report operational outcomes as data
+        (``close_transaction`` copies ``success``/``message`` straight through; the trim
+        path's whole body sits inside a ``try`` whose handler would flatten a raise into
+        ``Error: ...`` and lose the reason), so the refusal is returned and each caller
+        wraps it in its own convention.
+
+        Asked ONLY of an account that CAN hold options — one that cannot has nothing
+        pledged by construction and must not pay for a book read to be told so — and only
+        for a positive quantity. The position feed and the working-order book are touched
+        ONLY once a pledge is known to exist: on a live broker each is a round trip, and
+        an account with no short calls must not pay for them on every equity close.
+        """
+        if quantity is None or quantity <= 0 or not self._can_hold_options():
+            return None
+
+        pledged = self.shares_pledged_to_short_calls(symbol)
+        if pledged is None:
+            return (
+                f"{PLEDGED_COVER_REFUSAL}: how many {symbol} shares are pledged as cover "
+                f"for open short calls could not be measured — "
+                f"shares_pledged_to_short_calls() returned UNKNOWN, i.e. the OPTION BOOK "
+                f"did not answer (the logged error above names the unreadable row). "
+                f"Selling the {quantity:g} {symbol} share(s) that {action} would sell "
+                f"could therefore strip an open short call of its cover, and an "
+                f"unmeasurable pledge must not be read as 'nothing is pledged'. "
+                f"No {order_noun} was created. Repair the option order book and retry — "
+                f"this is NOT a shortfall and closing a position will not clear it.")
+        if pledged <= 0:
+            return None
+
+        held = self.held_shares_for_cover(symbol)
+        if held is None:
+            return (
+                f"{PLEDGED_COVER_REFUSAL}: {pledged} {symbol} share(s) are pledged as "
+                f"cover for open short calls, but how many this account actually holds "
+                f"could not be measured — held_shares_for_cover() returned UNKNOWN, i.e. "
+                f"the POSITION FEED did not answer (the logged error above names the "
+                f"fetch or the row that failed). Whether {action}, which would sell "
+                f"{quantity:g} share(s), would leave those calls naked is therefore "
+                f"unknown. No {order_noun} was created. Repair the position feed and "
+                f"retry.")
+
+        working = self.equity_shares_working_to_sell(
+            symbol, except_transaction_id=except_transaction_id)
+        if working is None:
+            return (
+                f"{PLEDGED_COVER_REFUSAL}: {pledged} {symbol} share(s) are pledged as "
+                f"cover for open short calls, but how many are ALREADY committed to be "
+                f"sold could not be measured — equity_shares_working_to_sell() returned "
+                f"UNKNOWN, i.e. a working {symbol} SELL row does not report a usable size "
+                f"(the logged error above names it). Whether {action}, which "
+                f"would sell {quantity:g} more share(s), would leave those calls naked is "
+                f"therefore unknown. No {order_noun} was created. Repair that order row "
+                f"and retry.")
+
+        remaining = held - working - quantity
+        if remaining >= pledged:
+            return None
+
+        already = ("" if working <= 0 else
+                   f" (another {working:g} share(s) are already committed to be sold by "
+                   f"orders working now, and they leave too)")
+        free = max(0, held - working - pledged)
+        remedy = (f"Buy back (or let expire) the short call to release its cover, "
+                  f"or sell only the {free:g} unpledged share(s)." if working <= 0 else
+                  f"Buy back (or let expire) the short call to release its cover, cancel "
+                  f"the {working:g} share(s) already working, or sell only the {free:g} "
+                  f"share(s) that are neither pledged nor already committed.")
+        return (
+            f"{PLEDGED_COVER_REFUSAL}: {action} would sell {quantity:g} {symbol} "
+            f"share(s), leaving {remaining:g} of the {held} this account holds"
+            f"{already} — but {pledged} are pledged as cover for open short calls, so "
+            f"that is short by {pledged - remaining:g} share(s) and would leave a written "
+            f"call NAKED. No {order_noun} was created. {remedy}")
+
     def submit_close_order_for_transaction(
         self,
         transaction: "Transaction",
@@ -1676,28 +1810,15 @@ class AccountInterface(ReadOnlyAccountInterface):
 
         # SEAM 1 / OPT-L1, THE EXIT HALF — never sell shares that are already COVER.
         #
-        # THE DAMAGE THIS PREVENTS, and it is the half that matters most. Seam 1 stopped the
-        # wrong-instrument order: an OPTION transaction can no longer be closed here (the
-        # guard at the top of this method), and options no longer enter the allocation plan.
-        # It did NOT stop this. A "set AAPL to 0%" allocation run walks the EQUITY
-        # transactions for AAPL and closes each one; every one of those closes is a perfectly
-        # valid equity close, so nothing above refuses it — and the 100 shares collateralising
-        # an open short call are sold, leaving that call NAKED. The option's own legs are
-        # untouched and every guard reports success.
+        # The decision itself, its arithmetic and the reasoning behind every branch live in
+        # ``cover_refusal_for_equity_sale``, which the partial-TRIM seam
+        # (``TransactionHelper.adjust_quantity_with_tpsl``) consults with the same call:
+        # the two paths sell the same shares out from under the same short calls, and two
+        # copies of the comparison would drift.
         #
-        # The question is only asked of an account that CAN hold options: one that cannot has
-        # nothing pledged, by construction, and must not pay for the book read (or, for a live
-        # broker, the position fetch) to be told so.
-        #
-        # And only on a SELL. Closing a SHORT equity position BUYS shares back, which can only
-        # ADD cover; refusing that would strand a short nobody can flatten, which is strictly
-        # worse than the naked call it does not prevent.
-        #
-        # BOTH ACCESSORS ARE TRI-STATE AND ``None`` IS A REFUSAL, NOT A ZERO. That is the
-        # entire argument of their docstrings: an unreadable option book is not an empty one,
-        # and ``get_positions()`` returning ``None`` is a FETCH FAILURE, not a flat account
-        # (the conflation that force-closed 8 real transactions on 2026-07-03). Selling on
-        # either unknown is exactly how a covered call goes naked during an outage.
+        # Asked only on a SELL. Closing a SHORT equity position BUYS shares back, which can
+        # only ADD cover; refusing that would strand a short nobody can flatten, which is
+        # strictly worse than the naked call it does not prevent.
         #
         # WHY A RESULT DICT AND NOT A ``raise``, given the asset-class guard above raises.
         # That one is a CALLER ERROR: no argument and no account state could make
@@ -1713,49 +1834,15 @@ class AccountInterface(ReadOnlyAccountInterface):
         # routine, expected, self-clearing refusal dressed as a crash. The allocation runner
         # (``portfolio_allocation_service._close_one_transaction``) treats a raise and a
         # falsy ``success`` identically, so nothing is lost in safety either way.
-        if close_side == OrderDirection.SELL and self._can_hold_options():
-            pledged = self.shares_pledged_to_short_calls(transaction.symbol)
-            if pledged is None:
-                msg = (
-                    f"{PLEDGED_COVER_REFUSAL}: how many {transaction.symbol} shares are "
-                    f"pledged as cover for open short calls could not be measured — "
-                    f"shares_pledged_to_short_calls() returned UNKNOWN, i.e. the OPTION BOOK "
-                    f"did not answer (the logged error above names the unreadable row). "
-                    f"Selling the {current_qty:g} share(s) of transaction {transaction.id} "
-                    f"could therefore strip an open short call of its cover, and an "
-                    f"unmeasurable pledge must not be read as 'nothing is pledged'. No close "
-                    f"order was created. Repair the option order book and retry — this is "
-                    f"NOT a shortfall and closing a position will not clear it.")
-                logger.error(f"submit_close_order_for_transaction: {msg}")
-                return {"success": False, "message": msg, "close_order_id": None}
-            if pledged > 0:
-                held = self.held_shares_for_cover(transaction.symbol)
-                if held is None:
-                    msg = (
-                        f"{PLEDGED_COVER_REFUSAL}: {pledged} {transaction.symbol} share(s) "
-                        f"are pledged as cover for open short calls, but how many this "
-                        f"account actually holds could not be measured — "
-                        f"held_shares_for_cover() returned UNKNOWN, i.e. the POSITION FEED "
-                        f"did not answer (the logged error above names the fetch or the row "
-                        f"that failed). Whether selling the {current_qty:g} share(s) of "
-                        f"transaction {transaction.id} would leave those calls naked is "
-                        f"therefore unknown. No close order was created. Repair the position "
-                        f"feed and retry.")
-                    logger.error(f"submit_close_order_for_transaction: {msg}")
-                    return {"success": False, "message": msg, "close_order_id": None}
-                remaining = held - current_qty
-                if remaining < pledged:
-                    msg = (
-                        f"{PLEDGED_COVER_REFUSAL}: closing transaction {transaction.id} would "
-                        f"sell {current_qty:g} {transaction.symbol} share(s), leaving "
-                        f"{remaining:g} of the {held} this account holds — but {pledged} are "
-                        f"pledged as cover for open short calls, so that is short by "
-                        f"{pledged - remaining:g} share(s) and would leave a written call "
-                        f"NAKED. No close order was created. Buy back (or let expire) the "
-                        f"short call to release its cover, or close only the "
-                        f"{max(0, held - pledged)} unpledged share(s).")
-                    logger.error(f"submit_close_order_for_transaction: {msg}")
-                    return {"success": False, "message": msg, "close_order_id": None}
+        if close_side == OrderDirection.SELL:
+            refusal = self.cover_refusal_for_equity_sale(
+                transaction.symbol, current_qty,
+                action=f"closing transaction {transaction.id}",
+                except_transaction_id=transaction.id,
+                order_noun="close order")
+            if refusal:
+                logger.error(f"submit_close_order_for_transaction: {refusal}")
+                return {"success": False, "message": refusal, "close_order_id": None}
 
         close_order = TradingOrder(
             account_id=self.id,

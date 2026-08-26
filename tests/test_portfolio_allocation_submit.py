@@ -14,6 +14,9 @@ from ba2_trade_platform.core.account_types import (
     CashTransfer, MarginInfo, MarketHours, OrderImpact,
 )
 from ba2_trade_platform.core.db import add_instance, get_db, get_instance, update_instance
+from ba2_trade_platform.core.interfaces.AccountInterface import (
+    AccountInterface as _RealAccountInterface,
+)
 from ba2_trade_platform.core.models import (
     PortfolioAllocationRun, PortfolioIncomeEvent, TradingOrder, Transaction,
 )
@@ -71,6 +74,20 @@ class FakeAccount:
     """Duck-typed stand-in for AccountInterface. No DB lookups, no broker."""
 
     supports_trading = True
+
+    # OPT-L1's exit guard, taken from the REAL AccountInterface rather than stubbed
+    # out. ``TransactionHelper.adjust_quantity_with_tpsl`` now asks every account
+    # whether the shares it is about to trim are pledged as cover for an open short
+    # call, and a double that answered "nothing is pledged" on its own authority
+    # would be asserting the fact under test. Bound here unchanged, the real
+    # capability check answers for itself: ``_can_hold_options`` is an isinstance
+    # against ``OptionsAccountInterface``, this duck-typed double is not one, and an
+    # account that cannot hold options has nothing pledged BY CONSTRUCTION. The
+    # cover accessors are therefore never reached, which is why the double needs
+    # none of them — and if the guard ever stopped checking the capability first,
+    # every trim test here would AttributeError rather than quietly pass.
+    _can_hold_options = _RealAccountInterface._can_hold_options
+    cover_refusal_for_equity_sale = _RealAccountInterface.cover_refusal_for_equity_sale
 
     def __init__(self, account_id: int = 1):
         self.id = account_id

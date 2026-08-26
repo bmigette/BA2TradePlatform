@@ -2367,3 +2367,452 @@ class TestTheExitGuardRefusesToSellPledgedCover:
             "a raise would have been re-wrapped by the outer handler: "
             + result["message"])
         assert submitted == []
+
+
+# ===========================================================================
+# THE SECOND LOT — the guard must subtract a close it has already authorised
+#
+# The guard as first written compared THIS transaction's size against a live,
+# account-wide ``held``, with no account of the closes the same run had already
+# created. ``_close_symbol`` walks EVERY transaction for a symbol, and the
+# codebase explicitly models multi-lot holdings (``split_delta_fifo``: "30 shares
+# held as 20 + 10"). 200 AAPL held as two 100-share lots with 100 pledged to one
+# short call therefore admitted BOTH closes — the guard's own scenario, defeated
+# by holding the shares in two rows instead of one.
+#
+# ON THE DEFERRED BRANCH THAT IS DETERMINISTIC, NOT A RACE. Whenever
+# ``close_transaction`` cancelled a TP/SL the close order is written PENDING and
+# nothing goes to the broker, so ``get_positions()`` CANNOT decrement between
+# iterations however slowly the loop runs. Both branches are pinned below; the
+# deferred one is the one that must never regress.
+# ===========================================================================
+class TestTheExitGuardNetsSalesAlreadyInFlight:
+
+    OCC = TestTheExitGuardRefusesToSellPledgedCover.OCC
+    _long_equity_txn = TestTheExitGuardRefusesToSellPledgedCover._long_equity_txn
+    _open_short_call = TestTheExitGuardRefusesToSellPledgedCover._open_short_call
+    _holding = TestTheExitGuardRefusesToSellPledgedCover._holding
+
+    def _accepting_account(self, acct_def, monkeypatch):
+        """A broker that ACCEPTS a market SELL and has not printed it yet.
+
+        The honest state of the world between submission and fill, and the only
+        one in which the immediate branch's hazard is visible: the order row is
+        persisted and working, ``get_positions()`` still reports every share.
+        A double that filled instantly AND decremented the holding would hide the
+        window; one that filled instantly and did NOT decrement would invent it.
+        """
+        from ba2_trade_platform.core.db import add_instance
+
+        account = MockAccount(acct_def.id)
+        sent = []
+
+        def _submit(order, **kwargs):
+            sent.append(order)
+            order.status = OrderStatus.NEW
+            order.account_id = account.id
+            order.broker_order_id = f"bkr-{len(sent)}"
+            if not order.id:
+                add_instance(order, expunge_after_flush=True)
+            return order
+
+        monkeypatch.setattr(account, "submit_order", _submit)
+        return account, sent
+
+    def _two_lots(self, acct_def, account, *, held=200.0, lot=100.0, contracts=1.0):
+        """``held`` shares of AAPL carried as TWO transactions, one short call."""
+        self._holding(account, held)
+        self._open_short_call(acct_def, contracts=contracts)
+        return (self._long_equity_txn(acct_def, shares=lot),
+                self._long_equity_txn(acct_def, shares=lot))
+
+    # -- the two branches --------------------------------------------------
+    def test_the_DEFERRED_close_of_a_second_lot_sees_the_first(self, monkeypatch):
+        """THE DETERMINISTIC ONE. Both closes are written PENDING behind a
+        cancelled TP/SL, so nothing reaches the broker and no fill can decrement
+        the holding between them. Before the netting both rows were written and
+        200 of 200 shares were queued to sell against a 100-share pledge."""
+        from ba2_common.core.trade_store import orders_where
+
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        first, second = self._two_lots(acct_def, account)
+        blocker = create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, status=OrderStatus.CANCELED)
+
+        one = account.submit_close_order_for_transaction(
+            first, last_broker_canceled_order_id=blocker.id)
+        two = account.submit_close_order_for_transaction(
+            second, last_broker_canceled_order_id=blocker.id)
+
+        assert one["success"] is True, one["message"]
+        assert two["success"] is False, "the second lot did not see the first"
+        assert PLEDGED_COVER_REFUSAL in two["message"], two["message"]
+        assert "already committed to be sold" in two["message"], two["message"]
+        queued = [o for o in orders_where(account_id=acct_def.id)
+                  if o.side == OrderDirection.SELL
+                  and o.order_type == OrderType.MARKET
+                  and o.status == OrderStatus.PENDING]
+        assert [o.quantity for o in queued] == [100.0], \
+            "200 of the 200 held shares were queued to sell against a 100-share pledge"
+        assert sent == [], "the deferred branch must not reach the broker at all"
+
+    def test_the_IMMEDIATE_close_of_a_second_lot_sees_the_first(self, monkeypatch):
+        """The same hole with the order actually sent. The broker has accepted
+        the first market SELL and not yet printed it, so the position feed still
+        reports 200 — which is exactly when the second close must not be sized
+        against it."""
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        first, second = self._two_lots(acct_def, account)
+
+        one = account.submit_close_order_for_transaction(first)
+        two = account.submit_close_order_for_transaction(second)
+
+        assert one["success"] is True, one["message"]
+        assert two["success"] is False, "the second lot did not see the first"
+        assert PLEDGED_COVER_REFUSAL in two["message"], two["message"]
+        assert [(o.symbol, o.side, o.quantity) for o in sent] == \
+            [("AAPL", OrderDirection.SELL, 100.0)], \
+            "both lots reached the broker and the short call was left naked"
+
+    def test_a_run_that_can_afford_BOTH_lots_still_closes_both(self, monkeypatch):
+        """THE INVERSE, and the reason netting is not just 'refuse more'. 300
+        held, 100 pledged: two 100-share lots can both go and the call keeps its
+        cover. A guard that counted in-flight sales without doing the arithmetic
+        would stop the second one anyway."""
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        first, second = self._two_lots(acct_def, account, held=300.0)
+
+        one = account.submit_close_order_for_transaction(first)
+        two = account.submit_close_order_for_transaction(second)
+
+        assert one["success"] is True and two["success"] is True, two["message"]
+        assert [o.quantity for o in sent] == [100.0, 100.0]
+
+    # -- what must NOT be netted ------------------------------------------
+    def test_a_transactions_OWN_working_close_is_not_counted_against_itself(
+            self, monkeypatch):
+        """A lot's own working SELL and the close being proposed dispose of the
+        SAME shares, and both exit seams cancel the lot's legs on the way. Count
+        them together and every retry of a protected close refuses forever, with
+        nothing an operator could do to clear it."""
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 200.0)
+        self._open_short_call(acct_def)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=txn.id,
+            comment="Closing position for transaction")
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(sent) == 1
+
+    def test_a_FILLED_close_is_not_subtracted_a_second_time(self, monkeypatch):
+        """A close that FILLED has already left the position and
+        ``get_positions()`` reports the smaller holding. Subtracting it again
+        would refuse a sale the account can plainly make.
+
+        Recorded as belt-and-braces rather than as a single-mutation
+        discriminator: TWO independent things keep a filled close out of the
+        total — the ACTIVE status filter, and ``ordered − filled`` being zero —
+        so widening either one alone changes nothing. Both must go at once for
+        this to fail, which is exactly the property worth stating.
+        """
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 200.0)          # the fill is already reflected here
+        self._open_short_call(acct_def)
+        other = self._long_equity_txn(acct_def, shares=100.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.FILLED, filled_qty=100.0, transaction_id=other.id)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(sent) == 1
+
+    def test_a_CANCELED_close_row_gives_its_shares_back(self, monkeypatch):
+        """A terminal row will never sell anything. Leaving it counted would
+        freeze the shares of every close that was ever abandoned."""
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 200.0)
+        self._open_short_call(acct_def)
+        other = self._long_equity_txn(acct_def, shares=100.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.CANCELED, transaction_id=other.id)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(sent) == 1
+
+    def test_a_RESTING_PROTECTIVE_LEG_is_not_netted__a_recorded_gap(self, monkeypatch):
+        """DELIBERATE, and pinned so that changing it is a decision.
+
+        A stop-loss on the covering shares really can strip a call, and counting
+        it here was tried. It cannot stay: ``close_transaction`` cancels a
+        transaction's legs AT THE BROKER without terminalising the DB rows (they
+        clear on the next ``refresh_orders``), so every later exit on the ticker
+        refused on the strength of orders that no longer existed — a guard that
+        blocks every exit is its own incident. ``MARKET`` is therefore the test
+        for "a sale already decided", which every close path on this platform
+        satisfies and no protective leg ever does.
+
+        Charging a stop against the cover it can strip belongs where the stop is
+        WRITTEN. If that is ever built here instead, this test is the one to
+        delete, on purpose, with the stale-cancel problem solved first.
+        """
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 200.0)
+        self._open_short_call(acct_def)
+        other = self._long_equity_txn(acct_def, shares=100.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.SELL_STOP,
+            status=OrderStatus.NEW, stop_price=140.0, transaction_id=other.id,
+            broker_order_id="bkr-stop")
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(sent) == 1
+
+    def test_a_working_close_on_ANOTHER_SYMBOL_is_not_netted(self, monkeypatch):
+        """Cover is per ticker and so is the supply against it."""
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 200.0)
+        self._open_short_call(acct_def)
+        create_trading_order(
+            account_id=acct_def.id, symbol="MSFT", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(sent) == 1
+
+    def test_an_OPTION_sell_order_is_not_counted_as_shares(self, monkeypatch):
+        """One contract is not one share. A working option SELL carries the
+        UNDERLYING in ``underlying_symbol`` and a contract count in ``quantity``;
+        read as shares it would subtract 100 from a share supply of 200 and
+        refuse a close the account can plainly make. Short PUTs so the pledge
+        itself is untouched and the asset-class filter is the only thing on
+        trial."""
+        from ba2_trade_platform.core.types import OptionRight
+        put = "AAPL260116P00150000"
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 200.0)
+        self._open_short_call(acct_def)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, asset_class=AssetClass.OPTION,
+            multiplier=100, contract_symbol=put, underlying_symbol="AAPL",
+            option_type=OptionRight.PUT, strike=150.0)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(sent) == 1
+
+    # -- partial fills and unknowns ---------------------------------------
+    def test_only_the_UNFILLED_REMAINDER_of_a_working_close_is_netted(self, monkeypatch):
+        """A close of 100 that has printed 60 has already taken 60 out of the
+        holding the feed reports; only the 40 still working is still to come.
+        Netting the whole 100 would double-count the filled part and refuse a
+        legitimate close."""
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 240.0)          # 300 bought, 60 of the other lot gone
+        self._open_short_call(acct_def)
+        other = self._long_equity_txn(acct_def, shares=100.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.PARTIALLY_FILLED, filled_qty=60.0,
+            transaction_id=other.id)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        # 240 held − 40 still working − 100 sold now = 100 left, exactly the pledge.
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is True, result["message"]
+        assert len(sent) == 1
+
+        # ...and one share more is over the line.
+        bigger = self._long_equity_txn(acct_def, shares=101.0)
+        refused = account.submit_close_order_for_transaction(bigger)
+        assert refused["success"] is False, refused["message"]
+
+    def test_a_filled_qty_ABOVE_the_ordered_quantity_does_not_ADD_supply(
+            self, monkeypatch):
+        """A damaged row is not a NEGATIVE commitment.
+
+        ``ordered − filled`` is −50 on a close of 100 that reports 150 filled, and
+        without the floor that number is SUBTRACTED from the working total —
+        inventing 50 shares of headroom out of a corrupted row, in the one
+        direction that uncovers a call. The clean 100-share close beside it is
+        what makes the sign visible: the total must be 100, not 50.
+
+        (The floor is redundant in the two option views, whose ``> _ASSIGNMENT_EPS``
+        test already drops a negative remainder. It is load-bearing here, where
+        the remainder is summed unconditionally, which is why the case is pinned
+        on this accessor.)
+        """
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 250.0)
+        self._open_short_call(acct_def)
+        clean = self._long_equity_txn(acct_def, shares=100.0)
+        damaged = self._long_equity_txn(acct_def, shares=100.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=clean.id)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.PARTIALLY_FILLED, filled_qty=150.0,
+            transaction_id=damaged.id)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        # 250 held − 100 working − 100 sold now = 50 left against a 100 pledge.
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is False, result["message"]
+        assert sent == []
+
+    def test_a_working_SELL_with_no_usable_SIZE_is_refused_and_names_the_order_book(
+            self, monkeypatch):
+        """UNKNOWN is not zero here either, and it is a THIRD system to repair.
+
+        A working SELL for 0 shares is a damaged row, not an order that sells
+        nothing — ``submit_order`` refuses to send one for exactly that reason
+        ("a zero-quantity TP/SL is cancelled by the broker and leaves the
+        position unprotected"). How many shares it will really take is unknown,
+        and unknown must not resolve to the number that frees the cover.
+
+        The message must not send the operator to the option book or the position
+        feed: both answered.
+        """
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 200.0)
+        self._open_short_call(acct_def)
+        other = self._long_equity_txn(acct_def, shares=100.0)
+        create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=0.0,
+            side=OrderDirection.SELL, order_type=OrderType.MARKET,
+            status=OrderStatus.PENDING, transaction_id=other.id)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is False
+        message = result["message"]
+        assert PLEDGED_COVER_REFUSAL in message, message
+        assert "does not report a usable size" in message, message
+        assert "option book" not in message.lower(), (
+            "the option book answered — blaming it sends the operator to the "
+            "wrong system: " + message)
+        assert "position feed" not in message.lower(), (
+            "the position feed answered — blaming it sends the operator to the "
+            "wrong system: " + message)
+        assert sent == []
+
+    def test_a_LOCKED_DATABASE_refuses_rather_than_reading_an_empty_order_book(
+            self, monkeypatch):
+        """The tri-state's absorb half, on the third accessor.
+
+        A locked database is the world being uncooperative, so it is absorbed
+        into UNKNOWN rather than propagated — and UNKNOWN refuses. Reading it as
+        "nothing is working" is how the netting silently stops existing during
+        exactly the outage in which two runners are most likely to overlap.
+        """
+        from sqlalchemy.exc import OperationalError
+        from ba2_common.core import trade_store
+
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 200.0)
+        self._open_short_call(acct_def)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+        real = trade_store.orders_where
+
+        def _locked(**kwargs):
+            if kwargs.get("statuses") is not None:
+                raise OperationalError("SELECT 1", {}, Exception("database is locked"))
+            return real(**kwargs)
+
+        monkeypatch.setattr(trade_store, "orders_where", _locked)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert result["success"] is False
+        assert PLEDGED_COVER_REFUSAL in result["message"], result["message"]
+        assert sent == []
+
+    def test_a_DEFECT_in_the_order_book_read_still_propagates(self, monkeypatch):
+        """The other half. Anything outside the benign set is a defect, and a
+        defect that quietly answered "unmeasurable" forever would be a gate that
+        has silently stopped working."""
+        from ba2_common.core import trade_store
+
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 200.0)
+        self._open_short_call(acct_def)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+        real = trade_store.orders_where
+
+        def _broken(**kwargs):
+            if kwargs.get("statuses") is not None:
+                raise TypeError("orders_where() got an unexpected keyword argument")
+            return real(**kwargs)
+
+        monkeypatch.setattr(trade_store, "orders_where", _broken)
+
+        with pytest.raises(TypeError):
+            account.submit_close_order_for_transaction(txn)
+        assert sent == []
+
+    def test_the_working_order_book_is_not_read_when_NOTHING_is_pledged(
+            self, monkeypatch):
+        """Same discipline as the position feed: a third read, and on a live
+        broker a third chance for an outage to block every exit on the platform.
+        An account with no short calls must not pay for it."""
+        acct_def = create_account_definition()
+        account, sent = self._accepting_account(acct_def, monkeypatch)
+        self._holding(account, 200.0)
+        txn = self._long_equity_txn(acct_def, shares=100.0)
+        calls = []
+        monkeypatch.setattr(account, "equity_shares_working_to_sell",
+                            lambda *a, **k: calls.append(1) or None)
+
+        result = account.submit_close_order_for_transaction(txn)
+
+        assert calls == [], "the working order book was read with nothing pledged"
+        assert result["success"] is True, result["message"]
+        assert len(sent) == 1

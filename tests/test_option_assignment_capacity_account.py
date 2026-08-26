@@ -276,10 +276,102 @@ def test_an_order_not_yet_linked_to_a_transaction_still_owes(mock_account):
 
 
 def test_a_terminal_order_owes_nothing(mock_account):
+    """A cancel that printed NOTHING releases everything — ``short_put_order``
+    leaves ``filled_qty`` NULL for a non-FILLED status, which is what makes this
+    an ordinary cancel rather than the raced one pinned below."""
     mock_account._balance = 100_000.0
-    short_put_order(mock_account, strike=225.0, txn_id=open_txn("AAPL"),
-                    status=OrderStatus.CANCELED)
+    order = short_put_order(mock_account, strike=225.0, txn_id=open_txn("AAPL"),
+                            status=OrderStatus.CANCELED)
+    assert get_instance(TradingOrder, order).filled_qty is None
     assert mock_account.short_put_assignment_exposure().cost == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# a CANCEL that raced a live FILL -- against the REAL store
+#
+# ``open_option_orders_book_wide`` filtered on ``not_statuses=terminal`` and
+# CANCELED is terminal, so a sell-to-open of 3 that filled 1 before the cancel
+# landed left the book entirely -- taking with it the one contract that genuinely
+# traded and can still be assigned. The platform knows this state occurs:
+# ``AlpacaAccount`` handles "a cancel that raced a live fill leaves the order
+# CANCELED with filled_qty > 0" explicitly.
+#
+# The accessor-level arithmetic is pinned in
+# packages/common/tests/test_option_collateral_pledge.py. THESE tests are about
+# the QUERY: whether the row is in the list at all, driven through the real store
+# and reaching all three views that share it.
+# ---------------------------------------------------------------------------
+def canceled_after_one_filled(account, *, strike=225.0, ordered=3, filled=1,
+                              reserve=None, txn_id=None):
+    return add_instance(TradingOrder(
+        account_id=account.id, symbol="AAPL", underlying_symbol="AAPL",
+        quantity=ordered, filled_qty=filled, side=OrderDirection.SELL,
+        order_type=OrderType.SELL_LIMIT, status=OrderStatus.CANCELED,
+        asset_class=AssetClass.OPTION, multiplier=100,
+        contract_symbol=f"AAPL260101P{int(strike * 1000):08d}",
+        option_type=OptionRight.PUT, strike=strike,
+        option_strategy=None if reserve is None else "cash_secured_put",
+        transaction_id=txn_id if txn_id is not None else open_txn("AAPL"),
+        data={} if reserve is None else {"option_reserve": reserve}))
+
+
+def test_a_cancel_that_raced_a_fill_stays_in_the_book(mock_account):
+    """The query, on its own. One contract traded; the row that records it must
+    survive its own order's death, exactly as a FILLED row does."""
+    order_id = canceled_after_one_filled(mock_account)
+    book = mock_account.open_option_orders_book_wide()
+    assert [o.id for o in book] == [order_id], \
+        "the one contract that genuinely traded left the book with the cancel"
+
+
+def test_a_cancel_that_raced_a_fill_still_owes_the_contract_it_sold(mock_account):
+    """0 was the fail-open answer: the account looked able to take on more
+    delivery obligation than it can pay for, because a put it really is short
+    stopped counting."""
+    mock_account._balance = 100_000.0
+    canceled_after_one_filled(mock_account)
+    exposure = mock_account.short_put_assignment_exposure()
+    assert exposure.cost == pytest.approx(22_500.0)     # ONE strike, not three
+    assert exposure.contracts == pytest.approx(1.0)
+
+
+def test_the_cancelled_remainder_is_not_charged(mock_account):
+    """The other direction, and the one that is easy to get wrong. Those two
+    contracts were never sold and this order will never sell them; charging
+    67,500 would refuse structures the account can plainly afford."""
+    mock_account._balance = 100_000.0
+    canceled_after_one_filled(mock_account)
+    assert mock_account.short_put_assignment_exposure().cost != pytest.approx(67_500.0)
+
+
+def test_the_RESERVE_POOL_pro_rates_a_cancel_that_raced_a_fill(mock_account):
+    """The third view of the same row, and it needs the same discrimination.
+
+    The stored reserve was sized for THREE contracts. One traded, so one strike
+    is still committed and two were released by the broker the moment the cancel
+    landed. Counting the whole 67,500 would reserve capital against contracts
+    that do not exist; counting 0 (the old behaviour) frees capital that is
+    genuinely spoken for.
+    """
+    mock_account._balance = 100_000.0
+    canceled_after_one_filled(mock_account, reserve=67_500.0)
+    assert mock_account.reserved_option_buying_power() == pytest.approx(22_500.0)
+
+
+def test_a_cancel_whose_transaction_has_CLOSED_is_gone_for_good(mock_account):
+    """"Still open until something closes them" is the whole rule. Once the
+    position itself is closed the row must leave the book like any other, or a
+    long-dead raced cancel would consume capacity forever."""
+    mock_account._balance = 100_000.0
+    txn = open_txn("AAPL")
+    canceled_after_one_filled(mock_account, reserve=67_500.0, txn_id=txn)
+    row = get_instance(Transaction, txn)
+    row.status = TransactionStatus.CLOSED
+    update_instance(row)
+
+    assert mock_account.open_option_orders_book_wide() == []
+    assert mock_account.short_put_assignment_exposure().cost == pytest.approx(0.0)
+    assert mock_account.reserved_option_buying_power() == pytest.approx(0.0)
 
 
 def test_another_accounts_short_puts_are_not_this_accounts_problem(mock_account):

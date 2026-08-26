@@ -398,6 +398,106 @@ def test_a_multi_leg_parent_row_is_skipped_and_its_short_call_leg_is_counted():
     assert acct.shares_pledged_to_short_calls("AAPL") == 100
 
 
+# ---------------------------------------------------------------------------
+# the CANCELLED partial fill -- the FAIL-OPEN twin of the window above
+#
+# The same 3-contract sell-to-open, once the broker's cancel lands after one
+# contract has printed, is CANCELED with filled_qty still 1. That is a real state
+# the platform already handles elsewhere (``AlpacaAccount``: "a cancel that raced
+# a live fill leaves the order CANCELED with filled_qty > 0"), and it used to
+# vanish from every view: ``open_option_orders_book_wide`` filtered on
+# ``not_statuses=get_terminal_statuses()`` and CANCELED is terminal, so the ONE
+# contract that genuinely traded left the book with the two that never will.
+# Measured: pledged 300 -> 0, and the equity close that had just been refused
+# went through and sold the cover.
+#
+# BOTH HALVES MATTER AND THEY POINT OPPOSITE WAYS. The cancelled remainder is
+# gone and must not be counted; the filled part is real and must be. The row is
+# therefore EXECUTED for its filled size -- netted, so a buy-to-close still
+# releases it -- and contributes no in-flight remainder.
+#
+# These tests drive the ACCESSOR with the row already in the book (the fake
+# supplies the list). The query change that keeps it there is pinned against the
+# real store in tests/test_option_assignment_capacity_account.py.
+# ---------------------------------------------------------------------------
+def canceled_after_partial(ordered, filled, **kw):
+    """A sell-to-open the broker cancelled after part of it had printed."""
+    row = partly_filled(ordered=ordered, filled=filled, **kw)
+    row.status = OrderStatus.CANCELED
+    return row
+
+
+def test_a_cancelled_partial_fill_still_pledges_what_it_TRADED():
+    """3 ordered, 1 filled, then cancelled: 100 shares, not 0.
+
+    Zero is the answer that hands back cover for a call that can still be
+    assigned — the fail-open direction, and the whole reason this row is kept.
+    """
+    acct = FakeOptionsAccount(book=[canceled_after_partial(ordered=3, filled=1)])
+    assert acct.shares_pledged_to_short_calls("AAPL") == 100
+
+
+def test_a_cancelled_partial_fill_does_NOT_pledge_its_cancelled_remainder():
+    """The other half of the same rule, and the direction it is easy to get
+    wrong. 300 would refuse share sales against an obligation nobody owes: those
+    2 contracts were never sold, and this order will never sell them."""
+    acct = FakeOptionsAccount(book=[canceled_after_partial(ordered=3, filled=1)])
+    assert acct.shares_pledged_to_short_calls("AAPL") != 300
+
+
+def test_the_filled_part_of_a_cancelled_order_is_NETTED_not_pinned():
+    """It goes to ``net``, never to the in-flight total.
+
+    ``pending`` is never netted, so parking it there would produce the same 100
+    today and pledge it FOREVER — a call bought back on Monday would still be
+    consuming cover in a year, and no action could clear it.
+    """
+    contract = occ()
+    acct = FakeOptionsAccount(book=[
+        canceled_after_partial(ordered=3, filled=1, contract=contract),
+        long_call(qty=1, contract=contract),        # the buy-to-close
+    ])
+    assert acct.shares_pledged_to_short_calls("AAPL") == 0
+
+
+def test_a_cancelled_order_that_filled_NOTHING_still_pledges_nothing():
+    """The inverse, and the reason the test is ``filled_qty``. An ordinary
+    cancel — nothing printed — releases everything, exactly as before."""
+    row = canceled_after_partial(ordered=3, filled=1)
+    row.filled_qty = None
+    assert FakeOptionsAccount(book=[row]).shares_pledged_to_short_calls("AAPL") == 0
+
+
+def test_a_cancelled_partial_BUY_to_close_releases_what_it_bought():
+    """Symmetry. Those contracts really were bought back, so the short is
+    relieved by them — treating only SELLs this way would over-report the pledge
+    on every raced buy-to-close and freeze shares nothing has a claim on."""
+    contract = occ()
+    acct = FakeOptionsAccount(book=[
+        short_call(qty=3, contract=contract),
+        canceled_after_partial(ordered=3, filled=1, side=OrderDirection.BUY,
+                               contract=contract),
+    ])
+    assert acct.shares_pledged_to_short_calls("AAPL") == 200
+
+
+def test_an_EXPIRED_partial_fill_is_treated_the_same_as_a_cancelled_one():
+    """The rule is about TERMINAL, not about the word CANCELED. An expiry that
+    lands mid-fill leaves the same shape and the same traded contract."""
+    row = canceled_after_partial(ordered=3, filled=1)
+    row.status = OrderStatus.EXPIRED
+    assert FakeOptionsAccount(book=[row]).shares_pledged_to_short_calls("AAPL") == 100
+
+
+def test_a_cancelled_partial_fill_whose_FILLED_size_is_unreadable_is_unmeasurable():
+    """A row claiming a fill it will not quantify is not a row that filled
+    nothing. Dropping it would let the least trustworthy row in the book be the
+    one that silently frees the cover."""
+    row = canceled_after_partial(ordered=3, filled=1)
+    row.filled_qty = "some"
+    assert FakeOptionsAccount(book=[row]).shares_pledged_to_short_calls("AAPL") is None
+
+
 # ===========================================================================
 # shares_pledged_to_short_calls -- the MULTIPLIER, read per contract
 # ===========================================================================

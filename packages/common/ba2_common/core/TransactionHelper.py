@@ -698,7 +698,15 @@ class TransactionHelper:
         
         The TradeManager's _check_all_waiting_trigger_orders() method monitors these
         orders and submits them when their trigger conditions are met.
-        
+
+        TWO REFUSALS LIVE HERE, both returned as ``{"success": False, ...}`` rather than
+        raised (see each guard's comment): an OPTION transaction, which this method cannot
+        resize at all, and a SELL trim that would take the account's holding below the
+        shares pledged as cover for an open short call
+        (``AccountInterface.cover_refusal_for_equity_sale``, shared with
+        ``submit_close_order_for_transaction``). Both refuse before any order is created
+        and before any protective leg is cancelled.
+
         Args:
             account: The AccountInterface instance to use for order operations
             transaction: The transaction to adjust
@@ -827,9 +835,45 @@ class TransactionHelper:
                 if close_qty >= current_qty:
                     result["message"] = f"Cannot close {close_qty} shares, only have {current_qty}"
                     return result
-                
+
+                # SEAM 1 / OPT-L1, THE EXIT HALF — the TRIM is the other way these shares
+                # leave. The close path has refused to sell pledged cover since Task 7, but
+                # this method sells equity too and carried only the OPT-L3 asset-class
+                # guard: a "set AAPL to 50%" allocation run reaches it through
+                # ``portfolio_allocation_service._adjust_symbol`` and, measured on the
+                # doubles, sold 50 of the 100 shares collateralising an open short call and
+                # returned success=True. Half a cover is no cover.
+                #
+                # ONE shared decision (``AccountInterface.cover_refusal_for_equity_sale``),
+                # not a second copy of the comparison: this seam being the one that never
+                # got the check is itself the argument against writing it twice.
+                #
+                # Placed BEFORE anything is created or cancelled — the very next statement
+                # persists the close order, and the step after it cancels the position's
+                # real TP/SL at the broker. A refusal further down would leave the position
+                # stripped of its protective legs on its way to being refused.
+                #
+                # Only on a SELL close: trimming a SHORT position BUYS shares back, which
+                # can only ADD cover.
+                #
+                # A result dict, never a raise, for this method's own stated reason (see
+                # the OPT-L3 guard above): all four call sites index result["success"], and
+                # the whole body sits inside a try whose handler would flatten a raise into
+                # a generic "Error: ..." and lose the reason.
+                if close_direction == OrderDirection.SELL:
+                    refusal = account.cover_refusal_for_equity_sale(
+                        symbol, close_qty,
+                        action=(f"trimming transaction {transaction.id} by "
+                                f"{close_qty:g} share(s)"),
+                        except_transaction_id=transaction.id,
+                        order_noun="order")
+                    if refusal:
+                        logger.error(f"adjust_quantity_with_tpsl: {refusal}")
+                        result["message"] = refusal
+                        return result
+
                 remaining_qty = new_qty
-                
+
                 # Step 1: Create WAITING_TRIGGER partial close order
                 # This order will be triggered when the first TP/SL order is CANCELED
                 trigger_order_id = None

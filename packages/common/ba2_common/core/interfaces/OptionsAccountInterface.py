@@ -1164,6 +1164,30 @@ class OptionsAccountInterface(ABC):
         has freed nothing yet); CLOSED/FAILED release it. An order with no transaction
         yet — submitted, not linked — is still in flight and still counts.
 
+        A TERMINAL ORDER THAT FILLED SOMETHING IS STILL IN THIS BOOK. The status filter
+        used to be ``not_statuses=get_terminal_statuses()`` alone, and ``CANCELED`` is
+        terminal — so a sell-to-open of 3 contracts that filled 1 and was then cancelled
+        left the book entirely, taking the one contract that GENUINELY TRADED with it.
+        Measured on the doubles: 300 shares pledged while ``PARTIALLY_FILLED``, then 0 the
+        instant the status flipped to ``CANCELED`` with ``filled_qty`` still 1, and the
+        equity close that had just been refused went straight through and sold the cover.
+        The platform knows this state occurs — ``AlpacaAccount`` handles "a cancel that
+        raced a live fill leaves the order CANCELED with filled_qty > 0" explicitly — and
+        it is the FAIL-OPEN TWIN of the partial-fill window closed in the accessors below:
+        one under-reported the part still working, this one lost the part that was done.
+        A cancel does not un-trade a contract; those contracts are open until something
+        closes them, so the row stays until its TRANSACTION closes, exactly like any other.
+
+        The consumers are responsible for the other half of that rule — the CANCELLED
+        REMAINDER is genuinely gone and must not be counted — which is why they classify
+        such a row as EXECUTED for its filled size rather than as in-flight for its
+        ordered size (see ``_traded_something``).
+
+        The status filter therefore moves out of the query and into Python. That costs
+        nothing on the in-memory backtest store (``orders_where`` already scans every row
+        and filters there) and one narrowed ``WHERE`` on SQLite, which is the price of not
+        being able to express "filled_qty > 0" through this seam.
+
         Routed through ``orders_where``/``transactions_where`` rather than a raw
         ``select`` because a raw select silently returns EMPTY while the SQL-less
         in-memory "dict trades" backtest store is active, and an empty book reads as a
@@ -1173,9 +1197,9 @@ class OptionsAccountInterface(ABC):
         from ba2_common.core.types import AssetClass, OrderStatus, TransactionStatus
 
         terminal = OrderStatus.get_terminal_statuses()
-        option_orders = [o for o in orders_where(account_id=self.id,
-                                                 not_statuses=terminal)
-                         if o.asset_class == AssetClass.OPTION]
+        option_orders = [o for o in orders_where(account_id=self.id)
+                         if o.asset_class == AssetClass.OPTION
+                         and (o.status not in terminal or self._traded_something(o))]
         if not any(o.transaction_id is not None for o in option_orders):
             return option_orders
         # One bulk lookup of the OPEN book (small — bounded by held positions), not N queries.
@@ -1278,6 +1302,57 @@ class OptionsAccountInterface(ABC):
         return pos.get(name) if isinstance(pos, dict) else getattr(pos, name, None)
 
     @classmethod
+    def _traded_something(cls, order) -> bool:
+        """Did this order put contracts on the book, whatever its status says NOW?
+
+        The test that keeps a cancelled-after-a-partial-fill row inside
+        ``open_option_orders_book_wide``. ``filled_qty`` is the only field that answers
+        it: a cancel does not un-trade what already printed.
+
+        A ``filled_qty`` that is PRESENT BUT UNREADABLE answers ``True``, not ``False``.
+        The row is claiming a fill it will not quantify, and dropping it would let the
+        least trustworthy row in the book be the one that silently frees cover; kept, its
+        size is judged by the accessors, which flag exactly that shape as UNMEASURABLE.
+        ``None`` is the one honest "nothing filled" and is the only value that excludes.
+        """
+        raw = getattr(order, "filled_qty", None)
+        if raw is None:
+            return False
+        value = cls._readable_number(raw)
+        return True if value is None else value > 0
+
+    @classmethod
+    def _working_remainder(cls, order, filled: float, *, what: str, label,
+                           consequence: str) -> Tuple[Optional[float], Optional[str]]:
+        """``(remainder, reason)`` — how much of ``order`` is STILL WORKING at the broker.
+
+        ONE definition for a window three readings of the same book have to agree about.
+        The pledge view, the assignment-exposure view and the in-flight equity view each
+        need "ordered minus filled" and each used to spell it out for itself, differing
+        only in the noun in the error message; the two option views' docstrings both
+        insist they must not drift about this window, and a comment is a weaker way to
+        say that than a shared function.
+
+        ``filled`` is passed IN rather than re-read here on purpose: the callers have
+        already decided what counts as filled for their row shape (the option views fall
+        back to ``quantity`` when ``filled_qty`` is falsy, and re-deriving it here would
+        double-count such a row — once in their ``net``, once in this remainder).
+
+        ``remainder`` is ``None`` exactly when the ORDERED quantity is unreadable, which
+        is an obligation of unknown size and must reach the caller as UNMEASURABLE rather
+        than as a zero remainder. ``max(0.0, ...)``: a ``filled_qty`` above the ordered
+        quantity is a damaged row, not a NEGATIVE obligation that hands the cover back.
+        """
+        ordered = cls._readable_positive_number(order.quantity)
+        if ordered is None:
+            return None, (
+                f"order {getattr(order, 'id', '?')} ({label}) is a {what} whose ordered "
+                f"quantity is unreadable (quantity={order.quantity!r}, "
+                f"filled_qty={order.filled_qty!r}) — how much of it is still working at "
+                f"the broker, and so {consequence}, is unknown")
+        return max(0.0, ordered - filled), None
+
+    @classmethod
     def _readable_positive_number(cls, raw) -> Optional[float]:
         """:meth:`_readable_number`, additionally refusing ``<= 0``.
 
@@ -1340,6 +1415,19 @@ class OptionsAccountInterface(ABC):
         pledged rather than 300, and during that window a consumer frees 200 shares the
         next fill leaves naked.
 
+        A CANCELLED PARTIAL FILL PLEDGES EXACTLY WHAT IT TRADED — the mirror of that rule,
+        and its FAIL-OPEN twin. The same 3-contract sell-to-open, once its status flips to
+        ``CANCELED`` with ``filled_qty`` still 1, has ONE real short call on the book and
+        two contracts that will never exist. Both halves matter and they point opposite
+        ways: the cancelled remainder is gone and must not be counted (300 would refuse
+        share sales against an obligation nobody owes), while the filled part is real and
+        must be (0 hands back cover for a call that can still be assigned — measured, the
+        pledge dropped 300 -> 0 and the equity close that had just been refused went
+        through). Such a row is therefore treated as EXECUTED FOR ITS FILLED SIZE: it
+        NETS, so a later buy-to-close releases it, and it contributes NO in-flight
+        remainder, because nothing of it is working any more. (``open_option_orders_book_
+        wide`` is what keeps the row visible at all; it used to drop every terminal row.)
+
         WHAT MAKES A ROW UNMEASURABLE — each case is "this row could be a short call on
         the ticker you asked about, and I cannot rule it out":
 
@@ -1401,6 +1489,7 @@ class OptionsAccountInterface(ABC):
             return None
 
         executed = OrderStatus.get_executed_statuses()
+        terminal = OrderStatus.get_terminal_statuses()
         net: dict = {}          # contract -> signed contracts, EXECUTED only (SELL −)
         pending: dict = {}      # contract -> in-flight SELL contracts, never netted
         mults: dict = {}        # contract -> set of readable multipliers seen
@@ -1409,6 +1498,13 @@ class OptionsAccountInterface(ABC):
         blind: List[str] = []
 
         for o in book:
+            if o.status in terminal and not self._traded_something(o):
+                # A dead order that printed NOTHING: it owes nothing and it is not in
+                # flight either. ``open_option_orders_book_wide`` already withholds these,
+                # so this is belt-and-braces — but without it the arithmetic depends on
+                # the query, and a row that reached ``pending`` here would pledge its full
+                # ordered size for a cancel that freed everything.
+                continue
             contract = getattr(o, "contract_symbol", None)
             if not contract:
                 # A multi-leg PARENT: no contract, no right, no strike. Its legs carry the
@@ -1483,7 +1579,14 @@ class OptionsAccountInterface(ABC):
             else:
                 mults.setdefault(contract, set()).add(mult)
 
-            if o.status in executed:
+            # A TERMINAL row reaching this line FILLED something (the others were skipped
+            # at the top of the loop), so it is EXECUTED for that filled size — ``raw_qty``
+            # above already resolved to ``filled_qty``. It goes into ``net``, never into
+            # ``pending``: those contracts really traded and must be releasable by a later
+            # buy-to-close, whereas ``pending`` is never netted and would pledge them
+            # forever. It grows no remainder either — a dead order is not working at the
+            # broker — which is the "the cancelled remainder is gone" half of the rule.
+            if o.status in executed or o.status in terminal:
                 net[contract] = net.get(contract, 0.0) + (-qty if is_sell else qty)
                 if is_sell and o.status == OrderStatus.PARTIALLY_FILLED:
                     # THE PARTIAL-FILL WINDOW. ``qty`` above is only what has FILLED
@@ -1496,20 +1599,13 @@ class OptionsAccountInterface(ABC):
                     # obligation. During that window a consumer would otherwise free 200
                     # shares that the next fill leaves naked. It goes into ``pending``,
                     # never into ``net``, so a buy-to-close cannot net it away early.
-                    ordered = self._readable_positive_number(o.quantity)
-                    if ordered is None:
-                        blind.append(
-                            f"order {getattr(o, 'id', '?')} ({contract}) is a PARTIALLY "
-                            f"FILLED SHORT CALL whose ordered quantity is unreadable "
-                            f"(quantity={o.quantity!r}, filled_qty={o.filled_qty!r}) — how "
-                            f"much of it is still working at the broker, and so how many "
-                            f"more {wanted} shares it can call away, is unknown")
-                    else:
-                        # max(): a filled_qty above the ordered quantity is a damaged row,
-                        # not a negative obligation that hands cover back.
-                        remainder = max(0.0, ordered - qty)
-                        if remainder > _ASSIGNMENT_EPS:
-                            pending[contract] = pending.get(contract, 0.0) + remainder
+                    remainder, reason = self._working_remainder(
+                        o, qty, what="PARTIALLY FILLED SHORT CALL", label=contract,
+                        consequence=f"how many more {wanted} shares it can call away")
+                    if remainder is None:
+                        blind.append(reason)
+                    elif remainder > _ASSIGNMENT_EPS:
+                        pending[contract] = pending.get(contract, 0.0) + remainder
             elif is_sell:
                 pending[contract] = pending.get(contract, 0.0) + qty
 
@@ -1648,6 +1744,145 @@ class OptionsAccountInterface(ABC):
         # the cover that would let a call be written naked.
         return int(math.floor(round(total, 6)))
 
+    def equity_shares_working_to_sell(
+        self, symbol: str, *, except_transaction_id: Optional[int] = None,
+    ) -> Optional[int]:
+        """Shares of ``symbol`` this account has already COMMITTED to sell but not sold.
+
+        THE THIRD COVER ACCESSOR, and the one that makes the other two answer a question
+        about the FUTURE rather than about this instant. TRI-STATE on the same terms: an
+        int including ``0`` is MEASURED; ``None`` is UNMEASURABLE and the caller refuses.
+
+        WHY IT EXISTS. ``held_shares_for_cover`` reports what the broker holds RIGHT NOW,
+        and the exit guard compared one transaction's size against it — with no account of
+        the closes the same run had already authorised. An allocation run that targets 0%
+        on a symbol walks EVERY transaction for it (``_close_symbol``), and the codebase
+        explicitly models multi-lot holdings (``split_delta_fifo``: "30 shares held as
+        20 + 10"). Measured on the doubles, 200 shares held as two 100-share lots with 100
+        pledged to one short call: both closes were admitted and 200 shares went out, so
+        the call was left NAKED by a guard whose whole purpose was to prevent that.
+
+        On the DEFERRED close branch it is not even a race. When ``close_transaction``
+        cancels a TP/SL, the close order is written ``PENDING`` and NOTHING is sent, so
+        ``get_positions()`` cannot decrement between iterations however slowly the loop
+        runs — both rows are written every time. That is also what makes this readable:
+        the first close is already durable state by the time the second one asks.
+
+        WHAT COUNTS. Every EQUITY MARKET SELL on this ACCOUNT, for this symbol, in an
+        ACTIVE status (``OrderStatus.get_active_statuses`` — "not terminal and not fully
+        filled"), for its UNFILLED REMAINDER only. The filled part of a partially filled
+        sell has already left the position and ``get_positions()`` reports it; counting it
+        again would double-subtract it. ``PENDING`` is in that set and is the case that
+        matters most: a deferred close is written PENDING and reaches the broker later.
+
+        MARKET IS THE TEST FOR "A SALE ALREADY DECIDED", and it is exact rather than
+        heuristic here. Every exit this platform writes is a MARKET order —
+        ``submit_close_order_for_transaction``, ``adjust_quantity_with_tpsl``'s partial
+        close, and ``TradeActions._close_position`` all build ``OrderType.MARKET`` — while
+        a protective leg is never one (a TP is ``SELL_LIMIT``, an SL ``SELL_STOP``, both
+        together an ``OCO``).
+
+        KNOWN GAP, recorded rather than papered over: a RESTING PROTECTIVE LEG can also
+        uncover a call, and it is not counted here. It was tried and reverted, because
+        ``close_transaction`` cancels a transaction's legs AT THE BROKER without
+        terminalising the DB rows (they clear on the next ``refresh_orders``), so counting
+        them made every subsequent exit on the ticker refuse on the strength of orders
+        that no longer existed — a guard that blocks every exit is its own incident, and
+        the finding that prompted this accessor is about closes the run itself authorised.
+        Charging a stop-loss against the cover it can strip is a real and separate
+        question, and it belongs where the stop is WRITTEN, not where a close is refused.
+
+        ACCOUNT-WIDE, not per transaction, for the same reason cover itself is account-
+        wide (see :meth:`held_shares_for_cover`): the broker does not care which
+        transaction sells the share, and a per-transaction reading would let two lots each
+        believe the other's shares are still there.
+
+        ``except_transaction_id`` EXISTS TO PREVENT A DOUBLE COUNT, and it is the one
+        exclusion. A caller asking "may I sell THIS transaction's shares?" is proposing an
+        alternative disposition of the very shares its own staged sale would take, not an
+        additional one: a close being RETRIED, or a partial close already sitting on that
+        transaction, is the same inventory read twice. Both exit seams also cancel that
+        transaction's own working rows on the way (that is what
+        ``last_broker_canceled_order_id`` is for, and what ``adjust_quantity_with_tpsl``'s
+        step 2 does). Counted, a retried close would refuse itself for as long as the
+        earlier row stayed unfilled, with no action that could clear it. Other
+        transactions' working sells stay counted: those dispose of shares this one does
+        not.
+
+        OPTION ROWS ARE SKIPPED on the ``asset_class`` field: one contract is not one
+        share, and an option SELL order counted here would subtract contracts from a share
+        count.
+
+        A SELL ROW THAT WILL NOT SAY HOW MANY SHARES IT WILL SELL IS UNMEASURABLE, never
+        ``0`` — the same rule the other two accessors apply to their own missing sizes.
+        """
+        from ba2_common.core.failure_modes import absorb_if_benign
+        from ba2_common.core.trade_store import orders_where
+        from ba2_common.core.types import (
+            AssetClass, OrderDirection, OrderStatus, OrderType)
+        from ba2_common.logger import logger
+
+        wanted = (symbol or "").strip().upper()
+        if not wanted:
+            logger.error(
+                f"Account {self.id}: equity_shares_working_to_sell({symbol!r}) has no "
+                f"symbol to measure — reporting UNKNOWN rather than 'nothing is on its "
+                f"way out'")
+            return None
+
+        try:
+            rows = orders_where(account_id=self.id,
+                                statuses=OrderStatus.get_active_statuses())
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            absorb_if_benign(e, *self._cover_benign_errors())
+            logger.error(
+                f"Account {self.id}: the working order book could not be read ({e}), so "
+                f"how many {wanted} shares are already committed to be sold is UNKNOWN — "
+                f"an unreadable order book is not an empty one.", exc_info=True)
+            return None
+        if rows is None:
+            logger.error(
+                f"Account {self.id}: the working order book came back as None, so how "
+                f"many {wanted} shares are already committed to be sold is UNKNOWN (None "
+                f"is a FETCH FAILURE, not an empty book).")
+            return None
+
+        total = 0.0
+        blind: List[str] = []
+        for o in rows:
+            if getattr(o, "asset_class", None) == AssetClass.OPTION:
+                continue
+            if (getattr(o, "symbol", None) or "").strip().upper() != wanted:
+                continue
+            if getattr(o, "side", None) != OrderDirection.SELL:
+                continue
+            if getattr(o, "order_type", None) != OrderType.MARKET:
+                continue
+            if (except_transaction_id is not None
+                    and getattr(o, "transaction_id", None) == except_transaction_id):
+                continue
+            # A negative / non-numeric filled_qty is read as "nothing has filled", which
+            # makes the whole ordered size count — the direction that refuses.
+            filled = self._readable_number(getattr(o, "filled_qty", None)) or 0.0
+            remainder, reason = self._working_remainder(
+                o, max(0.0, filled), what="working EQUITY SELL order", label=wanted,
+                consequence=f"how many more {wanted} shares are on their way out")
+            if remainder is None:
+                blind.append(reason)
+                continue
+            total += remainder
+
+        if blind:
+            logger.error(
+                f"Account {self.id}: how many {wanted} shares are already committed to be "
+                f"sold is UNKNOWN ({len(blind)} unreadable row(s)), so no further "
+                f"{wanted} sale can be shown to leave an open short call covered. "
+                + "; ".join(blind))
+            return None
+        # Rounded UP, like the pledge and for the same reason: under-reporting what is
+        # already on its way out is the direction that uncovers a call.
+        return int(math.ceil(round(total, 6)))
+
     def reserved_option_buying_power_detail(self) -> "ReservePool":
         """The reserve pool WITH its unknowns named — the honest form of the answer.
 
@@ -1688,9 +1923,23 @@ class OptionsAccountInterface(ABC):
           nothing by definition, ``"close"`` describes an action rather than a position, and
           multi-leg leg CHILDREN carry no ``option_strategy`` at all (the parent holds the
           reserve). Flagging those would make every spread permanently unknown.
+
+        A TERMINAL ROW IS PRO-RATED TO WHAT IT ACTUALLY FILLED. Such a row is in this book
+        only because it traded something before it died (see
+        ``open_option_orders_book_wide``), and its stored ``option_reserve`` was sized for
+        the ORDERED quantity — the broker released the part that never traded. A
+        3-contract cash-secured put that filled 1 and was then cancelled commits one
+        strike, not three. Counting the whole figure would be the same error this method
+        exists to prevent, only inverted: capital reserved against contracts that do not
+        exist, refusing structures the account can plainly afford. When the ratio itself
+        cannot be read the WHOLE reserve stands: over-reserving is a refusal, and this
+        method's entire argument is that an unknown must never resolve to the number that
+        frees money.
         """
+        from ba2_common.core.types import OrderStatus
         from ba2_common.logger import logger
 
+        terminal = OrderStatus.get_terminal_statuses()
         total = 0.0
         blind: List[str] = []
         for o in self.open_option_orders_book_wide():
@@ -1701,6 +1950,11 @@ class OptionsAccountInterface(ABC):
                 value = float(raw)
                 if math.isfinite(value):
                     reserve = value
+            if reserve is not None and getattr(o, "status", None) in terminal:
+                ordered = self._readable_positive_number(getattr(o, "quantity", None))
+                filled = self._readable_positive_number(getattr(o, "filled_qty", None))
+                if ordered is not None and filled is not None and filled < ordered:
+                    reserve = reserve * (filled / ordered)
             if strategy in self.RESERVING_STRATEGIES:
                 if reserve is None or reserve <= 0:
                     blind.append(
@@ -1803,17 +2057,30 @@ class OptionsAccountInterface(ABC):
         three, and admitted the next structure on capacity the next fill consumes. The two
         views deliberately read ONE query; leaving them inconsistent about the same window
         would be worse than either behaviour alone.
+
+        ONCE THAT ORDER IS CANCELLED IT IS CHARGED EXACTLY WHAT IT FILLED — the fail-open
+        twin of the same window, fixed with the pledge view for the same reason. Measured:
+        the 3-contract CSP with 1 filled owed 45,000 while working and 0 the instant its
+        status became ``CANCELED``, though one put was genuinely sold and can still be
+        assigned. The remaining contract nets like any fill (so a buy-to-close relieves
+        it) and grows no in-flight remainder, because nothing of that order is working.
         """
         from ba2_common.core.option_lifecycle import put_assignment_cost
         from ba2_common.core.types import OrderDirection, OrderStatus
 
         executed = OrderStatus.get_executed_statuses()
+        terminal = OrderStatus.get_terminal_statuses()
         net: dict = {}            # contract symbol -> signed contracts (BUY +, SELL -)
         meta: dict = {}           # contract symbol -> a representative order row
         pending_shorts: list = []
         blind: List[str] = []
 
         for o in self.open_option_orders_book_wide():
+            if o.status in terminal and not self._traded_something(o):
+                # Dead and it printed nothing: no delivery obligation, and not in flight
+                # either. Belt-and-braces for the same reason as the pledge view's copy —
+                # this arithmetic must not depend on which rows the query happened to send.
+                continue
             contract = getattr(o, "contract_symbol", None)
             if not contract:
                 # A multi-leg PARENT carries no contract, no strike and no right — its
@@ -1846,7 +2113,11 @@ class OptionsAccountInterface(ABC):
                     f"us is unknown, and unknown is not zero")
                 continue
             qty = float(raw_qty or 0.0)
-            if o.status in executed:
+            # A TERMINAL row reaching this line FILLED something (the others were skipped
+            # at the top of the loop), and ``raw_qty`` already resolved to that filled
+            # size. It is EXECUTED for that size — netted, so a buy-to-close relieves it —
+            # and grows no in-flight remainder: a dead order is not working at the broker.
+            if o.status in executed or o.status in terminal:
                 net[contract] = net.get(contract, 0.0) + (-qty if is_sell else qty)
                 meta[contract] = o
                 if is_sell and o.status == OrderStatus.PARTIALLY_FILLED:
@@ -1855,20 +2126,13 @@ class OptionsAccountInterface(ABC):
                     # working at the broker under the in-flight rule. Priced through the
                     # SAME pending list, so one code path covers "never filled" and "half
                     # filled" and they cannot drift.
-                    ordered = self._readable_positive_number(o.quantity)
-                    if ordered is None:
-                        blind.append(
-                            f"order {getattr(o, 'id', '?')} ({contract}) is a PARTIALLY "
-                            f"FILLED SHORT PUT whose ordered quantity is unreadable "
-                            f"(quantity={o.quantity!r}, filled_qty={o.filled_qty!r}) — how "
-                            f"many more contracts are still working at the broker, and so "
-                            f"could be assigned to us, is unknown")
-                    else:
-                        # max(): a filled_qty above the ordered quantity is a damaged row,
-                        # not a negative obligation that buys capacity back.
-                        remainder = max(0.0, ordered - qty)
-                        if remainder > _ASSIGNMENT_EPS:
-                            pending_shorts.append((o, remainder))
+                    remainder, reason = self._working_remainder(
+                        o, qty, what="PARTIALLY FILLED SHORT PUT", label=contract,
+                        consequence="how many more contracts could be assigned to us")
+                    if remainder is None:
+                        blind.append(reason)
+                    elif remainder > _ASSIGNMENT_EPS:
+                        pending_shorts.append((o, remainder))
             elif is_sell:
                 pending_shorts.append((o, qty))
 
