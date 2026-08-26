@@ -287,7 +287,11 @@ def test_dry_run_rows_carries_bp_usage_pct_and_reason_strings():
     rows = dry_run_rows(_plan())
     nvda = next(r for r in rows if r["symbol"] == "NVDA")
     assert nvda["bp_cost"] == pytest.approx(7200.0)
-    assert nvda["bp_usage_pct"] == pytest.approx(72.0)  # 7200 of 10000
+    # SIGNED, and over the budget the footer divides. Negative because a buy
+    # CONSUMES buying power: this fixture's plan carries no released_buying_power,
+    # so the denominator is still the published 10,000.
+    assert nvda["bp_usage_pct"] == pytest.approx(-72.0)  # -7200 of 10000
+    assert nvda["bp_effect"] == pytest.approx(-7200.0)
     assert "not marginable" in nvda["reasons"]
 
 

@@ -332,11 +332,14 @@ class HistoricalOptionsProvider:
         nearest 0.50 among CALLS in the window (live picks the nearest strike to spot;
         |delta| ≈ 0.5 is the options-native definition of at-the-money). Calls only, for
         determinism — put iv at the same strike/expiry is near-identical by put-call
-        parity, and live returns a single contract's iv, not a smoothed pair. Per-date
-        iv/delta come from the as-of-clamped bar's Black-Scholes inversion, overlaid with
-        the same fallback rule as _to_contract (bar preferred only when its OWN iv
-        computed), so this tracks iv changes across the whole backtest window. Returns
-        None when no cached snapshot exists or no in-window call has usable delta+iv."""
+        parity, and live returns a single contract's iv, not a smoothed pair.
+
+        iv/delta come ONLY from the as-of-clamped daily bar's Black-Scholes inversion
+        (2026-08-26, OPT-C8). There is no fallback to the chain-snapshot row: its greeks
+        carry no record of the date they were inverted from and can be LOOKAHEAD. See the
+        note at the read site. Returns None when no cached snapshot exists, or when no
+        in-window call has a clamped bar carrying both delta and iv — a genuine "not
+        measurable today", which is what the callers already handle."""
         # Memoized on (db_path, underlying, as_of): the scan below is pure w.r.t. those three
         # (the cache file is immutable during a run), and a GA re-evaluates the same
         # (symbol, date) pairs on every trial. See _WORKER_ATM_IV_CACHE for why this matters.
@@ -368,8 +371,40 @@ class HistoricalOptionsProvider:
             if exp < expiry_min or exp > expiry_max:
                 continue
             bar = _bar_history(self.db_path, r["occ_symbol"]).latest_on_or_before(as_of.isoformat())
-            g = bar if (bar and bar.get("iv") is not None) else r
-            delta, iv = g.get("delta"), g.get("iv")
+            # NO FALLBACK TO THE CHAIN ROW (2026-08-26, OPT-C8). This used to read
+            #     g = bar if (bar and bar.get("iv") is not None) else r
+            # and the `else r` had no as-of guarantee. The BAR is clamped
+            # (latest_on_or_before); the chain SNAPSHOT is clamped (latest_as_of); the
+            # snapshot ROW's greeks are not clamped by either. fetch_options.build_cache
+            # stamps every chain row `as_of = <build start>` but inverts its IV from
+            # `(bar on start) or bar_rows[0]` -- the first bar ANYWHERE in the fetch window
+            # when the contract did not trade on the build's start date, which can be months
+            # later. The row records no trace of which date its IV came from.
+            #
+            # And the fallback was at its worst exactly where it fired: with no bar on or
+            # before the clock, every bar the contract has is LATER than the clock, so the
+            # chain row's IV is inverted from a future price BY CONSTRUCTION.
+            #
+            # Why not stamp the row with its inversion date and refuse it when that date is
+            # after `as_of`? That needs a new option_chain column, and no existing cache has
+            # one (the shared 10.9 GB file predates even the iv/delta columns), so every row
+            # would read "provenance unknown" and be refused anyway -- the same behaviour as
+            # this, plus a migration and a second thing to keep correct. The provenance is
+            # not recoverable retrospectively; absent is the honest reading.
+            #
+            # Fails CLOSED, which the stack already copes with: this returns None when no
+            # in-window call has a usable clamped iv+delta, and IVRankCondition treats an
+            # unmeasurable IV as a refusal rather than as a zero. It costs precision (a
+            # contract whose bar exists but whose own inversion failed is now skipped) and
+            # buys the one cross-sectionally comparable option statistic being causal --
+            # which matters more since iv_rank became a searched gene on 2026-08-26.
+            #
+            # `_to_contract` still carries the same fallback for the SELECTION path. That is
+            # a wider behavioural change (it moves which contract every delta-method entry
+            # picks, in every backtest) and is deliberately not made here.
+            if bar is None:
+                continue
+            delta, iv = bar.get("delta"), bar.get("iv")
             if delta is None or iv is None:
                 continue
             key = (abs(abs(delta) - 0.5), exp, r["strike"])

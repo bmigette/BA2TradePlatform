@@ -35,6 +35,11 @@ _OPTION_ENTRY_ACTION_TYPES = _ALL_OPTION_ACTION_TYPES - {ExpertActionType.CLOSE_
 _OPTION_ENTRY_PARAM_KEYS = (
     'strike_method', 'strike_param', 'dte_min', 'dte_max',
     'sizing', 'min_open_interest', 'max_spread_pct', 'min_volume', 'wing_width_pct',
+    # PREMIUM-RICHNESS floor (a FRACTION, 0.15 == 15 %/yr), read by the CREDIT builders via
+    # _refuse_if_arc_below_floor. Absent means no floor -- the pre-OPT-C1 behaviour where any
+    # positive net credit is enough -- so it must NOT be defaulted here: 0.0 is a configured
+    # gate, not an absent one, and it refuses every structure whose ARC cannot be measured.
+    'min_arc',
 )
 
 

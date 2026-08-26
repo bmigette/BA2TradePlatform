@@ -42,21 +42,34 @@ from .options_cache import OptionsHistoryCache
 
 logger = logging.getLogger(__name__)
 
-# Alpaca options-history floor: no chain/bar data exists before this date.
+# THIS BUILDER IS ALPACA'S, so the floor it enforces is ALPACA'S — not a global one.
 #
-# MEASURED against the live API (2026-07-25), not taken from the docs — docs.alpaca.markets'
-# "About Market Data API" page claims options history back to 2016, which is FALSE for this
-# API. Four long-dated contracts that were actively trading well before 2024 (SPY 2024-06-21,
-# SPY 2024-12-20, the SPY 2025-01-17 LEAP and the AAPL 2025-01-17 LEAP), each requested over a
-# 2022-01-01 -> 2026-07-01 window, ALL return their first bar on exactly 2024-01-18; probes at
-# 2016/2018/2020/2022/2023-06/2023-12 return zero bars. It is a hard account-wide cutoff, the
-# same day for every symbol and expiry, and it is NOT a subscription limit — Algo Trader Plus
-# (OPRA) upgrades data QUALITY (real prints/volume/OI vs the indicative feed) but buys no extra
-# history. Pre-2024 options history needs a different vendor entirely.
+# The vendor whose history a window needs is a property of the vendor, and the floors differ
+# by more than a year (Alpaca 2024-01-18; dxfeed/TastyTrade 2022-10-01). The number below was
+# being enforced account-wide, which refuses windows another vendor can serve. It now lives
+# behind ``ba2_providers.options.options_history_floor(<vendor>)``, which asks each provider
+# class for its OWN limit; this module asks for "alpaca" because every network call it makes
+# is an Alpaca one (TradingClient contract discovery + OptionHistoricalDataClient bars).
 #
-# Was 2024-02-01 (~2 weeks conservative), which made this guard reject fetches that would in
-# fact succeed.
-_OPTIONS_HISTORY_FLOOR = date(2024, 1, 18)
+# THE ALPACA NUMBER AND ITS EVIDENCE, unchanged — it was expensively established:
+#
+#   MEASURED against the live API (2026-07-25), not taken from the docs — docs.alpaca.markets'
+#   "About Market Data API" page claims options history back to 2016, which is FALSE for this
+#   API. Four long-dated contracts that were actively trading well before 2024 (SPY 2024-06-21,
+#   SPY 2024-12-20, the SPY 2025-01-17 LEAP and the AAPL 2025-01-17 LEAP), each requested over a
+#   2022-01-01 -> 2026-07-01 window, ALL return their first bar on exactly 2024-01-18; probes at
+#   2016/2018/2020/2022/2023-06/2023-12 return zero bars. It is a hard account-wide cutoff, the
+#   same day for every symbol and expiry, and it is NOT a subscription limit — Algo Trader Plus
+#   (OPRA) upgrades data QUALITY (real prints/volume/OI vs the indicative feed) but buys no extra
+#   history. Pre-2024 options history needs a different vendor entirely.
+#
+#   Was 2024-02-01 (~2 weeks conservative), which made this guard reject fetches that would in
+#   fact succeed.
+#
+# The literal itself now lives once, on ``AlpacaOptionsProvider`` (which carries the same
+# evidence in its module docstring) — two copies of one vendor fact could drift apart, and
+# correcting only one of them is how the wrong guard stays wrong.
+_FETCH_PROVIDER = "alpaca"
 # How far past `end` to still pull contracts (so a position opened near `end` can pick an
 # expiry that lands after the window). Matches the handler's DTE windows comfortably.
 _EXPIRY_TAIL_DAYS = 60
@@ -415,9 +428,13 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
     from alpaca.data.requests import OptionBarsRequest
     from alpaca.data.timeframe import TimeFrame
     from ba2_providers import get_provider
-    if start < _OPTIONS_HISTORY_FLOOR:
+    from ba2_providers.options import options_history_floor
+    floor = options_history_floor(_FETCH_PROVIDER)
+    if start < floor:
         raise ValueError(
-            f"Alpaca options history starts {_OPTIONS_HISTORY_FLOOR.isoformat()}; pick a later --start")
+            f"{_FETCH_PROVIDER} options history starts {floor.isoformat()}; pick a later "
+            f"--start (a different vendor has a different floor — see "
+            f"ba2_providers.options.options_history_floor)")
     options_feed = _options_feed(feed)   # fail loud on a bad feed BEFORE any network/cred work
     key, secret = _alpaca_keys(api_key, api_secret)
     cache = OptionsHistoryCache(cache_db)

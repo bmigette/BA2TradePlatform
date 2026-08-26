@@ -283,24 +283,35 @@ def test_an_absent_floor_is_absent_from_the_config():
     assert "min_arc" not in cfg
 
 
-def test_the_gate_is_not_yet_enforced_by_the_builders():
-    """HONEST STATUS. The enforcement point is inside each credit builder in
-    ``TradeActions.py`` (where ``net_credit <= 0`` is refused today), which is owned by
-    another worktree and is deliberately NOT edited here. Until that one call lands, the
-    floor is carried but not applied -- which is why no GA gene is emitted for it: a gene the
-    simulation cannot see is the very defect this track is removing.
+def test_every_credit_builder_consults_the_gate():
+    """DRIFT GUARD, and the successor to this file's old "not yet enforced" marker.
 
-    When enforcement lands this test fails, and that failure is the signal to wire the gene.
+    That marker asserted ``admits_credit_structure`` was ABSENT from ``TradeActions``, and
+    was written to fail the moment enforcement landed -- the deliberate signal to emit the
+    GA gene. Enforcement has landed (``_refuse_if_arc_below_floor``, called by all eight
+    credit builders) and the gene is emitted
+    (``ba2test_launcher._OPTION_ARC_BANDS`` / ``_apply_option_min_arc_gene``), so the
+    marker is replaced by its inverse: a NEW credit builder that forgets the call is the
+    thing that can still go wrong.
+
+    Source-level on purpose. The BEHAVIOUR is pinned in
+    ``tests/test_option_arc_gate_enforced.py``, which drives every builder end to end; this
+    catches the ninth builder nobody added a behavioural test for.
     """
     import inspect
 
     from ba2_common.core import TradeActions
 
     src = inspect.getsource(TradeActions)
-    assert "admits_credit_structure" not in src, (
-        "TradeActions now consults the ARC gate -- delete this test and emit the "
-        "option_min_arc gene in ba2test_launcher._option_entry_action_for"
-    )
+    for cls_name in ("SellCashSecuredPutAction", "OpenBearCallSpreadAction",
+                     "OpenBullPutSpreadAction", "OpenShortStraddleAction",
+                     "OpenShortStrangleAction", "OpenIronCondorAction",
+                     "OpenJadeLizardAction", "OpenPutRatioSpreadAction"):
+        body = inspect.getsource(getattr(TradeActions, cls_name))
+        assert "_refuse_if_arc_below_floor" in body, (
+            f"{cls_name} admits its structure on net_credit > 0 alone -- it can still learn "
+            f"to sell near-worthless premium (OPT-C1)")
+    assert "admits_credit_structure" in src
 
 
 def test_the_helper_is_importable_from_the_package_root():

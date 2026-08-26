@@ -2336,19 +2336,37 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 # BEFORE YOU LAUNCH AN OPTION GRID — READ THIS
 # ==============================================================================================
 #
-# Three preconditions, as of 2026-08-26 (dev @ 4ac7cc48). Two of them will stop a run dead; the
-# third will let it run and waste the compute. None is a defect in this file — they are the
-# ragged edges left by the option work of 2026-08-25/26, recorded here because this is where
-# somebody stands when they decide to press go.
+# Three preconditions, as of 2026-08-26. One will stop a run dead, one will let it run and
+# waste the compute, and the third is now CLOSED and recorded so nobody re-opens it. None is a
+# defect in this file — they are the ragged edges left by the option work of 2026-08-25/26,
+# recorded here because this is where somebody stands when they decide to press go.
 #
-# 1. THE OPTION HISTORY FLOOR CONTRADICTS THE GRID WINDOW.  ** BLOCKING **
-#    `backend/app/services/backtest/fetch_options.py` carries
-#    `_OPTIONS_HISTORY_FLOOR = date(2024, 1, 18)`, and the grid window below starts 2023-01-01.
-#    Every pure-option job therefore RAISES before it runs. Resolve it one way or the other —
-#    either the floor drops to the real TastyTrade floor (if the data goes back that far), or
-#    the window starts in 2024 (if it does not). Do not "fix" it by widening the floor without
-#    checking the cache actually holds the bars: a floor that lies produces a backtest that
-#    silently trades on nothing.
+# 1. THE BACKTEST READS AN ALPACA STORE, SO 2023 IS STILL REFUSED.  ** BLOCKING **
+#    The floor is no longer global: `ba2_providers.options.options_history_floor` answers PER
+#    VENDOR (Alpaca 2024-01-18 measured; dxfeed/TastyTrade 2022-10-01, env-overridable), and
+#    `daily_backtest_handler.validate_options_window` consults the floor of the vendor serving
+#    the store the run actually reads. That much is fixed. The window below still starts
+#    2023-01-01 and every pure-option job STILL raises, because that vendor is Alpaca:
+#
+#      * the backtest builds exactly ONE option reader, `HistoricalOptionsProvider`, over an
+#        `OptionsHistoryCache` sqlite;
+#      * the only writer of that schema is `fetch_options.build_cache`, hard-wired to Alpaca;
+#      * TastyTrade history lands in a SEPARATE parquet tree
+#        (`CACHE_FOLDER/TastyTradeOptionsProvider/`) that nothing on the backtest path reads —
+#        only the read-only chain viewer does.
+#
+#    So no run can span both vendors, and FINISHING THE TASTYTRADE DOWNLOAD DOES NOT BY ITSELF
+#    UNBLOCK THE GRID. What unblocks it is wiring that parquet store into
+#    `HistoricalOptionsProvider` and moving `backtest_options_provider()` in the same change.
+#    Do NOT instead lower the Alpaca number: measured on the shared 10.9 GB cache (2026-08-26)
+#    it holds 0 bars before 2024-01-18, its earliest bar is 2024-02-01, and its only three
+#    chain snapshots are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it, and a
+#    floor that lies produces a backtest that trades on nothing and reports it as a result —
+#    strictly worse than this refusal.
+#
+#    (Noted in passing: even Alpaca's 2024-01-18 is ~2 weeks optimistic against that store,
+#    whose first chain snapshot is 2024-02-01. A vendor floor bounds what COULD have been
+#    fetched, not what was.)
 #
 # 2. THE GREEKS ARE NOT IN THE CACHE YET.  ** WASTES THE RUN **
 #    `iv_rank` and `iv_to_realized_vol` became live genes on 2026-08-26 (OPT-C1, OPT-C3). Both
@@ -2357,21 +2375,40 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    gate independently enabled at p=0.5, roughly 75% of every generation will score the
 #    zero-trade sentinel, and a plain (non-optimize) option backtest will trade nothing at all.
 #    The search recovers once the data lands; until then the run is mostly burning CPU on
-#    -1e9. TastyTrade collection was in progress on another machine — confirm it finished.
+#    -1e9. TastyTrade collection was in progress on another machine — confirm it finished,
+#    AND that it is readable by the backtest (see precondition 1: it lands in a store nothing
+#    on the backtest path reads).
+#    Sharper since 2026-08-26: `_compute_atm_iv` no longer falls back to the frozen
+#    chain-snapshot row, so where a stale row used to supply a number it now honestly supplies
+#    None. That removes a lookahead, and it also removes the last thing masking this gap.
 #
-# 3. THE ARC RICHNESS GATE IS BUILT BUT NOT ENFORCED.
-#    `ba2_common.core.option_economics` computes per-contract annualised return on collateral
-#    and is fully tested, and `rule_builders` forwards `option_min_arc` — but no credit builder
-#    consults it yet and no gene is emitted, because enforcement belongs in `TradeActions.py`.
-#    So a grid launched today still admits a credit structure on `net_credit > 0` alone: it can
-#    still learn to sell near-worthless premium, which is the behaviour the gate exists to stop.
-#    A test fails the moment enforcement lands, as the signal to emit the gene here.
+# 3. THE ARC RICHNESS GATE IS ENFORCED AND SEARCHED.  ** CLOSED 2026-08-26 **
+#    All eight credit builders in `ba2_common.core.TradeActions` now call
+#    `_refuse_if_arc_below_floor` beside their `net_credit <= 0` check, so a credit structure
+#    is no longer admitted on a positive credit alone, and an UNMEASURABLE return on
+#    collateral refuses rather than passes. `option_min_arc` is a searched gene per credit
+#    structure (`_OPTION_ARC_BANDS` below), banded by collateral family because ARC's
+#    denominator comes from the structure's own reserve branch.
+#    Two things to know before reading the results: the bands are DERIVED from the reserve
+#    arithmetic, not measured against a realised ARC distribution (there has been no option
+#    grid to measure), so re-centre the ceilings after the first run; and the gate is a no-op
+#    for every debit structure and for O_CC/O_PP, which post no collateral.
 #
-# Also outstanding, lower stakes: `options_provider._compute_atm_iv` falls back to the
-# chain-snapshot row whose IV has no as-of guarantee (OPT-C8 lookahead) — which matters MORE now
-# that iv_rank is searched; and `_option_consistent_annual_return` reads `avg_trades_per_year`
-# directly, so it still needs the structures-not-legs substitution `_trades_per_year` applies to
-# CAR, or three iron condors a year clears its 12/yr floor exactly as they used to clear CAR's.
+# CLOSED 2026-08-26: `_option_consistent_annual_return` -- the DEFAULT fitness for pure-option
+# grids -- now takes its trade frequency from `_trades_per_year` (STRUCTURES) instead of
+# `avg_trades_per_year` (LEGS), the substitution Track C already applied to CAR. Three iron
+# condors a year no longer clears the 12/yr disqualification floor, and the ramp is measured in
+# bets rather than legs. If you are comparing against results banked before this date, note
+# that thin multi-leg genomes ranked higher then than they will now. The equity metric is
+# unchanged (the 798-literal frozen corpus is green), and a drift guard now refuses any read of
+# `avg_trades_per_year` outside `_trades_per_year`.
+#
+# CLOSED 2026-08-26: `options_provider._compute_atm_iv` no longer falls back to the
+# chain-snapshot row (OPT-C8). That row's IV had no as-of guarantee and, in the case where the
+# fallback actually fired, was inverted from a future price by construction — which mattered
+# more once iv_rank became a searched gene. It now reads only the as-of-clamped bar and
+# returns None otherwise. See precondition 2: this makes the missing greeks MORE visible, not
+# less, which is the point.
 #
 # ==============================================================================================
 
@@ -2478,6 +2515,83 @@ def _option_entry_action_for(kind: str) -> dict:
     _apply_option_min_volume(cfg)
     _apply_option_strike_method_gene(cfg)
     _apply_option_sizing_gene(cfg)
+    _apply_option_min_arc_gene(cfg)
+    return cfg
+
+
+# --- premium richness as a gene (OPT-C1) ----------------------------------------------------
+#
+# Credit structures were admitted on `net_credit > 0` alone -- no minimum credit, no
+# credit-as-a-fraction-of-width, no return floor. `TradeActions` now consults
+# `option_economics.annualized_return_on_collateral` in every credit builder, and this is what
+# lets the GA SEARCH the floor rather than inherit somebody's guess at it.
+#
+# THE BAND IS PER COLLATERAL FAMILY, not shared, because ARC is a ratio whose denominator is
+# set by the structure's reserve branch (`OptionsAccountInterface.option_reserve_required`),
+# and those branches differ by an order of magnitude. One shared window would be unsatisfiable
+# for the full-notional structures and inert for the defined-risk ones -- the OPT-C5 defect
+# (a gene whose live domain is set by a different gene), reintroduced deliberately.
+#
+#   family          collateral / contract              worked example @ 35 DTE (x365/35=10.43)
+#   -------------   --------------------------------   --------------------------------------
+#   full notional   strike x 100  (also jade lizard's   CSP strike 90, credit 1.00:
+#                   put_strike + wing - credit, and       100/9000 x 10.43 = 0.12
+#                   the ratio spread's strike-credit)
+#   Reg-T naked     ~20% of notional less the OTM      ATM straddle, credit 7.43 on 2,000:
+#                   amount, floored at 10%               743/2000 x 10.43 = 3.87
+#   defined risk    (width - credit) x 100             5-wide bull put, credit 0.60:
+#                                                        60/440 x 10.43 = 1.42
+#
+# THESE BANDS ARE DERIVED FROM THE RESERVE ARITHMETIC AND A PLAUSIBLE CREDIT, NOT MEASURED --
+# there is no option grid to measure against yet (see precondition 1). Re-centre them on the
+# realised ARC distribution once one has run; the shape (three families, floor at 0) is what
+# should survive, not the ceilings.
+#
+# 0.0 IS A LEVEL, AND IT IS NOT "OFF". `admits_credit_structure` treats a configured 0.0 as a
+# gate that still refuses an UNMEASURABLE ARC, so the bottom of each band is "the credit may be
+# arbitrarily thin, but it must be priceable" -- a real, distinct hypothesis for the GA, and
+# the natural control arm against the higher levels.
+_ARC_FULL_NOTIONAL = (0.0, 0.30, 0.05)
+_ARC_REG_T_NAKED = (0.0, 6.0, 1.0)
+_ARC_DEFINED_RISK = (0.0, 3.0, 0.5)
+
+#: option ACTION TYPE -> (reserve-table strategy name, ARC band). Only the CREDIT builders
+#: appear: those are the ones that consult the gate, and they are exactly the reserve table's
+#: `RESERVING_STRATEGIES` that have a builder of their own (`credit_spread` / `naked_put` /
+#: `debit_spread` are pricing aliases with no action). A DEBIT structure posts no collateral,
+#: so a floor there would refuse every one of them -- see the ZERO_RESERVE note below.
+_OPTION_ARC_BANDS = {
+    "sell_cash_secured_put": ("cash_secured_put", _ARC_FULL_NOTIONAL),
+    "open_jade_lizard": ("jade_lizard", _ARC_FULL_NOTIONAL),
+    "open_put_ratio_spread": ("put_ratio_spread", _ARC_FULL_NOTIONAL),
+    "open_short_straddle": ("short_straddle", _ARC_REG_T_NAKED),
+    "open_short_strangle": ("short_strangle", _ARC_REG_T_NAKED),
+    "open_bear_call_spread": ("bear_call_spread", _ARC_DEFINED_RISK),
+    "open_bull_put_spread": ("bull_put_spread", _ARC_DEFINED_RISK),
+    "open_iron_condor": ("iron_condor", _ARC_DEFINED_RISK),
+}
+
+
+def _apply_option_min_arc_gene(cfg: dict) -> dict:
+    """Make the ARC floor searchable, in place, on CREDIT actions only.
+
+    A no-op for every debit / zero-reserve structure. That is not an oversight: a long call,
+    a butterfly and a COVERED CALL all reserve nothing (they are in
+    `OptionsAccountInterface.ZERO_RESERVE_STRATEGIES`), so `annualized_return_on_collateral`
+    has no denominator and returns None -- and a configured floor turns None into a refusal.
+    Emitting the gene there would silently delete those structures from the search the moment
+    the GA sampled any level at all, including the bottom one.
+    """
+    at = str(cfg.get("action_type") or "")
+    band = _OPTION_ARC_BANDS.get(at)
+    if band is None:
+        return cfg
+    lo, hi, step = band[1]
+    cfg.setdefault("option_min_arc", lo)
+    cfg.setdefault("option_min_arc_optimize", True)
+    cfg.setdefault("option_min_arc_min", lo)
+    cfg.setdefault("option_min_arc_max", hi)
+    cfg.setdefault("option_min_arc_step", step)
     return cfg
 
 

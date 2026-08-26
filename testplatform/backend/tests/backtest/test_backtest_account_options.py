@@ -111,6 +111,24 @@ def _seed_cache(db_path: str) -> None:
             },
         ],
     )
+    # ATM-IV NEEDS BARS, not just chain rows (2026-08-26, OPT-C8). ``_compute_atm_iv`` no
+    # longer falls back to the chain-snapshot row for iv/delta -- that row carries no record
+    # of the date its IV was inverted from, and where the fallback used to fire it was a
+    # future price by construction. The two in-window calls therefore get an as-of-clamped
+    # bar (dated on the 2024-03-05 clock) carrying the SAME iv/delta the chain rows claim, so
+    # this file keeps testing what it was written to test -- the B7 near-ATM SELECTION rule --
+    # through the only source that is causal. The no-fallback property itself is pinned in
+    # tests/backtest/test_atm_iv_no_lookahead.py.
+    cache.write_bar_rows([
+        {"occ_symbol": occ, "date": "2024-03-05", "open": px, "high": px, "low": px,
+         "close": px, "volume": 100, "underlying": "AAPL", "option_type": "call",
+         "strike": strike, "expiry": "2024-04-05", "iv": iv, "delta": delta,
+         "gamma": 0.04, "theta": -0.05, "vega": 0.10}
+        for occ, strike, px, iv, delta in (
+            ("AAPL240405C00180000", 180.0, 4.1, 0.33, 0.52),
+            ("AAPL240405C00150000", 150.0, 30.2, 0.80, 0.97),
+        )
+    ])
 
 
 def _make_price_source():

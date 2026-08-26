@@ -36,19 +36,63 @@ from app.services.task_queue import get_task_queue
 logger = logging.getLogger(__name__)
 
 
-# Alpaca's options-history floor: there is no chain/bar data before this date, so an
-# options backtest that starts earlier would silently see empty chains. Reject it with a
-# clear error instead (a missing cache still fails fast via OptionsCacheMiss).
+# The options-history floor is a PER-VENDOR fact, and this guard must use the floor of the
+# vendor whose history the run's store actually holds. Alpaca stops at a measured 2024-01-18;
+# dxfeed (via TastyTrade) reaches back to 2022-10-01. Enforcing one vendor's number globally
+# refuses windows the other can serve, and enforcing the LOWER of them would be worse still:
+# a floor that claims data exists where the store is empty produces a backtest that trades on
+# nothing and reports it as a result.
 #
-# SINGLE SOURCE OF TRUTH: imported from fetch_options (which documents how the date was
-# measured against the live API). This used to be a second, independent `date(2024, 2, 1)`
-# literal — two copies of the same vendor fact that could silently drift apart, so that
-# correcting the fetch guard alone would still leave backtests rejecting valid windows.
-from .fetch_options import _OPTIONS_HISTORY_FLOOR  # noqa: E402
+# SINGLE SOURCE OF TRUTH per vendor: ``ba2_providers.options.options_history_floor`` asks the
+# provider CLASS for its own limit (imported at call time to keep this module's import cheap).
+# This used to be a second, independent `date(2024, 2, 1)` literal, then an import of one
+# global constant from fetch_options; both spellings said "options" where they meant "Alpaca".
 
 
-def validate_options_window(start, uses_options: bool) -> None:
-    """Reject option backtests before Alpaca's options-history floor (2024-01-18, measured)."""
+def backtest_options_provider() -> str:
+    """Which VENDOR's history the backtest's option store actually holds.
+
+    ESTABLISHED FROM THE READ PATH, not configured — there is deliberately no env flag, for
+    the same reason ``_OPTION_HOLDOUT_START`` has none: moving it is a claim about the data,
+    and a claim about the data should be a reviewed change rather than something pasted into
+    a shell script.
+
+    The chain of facts, as of 2026-08-26:
+
+      * ``run_daily_backtest`` builds exactly ONE option reader,
+        ``HistoricalOptionsProvider(options_cache_db)``, which queries the ``option_chain`` /
+        ``option_bar`` tables of an ``OptionsHistoryCache`` sqlite;
+      * the only writer of that schema is ``fetch_options.build_cache``, hard-wired to Alpaca
+        (``TradingClient`` contract discovery + ``OptionHistoricalDataClient`` bars);
+      * TastyTrade/dxfeed history lands in a SEPARATE parquet tree
+        (``CACHE_FOLDER/TastyTradeOptionsProvider/<SYM>/exp=<DATE>/``, written by
+        ``tools/warm_options_history.py``) that NOTHING on the backtest path reads — only the
+        read-only chain viewer (``services/option_cache_reader.py``) does.
+
+    So a single run cannot span two vendors: there is one store and it has one origin. When
+    the parquet reader is wired into ``HistoricalOptionsProvider``, that change must move this
+    function too — a floor naming a vendor the store does not hold is precisely the lie this
+    seam exists to prevent.
+
+    Corroborated on the shared cache (measured 2026-08-26,
+    ``~/Documents/ba2/common/cache/options/options_history.sqlite``): 0 bars dated before
+    2024-01-18, earliest bar 2024-02-01, and the only three chain snapshots in the whole file
+    are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it.
+    """
+    return "alpaca"
+
+
+def validate_options_window(start, uses_options: bool,
+                            provider: Optional[str] = None) -> None:
+    """Reject option backtests starting before the SERVING vendor's options-history floor.
+
+    ``provider`` names the vendor whose history the run's option store holds; it defaults to
+    ``backtest_options_provider()``. An unknown vendor raises inside
+    ``options_history_floor`` rather than being waved through on an unmeasured floor.
+
+    A missing/empty cache still fails fast at read time via ``OptionsCacheMiss``; this is the
+    earlier, cheaper refusal for a window no vendor could have covered at all.
+    """
     if not uses_options:
         return
     if isinstance(start, datetime):
@@ -57,10 +101,16 @@ def validate_options_window(start, uses_options: bool) -> None:
         d = start
     else:
         d = date.fromisoformat(str(start)[:10])
-    if d < _OPTIONS_HISTORY_FLOOR:
+    from ba2_providers.options import options_history_floor
+
+    vendor = provider or backtest_options_provider()
+    floor = options_history_floor(vendor)
+    if d < floor:
         raise ValueError(
-            f"Options backtests require start >= {_OPTIONS_HISTORY_FLOOR.isoformat()} "
-            f"(Alpaca options history floor); got {d.isoformat()}.")
+            f"Options backtests served by {vendor!r} require start >= {floor.isoformat()} "
+            f"({vendor} options history floor); got {d.isoformat()}. Other vendors have "
+            f"other floors, but the one that applies is the floor of the store THIS run "
+            f"reads — see daily_backtest_handler.backtest_options_provider.")
 
 
 def assert_backtestable_risk_mode(class_name: str, resolved_settings: Dict[str, Any]) -> None:
