@@ -9,7 +9,7 @@ from ...core.db import get_db, get_all_instances, delete_instance, add_instance,
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
     preview_trade_action_result_retention, execute_trade_action_result_retention,
@@ -5130,16 +5130,38 @@ class TradeSettingsTab:
                         with action_value_container:
                             is_close = selected_type == ExpertActionType.CLOSE_OPTION.value
                             if not is_close:
-                                strike_method_select = ui.select(
-                                    options=['delta', 'percent_otm', 'consensus_target'],
-                                    label='Strike Method',
-                                    value=(action_config.get('strike_method', 'delta') if action_config else 'delta')
-                                ).classes('w-40').props('dense')
-                                strike_param_input = ui.input(
-                                    label='Strike Param',
-                                    value=str(action_config.get('strike_param', '')) if action_config else '',
-                                    placeholder='0.30 or {"long":0.45,"short":0.25}'
-                                ).classes('w-44').props('dense')
+                                # STRIKE METHOD IS OFFERED ONLY WHERE THE BUILDER READS IT
+                                # (OPT-S2). Eight of the seventeen entry builders hard-code
+                                # method="percent_otm" at every selection site, so
+                                # self.strike_method is a dead attribute on them. This select
+                                # used to be rendered for all of them and DEFAULTED to
+                                # 'delta': a user configuring an iron condor saw "delta",
+                                # typed 0.30 for a 30-delta short, and got a strike 0.30 %
+                                # out of the money -- effectively at the money, on the leg
+                                # that carries the risk, with nothing anywhere warning.
+                                # Refusing at config time is the fix and NOT a fallback:
+                                # honouring delta in those eight depends on whether delta is
+                                # computable from the chain, which is separate work.
+                                if honours_strike_method(selected_type):
+                                    strike_method_select = ui.select(
+                                        options=['delta', 'percent_otm', 'consensus_target'],
+                                        label='Strike Method',
+                                        value=(action_config.get('strike_method', 'delta') if action_config else 'delta')
+                                    ).classes('w-40').props('dense')
+                                    strike_param_input = ui.input(
+                                        label='Strike Param',
+                                        value=str(action_config.get('strike_param', '')) if action_config else '',
+                                        placeholder='0.30 or {"long":0.45,"short":0.25}'
+                                    ).classes('w-44').props('dense')
+                                else:
+                                    # The method is fixed, so the PARAMETER has to say what
+                                    # it is. A bare "Strike Param" with a 0.30 placeholder is
+                                    # exactly how "30-delta" became "0.30 % OTM".
+                                    strike_param_input = ui.input(
+                                        label='Strike % OTM',
+                                        value=str(action_config.get('strike_param', '')) if action_config else '',
+                                        placeholder='5.0 (this structure selects by % OTM)'
+                                    ).classes('w-44').props('dense')
                                 dte_min_input = ui.number(
                                     label='DTE min',
                                     value=action_config.get('dte_min', 20) if action_config else 20,
@@ -5296,7 +5318,16 @@ class TradeSettingsTab:
                         msp = action_refs['max_spread_input']()
                         wwp = action_refs['wing_width_input']()
 
-                        if sm:
+                        # THE SECOND RAIL, and it is not redundant (OPT-S2). The widget is
+                        # only rendered for actions that read strike_method, so `sm` is
+                        # normally None here anyway — but `wing_width_pct` proves how that
+                        # fails: it is the row's other conditional widget, and its closure
+                        # OUTLIVED the row, so a value from a previous action type was
+                        # persisted onto a structure that had no such field. `strike_method`
+                        # escapes that today only because the rebuild happens to reset its
+                        # name. Keyed on the ACTION rather than on the widget, this refuses
+                        # whatever the widget state turns out to be.
+                        if honours_strike_method(action_type) and sm:
                             action_config['strike_method'] = sm.value
                         if sp and sp.value:
                             raw = sp.value.strip()
