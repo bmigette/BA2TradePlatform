@@ -6079,7 +6079,28 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         return trading_order
 
-    def close_option_position(self, position, order_type="limit", limit_price=None):
+    def close_option_position(self, position, order_type="limit", limit_price=None,
+                              transaction_id=None):
+        """Submit a single-leg closing order that RIDES the open position's transaction.
+
+        The ``transaction_id=`` was previously omitted (the call was positional and stopped
+        at ``limit_price``), so ``submit_option_order`` minted a BRAND NEW Transaction for
+        every exit: the original position never reached CLOSED, so the exit condition that
+        decided to close it stayed true and re-submitted on every following pass, and the
+        buying-power reserve plus the short-put assignment exposure were never released
+        (``open_option_orders_book_wide`` holds an order until its transaction is
+        CLOSED/FAILED, and FILLED is not a terminal transaction status).
+
+        The id is resolved HERE rather than demanded from the caller because this method is
+        reachable from ``CloseOptionAction``, from operator scripts and from anything added
+        later; an explicit ``transaction_id`` from a caller that has one still wins.
+
+        An UNRESOLVED link does not block the exit. Flattening a real position matters more
+        than the ledger link, and refusing here would strand a position that can no longer
+        be closed — the same argument the cover guard makes for exempting ``"close"``. It is
+        logged as an error rather than passed over in silence, because the resulting orphan
+        transaction is exactly the state an operator has to repair by hand.
+        """
         from ba2_trade_platform.core.option_types import OptionLeg
         from ba2_trade_platform.core.types import OrderDirection
         close_side = OrderDirection.SELL if position.side == OrderDirection.BUY else OrderDirection.BUY
@@ -6089,8 +6110,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             option_type=position.option_type, strike=position.strike, expiry=position.expiry,
             underlying=position.underlying,
         )
+        if transaction_id is None:
+            transaction_id = self.open_option_transaction_id_for_contract(
+                position.contract_symbol)
+        if transaction_id is None:
+            logger.error(
+                f"Closing {position.contract_symbol} but no OPEN transaction holding it "
+                f"could be found — the close will be booked on a NEW transaction and the "
+                f"original position (if any) will not reach CLOSED. Submitting anyway: "
+                f"flattening the position at the broker takes priority over the ledger link.")
         return self.submit_option_order(
-            [leg], int(position.quantity), order_type, limit_price, option_strategy="close")
+            [leg], int(position.quantity), order_type, limit_price,
+            option_strategy="close", transaction_id=transaction_id)
 
     # ------------------------------------------------------------------
     # Option assignment / exercise / expiry reconciliation (Phase C2)

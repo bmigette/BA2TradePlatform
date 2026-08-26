@@ -11,7 +11,7 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ba2_common.core.option_types import OptionContract, OptionQuote, OptionLeg, OptionPosition
 from ba2_common.core.types import OptionRight
@@ -685,11 +685,99 @@ class OptionsAccountInterface(ABC):
         if changed:
             update_instance(txn)
 
+    def open_option_transaction_id_for_contract(self, contract_symbol: str) -> Optional[int]:
+        """The id of the OPEN transaction still HOLDING ``contract_symbol``, or ``None``.
+
+        A CLOSE MUST RIDE THE TRANSACTION IT IS CLOSING. ``submit_option_order`` creates a
+        brand-new Transaction whenever ``transaction_id`` is omitted
+        (``_create_transaction_for_order`` constructs one unconditionally — it never looks
+        for an existing open position), so a closing leg submitted without the id books the
+        exit as a fresh OPENING position of the opposite side. The original then never
+        reaches CLOSED, the exit condition that decided to close it is still true on the
+        next pass and submits again — forever — and neither the buying-power reserve nor
+        the short-put assignment exposure is ever released, because
+        ``open_option_orders_book_wide`` keeps every order whose transaction is not
+        CLOSED/FAILED and FILLED is not a terminal transaction state.
+
+        This lives at the SEAM rather than at the call sites for the reason the rest of
+        this file gives: ``close_option_position`` is reachable from ``CloseOptionAction``,
+        from operator scripts and from any future caller, and a link maintained at one of
+        those is a convention rather than an invariant.
+
+        MATCHING. Both shapes are covered: the single-leg entry, where the transaction's
+        own option order IS the contract, and the multi-leg entry, where the contract is
+        carried by a leg CHILD of the parent. Both rows carry ``transaction_id``, so one
+        scan over this account's option orders answers it.
+
+        NET, NOT PRESENCE. A contract whose buys and sells already offset is FLAT, and
+        re-attaching a second close to it would reduce a position that no longer exists.
+        Only a transaction with a non-zero net for the contract is returned. Ties break on
+        the LOWEST transaction id — FIFO, the convention used everywhere else here.
+
+        UNKNOWN IS NOT "NO TRANSACTION": an unreadable book returns ``None`` exactly as a
+        genuinely absent one does, so the caller must treat ``None`` as "could not link"
+        and say so loudly rather than pretending it linked. Only the benign
+        world-was-uncooperative errors are absorbed (see ``_cover_benign_errors``); a
+        ``ProgrammingError`` still propagates, because a lookup that answers "not found"
+        forever is a lookup that has quietly stopped working.
+        """
+        from ba2_common.core.trade_store import orders_where, transactions_where
+        from ba2_common.core.types import (
+            AssetClass, OrderDirection, OrderStatus, TransactionStatus)
+        from ba2_common.logger import logger
+
+        if not contract_symbol:
+            return None
+        try:
+            executed = OrderStatus.get_executed_statuses()
+            rows = [o for o in orders_where(account_id=self.id)
+                    if o.asset_class == AssetClass.OPTION
+                    and o.contract_symbol == contract_symbol
+                    and o.transaction_id is not None
+                    and (o.status in executed or self._traded_something(o))]
+            if not rows:
+                return None
+            live_ids = {t.id for t in transactions_where(
+                not_statuses=(TransactionStatus.CLOSED, TransactionStatus.FAILED))}
+            net: Dict[int, float] = {}
+            for o in rows:
+                if o.transaction_id not in live_ids:
+                    continue
+                qty = self._readable_number(o.filled_qty)
+                if qty is None:
+                    qty = self._readable_number(o.quantity)
+                if qty is None:
+                    continue
+                signed = qty if o.side == OrderDirection.BUY else -qty
+                net[o.transaction_id] = net.get(o.transaction_id, 0.0) + signed
+            holding = sorted(tid for tid, n in net.items() if abs(n) > 1e-9)
+            if not holding:
+                return None
+            if len(holding) > 1:
+                logger.warning(
+                    f"{len(holding)} open transactions hold {contract_symbol} "
+                    f"({holding}) — attaching the close to the oldest, {holding[0]}")
+            return holding[0]
+        except Exception as e:
+            if not isinstance(e, self._cover_benign_errors()):
+                raise
+            logger.error(
+                f"Could not read the option book to find the open transaction holding "
+                f"{contract_symbol}: {e}", exc_info=True)
+            return None
+
     @abstractmethod
     def close_option_position(self, position: OptionPosition,
                               order_type: str = "limit",
-                              limit_price: Optional[float] = None) -> Any:
-        """Submit a closing order for a held option position (opposite intent)."""
+                              limit_price: Optional[float] = None,
+                              transaction_id: Optional[int] = None) -> Any:
+        """Submit a closing order for a held option position (opposite intent).
+
+        ``transaction_id`` is the OPEN position's transaction — the one the close must
+        reduce. An implementation not given one must resolve it itself via
+        :meth:`open_option_transaction_id_for_contract`; submitting without it books the
+        exit as a NEW opening position (see that method for the full consequence).
+        """
         ...
 
     # --- IV rank (self-computed from stored ATM-IV history) ----------------
