@@ -2467,6 +2467,16 @@ def _screener_gate_opt_block(args, strategy_key: str) -> "dict | None":
 _DEBIT_OPTION_KINDS = {"O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS", "O_STRD", "O_STRG",
                        "OS1", "OS4"}
 
+# The same split at MEMBER granularity (the group keys removed). Entry gates are authored per
+# MEMBER -- a group's rules are one per member -- so a set that mixes members and group keys
+# cannot answer "is THIS structure long or short premium?".
+_DEBIT_OPTION_MEMBERS = _DEBIT_OPTION_KINDS & set(_OPTION_STRATS)
+_CREDIT_OPTION_MEMBERS = set(_OPTION_STRATS) - _DEBIT_OPTION_MEMBERS
+# Every member must land on exactly one side: an unclassified structure would silently get the
+# credit half's iv_rank gate (the wrong thesis) with nothing to notice it.
+if _DEBIT_OPTION_MEMBERS | _CREDIT_OPTION_MEMBERS != set(_OPTION_STRATS):
+    raise RuntimeError("option members are not partitioned into debit/credit halves")
+
 
 def _option_exit_rules(kind: str):
     """Close the held option at a premium-profit TP, an ELAPSED-time exit and a
@@ -2621,6 +2631,53 @@ def _price_target_gates(m: str) -> list:
     ]
 
 
+# --- implied-volatility-rank entry gate (OPT-C1 / OPT-C4-of-R3) -----------------------------
+#
+# `iv_rank` is the one genuinely BOUNDED (0-100), symbol-COMPARABLE option quantity the
+# platform owns. It is fully implemented (TradeConditions.IVRankCondition,
+# BacktestAccount.get_iv_rank, OptionsAccountInterface._iv_rank_from_series), registered in
+# every condition registry (ExpertEventType.N_IV_RANK, get_numeric_event_values, CONDITION_MAP,
+# rule_builders.FIELD_EVENT, rules_export_import._FIELD_ABBR) -- and until now NO GRID BUILT A
+# LEAF FOR IT. Measured across all 19 built option strategies before this change: 256 condition
+# leaves, 499 genes, ZERO iv_rank leaves and ZERO iv_rank genes.
+#
+# THE TWO HALVES MUST ASK FOR OPPOSITE THINGS (OPT-C4). A premium SELLER wants implied vol
+# expensive; a premium BUYER wants it cheap. The GA's gene space never searches a condition's
+# OPERATOR -- only its threshold and its ON/OFF flag -- so a single shared gate could only ever
+# express ONE of those theses, and the other half would be gated on the opposite of what it
+# wants. The operator is therefore SET PER HALF, from the same debit/credit split the exit
+# bands already use, and each half gets its own searched window:
+#
+#     debit  (long premium)  iv_rank <  V   V in 10..60   "only buy vol when it is cheap"
+#     credit (short premium) iv_rank >  V   V in 20..70   "only sell vol when it is expensive"
+#
+# matching the documented recipes in rules_documentation.py ("Buy calls only in cheap
+# volatility: iv_rank <= 30", "Sell premium when iv_rank is high").
+#
+# FAIL-CLOSED, and that is deliberate. `IVRankCondition` returns False for EVERY operator when
+# the rank is unavailable (fewer than IV_RANK_MIN_SAMPLES=5 usable ATM-IV points -- the case on
+# any options cache built before the greeks columns existed). So an individual that switches
+# this gate ON against a cache with no IV trades NOTHING and scores the zero-trade sentinel.
+# That is the correct reading of "we cannot measure the entry criterion", not a bug: the
+# alternative (treat unknown IV as passing) would let the GA collect the gate's credit while
+# never actually applying it. The gate carries its own ``toggle_optimize`` gene, so the search
+# can and will switch it off where the data is not there.
+_IV_RANK_GATE = {
+    True:  {"op": "<", "value": 30.0, "value_min": 10.0, "value_max": 60.0},   # debit
+    False: {"op": ">", "value": 60.0, "value_min": 20.0, "value_max": 70.0},   # credit
+}
+_IV_RANK_STEP = 5.0
+
+
+def _iv_rank_gate(m: str, member: str) -> dict:
+    """The iv_rank entry gate leaf for member prefix ``m`` (see above)."""
+    spec = _IV_RANK_GATE[member in _DEBIT_OPTION_MEMBERS]
+    return {"id": f"{m}-iv_rank", "field": "iv_rank", "op": spec["op"],
+            "value": spec["value"], "optimize": True,
+            "value_min": spec["value_min"], "value_max": spec["value_max"],
+            "value_step": _IV_RANK_STEP, "toggle_optimize": True}
+
+
 def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
     (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
@@ -2658,6 +2715,7 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
             {"id": f"{m}-gate_confidence", "field": "confidence", "op": ">", "value": 50,
              "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
              "toggle_optimize": True},
+            _iv_rank_gate(m, member),
             *price_target_conditions,
         ]},
         "actions": [_option_entry_action_for(member)],
