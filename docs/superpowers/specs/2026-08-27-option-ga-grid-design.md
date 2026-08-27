@@ -341,16 +341,38 @@ records for the confidence gate in opt 333, where `cond:gate_confidence:enabled`
 genomes against 0.14 in trading ones.
 
 The data exists — `DeterministicScorer` computes a target through `estimate_price_target`. It is
-simply not surfaced under the key the condition reads. **Fix by de-hard-keying the condition**:
-read whichever target the recommending expert produced, falling back to `data["FMPRating"]`. Now
-that three experts share `analyst_target_model` this is the right moment, and it is what the
-condition already claims to mean — "price relative to the analyst target", not "relative to
-FMPRating's". The two alternatives (have DeterministicScorer write the FMPRating key, or drop the
-four gates for it the way the confidence clamp does) are respectively narrower and lossier.
+simply not surfaced under the key the condition reads.
 
-**This doubles the job count.** Stage 1 becomes 18 structures x 2 experts = **36 jobs**. If that
-is too much, drop the second expert from stage 1 and use it in stage 3 as a generalisation check
-instead — the same logic that keeps the cap bands out of stage 1.
+**THE FIX MUST BE GENERAL, NOT A SECOND SPECIAL CASE.** The condition is expert-agnostic in
+meaning — "where is price relative to the analyst target" — and it should be expert-agnostic in
+code. Any expert that produces a price target must work; the GRID happens to run two of them, and
+that is a run-time choice, not a constraint to encode. So: resolve the RECOMMENDING expert and
+read its own blob.
+
+`ExpertRecommendation.data` is already "expert-specific data, nested by expert name", and
+`ExpertRecommendation.instance_id` → `ExpertInstance.expert` gives that name. The hard-coded
+`"FMPRating"` should always have been that lookup. Resolution order:
+
+1. `data[<the recommending expert's own name>]` — the general case, correct for every expert.
+2. failing that, the single blob in `data` that carries `target_low` — covers an expert nesting
+   under a label that differs from its class name.
+3. failing that, `data["FMPRating"]` — pure backward compatibility, so no existing FMPRating
+   ruleset changes behaviour.
+
+Return None (gate fails closed, as today) only when no expert produced a target at all.
+
+Rejected: having `DeterministicScorer` write the `"FMPRating"` key (a lie in the data, and the
+next expert hits the same wall), and dropping the four gates per-expert the way the confidence
+clamp does (loses 29% of the search, and encodes the constraint this decision exists to remove).
+
+The same generality applies to the confidence ceiling already in `_EXPERT_CONFIDENCE_CEILING`:
+that table is keyed by expert name and gains an entry per expert, which is fine because a
+measured ceiling genuinely IS per-expert. A price target is not.
+
+**Stage 1 is 18 structures x 2 experts = 36 jobs**, ~180,000 trials realistic. Both experts run
+in stage 1 rather than deferring one to stage 3, so that no conclusion about a structure rests on
+a single signal — a structure that works only under FMPRating is a different finding from one
+that works under both, and stage 1 is where that distinction is cheap to make.
 
 ## 7.1 What does NOT exist, measured
 
@@ -408,9 +430,9 @@ full-notional three belong to no group.
 |---|---|---|---|---|---|---|
 | 0a smoke | 2 | 8 | 2 | — | ~300 | ~300 |
 | 0b pilot | 18 | 60 | 10 | 4 | ~11,000 | ~11,000 |
-| 1 discovery | 18 | 200 | 60 | 8 | 216,000 | ~90,000 |
+| 1 discovery | **36** | 200 | 60 | 8 | 432,000 | ~180,000 |
 | 2 composition | 1 | 300 | 80 | 10 | 24,000 | ~8,000 |
-| **total** | | | | | **~251,000** | **~109,000** |
+| **total** | | | | | **~467,000** | **~199,000** |
 
 "Realistic" assumes early-stop fires around generation 25; "if full" is the ceiling where nothing
 ever plateaus. The true figure lands between, and stage 0b measures which end.
