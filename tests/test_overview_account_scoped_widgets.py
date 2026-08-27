@@ -519,8 +519,19 @@ def _use_brokers(monkeypatch, brokers):
                         lambda account_id, session=None: brokers.get(account_id))
 
 
-def _price(symbol, current_price):
-    return {'symbol': symbol, 'current_price': current_price}
+def _price(symbol, current_price, unrealized_pl=None):
+    """A broker position dict.
+
+    ``unrealized_pl`` is what the MANUAL-account path (``_rows_for_manual_account``)
+    sums directly; ``current_price`` is what the expert-driven, local-reconstruction
+    path (``_transaction_pl``) multiplies against the platform's own recorded fills.
+    A manual-account test that wants a specific figure must set ``unrealized_pl``
+    explicitly -- ``current_price`` alone no longer produces one for that account.
+    """
+    d = {'symbol': symbol, 'current_price': current_price}
+    if unrealized_pl is not None:
+        d['unrealized_pl'] = unrealized_pl
+    return d
 
 
 def _render_floating_pl(client, widget_cls):
@@ -546,10 +557,15 @@ def _render_floating_pl(client, widget_cls):
 
 def test_floating_pl_per_account_shows_pl_for_an_account_with_no_experts(
         nicegui_client, select_account, monkeypatch, manual_account):
-    """THE BUG. ``_calculate_pl_sync`` bailed out on the empty expert list."""
+    """THE BUG. ``_calculate_pl_sync`` bailed out on the empty expert list.
+
+    A manual account is priced from the BROKER's own ``unrealized_pl`` (see
+    ``_rows_for_manual_account``), not from this local trade's cost basis -- the
+    local trade exists here only to prove it is NOT what drives the number.
+    """
     _open_trade(manual_account, 'AAPL', qty=10.0, open_price=100.0)
-    _use_brokers(monkeypatch, {manual_account: _Broker([_price('AAPL', 110.0)],
-                                                       balance=25_000.0)})
+    _use_brokers(monkeypatch, {manual_account: _Broker(
+        [_price('AAPL', 110.0, unrealized_pl=100.0)], balance=25_000.0)})
 
     select_account(manual_account)
     texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
@@ -579,7 +595,7 @@ def test_floating_pl_per_account_never_shows_another_accounts_positions(
     _open_trade(manual_account, 'AAPL', qty=10.0, open_price=100.0)
     _open_trade(other_account, 'MSFT', expert_id=expert_id, qty=10.0, open_price=100.0)
     _use_brokers(monkeypatch, {
-        manual_account: _Broker([_price('AAPL', 110.0)]),
+        manual_account: _Broker([_price('AAPL', 110.0, unrealized_pl=100.0)]),
         other_account: _Broker([_price('MSFT', 105.0)]),
     })
 
@@ -633,7 +649,7 @@ def test_floating_pl_per_account_with_all_accounts_selected_shows_both(
     _open_trade(manual_account, 'AAPL', qty=10.0, open_price=100.0)
     _open_trade(other_account, 'MSFT', expert_id=expert_id, qty=10.0, open_price=100.0)
     _use_brokers(monkeypatch, {
-        manual_account: _Broker([_price('AAPL', 110.0)]),
+        manual_account: _Broker([_price('AAPL', 110.0, unrealized_pl=100.0)]),
         other_account: _Broker([_price('MSFT', 105.0)]),
     })
 
@@ -743,7 +759,8 @@ def test_floating_pl_per_account_lists_each_account_exactly_once(
     """Seeding the row from the account table must not double the rows of an
     account that ALSO has open transactions."""
     _open_trade(manual_account, 'AAPL', qty=10.0, open_price=100.0)
-    _use_brokers(monkeypatch, {manual_account: _Broker([_price('AAPL', 110.0)])})
+    _use_brokers(monkeypatch, {manual_account: _Broker(
+        [_price('AAPL', 110.0, unrealized_pl=100.0)])})
 
     select_account(manual_account)
     texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
@@ -933,16 +950,20 @@ def test_floating_pl_per_account_keeps_a_genuinely_zero_balance(
     assert 'Bal: unknown' not in texts
 
 
-def test_floating_pl_per_account_marks_a_row_partial_when_a_held_position_has_no_price(
+def test_floating_pl_per_account_marks_a_manual_row_partial_when_a_position_has_no_broker_pl(
         nicegui_client, select_account, monkeypatch, manual_account):
-    """A position the broker did not quote is a MISSING LEG, not a zero one.
+    """A broker position with no ``unrealized_pl`` is a MISSING LEG, not a zero one.
 
-    Silently skipping it (what the widget did) understated the account's P/L by
-    however much that position is worth, with nothing on screen to say so.
+    Silently skipping it (what the widget did before ``_rows_for_manual_account``
+    existed) understated the account's P/L by however much that position is worth,
+    with nothing on screen to say so. Local transactions play no part here: a
+    manual account's completeness is judged entirely by what the BROKER returned
+    (see ``_is_manual_account``), not by what the platform happens to have recorded.
     """
-    _open_trade(manual_account, 'AAPL', qty=10.0, open_price=100.0)
-    _open_trade(manual_account, 'MSFT', qty=10.0, open_price=100.0)
-    _use_brokers(monkeypatch, {manual_account: _Broker([_price('AAPL', 110.0)])})
+    _use_brokers(monkeypatch, {manual_account: _Broker([
+        _price('AAPL', 110.0, unrealized_pl=100.0),
+        {'symbol': 'MSFT', 'current_price': 105.0},   # no unrealized_pl
+    ])})
 
     select_account(manual_account)
     texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)
@@ -956,11 +977,13 @@ def test_floating_pl_per_account_marks_a_row_partial_when_a_held_position_has_no
 
 def test_floating_pl_per_account_treats_a_position_the_broker_did_not_price_as_unpriced(
         nicegui_client, select_account, monkeypatch, manual_account):
-    """A position in the book with ``current_price=None`` has no price.
+    """A manual-account position with no ``unrealized_pl`` has no measured P/L.
 
     Coercing that to 0.0 does not merely lose the leg -- it invents one, and the
     invented one is catastrophic: a $1,000 holding marked to zero prints a
-    $1,000 loss the account never took.
+    $1,000 loss the account never took. The local trade below is a red herring
+    on purpose: a manual account's P/L is priced from the broker's own book (see
+    ``_rows_for_manual_account``), so it must not influence the result either way.
     """
     _open_trade(manual_account, 'AAPL', qty=10.0, open_price=100.0)
     _use_brokers(monkeypatch, {manual_account: _Broker(
@@ -1173,7 +1196,9 @@ def test_the_per_account_widget_does_show_that_same_trade(
 
     Same row, same account: invisible to the per-EXPERT card (no expert of this
     account's owns it) and fully visible to the per-ACCOUNT card (the money is
-    this account's).
+    this account's). The local transaction below only proves the account is
+    picked up; its own cost basis is not what prices the row -- ``unrealized_pl``
+    on the broker position is (``_rows_for_manual_account``).
     """
     _, expert_id = expert_account
     txn = create_transaction(symbol='AAPL', quantity=10.0, side=OrderDirection.BUY,
@@ -1183,7 +1208,8 @@ def test_the_per_account_widget_does_show_that_same_trade(
                          side=OrderDirection.BUY, order_type=OrderType.MARKET,
                          status=OrderStatus.FILLED, transaction_id=txn.id,
                          filled_qty=10.0, open_price=100.0)
-    _use_brokers(monkeypatch, {manual_account: _Broker([_price('AAPL', 110.0)])})
+    _use_brokers(monkeypatch, {manual_account: _Broker(
+        [_price('AAPL', 110.0, unrealized_pl=100.0)])})
 
     select_account(manual_account)
     texts = _render_floating_pl(nicegui_client, FloatingPLPerAccountWidget)

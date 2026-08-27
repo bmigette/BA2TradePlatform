@@ -9,7 +9,7 @@ from typing import Dict, Optional, List, Sequence, Tuple
 from sqlmodel import select, Session
 from ...logger import logger
 from ...core.db import get_db
-from ...core.models import Transaction, AccountDefinition, TradingOrder
+from ...core.models import Transaction, AccountDefinition, TradingOrder, ExpertInstance
 from ...core.types import TransactionStatus, OrderStatus, OrderDirection, OrderType
 from ...core.utils import get_account_instance_from_id
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
@@ -563,6 +563,102 @@ class FloatingPLPerAccountWidget(_FloatingPLWidgetBase):
     _title = '📊 Floating P/L Per Account'
     _show_balance = True
     _empty_text = NO_ACCOUNTS_TEXT
+
+    def _is_manual_account(self, account_id: int, session: Session) -> bool:
+        """True when NO ``ExpertInstance`` trades this account -- a hand-managed book.
+
+        TastyTrade is the motivating case: 25 real, broker-held positions and a real
+        +$215 of floating P/L, but ZERO ``Transaction``/``TradingOrder`` rows anywhere
+        in the platform, because nothing on that account was ever opened through it.
+        Reconstructing P/L from local fills (what ``_rows_for_account`` does, and must
+        keep doing for an expert-driven account) answers "what has this platform
+        recorded", which is the wrong question for a book the platform never wrote
+        to -- it silently measures a real account at $0.00.
+
+        The fix applies to EVERY manual account, not only empty ones: a manual
+        account's local order rows (if any exist -- a user CAN place a trade by hand
+        through the platform) are at best a partial view of what the broker actually
+        holds, while ``get_positions()``'s own ``unrealized_pl`` per position is the
+        broker's real, complete number. See ``_rows_for_manual_account``.
+        """
+        return session.exec(
+            select(ExpertInstance.id).where(ExpertInstance.account_id == account_id).limit(1)
+        ).first() is None
+
+    def _rows_for_account(
+        self, account_id: int, trans_list: List[Tuple[Transaction, str]],
+        seed_name: Optional[str], session: Session,
+    ) -> List[PLRow]:
+        if self._is_manual_account(account_id, session):
+            return self._rows_for_manual_account(account_id, trans_list, seed_name, session)
+        return super()._rows_for_account(account_id, trans_list, seed_name, session)
+
+    def _rows_for_manual_account(
+        self, account_id: int, trans_list: List[Tuple[Transaction, str]],
+        seed_name: Optional[str], session: Session,
+    ) -> List[PLRow]:
+        """A manual account's row, priced from the BROKER's own per-position P/L.
+
+        Exactly one row: a manual account is scoped by account (never split by
+        expert), so every name in ``trans_list`` -- if there even are any -- is the
+        same account name ``_seed_rows`` already seeded.
+        """
+        names = list(dict.fromkeys(name for _, name in trans_list))
+        if not names and seed_name is not None:
+            names = [seed_name]
+        if not names:
+            return []
+        name = names[0]
+
+        account = get_account_instance_from_id(account_id, session=session)
+        if account is None:
+            logger.error(f"Could not build an account instance for account {account_id}; "
+                         f"its floating P/L is unknown, not zero")
+            return [PLRow(name=name, pl=None)]
+
+        balance: Optional[float] = None
+        if self._show_balance:
+            try:
+                bal = account.get_balance()
+                balance = float(bal) if bal is not None else None
+                if bal is None:
+                    logger.warning(f"Balance unavailable for account {account_id}; "
+                                   f"showing it as unknown rather than as zero")
+            except Exception as e:
+                logger.error(f"Could not fetch balance for account {account_id}: {e}",
+                             exc_info=True)
+                balance = None
+
+        try:
+            broker_positions = account.get_positions()
+        except Exception as e:
+            logger.error(f"get_positions() raised for account {account_id}: {e}",
+                         exc_info=True)
+            return [PLRow(name=name, pl=None, balance=balance)]
+
+        # TRI-STATE, same rule as the base: None is a fetch failure, [] is a
+        # genuinely flat (or genuinely empty) account.
+        if broker_positions is None:
+            logger.error(f"get_positions() failed for account {account_id}; its "
+                         f"floating P/L is unknown, not zero")
+            return [PLRow(name=name, pl=None, balance=balance)]
+
+        total = 0.0
+        unpriced: List[str] = []
+        for pos in broker_positions:
+            pos_dict = pos if isinstance(pos, dict) else dict(pos)
+            symbol = pos_dict.get('symbol')
+            pl = pos_dict.get('unrealized_pl')
+            # A position the broker returned but published no unrealized_pl for is
+            # left OUT of the sum, same rule as an unpriced leg in the base path --
+            # it must not be coerced into contributing zero.
+            if pl is None:
+                if symbol and symbol not in unpriced:
+                    unpriced.append(symbol)
+                continue
+            total += float(pl)
+
+        return [PLRow(name=name, pl=total, balance=balance, unpriced=tuple(unpriced))]
 
     def _scope_query(self, query, selected_account_id: Optional[int],
                      account_expert_ids: Optional[List[int]]):
