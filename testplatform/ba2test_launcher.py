@@ -1133,7 +1133,12 @@ _EXPERT_OPT = {
             # fixed at the class default); 'dynamic' scales expected_profit up with how far
             # the EPS surprise exceeds surprise_min_pct. dynamic_scale=0 makes 'dynamic'
             # numerically identical to 'static', so the GA can freely discover either.
-            "expected_profit_mode": {"optimize": True, "type": "choice", "choices": ["static", "dynamic"]},
+            # 2026-08-27: 'model' added (ba2_experts.analyst_target_model, commit a30794ac) --
+            # a fundamentals-only P/E x forward-EPS price target, replacing the surprise
+            # heuristic when selected. Falls back to 'static' behaviour whenever the model
+            # can't compute an estimate, so this is always safe for the GA to pick.
+            "expected_profit_mode": {"optimize": True, "type": "choice",
+                                     "choices": ["static", "dynamic", "model"]},
             "dynamic_scale": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
             # 2026-08-26 addition: a real earnings beat against a near-zero/negative analyst
             # estimate (surprise_pct's denominator) produces a mathematically-correct but
@@ -1153,6 +1158,19 @@ _EXPERT_OPT = {
         "expert_params": {
             "lookback_days": {"optimize": True, "min": 30, "max": 120, "step": 15, "type": "int"},
             "min_insiders": {"optimize": True, "min": 2, "max": 6, "step": 1, "type": "int"},
+            # 2026-08-27 addition (ba2_experts.analyst_target_model, commit a30794ac): this
+            # expert's expected_profit_percent was previously a flat, never-GA-tuned constant --
+            # 'model' replaces it with a fundamentals-only P/E x forward-EPS estimate, falling
+            # back to the flat value whenever the model can't compute one. No 'dynamic' mode
+            # exists for this expert (that's FMPEarningsDrift-specific, keyed on EPS-surprise
+            # magnitude, which this expert doesn't have).
+            "expected_profit_mode": {"optimize": True, "type": "choice",
+                                     "choices": ["static", "model"]},
+            # Same range and rationale as FMPEarningsDrift's cap of the same name (added after
+            # a live 3977% blowup there): a sane anchor P/E can still compound with a large
+            # following-period EPS growth estimate into an unrealistic multi-bagger target.
+            "max_expected_profit_percent": {"optimize": True, "min": 20.0, "max": 500.0,
+                                            "step": 20.0, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },
