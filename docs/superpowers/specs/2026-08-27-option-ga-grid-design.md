@@ -24,7 +24,20 @@ second wants one large genome seeded from the first.
 
 Verified against the code on 2026-08-27, not assumed:
 
-* **15 option strategy keys** in `_OPTION_STRATS`, all buildable as single-strategy jobs.
+* **15 pure-option strategy keys** in `_OPTION_STRATS`, all buildable as single-strategy jobs.
+* **Two EQUITY-ENTRY overlay keys**, `O_CC` (covered call) and `O_PP` (protective put), absent
+  from `_OPTION_STRATS` because they buy stock via the normal equity entry and splice an option
+  overlay into the exit rules. They are OPPOSITES: `O_CC` COLLECTS premium and caps upside,
+  `O_PP` PAYS premium for downside insurance.
+* **The wheel primitive**: a `has_assigned_shares` condition separating assigned stock from stock
+  bought outright, tested as a usable rule trigger (`tests/test_wheel_assignment_order.py`, 14
+  tests). There is no wheel STRATEGY, but this is what makes one expressible.
+* **A complete option backtest engine.** `backtest_account.py` carries ~24 option methods over
+  342 option references — chain fetch, quotes, multi-leg combo submit, fills with modelled
+  spread/slippage/participation cap, MTM, expiry settlement, assignment, called-away lot
+  splitting — plus `options_provider.py`, `fetch_options.py` and a full Black-Scholes
+  `option_greeks.py` with IV by inversion. **Early American assignment is NOT modelled**
+  (`daily_engine.py:1408`): options resolve at expiry only.
 * **4 family groups** `OS1`–`OS4` with toggleable members (`_OPTION_GROUPS`).
 * **Multi-job fan-out** — `optimize-batch` runs one GA job per strategy over a shared universe,
   each tagged with its own `optimization_id`.
@@ -116,7 +129,9 @@ OFF, so a failure there can only be data or wiring. 0b runs the real shape, so a
 green is configuration or strategy. 0b is also what turns the cost table below from an estimate
 into a schedule: it measures per-trial runtime on the machine that will do the work.
 
-### Stage 1 · Discovery — 15 jobs, one per structure
+### Stage 1 · Discovery — 18 jobs, one per structure
+
+The 15 pure-option keys plus the three wheel-family strategies below.
 
 Genome ~28, **population 200, generations 60 with early-stop patience 8**. ~5,000 trials per job
 in practice; 12,000 only if a job never plateaus.
@@ -128,6 +143,37 @@ structure trades at all on this data.
 All 15 are searchable here, including `O_CSP` / `O_JL` / `O_RS`, which the group filter excludes.
 That filter is unconditional and its own comment says the three "remain runnable as EXPLICIT
 single-strategy jobs" — stage 1 is exactly that.
+
+#### The wheel family — three more strategies, one of which must be built
+
+| key | entry | overlay | premium | build state |
+|---|---|---|---|---|
+| `O_CSP` | sell put (pure option) | — | collect | exists |
+| `O_CC` | buy stock (equity) | sell call | collect | exists |
+| `O_PP` | buy stock (equity) | buy put | **pay** | exists |
+| `O_WHEEL` | sell put (pure option) | sell call **on assigned shares** | collect | **to build** |
+
+`O_WHEEL` = `O_CSP`'s entry rule + `O_CC`'s guard/overlay pair, with ONE deliberate change: gate
+the overlay on **`has_assigned_shares`**, not `has_position`. `has_position` would write calls
+against any stock the expert holds; `has_assigned_shares` writes them only against shares the
+wheel actually put you into. That distinction IS the wheel.
+
+**It must use `_insert_option_overlay`, not append.** That helper exists because an appended
+overlay sat behind S2's always-matching floor stop and could never fire — and the GA could not
+route around it, since that rule declares no toggle gene. The consequence was not subtle: `O_CC`
+and `O_PP`, two OPPOSITE strategies, produced byte-identical top-5 results with zero trades
+carrying a contract symbol, because both were silently running the same plain long-equity
+baseline. Every pre-fix `O_CC`/`O_PP` number is a mislabelled equity run. A wheel that skips the
+splice degrades into plain `O_CSP` the same way.
+
+**Read wheel results knowing early assignment is not modelled.** In reality a deep-ITM short put
+is often assigned early, especially around dividends, so a backtested wheel turns over more
+slowly than a live one and overstates time-in-put. Not a reason to skip it; a reason not to read
+its turnover as real.
+
+**Capital binds this family twice.** All four must fund a full strike or 100 shares — spot ≤
+\$60 today, ≤ \$100 at the 50% cap. The wheel inherits that at the put AND again at the
+assigned lot.
 
 ### Stage 2 · Composition — 1 job, the deployable expert
 
@@ -144,7 +190,7 @@ Stage 1's per-structure verdicts are still recorded, because they are the knowle
 exists to produce, and a structure that could not trade at all is a finding worth having. They
 just do not gate anything.
 
-All 15 structures as toggleable members of ONE expert, plus the shared tier-1 gate.
+All 18 structures as toggleable members of ONE expert, plus the shared tier-1 gate.
 Genome **~300, ESTIMATED** — `OS_ALL` does not exist yet, so unlike every other figure in this
 spec that number is arithmetic (15 members x ~14 per-structure condition genes + 4 shared + the
 option genes + the entry toggles) rather than a measurement. Measure it with
@@ -255,9 +301,10 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
 
 ## 7. What has to be built
 
-1. **Shared condition ids** — emit `shared-rel_volume` and `shared-gate_confidence` in the group
+1. **`O_WHEEL`** — compose `O_CSP`'s entry with `O_CC`'s overlay pair, gated on `has_assigned_shares` and spliced with `_insert_option_overlay`.
+2. **Shared condition ids** — emit `shared-rel_volume` and `shared-gate_confidence` in the group
    builder. Verified to collapse 20 genes to 4 on OS1; no GA change.
-2. **An `OS_ALL` group** for stage 2, carrying every structure that survived stage 1.
+2. **An `OS_ALL` group** for stage 2, carrying all 18 structures.
 3. **Cross-job seeding** — read stage-1 winners and emit `initial_population` for stage 2. The
    hook exists for resume; this points it at another job's results.
 4. **A price-capped universe helper** for the full-notional three.
@@ -271,10 +318,10 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
 | stage | jobs | population | generations (ceiling) | early-stop | trials if full | realistic |
 |---|---|---|---|---|---|---|
 | 0a smoke | 2 | 8 | 2 | — | ~300 | ~300 |
-| 0b pilot | 15 | 60 | 10 | 4 | ~9,000 | ~9,000 |
-| 1 discovery | 15 | 200 | 60 | 8 | 180,000 | ~75,000 |
+| 0b pilot | 18 | 60 | 10 | 4 | ~11,000 | ~11,000 |
+| 1 discovery | 18 | 200 | 60 | 8 | 216,000 | ~90,000 |
 | 2 composition | 1 | 300 | 80 | 10 | 24,000 | ~8,000 |
-| **total** | | | | | **~213,000** | **~92,000** |
+| **total** | | | | | **~251,000** | **~109,000** |
 
 "Realistic" assumes early-stop fires around generation 25; "if full" is the ceiling where nothing
 ever plateaus. The true figure lands between, and stage 0b measures which end.
