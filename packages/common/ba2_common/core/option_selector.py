@@ -240,7 +240,22 @@ def filter_dte(chain: List[OptionContract], today: date,
     return out
 
 
-def _target_strike(method, strike_param, spot, target_price, option_type) -> Optional[float]:
+def target_strike(method, strike_param, spot, target_price, option_type) -> Optional[float]:
+    """The strike a non-delta method aims at, or None when there is no target strike.
+
+    ``None`` has THREE causes, not one: the ``delta`` method (which targets a delta, not a
+    strike), an unrecognised method, and ``consensus_target`` with no ``target_price`` — that
+    last branch returns the missing price verbatim, and it is reachable in production because
+    ``select_single``'s ``target_price`` defaults to ``None``. Spelling all three out matters
+    now that a second consumer exists: a caller who reads "None for the delta method" and
+    writes ``if method != "delta": abs(c.strike - target_strike(...))`` gets a TypeError on a
+    consensus_target rule whose recommendation carried no target.
+
+    PUBLIC because ``option_selection_policy`` needs the identical number to measure a
+    candidate's distance from the box centre. A second copy of this arithmetic would drift, and
+    the first symptom would be the new policy picking a different contract at DEFAULT weights —
+    breaking the no-op guarantee that lets the policy ship without changing any backtest.
+    """
     if method == "percent_otm":
         if option_type == OptionRight.CALL:
             return spot * (1 + strike_param / 100.0)
@@ -277,7 +292,7 @@ def _pick_by(method, cands, strike_param, spot, target_price, option_type):
         if not usable:
             return None
         return min(usable, key=lambda c: (abs(abs(c.delta) - abs(strike_param)), *_tie(c)))
-    ts = _target_strike(method, strike_param, spot, target_price, option_type)
+    ts = target_strike(method, strike_param, spot, target_price, option_type)
     if ts is None:
         return None
     return min(cands, key=lambda c: (abs(c.strike - ts), *_tie(c)))
