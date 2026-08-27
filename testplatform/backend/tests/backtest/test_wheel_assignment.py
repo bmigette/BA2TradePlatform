@@ -412,3 +412,89 @@ def test_a_worthless_call_leaves_the_shares_held_with_no_exit(tmp_path):
         assert len(rows) == 1 and rows[0]["exit_reason"] == "open_at_end"
     finally:
         ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# The COMPOSITION, added after review. Everything above drives the pieces by
+# hand; none of it pins the interaction that actually broke.
+# ---------------------------------------------------------------------------
+
+def test_the_engines_STEP_ORDER_cannot_sell_shares_out_from_under_a_written_call():
+    """The literal defect, pinned at the level it occurred: step order.
+
+    The bug was never in either component. It was that `_manage_open_positions` (step 3) runs
+    BEFORE `process_pending_assignment_liquidations` (step 4a-pre) on the same bar, so a covered
+    call written in step 3 had its collateral sold in step 4a-pre — a naked short call, produced
+    by two individually-correct functions in the wrong order.
+
+    Every other test in this file hand-drives one component. This asserts the invariant that
+    makes their combination safe: with the switch on, the liquidation queue is EMPTY when step
+    4a-pre runs, so no ordering of the two can strand a call. That is a stronger statement than
+    "the shares are still there" — it says there is nothing for the liquidation to do at all.
+    """
+    import inspect
+    from app.services.backtest import daily_engine as de
+
+    src = inspect.getsource(de.DailyBacktestEngine.run)
+    manage = src.index("_manage_open_positions")
+    liquidate = src.index("process_pending_assignment_liquidations")
+    assert manage < liquidate, (
+        "step order changed: the manage pass no longer precedes the assignment liquidation. "
+        "That is not automatically a bug, but this test and the wheel's safety both rest on "
+        "the queue being empty rather than on the order — re-read _book_assignment_share_leg "
+        "before adjusting this.")
+
+
+def test_a_group_containing_the_wheel_still_holds_its_assigned_stock():
+    """The most likely way to undo this whole change.
+
+    `--strategy` takes GROUP keys that expand to member lists, and putting O_WHEEL in a family
+    alongside O_CSP is the natural way to search it. Matching the bare key against
+    _HOLDS_ASSIGNED_STOCK would silently drop the flag for that arm and revert it to writing
+    covered calls whose shares are sold the same bar. The grid spec's own OS_ALL instruction
+    would have triggered exactly that.
+    """
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location("lch_wheel", "testplatform/ba2test_launcher.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["lch_wheel"] = m
+    try:
+        spec.loader.exec_module(m)
+    except SystemExit:
+        pass
+
+    assert m._hold_assigned_stock("O_WHEEL") is True
+    assert m._hold_assigned_stock("O_CSP") is False
+    assert m._hold_assigned_stock(None) is False, "bypass experts must not inherit it"
+
+    # A synthetic group containing the wheel must inherit the flag.
+    m._OPTION_GROUPS["OS_TEST_WHEEL"] = ["O_CSP", "O_WHEEL"]
+    try:
+        assert m._hold_assigned_stock("OS_TEST_WHEEL") is True, (
+            "a group containing O_WHEEL dropped the flag -- that arm reverts to naked calls")
+        m._OPTION_GROUPS["OS_TEST_PLAIN"] = ["O_CSP", "O_IC"]
+        assert m._hold_assigned_stock("OS_TEST_PLAIN") is False, (
+            "a group with no wheel member must NOT hold assigned stock -- that would leave "
+            "every other option strategy sitting on stock nothing manages, which is the "
+            "orphan problem the liquidation exists to prevent")
+    finally:
+        m._OPTION_GROUPS.pop("OS_TEST_WHEEL", None)
+        m._OPTION_GROUPS.pop("OS_TEST_PLAIN", None)
+
+
+@pytest.mark.parametrize("raw, expected", [
+    (True, True), (False, False), (None, False), ("", False),
+    ("true", True), ("1", True), ("yes", True),
+    ("false", False), ("0", False), ("no", False),
+])
+def test_a_stringly_typed_payload_flag_is_read_as_a_boolean(raw, expected):
+    """`bool("false")` is True, and this flag decides WHICH STRATEGY the run represents.
+
+    Not a cost knob like option_spread_pct: a form-encoded, env-sourced or YAML-sourced "false"
+    quietly enabling it turns a naked-call simulation into something labelled a wheel, or the
+    reverse.
+    """
+    from app.services.backtest.daily_backtest_handler import _as_bool
+    assert _as_bool(raw) is expected

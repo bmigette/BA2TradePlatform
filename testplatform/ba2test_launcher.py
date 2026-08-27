@@ -3155,8 +3155,21 @@ def _hold_assigned_stock(kind: Optional[str]) -> bool:
     ``kind`` is None for BYPASS experts (FactorRanker), which ignore ``--strategy`` and build
     the minimal strategy -- so whatever ``--strategy`` says about them is meaningless and must
     not leak into their account settings.
+
+    A GROUP KEY COUNTS IF ANY MEMBER NEEDS IT, and that is not defensive coding -- it is the
+    single most likely way for this whole change to be undone. ``--strategy`` accepts group keys
+    (``OS1``..``OS4``, ``OS_ALL``) that expand to member lists via ``_OPTION_GROUPS``, and adding
+    O_WHEEL to a family is the NATURAL way to search it alongside O_CSP. Matching the bare key
+    against ``_HOLDS_ASSIGNED_STOCK`` would silently drop the flag for that arm, and the arm
+    would revert to writing covered calls whose shares are sold the same bar -- the exact
+    naked-call defect this branch exists to remove, reintroduced by the obvious next step. The
+    grid spec's own OS_ALL instruction would have triggered it.
     """
-    return kind in _HOLDS_ASSIGNED_STOCK
+    if kind is None:
+        return False
+    if kind in _HOLDS_ASSIGNED_STOCK:
+        return True
+    return any(m in _HOLDS_ASSIGNED_STOCK for m in _OPTION_GROUPS.get(kind, ()))
 
 
 # SMOKE MODE (--gates-off): drop every OPTIONAL entry gate so a run exercises the PIPELINE

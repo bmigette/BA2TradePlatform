@@ -71,7 +71,7 @@ experts 485, `testplatform/backend` 1488 + 1 known Windows-only failure
 | `ba2_trade_platform/modules/accounts/AlpacaAccount.py` | leg-fill reconciliation; partial called-away split | 4, 5 |
 | `ba2_trade_platform/core/option_lifecycle_service.py` **(new)** | the live runner: loads book, calls the pure fn, submits | 8 |
 | `ba2_trade_platform/core/JobManager.py` | run the pass before the analyses; readiness reporting | 8, 9 |
-| `testplatform/backend/app/services/backtest/backtest_account.py` | stop liquidating assigned stock | 10 |
+| `testplatform/backend/app/services/backtest/backtest_account.py` | OPT-IN switch to hold assigned stock (default OFF — the polarity landed opposite to this task's title, deliberately) | 10 |
 | `testplatform/backend/app/services/backtest/daily_engine.py` | call the same pure fn | 10, 11 |
 
 New pure modules go in `packages/common` so live and backtest call one implementation. Two
@@ -662,8 +662,9 @@ git commit -m "feat(options): report unmanaged option positions and brokers with
 - Modify: `testplatform/backend/app/services/backtest/daily_engine.py`
 - Test: `testplatform/backend/tests/backtest/test_wheel_assignment.py`
 
-Today a short ITM put assigns and the resulting stock is fully liquidated at the next bar's open.
-**The wheel cannot be backtested at all.**
+~~Today a short ITM put assigns and the resulting stock is fully liquidated at the next bar's
+open. **The wheel cannot be backtested at all.**~~ **RESOLVED 2026-08-27** — holding is now
+opt-in per run via `hold_assigned_stock` (default OFF, so no historical result moved).
 
 **DONE 2026-08-27** — commits `d2e6db1` (engine) and `7345634` (launcher wiring), branch
 `wheel-engine`. The polarity landed the OTHER way round from the heading, deliberately:

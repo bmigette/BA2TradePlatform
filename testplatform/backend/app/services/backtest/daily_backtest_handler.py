@@ -411,6 +411,18 @@ def _build_screener_runtime(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]
     }
 
 
+def _as_bool(v) -> bool:
+    """Payload booleans, without the `bool("false") is True` trap.
+
+    `hold_assigned_stock` is not a cost knob like `option_spread_pct` -- flipping it changes
+    WHICH STRATEGY the run represents (a wheel vs a naked-call simulation), so a form-encoded,
+    env-sourced or YAML-sourced "false"/"0" quietly enabling it is not a rounding error.
+    """
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
 def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Parse + assemble the engine run config from the validated payload.
 
@@ -469,7 +481,7 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # per-strategy (ba2test_launcher._hold_assigned_stock); this is the API/CLI create
         # path's passthrough so a payload can carry it too. See
         # BacktestAccount.get_settings_definitions for what holding costs.
-        "hold_assigned_stock": bool(payload.get("hold_assigned_stock") or False),
+        "hold_assigned_stock": _as_bool(payload.get("hold_assigned_stock")),
     }
 
     # warmup_days: longest indicator/lookback window the experts need preloaded before

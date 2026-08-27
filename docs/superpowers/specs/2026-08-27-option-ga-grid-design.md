@@ -31,7 +31,8 @@ Verified against the code on 2026-08-27, not assumed:
   `O_PP` PAYS premium for downside insurance.
 * **The wheel primitive**: a `has_assigned_shares` condition separating assigned stock from stock
   bought outright, tested as a usable rule trigger (`tests/test_wheel_assignment_order.py`, 14
-  tests). There is no wheel STRATEGY, but this is what makes one expressible.
+  tests). `O_WHEEL` is now a registered strategy built on it (2026-08-27); this condition is
+  what made it expressible.
 * **A complete option backtest engine.** `backtest_account.py` carries ~24 option methods over
   342 option references — chain fetch, quotes, multi-leg combo submit, fills with modelled
   spread/slippage/participation cap, MTM, expiry settlement, assignment, called-away lot
@@ -183,7 +184,7 @@ Related correction to §2: that section claims "a complete option backtest engin
 lot splitting". Lot splitting exists in the LIVE account (`AlpacaAccount._settle_called_away`);
 in the backtest, assigned lots are liquidated the next bar unless `hold_assigned_stock` is set.
 
-#### The wheel family — three more strategies, one of which must be built
+#### The wheel family — four strategies, all now built
 
 | key | entry | overlay | premium | build state |
 |---|---|---|---|---|
@@ -210,6 +211,16 @@ is often assigned early, especially around dividends, so a backtested wheel turn
 slowly than a live one and overstates time-in-put. Not a reason to skip it; a reason not to read
 its turnover as real.
 
+**THE WHEEL HAS EXACTLY ONE EXIT, AND IT IS NOT GUARANTEED.** Traced, not inferred: held shares
+leave only when the covered call finishes ITM and they are called away at the strike. If the call
+expires worthless nothing sells them — the wheel's own exit rules are all `close_option`, and
+`cc_guard` halts the ruleset while a call is open so those rules never even evaluate. There is no
+margin-call path for long stock and no end-of-run flatten. The shares therefore ride to the end of
+the run, marked to market with `exit_reason="open_at_end"` (so the P&L reaches both the curve and
+the trade rows) with their capital locked. **Read an O_WHEEL result knowing its equity curve is a
+long-stock curve plus premium on every symbol assigned and not called away**, and that its capital
+efficiency depends entirely on the covered-call strike gene putting the call ITM often enough.
+
 **Capital binds this family twice.** All four must fund a full strike or 100 shares — spot ≤
 \$60 today, ≤ \$100 at the 50% cap. The wheel inherits that at the put AND again at the
 assigned lot.
@@ -229,7 +240,7 @@ Stage 1's per-structure verdicts are still recorded, because they are the knowle
 exists to produce, and a structure that could not trade at all is a finding worth having. They
 just do not gate anything.
 
-All 17 runnable structures as toggleable members of ONE expert, plus the shared tier-1 gate.
+All 18 structures as toggleable members of ONE expert, plus the shared tier-1 gate.
 Genome **~240, ESTIMATED** (was ~300 before the price-gate swap) — `OS_ALL` does not exist yet, so unlike every other figure in this
 spec that number is arithmetic (15 members x ~14 per-structure condition genes + 4 shared + the
 option genes + the entry toggles) rather than a measurement. Measure it with
@@ -344,7 +355,11 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
 2. **Swap the four `price_*` gates for one `expected_profit_target_percent` gate**, which every expert produces by construction. Shrinks each structure's genome 21% and the OS1 group's 25%.
 3. **Shared condition ids** — emit `shared-rel_volume` and `shared-gate_confidence` in the group
    builder. Verified to collapse 20 genes to 4 on OS1; no GA change.
-2. **An `OS_ALL` group** for stage 2, carrying all 18 runnable structures (O_WHEEL included as of 2026-08-27).
+2. **An `OS_ALL` group** for stage 2, carrying all 18 structures. **It MUST inherit
+   `hold_assigned_stock`** — `_hold_assigned_stock` resolves a group key by checking whether ANY
+   member needs it, so this works, but verify it rather than assume: a group whose wheel member
+   loses the flag reverts to writing covered calls whose shares are sold the same bar, which is
+   the naked-call defect this grid spent a branch removing.
 3. **Cross-job seeding** — read stage-1 winners and emit `initial_population` for stage 2. The
    hook exists for resume; this points it at another job's results.
 4. **A price-capped universe helper** for the full-notional three.
@@ -464,10 +479,10 @@ full-notional three belong to no group.
 | stage | jobs | population | generations (ceiling) | early-stop | trials if full | realistic |
 |---|---|---|---|---|---|---|
 | 0a smoke | 2 | 8 | 2 | — | ~300 | ~300 |
-| 0b pilot | 17 | 60 | 10 | 4 | ~10,000 | ~10,000 |
-| 1 discovery | **34** | 200 | 60 | 8 | 408,000 | ~170,000 |
+| 0b pilot | 18 | 60 | 10 | 4 | ~11,000 | ~11,000 |
+| 1 discovery | **36** | 200 | 60 | 8 | 432,000 | ~180,000 |
 | 2 composition | 1 | 300 | 80 | 10 | 24,000 | ~8,000 |
-| **total** | | | | | **~442,000** | **~189,000** |
+| **total** | | | | | **~467,000** | **~199,000** |
 
 "Realistic" assumes early-stop fires around generation 25; "if full" is the ceiling where nothing
 ever plateaus. The true figure lands between, and stage 0b measures which end.
