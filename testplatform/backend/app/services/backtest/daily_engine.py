@@ -737,6 +737,12 @@ class DailyBacktestEngine:
             #     backtest — close ALL of it at THIS bar's open (before this bar's expiries
             #     settle). One dict check when nothing is pending; equity-only runs never
             #     schedule any.
+            #
+            #     THIS RUNS AFTER THE MANAGE PASS (step 3), which is why the wheel needs
+            #     ``hold_assigned_stock``: the overlay writes a covered call against the
+            #     assigned shares in step 3 and this would sell them on the same bar,
+            #     leaving a naked short call. With the switch on nothing is ever scheduled,
+            #     so this stays the same single dict check.
             if hasattr(self.account, "process_pending_assignment_liquidations"):
                 try:
                     self.account.process_pending_assignment_liquidations()
@@ -1403,7 +1409,9 @@ class DailyBacktestEngine:
             (intrinsic fallback) — no share position, cash credited at the premium.
           * ITM short -> ALWAYS physically assigned (shares at the STRIKE); the assigned
             stock is unmanaged in a backtest, so it is liquidated in full at the next
-            bar's open (``process_pending_assignment_liquidations``).
+            bar's open (``process_pending_assignment_liquidations``) — unless the run sets
+            ``hold_assigned_stock``, in which case the shares are HELD for the strategy's
+            own rules to manage (the wheel's covered-call overlay).
 
         Early American assignment is NOT modelled — options resolve at expiry only.
 

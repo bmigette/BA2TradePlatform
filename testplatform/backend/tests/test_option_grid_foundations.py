@@ -145,14 +145,14 @@ def test_wheel_is_a_registered_strategy():
     assert "O_WHEEL" in m._OPTION_STRATEGY_KEYS
 
 
-def test_wheel_enters_by_selling_a_put(wheel_allowed):
+def test_wheel_enters_by_selling_a_put():
     m = _launcher()
     s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
     actions = [a.get("action_type") for r in s.entry_rules for a in (r.get("actions") or [])]
     assert "sell_cash_secured_put" in actions, f"wheel entry actions were {actions}"
 
 
-def test_wheel_writes_calls_ONLY_against_assigned_shares(wheel_allowed):
+def test_wheel_writes_calls_ONLY_against_assigned_shares():
     """The distinction that makes it a wheel.
 
     Gating on has_position would write calls against any stock the expert holds;
@@ -180,7 +180,7 @@ def test_wheel_writes_calls_ONLY_against_assigned_shares(wheel_allowed):
     assert cc_rules, "wheel has no covered-call overlay rule"
 
 
-def test_wheel_overlay_is_reachable_not_appended(wheel_allowed):
+def test_wheel_overlay_is_reachable_not_appended():
     """The bug that made every historical O_CC number a mislabelled equity run.
 
     An overlay appended AFTER S2's floor stop can never fire -- that rule is conditioned only on
@@ -197,7 +197,7 @@ def test_wheel_overlay_is_reachable_not_appended(wheel_allowed):
         f"the overlay is LAST in the exit list, which is the appended-and-unreachable shape: {ids}")
 
 
-def test_wheel_guards_against_stacking_a_second_call(wheel_allowed):
+def test_wheel_guards_against_stacking_a_second_call():
     m = _launcher()
     s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
     guards = [r for r in s.exit_rules
@@ -205,7 +205,7 @@ def test_wheel_guards_against_stacking_a_second_call(wheel_allowed):
     assert guards, "no stop_processing guard; the overlay will re-fire every manage cycle"
 
 
-def test_wheel_overlay_precedes_the_option_closes(wheel_allowed):
+def test_wheel_overlay_precedes_the_option_closes():
     """The pure-option list has no adjust_* rule, so 'not last' is not enough.
 
     ``opt_tp`` (profit_loss_percent >) and ``opt_time`` (days_opened >) compare fields an
@@ -238,7 +238,7 @@ def test_wheel_is_scored_and_railed_as_a_PURE_option_kind():
         m._assert_option_window_excludes_holdout(["O_WHEEL"], "2026-03-01")
 
 
-def test_wheel_reuses_O_CSPs_entry_gene_keys_verbatim(wheel_allowed):
+def test_wheel_reuses_O_CSPs_entry_gene_keys_verbatim():
     """Not cosmetic: it is what lets a stage-1 O_CSP winner seed an O_WHEEL job. encode_params
     drops keys the target space does not know, so a renamed entry rule would silently discard
     every entry gene of the seed."""
@@ -338,9 +338,6 @@ def test_gates_off_reaches_the_built_strategies_through_the_module_toggle(monkey
 
     m = _launcher()
     monkeypatch.setattr(m, "_OPTION_GATES_OFF", True)
-    # O_WHEEL needs the engine-development override: it refuses to build by default because the
-    # backtest sells assigned stock out from under the covered call the same bar it is written.
-    monkeypatch.setenv("BA2_ALLOW_UNRUNNABLE_WHEEL", "1")
     for kind in ("O_LC", "O_CSP", "O_WHEEL", "OS1"):
         strat = m._build_strategy(kind, f"g-{kind}", "FMPRating")
         for rule in strat.entry_rules:
@@ -487,36 +484,60 @@ def test_gates_off_is_available_on_BOTH_optimize_and_optimize_batch():
             "_cmd_optimize_batch never sets the module toggle, so the flag is inert there")
 
 
-@pytest.fixture
-def wheel_allowed(monkeypatch):
-    """O_WHEEL refuses to build unless the engine-development override is set.
+def test_o_wheel_builds_by_default():
+    """It used to REFUSE, by design, and the refusal is now gone because its precondition is.
 
-    The structure is CORRECT; the ENGINE cannot run it. These tests assert the structure, so
-    they set the override -- and the refusal itself is asserted separately below.
-    """
-    monkeypatch.setenv("BA2_ALLOW_UNRUNNABLE_WHEEL", "1")
-    yield
-
-
-def test_o_wheel_refuses_to_build_by_default():
-    """A prose warning in a docstring is not a guard.
-
-    The backtest liquidates assigned stock at the next bar's open (daily_engine step 4a-pre),
-    AFTER the manage pass has written a covered call against it (step 3) -- so every wheel
-    position the engine opens is a naked short call wearing a wheel's name. That does not
-    produce bad numbers, it produces a DIFFERENT STRATEGY's numbers, which is worse because they
-    look plausible. O_WHEEL is in _STRATEGY_BUILDERS, so any --strategies list containing it
-    would have launched.
+    The engine liquidated assigned stock at the next bar's open (daily_engine step 4a-pre),
+    AFTER the manage pass had written a covered call against it (step 3), so every wheel
+    position the engine opened was a naked short call wearing a wheel's name -- a DIFFERENT
+    STRATEGY's numbers, which is worse than bad ones because they look plausible. Plan Task 10
+    added ``BacktestAccount``'s ``hold_assigned_stock`` (default OFF), and the test below is what
+    makes the removal of the refusal safe rather than merely quiet: it proves the wheel's run
+    config actually turns the setting ON.
     """
     m = _launcher()
-    with pytest.raises(SystemExit) as exc:
-        m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
-    assert "naked short call" in str(exc.value)
-    assert "Task 10" in str(exc.value), "the refusal must name the fix that unblocks it"
-
-
-def test_o_wheel_stays_registered_so_the_fix_has_somewhere_to_land():
-    """Refused at BUILD time, not deleted. The composition is right and tested; only the engine
-    is missing, so removing the strategy would throw away correct work."""
-    m = _launcher()
+    s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
+    assert s is not None and s.entry_rules and s.exit_rules
     assert "O_WHEEL" in m._STRATEGY_BUILDERS
+
+
+def test_o_wheel_run_config_holds_assigned_stock(monkeypatch):
+    """The wheel is only a wheel if the ENGINE keeps the assigned shares.
+
+    Asserted where the GA actually reads it: this drives the REAL ``_cmd_optimize`` (the same
+    harness ``test_equity_cap_launcher`` uses for --equity-cap, with only the GA and the top-N
+    persistence stubbed) and reads ``hold_assigned_stock`` back off the persisted
+    ``StrategyOptimization.optimization_config``. Asserting ``_hold_assigned_stock("O_WHEEL")``
+    alone would pass with the helper wired to nothing.
+    """
+    from tests.test_equity_cap_launcher import _BASE_ARGV, _parse, _run_optimize
+
+    args = _parse(_BASE_ARGV + ["--strategy", "O_WHEEL"])
+    cfg = _run_optimize(args, monkeypatch)
+    assert cfg["backtest"]["account_settings"]["hold_assigned_stock"] is True, (
+        "the wheel's run config does not hold assigned stock, so the engine sells the shares "
+        "out from under the covered call on the bar it is written -- a naked short call"
+    )
+
+
+def test_only_the_wheel_holds_assigned_stock(monkeypatch):
+    """The mirror, and the reason this is per-strategy rather than a CLI flag.
+
+    A run whose rules cannot sell stock must keep the no-orphaned-stock liquidation; O_CSP is
+    exactly that case (it sells puts and its exits are all ``close_option``), so if it ever
+    started holding, its assigned shares would ride unmanaged to the end of the run.
+    """
+    from tests.test_equity_cap_launcher import _BASE_ARGV, _parse, _run_optimize
+
+    cfg = _run_optimize(_parse(_BASE_ARGV + ["--strategy", "O_CSP"]), monkeypatch)
+    assert cfg["backtest"]["account_settings"]["hold_assigned_stock"] is False
+
+
+def test_the_hold_set_is_explicit_about_which_kinds_manage_stock():
+    """One membership set, so adding a stock-managing structure is one line next to the reason."""
+    m = _launcher()
+    assert m._HOLDS_ASSIGNED_STOCK == {"O_WHEEL"}
+    assert m._hold_assigned_stock("O_WHEEL") is True
+    assert m._hold_assigned_stock("O_CSP") is False
+    assert m._hold_assigned_stock(None) is False, \
+        "bypass experts ignore --strategy; their account settings must not inherit it"

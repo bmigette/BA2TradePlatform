@@ -71,7 +71,7 @@ experts 485, `testplatform/backend` 1488 + 1 known Windows-only failure
 | `ba2_trade_platform/modules/accounts/AlpacaAccount.py` | leg-fill reconciliation; partial called-away split | 4, 5 |
 | `ba2_trade_platform/core/option_lifecycle_service.py` **(new)** | the live runner: loads book, calls the pure fn, submits | 8 |
 | `ba2_trade_platform/core/JobManager.py` | run the pass before the analyses; readiness reporting | 8, 9 |
-| `testplatform/backend/app/services/backtest/backtest_account.py` | stop liquidating assigned stock | 10 |
+| `testplatform/backend/app/services/backtest/backtest_account.py` | OPT-IN switch to hold assigned stock (default OFF — the polarity landed opposite to this task's title, deliberately) | 10 |
 | `testplatform/backend/app/services/backtest/daily_engine.py` | call the same pure fn | 10, 11 |
 
 New pure modules go in `packages/common` so live and backtest call one implementation. Two
@@ -662,40 +662,53 @@ git commit -m "feat(options): report unmanaged option positions and brokers with
 - Modify: `testplatform/backend/app/services/backtest/daily_engine.py`
 - Test: `testplatform/backend/tests/backtest/test_wheel_assignment.py`
 
-Today a short ITM put assigns and the resulting stock is fully liquidated at the next bar's open.
-**The wheel cannot be backtested at all.**
+~~Today a short ITM put assigns and the resulting stock is fully liquidated at the next bar's
+open. **The wheel cannot be backtested at all.**~~ **RESOLVED 2026-08-27** — holding is now
+opt-in per run via `hold_assigned_stock` (default OFF, so no historical result moved).
 
-- [ ] **Step 1: Write the failing test**
+**DONE 2026-08-27** — commits `d2e6db1` (engine) and `7345634` (launcher wiring), branch
+`wheel-engine`. The polarity landed the OTHER way round from the heading, deliberately:
 
-```python
-def test_assigned_shares_survive_to_the_next_bar_so_a_call_can_be_written():
-    """Short ITM put assigns 100 shares. They must still be held next bar."""
-```
+- [x] **Step 1: Write the failing test** —
+  `testplatform/backend/tests/backtest/test_wheel_assignment.py`, 6 tests including the named
+  `test_assigned_shares_survive_to_the_next_bar_so_a_call_can_be_written`.
 
-- [ ] **Step 2: Run it, watch it fail** — the position is flat; the liquidation already ran.
+- [x] **Step 2: Run it, watch it fail** — 4 of 6 failed; the covered call could not even be
+  written (`UNCOVERED SHORT CALL ... only 0 are free`) because the liquidation had already run.
 
-- [ ] **Step 3: Implement.** Assigned stock is held. Make the old behaviour an explicit,
-  documented setting if anything depends on it — do not silently change every historical result
-  without a switch and a note.
+- [x] **Step 3: Implement — as an OPT-IN switch, DEFAULT OFF.** Holding is NOT the new default.
+  The liquidation is not a bug: assigned stock no option rule manages rides unmanaged to the
+  end of the run (exercised ITM long calls doing exactly that were 67-85% of the OS1 blow-up's
+  final equity) and the behaviour is pinned as intent. So `BacktestAccount` gained a
+  `hold_assigned_stock` account setting (bool, required False) which suppresses ONLY the
+  scheduling in `_book_assignment_share_leg`; everything else about an assignment is unchanged.
+  `ba2test_launcher._HOLDS_ASSIGNED_STOCK = {"O_WHEEL"}` turns it on per strategy, and the
+  O_WHEEL build refusal (`_allow_unrunnable_wheel` / `BA2_ALLOW_UNRUNNABLE_WHEEL`) is deleted.
 
-- [ ] **Step 4: Run it, watch it pass.**
+- [x] **Step 4: Run it, watch it pass** — 6/6.
 
-- [ ] **Step 5: Run the full backtest suite** from `testplatform/backend`:
+- [x] **Step 5: Full suite.** `testplatform/backend/tests`: **3300 passed, 158 skipped**, 1
+  failed = the known Windows-only `test_worker_server.py::test_logs_rejects_path_traversal`.
+  Baseline on `dev` was 3291 passed with the same single failure; the +9 are new tests.
+  **NOTHING SHIFTED**, because default-off is bit-identical — proven, not asserted: a full
+  `DailyBacktestEngine.run()` over an ITM short put (so it exercises
+  `settle_single_leg_expiry` -> `_book_assignment_share_leg` ->
+  `process_pending_assignment_liquidations`) was run against a `dev` worktree and against the
+  change, dumping cash, equity, every order, every round-trip trade and every equity-curve
+  point as sorted JSON. The outputs diff clean; the same probe with the switch ON differs in
+  77 lines, so it is sensitive to what it certifies.
 
-```bash
-W=/Users/bmigette/Documents/dev/BA2/BA2TradePlatform
-PYTHONPATH=$W/packages/common:$W/packages/providers:$W/packages/experts:$W \
-  $W/venv/bin/python -m pytest tests/ -q
-```
+- [x] **Step 6: Commit.**
 
-Expected: the known Windows-only failure only. Report any result that shifts — several option
-strategies will now hold stock they previously dumped.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git commit -m "fix(backtest): assigned stock is held, so the wheel can be backtested at all"
-```
+**OPEN ISSUE this task exposes — the wheel's stock has ONE exit, and it is not guaranteed.**
+Once the shares are held, the only thing that closes them is the covered call being ASSIGNED
+ITM (`_book_assignment_share_leg`'s `closing` branch delivers them against the held lot). If
+the call keeps expiring worthless nothing sells the stock: every rule in O_WHEEL's exit list is
+a `close_option`, `cc_guard` halts the chain while a call is open, `maybe_margin_call_liquidation`
+only unwinds SHORT positions, and `DailyBacktestEngine.run` has no end-of-run flatten. The
+shares ride to the end of the run and are reported `open_at_end` (marked to market, so the P&L
+is not lost — but the capital is tied up). Pinned as a known limitation by
+`test_a_worthless_call_leaves_the_shares_held_with_no_exit`. No exit rule was invented for it.
 
 ---
 

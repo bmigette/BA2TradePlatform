@@ -124,6 +124,11 @@ def test_build_config_assembles_account_settings():
         # absent payload key means — never 0.0, which would make every position unaffordable.
         # See app/services/backtest/equity_cap.py.
         "equity_cap": None,
+        # Optional (2026-08-27): keep stock delivered by a short-option assignment instead of
+        # liquidating it at the next bar's open. False = the no-orphaned-stock policy, which
+        # is what an absent payload key must mean — the launcher turns it on per-strategy for
+        # the WHEEL alone (ba2test_launcher._HOLDS_ASSIGNED_STOCK).
+        "hold_assigned_stock": False,
     }
     assert cfg["enabled_instruments"] == ["AAPL"]
     assert cfg["initial_capital"] == 100_000.0

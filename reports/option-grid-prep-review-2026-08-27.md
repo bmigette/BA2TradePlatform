@@ -2,6 +2,12 @@
 
 **Date:** 2026-08-27
 **Scope:** all option-grid preparation work merged on `dev` in the last 7 days (pulled at review time; HEAD `30de779a`), reviewed against its plan/spec docs. One small incoming commit was expected after this review and is NOT covered here.
+> **H1/H2 SUPERSEDED 2026-08-27 (after this review).** Both were true at the reviewed commit
+> `30de779a` and are left UNAMENDED on purpose: this report is the audit record that motivated
+> the fix, and rewriting a dated finding destroys the evidence that it was found. The backtest
+> now holds assigned stock behind an opt-in `hold_assigned_stock` switch (default OFF) and
+> O_WHEEL is runnable — see the option-ga-grid design spec and lifecycle plan Task 10.
+
 **Method:** full git history walk (~50 commits in the option cluster), spec+plan read, three parallel deep-review passes (grid foundations, option-RM P1/P2a, model-lifecycle + live safety seams), independent re-verification of every high finding by direct code inspection and executed probes, and all four test suites run locally.
 
 ---

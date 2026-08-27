@@ -31,7 +31,8 @@ Verified against the code on 2026-08-27, not assumed:
   `O_PP` PAYS premium for downside insurance.
 * **The wheel primitive**: a `has_assigned_shares` condition separating assigned stock from stock
   bought outright, tested as a usable rule trigger (`tests/test_wheel_assignment_order.py`, 14
-  tests). There is no wheel STRATEGY, but this is what makes one expressible.
+  tests). `O_WHEEL` is now a registered strategy built on it (2026-08-27); this condition is
+  what made it expressible.
 * **A complete option backtest engine.** `backtest_account.py` carries ~24 option methods over
   342 option references — chain fetch, quotes, multi-leg combo submit, fills with modelled
   spread/slippage/participation cap, MTM, expiry settlement, assignment, called-away lot
@@ -132,9 +133,10 @@ OFF, so a failure there can only be data or wiring. 0b runs the real shape, so a
 green is configuration or strategy. 0b is also what turns the cost table below from an estimate
 into a schedule: it measures per-trial runtime on the machine that will do the work.
 
-### Stage 1 · Discovery — 17 structures x 2 experts = 34 jobs
+### Stage 1 · Discovery — 18 structures x 2 experts = 36 jobs
 
-The 15 pure-option keys plus `O_CC` and `O_PP`. `O_WHEEL` is EXCLUDED until the engine can hold assigned stock — see the warning below.
+The 15 pure-option keys plus `O_CC`, `O_PP` and `O_WHEEL`. The wheel was excluded until the
+engine could hold assigned stock; it can as of 2026-08-27 — see the section below.
 
 Genome ~22 after the price-gate swap, **population 200, generations 60 with early-stop patience 8**. ~5,000 trials per job
 in practice; 12,000 only if a job never plateaus.
@@ -147,36 +149,42 @@ All 15 are searchable here, including `O_CSP` / `O_JL` / `O_RS`, which the group
 That filter is unconditional and its own comment says the three "remain runnable as EXPLICIT
 single-strategy jobs" — stage 1 is exactly that.
 
-#### ⚠ O_WHEEL IS BUILT BUT NOT RUNNABLE — stage 1 is 17 structures, not 18
+#### O_WHEEL IS RUNNABLE AS OF 2026-08-27 — stage 1 is 18 structures
 
-Verified 2026-08-27 by code order, not inference. Per bar the engine runs
+**What was wrong** (verified by code order, not inference). Per bar the engine runs
 `_manage_open_positions` (step 3, `daily_engine.py` ~:718) BEFORE
 `process_pending_assignment_liquidations` (step 4a-pre, ~:740) — and that method's own docstring
-says it "closes ALL of it at the NEXT bar's OPEN". So the manage pass writes a covered call
-against the assigned shares and the liquidation sells those shares on the same bar. **Every wheel
-position the backtest opens is a naked short call wearing a wheel's name.**
+says it "closes ALL of it at the NEXT bar's OPEN". So the manage pass wrote a covered call
+against the assigned shares and the liquidation sold those shares on the same bar. **Every wheel
+position the backtest opened was a naked short call wearing a wheel's name** — worse than wrong
+numbers, because it is a DIFFERENT STRATEGY's numbers and they look plausible. Between
+2026-08-27 and the fix, `_build_strategy_wheel` refused at build time (overridable with
+`BA2_ALLOW_UNRUNNABLE_WHEEL=1`); both the refusal and the override are now GONE.
 
-That is worse than wrong numbers: it is a DIFFERENT STRATEGY's numbers, and they look plausible.
+**The fix** is Task 10 of `docs/superpowers/plans/2026-08-24-option-model-and-lifecycle.md`: a
+`hold_assigned_stock` account setting, **DEFAULT OFF**, that suppresses only the scheduling of
+the next-bar liquidation. Default-off was proven bit-identical by running a full
+`DailyBacktestEngine.run()` with an ITM short put against a `dev` worktree and diffing every
+order, trade and equity point. The wheel is the one kind in
+`ba2test_launcher._HOLDS_ASSIGNED_STOCK`, which is what puts the setting into its run config.
+The old liquidation behaviour is still pinned (it is still the default), and the new one is
+pinned beside it — see
+`test_option_orphan_stock_and_arb_guards.py::test_short_put_assignment_stock_liquidated_next_bar_open`
+and its `..._HELD_when_hold_assigned_stock_is_on` mirror, plus
+`tests/backtest/test_wheel_assignment.py`.
 
-`_build_strategy_wheel` now **raises at build time** rather than warning in a docstring — a
-prose warning is not a guard when the key sits in `_STRATEGY_BUILDERS` and any `--strategies`
-list containing it would have launched. Override for engine development only via
-`BA2_ALLOW_UNRUNNABLE_WHEEL=1`.
-
-**The unblocking fix is Task 10 of `docs/superpowers/plans/2026-08-24-option-model-and-lifecycle.md`**
-("the backtest must stop liquidating assigned stock"), which never landed — and the opposite
-behaviour is currently PINNED as intent by
-`test_option_orphan_stock_and_arb_guards.py::test_short_put_assignment_stock_liquidated_next_bar_open`.
-So it is a real decision, not an oversight to sweep up.
-
-Until then: **stage 1 runs 17 structures x 2 experts = 34 jobs.** The wheel composition is
-correct and tested; only the engine is missing, which is why the strategy stays registered.
+**Known limit, not a defect of the composition.** Once the shares are held, the only thing that
+CLOSES them is the covered call finishing ITM (the assignment delivers them). The wheel's exit
+list is all `close_option` and `cc_guard` halts the chain while a call is open, so a call that
+keeps expiring worthless leaves the stock held to the end of the run (reported `open_at_end`,
+marked to market). An O_WHEEL grid's capital efficiency therefore depends on the covered-call
+strike gene — read its results with that in mind.
 
 Related correction to §2: that section claims "a complete option backtest engine ... called-away
 lot splitting". Lot splitting exists in the LIVE account (`AlpacaAccount._settle_called_away`);
-in the backtest, assigned lots are liquidated the next bar.
+in the backtest, assigned lots are liquidated the next bar unless `hold_assigned_stock` is set.
 
-#### The wheel family — three more strategies, one of which must be built
+#### The wheel family — four strategies, all now built
 
 | key | entry | overlay | premium | build state |
 |---|---|---|---|---|
@@ -203,6 +211,16 @@ is often assigned early, especially around dividends, so a backtested wheel turn
 slowly than a live one and overstates time-in-put. Not a reason to skip it; a reason not to read
 its turnover as real.
 
+**THE WHEEL HAS EXACTLY ONE EXIT, AND IT IS NOT GUARANTEED.** Traced, not inferred: held shares
+leave only when the covered call finishes ITM and they are called away at the strike. If the call
+expires worthless nothing sells them — the wheel's own exit rules are all `close_option`, and
+`cc_guard` halts the ruleset while a call is open so those rules never even evaluate. There is no
+margin-call path for long stock and no end-of-run flatten. The shares therefore ride to the end of
+the run, marked to market with `exit_reason="open_at_end"` (so the P&L reaches both the curve and
+the trade rows) with their capital locked. **Read an O_WHEEL result knowing its equity curve is a
+long-stock curve plus premium on every symbol assigned and not called away**, and that its capital
+efficiency depends entirely on the covered-call strike gene putting the call ITM often enough.
+
 **Capital binds this family twice.** All four must fund a full strike or 100 shares — spot ≤
 \$60 today, ≤ \$100 at the 50% cap. The wheel inherits that at the put AND again at the
 assigned lot.
@@ -222,7 +240,7 @@ Stage 1's per-structure verdicts are still recorded, because they are the knowle
 exists to produce, and a structure that could not trade at all is a finding worth having. They
 just do not gate anything.
 
-All 17 runnable structures as toggleable members of ONE expert, plus the shared tier-1 gate.
+All 18 structures as toggleable members of ONE expert, plus the shared tier-1 gate.
 Genome **~240, ESTIMATED** (was ~300 before the price-gate swap) — `OS_ALL` does not exist yet, so unlike every other figure in this
 spec that number is arithmetic (15 members x ~14 per-structure condition genes + 4 shared + the
 option genes + the entry toggles) rather than a measurement. Measure it with
@@ -337,7 +355,11 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
 2. **Swap the four `price_*` gates for one `expected_profit_target_percent` gate**, which every expert produces by construction. Shrinks each structure's genome 21% and the OS1 group's 25%.
 3. **Shared condition ids** — emit `shared-rel_volume` and `shared-gate_confidence` in the group
    builder. Verified to collapse 20 genes to 4 on OS1; no GA change.
-2. **An `OS_ALL` group** for stage 2, carrying all 17 runnable structures (O_WHEEL joins when the engine can run it).
+2. **An `OS_ALL` group** for stage 2, carrying all 18 structures. **It MUST inherit
+   `hold_assigned_stock`** — `_hold_assigned_stock` resolves a group key by checking whether ANY
+   member needs it, so this works, but verify it rather than assume: a group whose wheel member
+   loses the flag reverts to writing covered calls whose shares are sold the same bar, which is
+   the naked-call defect this grid spent a branch removing.
 3. **Cross-job seeding** — read stage-1 winners and emit `initial_population` for stage 2. The
    hook exists for resume; this points it at another job's results.
 4. **A price-capped universe helper** for the full-notional three.
@@ -457,10 +479,10 @@ full-notional three belong to no group.
 | stage | jobs | population | generations (ceiling) | early-stop | trials if full | realistic |
 |---|---|---|---|---|---|---|
 | 0a smoke | 2 | 8 | 2 | — | ~300 | ~300 |
-| 0b pilot | 17 | 60 | 10 | 4 | ~10,000 | ~10,000 |
-| 1 discovery | **34** | 200 | 60 | 8 | 408,000 | ~170,000 |
+| 0b pilot | 18 | 60 | 10 | 4 | ~11,000 | ~11,000 |
+| 1 discovery | **36** | 200 | 60 | 8 | 432,000 | ~180,000 |
 | 2 composition | 1 | 300 | 80 | 10 | 24,000 | ~8,000 |
-| **total** | | | | | **~442,000** | **~189,000** |
+| **total** | | | | | **~467,000** | **~199,000** |
 
 "Realistic" assumes early-stop fires around generation 25; "if full" is the ceiling where nothing
 ever plateaus. The true figure lands between, and stage 0b measures which end.
@@ -486,6 +508,40 @@ It shares its machinery with the stage-1 → stage-2 seeding in §7.1: both are 
 optimization's best individual and start a new job near it". Build multi-source seeding once and
 this becomes a caller, not a second mechanism. The range-narrowing is the only additional piece —
 given a seeded value `v`, replace the gene's `[min, max]` with `v ± k·step`.
+
+## 8.2 Follow-on: the 1DTE grid variant, and the ETF question it depends on
+
+A second, much narrower grid: short-dated contracts on large/mega-cap high-volume names.
+
+**It is a 1DTE grid, not 0DTE, and that is forced rather than chosen.** The option cache holds
+DAILY bars only (`fetch_options` uses `TimeFrame.Day`), so a 0DTE contract has exactly ONE bar.
+Combined with `_option_fill_price`'s fill-bar rule — *"`next_bar_open` (default) uses the next
+trading day strictly after the current bar"* — that gives two dead ends: under `next_bar_open` the
+fill day is AFTER expiry so the order never fills, and under `same_bar_close` it fills at the
+expiry close and settles at that same close, which is degenerate. The information 0DTE strategies
+actually trade (the intraday path) is not in the cache at any setting.
+
+**1DTE works and gives the same economics.** Submit today, fill at tomorrow's open, expire at
+tomorrow's close: one full session of decay and delta. Single-stock weeklies expire Friday, so on
+equities this is *enter Thursday, expires Friday*. Daily bars are adequate here in a way they are
+not for 0DTE — a position entered at the open and held to expiry has no intraday path to miss.
+
+**Ten structures, not eighteen, and capital does the selecting.** At a \$10,000 per-instrument
+budget a cash-secured put needs spot ≤ \$100 and a short strangle spot ≤ \$500, so on
+index-priced underlyings only the 7 debit structures and the 3 defined-risk credit spreads fit.
+That is also the right answer on risk: selling naked or full-notional premium into a same-session
+expiry is the classic pick-up-pennies trade, and being forced away from it is a feature.
+
+**Share price stops mattering entirely**, since debit costs premium and defined-risk costs wing
+width. The whole per-structure spot sub-universe machinery §6 needs disappears, and ONE constraint
+remains: option volume — which is exactly where short-dated trading is hardest.
+
+**Blocked on `docs/superpowers/specs/2026-08-27-etf-option-universe-investigation.md`.** The deep
+1DTE books are ETFs, ETFs are absent from the screener metric store by construction, and their
+option history is not cached — a 2.4-year SPY window is ~100k contracts against a couple of
+thousand for a stock, so this is a ~50x add, not a marginal one. That investigation's first
+question (do the cached expiries include daily ones, or only Fridays?) decides whether this
+variant is "any weekday on three index ETFs" or "Thursdays only".
 
 ## 9. Out of scope, and why
 

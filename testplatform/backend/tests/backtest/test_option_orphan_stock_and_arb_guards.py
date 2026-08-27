@@ -9,6 +9,11 @@
          the next bar's open — no stock rides unmanaged beyond one bar.
      (Exercised ITM long calls riding to the end of the run were 67-85% of the OS1 runs'
      final equity.)
+     That liquidation is the DEFAULT and stays pinned here. It is now opt-out per run via
+     the ``hold_assigned_stock`` account setting, which the WHEEL needs (its covered-call
+     overlay is the thing that manages the assigned shares); both sides are pinned — see
+     ``test_short_put_assignment_stock_HELD_when_hold_assigned_stock_is_on`` below and
+     ``test_wheel_assignment.py``.
 
   B. NO-ARBITRAGE FILL GUARD (``_option_fill_price`` / ``_arb_fill_reject_reason``):
        * an ENTRY fill whose premium is below intrinsic by more than ``_ARB_FILL_TOLERANCE``
@@ -73,8 +78,13 @@ def _bar_row(occ, d, o, ot, strike, expiry, c=None):
             "option_type": ot, "strike": strike, "expiry": expiry.isoformat()}
 
 
-def _build(tmp_path, name, chain_rows, bar_rows):
-    """A BacktestAccount over a seeded temp options cache + the AAPL bar series."""
+def _build(tmp_path, name, chain_rows, bar_rows, cfg=None):
+    """A BacktestAccount over a seeded temp options cache + the AAPL bar series.
+
+    ``cfg`` defaults to the module ``CFG`` (which deliberately does NOT set
+    ``hold_assigned_stock``, so it exercises the DEFAULT); the wheel mirror test passes a
+    copy with the switch on.
+    """
     from app.services.backtest.backtest_db import backtest_trading_db, seed_account_definition
     from app.services.backtest.seam_wiring import wire_backtest_seams
     from app.services.backtest.backtest_account import BacktestAccount
@@ -82,6 +92,7 @@ def _build(tmp_path, name, chain_rows, bar_rows):
     from app.services.backtest.options_provider import HistoricalOptionsProvider
     from app.services.backtest.price_source import AsOfPriceSource
 
+    cfg = CFG if cfg is None else cfg
     cache_db = str(tmp_path / f"{name}_options_cache.sqlite")
     cache = OptionsHistoryCache(cache_db)
     if chain_rows:
@@ -93,11 +104,11 @@ def _build(tmp_path, name, chain_rows, bar_rows):
     wire_backtest_seams()
     ctx = backtest_trading_db(name)
     ctx.__enter__()
-    seed_account_definition(1, CFG)
+    seed_account_definition(1, cfg)
     ps = AsOfPriceSource(ohlcv_provider=None)
     ps.load_bars("AAPL", _AAPL_BARS)
     ps.set_clock(datetime(2024, 3, 5))
-    acct = BacktestAccount(1, ps, CFG, options_provider=provider)
+    acct = BacktestAccount(1, ps, cfg, options_provider=provider)
     wire_backtest_seams().register_account(1, acct)
     return acct, ps, ctx
 
@@ -337,15 +348,24 @@ def test_long_itm_call_expiry_no_premium_bar_settles_intrinsic_no_stock(tmp_path
 # A2: short-option assignment — stock at the strike, liquidated at the next bar open
 # ---------------------------------------------------------------------------
 def test_short_put_assignment_stock_liquidated_next_bar_open(tmp_path):
-    """ITM short put at expiry: +100 shares delivered at the strike (cash debited), then
-    the FULL assignment is sold at the next bar's open — no stock beyond one bar, cash
-    accounting exact."""
+    """DEFAULT behaviour. ITM short put at expiry: +100 shares delivered at the strike
+    (cash debited), then the FULL assignment is sold at the next bar's open — no stock
+    beyond one bar, cash accounting exact.
+
+    This is the no-orphaned-stock policy and it is still the DEFAULT: ``CFG`` sets no
+    ``hold_assigned_stock``, and the assertion below on ``_cfg`` says so out loud rather
+    than relying on the reader knowing what is absent from the dict. The opposite
+    behaviour is now also intentional and is pinned by the mirror test that follows —
+    both must hold, which is the point of having a switch at all.
+    """
     acct, ps, ctx = _build(
         tmp_path, "assnput",
         [_chain_row(_PUT180, "put", 180.0, _EXP_0308)],
         [_bar_row(_PUT180, "2024-03-06", 21.0, "put", 180.0, _EXP_0308)],
     )
     try:
+        assert acct._cfg.get("hold_assigned_stock", False) is False, \
+            "this test pins the DEFAULT; it is meaningless if the fixture opts in"
         # Sell-to-open 1x 180 put @21.0 (intrinsic at entry is 20 -> the credit is sane).
         acct.submit_option_order(
             legs=[_leg(_PUT180, OrderDirection.SELL, "sell_to_open",
@@ -376,6 +396,55 @@ def test_short_put_assignment_stock_liquidated_next_bar_open(tmp_path):
         assert closes[0].filled_qty == pytest.approx(100.0)
         assert closes[0].open_price == pytest.approx(165.0)  # the next bar's OPEN
         assert acct.process_pending_assignment_liquidations() is False
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_short_put_assignment_stock_HELD_when_hold_assigned_stock_is_on(tmp_path):
+    """The mirror of the test above — the SAME book with ``hold_assigned_stock`` on.
+
+    Both behaviours are intentional now, so both are pinned. The no-orphaned-stock policy
+    stays the default because assigned stock no rule manages rides unmanaged to the end of
+    the run (the OS1 blow-up); holding is opt-in for the WHEEL, whose covered-call overlay
+    is gated on ``has_assigned_shares`` and is written on the manage pass that runs BEFORE
+    this liquidation — so with the switch off the wheel's call is naked by the end of the
+    bar it was written on. Detailed wheel coverage lives in ``test_wheel_assignment.py``;
+    this pair exists so the two policies can never silently converge.
+
+    Everything up to the scheduling step is identical to the default run — same shares,
+    same strike, same cash — which is the evidence that the switch changes ONE thing.
+    """
+    acct, ps, ctx = _build(
+        tmp_path, "assnputhold",
+        [_chain_row(_PUT180, "put", 180.0, _EXP_0308)],
+        [_bar_row(_PUT180, "2024-03-06", 21.0, "put", 180.0, _EXP_0308)],
+        cfg={**CFG, "hold_assigned_stock": True},
+    )
+    try:
+        acct.submit_option_order(
+            legs=[_leg(_PUT180, OrderDirection.SELL, "sell_to_open",
+                       OptionRight.PUT, 180.0, _EXP_0308)],
+            quantity=1, order_type="market", option_strategy="naked_put")
+        acct.refresh_orders()
+        acct.refresh_transactions()
+        assert acct._cash == pytest.approx(100_000.0 + 2_100.0)
+
+        ps.set_clock(datetime(2024, 3, 8))
+        _engine(acct, ps)._apply_option_expiry(datetime(2024, 3, 8))
+        aapl = [p for p in acct.get_positions() if p["symbol"] == "AAPL"]
+        assert len(aapl) == 1 and aapl[0]["qty"] == 100
+        assert aapl[0]["avg_price"] == pytest.approx(180.0)       # identical to the default
+        assert acct._cash == pytest.approx(102_100.0 - 18_000.0)  # identical to the default
+        assert acct._pending_assignment_sells == {}, \
+            "the ONE difference: nothing is scheduled for the next-bar liquidation"
+
+        # Next bar (2024-03-11 open 165): the pass is a no-op and the shares are still held.
+        ps.set_clock(datetime(2024, 3, 11))
+        assert acct.process_pending_assignment_liquidations() is False
+        aapl = [p for p in acct.get_positions() if p["symbol"] == "AAPL"]
+        assert len(aapl) == 1 and aapl[0]["qty"] == 100
+        assert acct._cash == pytest.approx(84_100.0)              # no sale, no cash move
+        assert [o for o in acct.get_orders() if o.comment == "assignment_liquidation"] == []
     finally:
         ctx.__exit__(None, None, None)
 
