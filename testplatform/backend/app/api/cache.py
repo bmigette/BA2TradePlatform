@@ -42,13 +42,26 @@ def _parse_before(before: Optional[str]) -> Optional[datetime]:
 
 
 @router.get("/usage")
-async def cache_usage():
-    """Per-type disk usage (bytes, file count, oldest/newest mtime, destructive flag, TTL)."""
+def cache_usage():
+    """Per-type disk usage (bytes, file count, oldest/newest mtime, destructive flag, TTL).
+
+    Plain ``def``, not ``async def`` -- deliberately, and load-bearing. ``get_usage()``
+    is a synchronous ``Path.rglob("*")`` + ``stat()`` walk over every tracked cache root,
+    including the as_of provider caches and the options store, which together can hold
+    six-figure file counts. An ``async def`` handler runs directly on uvicorn's single
+    event-loop thread with no implicit offload, so that walk — worse under the disk
+    contention a live GA grid run adds — blocked EVERY request on the whole API, not just
+    this one: /health included, for minutes, until the process was killed (2026-08-27).
+    A plain ``def`` is what FastAPI/Starlette route to its worker threadpool automatically
+    (see ``list_screener_stores`` in api/backtests.py for the same idiom already in use),
+    so a slow scan now only occupies its own thread. This does not make the scan fast; it
+    stops one slow scan from taking the rest of the platform down with it.
+    """
     return {"types": cache_manager.get_usage()}
 
 
 @router.get("/usage/{cache_type}")
-async def cache_drill_down(cache_type: str):
+def cache_drill_down(cache_type: str):
     """Per-item breakdown for one cache type."""
     try:
         return {"type": cache_type, "items": cache_manager.drill_down(cache_type)}
@@ -60,7 +73,7 @@ async def cache_drill_down(cache_type: str):
 # Option-chain viewer (READ-ONLY). Declared before the /{cache_type} catch-all.
 # ---------------------------------------------------------------------------
 @router.get("/options/stores")
-async def option_stores():
+def option_stores():
     """Which option stores exist, and what each can honestly report.
 
     A store that is absent (the TastyTrade parquet store usually is — the download runs
@@ -71,7 +84,7 @@ async def option_stores():
 
 
 @router.get("/options/symbols")
-async def option_symbols(
+def option_symbols(
     q: str = Query(..., min_length=1, description="Symbol prefix, e.g. 'AAP'"),
     limit: int = Query(50, ge=1, le=500),
 ):
@@ -81,7 +94,7 @@ async def option_symbols(
 
 
 @router.get("/options/dates")
-async def option_dates(symbol: str = Query(..., min_length=1)):
+def option_dates(symbol: str = Query(..., min_length=1)):
     """The as-of dates that actually hold rows for this symbol, per store.
 
     The picker is populated from this. The legacy chain table holds three snapshot dates
@@ -91,7 +104,7 @@ async def option_dates(symbol: str = Query(..., min_length=1)):
 
 
 @router.get("/options/chain")
-async def option_chain(
+def option_chain(
     symbol: str = Query(..., min_length=1),
     as_of: str = Query(..., description="YYYY-MM-DD, from /options/dates"),
     store: str = Query(..., description="alpaca-chain | alpaca-bars | tastytrade-parquet"),
@@ -113,7 +126,7 @@ async def option_chain(
 
 
 @router.delete("")
-async def clear_all_caches(
+def clear_all_caches(
     before: Optional[str] = Query(None, description="Only delete entries older than YYYY-MM-DD"),
 ):
     """Clean all NON-destructive cache types. datasets + trained_models are excluded."""
@@ -121,7 +134,7 @@ async def clear_all_caches(
 
 
 @router.delete("/{cache_type}")
-async def clear_cache_type(
+def clear_cache_type(
     cache_type: str,
     before: Optional[str] = Query(None, description="Only delete entries older than YYYY-MM-DD"),
     symbol: Optional[str] = Query(None),
