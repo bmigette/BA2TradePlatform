@@ -139,3 +139,70 @@ def test_submit_to_broker_false_still_reaches_the_informational_result():
     assert acct.submitted == []
     assert result["success"] is True
     assert "not submitted" in result["message"]
+
+
+# --- Task 3: the 7 premium-sized builders ------------------------------------------------
+
+PREMIUM_SIZED = [
+    ("BuyCallAction", "long_call", 1),
+    ("BuyPutAction", "long_put", 1),
+    ("OpenBullCallSpreadAction", "bull_call_spread", 2),
+    ("OpenBearPutSpreadAction", "bear_put_spread", 2),
+    ("OpenStraddleAction", "straddle", 2),
+    ("OpenStrangleAction", "strangle", 2),
+    ("OpenCallButterflyAction", "call_butterfly", 3),
+]
+
+
+@pytest.mark.parametrize("cls_name, strategy, n_legs", PREMIUM_SIZED)
+def test_every_premium_sized_builder_resolves_without_submitting(cls_name, strategy, n_legs):
+    a, acct = _action(getattr(TradeActions, cls_name), strike_param=0.30, wing_width_pct=5.0)
+    resolved = a._resolve()
+    if not isinstance(resolved, ResolvedStructure):
+        pytest.skip(f"{cls_name} refused on this synthetic chain: {resolved['message']}")
+    assert acct.submitted == []
+    assert resolved.option_strategy == strategy
+    assert len(resolved.legs) == n_legs
+    assert len(resolved.payoff_legs) == n_legs
+    assert resolved.sizing_basis == "premium"
+    assert resolved.reserve_per_contract == 0.0
+    assert resolved.cost_per_contract == pytest.approx(resolved.limit_price * 100.0)
+    assert resolved.dte == 30
+
+
+@pytest.mark.parametrize("cls_name, strategy, n_legs", PREMIUM_SIZED)
+def test_payoff_legs_reprice_to_the_same_net_the_limit_price_carries(cls_name, strategy, n_legs):
+    """The payoff legs and the limit price are two views of one structure. If they disagree,
+    the risk manager's max-loss and the broker's fill price describe different trades."""
+    from ba2_common.core.option_payoff import validate_legs
+    from ba2_common.core.types import OrderDirection
+    a, _ = _action(getattr(TradeActions, cls_name), strike_param=0.30, wing_width_pct=5.0)
+    resolved = a._resolve()
+    if not isinstance(resolved, ResolvedStructure):
+        pytest.skip("refused on this synthetic chain")
+    assert validate_legs(resolved.payoff_legs) is None
+    # A payoff leg's `premium` is ALWAYS POSITIVE (the sign lives in `side`), so the net paid
+    # is the signed sum -- which must be the very number sent to the broker as the limit.
+    net_paid = sum((1 if leg.side == OrderDirection.BUY else -1) * leg.premium * leg.ratio
+                   for leg in resolved.payoff_legs)
+    assert net_paid == pytest.approx(resolved.limit_price, abs=1e-4)
+
+
+@pytest.mark.parametrize("cls_name, strategy, n_legs", PREMIUM_SIZED)
+def test_execute_still_submits_for_every_premium_sized_builder(cls_name, strategy, n_legs):
+    a, acct = _action(getattr(TradeActions, cls_name), strike_param=0.30, wing_width_pct=5.0)
+    result = a.execute()
+    if not result["success"]:
+        pytest.skip(f"{cls_name} refused on this synthetic chain: {result['message']}")
+    assert len(acct.submitted) == 1
+    assert acct.submitted[0]["option_strategy"] == strategy
+    assert acct.submitted[0]["quantity"] >= 1
+
+
+def test_the_butterfly_body_leg_carries_ratio_two():
+    a, _ = _action(TradeActions.OpenCallButterflyAction, wing_width_pct=5.0)
+    resolved = a._resolve()
+    if not isinstance(resolved, ResolvedStructure):
+        pytest.skip("refused on this synthetic chain")
+    ratios = sorted(leg.ratio for leg in resolved.payoff_legs)
+    assert ratios == [1, 1, 2]

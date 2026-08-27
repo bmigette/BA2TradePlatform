@@ -21,6 +21,7 @@ from ba2_common.core.db import get_db, add_instance, update_instance, get_instan
 from ba2_common.core.option_economics import (
     ARC_FLOOR_REFUSAL, admits_credit_structure, annualized_return_on_collateral,
 )
+from ba2_common.core.option_payoff import PayoffLeg
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selector import (
@@ -2469,7 +2470,7 @@ class BuyCallAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.BUY_CALL.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -2485,15 +2486,17 @@ class BuyCallAction(_OptionEntryAction):
         if contract.ask is None or contract.ask <= 0:
             return self._result(False, f"No ask price for {contract.symbol}")
         limit_price = contract.ask                          # buy at ASK
-        quantity = self._size(limit_price, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size long_call for {self.instrument_name} "
-                                f"(premium={limit_price})")
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
                         position_intent="buy_to_open", option_type=self.OPTION_TYPE,
                         strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
-        return self._submit_option_order([leg], quantity, limit_price, "long_call")
+        return ResolvedStructure(
+            request=None, legs=[leg],
+            payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=contract.ask, strike=contract.strike)],
+            limit_price=limit_price, option_strategy="long_call",
+            dte=self._dte_for(contract.expiry), reserve_per_contract=0.0,
+            cost_per_contract=limit_price * 100.0, sizing_basis="premium",
+            reserve_kwargs={})
 
     def get_description(self) -> str:
         return f"Buy long call on {self.instrument_name}"
@@ -2507,7 +2510,7 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_BULL_CALL_SPREAD.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -2528,18 +2531,22 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
         if net_debit <= 0:
             return self._result(False,
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} spread")
-        quantity = self._size(net_debit, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size bull_call_spread for {self.instrument_name} "
-                                f"(net_debit={net_debit})")
         long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=self.OPTION_TYPE,
                              strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
                               strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
-        return self._submit_option_order([long_leg, short_leg], quantity, net_debit, "bull_call_spread")
+        return ResolvedStructure(
+            request=None, legs=[long_leg, short_leg],
+            payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=long_c.ask, strike=long_c.strike),
+                         PayoffLeg(kind="call", side=OrderDirection.SELL,
+                                   premium=short_c.bid, strike=short_c.strike)],
+            limit_price=net_debit, option_strategy="bull_call_spread",
+            dte=self._dte_for(long_c.expiry), reserve_per_contract=0.0,
+            cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            reserve_kwargs={})
 
     def _spread_params(self) -> Tuple[Any, Any]:
         """Split strike_param into (long, short) params for the two legs."""
@@ -2563,7 +2570,7 @@ class BuyPutAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.BUY_PUT.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -2579,15 +2586,17 @@ class BuyPutAction(_OptionEntryAction):
         if contract.ask is None or contract.ask <= 0:
             return self._result(False, f"No ask price for {contract.symbol}")
         limit_price = contract.ask                          # buy at ASK
-        quantity = self._size(limit_price, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size long_put for {self.instrument_name} "
-                                f"(premium={limit_price})")
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
                         position_intent="buy_to_open", option_type=self.OPTION_TYPE,
                         strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
-        return self._submit_option_order([leg], quantity, limit_price, "long_put")
+        return ResolvedStructure(
+            request=None, legs=[leg],
+            payoff_legs=[PayoffLeg(kind="put", side=OrderDirection.BUY,
+                                   premium=contract.ask, strike=contract.strike)],
+            limit_price=limit_price, option_strategy="long_put",
+            dte=self._dte_for(contract.expiry), reserve_per_contract=0.0,
+            cost_per_contract=limit_price * 100.0, sizing_basis="premium",
+            reserve_kwargs={})
 
     def get_description(self) -> str:
         return f"Buy long put on {self.instrument_name}"
@@ -2601,7 +2610,7 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_BEAR_PUT_SPREAD.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -2623,18 +2632,22 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
         if net_debit <= 0:
             return self._result(False,
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} spread")
-        quantity = self._size(net_debit, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size bear_put_spread for {self.instrument_name} "
-                                f"(net_debit={net_debit})")
         long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=self.OPTION_TYPE,
                              strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
                               strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
-        return self._submit_option_order([long_leg, short_leg], quantity, net_debit, "bear_put_spread")
+        return ResolvedStructure(
+            request=None, legs=[long_leg, short_leg],
+            payoff_legs=[PayoffLeg(kind="put", side=OrderDirection.BUY,
+                                   premium=long_c.ask, strike=long_c.strike),
+                         PayoffLeg(kind="put", side=OrderDirection.SELL,
+                                   premium=short_c.bid, strike=short_c.strike)],
+            limit_price=net_debit, option_strategy="bear_put_spread",
+            dte=self._dte_for(long_c.expiry), reserve_per_contract=0.0,
+            cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            reserve_kwargs={})
 
     def _spread_params(self) -> Tuple[Any, Any]:
         """Split strike_param into (long, short) params for the two legs."""
@@ -3050,7 +3063,7 @@ class OpenStraddleAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_STRADDLE.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         call_chain = self._chain(OptionRight.CALL)
         put_chain = self._chain(OptionRight.PUT)
         if not call_chain or not put_chain:
@@ -3083,18 +3096,22 @@ class OpenStraddleAction(_OptionEntryAction):
         if net_debit <= 0:
             return self._result(False,
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} straddle")
-        quantity = self._size(net_debit, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size straddle for {self.instrument_name} "
-                                f"(net_debit={net_debit})")
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
         put_leg = OptionLeg(contract_symbol=put_c.symbol, side=OrderDirection.BUY,
                             position_intent="buy_to_open", option_type=OptionRight.PUT,
                             strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying)
-        return self._submit_option_order([call_leg, put_leg], quantity, net_debit, "straddle")
+        return ResolvedStructure(
+            request=None, legs=[call_leg, put_leg],
+            payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=call_c.ask, strike=call_c.strike),
+                         PayoffLeg(kind="put", side=OrderDirection.BUY,
+                                   premium=put_c.ask, strike=put_c.strike)],
+            limit_price=net_debit, option_strategy="straddle",
+            dte=self._dte_for(call_c.expiry), reserve_per_contract=0.0,
+            cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            reserve_kwargs={})
 
     def get_description(self) -> str:
         return f"Open long straddle on {self.instrument_name}"
@@ -3114,7 +3131,7 @@ class OpenStrangleAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_STRANGLE.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         call_chain = self._chain(OptionRight.CALL)
         put_chain = self._chain(OptionRight.PUT)
         if not call_chain or not put_chain:
@@ -3142,18 +3159,22 @@ class OpenStrangleAction(_OptionEntryAction):
         if net_debit <= 0:
             return self._result(False,
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} strangle")
-        quantity = self._size(net_debit, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size strangle for {self.instrument_name} "
-                                f"(net_debit={net_debit})")
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
         put_leg = OptionLeg(contract_symbol=put_c.symbol, side=OrderDirection.BUY,
                             position_intent="buy_to_open", option_type=OptionRight.PUT,
                             strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying)
-        return self._submit_option_order([call_leg, put_leg], quantity, net_debit, "strangle")
+        return ResolvedStructure(
+            request=None, legs=[call_leg, put_leg],
+            payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=call_c.ask, strike=call_c.strike),
+                         PayoffLeg(kind="put", side=OrderDirection.BUY,
+                                   premium=put_c.ask, strike=put_c.strike)],
+            limit_price=net_debit, option_strategy="strangle",
+            dte=self._dte_for(call_c.expiry), reserve_per_contract=0.0,
+            cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            reserve_kwargs={})
 
     def get_description(self) -> str:
         return f"Open long strangle on {self.instrument_name}"
@@ -3502,7 +3523,7 @@ class OpenCallButterflyAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_CALL_BUTTERFLY.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         chain = self._chain(OptionRight.CALL)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -3540,9 +3561,6 @@ class OpenCallButterflyAction(_OptionEntryAction):
         net_debit = round(lower.ask + upper.ask - 2 * body.bid, 4)
         if net_debit <= 0:
             return self._result(False, f"Non-positive debit for {self.instrument_name} butterfly")
-        quantity = self._size(net_debit, self.sizing)
-        if quantity < 1:
-            return self._result(False, f"Insufficient budget to size butterfly for {self.instrument_name}")
         legs = [
             OptionLeg(contract_symbol=lower.symbol, side=OrderDirection.BUY, ratio_qty=1,
                       position_intent="buy_to_open", option_type=OptionRight.CALL,
@@ -3554,7 +3572,18 @@ class OpenCallButterflyAction(_OptionEntryAction):
                       position_intent="buy_to_open", option_type=OptionRight.CALL,
                       strike=upper.strike, expiry=upper.expiry, underlying=upper.underlying),
         ]
-        return self._submit_option_order(legs, quantity, net_debit, "call_butterfly")
+        return ResolvedStructure(
+            request=None, legs=legs,
+            payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=lower.ask, strike=lower.strike, ratio=1),
+                         PayoffLeg(kind="call", side=OrderDirection.SELL,
+                                   premium=body.bid, strike=body.strike, ratio=2),
+                         PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=upper.ask, strike=upper.strike, ratio=1)],
+            limit_price=net_debit, option_strategy="call_butterfly",
+            dte=self._dte_for(body.expiry), reserve_per_contract=0.0,
+            cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            reserve_kwargs={})
 
     def get_description(self) -> str:
         return f"Open call butterfly on {self.instrument_name}"
