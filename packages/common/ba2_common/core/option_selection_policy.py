@@ -14,7 +14,7 @@ measure.
 THE DEFAULT IS A PROVABLE NO-OP. With only ``w_box_center`` at its pinned 1.0, ``pick`` selects
 exactly the contract ``option_selector._pick_by`` selects, tie-breaks included. That is what lets
 this ship without moving a single existing backtest — proven in
-``tests/test_option_selection_policy_noop.py`` (added by the next task).
+``tests/test_option_selection_policy_noop.py``.
 """
 from __future__ import annotations
 
@@ -96,8 +96,8 @@ def distance_from_target(c: OptionContract, ctx: PolicyContext) -> Optional[floa
     """How far this contract is from the box centre, in the strike method's own units.
 
     None when the contract cannot be measured at all (a delta method against a contract with no
-    delta). ``pick`` excludes those candidates outright rather than scoring them worst — see its
-    docstring in the next task for why that exactness matters.
+    delta). ``eligible`` excludes those candidates outright rather than scoring them worst — see
+    its docstring for why that exactness matters.
     """
     if ctx.strike_method == "delta":
         if c.delta is None or ctx.target is None:
@@ -188,3 +188,87 @@ def feature_matrix(candidates: Sequence[OptionContract],
                            for c in candidates]),
         "spread": _minimise([c.spread_pct for c in candidates]),
     }
+
+
+def _in_box(c: OptionContract, ctx: PolicyContext) -> bool:
+    """Is this contract inside the rule's box?
+
+    A box exists only when ``box_min < box_max``. Absent or degenerate bounds mean "aim at the
+    target, filter nothing" — see ``PolicyContext``. A contract whose box quantity cannot be
+    measured fails CLOSED, because "I don't know where this contract sits" is not a reason to
+    admit it to a band the rule deliberately narrowed.
+    """
+    if ctx.box_min is None or ctx.box_max is None or ctx.box_min >= ctx.box_max:
+        return True
+    v = box_value(c, ctx)
+    if v is None:
+        return False
+    return ctx.box_min <= v <= ctx.box_max
+
+
+def eligible(candidates: Sequence[OptionContract],
+             ctx: PolicyContext) -> List[OptionContract]:
+    """The candidates the policy is allowed to choose between.
+
+    Two filters, and the ORDER OF THE FIRST ONE IS LOAD-BEARING. Under the ``delta`` method a
+    contract with no delta is EXCLUDED, not scored worst. ``option_selector._pick_by`` does
+    exactly that (``usable = [c for c in cands if c.delta is not None]``, returning None if
+    none remain), and scoring them worst instead would differ from it whenever every candidate
+    lacks a delta: ``_pick_by`` returns None, a worst-score policy would return an arbitrary
+    contract with no measurable delta at all. That is a live selection change, so it is not
+    allowed.
+
+    AN UNAIMABLE REQUEST SELECTS NOTHING. Both branches below refuse outright when the method
+    has no target to measure against, because ``_pick_by`` refuses too and scoring instead
+    would make every distance unmeasurable, tie every candidate, and hand back the lowest
+    strike — a real contract chosen for no reason. Selecting nothing is a refusal the caller
+    can report; a wrong pick is not.
+    """
+    out = list(candidates)
+    if ctx.strike_method == "delta":
+        # A delta method with no target is a misconfigured ruleset, and ``_pick_by`` raises on
+        # it (``abs(None)``).
+        if ctx.target is None:
+            return []
+        out = [c for c in out if c.delta is not None]
+    elif target_strike(ctx.strike_method, ctx.target, ctx.spot, ctx.target_price,
+                       ctx.option_type) is None:
+        # ``consensus_target`` with no ``target_price`` — reachable in production, because
+        # ``select_single``'s ``target_price`` defaults to None — and any unrecognised method.
+        # ``_pick_by`` returns None for both (``if ts is None: return None``).
+        return []
+    return [c for c in out if _in_box(c, ctx)]
+
+
+def score_all(candidates: Sequence[OptionContract], ctx: PolicyContext,
+              policy: SelectionPolicy) -> List[float]:
+    """The weighted score of each candidate. Higher wins."""
+    m = feature_matrix(candidates, ctx)
+    weights = {"box_center": policy.w_box_center, "premium": policy.w_premium,
+               "iv": policy.w_iv, "rvol": policy.w_rvol, "spread": policy.w_spread}
+    return [sum(weights[name] * m[name][i] for name in FEATURE_NAMES)
+            for i in range(len(candidates))]
+
+
+def pick(candidates: Sequence[OptionContract], ctx: PolicyContext,
+         policy: SelectionPolicy) -> Optional[OptionContract]:
+    """The single best contract in the box, or None when the box is empty.
+
+    THE TIE-BREAK IS THE EXISTING ONE. Ties resolve to the LOWEST STRIKE and then the EARLIEST
+    EXPIRY, matching ``option_selector._tie``. That ordering is not cosmetic: the historical
+    cache lists the same strike under more than one in-window expiry, so candidates routinely
+    tie on the distance metric, and before the expiry term existed ``min()`` resolved them by
+    input-list order — reversing the chain changed which contract every structure pinned itself
+    to.
+
+    Implemented as ``min`` over ``(-score, strike, expiry)`` rather than ``max`` over score,
+    because that makes the two tie-break terms read in their natural ascending direction and
+    keeps them identical to the legacy key.
+    """
+    cands = eligible(candidates, ctx)
+    if not cands:
+        return None
+    scores = score_all(cands, ctx, policy)
+    best = min(range(len(cands)),
+               key=lambda i: (-scores[i], cands[i].strike, cands[i].expiry))
+    return cands[best]
