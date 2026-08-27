@@ -405,6 +405,31 @@ def test_option_jobs_can_size_a_full_notional_structure_at_spot_100():
         f"$10,000, i.e. 50% of a $20k account, so it can never open")
 
 
+@pytest.mark.parametrize("kind", ["S2", "O_STK"])
+def test_the_equity_BASELINE_keeps_the_original_cap(kind):
+    """O_STK is the control arm, and it is inside _OPTION_STRATEGY_KEYS.
+
+    _build_strategy_stock -> _build_strategy_S2: O_STK IS the plain-equity baseline the option
+    strategies are measured against. An earlier version of _rm_opt_for gated on
+    _OPTION_STRATEGY_KEYS and so handed it 50%, which would have made it incomparable to S2 and
+    to every prior O_STK run. Pinning only S2 could not catch that, because S2 is not in the set.
+    """
+    m = _launcher()
+    assert m._rm_opt_for(kind)["max_virtual_equity_per_instrument_percent"]["max"] == 30.0
+
+
+@pytest.mark.parametrize("kind", ["O_CC", "O_PP", "O_WHEEL", "O_CSP"])
+def test_the_hundred_share_structures_DO_get_the_raised_cap(kind):
+    """The mirror of the test above, and the reason the exclusion is O_STK alone.
+
+    A covered call must fund 100 shares -- $10,000 at spot $100, i.e. 50% of a $20k account,
+    exactly a cash-secured put's constraint. Gating on _PURE_OPTION_STRATEGIES would drop O_CC
+    and O_PP to 30% and pin them at spot $60, which is what the raise exists to relieve.
+    """
+    m = _launcher()
+    assert m._rm_opt_for(kind)["max_virtual_equity_per_instrument_percent"]["max"] == 50.0
+
+
 def test_equity_jobs_keep_the_original_cap():
     """The same setting is read by the equity risk manager. Raising it globally would move every
     equity grid and make new results incomparable to old ones."""

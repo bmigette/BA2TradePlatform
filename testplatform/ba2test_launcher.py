@@ -1383,12 +1383,23 @@ _OPTION_RM_OVERRIDE = {
 
 
 def _rm_opt_for(kind: str) -> dict:
-    """The classic-RM gene block for a strategy kind: `_RM_OPT`, plus the option override.
+    """The classic-RM gene block for a strategy kind: ``_RM_OPT``, plus the option override.
 
-    `_OPTION_STRATEGY_KEYS` is defined further down this module; it is read at CALL time (both
-    callers are the two optimize commands), so the forward reference is fine.
+    EVERY option kind gets the 50% ceiling EXCEPT ``O_STK``, and that exclusion is the whole
+    point of the function. ``O_STK`` is ``_build_strategy_stock`` -> ``_build_strategy_S2``, i.e.
+    the plain-equity BASELINE the option strategies are measured against. Widening its
+    per-instrument cap would make it incomparable both to ``S2`` (still 30) and to every prior
+    ``O_STK`` run — destroying the control arm in the name of helping the treatment arms.
+
+    ``O_CC`` and ``O_PP`` DO get it, even though they are equity-entry: a covered call must fund
+    100 shares, which at spot $100 is $10,000 — 50% of the grid's $20k account, exactly the same
+    constraint as a cash-secured put. Capping them at 30% would pin them to spot $60, which is
+    the constraint the raise exists to relieve.
+
+    Gating on ``_PURE_OPTION_STRATEGIES`` instead would be the natural-looking fix and is wrong
+    for that reason.
     """
-    if kind in _OPTION_STRATEGY_KEYS:
+    if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK":
         return {**_RM_OPT, **_OPTION_RM_OVERRIDE}
     return dict(_RM_OPT)
 
