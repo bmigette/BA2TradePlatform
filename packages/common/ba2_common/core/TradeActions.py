@@ -21,6 +21,8 @@ from ba2_common.core.db import get_db, add_instance, update_instance, get_instan
 from ba2_common.core.option_economics import (
     ARC_FLOOR_REFUSAL, admits_credit_structure, annualized_return_on_collateral,
 )
+from ba2_common.core.option_payoff import PayoffLeg
+from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selector import (
     select_single, select_vertical_spread, select_wing, passes_liquidity,
@@ -1871,9 +1873,24 @@ class _OptionEntryAction(TradeAction):
     """Shared base for option-entry actions (BuyCall / BullCallSpread / CoveredCall).
 
     Provides capability guard, chain fetch, contract selection, pct_equity
-    sizing, and the submit_to_broker gate. Concrete subclasses implement
-    `_build_and_submit()` which selects contract(s), builds legs, computes the
-    limit premium (buy@ask / sell@bid), sizes the order, and submits.
+    sizing, and the submit_to_broker gate.
+
+    TWO SUBCLASS CONTRACTS COEXIST, and that is a migration state, not a design.
+    The 2026-08-27 resolve split (phase 2a) moved the seven PREMIUM-SIZED builders
+    onto `_resolve()`, which selects contract(s), builds legs, computes the limit
+    premium (buy@ask / sell@bid) and returns a `ResolvedStructure` carrying
+    everything EXCEPT quantity -- the shared `_size_and_submit()` tail then sizes
+    and submits it. The remaining ten (8 reserve-sized, 2 held-shares overlays)
+    still implement `_build_and_submit()` and reach the broker themselves; the base
+    `_resolve()` bridges them so `execute()` has one entry point for both.
+
+    A refusal from either shape is the same thing: the `self._result(False, ...)`
+    dict, NOT a typed `StructureRefusal`. `_result` persists a `TradeActionResult`
+    row that the UI reads, so returning a pure value object would silently stop
+    writing it.
+
+    Phases 2b and 2c convert the other ten; when the last `_build_and_submit`
+    definition is gone, the bridge in the base `_resolve()` should become a raise.
     """
 
     OPTION_TYPE: OptionRight = OptionRight.CALL
@@ -2069,28 +2086,15 @@ class _OptionEntryAction(TradeAction):
             logger.debug(f"_max_equity_per_instrument_cap: could not resolve expert {instance_id}: {e}")
             return None
 
-    def _size(self, premium: float, sizing_pct: Optional[float]) -> int:
-        """floor(virtual_equity * sizing% / (premium * 100)); 0 if not sizeable.
+    def _size_by_cost(self, cost_per_contract: Optional[float],
+                      sizing_pct: Optional[float]) -> int:
+        """floor(virtual_equity * sizing% / cost_per_contract), capped as before.
 
-        The sizing budget is additionally capped by max_virtual_equity_per_instrument_percent
-        (see _max_equity_per_instrument_cap) -- whichever of the two budgets is tighter wins."""
-        if premium is None or premium <= 0 or not sizing_pct or sizing_pct <= 0:
-            return 0
-        equity = self._virtual_equity()
-        if equity is None or equity <= 0:
-            return 0
-        budget = equity * (sizing_pct / 100.0)
-        cap = self._max_equity_per_instrument_cap(equity)
-        if cap is not None:
-            budget = min(budget, cap)
-        return int(math.floor(budget / (premium * 100.0)))
-
-    def _size_by_reserve(self, reserve_per_contract: float,
-                         sizing_pct: Optional[float]) -> int:
-        """floor(virtual_equity * sizing% / reserve_per_contract). For credit/naked
-        structures where net premium is negative (can't size off premium). Same
-        max_virtual_equity_per_instrument_percent cap as _size() applies here too."""
-        if not reserve_per_contract or reserve_per_contract <= 0:
+        The single sizer ``_size`` and ``_size_by_reserve`` both reduce to. They remain on the
+        class (tests and the classic-RM path reference them) and now delegate here, so there is
+        one definition of the cap interaction rather than two copies that can drift.
+        """
+        if not cost_per_contract or cost_per_contract <= 0:
             return 0
         if not sizing_pct or sizing_pct <= 0:
             return 0
@@ -2101,7 +2105,36 @@ class _OptionEntryAction(TradeAction):
         cap = self._max_equity_per_instrument_cap(equity)
         if cap is not None:
             budget = min(budget, cap)
-        return int(math.floor(budget / reserve_per_contract))
+        return int(math.floor(budget / cost_per_contract))
+
+    def _size(self, premium: float, sizing_pct: Optional[float]) -> int:
+        """floor(virtual_equity * sizing% / (premium * 100)); 0 if not sizeable.
+
+        The sizing budget is additionally capped by max_virtual_equity_per_instrument_percent
+        (see _max_equity_per_instrument_cap) -- whichever of the two budgets is tighter wins.
+
+        Now a thin adapter over ``_size_by_cost``: a premium is a per-SHARE price, so one
+        contract costs ``premium * 100``.
+
+        NO PRODUCTION CALLER REMAINS as of phase 2a -- the seven premium-sized builders go
+        through ``_size_and_submit`` now, and ``grep -rn "\._size\b"`` finds only tests. An
+        earlier version of this line claimed "tests and the equity-side RM reference it", which
+        was half wrong: the equity RM has its own sizer and never called this. It is kept for
+        ``test_option_entry_sizing_cap.py``, which asserts the premium-side per-instrument cap
+        through this signature. Delete it only together with re-pointing that test at
+        ``_size_by_cost(premium * 100.0, pct)``."""
+        if premium is None or premium <= 0:
+            return 0
+        return self._size_by_cost(premium * 100.0, sizing_pct)
+
+    def _size_by_reserve(self, reserve_per_contract: float,
+                         sizing_pct: Optional[float]) -> int:
+        """floor(virtual_equity * sizing% / reserve_per_contract). For credit/naked
+        structures where net premium is negative (can't size off premium). Same
+        max_virtual_equity_per_instrument_percent cap as _size() applies here too.
+
+        Adapter over ``_size_by_cost``: the collateral IS the per-contract cost."""
+        return self._size_by_cost(reserve_per_contract, sizing_pct)
 
     def _held_equity_shares(self) -> Optional[float]:
         """Net filled equity shares across this expert's OPENED transactions for the symbol.
@@ -2370,11 +2403,69 @@ class _OptionEntryAction(TradeAction):
     def _build_and_submit(self) -> Dict[str, Any]:
         raise NotImplementedError
 
+    def _resolve(self):
+        """Select contracts, build legs, price the structure. Return a ``ResolvedStructure``
+        — or, for a refusal, the ``self._result(False, ...)`` dict the builder already returns.
+
+        REFUSALS STAY AS ``_result`` DICTS, not ``StructureRefusal``. ``_result`` PERSISTS a
+        ``TradeActionResult`` row (``create_and_save_action_result``), and the UI reads those
+        rows; returning a pure value object here would silently stop writing them. The typed
+        refusal is a Phase 3 concern, on the risk-manager side.
+
+        NO QUANTITY, AND NO ACCOUNT STATE THAT DEPENDS ON ONE. Everything a single action can
+        know about one structure belongs here; everything that needs the size belongs in
+        ``_size_and_submit``.
+
+        MIGRATION BRIDGE, DELIBERATE. The default delegates to the legacy ``_build_and_submit``
+        because the split lands in three phases: 2a converts the 7 premium-sized builders, 2b
+        the 8 reserve-sized ones and 2c the 2 share-overlay ones. An unconverted builder still
+        ends at ``_submit_option_order`` and so returns a result dict, which ``execute()``
+        passes straight back — byte-identical to calling ``_build_and_submit()`` directly, which
+        is what makes this refactor behaviour-neutral for the builders it has not reached yet.
+        Delete this body (back to ``raise NotImplementedError``) once ``_build_and_submit`` has
+        no definitions left.
+        """
+        return self._build_and_submit()
+
+    def _dte_for(self, expiry) -> int:
+        """Days to expiry against the action's clock (simulated in a backtest, wall in live).
+
+        Broken out because NO builder computed this before — it existed only transiently inside
+        ``_refuse_if_arc_below_floor``, and only when an ARC floor was configured.
+        ``ResolvedStructure`` needs it unconditionally.
+        """
+        return (expiry - self._today()).days
+
+    def _size_and_submit(self, resolved) -> Dict[str, Any]:
+        """Size ``resolved`` and submit it. The former tail of every ``_build_and_submit``.
+
+        BYTE-IDENTICAL ARITHMETIC TO WHAT IT REPLACES. ``_size(premium, pct)`` computed
+        ``floor(budget / (premium * 100))`` and ``_size_by_reserve(reserve, pct)`` computed
+        ``floor(budget / reserve)``. Both are ``floor(budget / cost_per_contract)``, which is
+        why ``ResolvedStructure`` carries that single number instead of the two inputs.
+        """
+        quantity = self._size_by_cost(resolved.cost_per_contract, self.sizing)
+        if quantity < 1:
+            # The structure's OWN historical wording, not a uniform one. These strings are
+            # persisted to TradeActionResult.message and rendered in the UI as the reason an
+            # entry did not fire; rewording five of seven of them would have made "behaviour
+            # neutral" false in the one place a user actually looks.
+            return self._result(
+                False,
+                resolved.budget_refusal_message
+                or (f"Insufficient budget to size {resolved.option_strategy} for "
+                    f"{self.instrument_name}"))
+        return self._submit_option_order(
+            resolved.legs, quantity, resolved.limit_price, resolved.option_strategy)
+
     def execute(self) -> "TradeActionResult":
         try:
             if not self._supports_options():
                 return self._result(False, f"Account does not support options for {self.instrument_name}")
-            return self._build_and_submit()
+            resolved = self._resolve()
+            if not isinstance(resolved, ResolvedStructure):
+                return resolved          # a refusal dict from _result(False, ...)
+            return self._size_and_submit(resolved)
         except OptionLiquidityDataMissingToday as e:
             # NOT a misconfiguration: this source HAS published the field before, so today's
             # chain simply came back without it (Alpaca types open_interest Optional). The
@@ -2406,7 +2497,7 @@ class BuyCallAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.BUY_CALL.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -2422,15 +2513,20 @@ class BuyCallAction(_OptionEntryAction):
         if contract.ask is None or contract.ask <= 0:
             return self._result(False, f"No ask price for {contract.symbol}")
         limit_price = contract.ask                          # buy at ASK
-        quantity = self._size(limit_price, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size long_call for {self.instrument_name} "
-                                f"(premium={limit_price})")
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
                         position_intent="buy_to_open", option_type=self.OPTION_TYPE,
                         strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
-        return self._submit_option_order([leg], quantity, limit_price, "long_call")
+        return ResolvedStructure(
+            request=None, legs=[leg],
+            payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=contract.ask, strike=contract.strike)],
+            limit_price=limit_price, option_strategy="long_call",
+            dte=self._dte_for(contract.expiry), reserve_per_contract=0.0,
+            cost_per_contract=limit_price * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size long_call for {self.instrument_name} "
+                f"(premium={limit_price})"),
+            reserve_kwargs={})
 
     def get_description(self) -> str:
         return f"Buy long call on {self.instrument_name}"
@@ -2444,7 +2540,7 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_BULL_CALL_SPREAD.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -2465,18 +2561,25 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
         if net_debit <= 0:
             return self._result(False,
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} spread")
-        quantity = self._size(net_debit, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size bull_call_spread for {self.instrument_name} "
-                                f"(net_debit={net_debit})")
         long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=self.OPTION_TYPE,
                              strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
                               strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
-        return self._submit_option_order([long_leg, short_leg], quantity, net_debit, "bull_call_spread")
+        return ResolvedStructure(
+            request=None, legs=[long_leg, short_leg],
+            payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=long_c.ask, strike=long_c.strike),
+                         PayoffLeg(kind="call", side=OrderDirection.SELL,
+                                   premium=short_c.bid, strike=short_c.strike)],
+            limit_price=net_debit, option_strategy="bull_call_spread",
+            dte=self._dte_for(long_c.expiry), reserve_per_contract=0.0,
+            cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size bull_call_spread for {self.instrument_name} "
+                f"(net_debit={net_debit})"),
+            reserve_kwargs={})
 
     def _spread_params(self) -> Tuple[Any, Any]:
         """Split strike_param into (long, short) params for the two legs."""
@@ -2500,7 +2603,7 @@ class BuyPutAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.BUY_PUT.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -2516,15 +2619,20 @@ class BuyPutAction(_OptionEntryAction):
         if contract.ask is None or contract.ask <= 0:
             return self._result(False, f"No ask price for {contract.symbol}")
         limit_price = contract.ask                          # buy at ASK
-        quantity = self._size(limit_price, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size long_put for {self.instrument_name} "
-                                f"(premium={limit_price})")
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
                         position_intent="buy_to_open", option_type=self.OPTION_TYPE,
                         strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
-        return self._submit_option_order([leg], quantity, limit_price, "long_put")
+        return ResolvedStructure(
+            request=None, legs=[leg],
+            payoff_legs=[PayoffLeg(kind="put", side=OrderDirection.BUY,
+                                   premium=contract.ask, strike=contract.strike)],
+            limit_price=limit_price, option_strategy="long_put",
+            dte=self._dte_for(contract.expiry), reserve_per_contract=0.0,
+            cost_per_contract=limit_price * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size long_put for {self.instrument_name} "
+                f"(premium={limit_price})"),
+            reserve_kwargs={})
 
     def get_description(self) -> str:
         return f"Buy long put on {self.instrument_name}"
@@ -2538,7 +2646,7 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_BEAR_PUT_SPREAD.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -2560,18 +2668,25 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
         if net_debit <= 0:
             return self._result(False,
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} spread")
-        quantity = self._size(net_debit, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size bear_put_spread for {self.instrument_name} "
-                                f"(net_debit={net_debit})")
         long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=self.OPTION_TYPE,
                              strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
                               strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
-        return self._submit_option_order([long_leg, short_leg], quantity, net_debit, "bear_put_spread")
+        return ResolvedStructure(
+            request=None, legs=[long_leg, short_leg],
+            payoff_legs=[PayoffLeg(kind="put", side=OrderDirection.BUY,
+                                   premium=long_c.ask, strike=long_c.strike),
+                         PayoffLeg(kind="put", side=OrderDirection.SELL,
+                                   premium=short_c.bid, strike=short_c.strike)],
+            limit_price=net_debit, option_strategy="bear_put_spread",
+            dte=self._dte_for(long_c.expiry), reserve_per_contract=0.0,
+            cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size bear_put_spread for {self.instrument_name} "
+                f"(net_debit={net_debit})"),
+            reserve_kwargs={})
 
     def _spread_params(self) -> Tuple[Any, Any]:
         """Split strike_param into (long, short) params for the two legs."""
@@ -2987,7 +3102,7 @@ class OpenStraddleAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_STRADDLE.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         call_chain = self._chain(OptionRight.CALL)
         put_chain = self._chain(OptionRight.PUT)
         if not call_chain or not put_chain:
@@ -3020,18 +3135,25 @@ class OpenStraddleAction(_OptionEntryAction):
         if net_debit <= 0:
             return self._result(False,
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} straddle")
-        quantity = self._size(net_debit, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size straddle for {self.instrument_name} "
-                                f"(net_debit={net_debit})")
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
         put_leg = OptionLeg(contract_symbol=put_c.symbol, side=OrderDirection.BUY,
                             position_intent="buy_to_open", option_type=OptionRight.PUT,
                             strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying)
-        return self._submit_option_order([call_leg, put_leg], quantity, net_debit, "straddle")
+        return ResolvedStructure(
+            request=None, legs=[call_leg, put_leg],
+            payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=call_c.ask, strike=call_c.strike),
+                         PayoffLeg(kind="put", side=OrderDirection.BUY,
+                                   premium=put_c.ask, strike=put_c.strike)],
+            limit_price=net_debit, option_strategy="straddle",
+            dte=self._dte_for(call_c.expiry), reserve_per_contract=0.0,
+            cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size straddle for {self.instrument_name} "
+                f"(net_debit={net_debit})"),
+            reserve_kwargs={})
 
     def get_description(self) -> str:
         return f"Open long straddle on {self.instrument_name}"
@@ -3051,7 +3173,7 @@ class OpenStrangleAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_STRANGLE.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         call_chain = self._chain(OptionRight.CALL)
         put_chain = self._chain(OptionRight.PUT)
         if not call_chain or not put_chain:
@@ -3079,18 +3201,25 @@ class OpenStrangleAction(_OptionEntryAction):
         if net_debit <= 0:
             return self._result(False,
                                 f"Non-positive net debit ({net_debit}) for {self.instrument_name} strangle")
-        quantity = self._size(net_debit, self.sizing)
-        if quantity < 1:
-            return self._result(False,
-                                f"Insufficient budget to size strangle for {self.instrument_name} "
-                                f"(net_debit={net_debit})")
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.BUY,
                              position_intent="buy_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
         put_leg = OptionLeg(contract_symbol=put_c.symbol, side=OrderDirection.BUY,
                             position_intent="buy_to_open", option_type=OptionRight.PUT,
                             strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying)
-        return self._submit_option_order([call_leg, put_leg], quantity, net_debit, "strangle")
+        return ResolvedStructure(
+            request=None, legs=[call_leg, put_leg],
+            payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=call_c.ask, strike=call_c.strike),
+                         PayoffLeg(kind="put", side=OrderDirection.BUY,
+                                   premium=put_c.ask, strike=put_c.strike)],
+            limit_price=net_debit, option_strategy="strangle",
+            dte=self._dte_for(call_c.expiry), reserve_per_contract=0.0,
+            cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size strangle for {self.instrument_name} "
+                f"(net_debit={net_debit})"),
+            reserve_kwargs={})
 
     def get_description(self) -> str:
         return f"Open long strangle on {self.instrument_name}"
@@ -3439,7 +3568,7 @@ class OpenCallButterflyAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_CALL_BUTTERFLY.value
 
-    def _build_and_submit(self) -> Dict[str, Any]:
+    def _resolve(self):
         chain = self._chain(OptionRight.CALL)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -3477,9 +3606,6 @@ class OpenCallButterflyAction(_OptionEntryAction):
         net_debit = round(lower.ask + upper.ask - 2 * body.bid, 4)
         if net_debit <= 0:
             return self._result(False, f"Non-positive debit for {self.instrument_name} butterfly")
-        quantity = self._size(net_debit, self.sizing)
-        if quantity < 1:
-            return self._result(False, f"Insufficient budget to size butterfly for {self.instrument_name}")
         legs = [
             OptionLeg(contract_symbol=lower.symbol, side=OrderDirection.BUY, ratio_qty=1,
                       position_intent="buy_to_open", option_type=OptionRight.CALL,
@@ -3491,7 +3617,20 @@ class OpenCallButterflyAction(_OptionEntryAction):
                       position_intent="buy_to_open", option_type=OptionRight.CALL,
                       strike=upper.strike, expiry=upper.expiry, underlying=upper.underlying),
         ]
-        return self._submit_option_order(legs, quantity, net_debit, "call_butterfly")
+        return ResolvedStructure(
+            request=None, legs=legs,
+            payoff_legs=[PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=lower.ask, strike=lower.strike, ratio=1),
+                         PayoffLeg(kind="call", side=OrderDirection.SELL,
+                                   premium=body.bid, strike=body.strike, ratio=2),
+                         PayoffLeg(kind="call", side=OrderDirection.BUY,
+                                   premium=upper.ask, strike=upper.strike, ratio=1)],
+            limit_price=net_debit, option_strategy="call_butterfly",
+            dte=self._dte_for(body.expiry), reserve_per_contract=0.0,
+            cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size butterfly for {self.instrument_name}"),
+            reserve_kwargs={})
 
     def get_description(self) -> str:
         return f"Open call butterfly on {self.instrument_name}"
