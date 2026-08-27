@@ -238,6 +238,48 @@ def test_assigned_shares_survive_to_the_next_bar_so_a_call_can_be_written(tmp_pa
         ctx.__exit__(None, None, None)
 
 
+def test_the_held_lot_is_visible_to_the_EXPERT_that_wrote_the_put(tmp_path):
+    """The link between "shares are held" and "the wheel can see them", pinned separately.
+
+    Holding is useless if the manage pass cannot find the lot. Both readers key on the
+    expert: ``DailyBacktestEngine._held_transactions`` selects
+    ``transactions_where(expert_id=...)`` and ``HasAssignedSharesCondition`` queries
+    ``open_transactions(expert_id=self.expert_recommendation.instance_id, ...)`` for the
+    ``csp_assignment`` origin. So the assignment lot MUST inherit the option transaction's
+    ``expert_id`` — if it came out None the shares would be held and invisible, and cc_sell
+    would never fire.
+    """
+    from ba2_common.core.db import update_instance
+    from ba2_common.core.trade_store import transactions_where
+
+    cfg = {**_BASE_CFG, "hold_assigned_stock": True}
+    acct, ps, ctx = _build(tmp_path, "wheelexpertid", 77, cfg)
+    try:
+        _sell_the_put(acct)
+        # The engine's option-entry path stamps expert_id from the recommendation
+        # (AccountInterface._create_transaction_for_order); this harness submits directly,
+        # so pin it here and assert the assignment CARRIES IT FORWARD.
+        opt_txn = [t for t in transactions_where() if t.asset_class == AssetClass.OPTION][0]
+        opt_txn.expert_id = 909
+        update_instance(opt_txn)
+
+        _assign_the_put(acct, ps, cfg)
+        ps.set_clock(datetime(2024, 3, 11))
+        acct.process_pending_assignment_liquidations()
+
+        held = [t for t in transactions_where(expert_id=909,
+                                              status=TransactionStatus.OPENED)
+                if t.asset_class != AssetClass.OPTION]
+        assert len(held) == 1, (
+            "the assigned lot is invisible to the expert that wrote the put — "
+            "_held_transactions selects by expert_id, so the wheel's manage pass never "
+            "sees the shares and cc_sell never fires"
+        )
+        assert (held[0].meta_data or {}).get("origin") == TXN_ORIGIN_CSP_ASSIGNMENT
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 def test_default_run_still_liquidates_the_same_assignment(tmp_path):
     """The control: the SAME book without the switch behaves exactly as it always has.
 
