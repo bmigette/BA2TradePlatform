@@ -149,39 +149,60 @@ learned on mid caps transfers, rather than paying 3x up front to find out.
 
 ## 6. Capital and universe
 
-**Capital: \$20,000.** This is already the grid's documented assumption; the affordability
-filter's rationale is computed against exactly that figure, with measured per-contract reserves:
+**Capital: \$20,000 account balance.** `virtual_equity_pct` defaults to 100 in backtests, so
+account balance, virtual equity and the expert's sizing base are the same number.
 
-| structure | spot 40 | spot 100 | spot 200 | spot 320 |
-|---|---|---|---|---|
-| cash-secured put | 3,600 | 9,000 | 18,000 | 28,800 |
-| jade lizard | 3,760 | 9,400 | 18,800 | 30,080 |
-| put ratio spread | 3,580 | 8,950 | 17,900 | 28,640 |
-| short strangle | 400 | 1,000 | 2,000 | 3,200 |
-| iron condor | 160 | 400 | 800 | 1,280 |
+**But the account balance is NOT the sizing budget, and this is where the existing filter is
+misleading.** Option sizing is
+`budget = equity x min(option_sizing%, max_virtual_equity_per_instrument_percent%)`. Both are
+GENES: `option_sizing` searches 5–40% for the full-notional band, and the per-instrument cap
+searches 5–30%. So the per-instrument budget is **\$1,000 at the floor of both and \$6,000 at
+the ceiling of both** — never \$20,000. The affordability filter's rationale compares
+per-contract reserve against the whole account and therefore understates the constraint by up
+to 3.3x.
 
-**Universe: the screener cap bands** — but stage 1 runs on **one band only, `mid` (\$2B–\$10B)**,
-with `small` and `large` deferred to stage 3.
+Measured against `option_reserve_required`, the highest spot at which ONE contract fits:
+
+| structure | budget \$6,000 (both genes at ceiling) | \$3,000 (mid) | \$1,000 (both at floor) |
+|---|---|---|---|
+| cash-secured put | \$60 | \$30 | \$10 |
+| jade lizard | \$56 | \$26 | \$6 |
+| put ratio spread | \$61 | \$31 | \$11 |
+| short strangle | \$300 | \$150 | \$50 |
+| iron condor | any spot | any spot | any spot |
+
+Three consequences, and the second was not visible before this was measured:
+
+* **The full-notional three are cheap-underlying-only at \$20k.** Spot ≤ \$60 at best, ≤ \$30
+  at typical gene settings. They stay in stage 1 — a measured "this structure is unreachable at
+  this account size" is a finding, not a failure — but they run against an explicit
+  **spot ≤ \$60 sub-universe**, and their result must be read as conditional on that. Running
+  them on the full band would spend 15,000 trials each rediscovering the reserve table.
+* **Short straddle and short strangle have a spot ceiling too** (\$300 permissive, \$50
+  restrictive). I had treated Reg-T naked structures as affordable everywhere; they are not.
+  They run on a **spot ≤ \$300 sub-universe**, which excludes most mega caps.
+* **Only defined-risk structures are spot-independent** — iron condor, the credit and debit
+  verticals, butterflies. Their reserve is a function of wing width, not of the underlying, so
+  they alone can search the full band.
+
+**Universe: the screener cap bands** — but stage 1 runs on **one band only, `mid`
+(\$2B–\$10B)**, with `small` and `large` deferred to stage 3.
 
 This is a decision, not an oversight, and it is the single biggest cost lever in the plan.
 Running all three bands in stage 1 would make it 45 jobs and ~675,000 trials instead of 15 and
 ~225,000. `mid` is the right one to start with for two independent reasons: small caps
 (\$50M–\$2B) largely have thin or nonexistent option chains, so the liquidity floor and the
 10%-of-bar-volume fill cap would dominate the result rather than the strategy; and mega caps
-carry share prices that put the full-notional three out of reach at \$20k. Mid caps have real
-chains and moderate share prices. Flip this to all three bands if the compute is available —
-it is one argument in the driver.
+carry share prices that put five of the fifteen structures out of reach. Flip this to all three
+bands if the compute is available — it is one argument in the driver.
 
-**Cap band is not share price, and that matters here.** The binding constraint for the three
-full-notional structures is share price (≤ ~\$200 at \$20k), and a cap band does not express it:
-a \$10B company can trade at \$30 or \$800. Two consequences, both explicit in the script:
+**Cap band is not share price**, which is why the spot sub-universes above are defined on price
+and not on band: a \$10B company can trade at \$30 or \$800, so the band controls neither
+affordability nor option-chain depth.
 
-* `O_CSP`, `O_JL` and `O_RS` run stage 1 against a **price-capped sub-universe (spot ≤ \$180)**.
-  Without it they burn trials refusing on expensive names, which is a data-shaped result
-  masquerading as a strategy result.
-* **ETFs need an explicit list**, since they carry no screener market cap. At \$20k they are
-  fine for defined-risk spreads, strangles and straddles, and excluded from the full-notional
-  three by the same price cap (SPY and QQQ fail it; IWM is borderline).
+**ETFs need an explicit list**, since they carry no screener market cap. At \$20k they are fine
+for defined-risk structures and excluded from the full-notional three and the naked-vol two by
+the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$300 cap).
 
 ## 7. What has to be built
 
