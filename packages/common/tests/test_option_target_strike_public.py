@@ -30,3 +30,17 @@ def test_consensus_target_returns_the_target_price():
 
 def test_delta_method_has_no_target_strike():
     assert target_strike("delta", 0.3, 100.0, None, OptionRight.CALL) is None
+
+
+def test_consensus_target_with_no_target_price_is_None():
+    """The third path to None, and the one a caller is most likely to miss.
+
+    ``select_single``'s ``target_price`` defaults to None, so this is reachable whenever a
+    consensus_target rule fires on a recommendation that carries no target. The selection
+    policy relies on it returning None rather than raising.
+    """
+    assert target_strike("consensus_target", None, 100.0, None, OptionRight.CALL) is None
+
+
+def test_an_unrecognised_method_is_None_rather_than_a_guess():
+    assert target_strike("nearest_round_number", 5.0, 100.0, 110.0, OptionRight.CALL) is None

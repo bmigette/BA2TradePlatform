@@ -212,7 +212,8 @@ class PayoffLeg:
     side: OrderDirection          # BUY = long, SELL = short
     ratio: int = 1                # legs per one structure unit
     premium: float                # per share, ALWAYS POSITIVE: paid if BUY, received if SELL
-    multiplier: float = 100.0     # 1.0 for a stock leg
+    multiplier: float = 100.0     # stock legs keep this default: one stock leg IS the
+                                  # 100 shares backing one contract
 ```
 
 Payoff of one structure unit at underlying `S`:
