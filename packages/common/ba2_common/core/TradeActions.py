@@ -1873,9 +1873,24 @@ class _OptionEntryAction(TradeAction):
     """Shared base for option-entry actions (BuyCall / BullCallSpread / CoveredCall).
 
     Provides capability guard, chain fetch, contract selection, pct_equity
-    sizing, and the submit_to_broker gate. Concrete subclasses implement
-    `_build_and_submit()` which selects contract(s), builds legs, computes the
-    limit premium (buy@ask / sell@bid), sizes the order, and submits.
+    sizing, and the submit_to_broker gate.
+
+    TWO SUBCLASS CONTRACTS COEXIST, and that is a migration state, not a design.
+    The 2026-08-27 resolve split (phase 2a) moved the seven PREMIUM-SIZED builders
+    onto `_resolve()`, which selects contract(s), builds legs, computes the limit
+    premium (buy@ask / sell@bid) and returns a `ResolvedStructure` carrying
+    everything EXCEPT quantity -- the shared `_size_and_submit()` tail then sizes
+    and submits it. The remaining ten (8 reserve-sized, 2 held-shares overlays)
+    still implement `_build_and_submit()` and reach the broker themselves; the base
+    `_resolve()` bridges them so `execute()` has one entry point for both.
+
+    A refusal from either shape is the same thing: the `self._result(False, ...)`
+    dict, NOT a typed `StructureRefusal`. `_result` persists a `TradeActionResult`
+    row that the UI reads, so returning a pure value object would silently stop
+    writing it.
+
+    Phases 2b and 2c convert the other ten; when the last `_build_and_submit`
+    definition is gone, the bridge in the base `_resolve()` should become a raise.
     """
 
     OPTION_TYPE: OptionRight = OptionRight.CALL
@@ -2099,8 +2114,15 @@ class _OptionEntryAction(TradeAction):
         (see _max_equity_per_instrument_cap) -- whichever of the two budgets is tighter wins.
 
         Now a thin adapter over ``_size_by_cost``: a premium is a per-SHARE price, so one
-        contract costs ``premium * 100``. Kept as a named method because tests and the
-        equity-side RM reference it."""
+        contract costs ``premium * 100``.
+
+        NO PRODUCTION CALLER REMAINS as of phase 2a -- the seven premium-sized builders go
+        through ``_size_and_submit`` now, and ``grep -rn "\._size\b"`` finds only tests. An
+        earlier version of this line claimed "tests and the equity-side RM reference it", which
+        was half wrong: the equity RM has its own sizer and never called this. It is kept for
+        ``test_option_entry_sizing_cap.py``, which asserts the premium-side per-instrument cap
+        through this signature. Delete it only together with re-pointing that test at
+        ``_size_by_cost(premium * 100.0, pct)``."""
         if premium is None or premium <= 0:
             return 0
         return self._size_by_cost(premium * 100.0, sizing_pct)
@@ -2424,10 +2446,15 @@ class _OptionEntryAction(TradeAction):
         """
         quantity = self._size_by_cost(resolved.cost_per_contract, self.sizing)
         if quantity < 1:
+            # The structure's OWN historical wording, not a uniform one. These strings are
+            # persisted to TradeActionResult.message and rendered in the UI as the reason an
+            # entry did not fire; rewording five of seven of them would have made "behaviour
+            # neutral" false in the one place a user actually looks.
             return self._result(
                 False,
-                f"Insufficient budget to size {resolved.option_strategy} for "
-                f"{self.instrument_name} (premium={resolved.limit_price})")
+                resolved.budget_refusal_message
+                or (f"Insufficient budget to size {resolved.option_strategy} for "
+                    f"{self.instrument_name}"))
         return self._submit_option_order(
             resolved.legs, quantity, resolved.limit_price, resolved.option_strategy)
 
@@ -2496,6 +2523,9 @@ class BuyCallAction(_OptionEntryAction):
             limit_price=limit_price, option_strategy="long_call",
             dte=self._dte_for(contract.expiry), reserve_per_contract=0.0,
             cost_per_contract=limit_price * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size long_call for {self.instrument_name} "
+                f"(premium={limit_price})"),
             reserve_kwargs={})
 
     def get_description(self) -> str:
@@ -2546,6 +2576,9 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
             limit_price=net_debit, option_strategy="bull_call_spread",
             dte=self._dte_for(long_c.expiry), reserve_per_contract=0.0,
             cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size bull_call_spread for {self.instrument_name} "
+                f"(net_debit={net_debit})"),
             reserve_kwargs={})
 
     def _spread_params(self) -> Tuple[Any, Any]:
@@ -2596,6 +2629,9 @@ class BuyPutAction(_OptionEntryAction):
             limit_price=limit_price, option_strategy="long_put",
             dte=self._dte_for(contract.expiry), reserve_per_contract=0.0,
             cost_per_contract=limit_price * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size long_put for {self.instrument_name} "
+                f"(premium={limit_price})"),
             reserve_kwargs={})
 
     def get_description(self) -> str:
@@ -2647,6 +2683,9 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
             limit_price=net_debit, option_strategy="bear_put_spread",
             dte=self._dte_for(long_c.expiry), reserve_per_contract=0.0,
             cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size bear_put_spread for {self.instrument_name} "
+                f"(net_debit={net_debit})"),
             reserve_kwargs={})
 
     def _spread_params(self) -> Tuple[Any, Any]:
@@ -3111,6 +3150,9 @@ class OpenStraddleAction(_OptionEntryAction):
             limit_price=net_debit, option_strategy="straddle",
             dte=self._dte_for(call_c.expiry), reserve_per_contract=0.0,
             cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size straddle for {self.instrument_name} "
+                f"(net_debit={net_debit})"),
             reserve_kwargs={})
 
     def get_description(self) -> str:
@@ -3174,6 +3216,9 @@ class OpenStrangleAction(_OptionEntryAction):
             limit_price=net_debit, option_strategy="strangle",
             dte=self._dte_for(call_c.expiry), reserve_per_contract=0.0,
             cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size strangle for {self.instrument_name} "
+                f"(net_debit={net_debit})"),
             reserve_kwargs={})
 
     def get_description(self) -> str:
@@ -3583,6 +3628,8 @@ class OpenCallButterflyAction(_OptionEntryAction):
             limit_price=net_debit, option_strategy="call_butterfly",
             dte=self._dte_for(body.expiry), reserve_per_contract=0.0,
             cost_per_contract=net_debit * 100.0, sizing_basis="premium",
+            budget_refusal_message=(
+                f"Insufficient budget to size butterfly for {self.instrument_name}"),
             reserve_kwargs={})
 
     def get_description(self) -> str:

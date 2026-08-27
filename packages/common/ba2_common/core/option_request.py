@@ -127,14 +127,27 @@ class ResolvedStructure:
     reserve_per_contract: float
     cost_per_contract: float
     sizing_basis: str
+    #: The EXACT "insufficient budget" message this structure used to emit from its own tail.
+    #: Carried rather than derived because it is not derivable: the label differs per structure
+    #: (`premium=` for singles, `net_debit=` for debit multi-leg, `strike=` and `max_loss=` for
+    #: the credit builders in 2b), several structures have no parenthetical at all, and the
+    #: butterfly names itself "butterfly" where its option_strategy is "call_butterfly".
+    #:
+    #: It matters because `_result` PERSISTS this into `TradeActionResult.message` and the UI
+    #: renders it as the reason an entry did not fire. A refactor advertised as behaviour-neutral
+    #: that quietly rewords five of seven user-visible strings is not behaviour-neutral.
+    budget_refusal_message: Optional[str] = None
     reserve_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.sizing_basis not in SIZING_BASES:
             raise ValueError(
                 f"Unknown sizing_basis {self.sizing_basis!r}; expected one of "
-                f"{list(SIZING_BASES)}. The shared sizing tail dispatches on this, so an "
-                f"unrecognised value would silently size nothing.")
+                f"{list(SIZING_BASES)}. Phase 2a's shared tail does NOT yet dispatch on this — "
+                f"it sizes every structure off cost_per_contract, which is correct only for the "
+                f"7 premium-sized builders that exist today. The field is validated now so that "
+                f"2b's reserve builders and 2c's held-shares overlays cannot be routed through "
+                f"a tail that has no branch for them.")
 
 
 @dataclass(frozen=True)

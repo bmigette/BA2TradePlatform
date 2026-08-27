@@ -281,3 +281,51 @@ def test_the_per_instrument_cap_still_clamps_the_shared_tails_budget(monkeypatch
     # and the tighter of the two must win -> 9.
     assert len(acct.submitted) == 1
     assert acct.submitted[0]["quantity"] == 9
+
+
+# --- refusal-message parity, added after the 2026-08-27 code-quality review -------------------
+#
+# The review found the shared tail had REWORDED five of the seven "insufficient budget" messages.
+# They are persisted to TradeActionResult.message and rendered in the UI as the reason an entry
+# did not fire, so a refactor advertised as behaviour-neutral had quietly changed the one thing a
+# user actually reads. These strings are lifted verbatim from the pre-split source
+# (commit 7a7a1bbc^) -- if the tail ever re-uniformises them, this fails.
+
+HISTORICAL_BUDGET_REFUSALS = [
+    ("BuyCallAction",            "Insufficient budget to size long_call for X (premium="),
+    ("BuyPutAction",             "Insufficient budget to size long_put for X (premium="),
+    ("OpenBullCallSpreadAction", "Insufficient budget to size bull_call_spread for X (net_debit="),
+    ("OpenBearPutSpreadAction",  "Insufficient budget to size bear_put_spread for X (net_debit="),
+    ("OpenStraddleAction",       "Insufficient budget to size straddle for X (net_debit="),
+    ("OpenStrangleAction",       "Insufficient budget to size strangle for X (net_debit="),
+    # No parenthetical, and it calls itself "butterfly" where its option_strategy is
+    # "call_butterfly" -- which is exactly why the message is CARRIED and not derived.
+    ("OpenCallButterflyAction",  "Insufficient budget to size butterfly for X"),
+]
+
+
+@pytest.mark.parametrize("cls_name, expected_prefix", HISTORICAL_BUDGET_REFUSALS)
+def test_the_budget_refusal_message_is_the_one_this_structure_always_emitted(
+        cls_name, expected_prefix):
+    # sizing=0.001% makes the budget smaller than one contract for every structure, which is
+    # the only path to the quantity < 1 branch without mocking the sizer.
+    a, acct = _action(getattr(TradeActions, cls_name), sizing=0.001, wing_width_pct=5.0)
+    result = a.execute()
+    assert result["success"] is False
+    assert acct.submitted == []
+    assert result["message"].startswith(expected_prefix), (
+        f"{cls_name} refusal drifted.\n  expected prefix: {expected_prefix!r}\n"
+        f"  actual:          {result['message']!r}")
+
+
+def test_a_structure_with_no_carried_message_still_refuses_intelligibly():
+    """The fallback exists for 2b/2c builders that have not been converted yet."""
+    from ba2_common.core.option_request import ResolvedStructure
+    a, _ = _action(TradeActions.BuyCallAction, sizing=0.001)
+    bare = ResolvedStructure(
+        request=None, legs=[], payoff_legs=[], limit_price=1.0,
+        option_strategy="some_future_structure", dte=30, reserve_per_contract=0.0,
+        cost_per_contract=100.0, sizing_basis="premium", reserve_kwargs={})
+    out = a._size_and_submit(bare)
+    assert out["success"] is False
+    assert "some_future_structure" in out["message"]

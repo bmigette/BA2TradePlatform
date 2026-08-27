@@ -58,6 +58,7 @@ There is a fifth finding that this plan deliberately does **not** act on, record
 | `packages/common/ba2_common/core/option_request.py` | **Modified.** Split `ResolvedStructure` into resolve-time and score-time halves; add `cost_per_contract` and `sizing_basis`; register the refusal phrases the builders actually emit. |
 | `packages/common/ba2_common/core/TradeActions.py` | **Modified.** Add `_resolve()`/`_size_and_submit()` to `_OptionEntryAction`; rewrite `execute()`; convert 7 concrete builders. |
 | `packages/common/tests/test_option_resolve_split.py` | **New.** Proves the split is behaviour-neutral and that `_resolve()` is independently callable. |
+| `tests/test_no_zero_coercion.py` | **Modified, expected.** Its allowlist is keyed by literal `file:line`, so moving code in `TradeActions.py` shifts the key and the guard fails until it is re-pointed. This is the one sanctioned exception to "do not fix a passing test that broke" — the guard's own failure message tells you to do it. |
 
 ---
 
@@ -371,6 +372,13 @@ In `packages/common/ba2_common/core/TradeActions.py`, replace the `_build_and_su
     def _resolve(self):
         """Select contracts, build legs, price the structure. Return a ``ResolvedStructure``
         — or, for a refusal, the ``self._result(False, ...)`` dict the builder already returns.
+
+        DO NOT make this body ``raise NotImplementedError`` (an earlier draft of this plan did,
+        and it is wrong). ``execute()`` calls ``_resolve()`` for EVERY builder, but after this
+        task all 17 still define only ``_build_and_submit`` — the raise would be swallowed by
+        ``execute()``'s generic ``except Exception`` and turn every option entry into a failed
+        result. The body must be a migration bridge, ``return self._build_and_submit()``, until
+        phases 2b/2c convert the last one.
 
         REFUSALS STAY AS ``_result`` DICTS, not ``StructureRefusal``. ``_result`` PERSISTS a
         ``TradeActionResult`` row (``create_and_save_action_result``), and the UI reads those
