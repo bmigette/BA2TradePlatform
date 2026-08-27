@@ -609,7 +609,6 @@ and immediately before `return rule`:
         # off", which makes it the right discriminator: a leaf carrying it is a strategy opinion,
         # a leaf without it is a correctness guard (`has_no_position`) that must stay on — with
         # it off, a smoke run would stack duplicate positions and mask the plumbing it is testing.
-        for leaf in rule["conditions"]["conditions"]:
         rule["conditions"]["conditions"] = [
             leaf for leaf in rule["conditions"]["conditions"]
             if not leaf.get("toggle_optimize")]

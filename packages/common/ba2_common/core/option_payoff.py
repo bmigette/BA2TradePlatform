@@ -113,7 +113,16 @@ def validate_legs(legs: Sequence[PayoffLeg]) -> Optional[str]:
             # an unbounded structure — so for a short-call-bearing shape this is the only quote
             # sanity check there is. There is deliberately NO equivalent bound for a call: its
             # value is unbounded above, so nothing spot-free can be asserted about it.
-            if premium > strike:
+            #                                                          ^^^^^^^^^^^^^^^^^^
+            # PUTS ONLY, and the `kind == "put"` below is load-bearing. An earlier version of
+            # this check sat under `kind in _OPTION_KINDS`, i.e. it applied to CALLS TOO —
+            # directly contradicting the sentence above it. A deep-ITM call is legitimately
+            # worth more than its strike (strike 50 with spot 160 marks around 110), so a
+            # perfectly ordinary long call was refused, `max_loss` returned UNMEASURABLE, and
+            # the message told the reader "a put can never be worth more than its strike" about
+            # a call. Harmless while nothing imports this, and a wrong-refusal debugging session
+            # the moment Phase 3 makes max_loss the sizing budget.
+            if leg.kind == "put" and premium > strike:
                 return (f"{where}: premium {premium} exceeds strike {strike}; a put can never "
                         f"be worth more than its strike, so this quote is wrong")
     return None

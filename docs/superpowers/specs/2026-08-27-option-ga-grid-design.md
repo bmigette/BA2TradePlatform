@@ -132,9 +132,9 @@ OFF, so a failure there can only be data or wiring. 0b runs the real shape, so a
 green is configuration or strategy. 0b is also what turns the cost table below from an estimate
 into a schedule: it measures per-trial runtime on the machine that will do the work.
 
-### Stage 1 · Discovery — 18 jobs, one per structure
+### Stage 1 · Discovery — 17 structures x 2 experts = 34 jobs
 
-The 15 pure-option keys plus the three wheel-family strategies below.
+The 15 pure-option keys plus `O_CC` and `O_PP`. `O_WHEEL` is EXCLUDED until the engine can hold assigned stock — see the warning below.
 
 Genome ~22 after the price-gate swap, **population 200, generations 60 with early-stop patience 8**. ~5,000 trials per job
 in practice; 12,000 only if a job never plateaus.
@@ -146,6 +146,35 @@ structure trades at all on this data.
 All 15 are searchable here, including `O_CSP` / `O_JL` / `O_RS`, which the group filter excludes.
 That filter is unconditional and its own comment says the three "remain runnable as EXPLICIT
 single-strategy jobs" — stage 1 is exactly that.
+
+#### ⚠ O_WHEEL IS BUILT BUT NOT RUNNABLE — stage 1 is 17 structures, not 18
+
+Verified 2026-08-27 by code order, not inference. Per bar the engine runs
+`_manage_open_positions` (step 3, `daily_engine.py` ~:718) BEFORE
+`process_pending_assignment_liquidations` (step 4a-pre, ~:740) — and that method's own docstring
+says it "closes ALL of it at the NEXT bar's OPEN". So the manage pass writes a covered call
+against the assigned shares and the liquidation sells those shares on the same bar. **Every wheel
+position the backtest opens is a naked short call wearing a wheel's name.**
+
+That is worse than wrong numbers: it is a DIFFERENT STRATEGY's numbers, and they look plausible.
+
+`_build_strategy_wheel` now **raises at build time** rather than warning in a docstring — a
+prose warning is not a guard when the key sits in `_STRATEGY_BUILDERS` and any `--strategies`
+list containing it would have launched. Override for engine development only via
+`BA2_ALLOW_UNRUNNABLE_WHEEL=1`.
+
+**The unblocking fix is Task 10 of `docs/superpowers/plans/2026-08-24-option-model-and-lifecycle.md`**
+("the backtest must stop liquidating assigned stock"), which never landed — and the opposite
+behaviour is currently PINNED as intent by
+`test_option_orphan_stock_and_arb_guards.py::test_short_put_assignment_stock_liquidated_next_bar_open`.
+So it is a real decision, not an oversight to sweep up.
+
+Until then: **stage 1 runs 17 structures x 2 experts = 34 jobs.** The wheel composition is
+correct and tested; only the engine is missing, which is why the strategy stays registered.
+
+Related correction to §2: that section claims "a complete option backtest engine ... called-away
+lot splitting". Lot splitting exists in the LIVE account (`AlpacaAccount._settle_called_away`);
+in the backtest, assigned lots are liquidated the next bar.
 
 #### The wheel family — three more strategies, one of which must be built
 
@@ -193,7 +222,7 @@ Stage 1's per-structure verdicts are still recorded, because they are the knowle
 exists to produce, and a structure that could not trade at all is a finding worth having. They
 just do not gate anything.
 
-All 18 structures as toggleable members of ONE expert, plus the shared tier-1 gate.
+All 17 runnable structures as toggleable members of ONE expert, plus the shared tier-1 gate.
 Genome **~240, ESTIMATED** (was ~300 before the price-gate swap) — `OS_ALL` does not exist yet, so unlike every other figure in this
 spec that number is arithmetic (15 members x ~14 per-structure condition genes + 4 shared + the
 option genes + the entry toggles) rather than a measurement. Measure it with
@@ -308,7 +337,7 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
 2. **Swap the four `price_*` gates for one `expected_profit_target_percent` gate**, which every expert produces by construction. Shrinks each structure's genome 21% and the OS1 group's 25%.
 3. **Shared condition ids** — emit `shared-rel_volume` and `shared-gate_confidence` in the group
    builder. Verified to collapse 20 genes to 4 on OS1; no GA change.
-2. **An `OS_ALL` group** for stage 2, carrying all 18 structures.
+2. **An `OS_ALL` group** for stage 2, carrying all 17 runnable structures (O_WHEEL joins when the engine can run it).
 3. **Cross-job seeding** — read stage-1 winners and emit `initial_population` for stage 2. The
    hook exists for resume; this points it at another job's results.
 4. **A price-capped universe helper** for the full-notional three.
@@ -428,10 +457,10 @@ full-notional three belong to no group.
 | stage | jobs | population | generations (ceiling) | early-stop | trials if full | realistic |
 |---|---|---|---|---|---|---|
 | 0a smoke | 2 | 8 | 2 | — | ~300 | ~300 |
-| 0b pilot | 18 | 60 | 10 | 4 | ~11,000 | ~11,000 |
-| 1 discovery | **36** | 200 | 60 | 8 | 432,000 | ~180,000 |
+| 0b pilot | 17 | 60 | 10 | 4 | ~10,000 | ~10,000 |
+| 1 discovery | **34** | 200 | 60 | 8 | 408,000 | ~170,000 |
 | 2 composition | 1 | 300 | 80 | 10 | 24,000 | ~8,000 |
-| **total** | | | | | **~467,000** | **~199,000** |
+| **total** | | | | | **~442,000** | **~189,000** |
 
 "Realistic" assumes early-stop fires around generation 25; "if full" is the ceiling where nothing
 ever plateaus. The true figure lands between, and stage 0b measures which end.
