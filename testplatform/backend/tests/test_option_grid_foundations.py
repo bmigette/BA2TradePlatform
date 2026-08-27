@@ -132,3 +132,117 @@ def test_single_and_group_jobs_use_the_SAME_key_for_a_shared_gate(gate):
     single = {g for g in _space(m, "O_LC") if gate in g}
     group = {g for g in _space(m, "OS1") if gate in g}
     assert single == group, f"{gate} keys differ: single={sorted(single)} group={sorted(group)}"
+
+
+# ==============================================================================================
+# Task 3 — O_WHEEL
+# ==============================================================================================
+
+
+def test_wheel_is_a_registered_strategy():
+    m = _launcher()
+    assert "O_WHEEL" in m._STRATEGY_BUILDERS
+    assert "O_WHEEL" in m._OPTION_STRATEGY_KEYS
+
+
+def test_wheel_enters_by_selling_a_put():
+    m = _launcher()
+    s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
+    actions = [a.get("action_type") for r in s.entry_rules for a in (r.get("actions") or [])]
+    assert "sell_cash_secured_put" in actions, f"wheel entry actions were {actions}"
+
+
+def test_wheel_writes_calls_ONLY_against_assigned_shares():
+    """The distinction that makes it a wheel.
+
+    Gating on has_position would write calls against any stock the expert holds;
+    has_assigned_shares writes them only against shares the wheel's own put put you into. The
+    condition exists and is tested as a rule trigger in tests/test_wheel_assignment_order.py.
+    """
+    m = _launcher()
+    s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
+    fields = []
+
+    def walk(node):
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+        elif isinstance(node, dict):
+            if node.get("field"):
+                fields.append(node["field"])
+            for v in node.values():
+                walk(v)
+
+    walk(s.exit_rules)
+    assert "has_assigned_shares" in fields, f"wheel overlay gates on {sorted(set(fields))}"
+    cc_rules = [r for r in s.exit_rules
+                if any(a.get("action_type") == "sell_covered_call" for a in (r.get("actions") or []))]
+    assert cc_rules, "wheel has no covered-call overlay rule"
+
+
+def test_wheel_overlay_is_reachable_not_appended():
+    """The bug that made every historical O_CC number a mislabelled equity run.
+
+    An overlay appended AFTER S2's floor stop can never fire -- that rule is conditioned only on
+    has_position, matches every managed position, and declares no toggle gene so the GA cannot
+    route around it. O_CC and O_PP, two OPPOSITE strategies, produced byte-identical top-5
+    results with zero trades carrying a contract symbol because of it. The overlay must be
+    SPLICED before the first stop-adjusting rule.
+    """
+    m = _launcher()
+    s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
+    ids = [r.get("id") for r in s.exit_rules]
+    assert "cc_sell" in ids, f"no overlay rule in {ids}"
+    assert ids.index("cc_sell") < len(ids) - 1, (
+        f"the overlay is LAST in the exit list, which is the appended-and-unreachable shape: {ids}")
+
+
+def test_wheel_guards_against_stacking_a_second_call():
+    m = _launcher()
+    s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
+    guards = [r for r in s.exit_rules
+              if any(a.get("action_type") == "stop_processing" for a in (r.get("actions") or []))]
+    assert guards, "no stop_processing guard; the overlay will re-fire every manage cycle"
+
+
+def test_wheel_overlay_precedes_the_option_closes():
+    """The pure-option list has no adjust_* rule, so 'not last' is not enough.
+
+    ``opt_tp`` (profit_loss_percent >) and ``opt_time`` (days_opened >) compare fields an
+    assigned-STOCK position also carries, so either can match on the very position the overlay
+    exists to cover and break the first-match walk with a close_option that has no option to
+    close. Appending the pair anywhere behind them re-creates OPT-B1 in a quieter form.
+    """
+    m = _launcher()
+    s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
+    ids = [r.get("id") for r in s.exit_rules]
+    assert ids.index("cc_guard") < ids.index("cc_sell"), (
+        f"the NOT-idiom guard only works if it evaluates first: {ids}")
+    for closer in ("opt_tp", "opt_time", "opt_dte"):
+        assert ids.index("cc_sell") < ids.index(closer), (
+            f"{closer} can match on an assigned-stock position and shadow the overlay: {ids}")
+
+
+def test_wheel_is_scored_and_railed_as_a_PURE_option_kind():
+    """It has no _OPTION_STRATS row (it reuses O_CSP's entry), but it is not an equity strategy.
+
+    Both consumers of _PURE_OPTION_STRATEGIES would be wrong if the wheel were classed with the
+    equity-entry overlays: its book is an option book, so calmar/sharpe would reward the
+    barely-trading configs the option metric exists to reject, and it reads the options cache, so
+    an unrailed window would spend the reserved 2026 walk-forward set.
+    """
+    m = _launcher()
+    assert "O_WHEEL" in m._PURE_OPTION_STRATEGIES
+    assert m._resolve_fitness(None, "O_WHEEL", "calmar_ratio") == "option_consistent_annual_return"
+    with pytest.raises(SystemExit):
+        m._assert_option_window_excludes_holdout(["O_WHEEL"], "2026-03-01")
+
+
+def test_wheel_reuses_O_CSPs_entry_gene_keys_verbatim():
+    """Not cosmetic: it is what lets a stage-1 O_CSP winner seed an O_WHEEL job. encode_params
+    drops keys the target space does not know, so a renamed entry rule would silently discard
+    every entry gene of the seed."""
+    m = _launcher()
+    csp = {g for g in _space(m, "O_CSP") if g.startswith("entry:") or g.startswith("cond:")}
+    wheel = {g for g in _space(m, "O_WHEEL") if g.startswith("entry:") or g.startswith("cond:")}
+    assert csp == wheel, f"entry gene keys diverged: {sorted(csp ^ wheel)}"

@@ -2345,7 +2345,21 @@ if _empty_groups:
         f"{sorted(_FULL_NOTIONAL_OPTION_KINDS)}; drop the group or relax the exclusion.")
 
 # Pure-option strategy keys (entry is the option action; no equity leg). O_CC/O_STK are equity.
-_PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS)
+#
+# ``O_WHEEL`` is listed EXPLICITLY because it is a COMPOSITE: it has no ``_OPTION_STRATS`` row of
+# its own (it reuses O_CSP's entry wholesale — see ``_build_strategy_wheel``), so the derived
+# ``set(_OPTION_STRATS)`` cannot find it. It is nonetheless pure-option in every sense the two
+# consumers of this set care about, and both would be WRONG if it were classed with the
+# equity-entry overlays:
+#
+#   * ``_resolve_fitness`` — the wheel's book is an option book, and calmar/sharpe on an option
+#     book rewards barely-trading low-drawdown configs (the v6 OS evidence in that docstring).
+#   * ``_assert_option_window_excludes_holdout`` — the wheel reads the options cache, so a
+#     window running into 2026 spends the reserved walk-forward set exactly as OS1 would.
+#
+# Nothing indexes ``_OPTION_STRATS[kind]`` off this set (checked: the only two readers are the
+# two above), so a member with no row is safe here.
+_PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS) | {"O_WHEEL"}
 # All launcher option/equity strategy keys handled by the option builders.
 _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 
@@ -3179,7 +3193,7 @@ def _with_round_lot_entry(s, lot: int = 100):
     return s
 
 
-def _insert_option_overlay(exit_rules, guard, overlay):
+def _insert_option_overlay(exit_rules, guard, overlay, *, anchor: str = "adjust"):
     """Splice an option OVERLAY pair (guard + overlay) into an exit list so it is REACHABLE.
 
     The engine evaluates an OPEN_POSITIONS ruleset FIRST-MATCH: ``TradeActionEvaluator``
@@ -3192,7 +3206,8 @@ def _insert_option_overlay(exit_rules, guard, overlay):
     unconditional in every genome. Every O_CC / O_PP number ever produced is therefore a
     mislabelled plain-equity run, and the two jobs were byte-identical to each other.
 
-    Placement: AFTER the closing rules, BEFORE the first stop-adjusting rule.
+    Placement (``anchor="adjust"``, the EQUITY-entry default): AFTER the closing rules, BEFORE
+    the first stop-adjusting rule.
 
       * a matched CLOSE still breaks first, so no option is written against shares that are
         being sold on that same bar (that would leave a naked short call);
@@ -3210,8 +3225,32 @@ def _insert_option_overlay(exit_rules, guard, overlay):
     Fails loud when no stop-adjusting rule exists: the insertion point would then be a
     guess, and guessing is how the overlay got appended past the floor stop in the first
     place.
+
+    ``anchor="front"`` is the PURE-OPTION exit list's placement (O_WHEEL), and it is opt-in
+    precisely so the loud failure above still protects the equity lists. A pure-option exit
+    list (``_option_exit_rules``) has NO ``adjust_*`` rule at all — every rule is a
+    ``close_option`` — so "after the closes, before the adjusts" has no referent, and the two
+    constraints resolve differently:
+
+      * the "a matched close breaks first" constraint does NOT bind. Those closes act on the
+        OPTION leg, not on shares, and the wheel's overlay gate (``has_assigned_shares``) can
+        only be true once the short put is GONE. The two states are mutually exclusive by
+        construction, so there is no bar on which a close and the overlay both want to act.
+      * the REACHABILITY constraint binds, and points the other way. ``opt_tp``
+        (``profit_loss_percent >``) and ``opt_time`` (``days_opened >``) compare fields an
+        assigned-STOCK position also carries, so either can match on the very position the
+        overlay exists to cover and break the walk with a ``close_option`` that has no option
+        to close. Front placement removes that shadow outright rather than reasoning about
+        when it bites.
+
+    The guard still precedes the overlay in both modes — it is the codebase's NOT idiom and
+    only works if it evaluates first.
     """
     rules = list(exit_rules or [])
+    if anchor == "front":
+        return [guard, overlay] + rules
+    if anchor != "adjust":
+        raise ValueError(f"_insert_option_overlay: unknown anchor {anchor!r}")
     for idx, rule in enumerate(rules):
         actions = [str(a.get("action_type") or a.get("action") or "")
                    for a in (rule.get("actions") or [])]
@@ -3254,6 +3293,67 @@ def _build_strategy_covered_call(kind: str):
          # Writing the call must NOT consume the bar's single first-match slot: the exit
          # rules behind it (the break-even lock, the floor stop) still have to run.
          "continue_processing": True})
+    return s
+
+
+def _build_strategy_wheel(kind: str):
+    """O_WHEEL — sell a cash-secured put; when it is ASSIGNED, write calls against the shares.
+
+    A composition of two existing builders, not new machinery: ``O_CSP``'s pure-option entry
+    rule plus ``O_CC``'s guard/overlay pair, with ONE deliberate change — the overlay is gated
+    on ``has_assigned_shares`` rather than ``has_position``.
+
+    That gate IS the wheel. ``has_position`` would write calls against any stock the expert
+    happens to hold, including shares bought outright by some other rule; ``has_assigned_shares``
+    writes them only against shares this strategy's own put delivered. The condition exists and
+    is covered as a rule trigger by tests/test_wheel_assignment_order.py.
+
+    THE ENTRY IS O_CSP'S, IDS INCLUDED (``o_csp-entry``, ``o_csp-signal``, ...). Deliberate: it
+    is literally the same entry, so an O_CSP job and an O_WHEEL job produce IDENTICAL entry gene
+    keys and a stage-1 O_CSP winner can be encoded into an O_WHEEL space without
+    ``encode_params`` dropping anything. Only the exit list differs.
+
+    SPLICED, never appended (OPT-B1). An overlay appended after an always-matching rule can
+    never fire, and the GA cannot route around one that declares no toggle gene. That defect is
+    why O_CC and O_PP — opposite strategies — once produced byte-identical top-5 results with
+    zero trades carrying a contract symbol. Here the splice is ``anchor="front"``: the
+    pure-option exit list has no ``adjust_*`` rule to sit in front of, and ``opt_tp`` /
+    ``opt_time`` can match on an assigned-stock position and shadow the overlay. See
+    ``_insert_option_overlay``.
+
+    NOT round-lot constrained, unlike O_CC/O_PP: the shares arrive from assignment in exact
+    100-share lots by construction, so there is no odd-lot entry to floor.
+
+    ** THE BACKTEST CANNOT RUN THIS MEANINGFULLY TODAY — see the assignment-liquidation
+    precondition. ** ``BacktestAccount.settle_single_leg_expiry`` physically assigns every ITM
+    short option and then schedules the resulting stock for FULL liquidation at the next bar's
+    open (``process_pending_assignment_liquidations``, the "no orphaned stock" policy), because
+    "a backtest strategy manages OPTIONS (its exit rules are all close_option)". The wheel is
+    the first strategy for which that is false. Worse than inert: ``daily_engine`` runs the
+    MANAGE pass (step 3) BEFORE the liquidation (step 4a-pre) on the following bar, so the
+    overlay sees the assigned shares, writes a call against them, and the liquidation then sells
+    the shares out from under it — a NAKED short call. Registering the strategy is Task 3;
+    teaching the backtest to leave wheel-assigned stock alone is not, and it would move every
+    existing option run's numbers. Do not launch an O_WHEEL grid until that is fixed.
+    """
+    s = _build_strategy_option("O_CSP")
+    s.name = kind
+    s.exit_rules = _insert_option_overlay(
+        s.exit_rules,
+        {"id": "cc_guard",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "cc_guard_has_cc", "field": "has_covered_call"}]},
+         "actions": [{"action_type": "stop_processing"}],
+         "continue_processing": False},
+        {"id": "cc_sell",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "cc_assigned", "field": "has_assigned_shares"}]},
+         "actions": [_option_overlay_action(
+             "sell_covered_call", strike_param=5.0,
+             strike_min=2.0, strike_max=12.0, strike_step=2.0)],
+         # See O_CC's cc_sell: writing the call must not consume the bar's first-match slot.
+         "continue_processing": True},
+        anchor="front")
     return s
 
 
@@ -3314,6 +3414,8 @@ _STRATEGY_BUILDERS = {
     "O_STRG": _build_strategy_option,
     "O_CC": _build_strategy_covered_call, "O_STK": _build_strategy_stock,
     "O_PP": _build_strategy_protective_put,
+    # O_CSP's option entry + O_CC's covered-call overlay, gated on has_assigned_shares.
+    "O_WHEEL": _build_strategy_wheel,
     # Grouped option families (one job searches the whole family; see _OPTION_GROUPS):
     "OS1": _build_strategy_option_group, "OS2": _build_strategy_option_group,
     "OS3": _build_strategy_option_group, "OS4": _build_strategy_option_group,
