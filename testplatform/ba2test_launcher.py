@@ -3890,6 +3890,11 @@ def _cmd_optimize_batch(args) -> int:
     from app.services.backtest.daily_backtest_handler import derive_warmup_days
     from app.services.task_queue import get_task_queue
 
+    # Same module-level toggle _cmd_optimize sets. Without this, --gates-off parses on the
+    # batch command and then does NOTHING -- the worst kind of flag, because the run completes
+    # and reports "no trades" for a reason the operator has just tried to rule out.
+    global _OPTION_GATES_OFF
+    _OPTION_GATES_OFF = bool(getattr(args, "gates_off", False))
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
@@ -4870,6 +4875,12 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--universe", required=True, help="Comma-separated symbols (shared by all jobs).")
     ob.add_argument("--start", required=True, help="ISO start date.")
     ob.add_argument("--end", required=True, help="ISO end date.")
+    ob.add_argument("--gates-off", action="store_true",
+                    help="Disable every OPTIONAL option-entry condition gate (smoke runs). Same "
+                         "flag as `optimize --gates-off`; without it on THIS command the module "
+                         "toggle stays False and a batch smoke run silently keeps its gates ON, "
+                         "which produces exactly the ambiguous 'traded nothing' the smoke stage "
+                         "exists to eliminate.")
     ob.add_argument("--fitness", default=None,
                     help="Fitness metric, resolved PER JOB when omitted: "
                          "'option_consistent_annual_return' for pure-option kinds "

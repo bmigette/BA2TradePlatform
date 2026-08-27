@@ -462,3 +462,23 @@ def test_both_optimize_commands_build_the_gene_block_through_the_scoped_helper(c
     src = inspect.getsource(getattr(_launcher(), cmd))
     assert "_rm_opt_for(" in src, f"{cmd} does not build its RM gene block through _rm_opt_for"
     assert "**_RM_OPT" not in src, f"{cmd} still spreads the unscoped _RM_OPT"
+
+
+def test_gates_off_is_available_on_BOTH_optimize_and_optimize_batch():
+    """A flag that parses and does nothing is worse than a missing flag.
+
+    --gates-off sets a module-level toggle. _cmd_optimize set it; _cmd_optimize_batch did not,
+    so `optimize-batch --gates-off` would have parsed cleanly, left every gate ON, and reported
+    "no trades" -- which is precisely the ambiguity the smoke stage exists to eliminate, arriving
+    with a green tick.
+    """
+    import argparse
+    m = _launcher()
+    parser = m._build_parser() if hasattr(m, "_build_parser") else None
+    if parser is None:
+        import inspect
+        src = inspect.getsource(m)
+        assert src.count('"--gates-off"') >= 2, (
+            "--gates-off is declared on only one subcommand")
+        assert "_OPTION_GATES_OFF" in src.split("def _cmd_optimize_batch")[1][:2000], (
+            "_cmd_optimize_batch never sets the module toggle, so the flag is inert there")
