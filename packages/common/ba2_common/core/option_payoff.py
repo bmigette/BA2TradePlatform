@@ -106,3 +106,89 @@ def payoff_at(legs: Sequence[PayoffLeg], spot: float) -> float:
         s = _sign(leg.side)
         total += (s * intrinsic - s * leg.premium) * leg.ratio * leg.multiplier
     return total
+
+
+#: The three states of a max-loss answer. Strings rather than an Enum because they are compared,
+#: logged and asserted on far more often than they are iterated.
+MEASURED = "MEASURED"
+UNBOUNDED = "UNBOUNDED"
+UNMEASURABLE = "UNMEASURABLE"
+
+
+@dataclass(frozen=True)
+class MaxLossResult:
+    """A max-loss answer, in three explicitly named states.
+
+    DELIBERATELY NOT AN ``Optional[float]``. This codebase's recurring defect class is "unknown
+    reads as zero", and here that would be doubly bad: a max loss of ``0.0`` makes a structure
+    look free to open, and an unbounded structure collapsed to ``0.0`` makes the single most
+    dangerous position on the board look like the cheapest. Three states, each named, so a
+    caller cannot handle one by accident.
+
+    ``amount`` is set iff ``state == MEASURED`` and is POSITIVE dollars of loss.
+    ``reason`` is set iff ``state == UNMEASURABLE``.
+    """
+
+    state: str
+    amount: Optional[float] = None
+    reason: Optional[str] = None
+
+
+def critical_points(legs: Sequence[PayoffLeg]) -> List[float]:
+    """The underlying prices at which the payoff slope can change: zero and every strike.
+
+    The payoff is piecewise linear with kinks ONLY at strikes, so the minimum over the bounded
+    region ``[0, highest strike]`` is always attained at one of these points. This makes the
+    max-loss search EXACT rather than a sample of the curve.
+    """
+    points = {0.0}
+    for leg in legs:
+        if leg.kind in _OPTION_KINDS:
+            points.add(float(leg.strike))
+    return sorted(points)
+
+
+def upside_slope(legs: Sequence[PayoffLeg]) -> float:
+    """d(payoff)/d(spot) ABOVE every strike, in dollars per dollar of underlying.
+
+    Only calls and stock have intrinsic value up there; every put is worthless. A NEGATIVE slope
+    means the payoff falls without limit as the underlying rises — the one and only way an
+    option structure's loss can be unbounded.
+
+    The downside needs no equivalent test: below every strike, each short put loses at most its
+    own strike, so ``payoff_at(legs, 0)`` is always finite. Losses are unbounded above, never
+    below.
+    """
+    slope = 0.0
+    for leg in legs:
+        if leg.kind in ("call", "stock"):
+            slope += _sign(leg.side) * leg.ratio * leg.multiplier
+    return slope
+
+
+def max_loss(legs: Sequence[PayoffLeg]) -> MaxLossResult:
+    """The worst-case loss of ONE structure unit at expiry, as POSITIVE dollars.
+
+    See ``MaxLossResult`` for why this is not a float.
+    """
+    problem = validate_legs(legs)
+    if problem is not None:
+        return MaxLossResult(UNMEASURABLE, reason=problem)
+
+    if upside_slope(legs) < 0:
+        return MaxLossResult(UNBOUNDED)
+
+    worst = min(payoff_at(legs, s) for s in critical_points(legs))
+
+    # A structure that cannot lose at ANY underlying price is an arbitrage. In practice that
+    # never means free money — it means a stale, crossed or mis-signed quote. Reporting it as a
+    # max loss of 0 would make it the cheapest thing on the board and the triage would take it
+    # every time, at whatever size the budget allows.
+    if worst >= 0:
+        return MaxLossResult(
+            UNMEASURABLE,
+            reason=(f"structure shows no losing outcome (worst payoff {worst:.2f} at expiry); "
+                    f"a risk-free structure is an arbitrage, so this is a stale or crossed "
+                    f"quote rather than free money"))
+
+    return MaxLossResult(MEASURED, amount=-worst)
