@@ -395,3 +395,45 @@ def test_the_gates_off_flag_exists_on_the_optimize_command():
     out = subprocess.run([sys.executable, "testplatform/ba2test_launcher.py", "optimize", "--help"],
                          capture_output=True, text=True, env=env, timeout=300)
     assert "--gates-off" in out.stdout, out.stdout[-2000:] + out.stderr[-2000:]
+
+
+def test_option_jobs_can_size_a_full_notional_structure_at_spot_100():
+    m = _launcher()
+    cap = m._rm_opt_for("O_CSP")["max_virtual_equity_per_instrument_percent"]
+    assert cap["max"] >= 50.0, (
+        f"per-instrument cap tops out at {cap['max']}%; a cash-secured put at spot 100 reserves "
+        f"$10,000, i.e. 50% of a $20k account, so it can never open")
+
+
+def test_equity_jobs_keep_the_original_cap():
+    """The same setting is read by the equity risk manager. Raising it globally would move every
+    equity grid and make new results incomparable to old ones."""
+    m = _launcher()
+    assert m._rm_opt_for("S2")["max_virtual_equity_per_instrument_percent"]["max"] == 30.0
+
+
+def test_the_full_notional_sizing_band_reaches_fifty_percent():
+    m = _launcher()
+    lo, hi, step = m._OPTION_SIZING_BANDS[20.0]
+    assert hi >= 50.0, f"full-notional option_sizing band tops out at {hi}%"
+
+
+def test_raising_one_range_alone_would_not_help():
+    """Documents WHY both move: the budget is the MIN of the two."""
+    m = _launcher()
+    cap = m._rm_opt_for("O_CSP")["max_virtual_equity_per_instrument_percent"]["max"]
+    sizing = m._OPTION_SIZING_BANDS[20.0][1]
+    assert min(cap, sizing) >= 50.0
+
+
+@pytest.mark.parametrize("cmd", ["_cmd_optimize", "_cmd_optimize_batch"])
+def test_both_optimize_commands_build_the_gene_block_through_the_scoped_helper(cmd):
+    """An override nobody calls is exactly as inert as no override -- the same failure mode as a
+    CLI flag that is parsed and never applied. Both commands spread the classic-RM block into
+    ``expert_params`` and BOTH have to go through ``_rm_opt_for`` or option jobs silently keep
+    the 30% equity ceiling. Asserted on the source because the real path needs a DB + a queue."""
+    import inspect
+
+    src = inspect.getsource(getattr(_launcher(), cmd))
+    assert "_rm_opt_for(" in src, f"{cmd} does not build its RM gene block through _rm_opt_for"
+    assert "**_RM_OPT" not in src, f"{cmd} still spreads the unscoped _RM_OPT"

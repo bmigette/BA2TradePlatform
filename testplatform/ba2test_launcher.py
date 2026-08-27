@@ -1366,6 +1366,33 @@ _RM_OPT = {
     **_REGIME_OPT,
 }
 
+#: Option jobs need a higher per-instrument ceiling than equity ones, and the setting is shared.
+#:
+#: A cash-secured put at spot $100 reserves strike*100 = $10,000, exactly 50% of the grid's $20k
+#: account. The sizing budget is `equity * min(option_sizing%, max_virtual_equity_per_instrument
+#: _percent%)`, so BOTH ranges must reach 50% — raising either alone changes nothing (see
+#: _OPTION_SIZING_BANDS' full-notional row). At the old 30% ceiling the full-notional structures
+#: topped out at spot $60 and could not open on most of a large-cap universe.
+#:
+#: SCOPED, not global: the classic equity risk manager reads the same setting, so editing
+#: `_RM_OPT` in place would move every equity grid and make new results incomparable to old.
+_OPTION_RM_OVERRIDE = {
+    "max_virtual_equity_per_instrument_percent": {
+        "optimize": True, "min": 5.0, "max": 50.0, "step": 5.0, "type": "float"},
+}
+
+
+def _rm_opt_for(kind: str) -> dict:
+    """The classic-RM gene block for a strategy kind: `_RM_OPT`, plus the option override.
+
+    `_OPTION_STRATEGY_KEYS` is defined further down this module; it is read at CALL time (both
+    callers are the two optimize commands), so the forward reference is fine.
+    """
+    if kind in _OPTION_STRATEGY_KEYS:
+        return {**_RM_OPT, **_OPTION_RM_OVERRIDE}
+    return dict(_RM_OPT)
+
+
 # Bypass experts (FactorRanker) size their own portfolio and skip the classic per-trade RM
 # entirely, EXCEPT for one piece it still reuses: risk_per_trade_pct is the per-name
 # max-loss-vs-equity budget, which FactorPortfolioManager.protective_stop_price turns into the
@@ -2686,7 +2713,11 @@ _OPTION_SIZING_BANDS = {
     5.0:  (1.0, 10.0, 1.0),    # long premium: floor at 1% (a real 1-contract bet), cap at 2x
     8.0:  (2.0, 16.0, 2.0),    # butterfly
     15.0: (5.0, 30.0, 2.5),    # defined-risk / skewed credit
-    20.0: (5.0, 40.0, 5.0),    # neutral credit + full-notional
+    # neutral credit + full-notional. The 50% top is set by the full-notional structures: a
+    # cash-secured put at spot $100 reserves $10,000 = 50% of the grid's $20k account, and the
+    # budget is equity * MIN(this, max_virtual_equity_per_instrument_percent) — so this row and
+    # _OPTION_RM_OVERRIDE have to move together or neither moves anything.
+    20.0: (5.0, 50.0, 5.0),
 }
 _missing_sizings = sorted({cfg["option_sizing"] for cfg in _OPTION_STRATS.values()
                            if cfg.get("option_sizing") is not None}
@@ -3766,7 +3797,8 @@ def _cmd_optimize(args) -> int:
             # spec opts out via no_bypass_rm — not the full _RM_OPT). Screener genes (screener:*
             # namespace) are merged in ONLY when --screener is set.
             "expert_params": ({**_bypass_gene_space(spec), **screener_genes} if bypass
-                              else {**spec["expert_params"], **_RM_OPT, **screener_genes, **schedule_genes}),
+                              else {**spec["expert_params"], **_rm_opt_for(args.strategy),
+                                    **screener_genes, **schedule_genes}),
             "backtest": backtest_block,
         }
         if getattr(args, "warm_start_from", None) is not None:
@@ -3961,7 +3993,7 @@ def _cmd_optimize_batch(args) -> int:
                 # exits — the gene would be dead weight); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
-                                  else {**spec["expert_params"], **_RM_OPT,
+                                  else {**spec["expert_params"], **_rm_opt_for(strat_kind),
                                         **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
                 "backtest": backtest_block,
             }

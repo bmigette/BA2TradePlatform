@@ -81,10 +81,17 @@ def test_the_band_brackets_the_authored_size_and_actually_varies(kind):
 @pytest.mark.parametrize("kind", _SINGLES)
 def test_the_band_never_reaches_zero_or_the_whole_account(kind):
     """A 0% size is a structure that cannot open (a zero-trade genome dressed as a real one);
-    an unbounded one bets the account on a single structure."""
+    an unbounded one bets the account on a single structure.
+
+    The ceiling was 40% until 2026-08-27. It moved to 50% because that is the smallest number at
+    which a FULL-NOTIONAL structure can open on a $100 name: a cash-secured put at spot $100
+    reserves strike*100 = $10,000, i.e. exactly 50% of the grid's $20k account. At 40% the
+    full-notional kinds (O_CSP/O_JL/O_RS) topped out at spot $60 and were unopenable on most of a
+    large-cap universe. It stays BOUNDED -- 50% is half the account on one structure, which is the
+    most a cash-secured put can ever need; anything above it is not sizing, it is leverage."""
     spec = collect_param_space(_build(kind))[f"entry:{kind.lower()}-entry:a0:option_sizing"]
     assert spec["min"] >= 1.0, f"{kind}: sizing can go to {spec['min']}%"
-    assert spec["max"] <= 40.0, f"{kind}: sizing can reach {spec['max']}% of equity"
+    assert spec["max"] <= 50.0, f"{kind}: sizing can reach {spec['max']}% of equity"
 
 
 def test_the_bands_differ_by_structure_class():
