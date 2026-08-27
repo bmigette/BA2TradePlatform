@@ -93,3 +93,42 @@ def test_no_value_offset_from_survives_in_an_option_entry_rule():
         return out
 
     assert walk(strat.entry_rules, []) == []
+
+
+SHARED = ["rel_volume", "gate_confidence"]
+
+
+@pytest.mark.parametrize("gate", SHARED)
+def test_the_expert_independent_gates_are_shared_across_group_members(gate):
+    """One gene for the whole family, not one per member.
+
+    These two are shared because their SEMANTICS do not vary by structure -- the launcher's own
+    comment on rel_volume says "the searched threshold is the only per-half difference, and there
+    is none". iv_rank and iv_to_realized_vol are NOT shared and must not be: their operator flips
+    between debit (`<`, buy cheap vol) and credit (`>`, sell rich vol) members, and the GA never
+    searches an operator, so a shared gate there is not expressible at all.
+    """
+    genes = [g for g in _space(_launcher(), "OS1") if gate in g]
+    assert genes, f"{gate} produced no genes at all"
+    assert all(g.startswith(f"cond:shared-{gate}") for g in genes), (
+        f"{gate} is still per-member: {sorted(genes)}")
+    assert len(genes) == 2, f"expected exactly value+enabled, got {sorted(genes)}"
+
+
+@pytest.mark.parametrize("gate", ["iv_rank", "iv_rv"])
+def test_the_direction_dependent_gates_stay_per_member(gate):
+    genes = [g for g in _space(_launcher(), "OS1") if gate in g]
+    assert not any("shared-" in g for g in genes), (
+        f"{gate}'s operator flips debit/credit; sharing it is not expressible")
+    assert len(genes) == 10, f"OS1 has 5 members, so {gate} should emit 10 genes"
+
+
+@pytest.mark.parametrize("gate", SHARED)
+def test_single_and_group_jobs_use_the_SAME_key_for_a_shared_gate(gate):
+    """The seeding requirement. A stage-1 single-structure winner is later encoded into the
+    stage-2 group space; a key present in one and absent from the other is dropped silently by
+    encode_params, so the shared gates must key identically in both shapes."""
+    m = _launcher()
+    single = {g for g in _space(m, "O_LC") if gate in g}
+    group = {g for g in _space(m, "OS1") if gate in g}
+    assert single == group, f"{gate} keys differ: single={sorted(single)} group={sorted(group)}"

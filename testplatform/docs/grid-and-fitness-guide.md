@@ -198,10 +198,22 @@ the same signal.
 
 The other entry gates on the same rule are `{m}-signal` (the expert's bullish/bearish flag),
 `{m}-flat` (`has_no_position` — a correctness guard, and the one leaf with no `enabled` gene),
-`{m}-gate_confidence`, `{m}-iv_rank`, `{m}-rel_volume` and `{m}-iv_rv`. `iv_rank` and `iv_rv`
-are built **per member** with the operator flipped between the debit and credit halves, because
-the GA's gene-space collector only ever optimizes a condition's `value` (via
-`value_min`/`value_max`) and its `enabled` flag (via `toggle_optimize`), never its `op` — one
-shared leaf could express only one of the two theses.
+`{m}-iv_rank`, `{m}-iv_rv`, plus the two **shared** gates `shared-gate_confidence` and
+`shared-rel_volume`. `iv_rank` and `iv_rv` are built **per member** with the operator flipped
+between the debit and credit halves, because the GA's gene-space collector only ever optimizes
+a condition's `value` (via `value_min`/`value_max`) and its `enabled` flag (via
+`toggle_optimize`), never its `op` — one shared leaf could express only one of the two theses.
+
+`gate_confidence` and `rel_volume` carry a `shared-` id instead of a member prefix, so a whole
+group searches **one** threshold for each rather than one per structure (OS1: 20 genes collapse
+to 4). They are shared because their semantics do not vary by structure — expert conviction in
+the symbol, and real participation behind the signal, read the same whichever way the premium
+flows. The shared id is used in a **single-structure** job too, so a stage-1 winner's gene keys
+are still known in a stage-2 group space (`encode_params` drops unknown keys silently).
+Sharing is safe on both paths: `decode_params` builds one `cond_by_id` map for the whole
+strategy and substitutes by node id, so the single gene lands on every member's leaf, and
+`triggers_from_condition_tree` keys the seeded EventAction triggers by position within one rule
+(`cond_0`, `cond_1`, …), never by condition id, so duplicate ids across sibling rules cannot
+collide.
 
 Gate wiring: `_option_entry_rule()` in `testplatform/ba2test_launcher.py`.

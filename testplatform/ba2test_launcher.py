@@ -3027,9 +3027,26 @@ _IV_RV_GATE = {
 _IV_RV_RANGE = {"value_min": 0.8, "value_max": 1.6, "value_step": 0.1}
 
 
-def _relative_volume_gate(m: str) -> dict:
-    """The relative-volume entry gate leaf for member prefix ``m``."""
-    return {"id": f"{m}-rel_volume", "field": "relative_volume", "op": ">",
+def _relative_volume_gate() -> dict:
+    """The relative-volume entry gate leaf. SHARED across every member of a group.
+
+    Shared because its semantics genuinely do not vary by structure: real participation behind
+    the signal confirms a trade whether you are buying or selling premium, and this gate has no
+    per-half difference at all -- it was replicated per member as pure duplication.
+
+    Contrast ``_iv_rank_gate`` / ``_iv_rv_gate``, which must stay per-member: their operator
+    flips between debit and credit halves and the GA never searches an operator, so one shared
+    node cannot express both.
+
+    The id is deliberately the same in a SINGLE-structure job and in a group, so a stage-1
+    winner's gene keys survive being encoded into the stage-2 group space. Sharing is safe on
+    both sides of the fence: ``decode_params`` builds ONE ``cond_by_id`` map for the whole
+    strategy and ``_apply_to_tree`` substitutes by node id, so one gene lands on every member's
+    leaf; and the engine's ``triggers_from_condition_tree`` keys triggers by POSITION within a
+    single rule (``cond_0``, ``cond_1``, ...), never by condition id, so duplicate ids across
+    sibling rules cannot collide when the ruleset is seeded.
+    """
+    return {"id": "shared-rel_volume", "field": "relative_volume", "op": ">",
             "optimize": True, "toggle_optimize": True, **_RELATIVE_VOLUME_GATE}
 
 
@@ -3070,7 +3087,14 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     optimizable confidence gate + the iv_rank / relative-volume / iv-vs-realised-vol gates +
     ONE expected-profit gate, action = the member's option action config. Rule/condition ids
     are prefixed with the member key so a GROUP of these rules yields uniquely-keyed genes per
-    member. ``toggleable`` adds the rule-level enabled gene (group members only — a
+    member — EXCEPT the two expert-independent gates, and that exception is the point:
+    ``shared-gate_confidence`` and ``shared-rel_volume`` carry the SAME id in every member, so
+    a family searches ONE threshold for each instead of one per structure (OS1: 20 genes
+    collapse to 4). They are shared because their semantics do not vary by structure — expert
+    conviction in the symbol, and real participation behind the signal, read the same whichever
+    way the premium flows. The same id is used in a SINGLE-structure job so a stage-1 winner's
+    gene keys are still known in the stage-2 group space (``encode_params`` drops unknown keys
+    silently). ``toggleable`` adds the rule-level enabled gene (group members only — a
     single-strategy job keeps its one entry always-on).
 
     Every gate except ``-flat`` is independently ``toggle_optimize=True``: ``-flat``
@@ -3093,11 +3117,11 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
             {"id": f"{m}-signal", "field": _OPTION_ENTRY_GATE[member], "field_type": "flag",
              "toggle_optimize": True},
             {"id": f"{m}-flat", "field": "has_no_position", "field_type": "flag"},
-            {"id": f"{m}-gate_confidence", "field": "confidence", "op": ">", "value": 50,
+            {"id": "shared-gate_confidence", "field": "confidence", "op": ">", "value": 50,
              "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
              "toggle_optimize": True},
             _iv_rank_gate(m, member),
-            _relative_volume_gate(m),
+            _relative_volume_gate(),
             _iv_rv_gate(m, member),
             _expected_profit_gate(m),
         ]},
