@@ -86,6 +86,16 @@ SPREAD_BPS="${SPREAD_BPS:-9}"      # MEASURED mid-band median (Alpaca SIP 2026-0
 STRESS_SPREAD_MULT="${STRESS_SPREAD_MULT:-1.5}"   # 1.5 x median ~= the measured p90
 POPULATION="${POPULATION:-40}"
 GENERATIONS="${GENERATIONS:-8}"
+# REMOTE POOL SLOTS. Mirrors ds_remote_slots_for below -- this is a property of the GRID RUN (a
+# measured per-trial footprint at a given box size), not of the expert's Python class. Used to
+# live as FMPSenateTraderWeight.max_remote_worker_slots; moved here 2026-08-27 so every
+# memory-heavy expert's remote concurrency is set by the driver that actually knows the box and
+# the trial shape, the same way DeterministicScorer's already was, instead of requiring a
+# class-attribute edit (and a code deploy) per expert. Senate is ~11-12 GB/trial, same footprint
+# that set PARALLEL=2 above; 3 remote slots leaves headroom on the worker the same way that
+# local-parallel figure does on the master (see header comment history: 4 drove the sen5min3
+# master to 99.5-99.7% memory).
+SENATE_REMOTE_SLOTS="${SENATE_REMOTE_SLOTS:-3}"
 
 STRESS_BPS=$(awk -v s="$SPREAD_BPS" -v m="$STRESS_SPREAD_MULT" 'BEGIN{printf "%.6g", s*m}')
 
@@ -248,11 +258,15 @@ if [ -n "$DS_STRATEGIES_EXTRA" ]; then
 fi
 
 
+# Grid-driven remote concurrency cap for the memory-heavy expert about to run -- see
+# SENATE_REMOTE_SLOTS above. Applied by strategy_optimization_handler as the TIGHTEST of
+# (this env var, the worker's own reported capacity), same mechanism ds_matrix already uses.
+export BA2_MAX_REMOTE_SLOTS="$SENATE_REMOTE_SLOTS"
 for MODE in risk_atr notional; do
   for S in $STRATEGIES; do
     NAME="sen-${S}-goal2020-${MODE}"
     echo
-    echo "=== $NAME  start $(date)"
+    echo "=== $NAME  start $(date) (remote slots ${BA2_MAX_REMOTE_SLOTS})"
     "$PY" testplatform/ba2test_launcher.py optimize \
       --expert FMPSenateTraderWeight \
       --strategy "$S" \

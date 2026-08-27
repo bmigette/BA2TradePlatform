@@ -237,16 +237,17 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
     # 2026-07-20 Senate-matrix memory investigation: a single trial's congress scoring caches
     # (see _WORKER_SCORING_CACHE above) plus per-symbol/per-day gather state run ~11-12GB RSS at
-    # steady state. Running a remote worker's full advertised /health capacity (e.g. 8 slots)
-    # concurrently risks OOM-ing that box. strategy_optimization_handler._max_remote_slots_for_experts
-    # reads this class attribute (mirroring how bypasses_classic_rm is read) and caps
-    # DistributedEvaluator's remote dispatcher threads per worker to this value for any
-    # optimization run that includes this expert.
-    # Lowered 4 -> 3 on 2026-07-30. At 4 the sen5min3 grid drove the MASTER box to 99.5-99.7%
-    # memory (170-860MB free of 64GB across 25 sampled points) — ~12GB/trial does not fit 4-up
-    # alongside the master. 3 leaves headroom on both the local pool (--parallel 3) and the
-    # remote worker, which is sized the same way.
-    max_remote_worker_slots = 3
+    # steady state -- running a remote worker's full advertised /health capacity (e.g. 8 slots)
+    # concurrently risks OOM-ing that box.
+    #
+    # This used to be a `max_remote_worker_slots` class attribute here, read by
+    # strategy_optimization_handler._max_remote_slots_for_experts. Moved OUT to the grid driver
+    # (tools/grid_goal2020_matrix3.sh's SENATE_REMOTE_SLOTS -> BA2_MAX_REMOTE_SLOTS) on 2026-08-27:
+    # remote concurrency safe for a given trial shape is a property of the RUN (box size, worker
+    # capacity, measured footprint on that day) — DeterministicScorer's per-band remote sizing in
+    # the same driver already worked this way; Senate baking a magic number into the expert class
+    # was the odd one out, requiring a code change + deploy to retune instead of a driver-script
+    # edit. See BA2_MAX_REMOTE_SLOTS in strategy_optimization_handler.py for the current mechanism.
 
     @classmethod
     def description(cls) -> str:
