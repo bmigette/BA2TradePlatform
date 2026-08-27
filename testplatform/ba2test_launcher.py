@@ -4651,13 +4651,15 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--start", required=True, help="ISO start date.")
     op.add_argument("--end", required=True, help="ISO end date.")
     op.add_argument("--fitness", default=None,
-                    help="Fitness metric. Default: 'consistent_annual_return' for pure-option "
-                         "strategies (OS1-OS4 + O_* option entries; NOT the equity-entry "
-                         "O_CC/O_PP/O_STK), 'sharpe_ratio' for stock strategies. "
+                    help="Fitness metric. Default: 'option_consistent_annual_return' (aliases "
+                         "'option_car'/'ocar') for pure-option strategies (OS1-OS4 + O_* option "
+                         "entries; NOT the equity-entry O_CC/O_PP/O_STK), 'sharpe_ratio' for "
+                         "stock strategies. "
                          "'consistent_annual_return' (aliases 'car'/'goal') targets ~30%%/yr "
                          "EVERY year: (adjusted) annualized return, hard >=30 trades/yr gate, "
                          "soft drawdown penalty beyond 20%%, x worst-year/mean-year consistency "
-                         "(--fitness-trade-scale is a no-op for it).")
+                         "(--fitness-trade-scale is a no-op for it); the option default is that "
+                         "shape applied to an option book.")
     op.add_argument("--generations", type=int, default=6)
     op.add_argument("--population", type=int, default=10)
     op.add_argument("--parallel", type=int, default=4, help="Parallel trials (ThreadPoolExecutor).")
@@ -4858,10 +4860,10 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--start", required=True, help="ISO start date.")
     ob.add_argument("--end", required=True, help="ISO end date.")
     ob.add_argument("--fitness", default=None,
-                    help="Fitness metric, resolved PER JOB when omitted: 'consistent_annual_return' "
-                         "for pure-option kinds (OS1-OS4/O_*), 'calmar_ratio' for stock kinds "
-                         "(the historical batch default). See optimize --fitness for "
-                         "'consistent_annual_return' ('car'/'goal').")
+                    help="Fitness metric, resolved PER JOB when omitted: "
+                         "'option_consistent_annual_return' for pure-option kinds "
+                         "(OS1-OS4/O_*), 'calmar_ratio' for stock kinds (the historical batch "
+                         "default). See optimize --fitness for what those metrics mean.")
     ob.add_argument("--generations", type=int, default=8)
     ob.add_argument("--population", type=int, default=40)
     ob.add_argument("--parallel", type=int, default=6, help="Process-pool workers per job.")
