@@ -132,9 +132,10 @@ OFF, so a failure there can only be data or wiring. 0b runs the real shape, so a
 green is configuration or strategy. 0b is also what turns the cost table below from an estimate
 into a schedule: it measures per-trial runtime on the machine that will do the work.
 
-### Stage 1 · Discovery — 17 structures x 2 experts = 34 jobs
+### Stage 1 · Discovery — 18 structures x 2 experts = 36 jobs
 
-The 15 pure-option keys plus `O_CC` and `O_PP`. `O_WHEEL` is EXCLUDED until the engine can hold assigned stock — see the warning below.
+The 15 pure-option keys plus `O_CC`, `O_PP` and `O_WHEEL`. The wheel was excluded until the
+engine could hold assigned stock; it can as of 2026-08-27 — see the section below.
 
 Genome ~22 after the price-gate swap, **population 200, generations 60 with early-stop patience 8**. ~5,000 trials per job
 in practice; 12,000 only if a job never plateaus.
@@ -147,34 +148,40 @@ All 15 are searchable here, including `O_CSP` / `O_JL` / `O_RS`, which the group
 That filter is unconditional and its own comment says the three "remain runnable as EXPLICIT
 single-strategy jobs" — stage 1 is exactly that.
 
-#### ⚠ O_WHEEL IS BUILT BUT NOT RUNNABLE — stage 1 is 17 structures, not 18
+#### O_WHEEL IS RUNNABLE AS OF 2026-08-27 — stage 1 is 18 structures
 
-Verified 2026-08-27 by code order, not inference. Per bar the engine runs
+**What was wrong** (verified by code order, not inference). Per bar the engine runs
 `_manage_open_positions` (step 3, `daily_engine.py` ~:718) BEFORE
 `process_pending_assignment_liquidations` (step 4a-pre, ~:740) — and that method's own docstring
-says it "closes ALL of it at the NEXT bar's OPEN". So the manage pass writes a covered call
-against the assigned shares and the liquidation sells those shares on the same bar. **Every wheel
-position the backtest opens is a naked short call wearing a wheel's name.**
+says it "closes ALL of it at the NEXT bar's OPEN". So the manage pass wrote a covered call
+against the assigned shares and the liquidation sold those shares on the same bar. **Every wheel
+position the backtest opened was a naked short call wearing a wheel's name** — worse than wrong
+numbers, because it is a DIFFERENT STRATEGY's numbers and they look plausible. Between
+2026-08-27 and the fix, `_build_strategy_wheel` refused at build time (overridable with
+`BA2_ALLOW_UNRUNNABLE_WHEEL=1`); both the refusal and the override are now GONE.
 
-That is worse than wrong numbers: it is a DIFFERENT STRATEGY's numbers, and they look plausible.
+**The fix** is Task 10 of `docs/superpowers/plans/2026-08-24-option-model-and-lifecycle.md`: a
+`hold_assigned_stock` account setting, **DEFAULT OFF**, that suppresses only the scheduling of
+the next-bar liquidation. Default-off was proven bit-identical by running a full
+`DailyBacktestEngine.run()` with an ITM short put against a `dev` worktree and diffing every
+order, trade and equity point. The wheel is the one kind in
+`ba2test_launcher._HOLDS_ASSIGNED_STOCK`, which is what puts the setting into its run config.
+The old liquidation behaviour is still pinned (it is still the default), and the new one is
+pinned beside it — see
+`test_option_orphan_stock_and_arb_guards.py::test_short_put_assignment_stock_liquidated_next_bar_open`
+and its `..._HELD_when_hold_assigned_stock_is_on` mirror, plus
+`tests/backtest/test_wheel_assignment.py`.
 
-`_build_strategy_wheel` now **raises at build time** rather than warning in a docstring — a
-prose warning is not a guard when the key sits in `_STRATEGY_BUILDERS` and any `--strategies`
-list containing it would have launched. Override for engine development only via
-`BA2_ALLOW_UNRUNNABLE_WHEEL=1`.
-
-**The unblocking fix is Task 10 of `docs/superpowers/plans/2026-08-24-option-model-and-lifecycle.md`**
-("the backtest must stop liquidating assigned stock"), which never landed — and the opposite
-behaviour is currently PINNED as intent by
-`test_option_orphan_stock_and_arb_guards.py::test_short_put_assignment_stock_liquidated_next_bar_open`.
-So it is a real decision, not an oversight to sweep up.
-
-Until then: **stage 1 runs 17 structures x 2 experts = 34 jobs.** The wheel composition is
-correct and tested; only the engine is missing, which is why the strategy stays registered.
+**Known limit, not a defect of the composition.** Once the shares are held, the only thing that
+CLOSES them is the covered call finishing ITM (the assignment delivers them). The wheel's exit
+list is all `close_option` and `cc_guard` halts the chain while a call is open, so a call that
+keeps expiring worthless leaves the stock held to the end of the run (reported `open_at_end`,
+marked to market). An O_WHEEL grid's capital efficiency therefore depends on the covered-call
+strike gene — read its results with that in mind.
 
 Related correction to §2: that section claims "a complete option backtest engine ... called-away
 lot splitting". Lot splitting exists in the LIVE account (`AlpacaAccount._settle_called_away`);
-in the backtest, assigned lots are liquidated the next bar.
+in the backtest, assigned lots are liquidated the next bar unless `hold_assigned_stock` is set.
 
 #### The wheel family — three more strategies, one of which must be built
 
@@ -337,7 +344,7 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
 2. **Swap the four `price_*` gates for one `expected_profit_target_percent` gate**, which every expert produces by construction. Shrinks each structure's genome 21% and the OS1 group's 25%.
 3. **Shared condition ids** — emit `shared-rel_volume` and `shared-gate_confidence` in the group
    builder. Verified to collapse 20 genes to 4 on OS1; no GA change.
-2. **An `OS_ALL` group** for stage 2, carrying all 17 runnable structures (O_WHEEL joins when the engine can run it).
+2. **An `OS_ALL` group** for stage 2, carrying all 18 runnable structures (O_WHEEL included as of 2026-08-27).
 3. **Cross-job seeding** — read stage-1 winners and emit `initial_population` for stage 2. The
    hook exists for resume; this points it at another job's results.
 4. **A price-capped universe helper** for the full-notional three.

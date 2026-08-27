@@ -3137,16 +3137,26 @@ def _expected_profit_gate(m: str) -> dict:
             "optimize": True, "toggle_optimize": True, **_EXPECTED_PROFIT_GATE}
 
 
-def _allow_unrunnable_wheel() -> bool:
-    """Escape hatch for engine development only -- see `_build_strategy_wheel`.
+# Strategy kinds whose OWN rules manage stock delivered by an option assignment, and which
+# therefore need the backtest to STOP liquidating that stock at the next bar's open. Only the
+# wheel: its covered-call overlay is gated on ``has_assigned_shares``, so the assigned shares
+# are the position it exists to manage.
+#
+# PER-STRATEGY, not a CLI flag. The switch is a property of what the ruleset does, not an
+# operator preference -- a flag would let an O_CSP grid hold stock nothing in it can sell, which
+# is the orphaned-stock blow-up the liquidation exists to prevent. Keeping the set here means
+# adding a stock-managing structure later is one line, next to the reason.
+_HOLDS_ASSIGNED_STOCK = {"O_WHEEL"}
 
-    Read at CALL time, not import time. A module-level constant would be evaluated once when the
-    launcher is first imported, so a test or a shell that sets the variable afterwards would be
-    silently ignored -- and the failure mode is a refusal nobody can turn off, which is a worse
-    guard than none. Env-gated rather than a CLI flag so it cannot be reached from a grid
-    command line by accident.
+
+def _hold_assigned_stock(kind: Optional[str]) -> bool:
+    """Whether ``kind``'s run config should set ``BacktestAccount.hold_assigned_stock``.
+
+    ``kind`` is None for BYPASS experts (FactorRanker), which ignore ``--strategy`` and build
+    the minimal strategy -- so whatever ``--strategy`` says about them is meaningless and must
+    not leak into their account settings.
     """
-    return os.environ.get("BA2_ALLOW_UNRUNNABLE_WHEEL") == "1"
+    return kind in _HOLDS_ASSIGNED_STOCK
 
 
 # SMOKE MODE (--gates-off): drop every OPTIONAL entry gate so a run exercises the PIPELINE
@@ -3409,45 +3419,28 @@ def _build_strategy_wheel(kind: str):
     NOT round-lot constrained, unlike O_CC/O_PP: the shares arrive from assignment in exact
     100-share lots by construction, so there is no odd-lot entry to floor.
 
-    ** THE BACKTEST CANNOT RUN THIS MEANINGFULLY TODAY — see the assignment-liquidation
-    precondition. ** ``BacktestAccount.settle_single_leg_expiry`` physically assigns every ITM
-    short option and then schedules the resulting stock for FULL liquidation at the next bar's
-    open (``process_pending_assignment_liquidations``, the "no orphaned stock" policy), because
-    "a backtest strategy manages OPTIONS (its exit rules are all close_option)". The wheel is
-    the first strategy for which that is false. Worse than inert: ``daily_engine`` runs the
-    MANAGE pass (step 3) BEFORE the liquidation (step 4a-pre) on the following bar, so the
-    overlay sees the assigned shares, writes a call against them, and the liquidation then sells
-    the shares out from under it — a NAKED short call. Registering the strategy is Task 3;
-    teaching the backtest to leave wheel-assigned stock alone is not, and it would move every
-    existing option run's numbers. Do not launch an O_WHEEL grid until that is fixed.
-    """
-    # HARD REFUSAL, not a docstring warning. Verified 2026-08-27 by code order, not inference:
-    #
-    #   daily_engine step 3  (~:718) `_manage_open_positions` -> cc_sell sees has_assigned_shares
-    #                                 and writes a covered call against the 100 assigned shares
-    #   daily_engine step 4a-pre (~:740) `process_pending_assignment_liquidations` -> "closes ALL
-    #                                 of it at the NEXT bar's OPEN" (its own docstring)
-    #
-    # So the call is written and the shares backing it are sold on the SAME bar. Every wheel
-    # position the backtest opens is a NAKED SHORT CALL wearing a wheel's name. It does not
-    # produce bad numbers -- it produces a different strategy's numbers, which is worse, because
-    # they look plausible.
-    #
-    # The engine fix is Task 10 of docs/superpowers/plans/2026-08-24-option-model-and-lifecycle.md
-    # ("The backtest must stop liquidating assigned stock"), which never landed; the opposite
-    # behaviour is currently PINNED as intent by
-    # test_option_orphan_stock_and_arb_guards.py::test_short_put_assignment_stock_liquidated_next_bar_open.
-    # Until that is resolved this raises rather than warns, because a prose warning in a
-    # docstring is not a guard -- O_WHEEL is in _STRATEGY_BUILDERS and any `--strategies` list
-    # containing it would have launched.
-    if not _allow_unrunnable_wheel():
-        sys.exit(
-            "O_WHEEL cannot be backtested: the engine liquidates assigned stock at the next "
-            "bar's open (daily_engine step 4a-pre), AFTER the manage pass has written a covered "
-            "call against it -- so every wheel position becomes a naked short call. Fix Task 10 "
-            "of the option-model-and-lifecycle plan first. Set BA2_ALLOW_UNRUNNABLE_WHEEL=1 to "
-            "override for engine development.")
+    THE ENGINE PRECONDITION, and how it is met. Until 2026-08-27 this builder REFUSED to run:
+    ``BacktestAccount.settle_single_leg_expiry`` physically assigns every ITM short option and
+    then scheduled the resulting stock for FULL liquidation at the next bar's open
+    (``process_pending_assignment_liquidations``, the "no orphaned stock" policy) — and
+    ``daily_engine`` runs the MANAGE pass (step 3) BEFORE that liquidation (step 4a-pre), so the
+    overlay wrote a call against the assigned shares and the liquidation sold them out from
+    under it on the same bar. Every wheel position the engine opened was a NAKED SHORT CALL.
 
+    Plan Task 10 fixed that with the ``hold_assigned_stock`` account setting (DEFAULT OFF, so no
+    existing option run moved). O_WHEEL is the one kind in ``_HOLDS_ASSIGNED_STOCK``, which is
+    what puts the setting into its run config — see ``_hold_assigned_stock``. That wiring is not
+    optional decoration: without it this strategy silently becomes a naked-call grid again, so
+    ``test_option_grid_foundations.py`` asserts the run config carries it.
+
+    KNOWN LIMIT of the composition: with the shares held, the only thing that CLOSES them is the
+    covered call finishing ITM (the assignment delivers them). The exit list is all
+    ``close_option`` and ``cc_guard`` halts the chain while a call is open, so a call that keeps
+    expiring worthless leaves the stock held to the end of the run (reported ``open_at_end``).
+    That is the wheel's real shape, not a defect of this builder — but it means an O_WHEEL run's
+    capital efficiency depends on the strike gene, and it is pinned in
+    ``tests/backtest/test_wheel_assignment.py``.
+    """
     s = _build_strategy_option("O_CSP")
     s.name = kind
     s.exit_rules = _insert_option_overlay(
@@ -3688,6 +3681,10 @@ def _cmd_optimize(args) -> int:
                 # population must face the same capital, or they are scored against
                 # different denominators. None = off.
                 "equity_cap": getattr(args, "equity_cap", None),
+                # PER-STRATEGY (see _hold_assigned_stock): True only for kinds whose own
+                # rules manage assigned stock -- the wheel. False everywhere else keeps the
+                # no-orphaned-stock liquidation, so every non-wheel run is unchanged.
+                "hold_assigned_stock": _hold_assigned_stock(None if bypass else args.strategy),
             },
             "warmup_days": derive_warmup_days([expert]),
             "seed": int(args.seed),
@@ -4003,6 +4000,9 @@ def _cmd_optimize_batch(args) -> int:
                     "fill_model": args.fill_model,
                     # RUN-LEVEL, never a gene (see --equity-cap). None = off.
                     "equity_cap": getattr(args, "equity_cap", None),
+                    # PER-STRATEGY (see _hold_assigned_stock): the wheel manages its
+                    # assigned stock, so it must not be liquidated at the next bar's open.
+                    "hold_assigned_stock": _hold_assigned_stock(None if bypass else strat_kind),
                 },
                 "warmup_days": derive_warmup_days([expert]),
                 "seed": int(args.seed),
