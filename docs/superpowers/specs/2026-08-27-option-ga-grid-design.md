@@ -49,8 +49,11 @@ Verified against the code on 2026-08-27, not assumed:
 * **Population seeding** — `genetic.py` accepts `initial_population` (built for resume).
 * **Screener cap bands** — small \$50M–\$2B, mid \$2B–\$10B, large ≥\$10B.
 
-The machinery is essentially complete. What is missing is decided values, two small wiring
-pieces, and a driver.
+**CORRECTION, 2026-08-27, after a 5-agent survey of the actual mechanisms.** An earlier draft of
+this section ended "the machinery is essentially complete; what is missing is decided values, two
+small wiring pieces, and a driver." That was wrong, and section 7 now carries the real list. The
+pieces above genuinely exist, but roughly half of what this grid needs does not — most
+importantly cross-job seeding, which the whole stage-1 → stage-2 design rests on. See §7.1.
 
 ## 3. The measurement that shapes everything
 
@@ -312,6 +315,56 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
    operator can stop after stage 0, or re-run one structure without re-running the grid.
 6. **Fix the stale `optimize-batch --fitness` help**, which still says `consistent_annual_return`
    where the code correctly resolves `option_consistent_annual_return`.
+
+## 7.1 What does NOT exist, measured
+
+Everything below was verified against the code, and several items falsify claims made earlier in
+this document. They are listed here rather than quietly fixed inline so the size of the work is
+visible.
+
+**Cross-job seeding is the biggest build item, and the obvious version is broken.**
+`warmStartFromOptimizationId` is a SINGLE int with no plural form and no merge; stage 2 needs 18
+winners combined. Worse, `genetic.py:377` fills any gene absent from the seed with
+`config['min']`, and an `enabled` gene's range is `(0, 1)` — so encoding a single-structure
+winner into the `OS_ALL` space sets **every member toggle to 0** and the seeded individual trades
+nothing. Seeding must therefore (a) merge N sources, (b) explicitly set each seeded member's
+toggle ON, and (c) leave un-seeded members at their authored defaults rather than at zero.
+
+**The shared-id change collides with seeding.** Renaming `{member}-rel_volume` to
+`shared-rel_volume` in the group builder only would make stage-1's `cond:o_lc-rel_volume:*` keys
+UNKNOWN in the stage-2 space, and `encode_params` drops unknown keys silently. Either both job
+shapes use the shared id, or the seeder translates keys. Decide before implementing either.
+
+**`OS_ALL` would give its debit members CREDIT exit bands.** `_option_exit_rules(kind)` branches
+on the GROUP key and `OS_ALL` is not in `_DEBIT_OPTION_KINDS`. Exit condition ids (`tp`, `td`,
+`dte`, `sl`) are also unprefixed, so per-member exits are not expressible at all. Registering
+`OS_ALL` additionally fails two live tests, one of which asserts that `O_CSP`/`O_JL`/`O_RS` are
+in NO group — i.e. it asserts the opposite of the intended change.
+
+**Section 6's universe design is not implementable as written.** `--screener-cap-band` is read
+only inside the `if args.screener:` branch, so a pure-option job cannot use a cap band at all.
+ETFs are excluded from the screener metric store at BUILD time (`isEtf=false`; SPY, QQQ, IWM,
+XLF and TLT are all absent), so they cannot be combined with the gate. No `_OPTION_STRATS` entry
+declares a `screener_gate_base`, and `_screener_gate_base_for_strategy` merges member dicts with
+`merged.update(...)`, so a single `price_max` collapses to one value for a whole group. No tool
+exists to dump a price-capped universe list.
+
+**Stage 0a needs a flag that does not exist.** The condition gates are `toggle_optimize=True`
+nodes the GA searches; there is no "all gates off" knob.
+
+**`optimize-batch` cannot drive this grid.** No warm-start argument, no per-job name, and it
+never calls `_screener_gate_opt_block`. It also polls forever when `ba2-test serve` is not
+running — `queue_task` writes `"queued"` and the break set has no timeout. The driver should loop
+`optimize` sequentially instead.
+
+**Elitism is hardcoded at 0.1%** (`elitismPercent` 0.1, `genetic.py:647` takes
+`max(1, int(0.001 * len(population)))`), i.e. exactly ONE elite individual at any population
+below 1000, with no CLI flag. At the populations in §8 that is effectively no elitism.
+
+**Four existing tests must be rewritten in the same commits as the changes they guard**, two of
+which assert the current behaviour as intent: `test_launcher_volume_vol_genes.py` asserts
+`rel_volume` is searched PER MEMBER, and `test_option_strategy_builders.py` asserts the
+full-notional three belong to no group.
 
 ## 8. Cost
 
