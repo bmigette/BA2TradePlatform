@@ -143,9 +143,11 @@ This stage produces the artefact: one expert that opens the best structure.
 
 ### Stage 3 · Generalisation — optional
 
-The stage-2 winner re-run against the `small` and `large` cap bands it has not seen, and against
-a holdout window. This is where the band split earns its keep: it answers whether the arbitration
-learned on mid caps transfers, rather than paying 3x up front to find out.
+The stage-2 winner re-run against the `mid` and `small` cap bands it has not seen, and against
+a holdout window. This is where the band split earns its keep: it answers whether the
+arbitration learned on large caps transfers down the liquidity curve, rather than paying 3x
+up front to find out. Expect degradation — thinner chains mean more contracts rejected by
+the volume gate — and that degradation is itself the result worth having.
 
 ## 6. Capital and universe
 
@@ -185,20 +187,35 @@ Three consequences, and the second was not visible before this was measured:
   verticals, butterflies. Their reserve is a function of wing width, not of the underlying, so
   they alone can search the full band.
 
-**Universe: the screener cap bands** — but stage 1 runs on **one band only, `mid`
-(\$2B–\$10B)**, with `small` and `large` deferred to stage 3.
+**Universe: the screener cap bands, and stage 1 runs on `large` (≥\$10B) alone.** `small` and
+`mid` are deferred to stage 3.
 
-This is a decision, not an oversight, and it is the single biggest cost lever in the plan.
-Running all three bands in stage 1 would make it 45 jobs and ~675,000 trials instead of 15 and
-~225,000. `mid` is the right one to start with for two independent reasons: small caps
-(\$50M–\$2B) largely have thin or nonexistent option chains, so the liquidity floor and the
-10%-of-bar-volume fill cap would dominate the result rather than the strategy; and mega caps
-carry share prices that put five of the fifteen structures out of reach. Flip this to all three
-bands if the compute is available — it is one argument in the driver.
+Large is not a compromise, it is the priority, for three reasons:
+
+* **Liquidity is the UNIVERSAL constraint; affordability is a minority one.** Thin option chains
+  break all fifteen structures — the `option_min_volume` gate rejects the contract and the fill
+  engine's 10%-of-bar-volume participation cap means a too-thin contract yields an order that
+  can never fill, only retry. Affordability binds five of fifteen. Choosing the universe to suit
+  the minority constraint at the cost of the universal one is backwards.
+* **Market cap and share price are independent, and that cuts both ways.** The large band
+  contains plenty of cheap-priced names — a \$10B+ company can trade at \$11 or \$800 — so the
+  `spot ≤ \$60` sub-universe the full-notional three need is populated INSIDE the large band.
+  Dropping to mid caps buys nothing for affordability and costs chain depth.
+* **It is the universe every existing option finding was measured against.** The affordability
+  filter's own rationale reads "On this large-cap universe at the grid's \$20k capital", and the
+  equity experts run the same band. Deviating would make new results incomparable to old ones
+  for no gain.
+
+Running all three bands in stage 1 would be 45 jobs and ~675,000 trials instead of 15 and
+~225,000; that is the single biggest cost lever in the plan and it is one argument in the driver.
+
+**Stage 0 should report the sub-universe populations** — how many large-band names sit under
+\$60 and under \$300 — because that is the number which decides whether the five
+price-constrained structures have anything to trade, and it cannot be measured from a machine
+without the data.
 
 **Cap band is not share price**, which is why the spot sub-universes above are defined on price
-and not on band: a \$10B company can trade at \$30 or \$800, so the band controls neither
-affordability nor option-chain depth.
+and not on band: the band controls neither affordability nor option-chain depth.
 
 **ETFs need an explicit list**, since they carry no screener market cap. At \$20k they are fine
 for defined-risk structures and excluded from the full-notional three and the naked-vol two by
