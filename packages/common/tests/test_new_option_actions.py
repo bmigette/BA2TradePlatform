@@ -384,12 +384,31 @@ def _submitted_option_strategies():
             continue
         fn = node.func
         name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
-        if name != "_submit_option_order":
-            continue
-        for arg in list(node.args) + [kw.value for kw in node.keywords]:
-            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                found.add(arg.value)
+        # TWO shapes, because the 2026-08-27 resolve split moved seven builders off the first.
+        #
+        # Before the split every builder ended in `_submit_option_order(legs, qty, px, "name")`,
+        # so scanning that one call site saw all 17. After it, the premium-sized seven return
+        # `ResolvedStructure(..., option_strategy="name", ...)` and a SHARED tail does the
+        # submitting -- the scan still passed, but it was only seeing the ten unconverted
+        # builders. A drift guard that quietly halves its own coverage is worse than none,
+        # because the green tick now certifies less than the reader believes.
+        if name == "_submit_option_order":
+            for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    found.add(arg.value)
+        elif name == "ResolvedStructure":
+            for kw in node.keywords:
+                if kw.arg == "option_strategy" and isinstance(kw.value, ast.Constant):
+                    if isinstance(kw.value.value, str):
+                        found.add(kw.value.value)
     assert found, "the ast scan found no strategies — the scan itself is broken"
+    # Coverage floor. Phase 2a converted 7 of 17 builders; 2b and 2c convert the rest, and each
+    # conversion moves a name from one shape to the other. This asserts the TOTAL never falls,
+    # which is the property the scan actually depends on and the one that silently broke.
+    assert len(found) >= 17, (
+        f"the ast scan sees only {len(found)} strategies ({sorted(found)}); it should see all 17 "
+        f"entry builders across both call shapes. A builder was probably converted to a third "
+        f"shape the scan does not know about.")
     return found
 
 

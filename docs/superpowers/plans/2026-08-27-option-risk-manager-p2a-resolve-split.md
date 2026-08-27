@@ -58,6 +58,7 @@ There is a fifth finding that this plan deliberately does **not** act on, record
 | `packages/common/ba2_common/core/option_request.py` | **Modified.** Split `ResolvedStructure` into resolve-time and score-time halves; add `cost_per_contract` and `sizing_basis`; register the refusal phrases the builders actually emit. |
 | `packages/common/ba2_common/core/TradeActions.py` | **Modified.** Add `_resolve()`/`_size_and_submit()` to `_OptionEntryAction`; rewrite `execute()`; convert 7 concrete builders. |
 | `packages/common/tests/test_option_resolve_split.py` | **New.** Proves the split is behaviour-neutral and that `_resolve()` is independently callable. |
+| `tests/test_no_zero_coercion.py` | **Modified, expected.** Its allowlist is keyed by literal `file:line`, so moving code in `TradeActions.py` shifts the key and the guard fails until it is re-pointed. This is the one sanctioned exception to "do not fix a passing test that broke" — the guard's own failure message tells you to do it. |
 
 ---
 
@@ -371,6 +372,13 @@ In `packages/common/ba2_common/core/TradeActions.py`, replace the `_build_and_su
     def _resolve(self):
         """Select contracts, build legs, price the structure. Return a ``ResolvedStructure``
         — or, for a refusal, the ``self._result(False, ...)`` dict the builder already returns.
+
+        DO NOT make this body ``raise NotImplementedError`` (an earlier draft of this plan did,
+        and it is wrong). ``execute()`` calls ``_resolve()`` for EVERY builder, but after this
+        task all 17 still define only ``_build_and_submit`` — the raise would be swallowed by
+        ``execute()``'s generic ``except Exception`` and turn every option entry into a failed
+        result. The body must be a migration bridge, ``return self._build_and_submit()``, until
+        phases 2b/2c convert the last one.
 
         REFUSALS STAY AS ``_result`` DICTS, not ``StructureRefusal``. ``_result`` PERSISTS a
         ``TradeActionResult`` row (``create_and_save_action_result``), and the UI reads those
@@ -812,6 +820,91 @@ Expected: `packages/common` up by the new tests only; `tests/` **4410**; backend
 git add testplatform/version.py
 git commit -m "chore: bump TEST_APP_VERSION for the option resolve split (phase 2a)"
 git push
+```
+
+---
+
+### Task 7: Update the option grid runner's precondition block
+
+**Files:**
+- Modify: `testplatform/ba2test_launcher.py` (the `BEFORE YOU LAUNCH AN OPTION GRID — READ THIS` block, from line ~2354)
+
+**Phase 2a needs NO functional change to the grid runner.** Verified: `grep -n
+"_build_and_submit\|_size_by_reserve\|_size(\|ResolvedStructure\|_submit_option_order"
+testplatform/ba2test_launcher.py` returns nothing — the launcher emits action CONFIG, and the
+config shape is untouched by this phase. Do not change `_option_entry_action_for`,
+`_apply_option_sizing_gene`, `_apply_option_min_arc_gene` or `_OPTION_STRATS`.
+
+What must change is the standing note somebody reads when they decide to press go, because the
+survey added a precondition that did not exist when the block was written.
+
+- [ ] **Step 1: Confirm there is still no coupling**
+
+Run: `grep -n "_build_and_submit\|_size_by_reserve\|_size(\|ResolvedStructure\|_submit_option_order" testplatform/ba2test_launcher.py`
+Expected: no output. If there IS output after Task 3, the split leaked into the launcher and
+this plan's behaviour-neutrality claim is false — stop and report.
+
+- [ ] **Step 2: Add precondition 4 to the block**
+
+Insert after precondition 3 (keep the existing numbering and prose style — dense, evidence-first,
+explaining the consequence rather than just the fact):
+
+```python
+# 4. THE SIZING GENES ARE ABOUT TO CHANGE HANDS, AND THAT MAKES OLD RESULTS INCOMPARABLE.
+#    ** NOT BLOCKING TODAY; BLOCKING FOR ANY CROSS-PHASE COMPARISON **
+#    `option_sizing`, `option_min_arc` and the strike-method genes are consumed TODAY by one
+#    thing only: the action's own `_size` / `_size_by_reserve`, inside `_build_and_submit`.
+#    Phase 2a (2026-08-27) splits that method into `_resolve()` + a shared sizing tail with
+#    byte-identical arithmetic, so grids run before and after it ARE comparable. Phase 3 moves
+#    sizing to an option risk manager that triages several structures against ONE budget, and
+#    at that point `option_sizing` stops meaning "this structure's share of equity" and starts
+#    meaning "this structure's CAP within a shared per-instrument budget". Same name, different
+#    quantity. A grid run across that boundary is comparing two different experiments.
+#
+#    There are three sizing families, not one, which is why the split lands in three parts:
+#    7 builders size off premium (`_size`), 8 off collateral (`_size_by_reserve`), and 2 --
+#    covered call and protective put -- size off HELD SHARES and ignore `option_sizing`
+#    entirely. Any conclusion drawn about `option_sizing` from an O_CC or O_PP arm is a
+#    conclusion about a gene that arm never read.
+#
+#    Also recorded here because this is where somebody stands when they press go: option entry
+#    actions are reached from FOUR paths -- the enter_market ruleset, the open-positions overlay
+#    ruleset, the unified TradeRule entry path, and the PremiumSeller bypass expert, which opens
+#    option positions with no TradeAction and no risk manager at all (its only rails are
+#    `_within_rails` / `_book_totals`). A grid arm using PremiumSeller is not exercising any of
+#    the option RM work.
+```
+
+- [ ] **Step 3: Extend precondition 2 with the expiry-tail finding**
+
+Precondition 2 covers the missing greeks. Append to it, because it is the same class of problem
+(a run that completes and reports a result about nothing):
+
+```python
+#    RELATED, AND IT WILL BITE THE LONG TERMS SPECIFICALLY: `fetch_options._EXPIRY_TAIL_DAYS`
+#    is 60, so the cache only holds contracts expiring within 60 days of the run's END date.
+#    From a bar at date `d` the largest DTE any chain can contain is `run_end + 60 - d`. Once
+#    `OptionTerm` becomes a gene (phase 5) with HARD windows and no widening, THREE_MONTHS
+#    (76-149), SIX_MONTHS (150-269) and LEAPS (270-1095) therefore refuse outright near the end
+#    of every run, and LEAPS is unusable in any run shorter than about fifteen months. The GA
+#    would learn "LEAPS is bad" for a data-availability reason with no economic content. Either
+#    raise the tail before searching terms, or restrict the term gene's choice set to what the
+#    fetch window can actually serve.
+```
+
+- [ ] **Step 4: Verify the file still imports and the launcher's tests pass**
+
+Run: `./venv/bin/python -c "import ast,pathlib; ast.parse(pathlib.Path('testplatform/ba2test_launcher.py').read_text()); print('parses')"`
+Expected: `parses`
+
+Run: `PYTHONPATH=packages/common:packages/providers:packages/experts ./venv/bin/python -m pytest testplatform/backend/tests -q -k "launcher or option"`
+Expected: no new failures against the pre-change count.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add testplatform/ba2test_launcher.py
+git commit -m "docs(grid): record the sizing-gene handover and the expiry-tail limit on long terms"
 ```
 
 ---

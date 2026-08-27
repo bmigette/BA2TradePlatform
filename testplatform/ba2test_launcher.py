@@ -2354,10 +2354,12 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 # BEFORE YOU LAUNCH AN OPTION GRID — READ THIS
 # ==============================================================================================
 #
-# Three preconditions, as of 2026-08-26. One will stop a run dead, one will let it run and
-# waste the compute, and the third is now CLOSED and recorded so nobody re-opens it. None is a
-# defect in this file — they are the ragged edges left by the option work of 2026-08-25/26,
-# recorded here because this is where somebody stands when they decide to press go.
+# Four preconditions, as of 2026-08-27. One will stop a run dead, one will let it run and
+# waste the compute, the third is now CLOSED and recorded so nobody re-opens it, and the fourth
+# blocks nothing today — it blocks COMPARING today's run against one launched after phase 3.
+# None is a defect in this file — they are the ragged edges left by the option work of
+# 2026-08-25/27, recorded here because this is where somebody stands when they decide to press
+# go.
 #
 # 1. THE BACKTEST READS AN ALPACA STORE, SO 2023 IS STILL REFUSED.  ** BLOCKING **
 #    The floor is no longer global: `ba2_providers.options.options_history_floor` answers PER
@@ -2400,6 +2402,16 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    chain-snapshot row, so where a stale row used to supply a number it now honestly supplies
 #    None. That removes a lookahead, and it also removes the last thing masking this gap.
 #
+#    RELATED, AND IT WILL BITE THE LONG TERMS SPECIFICALLY: `fetch_options._EXPIRY_TAIL_DAYS`
+#    is 60, so the cache only holds contracts expiring within 60 days of the run's END date.
+#    From a bar at date `d` the largest DTE any chain can contain is `run_end + 60 - d`. Once
+#    `OptionTerm` becomes a gene (phase 5) with HARD windows and no widening, THREE_MONTHS
+#    (76-149), SIX_MONTHS (150-269) and LEAPS (270-1095) therefore refuse outright near the end
+#    of every run, and LEAPS is unusable in any run shorter than about fifteen months. The GA
+#    would learn "LEAPS is bad" for a data-availability reason with no economic content. Either
+#    raise the tail before searching terms, or restrict the term gene's choice set to what the
+#    fetch window can actually serve.
+#
 # 3. THE ARC RICHNESS GATE IS ENFORCED AND SEARCHED.  ** CLOSED 2026-08-26 **
 #    All eight credit builders in `ba2_common.core.TradeActions` now call
 #    `_refuse_if_arc_below_floor` beside their `net_credit <= 0` check, so a credit structure
@@ -2411,6 +2423,33 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    arithmetic, not measured against a realised ARC distribution (there has been no option
 #    grid to measure), so re-centre the ceilings after the first run; and the gate is a no-op
 #    for every debit structure and for O_CC/O_PP, which post no collateral.
+#
+# 4. THE SIZING GENES ARE ABOUT TO CHANGE HANDS, AND THAT MAKES OLD RESULTS INCOMPARABLE.
+#    ** NOT BLOCKING TODAY; BLOCKING FOR ANY CROSS-PHASE COMPARISON **
+#    `option_sizing`, `option_min_arc` and the strike-method genes are consumed by exactly one
+#    thing: the entry action's own sizing tail. Until 2026-08-27 that tail was `_size` /
+#    `_size_by_reserve` inlined at the bottom of each `_build_and_submit`. Phase 2a (landed
+#    2026-08-27) split the 7 premium-sized builders into a `_resolve()` that prices the
+#    structure and a shared `_size_and_submit` that sizes it, folding both sizers into a single
+#    `_size_by_cost` = `floor(budget / cost_per_contract)`, which is what each already computed.
+#    Grids run before and after that split ARE comparable. Phase 3 is where that stops being
+#    true: sizing moves to an option risk manager that triages several structures against
+#    ONE budget, and `option_sizing` stops meaning "this structure's share of equity" and starts
+#    meaning "this structure's CAP within a shared per-instrument budget". Same name, different
+#    quantity. A grid run across THAT boundary is comparing two different experiments.
+#
+#    There are three sizing families, not one, which is why the split lands in three parts:
+#    7 builders size off premium (`_size`, converted in 2a), 8 off collateral
+#    (`_size_by_reserve`, phase 2b), and 2 — covered call and protective put — size off HELD
+#    SHARES and ignore `option_sizing` entirely (phase 2c). Any conclusion drawn about
+#    `option_sizing` from an O_CC or O_PP arm is a conclusion about a gene that arm never read.
+#
+#    Also recorded here because this is where somebody stands when they press go: option entry
+#    actions are reached from FOUR paths — the enter_market ruleset, the open-positions overlay
+#    ruleset, the unified TradeRule entry path, and the PremiumSeller bypass expert, which opens
+#    option positions with no TradeAction and no risk manager at all (its only rails are
+#    `_within_rails` / `_book_totals`). A grid arm using PremiumSeller is not exercising any of
+#    the option RM work.
 #
 # CLOSED 2026-08-26: `_option_consistent_annual_return` -- the DEFAULT fitness for pure-option
 # grids -- now takes its trade frequency from `_trades_per_year` (STRUCTURES) instead of
