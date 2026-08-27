@@ -206,3 +206,78 @@ def test_the_butterfly_body_leg_carries_ratio_two():
         pytest.skip("refused on this synthetic chain")
     ratios = sorted(leg.ratio for leg in resolved.payoff_legs)
     assert ratios == [1, 1, 2]
+
+
+# --- Task 5: the split changed no arithmetic ---------------------------------------------
+
+def test_the_unified_sizer_reproduces_both_old_sizers_exactly():
+    """`_size` and `_size_by_reserve` now both delegate to `_size_by_cost`. This pins that the
+    delegation is arithmetic-preserving, over the whole grid of inputs that used to hit two
+    separate implementations -- including the zero and negative cases each guarded differently.
+    """
+    import math
+    a, _ = _action(TradeActions.BuyCallAction)
+    equity = a._virtual_equity()
+    for premium in (0.01, 0.10, 1.00, 1.10, 7.35, 250.0):
+        for pct in (0.5, 1.0, 10.0, 100.0):
+            budget = equity * (pct / 100.0)
+            cap = a._max_equity_per_instrument_cap(equity)
+            if cap is not None:
+                budget = min(budget, cap)
+            assert a._size(premium, pct) == int(math.floor(budget / (premium * 100.0)))
+            assert a._size_by_reserve(premium * 100.0, pct) == a._size(premium, pct)
+
+
+@pytest.mark.parametrize("bad", [0, -1.0, None])
+def test_both_sizers_still_refuse_the_unsizeable_inputs_they_always_refused(bad):
+    a, _ = _action(TradeActions.BuyCallAction)
+    assert a._size(bad, 10.0) == 0
+    assert a._size(1.0, bad) == 0
+    assert a._size_by_reserve(bad, 10.0) == 0
+    assert a._size_by_reserve(100.0, bad) == 0
+
+
+def test_a_premium_structure_the_budget_cannot_afford_submits_NOTHING():
+    """The shared tail's ``quantity < 1`` refusal, exercised through ``execute()``.
+
+    Every other test in this file funds a size of 90, so a tail that refused only at
+    ``quantity < 0`` would look identical to the real one: it would sail past the guard with
+    ``quantity == 0`` and hand a ZERO-contract order to ``_submit_option_order``, which does
+    not re-check the size. "The smallest tradeable size" is not the same fact as "the size the
+    budget allows" -- the sibling credit builders pin this for their own inline tails
+    (``test_bull_put_spread.py``, found by mutation A62); the shared tail now needs its own.
+    """
+    a, acct = _action(TradeActions.BuyCallAction, sizing=0.1)   # $100 budget vs $110/contract
+    result = a.execute()
+    assert result["success"] is False
+    assert "Insufficient budget" in result["message"]
+    assert acct.submitted == []
+
+
+def test_the_per_instrument_cap_still_clamps_the_shared_tails_budget(monkeypatch):
+    """``min(budget, cap)`` inside ``_size_by_cost`` -- the ONE place both sizing families now
+    apply ``max_virtual_equity_per_instrument_percent``.
+
+    Pinned here, and not only in ``test_option_entry_sizing_cap.py``, because that file calls
+    ``_size`` directly: it cannot see whether ``execute()``'s new shared tail still routes
+    through the capped sizer. Every other test in this module leaves ``instance_id`` None, so
+    the cap resolves to None and deleting the clamp changes nothing they measure.
+    """
+    import ba2_common.core.instance_resolver as ir_mod
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import ExpertInstance
+
+    inst_id = add_instance(ExpertInstance(account_id=1, expert="MockExpert",
+                                          virtual_equity_pct=100.0))
+    capped = SimpleNamespace(settings={"max_virtual_equity_per_instrument_percent": 1.0})
+    monkeypatch.setattr(
+        ir_mod, "get_instance_resolver",
+        lambda: SimpleNamespace(get_expert_instance=lambda _id: capped))
+
+    a, acct = _action(TradeActions.BuyCallAction)
+    a.expert_recommendation.instance_id = inst_id
+    a.execute()
+    # sizing=10% of $100k funds $10,000 -> 90 contracts at $110. The 1% cap funds $1,000,
+    # and the tighter of the two must win -> 9.
+    assert len(acct.submitted) == 1
+    assert acct.submitted[0]["quantity"] == 9
