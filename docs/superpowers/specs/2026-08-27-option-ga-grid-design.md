@@ -89,7 +89,7 @@ set **is** the knowledge the grid exists to produce.
 
 ## 5. Stages
 
-### Stage 0 · Smoke — prove the pipeline, not the strategy
+### Stage 0a · Smoke — prove the pipeline, not the strategy
 
 Two structures (one debit, one credit), population 8, 2 generations, 3 symbols, ~3 months, and
 **every optional condition gate disabled**. A few hundred trials; minutes.
@@ -102,11 +102,24 @@ whoever runs the real grid so they can verify their machine before committing da
 
 **Pass criteria, stated so the run is falsifiable:** at least one structure opens, at least one
 closes at or before expiry, the fitness is a finite number rather than the sentinel, results
-persist with an `optimization_id`, and every configured worker answers.
+persist with an `optimization_id`, and every configured worker answers. It must also **report the
+sub-universe populations** — how many large-band names sit under \$100 and under \$300 — since
+that decides whether the price-constrained structures have anything to trade.
+
+### Stage 0b · Pilot — prove the GRID, on a short window
+
+All 15 structures, gates **on**, real settings, a few months, population 60, 10 generations.
+~9,000 trials.
+
+Distinct from 0a and both are worth having, because they fail differently. 0a runs with the gates
+OFF, so a failure there can only be data or wiring. 0b runs the real shape, so a failure with 0a
+green is configuration or strategy. 0b is also what turns the cost table below from an estimate
+into a schedule: it measures per-trial runtime on the machine that will do the work.
 
 ### Stage 1 · Discovery — 15 jobs, one per structure
 
-Genome ~28, population 500 (18×), 30 generations, ≈15,000 trials per job.
+Genome ~28, **population 200, generations 60 with early-stop patience 8**. ~5,000 trials per job
+in practice; 12,000 only if a job never plateaus.
 
 Each job answers "under what conditions did *this* structure work", with every per-structure
 condition searched independently. It also answers the cheap question first: whether the
@@ -118,26 +131,38 @@ single-strategy jobs" — stage 1 is exactly that.
 
 ### Stage 2 · Composition — 1 job, the deployable expert
 
-**Survival criterion, stated so stage 1 is decidable rather than a judgement call.** A structure
-advances to stage 2 when its best stage-1 individual: opened at least 20 trades, scored a finite
-fitness rather than the zero-trade sentinel, and did not achieve its result on a single symbol
-(no more than 50% of its trades on one underlying). The first two separate "this structure does
-not work" from "this structure could not run"; the third rejects the single-symbol artefact that
-a 15,000-trial search will otherwise find. A structure that fails only the trade-count test is
-recorded as UNDETERMINED, not as rejected — the distinction matters when the cause is a data gap.
+**THERE IS NO SURVIVAL GATE, AND THAT IS DELIBERATE.** An earlier draft advanced only structures
+that cleared a trade-count and diversification bar. That was a decomposition bias: a structure
+which earns its place only ALONGSIDE another is judged alone in stage 1, dropped, and stage 2
+then inherits an exclusion that was never tested in the context where it mattered.
 
-Every surviving structure as a toggleable member of ONE expert, plus the shared tier-1 gate.
+So **all 15 structures enter stage 2 as members regardless of stage-1 performance.** Stage 1's
+results are used only as SEEDS — structures that did well start from their stage-1 winner, the
+rest start from authored defaults. Stage 1 hands out head starts; it has no power to exclude.
+
+Stage 1's per-structure verdicts are still recorded, because they are the knowledge the grid
+exists to produce, and a structure that could not trade at all is a finding worth having. They
+just do not gate anything.
+
+All 15 structures as toggleable members of ONE expert, plus the shared tier-1 gate.
 Genome **~300, ESTIMATED** — `OS_ALL` does not exist yet, so unlike every other figure in this
 spec that number is arithmetic (15 members x ~14 per-structure condition genes + 4 shared + the
 option genes + the entry toggles) rather than a measurement. Measure it with
 `collect_param_space` as the first step of building it, and re-derive the population from what
-comes back. **Seeded from stage 1's winners** via `initial_population`. Population 2000, 40
-generations, ≈80,000 trials.
+comes back. **Seeded from stage 1's winners** via `initial_population`. **Population 300,
+generations 80 with early-stop patience 10** — ~8,000 trials in practice.
 
-Seeding is what makes this tractable. A 290-dimensional search from a random start would need a
-population in the thousands merely to cover the space once; starting from 15 independently
-optimised structures, the GA begins near a solution and mostly learns arbitration — which
-members to enable and how they interact.
+**Seeding collapses the effective dimensionality, and that is why the population is 300 and not
+3,000.** Stage 2 is not a cold search of ~300 genes: roughly 280 of them arrive near-optimal from
+stage 1 and need only local refinement. What is genuinely unknown is the ~15 member on/off
+toggles and the 4 shared-gate genes — an effective dimensionality nearer 20. Sizing the
+population for a cold 300-dimensional search would have been wrong by an order of magnitude.
+
+**Generations are a ceiling, not a cost.** `genetic.py` stops when the best fitness has not
+improved for `early_stopping_generations`, so a high generation cap is only paid for while the
+search is still improving. Spend on PATIENCE rather than on population: 8–10 rather than the
+default 4, because a rugged fitness landscape plateaus and then breaks through, and patience 4
+cuts it off mid-plateau.
 
 This stage produces the artefact: one expert that opens the best structure.
 
@@ -167,7 +192,7 @@ Measured against `option_reserve_required`, the highest spot at which ONE contra
 
 | structure | budget \$6,000 (both genes at ceiling) | \$3,000 (mid) | \$1,000 (both at floor) |
 |---|---|---|---|
-| cash-secured put | \$60 | \$30 | \$10 |
+| cash-secured put | \$60 | \$30 | \$10 |   ← \$100 once the cap gene reaches 50%
 | jade lizard | \$56 | \$26 | \$6 |
 | put ratio spread | \$61 | \$31 | \$11 |
 | short strangle | \$300 | \$150 | \$50 |
@@ -175,10 +200,17 @@ Measured against `option_reserve_required`, the highest spot at which ONE contra
 
 Three consequences, and the second was not visible before this was measured:
 
-* **The full-notional three are cheap-underlying-only at \$20k.** Spot ≤ \$60 at best, ≤ \$30
-  at typical gene settings. They stay in stage 1 — a measured "this structure is unreachable at
+* **The full-notional three need the per-instrument cap raised to 50%.** At today's 30% ceiling
+  they top out at spot \$60. A cash-secured put at spot \$100 reserves exactly \$10,000, i.e.
+  50% of a \$20k account, so BOTH gene ranges move: `max_virtual_equity_per_instrument_percent`
+  5–30% → **5–50%**, and the full-notional `option_sizing` band 5–40% → **5–50%** (the budget is
+  the min of the two, so raising one alone does nothing). The consequence is concentration, and
+  it is inherent rather than a flaw: at 50% you hold at most TWO such positions, one contract
+  each, and an assignment leaves you owning \$10,000 of stock — half the account. **Scope the
+  raised range to the option grid**, since the same setting is read by the equity risk manager
+  and a global change would move every equity grid. They stay in stage 1 — a measured "this structure is unreachable at
   this account size" is a finding, not a failure — but they run against an explicit
-  **spot ≤ \$60 sub-universe**, and their result must be read as conditional on that. Running
+  **spot ≤ \$100 sub-universe**, and their result must be read as conditional on that. Running
   them on the full band would spend 15,000 trials each rediscovering the reserve table.
 * **Short straddle and short strangle have a spot ceiling too** (\$300 permissive, \$50
   restrictive). I had treated Reg-T naked structures as affordable everywhere; they are not.
@@ -199,7 +231,7 @@ Large is not a compromise, it is the priority, for three reasons:
   the minority constraint at the cost of the universal one is backwards.
 * **Market cap and share price are independent, and that cuts both ways.** The large band
   contains plenty of cheap-priced names — a \$10B+ company can trade at \$11 or \$800 — so the
-  `spot ≤ \$60` sub-universe the full-notional three need is populated INSIDE the large band.
+  `spot ≤ \$100` sub-universe the full-notional three need is populated INSIDE the large band.
   Dropping to mid caps buys nothing for affordability and costs chain depth.
 * **It is the universe every existing option finding was measured against.** The affordability
   filter's own rationale reads "On this large-cap universe at the grid's \$20k capital", and the
@@ -236,12 +268,16 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
 
 ## 8. Cost
 
-| stage | jobs | population | generations | trials |
-|---|---|---|---|---|
-| 0 smoke | 2 | 8 | 2 | ~300 |
-| 1 discovery | 15 | 500 | 30 | ~225,000 |
-| 2 composition | 1 | 2000 | 40 | ~80,000 |
-| **total** | | | | **~305,000** |
+| stage | jobs | population | generations (ceiling) | early-stop | trials if full | realistic |
+|---|---|---|---|---|---|---|
+| 0a smoke | 2 | 8 | 2 | — | ~300 | ~300 |
+| 0b pilot | 15 | 60 | 10 | 4 | ~9,000 | ~9,000 |
+| 1 discovery | 15 | 200 | 60 | 8 | 180,000 | ~75,000 |
+| 2 composition | 1 | 300 | 80 | 10 | 24,000 | ~8,000 |
+| **total** | | | | | **~213,000** | **~92,000** |
+
+"Realistic" assumes early-stop fires around generation 25; "if full" is the ceiling where nothing
+ever plateaus. The true figure lands between, and stage 0b measures which end.
 
 Per-trial runtime on the target machine is the number that decides whether this is a weekend or
 a fortnight, and it cannot be measured from here. Stage 0 measures it as a side effect, which is
