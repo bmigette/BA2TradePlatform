@@ -2930,73 +2930,30 @@ def _build_strategy_option(kind: str):
     return s
 
 
-# --- price-vs-analyst-target entry gates ---------------------------------------------------
+# --- price-vs-analyst-target entry gates: REMOVED 2026-08-27, do not re-add ------------------
 #
-# Two BANDS, one per analyst-target line, each expressed as a FLOOR gene plus a strictly
-# positive WIDTH gene (``value_offset_from``, decoded in strategy_param_space._apply_to_tree).
+# The option entry rule used to carry FOUR gates on ``price_vs_target_low_percent`` /
+# ``price_vs_target_high_percent`` (two floor+width bands, chained through
+# ``value_offset_from``). They are gone, replaced by the single ``_expected_profit_gate`` below,
+# for a reason that no amount of re-parameterising could fix:
 #
-# WHY NOT FOUR INDEPENDENT ABSOLUTE THRESHOLDS (the shape before 2026-08-26, OPT-C5). The four
-# gates are two pairs, and each pair tests the SAME field with opposing operators, i.e. an
-# interval. As independent absolute genes on one shared -20..+20 step-5 grid, ~half of each
-# pair's joint values put the ceiling at or below the floor — an EMPTY conjunction that
-# guarantees zero trades for every symbol on every bar and scores the identical zero-trade
-# sentinel, so selection gets no gradient from it. Measured exhaustively on the built O_LC
-# rule over all 16 toggle combinations x 9^4 values: 27,135 / 104,976 = **25.8 % of the joint
-# gene space was guaranteed-empty** — and the AUTHORED DEFAULT (all four gates on, every
-# threshold 0.0 -> "low% < 0 AND low% > 0") was itself one of them, which is precisely where
-# warm-start and every hand-seeded individual begins.
+#   ``PriceVsTargetLowCondition`` / ``PriceVsTargetHighCondition`` are hard-keyed to
+#   ``expert_recommendation.data["FMPRating"]["target_low"|"target_high"]``. ONLY FMPRating
+#   writes that key. Under any other expert — DeterministicScorer, or anything the grid adds
+#   later — all four gates fail CLOSED, so 8 of ~28 genes per structure were dead weight and any
+#   genome that switched one ON traded nothing and scored the zero-trade sentinel.
 #
-# With the width parameterisation every point of the grid is a live interval. Expressiveness is
-# unchanged: each bound keeps its own independent ON/OFF gene, so floor-only ("already above
-# the low estimate"), ceiling-only ("still below the low estimate"), band, and the cross-field
-# "inside the analyst range" (low floor + high ceiling) all remain reachable.
+# The earlier work on these gates (OPT-C5's 25.8 %-guaranteed-empty joint space, OPT-C12's
+# inert -20..+20 high-target window) was real, but it was optimising the shape of a gate that
+# only one expert can answer at all. ``expected_profit_percent`` is non-nullable on
+# ``ExpertRecommendation`` and carries the same "how far from here to the target" information,
+# so one expert-independent gate replaces the four.
 #
-# Residual (deliberate): a cross-field pair — a floor on the LOW line against a ceiling on the
-# HIGH line — can still be empty, but only for symbols whose target_high/target_low ratio is
-# tight enough. That is a symbol-dependent FILTER carrying real information, not a
-# symbol-independent guaranteed zero, so it is left searchable.
-#
-# WINDOWS (OPT-C12). ``price_vs_target_high_percent`` — how far spot sits above the analyst
-# HIGH target — has a ~-31 % median across the universe, so the original shared -20..+20 window
-# put ~77 % of symbols outside the searchable range and the two high gates were inert on them.
-# The high floor therefore gets its own -50..+10 window, which brackets the median; the low
-# line keeps -20..+20, which the review did not flag.
-_PRICE_GATE_LOW_FLOOR = {"value": -20.0, "value_min": -20.0, "value_max": 20.0,
-                         "value_step": 5.0}
-_PRICE_GATE_HIGH_FLOOR = {"value": -50.0, "value_min": -50.0, "value_max": 10.0,
-                          "value_step": 5.0}
-#: Band WIDTH above the paired floor. Strictly positive (min == step), which is what makes the
-#: interval non-empty for every combination the GA can sample.
-_PRICE_GATE_WIDTH = {"value_min": 5.0, "value_max": 45.0, "value_step": 5.0}
-
-
-def _price_target_gates(m: str) -> list:
-    """The four price-vs-analyst-target entry gates for member prefix ``m`` (see above).
-
-    Authored defaults are the PERMISSIVE end of each band (floor at its minimum, width at its
-    maximum), so the seeded individual behaves like the rating-only strategy the grid has
-    always intended — instead of the guaranteed-zero-trade conjunction the all-zero default
-    used to be.
-    """
-    low_floor = _PRICE_GATE_LOW_FLOOR
-    high_floor = _PRICE_GATE_HIGH_FLOOR
-    w = _PRICE_GATE_WIDTH
-    return [
-        # FLOORS (">"): the band's lower edge, an absolute % vs the target line.
-        {"id": f"{m}-price_low_above", "field": "price_vs_target_low_percent", "op": ">",
-         "optimize": True, "toggle_optimize": True, **low_floor},
-        {"id": f"{m}-price_high_above", "field": "price_vs_target_high_percent", "op": ">",
-         "optimize": True, "toggle_optimize": True, **high_floor},
-        # CEILINGS ("<"): the band's upper edge, decoded as floor + width. ``value`` stays the
-        # ABSOLUTE authored threshold (an un-decoded template must still seed a valid rule);
-        # value_min/max/step describe the WIDTH the GA searches.
-        {"id": f"{m}-price_low_below", "field": "price_vs_target_low_percent", "op": "<",
-         "value": low_floor["value"] + w["value_max"], "optimize": True,
-         "toggle_optimize": True, "value_offset_from": f"{m}-price_low_above", **w},
-        {"id": f"{m}-price_high_below", "field": "price_vs_target_high_percent", "op": "<",
-         "value": high_floor["value"] + w["value_max"], "optimize": True,
-         "toggle_optimize": True, "value_offset_from": f"{m}-price_high_above", **w},
-    ]
+# Removing them also removed the launcher's ONLY user of ``value_offset_from``. That mechanism
+# resolves its base id against the GLOBAL gene map, so a shared condition id (see the
+# ``shared-*`` leaves) would have silently coupled members across a family — keep it unused
+# here. The mechanism itself is still exercised by
+# tests/test_strategy_param_space_value_offset_from.py.
 
 
 # --- implied-volatility-rank entry gate (OPT-C1 / OPT-C4-of-R3) -----------------------------
@@ -3084,33 +3041,51 @@ def _iv_rv_gate(m: str, member: str) -> dict:
             **_IV_RV_RANGE}
 
 
+# EXPECTED PROFIT — the entry's only signal-strength gate, and the ONLY one every expert can
+# answer. `ExpertRecommendation.expected_profit_percent` is non-nullable, so an expert cannot
+# omit it; `target_price` is nullable and DERIVES from it when absent (see the field's own
+# description), so the two are the same signal and this gate covers both.
+#
+# It REPLACES the four price_vs_target_* gates. Those read
+# `expert_recommendation.data["FMPRating"]["target_low"]` via a hard-keyed condition, and only
+# FMPRating writes that key — so under DeterministicScorer (or any future expert) all four
+# failed CLOSED, taking 8 of ~28 genes per structure with them and making any genome that
+# enabled one trade nothing.
+#
+# Range is AUTHORED, not measured: 2-20% brackets "any positive edge" through "a call the expert
+# is loud about", and the grid searches the threshold. Re-centre it on the realised
+# expected_profit distribution once a grid has run.
+_EXPECTED_PROFIT_GATE = {"value": 5.0, "value_min": 2.0, "value_max": 20.0, "value_step": 2.0}
+
+
+def _expected_profit_gate(m: str) -> dict:
+    """The expected-profit entry gate leaf for member prefix ``m``."""
+    return {"id": f"{m}-exp_profit", "field": "expected_profit_target_percent", "op": ">",
+            "optimize": True, "toggle_optimize": True, **_EXPECTED_PROFIT_GATE}
+
+
 def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
     (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
-    optimizable confidence gate + four price-vs-analyst-target-range gates, action = the
-    member's option action config. Rule/condition ids are prefixed with the member key so a
-    GROUP of these rules yields uniquely-keyed genes per member. ``toggleable`` adds the
-    rule-level enabled gene (group members only — a single-strategy job keeps its one entry
-    always-on).
+    optimizable confidence gate + the iv_rank / relative-volume / iv-vs-realised-vol gates +
+    ONE expected-profit gate, action = the member's option action config. Rule/condition ids
+    are prefixed with the member key so a GROUP of these rules yields uniquely-keyed genes per
+    member. ``toggleable`` adds the rule-level enabled gene (group members only — a
+    single-strategy job keeps its one entry always-on).
 
-    The signal (bullish/bearish) gate and all four price-vs-target gates are independently
-    toggle_optimize=True. Op is fixed per gate (the GA's gene space only ever searches a
-    condition's threshold value and enabled flag, never its operator - see
-    docs/plans/2026-07-21-options-price-target-conditions.md's "Design reference"), so each
-    directional pattern needs its OWN gate rather than one gate whose op could flip:
-    price_low_below (< , "still below the low estimate") + price_high_above (> , "already
-    above the high estimate") + price_low_above (>) + price_high_below (< , the last two
-    paired together = "inside the analyst range"). The GA can search: rating-only (today's
-    behavior, all four price gates OFF), price-only (signal gate OFF, e.g. "put even though
-    the rating still says buy" via price_high_above alone), any combination of the four price
-    gates together, or every gate off entirely.
+    Every gate except ``-flat`` is independently ``toggle_optimize=True``: ``-flat``
+    (``has_no_position``) is a correctness guard, not a strategy opinion, so the GA may not
+    switch it off. Op is fixed per gate — the GA's gene space only ever searches a condition's
+    threshold value and its enabled flag, never its operator (see
+    docs/plans/2026-07-21-options-price-target-conditions.md's "Design reference"). That is why
+    ``_iv_rank_gate`` and ``_iv_rv_gate`` are built PER MEMBER: their direction flips between
+    the debit and credit halves, and one shared leaf could only ever express one of the two.
 
-    The two SAME-FIELD pairs are parameterised as (floor, width>0) rather than two independent
-    absolute thresholds -- see ``_price_target_gates``, which is where the 25.8 % of
-    guaranteed-empty gene space (OPT-C5) and the inert high-target window (OPT-C12) were fixed.
+    SIGNAL STRENGTH is gated by ``_expected_profit_gate`` alone. It replaced four
+    ``price_vs_target_*`` gates on 2026-08-27; see the tombstone comment above
+    ``_iv_rank_gate`` for why those could never work under a non-FMPRating expert.
     """
     m = member.lower()
-    price_target_conditions = _price_target_gates(m)
     rule = {
         "id": f"{m}-entry",
         "name": f"{member}-entry",
@@ -3124,7 +3099,7 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
             _iv_rank_gate(m, member),
             _relative_volume_gate(m),
             _iv_rv_gate(m, member),
-            *price_target_conditions,
+            _expected_profit_gate(m),
         ]},
         "actions": [_option_entry_action_for(member)],
         "continue_processing": False,

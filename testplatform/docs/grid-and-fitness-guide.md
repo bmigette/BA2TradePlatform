@@ -177,31 +177,31 @@ free-form — there's no fixed vocabulary). Runs predating this feature (or that
 
 ---
 
-## 6. Options entry conditions: price-vs-analyst-target gates
+## 6. Options entry conditions: the signal-strength gate
 
-OS1/OS2/OS3 members can gate entries on where price sits relative to FMPRating's analyst
-price-target range, independent of the expert's own BUY/SELL/HOLD rating. Two `CompareCondition`
-fields drive this: `price_vs_target_low_percent = (current_price - target_low) / target_low * 100`
-and `price_vs_target_high_percent = (current_price - target_high) / target_high * 100` — positive
-means price is already above that estimate, negative means it's still below.
+Every pure-option member's entry rule carries one gate on how strong the expert's call is,
+`{m}-exp_profit` (`expected_profit_target_percent > X`, searched over 2–20 % with its own
+`enabled` gene). `ExpertRecommendation.expected_profit_percent` is **non-nullable**, so every
+expert produces it; `target_price` is nullable and derives from it when absent, so the two are
+the same signal.
 
-Because the GA's gene-space collector only ever optimizes a condition's `value` (via
-`value_min`/`value_max`) and `enabled` flag (via `toggle_optimize`), never its `op`, each field is
-wired as **two** fixed-direction gates per member so the GA can reach both comparison shapes:
+> **Removed 2026-08-27: the four `price_vs_target_*` gates.** Members used to also gate on where
+> price sat inside FMPRating's analyst target range, via `{m}-price_low_above` /
+> `{m}-price_low_below` / `{m}-price_high_above` / `{m}-price_high_below`. Those are gone.
+> `PriceVsTargetLowCondition` / `PriceVsTargetHighCondition` read
+> `expert_recommendation.data["FMPRating"]["target_low"|"target_high"]`, and **only FMPRating
+> writes that key** — so under any other expert all four failed CLOSED, and any genome that
+> switched one on traded nothing while spending 8 of ~28 genes per structure. The single
+> expert-independent `exp_profit` gate replaces them. The condition classes still exist in
+> `packages/common/ba2_common/core/TradeConditions.py` and can be wired into a rule by hand;
+> they are just no longer part of any grid's genome.
 
-- `{m}-price_low_below` (`price_vs_target_low_percent < X`) and `{m}-price_low_above`
-  (`price_vs_target_low_percent > X`)
-- `{m}-price_high_above` (`price_vs_target_high_percent > X`) and `{m}-price_high_below`
-  (`price_vs_target_high_percent < X`)
+The other entry gates on the same rule are `{m}-signal` (the expert's bullish/bearish flag),
+`{m}-flat` (`has_no_position` — a correctness guard, and the one leaf with no `enabled` gene),
+`{m}-gate_confidence`, `{m}-iv_rank`, `{m}-rel_volume` and `{m}-iv_rv`. `iv_rank` and `iv_rv`
+are built **per member** with the operator flipped between the debit and credit halves, because
+the GA's gene-space collector only ever optimizes a condition's `value` (via
+`value_min`/`value_max`) and its `enabled` flag (via `toggle_optimize`), never its `op` — one
+shared leaf could express only one of the two theses.
 
-Combining `price_low_above` + `price_high_below` reconstructs "price inside the analyst range"
-(useful for iron condors/strangles); `price_high_above` alone lets a bearish structure fire
-purely because price has already cleared the analyst's high estimate, regardless of the expert's
-own rating still saying BUY.
-
-Condition classes: `PriceVsTargetLowCondition`/`PriceVsTargetHighCondition` in
-`packages/common/ba2_common/core/TradeConditions.py`. Gate wiring: `_option_entry_rule()` in
-`testplatform/ba2test_launcher.py` (OS1/OS2/OS3 are defined in `tools/run_options_matrix.py`).
-A third field, `price_vs_target_consensus_percent` (vs. the median/consensus target,
-`PriceVsTargetConsensusCondition`), also exists but isn't wired into any strategy by default —
-it's a general-purpose primitive, available to wire into a specific member's rule by hand.
+Gate wiring: `_option_entry_rule()` in `testplatform/ba2test_launcher.py`.
