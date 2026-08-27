@@ -31,6 +31,7 @@ from app.models.strategy import Strategy
 from app.models.strategy_optimization import StrategyOptimization
 from app.services import strategy_optimization_handler as _soh
 from app.services import sync_client as _sync_client
+from app.services import worker_client as _worker_client
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -296,3 +297,75 @@ def test_persist_top_no_buffer_falls_back_to_full_rerun(monkeypatch):
 
     assert persisted == 1
     assert calls == ["TOP1-top-n-opt"]
+
+
+# --- remote-dispatch retry + local fallback (2026-08-27) --------------------------------------
+# Before this, a top-N re-run round-robined onto a remote worker got exactly one shot: any
+# failure (a leaked pool slot, a worker mid self-update returning 503, a dropped connection)
+# permanently dropped that rank -- goal2020 opt 361, 362, and 364 all lost top-N members this
+# way and had to be recovered by hand. _remote_then_local gives a transient remote failure one
+# retry, then falls back to running the trial directly rather than losing the rank.
+
+_FAKE_WORKER = {"id": 1, "name": "remote1", "url": "http://remote1:8100", "password": "x"}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_retry_backoff(monkeypatch):
+    """Every test here drives its own fake failures; a real sleep between retries would just
+    slow the suite down."""
+    monkeypatch.setattr(mod, "_REMOTE_RETRY_BACKOFF_S", 0.0)
+
+
+def test_remote_then_local_succeeds_on_first_try_no_fallback(monkeypatch):
+    calls = []
+    monkeypatch.setattr(_worker_client, "run_trial_full",
+                        lambda w, tc, fm: calls.append("remote") or {"ok": True, "results": {}})
+    monkeypatch.setattr(
+        _soh, "_persist_trial_worker",
+        lambda cfg: (_ for _ in ()).throw(AssertionError("must not fall back on first success")),
+    )
+
+    out = mod._remote_then_local(_FAKE_WORKER, {"name": "TOP1"}, "sharpe")
+
+    assert out == {"ok": True, "results": {}}
+    assert calls == ["remote"]
+
+
+def test_remote_then_local_retries_once_then_succeeds(monkeypatch):
+    attempts = []
+
+    def flaky(w, tc, fm):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise RuntimeError("503 Service Unavailable (worker mid self-update)")
+        return {"ok": True, "results": {"from": "retry"}}
+
+    monkeypatch.setattr(_worker_client, "run_trial_full", flaky)
+    monkeypatch.setattr(
+        _soh, "_persist_trial_worker",
+        lambda cfg: (_ for _ in ()).throw(AssertionError("must not fall back — retry succeeded")),
+    )
+
+    out = mod._remote_then_local(_FAKE_WORKER, {"name": "TOP1"}, "sharpe")
+
+    assert out == {"ok": True, "results": {"from": "retry"}}
+    assert len(attempts) == 2
+
+
+def test_remote_then_local_falls_back_after_two_remote_failures(monkeypatch):
+    attempts = []
+
+    def always_fails(w, tc, fm):
+        attempts.append(1)
+        raise RuntimeError("worker unreachable")
+
+    monkeypatch.setattr(_worker_client, "run_trial_full", always_fails)
+    monkeypatch.setattr(
+        _soh, "_persist_trial_worker",
+        lambda cfg: {"ok": True, "results": {"from": "local-fallback"}},
+    )
+
+    out = mod._remote_then_local(_FAKE_WORKER, {"name": "TOP1"}, "sharpe")
+
+    assert out == {"ok": True, "results": {"from": "local-fallback"}}
+    assert len(attempts) == 2, "must try remote exactly twice before falling back"

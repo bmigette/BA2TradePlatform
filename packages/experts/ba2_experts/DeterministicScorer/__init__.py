@@ -36,6 +36,7 @@ from ba2_common.core.types import (
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPApiKeyMixin
+from ba2_experts.analyst_target_model import estimate_price_target, fetch_estimator_inputs
 
 from . import data
 from . import explain
@@ -53,7 +54,7 @@ from .macro import (trend_score, vix_score, sahm_score, credit_score,
                     yield_curve_score, regime_composite, DEF_MW, DEF_YC_SCALE,
                     DEF_M_FLOOR, DEF_HARD_RISKOFF)
 from .combine import (final_score, schmitt_trigger, atr_target_price,
-                      atr_stop_price, confidence_from_score,
+                      atr_stop_price, resolve_target_price, confidence_from_score,
                       DEF_W_TECHNICAL, DEF_W_FUNDAMENTAL, DEF_W_ANALYST,
                       DEF_K_COMPRESS, DEF_THETA_BUY, DEF_THETA_SELL,
                       DEF_K_STOP, DEF_K_TARGET, DEF_VETO_CAP, DEF_W_EARNINGS)
@@ -283,6 +284,40 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
                          "description": "Profit target in ATR multiples"},
             "target_from_score": {"type": "bool", "required": False, "default": False,
                                   "description": "Stretch the target multiple up to +30% with |final score|"},
+            "use_model_target": {
+                "type": "bool", "required": False, "default": False,
+                "description": "BUY only: replace the ATR target price with "
+                               "ba2_experts.analyst_target_model's fundamentals-only "
+                               "price-target estimate (P/E x forward EPS) whenever it can "
+                               "compute one -- atr_target_price is pure price-volatility, "
+                               "unrelated to fundamental valuation. Falls back to the ATR "
+                               "target when the model can't compute one (insufficient "
+                               "estimate coverage, or an anchor P/E too extreme to be a real "
+                               "valuation). SELL/short target and the stop price are always "
+                               "ATR-based regardless of this setting -- the estimator is an "
+                               "intrinsically bullish valuation, there is no equivalent "
+                               "downside-target concept here. Default off.",
+            },
+            "model_target_method": {
+                "type": "str", "required": False, "default": "forward",
+                "choices": ["forward", "trailing"],
+                "description": "Only used when use_model_target=true. 'forward' anchors the "
+                               "P/E multiple on the nearest-FY consensus EPS estimate "
+                               "(unbiased on average, validated in "
+                               "test_files/probe_analyst_price_target_model.py); 'trailing' "
+                               "anchors on trailing TTM reported EPS (lower worst-case, "
+                               "persistent low bias). See ba2_experts.analyst_target_model's "
+                               "module docstring for the full validation writeup.",
+            },
+            "max_expected_profit_percent": {
+                "type": "float", "required": False, "default": 100.0,
+                "description": "Only used when use_model_target=true. Hard ceiling on the "
+                               "model's implied profit % (target capped at 2x price by "
+                               "default) -- a sane anchor P/E can still compound with a large "
+                               "following-period EPS growth estimate into an unrealistic "
+                               "multi-bagger target. Mirrors FMPEarningsDrift's "
+                               "max_expected_profit_percent (added after a live 3977% blowup).",
+            },
             # ---- data policy ----
             "min_history_days": {"type": "int", "required": False, "default": 260,
                                  "description": "Min OHLCV bars required (else SKIP)"},
@@ -309,6 +344,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         "vix_calm", "vix_stress", "yc_scale", "index_symbol",
         "atr_period", "k_stop", "k_target", "target_from_score",
         "min_history_days",
+        "use_model_target", "model_target_method", "max_expected_profit_percent",
     )
 
     # ------------------------------------------------------- backtest entry
@@ -327,6 +363,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         self._gather_w_analyst = float(settings.get("w_analyst", DEF_W_ANALYST) or 0.0)
         self._gather_w_earnings = float(settings.get("w_earnings", DEF_W_EARNINGS) or 0.0)
         self._gather_index_symbol = str(settings.get("index_symbol", data.INDEX_SYMBOL))
+        self._gather_use_model_target = bool(settings.get("use_model_target", False))
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, settings, as_of)
 
@@ -360,7 +397,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         if df is not None and not df.empty:
             current_price = float(df["Close"].iloc[-1])
 
-        return {
+        bundle = {
             "symbol": symbol,
             "ohlcv": df,
             "statements": statements,
@@ -371,6 +408,11 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             "index_closes": index_closes,
             "current_price": current_price,
         }
+        # Only fetch the model's inputs when use_model_target=true -- opt-in I/O, matching the
+        # default-off contract every other gate in this method already follows.
+        if bool(getattr(self, "_gather_use_model_target", False) or False):
+            bundle["estimator_inputs"] = fetch_estimator_inputs(providers, symbol, as_of)
+        return bundle
 
     # --------------------------------------------------------------- process
     def _process(self, data_bundle: Dict[str, Any], settings: Dict[str, Any],
@@ -460,7 +502,21 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         signal = signal_map[action]
 
         atr = tech.get("atr")
-        target_price = atr_target_price(current_price, atr, action, settings, final) \
+        # ba2_experts.analyst_target_model (opt-in, default off): atr_target_price is pure
+        # price-volatility (+/- k * ATR) -- unrelated to fundamental valuation,
+        # DeterministicScorer's own "less accurate way of calculating... target price".
+        # resolve_target_price enforces BUY-only for the model leg; stop price is ALWAYS
+        # ATR-based regardless of this setting (risk management, not valuation).
+        model_target_price = None
+        if action == "BUY" and bool(settings.get("use_model_target", False)):
+            model_out = estimate_price_target(
+                data_bundle.get("estimator_inputs") or {}, current_price=current_price,
+                method=str(settings.get("model_target_method", "forward")),
+                max_expected_profit_percent=float(settings.get("max_expected_profit_percent", 100.0)))
+            if model_out is not None:
+                model_target_price = model_out["target_price"]
+        target_price = resolve_target_price(
+            current_price, atr, action, settings, final, model_target_price) \
             if action in ("BUY", "SELL") else None
         stop_price = atr_stop_price(current_price, atr, action, settings) \
             if action in ("BUY", "SELL") else None
@@ -808,6 +864,7 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             self._gather_w_analyst = float(settings.get("w_analyst", 0.0) or 0.0)
             self._gather_w_earnings = float(settings.get("w_earnings", 0.0) or 0.0)
             self._gather_index_symbol = str(settings.get("index_symbol", "SPY"))
+            self._gather_use_model_target = bool(settings.get("use_model_target", False))
 
             providers = self._live_providers()
             bundle = self._gather(providers, as_of=None)

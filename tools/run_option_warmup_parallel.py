@@ -128,15 +128,23 @@ def main():
         chunk_file = rf"{REPO}\tools\_wu_chunk_{i}.txt"
         with open(chunk_file, "w", encoding="utf-8") as f:
             f.write("\n".join(chunk) + "\n")
+        # worker_N.log is the tool's OWN bounded, rotating progress/retry/error log (--log-file:
+        # 10 MiB x 5 backups = 50 MiB ceiling per worker). worker_N.stderr.log is the raw
+        # stdout/stderr pipe -- a thin safety net that only ever holds an uncaught-exception
+        # traceback or the Ctrl-C message, since --log-file takes over everything routine.
+        # Before --log-file existed, THIS raw pipe caught the tastytrade SDK's own DEBUG
+        # wire-trace (one line per websocket frame) with no bound at all -- 1-1.7 GB per
+        # worker within a day. Never point subprocess stdout at an unrotated file again.
+        log_file = rf"{LOG_DIR}\worker_{i}.log"
+        stderr_file = rf"{LOG_DIR}\worker_{i}.stderr.log"
         argv = [PY, SCRIPT, "--symbols-file", chunk_file, "--db", PROD_DB, "--account-id", "2",
-               "--batch-size", str(args.batch_size)]
+               "--batch-size", str(args.batch_size), "--log-file", log_file]
         if args.dry_run:
             argv.append("--dry-run")
         if args.limit:
             argv += ["--limit", str(args.limit)]
-        log_file = rf"{LOG_DIR}\worker_{i}.log"
-        print(f"  worker {i}: {len(chunk)} symbols -> {log_file}")
-        f_out = open(log_file, "a", encoding="utf-8", errors="replace")
+        print(f"  worker {i}: {len(chunk)} symbols -> {log_file} (stderr: {stderr_file})")
+        f_out = open(stderr_file, "a", encoding="utf-8", errors="replace")
         p = subprocess.Popen(argv, stdout=f_out, stderr=subprocess.STDOUT, cwd=REPO)
         procs.append((p, f_out, log_file))
         time.sleep(2)  # stagger session creation slightly

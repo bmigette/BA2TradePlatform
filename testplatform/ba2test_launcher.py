@@ -1133,8 +1133,24 @@ _EXPERT_OPT = {
             # fixed at the class default); 'dynamic' scales expected_profit up with how far
             # the EPS surprise exceeds surprise_min_pct. dynamic_scale=0 makes 'dynamic'
             # numerically identical to 'static', so the GA can freely discover either.
-            "expected_profit_mode": {"optimize": True, "type": "choice", "choices": ["static", "dynamic"]},
+            # 2026-08-27: 'model' added (ba2_experts.analyst_target_model, commit a30794ac) --
+            # a fundamentals-only P/E x forward-EPS price target, replacing the surprise
+            # heuristic when selected. Falls back to 'static' behaviour whenever the model
+            # can't compute an estimate, so this is always safe for the GA to pick.
+            "expected_profit_mode": {"optimize": True, "type": "choice",
+                                     "choices": ["static", "dynamic", "model"]},
             "dynamic_scale": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
+            # 2026-08-26 addition: a real earnings beat against a near-zero/negative analyst
+            # estimate (surprise_pct's denominator) produces a mathematically-correct but
+            # meaningless surprise -- e.g. reported 0.76 vs estimated -0.04 is a genuine beat,
+            # but "2000% surprise" is not a number 'dynamic' mode should scale a price target
+            # from. Hit live 2026-08-26 (instance 6, SA): expected_profit_percent=3977%,
+            # unreachable and distorting order-priority scoring against every other candidate
+            # (TradeRiskManagement.compute_order_priority_score is weighted by it directly).
+            # Range 20-500: below the GA's own expected_profit_percent ceiling (20) the cap
+            # would silently override 'static' mode's own tuned value, which defeats the point.
+            "max_expected_profit_percent": {"optimize": True, "min": 20.0, "max": 500.0,
+                                            "step": 20.0, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },
@@ -1142,6 +1158,19 @@ _EXPERT_OPT = {
         "expert_params": {
             "lookback_days": {"optimize": True, "min": 30, "max": 120, "step": 15, "type": "int"},
             "min_insiders": {"optimize": True, "min": 2, "max": 6, "step": 1, "type": "int"},
+            # 2026-08-27 addition (ba2_experts.analyst_target_model, commit a30794ac): this
+            # expert's expected_profit_percent was previously a flat, never-GA-tuned constant --
+            # 'model' replaces it with a fundamentals-only P/E x forward-EPS estimate, falling
+            # back to the flat value whenever the model can't compute one. No 'dynamic' mode
+            # exists for this expert (that's FMPEarningsDrift-specific, keyed on EPS-surprise
+            # magnitude, which this expert doesn't have).
+            "expected_profit_mode": {"optimize": True, "type": "choice",
+                                     "choices": ["static", "model"]},
+            # Same range and rationale as FMPEarningsDrift's cap of the same name (added after
+            # a live 3977% blowup there): a sane anchor P/E can still compound with a large
+            # following-period EPS growth estimate into an unrealistic multi-bagger target.
+            "max_expected_profit_percent": {"optimize": True, "min": 20.0, "max": 500.0,
+                                            "step": 20.0, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },
@@ -3826,6 +3855,38 @@ def _cmd_optimize_batch(args) -> int:
     return 0
 
 
+# How long to wait before the ONE retry in _remote_then_local. Short: the failure this covers
+# (a worker mid self-update returning 503 for its still-restarting endpoints, or a dropped
+# connection) typically clears within seconds, not minutes.
+_REMOTE_RETRY_BACKOFF_S = 5.0
+
+
+def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]:
+    """Try *worker* for a top-N re-run, retrying once after a short backoff, then fall back to
+    running the trial directly (the same path a "local" slot uses) rather than permanently
+    losing this rank.
+
+    Before this, a remote-dispatched top-N re-run got exactly one shot: a leaked pool slot
+    (opt 361/362) or a worker mid self-update returning 503 for its still-restarting endpoints
+    (opt 364) both silently dropped that rank, and someone had to notice the gap and recover it
+    by hand. Both were transient -- a retry a few seconds later, or falling back to a box that's
+    definitely not restarting, gets the row on the first attempt instead."""
+    import time
+    from app.services.strategy_optimization_handler import _persist_trial_worker
+    from app.services.worker_client import run_trial_full
+    last_exc: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            return run_trial_full(worker, trial_cfg, fitness_metric)
+        except Exception as e:  # noqa: BLE001 -- transient remote failure; retry/fallback below
+            last_exc = e
+            if attempt == 0:
+                print(f"    remote {worker.get('name')} failed ({e!r}); retrying once...")
+                time.sleep(_REMOTE_RETRY_BACKOFF_S)
+    print(f"    remote {worker.get('name')} failed twice ({last_exc!r}); falling back to local")
+    return _persist_trial_worker(trial_cfg)
+
+
 def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1,
                             last_gen_full_results: Optional[Dict[str, Any]] = None) -> int:
     """Re-run the optimization's TOP-N distinct param sets and persist each as a tagged,
@@ -4016,7 +4077,6 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             from app.services.strategy_optimization_handler import (
                 _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
             )
-            from app.services.worker_client import run_trial_full
             env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
             fitness_metric = opt.fitness_metric or "consistent_annual_return"
             print(f"    persisting top {len(specs)} across {n_local} local + "
@@ -4033,7 +4093,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 for idx, (rk, tc, sp2) in enumerate(specs):
                     slot = slots[idx % len(slots)]
                     fut = (local_ex.submit(_persist_trial_worker, tc) if slot == "local"
-                           else remote_ex.submit(run_trial_full, slot, tc, fitness_metric))
+                           else remote_ex.submit(_remote_then_local, slot, tc, fitness_metric))
                     futs[fut] = (rk, tc, sp2)
                 for fut in as_completed(futs):
                     rk, tc, sp2 = futs[fut]

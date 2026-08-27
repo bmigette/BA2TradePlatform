@@ -655,3 +655,81 @@ def test_a_bad_symbols_discovery_failure_does_not_abort_the_rest_of_the_run(
     assert "AAPL" in plan.per_symbol
     for e in EXPIRIES:
         assert store.partition_state("AAPL", e, START, END) is PartitionState.COMPLETE
+
+
+# --------------------------------------------------------------------------- #
+# --log-file (2026-08-26: worker logs hit 1-1.7 GB each within a day -- almost entirely the
+# tastytrade SDK's own DEBUG wire-trace, not this tool's own progress lines)
+# --------------------------------------------------------------------------- #
+def test_log_file_receives_this_tools_own_progress_lines(provider, store, tmp_path):
+    import logging
+
+    log_path = str(tmp_path / "worker_0.log")
+    clock = FakeClock()
+    rc = warm.main(
+        ["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+         "--rate-limit", "0", "--discovery", "rest", "--log-file", log_path],
+        provider=provider, store=store, clock=clock, sleep=lambda s: clock.advance(s))
+    assert rc == 0
+    assert os.path.exists(log_path)
+    with open(log_path, encoding="utf-8") as f:
+        content = f.read()
+    assert "done:" in content  # the final summary line, via the injected log()
+
+    # The handler created for this run must not linger and keep writing into a closed test
+    # temp dir on the NEXT test that reuses the same logger name / file path.
+    logging.getLogger(f"warm_options_history.{log_path}").handlers.clear()
+
+
+def test_no_log_file_falls_back_to_the_injected_log_or_print(provider, store):
+    """Explicit ``log=`` (what every other test in this file relies on) must still win over
+    stdout even when --log-file is not passed -- CLI-only behaviour is opt-in, not forced."""
+    rc, lines = _run(provider, store)
+    assert rc == 0
+    assert any("done:" in l for l in lines)
+
+
+def test_the_vendor_debug_logger_is_capped_regardless_of_log_file(provider, store):
+    """tastytrade/__init__.py sets its OWN logger to DEBUG at import time; streamer.py then logs
+    every raw websocket frame at that level. Left alone, a single busy expiry emits thousands of
+    records -- the actual source of the multi-GB/day worker logs, not this tool's own (sparse)
+    progress/retry lines. This must be capped on every run, not just when --log-file is used."""
+    import logging
+
+    logging.getLogger("tastytrade").setLevel(logging.DEBUG)  # simulate the SDK's import-time set
+    rc, _lines = _run(provider, store)
+    assert rc == 0
+    assert logging.getLogger("tastytrade").level == logging.WARNING
+
+
+def test_the_vendor_debug_cap_survives_the_sdks_own_lazy_import(provider, store):
+    """Regression for the 2026-08-26 fix-that-didn't-fix-it: a live relaunch with the FIRST
+    version of this cap kept emitting DEBUG spam, because tastytrade/__init__.py's
+    logger.setLevel(DEBUG) runs the first time ANYTHING imports the package -- and our own
+    provider wrapper does that LAZILY, deep inside the actual streaming call (only reached once
+    a unit opens a socket), i.e. AFTER a setLevel(WARNING) placed early in main() had already
+    run. That later, SDK-owned setLevel(DEBUG) silently overwrote the early cap.
+
+    First prove the mechanism is real (cap-then-import loses); then prove main()'s own ordering
+    (import-then-cap) survives a later re-import exactly the way the real streaming call would
+    trigger it."""
+    import logging
+    import sys
+
+    sys.modules.pop("tastytrade", None)  # simulate: never yet imported in this process
+
+    # The FIRST (broken) fix: cap before the SDK's own (lazy, later) import ever runs.
+    logging.getLogger("tastytrade").setLevel(logging.WARNING)
+    import tastytrade  # noqa: F401 -- exactly what ba2_providers' lazy `from tastytrade import
+    # DXLinkStreamer` does the first time a unit actually streams
+    assert logging.getLogger("tastytrade").level == logging.DEBUG, (
+        "if this fails, the SDK no longer sets DEBUG at import time and the ordering bug this "
+        "test guards no longer applies -- the fix in main() could be simplified")
+
+    # main()'s actual ordering: import the SDK itself FIRST (forcing its one-time init to run
+    # now), cap SECOND. A later re-import (this test's own `import tastytrade` above, or the
+    # real streaming call) is then a sys.modules cache hit -- __init__.py does not re-run, so
+    # the cap sticks for the rest of the process.
+    rc, _lines = _run(provider, store)
+    assert rc == 0
+    assert logging.getLogger("tastytrade").level == logging.WARNING

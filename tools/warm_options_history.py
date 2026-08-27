@@ -36,12 +36,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sqlite3
 import sys
 import time as _time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from logging.handlers import RotatingFileHandler
 from typing import Callable, Dict, List, Optional, Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -164,7 +166,31 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--db", help="Read-only sqlite path to load TastyTrade credentials from "
                                 "when the environment does not supply them.")
     p.add_argument("--account-id", type=int, help="Account row id inside --db.")
+    p.add_argument("--log-file",
+                   help="Write progress/retry/error lines to this path via a bounded "
+                        "RotatingFileHandler instead of stdout. Use this (not shell "
+                        "redirection) for a long unattended run: plain redirection lets the "
+                        "vendor library's own DEBUG wire-trace (one record per websocket "
+                        "frame -- gigabytes/day on a busy chain) grow the file forever.")
+    p.add_argument("--log-max-bytes", type=int, default=10 * 1024 * 1024,
+                   help="Rotate --log-file after this many bytes (default 10 MiB).")
+    p.add_argument("--log-backups", type=int, default=5,
+                   help="How many rotated --log-file backups to keep (default 5).")
     return p.parse_args(list(argv) if argv is not None else None)
+
+
+def _configure_rotating_log(path: str, max_bytes: int, backups: int) -> Callable[[str], None]:
+    """A ``log(msg)`` callable that writes to a bounded, rotating file instead of stdout."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    file_logger = logging.getLogger(f"warm_options_history.{path}")
+    file_logger.setLevel(logging.INFO)
+    file_logger.propagate = False
+    file_logger.handlers.clear()
+    handler = RotatingFileHandler(path, maxBytes=max_bytes, backupCount=backups,
+                                  encoding="utf-8", delay=True)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    file_logger.addHandler(handler)
+    return file_logger.info
 
 
 def resolve_symbols(ns: argparse.Namespace) -> List[str]:
@@ -577,7 +603,27 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
     ns = parse_args(argv)
     clock = clock or (lambda: datetime.now(timezone.utc))
     sleep = sleep or _time.sleep
-    log = log or print
+
+    # The tastytrade SDK sets its OWN logger to DEBUG at import time (tastytrade/__init__.py) and
+    # streamer.py logs every raw websocket frame at that level -- one record per contract per
+    # candle. That import-time setLevel(DEBUG) runs exactly ONCE per process, the first time
+    # anything does `import tastytrade` -- and our own provider wrapper does that LAZILY, deep
+    # inside the streaming call (ba2_providers/options/tastytrade.py's `from tastytrade import
+    # DXLinkStreamer`, only reached once a unit actually opens a socket). A setLevel(WARNING)
+    # placed here alone runs BEFORE that lazy import ever fires, so the SDK's own DEBUG setting
+    # -- applied later, on first stream -- silently overwrites it (confirmed live: DEBUG spam
+    # kept flowing after the "fix" that didn't force this ordering). Import the SDK ourselves
+    # FIRST so its one-time init has already happened, then cap it -- guaranteeing our override
+    # is the one that sticks, regardless of when streaming actually starts.
+    try:
+        import tastytrade as _tastytrade_sdk  # noqa: F401 -- imported only to force its __init__
+    except ImportError:  # pragma: no cover - sdk not installed; nothing to cap
+        pass
+    logging.getLogger("tastytrade").setLevel(logging.WARNING)
+
+    if log is None:
+        log = _configure_rotating_log(ns.log_file, ns.log_max_bytes, ns.log_backups) \
+            if ns.log_file else print
 
     symbols = resolve_symbols(ns)
     if not symbols:

@@ -429,6 +429,106 @@ def test_backtest_pins_analyst_weight_and_index_from_settings():
 
 
 # --------------------------------------------------------------------------- #
+# use_model_target (ba2_experts.analyst_target_model, opt-in, default off) -- mirrors the
+# w_analyst/index_symbol gather-time-pinning pattern directly above.
+# --------------------------------------------------------------------------- #
+def test_backtest_pins_use_model_target_from_settings():
+    from ba2_common.core.backtest_context import BacktestContext
+
+    e = DeterministicScorer.__new__(DeterministicScorer)
+    e.id = 1
+    e._gather_symbol = "AAPL"
+    captured = {}
+
+    def _fake_gather(providers, as_of):
+        captured["use_model_target"] = getattr(e, "_gather_use_model_target", None)
+        return {"symbol": "AAPL", "ohlcv": None, "current_price": None,
+                "statements": {}, "grades_rows": [], "macro_inputs": {},
+                "index_closes": None}
+
+    e._gather = _fake_gather
+    ctx = BacktestContext(providers=None, settings={"use_model_target": True},
+                          extra={"symbol": "AAPL"})
+    e.analyze_as_of(NOW, ctx)
+    assert captured["use_model_target"] is True
+
+
+def test_backtest_use_model_target_defaults_false():
+    from ba2_common.core.backtest_context import BacktestContext
+
+    e = DeterministicScorer.__new__(DeterministicScorer)
+    e.id = 1
+    e._gather_symbol = "AAPL"
+    captured = {}
+
+    def _fake_gather(providers, as_of):
+        captured["use_model_target"] = getattr(e, "_gather_use_model_target", None)
+        return {"symbol": "AAPL", "ohlcv": None, "current_price": None,
+                "statements": {}, "grades_rows": [], "macro_inputs": {},
+                "index_closes": None}
+
+    e._gather = _fake_gather
+    ctx = BacktestContext(providers=None, settings={}, extra={"symbol": "AAPL"})
+    e.analyze_as_of(NOW, ctx)
+    assert captured["use_model_target"] is False
+
+
+def test_gather_fetches_estimator_inputs_only_when_use_model_target_is_on():
+    """Opt-in I/O: _gather must never call fetch_estimator_inputs (which itself calls
+    get_past_earnings/get_earnings_estimates) unless use_model_target is set."""
+    import pandas as pd
+
+    e = DeterministicScorer.__new__(DeterministicScorer)
+    e.id = 1
+    e._gather_symbol = "AAPL"
+    e._gather_w_analyst = 0.0
+    e._gather_w_earnings = 0.0
+    e._gather_index_symbol = "SPY"
+
+    class ExplodingDetails:
+        def get_past_earnings(self, *a, **k):
+            raise AssertionError("get_past_earnings called even though use_model_target=False")
+
+        def get_earnings_estimates(self, *a, **k):
+            raise AssertionError("get_earnings_estimates called even though use_model_target=False")
+
+        def get_balance_sheet(self, *a, **k):
+            return {"statements": []}
+
+        def get_income_statement(self, *a, **k):
+            return {"statements": []}
+
+        def get_cashflow_statement(self, *a, **k):
+            return {"statements": []}
+
+    class FakeOHLCV:
+        def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d"):
+            return pd.DataFrame({"Close": [100.0]})
+
+    class FakeMacro:
+        def get_indicator_data(self, *a, **k):
+            return None
+
+    def _get_provider(cat, name, **kw):
+        return {"fundamentals_details": ExplodingDetails(), "ohlcv": FakeOHLCV(),
+                "indicators": FakeMacro()}.get(cat)
+
+    from ba2_common.core.backtest_context import LiveProviderBundle
+    providers = LiveProviderBundle(_get_provider)
+
+    # use_model_target OFF (default): must not blow up on the exploding fakes.
+    e._gather_use_model_target = False
+    bundle = e._gather(providers, as_of=NOW)
+    assert "estimator_inputs" not in bundle
+
+    # use_model_target ON: now the exploding fake IS reached -- prove it's actually wired,
+    # not merely untested, by asserting the AssertionError surfaces.
+    e._gather_use_model_target = True
+    with pytest.raises(AssertionError, match="get_past_earnings called"):
+        e._gather(providers, as_of=NOW)
+
+
+# --------------------------------------------------------------------------- #
 # MINEURS - crash guards on GA/UI-reachable parameter combinations.
 # --------------------------------------------------------------------------- #
 def test_fundamentals_max_age_spans_a_full_annual_filing_cycle():

@@ -40,6 +40,7 @@ from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin
 from ba2_experts.earnings_surprise import surprise_percent as _surprise_percent
+from ba2_experts.analyst_target_model import estimate_price_target, fetch_estimator_inputs
 from ba2_providers.cache.cached_get import past_earnings_get
 from ba2_providers.fmp_common import TTLCache, fmp_list_call
 from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
@@ -210,11 +211,29 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
             },
             "expected_profit_mode": {
                 "type": "str", "required": False, "default": "static",
-                "choices": ["static", "dynamic"],
+                "choices": ["static", "dynamic", "model"],
                 "description": "'static': every BUY gets the flat expected_profit_percent. "
                                "'dynamic': expected_profit_percent scales up with how far the "
                                "EPS surprise exceeds surprise_min_pct (see dynamic_scale). "
-                               "dynamic_scale=0 makes 'dynamic' numerically identical to 'static'.",
+                               "dynamic_scale=0 makes 'dynamic' numerically identical to 'static'. "
+                               "'model': expected_profit_percent comes from "
+                               "ba2_experts.analyst_target_model's fundamentals-only price-target "
+                               "estimator (P/E x forward EPS) instead of the surprise heuristic -- "
+                               "falls back to the flat expected_profit_percent whenever the model "
+                               "can't compute one (insufficient estimate coverage, or the implied "
+                               "P/E is too extreme to be a real valuation). See "
+                               "model_target_method. Default off (static).",
+            },
+            "model_target_method": {
+                "type": "str", "required": False, "default": "forward",
+                "choices": ["forward", "trailing"],
+                "description": "Only used when expected_profit_mode='model'. 'forward' anchors "
+                               "the P/E multiple on the nearest-FY consensus EPS estimate "
+                               "(unbiased on average, validated in "
+                               "test_files/probe_analyst_price_target_model.py); 'trailing' "
+                               "anchors on trailing TTM reported EPS (lower worst-case, "
+                               "persistent low bias). See ba2_experts.analyst_target_model's "
+                               "module docstring for the full validation writeup.",
             },
             "dynamic_scale": {
                 "type": "float", "required": False, "default": 0.0,
@@ -222,6 +241,23 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
                                "per 1 point the EPS surprise exceeds surprise_min_pct: "
                                "expected_profit = expected_profit_percent + dynamic_scale * "
                                "max(0, surprise_pct - surprise_min_pct). Ignored in 'static' mode.",
+            },
+            "max_expected_profit_percent": {
+                "type": "float", "required": False, "default": 100.0,
+                "description": "Hard ceiling on expected_profit_percent, applied after "
+                               "static/dynamic/model computation, all three modes. Exists because "
+                               "surprise_pct's denominator is the CONSENSUS ESTIMATE, and a "
+                               "real earnings beat against a near-zero (or negative) estimate "
+                               "produces a mathematically-correct but meaningless surprise -- "
+                               "e.g. reported 0.76 vs estimated -0.04 is a genuine beat, but "
+                               "'2000% surprise' is not a number 'dynamic' mode should be free "
+                               "to scale a price target from. Without this cap that 2026-08-26 "
+                               "case reached a 3977% expected_profit_percent live (instance 6, "
+                               "SA) -- expected_profit_percent feeds both the expert's own "
+                               "target price (TradeActions/TradeConditions) and order-priority "
+                               "scoring (TradeRiskManagement.compute_order_priority_score), so "
+                               "an uncapped blowup distorts capital allocation across every "
+                               "other candidate too, not just this symbol's unreachable TP.",
             },
         }
 
@@ -233,7 +269,8 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
     # code path; with as_of=None the fetch is byte-identical to the live path.
     # ------------------------------------------------------------------
     _SETTING_KEYS = ("surprise_min_pct", "max_days_since_report", "expected_profit_percent",
-                      "expected_profit_mode", "dynamic_scale")
+                      "expected_profit_mode", "dynamic_scale", "max_expected_profit_percent",
+                      "model_target_method")
 
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         symbol = self._gather_symbol
@@ -278,7 +315,14 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
         current_price = (self._get_current_price(symbol) if as_of is None
                          else providers.price_at_date(symbol, as_of))
-        return {"latest_earnings": latest, "current_price": current_price, "symbol": symbol}
+        bundle = {"latest_earnings": latest, "current_price": current_price, "symbol": symbol}
+        # Only fetch the model's inputs when expected_profit_mode='model' -- avoids the extra
+        # I/O (and disk-cache pressure) on every other run, matching the opt-in/default-off
+        # contract. Resolved before _gather by run_analysis/analyze_as_of, mirroring
+        # _gather_max_days_since_report.
+        if getattr(self, "_gather_expected_profit_mode", "static") == "model":
+            bundle["estimator_inputs"] = fetch_estimator_inputs(providers, symbol, as_of)
+        return bundle
 
     def _process(self, data_bundle: Dict[str, Any], settings: Dict[str, Any],
                  as_of: Optional[datetime] = None) -> Recommendation:
@@ -291,16 +335,38 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
         # them, unlike the required settings above which fail loud on a missing key.
         expected_profit_mode = str(settings.get("expected_profit_mode", "static"))
         dynamic_scale = float(settings.get("dynamic_scale", 0.0))
+        max_expected_profit = float(settings.get("max_expected_profit_percent", 100.0))
+        model_target_method = str(settings.get("model_target_method", "forward"))
         result = evaluate_earnings_drift(data_bundle["latest_earnings"], now, surprise_min, max_days)
 
         if result["is_signal"]:
-            if expected_profit_mode == "dynamic" and result["surprise_pct"] is not None:
+            if expected_profit_mode == "model":
+                # ba2_experts.analyst_target_model: fundamentals-only P/E x forward-EPS estimate,
+                # reusing the SAME max_expected_profit_percent cap as static/dynamic below (one
+                # setting, all three modes) rather than a second duplicate cap setting. Falls
+                # back to the flat expected_profit_base whenever the model can't compute one
+                # (thin estimate coverage, or an anchor P/E too extreme to be a real valuation)
+                # -- a BUY must still carry a usable profit number.
+                model_out = estimate_price_target(
+                    data_bundle.get("estimator_inputs") or {}, current_price=data_bundle["current_price"],
+                    method=model_target_method, max_expected_profit_percent=max_expected_profit)
+                expected_profit = (model_out["expected_profit_percent"] if model_out is not None
+                                   else expected_profit_base)
+            elif expected_profit_mode == "dynamic" and result["surprise_pct"] is not None:
                 # dynamic_scale=0 is numerically identical to 'static' -- the excess-surprise
                 # bonus vanishes and expected_profit collapses to expected_profit_base.
                 excess_surprise = max(0.0, float(result["surprise_pct"]) - surprise_min)
                 expected_profit = expected_profit_base + dynamic_scale * excess_surprise
             else:
                 expected_profit = expected_profit_base
+            # HARD CEILING, all three modes ('model' already applied it above, but a plain min()
+            # is idempotent so this stays the single source of truth for static/dynamic).
+            # surprise_pct's denominator is the analyst estimate, and a genuine beat against a
+            # near-zero/negative estimate produces a mathematically-correct but meaningless
+            # surprise (see max_expected_profit_percent's own docstring for the live incident
+            # this guards against) -- 'dynamic' must not be free to scale a price target off that
+            # number, and a misconfigured flat 'static' value is capped too.
+            expected_profit = min(expected_profit, max_expected_profit)
             signal, confidence, expected = OrderRecommendation.BUY, result["confidence"], expected_profit
         else:
             signal, confidence, expected = OrderRecommendation.HOLD, 10.0, 0.0
@@ -340,6 +406,7 @@ Confidence: {confidence:.1f}%
         pattern as FMPRating/FMPInsiderClusterBuy/DeterministicScorer)."""
         self._gather_symbol = context.extra.get("symbol", getattr(self, "_gather_symbol", None))
         self._gather_max_days_since_report = int(context.settings["max_days_since_report"])
+        self._gather_expected_profit_mode = context.settings.get("expected_profit_mode", "static")
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, context.settings, as_of)
 
@@ -440,6 +507,7 @@ Confidence: {confidence:.1f}%
             settings = self._resolve_settings(self._SETTING_KEYS)
             self._gather_symbol = symbol
             self._gather_max_days_since_report = settings["max_days_since_report"]
+            self._gather_expected_profit_mode = settings.get("expected_profit_mode", "static")
             providers = self._live_providers()
             bundle = self._gather(providers, as_of=None)
             if not bundle.get("current_price"):

@@ -49,7 +49,7 @@ import os
 import random
 import sys
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 
 _BACKEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                              "testplatform", "backend")
@@ -603,6 +603,228 @@ def check_senate_skill_score_coverage(cache_folder: str, start: str, end: str) -
     }
 
 
+def _default_options_universe_path() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "options_universe_large_cap.txt")
+
+
+def _read_symbol_list(path: str) -> List[str]:
+    if not os.path.isfile(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [ln.strip().upper() for ln in f if ln.strip() and not ln.startswith("#")]
+
+
+def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15,
+                         shallow_expiries_threshold: int = 3,
+                         gap_start: Optional[str] = None, gap_end: Optional[str] = None) -> dict:
+    """Coverage + non-triviality of the TastyTrade options parquet store
+    (``tools/warm_options_history.py``'s target, ``CACHE_FOLDER/TastyTradeOptionsProvider``).
+
+    Four things, none of which the other checks in this file touch (options data is entirely
+    outside push_cache's OHLCV/metric_store sync and outside the fmp_history warm-cache checks):
+
+    1. UNIVERSE COVERAGE: for each symbol in the target universe (default
+       ``tools/options_universe_large_cap.txt``, the same list ``run_option_warmup_parallel.py``
+       warms), whether it has at least one COMPLETED (underlying, expiry) manifest -- NOT just a
+       directory. A directory alone is created the moment a symbol's chunk starts, before
+       anything actually finishes, so counting it as "present" would call a symbol whose worker
+       died mid-first-fetch "covered". Separately reports symbols the store has data for that
+       AREN'T in the current universe file (harmless -- e.g. a symbol dropped from the universe
+       after already being warmed, like the punctuation-ticker cleanup in warm_options_history.py)
+       so that never reads as a coverage gap.
+
+    2. PER-SYMBOL DEPTH: symbols WITH at least one completed partition but very few of them -- a
+       stalled/interrupted worker chunk (see ``run_option_warmup_parallel.py``'s crash/reboot
+       recovery) or a symbol that genuinely has a thin chain, indistinguishable from a directory
+       listing alone. Symbols with ZERO completed partitions are reported separately (as
+       "started, nothing finished yet"), not folded into this bucket -- they're a different
+       situation (in flight or dead) from "finished a few, needs more".
+
+    3. IV/OPEN_INTEREST/VOLUME NON-NULL RATE (sampled, from symbols that actually have data): the
+       entire reason this store exists over the incumbent options_history.sqlite is that
+       ``imp_volatility``/``open_interest`` were NULL across all 6,757,055 of ITS rows (see
+       parquet_store.py's COLUMNS docstring and warm_options_history.py's module docstring). A
+       silently-regressed fetch that stopped populating these fields would pass every other check
+       here (files exist, non-empty, right shape) while quietly reproducing the exact defect this
+       pipeline was built to fix. ``open``/``high``/``low``/``close`` are NOT sampled here: they
+       are written via ``float(bar.open)`` etc in ``parquet_store._frame`` (see there), which
+       raises at write time rather than persisting a null, so a column-complete partition can
+       only ever have those four columns fully populated -- sampling them would always report
+       100% and catch nothing a "does the partition exist" check doesn't already catch.
+
+    4. EXPIRY GAPS (every symbol with data, not sampled -- this is cheap: directory listing +
+       date arithmetic, no parquet reads): ``--discovery synthetic`` (the default, and the only
+       mode a personal OAuth app can use -- see warm_options_history.py) plans to fetch EVERY
+       Friday in the window (``expiry_calendar``), so that is the oracle. A Friday with a
+       manifest -- COMPLETE *or* EMPTY, a holiday-shifted Friday genuinely has no chain and is
+       recorded as such -- is not a gap; a Friday with NO manifest at all inside the SPAN the
+       symbol has otherwise already reached (strictly between its earliest and latest completed
+       expiry) means that unit was queued and never finished: a worker chunk that died mid-run,
+       or a resume that somehow skipped it. Fridays outside that span are a coverage/"shallow"
+       question (the symbol just hasn't caught up yet), not a gap in the middle of finished work,
+       so they are deliberately excluded here to keep this signal specific.
+
+    Returns ``{universe_size, covered, zero_partitions: [...], never_started: [...],
+    extra_not_in_universe: [...], shallow: {symbol: n_expiries}, total_partitions,
+    iv_sample: {...}, gaps: {symbol: [missing_expiry_iso, ...]}, gap_window: [start, end]}``.
+    """
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+    from ba2_providers.options.tastytrade import expiry_calendar
+    from datetime import date
+
+    store = OptionHistoryParquetStore()
+    universe_path = universe_path or _default_options_universe_path()
+    universe = set(_read_symbol_list(universe_path))
+    present_dirs = set(store.underlyings())
+
+    # completed_expiries() is the ground truth ("has real data"), not underlyings() ("has a
+    # directory") -- computed once per present symbol and reused for every category below.
+    per_symbol_expiries = {sym: len(store.completed_expiries(sym)) for sym in sorted(present_dirs)}
+    with_data = {sym for sym, n in per_symbol_expiries.items() if n > 0}
+    total_partitions = sum(per_symbol_expiries.values())
+
+    covered = sorted(universe & with_data) if universe else sorted(with_data)
+    zero_partitions = sorted(universe & (present_dirs - with_data)) if universe else []
+    never_started = sorted(universe - present_dirs) if universe else []
+    extra_not_in_universe = sorted(present_dirs - universe) if universe else []
+    shallow = {sym: n for sym in (universe & with_data if universe else with_data)
+              if (n := per_symbol_expiries[sym]) < shallow_expiries_threshold}
+
+    # IV/open_interest non-null rate, sampled from symbols that actually HAVE data -- sampling
+    # from present_dirs would waste slots on the zero-partition case above (nothing to read).
+    # Reading every symbol's full history here would be as slow as the fetch itself; a random
+    # sample (seeded, so a re-run is comparable) is enough to catch a systemic regression (every
+    # row null) vs. normal sparse-quote NaNs.
+    iv_res = {"sampled": 0, "rows": 0, "iv_nonnull_pct": None, "oi_nonnull_pct": None,
+              "volume_nonnull_pct": None, "unreadable": []}
+    pool = sorted(with_data)
+    sample_syms = pool if len(pool) <= iv_sample else random.Random(1337).sample(pool, iv_sample)
+    iv_nonnull = oi_nonnull = vol_nonnull = rows = 0
+    for sym in sample_syms:
+        try:
+            df = store.read_underlying(sym)
+        except Exception:  # noqa: BLE001 — an unreadable partition is itself a finding
+            iv_res["unreadable"].append(sym)
+            continue
+        if df is None or df.empty:
+            continue
+        iv_res["sampled"] += 1
+        rows += len(df)
+        iv_nonnull += int(df["iv"].notna().sum())
+        oi_nonnull += int(df["open_interest"].notna().sum())
+        vol_nonnull += int(df["volume"].notna().sum())
+    iv_res["rows"] = rows
+    if rows:
+        iv_res["iv_nonnull_pct"] = round(iv_nonnull / rows * 100.0, 1)
+        iv_res["oi_nonnull_pct"] = round(oi_nonnull / rows * 100.0, 1)
+        iv_res["volume_nonnull_pct"] = round(vol_nonnull / rows * 100.0, 1)
+
+    # Expiry gaps: see docstring point 4. The oracle is every Friday --discovery synthetic
+    # would have PLANNED to fetch; comparing that against completed_expiries() (which counts
+    # EMPTY manifests as present, so a real holiday-shifted Friday is never a false positive)
+    # finds a hole left by a chunk that died mid-run or a resume that skipped ahead.
+    gstart = date.fromisoformat(gap_start) if gap_start else date(2023, 1, 1)
+    gend = date.fromisoformat(gap_end) if gap_end else date.today()
+    expected = expiry_calendar(gstart, gend)
+    gaps: dict = {}
+    for sym in (covered if universe else sorted(with_data)):
+        actual = set(store.completed_expiries(sym))
+        if not actual:
+            continue
+        lo, hi = min(actual), max(actual)
+        missing = [e for e in expected if lo < e < hi and e not in actual]
+        if missing:
+            gaps[sym] = [e.isoformat() for e in missing]
+
+    return {
+        "universe_size": len(universe), "covered": covered,
+        "zero_partitions": zero_partitions, "never_started": never_started,
+        "extra_not_in_universe": extra_not_in_universe,
+        "total_partitions": total_partitions, "shallow": shallow, "iv_sample": iv_res,
+        "gaps": gaps, "gap_window": [gstart.isoformat(), gend.isoformat()],
+        "store_root": store.root, "disk_bytes": store.disk_bytes(),
+    }
+
+
+def print_options_cache_report(universe_path: Optional[str], iv_sample: int,
+                                gap_start: Optional[str] = None,
+                                gap_end: Optional[str] = None) -> bool:
+    """Runs check_options_cache and prints a report. Returns True if nothing looks broken."""
+    print("\n=== options cache (TastyTradeOptionsProvider) ===")
+    res = check_options_cache(universe_path, iv_sample, gap_start=gap_start, gap_end=gap_end)
+    ok = True
+
+    print(f"  store root: {res['store_root']}  ({res['disk_bytes'] / (1 << 30):.2f} GB on disk)")
+    print(f"  universe coverage: {len(res['covered'])}/{res['universe_size']} symbol(s) have "
+          f"at least one COMPLETED partition; {res['total_partitions']} completed "
+          f"(underlying, expiry) partition(s) total")
+
+    if res["zero_partitions"]:
+        n = len(res["zero_partitions"])
+        print(f"  STARTED, NOTHING FINISHED YET ({n}) -- in flight, or a dead/interrupted "
+              f"chunk: {res['zero_partitions'][:15]}{' ...' if n > 15 else ''}")
+        ok = False
+
+    if res["never_started"]:
+        n = len(res["never_started"])
+        print(f"  NEVER STARTED ({n}): {res['never_started'][:15]}"
+              f"{' ...' if n > 15 else ''}")
+        ok = False
+
+    if res["extra_not_in_universe"]:
+        n = len(res["extra_not_in_universe"])
+        print(f"  ({n} symbol(s) cached but not in the current universe file -- harmless, e.g. "
+              f"dropped from the universe after being warmed: {res['extra_not_in_universe'][:10]}"
+              f"{' ...' if n > 10 else ''})")
+
+    if res["shallow"]:
+        print(f"  shallow ({len(res['shallow'])} symbol(s) with < a handful of completed "
+              f"expiries -- likely still in progress or an interrupted chunk):")
+        for sym, n in sorted(res["shallow"].items(), key=lambda kv: kv[1])[:15]:
+            print(f"    [{sym}] {n} expiries")
+    else:
+        print("  no shallow symbols (every present symbol has a reasonable expiry count).")
+
+    iv = res["iv_sample"]
+    print(f"  IV/open_interest/volume non-null rate (sampled {iv['sampled']} symbol(s), "
+          f"{iv['rows']} row(s)):")
+    if iv["rows"]:
+        print(f"    iv: {iv['iv_nonnull_pct']}%   open_interest: {iv['oi_nonnull_pct']}%   "
+              f"volume: {iv['volume_nonnull_pct']}%")
+        # A near-total null rate on a REAL sample is exactly the incumbent-cache defect this
+        # store exists to fix -- fail loud, don't just note it.
+        if iv["iv_nonnull_pct"] < 5.0 and iv["oi_nonnull_pct"] < 5.0:
+            print("    <-- both near-zero: this looks like the exact defect this store was "
+                  "built to avoid (see module docstring). Check the fetch path, not just data.")
+            ok = False
+        if iv["volume_nonnull_pct"] < 50.0:
+            print("    <-- volume mostly null: bars without volume are close to useless even "
+                  "with iv/open_interest populated. Check the fetch path.")
+            ok = False
+    else:
+        print("    no readable rows sampled -- store may be empty or still warming up.")
+    if iv["unreadable"]:
+        print(f"    unreadable: {iv['unreadable']}")
+        ok = False
+
+    gaps = res["gaps"]
+    gw = res["gap_window"]
+    if gaps:
+        n_missing = sum(len(v) for v in gaps.values())
+        print(f"  EXPIRY GAPS ({len(gaps)} symbol(s), {n_missing} missing Friday(s) total, "
+              f"window {gw[0]}..{gw[1]}) -- fetched some later expiries but skipped one in the "
+              f"middle; likely an interrupted worker chunk:")
+        for sym, missing in sorted(gaps.items())[:15]:
+            shown = missing[:5]
+            print(f"    [{sym}] {shown}{' ...' if len(missing) > 5 else ''}")
+        ok = False
+    else:
+        print(f"  no expiry gaps (window {gw[0]}..{gw[1]}): every symbol's completed expiries "
+              f"are contiguous with no unfetched Friday between its earliest and latest.")
+
+    return ok
+
+
 # Expert -> max indicator lookback in trading BARS, and the bars->calendar-days conversion.
 # MIRRORS ``daily_backtest_handler._EXPERT_WARMUP_BARS`` / ``derive_warmup_days`` (kept as a
 # local copy rather than an import so this tool stays runnable without the backtest package on
@@ -843,6 +1065,21 @@ def main() -> int:
     ap.add_argument("--skip-validity", action="store_true", help="Skip the period validity check (metric_store column NaN rates + OHLCV per-month coverage + expert warm-cache existence).")
     ap.add_argument("--validity-symbols", type=int, default=25, help="How many OHLCV symbols to sample for the per-month coverage check (default 25).")
     ap.add_argument("--nan-threshold", type=float, default=0.5, help="Flag a metric_store column if its NaN rate for a month exceeds this fraction (default 0.5 = 50%%).")
+    ap.add_argument("--check-options", action="store_true",
+                    help="Also check the TastyTrade options parquet store (universe coverage, "
+                         "per-symbol partition depth, IV/open_interest/volume non-null rate, "
+                         "per-symbol expiry gaps). Off by default -- separate from the "
+                         "equity-grid checks above and can be slow on a large store.")
+    ap.add_argument("--options-universe", default=None,
+                    help="Symbol list to check options coverage against (default: "
+                         "tools/options_universe_large_cap.txt).")
+    ap.add_argument("--options-iv-sample", type=int, default=15,
+                    help="How many symbols to sample for the IV/open_interest/volume non-null check (default 15).")
+    ap.add_argument("--options-gap-start", default=None,
+                    help="Start of the expiry-gap oracle window, YYYY-MM-DD (default: 2023-01-01, "
+                         "matching warm_options_history.py's DEFAULT_START).")
+    ap.add_argument("--options-gap-end", default=None,
+                    help="End of the expiry-gap oracle window, YYYY-MM-DD (default: today).")
     args = ap.parse_args()
 
     overall_ok = True
@@ -866,6 +1103,11 @@ def main() -> int:
         if start and end:
             if not check_period_validity(start, end, args.nan_threshold, args.validity_symbols, args.ohlcv_interval):
                 overall_ok = False
+
+    if args.check_options:
+        if not print_options_cache_report(args.options_universe, args.options_iv_sample,
+                                          args.options_gap_start, args.options_gap_end):
+            overall_ok = False
 
     if args.skip_workers:
         print()

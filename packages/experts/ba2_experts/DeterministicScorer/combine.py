@@ -224,6 +224,25 @@ def atr_target_price(price: float, atr: Optional[float], direction: str,
     return float(price - k * atr)
 
 
+def resolve_target_price(price: float, atr: Optional[float], direction: str,
+                         s: Dict[str, Any], final: Optional[float] = None,
+                         model_target_price: Optional[float] = None) -> Optional[float]:
+    """The target price _process actually uses: model_target_price if given AND direction is
+    BUY, else atr_target_price.
+
+    Pure and provider-free by design (mirrors atr_target_price/atr_stop_price) -- the caller
+    computes model_target_price beforehand (calling
+    ba2_experts.analyst_target_model.estimate_price_target with the already-fetched
+    estimator_inputs, only when use_model_target=true). BUY-only ENFORCED here, not just by
+    caller convention: the estimator is an intrinsically bullish P/E x forward-EPS valuation,
+    there is no equivalent "model downside target" for a SELL/short, so a model_target_price
+    passed alongside direction='SELL' is deliberately ignored rather than trusted.
+    """
+    if model_target_price is not None and direction == "BUY":
+        return model_target_price
+    return atr_target_price(price, atr, direction, s, final)
+
+
 def atr_stop_price(price: float, atr: Optional[float], direction: str,
                    s: Dict[str, Any]) -> Optional[float]:
     """Stop hint = price ∓ k_stop * ATR (passed to the risk manager via

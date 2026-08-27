@@ -240,4 +240,40 @@ def test_atr_target_from_score_stretches():
 
 def test_confidence_bounds():
     assert 5.0 <= C.confidence_from_score(0.01) <= 100.0
+
+
+# --------------------------------------------------------------------------- #
+# resolve_target_price: the model-target/ATR-target selector (use_model_target, opt-in)
+# --------------------------------------------------------------------------- #
+def test_resolve_target_price_uses_the_model_target_on_a_buy_when_given():
+    s = {"k_target": 4.5}
+    tp = C.resolve_target_price(100.0, 2.0, "BUY", s, model_target_price=150.0)
+    assert tp == 150.0  # NOT the ATR target (109.0)
+
+
+def test_resolve_target_price_falls_back_to_atr_when_no_model_target():
+    s = {"k_target": 4.5}
+    tp = C.resolve_target_price(100.0, 2.0, "BUY", s, model_target_price=None)
+    assert tp == pytest.approx(109.0)  # identical to atr_target_price
+
+
+def test_resolve_target_price_ignores_a_model_target_on_sell():
+    """A model_target_price is intrinsically bullish (P/E x forward EPS) -- passed alongside
+    direction='SELL' it must be ignored, not trusted, and the ATR short target used instead."""
+    s = {"k_target": 4.5}
+    tp = C.resolve_target_price(100.0, 2.0, "SELL", s, model_target_price=150.0)
+    assert tp == pytest.approx(91.0)  # the ATR SELL target, same as atr_target_price(..., "SELL")
+    assert tp == C.atr_target_price(100.0, 2.0, "SELL", s)
+
+
+def test_resolve_target_price_matches_atr_target_price_when_no_model_target_given():
+    """resolve_target_price(model_target_price=None) must be a pure passthrough to
+    atr_target_price -- this is the existing behaviour every prior test locked in, and
+    use_model_target=False (the default) must reproduce it exactly."""
+    s = {"k_target": 4.5, "target_from_score": True}
+    for direction in ("BUY", "SELL"):
+        for final in (0.0, 0.5, 1.0):
+            assert (C.resolve_target_price(100.0, 2.0, direction, s, final=final,
+                                           model_target_price=None)
+                   == C.atr_target_price(100.0, 2.0, direction, s, final=final))
     assert C.confidence_from_score(1.0) == pytest.approx(100.0)
