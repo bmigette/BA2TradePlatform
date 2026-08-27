@@ -1658,50 +1658,30 @@ def _is_bypass_expert(backtest_cfg: Dict[str, Any]) -> bool:
 
 
 def _max_remote_slots_for_experts(backtest_cfg: Dict[str, Any]) -> Optional[int]:
-    """Tightest ``max_remote_worker_slots`` declared by any expert named in *backtest_cfg*.
+    """Remote dispatcher slot cap for this run, from ``BA2_MAX_REMOTE_SLOTS``.
 
-    Mirrors ``_is_bypass_expert``'s resolution (same ``_SUPPORTED_EXPERTS`` lookup). Memory-heavy
-    experts (e.g. FMPSenateTraderWeight — see its class attribute) cap how many concurrent remote
-    dispatcher slots ``DistributedEvaluator`` engages per worker, regardless of the worker's
-    reported ``/health`` capacity, so a worker advertising more slots than the expert's per-trial
-    footprint can safely run isn't driven into OOM. Returns None (uncapped — use the worker's
-    full reported capacity, the pre-existing behaviour) when no named expert declares a cap.
+    *backtest_cfg* is unused (kept for call-site stability) — the cap used to also be resolved
+    PER EXPERT, from a ``max_remote_worker_slots`` class attribute (e.g. FMPSenateTraderWeight
+    declared 3). Removed 2026-08-27: how many concurrent remote dispatcher slots
+    ``DistributedEvaluator`` may engage per worker before a memory-heavy trial risks OOM-ing that
+    box is a property of the RUN (box size, worker capacity, measured per-trial footprint on that
+    day) — not of the expert's Python class, which would need a code change + deploy to retune and
+    invited exactly one expert (Senate) hardcoding a number nothing else needed to. The grid
+    driver that actually knows the trial shape sets this env var instead (see
+    tools/grid_goal2020_matrix3.sh's ``ds_remote_slots_for``/``SENATE_REMOTE_SLOTS`` for the
+    established pattern). Returns None (uncapped — use each worker's full reported capacity) when
+    unset.
     """
-    import importlib
     import os as _os
 
-    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS
-
-    cap: Optional[int] = None
-    # OPERATIONAL OVERRIDE (added 2026-08-09). The per-expert attribute is a property of the
-    # STRATEGY's memory footprint; this is a property of the BOX on a given day. When a worker is
-    # under pressure you need to shed slots for every expert in the run without editing expert
-    # classes (which would be a code change, would apply to every future run, and would be easy to
-    # forget to revert). Applied as the TIGHTEST of the two, so it can only ever reduce
-    # concurrency -- an env var must not be able to talk an expert into exceeding its declared
-    # safe slot count. Unset -> pre-existing behaviour, exactly.
     _env = _os.environ.get("BA2_MAX_REMOTE_SLOTS")
-    if _env:
-        try:
-            _env_cap = int(_env)
-            if _env_cap > 0:
-                cap = _env_cap
-        except ValueError:
-            pass
-    for spec in backtest_cfg.get("experts", []) or []:
-        class_name = spec.get("class") if isinstance(spec, dict) else spec
-        module_path = _SUPPORTED_EXPERTS.get(class_name)
-        if not module_path:
-            continue
-        try:
-            module = importlib.import_module(module_path)
-            expert_cls = getattr(module, class_name)
-        except Exception:  # noqa: BLE001 — never let detection raise; default to uncapped
-            continue
-        expert_cap = getattr(expert_cls, "max_remote_worker_slots", None)
-        if expert_cap is not None:
-            cap = expert_cap if cap is None else min(cap, expert_cap)
-    return cap
+    if not _env:
+        return None
+    try:
+        cap = int(_env)
+    except ValueError:
+        return None
+    return cap if cap > 0 else None
 
 
 # ---------------------------------------------------------------------------

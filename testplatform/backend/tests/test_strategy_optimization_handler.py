@@ -780,22 +780,28 @@ def test_is_bypass_expert_detects_factorranker_and_clean_experts():
     assert H._is_bypass_expert({"engine": "daily", "experts": ["NoSuchExpert"]}) is False
 
 
-def test_max_remote_slots_for_experts_reads_senate_cap_and_defaults_uncapped():
-    """``_max_remote_slots_for_experts`` returns FMPSenateTraderWeight's declared
-    ``max_remote_worker_slots`` (memory-heavy trials cap remote concurrency below a worker's
-    reported /health capacity), None for experts that don't declare a cap, and the tightest
-    cap when multiple capped experts are named in the same run."""
-    senate_cfg = {"engine": "daily", "experts": [{"class": "FMPSenateTraderWeight", "settings": {}}]}
-    clean_cfg = {"engine": "daily", "experts": [{"class": "FMPEarningsDrift", "settings": {}}]}
-    # 3, not 4: lowered when a Senate trial was measured at ~11-12GB (see the memory work).
-    assert H._max_remote_slots_for_experts(senate_cfg) == 3
-    assert H._max_remote_slots_for_experts(clean_cfg) is None
-    assert H._max_remote_slots_for_experts({"engine": "daily", "experts": ["NoSuchExpert"]}) is None
-    mixed_cfg = {"engine": "daily", "experts": [
-        {"class": "FMPSenateTraderWeight", "settings": {}},
-        {"class": "FMPEarningsDrift", "settings": {}},
-    ]}
-    assert H._max_remote_slots_for_experts(mixed_cfg) == 3  # tightest cap wins
+def test_max_remote_slots_for_experts_reads_the_env_var_only(monkeypatch):
+    """``_max_remote_slots_for_experts`` is now driven ENTIRELY by ``BA2_MAX_REMOTE_SLOTS`` --
+    no per-expert class attribute lookup (removed 2026-08-27: remote concurrency safe for a
+    given trial shape is a property of the RUN/box, not the expert's Python class; the grid
+    driver sets this env var instead, see tools/grid_goal2020_matrix3.sh). backtest_cfg's
+    content (which experts are named) must have NO effect any more."""
+    any_cfg = {"engine": "daily", "experts": [{"class": "FMPSenateTraderWeight", "settings": {}}]}
+    empty_cfg = {"engine": "daily", "experts": []}
+
+    monkeypatch.delenv("BA2_MAX_REMOTE_SLOTS", raising=False)
+    assert H._max_remote_slots_for_experts(any_cfg) is None
+    assert H._max_remote_slots_for_experts(empty_cfg) is None
+
+    monkeypatch.setenv("BA2_MAX_REMOTE_SLOTS", "3")
+    assert H._max_remote_slots_for_experts(any_cfg) == 3
+    assert H._max_remote_slots_for_experts(empty_cfg) == 3  # expert-agnostic, as intended
+
+    monkeypatch.setenv("BA2_MAX_REMOTE_SLOTS", "0")
+    assert H._max_remote_slots_for_experts(any_cfg) is None  # 0/negative -> uncapped, not zero
+
+    monkeypatch.setenv("BA2_MAX_REMOTE_SLOTS", "not-a-number")
+    assert H._max_remote_slots_for_experts(any_cfg) is None  # never raises on a bad value
 
 
 def test_resolve_parallel_individuals_zero_is_not_the_missing_key_default():

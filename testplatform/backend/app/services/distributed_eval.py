@@ -164,9 +164,12 @@ class DistributedEvaluator:
         self.master_version = master_version
         self.log = log
         # Per-run ceiling on concurrent remote slots PER WORKER, regardless of the worker's
-        # reported /health capacity. Used by memory-heavy experts (e.g. FMPSenateTraderWeight,
-        # see max_remote_worker_slots there) so a worker that advertises 8 slots doesn't run 8
-        # concurrent trials of an expert whose per-trial footprint would OOM it.
+        # reported /health capacity -- so a worker that advertises 8 slots doesn't run 8
+        # concurrent trials of a memory-heavy expert (e.g. FMPSenateTraderWeight, ~11-12GB/trial)
+        # whose per-trial footprint would OOM it. Set via BA2_MAX_REMOTE_SLOTS by the grid driver
+        # that knows the trial shape for THIS run (see strategy_optimization_handler.py's
+        # _max_remote_slots_for_experts and tools/grid_goal2020_matrix3.sh) -- not an expert
+        # class attribute, which was a code-change-per-retune away from the box it actually runs on.
         self.max_remote_slots_per_worker = max_remote_slots_per_worker
         # 2026-07-28: both budgets were 1800s, which is only ~2x a real trial and collapsed the
         # Senate 5min grid twice. MEASURED on an idle box (test_files/profile_senate_trial.py):
