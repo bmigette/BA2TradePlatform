@@ -117,7 +117,7 @@ contract* and *how many* move out.
 | file | status | responsibility |
 |---|---|---|
 | `ba2_common/core/option_terms.py` | new, pure | `OptionTerm` enum ↔ DTE window |
-| `ba2_common/core/option_payoff.py` | new, pure | payoff at expiry from a leg set → max loss, max profit, breakevens |
+| `ba2_common/core/option_payoff.py` | new, pure | payoff at expiry from a leg set → payoff-at-price and max loss |
 | `ba2_common/core/option_selection_policy.py` | new, pure | weighted candidate scoring inside the box |
 | `ba2_common/core/option_request.py` | new, pure | `OptionStructureRequest`, `ResolvedStructure`, `StructureRefusal` |
 | `ba2_common/core/OptionRiskManagement.py` | new | resolve → score → triage → size → submit |
@@ -243,7 +243,13 @@ cannot lose at any underlying price is an arbitrage; in practice it means a stal
 It refuses with `MAX_LOSS_UNMEASURABLE_REFUSAL` and logs loudly.
 
 Covered call, protective put and buy-write pass their stock leg into the same evaluator, so the
-entanglement needs no special case.
+entanglement needs no special case. Note what the evaluator then says about a covered call: its max
+loss is `(basis − credit) × 100`, the stock going to zero — **not** `(basis − strike − credit)`, which
+is the intuitive-but-wrong answer a hand-written table invites. The strike caps the *upside*, not the
+downside. This is the argument for deriving rather than tabulating, in miniature.
+
+Only `payoff_at(legs, spot)` and `max_loss(legs)` are built. Max profit and breakevens are
+computable from the same curve but have no caller, so they are not built (YAGNI).
 
 ## 6. Terms
 
