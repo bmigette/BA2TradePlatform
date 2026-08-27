@@ -19,6 +19,8 @@ Exit code 0 with empty output when there is nothing to report (cron-safe).
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -33,7 +35,24 @@ DEFAULT_DBS = {
 
 MORNING_WINDOW = (10, 30)  # 1h after open -> prod report
 EVENING_WINDOW = (15, 30)  # 30min before close -> dev report
-WINDOW_MINUTES = 14
+WINDOW_MINUTES = 30        # wide window: survives a missed tick; dedupe keeps output once/day
+STATE_FILE = os.path.join(os.environ.get("LOCALAPPDATA", "."), "hermes", "state", "ba2_trade_report_last.json")
+
+
+def _claim(mode: str, day: str) -> bool:
+    """Return True only for the first call per (mode, day) — dedupes cron ticks."""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        state = {}
+    key = f"{mode}:{day}"
+    if state.get("last") == key:
+        return False
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"last": key}, f)
+    return True
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -180,7 +199,7 @@ def auto() -> str:
     minutes = now.hour * 60 + now.minute
     day = now.date().isoformat()
     for (h, m), mode, dbkey in ((MORNING_WINDOW, "morning", "prod"), (EVENING_WINDOW, "evening", "dev")):
-        if 0 <= minutes - (h * 60 + m) < WINDOW_MINUTES:
+        if 0 <= minutes - (h * 60 + m) < WINDOW_MINUTES and _claim(mode, day):
             return morning_report(DEFAULT_DBS[dbkey], day, 5) if mode == "morning" else evening_report(DEFAULT_DBS[dbkey], day)
     return ""
 
