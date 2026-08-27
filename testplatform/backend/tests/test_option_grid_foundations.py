@@ -246,3 +246,152 @@ def test_wheel_reuses_O_CSPs_entry_gene_keys_verbatim():
     csp = {g for g in _space(m, "O_CSP") if g.startswith("entry:") or g.startswith("cond:")}
     wheel = {g for g in _space(m, "O_WHEEL") if g.startswith("entry:") or g.startswith("cond:")}
     assert csp == wheel, f"entry gene keys diverged: {sorted(csp ^ wheel)}"
+
+
+# ==============================================================================================
+# Task 4 — --gates-off, the smoke stage's "prove the plumbing, not the strategy" switch
+# ==============================================================================================
+#
+# MECHANISM, AND WHY IT IS REMOVAL AND NOT A FLAG. The obvious implementation -- stamp
+# ``enabled: False`` on each optional leaf -- is a no-op TWICE OVER on this call chain, and both
+# halves were checked against the real code before this was written:
+#
+#   1. ``ConditionLeaf.to_canonical_dict`` rebuilds every leaf from DECLARED fields only, and
+#      ``enabled`` is not one of them. ``normalize_trade_rules`` -- which BOTH option builders
+#      call -- therefore deletes the key. (The same trap ``value_offset_from``'s own docstring
+#      warns about: "an undeclared key is silently dropped by normalize_trade_rules".)
+#   2. Nothing downstream reads a leaf-level ``enabled`` even when it survives.
+#      ``triggers_from_condition_tree`` emits one EventAction trigger per leaf it walks, and the
+#      GA's own ON/OFF toggle disables a gate by DELETING the child node
+#      (``strategy_param_space._apply_to_tree``: "a child whose 'enabled' gene decoded to 0 is
+#      dropped"), never by flagging it.
+#
+# A marked-but-present gate would have produced a smoke run that reports itself gates-off while
+# every gate still fires -- precisely the confusion stage 0a exists to eliminate. Removing the
+# leaf also removes its ``cond:<id>:enabled`` gene, so the GA cannot switch the gate back on for
+# half the population, which a static flag could never have prevented either.
+
+
+def _entry_leaves(rule):
+    return rule["conditions"]["conditions"]
+
+
+def _toggleable(rule):
+    return [c for c in _entry_leaves(rule) if c.get("toggle_optimize")]
+
+
+def test_gates_off_disables_every_optional_entry_gate():
+    """Stage 0a's purpose: separate 'the plumbing is broken' from 'the strategy is bad'.
+
+    iv_rank and iv_to_realized_vol fail CLOSED when IV is unmeasurable, and an options cache
+    without greeks makes every gated individual trade nothing and score the zero-trade sentinel.
+    With the gates off, 'traded nothing' can only mean data or wiring.
+
+    ``toggle_optimize`` is the discriminator: a leaf carrying it is a strategy opinion the GA is
+    already allowed to switch off; a leaf without it is a correctness guard.
+    """
+    m = _launcher()
+    assert _toggleable(m._option_entry_rule("O_LC")), (
+        "no toggleable gates found; the test is measuring the wrong thing")
+    rule = m._option_entry_rule("O_LC", gates_off=True)
+    assert _toggleable(rule) == [], (
+        f"these gates are still in the tree: {[c['id'] for c in _toggleable(rule)]}")
+
+
+def test_gates_off_leaves_the_structural_conditions_ALONE():
+    """``has_no_position`` is not a strategy gate, it is a correctness guard. Dropping it would
+    let the smoke run stack duplicate positions and mask the very plumbing it is testing."""
+    m = _launcher()
+    rule = m._option_entry_rule("O_LC", gates_off=True)
+    assert [c["id"] for c in _entry_leaves(rule)] == ["o_lc-flat"]
+
+
+def test_gates_off_defaults_to_false():
+    m = _launcher()
+    normal = m._option_entry_rule("O_LC")
+    assert [c["id"] for c in _entry_leaves(normal)] == [
+        "o_lc-signal", "o_lc-flat", "shared-gate_confidence", "o_lc-iv_rank",
+        "shared-rel_volume", "o_lc-iv_rv", "o_lc-exp_profit"]
+
+
+def test_gates_off_survives_normalisation_and_reaches_the_ENGINE():
+    """The test that a marked-not-removed implementation fails.
+
+    The engine never sees the rule dict the builder returns: it sees the EventAction triggers
+    that ``normalize_trade_rules`` -> ``triggers_from_condition_tree`` produce from it. A gate
+    that is still a leaf at that point is still evaluated, whatever it is flagged with.
+    """
+    from ba2_common.core.rule_builders import triggers_from_condition_tree
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    m = _launcher()
+    rule = normalize_trade_rules([m._option_entry_rule("O_LC", gates_off=True)])[0]
+    fired = {t["event_type"] for t in triggers_from_condition_tree(rule["conditions"]).values()}
+    assert fired == {"has_no_position"}, f"the engine still evaluates {sorted(fired)}"
+
+
+def test_gates_off_reaches_the_built_strategies_through_the_module_toggle(monkeypatch):
+    """``_build_strategy`` dispatches ``_STRATEGY_BUILDERS[kind](kind)`` for option kinds, so the
+    flag cannot travel as an argument; it rides the module-level toggle set at command entry,
+    the same route ``--option-min-volume`` already takes. Single AND group shapes."""
+    from ba2_common.core.rule_builders import triggers_from_condition_tree
+
+    m = _launcher()
+    monkeypatch.setattr(m, "_OPTION_GATES_OFF", True)
+    for kind in ("O_LC", "O_CSP", "O_WHEEL", "OS1"):
+        strat = m._build_strategy(kind, f"g-{kind}", "FMPRating")
+        for rule in strat.entry_rules:
+            fired = {t["event_type"]
+                     for t in triggers_from_condition_tree(rule["conditions"]).values()}
+            assert fired == {"has_no_position"}, f"{kind}/{rule.get('id')} still gates on {fired}"
+
+
+ENTRY_GATE_GENE_MARKERS = ("signal", "gate_confidence", "iv_rank", "rel_volume", "iv_rv",
+                           "exp_profit")
+
+
+def test_gates_off_leaves_no_gene_the_GA_could_flip_back_ON(monkeypatch):
+    """Removal, not marking, is what makes this hold: a gate that keeps its
+    ``cond:<id>:enabled`` gene is switched back ON by roughly half the population, so a
+    'gates-off' run would still be gated for most of its trials.
+
+    The EXIT conditions (``tp`` / ``td`` / ``dte``) are deliberately untouched — stage 0a's pass
+    criteria include "at least one structure CLOSES at or before expiry", which is exactly what
+    those rules do. --gates-off is about entry gates only.
+    """
+    m = _launcher()
+    on = {g for g in _space(m, "O_LC") if g.startswith("cond:")}
+    entry_genes = {g for g in on if any(k in g for k in ENTRY_GATE_GENE_MARKERS)}
+    assert entry_genes, "control failed: O_LC has no entry-gate genes even with the gates ON"
+    monkeypatch.setattr(m, "_OPTION_GATES_OFF", True)
+    off = {g for g in _space(m, "O_LC") if g.startswith("cond:")}
+    assert off == on - entry_genes, (
+        f"gates-off should remove exactly the entry-gate genes; diff={sorted(off ^ (on - entry_genes))}")
+
+
+def test_gates_off_is_threaded_from_the_optimize_command():
+    """A flag the CLI parses but never applies is exactly as inert as no flag at all -- the
+    min_volume bug this suite's sibling (test_option_min_volume_wiring.py) was written for.
+
+    ``_cmd_optimize`` sets the module toggle before it does anything else, so an unknown expert
+    (which exits a few lines later) is enough to observe it.
+    """
+    from types import SimpleNamespace
+
+    m = _launcher()
+    assert m._OPTION_GATES_OFF is False
+    with pytest.raises(SystemExit):
+        m._cmd_optimize(SimpleNamespace(gates_off=True, expert="NoSuchExpert-for-the-test"))
+    assert m._OPTION_GATES_OFF is True
+
+
+def test_the_gates_off_flag_exists_on_the_optimize_command():
+    """The parser is built inline in ``main()``, which chdirs into backend/ -- so it is
+    exercised the way a user would: as a subprocess."""
+    import os
+    import subprocess
+
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    out = subprocess.run([sys.executable, "testplatform/ba2test_launcher.py", "optimize", "--help"],
+                         capture_output=True, text=True, env=env, timeout=300)
+    assert "--gates-off" in out.stdout, out.stdout[-2000:] + out.stderr[-2000:]

@@ -3095,7 +3095,16 @@ def _expected_profit_gate(m: str) -> dict:
             "optimize": True, "toggle_optimize": True, **_EXPECTED_PROFIT_GATE}
 
 
-def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
+# SMOKE MODE (--gates-off): drop every OPTIONAL entry gate so a run exercises the PIPELINE
+# rather than the strategy. Set from --gates-off at command entry; module-level for the same
+# reason as _OPTION_MIN_VOLUME -- _option_entry_rule is called deep inside the strategy
+# builders (_build_strategy dispatches _STRATEGY_BUILDERS[kind](kind) for option kinds), far
+# from the parsed args.
+_OPTION_GATES_OFF = False
+
+
+def _option_entry_rule(member: str, *, toggleable: bool = False,
+                       gates_off: "bool | None" = None) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
     (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
     optimizable confidence gate + the iv_rank / relative-volume / iv-vs-realised-vol gates +
@@ -3122,6 +3131,9 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     SIGNAL STRENGTH is gated by ``_expected_profit_gate`` alone. It replaced four
     ``price_vs_target_*`` gates on 2026-08-27; see the tombstone comment above
     ``_iv_rank_gate`` for why those could never work under a non-FMPRating expert.
+
+    ``gates_off`` (default: the module-level ``_OPTION_GATES_OFF``, set by --gates-off) REMOVES
+    every optional gate for the smoke stage — see the block at the end of this function.
     """
     m = member.lower()
     rule = {
@@ -3142,6 +3154,25 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
         "actions": [_option_entry_action_for(member)],
         "continue_processing": False,
     }
+    # An explicit argument wins; None (the normal case) defers to the CLI-set module global.
+    if _OPTION_GATES_OFF if gates_off is None else gates_off:
+        # SMOKE MODE. Every OPTIONAL gate comes OUT of the tree so the run exercises the
+        # pipeline rather than the strategy. ``toggle_optimize`` is precisely the marker for
+        # "the GA may switch this off", which makes it the right discriminator: a leaf carrying
+        # it is a strategy opinion, a leaf without it is a correctness guard (``has_no_position``)
+        # that must stay on — with it off, a smoke run would stack duplicate positions and mask
+        # the plumbing it is testing.
+        #
+        # REMOVED, not flagged ``enabled: False``, because a flag would be inert TWICE OVER:
+        # ``ConditionLeaf.to_canonical_dict`` rebuilds a leaf from DECLARED fields only, so
+        # ``normalize_trade_rules`` (which both option builders call) deletes an ``enabled``
+        # key; and nothing reads one anyway — ``triggers_from_condition_tree`` seeds a trigger
+        # for every leaf it walks, and the GA's own ON/OFF toggle works by DELETING the child
+        # node (``strategy_param_space._apply_to_tree``). Removal also takes the gate's
+        # ``cond:<id>:enabled`` gene with it, so the GA cannot switch a gate back on for half
+        # the population — which no static flag could have prevented.
+        rule["conditions"]["conditions"] = [
+            leaf for leaf in rule["conditions"]["conditions"] if not leaf.get("toggle_optimize")]
     if toggleable:
         rule["toggle_optimize"] = True
     return rule
@@ -3501,8 +3532,10 @@ def _cmd_optimize(args) -> int:
     per-trial logging. Persists the best trial as a tagged Backtest (optimization_id) and writes
     the HTML report.
     """
-    global _OPTION_MIN_VOLUME
+    global _OPTION_MIN_VOLUME, _OPTION_GATES_OFF
     _OPTION_MIN_VOLUME = int(getattr(args, "option_min_volume", _OPTION_MIN_VOLUME_DEFAULT))
+    # Read BEFORE _build_strategy below — the option builders consult the module global.
+    _OPTION_GATES_OFF = bool(getattr(args, "gates_off", False))
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -4705,6 +4738,17 @@ def main(argv: "list | None" = None) -> int:
                          "selector hands the filler candidates it rejects, and the order just sits "
                          "pending. Cached-bar distribution: p25=3, p50=14, p75=71. A tradability "
                          "floor, NOT a GA gene (exposed, the GA would drive it to 0). 0 disables.")
+    op.add_argument("--gates-off", action="store_true",
+                    help="SMOKE RUNS: drop every OPTIONAL option-entry condition gate (the "
+                         "directional signal, confidence, iv_rank, relative volume, "
+                         "iv_to_realized_vol and expected profit), genes included. iv_rank and "
+                         "iv_to_realized_vol fail CLOSED when IV is unmeasurable, so on a cache "
+                         "without greeks a gated individual trades nothing and scores the "
+                         "zero-trade sentinel; with the gates off, 'traded nothing' can only mean "
+                         "data or wiring. Correctness guards (has_no_position) and the EXIT rules "
+                         "stay on, and so do the equity gates of the overlay kinds (O_CC/O_PP), "
+                         "which do not enter through the option rule. Not for a real grid: the "
+                         "entry then fires on every evaluated symbol.")
     op.add_argument("--fill-model", default="next_bar_open")
     op.add_argument("--interval", default="5min", help="Execution/fill clock interval (default 5min for "
                     "precise intraday TP/SL; analysis cadence is set by --run-schedule).")
