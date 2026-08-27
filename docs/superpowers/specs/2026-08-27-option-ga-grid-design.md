@@ -440,6 +440,24 @@ Per-trial runtime on the target machine is the number that decides whether this 
 a fortnight, and it cannot be measured from here. Stage 0 measures it as a side effect, which is
 a second reason to run it first: it converts this table from an estimate into a schedule.
 
+## 8.1 Deferred: seed the expert settings from a known-good equity run
+
+The expert contributes its own optimizable genes on top of the strategy's: **FMPRating 6**
+(`profit_ratio`, `min_analysts`, `price_target_window_days`, `min_price_targets_per_quarter`,
+`max_analyst_age_months`, `target_price_type`) and **DeterministicScorer 9** (four section
+weights, `macro_mode`, `theta_buy`, `theta_sell`, `k_target`, `k_stop`). Against a 22-gene
+structure genome that is 21–29% of the search spent rediscovering settings an equity grid has
+already tuned.
+
+So: seed those from a known-good stock-strategy result and narrow their ranges around the seed
+rather than searching them wide. **Precondition: the equity GA jobs currently running must
+finish** — there is nothing to seed from until they do. Deferred on that basis, not on difficulty.
+
+It shares its machinery with the stage-1 → stage-2 seeding in §7.1: both are "read a completed
+optimization's best individual and start a new job near it". Build multi-source seeding once and
+this becomes a caller, not a second mechanism. The range-narrowing is the only additional piece —
+given a seeded value `v`, replace the gene's `[min, max]` with `v ± k·step`.
+
 ## 9. Out of scope, and why
 
 * **The option data pipeline.** The target machine has the data. This repo's own backtest reads
