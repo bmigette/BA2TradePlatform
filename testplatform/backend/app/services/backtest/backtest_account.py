@@ -323,6 +323,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # from an assigned naked short call). Option strategies never manage the resulting
         # stock, so process_pending_assignment_liquidations closes ALL of it at the NEXT
         # bar's open (broker post-assignment liquidation; no orphaned stock in backtests).
+        # Stays EMPTY when the run sets ``hold_assigned_stock`` — read from ``self._cfg`` at
+        # each assignment in _book_assignment_share_leg (assignments are rare; nothing is
+        # gained by caching it, and a cached copy would silently ignore a config change).
         self._pending_assignment_sells: Dict[str, float] = {}
         # OPT-B4 (option TIF DAY): order id -> the SIMULATED calendar date the option order
         # was staged on. ``TradingOrder.created_at`` is stamped with the WALL clock by the ORM
@@ -385,6 +388,24 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                "Widened for thin contracts and floored at "
                                "option_spread_min_tick. Defaults to 0.0 (exact no-op, "
                                "pre-2026-07-25 behaviour); the grid passes a real value.",
+            },
+            "hold_assigned_stock": {
+                "type": "bool",
+                "required": False,
+                "description": "When True, stock created by a short-option assignment is "
+                               "KEPT instead of being liquidated at the next bar's open. "
+                               "Exists for the WHEEL, which is the only strategy whose "
+                               "rules manage the assigned shares (its covered-call overlay "
+                               "is gated on has_assigned_shares): the manage pass runs "
+                               "BEFORE the liquidation on the following bar, so with this "
+                               "off every wheel position is written as a covered call and "
+                               "sold naked on the same bar. What it COSTS: the "
+                               "no-orphaned-stock policy stops applying, so assigned shares "
+                               "no option rule manages will ride to the end of the run "
+                               "(marked to market, reported open_at_end) — exercised ITM "
+                               "longs riding to 67-85% of final equity was the OS1 blow-up. "
+                               "Only turn it on for a strategy that actually manages stock. "
+                               "Defaults to False (exact no-op, pre-2026-08-27 behaviour).",
             },
             "option_spread_min_tick": {
                 "type": "float",
@@ -3048,6 +3069,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             the next-bar orphan liquidation — scheduling the full assignment would sell down
             an unrelated lot the strategy still owns.
 
+        ``hold_assigned_stock`` (run setting, DEFAULT OFF) suppresses ONLY that last
+        scheduling step. Everything else about an assignment — the cash at the strike, the
+        ledger move, the closing fill on an offset lot, the new lot's transaction + entry
+        order and its ``origin=csp_assignment`` tag — is identical either way, so a run with
+        the switch off is bit-for-bit what it was before the switch existed. It is opt-in
+        because the wheel is the only strategy whose rules manage the delivered shares; see
+        the setting's description in ``get_settings_definitions`` for what holding costs.
+
         Cash has already moved in the caller; this moves no cash of its own.
         """
         pos = self._positions.get(symbol)
@@ -3066,11 +3095,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if opening > 0:
             self._open_assigned_stock_transaction(
                 symbol, opening, is_long=(signed > 0), price=price, expert_id=expert_id)
-            # Only the newly-orphaned lot is unmanaged; schedule THAT for the next bar.
-            self._pending_assignment_sells[symbol] = (
-                self._pending_assignment_sells.get(symbol, 0.0)
-                + (opening if signed > 0 else -opening)
-            )
+            # Only the newly-orphaned lot is unmanaged; schedule THAT for the next bar —
+            # unless this run HOLDS assigned stock, in which case the lot is the strategy's
+            # to manage (the wheel writes calls against it) and nothing is scheduled.
+            if not self._cfg.get("hold_assigned_stock", False):
+                self._pending_assignment_sells[symbol] = (
+                    self._pending_assignment_sells.get(symbol, 0.0)
+                    + (opening if signed > 0 else -opening)
+                )
 
     def _open_assigned_stock_transaction(
         self, symbol: str, qty: float, *, is_long: bool, price: float,
@@ -3147,7 +3179,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             schedules a broker-style liquidation of the resulting stock at the NEXT bar's
             open via ``process_pending_assignment_liquidations`` (not only the
             cash-negative case, which previously sold just enough to restore cash >= 0 and
-            left the REST of the assigned shares orphaned).
+            left the REST of the assigned shares orphaned). A run that sets
+            ``hold_assigned_stock`` (the WHEEL) opts out of that last step only — the
+            assignment itself is identical, the shares are simply kept.
 
         Assignment cash always moves at the STRIKE; the sell-to-close credit is the only
         premium-priced leg. Deterministic at-expiry settlement — no slippage/commission,
@@ -3179,11 +3213,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # opened a new lot. A COVERED call delivers shares the account already held:
                 # that part is booked as a closing fill on the lot's own transaction and there
                 # is nothing left to liquidate (scheduling it would sell down an unrelated lot).
+                # ``hold_assigned_stock`` runs skip the scheduling entirely — say which
+                # happened, or the log reads as a liquidation that never comes.
                 logger.warning(
-                    "[backtest] short-%s assignment of %d x %s at strike %.2f — scheduling "
-                    "assignment_liquidation of the assigned stock at the next bar's open "
+                    "[backtest] short-%s assignment of %d x %s at strike %.2f — %s "
                     "(cash now $%.2f).",
                     "call" if is_call else "put", shares, position.underlying, strike,
+                    ("HOLDING the assigned stock (hold_assigned_stock is on; the strategy's "
+                     "own rules must manage and exit it)"
+                     if self._cfg.get("hold_assigned_stock", False) else
+                     "scheduling assignment_liquidation of the assigned stock at the next "
+                     "bar's open"),
                     self._cash,
                 )
             return ok
@@ -3215,7 +3255,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Each liquidation persists a synthetic FILLED closing order (comment
         ``assignment_liquidation``) so the equity move is a visible trade. A symbol with
         no bar this tick stays pending for the next bar. One dict check when nothing is
-        pending; equity-only runs never schedule anything.
+        pending; equity-only runs never schedule anything — and neither do runs that set
+        ``hold_assigned_stock`` (the wheel), for which this method is a permanent no-op
+        because ``_book_assignment_share_leg`` never fills the pending dict.
 
         Returns True when any shares were liquidated.
         """
