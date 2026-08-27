@@ -105,7 +105,7 @@ Two alternatives were considered and rejected:
 ### 4.2 What makes this a bounded change
 
 The submit path is already a single seam: `_submit_option_order(legs, quantity, limit_price,
-option_strategy, option_reserve)` at `TradeActions.py:2326`. All 16 builders end by calling it. The
+option_strategy, option_reserve)` at `TradeActions.py:2326`. All 17 builders end by calling it. The
 refactor splits each `_build_and_submit()` into a `_resolve()` that returns everything **except**
 quantity, and lets the RM supply quantity and call the existing submit seam.
 
@@ -556,7 +556,7 @@ with all of the new code present and unused.
 | phase | content | behaviour change |
 |---|---|---|
 | P1 | the four pure units (`option_terms`, `option_payoff`, `option_selection_policy`, `option_request`) | none |
-| P2 | `_build_and_submit` → `_resolve` split across the 16 builders | none — the RM calls resolve then submits with the action's own quantity |
+| P2 | `_build_and_submit` → `_resolve` split across the 17 builders (7 size via `_size`, 8 via `_size_by_reserve`, 2 off held shares) | none — `execute()` calls resolve then sizes and submits exactly as before |
 | P3 | `OptionRiskManagement`: three lanes, triage, confidence sizing | gated on `classic_options` |
 | P4 | buy-write and `WAITING_TRIGGER` share servicing | new structure |
 | P5 | genes and grid wiring | grid only; blocked on §12 |
