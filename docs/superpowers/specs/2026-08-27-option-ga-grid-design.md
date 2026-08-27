@@ -305,7 +305,8 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
 ## 7. What has to be built
 
 1. **`O_WHEEL`** — compose `O_CSP`'s entry with `O_CC`'s overlay pair, gated on `has_assigned_shares` and spliced with `_insert_option_overlay`.
-2. **Shared condition ids** — emit `shared-rel_volume` and `shared-gate_confidence` in the group
+2. **De-hard-key `PriceVsTargetLow/HighCondition`** so the four price gates work under any expert carrying a price target, not only FMPRating.
+3. **Shared condition ids** — emit `shared-rel_volume` and `shared-gate_confidence` in the group
    builder. Verified to collapse 20 genes to 4 on OS1; no GA change.
 2. **An `OS_ALL` group** for stage 2, carrying all 18 structures.
 3. **Cross-job seeding** — read stage-1 winners and emit `initial_population` for stage 2. The
@@ -315,6 +316,41 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
    operator can stop after stage 0, or re-run one structure without re-running the grid.
 6. **Fix the stale `optimize-batch --fitness` help**, which still says `consistent_annual_return`
    where the code correctly resolves `option_consistent_annual_return`.
+
+## 6.1 Signal experts — FMPRating AND DeterministicScorer
+
+The grid runs each structure against TWO signal experts, so a structure's result is not an
+artefact of one signal. Both are already first-class launcher experts with their own gene blocks
+and prewarm handlers, and `DeterministicScorer` now carries the shared `analyst_target_model`
+price-target estimator alongside `FMPEarningsDrift` and `FMPInsiderClusterBuy`.
+
+One interaction is already handled and one is not.
+
+**Handled: the confidence ceiling.** `DeterministicScorer` computes `confidence = 100 * |final|`
+where `final` is a `tanh`, and it was MEASURED to top out at 0.562 over 5,970 bars — so a gate
+above ~56 can never pass. `_clamp_confidence_genes` caps every `confidence` condition at the
+expert's ceiling (50 for this one), and `_build_strategy` applies it on the option branch too.
+Nothing to build.
+
+**NOT handled: the price-target gates are dead for any expert but FMPRating.**
+`PriceVsTargetLowCondition` reads `expert_recommendation.data["FMPRating"]["target_low"]` —
+hard-keyed — and only `FMPRating` writes `target_low`. Under `DeterministicScorer` all four
+`price_*` gates therefore fail closed: **8 of ~28 genes per structure, ~29% of the genome**, and
+any genome that enables one trades nothing. That is the same pathology the launcher already
+records for the confidence gate in opt 333, where `cond:gate_confidence:enabled` ran 0.80 in dead
+genomes against 0.14 in trading ones.
+
+The data exists — `DeterministicScorer` computes a target through `estimate_price_target`. It is
+simply not surfaced under the key the condition reads. **Fix by de-hard-keying the condition**:
+read whichever target the recommending expert produced, falling back to `data["FMPRating"]`. Now
+that three experts share `analyst_target_model` this is the right moment, and it is what the
+condition already claims to mean — "price relative to the analyst target", not "relative to
+FMPRating's". The two alternatives (have DeterministicScorer write the FMPRating key, or drop the
+four gates for it the way the confidence clamp does) are respectively narrower and lossier.
+
+**This doubles the job count.** Stage 1 becomes 18 structures x 2 experts = **36 jobs**. If that
+is too much, drop the second expert from stage 1 and use it in stage 3 as a generalisation check
+instead — the same logic that keeps the cap bands out of stage 1.
 
 ## 7.1 What does NOT exist, measured
 
