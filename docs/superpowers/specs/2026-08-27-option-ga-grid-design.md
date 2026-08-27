@@ -136,7 +136,7 @@ into a schedule: it measures per-trial runtime on the machine that will do the w
 
 The 15 pure-option keys plus the three wheel-family strategies below.
 
-Genome ~28, **population 200, generations 60 with early-stop patience 8**. ~5,000 trials per job
+Genome ~22 after the price-gate swap, **population 200, generations 60 with early-stop patience 8**. ~5,000 trials per job
 in practice; 12,000 only if a job never plateaus.
 
 Each job answers "under what conditions did *this* structure work", with every per-structure
@@ -194,7 +194,7 @@ exists to produce, and a structure that could not trade at all is a finding wort
 just do not gate anything.
 
 All 18 structures as toggleable members of ONE expert, plus the shared tier-1 gate.
-Genome **~300, ESTIMATED** — `OS_ALL` does not exist yet, so unlike every other figure in this
+Genome **~240, ESTIMATED** (was ~300 before the price-gate swap) — `OS_ALL` does not exist yet, so unlike every other figure in this
 spec that number is arithmetic (15 members x ~14 per-structure condition genes + 4 shared + the
 option genes + the entry toggles) rather than a measurement. Measure it with
 `collect_param_space` as the first step of building it, and re-derive the population from what
@@ -305,7 +305,7 @@ the spot caps above (SPY and QQQ fail every one of them; IWM passes only the \$3
 ## 7. What has to be built
 
 1. **`O_WHEEL`** — compose `O_CSP`'s entry with `O_CC`'s overlay pair, gated on `has_assigned_shares` and spliced with `_insert_option_overlay`.
-2. **De-hard-key `PriceVsTargetLow/HighCondition`** so the four price gates work under any expert carrying a price target, not only FMPRating.
+2. **Swap the four `price_*` gates for one `expected_profit_target_percent` gate**, which every expert produces by construction. Shrinks each structure's genome 21% and the OS1 group's 25%.
 3. **Shared condition ids** — emit `shared-rel_volume` and `shared-gate_confidence` in the group
    builder. Verified to collapse 20 genes to 4 on OS1; no GA change.
 2. **An `OS_ALL` group** for stage 2, carrying all 18 structures.
@@ -332,42 +332,41 @@ above ~56 can never pass. `_clamp_confidence_genes` caps every `confidence` cond
 expert's ceiling (50 for this one), and `_build_strategy` applies it on the option branch too.
 Nothing to build.
 
-**NOT handled: the price-target gates are dead for any expert but FMPRating.**
-`PriceVsTargetLowCondition` reads `expert_recommendation.data["FMPRating"]["target_low"]` —
-hard-keyed — and only `FMPRating` writes `target_low`. Under `DeterministicScorer` all four
-`price_*` gates therefore fail closed: **8 of ~28 genes per structure, ~29% of the genome**, and
-any genome that enables one trades nothing. That is the same pathology the launcher already
-records for the confidence gate in opt 333, where `cond:gate_confidence:enabled` ran 0.80 in dead
-genomes against 0.14 in trading ones.
+**NOT handled, and the fix is a simplification rather than a patch.** The four `price_*` gates
+read `price_vs_target_low_percent` / `price_vs_target_high_percent`, and
+`PriceVsTargetLowCondition` is hard-keyed to `expert_recommendation.data["FMPRating"]["target_low"]`.
+Only `FMPRating` writes `target_low`. Under any other expert all four gates fail closed — **8 of
+~28 genes per structure, ~29% of the genome** — and a genome that enables one trades nothing. That
+is the pathology the launcher already records for the confidence gate in opt 333, where
+`cond:gate_confidence:enabled` ran 0.80 in dead genomes against 0.14 in trading ones.
 
-The data exists — `DeterministicScorer` computes a target through `estimate_price_target`. It is
-simply not surfaced under the key the condition reads.
+**Replace the four gates with ONE gate on `expected_profit_target_percent`.** Not a de-hard-keying
+of the existing condition — a swap to the signal that is universal by construction:
 
-**THE FIX MUST BE GENERAL, NOT A SECOND SPECIAL CASE.** The condition is expert-agnostic in
-meaning — "where is price relative to the analyst target" — and it should be expert-agnostic in
-code. Any expert that produces a price target must work; the GRID happens to run two of them, and
-that is a run-time choice, not a constraint to encode. So: resolve the RECOMMENDING expert and
-read its own blob.
+* `ExpertRecommendation.expected_profit_percent` is **non-nullable**. Every expert produces it.
+* `N_EXPECTED_PROFIT_TARGET_PERCENT` / `ExpectedProfitTargetPercentCondition` already exist.
+* `target_price` is nullable and DERIVES from `expected_profit_percent` when absent, so the two
+  are the same signal — the model's own description says so.
 
-`ExpertRecommendation.data` is already "expert-specific data, nested by expert name", and
-`ExpertRecommendation.instance_id` → `ExpertInstance.expert` gives that name. The hard-coded
-`"FMPRating"` should always have been that lookup. Resolution order:
+It is better on four counts, three of them measured:
 
-1. `data[<the recommending expert's own name>]` — the general case, correct for every expert.
-2. failing that, the single blob in `data` that carries `target_low` — covers an expert nesting
-   under a label that differs from its class name.
-3. failing that, `data["FMPRating"]` — pure backward compatibility, so no existing FMPRating
-   ruleset changes behaviour.
+| | genome before | after | |
+|---|---|---|---|
+| per structure (`O_LC`) | 28 | **22** | 21% smaller |
+| `O_IC` | 30 | 24 | 20% smaller |
+| `OS1` group | 120 | **90** | 25% smaller |
 
-Return None (gate fails closed, as today) only when no expert produced a target at all.
+1. Expert-agnostic by construction — no name lookup, no fallback chain, no reading another
+   expert's data blob.
+2. A 21–25% smaller genome, lifting option genes from 20% to ~27% of the search. That is the
+   problem §3 opened with.
+3. It removes the `value_offset_from` coupling between the price gates. Those offsets resolve
+   their base against the GLOBAL gene map, so any future shared id would have silently coupled
+   members across a family.
+4. One gate to reason about instead of four.
 
-Rejected: having `DeterministicScorer` write the `"FMPRating"` key (a lie in the data, and the
-next expert hits the same wall), and dropping the four gates per-expert the way the confidence
-clamp does (loses 29% of the search, and encodes the constraint this decision exists to remove).
-
-The same generality applies to the confidence ceiling already in `_EXPERT_CONFIDENCE_CEILING`:
-that table is keyed by expert name and gains an entry per expert, which is fine because a
-measured ceiling genuinely IS per-expert. A price target is not.
+What is given up: the four gates could express a price BAND against the analyst low/high range.
+That band is FMPRating-specific data, which is precisely what this removes.
 
 **Stage 1 is 18 structures x 2 experts = 36 jobs**, ~180,000 trials realistic. Both experts run
 in stage 1 rather than deferring one to stage 3, so that no conclusion about a structure rests on
