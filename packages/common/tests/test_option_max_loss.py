@@ -283,3 +283,22 @@ def test_payoff_at_raises_on_an_unknown_kind_rather_than_pricing_it_as_stock():
     # stock and returned a plausible 11900.0 while the docstring promised a raise.
     with pytest.raises(ValueError):
         payoff_at([PayoffLeg(kind="future", side=LONG, premium=1.0, strike=100)], 120.0)
+
+
+def test_a_deep_itm_CALL_may_be_worth_more_than_its_strike():
+    """The put-only quote bound must not touch calls. Regression for a real defect.
+
+    The bound exists because a put's greatest possible value at expiry is its strike. A CALL has
+    no such ceiling -- its value is unbounded above -- and the comment beside the check says so.
+    The check nonetheless sat under `kind in _OPTION_KINDS`, so a strike-50 call marked at 102
+    (entirely normal with spot around 160) was refused as a bad quote, max_loss came back
+    UNMEASURABLE, and the message accused it of being a put.
+    """
+    r = max_loss([leg("call", LONG, 102.0, 50.0)])
+    assert r.state == MEASURED, f"deep-ITM call refused: {r.reason}"
+    assert r.amount == pytest.approx(10_200.0)      # the debit, and nothing else
+
+
+def test_the_put_bound_still_bites():
+    r = max_loss([leg("put", LONG, 102.0, 50.0)])
+    assert r.state == UNMEASURABLE and "strike" in r.reason

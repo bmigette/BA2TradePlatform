@@ -29,6 +29,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "te
 
 import ba2test_launcher as L  # noqa: E402
 
+
+@pytest.fixture(autouse=True)
+def _allow_unrunnable_wheel(monkeypatch):
+    """O_WHEEL refuses to BUILD unless this override is set.
+
+    Deliberate: the backtest liquidates assigned stock at the next bar's open, AFTER the manage
+    pass has written a covered call against it, so every wheel position it opens is a naked short
+    call. Tests in this file enumerate and build EVERY registered key, so they need the
+    engine-development override. The refusal itself is asserted in
+    test_option_grid_foundations.py::test_o_wheel_refuses_to_build_by_default.
+    """
+    monkeypatch.setenv("BA2_ALLOW_UNRUNNABLE_WHEEL", "1")
+
+
 _BASE_ARGV = [
     "optimize",
     "--expert", "FMPRating",

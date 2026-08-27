@@ -145,14 +145,14 @@ def test_wheel_is_a_registered_strategy():
     assert "O_WHEEL" in m._OPTION_STRATEGY_KEYS
 
 
-def test_wheel_enters_by_selling_a_put():
+def test_wheel_enters_by_selling_a_put(wheel_allowed):
     m = _launcher()
     s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
     actions = [a.get("action_type") for r in s.entry_rules for a in (r.get("actions") or [])]
     assert "sell_cash_secured_put" in actions, f"wheel entry actions were {actions}"
 
 
-def test_wheel_writes_calls_ONLY_against_assigned_shares():
+def test_wheel_writes_calls_ONLY_against_assigned_shares(wheel_allowed):
     """The distinction that makes it a wheel.
 
     Gating on has_position would write calls against any stock the expert holds;
@@ -180,7 +180,7 @@ def test_wheel_writes_calls_ONLY_against_assigned_shares():
     assert cc_rules, "wheel has no covered-call overlay rule"
 
 
-def test_wheel_overlay_is_reachable_not_appended():
+def test_wheel_overlay_is_reachable_not_appended(wheel_allowed):
     """The bug that made every historical O_CC number a mislabelled equity run.
 
     An overlay appended AFTER S2's floor stop can never fire -- that rule is conditioned only on
@@ -197,7 +197,7 @@ def test_wheel_overlay_is_reachable_not_appended():
         f"the overlay is LAST in the exit list, which is the appended-and-unreachable shape: {ids}")
 
 
-def test_wheel_guards_against_stacking_a_second_call():
+def test_wheel_guards_against_stacking_a_second_call(wheel_allowed):
     m = _launcher()
     s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
     guards = [r for r in s.exit_rules
@@ -205,7 +205,7 @@ def test_wheel_guards_against_stacking_a_second_call():
     assert guards, "no stop_processing guard; the overlay will re-fire every manage cycle"
 
 
-def test_wheel_overlay_precedes_the_option_closes():
+def test_wheel_overlay_precedes_the_option_closes(wheel_allowed):
     """The pure-option list has no adjust_* rule, so 'not last' is not enough.
 
     ``opt_tp`` (profit_loss_percent >) and ``opt_time`` (days_opened >) compare fields an
@@ -238,7 +238,7 @@ def test_wheel_is_scored_and_railed_as_a_PURE_option_kind():
         m._assert_option_window_excludes_holdout(["O_WHEEL"], "2026-03-01")
 
 
-def test_wheel_reuses_O_CSPs_entry_gene_keys_verbatim():
+def test_wheel_reuses_O_CSPs_entry_gene_keys_verbatim(wheel_allowed):
     """Not cosmetic: it is what lets a stage-1 O_CSP winner seed an O_WHEEL job. encode_params
     drops keys the target space does not know, so a renamed entry rule would silently discard
     every entry gene of the seed."""
@@ -338,6 +338,9 @@ def test_gates_off_reaches_the_built_strategies_through_the_module_toggle(monkey
 
     m = _launcher()
     monkeypatch.setattr(m, "_OPTION_GATES_OFF", True)
+    # O_WHEEL needs the engine-development override: it refuses to build by default because the
+    # backtest sells assigned stock out from under the covered call the same bar it is written.
+    monkeypatch.setenv("BA2_ALLOW_UNRUNNABLE_WHEEL", "1")
     for kind in ("O_LC", "O_CSP", "O_WHEEL", "OS1"):
         strat = m._build_strategy(kind, f"g-{kind}", "FMPRating")
         for rule in strat.entry_rules:
@@ -482,3 +485,38 @@ def test_gates_off_is_available_on_BOTH_optimize_and_optimize_batch():
             "--gates-off is declared on only one subcommand")
         assert "_OPTION_GATES_OFF" in src.split("def _cmd_optimize_batch")[1][:2000], (
             "_cmd_optimize_batch never sets the module toggle, so the flag is inert there")
+
+
+@pytest.fixture
+def wheel_allowed(monkeypatch):
+    """O_WHEEL refuses to build unless the engine-development override is set.
+
+    The structure is CORRECT; the ENGINE cannot run it. These tests assert the structure, so
+    they set the override -- and the refusal itself is asserted separately below.
+    """
+    monkeypatch.setenv("BA2_ALLOW_UNRUNNABLE_WHEEL", "1")
+    yield
+
+
+def test_o_wheel_refuses_to_build_by_default():
+    """A prose warning in a docstring is not a guard.
+
+    The backtest liquidates assigned stock at the next bar's open (daily_engine step 4a-pre),
+    AFTER the manage pass has written a covered call against it (step 3) -- so every wheel
+    position the engine opens is a naked short call wearing a wheel's name. That does not
+    produce bad numbers, it produces a DIFFERENT STRATEGY's numbers, which is worse because they
+    look plausible. O_WHEEL is in _STRATEGY_BUILDERS, so any --strategies list containing it
+    would have launched.
+    """
+    m = _launcher()
+    with pytest.raises(SystemExit) as exc:
+        m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
+    assert "naked short call" in str(exc.value)
+    assert "Task 10" in str(exc.value), "the refusal must name the fix that unblocks it"
+
+
+def test_o_wheel_stays_registered_so_the_fix_has_somewhere_to_land():
+    """Refused at BUILD time, not deleted. The composition is right and tested; only the engine
+    is missing, so removing the strategy would throw away correct work."""
+    m = _launcher()
+    assert "O_WHEEL" in m._STRATEGY_BUILDERS

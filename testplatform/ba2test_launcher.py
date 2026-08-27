@@ -3137,6 +3137,18 @@ def _expected_profit_gate(m: str) -> dict:
             "optimize": True, "toggle_optimize": True, **_EXPECTED_PROFIT_GATE}
 
 
+def _allow_unrunnable_wheel() -> bool:
+    """Escape hatch for engine development only -- see `_build_strategy_wheel`.
+
+    Read at CALL time, not import time. A module-level constant would be evaluated once when the
+    launcher is first imported, so a test or a shell that sets the variable afterwards would be
+    silently ignored -- and the failure mode is a refusal nobody can turn off, which is a worse
+    guard than none. Env-gated rather than a CLI flag so it cannot be reached from a grid
+    command line by accident.
+    """
+    return os.environ.get("BA2_ALLOW_UNRUNNABLE_WHEEL") == "1"
+
+
 # SMOKE MODE (--gates-off): drop every OPTIONAL entry gate so a run exercises the PIPELINE
 # rather than the strategy. Set from --gates-off at command entry; module-level for the same
 # reason as _OPTION_MIN_VOLUME -- _option_entry_rule is called deep inside the strategy
@@ -3409,6 +3421,33 @@ def _build_strategy_wheel(kind: str):
     teaching the backtest to leave wheel-assigned stock alone is not, and it would move every
     existing option run's numbers. Do not launch an O_WHEEL grid until that is fixed.
     """
+    # HARD REFUSAL, not a docstring warning. Verified 2026-08-27 by code order, not inference:
+    #
+    #   daily_engine step 3  (~:718) `_manage_open_positions` -> cc_sell sees has_assigned_shares
+    #                                 and writes a covered call against the 100 assigned shares
+    #   daily_engine step 4a-pre (~:740) `process_pending_assignment_liquidations` -> "closes ALL
+    #                                 of it at the NEXT bar's OPEN" (its own docstring)
+    #
+    # So the call is written and the shares backing it are sold on the SAME bar. Every wheel
+    # position the backtest opens is a NAKED SHORT CALL wearing a wheel's name. It does not
+    # produce bad numbers -- it produces a different strategy's numbers, which is worse, because
+    # they look plausible.
+    #
+    # The engine fix is Task 10 of docs/superpowers/plans/2026-08-24-option-model-and-lifecycle.md
+    # ("The backtest must stop liquidating assigned stock"), which never landed; the opposite
+    # behaviour is currently PINNED as intent by
+    # test_option_orphan_stock_and_arb_guards.py::test_short_put_assignment_stock_liquidated_next_bar_open.
+    # Until that is resolved this raises rather than warns, because a prose warning in a
+    # docstring is not a guard -- O_WHEEL is in _STRATEGY_BUILDERS and any `--strategies` list
+    # containing it would have launched.
+    if not _allow_unrunnable_wheel():
+        sys.exit(
+            "O_WHEEL cannot be backtested: the engine liquidates assigned stock at the next "
+            "bar's open (daily_engine step 4a-pre), AFTER the manage pass has written a covered "
+            "call against it -- so every wheel position becomes a naked short call. Fix Task 10 "
+            "of the option-model-and-lifecycle plan first. Set BA2_ALLOW_UNRUNNABLE_WHEEL=1 to "
+            "override for engine development.")
+
     s = _build_strategy_option("O_CSP")
     s.name = kind
     s.exit_rules = _insert_option_overlay(
@@ -4885,7 +4924,7 @@ def main(argv: "list | None" = None) -> int:
                     help="Fitness metric, resolved PER JOB when omitted: "
                          "'option_consistent_annual_return' for pure-option kinds "
                          "(OS1-OS4/O_*), 'calmar_ratio' for stock kinds (the historical batch "
-                         "default). See optimize --fitness for what those metrics mean.")
+                         "default). See optimize --fitness for what those metrics mean. Equity-ENTRY option kinds (O_CC/O_PP/O_STK) are excluded from that and keep the stock default, matching _resolve_fitness.")
     ob.add_argument("--generations", type=int, default=8)
     ob.add_argument("--population", type=int, default=40)
     ob.add_argument("--parallel", type=int, default=6, help="Process-pool workers per job.")
