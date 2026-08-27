@@ -21,6 +21,7 @@ from ba2_common.core.db import get_db, add_instance, update_instance, get_instan
 from ba2_common.core.option_economics import (
     ARC_FLOOR_REFUSAL, admits_credit_structure, annualized_return_on_collateral,
 )
+from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selector import (
     select_single, select_vertical_spread, select_wing, passes_liquidity,
@@ -2069,28 +2070,15 @@ class _OptionEntryAction(TradeAction):
             logger.debug(f"_max_equity_per_instrument_cap: could not resolve expert {instance_id}: {e}")
             return None
 
-    def _size(self, premium: float, sizing_pct: Optional[float]) -> int:
-        """floor(virtual_equity * sizing% / (premium * 100)); 0 if not sizeable.
+    def _size_by_cost(self, cost_per_contract: Optional[float],
+                      sizing_pct: Optional[float]) -> int:
+        """floor(virtual_equity * sizing% / cost_per_contract), capped as before.
 
-        The sizing budget is additionally capped by max_virtual_equity_per_instrument_percent
-        (see _max_equity_per_instrument_cap) -- whichever of the two budgets is tighter wins."""
-        if premium is None or premium <= 0 or not sizing_pct or sizing_pct <= 0:
-            return 0
-        equity = self._virtual_equity()
-        if equity is None or equity <= 0:
-            return 0
-        budget = equity * (sizing_pct / 100.0)
-        cap = self._max_equity_per_instrument_cap(equity)
-        if cap is not None:
-            budget = min(budget, cap)
-        return int(math.floor(budget / (premium * 100.0)))
-
-    def _size_by_reserve(self, reserve_per_contract: float,
-                         sizing_pct: Optional[float]) -> int:
-        """floor(virtual_equity * sizing% / reserve_per_contract). For credit/naked
-        structures where net premium is negative (can't size off premium). Same
-        max_virtual_equity_per_instrument_percent cap as _size() applies here too."""
-        if not reserve_per_contract or reserve_per_contract <= 0:
+        The single sizer ``_size`` and ``_size_by_reserve`` both reduce to. They remain on the
+        class (tests and the classic-RM path reference them) and now delegate here, so there is
+        one definition of the cap interaction rather than two copies that can drift.
+        """
+        if not cost_per_contract or cost_per_contract <= 0:
             return 0
         if not sizing_pct or sizing_pct <= 0:
             return 0
@@ -2101,7 +2089,29 @@ class _OptionEntryAction(TradeAction):
         cap = self._max_equity_per_instrument_cap(equity)
         if cap is not None:
             budget = min(budget, cap)
-        return int(math.floor(budget / reserve_per_contract))
+        return int(math.floor(budget / cost_per_contract))
+
+    def _size(self, premium: float, sizing_pct: Optional[float]) -> int:
+        """floor(virtual_equity * sizing% / (premium * 100)); 0 if not sizeable.
+
+        The sizing budget is additionally capped by max_virtual_equity_per_instrument_percent
+        (see _max_equity_per_instrument_cap) -- whichever of the two budgets is tighter wins.
+
+        Now a thin adapter over ``_size_by_cost``: a premium is a per-SHARE price, so one
+        contract costs ``premium * 100``. Kept as a named method because tests and the
+        equity-side RM reference it."""
+        if premium is None or premium <= 0:
+            return 0
+        return self._size_by_cost(premium * 100.0, sizing_pct)
+
+    def _size_by_reserve(self, reserve_per_contract: float,
+                         sizing_pct: Optional[float]) -> int:
+        """floor(virtual_equity * sizing% / reserve_per_contract). For credit/naked
+        structures where net premium is negative (can't size off premium). Same
+        max_virtual_equity_per_instrument_percent cap as _size() applies here too.
+
+        Adapter over ``_size_by_cost``: the collateral IS the per-contract cost."""
+        return self._size_by_cost(reserve_per_contract, sizing_pct)
 
     def _held_equity_shares(self) -> Optional[float]:
         """Net filled equity shares across this expert's OPENED transactions for the symbol.
@@ -2370,11 +2380,64 @@ class _OptionEntryAction(TradeAction):
     def _build_and_submit(self) -> Dict[str, Any]:
         raise NotImplementedError
 
+    def _resolve(self):
+        """Select contracts, build legs, price the structure. Return a ``ResolvedStructure``
+        — or, for a refusal, the ``self._result(False, ...)`` dict the builder already returns.
+
+        REFUSALS STAY AS ``_result`` DICTS, not ``StructureRefusal``. ``_result`` PERSISTS a
+        ``TradeActionResult`` row (``create_and_save_action_result``), and the UI reads those
+        rows; returning a pure value object here would silently stop writing them. The typed
+        refusal is a Phase 3 concern, on the risk-manager side.
+
+        NO QUANTITY, AND NO ACCOUNT STATE THAT DEPENDS ON ONE. Everything a single action can
+        know about one structure belongs here; everything that needs the size belongs in
+        ``_size_and_submit``.
+
+        MIGRATION BRIDGE, DELIBERATE. The default delegates to the legacy ``_build_and_submit``
+        because the split lands in three phases: 2a converts the 7 premium-sized builders, 2b
+        the 8 reserve-sized ones and 2c the 2 share-overlay ones. An unconverted builder still
+        ends at ``_submit_option_order`` and so returns a result dict, which ``execute()``
+        passes straight back — byte-identical to calling ``_build_and_submit()`` directly, which
+        is what makes this refactor behaviour-neutral for the builders it has not reached yet.
+        Delete this body (back to ``raise NotImplementedError``) once ``_build_and_submit`` has
+        no definitions left.
+        """
+        return self._build_and_submit()
+
+    def _dte_for(self, expiry) -> int:
+        """Days to expiry against the action's clock (simulated in a backtest, wall in live).
+
+        Broken out because NO builder computed this before — it existed only transiently inside
+        ``_refuse_if_arc_below_floor``, and only when an ARC floor was configured.
+        ``ResolvedStructure`` needs it unconditionally.
+        """
+        return (expiry - self._today()).days
+
+    def _size_and_submit(self, resolved) -> Dict[str, Any]:
+        """Size ``resolved`` and submit it. The former tail of every ``_build_and_submit``.
+
+        BYTE-IDENTICAL ARITHMETIC TO WHAT IT REPLACES. ``_size(premium, pct)`` computed
+        ``floor(budget / (premium * 100))`` and ``_size_by_reserve(reserve, pct)`` computed
+        ``floor(budget / reserve)``. Both are ``floor(budget / cost_per_contract)``, which is
+        why ``ResolvedStructure`` carries that single number instead of the two inputs.
+        """
+        quantity = self._size_by_cost(resolved.cost_per_contract, self.sizing)
+        if quantity < 1:
+            return self._result(
+                False,
+                f"Insufficient budget to size {resolved.option_strategy} for "
+                f"{self.instrument_name} (premium={resolved.limit_price})")
+        return self._submit_option_order(
+            resolved.legs, quantity, resolved.limit_price, resolved.option_strategy)
+
     def execute(self) -> "TradeActionResult":
         try:
             if not self._supports_options():
                 return self._result(False, f"Account does not support options for {self.instrument_name}")
-            return self._build_and_submit()
+            resolved = self._resolve()
+            if not isinstance(resolved, ResolvedStructure):
+                return resolved          # a refusal dict from _result(False, ...)
+            return self._size_and_submit(resolved)
         except OptionLiquidityDataMissingToday as e:
             # NOT a misconfiguration: this source HAS published the field before, so today's
             # chain simply came back without it (Alpaca types open_interest Optional). The
