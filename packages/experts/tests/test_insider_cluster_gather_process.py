@@ -12,6 +12,7 @@ detect_insider_cluster fixtures for value parity.
 from datetime import datetime, timezone
 
 import pandas as pd
+import pytest
 
 from ba2_experts.FMPInsiderClusterBuy import FMPInsiderClusterBuy
 from ba2_common.core.types import OrderRecommendation
@@ -165,3 +166,90 @@ def test_analyze_as_of_sets_gather_lookback_from_settings():
         settings={**SETTINGS, "lookback_days": 45}, as_of=NOW, extra={"symbol": "AAPL"})
     e.analyze_as_of(NOW, ctx)
     assert captured["lookback_days"] == 45
+
+
+# --------------------------------------------------------------------------- #
+# expected_profit_mode='model' (ba2_experts.analyst_target_model, opt-in, default off)
+# --------------------------------------------------------------------------- #
+class FakeDetails:
+    def __init__(self, earnings=None, estimates=None):
+        self._earnings = earnings if earnings is not None else []
+        self._estimates = estimates if estimates is not None else [
+            {"estimated_eps_avg": 5.0}, {"estimated_eps_avg": 6.0}]
+
+    def get_past_earnings(self, symbol, frequency, end_date, lookback_periods, format_type, **kw):
+        return {"earnings": self._earnings}
+
+    def get_earnings_estimates(self, symbol, frequency, as_of_date, lookback_periods, format_type, **kw):
+        return {"estimates": self._estimates}
+
+
+def _model_provider(insider_payload, **details_kwargs):
+    insider, ohlcv, details = FakeInsider(insider_payload), FakeOHLCV(), FakeDetails(**details_kwargs)
+    return lambda c, n, **k: {"insider": insider, "ohlcv": ohlcv, "fundamentals_details": details}[c]
+
+
+def test_process_model_mode_replaces_the_flat_constant():
+    e = _expert()
+    settings = {**SETTINGS, "expected_profit_mode": "model"}
+    e._gather_expected_profit_mode = "model"
+    bundle = e._gather(LiveProviderBundle(_model_provider(THREE_BUYERS)), as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.signal == OrderRecommendation.BUY
+    # current_price=100, anchor P/E = 100/5.0 = 20x, following EPS 6.0 -> target 120 -> +20%
+    assert rec.expected_profit_percent == pytest.approx(20.0)
+
+
+def test_process_model_mode_falls_back_to_flat_percent_when_uncomputable():
+    e = _expert()
+    settings = {**SETTINGS, "expected_profit_mode": "model"}
+    e._gather_expected_profit_mode = "model"
+    bundle = e._gather(
+        LiveProviderBundle(_model_provider(THREE_BUYERS, estimates=[{"estimated_eps_avg": 5.0}])),
+        as_of=NOW)  # only 1 period -- 'forward' needs 2
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.expected_profit_percent == 10.0  # SETTINGS' flat expected_profit_percent
+
+
+def test_process_model_mode_respects_max_expected_profit_percent_cap():
+    e = _expert()
+    settings = {**SETTINGS, "expected_profit_mode": "model", "max_expected_profit_percent": 5.0}
+    e._gather_expected_profit_mode = "model"
+    bundle = e._gather(LiveProviderBundle(_model_provider(THREE_BUYERS)), as_of=NOW)  # uncapped +20%
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.expected_profit_percent == pytest.approx(5.0)
+
+
+def test_process_model_mode_only_applies_on_a_real_cluster():
+    """A HOLD (no cluster) must stay expected_profit=0 even in 'model' mode -- the model
+    should never be consulted for a symbol that isn't actually a BUY."""
+    e = _expert()
+    settings = {**SETTINGS, "expected_profit_mode": "model"}
+    e._gather_expected_profit_mode = "model"
+    bundle = e._gather(LiveProviderBundle(_model_provider(TWO_BUYERS)), as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.signal == OrderRecommendation.HOLD
+    assert rec.expected_profit_percent == 0.0
+
+
+def test_static_mode_is_still_the_default_and_ignores_estimator_data():
+    """Default settings (no expected_profit_mode key) must behave exactly as before this
+    feature existed -- the flat constant, untouched."""
+    e = _expert()
+    e._gather_expected_profit_mode = "static"
+    bundle = e._gather(LiveProviderBundle(_provider_resolver(THREE_BUYERS)), as_of=NOW)
+    rec = e._process(bundle, SETTINGS, as_of=NOW)
+    assert rec.expected_profit_percent == 10.0
+
+
+def test_gather_does_not_fetch_estimator_inputs_when_mode_is_not_model():
+    class ExplodingDetails(FakeDetails):
+        def get_earnings_estimates(self, *a, **k):
+            raise AssertionError("estimator inputs fetched even though mode != 'model'")
+
+    e = _expert()
+    e._gather_expected_profit_mode = "static"
+    provider = lambda c, n, **k: {"insider": FakeInsider(THREE_BUYERS), "ohlcv": FakeOHLCV(),
+                                  "fundamentals_details": ExplodingDetails()}[c]
+    bundle = e._gather(LiveProviderBundle(provider), as_of=NOW)
+    assert "estimator_inputs" not in bundle

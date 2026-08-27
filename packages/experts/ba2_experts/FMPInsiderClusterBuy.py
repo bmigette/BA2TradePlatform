@@ -25,6 +25,7 @@ from ba2_common.core.types import (
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin
+from ba2_experts.analyst_target_model import estimate_price_target, fetch_estimator_inputs
 from ba2_providers.cache.cached_get import insider_get
 
 
@@ -119,7 +120,42 @@ class FMPInsiderClusterBuy(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             },
             "expected_profit_percent": {
                 "type": "float", "required": True, "default": 10.0,
-                "description": "Expected profit %% attached to BUY recommendations",
+                "description": "Expected profit %% attached to BUY recommendations. In 'model' "
+                               "mode this is only the FALLBACK value used when the model can't "
+                               "compute one.",
+            },
+            "expected_profit_mode": {
+                "type": "str", "required": False, "default": "static",
+                "choices": ["static", "model"],
+                "description": "'static': every cluster BUY gets the flat expected_profit_percent "
+                               "(this expert's original, purely-heuristic behaviour -- it has no "
+                               "market-data-derived way to size a profit target on its own). "
+                               "'model': expected_profit_percent comes from "
+                               "ba2_experts.analyst_target_model's fundamentals-only price-target "
+                               "estimator (P/E x forward EPS) instead -- falls back to the flat "
+                               "expected_profit_percent whenever the model can't compute one "
+                               "(insufficient estimate coverage, or the implied P/E is too "
+                               "extreme to be a real valuation). Default off (static).",
+            },
+            "model_target_method": {
+                "type": "str", "required": False, "default": "forward",
+                "choices": ["forward", "trailing"],
+                "description": "Only used when expected_profit_mode='model'. 'forward' anchors "
+                               "the P/E multiple on the nearest-FY consensus EPS estimate "
+                               "(unbiased on average, validated in "
+                               "test_files/probe_analyst_price_target_model.py); 'trailing' "
+                               "anchors on trailing TTM reported EPS (lower worst-case, "
+                               "persistent low bias). See ba2_experts.analyst_target_model's "
+                               "module docstring for the full validation writeup.",
+            },
+            "max_expected_profit_percent": {
+                "type": "float", "required": False, "default": 100.0,
+                "description": "Hard ceiling on expected_profit_percent (both modes). In 'model' "
+                               "mode a sane anchor P/E can still compound with a large "
+                               "following-period EPS growth estimate into an unrealistic "
+                               "multi-bagger target; in 'static' mode this simply caps a "
+                               "misconfigured flat value. Mirrors FMPEarningsDrift's "
+                               "max_expected_profit_percent (added after a live 3977% blowup).",
             },
         }
 
@@ -136,7 +172,8 @@ class FMPInsiderClusterBuy(ExpertDataExportInterface, AnalysisStatusRenderMixin,
     # self._gather_lookback_days: live run_analysis sets it from resolved
     # settings; analyze_as_of sets it from context.settings["lookback_days"].
     # ------------------------------------------------------------------
-    _SETTING_KEYS = ("lookback_days", "min_insiders", "min_total_value", "expected_profit_percent")
+    _SETTING_KEYS = ("lookback_days", "min_insiders", "min_total_value", "expected_profit_percent",
+                      "expected_profit_mode", "model_target_method", "max_expected_profit_percent")
 
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         symbol = self._gather_symbol
@@ -151,13 +188,24 @@ class FMPInsiderClusterBuy(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
         current_price = (self._get_current_price(symbol) if as_of is None
                          else providers.price_at_date(symbol, as_of))
-        return {"insider_data": insider_data, "current_price": current_price, "symbol": symbol}
+        bundle = {"insider_data": insider_data, "current_price": current_price, "symbol": symbol}
+        # Only fetch the model's inputs when expected_profit_mode='model' -- opt-in I/O,
+        # matching the default-off contract. Resolved before _gather by run_analysis/
+        # analyze_as_of, mirroring _gather_lookback_days.
+        if getattr(self, "_gather_expected_profit_mode", "static") == "model":
+            bundle["estimator_inputs"] = fetch_estimator_inputs(providers, symbol, as_of)
+        return bundle
 
     def _process(self, data_bundle: Dict[str, Any], settings: Dict[str, Any],
                  as_of: Optional[datetime] = None) -> Recommendation:
         rec = self._calculate_recommendation(
             data_bundle["insider_data"], int(settings["min_insiders"]),
-            float(settings["min_total_value"]), float(settings["expected_profit_percent"]))
+            float(settings["min_total_value"]), float(settings["expected_profit_percent"]),
+            expected_profit_mode=str(settings.get("expected_profit_mode", "static")),
+            model_target_method=str(settings.get("model_target_method", "forward")),
+            max_expected_profit_percent=float(settings.get("max_expected_profit_percent", 100.0)),
+            estimator_inputs=data_bundle.get("estimator_inputs"),
+            current_price=data_bundle["current_price"])
         return Recommendation(
             signal=rec["signal"], confidence=round(rec["confidence"], 1),
             current_price=data_bundle["current_price"], details=rec["details"],
@@ -170,19 +218,39 @@ class FMPInsiderClusterBuy(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         _gather to bound the fetch window) then run the SAME _gather+_process as live."""
         self._gather_symbol = context.extra.get("symbol", getattr(self, "_gather_symbol", None))
         self._gather_lookback_days = int(context.settings["lookback_days"])
+        self._gather_expected_profit_mode = context.settings.get("expected_profit_mode", "static")
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, context.settings, as_of)
 
     def _calculate_recommendation(self, insider_data: Dict[str, Any],
                                   min_insiders: int, min_total_value: float,
-                                  expected_profit: float) -> Dict[str, Any]:
+                                  expected_profit: float, *,
+                                  expected_profit_mode: str = "static",
+                                  model_target_method: str = "forward",
+                                  max_expected_profit_percent: float = 100.0,
+                                  estimator_inputs: Optional[Dict[str, Any]] = None,
+                                  current_price: Optional[float] = None) -> Dict[str, Any]:
         cluster = detect_insider_cluster(
             insider_data.get("transactions", []), min_insiders, min_total_value)
 
         if cluster["is_cluster"]:
             signal = OrderRecommendation.BUY
             confidence = cluster["confidence"]
-            expected = expected_profit
+            if expected_profit_mode == "model":
+                # ba2_experts.analyst_target_model: fundamentals-only P/E x forward-EPS estimate,
+                # replacing this expert's original flat constant with an actual market-data-
+                # derived figure. Falls back to the flat expected_profit whenever the model
+                # can't compute one (insufficient estimate coverage, or an anchor P/E too
+                # extreme to be a real valuation) -- a cluster BUY must still carry a usable
+                # profit number, exactly as it always has.
+                model_out = estimate_price_target(
+                    estimator_inputs or {}, current_price=current_price,
+                    method=model_target_method,
+                    max_expected_profit_percent=max_expected_profit_percent)
+                expected = model_out["expected_profit_percent"] if model_out is not None \
+                    else expected_profit
+            else:
+                expected = expected_profit
         else:
             signal = OrderRecommendation.HOLD
             confidence = 10.0
@@ -286,6 +354,7 @@ Confidence: {confidence:.1f}%
 
             self._gather_symbol = symbol
             self._gather_lookback_days = lookback_days   # gather-time fetch window
+            self._gather_expected_profit_mode = settings.get("expected_profit_mode", "static")
             providers = self._live_providers()
             bundle = self._gather(providers, as_of=None)
             if not bundle.get("current_price"):
