@@ -494,6 +494,40 @@ optimization's best individual and start a new job near it". Build multi-source 
 this becomes a caller, not a second mechanism. The range-narrowing is the only additional piece —
 given a seeded value `v`, replace the gene's `[min, max]` with `v ± k·step`.
 
+## 8.2 Follow-on: the 1DTE grid variant, and the ETF question it depends on
+
+A second, much narrower grid: short-dated contracts on large/mega-cap high-volume names.
+
+**It is a 1DTE grid, not 0DTE, and that is forced rather than chosen.** The option cache holds
+DAILY bars only (`fetch_options` uses `TimeFrame.Day`), so a 0DTE contract has exactly ONE bar.
+Combined with `_option_fill_price`'s fill-bar rule — *"`next_bar_open` (default) uses the next
+trading day strictly after the current bar"* — that gives two dead ends: under `next_bar_open` the
+fill day is AFTER expiry so the order never fills, and under `same_bar_close` it fills at the
+expiry close and settles at that same close, which is degenerate. The information 0DTE strategies
+actually trade (the intraday path) is not in the cache at any setting.
+
+**1DTE works and gives the same economics.** Submit today, fill at tomorrow's open, expire at
+tomorrow's close: one full session of decay and delta. Single-stock weeklies expire Friday, so on
+equities this is *enter Thursday, expires Friday*. Daily bars are adequate here in a way they are
+not for 0DTE — a position entered at the open and held to expiry has no intraday path to miss.
+
+**Ten structures, not eighteen, and capital does the selecting.** At a \$10,000 per-instrument
+budget a cash-secured put needs spot ≤ \$100 and a short strangle spot ≤ \$500, so on
+index-priced underlyings only the 7 debit structures and the 3 defined-risk credit spreads fit.
+That is also the right answer on risk: selling naked or full-notional premium into a same-session
+expiry is the classic pick-up-pennies trade, and being forced away from it is a feature.
+
+**Share price stops mattering entirely**, since debit costs premium and defined-risk costs wing
+width. The whole per-structure spot sub-universe machinery §6 needs disappears, and ONE constraint
+remains: option volume — which is exactly where short-dated trading is hardest.
+
+**Blocked on `docs/superpowers/specs/2026-08-27-etf-option-universe-investigation.md`.** The deep
+1DTE books are ETFs, ETFs are absent from the screener metric store by construction, and their
+option history is not cached — a 2.4-year SPY window is ~100k contracts against a couple of
+thousand for a stock, so this is a ~50x add, not a marginal one. That investigation's first
+question (do the cached expiries include daily ones, or only Fridays?) decides whether this
+variant is "any weekday on three index ETFs" or "Thursdays only".
+
 ## 9. Out of scope, and why
 
 * **The option data pipeline.** The target machine has the data. This repo's own backtest reads
