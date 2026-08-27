@@ -28,7 +28,24 @@ from app.services.strategy_param_space import (  # noqa: E402
 
 _SINGLES = sorted(mod._OPTION_STRATS)
 _GROUPS = sorted(mod._OPTION_GROUPS)
-_GATES = (("rel_volume", "relative_volume"), ("iv_rv", "iv_to_realized_vol"))
+
+# THE TWO GATES KEY DIFFERENTLY, ON PURPOSE.
+#
+# ``rel_volume`` is SHARED: every member of a group carries the SAME condition id
+# (``shared-rel_volume``), so a family searches ONE threshold rather than one per structure.
+# ``iv_rv`` is PER MEMBER (``{member}-iv_rv``).
+#
+# The split is semantic, not cosmetic. iv_rv's OPERATOR flips between the halves -- a premium
+# BUYER wants the ratio low (`<`), a SELLER wants it high (`>`) -- and the GA's gene space never
+# searches an operator, only a threshold and an ON/OFF flag. One shared iv_rv leaf could
+# therefore express only one of the two theses and would gate the other half on the opposite of
+# what it wants. rel_volume has no per-half difference at all ("real participation behind the
+# signal" confirms a trade whichever way the premium flows), so replicating it per member was
+# pure duplication of one gene, and it now keys identically in a single-structure job and in a
+# group so a stage-1 winner's genes are still known in the stage-2 group space.
+_SHARED_GATES = (("rel_volume", "relative_volume"),)
+_PER_MEMBER_GATES = (("iv_rv", "iv_to_realized_vol"),)
+_GATES = _SHARED_GATES + _PER_MEMBER_GATES
 
 
 def _build(kind):
@@ -48,7 +65,7 @@ def _leaf(rule, cid):
 # 1. They reach the searched space
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("kind", _SINGLES)
-@pytest.mark.parametrize("suffix,field", _GATES)
+@pytest.mark.parametrize("suffix,field", _PER_MEMBER_GATES)
 def test_every_structure_searches_the_gate(kind, suffix, field):
     space = collect_param_space(_build(kind))
     m = kind.lower()
@@ -58,12 +75,39 @@ def test_every_structure_searches_the_gate(kind, suffix, field):
         f"{kind}: {field} has no ON/OFF gene, and it fails CLOSED where the data is missing")
 
 
+@pytest.mark.parametrize("kind", _SINGLES)
+@pytest.mark.parametrize("suffix,field", _SHARED_GATES)
+def test_every_structure_searches_the_shared_gate_under_the_shared_key(kind, suffix, field):
+    """Same requirement as above -- the gate must reach the searched space -- but under the
+    SHARED id, and under that id even in a single-structure job. Keying it per member here and
+    shared in a group would make the stage-1 winner's key unknown in the stage-2 space, and
+    ``encode_params`` drops unknown keys silently."""
+    space = collect_param_space(_build(kind))
+    assert f"cond:shared-{suffix}:value" in space, (
+        f"{kind}: {field} is not in the emitted parameter space: {sorted(space)}")
+    assert f"cond:shared-{suffix}:enabled" in space, (
+        f"{kind}: {field} has no ON/OFF gene, and it fails CLOSED where the data is missing")
+
+
 @pytest.mark.parametrize("kind", _GROUPS)
-@pytest.mark.parametrize("suffix,_field", _GATES)
+@pytest.mark.parametrize("suffix,_field", _PER_MEMBER_GATES)
 def test_every_group_member_searches_it_independently(kind, suffix, _field):
     space = collect_param_space(_build(kind))
     for member in mod._OPTION_GROUPS[kind]:
         assert f"cond:{member.lower()}-{suffix}:value" in space
+
+
+@pytest.mark.parametrize("kind", _GROUPS)
+@pytest.mark.parametrize("suffix,_field", _SHARED_GATES)
+def test_the_shared_gate_is_ONE_gene_for_the_whole_group(kind, suffix, _field):
+    """The counterpart of the test above, and deliberately its opposite: a shared gate must
+    emit exactly one value + one enabled gene no matter how many members the group has, and no
+    per-member key may survive alongside them (two keys for one semantic knob would let the GA
+    spend budget searching a difference that does not exist)."""
+    space = collect_param_space(_build(kind))
+    keys = sorted(k for k in space if suffix in k)
+    assert keys == [f"cond:shared-{suffix}:enabled", f"cond:shared-{suffix}:value"], (
+        f"{kind}: {suffix} emitted {keys}")
 
 
 @pytest.mark.parametrize("kind", _GROUPS + _SINGLES)
@@ -79,7 +123,7 @@ def test_the_leaf_becomes_a_trigger(kind, _suffix, field):
             f"{kind}/{rule['id']}: the {field} gate produced no trigger")
 
 
-@pytest.mark.parametrize("suffix,_field", _GATES)
+@pytest.mark.parametrize("suffix,_field", _PER_MEMBER_GATES)
 def test_the_genes_decode_onto_the_leaf(suffix, _field):
     strategy = _build("O_LC")
     decoded = decode_params(strategy, {f"cond:o_lc-{suffix}:value": 1.25})
@@ -87,6 +131,23 @@ def test_the_genes_decode_onto_the_leaf(suffix, _field):
     off = decode_params(strategy, {f"cond:o_lc-{suffix}:enabled": 0})
     ids = [c.get("id") for c in off["entry_rules"][0]["conditions"]["conditions"]]
     assert f"o_lc-{suffix}" not in ids
+
+
+@pytest.mark.parametrize("suffix,_field", _SHARED_GATES)
+def test_the_shared_gene_decodes_onto_EVERY_member_leaf(suffix, _field):
+    """Sharing is only real if the one gene actually reaches all of them. ``decode_params``
+    builds a single ``cond_by_id`` map for the whole strategy and substitutes by node id, so the
+    one key must land on every member's leaf -- and switch every one of them off together."""
+    strategy = _build("OS1")
+    members = mod._OPTION_GROUPS["OS1"]
+    decoded = decode_params(strategy, {f"cond:shared-{suffix}:value": 1.25})
+    assert len(decoded["entry_rules"]) == len(members)
+    for rule in decoded["entry_rules"]:
+        assert _leaf(rule, f"shared-{suffix}")["value"] == 1.25, rule["id"]
+    off = decode_params(strategy, {f"cond:shared-{suffix}:enabled": 0})
+    for rule in off["entry_rules"]:
+        ids = [c.get("id") for c in rule["conditions"]["conditions"]]
+        assert f"shared-{suffix}" not in ids, rule["id"]
 
 
 # ---------------------------------------------------------------------------
@@ -131,14 +192,15 @@ def test_the_iv_rv_window_brackets_parity():
 @pytest.mark.parametrize("kind", _SINGLES)
 def test_relative_volume_asks_for_participation(kind):
     """Elevated volume confirms an entry whichever way the premium flows, so unlike iv_rank
-    and IV/RV this gate is one-directional on purpose."""
-    leaf = _leaf(mod._option_entry_rule(kind), f"{kind.lower()}-rel_volume")
+    and IV/RV this gate is one-directional on purpose -- which is exactly why it is also the
+    gate that can be SHARED, hence the ``shared-`` id rather than a member prefix."""
+    leaf = _leaf(mod._option_entry_rule(kind), "shared-rel_volume")
     assert leaf["field"] == "relative_volume"
     assert leaf["op"] == ">"
 
 
 def test_the_relative_volume_window_spans_quiet_to_unusual():
-    spec = collect_param_space(_build("O_LC"))["cond:o_lc-rel_volume:value"]
+    spec = collect_param_space(_build("O_LC"))["cond:shared-rel_volume:value"]
     assert spec["min"] < 1.0 < spec["max"], (
         f"relative volume searched over {spec['min']}..{spec['max']}: it cannot distinguish "
         f"quiet from busy")

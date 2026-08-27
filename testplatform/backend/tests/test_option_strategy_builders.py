@@ -2,7 +2,7 @@
 
 The launcher (``testplatform/ba2test_launcher.py``) is a top-level script, not an
 importable package module, so we load it by file path. We assert:
-  * all 10 option/equity strategy keys are registered in ``_STRATEGY_BUILDERS``,
+  * all 11 option/equity strategy keys are registered in ``_STRATEGY_BUILDERS``,
   * ``_option_entry_action_for`` emits the right option action config (incl.
     ``option_strike_param`` and, for wing structures, an optimizable wing range),
   * building O_IC carries an entry_action with the iron-condor action + wing range,
@@ -24,10 +24,13 @@ mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mod)
 
 
-_ALL_KEYS = ["O_LC", "O_CC", "O_VERT", "O_STK", "O_SSTG", "O_SSTD",
+_ALL_KEYS = ["O_LC", "O_CC", "O_VERT", "O_STK", "O_SSTG", "O_SSTD", "O_WHEEL",
              "O_IC", "O_JL", "O_BF", "O_RS",
              "O_BULLCS", "O_BEARCS", "O_CSP", "O_STRD", "O_STRG", "O_PP"]
-_PURE_OPTION_KEYS = ["O_LC", "O_VERT", "O_SSTG", "O_SSTD", "O_IC", "O_JL", "O_BF", "O_RS",
+# O_WHEEL is pure-option by entry (it sells a put) even though it grows an equity leg on
+# assignment -- _PURE_OPTION_STRATEGIES includes it, and _resolve_fitness gives it the
+# option metric on that basis.
+_PURE_OPTION_KEYS = ["O_LC", "O_VERT", "O_SSTG", "O_SSTD", "O_IC", "O_JL", "O_BF", "O_RS", "O_WHEEL",
                      "O_BULLCS", "O_BEARCS", "O_CSP", "O_STRD", "O_STRG"]
 
 

@@ -58,3 +58,46 @@ def test_the_option_grid_never_reaches_the_equity_metric_by_default():
               for k in mod._PURE_OPTION_STRATEGIES}
     assert picked == {_OPTION_METRIC}
     assert "consistent_annual_return" not in picked
+
+
+# --- the CLI help must say what the code does -------------------------------------------------
+#
+# ``--help`` is what somebody reads before launching a multi-day grid, and both commands' help
+# named the EQUITY metric as the pure-option default long after `_resolve_fitness` stopped
+# returning it. Nothing else would ever catch that drift.
+
+def _fitness_help(command: str) -> str:
+    """The ``--fitness`` help block of ``command``, whitespace-collapsed.
+
+    The parser is built inline in ``main()``, which chdirs into ``backend/``, so the help is
+    exercised the way a user sees it: as a subprocess.
+    """
+    import re
+    import subprocess
+
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    out = subprocess.run([sys.executable, _launcher, command, "--help"],
+                         capture_output=True, text=True, env=env, timeout=300)
+    assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-2000:]
+    flat = " ".join(out.stdout.split())
+    # `--fitness FITNESS ... --generations` matches TWICE: once in the usage line (where the
+    # span is empty) and once in the options list. Take the longest — the one with the help.
+    blocks = re.findall(r"--fitness FITNESS(.*?)--generations", flat)
+    assert blocks, f"no --fitness block in `{command} --help`: {flat[-2000:]}"
+    return max(blocks, key=len)
+
+
+@pytest.mark.parametrize("command,stock_default", [("optimize", "sharpe_ratio"),
+                                                   ("optimize-batch", "calmar_ratio")])
+def test_the_fitness_help_names_the_metric_resolve_fitness_actually_picks(command, stock_default):
+    import re
+
+    block = _fitness_help(command)
+    first = re.search(r"\b(option_)?consistent_annual_return\b", block)
+    assert first, f"`{command} --help` never names the option default at all: {block}"
+    assert first.group(1) == "option_", (
+        f"`{command} --help` announces the EQUITY metric as the option default; "
+        f"_resolve_fitness returns {_OPTION_METRIC!r}. Help block: {block}")
+    assert mod._resolve_fitness(None, "O_LC", stock_default) == _OPTION_METRIC
+    assert stock_default in block, (
+        f"`{command} --help` does not name its stock default {stock_default!r}: {block}")

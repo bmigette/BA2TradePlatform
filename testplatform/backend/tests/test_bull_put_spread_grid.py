@@ -167,7 +167,11 @@ def test_its_genes_are_emitted_standalone():
     space = collect_param_space(mod._build_strategy_option(KIND))
     assert f"entry:{RID}:a0:option_strike_param" in space
     assert f"entry:{RID}:a0:option_dte" in space
-    assert f"cond:{RID.replace('-entry', '')}-gate_confidence:value" in space
+    # The confidence gate is keyed ``shared-gate_confidence``, NOT ``{member}-...``: expert
+    # conviction in a symbol is structure-independent, so one gene serves a whole group, and the
+    # same id is used standalone so a single-structure winner's key is still known in the group
+    # space. Only the direction-dependent gates (iv_rank, iv_rv, signal) keep a member prefix.
+    assert "cond:shared-gate_confidence:value" in space
 
 
 def test_its_genes_are_emitted_inside_the_OS3_group():

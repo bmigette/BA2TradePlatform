@@ -601,14 +601,18 @@ and immediately before `return rule`:
 
 ```python
     if gates_off:
+        # REMOVE the leaves, do not mark them. `ConditionLeaf.to_canonical_dict` rebuilds leaves
+        # from declared fields, so `normalize_trade_rules` DROPS an `enabled` key and the marker
+        # never reaches the engine — `_apply_to_tree` disables a gate by deleting the node.
         # SMOKE MODE. Turn every OPTIONAL gate off so the run exercises the pipeline rather than
         # the strategy. `toggle_optimize` is precisely the marker for "the GA may switch this
         # off", which makes it the right discriminator: a leaf carrying it is a strategy opinion,
         # a leaf without it is a correctness guard (`has_no_position`) that must stay on — with
         # it off, a smoke run would stack duplicate positions and mask the plumbing it is testing.
         for leaf in rule["conditions"]["conditions"]:
-            if leaf.get("toggle_optimize"):
-                leaf["enabled"] = False
+        rule["conditions"]["conditions"] = [
+            leaf for leaf in rule["conditions"]["conditions"]
+            if not leaf.get("toggle_optimize")]
 ```
 
 Thread it from the CLI. Add to the `optimize` parser (~4436):
@@ -712,8 +716,16 @@ _OPTION_RM_OVERRIDE = {
 
 
 def _rm_opt_for(kind: str) -> dict:
-    """The classic-RM gene block for a strategy kind: `_RM_OPT`, plus the option override."""
-    if kind in _OPTION_STRATEGY_KEYS:
+    """The classic-RM gene block for a strategy kind: `_RM_OPT`, plus the option override.
+
+    EXCLUDE `O_STK`. It is inside `_OPTION_STRATEGY_KEYS` but it is
+    `_build_strategy_stock` -> `_build_strategy_S2`, i.e. the plain-equity BASELINE the option
+    strategies are measured against; widening its cap destroys the control arm. `O_CC`/`O_PP`
+    DO get the raise — a covered call funds 100 shares, $10,000 at spot $100, the same
+    constraint as a CSP. Gating on `_PURE_OPTION_STRATEGIES` looks right and is wrong for that
+    reason.
+    """
+    if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK":
         return {**_RM_OPT, **_OPTION_RM_OVERRIDE}
     return dict(_RM_OPT)
 ```
