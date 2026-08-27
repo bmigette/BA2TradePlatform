@@ -3837,6 +3837,38 @@ def _cmd_optimize_batch(args) -> int:
     return 0
 
 
+# How long to wait before the ONE retry in _remote_then_local. Short: the failure this covers
+# (a worker mid self-update returning 503 for its still-restarting endpoints, or a dropped
+# connection) typically clears within seconds, not minutes.
+_REMOTE_RETRY_BACKOFF_S = 5.0
+
+
+def _remote_then_local(worker: Dict[str, Any], trial_cfg: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]:
+    """Try *worker* for a top-N re-run, retrying once after a short backoff, then fall back to
+    running the trial directly (the same path a "local" slot uses) rather than permanently
+    losing this rank.
+
+    Before this, a remote-dispatched top-N re-run got exactly one shot: a leaked pool slot
+    (opt 361/362) or a worker mid self-update returning 503 for its still-restarting endpoints
+    (opt 364) both silently dropped that rank, and someone had to notice the gap and recover it
+    by hand. Both were transient -- a retry a few seconds later, or falling back to a box that's
+    definitely not restarting, gets the row on the first attempt instead."""
+    import time
+    from app.services.strategy_optimization_handler import _persist_trial_worker
+    from app.services.worker_client import run_trial_full
+    last_exc: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            return run_trial_full(worker, trial_cfg, fitness_metric)
+        except Exception as e:  # noqa: BLE001 -- transient remote failure; retry/fallback below
+            last_exc = e
+            if attempt == 0:
+                print(f"    remote {worker.get('name')} failed ({e!r}); retrying once...")
+                time.sleep(_REMOTE_RETRY_BACKOFF_S)
+    print(f"    remote {worker.get('name')} failed twice ({last_exc!r}); falling back to local")
+    return _persist_trial_worker(trial_cfg)
+
+
 def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1,
                             last_gen_full_results: Optional[Dict[str, Any]] = None) -> int:
     """Re-run the optimization's TOP-N distinct param sets and persist each as a tagged,
@@ -4027,7 +4059,6 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             from app.services.strategy_optimization_handler import (
                 _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
             )
-            from app.services.worker_client import run_trial_full
             env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
             fitness_metric = opt.fitness_metric or "consistent_annual_return"
             print(f"    persisting top {len(specs)} across {n_local} local + "
@@ -4044,7 +4075,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 for idx, (rk, tc, sp2) in enumerate(specs):
                     slot = slots[idx % len(slots)]
                     fut = (local_ex.submit(_persist_trial_worker, tc) if slot == "local"
-                           else remote_ex.submit(run_trial_full, slot, tc, fitness_metric))
+                           else remote_ex.submit(_remote_then_local, slot, tc, fitness_metric))
                     futs[fut] = (rk, tc, sp2)
                 for fut in as_completed(futs):
                     rk, tc, sp2 = futs[fut]
