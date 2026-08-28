@@ -1811,9 +1811,17 @@ def _build_daily_trial_config(
         {"exit_rules": decoded.get("exit_rules"), "entry_action": entry_action}
     ):
         options_cache_db = default_options_cache_db()
-    # WHICH store serves the trial is a RUN-level choice, carried on backtest_cfg and forwarded
-    # verbatim to every trial (a GA population must not straddle two stores). Absent -> the
-    # sqlite default, so an equity-only or pre-existing options job is unchanged.
+    # WHICH store serves the trial is a RUN-level choice, carried on backtest_cfg (a GA
+    # population must not straddle two stores). RESOLVED HERE, ON THE MASTER, and written into
+    # the trial config below rather than forwarded verbatim: a distributed trial ships only
+    # {config, fitness_metric, cache_root, inmem_trades} (worker_client.run_trial), so a store
+    # chosen via BACKTEST_OPTIONS_STORE never reached the worker and the worker silently
+    # re-resolved to the sqlite default — a whole grid scored against the wrong vendor's
+    # history while every log on the master said parquet. Absent + no env -> sqlite, so an
+    # equity-only or pre-existing options job is unchanged.
+    from app.services.backtest.options_store import resolve_options_store
+
+    options_store = resolve_options_store(backtest_cfg)
     validate_options_window(backtest_cfg["start_date"], bool(options_cache_db),
                             backtest_options_provider(backtest_cfg))
 
@@ -1978,8 +1986,9 @@ def _build_daily_trial_config(
         # option exit rule (and its option_strike_param/option_dte genes) can fetch a chain. None for an
         # equity-only trial (byte-identical to the prior behaviour).
         "options_cache_db": options_cache_db,
-        # Run-level store selection, forwarded per trial. None -> sqlite (unchanged).
-        "options_store": backtest_cfg.get("options_store"),
+        # Run-level store selection, RESOLVED on the master (see above) so the trial config is
+        # self-describing and survives the trip to a remote worker. Never None.
+        "options_store": options_store,
         "options_parquet_root": backtest_cfg.get("options_parquet_root"),
         "options_risk_free_rate": backtest_cfg.get("options_risk_free_rate"),
         # SCREENER seam: the per-individual effective screener settings + store path the engine

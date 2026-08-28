@@ -504,6 +504,9 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     # ``sqlite``) — see options_store.py. It selects the READER and therefore the VENDOR whose
     # history floor is enforced below, which is why it is resolved here rather than left to
     # run_daily_backtest.
+    from app.services.backtest.options_store import resolve_options_store
+
+    options_store = resolve_options_store(payload)
     options_cache_db = payload.get("options_cache_db")
     uses_options = strategy_uses_options(payload)
     if uses_options and not options_cache_db:
@@ -556,9 +559,15 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         "options_cache_db": options_cache_db,
         # WHICH store serves the run: "sqlite" (default, the Alpaca OptionsHistoryCache — every
         # recorded backtest number came from it) or "parquet" (the TastyTrade/dxfeed tree).
-        # Forwarded verbatim, including None, so ``resolve_options_store`` can fall through to
-        # BACKTEST_OPTIONS_STORE and then to the sqlite default in exactly one place.
-        "options_store": payload.get("options_store"),
+        # THE RESOLVED VALUE, not the raw payload key: the config must carry the DECISION, not
+        # leave every later process to re-derive it from an environment it may not share. This
+        # used to be ``payload.get("options_store")``, i.e. None whenever the store came from
+        # ``BACKTEST_OPTIONS_STORE`` — and a distributed trial ships only {config, ...}
+        # (worker_client.run_trial), so the env never travelled. A remote worker then silently
+        # re-resolved to the SQLITE default while the master believed the job was on parquet.
+        # Silently, because the fallback is a valid store: the run produces numbers, they are
+        # just from the wrong vendor's history.
+        "options_store": options_store,
         "options_parquet_root": payload.get("options_parquet_root"),
         "options_risk_free_rate": payload.get("options_risk_free_rate"),
         # Screener (universe.mode=='screener'): per-bar metric_store entry gate (point-in-time,
