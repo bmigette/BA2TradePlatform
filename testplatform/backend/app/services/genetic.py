@@ -15,6 +15,22 @@ import json
 
 logger = logging.getLogger(__name__)
 
+#: What an individual scores when its fitness function RAISES.
+#:
+#: Not 0.0. Strategy fitnesses are routinely negative (a losing config scores -6, -44, ...), so
+#: 0.0 does not mean "worst" — it means "better than every genome that actually traded", and the
+#: GA duly breeds toward whatever crashes the backtest. ``strategy_optimization_handler``'s BATCH
+#: path already scores a failed trial at ``ZERO_TRADE_SENTINEL`` for exactly this reason; this
+#: branch — the one taken when ``--parallel <= 1`` maps the fitness function in-process — was
+#: never updated to match, which made a crash worth 0.0 at parallel=1 and -1e9 at parallel>1.
+#: That was the last remaining way ``--parallel`` could change a search's answer.
+#:
+#: Kept numerically equal to ``ZERO_TRADE_SENTINEL`` (pinned by a test) rather than imported, so
+#: this module stays independent of the strategy stack it is also used outside of. Harmless for
+#: the ML GA, whose metrics are non-negative: 0.0 was already its worst score, and this is still
+#: worst.
+FITNESS_EVALUATION_FAILED = -1.0e9
+
 # Check for DEAP availability
 try:
     from deap import base, creator, tools, algorithms
@@ -633,7 +649,7 @@ class GeneticOptimizer:
                 return (fitness,)
             except Exception as e:
                 logger.warning(f"Fitness evaluation failed: {e}")
-                return (0.0,)
+                return (FITNESS_EVALUATION_FAILED,)
 
         self.toolbox.register("evaluate", evaluate)
 

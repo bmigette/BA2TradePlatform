@@ -27,7 +27,7 @@ import random
 import numpy as np
 import pytest
 
-from app.services.genetic import GeneticOptimizer
+from app.services.genetic import FITNESS_EVALUATION_FAILED, GeneticOptimizer
 
 
 SPACE = {
@@ -240,3 +240,49 @@ def test_population_still_inherits_the_callers_seed():
     c = [list(_ind) for _ind in GeneticOptimizer(
         param_ranges=SPACE, population_size=6, n_generations=1).toolbox.population(n=6)]
     assert a != c
+
+
+# ---------------------------------------------------------------------------------------------
+# A crashed trial must not outrank a real one -- the last way --parallel changed an answer
+# ---------------------------------------------------------------------------------------------
+# strategy_optimization_handler's BATCH path scores a failed trial at ZERO_TRADE_SENTINEL and says
+# why: "the old 0.0 fallback ranked ABOVE every legitimately-negative individual, biasing selection
+# toward crashes". The in-process branch here was never updated to match, so the same crash scored
+# 0.0 at parallel<=1 and -1e9 at parallel>1. Strategy fitnesses are routinely negative (the O_LC
+# probe runs score -6.04 and -43.66), so 0.0 does not mean "worst" -- it means "better than every
+# genome that actually traded".
+
+def _always_raises(params):
+    raise RuntimeError("backtest blew up")
+
+
+def test_a_crashed_trial_scores_worse_than_any_real_individual():
+    """Every trial crashes, so the reported best IS the failure score. It must be the
+    always-worst sentinel, never 0.0."""
+    result = _run_in_process(_always_raises)
+
+    assert result["best_fitness"] == FITNESS_EVALUATION_FAILED
+    assert result["best_fitness"] < 0.0, "a crash scored >= 0, so it outranks a losing strategy"
+
+
+def test_a_crash_never_outranks_a_legitimately_negative_genome():
+    """The real shape: some genomes crash, the rest lose money. A losing strategy must win over
+    a crash -- with the 0.0 fallback the crash won every time and the GA bred toward it."""
+    def flaky(params):
+        if params["c"] > 10:
+            raise RuntimeError("backtest blew up")
+        return -100.0 - params["a"]      # always negative, best (least bad) at a == 0
+
+    result = _run_in_process(flaky)
+
+    assert result["best_fitness"] < 0.0
+    assert result["best_fitness"] > FITNESS_EVALUATION_FAILED
+    assert result["best_params"]["c"] <= 10, "the winner is a genome that crashed"
+
+
+def test_the_in_process_failure_score_matches_the_batch_path():
+    """Parity is the point: the two paths must agree on what a failure is worth, or --parallel
+    changes the answer again for exactly the genomes that crash."""
+    from app.services.strategy_fitness import ZERO_TRADE_SENTINEL
+
+    assert FITNESS_EVALUATION_FAILED == ZERO_TRADE_SENTINEL
