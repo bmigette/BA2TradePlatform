@@ -2635,6 +2635,7 @@ def _option_entry_action_for(kind: str) -> dict:
     _apply_option_strike_method_gene(cfg)
     _apply_option_sizing_gene(cfg)
     _apply_option_min_arc_gene(cfg)
+    _apply_option_entry_cross_gene(cfg)
     return cfg
 
 
@@ -2808,6 +2809,57 @@ def _apply_option_strike_method_gene(cfg: dict) -> dict:
     return cfg
 
 
+# --- the ENTRY QUOTE as a gene (F3) ---------------------------------------------------------
+#
+# Option entry limits are quoted at the ANALYSIS bar's close, but the default `next_bar_open`
+# fill model makes the NEXT bar's open cross that stale quote. And the quote is a MID, not a
+# touch: the historical option store carries `bid == ask` on every row it fills in at all (the
+# parquet store has no bid/ask column whatsoever), so `contract.ask` and `contract.bid` are both
+# just the close, while the tradeable spread is MODELLED at fill time by --option-spread-pct.
+# A seller therefore fills only if the premium RISES by a whole modelled half-spread overnight
+# -- which for decaying OTM premium is the wrong way round, so the DAY order expires unfilled
+# and premium sellers structurally almost never trade. Measured head-to-head on INTC Feb-Dec
+# 2024: O_CSP got 6 trades under next_bar_open and 9 under same_bar_close; an earlier AAPL probe
+# got 0 against 17.
+#
+# `next_bar_open` STAYS THE DEFAULT (no look-ahead, and every existing equity grid used it, so
+# numbers stay comparable) and the QUOTE side is what becomes searchable instead.
+#
+# A FRACTION, NOT AN OFFSET, for the same reason the selection-policy features are chain-
+# relative: an absolute $0.05 means something completely different on a $0.40 put and a $12
+# call, while a fraction of that contract's own modelled spread is scale-free across symbols
+# and premium levels.
+#
+# ONE BAND FOR EVERY STRUCTURE, unlike option_sizing / option_min_arc. Those are quantities
+# whose meaning is set by the structure (20 % of equity, or a return on a collateral branch
+# that differs by an order of magnitude); this one is already normalised BY the structure --
+# it is a fraction of that structure's own legs' own spreads -- so a shared band is the same
+# hypothesis everywhere.
+#
+# 0.0 IS THE AUTHORED DEFAULT AND IT IS AN EXACT NO-OP: the entry keeps quoting the builder's
+# `contract.ask`/`contract.bid`/net untouched, so no existing option result moves. 1.0 quotes
+# at the far touch `_option_cross` already models the fill at. 0.25 steps give the GA five
+# levels including both ends.
+_OPTION_ENTRY_CROSS_BAND = (0.0, 1.0, 0.25)
+
+
+def _apply_option_entry_cross_gene(cfg: dict) -> dict:
+    """Make the entry-quote concession searchable, in place, on ANY option entry action.
+
+    No exemption list, deliberately: every one of the seventeen entry builders ends at
+    ``_OptionEntryAction._submit_option_order``, which is where the concession is applied, so
+    there is no builder for which this gene is inert -- the failure mode that forced
+    ``_apply_option_sizing_gene`` and ``_apply_option_min_arc_gene`` to carry one.
+    """
+    lo, hi, step = _OPTION_ENTRY_CROSS_BAND
+    cfg.setdefault("option_entry_cross", lo)
+    cfg.setdefault("option_entry_cross_optimize", True)
+    cfg.setdefault("option_entry_cross_min", lo)
+    cfg.setdefault("option_entry_cross_max", hi)
+    cfg.setdefault("option_entry_cross_step", step)
+    return cfg
+
+
 def _apply_option_min_volume(cfg: dict) -> dict:
     """Stamp the tradability floor onto ANY option action config, in place.
 
@@ -2834,7 +2886,8 @@ def _option_overlay_action(action_type: str, *, strike_param: float,
     touch while the same knobs were searched on every pure-option key. Sizing genuinely is
     not a knob here -- both actions size off the HELD share count (1 contract per 100
     shares), not option_sizing."""
-    return _apply_option_strike_method_gene(_apply_option_min_volume({
+    return _apply_option_entry_cross_gene(_apply_option_strike_method_gene(
+      _apply_option_min_volume({
         "action_type": action_type,
         "option_strike_method": "percent_otm", "option_strike_param": strike_param,
         "option_dte_min": dte_min, "option_dte_max": dte_max,
@@ -2842,7 +2895,7 @@ def _option_overlay_action(action_type: str, *, strike_param: float,
         "option_strike_param_max": strike_max, "option_strike_param_step": strike_step,
         "option_dte_optimize": True, "option_dte_min_range": dte_min_range,
         "option_dte_max_range": dte_max_range, "option_dte_step": dte_step,
-    }))
+    })))
 
 
 def _screener_gate_base_for_strategy(kind: str) -> dict:

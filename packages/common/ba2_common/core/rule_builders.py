@@ -226,6 +226,12 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     # structure is admitted on ``net_credit > 0`` alone -- so it must stay absent rather than
     # defaulting to 0.0, which would be a configured gate that refuses every unmeasurable ARC.
     ("min_arc", ("option_min_arc",)),
+    # ENTRY-QUOTE CONCESSION (F3): the fraction of the contract's own MODELLED bid-ask spread
+    # the entry gives up when it quotes (0 = the mid, which is where the historical option
+    # store's degenerate bid==ask quote puts every entry today; 1 = the far touch the fill
+    # engine already models). Absent or 0.0 is the pre-F3 quote EXACTLY. See
+    # ``core.option_entry_quote``.
+    ("entry_cross", ("option_entry_cross",)),
 )
 
 

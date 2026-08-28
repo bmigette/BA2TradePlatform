@@ -21,6 +21,9 @@ from ba2_common.core.db import get_db, add_instance, update_instance, get_instan
 from ba2_common.core.option_economics import (
     ARC_FLOOR_REFUSAL, admits_credit_structure, annualized_return_on_collateral,
 )
+from ba2_common.core.option_entry_quote import (
+    ENTRY_CROSS_NEUTRAL, entry_limit_with_concession, quote_concession,
+)
 from ba2_common.core.option_payoff import PayoffLeg
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
@@ -1909,6 +1912,7 @@ class _OptionEntryAction(TradeAction):
                  min_volume: Optional[int] = None,
                  wing_width_pct: Optional[float] = None,
                  min_arc: Optional[float] = None,
+                 entry_cross: Optional[float] = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
@@ -1932,6 +1936,11 @@ class _OptionEntryAction(TradeAction):
         # collateral, so its return ON collateral is undefined rather than zero, and gating
         # it here would refuse every long option ever opened. See core.option_economics.
         self.min_arc = min_arc
+        # ENTRY-QUOTE CONCESSION: the fraction of the contract's own MODELLED bid-ask spread
+        # this entry gives up when it quotes (0 = the mid, 1 = the far touch). None/0.0 is the
+        # pre-F3 quote exactly. Only a simulator that models a spread can answer it, so in
+        # live it is inert by construction -- see core.option_entry_quote.
+        self.entry_cross = entry_cross
 
     # --- helpers ----------------------------------------------------------
     def _action_type_value(self) -> str:
@@ -2355,6 +2364,55 @@ class _OptionEntryAction(TradeAction):
              "cover_held": verdict.held,
              "cover_pledged": verdict.pledged})
 
+    def _modelled_half_spreads(self, legs: List[OptionLeg]) -> Optional[List[float]]:
+        """One modelled half-spread per leg, or None when this account models no spread.
+
+        Duck-typed on purpose (the same idiom as ``_today``'s ``_as_of_date`` lookup): the hook
+        exists only on the BACKTEST account, because only a simulator has a MODELLED spread to
+        concede. A live account has real quotes and its builders already quote at the real
+        touch, so the absence of the hook is what keeps live byte-identical.
+
+        Returns None -- meaning "no concession" -- if ANY leg cannot be priced by the model.
+        A partial concession would be measured against a spread the fill engine will charge in
+        full on the missing leg, so falling back to the historical quote is the honest answer.
+        """
+        hook = getattr(self.account, "option_modelled_half_spread", None)
+        if not callable(hook):
+            return None
+        out: List[float] = []
+        for leg in legs:
+            half = hook(leg.contract_symbol)
+            if half is None:
+                logger.debug(f"{self._action_type_value()} for {self.instrument_name}: no "
+                             f"modelled spread for {leg.contract_symbol}; quoting the entry "
+                             f"unchanged")
+                return None
+            out.append(float(half))
+        return out
+
+    def _quote_with_concession(self, legs: List[OptionLeg], limit_price: float) -> float:
+        """``limit_price`` after giving up ``self.entry_cross`` of the modelled spread.
+
+        Three ways to get the untouched quote back, all of them today's behaviour: the gene is
+        unset or 0.0, the account models no spread (every live account), or a leg's spread is
+        unmodellable. See ``core.option_entry_quote`` for the direction rules and the floors.
+        """
+        fraction = self.entry_cross
+        if fraction is None or float(fraction) == ENTRY_CROSS_NEUTRAL:
+            return limit_price
+        if limit_price is None:
+            return limit_price
+        halves = self._modelled_half_spreads(legs)
+        if halves is None:
+            return limit_price
+        quoted = entry_limit_with_concession(float(limit_price), legs, halves, fraction)
+        if quoted != limit_price:
+            logger.debug(
+                f"{self._action_type_value()} for {self.instrument_name}: entry_cross="
+                f"{float(fraction):.2f} moved the limit {limit_price:+.4f} -> {quoted:+.4f} "
+                f"(modelled concession {quote_concession(legs, halves, fraction):.4f}/share)")
+        return quoted
+
     def _submit_option_order(self, legs: List[OptionLeg], quantity: int,
                              limit_price: float, option_strategy: str,
                              option_reserve: Optional[float] = None) -> Dict[str, Any]:
@@ -2363,16 +2421,36 @@ class _OptionEntryAction(TradeAction):
         When `option_reserve` is provided (short-premium strategies: CSP / credit
         spread), it is persisted on the parent order's `data["option_reserve"]` so
         `OptionsAccountInterface.reserved_option_buying_power()` can account for it.
+
+        THE ENTRY-QUOTE CONCESSION IS APPLIED HERE (F3), the one choke point all seventeen
+        builders reach, so no builder can be forgotten and none needs to know about it.
+        ``entry_cross`` = the fraction of each leg's own modelled spread this entry gives up;
+        at the default 0.0 (or on any account with no spread model, i.e. every live one) the
+        limit is returned untouched and this method is byte-identical to before.
+
+        AFTER SIZING, DELIBERATELY. ``_size_and_submit`` has already divided the budget by the
+        UNCONCEDED cost, and ``option_reserve`` was computed from the unconceded credit. Both
+        stay that way: the concession is bounded by one modelled half-spread per leg (2.5 % of
+        premium at the grid's ``--option-spread-pct 5.0``), while folding it into the sizing
+        would turn a quote gene into a size gene and make ``option_sizing``'s own band mean
+        something different at each level of it.
         """
+        quoted = self._quote_with_concession(legs, limit_price)
         expert_rec_id = self.expert_recommendation.id if self.expert_recommendation else None
         data = {
             "option_strategy": option_strategy,
             "quantity": quantity,
-            "limit_price": limit_price,
+            "limit_price": quoted,
             "legs": [{"contract_symbol": leg.contract_symbol, "side": leg.side.value,
                       "position_intent": leg.position_intent, "strike": leg.strike}
                      for leg in legs],
         }
+        # Only when the concession actually moved the quote, so a default run persists the
+        # SAME TradeActionResult data dict it always has.
+        if quoted != limit_price:
+            data["entry_cross"] = float(self.entry_cross)
+            data["entry_quote_concession"] = quoted - limit_price   # signed: shows the direction
+        limit_price = quoted
         if option_reserve is not None:
             data["option_reserve"] = option_reserve
         if not self.submit_to_broker:
