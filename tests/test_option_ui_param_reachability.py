@@ -269,7 +269,15 @@ def test_the_editor_persists_every_param_it_is_expected_to(editor):
     # percent_otm at every selection site, so offering the field there is the OPT-S2 trap.
     # Its reachability on the nine actions that DO read it is asserted immediately below,
     # so this exclusion cannot hide the field disappearing everywhere.
-    expected = consumed - {'min_volume', 'strike_method'}
+    #
+    # entry_cross is the second deliberate omission, for the same KIND of reason as
+    # min_volume: it is a fraction of the SIMULATOR's modelled bid-ask spread, and only a
+    # simulator has one (``_OptionEntryAction._modelled_half_spreads`` duck-types
+    # ``option_modelled_half_spread``, which exists on BacktestAccount and on no live
+    # account). A live account has real quotes and its builders already quote at the real
+    # touch -- buy@ask / sell@bid IS a full concession -- so a live editor field could only
+    # ever be a control that changes nothing. See core.option_entry_quote.
+    expected = consumed - {'min_volume', 'strike_method', 'entry_cross'}
     assert expected <= persisted, f"live rules cannot set: {sorted(expected - persisted)}"
     assert 'min_volume' not in persisted
     assert 'strike_method' not in persisted
@@ -289,8 +297,9 @@ def test_the_editor_persists_every_param_for_a_structure_that_reads_the_strike_m
 
     persisted = set(saved) - {'action_type'}
     consumed = set(_OPTION_ENTRY_PARAM_KEYS)
-    # wing_width_pct is the per-action omission here, mirroring strike_method above.
-    expected = consumed - {'min_volume', 'wing_width_pct'}
+    # wing_width_pct is the per-action omission here, mirroring strike_method above;
+    # entry_cross is backtest-only (see the note in the sibling test).
+    expected = consumed - {'min_volume', 'wing_width_pct', 'entry_cross'}
     assert expected <= persisted, f"live rules cannot set: {sorted(expected - persisted)}"
     assert 'strike_method' in persisted
     assert persisted <= consumed
@@ -311,6 +320,24 @@ def test_every_persisted_param_survives_the_trip_into_the_action(editor):
                            SimpleNamespace(), None, None, **kwargs)
     for key, value in kwargs.items():
         assert getattr(action, key) == value, key
+
+
+def test_the_entry_cross_omission_is_justified_by_the_live_accounts_themselves():
+    """The executable half of the ``entry_cross`` exclusion above.
+
+    ``_OptionEntryAction`` sizes the concession by duck-typing ``option_modelled_half_spread``
+    off the account, so an account without it concedes nothing whatever the rule says. If a
+    live broker ever grows that seam, this fails and the editor owes the field a widget --
+    which is the only thing that would make an exclusion honest rather than a hole.
+    """
+    from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
+    from ba2_trade_platform.modules.accounts.IBKRAccount import IBKRAccount
+    from ba2_trade_platform.modules.accounts.TastyTradeAccount import TastyTradeAccount
+
+    for cls in (AlpacaAccount, IBKRAccount, TastyTradeAccount):
+        assert not hasattr(cls, "option_modelled_half_spread"), (
+            f"{cls.__name__} now models an option spread, so entry_cross is no longer "
+            f"backtest-only and the live rule editor must offer it")
 
 
 def test_the_deliberate_omission_is_documented_where_someone_would_add_it(settings_module):

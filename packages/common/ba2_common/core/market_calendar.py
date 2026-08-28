@@ -22,6 +22,7 @@ Offline: ``pandas_market_calendars`` ships the NYSE holiday and half-day rules a
 DATA, so no network call is ever made here.
 """
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Any, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -87,9 +88,13 @@ def clear_nyse_calendar_cache() -> None:
     for tests and for a long-lived process that has had the package replaced
     underneath it. It is NOT the market-status cache -- that one lives on the
     account (``ReadOnlyAccountInterface.clear_market_hours_cache``).
+
+    The computed SCHEDULES go too: they are derived from this calendar, so keeping them
+    would serve the old holiday ruleset forever from a cache the caller just cleared.
     """
     global _CALENDAR
     _CALENDAR = None
+    _nyse_sessions_memo.cache_clear()
 
 
 def _require_aware(moment: datetime) -> datetime:
@@ -107,6 +112,38 @@ def _require_aware(moment: datetime) -> datetime:
             "market-hours instants must be timezone-aware; a naive datetime "
             "would silently shift the 09:30/16:00 ET boundaries")
     return moment.astimezone(timezone.utc)
+
+
+#: How many distinct day-ranges keep their computed schedule. `_nyse_calendar` memoises the
+#: calendar OBJECT; `.schedule()` is where pandas_market_calendars actually works (~10ms a
+#: call), and it was recomputed every time. On the option backtest path that was 40% of a
+#: trial's wall-clock: `BacktestAccount._iv_rank_sample_dates` asks for one trailing window
+#: per iv_rank evaluation, so a run walks a sliding range and re-derives neighbouring windows
+#: that overlap by all but a day or two.
+#:
+#: BOUNDED, because the keys are unbounded: a backtest generates one range per analysis bar
+#: (hundreds over a multi-year window) and a live process one per day, forever. 512 ranges of
+#: ~250 sessions is a few MB and covers a whole trial's sliding window without eviction.
+_SESSIONS_MEMO_SIZE = 512
+
+
+@lru_cache(maxsize=_SESSIONS_MEMO_SIZE)
+def _nyse_sessions_memo(first_day: date, last_day: date) -> Tuple[Tuple[datetime, datetime], ...]:
+    """``nyse_regular_sessions`` without the defensive copy. Returns a TUPLE.
+
+    Immutable on purpose: a cached list handed to two callers lets the first one's ``pop()``
+    silently delete a trading session for every later caller, turning a read into a write.
+    The public function copies into a fresh list, which is microseconds against the ~10ms
+    this avoids.
+    """
+    schedule = _nyse_calendar().schedule(start_date=first_day, end_date=last_day)
+    sessions = [
+        (row.market_open.to_pydatetime().astimezone(timezone.utc),
+         row.market_close.to_pydatetime().astimezone(timezone.utc))
+        for row in schedule.itertuples()
+    ]
+    sessions.sort()
+    return tuple(sessions)
 
 
 def nyse_regular_sessions(first_day: date, last_day: date) -> List[Tuple[datetime, datetime]]:
@@ -127,14 +164,7 @@ def nyse_regular_sessions(first_day: date, last_day: date) -> List[Tuple[datetim
     Raises:
         MarketCalendarUnavailable: see ``_nyse_calendar``.
     """
-    schedule = _nyse_calendar().schedule(start_date=first_day, end_date=last_day)
-    sessions = [
-        (row.market_open.to_pydatetime().astimezone(timezone.utc),
-         row.market_close.to_pydatetime().astimezone(timezone.utc))
-        for row in schedule.itertuples()
-    ]
-    sessions.sort()
-    return sessions
+    return list(_nyse_sessions_memo(first_day, last_day))
 
 
 def nyse_market_hours(now: Optional[datetime] = None) -> MarketHours:

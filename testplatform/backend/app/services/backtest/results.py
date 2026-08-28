@@ -199,18 +199,37 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
     """Build the ``refine_drawdown_fn(trades, max_drawdown) -> max_drawdown`` closure that
     ``_compute_metrics`` calls, wiring ``intraday_drawdown.refine_max_drawdown``'s
     dependency-injected callables to REAL data sources: the account's own daily price source
-    (``_price``) for daily bar lows / underlying prices, its options cache (``_options.cache``)
-    for delta-at-entry, and the shared FMP OHLCV provider's 5-minute bars for the intraday
-    re-pricing window. Returns None (skip refinement entirely) if the account doesn't expose
-    the private attributes this needs (e.g. a lightweight test stub) -- this is purely a
-    refinement layer, never a hard dependency.
+    (``_price``) for daily bar lows / underlying prices, its option READER
+    (``_options.delta_at_entry``) for delta-at-entry, and the shared FMP OHLCV provider's
+    5-minute bars for the intraday re-pricing window. Returns None (skip refinement entirely)
+    if the account doesn't expose the private attributes this needs (e.g. an equity-only run,
+    or a lightweight test stub) -- this is purely a refinement layer, never a hard dependency.
+
+    THE OPTION SEAM IS A NAMED METHOD, AND ITS ABSENCE IS LOUD. This used to bind
+    ``options.cache.db_path`` -- an attribute only the SQLITE reader
+    (``HistoricalOptionsProvider``) has. ``ParquetOptionsProvider`` exposes ``root`` /
+    ``store_path`` instead, so on the parquet backend this function returned None and the
+    refinement switched itself OFF with no log and no warning. That is not just a missing
+    feature: ``strategy_fitness.option_consistent_annual_return`` divides by
+    ``max_drawdown``, so the same strategy over the same window SCORED DIFFERENTLY depending
+    on which store served the options, for a reason nothing in the result could show. Both
+    readers now implement ``delta_at_entry(underlying, occ_symbol, when)``; a reader that does
+    not is a WARNING, because silence is the actual defect.
     """
     price = getattr(account, "_price", None)
     options = getattr(account, "_options", None)
     if price is None or options is None:
+        # Equity-only run (or a stub with no price source): there is nothing option-shaped to
+        # refine, which is normal and not worth a line in the log.
         return None
-    cache = getattr(options, "cache", None)
-    if cache is None:
+    delta_at_entry = getattr(options, "delta_at_entry", None)
+    if not callable(delta_at_entry):
+        logger.warning(
+            "[backtest] intraday drawdown refinement SKIPPED: option reader %s exposes no "
+            "delta_at_entry(underlying, occ_symbol, when). max_drawdown stays at the "
+            "daily-close figure, so any metric divided by it (calmar_ratio, "
+            "option_consistent_annual_return) is NOT comparable with a run whose reader "
+            "supports it.", type(options).__name__)
         return None
     # ``commission_per_trade`` lives under ``account_settings`` (the BacktestAccount's resolved
     # config -- see daily_backtest_handler._build_config), NEVER at the top level. Reading it as
@@ -247,22 +266,17 @@ def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[
         return price.close_at(symbol, dt)
 
     def _delta_at_entry(underlying: str, contract: str, dt: Any) -> Optional[float]:
-        # Route through options_provider's OWN worker-cached chain history (bisect over an
-        # already-loaded-once-per-underlying structure) instead of OptionsHistoryCache's raw
-        # methods, which open a fresh sqlite3 connection on every call. The backtest's normal
-        # option pricing/entry path already populates this cache for every underlying this
-        # trial touches, so by the time refinement runs it's typically already warm.
-        from app.services.backtest.options_provider import _chain_history
-
-        as_of = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)
-        hist = _chain_history(cache.db_path, underlying)
-        snapshot = hist.latest_as_of(as_of)
-        if snapshot is None:
+        # The seam, whichever reader is behind it. Each backend answers it over its OWN
+        # worker-cached structure (sqlite: the bisected chain history; parquet: the columnar
+        # as-of clamp), both of which the run's normal pricing path has already warmed.
+        # Never fatal -- a refinement that raises would fail an otherwise finished run.
+        try:
+            return delta_at_entry(underlying, contract, dt)
+        except Exception:  # noqa: BLE001
+            logger.warning("[backtest] delta_at_entry(%s, %s, %s) failed; leaving that trade "
+                           "out of the intraday refinement.", underlying, contract, dt,
+                           exc_info=True)
             return None
-        for row in hist.by_asof.get(snapshot, []):
-            if row.get("occ_symbol") == contract:
-                return row.get("delta")
-        return None
 
     def _bars_5m_between(symbol: str, entry: Any, exit_: Any) -> List[Dict[str, Optional[float]]]:
         df = _bars_5m_for_symbol(symbol)

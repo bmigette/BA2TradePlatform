@@ -40,6 +40,10 @@ _OPTION_ENTRY_PARAM_KEYS = (
     # positive net credit is enough -- so it must NOT be defaulted here: 0.0 is a configured
     # gate, not an absent one, and it refuses every structure whose ARC cannot be measured.
     'min_arc',
+    # ENTRY-QUOTE CONCESSION (F3): fraction of the contract's own MODELLED spread the entry
+    # gives up when it quotes. Absent or 0.0 leaves the builder's quote untouched, and a live
+    # account -- which models no spread -- ignores it entirely. See core.option_entry_quote.
+    'entry_cross',
 )
 
 

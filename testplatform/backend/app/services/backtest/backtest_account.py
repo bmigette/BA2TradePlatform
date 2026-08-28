@@ -1786,6 +1786,36 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         half = self._option_half_spread(px, bar)
         return px + half if side_is_buy else max(0.0, px - half)
 
+    def option_modelled_half_spread(self, contract_symbol: str) -> Optional[float]:
+        """Half the modeled spread for ``contract_symbol`` on the CURRENT (as-of) bar, or None.
+
+        THE ENTRY-QUOTE SEAM (F3). ``_OptionEntryAction`` duck-types this off the account to
+        size its ``entry_cross`` concession (see ``ba2_common.core.option_entry_quote``): the
+        entry may quote away from the mid by a fraction of the SAME spread the fill will
+        charge, instead of quoting the analysis mid and then being asked to earn the whole
+        spread back overnight. Public, unlike its ``_option_half_spread`` delegate, precisely
+        because a caller outside this class is meant to read it — and it is the ONLY such
+        caller, which is why no live account has it (a live account has real quotes; its
+        builders already quote at the real touch, so live concedes nothing extra).
+
+        AS-OF, NOT FILL-DAY, and that is the hermetic point: this answers with the bar the
+        action can already see (the one it selected the contract from), never the bar the
+        order will fill on. The fill-day spread may differ (a different day's volume can flip
+        the thin-widening); a quote set from the fill day's spread would be look-ahead.
+
+        None when there is no options provider, no as-of bar for the contract, or no close on
+        it — the caller then leaves the quote exactly as the builder priced it.
+        """
+        if self._options is None:
+            return None
+        bar = self._options.get_bar(contract_symbol, self._as_of_date())
+        if not bar:
+            return None
+        px = bar.get("close")
+        if px is None:
+            return None
+        return self._option_half_spread(float(px), bar)
+
     def _option_slip(self, px: float, side_is_buy: bool, bar: dict) -> float:
         """Option fill price after execution slippage + the modeled half bid-ask spread.
 

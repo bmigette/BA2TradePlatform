@@ -75,15 +75,23 @@ class _FakePrice:
 
 
 class _RefineAccountStub:
-    """Account stub carrying the private attrs ``_build_refine_drawdown_fn`` requires."""
+    """Account stub carrying the private attrs ``_build_refine_drawdown_fn`` requires.
+
+    ``_options`` is the REAL sqlite reader over the test's tiny cache, not a namespace faking
+    its internals: the refinement's option seam is the named ``delta_at_entry`` method (see
+    ``results._build_refine_drawdown_fn``), so a stub that only carried a ``.cache`` attribute
+    would exercise a shape neither backend actually has.
+    """
 
     _wiped_out = False
 
     def __init__(self, snaps, trades, cache_db_path):
+        from app.services.backtest.options_provider import HistoricalOptionsProvider
+
         self._snaps = snaps
         self._trades = trades
         self._price = _FakePrice()
-        self._options = SimpleNamespace(cache=SimpleNamespace(db_path=cache_db_path))
+        self._options = HistoricalOptionsProvider(cache_db_path)
 
     def get_balance_history(self):
         return self._snaps

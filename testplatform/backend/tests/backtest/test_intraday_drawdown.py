@@ -7,6 +7,7 @@ Run from the backend dir:
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
 
 import pytest
@@ -240,6 +241,173 @@ def test_build_refine_drawdown_fn_is_none_for_equity_only_account():
         assert _build_refine_drawdown_fn(acct, {"initial_capital": 100_000.0}) is None
     finally:
         ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# The OPTION seam: _build_refine_drawdown_fn must follow the READER, not an
+# incidental attribute only one backend happens to have.
+# ---------------------------------------------------------------------------
+class _RefinePrice:
+    def bar_at(self, symbol, dt):
+        return {"low": 99.0}
+
+    def prev_bar(self, symbol, dt):
+        return {"low": 100.0}
+
+    def close_at(self, symbol, dt=None):
+        return 100.0
+
+
+def _no_fmp(monkeypatch):
+    """The refinement builds an FMP 5-minute provider eagerly; keep it off the network."""
+    from types import SimpleNamespace
+    import ba2_providers
+
+    monkeypatch.setattr(ba2_providers, "get_provider",
+                        lambda *a, **k: SimpleNamespace(get_ohlcv_data=lambda *a, **k: None))
+
+
+_REFINE_CFG = {"initial_capital": 100_000.0,
+               "account_settings": {"commission_per_trade": 1.0}}
+
+#: An entry timestamp, in the shape the refinement actually hands the seam.
+_ENTRY = datetime(2024, 1, 2, 15, 45)
+
+
+@contextmanager
+def _captured_warnings():
+    """``ba2_common``'s logger sets ``propagate = False``, so caplog's root handler never
+    sees it; attach a collector directly."""
+    import logging
+    from ba2_common.logger import logger as ba2_logger
+
+    records = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    h = _Collect(level=logging.WARNING)
+    ba2_logger.addHandler(h)
+    try:
+        yield records
+    finally:
+        ba2_logger.removeHandler(h)
+
+
+def test_refinement_is_wired_for_the_PARQUET_backend_too(monkeypatch, tmp_path):
+    """REGRESSION. ``_build_refine_drawdown_fn`` used to bind ``options.cache.db_path`` --
+    an attribute only ``HistoricalOptionsProvider`` has -- so on a parquet-backed account it
+    returned None and the intraday refinement switched itself OFF silently.
+
+    That is not merely a missing feature: ``strategy_fitness`` divides by ``max_drawdown``
+    for ``option_consistent_annual_return``, so the same strategy over the same window
+    SCORED DIFFERENTLY depending on which option store served it, with nothing in the result
+    to show why.
+    """
+    from types import SimpleNamespace
+    from app.services.backtest.parquet_options_provider import (
+        ParquetOptionsProvider, clear_worker_parquet_options_cache)
+    from app.services.backtest.results import _build_refine_drawdown_fn
+
+    _no_fmp(monkeypatch)
+    root = tmp_path / "TastyTradeOptionsProvider"
+    root.mkdir()
+    clear_worker_parquet_options_cache()
+    try:
+        acct = SimpleNamespace(
+            _price=_RefinePrice(),
+            _options=ParquetOptionsProvider(str(root), spot_source=lambda s, d: 100.0,
+                                            risk_free_rate=0.045, spot_scope="refine"),
+            _equity_at=lambda dt: 100_000.0)
+        assert _build_refine_drawdown_fn(acct, _REFINE_CFG) is not None
+    finally:
+        clear_worker_parquet_options_cache()
+
+
+def test_both_backends_expose_the_named_delta_at_entry_seam():
+    """The seam is a METHOD both readers implement, checked by name and arity so a rename on
+    one side cannot re-open the silent-skip hole."""
+    import inspect
+    from app.services.backtest.options_provider import HistoricalOptionsProvider
+    from app.services.backtest.parquet_options_provider import ParquetOptionsProvider
+
+    a = inspect.signature(HistoricalOptionsProvider.delta_at_entry)
+    b = inspect.signature(ParquetOptionsProvider.delta_at_entry)
+    assert str(a) == str(b), f"sqlite {a} != parquet {b}"
+    assert list(a.parameters) == ["self", "underlying", "occ_symbol", "when"]
+
+
+def test_a_reader_without_delta_at_entry_is_a_WARNING_not_silence(monkeypatch):
+    """SILENCE WAS THE DEFECT. Skipping is allowed; skipping without saying so is not --
+    ``max_drawdown`` (and every metric divided by it) is then not comparable across runs."""
+    from types import SimpleNamespace
+    from app.services.backtest.results import _build_refine_drawdown_fn
+
+    _no_fmp(monkeypatch)
+    acct = SimpleNamespace(_price=_RefinePrice(), _options=SimpleNamespace(get_bar=lambda *a: None))
+    with _captured_warnings() as msgs:
+        assert _build_refine_drawdown_fn(acct, _REFINE_CFG) is None
+    assert any("delta_at_entry" in m and "SKIPPED" in m for m in msgs), msgs
+
+
+def test_an_equity_only_account_skips_QUIETLY(monkeypatch):
+    """The other half: an equity run has no options at all, which is normal and must not
+    spam a warning on every single backtest."""
+    from types import SimpleNamespace
+    from app.services.backtest.results import _build_refine_drawdown_fn
+
+    _no_fmp(monkeypatch)
+    acct = SimpleNamespace(_price=_RefinePrice(), _options=None)
+    with _captured_warnings() as msgs:
+        assert _build_refine_drawdown_fn(acct, _REFINE_CFG) is None
+    assert not [m for m in msgs if "delta_at_entry" in m], msgs
+
+
+def test_the_refinement_calls_the_readers_delta_at_entry(monkeypatch):
+    """The closure must route to the READER's method, with (underlying, contract, when)."""
+    from types import SimpleNamespace
+    from app.services.backtest import intraday_drawdown
+    from app.services.backtest.results import _build_refine_drawdown_fn
+
+    _no_fmp(monkeypatch)
+    seen = {}
+    calls = []
+    acct = SimpleNamespace(
+        _price=_RefinePrice(),
+        _options=SimpleNamespace(
+            delta_at_entry=lambda u, c, w: (calls.append((u, c, w)), 0.5)[1]),
+        _equity_at=lambda dt: 100_000.0)
+
+    monkeypatch.setattr(intraday_drawdown, "refine_max_drawdown",
+                        lambda trades, md, **kw: (seen.update(kw), md)[1])
+    fn = _build_refine_drawdown_fn(acct, _REFINE_CFG)
+    assert fn is not None
+    fn([], -2.0)
+    assert seen["delta_at_entry"]("AAPL", "AAPL240315C00180000", _ENTRY) == 0.5
+    assert calls == [("AAPL", "AAPL240315C00180000", _ENTRY)]
+
+
+def test_a_reader_that_raises_does_not_fail_the_finished_run(monkeypatch):
+    """A refinement is a refinement: a broken delta lookup drops that trade from the estimate,
+    it does not throw away a completed backtest."""
+    from types import SimpleNamespace
+    from app.services.backtest import intraday_drawdown
+    from app.services.backtest.results import _build_refine_drawdown_fn
+
+    _no_fmp(monkeypatch)
+    seen = {}
+
+    def _boom(*a, **k):
+        raise RuntimeError("chain history unreadable")
+
+    acct = SimpleNamespace(_price=_RefinePrice(),
+                           _options=SimpleNamespace(delta_at_entry=_boom),
+                           _equity_at=lambda dt: 100_000.0)
+    monkeypatch.setattr(intraday_drawdown, "refine_max_drawdown",
+                        lambda trades, md, **kw: (seen.update(kw), md)[1])
+    _build_refine_drawdown_fn(acct, _REFINE_CFG)([], -2.0)
+    assert seen["delta_at_entry"]("AAPL", "X", _ENTRY) is None
 
 
 def test_refine_never_improves_on_the_daily_figure():
