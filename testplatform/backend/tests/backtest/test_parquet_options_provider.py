@@ -441,3 +441,29 @@ def test_spot_scope_tracks_the_ohlcv_memo_eviction_key():
                  ("start_date", "2023-01-02"), ("end_date", "2023-04-30"),
                  ("warmup_days", 60)):
         assert spot_scope({**base, k: v}) != spot_scope(base), k
+
+
+# --------------------------------------------------------------------------- #
+# 8. COVERAGE IS STATED, because the vendor floor cannot state it
+# --------------------------------------------------------------------------- #
+def test_loading_an_underlying_logs_its_actual_bar_coverage(caplog, provider):
+    """The floor bounds what COULD have been downloaded; only the tree knows what WAS. A run
+    outside the downloaded window otherwise reads an empty store and reports the zero-trade
+    result as a result."""
+    import logging
+
+    clear_worker_parquet_options_cache()
+    with caplog.at_level(logging.INFO, logger=pq.__name__):
+        _wide(provider, date(2023, 1, 10))
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("2023-01-03..2023-01-10" in m and _UNDER in m for m in msgs), msgs
+
+
+def test_an_underlying_with_no_partitions_warns(caplog, provider):
+    import logging
+
+    clear_worker_parquet_options_cache()
+    with caplog.at_level(logging.WARNING, logger=pq.__name__):
+        provider.get_chain("NOPE", date(2023, 1, 10), expiry_min=date(2023, 1, 1),
+                           expiry_max=date(2023, 12, 31))
+    assert any("NO partitions for NOPE" in r.getMessage() for r in caplog.records)

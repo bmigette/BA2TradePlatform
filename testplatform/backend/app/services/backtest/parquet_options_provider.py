@@ -98,6 +98,7 @@ dicts only when a caller actually reads one.
 """
 from __future__ import annotations
 
+import logging
 import os
 from collections import OrderedDict
 from datetime import date, timedelta
@@ -112,6 +113,8 @@ from ba2_providers.options.tastytrade import parse_occ
 
 from .option_greeks import compute_iv_and_greeks
 from .options_cache import OptionsCacheMiss
+
+logger = logging.getLogger(__name__)
 
 #: Underlyings held per worker process. Measured: GOOG's 27,974 rows cost 2.95 MB columnar
 #: (13 data arrays + the 6 lazy greeks arrays + the contract-symbol list), so the default cap
@@ -338,7 +341,23 @@ def _load_underlying(root: str, underlying: str, rate: float,
 
     store = OptionHistoryParquetStore(root=root)
     df = store.read_underlying(underlying)
-    return _Underlying(underlying, rate, df, spot_source)
+    u = _Underlying(underlying, rate, df, spot_source)
+    # COVERAGE, STATED ONCE PER UNDERLYING PER WORKER. The vendor's history FLOOR bounds what
+    # COULD have been downloaded; it says nothing about what this tree actually holds, and a
+    # run outside the downloaded window reads an empty store and reports the resulting
+    # zero-trade result as a result. That is the failure the floor seam exists to prevent, one
+    # level down, and it is not detectable from the floor. One log line per underlying is the
+    # cheapest honest signal: a 2024 run against a 2023-only tree says so in the first
+    # screenful instead of at the post-mortem.
+    if u.n_rows:
+        logger.info("[backtest] parquet option store: %s %d bars / %d contracts, %s..%s",
+                    underlying, u.n_rows, len(u.c_occ),
+                    date.fromordinal(int(u.bar_ord.min())).isoformat(),
+                    date.fromordinal(int(u.bar_ord.max())).isoformat())
+    else:
+        logger.warning("[backtest] parquet option store: NO partitions for %s under %s — "
+                       "every chain read for it will be empty.", underlying, root)
+    return u
 
 
 def _underlying(root: str, underlying: str, rate: float, spot_scope: str,
