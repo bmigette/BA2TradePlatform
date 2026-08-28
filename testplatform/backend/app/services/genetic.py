@@ -72,6 +72,24 @@ def _jsonable_to_py_state(s):
     )
 
 
+def _clone_global_rng() -> random.Random:
+    """A private ``random.Random`` carrying the CURRENT global ``random`` module state.
+
+    This is how the GA inherits its caller's seed without an API change and without consuming a
+    single draw: ``handle_strategy_optimization`` does ``random.seed(ga["seed"])`` and then
+    constructs the optimizer, so a snapshot taken at construction time IS the seeded stream.
+    Because ``random.Random`` and the module-level functions are the same Mersenne Twister with
+    the same methods, the private generator then yields byte-identical numbers to the ones the
+    module would have produced -- so switching the GA onto it changes nothing except WHO can
+    disturb it.
+
+    Which is the entire point: see ``GeneticOptimizer._rng``.
+    """
+    rng = random.Random()
+    rng.setstate(random.getstate())
+    return rng
+
+
 def _accepts_on_result(batch_fitness) -> bool:
     """Does this batch evaluator take the incremental-result callback?
 
@@ -152,6 +170,27 @@ class GeneticOptimizer:
         self.elitism_percent = elitism_percent
         self.parallel_individuals = max(1, parallel_individuals)
 
+        # THE GA'S OWN RANDOMNESS, isolated from the fitness evaluation's.
+        #
+        # Every draw the search itself makes -- the initial population, tournament selection, the
+        # crossover/mutation gates, the crossover points, the mutation gaussians -- comes from
+        # here and NEVER from the global ``random`` module. Seeded by cloning the module state at
+        # construction (the caller has just done ``random.seed(seed)``), so the sequence is
+        # exactly the one the module would have produced.
+        #
+        # WHY (bug F4: a GA result depended on ``--parallel``). The fitness evaluation runs in
+        # this same process when ``parallel <= 1`` and no remote workers are configured
+        # (``strategy_optimization_handler._dispatch_engages`` -> ``batch_fitness is None`` ->
+        # the ``map(self.toolbox.evaluate, ...)`` branch below), and in spawned worker PROCESSES
+        # otherwise. ``DailyBacktestEngine.run()`` opens with ``random.seed(self.seed)`` for its
+        # own reproducibility -- harmless in a worker, but in-process it RESET the GA's stream
+        # after every single trial. Measured on 5 symbols, pop=16 gen=3, seed=42: parallel=4 and
+        # 8 gave -6.04 while parallel=1 gave -43.66, with generation 0 (drawn before any
+        # evaluation) identical in both and every later generation different. A private
+        # generator makes the search depend on (seed, population, generations) alone; nothing a
+        # fitness function does to the global RNG can reach it.
+        self._rng = _clone_global_rng()
+
         self.toolbox = None
         self.best_individual = None
         self.best_fitness = None
@@ -186,14 +225,14 @@ class GeneticOptimizer:
             if config['type'] == 'int':
                 self.toolbox.register(
                     f"attr_{i}",
-                    random.randint,
+                    self._rng.randint,
                     config['min'],
                     config['max']
                 )
             else:
                 self.toolbox.register(
                     f"attr_{i}",
-                    random.uniform,
+                    self._rng.uniform,
                     config['min'],
                     config['max']
                 )
@@ -211,24 +250,64 @@ class GeneticOptimizer:
             self.toolbox.individual
         )
 
-        # Register genetic operators
-        self.toolbox.register("mate", tools.cxTwoPoint)
+        # Register genetic operators.
+        #
+        # ``mate`` and ``select`` are LOCAL re-implementations of ``tools.cxTwoPoint`` and
+        # ``tools.selTournament`` rather than the DEAP originals: those draw from the global
+        # ``random`` module (they are documented as doing so) and there is no seam to hand them
+        # a generator. Routing them through ``self._rng`` is what keeps the whole search immune
+        # to a fitness function touching the global RNG -- see ``self._rng``. The draw sequence
+        # is identical to DEAP's, so this changes no result on its own.
+        self.toolbox.register("mate", self._cx_two_point)
         self.toolbox.register("mutate", self._mutate_individual)
-        self.toolbox.register("select", tools.selTournament, tournsize=3)
+        self.toolbox.register("select", self._sel_tournament, tournsize=3)
+
+    def _cx_two_point(self, ind1: List, ind2: List) -> Tuple[List, List]:
+        """``tools.cxTwoPoint`` on the optimizer's private RNG (see ``_setup_deap``).
+
+        Draw-for-draw identical to DEAP 1.4's implementation: two ``randint`` calls, the second
+        bumped/swapped the same way, then an in-place slice exchange.
+        """
+        size = min(len(ind1), len(ind2))
+        cxpoint1 = self._rng.randint(1, size)
+        cxpoint2 = self._rng.randint(1, size - 1)
+        if cxpoint2 >= cxpoint1:
+            cxpoint2 += 1
+        else:
+            cxpoint1, cxpoint2 = cxpoint2, cxpoint1
+
+        ind1[cxpoint1:cxpoint2], ind2[cxpoint1:cxpoint2] = (
+            ind2[cxpoint1:cxpoint2], ind1[cxpoint1:cxpoint2])
+        return ind1, ind2
+
+    def _sel_tournament(self, individuals: List, k: int, tournsize: int,
+                        fit_attr: str = "fitness") -> List:
+        """``tools.selTournament`` on the optimizer's private RNG (see ``_setup_deap``).
+
+        Draw-for-draw identical to DEAP 1.4: ``k`` tournaments, each ``tournsize`` uniform
+        ``choice`` draws with replacement, winner by ``max`` (which keeps the FIRST maximum, as
+        DEAP's does). Returns references into *individuals*, not copies -- the caller clones.
+        """
+        from operator import attrgetter
+        chosen = []
+        for _ in range(k):
+            aspirants = [self._rng.choice(individuals) for _ in range(tournsize)]
+            chosen.append(max(aspirants, key=attrgetter(fit_attr)))
+        return chosen
 
     def _create_individual(self) -> List:
         """Create a random individual (chromosome)."""
         individual = []
         for i, (param_name, config) in enumerate(self.param_ranges.items()):
             if config['type'] == 'int':
-                value = random.randint(config['min'], config['max'])
+                value = self._rng.randint(config['min'], config['max'])
             elif config['type'] == 'choice':
                 # Categorical gene: encoded as an int INDEX into config['choices']
                 # (decode_individual maps it back to the choice value, e.g. a target_price_type
                 # string). The GA evolves the index; min/max are 0..len-1.
-                value = random.randint(0, len(config['choices']) - 1)
+                value = self._rng.randint(0, len(config['choices']) - 1)
             else:
-                value = random.uniform(config['min'], config['max'])
+                value = self._rng.uniform(config['min'], config['max'])
             individual.append(value)
         return creator.Individual(individual)
 
@@ -244,18 +323,18 @@ class GeneticOptimizer:
             Mutated individual (tuple for DEAP compatibility)
         """
         for i, (param_name, config) in enumerate(self.param_ranges.items()):
-            if random.random() < indpb:
+            if self._rng.random() < indpb:
                 if config['type'] == 'choice':
                     # Categorical: nudge the int index, clamped to 0..len-1.
                     n = len(config['choices'])
                     sigma = max(1.0, (n - 1) / 6)
                     individual[i] = int(np.clip(
-                        round(individual[i] + random.gauss(0, sigma)), 0, n - 1))
+                        round(individual[i] + self._rng.gauss(0, sigma)), 0, n - 1))
                 elif config['type'] == 'int':
                     # Gaussian mutation for integers
                     sigma = (config['max'] - config['min']) / 6
                     individual[i] = int(np.clip(
-                        individual[i] + random.gauss(0, sigma),
+                        individual[i] + self._rng.gauss(0, sigma),
                         config['min'],
                         config['max']
                     ))
@@ -263,7 +342,7 @@ class GeneticOptimizer:
                     # Gaussian mutation for floats
                     sigma = (config['max'] - config['min']) / 6
                     individual[i] = np.clip(
-                        individual[i] + random.gauss(0, sigma),
+                        individual[i] + self._rng.gauss(0, sigma),
                         config['min'],
                         config['max']
                     )
@@ -410,6 +489,25 @@ class GeneticOptimizer:
             except Exception as e:
                 logger.warning(f"Could not restore numpy random state: {e}")
 
+        # Restore the GA's OWN generator -- the one that actually decides the rest of the search
+        # (see self._rng). Without this a resume would carry on from a construction-time clone of
+        # whatever the global RNG happened to be, i.e. from the wrong point in the sequence.
+        #
+        # LEGACY checkpoints (written while the GA still drew from the global module) have no
+        # 'ga_random_state'; re-cloning the global state we just restored above reproduces what
+        # those runs would have continued with exactly, so an in-flight resume is unaffected.
+        #
+        # Always MUTATE self._rng in place rather than rebinding it: the toolbox's ``attr_i``
+        # generators are bound methods of this exact object.
+        if 'ga_random_state' in checkpoint:
+            try:
+                self._rng.setstate(_jsonable_to_py_state(checkpoint['ga_random_state']))
+            except Exception as e:
+                logger.warning(f"Could not restore GA random state: {e}")
+                self._rng.setstate(random.getstate())
+        else:
+            self._rng.setstate(random.getstate())
+
         logger.info(f"Resuming from generation {checkpoint.get('generation', 0)}")
         # partial=True means the stored generation was INTERRUPTED mid-evaluation, so resume INTO
         # it rather than after it. The fitness list carries which individuals are already done.
@@ -481,6 +579,11 @@ class GeneticOptimizer:
             'history': self.history,
             'random_state': _py_state_to_jsonable(random.getstate()),
             'np_random_state': _np_state_to_jsonable(np.random.get_state()),
+            # The GA's OWN generator (self._rng) -- the only one whose position decides the rest
+            # of the search. The two above are the PROCESS globals, kept because a fitness
+            # function may legitimately depend on them; this one is what makes a resume land on
+            # the same offspring the uninterrupted run would have produced.
+            'ga_random_state': _py_state_to_jsonable(self._rng.getstate()),
         }
 
     def optimize(
@@ -658,14 +761,14 @@ class GeneticOptimizer:
 
             # Crossover
             for child1, child2 in zip(offspring[::2], offspring[1::2]):
-                if random.random() < self.crossover_prob:
+                if self._rng.random() < self.crossover_prob:
                     self.toolbox.mate(child1, child2)
                     del child1.fitness.values
                     del child2.fitness.values
 
             # Mutation
             for mutant in offspring:
-                if random.random() < self.mutation_prob:
+                if self._rng.random() < self.mutation_prob:
                     self.toolbox.mutate(mutant)
                     del mutant.fitness.values
 
