@@ -1092,6 +1092,27 @@ def _apply_options_seam(spec: dict, backtest_block: dict) -> None:
         backtest_block["options_cache_db"] = default_options_cache_db()
 
 
+def _apply_options_store(args, backtest_block: dict) -> None:
+    """Write the RESOLVED option store onto the run's backtest block (--options-store, else
+    ``BACKTEST_OPTIONS_STORE``, else ``sqlite`` — resolve_options_store owns that order).
+
+    Unconditional, and it stores the DECISION rather than the raw flag, because a grid does not
+    run in one process: ``_cmd_optimize_batch`` hands the block to the task queue and the GA
+    fans trials out to remote workers, which receive ONLY {config, fitness_metric, cache_root,
+    inmem_trades} (worker_client.run_trial). No environment travels with a trial, so a store
+    selected by exporting BACKTEST_OPTIONS_STORE reached the master and nothing else: the worker
+    re-resolved to the sqlite default and served Alpaca history for a job the master reported as
+    parquet. Recording it here also makes the persisted optimization_config replayable
+    (rerun_handler feeds the SAME block back through _build_daily_trial_config).
+
+    ``sqlite`` is what an unflagged run already resolved to, so writing it changes nothing for
+    existing jobs — it only stops the answer depending on who is asking.
+    """
+    from app.services.backtest.options_store import resolve_options_store
+    backtest_block["options_store"] = resolve_options_store(
+        {"options_store": getattr(args, "options_store", None)})
+
+
 def _bypass_gene_space(spec: dict) -> dict:
     """GA gene space for a BYPASS expert: its expert_params plus the narrow _BYPASS_RM_OPT block
     UNLESS the spec opts out (no_bypass_rm — PremiumSeller's manager owns its exits, so the
@@ -3784,6 +3805,12 @@ def _cmd_optimize(args) -> int:
         }
         # Options experts get the offline options-cache seam (no-op for equity experts).
         _apply_options_seam(spec, backtest_block)
+        # WHICH store the run reads, resolved and recorded here rather than left to whatever
+        # environment each trial process happens to have. Applies to every run, not just the
+        # options-EXPERT ones above: a pure-option STRATEGY (--strategy O_LC) runs a classic
+        # expert, so _apply_options_seam is a no-op for it while it is exactly the kind of job
+        # that needs the parquet store.
+        _apply_options_store(args, backtest_block)
 
         # Screener-settings optimization: when --screener, attach a screener_opt block to the
         # backtest config (store + base settings + scan cadence — an OPTIMIZATION config option,
@@ -4102,6 +4129,10 @@ def _cmd_optimize_batch(args) -> int:
             }
             # Options experts get the offline options-cache seam (no-op for equity experts).
             _apply_options_seam(spec, backtest_block)
+            # The store decision, resolved once and recorded on the block. THIS driver is the one
+            # that fans out to remote workers, so it is the one for which "the store came from an
+            # exported env var" is a silent lie (see _apply_options_store).
+            _apply_options_store(args, backtest_block)
             # Target-anchored variants (S4): the TP-on-target anchoring lives on the Strategy row
             # itself (strat.entry_actions, seeded by _build_strategy_S4) — nothing to thread onto
             # the run config here.
@@ -4642,6 +4673,10 @@ def main(argv: "list | None" = None) -> int:
         _DEFAULT_SCREENER_STORE_DIR = None
         _DEFAULT_OPTIONS_CACHE_DB = None
 
+    # The two option READERS a run can be served by (backtest/options_store.py). Taken from the
+    # seam rather than spelled out here so a third store cannot exist without the CLI offering it.
+    from app.services.backtest.options_store import OPTIONS_STORES as _OPTIONS_STORES
+
     p = argparse.ArgumentParser(prog="ba2-test", description="BA2 Test Platform CLI.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -4903,6 +4938,15 @@ def main(argv: "list | None" = None) -> int:
                          "selector hands the filler candidates it rejects, and the order just sits "
                          "pending. Cached-bar distribution: p25=3, p50=14, p75=71. A tradability "
                          "floor, NOT a GA gene (exposed, the GA would drive it to 0). 0 disables.")
+    op.add_argument("--options-store", default=None, choices=list(_OPTIONS_STORES),
+                    help="WHICH option store the run reads, and therefore whose history floor "
+                         "applies: 'sqlite' (default -- the Alpaca-built OptionsHistoryCache, "
+                         "floor 2024-01-18, the store every recorded backtest number came from) "
+                         "or 'parquet' (the TastyTrade/dxfeed tree, floor 2022-10-01, the only "
+                         "one holding 2023). Omitted -> $BACKTEST_OPTIONS_STORE, then sqlite. "
+                         "State it on the command line for a DISTRIBUTED run: the env var is "
+                         "read on whichever process resolves it, and no environment travels "
+                         "with a trial shipped to a remote worker.")
     op.add_argument("--gates-off", action="store_true",
                     help="SMOKE RUNS: drop every OPTIONAL option-entry condition gate (the "
                          "directional signal, confidence, iv_rank, relative volume, "
@@ -5046,6 +5090,13 @@ def main(argv: "list | None" = None) -> int:
                          "selector hands the filler candidates it rejects, and the order just sits "
                          "pending. Cached-bar distribution: p25=3, p50=14, p75=71. A tradability "
                          "floor, NOT a GA gene (exposed, the GA would drive it to 0). 0 disables.")
+    ob.add_argument("--options-store", default=None, choices=list(_OPTIONS_STORES),
+                    help="WHICH option store every job in the batch reads: 'sqlite' (default, "
+                         "Alpaca, floor 2024-01-18) or 'parquet' (TastyTrade/dxfeed, floor "
+                         "2022-10-01, the only one holding 2023). Omitted -> "
+                         "$BACKTEST_OPTIONS_STORE, then sqlite. THIS is the driver that fans "
+                         "trials out to remote workers, and no environment travels with a "
+                         "trial -- state the store here.")
     ob.add_argument("--fill-model", default="next_bar_open")
     ob.add_argument("--interval", default="5min",
                     help="Fill-clock interval (default 5min for precise intraday TP/SL).")
