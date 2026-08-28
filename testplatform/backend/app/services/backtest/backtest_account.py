@@ -327,6 +327,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # each assignment in _book_assignment_share_leg (assignments are rare; nothing is
         # gained by caching it, and a cached copy would silently ignore a config change).
         self._pending_assignment_sells: Dict[str, float] = {}
+        # OPT-L1 exit half: (symbol, reason) pairs the PLEDGED-COVER lock has already
+        # explained at ERROR in this run. The lock fires REPEATEDLY by design (a staged
+        # TP/SL re-arms on every bar its level is crossed — the measured BAC case stood
+        # for 40 consecutive bars), so the full explanation is logged once per symbol per
+        # reason and the recurrences drop to DEBUG. See _pledged_share_lock.
+        self._pledged_lock_logged: set = set()
         # OPT-B4 (option TIF DAY): order id -> the SIMULATED calendar date the option order
         # was staged on. ``TradingOrder.created_at`` is stamped with the WALL clock by the ORM
         # and is therefore useless for ageing in a backtest. Read only by
@@ -906,6 +912,235 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     covered.add(lot.contract_symbol)
                     available -= needed
         return covered
+
+    def _ledger_shares_pledged_to_short_calls(self, underlying: str) -> Optional[int]:
+        """Shares of ``underlying`` PLEDGED as cover by open SHORT CALL lots — or None.
+
+        OPT-L1, THE SIMULATOR'S EXIT HALF. A broker LOCKS the shares collateralising a
+        written call: while the covered call is open you cannot sell the stock, because
+        that would leave a naked call with unbounded upside risk. This is the number that
+        lock is measured against (see ``_pledged_share_lock``).
+
+        TRI-STATE, and the whole point of the method. An int (INCLUDING 0) is MEASURED and
+        the caller may sell against it; ``None`` is UNMEASURABLE and the caller must
+        REFUSE. "We could not find out" is not "nothing is pledged" — that conflation is
+        exactly how a covered call goes naked, and it is the house's dominant defect class.
+
+        WHY THIS IS NOT ``_covered_short_call_contracts`` AND NOT THE INHERITED
+        ``shares_pledged_to_short_calls``:
+
+          * ``_covered_short_call_contracts`` answers a DIFFERENT question — "which lots
+            are FULLY covered", allocated GREEDILY largest-lot-first, all-or-nothing per
+            lot. It feeds the maintenance-margin sum and the margin-call candidate set, so
+            its "unresolvable lot -> skip" behaviour is pinned by tests and must not move;
+            and reusing it here would reproduce its greedy artifact (two lots on one
+            underlying where the first claims the shares) as a phantom shortfall. The lock
+            needs the per-underlying SUM, which is allocation-free.
+          * ``OptionsAccountInterface.shares_pledged_to_short_calls`` (inherited, and
+            correct — it is what refuses the LIVE close path, and it works on this class)
+            reads the ORDER BOOK. That is the right source live, where an unfilled
+            sell-to-open is a real in-flight obligation. Here it means a DB/transaction
+            scan on a per-fill hot path, and the fill-time question is about the ledger
+            AFTER this bar's earlier fills. This reads ``_option_positions`` directly:
+            O(lots), hermetic, and the more accurate of the two at fill time. Both are
+            conservative, so double-guarding the close path costs nothing.
+
+        WHAT PLEDGES AND WHAT DOES NOT. Only SHORT CALL lots pledge SHARES. A short PUT
+        obliges CASH (cash-secured) and places no claim on share inventory — counting it
+        would refuse a sale nothing has a claim on, which silently disables exits and is
+        the mirror error of the defect. LONG options pledge nothing: only the short side
+        can be called away. Lots netted to ZERO are left in ``_option_positions`` rather
+        than removed, so ``qty >= 0`` skips both the longs and the closed shorts.
+
+        THE MULTIPLIER IS READ PER LOT AND NEVER ASSUMED (OPT-L7). An adjusted contract —
+        post-split, post-merger — can deliver a different number of shares, so
+        ``float(lot.multiplier or 100)`` (the shape used a few lines above, where a guess
+        only perturbs a margin estimate) would under-report the pledge on precisely the
+        contract whose oddity nobody remembers. Unreadable here means UNKNOWN.
+
+        EVERY WAY THE ANSWER CAN FAIL, and ONE failure poisons the WHOLE answer rather
+        than shrinking it — a partial sum is a smaller number that looks exactly like a
+        measured one, and the caller would free the difference:
+
+          * ``_lot_order`` returns None: no order row carries this contract's terms (or
+            every row for it has a NULL strike, which the index refuses). The lot might be
+            a short call on this ticker and we cannot rule it out.
+          * the right is neither CALL nor PUT (a malformed/absent ``option_type``): it
+            might be the call.
+          * a short CALL with no ``underlying_symbol``: it might be on THIS ticker, so it
+            has to poison every ticker's answer. There is deliberately no fall-back to
+            ``o.symbol`` — on an option leg row that field can hold the OCC string, which
+            would never match and would report the shares as free.
+          * a multiplier that is absent or <= 0: a missing field, not a contract that
+            delivers no shares.
+
+        ROUNDED UP, and paired with a round-DOWN on the holding at the call site: a
+        fractional share cannot cover a contract, so both roundings must point at
+        "less free inventory than the raw arithmetic suggests".
+        """
+        wanted = (underlying or "").strip().upper()
+        if not wanted:
+            logger.error(
+                "[backtest] PLEDGED COVER: _ledger_shares_pledged_to_short_calls(%r) has no "
+                "underlying to measure — reporting UNKNOWN rather than 'nothing is pledged', "
+                "which is what a 0 would be read as.", underlying)
+            return None
+
+        total = 0.0
+        for lot in self._option_positions.values():
+            if lot.qty >= 0:
+                continue  # long lots and bought-back (zeroed) shorts pledge nothing
+            contract = lot.contract_symbol
+            o = self._lot_order(contract)
+            if o is None:
+                logger.error(
+                    "[backtest] PLEDGED COVER UNMEASURABLE for %s: the held SHORT lot %s "
+                    "(%g contract(s)) has no resolvable option order — no row carries the "
+                    "contract, or every row for it has a NULL strike. It may be a short CALL "
+                    "on %s, so how many shares are pledged CANNOT be measured and must not be "
+                    "read as zero. Repair the option order book; this is NOT a share shortfall.",
+                    wanted, contract, lot.qty, wanted)
+                return None
+            right = o.option_type
+            if right == OptionRight.PUT:
+                continue  # a short put pledges CASH (cash-secured), never share inventory
+            if right != OptionRight.CALL:
+                logger.error(
+                    "[backtest] PLEDGED COVER UNMEASURABLE for %s: the held SHORT lot %s "
+                    "(%g contract(s)) reports option_type=%r — neither CALL nor PUT. It might "
+                    "be the call whose cover is about to be sold, so the pledge is UNKNOWN.",
+                    wanted, contract, lot.qty, right)
+                return None
+            under = (o.underlying_symbol or "").strip().upper()
+            if not under:
+                logger.error(
+                    "[backtest] PLEDGED COVER UNMEASURABLE for %s: the held SHORT CALL lot %s "
+                    "(%g contract(s)) names no underlying_symbol, so its pledge cannot be "
+                    "attributed to a ticker — it might be on %s. (There is no fall-back to "
+                    "order.symbol: on an option leg row that field holds the OCC string and "
+                    "would never match, reporting the shares as free.)",
+                    wanted, contract, lot.qty, wanted)
+                return None
+            if under != wanted:
+                continue
+            multiplier = lot.multiplier
+            if multiplier is None or multiplier <= 0:
+                logger.error(
+                    "[backtest] PLEDGED COVER UNMEASURABLE for %s: the held SHORT CALL lot %s "
+                    "(%g contract(s)) has multiplier=%r. A multiplier is a MISSING FIELD when "
+                    "it is absent or <= 0, not a contract that delivers no shares — guessing "
+                    "100 would under-report an adjusted (post-split) contract's pledge.",
+                    wanted, contract, lot.qty, multiplier)
+                return None
+            total += abs(float(lot.qty)) * float(multiplier)
+        # Round UP (the -1e-9 keeps an exact 100.0 at 100 rather than pushing it to 101):
+        # a partial contract still calls away a whole block of shares.
+        return int(math.ceil(total - 1e-9)) if total > 0 else 0
+
+    def _pledged_share_lock(self, symbol: str, qty: float, *, context: str) -> float:
+        """How many of ``qty`` shares of ``symbol`` may ACTUALLY be sold — the broker's lock.
+
+        THE SELL-SIDE MIRROR of the CASH-SECURED safeguard in ``_apply_fill``. That one
+        stops a BUY the account cannot fund; this one stops a SELL the account is not
+        free to make, because the shares are pledged as cover for an open short call.
+
+        MEASURED DEFECT (O_CC / GOOG,BAC,INTC,F,T / 2023-01-10..2023-03-28 / $100k /
+        gates-off / 1d): four short calls carried for up to 40 bars with 4 shares held
+        against 200 needed — genuinely naked calls with unbounded upside risk, produced
+        with no error and no log line, because the equity exit rules (a staged trailing
+        stop plus a time exit) sold the collateral out from under them. The GA arms that
+        sell premium can therefore book premium against a risk profile no broker would
+        permit, which in a benign window reads as free money.
+
+        CLAMP, DO NOT BLANKET-REFUSE. A broker lets you sell the UNPLEDGED EXCESS: 297
+        held with 200 pledged sells 97; 200 held with 200 pledged sells nothing. Refusing
+        wholesale would disable legitimate exits on any ticker that happens to carry a
+        covered call, which is its own (quieter) way of producing wrong numbers.
+
+        THE ALTERNATIVE THAT WAS REJECTED: allow the sale and buy the call back on the
+        next bar. That leaves real OVERNIGHT naked exposure — precisely the risk being
+        modelled — so the lock is modelled instead.
+
+        THREE SHORT-CIRCUITS, in cost order, and each one keeps a class of run
+        bit-identical to before this method existed:
+
+          1. no option lots at all -> equity-only runs pay one dict truth test;
+          2. the account is not LONG the symbol -> a sell from flat or from a short OPENS
+             or ADDS TO a short. There are no long shares to pledge and nothing to strip,
+             so short selling is never touched;
+          3. a MEASURED pledge of 0 -> return ``qty`` unchanged. In particular a
+             long-to-short FLIP is left alone here, and only clamped when something is
+             actually pledged (in which case forgoing the short leg is the conservative
+             reading; the simulator's exits do not flip in practice).
+
+        UNKNOWN IS A REFUSAL, NOT A ZERO: an unmeasurable pledge returns 0 (sell nothing)
+        and says so, naming the lot that could not be measured, so an operator repairs the
+        order book instead of hunting a phantom shortfall.
+
+        THE LOG IS DEDUPED PER (symbol, reason) PER RUN, unlike the cash-secured block
+        above. That one is documented as "never fires in a correct run"; this one fires
+        REPEATEDLY BY DESIGN — a staged TP/SL re-arms on every bar the level is crossed,
+        and the measured BAC case stood for 40 consecutive bars. One loud ERROR carrying
+        the full explanation, then DEBUG, keeps a GA's logs readable without hiding the
+        event.
+
+        NOT EVERY SHARE-MUTATING PATH GOES THROUGH HERE, deliberately.
+        ``_book_assignment_share_leg`` (the broker DELIVERING the stock on assignment) is
+        exempt: it removes the shares AND the call together, and blocking it would
+        deadlock the wheel, whose only exit IS being called away. ``_liquidate_stock_
+        position`` is exempt by construction — its only caller iterates ``qty < 0``, so it
+        is always a BUY-to-cover that RAISES the share count. This is also why the lock
+        lives at the order/fill boundary and never in the shared ``_update_position``.
+        """
+        if qty <= 0 or not self._option_positions:
+            return qty
+        pos = self._positions.get(symbol)
+        held = float(pos.qty) if pos is not None else 0.0
+        if held <= 0:
+            return qty  # selling from flat/short opens a short; nothing is pledged
+
+        pledged = self._ledger_shares_pledged_to_short_calls(symbol)
+        if pledged is None:
+            self._log_pledged_lock(
+                symbol, "unmeasurable",
+                "[backtest] PLEDGED COVER: REFUSING to sell %g %s share(s) (%s) — how many "
+                "are pledged as cover for open short calls could not be measured (the ERROR "
+                "above names the unreadable lot). The account holds %g; selling any of them "
+                "could strip an open short call of its cover, and an unmeasurable pledge must "
+                "not be read as 'nothing is pledged'. Repair the option order book — this is "
+                "NOT a shortfall and closing a position will not clear it.",
+                (qty, symbol, context, held))
+            return 0.0
+        if pledged <= 0:
+            return qty  # MEASURED zero: nothing has a claim, path unchanged
+
+        # Round the holding DOWN against a pledge rounded UP: a fractional share cannot
+        # cover a contract, so both roundings point at "less free inventory".
+        free = max(0.0, float(math.floor(held)) - float(pledged))
+        if qty <= free:
+            return qty
+        self._log_pledged_lock(
+            symbol, "clamped" if free > 0 else "blocked",
+            "[backtest] PLEDGED-COVER lock TRIPPED on %s (%s): a SELL of %g share(s) would "
+            "leave %g of the %g this account holds, but %d are pledged as cover for open "
+            "short calls — short by %g, which would leave a written call NAKED (unbounded "
+            "upside risk a broker would not permit). %s Buy back or let the short call "
+            "expire to release its cover. NOTE this can recur on every bar while the pledge "
+            "stands (a staged TP/SL re-arms each bar it is crossed); further occurrences "
+            "for %s are logged at DEBUG.",
+            (symbol, context, qty, held - qty, held, pledged, pledged - (held - qty),
+             (f"Clamping the sale to the {free:g} unpledged share(s)." if free > 0 else
+              "NOTHING may be sold; the sale is refused in full."), symbol))
+        return free
+
+    def _log_pledged_lock(self, symbol: str, reason: str, fmt: str, args: tuple) -> None:
+        """LOUD once per (symbol, reason) per run, DEBUG thereafter. See ``_pledged_share_lock``."""
+        key = (symbol, reason)
+        if key in self._pledged_lock_logged:
+            logger.debug(fmt, *args)
+            return
+        self._pledged_lock_logged.add(key)
+        logger.error(fmt, *args)
 
     def maybe_margin_call_liquidation(self) -> bool:
         """Force-liquidate SHORT positions when equity breaches maintenance margin.
@@ -2276,9 +2511,27 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 fill_px = self._evaluate_fill(probe, as_of)
                 if fill_px is None:
                     continue  # not crossed this bar
+                # PLEDGED-COVER lock, asked BEFORE the row is written (OPT-L1 exit half).
+                # _apply_fill would clamp this too, but this loop is the path that actually
+                # leaked in O_CC and it builds + PERSISTS a brand-new order on every bar the
+                # level is crossed: leaving the refusal to fill time would litter the book
+                # with one CANCELED row and one cache invalidation per bar for as long as the
+                # pledge stands (40 consecutive bars, measured). `held` here is NET FILLED
+                # from the order rows; the lock reads the ledger, which is the more accurate
+                # view of what is actually sellable right now.
+                sell_qty = held
+                if close_side == OrderDirection.SELL:
+                    sell_qty = self._pledged_share_lock(
+                        entry.symbol, held,
+                        context=f"bracket {leg} exit on transaction {txn_id}")
+                    if sell_qty <= 0:
+                        # Nothing may be sold. The TP/SL still lives on the TRANSACTION, so
+                        # the exit is deferred rather than lost: it re-arms and goes through
+                        # the moment the short call is bought back or expires.
+                        continue
                 ts = int(as_of.timestamp()) if hasattr(as_of, "timestamp") else 0
                 order = TradingOrder(
-                    account_id=self.id, symbol=entry.symbol, quantity=held, side=close_side,
+                    account_id=self.id, symbol=entry.symbol, quantity=sell_qty, side=close_side,
                     order_type=otype, stop_price=stop_price, limit_price=limit_price,
                     transaction_id=txn_id,
                     depends_on_order=entry.id,
@@ -3305,6 +3558,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         ``hold_assigned_stock`` (the wheel), for which this method is a permanent no-op
         because ``_book_assignment_share_leg`` never fills the pending dict.
 
+        THE PLEDGED-COVER LOCK APPLIES TO THE SELL-LONG BRANCH (OPT-L1 exit half). This
+        method runs AFTER the manage pass, and ``daily_engine`` already documents the
+        hazard in prose: the overlay writes a covered call against the assigned shares in
+        step 3 and this would sell them on the same bar, leaving a naked short call. Until
+        now the ONLY mitigation was the opt-in per-strategy ``hold_assigned_stock``, so
+        every arm that is not O_WHEEL was exposed — reproduced on the DEFAULT config.
+        The sale is therefore clamped to the unpledged excess and any remainder STAYS
+        QUEUED (mirroring the existing "no bar this tick -> retry next bar" idiom rather
+        than the unconditional pop), so the shares liquidate the moment the call is bought
+        back or expires instead of being silently forgotten. The ``assigned < 0`` branch
+        BUYS BACK short stock, which can only ever ADD cover, and is never touched.
+
         Returns True when any shares were liquidated.
         """
         if not self._pending_assignment_sells:
@@ -3327,6 +3592,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if px <= 0:
                 continue
             to_close = float(min(abs(assigned), held))
+            # PLEDGED-COVER lock on the SELL-LONG branch only (see the docstring). The
+            # buy-back branch adds cover and is exempt. `locked_out` is what the lock — not
+            # the `held` bound — held back, so a run where the lock never bites keeps the
+            # historical unconditional pop and stays byte-identical.
+            locked_out = 0.0
+            if assigned > 0:
+                sellable = self._pledged_share_lock(
+                    symbol, to_close, context="assignment_liquidation (next-bar orphan sale)")
+                locked_out = to_close - sellable
+                if sellable <= 0:
+                    continue  # stays queued: retry once the short call releases its cover
+                to_close = float(sellable)
             signed = -to_close if assigned > 0 else to_close  # sell long / buy back short
             self._cash -= signed * px
             self._update_position(symbol, signed, px)
@@ -3338,7 +3615,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 "assigned stock is unmanaged in a backtest; cash now $%.2f.",
                 "sold" if assigned > 0 else "bought back", to_close, symbol, px, self._cash,
             )
-            self._pending_assignment_sells.pop(symbol)
+            if locked_out > 0:
+                # Only the PLEDGED remainder stays queued. Popping it here (what the
+                # unconditional pop did) would silently forget orphaned stock the lock
+                # merely DEFERRED, leaving it unmanaged to run end — the OS1 blow-up this
+                # method exists to prevent.
+                self._pending_assignment_sells[symbol] = locked_out
+            else:
+                self._pending_assignment_sells.pop(symbol)
             traded_any = True
         return traded_any
 
@@ -3949,6 +4233,34 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 qty = float(affordable)
                 signed = qty
                 order.quantity = qty
+        # PLEDGED-COVER safeguard (OPT-L1 exit half) — the SELL-side MIRROR of the
+        # cash-secured block above, and the single choke point for every strategy-driven
+        # share sale (the working-order loop in refresh_orders and _apply_bracket_exits both
+        # land here). A broker LOCKS the shares that collateralise a written call; the
+        # simulator did not, so O_CC's trailing stop sold the collateral and left four
+        # measurably NAKED short calls standing for up to 40 bars. _pledged_share_lock owns
+        # the reasoning, the tri-state pledge and the (deduped) LOUD log; it returns `qty`
+        # untouched for equity-only runs, for a sell from flat/short, and whenever the pledge
+        # is a MEASURED zero — so every path that was correct before is byte-identical.
+        #
+        # Unlike the cash-secured branch this does NOT cancel the OCO sibling: the position
+        # is still OPEN and still needs its other protective leg. The exit is refused, not
+        # the position abandoned — a re-armed TP/SL simply retries on the next bar and gets
+        # through the moment the call is bought back or expires.
+        if signed < 0 and qty > 0:
+            sellable = self._pledged_share_lock(
+                order.symbol, qty,
+                context=f"order {order.broker_order_id} / {order.comment or 'no comment'}")
+            if sellable <= 0:
+                order.status = OrderStatus.CANCELED
+                order.quantity = 0
+                update_instance(order)
+                return
+            if sellable < qty:
+                qty = float(sellable)
+                signed = -qty
+                order.quantity = qty  # persist, or refresh_transactions' net-filled
+                #                       arithmetic disagrees with the ledger
         # Buying spends cash (signed>0 -> cash decreases); selling adds cash.
         self._cash -= signed * fill_px
         self._cash -= commission

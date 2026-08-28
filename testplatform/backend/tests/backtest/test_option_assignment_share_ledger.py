@@ -89,6 +89,22 @@ def _build(tmp_path, account_id, *, with_equity_lot: bool, trim_shares: int = 0)
     plain market sell, no ``depends_on_order``, so the lot stays OPENED at the remainder) —
     the coverage-drift state OPT-L1 polices. The call itself must be written while the full
     round lot is held; the cover guard refuses otherwise.
+
+    THE TRIM IS BOOKED DIRECTLY, NOT THROUGH ``_apply_fill``, and that is the point rather
+    than a shortcut. Since the PLEDGED-COVER lock landed (OPT-L1's exit half —
+    ``test_pledged_share_lock.py``) ``_apply_fill`` REFUSES exactly this sale: 100 shares
+    held with 100 pledged leaves zero unpledged excess, so the trim order is CANCELED and
+    the drift never happens. That is the correct behaviour of the fill path and the reason
+    the O_CC arm no longer carries naked calls.
+
+    The drift state itself is still reachable at runtime by routes the fill path does not
+    own — a PARTIAL assignment on another contract eating the cover, a corporate action, or
+    simply state persisted before the lock existed — and the assignment LEDGER (this file's
+    actual subject) must still split the delivery correctly when it arrives. So the fixture
+    reproduces the END STATE by hand: the same FILLED 60-share SELL row on the same equity
+    transaction and the same ledger move, minus the guarded fill path. This mirrors the
+    idiom ``test_options_review_fixes.py`` already uses to build partially-covered
+    positions (``acct._update_position(...)`` plus a hand-written order row).
     """
     from app.services.backtest.backtest_db import backtest_trading_db, seed_account_definition
     from app.services.backtest.seam_wiring import wire_backtest_seams
@@ -135,7 +151,7 @@ def _build(tmp_path, account_id, *, with_equity_lot: bool, trim_shares: int = 0)
         assert [t.id for t in _open_equity_txns(acct)] == [equity_txn_id]
 
     if trim_shares:
-        from ba2_common.core.db import add_instance
+        from ba2_common.core.db import add_instance, update_instance
 
         trim = TradingOrder(
             account_id=acct.id, symbol="AAPL", quantity=trim_shares,
@@ -144,7 +160,18 @@ def _build(tmp_path, account_id, *, with_equity_lot: bool, trim_shares: int = 0)
             broker_order_id=acct._next_broker_id(), comment="trim")
         add_instance(trim)
         acct.invalidate_order_cache()
-        acct._apply_fill(acct.get_order(trim.broker_order_id), 160.0, datetime(2024, 3, 6))
+        # The bookkeeping ``_apply_fill`` would do, minus the PLEDGED-COVER lock that now
+        # (correctly) refuses this sale — see the docstring. Cash, ledger and the FILLED
+        # order row are identical to what the fill path produced before the lock existed.
+        booked = acct.get_order(trim.broker_order_id)
+        acct._cash += float(trim_shares) * 160.0
+        acct._update_position("AAPL", -float(trim_shares), 160.0)
+        booked.filled_qty = float(trim_shares)
+        booked.open_price = 160.0
+        booked.status = OrderStatus.FILLED
+        update_instance(booked)
+        acct._fill_dates[booked.id] = datetime(2024, 3, 6)
+        acct.invalidate_order_cache()
         acct.refresh_transactions()
         assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"][0]["qty"] == \
             pytest.approx(100.0 - trim_shares)
