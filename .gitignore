@@ -180,3 +180,15 @@ fetch_5min*.log
 # Stray SQLite files created by the testplatform backend suite
 testplatform/backend/db
 testplatform/backend/OTHER_DB
+
+# Runtime scratch / ops artifacts (added 2026-08-28)
+grid_goal2020.log*
+grid_ed_memdiag.log*
+testplatform_serve.log*
+mem_probe_*
+logs.bak.*
+.nicegui/
+dl_forecasting.db
+tools/_wu_chunk_*.txt
+remaining_5min_symbols.txt
+.superpowers/

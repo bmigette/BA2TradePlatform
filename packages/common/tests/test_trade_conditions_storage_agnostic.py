@@ -206,6 +206,94 @@ def test_covered_call_condition_requires_the_matching_strategy(repo):
     assert cond2.evaluate() is True
 
 
+# ------------------------------------------------------------- option grid gates
+# The option GA grid's entry/exit rules fire on these conditions (2026-08-27 grid
+# foundations). The 2026-07-30 inert-gate incident proved a condition can be DEAD in
+# the RAM backtest store while alive on SQLite — so every gate the grid reads is
+# pinned here against the fake repository, including the discrimination cases, not
+# just the positive ones.
+def _assigned_txn(expert_id=EXPERT_ID, symbol=SYMBOL, txn_id=None):
+    from ba2_common.core.types import TXN_ORIGIN_CSP_ASSIGNMENT
+    return Transaction(
+        id=txn_id, expert_id=expert_id, symbol=symbol, status=TransactionStatus.OPENED,
+        side=OrderDirection.BUY, quantity=100.0, open_price=180.0,
+        open_date=NOW - timedelta(days=5), meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT},
+    )
+
+
+def test_assigned_shares_fires_only_on_assignment_origin(repo):
+    """The wheel overlay's trigger. The assigned lot is an ordinary OPENED BUY
+    transaction; only meta_data.origin separates it from stock bought outright, so
+    both arms must be pinned — a condition that fired on ANY held lot would write
+    calls over stock the expert never meant to cover."""
+    from ba2_common.core.TradeConditions import HasAssignedSharesCondition
+
+    def cond():
+        return HasAssignedSharesCondition(account=None, instrument_name=SYMBOL,
+                                          expert_recommendation=_Rec(), existing_order=None)
+
+    assert cond().evaluate() is False, "no stock at all must not fire"
+
+    repo.rows.append(_open_txn(txn_id=7))  # bought outright, no origin
+    assert cond().evaluate() is False, "stock bought outright must not fire"
+
+    repo.rows.append(_assigned_txn(txn_id=8))
+    assert cond().evaluate() is True
+
+    repo.rows.clear()
+    repo.rows.append(_assigned_txn(expert_id=999, txn_id=9))
+    assert cond().evaluate() is False, "another expert's assignment must not fire"
+
+    repo.rows.append(_assigned_txn(symbol="MSFT", txn_id=10))
+    assert cond().evaluate() is False, "another symbol's assignment must not fire"
+
+
+def test_assigned_shares_ignores_sell_side_lots(repo):
+    """The overlay needs SHARES; an OPENED SELL transaction (a short) is not stock
+    the expert can write calls against, whatever its origin."""
+    from ba2_common.core.TradeConditions import HasAssignedSharesCondition
+    from ba2_common.core.types import TXN_ORIGIN_CSP_ASSIGNMENT
+    repo.rows.append(Transaction(
+        id=7, expert_id=EXPERT_ID, symbol=SYMBOL, status=TransactionStatus.OPENED,
+        side=OrderDirection.SELL, quantity=100.0, open_price=180.0,
+        open_date=NOW - timedelta(days=5), meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT},
+    ))
+    cond = HasAssignedSharesCondition(account=None, instrument_name=SYMBOL,
+                                      expert_recommendation=_Rec(), existing_order=None)
+    assert cond.evaluate() is False
+
+
+def test_days_opened_reads_the_sim_clock_open_date_not_the_order_wall_clock(repo):
+    """The grid's opt_time exit. The transaction's sim-stamped open_date must win:
+    falling back to the order's wall-clock created_at would collapse days_opened to
+    ~0 in every backtest and silently disable the gene (the exact defect class this
+    suite exists to catch)."""
+    from ba2_common.core.TradeConditions import DaysOpenedCondition
+    from ba2_common.core.models import TradingOrder
+    from ba2_common.core.types import OrderType, OrderStatus
+
+    repo.rows.append(Transaction(
+        id=7, expert_id=EXPERT_ID, symbol=SYMBOL, status=TransactionStatus.OPENED,
+        side=OrderDirection.BUY, quantity=100.0, open_price=100.0,
+        open_date=NOW - timedelta(days=9),
+    ))
+    order = TradingOrder(
+        account_id=1, symbol=SYMBOL, quantity=100.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, status=OrderStatus.FILLED, transaction_id=7,
+        created_at=NOW,  # wall-clock: would read 0 days if it were used
+    )
+    cond = DaysOpenedCondition(account=None, instrument_name=SYMBOL,
+                               expert_recommendation=_Rec(), operator_str=">",
+                               value=4.0, existing_order=order)
+    assert cond.evaluate() is True
+    assert cond.calculated_value == 9.0, "must count from the sim open_date, not now"
+
+    cond8 = DaysOpenedCondition(account=None, instrument_name=SYMBOL,
+                                expert_recommendation=_Rec(), operator_str=">",
+                                value=10.0, existing_order=order)
+    assert cond8.evaluate() is False, "9 days open must not satisfy >10"
+
+
 # ----------------------------------------------------- backend parity (only
 # place in this file that names a storage backend)
 def _days_ago(dt) -> int:
@@ -293,6 +381,51 @@ def test_both_backends_resolve_open_option_orders_identically(tmp_path):
 
     assert len(sql_hits) == 1
     assert len(mem_hits) == len(sql_hits), "both backends must resolve the txn->order link"
+
+
+def test_both_backends_agree_on_assigned_shares_and_the_wheel_gates(tmp_path):
+    """The grid's wheel overlay fires on has_assigned_shares; the 2026-07-30 incident
+    class is a condition that answers differently under the two stores. Seed the SAME
+    book (one assigned lot, one bought lot, a covered call over the assigned lot) into
+    SQLite and the RAM store and demand identical answers from the conditions
+    themselves."""
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.TradeConditions import (
+        HasAssignedSharesCondition, HasCoveredCallCondition, HasNoPositionCondition,
+    )
+    from ba2_common.core.types import TXN_ORIGIN_CSP_ASSIGNMENT
+
+    def _eval_wheel_gates():
+        txn_id = add_instance(Transaction(
+            expert_id=EXPERT_ID, symbol=SYMBOL, status=TransactionStatus.OPENED,
+            side=OrderDirection.BUY, quantity=100.0, open_price=180.0,
+            open_date=NOW - timedelta(days=5),
+            meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT},
+        ))
+        add_instance(_open_txn())  # bought outright
+        add_instance(_option_order(txn_id=txn_id, option_type=OptionRight.CALL,
+                                   side=OrderDirection.SELL, strategy="covered_call"))
+        rec = _Rec()
+        return {
+            "has_assigned_shares": HasAssignedSharesCondition(
+                account=None, instrument_name=SYMBOL, expert_recommendation=rec,
+                existing_order=None).evaluate(),
+            "has_covered_call": HasCoveredCallCondition(
+                account=None, instrument_name=SYMBOL, expert_recommendation=rec,
+                existing_order=None).evaluate(),
+            "has_no_position": HasNoPositionCondition(
+                account=None, instrument_name=SYMBOL, expert_recommendation=rec,
+                existing_order=None).evaluate(),
+        }
+
+    with _sqlite_backend(tmp_path):
+        sql = _eval_wheel_gates()
+    with _inmem_backend():
+        mem = _eval_wheel_gates()
+
+    assert sql == {"has_assigned_shares": True, "has_covered_call": True,
+                   "has_no_position": False}
+    assert mem == sql, f"the wheel gates diverge between backends: sqlite={sql} mem={mem}"
 
 
 # ---------------------------------------------------------------------------

@@ -140,3 +140,15 @@ Note: the plan's "known Windows-only failure" (`test_worker_server.py::test_logs
 2. **Exclude O_WHEEL until H1/H2 are fixed** — or add a code-level refusal. Running it today doesn't produce bad numbers; it produces a naked-call simulation labelled as a wheel. Amend the grid spec's "18 jobs" accordingly (or fix the engine first).
 3. **Fix the one-line call-leg guard (H3) before Phase 3 wires `max_loss` into sizing** — cheap now, a wrong-refusal debugging session later.
 4. Housekeeping: plan Task 4 snippet syntax (M2), batch fitness help precision (L1), the two stale docstrings (L2), and deciding the fate of lifecycle plan Tasks 9/11/12 (H4) so the docs stop implying they're done.
+
+---
+
+## Addendum — storage-parity check of the grid's conditions (2026-08-27 evening)
+
+The 2026-07-30 inert-gate incident (`DaysSinceLastClose*` reading an EMPTY in-memory store while SQLite saw the rows — 30 of 153 optimizations scored dead genes) raised the question whether the option grid's own conditions are storage-safe. Audited and probed:
+
+- **Every storage-touching grid condition goes through a storage-aware path** — the `trade_repository` seam (`HasAssignedSharesCondition`, `HasCoveredCallCondition`, `HasProtectivePutCondition`, `HasOptionPositionCondition`, `DaysOpenedCondition`'s open-date lookup) or the dual-path `trade_store` helpers (`transactions_where`, `get_or_none`, `orders_where` behind `has_no_position`, `days_to_expiry`). The one remaining raw `get_db()` in `TradeConditions.py:158` queries `ExpertRecommendation`, not an in-mem trade model — not this defect class.
+- **Executed parity probe** (`test_files/probe_option_grid_condition_parity.py`): the same book seeded into SQLite and the RAM backtest store; all six storage-touching conditions answer identically under both. The discrimination arm proves the answers are real, not "always True": bought-outright shares do NOT fire `has_assigned_shares`; a 3-day-old position correctly fails `days_opened > 4`.
+- **Pinned permanently:** 4 new tests in `packages/common/tests/test_trade_conditions_storage_agnostic.py` (29 → 33 passing), including a dual-backend parity test for the wheel gates. Full `packages/common/tests` suite re-run green.
+
+**Verdict:** no inert-gate risk found in the grid's condition set. (This does NOT clear H1/H2 — those are engine bar-ordering, a different layer.)
