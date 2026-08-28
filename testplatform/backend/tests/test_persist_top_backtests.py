@@ -421,7 +421,7 @@ def test_persist_trial_worker_retries_once_then_succeeds(monkeypatch):
     assert len(attempts) == 2
 
 
-def test_persist_trial_worker_returns_failure_after_two_local_failures(monkeypatch):
+def test_persist_trial_worker_returns_failure_after_four_local_failures(monkeypatch):
     attempts = []
 
     def always_fails(cfg):
@@ -435,4 +435,27 @@ def test_persist_trial_worker_returns_failure_after_two_local_failures(monkeypat
 
     assert out["ok"] is False
     assert "disk I/O error" in out["error"]
-    assert len(attempts) == 2, "must try exactly twice before giving up (existing contract: ok=False, never raises)"
+    assert len(attempts) == 4, "must try exactly 4 times before giving up (existing contract: ok=False, never raises)"
+
+
+def test_persist_trial_worker_retry_backoff_doubles_each_attempt(monkeypatch):
+    """opt 379/380 (2026-08-28) re-hit the SAME disk I/O error on the single 5s retry the prior
+    fix gave it -- sustained contention, not a one-off blip. This locks in the doubling schedule
+    (5s, 10s, 20s) that replaced the flat single retry."""
+    attempts = []
+    sleeps = []
+
+    def always_fails(cfg):
+        attempts.append(1)
+        import sqlite3
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(f"{_DAILY_BACKTEST_HANDLER}.run_daily_backtest", always_fails)
+    monkeypatch.setattr(_soh, "_LOCAL_RETRY_BACKOFF_S", 5.0)  # override the autouse 0.0 for this test
+    monkeypatch.setattr("time.sleep", lambda s: sleeps.append(s))
+
+    out = _soh._persist_trial_worker({"name": "TOP1"})
+
+    assert out["ok"] is False
+    assert len(attempts) == 4
+    assert sleeps == [5.0, 10.0, 20.0]

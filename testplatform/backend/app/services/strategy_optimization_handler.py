@@ -813,10 +813,15 @@ def _fitness_suffix(fit_raw: Any, fit_ranked: Any, robustness: Any) -> str:
         return ""
 
 
-# How long to wait before the ONE retry in _persist_trial_worker. Short: the failure this covers
-# (a transient sqlite3.OperationalError writing the trial's own persist_trading_db file under
-# concurrent disk load) typically clears within seconds, not minutes.
+# Backoff schedule for _persist_trial_worker's retries: base delay, doubled each attempt (5s,
+# 10s, 20s between ATTEMPTS=4 tries). A single 5s retry (the original fix) was NOT enough: opt
+# 379 and opt 380 both re-hit the identical sqlite3.OperationalError('disk I/O error') on that
+# one retry too, on 2026-08-28, under SUSTAINED (not momentary) disk contention from concurrent
+# grid jobs + manual recovery re-runs sharing the same box -- a fixed short wait doesn't give
+# that kind of contention time to clear. Exponential backoff over more attempts trades a longer
+# worst case for actually riding it out.
 _LOCAL_RETRY_BACKOFF_S = 5.0
+_LOCAL_RETRY_ATTEMPTS = 4
 
 
 def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, Any]:
@@ -829,12 +834,14 @@ def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, 
     ``_remote_then_local`` as the final local fallback when the remote path fails twice. On error
     returns ``{ok: False, error}`` so one bad re-run never poisons the pool or aborts the others.
 
-    Retries once before giving up: goal2020 opt 361/362/364/372/377 all lost a top-N rank to a
-    single transient failure (a leaked worker slot, a mid-restart 503, or here, a bare
-    ``sqlite3.OperationalError('disk I/O error')`` writing the trial's own ``persist_trading_db``
-    file under concurrent disk load from other trials/workers) — none of them a real defect in
-    the genome, all likely to clear on a retry a few seconds later. Mirrors
-    ``_remote_then_local``'s retry-before-giving-up shape one layer in.
+    Retries up to ``_LOCAL_RETRY_ATTEMPTS - 1`` times, with exponential backoff, before giving up:
+    goal2020 opt 361/362/364/372/377/379/380 all lost a top-N rank to a transient failure (a leaked
+    worker slot, a mid-restart 503, or here, a bare ``sqlite3.OperationalError('disk I/O error')``
+    writing the trial's own ``persist_trading_db`` file under concurrent disk load) — none of them
+    a real defect in the genome. A flat single retry (5s) turned out not to be enough for the disk
+    I/O case specifically when the contention is sustained rather than a one-off blip (opt 379/380
+    re-hit it on the retry too); the doubling schedule gives sustained contention more room to
+    clear. Mirrors ``_remote_then_local``'s retry-before-giving-up shape one layer in.
 
     ``ctl`` is the worker's per-job cancellation block. It is accepted here because
     ``worker_server._submit_job`` appends one to EVERY pooled call — without this parameter
@@ -843,13 +850,13 @@ def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, 
     import time
     from app.services.backtest.daily_backtest_handler import run_daily_backtest
     last_exc: Optional[Exception] = None
-    for attempt in range(2):
+    for attempt in range(_LOCAL_RETRY_ATTEMPTS):
         try:
             return {"ok": True, "results": run_daily_backtest(config)}
         except Exception as e:  # noqa: BLE001 — surface as a failed re-run, keep the others going
             last_exc = e
-            if attempt == 0:
-                time.sleep(_LOCAL_RETRY_BACKOFF_S)
+            if attempt < _LOCAL_RETRY_ATTEMPTS - 1:
+                time.sleep(_LOCAL_RETRY_BACKOFF_S * (2 ** attempt))
     return {"ok": False, "error": repr(last_exc)}
 
 
