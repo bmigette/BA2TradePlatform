@@ -455,9 +455,23 @@ def test_a_group_containing_the_wheel_still_holds_its_assigned_stock():
     would have triggered exactly that.
     """
     import importlib.util
+    import os
     import sys
 
-    spec = importlib.util.spec_from_file_location("lch_wheel", "testplatform/ba2test_launcher.py")
+    # Resolved off __file__, not a bare "testplatform/ba2test_launcher.py" string: that
+    # string is only correct when pytest's CWD happens to be the repo root. CI (and any
+    # correct local run) sets `working-directory: testplatform/backend`, under which the
+    # bare string resolved to testplatform/backend/testplatform/ba2test_launcher.py --
+    # which does not exist -- and FileNotFoundError failed this test on every commit since
+    # it was added (parity-and-coverage CI, 2026-08-28). Same idiom as
+    # tests/test_launcher_resolve_fitness.py, one directory deeper (this file lives in
+    # tests/backtest/, not tests/).
+    _backend_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    _launcher_path = os.path.normpath(os.path.join(_backend_root, "..", "ba2test_launcher.py"))
+    if _backend_root not in sys.path:
+        sys.path.insert(0, _backend_root)
+
+    spec = importlib.util.spec_from_file_location("lch_wheel", _launcher_path)
     m = importlib.util.module_from_spec(spec)
     sys.modules["lch_wheel"] = m
     try:
