@@ -189,6 +189,39 @@ def test_the_symbol_is_free_again_after_the_order_expires(acct):
     )
 
 
+def test_refresh_orders_signals_the_roll_on_an_expiry_with_no_fill(acct):
+    """F1 (option-grid probe 2026-08-27): the engine runs the transaction roll ONLY when
+    refresh_orders() reports a change. An option DAY-limit that ages out terminalises its
+    entry order with NO fill — if refresh_orders() stays falsy the roll is skipped, the
+    parent Transaction stays WAITING, and the dup gate locks the symbol for the whole run
+    (measured: 146 consecutive entry skips, June → December, from ONE expired order).
+
+    This test mimics the engine's gate verbatim: roll if and only if the signal is truthy.
+    The account-level test above calls refresh_transactions() unconditionally, which is
+    exactly why it could not catch this.
+    """
+    a, ps = acct
+    a.submit_option_order(legs=[_leg(_C180, OrderDirection.BUY)], quantity=1,
+                          order_type="limit", limit_price=3.00, option_strategy="long_call")
+    if a.refresh_orders():          # the engine's gate, verbatim
+        a.refresh_transactions()
+    assert _open_txns(a), "precondition: the unfilled entry does hold a WAITING transaction"
+
+    ps.set_clock(_D1)               # the session after — the DAY order ages out here
+    changed = a.refresh_orders()
+    assert changed, (
+        "the expiry of an unfilled DAY-limit must be reported as a book change: it is the "
+        "ONLY event on this bar, and the transaction roll it gates is what releases the "
+        "WAITING Transaction"
+    )
+    if changed:
+        a.refresh_transactions()
+
+    assert _open_txns(a) == [], (
+        "under the engine's own gating the expired entry still holds a WAITING transaction"
+    )
+
+
 def test_a_limit_that_crosses_in_its_own_session_is_untouched(acct):
     """The rule ages orders out; it must not cancel one that traded."""
     a, ps = acct

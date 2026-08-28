@@ -1489,12 +1489,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Step 0 is the OPTION DAY-ORDER sweep (``_expire_stale_option_limits``), which runs
         BEFORE the fill loop so an aged-out limit cannot trade on the bar it dies.
 
-        Returns whether ANY order filled this bar. The engine uses this to skip the
-        transaction roll + bracket attach on no-fill bars (both are no-ops there), which is
-        the common case on a fine fill clock (5-minute) and a large share of per-bar runtime.
+        Returns whether ANY order filled OR was terminalised this bar. The engine uses this to
+        skip the transaction roll + bracket attach on no-change bars (both are no-ops there),
+        which is the common case on a fine fill clock (5-minute) and a large share of per-bar
+        runtime. A DAY-order expiry counts as a change: it terminalises an entry order with no
+        fill, and the roll is what releases the parent WAITING Transaction.
         """
         as_of = self._price.now()
-        self._expire_stale_option_limits(as_of)
+        # Step 0: the DAY-order sweep. Its return is the "book changed without a fill" half of
+        # the signal below: an expiry terminalises an entry order, which is exactly the state
+        # refresh_transactions needs to roll in order to release the parent WAITING Transaction
+        # (the engine's dup gate reads it). OPT-B4 shipped the sweep but the engine still gated
+        # the roll on fills only, so an expired entry left its WAITING transaction behind and
+        # locked the symbol out of the rest of the run (F1, option-grid probe 2026-08-27).
+        book_changed = self._expire_stale_option_limits(as_of)
 
         active = OrderStatus.get_active_statuses()
         # Working orders: entries (MARKET/LIMIT/STOP), plain exit sells, and option legs. TP/SL
@@ -1553,9 +1561,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # this bar and synthesize the closing order when crossed (replaces WAITING_TRIGGER/OCO legs).
         if self._apply_bracket_exits(as_of):
             filled = True
-        return filled
+        # An option DAY-order expiry changed the book WITHOUT a fill — the engine must still roll
+        # transactions (see the Step 0 note above), so report it as a book change too.
+        return filled or book_changed
 
-    def _expire_stale_option_limits(self, as_of) -> None:
+    def _expire_stale_option_limits(self, as_of) -> bool:
         """TIME-IN-FORCE DAY for option LIMIT orders (OPT-B4).
 
         Live forces ``TimeInForce.DAY`` on every option order (``AlpacaAccount``), and all 17
@@ -1586,9 +1596,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         A partially filled row keeps its ``filled_qty``: the contracts that traded are real, and
         ``reserved_option_buying_power_detail`` pro-rates a terminal row to exactly that part.
+
+        Returns True when ANY order was terminalised — the caller (``refresh_orders``) folds
+        that into its "the book changed" signal, because an EXPIRED entry order is exactly the
+        state ``refresh_transactions``' WAITING->CLOSED arm reads to release the parent
+        Transaction. Without the roll the dup gate keeps the symbol locked for the whole run.
         """
         if not self._option_order_day:
-            return
+            return False
         today = as_of.date() if hasattr(as_of, "date") else as_of
         day_limits = (OrderType.BUY_LIMIT, OrderType.SELL_LIMIT)
         expired_any = False
@@ -1615,6 +1630,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if expired_any:
             self.invalidate_order_cache()
             self._option_memo_gen += 1
+        return expired_any
 
     def _is_single_leg_option(self, order) -> bool:
         """True for an OPTION order that fills *independently* against a premium bar.

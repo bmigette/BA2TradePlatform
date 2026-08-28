@@ -723,11 +723,14 @@ class DailyBacktestEngine:
                 self.account.invalidate_order_cache()
 
             # 4. fills on THIS bar's working orders; roll order state into transactions.
-            #     A transaction only changes state when one of its orders fills, and the bracket
-            #     pass only has work when a transaction freshly OPENED — both are no-ops on a bar
-            #     where nothing filled. On a 5-minute fill clock almost every bar has no fill, and
-            #     the roll (incl. the ba2_common base sync_transaction_orders) + bracket pass were
-            #     ~half of per-bar runtime (profiled), so gate them on the fill signal.
+            #     A transaction changes state when one of its orders fills, when a bracket
+            #     crosses, OR when an option DAY-limit EXPIRES unfilled (refresh_orders folds
+            #     the expiry sweep into its signal — the roll is what releases the parent
+            #     WAITING Transaction so the dup gate frees the symbol; F1). On a bar with none
+            #     of those the roll + bracket pass are no-ops; on a 5-minute fill clock almost
+            #     every bar qualifies, and the roll (incl. the ba2_common base
+            #     sync_transaction_orders) + bracket pass were ~half of per-bar runtime
+            #     (profiled), so gate them on the change signal.
             filled = self.account.refresh_orders()
             if filled:
                 self.account.refresh_transactions()
