@@ -49,37 +49,37 @@ logger = logging.getLogger(__name__)
 # global constant from fetch_options; both spellings said "options" where they meant "Alpaca".
 
 
-def backtest_options_provider() -> str:
+def backtest_options_provider(config: Optional[Dict[str, Any]] = None) -> str:
     """Which VENDOR's history the backtest's option store actually holds.
 
-    ESTABLISHED FROM THE READ PATH, not configured — there is deliberately no env flag, for
-    the same reason ``_OPTION_HOLDOUT_START`` has none: moving it is a claim about the data,
-    and a claim about the data should be a reviewed change rather than something pasted into
-    a shell script.
+    STILL ESTABLISHED FROM THE READ PATH — it is now derived from WHICH READER the run builds
+    rather than hard-coded, which is the same claim made honestly once there are two. The map
+    lives in ``options_store.STORE_VENDOR`` so the store and its vendor cannot drift apart:
 
-    The chain of facts, as of 2026-08-26:
+      * ``sqlite``  -> ``alpaca``. ``options_provider.HistoricalOptionsProvider`` over an
+        ``OptionsHistoryCache``, whose only writer is ``fetch_options.build_cache``, hard-wired
+        to Alpaca (``TradingClient`` discovery + ``OptionHistoricalDataClient`` bars).
+        THE DEFAULT.
+      * ``parquet`` -> ``tastytrade``. ``parquet_options_provider.ParquetOptionsProvider`` over
+        ``CACHE_FOLDER/TastyTradeOptionsProvider/<SYM>/exp=<DATE>/``, written by
+        ``tools/warm_options_history.py`` from dxfeed via TastyTrade.
 
-      * ``run_daily_backtest`` builds exactly ONE option reader,
-        ``HistoricalOptionsProvider(options_cache_db)``, which queries the ``option_chain`` /
-        ``option_bar`` tables of an ``OptionsHistoryCache`` sqlite;
-      * the only writer of that schema is ``fetch_options.build_cache``, hard-wired to Alpaca
-        (``TradingClient`` contract discovery + ``OptionHistoricalDataClient`` bars);
-      * TastyTrade/dxfeed history lands in a SEPARATE parquet tree
-        (``CACHE_FOLDER/TastyTradeOptionsProvider/<SYM>/exp=<DATE>/``, written by
-        ``tools/warm_options_history.py``) that NOTHING on the backtest path reads — only the
-        read-only chain viewer (``services/option_cache_reader.py``) does.
+    A single run still cannot span two vendors: ``build_options_provider`` builds exactly ONE
+    reader and this answers for that one. A floor naming a vendor the store does not hold is
+    precisely the lie this seam exists to prevent, so the selection (``options_store``, env
+    ``BACKTEST_OPTIONS_STORE``, default ``sqlite``) is the ONLY input here — there is still no
+    knob that moves the vendor independently of the store being read.
 
-    So a single run cannot span two vendors: there is one store and it has one origin. When
-    the parquet reader is wired into ``HistoricalOptionsProvider``, that change must move this
-    function too — a floor naming a vendor the store does not hold is precisely the lie this
-    seam exists to prevent.
-
-    Corroborated on the shared cache (measured 2026-08-26,
+    Corroborated on the shared sqlite cache (measured 2026-08-26,
     ``~/Documents/ba2/common/cache/options/options_history.sqlite``): 0 bars dated before
     2024-01-18, earliest bar 2024-02-01, and the only three chain snapshots in the whole file
-    are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it.
+    are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it. The parquet tree
+    measured 2026-08-28 holds 686 underlyings / 9,587 partitions over 2023-01-03..2023-03-31,
+    i.e. exactly the window the sqlite cannot serve.
     """
-    return "alpaca"
+    from app.services.backtest.options_store import STORE_VENDOR, resolve_options_store
+
+    return STORE_VENDOR[resolve_options_store(config)]
 
 
 def validate_options_window(start, uses_options: bool,
@@ -499,11 +499,17 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
     # HistoricalOptionsProvider from it. Validate the Feb-2024 options-history floor here so an
     # out-of-window options run fails early with a clear message. Equity-only runs (no option
     # rule) keep ``options_cache_db`` None and skip validation — behaviour is byte-identical.
+    #
+    # WHICH store serves that run is a separate, explicit choice (``options_store``; default
+    # ``sqlite``) — see options_store.py. It selects the READER and therefore the VENDOR whose
+    # history floor is enforced below, which is why it is resolved here rather than left to
+    # run_daily_backtest.
     options_cache_db = payload.get("options_cache_db")
     uses_options = strategy_uses_options(payload)
     if uses_options and not options_cache_db:
         options_cache_db = default_options_cache_db()
-    validate_options_window(start_date, uses_options or bool(options_cache_db))
+    validate_options_window(start_date, uses_options or bool(options_cache_db),
+                            backtest_options_provider(payload))
 
     return {
         "backtest_id": payload["backtest_id"],
@@ -548,6 +554,13 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # when the strategy's exit/RM rules name an option action; absent/None -> equity-only
         # (unchanged).
         "options_cache_db": options_cache_db,
+        # WHICH store serves the run: "sqlite" (default, the Alpaca OptionsHistoryCache — every
+        # recorded backtest number came from it) or "parquet" (the TastyTrade/dxfeed tree).
+        # Forwarded verbatim, including None, so ``resolve_options_store`` can fall through to
+        # BACKTEST_OPTIONS_STORE and then to the sqlite default in exactly one place.
+        "options_store": payload.get("options_store"),
+        "options_parquet_root": payload.get("options_parquet_root"),
+        "options_risk_free_rate": payload.get("options_risk_free_rate"),
         # Screener (universe.mode=='screener'): per-bar metric_store entry gate (point-in-time,
         # cached) — same mechanism the optimizer uses. None for static runs (engine gate no-op).
         "screener_runtime": _build_screener_runtime(payload),
@@ -750,20 +763,18 @@ def run_daily_backtest(
         int(config.get("warmup_days") or 0),
     ))
 
-    # Options seam: a present ``options_cache_db`` flags an options run. Build the as-of
-    # clamped HistoricalOptionsProvider from it and inject it into the account; a missing
-    # cache fails fast (OptionsCacheMiss is raised by the cache reader, not swallowed).
-    # Validate the Feb-2024 options-history floor BEFORE the run starts (clear error vs.
-    # silently empty chains). Equity-only runs (no cache db) are unaffected.
+    # Options seam: a present ``options_cache_db`` flags an options run. Validate the SERVING
+    # VENDOR's options-history floor BEFORE the run starts (clear error vs. silently empty
+    # chains); which vendor that is follows from which store the run reads (``options_store``,
+    # default ``sqlite`` -> Alpaca). Equity-only runs (no cache db) are unaffected.
+    #
+    # The READER itself is built further down, once ``ps`` exists: the parquet backend needs a
+    # spot source for its Black-Scholes greeks and the run's AsOfPriceSource is it. The sqlite
+    # backend ignores that argument and is constructed exactly as before.
     options_cache_db = config.get("options_cache_db")
     uses_options = bool(options_cache_db)
-    validate_options_window(config["start_date"], uses_options)
-    if uses_options:
-        from .options_provider import HistoricalOptionsProvider
-
-        options_provider = HistoricalOptionsProvider(options_cache_db)
-    else:
-        options_provider = None
+    validate_options_window(config["start_date"], uses_options,
+                            backtest_options_provider(config))
 
     resolver = wire_backtest_seams()
     account_id = 1
@@ -815,6 +826,15 @@ def run_daily_backtest(
             config["end_date"],
             warmup_days=config["warmup_days"],
         )
+
+        # ONE option reader, chosen explicitly and defaulting to sqlite (options_store.py).
+        # Built here rather than above only because the parquet backend derives its greeks
+        # from ``ps``'s underlying closes; for the sqlite backend this is the same
+        # ``HistoricalOptionsProvider(options_cache_db)`` construction as before, and for an
+        # equity-only run it is still None.
+        from app.services.backtest.options_store import build_options_provider
+
+        options_provider = build_options_provider(config, price_source=ps)
 
         account = BacktestAccount(
             account_id, ps, config["account_settings"], options_provider=options_provider

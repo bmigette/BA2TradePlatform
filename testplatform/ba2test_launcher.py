@@ -2417,19 +2417,26 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    The floor is no longer global: `ba2_providers.options.options_history_floor` answers PER
 #    VENDOR (Alpaca 2024-01-18 measured; dxfeed/TastyTrade 2022-10-01, env-overridable), and
 #    `daily_backtest_handler.validate_options_window` consults the floor of the vendor serving
-#    the store the run actually reads. That much is fixed. The window below still starts
-#    2023-01-01 and every pure-option job STILL raises, because that vendor is Alpaca:
+#    the store the run actually reads. That much is fixed.
 #
-#      * the backtest builds exactly ONE option reader, `HistoricalOptionsProvider`, over an
-#        `OptionsHistoryCache` sqlite;
-#      * the only writer of that schema is `fetch_options.build_cache`, hard-wired to Alpaca;
-#      * TastyTrade history lands in a SEPARATE parquet tree
-#        (`CACHE_FOLDER/TastyTradeOptionsProvider/`) that nothing on the backtest path reads —
-#        only the read-only chain viewer does.
+#    UPDATED 2026-08-28 — THE PARQUET STORE IS NOW READABLE BY THE BACKTEST, BUT YOU MUST ASK
+#    FOR IT. There are two readers behind one seam (`backtest/options_store.py`):
 #
-#    So no run can span both vendors, and FINISHING THE TASTYTRADE DOWNLOAD DOES NOT BY ITSELF
-#    UNBLOCK THE GRID. What unblocks it is wiring that parquet store into
-#    `HistoricalOptionsProvider` and moving `backtest_options_provider()` in the same change.
+#      * `sqlite` (THE DEFAULT) -> `HistoricalOptionsProvider` over the Alpaca-built
+#        `OptionsHistoryCache`. Vendor `alpaca`, floor 2024-01-18. Every backtest number on
+#        record came from here, and it stays the default for exactly that reason.
+#      * `parquet` -> `ParquetOptionsProvider` over `CACHE_FOLDER/TastyTradeOptionsProvider/`.
+#        Vendor `tastytrade`, floor 2022-10-01.
+#
+#    A pure-option job over the 2023-01-01 window below therefore STILL raises unless the run
+#    selects the parquet store — set `options_store: "parquet"` on the backtest block (it is
+#    forwarded per trial by `strategy_optimization_handler._build_daily_trial_config`), or
+#    export `BACKTEST_OPTIONS_STORE=parquet` for the whole job. Check the tree covers the
+#    window first: locally it holds 686 underlyings over 2023-01-03..2023-03-31 ONLY, so a
+#    2023-01-01..2025-12-31 grid would read an empty store for 33 of its 36 months.
+#    A run still cannot span two vendors: one reader is built, and
+#    `backtest_options_provider()` answers for that one.
+#
 #    Do NOT instead lower the Alpaca number: measured on the shared 10.9 GB cache (2026-08-26)
 #    it holds 0 bars before 2024-01-18, its earliest bar is 2024-02-01, and its only three
 #    chain snapshots are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it, and a
@@ -2448,8 +2455,11 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    zero-trade sentinel, and a plain (non-optimize) option backtest will trade nothing at all.
 #    The search recovers once the data lands; until then the run is mostly burning CPU on
 #    -1e9. TastyTrade collection was in progress on another machine — confirm it finished,
-#    AND that it is readable by the backtest (see precondition 1: it lands in a store nothing
-#    on the backtest path reads).
+#    AND that the run actually reads it (see precondition 1: the parquet store is readable
+#    now, but only when `options_store: "parquet"` is selected; the sqlite default still has
+#    no greeks). On the parquet store `get_atm_iv` DOES return a number — the greeks are
+#    Black-Scholes-inverted per bar at read time (`option_greeks.compute_iv_and_greeks`,
+#    the same function that filled the sqlite store's) rather than baked in at build time.
 #    Sharper since 2026-08-26: `_compute_atm_iv` no longer falls back to the frozen
 #    chain-snapshot row, so where a stale row used to supply a number it now honestly supplies
 #    None. That removes a lookahead, and it also removes the last thing masking this gap.

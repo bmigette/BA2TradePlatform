@@ -72,10 +72,20 @@ _MISSING = object()
 
 
 def clear_worker_options_cache() -> None:
-    """Drop every cached chain/bar history + ATM-IV result (test isolation / explicit reset)."""
+    """Drop every cached chain/bar history + ATM-IV result (test isolation / explicit reset).
+
+    Also clears the PARQUET backend's worker caches. There are two readers behind one seam
+    (see ``options_store.py``) and one reset entry point: every existing caller of this
+    function means "forget everything the option readers cached", and leaving the second
+    store's caches alive would make that promise quietly false. Imported at call time — this
+    module must stay importable without pandas/numpy for the sqlite path.
+    """
     _WORKER_CHAIN_CACHE.clear()
     _WORKER_BAR_CACHE.clear()
     _WORKER_ATM_IV_CACHE.clear()
+    from .parquet_options_provider import clear_worker_parquet_options_cache
+
+    clear_worker_parquet_options_cache()
 
 
 class _ChainHistory:
