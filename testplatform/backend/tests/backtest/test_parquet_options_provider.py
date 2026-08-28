@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import inspect
 import os
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -108,7 +108,7 @@ def _wide(p, as_of):
 # --------------------------------------------------------------------------- #
 # 1. ONE INTERFACE, TWO BACKENDS
 # --------------------------------------------------------------------------- #
-_SEAM_METHODS = ("get_chain", "get_quote", "get_bar", "get_atm_iv")
+_SEAM_METHODS = ("get_chain", "get_quote", "get_bar", "get_atm_iv", "delta_at_entry")
 
 
 @pytest.mark.parametrize("name", _SEAM_METHODS)
@@ -235,6 +235,42 @@ def test_bar_dict_carries_the_columns_the_engine_reads(provider):
     assert bar["iv"] != bar["vendor_iv"]
 
 
+def test_get_bar_returns_a_fresh_dict_the_caller_may_mutate(provider):
+    """The bar dict is MEMOISED per row (it is rebuilt on every MTM/fill/expiry read and the
+    row is immutable once cached), so ``get_bar`` must hand out a copy. Returning the memo
+    itself would turn any caller's ``bar["close"] = ...`` into cross-call corruption of every
+    later read of that bar."""
+    a = provider.get_bar(_C100, date(2023, 1, 10))
+    a["close"] = -999.0
+    a["injected"] = True
+    b = provider.get_bar(_C100, date(2023, 1, 10))
+    assert b is not a
+    assert b["close"] == pytest.approx(7.2)
+    assert "injected" not in b
+
+
+def test_the_bar_dict_memo_is_per_row_not_per_contract(provider):
+    """MUTATION KILLER for the memo key: memoising on the CONTRACT instead of the ROW would
+    serve 01-05's bar again on 01-10."""
+    assert provider.get_bar(_C100, date(2023, 1, 5))["close"] == pytest.approx(6.2)
+    assert provider.get_bar(_C100, date(2023, 1, 10))["close"] == pytest.approx(7.2)
+    assert provider.get_bar(_C100, date(2023, 1, 5))["date"] == "2023-01-05"
+    assert provider.get_bar(_C100, date(2023, 1, 10))["date"] == "2023-01-10"
+
+
+def test_bar_dict_is_built_once_per_row(provider):
+    """The greeks are the expensive part and they are already memoised; the DICT around them
+    (two ISO conversions, seven NaN tests, a 17-key build — 5.4 us measured) was not."""
+    u = provider._u(_UNDER)
+    ci = u.c_index[_C100]
+    i = u.exact_row(ci, date(2023, 1, 10).toordinal())
+    first = u.bar_dict(i, ci, provider.spot_source)
+    assert len(u._bar_memo) == 1
+    u._bar_memo[i]["close"] = 1234.5   # poison the memo: a rebuild would not see it
+    assert u.bar_dict(i, ci, provider.spot_source)["close"] == pytest.approx(1234.5)
+    assert first["close"] == pytest.approx(7.2)
+
+
 def test_chain_filters(provider):
     d = date(2023, 1, 10)
     calls = provider.get_chain(_UNDER, d, expiry_min=date(2023, 1, 1),
@@ -265,15 +301,25 @@ def test_absent_store_root_fails_loud(tmp_path):
 # --------------------------------------------------------------------------- #
 # 4. CACHING — the GA rebuilds the provider once per trial from the same store
 # --------------------------------------------------------------------------- #
-def test_second_provider_reuses_the_worker_cache_no_reload(monkeypatch, store_root):
-    real = pq._load_underlying
+def _count_reads(monkeypatch):
+    """Count PARQUET READS (``_load_raw_underlying``), which is the expensive thing.
+
+    Not overlay construction: the greeks overlay is cheap and scope-keyed by design, while
+    re-reading and re-parsing the bytes is what a scope change used to cost.
+    """
+    real = pq._load_raw_underlying
     calls = {"n": 0}
 
-    def counting(root, underlying, rate, spot_source):
+    def counting(root, underlying):
         calls["n"] += 1
-        return real(root, underlying, rate, spot_source)
+        return real(root, underlying)
 
-    monkeypatch.setattr(pq, "_load_underlying", counting)
+    monkeypatch.setattr(pq, "_load_raw_underlying", counting)
+    return calls
+
+
+def test_second_provider_reuses_the_worker_cache_no_reload(monkeypatch, store_root):
+    calls = _count_reads(monkeypatch)
 
     p1 = ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=_RATE,
                                   spot_scope="test")
@@ -293,14 +339,7 @@ def test_clear_worker_options_cache_also_clears_the_parquet_backend(monkeypatch,
     everything the option readers cached"."""
     from app.services.backtest.options_provider import clear_worker_options_cache
 
-    real = pq._load_underlying
-    calls = {"n": 0}
-
-    def counting(root, underlying, rate, spot_source):
-        calls["n"] += 1
-        return real(root, underlying, rate, spot_source)
-
-    monkeypatch.setattr(pq, "_load_underlying", counting)
+    calls = _count_reads(monkeypatch)
     p = ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=_RATE,
                                   spot_scope="test")
     _wide(p, date(2023, 1, 10))
@@ -318,6 +357,7 @@ def test_underlying_cache_is_lru_bounded(monkeypatch, store_root):
     p.get_chain("OTHER", date(2023, 1, 10), expiry_min=date(2023, 1, 1),
                 expiry_max=date(2023, 12, 31))
     assert len(pq._WORKER_UNDERLYING_CACHE) <= 1
+    assert len(pq._WORKER_RAW_CACHE) <= 1
 
 
 def test_atm_iv_result_is_memoised(monkeypatch, store_root):
@@ -344,6 +384,64 @@ def test_atm_iv_memo_caches_none_too(monkeypatch, store_root):
 
     monkeypatch.setattr(ParquetOptionsProvider, "_compute_atm_iv", boom)
     assert p.get_atm_iv(_UNDER, date(2023, 1, 9)) is None
+
+
+# --------------------------------------------------------------------------- #
+# 4b. delta_at_entry — the intraday-drawdown refinement's seam (results.py)
+# --------------------------------------------------------------------------- #
+def test_delta_at_entry_is_the_clamped_bars_delta(provider):
+    """Same as-of discipline as the chain: the LATEST bar on or before the entry date."""
+    d5 = {c.symbol: c for c in _wide(provider, date(2023, 1, 5))}[_C100].delta
+    d10 = {c.symbol: c for c in _wide(provider, date(2023, 1, 10))}[_C100].delta
+    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) == d5
+    # 01-07 has no bar; the clamp must serve 01-05's delta, never 01-10's.
+    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 7)) == d5
+    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 10)) == d10
+    assert d5 != d10
+
+
+@pytest.mark.parametrize("when", [
+    datetime(2023, 1, 5, 15, 45),          # what the refinement actually holds
+    date(2023, 1, 5),
+    "2023-01-05",
+    "2023-01-05 15:45:00",
+    "2023-01-05T15:45:00",
+])
+def test_delta_at_entry_accepts_every_shape_the_refinement_hands_it(provider, when):
+    expected = provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 5))
+    assert expected is not None
+    assert provider.delta_at_entry(_UNDER, _C100, when) == expected
+
+
+def test_delta_at_entry_is_none_not_a_crash_for_anything_unknown(provider):
+    assert provider.delta_at_entry(_UNDER, _C100, date(2022, 12, 31)) is None   # before any bar
+    assert provider.delta_at_entry(_UNDER, "ZZ230120C09999000", date(2023, 1, 10)) is None
+    assert provider.delta_at_entry("NOPE", _C100, date(2023, 1, 10)) is None
+    assert provider.delta_at_entry(_UNDER, _C100, None) is None
+    assert provider.delta_at_entry(_UNDER, _C100, "not-a-date") is None
+
+
+def test_both_backends_answer_delta_at_entry(tmp_path, provider):
+    """FINDING 3. ``results._build_refine_drawdown_fn`` used to bind ``options.cache.db_path``
+    — sqlite-only — so the intraday refinement silently disabled itself on parquet and
+    ``option_consistent_annual_return`` (which divides by max_drawdown) differed between the
+    two stores for a reason nothing in the result could show."""
+    from app.services.backtest.options_cache import OptionsHistoryCache
+    from app.services.backtest.options_provider import _WORKER_CHAIN_CACHE
+
+    _WORKER_CHAIN_CACHE.clear()
+    db = str(tmp_path / "opt.sqlite")
+    OptionsHistoryCache(db).write_chain_rows(_UNDER, "2023-01-05", [
+        {"occ_symbol": _C100, "option_type": "call", "strike": 100.0,
+         "expiry": "2023-01-20", "bid": 6.1, "ask": 6.3, "last": 6.2, "iv": 0.33,
+         "delta": 0.61}])
+    try:
+        sq = HistoricalOptionsProvider(db)
+        assert sq.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) == pytest.approx(0.61)
+        assert sq.delta_at_entry(_UNDER, _C100, date(2022, 1, 1)) is None
+        assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) is not None
+    finally:
+        _WORKER_CHAIN_CACHE.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -414,19 +512,89 @@ def test_a_different_spot_scope_does_not_reuse_another_runs_greeks(store_root):
 def test_the_same_spot_scope_does_reuse(monkeypatch, store_root):
     """The other half: a GA's trials share a scope (same universe + window), which is what
     makes the greeks affordable at all."""
-    real = pq._load_underlying
-    calls = {"n": 0}
-
-    def counting(root, underlying, rate, spot_source):
-        calls["n"] += 1
-        return real(root, underlying, rate, spot_source)
-
-    monkeypatch.setattr(pq, "_load_underlying", counting)
+    calls = _count_reads(monkeypatch)
     for _ in range(3):
         p = ParquetOptionsProvider(store_root, spot_source=_spot_source,
                                    risk_free_rate=_RATE, spot_scope="one-job")
         _wide(p, date(2023, 1, 10))
     assert calls["n"] == 1
+
+
+def test_a_new_spot_scope_reuses_the_PARQUET_BYTES_and_only_redoes_the_greeks(
+        monkeypatch, store_root):
+    """THE SPLIT. A scope change must cost a greeks overlay, not a re-read.
+
+    ``_build_daily_trial_config`` sets ``enabled_instruments`` per INDIVIDUAL (to that trial's
+    screener candidates) and ``spot_scope`` is derived from it, so in a screener GA the scope
+    changes between trials of one job. Keyed as one object this re-read and re-parsed
+    byte-identical parquet every time (measured on the real tree: GOOG 145 ms cold, 4.5 us
+    warm, 58 ms on a new scope) and left two full copies in the LRU.
+    """
+    calls = _count_reads(monkeypatch)
+    a = ParquetOptionsProvider(store_root, spot_source=lambda s, d: 100.0,
+                               risk_free_rate=_RATE, spot_scope="run-A")
+    _wide(a, date(2023, 1, 10))
+    assert calls["n"] == 1
+
+    b = ParquetOptionsProvider(store_root, spot_source=lambda s, d: 104.0,
+                               risk_free_rate=_RATE, spot_scope="run-B")
+    _wide(b, date(2023, 1, 10))
+    assert calls["n"] == 1, "a new spot scope re-read the identical parquet bytes"
+    # ONE copy of the bytes, TWO overlays — the whole point.
+    assert len(pq._WORKER_RAW_CACHE) == 1
+    assert len(pq._WORKER_UNDERLYING_CACHE) == 2
+    # And they genuinely share the same underlying arrays, not two equal copies.
+    (raw,) = list(pq._WORKER_RAW_CACHE.values())
+    for overlay in pq._WORKER_UNDERLYING_CACHE.values():
+        assert overlay.raw is raw
+
+
+def test_a_new_risk_free_rate_also_only_redoes_the_greeks(monkeypatch, store_root):
+    """The rate is a pricing assumption, not data: same bytes, different inversion."""
+    calls = _count_reads(monkeypatch)
+    a = ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=0.01,
+                               spot_scope="same")
+    b = ParquetOptionsProvider(store_root, spot_source=_spot_source, risk_free_rate=0.09,
+                               spot_scope="same")
+    da = {c.symbol: c for c in _wide(a, date(2023, 1, 10))}[_C100].delta
+    db = {c.symbol: c for c in _wide(b, date(2023, 1, 10))}[_C100].delta
+    assert calls["n"] == 1
+    assert da != db, "the rate is not in the greeks-overlay key"
+
+
+def test_the_worker_cache_does_not_pin_the_runs_spot_source(store_root):
+    """FINDING 4. ``price_source_spot`` closes over the run's ``AsOfPriceSource`` (and so over
+    that run's whole OHLCV memo). Nothing on the run path clears these caches
+    — ``clear_worker_parquet_options_cache`` has no production caller — so a cached object
+    holding that closure pins the finished run's memory for the life of the pool worker.
+
+    The spot source therefore lives on the PROVIDER and is threaded into the greeks call; what
+    the overlay caches is the resulting float.
+    """
+    import gc
+    import weakref
+
+    class _Source:
+        def __call__(self, underlying, on):
+            return 100.0
+
+    src = _Source()
+    p = ParquetOptionsProvider(store_root, spot_source=src, risk_free_rate=_RATE,
+                               spot_scope="pin-check")
+    _wide(p, date(2023, 1, 10))
+    p.get_bar(_C100, date(2023, 1, 10))
+    ref = weakref.ref(src)
+
+    del p, src
+    gc.collect()
+    assert ref() is None, (
+        "the worker option cache is still holding the run's spot source "
+        f"(referrers: {gc.get_referrers(ref())!r})")
+    # The cached overlay is still there and still usable — only the closure went.
+    assert pq._WORKER_UNDERLYING_CACHE
+    q = ParquetOptionsProvider(store_root, spot_source=lambda s, d: 100.0,
+                               risk_free_rate=_RATE, spot_scope="pin-check")
+    assert q.get_bar(_C100, date(2023, 1, 10))["close"] == pytest.approx(7.2)
 
 
 def test_spot_scope_tracks_the_ohlcv_memo_eviction_key():
