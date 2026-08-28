@@ -93,18 +93,23 @@ def test_an_unknown_vendor_is_refused_rather_than_waved_through():
 # --------------------------------------------------------------------------- #
 # 3. Which provider actually serves the backtest today
 # --------------------------------------------------------------------------- #
-def test_the_backtest_store_is_served_by_alpaca_today():
-    """ESTABLISHED, not assumed. ``HistoricalOptionsProvider`` reads exactly one store --
-    the ``OptionsHistoryCache`` sqlite -- and the only writer of that schema is
-    ``fetch_options.build_cache``, which is hard-wired to Alpaca. The TastyTrade parquet
-    tree is written by tools/warm_options_history.py and read by NOTHING on the backtest
-    path (only the read-only chain viewer), so no run can span both vendors.
+def test_the_backtest_store_is_served_by_alpaca_by_default(monkeypatch):
+    """ESTABLISHED, not assumed. A run that does not ask for another store builds
+    ``HistoricalOptionsProvider`` over the ``OptionsHistoryCache`` sqlite, and the only
+    writer of that schema is ``fetch_options.build_cache``, hard-wired to Alpaca.
+
+    Since 2026-08-28 the TastyTrade parquet tree IS readable by the backtest, but only when
+    the run selects it (``options_store``/``BACKTEST_OPTIONS_STORE``, see
+    ``backtest/options_store.py``). Still exactly one reader per run, so still no run
+    spanning two vendors — the vendor named here follows the store actually built.
     """
+    monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)
     assert backtest_options_provider() == "alpaca"
 
 
-def test_the_default_guard_still_refuses_2023():
+def test_the_default_guard_still_refuses_2023(monkeypatch):
     """Consequence of the above, and the regression that matters: making the floor
     per-vendor must NOT quietly admit a window the store cannot serve."""
+    monkeypatch.delenv("BACKTEST_OPTIONS_STORE", raising=False)
     with pytest.raises(ValueError):
         validate_options_window("2023-01-01", uses_options=True)

@@ -117,11 +117,13 @@ def main() -> int:
     # NOTE ON THE START: daily_backtest_handler.validate_options_window enforces the
     # options-history floor of the VENDOR SERVING THE RUN'S STORE (see
     # ba2_providers.options.options_history_floor -- Alpaca 2024-01-18 measured, TastyTrade
-    # 2022-10-01). The store the backtest reads is the Alpaca-built OptionsHistoryCache sqlite,
-    # so an option job starting 2023-01-01 raises "Options backtests served by 'alpaca' require
-    # start >= 2024-01-18" before it runs. That changes when the TastyTrade parquet store is
-    # wired into HistoricalOptionsProvider and backtest_options_provider() moves with it --
-    # NOT by lowering the Alpaca number, which would admit a window the sqlite is empty for.
+    # 2022-10-01). The store the backtest reads DEFAULTS to the Alpaca-built OptionsHistoryCache
+    # sqlite, so an option job starting 2023-01-01 raises "Options backtests served by 'alpaca'
+    # require start >= 2024-01-18" before it runs unless the run selects the TastyTrade parquet
+    # store (options_store="parquet" / BACKTEST_OPTIONS_STORE=parquet -- see
+    # backtest/options_store.py, added 2026-08-28). Selecting it moves the floor to 2022-10-01
+    # HONESTLY, because it also moves which store is read; do NOT instead lower the Alpaca
+    # number, which would admit a window the sqlite is empty for.
     ap.add_argument("--start", default="2023-01-01",
                     help="Backtest start (default 2023-01-01; requires the options cache -- "
                          "and the serving vendor's history floor -- to reach that far back).")

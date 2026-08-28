@@ -2417,19 +2417,26 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    The floor is no longer global: `ba2_providers.options.options_history_floor` answers PER
 #    VENDOR (Alpaca 2024-01-18 measured; dxfeed/TastyTrade 2022-10-01, env-overridable), and
 #    `daily_backtest_handler.validate_options_window` consults the floor of the vendor serving
-#    the store the run actually reads. That much is fixed. The window below still starts
-#    2023-01-01 and every pure-option job STILL raises, because that vendor is Alpaca:
+#    the store the run actually reads. That much is fixed.
 #
-#      * the backtest builds exactly ONE option reader, `HistoricalOptionsProvider`, over an
-#        `OptionsHistoryCache` sqlite;
-#      * the only writer of that schema is `fetch_options.build_cache`, hard-wired to Alpaca;
-#      * TastyTrade history lands in a SEPARATE parquet tree
-#        (`CACHE_FOLDER/TastyTradeOptionsProvider/`) that nothing on the backtest path reads —
-#        only the read-only chain viewer does.
+#    UPDATED 2026-08-28 — THE PARQUET STORE IS NOW READABLE BY THE BACKTEST, BUT YOU MUST ASK
+#    FOR IT. There are two readers behind one seam (`backtest/options_store.py`):
 #
-#    So no run can span both vendors, and FINISHING THE TASTYTRADE DOWNLOAD DOES NOT BY ITSELF
-#    UNBLOCK THE GRID. What unblocks it is wiring that parquet store into
-#    `HistoricalOptionsProvider` and moving `backtest_options_provider()` in the same change.
+#      * `sqlite` (THE DEFAULT) -> `HistoricalOptionsProvider` over the Alpaca-built
+#        `OptionsHistoryCache`. Vendor `alpaca`, floor 2024-01-18. Every backtest number on
+#        record came from here, and it stays the default for exactly that reason.
+#      * `parquet` -> `ParquetOptionsProvider` over `CACHE_FOLDER/TastyTradeOptionsProvider/`.
+#        Vendor `tastytrade`, floor 2022-10-01.
+#
+#    A pure-option job over the 2023-01-01 window below therefore STILL raises unless the run
+#    selects the parquet store — set `options_store: "parquet"` on the backtest block (it is
+#    forwarded per trial by `strategy_optimization_handler._build_daily_trial_config`), or
+#    export `BACKTEST_OPTIONS_STORE=parquet` for the whole job. Check the tree covers the
+#    window first: locally it holds 686 underlyings over 2023-01-03..2023-03-31 ONLY, so a
+#    2023-01-01..2025-12-31 grid would read an empty store for 33 of its 36 months.
+#    A run still cannot span two vendors: one reader is built, and
+#    `backtest_options_provider()` answers for that one.
+#
 #    Do NOT instead lower the Alpaca number: measured on the shared 10.9 GB cache (2026-08-26)
 #    it holds 0 bars before 2024-01-18, its earliest bar is 2024-02-01, and its only three
 #    chain snapshots are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it, and a
@@ -2448,8 +2455,11 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    zero-trade sentinel, and a plain (non-optimize) option backtest will trade nothing at all.
 #    The search recovers once the data lands; until then the run is mostly burning CPU on
 #    -1e9. TastyTrade collection was in progress on another machine — confirm it finished,
-#    AND that it is readable by the backtest (see precondition 1: it lands in a store nothing
-#    on the backtest path reads).
+#    AND that the run actually reads it (see precondition 1: the parquet store is readable
+#    now, but only when `options_store: "parquet"` is selected; the sqlite default still has
+#    no greeks). On the parquet store `get_atm_iv` DOES return a number — the greeks are
+#    Black-Scholes-inverted per bar at read time (`option_greeks.compute_iv_and_greeks`,
+#    the same function that filled the sqlite store's) rather than baked in at build time.
 #    Sharper since 2026-08-26: `_compute_atm_iv` no longer falls back to the frozen
 #    chain-snapshot row, so where a stale row used to supply a number it now honestly supplies
 #    None. That removes a lookahead, and it also removes the last thing masking this gap.
@@ -2625,6 +2635,7 @@ def _option_entry_action_for(kind: str) -> dict:
     _apply_option_strike_method_gene(cfg)
     _apply_option_sizing_gene(cfg)
     _apply_option_min_arc_gene(cfg)
+    _apply_option_entry_cross_gene(cfg)
     return cfg
 
 
@@ -2798,6 +2809,57 @@ def _apply_option_strike_method_gene(cfg: dict) -> dict:
     return cfg
 
 
+# --- the ENTRY QUOTE as a gene (F3) ---------------------------------------------------------
+#
+# Option entry limits are quoted at the ANALYSIS bar's close, but the default `next_bar_open`
+# fill model makes the NEXT bar's open cross that stale quote. And the quote is a MID, not a
+# touch: the historical option store carries `bid == ask` on every row it fills in at all (the
+# parquet store has no bid/ask column whatsoever), so `contract.ask` and `contract.bid` are both
+# just the close, while the tradeable spread is MODELLED at fill time by --option-spread-pct.
+# A seller therefore fills only if the premium RISES by a whole modelled half-spread overnight
+# -- which for decaying OTM premium is the wrong way round, so the DAY order expires unfilled
+# and premium sellers structurally almost never trade. Measured head-to-head on INTC Feb-Dec
+# 2024: O_CSP got 6 trades under next_bar_open and 9 under same_bar_close; an earlier AAPL probe
+# got 0 against 17.
+#
+# `next_bar_open` STAYS THE DEFAULT (no look-ahead, and every existing equity grid used it, so
+# numbers stay comparable) and the QUOTE side is what becomes searchable instead.
+#
+# A FRACTION, NOT AN OFFSET, for the same reason the selection-policy features are chain-
+# relative: an absolute $0.05 means something completely different on a $0.40 put and a $12
+# call, while a fraction of that contract's own modelled spread is scale-free across symbols
+# and premium levels.
+#
+# ONE BAND FOR EVERY STRUCTURE, unlike option_sizing / option_min_arc. Those are quantities
+# whose meaning is set by the structure (20 % of equity, or a return on a collateral branch
+# that differs by an order of magnitude); this one is already normalised BY the structure --
+# it is a fraction of that structure's own legs' own spreads -- so a shared band is the same
+# hypothesis everywhere.
+#
+# 0.0 IS THE AUTHORED DEFAULT AND IT IS AN EXACT NO-OP: the entry keeps quoting the builder's
+# `contract.ask`/`contract.bid`/net untouched, so no existing option result moves. 1.0 quotes
+# at the far touch `_option_cross` already models the fill at. 0.25 steps give the GA five
+# levels including both ends.
+_OPTION_ENTRY_CROSS_BAND = (0.0, 1.0, 0.25)
+
+
+def _apply_option_entry_cross_gene(cfg: dict) -> dict:
+    """Make the entry-quote concession searchable, in place, on ANY option entry action.
+
+    No exemption list, deliberately: every one of the seventeen entry builders ends at
+    ``_OptionEntryAction._submit_option_order``, which is where the concession is applied, so
+    there is no builder for which this gene is inert -- the failure mode that forced
+    ``_apply_option_sizing_gene`` and ``_apply_option_min_arc_gene`` to carry one.
+    """
+    lo, hi, step = _OPTION_ENTRY_CROSS_BAND
+    cfg.setdefault("option_entry_cross", lo)
+    cfg.setdefault("option_entry_cross_optimize", True)
+    cfg.setdefault("option_entry_cross_min", lo)
+    cfg.setdefault("option_entry_cross_max", hi)
+    cfg.setdefault("option_entry_cross_step", step)
+    return cfg
+
+
 def _apply_option_min_volume(cfg: dict) -> dict:
     """Stamp the tradability floor onto ANY option action config, in place.
 
@@ -2824,7 +2886,8 @@ def _option_overlay_action(action_type: str, *, strike_param: float,
     touch while the same knobs were searched on every pure-option key. Sizing genuinely is
     not a knob here -- both actions size off the HELD share count (1 contract per 100
     shares), not option_sizing."""
-    return _apply_option_strike_method_gene(_apply_option_min_volume({
+    return _apply_option_entry_cross_gene(_apply_option_strike_method_gene(
+      _apply_option_min_volume({
         "action_type": action_type,
         "option_strike_method": "percent_otm", "option_strike_param": strike_param,
         "option_dte_min": dte_min, "option_dte_max": dte_max,
@@ -2832,7 +2895,7 @@ def _option_overlay_action(action_type: str, *, strike_param: float,
         "option_strike_param_max": strike_max, "option_strike_param_step": strike_step,
         "option_dte_optimize": True, "option_dte_min_range": dte_min_range,
         "option_dte_max_range": dte_max_range, "option_dte_step": dte_step,
-    }))
+    })))
 
 
 def _screener_gate_base_for_strategy(kind: str) -> dict:

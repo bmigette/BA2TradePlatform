@@ -38,6 +38,9 @@ Namespacing:
   exit:<rid>:a<i>:option_sizing    option position size (% of equity per structure)
   exit:<rid>:a<i>:option_min_arc   minimum annualised return on collateral a CREDIT
                                    structure must offer (fraction; credit actions only)
+  exit:<rid>:a<i>:option_entry_cross  fraction of the contract's own MODELLED bid-ask
+                                   spread the entry gives up when it quotes (0 = mid,
+                                   1 = the far touch the fill engine models)
   schedule:<day>                   ON/OFF toggle for that weekday's entry scan
   screener:<setting>               screener settings
 
@@ -267,6 +270,18 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
             action.get("option_min_arc_min"),
             action.get("option_min_arc_max"),
             action.get("option_min_arc_step"), is_int=False,
+        )
+    # ENTRY-QUOTE CONCESSION (F3): what fraction of the contract's own MODELLED spread the
+    # entry gives up when it quotes. The default fill model (next_bar_open) makes the NEXT
+    # bar cross a quote struck at the ANALYSIS bar, and the historical store's bid==ask puts
+    # that quote at the MID -- so an entry has to earn the whole modelled spread back
+    # overnight before anything fills, and premium sellers structurally almost never do.
+    # 0.0 is the pre-F3 quote exactly; 1.0 is the touch the fill engine already models.
+    if action.get("option_entry_cross_optimize"):
+        out[f"{prefix}:option_entry_cross"] = _range_entry(
+            action.get("option_entry_cross_min"),
+            action.get("option_entry_cross_max"),
+            action.get("option_entry_cross_step"), is_int=False,
         )
 
 
@@ -524,6 +539,8 @@ def _decode_rule_list(rules, ns: str,
                 action["option_sizing"] = agenes["option_sizing"]
             if "option_min_arc" in agenes:
                 action["option_min_arc"] = agenes["option_min_arc"]
+            if "option_entry_cross" in agenes:
+                action["option_entry_cross"] = agenes["option_entry_cross"]
             actions.append(action)
         rule["actions"] = actions
         if rule.get("conditions"):
