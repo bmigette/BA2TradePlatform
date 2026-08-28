@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from ba2_common.core import market_calendar
 from ba2_common.core.account_types import MARKET_HOURS_SOURCE_FALLBACK
 from ba2_common.core.market_calendar import (
     NY_TZ,
@@ -224,3 +225,85 @@ def test_next_close_at_the_closing_instant_is_TOMORROWS_close_not_now():
     assert hours.is_open is False
     assert hours.next_close == _ny(2026, 8, 20, 16, 0)
     assert hours.next_close > at_the_close
+
+
+# ---------------------------------------------------------------------------
+# The schedule memo
+# ---------------------------------------------------------------------------
+# `_nyse_calendar()` memoises the calendar OBJECT, but `.schedule()` -- which is
+# where pandas_market_calendars actually does its work -- was recomputed on every
+# call, at ~10ms a go. Measured on the option backtest path, where
+# `BacktestAccount._iv_rank_sample_dates` asks for one trailing window per
+# iv_rank evaluation: 40% of a whole trial's wall-clock, at both a 3-month and a
+# 1-year window, went into rebuilding schedules for ranges already computed.
+
+def test_the_same_day_range_is_not_recomputed():
+    """A repeat range must not reach pandas_market_calendars a second time."""
+    clear_nyse_calendar_cache()
+    first, last = _ny(2026, 7, 1).date(), _ny(2026, 7, 7).date()
+    calendar = market_calendar._nyse_calendar()
+    calls = []
+    real_schedule = calendar.schedule
+
+    def counting_schedule(*a, **kw):
+        calls.append((a, kw))
+        return real_schedule(*a, **kw)
+
+    object.__setattr__(calendar, "schedule", counting_schedule)
+    try:
+        first_result = nyse_regular_sessions(first, last)
+        second_result = nyse_regular_sessions(first, last)
+    finally:
+        object.__setattr__(calendar, "schedule", real_schedule)
+
+    assert len(calls) == 1, f"schedule() rebuilt {len(calls)}x for one range"
+    assert first_result == second_result
+
+
+def test_a_different_range_is_still_computed():
+    """The memo keys on the range -- it must not answer July with June."""
+    clear_nyse_calendar_cache()
+    july = nyse_regular_sessions(_ny(2026, 7, 1).date(), _ny(2026, 7, 7).date())
+    june = nyse_regular_sessions(_ny(2026, 6, 1).date(), _ny(2026, 6, 7).date())
+
+    assert [o.astimezone(NY_TZ).date().isoformat() for o, _ in june] == [
+        "2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04", "2026-06-05"]
+    assert june != july
+
+
+def test_mutating_the_returned_list_cannot_corrupt_the_memo():
+    """Callers get their OWN list. A shared one would let any caller's `.pop()`
+    silently delete a trading session for every later caller -- the memo must not
+    turn a read into a write."""
+    clear_nyse_calendar_cache()
+    first, last = _ny(2026, 7, 1).date(), _ny(2026, 7, 7).date()
+    victim = nyse_regular_sessions(first, last)
+    assert len(victim) == 4
+    victim.pop()
+    victim.append("garbage")
+
+    assert nyse_regular_sessions(first, last) == [
+        s for s in nyse_regular_sessions(_ny(2026, 7, 1).date(), _ny(2026, 7, 7).date())]
+    assert len(nyse_regular_sessions(first, last)) == 4
+
+
+def test_clearing_the_calendar_also_clears_the_schedules():
+    """The schedules are DERIVED from the calendar. `clear_nyse_calendar_cache`
+    exists for a process whose package was swapped underneath it; leaving stale
+    schedules behind would keep serving the old holiday ruleset forever."""
+    clear_nyse_calendar_cache()
+    first, last = _ny(2026, 7, 1).date(), _ny(2026, 7, 7).date()
+    nyse_regular_sessions(first, last)
+
+    clear_nyse_calendar_cache()
+
+    calendar = market_calendar._nyse_calendar()
+    calls = []
+    real_schedule = calendar.schedule
+    object.__setattr__(calendar, "schedule", lambda *a, **kw: (calls.append(1), real_schedule(*a, **kw))[1])
+    try:
+        nyse_regular_sessions(first, last)
+    finally:
+        object.__setattr__(calendar, "schedule", real_schedule)
+
+    assert len(calls) == 1, "cleared cache still served a memoised schedule"
