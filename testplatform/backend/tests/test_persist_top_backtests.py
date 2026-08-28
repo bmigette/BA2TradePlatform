@@ -369,3 +369,70 @@ def test_remote_then_local_falls_back_after_two_remote_failures(monkeypatch):
 
     assert out == {"ok": True, "results": {"from": "local-fallback"}}
     assert len(attempts) == 2, "must try remote exactly twice before falling back"
+
+
+# --- local re-run retry (2026-08-28) -----------------------------------------------------------
+# _persist_trial_worker used to give up on the FIRST failure of run_daily_backtest, whether it
+# was on a local slot or the remote-fallback's local attempt. goal2020 opt 372 and opt 377 both
+# lost a top-N rank this way to a transient sqlite3.OperationalError('disk I/O error') writing
+# the trial's own persist_trading_db file -- a one-off disk hiccup, not a real defect in the
+# genome, that a single retry would very likely have ridden out. Mirrors _remote_then_local's
+# retry-before-giving-up shape, one layer in from the remote path.
+
+_DAILY_BACKTEST_HANDLER = "app.services.backtest.daily_backtest_handler"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_local_retry_backoff(monkeypatch):
+    """Every test here drives its own fake failures; a real sleep would just slow the suite."""
+    monkeypatch.setattr(_soh, "_LOCAL_RETRY_BACKOFF_S", 0.0)
+
+
+def test_persist_trial_worker_succeeds_first_try_no_retry(monkeypatch):
+    calls = []
+
+    def run_ok(cfg):
+        calls.append(1)
+        return {"equity_curve": []}
+
+    monkeypatch.setattr(f"{_DAILY_BACKTEST_HANDLER}.run_daily_backtest", run_ok)
+
+    out = _soh._persist_trial_worker({"name": "TOP1"})
+
+    assert out == {"ok": True, "results": {"equity_curve": []}}
+    assert len(calls) == 1
+
+
+def test_persist_trial_worker_retries_once_then_succeeds(monkeypatch):
+    attempts = []
+
+    def flaky(cfg):
+        attempts.append(1)
+        if len(attempts) == 1:
+            import sqlite3
+            raise sqlite3.OperationalError("disk I/O error")
+        return {"equity_curve": [1]}
+
+    monkeypatch.setattr(f"{_DAILY_BACKTEST_HANDLER}.run_daily_backtest", flaky)
+
+    out = _soh._persist_trial_worker({"name": "TOP1"})
+
+    assert out == {"ok": True, "results": {"equity_curve": [1]}}
+    assert len(attempts) == 2
+
+
+def test_persist_trial_worker_returns_failure_after_two_local_failures(monkeypatch):
+    attempts = []
+
+    def always_fails(cfg):
+        attempts.append(1)
+        import sqlite3
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(f"{_DAILY_BACKTEST_HANDLER}.run_daily_backtest", always_fails)
+
+    out = _soh._persist_trial_worker({"name": "TOP1"})
+
+    assert out["ok"] is False
+    assert "disk I/O error" in out["error"]
+    assert len(attempts) == 2, "must try exactly twice before giving up (existing contract: ok=False, never raises)"

@@ -813,24 +813,44 @@ def _fitness_suffix(fit_raw: Any, fit_ranked: Any, robustness: Any) -> str:
         return ""
 
 
+# How long to wait before the ONE retry in _persist_trial_worker. Short: the failure this covers
+# (a transient sqlite3.OperationalError writing the trial's own persist_trading_db file under
+# concurrent disk load) typically clears within seconds, not minutes.
+_LOCAL_RETRY_BACKOFF_S = 5.0
+
+
 def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, Any]:
     """Run a TOP-N re-run and return the FULL results dict (equity curve / trades / metrics) for
     the master to persist as a tagged Backtest.
 
     Distinct from ``_trial_worker``, which returns only the scalar fitness: the top-N persist needs
     the whole results blob. Used by ``_persist_top_backtests`` to fan the independent re-runs across
-    a bounded local process pool (the re-runs are the slow post-GA phase). On error returns
-    ``{ok: False, error}`` so one bad re-run never poisons the pool or aborts the others.
+    a bounded local process pool (the re-runs are the slow post-GA phase), and by
+    ``_remote_then_local`` as the final local fallback when the remote path fails twice. On error
+    returns ``{ok: False, error}`` so one bad re-run never poisons the pool or aborts the others.
+
+    Retries once before giving up: goal2020 opt 361/362/364/372/377 all lost a top-N rank to a
+    single transient failure (a leaked worker slot, a mid-restart 503, or here, a bare
+    ``sqlite3.OperationalError('disk I/O error')`` writing the trial's own ``persist_trading_db``
+    file under concurrent disk load from other trials/workers) — none of them a real defect in
+    the genome, all likely to clear on a retry a few seconds later. Mirrors
+    ``_remote_then_local``'s retry-before-giving-up shape one layer in.
 
     ``ctl`` is the worker's per-job cancellation block. It is accepted here because
     ``worker_server._submit_job`` appends one to EVERY pooled call — without this parameter
     /submit-trial-full would raise a TypeError on arity the moment cancellation shipped.
     """
-    try:
-        from app.services.backtest.daily_backtest_handler import run_daily_backtest
-        return {"ok": True, "results": run_daily_backtest(config)}
-    except Exception as e:  # noqa: BLE001 — surface as a failed re-run, keep the others going
-        return {"ok": False, "error": repr(e)}
+    import time
+    from app.services.backtest.daily_backtest_handler import run_daily_backtest
+    last_exc: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            return {"ok": True, "results": run_daily_backtest(config)}
+        except Exception as e:  # noqa: BLE001 — surface as a failed re-run, keep the others going
+            last_exc = e
+            if attempt == 0:
+                time.sleep(_LOCAL_RETRY_BACKOFF_S)
+    return {"ok": False, "error": repr(last_exc)}
 
 
 def _resolve_workers(db: Any, worker_ids: Optional[list]) -> list:
