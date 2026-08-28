@@ -31,7 +31,7 @@ from collections import OrderedDict
 from datetime import date, timedelta
 import os
 import sqlite3
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from ba2_common.core.option_types import OptionContract, OptionQuote
 from ba2_common.core.types import OptionRight
 from .options_cache import OptionsHistoryCache
@@ -309,6 +309,32 @@ class HistoricalOptionsProvider:
 
     def get_bar(self, occ_symbol: str, as_of: date) -> Optional[dict]:
         return _bar_history(self.db_path, occ_symbol).by_date.get(as_of.isoformat())
+
+    def delta_at_entry(self, underlying: str, occ_symbol: str, when: Any) -> Optional[float]:
+        """The contract's delta AS OF ``when`` — the ONE option-specific input
+        ``results._build_refine_drawdown_fn`` needs for the intraday-drawdown refinement.
+
+        A NAMED SEAM METHOD, not an attribute reach. This body used to live inside
+        ``results.py`` as a closure over ``options.cache.db_path``, which only THIS reader
+        has: on the parquet backend the whole refinement silently returned None, so
+        ``max_drawdown`` (and therefore ``option_consistent_annual_return``) differed between
+        the two stores for a reason invisible from the result. Both readers implement this
+        now and the refinement follows the reader.
+
+        Routes through the worker-cached chain history (bisect over a structure loaded once
+        per underlying) rather than ``OptionsHistoryCache``'s raw methods, which open a fresh
+        sqlite3 connection per call. The backtest's own pricing/entry path has already
+        populated it for every underlying the trial touched.
+        """
+        as_of = when.strftime("%Y-%m-%d") if hasattr(when, "strftime") else str(when)
+        hist = _chain_history(self.db_path, underlying)
+        snapshot = hist.latest_as_of(as_of)
+        if snapshot is None:
+            return None
+        for row in hist.by_asof.get(snapshot, []):
+            if row.get("occ_symbol") == occ_symbol:
+                return row.get("delta")
+        return None
 
     def get_atm_iv(self, underlying: str, as_of: date) -> Optional[float]:
         """NEAR-ATM implied volatility (0-1) for ``underlying`` as of ``as_of`` — feeds
