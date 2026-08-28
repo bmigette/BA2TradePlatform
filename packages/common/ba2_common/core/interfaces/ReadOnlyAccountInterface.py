@@ -1268,7 +1268,40 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # partial-sale case, whose pre-existing behaviour this must not change.
                     option_contracts_still_open = not every_option_contract_is_flat(option_net)
 
-                    if oco_leg_filled and transaction.status == TransactionStatus.OPENED:
+                    # A PARTIALLY FILLED OCO LEG DOES NOT CLOSE THE TRANSACTION.
+                    #
+                    # ``oco_leg_filled`` is a MEMBERSHIP test — "some dependent order
+                    # carrying an OCO marker is FILLED" — with no quantity anywhere in it,
+                    # exactly the hole the ``tp_sl_filled`` arm below was given
+                    # ``equity_position_is_flat`` to plug ("a 100-share closing fill on a
+                    # 300-share transaction marked all 300 CLOSED"). This arm had the same
+                    # hole and ran FIRST, so anything wearing an ``OCO-`` comment walked
+                    # straight past that guard.
+                    #
+                    # WHAT IT COST, measured. The backtest's pledged-cover lock CLAMPS a
+                    # stop-loss to the shares that are not collateralising a written call
+                    # (297 held, 200 pledged -> sell 97). The clamped leg still carries the
+                    # ``OCO-SL-`` comment, so this arm closed the WHOLE transaction on it:
+                    # status CLOSED, ``quantity`` rewritten to the 196 that never sold, and
+                    # a fabricated P&L logged on them. Those 196 shares then had no OPENED
+                    # transaction — no TP/SL, invisible to every exit pass, and absent from
+                    # the round-trip trade list while the equity curve still marked them —
+                    # so trade-level metrics (win_rate / profit_factor / expectancy) stopped
+                    # reconciling with the curve the GA scores. A partial fill is a REDUCED
+                    # position, not a closed one; leaving the row OPENED is what lets the
+                    # exit re-arm on the next bar and finish the job.
+                    #
+                    # ONLY the equity axis is added here, deliberately. The option axis has
+                    # its own long-standing guard on the arm below
+                    # (``option_contracts_still_open``), and wiring it in here as well would
+                    # change which structures close through THIS door — a different question
+                    # from the quantity hole, with its own evidence, and not this fix.
+                    # ``equity_position_is_flat`` is inert for a multi-leg structure (forced
+                    # True above, where the mixed-unit quantity has no meaning) and for any
+                    # transaction whose fills balance, so every full close still fires here
+                    # exactly as before.
+                    if (oco_leg_filled and transaction.status == TransactionStatus.OPENED
+                            and equity_position_is_flat):
                         filled_oco_legs = [
                             o for o in dependent_orders
                             if (o.status == OrderStatus.FILLED and

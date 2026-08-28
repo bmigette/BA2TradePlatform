@@ -971,8 +971,39 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             has to poison every ticker's answer. There is deliberately no fall-back to
             ``o.symbol`` — on an option leg row that field can hold the OCC string, which
             would never match and would report the shares as free.
+          * a short CALL on THIS ticker with no ``expiry``: whether it is still alive
+            cannot be decided, and a lot that might be alive still pledges (see below).
           * a multiplier that is absent or <= 0: a missing field, not a contract that
             delivers no shares.
+
+        AN EXPIRED CONTRACT PLEDGES NOTHING, AND SAYS SO LOUDLY. A call that has passed
+        its expiry can no longer be assigned, so it holds no claim on any share — the
+        broker released that cover at settlement. Counting it is not "conservative", it is
+        WRONG in the disabling direction: measured on the O_CC reference run
+        (GOOG,BAC,INTC,F,T / 2023-01-10..2023-03-28), BAC's pledge on 2023-03-08 came out
+        at 600 shares against ONE live 200-share call, because two lots that had expired on
+        2023-02-10 and 2023-03-03 were still being counted. 297 held minus a phantom 600
+        left ZERO free, so the 293-share stop-loss was refused IN FULL on three consecutive
+        bars instead of clamping to the 97 shares the design promises — the shares then rode
+        to run end with no exit. On the same bar the platform's own order-book measure
+        (``OptionsAccountInterface.shares_pledged_to_short_calls``) answered 200: two guards
+        in one run disagreeing by 400 shares, with the ledger the wrong one.
+
+        WHY AN EXPIRED LOT IS STILL IN THE LEDGER AT ALL is a separate, PRE-EXISTING
+        bookkeeping fault, and this method is where it becomes visible, so it is named at
+        ERROR (once per contract per run). ``_apply_option_expiry`` settles what
+        ``get_option_positions()`` reports, and that view is derived from OPENED
+        transactions; a lot whose option transaction was closed by some other route is
+        therefore never settled and its ``_OptionLot.qty`` stays non-zero forever. Treating
+        it as live cover would make the pledge PERMANENT — the contract can never expire
+        again to release it — which is a frozen exit, not a safeguard. This does NOT repair
+        the ledger (that is not this method's job and a silent repair here would hide the
+        fault); it reports it and answers the question that was actually asked.
+
+        STRICTLY ``expiry < today``. The engine settles a contract on the bar where
+        ``expiry <= as_of`` (``daily_engine._apply_option_expiry``), and the bracket/fill
+        paths that consult this lock run EARLIER in that same bar, so on the expiry day
+        itself the call is still live and still pledges.
 
         ROUNDED UP, and paired with a round-DOWN on the holding at the call site: a
         fractional share cannot cover a contract, so both roundings must point at
@@ -1022,6 +1053,36 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     wanted, contract, lot.qty, wanted)
                 return None
             if under != wanted:
+                continue
+            # ALIVE OR NOT? Only a call that can still be assigned has a claim on shares.
+            expiry = o.expiry
+            if expiry is None:
+                logger.error(
+                    "[backtest] PLEDGED COVER UNMEASURABLE for %s: the held SHORT CALL lot %s "
+                    "(%g contract(s)) carries no expiry, so whether it is still alive — and "
+                    "therefore whether it still holds a claim on %s shares — cannot be "
+                    "decided. An undated contract is not an expired one; repair the option "
+                    "order book. This is NOT a share shortfall.",
+                    wanted, contract, lot.qty, wanted)
+                return None
+            if expiry < self._as_of_date():
+                # PRE-EXISTING LEDGER FAULT, surfaced here rather than silently obeyed.
+                # An expired call cannot be assigned, so it pledges nothing; but a lot that
+                # is still on the ledger days after its expiry was never settled (see the
+                # docstring — get_option_positions() only reports OPENED transactions), and
+                # counting it would freeze this ticker's exits for the rest of the run.
+                self._log_pledged_lock(
+                    contract, "stale-expired-lot",
+                    "[backtest] PLEDGED COVER: the option lot ledger still carries %s "
+                    "(%g contract(s), a SHORT CALL on %s) even though it EXPIRED on %s and "
+                    "today is %s. An expired call can no longer be assigned, so it pledges "
+                    "NO shares and is excluded — counting it would lock %s's shares forever, "
+                    "because the contract can never expire again to release them. The lot "
+                    "should have been settled by the expiry pass: its option transaction is "
+                    "no longer OPENED, so get_option_positions() never showed it to "
+                    "_apply_option_expiry. Repair the option transaction bookkeeping; the "
+                    "pledge itself is unaffected.",
+                    (contract, lot.qty, wanted, expiry, self._as_of_date(), wanted))
                 continue
             multiplier = lot.multiplier
             if multiplier is None or multiplier <= 0:
@@ -1133,9 +1194,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
               "NOTHING may be sold; the sale is refused in full."), symbol))
         return free
 
-    def _log_pledged_lock(self, symbol: str, reason: str, fmt: str, args: tuple) -> None:
-        """LOUD once per (symbol, reason) per run, DEBUG thereafter. See ``_pledged_share_lock``."""
-        key = (symbol, reason)
+    def _log_pledged_lock(self, subject: str, reason: str, fmt: str, args: tuple) -> None:
+        """LOUD once per (subject, reason) per run, DEBUG thereafter. See ``_pledged_share_lock``.
+
+        ``subject`` is whatever the recurrence is keyed on: the TICKER for the lock's own
+        refusal/clamp (one explanation per symbol, however many bars it stands for) and the
+        CONTRACT for the stale-expired-lot report in
+        ``_ledger_shares_pledged_to_short_calls`` (one per dead contract, not one per bar
+        per ticker that happens to consult it).
+        """
+        key = (subject, reason)
         if key in self._pledged_lock_logged:
             logger.debug(fmt, *args)
             return

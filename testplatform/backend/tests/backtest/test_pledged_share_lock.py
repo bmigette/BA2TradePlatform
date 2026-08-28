@@ -66,6 +66,7 @@ _CALL_200 = "AAPL240315C00200000"   # the pledging short call
 _CALL_210 = "AAPL240315C00210000"   # a second short call on the same underlying
 _PUT_170 = "AAPL240315P00170000"    # a short PUT — pledges cash, not shares
 _MSFT_CALL = "MSFT240315C00400000"  # a short call on an UNRELATED ticker
+_CALL_SOON = "AAPL240306C00200000"  # a short call expiring 2024-03-06, mid-fixture
 
 _AAPL_BARS = [
     {"Date": datetime(2024, 3, 5), "Open": 180, "High": 181, "Low": 179, "Close": 180, "Volume": 1000},
@@ -82,23 +83,23 @@ _MSFT_BARS = [
 # --------------------------------------------------------------------------- #
 # Harness — the terse pledge-arithmetic shape from test_options_review_fixes.py
 # --------------------------------------------------------------------------- #
-def _chain(sym, k, ot="call", underlying="AAPL"):
-    return {"occ_symbol": sym, "option_type": ot, "strike": k, "expiry": "2024-03-15",
+def _chain(sym, k, ot="call", underlying="AAPL", expiry="2024-03-15"):
+    return {"occ_symbol": sym, "option_type": ot, "strike": k, "expiry": expiry,
             "bid": 2.0, "ask": 2.2, "last": 2.1, "iv": 0.25}
 
 
-def _bar(sym, d, close, ot, k, underlying="AAPL"):
+def _bar(sym, d, close, ot, k, underlying="AAPL", expiry="2024-03-15"):
     return {"occ_symbol": sym, "date": d, "open": close, "high": close, "low": close,
             "close": close, "volume": 100, "underlying": underlying,
-            "option_type": ot, "strike": k, "expiry": "2024-03-15"}
+            "option_type": ot, "strike": k, "expiry": expiry}
 
 
-def _leg(sym, ot, k, underlying="AAPL", side=OrderDirection.SELL):
+def _leg(sym, ot, k, underlying="AAPL", side=OrderDirection.SELL, expiry=date(2024, 3, 15)):
     from ba2_common.core.option_types import OptionLeg
 
     intent = "buy_to_open" if side == OrderDirection.BUY else "sell_to_open"
     return OptionLeg(contract_symbol=sym, side=side, ratio_qty=1, position_intent=intent,
-                     option_type=ot, strike=k, expiry=date(2024, 3, 15), underlying=underlying)
+                     option_type=ot, strike=k, expiry=expiry, underlying=underlying)
 
 
 def _account(tmp_path, tag, *, chains, bars, symbols=("AAPL",)):
@@ -134,10 +135,11 @@ def _account(tmp_path, tag, *, chains, bars, symbols=("AAPL",)):
     return acct, ps, ctx
 
 
-def _write_short(acct, sym, ot, strike, contracts, *, strategy, underlying="AAPL"):
+def _write_short(acct, sym, ot, strike, contracts, *, strategy, underlying="AAPL",
+                 expiry=date(2024, 3, 15)):
     """Write ``contracts`` short options and fill them off the next bar."""
     acct.submit_option_order(
-        legs=[_leg(sym, ot, strike, underlying=underlying)],
+        legs=[_leg(sym, ot, strike, underlying=underlying, expiry=expiry)],
         quantity=contracts, order_type="market", option_strategy=strategy,
     )
     acct.refresh_orders()
@@ -706,5 +708,283 @@ def test_an_equity_only_account_is_untouched(tmp_path):
 
         assert order.status == OrderStatus.FILLED
         assert _shares(acct) == pytest.approx(0.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# =========================================================================== #
+# AN EXPIRED CALL PLEDGES NOTHING — over-refusing is its own way of being wrong
+# =========================================================================== #
+# The first cut of the pledge summed EVERY short lot in ``_option_positions`` with no test
+# on ``expiry``, and nothing reconciles that ledger: ``_apply_option_expiry`` settles what
+# ``get_option_positions()`` reports, and that view is derived from OPENED transactions, so
+# a lot whose option transaction closed by another route is never settled and its qty stays
+# non-zero forever. Measured on the reference run (O_CC / GOOG,BAC,INTC,F,T /
+# 2023-01-10..2023-03-28), BAC's pledge on 2023-03-08 came out at 600 against ONE live
+# 200-share call, because two contracts that expired on 2023-02-10 and 2023-03-03 were still
+# being counted. 297 held minus a phantom 600 left ZERO free, so the 293-share stop-loss was
+# refused IN FULL on three consecutive bars instead of clamping to 97 — and the pledge could
+# never be released, because a contract cannot expire twice. On the same bar the platform's
+# own order-book measure answered 200: two guards in one run, 400 shares apart.
+def test_an_expired_short_call_lot_pledges_nothing_and_names_itself(tmp_path, caplog):
+    """A call past its expiry can no longer be assigned, so it holds no claim on shares.
+
+    The lot is still on the ledger only because the expiry pass never saw it — a separate,
+    PRE-EXISTING bookkeeping fault. Obeying it would freeze this ticker's exits for the rest
+    of the run, so it is excluded from the pledge and reported at ERROR instead.
+    """
+    import logging
+
+    acct, ps, ctx = _account(
+        tmp_path, "lock-expired",
+        chains={"AAPL": [_chain(_CALL_SOON, 200.0, expiry="2024-03-06")]},
+        bars=[_bar(_CALL_SOON, "2024-03-06", 2.0, "call", 200.0, expiry="2024-03-06")])
+    try:
+        acct._update_position("AAPL", 100, 180.0)
+        _write_short(acct, _CALL_SOON, OptionRight.CALL, 200.0, 1,
+                     strategy="covered_call", expiry=date(2024, 3, 6))
+        assert acct._option_positions[_CALL_SOON].qty == -1
+
+        # While it is alive the shares are locked, exactly as before.
+        assert acct._ledger_shares_pledged_to_short_calls("AAPL") == 100
+
+        # The contract expires; the settlement pass never runs (the ledger fault), so the
+        # lot is still short. It is nonetheless DEAD: nobody can be assigned on it.
+        ps.set_clock(datetime(2024, 3, 8))
+        with caplog.at_level(logging.ERROR):
+            assert acct._ledger_shares_pledged_to_short_calls("AAPL") == 0, (
+                "an expired call cannot be assigned, so it pledges no shares — counting it "
+                "locks the ticker forever, because it can never expire again")
+        assert _CALL_SOON in caplog.text and "EXPIRED" in caplog.text.upper(), (
+            f"the stale ledger lot must be named, not silently obeyed; got:\n{caplog.text}")
+
+        order = _equity_sell(acct, "AAPL", 100, 190.0, as_of=datetime(2024, 3, 8))
+        assert order.status == OrderStatus.FILLED
+        assert _shares(acct) == pytest.approx(0.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_the_expiry_day_itself_still_pledges(tmp_path):
+    """``expiry < today``, strictly.
+
+    ``daily_engine._apply_option_expiry`` settles a contract on the bar where
+    ``expiry <= as_of``, and the fill / bracket passes that consult this lock run EARLIER in
+    that same bar. On the expiry day the call is still live and can still be assigned, so
+    its cover is still locked.
+    """
+    acct, ps, ctx = _account(
+        tmp_path, "lock-expiryday",
+        chains={"AAPL": [_chain(_CALL_SOON, 200.0, expiry="2024-03-06")]},
+        bars=[_bar(_CALL_SOON, "2024-03-06", 2.0, "call", 200.0, expiry="2024-03-06")])
+    try:
+        acct._update_position("AAPL", 100, 180.0)
+        _write_short(acct, _CALL_SOON, OptionRight.CALL, 200.0, 1,
+                     strategy="covered_call", expiry=date(2024, 3, 6))
+
+        ps.set_clock(datetime(2024, 3, 6))
+        assert acct._ledger_shares_pledged_to_short_calls("AAPL") == 100
+
+        order = _equity_sell(acct, "AAPL", 100, 190.0)
+        assert order.status == OrderStatus.CANCELED
+        assert _shares(acct) == pytest.approx(100.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_a_short_call_lot_with_no_expiry_is_unmeasurable(tmp_path):
+    """No expiry means "alive or dead?" cannot be answered — which is not "dead".
+
+    The excluding branch above turns on a KNOWN date in the past. An undated contract is a
+    missing field, and reading it as expired would hand back cover on a guess.
+    """
+    acct, ps, ctx = _account(
+        tmp_path, "lock-noexpiry",
+        chains={"AAPL": [_chain(_CALL_200, 200.0)]},
+        bars=[_bar(_CALL_200, "2024-03-06", 2.0, "call", 200.0)])
+    try:
+        acct._update_position("AAPL", 500, 180.0)
+        _write_short(acct, _CALL_200, OptionRight.CALL, 200.0, 1, strategy="covered_call")
+        acct._lot_order(_CALL_200).expiry = None
+
+        assert acct._ledger_shares_pledged_to_short_calls("AAPL") is None
+
+        order = _equity_sell(acct, "AAPL", 100, 190.0)
+        assert order.status == OrderStatus.CANCELED
+        assert _shares(acct) == pytest.approx(500.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# =========================================================================== #
+# A CLAMPED EXIT REDUCES THE POSITION — IT DOES NOT CLOSE THE TRANSACTION
+# =========================================================================== #
+def test_a_clamped_bracket_exit_leaves_the_transaction_open_and_re_arms(tmp_path):
+    """The clamp's whole promise: the rest of the exit is DEFERRED, not lost.
+
+    The clamped stop is still written with the ``OCO-SL-`` comment, and
+    ``ReadOnlyAccountInterface.refresh_transactions``' ``oco_leg_filled`` arm used to close
+    the transaction on it with no quantity test at all — the same hole its ``tp_sl_filled``
+    sibling was given ``equity_position_is_flat`` to plug. A 97-of-297 clamp therefore
+    marked the WHOLE row CLOSED, rewrote ``quantity`` to the 200 that never sold and logged
+    a fabricated P&L on them. Those 200 shares then had no OPENED transaction: no TP/SL,
+    invisible to ``_apply_bracket_exits`` (which iterates OPENED rows), unreachable by any
+    exit rule, and absent from the round-trip trade list while the equity curve still
+    marked them — so the trade metrics a GA scores stopped reconciling with the curve.
+    """
+    from ba2_common.core.db import get_instance, update_instance
+    from ba2_common.core.models import TradingOrder, Transaction
+    from ba2_common.core.types import TransactionStatus
+
+    acct, ps, ctx = _account(
+        tmp_path, "lock-bracket-rearm",
+        chains={"AAPL": [_chain(_CALL_200, 200.0)]},
+        bars=[_bar(_CALL_200, "2024-03-06", 2.0, "call", 200.0)])
+    try:
+        buy = TradingOrder(account_id=acct.id, symbol="AAPL", quantity=297,
+                           side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                           status=OrderStatus.NEW, comment="equity-lot")
+        acct.submit_order(buy)
+        persisted = acct.get_order(buy.broker_order_id)
+        eq_txn_id = persisted.transaction_id
+        acct._apply_fill(persisted, 180.0, datetime(2024, 3, 5))
+        acct.refresh_transactions()
+
+        _write_short(acct, _CALL_200, OptionRight.CALL, 200.0, 2, strategy="covered_call")
+        assert acct._ledger_shares_pledged_to_short_calls("AAPL") == 200
+
+        txn = get_instance(Transaction, eq_txn_id)
+        txn.stop_loss = 179.5
+        update_instance(txn)
+        ps.set_clock(datetime(2024, 3, 6))       # next_bar_open -> fills off the 03-08 bar
+
+        assert acct._apply_bracket_exits(datetime(2024, 3, 6)) is True
+        assert _shares(acct) == pytest.approx(200.0)
+
+        # THE REGRESSION: rolling the fill into the transaction must not close it.
+        acct.refresh_transactions()
+        txn = get_instance(Transaction, eq_txn_id)
+        assert txn.status == TransactionStatus.OPENED, (
+            f"a 97-of-297 partial exit closed the whole transaction ({txn.status}); the 200 "
+            f"unsold shares are now orphaned — no stop, no exit rule, no trade row")
+        assert float(txn.quantity) == pytest.approx(200.0), (
+            "the row must describe what is still held")
+        assert txn.stop_loss == pytest.approx(179.5), "the stop must survive to re-arm"
+
+        # Buy the calls back: the pledge is released and the deferred exit finishes the job.
+        acct._update_option_position(_CALL_200, 2.0, 2.0, 100.0)
+        assert acct._ledger_shares_pledged_to_short_calls("AAPL") == 0
+        assert acct._apply_bracket_exits(datetime(2024, 3, 6)) is True
+        assert _shares(acct) == pytest.approx(0.0), (
+            "the deferred exit must go through the moment the cover is released")
+
+        acct.refresh_transactions()
+        assert get_instance(Transaction, eq_txn_id).status == TransactionStatus.CLOSED
+
+        # And the trade ledger must account for every share the equity curve carries.
+        sold = sum(float(t["size"]) for t in acct.get_round_trip_trades()
+                   if t.get("symbol") == "AAPL" and t.get("exit_reason") == "stop_loss")
+        assert sold == pytest.approx(297.0), (
+            f"the round trips must add up to the 297 shares that actually traded, got {sold}")
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_a_full_bracket_exit_still_closes_its_transaction(tmp_path):
+    """The guard above must not hold a NORMAL exit open — the everyday path is untouched."""
+    from ba2_common.core.db import get_instance, update_instance
+    from ba2_common.core.models import TradingOrder, Transaction
+    from ba2_common.core.types import TransactionStatus
+
+    acct, ps, ctx = _account(
+        tmp_path, "lock-bracket-full",
+        chains={"AAPL": [_chain(_CALL_200, 200.0)]},
+        bars=[_bar(_CALL_200, "2024-03-06", 2.0, "call", 200.0)])
+    try:
+        buy = TradingOrder(account_id=acct.id, symbol="AAPL", quantity=100,
+                           side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                           status=OrderStatus.NEW, comment="equity-lot")
+        acct.submit_order(buy)
+        persisted = acct.get_order(buy.broker_order_id)
+        eq_txn_id = persisted.transaction_id
+        acct._apply_fill(persisted, 180.0, datetime(2024, 3, 5))
+        acct.refresh_transactions()
+
+        txn = get_instance(Transaction, eq_txn_id)
+        txn.stop_loss = 179.5
+        update_instance(txn)
+        ps.set_clock(datetime(2024, 3, 6))
+
+        assert acct._apply_bracket_exits(datetime(2024, 3, 6)) is True
+        assert _shares(acct) == pytest.approx(0.0)
+        acct.refresh_transactions()
+        assert get_instance(Transaction, eq_txn_id).status == TransactionStatus.CLOSED
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# =========================================================================== #
+# A REFUSED CLOSE LEAVES THE ROW EXACTLY AS IT FOUND IT
+# =========================================================================== #
+def test_a_cover_refused_close_does_not_park_the_transaction_in_closing(tmp_path):
+    """``close_transaction`` flips a row to CLOSING before it ever asks the cover guard.
+
+    The guard sat only in ``submit_close_order_for_transaction``, at the bottom of that
+    walk, so a refusal left the transaction in CLOSING with NO closing order — and CLOSING
+    is a dead end: the exit passes that would retry it, and the backtest's bracket TP/SL
+    sweep, scan OPENED rows only. Measured on O_CC/BAC: refused 2023-03-13, the short call
+    it was waiting on bought back 2023-05-10, still CLOSING at run end holding 200 shares
+    nothing could sell. The refusal is SELF-CLEARING, so it must leave the row re-armable.
+    """
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import TradingOrder, Transaction
+    from ba2_common.core.types import TransactionStatus
+
+    acct, ps, ctx = _account(
+        tmp_path, "lock-closetxn",
+        chains={"AAPL": [_chain(_CALL_200, 200.0)]},
+        bars=[_bar(_CALL_200, "2024-03-06", 2.0, "call", 200.0),
+              _bar(_CALL_200, "2024-03-08", 2.0, "call", 200.0)])
+    try:
+        buy = TradingOrder(account_id=acct.id, symbol="AAPL", quantity=200,
+                           side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                           status=OrderStatus.NEW, comment="equity-lot")
+        acct.submit_order(buy)
+        persisted = acct.get_order(buy.broker_order_id)
+        eq_txn_id = persisted.transaction_id
+        acct._apply_fill(persisted, 180.0, datetime(2024, 3, 5))
+        acct.refresh_transactions()
+
+        _write_short(acct, _CALL_200, OptionRight.CALL, 200.0, 2, strategy="covered_call")
+        assert acct._ledger_shares_pledged_to_short_calls("AAPL") == 200
+
+        result = acct.close_transaction(eq_txn_id)
+
+        assert result["success"] is False
+        assert "PLEDGED COVER" in result["message"]
+        assert result["close_order_id"] is None
+        txn = get_instance(Transaction, eq_txn_id)
+        assert txn.status == TransactionStatus.OPENED, (
+            f"a refused close parked the row in {txn.status}, which nothing revisits — the "
+            f"position can never be closed again even once the cover is released")
+        closes = [o for o in acct.get_orders()
+                  if o.transaction_id == eq_txn_id and o.side == OrderDirection.SELL]
+        assert closes == [], "the refusal must write no order at all"
+
+        # Release the cover for real — through the option book, which is the view
+        # ``cover_refusal_for_equity_sale`` reads (the ledger helper alone would leave a
+        # live sell-to-open row on the book and the refusal would stand, correctly).
+        pos = [p for p in acct.get_option_positions() if p.contract_symbol == _CALL_200]
+        assert len(pos) == 1
+        acct.close_option_position(pos[0], order_type="market")
+        ps.set_clock(datetime(2024, 3, 6))
+        acct.refresh_orders()                    # next_bar_open -> fills off the 03-08 bar
+        acct.refresh_transactions()
+        assert acct._option_positions[_CALL_200].qty == 0
+        assert acct.shares_pledged_to_short_calls("AAPL") == 0
+
+        again = acct.close_transaction(eq_txn_id)
+        assert again["success"] is True, again["message"]
+        assert again["close_order_id"] is not None
     finally:
         ctx.__exit__(None, None, None)

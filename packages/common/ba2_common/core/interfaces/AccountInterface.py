@@ -2032,7 +2032,48 @@ class AccountInterface(ReadOnlyAccountInterface):
             if transaction.status == TransactionStatus.CLOSING:
                 logger.info(f"Transaction {transaction_id} is already in CLOSING status")
                 # Continue anyway - this could be a retry
-            
+
+            # SEAM 2 / OPT-L1 — the PLEDGED-COVER refusal has to be asked HERE too, before
+            # ANYTHING is mutated, for exactly the reason the OPTION guard at the top of
+            # this method is duplicated from submit_close_order_for_transaction: by the
+            # time control reaches that helper this method has already flipped the row to
+            # CLOSING and cancelled the position's working orders.
+            #
+            # WHAT THE BOTTOM-ONLY REFUSAL COST, measured. A covered-call arm whose equity
+            # exit is refused because the shares collateralise a live short call left the
+            # transaction in CLOSING with NO closing order ever written — and CLOSING is a
+            # dead end: the exit passes that would retry it (and the backtest's bracket
+            # TP/SL sweep) scan OPENED rows only, so the retry never came. The position
+            # rode to the end of the run unmanaged, still holding the shares, even after
+            # the short call it was waiting on had been bought back and the cover released
+            # (measured on O_CC/BAC: refused 2023-03-13, cover released 2023-05-10, still
+            # CLOSING at run end). The refusal is SELF-CLEARING by nature — buy the call
+            # back, or let it expire — so it must leave the transaction exactly as it found
+            # it, OPENED and re-armable, not park it in a state nothing revisits.
+            #
+            # The decision itself lives in ``cover_refusal_for_equity_sale`` (one copy, so
+            # this seam and the helper's cannot drift) and is asked with the same arguments
+            # the helper uses, so a close that gets past here is not refused a second time
+            # for a different reason. ``except_transaction_id`` is this transaction: its own
+            # working rows are the ones being replaced.
+            #
+            # Asked only when closing a LONG (a close that SELLS). Closing a short BUYS the
+            # shares back, which can only ADD cover. Asked only when something is actually
+            # open: a net of zero is the helper's "already flat, nothing to close" path,
+            # which must stay a success and must not consult the option book to say so.
+            if transaction.side == OrderDirection.BUY:
+                net_open = abs(transaction.get_current_open_qty())
+                if net_open > 0:
+                    refusal = self.cover_refusal_for_equity_sale(
+                        transaction.symbol, net_open,
+                        action=f"closing transaction {transaction.id}",
+                        except_transaction_id=transaction.id,
+                        order_noun="close order")
+                    if refusal:
+                        logger.error(f"close_transaction: {refusal}")
+                        result['message'] = refusal
+                        return result
+
             # Set transaction status to CLOSING to prevent duplicate close attempts
             if transaction.status != TransactionStatus.CLOSING:
                 transaction.status = TransactionStatus.CLOSING
