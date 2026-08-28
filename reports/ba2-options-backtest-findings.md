@@ -307,3 +307,112 @@ lookup to use the underlying's DAILY calendar regardless of the run's fill clock
 and preserve intraday TP/SL precision for the equity control arm (O_STK) and stock legs
 (covered call, assigned wheel stock), which DO have 5-min bars and are the only reason to want the
 finer clock at all. Not yet implemented; it changes results for any option run made at 5min.
+
+**Superseded in part by F6 below:** the covered-call/assigned-stock half of that argument is void.
+A broker LOCKS those shares, so there is no intraday equity exit on them to gain resolution for.
+Only the O_STK equity control arm remains a reason to want 5min, which is not enough to buy a
+broken option fill model. The `--interval 1d` recommendation stands, more strongly.
+
+---
+
+## 2026-08-28 (evening) — F6: the backtest let a covered call go NAKED
+
+### The defect
+
+A broker LOCKS the shares collateralising a short call — while the covered call is open you cannot
+sell the stock, because that would leave a naked call. The simulator modelled no such lock, so
+O_CC's equity exits (it carries a staged trailing stop + time exit) sold the shares out from under
+the written call.
+
+Measured on O_CC / GOOG,BAC,INTC,F,T / 2023-01-10..2023-03-28 / $100k / gates-off / `--interval 1d`
+by instrumenting `_covered_short_call_contracts`, classified into three buckets so a dead lot is
+never filed as a live naked call:
+
+```
+PRE-LOCK (9096c27e)   O_CC: trades=19   uncovered short calls: 6
+  contract              held  needed  bars  alive  nakedbars  verdict
+  INTC230303C00030000      2     200    27     10         10  GENUINELY NAKED
+  BAC230414C00034000       4     200    15     15         15  GENUINELY NAKED
+  BAC230303C00037000       4     200    40     23          0  greedy-allocation artifact
+  BAC230210C00036000       4     200    15      0          0  stale EXPIRED ledger lot
+  BAC230303C00038000     297     200    19     19          0  greedy-allocation artifact
+  GOOG230414C00105000    107     100     9      9          0  greedy-allocation artifact
+```
+
+Two genuinely naked short calls — unbounded upside risk — held for 10 and 15 bars. The
+greedy-allocation rows are NOT this bug (`_covered_short_call_contracts` allocates
+largest-lot-first, so a second lot on the same underlying is legitimately reported uncovered while
+the shares are in fact there). The *stale expired* row was a second defect this work uncovered
+(D1 below).
+
+The codebase already knew this state was dangerous: `option_lifecycle.py` ranks
+`LIFECYCLE_COVER_LOST` second in precedence, above profit capture — *"A covered call that has lost
+its shares is a NAKED short call ... The reason is the alarm."* But `run_option_lifecycle_pass` is
+called only from `JobManager.py`, the LIVE path. There were **zero** references to the lifecycle or
+cover-lost machinery anywhere under `testplatform/backend/app/services/backtest/`. The backtest had
+neither the lock nor the alarm.
+
+### The fix — model the lock (`a6aca81e`, `9179aabf`, TEST_APP_VERSION 2026.08.0049)
+
+Chosen over the alternative ("allow the sale, close the call next bar") because that leaves real
+overnight naked exposure. An equity sell may not reduce the share count below what is pledged to
+open short calls, and it **clamps** rather than blanket-refuses — a broker lets you sell the
+unpledged excess (297 held, 200 pledged → sell 97, land on exactly 200; zero excess → cancel the
+order). Only short CALLs pledge shares (short puts pledge cash; long options pledge nothing).
+Assignment delivery is never blocked — a called-away covered call removes the shares and the call
+together, and guarding that path would deadlock the wheel. An unmeasurable pledge REFUSES and names
+the lot, rather than reading as "nothing pledged" and failing open into the very state being
+prevented.
+
+**Three further defects were found by adversarial review and fixed in `9179aabf`** — all reproduced
+before being fixed, none theoretical:
+
+* **D1 — the pledge counted EXPIRED contracts.** No expiry test, and the lot ledger is never
+  reconciled, so at bar 2023-03-08 BAC asked to sell 293 and was allowed 0: a ledger pledge of 600
+  against a true book pledge of 200, from two contracts that had expired on 02-10 and 03-03. A lot
+  whose expiry has passed now pledges nothing (strictly `<`, since expiry settles at `<=` and the
+  fill pass runs earlier in the same bar), and the stale lot is named at ERROR once per contract
+  rather than silently obeyed or silently repaired.
+* **D2 — a clamped partial fill CLOSED its transaction and stranded the residue.** `oco_leg_filled`
+  was a membership test with no quantity in it, so a clamped stop still wearing its `OCO-SL-`
+  comment marked the whole transaction CLOSED with a fabricated P&L on shares that never sold.
+  Those shares then had no OPENED transaction — no TP/SL, invisible to every exit pass, absent from
+  the round-trip trade list while the equity curve still marked them — so trade-level metrics
+  stopped reconciling with the curve the GA scores.
+* **D3 — a refused close stranded the row in CLOSING.** The pre-existing refusal was asked only at
+  the bottom seam, by which point `close_transaction` had already flipped the row to CLOSING and
+  cancelled its working orders — and CLOSING is a dead end, since the retry passes scan OPENED only.
+  Measured on O_CC/BAC: refused 2023-03-13, cover released 2023-05-10, still CLOSING at run end. The
+  refusal is self-clearing by nature, so it must leave the row exactly as it found it.
+
+D2 and D3 are in `packages/common` (`ReadOnlyAccountInterface`, `AccountInterface`) and therefore
+change LIVE behaviour too. Both reuse `cover_refusal_for_equity_sale` /
+`shares_pledged_to_short_calls`, the pre-existing tri-state helpers from `828e65a9` — no second,
+divergent notion of cover was introduced.
+
+### Result
+
+```
+POST-LOCK (9179aabf)  O_CC: trades=15   GENUINELY NAKED: 0
+                      final_equity 97741.34   total_return -2.26%   (was -1.42%)
+```
+
+**O_CC's historical numbers move and are no longer comparable to prior runs** — it had been booking
+premium against risk a broker would not have permitted. A 19-arm sweep at full precision confirms
+only O_CC moves: 18/19 arms byte-identical, including O_WHEEL, O_PP and O_CSP, so the shared-code
+repairs do not leak outside covered structures.
+
+Suites: backend `1 failed, 3520 passed, 158 skipped` (the 1 is the known Windows-only
+`test_logs_rejects_path_traversal`, reproduced in isolation and untouched by these commits);
+`tests/` 4411 passed; `packages/common` 2446 passed — all three re-run independently of the agents
+that wrote the code. Test sensitivity was verified by neutering each of the four fixes one at a time
+in a scratch worktree: with `_pledged_share_lock` stubbed to a passthrough, 12 of the 24 new cases
+fail and the 12 ALLOW-path cases stay green.
+
+### Still open
+
+`SellAction` (`ba2_common/core/TradeActions.py`) is an unguarded equity-sell path in LIVE: it calls
+`create_order_record(side="sell", ...)` with no pledge check, unlike `CloseAction`, which delegates
+to `close_transaction`. In the BACKTEST it funnels through
+`submit_order → refresh_orders → _apply_fill`, so the new fill-time clamp covers it. The live gap is
+real and not yet closed.
