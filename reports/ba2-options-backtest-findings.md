@@ -206,3 +206,104 @@ and record it alongside the seed.
 clears, so the clamp wrote a short option for ZERO premium while carrying the full assignment
 liability. Now DECLINED (returns the original limit) — an unfillable order is the honest outcome.
 Two tests that had pinned the clamp as intent were re-pointed at the corrected semantics.
+
+---
+
+## 2026-08-28 (evening, laptop) — F4 fixed; a 40% perf win; and the fill clock is not a speed knob
+
+### F4 — FIXED, shipped as `655c0ddf` + `e15b9af4` (TEST_APP_VERSION 2026.08.0046)
+
+**The cause was NOT the one guessed above.** It is not evaluation order permuting the RNG draws:
+`batch_fitness` returns fitnesses index-aligned and nothing in the master's batch loop draws
+randomness — which is exactly why `parallel=4` and `parallel=8` agreed with each other.
+
+The real mechanism: the GA drew all of its own randomness from the process-global `random`
+module, and `DailyBacktestEngine.run()` opens with `random.seed(self.seed)`
+(`backtest/daily_engine.py:481`). At `--parallel <= 1`,
+`_dispatch_engages()` returns False, so `genetic.py` evaluates IN-PROCESS
+(`list(map(self.toolbox.evaluate, ...))`) and every trial **reset the GA's stream mid-search**. At
+`--parallel > 1` the trial runs in a spawned worker and the master's RNG is untouched. So the
+stream was reset, not merely permuted — a stronger failure than the one hypothesised.
+
+The fix gives the optimizer a private `random.Random`, cloned from the global state at
+construction (so the draw sequence stays byte-identical to the old one) and checkpointed as
+`ga_random_state`. `tools.cxTwoPoint` / `tools.selTournament` are replaced by draw-for-draw
+identical local re-implementations, because DEAP offers no seam to hand those a generator.
+
+Verified: small case (5 symbols, pop=16 gen=3) `parallel=1/2/4/8` all → **-6.04**, identical
+`best_params` and the identical 29-genome evaluated set. Large case (9 symbols, pop=40 gen=5)
+`parallel=1` and `parallel=8` both → **335.3088156886005**, same 138 genomes. Both large runs were
+bracketed by a source-tree checksum to prove no concurrent edit landed mid-experiment.
+**`--parallel > 1` results did not move at all** — only `parallel=1` changed, onto the answer the
+other settings always gave. So no previously-recorded grid result at `--parallel > 1` is invalidated.
+
+A second, independent parallelism dependence found and fixed in the same area (`e15b9af4`):
+`genetic.py`'s in-process `evaluate()` scored a RAISING fitness function at `0.0`, while the batch
+path scores `ZERO_TRADE_SENTINEL`. Strategy fitnesses are routinely negative (-6.04, -43.66), so
+`0.0` meant "better than every genome that actually traded" and the GA would breed toward whatever
+crashes the backtest. Now a named `FITNESS_EVALUATION_FAILED`, pinned by test to equal
+`ZERO_TRADE_SENTINEL`.
+
+### PERF — the NYSE schedule was 40% of every option trial (`b602aac8`)
+
+`_nyse_calendar()` memoised the calendar OBJECT, but `.schedule()` — where
+`pandas_market_calendars` actually works, ~10 ms a call — re-ran for every range.
+`BacktestAccount._iv_rank_sample_dates` requests one trailing window per iv_rank evaluation, so a
+run walks a sliding range and re-derives windows overlapping the previous by all but a day.
+
+Profiled on the GA trial path (5 symbols, O_LC, 5min clock, weekly analysis):
+
+| window | before | after | `nyse_regular_sessions` share of wall |
+|---|---|---|---|
+| 3 months | 0.52 s | **0.25 s** | 37% → 0% |
+| 1 year | 0.86 s | **0.56 s** | 41% → 0% |
+
+`get_iv_rank` fell from ~40% of wall to ~2%. Fitness is byte-identical (-6.04 before and after,
+same seed) — this changes no number, only how often it is recomputed. The memo is bounded (512
+ranges) and returns a copy, so no caller's mutation can delete a trading session for everyone else.
+
+Scaling, measured rather than extrapolated: 4× the window costs 2.2× the time (fixed
+preload/warmup/chain-load do not scale), so the earlier linear ~1.5 s/trial estimate for a
+2–3 year stage-1 window is pessimistic. Still measured on 5 symbols only; a larger universe moves it.
+
+### F5 — HIGH: on a 5-min clock, `next_bar_open` silently becomes SAME-DAY-OPEN for options
+
+**Option bars are DAILY ONLY.** Every file in the parquet store is `<SYM>_<expiry>_1d.parquet`
+keyed by a `bar_date` (9,587 files checked). There is no intraday option data anywhere, so a 5-min
+fill clock adds **zero** price resolution for an option leg — the premium is constant across all 78
+intraday steps of a session.
+
+Worse, it changes the fill model. `_option_fill_price` picks the fill day via
+`self._price.next_bar_date(underlying, as_of)` — the next bar of the UNDERLYING's series — then
+takes `.date()`. On a 5-min clock the next bar is 5 minutes later, whose date is the SAME DAY:
+
+| clock | order placed | resolved option fill day |
+|---|---|---|
+| 1d | 2023-02-01 | 2023-02-02 — next trading day ✅ |
+| 5min | 09:30 | **2023-02-01 — same day** ❌ |
+| 5min | 12:00 | **2023-02-01 — same day** ❌ |
+| 5min | 15:55 | 2023-02-02 — next trading day |
+
+So for 77 of 78 bars a session, an option order quoted on the analysis bar fills against **that
+same day's daily bar OPEN**. Three consequences:
+
+1. **The overnight gap risk `next_bar_open` exists to impose is gone** for option legs, while it
+   still applies to equity legs — one run, two fill models.
+2. **Look-ahead for any order not decided at the open.** An entry decided at 12:00, after observing
+   the underlying's intraday move, fills at the option's 09:30 price. A GA is precisely the machine
+   that finds and exploits that. The current grid analyses only at `times: ["09:30"]`, which limits
+   the exposure — but pending orders retry on later bars, and the management schedule does not.
+3. **The F3 `option_entry_cross` gene measures something else.** It was designed against the
+   overnight barrier; at 5min that barrier does not exist for options.
+
+Measured effect on trade counts (5 symbols, Q1-2023, gates-off, 1d vs 5min): O_STK 9/9 (equity,
+unaffected), O_LC 5→6, O_LP 2→4, O_STRD 8/8, O_STRG 6→4, O_CC 12→13. Pure-option structures move,
+so this is not academic.
+
+**Recommendation: run the option grid at `--interval 1d`** until this is resolved. 5min costs ~50%
+more wall clock to buy a fill model nobody chose. The principled fix is for the option fill-day
+lookup to use the underlying's DAILY calendar regardless of the run's fill clock, so
+`next_bar_open` means "next trading day" for an option at any interval — that would make 5min safe
+and preserve intraday TP/SL precision for the equity control arm (O_STK) and stock legs
+(covered call, assigned wheel stock), which DO have 5-min bars and are the only reason to want the
+finer clock at all. Not yet implemented; it changes results for any option run made at 5min.
