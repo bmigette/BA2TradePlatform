@@ -122,19 +122,33 @@ def test_the_concession_scales_linearly_between_the_two_ends():
 # 2. the floors
 # =========================================================================== #
 def test_a_single_leg_sell_never_quotes_below_zero():
-    """Mirrors ``_option_cross``'s own ``max(0.0, px - half)``: a modelled spread wider than
-    the premium must not ask the account to pay in order to sell."""
-    assert entry_limit_with_concession(
-        0.05, [_leg(OrderDirection.SELL)], [0.40], 1.0) == 0.0
+    """A spread wider than the premium must not ask the account to pay in order to sell.
+
+    The invariant is unchanged; HOW it is satisfied changed on review. Clamping to `0.0` looked
+    like the safe floor and was the opposite: a SELL_LIMIT of 0.0 ALWAYS clears (`_option_cross`
+    floors the sell at `max(0.0, px - half)`, and the arb guard does not fire on an OTM contract
+    whose intrinsic is 0), so the clamp wrote a short option for ZERO premium while carrying the
+    full assignment liability. The concession is now DECLINED instead, leaving the order exactly
+    where it was -- unfillable, which is the honest outcome when the whole premium is narrower
+    than the spread being crossed.
+    """
+    quoted = entry_limit_with_concession(0.05, [_leg(OrderDirection.SELL)], [0.40], 1.0)
+    assert quoted == 0.05, "the original limit, unchanged -- not a zero-premium short"
+    assert quoted > 0.0
 
 
 def test_a_multileg_credit_never_becomes_a_debit():
     """The parent's recorded side is derived from the SIGN of this number
     (``submit_option_order``: ``BUY if limit_price >= 0``), so a concession bigger than the
-    structure's own credit must not silently re-sign the order. Clamped instead -- and such an
-    order simply will not fill, because the achieved net pays that same spread."""
+    structure's own credit must not silently re-sign the order.
+
+    DECLINED rather than clamped, for the same reason as the single-leg case: a zero NET is the
+    always-clearing value for a structure that posts collateral, so clamping manufactured a
+    free-risk entry where declining leaves an honestly unfillable one."""
     legs = [_leg(OrderDirection.SELL, sym="A"), _leg(OrderDirection.BUY, sym="B")]
-    assert entry_limit_with_concession(-0.02, legs, [0.10, 0.06], 1.0) == 0.0
+    quoted = entry_limit_with_concession(-0.02, legs, [0.10, 0.06], 1.0)
+    assert quoted == -0.02, "the original credit, unchanged -- not a zero-net order"
+    assert quoted < 0.0, "still a credit, so submit_option_order still records a SELL"
 
 
 # =========================================================================== #

@@ -142,10 +142,25 @@ def entry_limit_with_concession(limit_price: float, legs: Sequence[OptionLeg],
     give = quote_concession(legs, half_spreads, fraction)
     if give <= 0.0:
         return limit_price
+    # A CONCESSION THAT WOULD WIPE OUT THE PREMIUM IS DECLINED, NOT CLAMPED.
+    #
+    # `max(0.0, limit - give)` looks like the safe floor -- "never ask the account to pay to
+    # sell" -- and it is the opposite. A SELL_LIMIT of 0.0 ALWAYS clears (`_option_cross` floors
+    # the sell at `max(0.0, px - half)`, and the arb guard does not fire on an OTM contract whose
+    # intrinsic is 0), so the clamp converts an order that would honestly have expired unfilled
+    # into a short option written for ZERO premium while carrying the full assignment liability.
+    # Fabricated risk with no compensation. Reachable with the grid's own
+    # --option-spread-min-tick 0.02, doubled on a thin contract, against anything priced at or
+    # below $0.02.
+    #
+    # Declining leaves the order exactly where it was: unfillable, which is the honest outcome
+    # when the whole premium is narrower than the spread being crossed.
     if len(legs) == 1:
         if legs[0].side == OrderDirection.SELL:
-            return max(0.0, limit_price - give)
+            conceded = limit_price - give
+            return conceded if conceded > 0.0 else limit_price
         return limit_price + give
     if limit_price < 0.0:
-        return min(limit_price + give, 0.0)   # a credit stays a credit
+        conceded = limit_price + give          # a credit is negative; concession shrinks it
+        return conceded if conceded < 0.0 else limit_price
     return limit_price + give

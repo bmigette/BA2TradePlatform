@@ -147,3 +147,62 @@ Recommendation (recorded, not applied):
 ### Outstanding
 - Grid master was DOWN at 03:21 UTC (24 jobs swept). Needs a look from the master box.
 - Probe script gained `--ride-to-expiry` (untracked in repo, lives in worktree).
+
+---
+
+## 2026-08-28 (day, laptop) — parquet store wired + GA validated e2e on Q1-2023
+
+Local box, `~/Documents/ba2/common/cache/TastyTradeOptionsProvider` (the Q1-2023 export:
+686 underlyings, 9,587 partitions, 205 MB). `BACKTEST_OPTIONS_STORE=parquet`.
+
+### Wired: the backtest can now read the parquet store
+`ParquetOptionsProvider` + `options_store.resolve_options_store()`; sqlite stays the DEFAULT and
+was proven bit-identical (full-engine digest vs a pristine `dev` worktree, with a 1e-9 fill-price
+mutation shown to break the digest, so the identity means something). As-of clamping is TESTED,
+not asserted — future bars are refused, a not-yet-trading contract is absent from the chain, and
+delta differs across as-of dates.
+
+Measured: cold chain load 56-273 ms/underlying, warm 0.5-1.5 ms (~60-100x). GOOG @2023-01-17
+returns 180 contracts over 6 expiries, monotone delta, put/call parity on iv, and REAL
+open_interest — the field the sqlite store has NULL on all 6,757,055 of its chain rows.
+
+### Structure sweep — 19 kinds, 9 symbols, 2023-01-10..2023-03-28, $100k, gates-off
+**0 errors, 16 of 19 traded.** Wall 0.3-1.6 s per backtest.
+O_WHEEL traded 28 times, so the wheel runs end-to-end on real data through the new store.
+Zero-trade: O_BULLPS, O_IC, O_SSTG — all multi-leg credit, all fill-starved on thin chains,
+consistent with the 10%-of-bar-volume participation cap. Same cause class as the babatest probe.
+
+### GA e2e — it works, and it is fast
+pop=40 x gen=5 = 200 trials, 9 symbols:
+| parallel | wall | per trial |
+|---|---|---|
+| 8 | 30.4 s | **152 ms** |
+| 4 | 40.8 s | 204 ms |
+| 1 | 60.2 s | 301 ms |
+
+The winning genome confirms this session's work is live end-to-end:
+`option_entry_cross` (the F3 gene), `cond:shared-gate_confidence` / `cond:shared-rel_volume`
+(shared ids), `cond:o_lc-exp_profit` (the gate that replaced the four FMPRating-only price gates).
+
+### NEW FINDING — F4 (HIGH for the grid): results are not reproducible across `--parallel`
+Same seed, same everything else, ONLY `--parallel` differing:
+
+    pop=40 gen=5 : parallel=8 -> 791.25   parallel=4 -> 791.25   parallel=1 -> 871.27
+    pop=16 gen=3 : parallel=4 -> -6.04    parallel=1 -> -43.66
+
+Each configuration IS reproducible with itself (ran twice, identical both times), so this is not
+flakiness — `--parallel` is part of the experiment, not a speed knob. Consequences:
+ * a grid result cannot be reproduced on a box with a different core count;
+ * distributed workers with differing `--parallel` are not running the same experiment;
+ * comparing two jobs is only valid if their parallelism matched.
+Likely cause: evaluation order changes how the GA consumes the RNG (selection/mutation draws),
+rather than any per-trial nondeterminism — the per-trial backtests themselves are deterministic.
+Fix direction: seed each individual's evaluation from (seed, generation, individual index) so the
+draw sequence is independent of completion order. Until then, PIN `--parallel` in the grid config
+and record it alongside the seed.
+
+### Also fixed here
+`entry_limit_with_concession` clamped a too-large concession to `0.0`. A SELL_LIMIT of 0.0 ALWAYS
+clears, so the clamp wrote a short option for ZERO premium while carrying the full assignment
+liability. Now DECLINED (returns the original limit) — an unfillable order is the honest outcome.
+Two tests that had pinned the clamp as intent were re-pointed at the corrected semantics.
