@@ -176,6 +176,25 @@ def test_spot_source_reads_the_price_source_as_of_that_date():
     assert seen == [("AAPL", date(2023, 1, 5))]
 
 
+def test_spot_source_over_a_real_daily_price_source_returns_that_days_close():
+    """Pins the semantics the parquet reader's greeks depend on, against the REAL
+    AsOfPriceSource rather than a stub: on a daily source a bar's own date resolves to that
+    bar's close (not the previous session's), a gap forward-fills the last KNOWN close, and a
+    date before the first bar is None — never a future one."""
+    from app.services.backtest.price_source import AsOfPriceSource
+
+    ps = AsOfPriceSource(ohlcv_provider=None)
+    ps.load_bars("AAPL", [
+        {"Date": date(2023, 1, 3), "Open": 1, "High": 1, "Low": 1, "Close": 101.0, "Volume": 1},
+        {"Date": date(2023, 1, 5), "Open": 1, "High": 1, "Low": 1, "Close": 105.0, "Volume": 1},
+    ])
+    spot = price_source_spot(ps)
+    assert spot("AAPL", date(2023, 1, 3)) == pytest.approx(101.0)
+    assert spot("AAPL", date(2023, 1, 4)) == pytest.approx(101.0)   # gap -> last KNOWN
+    assert spot("AAPL", date(2023, 1, 5)) == pytest.approx(105.0)
+    assert spot("AAPL", date(2023, 1, 2)) is None                   # never a future close
+
+
 # --------------------------------------------------------------------------- #
 # Config plumbing (single-run + optimizer trial)
 # --------------------------------------------------------------------------- #
