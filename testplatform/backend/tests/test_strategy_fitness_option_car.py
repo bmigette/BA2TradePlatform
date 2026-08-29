@@ -322,6 +322,28 @@ def test_sentinels_are_inherited():
     assert compute_fitness(OCAR, None) == ZERO_TRADE_SENTINEL
 
 
+def test_a_measured_total_loss_is_disqualified_regardless_of_return():
+    """Added 2026-08-29 after a live stage-1 genome: total_return +3189% on
+    max_drawdown -100% scored fitness +1.6 under the squared penalty alone -- a positive
+    score kept a bust genome breeding. A curve that ends at zero without the engine's
+    account_wiped_out flag must still be killed."""
+    assert compute_fitness(OCAR, _r(max_drawdown=-100.0)) == WIPED_OUT_SENTINEL
+    # an enormous base must not rescue it
+    assert compute_fitness(OCAR, _r(annualized_return=500.0, max_drawdown=-100.0)) == \
+        WIPED_OUT_SENTINEL
+    # magnitude semantics like the penalty itself
+    assert compute_fitness(OCAR, _r(max_drawdown=100.0)) == WIPED_OUT_SENTINEL
+    assert compute_fitness(OCAR, _r(max_drawdown=-141.7)) == WIPED_OUT_SENTINEL
+    # ranked WORSE than never having traded at all
+    assert WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL
+
+
+def test_a_near_total_loss_is_penalized_but_not_disqualified():
+    score = compute_fitness(OCAR, _r(max_drawdown=-99.9))
+    assert score != WIPED_OUT_SENTINEL
+    assert math.isfinite(score)
+
+
 def test_negative_base_returned_unfactored():
     """INHERITED, and deliberately so: multiplying a negative by a <1 factor would IMPROVE a
     losing genome. The consequence -- that no risk term ever touches a losing genome, so risk
@@ -537,6 +559,10 @@ def test_risk_versus_return_dominance_over_the_observed_band_is_pinned():
 
 
 def test_scores_stay_finite_across_the_whole_drawdown_sweep():
-    for dd in [d / 4.0 for d in range(0, 481)]:
+    # 2026-08-29: dd >= 100% now returns WIPED_OUT_SENTINEL outright (kill switch), so the
+    # sweep splits at the threshold instead of demanding positivity everywhere.
+    for dd in [d / 4.0 for d in range(0, 400)]:
         f = compute_fitness(OCAR, _r(max_drawdown=-dd))
         assert math.isfinite(f) and f > 0
+    for dd in [d / 4.0 for d in range(400, 481)]:
+        assert compute_fitness(OCAR, _r(max_drawdown=-dd)) == WIPED_OUT_SENTINEL
