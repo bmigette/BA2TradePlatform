@@ -6,7 +6,15 @@ itself is right, so the curve is pinned to arithmetic a reader can verify in the
 """
 import pytest
 
-from ba2_common.core.option_payoff import PayoffLeg, payoff_at, validate_legs
+from ba2_common.core.option_payoff import (
+    MEASURED,
+    UNBOUNDED,
+    UNMEASURABLE,
+    PayoffLeg,
+    max_profit,
+    payoff_at,
+    validate_legs,
+)
 from ba2_common.core.types import OrderDirection
 
 
@@ -93,3 +101,38 @@ def test_validate_legs_names_the_problem(legs, fragment):
 
 def test_validate_legs_accepts_a_good_structure():
     assert validate_legs([long_call(100, 5.0), short_call(110, 2.0)]) is None
+
+
+def test_a_long_call_has_unbounded_profit_and_is_not_called_unprofitable():
+    """THE GUARD ORDER. A long call's payoff is NON-POSITIVE across [0, K_max] -- it is
+    the debit, everywhere below the strike. A 'cannot profit anywhere' test running first
+    would report every ordinary long call as UNMEASURABLE, the exact mirror of the bug
+    max_loss's own ordering comment describes."""
+    result = max_profit([long_call(100.0, 2.50)])
+    assert result.state == UNBOUNDED
+    assert result.reason is None
+
+
+def test_a_credit_vertical_profits_at_most_its_credit():
+    """Short 100c @ 3.00, long 105c @ 1.00 -> net credit 2.00/share = $200/unit."""
+    legs = [short_call(100.0, 3.00), long_call(105.0, 1.00)]
+    result = max_profit(legs)
+    assert result.state == MEASURED
+    assert result.amount == pytest.approx(200.0)
+
+
+def test_a_naked_short_put_profits_at_most_its_credit():
+    """Bounded ABOVE (the credit) while unbounded BELOW -- so max_profit is MEASURED on
+    the very structure whose max_loss is UNBOUNDED. The two answers are independent."""
+    result = max_profit([short_put(90.0, 4.00)])
+    assert result.state == MEASURED
+    assert result.amount == pytest.approx(400.0)
+
+
+def test_a_debit_spread_bought_above_its_width_cannot_profit():
+    """Long 100c @ 6.00, short 105c @ 1.00 = 5.00 debit for a 5.00-wide spread. Best
+    outcome is exactly break-even, which is a crossed or stale quote rather than a trade."""
+    legs = [long_call(100.0, 6.00), short_call(105.0, 1.00)]
+    result = max_profit(legs)
+    assert result.state == UNMEASURABLE
+    assert "profit" in result.reason.lower()

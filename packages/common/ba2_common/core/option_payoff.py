@@ -282,3 +282,78 @@ def max_loss(legs: Sequence[PayoffLeg]) -> MaxLossResult:
                     f"money"))
 
     return MaxLossResult(MEASURED, amount=-worst)
+
+
+#: Mirror of MIN_MEASURABLE_LOSS. A structure whose best outcome is under a cent is not a
+#: trade with a thin edge; it is a stale or crossed quote. Same magnitude for the same
+#: reason -- one cent is far below any real structure's per-unit profit and far above the
+#: floating-point dust a credit-equals-width subtraction leaves behind.
+MIN_MEASURABLE_PROFIT = 0.01
+
+
+@dataclass(frozen=True)
+class MaxProfitResult:
+    """A max-profit answer, in the same three explicitly named states as MaxLossResult.
+
+    A SEPARATE TYPE rather than reusing MaxLossResult, whose docstring promises ``amount``
+    is "POSITIVE dollars of LOSS". One dataclass carrying both meanings is how a caller
+    ends up sizing a budget off a profit.
+
+    ``amount`` is set iff ``state == MEASURED`` and is POSITIVE dollars of profit.
+    ``reason`` is set iff ``state == UNMEASURABLE``.
+    """
+
+    state: str
+    amount: Optional[float] = None
+    reason: Optional[str] = None
+
+
+def max_profit(legs: Sequence[PayoffLeg]) -> MaxProfitResult:
+    """The best-case profit of ONE structure unit at expiry, as POSITIVE dollars.
+
+    The mirror of ``max_loss``: same critical-points scan, ``max`` where that takes ``min``,
+    and the SAME NON-NEGOTIABLE GUARD ORDER for the mirrored reason. A long call is
+    non-positive across the whole of ``[0, K_max]`` -- it is simply the debit -- so running
+    the "cannot profit" test before the slope test would report every ordinary long call as
+    UNMEASURABLE, exactly as running the arbitrage test first reports every naked short call
+    that way in ``max_loss``.
+    """
+    problem = validate_legs(legs)
+    if problem is not None:
+        return MaxProfitResult(UNMEASURABLE, reason=problem)
+
+    # THE ORDER OF THESE TWO GUARDS IS NOT NEGOTIABLE — the mirror of the identical note in
+    # `max_loss`. A POSITIVE upside slope means the payoff rises without limit as the
+    # underlying rises, so no scan of [0, K_max] can name a best case. Run the "cannot
+    # profit" test first and every ordinary long call comes back UNMEASURABLE, because a
+    # long call's payoff really is non-positive across that whole bounded region: it is the
+    # debit below the strike and only crosses zero above the break-even, which lies outside
+    # the scan. Unbounded profit is the DEFINING property of long premium, not a defect in
+    # it, and a selection mode that quietly demoted every long call would answer "does long
+    # premium pay?" by construction rather than by measurement.
+    if upside_slope(legs) > _SLOPE_EPSILON:
+        return MaxProfitResult(UNBOUNDED)
+
+    best = max(payoff_at(legs, s) for s in critical_points(legs))
+
+    # A structure that cannot profit at ANY underlying price is the mirror of the arbitrage
+    # the `max_loss` branch catches, and it means the same thing: a stale, crossed or
+    # mis-signed quote rather than a real trade. The canonical shape is a debit spread
+    # bought for its full width — a 5.00-wide vertical paid 5.00 — whose best outcome is
+    # exactly break-even.
+    #
+    # The comparison carries MIN_MEASURABLE_PROFIT rather than testing `<= 0` for the same
+    # reason `max_loss` carries MIN_MEASURABLE_LOSS: with ordinary two-decimal premiums the
+    # debit-equals-width subtraction lands a few ULPs on either side of zero, so about half
+    # of these would otherwise be reported as MEASURED with a sub-cent profit. That number
+    # then feeds `w_rr = max_profit / max_loss`, where a 1e-15 numerator is not a small
+    # score but a rounding artefact ranked against real ones.
+    if best <= MIN_MEASURABLE_PROFIT:
+        return MaxProfitResult(
+            UNMEASURABLE,
+            reason=(f"structure shows no meaningful profitable outcome (best payoff "
+                    f"{best:.4f} at expiry, within {MIN_MEASURABLE_PROFIT} of break-even); "
+                    f"a structure that cannot profit is a stale or crossed quote rather "
+                    f"than a trade"))
+
+    return MaxProfitResult(MEASURED, amount=best)
