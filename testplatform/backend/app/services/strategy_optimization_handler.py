@@ -277,6 +277,11 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                # A handful of floats; nothing measurable added to the pickled payload.
                "fitness_raw": results.get("fitness_raw"),
                "robustness": results.get("robustness"),
+               # PROFIT + DRAWDOWN ride along too (a few floats, same rationale): the GA ranks
+               # on fitness, but a result you cannot read in DOLLAR TERMS invites exactly the
+               # "consistent by luck" blind spot the consistent-annual fitness exists to fight.
+               "total_return": results.get("total_return"),
+               "max_drawdown": results.get("max_drawdown"),
                # Per-trial memory telemetry (a few psutil/len calls — negligible): RSS of
                # THIS worker process + the two per-process OHLCV caches, so a memory-driven
                # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
@@ -1082,6 +1087,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     # onto `results`), so an in-process run is not the odd one out.
                     "fitness_raw": (results or {}).get("fitness_raw"),
                     "robustness": (results or {}).get("robustness"),
+                    "total_return": (results or {}).get("total_return"),
+                    "max_drawdown": (results or {}).get("max_drawdown"),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -1343,7 +1350,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                             # and which factor discounted it, without re-running the trial.
                             {"params": flat, "fitness": fit, "key": key, "trades": out["trades"],
                              "fitness_raw": out.get("fitness_raw"),
-                             "robustness": out.get("robustness")}
+                             "robustness": out.get("robustness"),
+                             "total_return": out.get("total_return"),
+                             "max_drawdown": out.get("max_drawdown")}
                         )
                         if is_last_gen:
                             _capture_full_result(last_gen_full_results, key, out)
