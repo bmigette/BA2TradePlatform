@@ -11,7 +11,7 @@ trade count, total return (%) and max drawdown (%). Jobs completed before the me
 show '-' for return/DD.
 
 Usage:
-  python tools/stage1_gen_report.py [--db /tmp/ba2-stage1/test/dl_forecasting.db]
+  python tools/stage1_gen_report.py [--db /home/debian/ba2-grid/home/test/dl_forecasting.db]
       [--job NAME] [--md OUT.md] [--last N]
 """
 from __future__ import annotations
@@ -108,7 +108,7 @@ def report(db: str, job_filter: Optional[str], last: Optional[int]) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--db", default="/tmp/ba2-stage1/test/dl_forecasting.db")
+    ap.add_argument("--db", default="/home/debian/ba2-grid/home/test/dl_forecasting.db")
     ap.add_argument("--job", default=None, help="Substring filter on job name.")
     ap.add_argument("--md", default=None, help="Also write the report to this path.")
     ap.add_argument("--last", type=int, default=None, help="Only the last N generations.")
