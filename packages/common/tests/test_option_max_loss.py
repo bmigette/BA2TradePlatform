@@ -99,11 +99,21 @@ def test_bad_leg_is_unmeasurable_and_says_why():
 
 def test_a_structure_that_cannot_lose_is_unmeasurable_not_free_money():
     # Long 100 call for 1.0 AND short 100 call for 4.0 -> a 3.0 credit for zero risk.
-    # That is an arbitrage, i.e. a stale or crossed quote.
+    # That is an arbitrage: the same strike cannot be worth 1.0 to buy and 4.0 to sell, so
+    # the leg set or the premium signs are wrong.
     legs = [leg("call", LONG, 1.0, 100), leg("call", SHORT, 4.0, 100)]
     r = max_loss(legs)
     assert r.state == UNMEASURABLE
     assert "arbitrage" in r.reason
+    # AND IT IS NOT DESCRIBED AS A NEAR-BREAK-EVEN QUOTE. The worst outcome here is +300 at
+    # every price; the message used to tell the reader it was "within 0.01 of break-even ...
+    # a stale or crossed quote", which is a claim about freshness for a structure whose real
+    # fault is that its legs cannot have been built the way they were priced. Two causes, two
+    # remedies -- and the counterpart of the assertion in the credit-equals-width test below,
+    # which pins the branch that DOES deserve the stale-quote reading.
+    assert "stale" not in r.reason and "crossed" not in r.reason
+    assert "300.0000" in r.reason
+    assert "profits at every underlying price" in r.reason.lower()
 
 
 def test_measured_amount_is_always_positive():
@@ -157,6 +167,10 @@ def test_credit_equal_to_width_is_unmeasurable_not_a_sub_cent_budget():
     r = max_loss([leg("call", SHORT, 0.60, 95.0), leg("call", LONG, 0.10, 95.5)])
     assert r.state == UNMEASURABLE
     assert r.amount is None
+    # This one genuinely IS within a cent of break-even, so it genuinely IS the stale-quote
+    # reading. Paired with the arbitrage test above so that neither branch can be deleted or
+    # merged back into one message without a failure.
+    assert "stale or crossed" in r.reason
 
 
 def test_no_measured_loss_is_ever_small_enough_to_size_absurdly():

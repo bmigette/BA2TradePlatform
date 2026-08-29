@@ -111,6 +111,12 @@ def test_a_long_call_has_unbounded_profit_and_is_not_called_unprofitable():
     result = max_profit([long_call(100.0, 2.50)])
     assert result.state == UNBOUNDED
     assert result.reason is None
+    # UNBOUNDED must carry NO amount. This is the "unknown reads as a number" defect that
+    # MaxLossResult's docstring exists to prevent, in its profit-side form: an amount populated
+    # here would be the best value on [0, K_max], i.e. the debit -- a NEGATIVE number handed
+    # out under a field documented as positive dollars of profit, and a ranking signal for a
+    # structure whose upside is in fact open-ended.
+    assert result.amount is None
 
 
 def test_a_credit_vertical_profits_at_most_its_credit():
@@ -136,3 +142,24 @@ def test_a_debit_spread_bought_above_its_width_cannot_profit():
     result = max_profit(legs)
     assert result.state == UNMEASURABLE
     assert "profit" in result.reason.lower()
+    # This one really IS the break-even case, so it really does get the stale-quote reading.
+    # Pinned as the counterpart of the test below: together they stop the two branches being
+    # collapsed back into the single message that described every refusal this way.
+    assert "stale or crossed" in result.reason
+
+
+def test_a_structure_that_loses_everywhere_is_not_blamed_on_a_crossed_quote():
+    """Long 100c @ 7.00, short 105c @ 1.00 = 6.00 debit for a 5.00-wide spread. Best outcome
+    is -100.00, a DECISIVE loss rather than a break-even.
+
+    The refusal is right; the diagnosis must not be. -100.00 is not "within 0.01 of
+    break-even", and calling it a stale or crossed quote sends an operator hunting a broken
+    price that does not exist -- paying above the width is a real, legitimately priced trade
+    and the fault is in the strikes chosen, not in the chain.
+    """
+    legs = [long_call(100.0, 7.00), short_call(105.0, 1.00)]
+    result = max_profit(legs)
+    assert result.state == UNMEASURABLE
+    assert "stale" not in result.reason and "crossed" not in result.reason
+    assert "-100.0000" in result.reason      # the actual best case, not a claim about zero
+    assert "loses at every underlying price" in result.reason.lower()
