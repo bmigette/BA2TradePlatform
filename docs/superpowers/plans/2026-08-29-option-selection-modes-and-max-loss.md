@@ -52,6 +52,31 @@ policy pays nothing.
 
 ---
 
+## READ THIS SECOND — an unmeasurable max PROFIT must never narrow the search
+
+**Operator constraint, 2026-08-29:** a structure whose max profit cannot be measured must still be
+explored. `UNBOUNDED` profit is the defining property of a long call, not a defect in it, and the
+grid exists partly to find out whether long premium pays. Any behaviour that quietly demotes those
+structures would answer that question by construction rather than by measurement.
+
+Three rules follow, and every one of them is asserted by a test in this plan:
+
+1. **Never exclude on profit.** `max_loss_ceiling` is the *only* payoff-derived filter. There is
+   no max-profit filter, and Task 5 must not grow one.
+2. **Inapplicable means inert, never worst.** When the whole column is unrankable the weight
+   contributes uniformly, so ranking is untouched. What must never happen is a structure scoring
+   `_WORST` on profit *while its peers score real values* — that is demotion wearing the costume
+   of fail-closed. This is why `inapplicable_features` asks whether the **column** is unrankable
+   rather than whether a candidate is.
+3. **Never emit the gene where it cannot apply** (Task 10). A weight the GA can turn up against a
+   structure it cannot describe is worse than no weight at all.
+
+**Fail-closed applies to LOSS, not to PROFIT, and the asymmetry is deliberate.** An unmeasurable
+loss admitted to a budget can bankrupt the sleeve; an unmeasurable profit costs nothing but a
+ranking signal. Symmetry here would be a bug in the safe direction only by accident.
+
+---
+
 ## Phase P1 — pure units (behaviour-neutral)
 
 ### Task 1: `max_profit()` — the mirror of `max_loss()`
@@ -493,7 +518,50 @@ def test_an_unmeasurable_max_loss_fails_CLOSED_against_a_ceiling():
     ctx = PolicyContext(strike_method="delta", today=date(2026, 1, 1), target=0.30,
                         structure_fn=_credit_vertical(5.0), max_loss_ceiling=250.0)
     assert pick(cands, ctx, SelectionPolicy()) is None
+
+
+def test_an_UNBOUNDED_max_loss_is_charged_notional_not_excluded():
+    """§8.3 CONFORMANCE. When undefined risk is permitted the design charges spot x 100 --
+    the cash-secured-put treatment -- rather than refusing. Excluding it here would make
+    the ceiling silently override allow_undefined_risk_options, so a permitted naked short
+    could never be selected at all and the setting would read as working while doing
+    nothing."""
+    def _naked_short_put(c):
+        return [PayoffLeg(kind="put", side=OrderDirection.SELL, premium=c.mid,
+                          strike=c.strike)]
+
+    cands = [_c(100, 2.90, 3.10, 0.30)]
+    ctx = PolicyContext(strike_method="delta", today=date(2026, 1, 1), target=0.30,
+                        structure_fn=_naked_short_put, spot=100.0,
+                        undefined_risk_notional=10_000.0,   # spot x 100
+                        max_loss_ceiling=12_000.0)
+    assert pick(cands, ctx, SelectionPolicy()) is not None
+
+    ctx_tight = replace(ctx, max_loss_ceiling=5_000.0)
+    assert pick(cands, ctx_tight, SelectionPolicy()) is None
+
+
+def test_an_UNBOUNDED_max_loss_is_excluded_when_undefined_risk_is_NOT_permitted():
+    """undefined_risk_notional=None is the default and means 'not permitted here', which
+    is §8.3's default refusal -- not an oversight to be papered over with a guess."""
+    def _naked_short_put(c):
+        return [PayoffLeg(kind="put", side=OrderDirection.SELL, premium=c.mid,
+                          strike=c.strike)]
+
+    cands = [_c(100, 2.90, 3.10, 0.30)]
+    ctx = PolicyContext(strike_method="delta", today=date(2026, 1, 1), target=0.30,
+                        structure_fn=_naked_short_put, spot=100.0,
+                        max_loss_ceiling=1_000_000.0)
+    assert pick(cands, ctx, SelectionPolicy()) is None
 ```
+
+> **This pair of tests is a CORRECTION to the first draft of this plan, not an addition.**
+> The draft filtered on `_payoff_pair(c, ctx)[1] or float("inf")`, which collapses `UNBOUNDED`
+> and `UNMEASURABLE` into "excluded". That silently overrides
+> `allow_undefined_risk_options`: with the setting ON, design §8.3 charges `spot × 100` and
+> proceeds, but the draft filter would drop the candidate anyway — a permitted structure that
+> can never be picked, and a setting that reads as working while doing nothing. `UNBOUNDED`
+> (a known shape, priced by rule) and `UNMEASURABLE` (a broken quote) must not share a branch.
 
 **Step 2: Run, verify failure.**
 
@@ -507,17 +575,51 @@ def test_an_unmeasurable_max_loss_fails_CLOSED_against_a_ceiling():
     #: exist yet at selection time; threading a number that does not exist would be a
     #: fiction. Triage still sizes and refuses against the full budget afterwards.
     max_loss_ceiling: Optional[float] = None
+
+    #: Dollars to charge ONE contract of an UNBOUNDED-loss structure, per design §8.3 --
+    #: ``spot x 100``, the cash-secured-put treatment. None means undefined risk is NOT
+    #: permitted here, which is §8.3's default.
+    #:
+    #: This exists so the ceiling cannot silently override
+    #: ``allow_undefined_risk_options``. Collapsing UNBOUNDED into "excluded" would make a
+    #: permitted naked short unselectable while the setting still read as ON.
+    undefined_risk_notional: Optional[float] = None
 ```
 
-Add the filter at the END of `eligible`, after the box filter:
+Add a chargeable-loss helper and the filter at the END of `eligible`, after the box filter:
+```python
+def _chargeable_max_loss(c, ctx):
+    """Dollars this candidate's max loss should be CHARGED against the ceiling.
+
+    THREE STATES, THREE ANSWERS -- collapsing any two of them is a bug:
+      * MEASURED     -> the measured amount;
+      * UNBOUNDED    -> ``undefined_risk_notional`` when permitted (design §8.3), else
+                        infinity, i.e. refused for lack of permission rather than for
+                        lack of a number;
+      * UNMEASURABLE -> infinity. A broken quote is never priced by rule.
+    """
+    from ba2_common.core.option_payoff import MEASURED, UNBOUNDED, max_loss
+    if ctx.structure_fn is None:
+        return float("inf")
+    legs = ctx.structure_fn(c)
+    if not legs:
+        return float("inf")
+    result = max_loss(legs)
+    if result.state == MEASURED:
+        return result.amount
+    if result.state == UNBOUNDED and ctx.undefined_risk_notional is not None:
+        return ctx.undefined_risk_notional
+    return float("inf")
+```
 ```python
     boxed = [c for c in out if _in_box(c, ctx)]
     if ctx.max_loss_ceiling is None:
         return boxed
-    # FAILS CLOSED: a candidate whose max loss cannot be measured is not admitted to a
-    # budget it might exceed. Same direction as passes_liquidity and _in_box.
+    # FAILS CLOSED on LOSS ONLY. There is deliberately no max-PROFIT filter: an
+    # unmeasurable profit costs a ranking signal, an unmeasurable loss can bankrupt the
+    # sleeve. See "an unmeasurable max PROFIT must never narrow the search".
     return [c for c in boxed
-            if (_payoff_pair(c, ctx)[1] or float("inf")) <= ctx.max_loss_ceiling]
+            if _chargeable_max_loss(c, ctx) <= ctx.max_loss_ceiling]
 ```
 
 **Step 4: Run.**
