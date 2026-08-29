@@ -6,3 +6,4 @@ Branch: stage1-trial-metrics @ /home/debian/ba2-grid/repo.
 
 ## Progress log
 - 2026-08-29 17:01 UTC | active=yes mem=8.0GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 best=7.1042 ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 17:31 UTC | active=yes mem=8.9GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 best=13.8222 ret=n/a dd=n/a | completed=0 failed=0
