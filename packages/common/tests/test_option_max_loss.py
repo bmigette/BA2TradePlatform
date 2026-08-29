@@ -112,7 +112,10 @@ def test_a_structure_that_cannot_lose_is_unmeasurable_not_free_money():
     # remedies -- and the counterpart of the assertion in the credit-equals-width test below,
     # which pins the branch that DOES deserve the stale-quote reading.
     assert "stale" not in r.reason and "crossed" not in r.reason
-    assert "300.0000" in r.reason
+    # "300", not "300.0000": pinning the :.4f specifier would fail on a later formatting
+    # change while catching no real defect. This still fails if the branch stops reporting
+    # the actual worst case, which is the behaviour under test.
+    assert "300" in r.reason
     assert "profits at every underlying price" in r.reason.lower()
 
 

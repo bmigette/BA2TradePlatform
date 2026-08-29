@@ -4,13 +4,17 @@ WHY HAND-COMPUTED AND NOT PROPERTY-ONLY. The whole point of deriving max loss fr
 curve is that a hand-written per-structure table drifts. That argument only holds if the curve
 itself is right, so the curve is pinned to arithmetic a reader can verify in their head.
 """
+import re
+
 import pytest
 
 from ba2_common.core.option_payoff import (
     MEASURED,
+    MIN_MEASURABLE_PROFIT,
     UNBOUNDED,
     UNMEASURABLE,
     PayoffLeg,
+    max_loss,
     max_profit,
     payoff_at,
     validate_legs,
@@ -135,31 +139,120 @@ def test_a_naked_short_put_profits_at_most_its_credit():
     assert result.amount == pytest.approx(400.0)
 
 
-def test_a_debit_spread_bought_above_its_width_cannot_profit():
-    """Long 100c @ 6.00, short 105c @ 1.00 = 5.00 debit for a 5.00-wide spread. Best
-    outcome is exactly break-even, which is a crossed or stale quote rather than a trade."""
+def test_a_debit_spread_bought_at_its_full_width_cannot_profit():
+    """Long 100c @ 6.00, short 105c @ 1.00 = 5.00 debit for a 5.00-wide spread -- paid
+    exactly AT the width, so the best outcome is exactly break-even."""
     legs = [long_call(100.0, 6.00), short_call(105.0, 1.00)]
     result = max_profit(legs)
     assert result.state == UNMEASURABLE
     assert "profit" in result.reason.lower()
-    # This one really IS the break-even case, so it really does get the stale-quote reading.
-    # Pinned as the counterpart of the test below: together they stop the two branches being
-    # collapsed back into the single message that described every refusal this way.
-    assert "stale or crossed" in result.reason
+    assert "0.0" in result.reason        # its own best case, in any float format
 
 
-def test_a_structure_that_loses_everywhere_is_not_blamed_on_a_crossed_quote():
-    """Long 100c @ 7.00, short 105c @ 1.00 = 6.00 debit for a 5.00-wide spread. Best outcome
-    is -100.00, a DECISIVE loss rather than a break-even.
+def test_paying_at_and_above_the_width_get_the_SAME_diagnosis():
+    """THE MAGNITUDE OF THE SHORTFALL DOES NOT IMPLY ITS CAUSE, so the message must not
+    claim it does. This is the paired assertion that used to pin a two-branch split, kept
+    and inverted after review showed the split itself was the bug.
 
-    The refusal is right; the diagnosis must not be. -100.00 is not "within 0.01 of
-    break-even", and calling it a stale or crossed quote sends an operator hunting a broken
-    price that does not exist -- paying above the width is a real, legitimately priced trade
-    and the fault is in the strikes chosen, not in the chain.
+    A 5.00-wide vertical paid 5.00 (best case 0.00) and the same vertical paid 6.00 (best
+    case -100.00) have the IDENTICAL fault: a builder chose strikes that cannot pay. A
+    magnitude split gave them opposite diagnoses one cent apart -- the second was told the
+    quote was fine, the first that the chain was stale. Both readings are in fact plausible
+    for both, since a deep-ITM vertical really does quote at about its width. The refusal
+    must therefore name BOTH causes and assert NEITHER.
+
+    The mirrored split in ``max_loss`` is sound and stays: a guaranteed PROFIT cannot be
+    bought in a live chain, while a guaranteed LOSS can be bought any day of the week.
     """
-    legs = [long_call(100.0, 7.00), short_call(105.0, 1.00)]
-    result = max_profit(legs)
-    assert result.state == UNMEASURABLE
-    assert "stale" not in result.reason and "crossed" not in result.reason
-    assert "-100.0000" in result.reason      # the actual best case, not a claim about zero
-    assert "loses at every underlying price" in result.reason.lower()
+    at_width = max_profit([long_call(100.0, 6.00), short_call(105.0, 1.00)])
+    above_width = max_profit([long_call(100.0, 7.00), short_call(105.0, 1.00)])
+
+    assert at_width.state == UNMEASURABLE and above_width.state == UNMEASURABLE
+    # Same sentence for both -- only the reported best case differs. Compared with the
+    # numbers stripped out so this pins the WORDING, not the float format specifier.
+    strip = lambda text: re.sub(r"-?[\d.]+", "", text)
+    assert strip(at_width.reason) == strip(above_width.reason)
+    # Each still reports its OWN number rather than a claim about zero.
+    assert "-100" in above_width.reason
+    # And neither asserts a single cause: both remedies are named, neither is promised.
+    for reason in (at_width.reason, above_width.reason):
+        assert "cannot pay" in reason
+        assert "builder" in reason and "stale or crossed chain" in reason
+        assert "cannot tell them apart" in reason
+
+
+def test_debit_equal_to_width_is_unmeasurable_not_a_sub_cent_profit():
+    """MIN_MEASURABLE_PROFIT itself, which nothing else in this file constrains.
+
+    The mirror of ``test_credit_equal_to_width_is_unmeasurable_not_a_sub_cent_budget``, and
+    it exists because of the trap that test documents: the premiums chosen for the
+    break-even cases above (6.00/1.00) land on EXACT zero, so mutating the comparison to a
+    bare ``best <= 0.0`` passes every one of them. Long 0.57 / short 0.07 on a half-dollar
+    width is the same structure and lands at +6.217e-15 instead, which a bare ``<= 0``
+    admits as MEASURED.
+
+    A sub-cent profit is not a thin edge. It becomes the numerator of
+    ``w_rr = max_profit / max_loss``, so it is a rounding artefact ranked against real
+    scores -- the selection-side analogue of the absurd contract count on the loss side.
+    """
+    r = max_profit([long_call(100.0, 0.57), short_call(100.5, 0.07)])
+    assert r.state == UNMEASURABLE
+    assert r.amount is None
+
+
+def test_no_measured_profit_is_ever_sub_cent_dust():
+    """The general form of the case above, swept rather than sampled.
+
+    Mirrors ``test_no_measured_loss_is_ever_small_enough_to_size_absurdly`` over the same
+    grid. 120 of these 800 pairs land strictly above zero on IEEE arithmetic; every one of
+    them must be refused rather than scored.
+    """
+    for width in (0.5, 1.0, 2.5, 5.0):
+        for cents in range(1, 400):
+            long_premium = round(cents * 0.01, 2)
+            short_premium = round(long_premium - width, 2)
+            if short_premium < 0:
+                continue
+            r = max_profit([long_call(100.0, long_premium),
+                            short_call(100.0 + width, short_premium)])
+            if r.state == MEASURED:
+                assert r.amount >= MIN_MEASURABLE_PROFIT, (
+                    f"long {long_premium} / short {short_premium} width {width} produced a "
+                    f"MEASURED max profit of {r.amount!r}, which is floating-point dust "
+                    f"ranked against real w_rr scores")
+
+
+def test_empty_legs_reaches_unmeasurable_through_max_profit():
+    """Coverage parity with ``max_loss``: pins the validate_legs path THROUGH this function,
+    not just validate_legs in isolation."""
+    r = max_profit([])
+    assert r.state == UNMEASURABLE and "no legs" in r.reason
+    assert r.amount is None
+
+
+def test_measured_profit_amount_is_always_positive():
+    """``amount`` is documented as POSITIVE dollars of profit. The mirror of the loss-side
+    assertion, and the guard against a stray sign flip making it the payoff's own value."""
+    r = max_profit([short_put(90.0, 4.00)])
+    assert r.amount > 0
+
+
+def test_every_refusal_reason_is_ascii():
+    """Refusals travel to logs and consoles, and a cp1252 stream raises UnicodeEncodeError
+    on an em dash -- a crash on the error path, which is the one path that must not have a
+    failure mode of its own. The surrounding comments in option_payoff.py use em dashes
+    freely and are safe, so copying one into a message is easy and otherwise unguarded.
+
+    Both functions, and both the validation and the payoff-shape refusals.
+    """
+    unpayable = [long_call(100.0, 7.00), short_call(105.0, 1.00)]
+    risk_free = [long_call(100.0, 1.00), short_call(100.0, 4.00)]
+    bad_leg = [PayoffLeg(kind="call", side=OrderDirection.BUY, premium=5.0, strike=None)]
+
+    reasons = [max_profit(unpayable).reason, max_profit(bad_leg).reason, max_profit([]).reason,
+               max_loss(risk_free).reason, max_loss(bad_leg).reason, max_loss([]).reason,
+               max_loss([short_call(95.0, 0.60), long_call(95.5, 0.10)]).reason]
+
+    for reason in reasons:
+        assert reason is not None
+        assert reason.isascii(), f"non-ASCII characters in a refusal reason: {reason!r}"

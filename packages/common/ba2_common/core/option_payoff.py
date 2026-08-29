@@ -166,6 +166,15 @@ MEASURED = "MEASURED"
 UNBOUNDED = "UNBOUNDED"
 UNMEASURABLE = "UNMEASURABLE"
 
+#: EVERY ``reason`` STRING IN THIS MODULE MUST BE PURE ASCII — stated here, at the definition
+#: of the state that carries one, because that is upstream of all of them. These strings are
+#: refusals, so they travel to logs and consoles; on Windows a cp1252 stream raises
+#: UnicodeEncodeError on an em dash, which turns a clean refusal into a crash on the error
+#: path — the one path that must never have its own failure mode. The surrounding COMMENTS use
+#: em dashes freely and are safe; only the runtime strings are constrained, which is exactly
+#: why copying a dash from a neighbouring comment into a message is easy and unguarded.
+#: ``test_every_refusal_reason_is_ascii`` enforces this.
+
 #: Below this many dollars, a computed loss is floating-point noise around zero rather than a
 #: risk budget, and it is treated as UNMEASURABLE.
 #:
@@ -292,8 +301,14 @@ def max_loss(legs: Sequence[PayoffLeg]) -> MaxLossResult:
         # earlier version described every one of them as "within 0.01 of break-even ... a stale
         # or crossed quote". A structure whose WORST outcome is +300 is not within a cent of
         # anything; it is a textbook arbitrage, and the thing to check is how the legs were
-        # built, not how fresh the quote is. Same defect, and same fix, as the mirrored branch
-        # in `max_profit`.
+        # built, not how fresh the quote is.
+        #
+        # THE SPLIT IS SOUND HERE AND IS NOT MIRRORED IN `max_profit` — see the long note at
+        # that function's refusal for why. In one line: a guaranteed PROFIT at every price
+        # cannot exist in a live chain, so a decisively positive worst case really does imply
+        # a bad leg set; whereas a guaranteed LOSS can be bought for real money any day, so on
+        # the profit side magnitude implies nothing about cause and a split there would give
+        # two identical faults opposite diagnoses a cent apart.
         if worst <= MIN_MEASURABLE_LOSS:
             return MaxLossResult(
                 UNMEASURABLE,
@@ -313,9 +328,11 @@ def max_loss(legs: Sequence[PayoffLeg]) -> MaxLossResult:
 
 
 #: Mirror of MIN_MEASURABLE_LOSS. A structure whose best outcome is under a cent is not a
-#: trade with a thin edge; it is a stale or crossed quote. Same magnitude for the same
+#: trade with a thin edge; it is a structure that cannot pay. Same magnitude for the same
 #: reason -- one cent is far below any real structure's per-unit profit and far above the
-#: floating-point dust a credit-equals-width subtraction leaves behind.
+#: floating-point dust a DEBIT-equals-width subtraction leaves behind. (Debit, not credit:
+#: the loss-side constant is the one that reasons about a credit. The two sides meet at
+#: zero from opposite directions and the wrong word here sends a reader to the wrong half.)
 MIN_MEASURABLE_PROFIT = 0.01
 
 
@@ -374,38 +391,43 @@ def max_profit(legs: Sequence[PayoffLeg]) -> MaxProfitResult:
 
     best = max(payoff_at(legs, s) for s in critical_points(legs))
 
-    # A structure that cannot profit at ANY underlying price is the mirror of the arbitrage
-    # the `max_loss` branch catches, and it means the same thing: a stale, crossed or
-    # mis-signed quote rather than a real trade. The canonical shape is a debit spread
-    # bought for its full width — a 5.00-wide vertical paid 5.00 — whose best outcome is
-    # exactly break-even.
-    #
     # The comparison carries MIN_MEASURABLE_PROFIT rather than testing `<= 0` for the same
     # reason `max_loss` carries MIN_MEASURABLE_LOSS: with ordinary two-decimal premiums the
-    # debit-equals-width subtraction lands a few ULPs on either side of zero, so about half
-    # of these would otherwise be reported as MEASURED with a sub-cent profit. That number
-    # then feeds `w_rr = max_profit / max_loss`, where a 1e-15 numerator is not a small
-    # score but a rounding artefact ranked against real ones.
+    # debit-equals-width subtraction lands a few ULPs on either side of zero, and landing just
+    # ABOVE it is the harmful direction here. Swept over the same grid the loss-side test uses
+    # (widths 0.5/1.0/2.5/5.0 x every two-decimal debit from 0.01, 800 pairs), 120 of them —
+    # 15%, the same rate the loss-side constant reports — come out strictly positive, e.g.
+    # 6.217e-15 for a 0.57/0.07 half-dollar vertical. A bare `<= 0` admits every one of those
+    # as MEASURED, and that number then feeds `w_rr = max_profit / max_loss`, where a 1e-15
+    # numerator is not a thin score but a rounding artefact ranked against real ones.
     if best <= MIN_MEASURABLE_PROFIT:
-        # TWO CAUSES, TWO REMEDIES — and the reason must not blame the wrong one. This branch
-        # fires for ANY non-profitable best case, and an earlier version told every one of them
-        # it was "within 0.01 of break-even ... a stale or crossed quote". For a 5-wide vertical
-        # paid 6.00 the best case is -100.00, which is neither, and that message sends an
-        # operator hunting a broken quote that does not exist.
-        if best >= -MIN_MEASURABLE_PROFIT:
-            return MaxProfitResult(
-                UNMEASURABLE,
-                reason=(f"structure's best outcome is break-even (best payoff {best:.4f} at "
-                        f"expiry, within {MIN_MEASURABLE_PROFIT} of zero): there is no profit "
-                        f"to measure, and a structure that cannot profit at ANY price is a "
-                        f"stale or crossed quote rather than a trade -- re-pull the chain "
-                        f"before trusting this price"))
+        # ONE MESSAGE, DELIBERATELY — and NOT the two-way magnitude split that `max_loss` uses
+        # thirty lines above. THE ASYMMETRY IS THE POINT; do not "restore symmetry" here.
+        #
+        # `max_loss` may infer cause from magnitude because on that side magnitude really does
+        # imply cause: a worst case of decisively POSITIVE dollars is a guaranteed profit at
+        # every price, and a live chain does not offer one, so the leg set or the signs must be
+        # wrong. That is a sound claim about the market.
+        #
+        # On the profit side the same inference is FALSE. A 5.00-wide vertical paid exactly
+        # 5.00 and the same vertical paid 5.01 have the IDENTICAL cause — a builder that chose
+        # strikes which cannot pay — yet a magnitude split puts them in different branches and
+        # gives them opposite diagnoses one cent apart. Worse, both readings are individually
+        # plausible for BOTH magnitudes: a deep-ITM vertical genuinely quotes at about its
+        # width, so crossing the ask pays width or a shade over on a perfectly good chain,
+        # while a stale chain can just as easily print either. The payoff curve at expiry
+        # cannot distinguish an unpayable structure from a broken quote, because the two
+        # produce the same curve.
+        #
+        # So the message names the ambiguity and both remedies rather than asserting one cause
+        # and sending the reader to hunt a defect that may not exist. A refusal that says "I
+        # cannot tell which of these two it is" is worth more than a confident wrong answer.
         return MaxProfitResult(
             UNMEASURABLE,
-            reason=(f"structure LOSES at every underlying price (best payoff {best:.4f} at "
-                    f"expiry): the quote is not necessarily broken -- paying more than the "
-                    f"width for a spread is a real, legitimately priced trade -- so this is a "
-                    f"structure not to open rather than a quote to re-pull; check the strikes "
-                    f"and premiums the builder chose"))
+            reason=(f"structure cannot profit at any underlying price (best payoff {best:.4f} "
+                    f"at expiry): the strikes and premiums chosen cannot pay. That is either a "
+                    f"builder picking an unpayable structure or a stale or crossed chain, and "
+                    f"the expiry payoff alone cannot tell them apart -- check the strikes the "
+                    f"builder chose, and re-pull the quote, before trusting this price"))
 
     return MaxProfitResult(MEASURED, amount=best)
