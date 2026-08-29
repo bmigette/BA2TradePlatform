@@ -177,20 +177,41 @@ def test_credit_equal_to_width_is_unmeasurable_not_a_sub_cent_budget():
 
 
 def test_no_measured_loss_is_ever_small_enough_to_size_absurdly():
-    """The general form of the case above, swept rather than sampled."""
+    """The general form of the case above, swept rather than sampled.
+
+    The sweep also pins the UPPER edge of the break-even branch. 132 of these pairs land
+    with a worst case in the dust band ``(0, MIN_MEASURABLE_LOSS]`` -- positive, but by
+    around 1e-15 -- and those must keep the break-even reading. Mutating that boundary to
+    ``worst <= 0.0`` survived the whole suite before this assertion existed: every one of
+    them would move to "structure PROFITS at every underlying price ... a risk-free
+    arbitrage of this size does not survive in a live chain", announcing an arbitrage of
+    half a cent. That is the exact defect the profit side was corrected for, mirrored.
+    """
+    checked_dust_band = 0
     for width in (0.5, 1.0, 2.5, 5.0):
         for cents in range(1, 400):
             short_premium = round(cents * 0.01, 2)
             long_premium = round(short_premium - width, 2)
             if long_premium < 0:
                 continue
-            r = max_loss([leg("call", SHORT, short_premium, 100.0),
-                          leg("call", LONG, long_premium, 100.0 + width)])
+            legs = [leg("call", SHORT, short_premium, 100.0),
+                    leg("call", LONG, long_premium, 100.0 + width)]
+            r = max_loss(legs)
             if r.state == MEASURED:
                 assert r.amount >= MIN_MEASURABLE_LOSS, (
                     f"short {short_premium} / long {long_premium} width {width} produced a "
                     f"MEASURED max loss of {r.amount!r}, which sizes "
                     f"{int(1000 / r.amount):,} contracts on a $1,000 budget")
+            elif 0.0 < min(payoff_at(legs, s) for s in critical_points(legs)) \
+                    <= MIN_MEASURABLE_LOSS:
+                checked_dust_band += 1
+                assert "stale or crossed" in r.reason, (
+                    f"short {short_premium} / long {long_premium} width {width} has a worst "
+                    f"case inside the dust band but was diagnosed as an arbitrage: {r.reason}")
+
+    # The band must not be empty, or the assertion above is vacuous and the boundary is
+    # unpinned again without anything failing.
+    assert checked_dust_band > 0
 
 
 def test_empty_legs_reaches_unmeasurable_through_max_loss():

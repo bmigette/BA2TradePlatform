@@ -309,6 +309,16 @@ def max_loss(legs: Sequence[PayoffLeg]) -> MaxLossResult:
         # a bad leg set; whereas a guaranteed LOSS can be bought for real money any day, so on
         # the profit side magnitude implies nothing about cause and a split there would give
         # two identical faults opposite diagnoses a cent apart.
+        #
+        # THE BREAK-EVEN HALF RESTS ON A SECOND ASSUMPTION, stated because it is about the
+        # CALLERS and not about arithmetic: that no builder emits a zero-risk-AND-zero-reward
+        # structure. Nothing in `TradeActions.py` currently can — the same-strike pairs that
+        # would do it (`long 100c @2.00 / short 100c @2.00`) are not a shape any builder
+        # constructs — so within this codebase a flat payoff really is a quote artefact. If a
+        # box, conversion or reversal builder ever lands, that stops being true and this half
+        # of the split acquires exactly the defect `max_profit`'s did: it would tell the reader
+        # "a zero-risk structure at real prices is a stale or crossed quote" about a builder
+        # degeneracy with a perfectly good chain behind it. REVISIT THIS BRANCH THEN.
         if worst <= MIN_MEASURABLE_LOSS:
             return MaxLossResult(
                 UNMEASURABLE,
@@ -422,10 +432,20 @@ def max_profit(legs: Sequence[PayoffLeg]) -> MaxProfitResult:
         # So the message names the ambiguity and both remedies rather than asserting one cause
         # and sending the reader to hunt a defect that may not exist. A refusal that says "I
         # cannot tell which of these two it is" is worth more than a confident wrong answer.
+        #
+        # "MEANINGFULLY" IS LOAD-BEARING, not padding. This branch fires on
+        # `best <= MIN_MEASURABLE_PROFIT`, so it also admits STRICTLY POSITIVE best cases up to
+        # a cent — the 0.57/0.07 half-dollar vertical that profits by 6.2e-15 lands here. A
+        # flat "cannot profit at any underlying price" would be false for that whole band, and
+        # a refusal that states a falsehood about the very number it is printing is worse than
+        # one that hedges. `max_loss` is careful in exactly this way: it reserves its
+        # unconditional "PROFITS at every underlying price" for `worst > MIN_MEASURABLE_LOSS`
+        # and hedges inside the band.
         return MaxProfitResult(
             UNMEASURABLE,
-            reason=(f"structure cannot profit at any underlying price (best payoff {best:.4f} "
-                    f"at expiry): the strikes and premiums chosen cannot pay. That is either a "
+            reason=(f"structure cannot profit meaningfully at any underlying price (best "
+                    f"payoff {best:.4f} at expiry): the strikes and premiums chosen cannot "
+                    f"pay. That is either a "
                     f"builder picking an unpayable structure or a stale or crossed chain, and "
                     f"the expiry payoff alone cannot tell them apart -- check the strikes the "
                     f"builder chose, and re-pull the quote, before trusting this price"))

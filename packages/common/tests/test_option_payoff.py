@@ -46,6 +46,20 @@ def long_stock(entry):
     return PayoffLeg(kind="stock", side=OrderDirection.BUY, premium=entry, strike=None)
 
 
+def reported_payoff(reason):
+    """The payoff figure a refusal message quotes, as a float.
+
+    Assertions on these messages compare the NUMBER, never a substring of it. Substring
+    checks are silently one-directional here: ``"0.0" in reason`` also matches
+    ``"-100.0000"``, so it cannot tell the two refusal cases apart and passes even when both
+    report the same wrong figure. Extracting and comparing survives a format change too,
+    which a hardcoded ``"0.0000"`` does not.
+    """
+    match = re.search(r"payoff (-?[\d.]+)", reason)
+    assert match is not None, f"no payoff figure in refusal reason: {reason!r}"
+    return float(match.group(1))
+
+
 def test_long_call_below_strike_loses_exactly_the_debit():
     legs = [long_call(100, 5.0)]
     assert payoff_at(legs, 90.0) == pytest.approx(-500.0)
@@ -146,7 +160,7 @@ def test_a_debit_spread_bought_at_its_full_width_cannot_profit():
     result = max_profit(legs)
     assert result.state == UNMEASURABLE
     assert "profit" in result.reason.lower()
-    assert "0.0" in result.reason        # its own best case, in any float format
+    assert reported_payoff(result.reason) == 0.0
 
 
 def test_paying_at_and_above_the_width_get_the_SAME_diagnosis():
@@ -172,8 +186,13 @@ def test_paying_at_and_above_the_width_get_the_SAME_diagnosis():
     # numbers stripped out so this pins the WORDING, not the float format specifier.
     strip = lambda text: re.sub(r"-?[\d.]+", "", text)
     assert strip(at_width.reason) == strip(above_width.reason)
-    # Each still reports its OWN number rather than a claim about zero.
-    assert "-100" in above_width.reason
+    # Each still reports its OWN best case. EXTRACTED AND COMPARED AS A NUMBER, not as a
+    # substring: `"0.0" in ...` reads like it pins the at-width case but is vacuous, because
+    # "0.0" is also a substring of "-100.0000". It therefore passed while the message
+    # hardcoded -100.0000 for BOTH, i.e. it constrained exactly one of the two directions it
+    # appeared to cover.
+    assert reported_payoff(at_width.reason) == 0.0
+    assert reported_payoff(above_width.reason) == -100.0
     # And neither asserts a single cause: both remedies are named, neither is promised.
     for reason in (at_width.reason, above_width.reason):
         assert "cannot pay" in reason
