@@ -146,8 +146,12 @@ def test_a_credit_vertical_profits_at_most_its_credit():
 
 
 def test_a_naked_short_put_profits_at_most_its_credit():
-    """Bounded ABOVE (the credit) while unbounded BELOW -- so max_profit is MEASURED on
-    the very structure whose max_loss is UNBOUNDED. The two answers are independent."""
+    """A naked short put is bounded on BOTH sides: profit is capped at the credit received, and
+    loss is capped too -- the underlying cannot go below zero, so ``max_loss`` MEASURES it at
+    ``(strike - credit) * multiplier`` rather than reporting UNBOUNDED (that state is reserved
+    for a payoff that falls without limit, which only a net-short CALL or short stock produces).
+    This test pins the profit side only; ``max_loss`` on the same structure is pinned elsewhere.
+    The two answers are computed independently and neither implies the other."""
     result = max_profit([short_put(90.0, 4.00)])
     assert result.state == MEASURED
     assert result.amount == pytest.approx(400.0)

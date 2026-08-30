@@ -842,11 +842,18 @@ def test_without_a_structure_fn_the_ceiling_is_inapplicable_rather_than_total():
     ``consensus_target``, and the same asymmetry ``_column_cannot_rank`` already draws: one
     absent value is a defect in THAT candidate, an empty column is a defect in the QUESTION.
 
-    IT IS SAFE BECAUSE THE CEILING IS NOT THE ENFORCEMENT. Sizing still measures the real legs
-    and still refuses at ``contracts = 0``, so an unaffordable pick costs the bar's trade, never
-    the budget. Admitting can lose a trade the ceiling would have saved; refusing loses every
-    trade the builder would ever make. Only one of those two is recoverable by teaching the
-    builder its closure.
+    IT IS SAFE BECAUSE WITH NO ``structure_fn`` THE FILTER IS INERT -- byte-identical to the
+    pre-ceiling pick, so nothing can regress. That argument needs no downstream layer, which is
+    just as well, because none exists: there is no option-structure triage today (``book_left``,
+    ``instrument_left`` and ``structure_cap`` have zero hits repo-wide and live only in the
+    design), and the one sizing step that does exist divides by PREMIUM or RESERVE
+    (``option_request.SIZING_BASES``), never by max loss -- so for a credit spread, whose premium
+    outlay and max loss are different numbers, an unaffordable pick is NOT caught downstream by
+    any "refuses at contracts = 0" mechanism. That claim was retracted from ``eligible``'s own
+    docstring (3d676204) as false in the present tense; admitting here can therefore lose a real
+    trade the ceiling would have saved, and that is accepted because the alternative -- refusing
+    everything for want of a closure -- loses every trade the builder would ever make. Only the
+    first is recoverable, by teaching the builder its closure.
     """
     context = ctx(max_loss_ceiling=1.0)                # a one-dollar budget, and it binds nothing
     assert eligible(PAIR, context) == PAIR
