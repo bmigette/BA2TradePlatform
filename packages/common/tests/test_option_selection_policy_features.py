@@ -36,9 +36,12 @@ from ba2_common.core.option_selection_policy import (
     PAYOFF_FEATURES,
     PolicyContext,
     SelectionPolicy,
+    _OFF_SCALE,
     _profit_and_risk,
+    _reward_to_risk,
     feature_matrix,
     inapplicable_features,
+    payoff_columns,
     pick,
 )
 from ba2_common.core.option_types import OptionContract
@@ -105,6 +108,30 @@ def naked_short_put(cand):
 def short_stock(cand):
     """Unbounded loss with NO strike to attribute it to -- the case that must NOT be guessed."""
     return [PayoffLeg(kind="stock", side=OrderDirection.SELL, premium=cand.mid, strike=None)]
+
+
+def short_stock_with_a_bookkeeping_strike(cand):
+    """The same unbounded shape, but carrying a strike that means nothing.
+
+    ``validate_legs`` PERMITS this: its strike checks sit under ``kind in _OPTION_KINDS``, so a
+    stock leg's ``strike`` field is never inspected and any value survives. A builder recording
+    the strike it hedged around, or reusing one leg dataclass for every kind, produces exactly
+    this. The number is bookkeeping, not an assignment price, and nothing may be computed from
+    it.
+    """
+    return [PayoffLeg(kind="stock", side=OrderDirection.SELL, premium=cand.mid, strike=95.0)]
+
+
+def free_long_call(cand):
+    """A long call bought for nothing: profit UNBOUNDED and loss UNMEASURABLE at once.
+
+    THE ONLY SHAPE THAT SEPARATES ``_reward_to_risk``'s TWO GUARDS. A 0-bid/0-ask far strike is
+    an ordinary chain row, not a contrived one; ``max_profit`` reports UNBOUNDED off the upside
+    slope while ``max_loss`` sees a payoff that is flat at zero and refuses it as a break-even
+    quote. Every other structure in this file makes at most one of the two states.
+    """
+    return [PayoffLeg(kind="call", side=OrderDirection.BUY, premium=cand.mid,
+                      strike=cand.strike)]
 
 
 def call_ratio_spread(cand):
@@ -201,6 +228,30 @@ def test_a_better_ratio_scores_higher_on_rr():
     assert m["rr"] == [1.0, 0.0]
 
 
+def test_precomputed_payoff_columns_are_reused_by_both_entry_points():
+    """Sharing ONE payoff pass is what stops the report describing numbers the ranking never saw.
+
+    ``_column_cannot_rank`` already stops the two entry points drifting in their PREDICATE, but
+    computing separately they each invoke ``structure_fn`` afresh -- so a stateful or
+    non-deterministic closure could still have them disagree about the INPUT. Counting the calls
+    is what proves the parameter is wired rather than accepted and ignored, which is this
+    module's recurring way of shipping something decorative. It also halves 5039us of work.
+    """
+    seen = []
+
+    def _counting(cand):
+        seen.append(cand.strike)
+        return credit_vertical(5.0)(cand)
+
+    context = ctx(structure_fn=_counting)
+    columns = payoff_columns([RICH, POOR], context)
+    assert len(seen) == 2
+    m = feature_matrix([RICH, POOR], context, only=["profit", "rr"], payoff=columns)
+    assert inapplicable_features([RICH, POOR], context, payoff=columns) == ()
+    assert len(seen) == 2                      # neither entry point re-invoked the closure
+    assert m["profit"] == [1.0, 0.0] and m["rr"] == [1.0, 0.0]
+
+
 def test_both_payoff_features_are_applicable_for_a_defined_risk_structure():
     assert inapplicable_features([RICH, POOR], ctx(structure_fn=credit_vertical(5.0))) == ()
 
@@ -279,6 +330,72 @@ def test_a_long_call_among_verticals_is_not_demoted_by_either_payoff_weight(poli
     context = ctx(structure_fn=_mixed(100.0, long_call))
     assert pick(MIXED, ctx(), SelectionPolicy()) is MIXED_LONG_CALL      # the baseline
     assert pick(MIXED, context, policy) is MIXED_LONG_CALL
+
+
+FREE_LONG_CALL = c(100, bid=0.0, ask=0.0, delta=0.30)
+FREEBIE = [MIXED_VERTICAL_RICH, FREE_LONG_CALL, MIXED_VERTICAL_POOR]
+
+
+def test_a_missing_denominator_beats_an_off_scale_numerator():
+    """THE GUARD PRECEDENCE IN ``_reward_to_risk``, pinned directly because it is the single
+    most-argued line in this design and swapping it is otherwise invisible.
+
+    A long call bought for 0.00 is UNBOUNDED on profit and UNMEASURABLE on loss simultaneously,
+    so it is the only input where the two guards disagree:
+
+        risk-first (current) -> None        this candidate fails closed, the column keeps ranking
+        profit-first         -> _OFF_SCALE  the whole column goes inert
+
+    Current order is right: an UNMEASURABLE loss is a BROKEN QUOTE, and one crossed market must
+    not be able to disable a gene for every candidate beside it. The price of that choice is
+    real and is asserted below -- see the companion test.
+    """
+    assert _reward_to_risk(_OFF_SCALE, None) is None
+    # ...and the same at the column level, which is where it changes a pick.
+    context = ctx(structure_fn=_mixed(100.0, free_long_call))
+    assert _profit_and_risk(FREE_LONG_CALL, context) == (_OFF_SCALE, None)
+    assert inapplicable_features(FREEBIE, context) == ("profit",)      # rr stays LIVE
+    m = feature_matrix(FREEBIE, context, only=["profit", "rr"])
+    assert m["profit"] == [0.0, 0.0, 0.0]      # off-scale present -> inert
+    assert m["rr"] == [1.0, 0.0, 0.0]          # 390/110, freebie fails closed, 90/410
+
+
+def test_the_precedence_accepts_demoting_a_long_call_on_a_broken_quote():
+    """THE PRICE OF THE CHOICE ABOVE, asserted rather than argued.
+
+    On this input the long call IS demoted on ``rr`` while its peers score real ratios -- the
+    thing the governing constraint forbids. It arrives through the candidate's own unmeasurable
+    LOSS rather than through its unbounded profit, but the effect on the pick is identical, and
+    a design note that only lists what a choice prevents is half a note.
+
+    Accepted because the alternative is worse in kind, not merely in degree: one stale or
+    crossed quote anywhere in the chain would take ``rr`` inert for every candidate beside it,
+    silently converting a data outage into a disabled gene. A demotion is confined to the
+    candidate whose quote is broken.
+    """
+    context = ctx(structure_fn=_mixed(100.0, free_long_call))
+    assert pick(FREEBIE, ctx(), SelectionPolicy()) is FREE_LONG_CALL          # the baseline
+    assert pick(FREEBIE, context, SelectionPolicy(w_rr=5.0)) is MIXED_VERTICAL_RICH
+    # ...while `profit`, which reads the UNBOUNDED state rather than the broken quote, does not
+    # move the pick at all. The two features part company on the very same candidate.
+    assert pick(FREEBIE, context, SelectionPolicy(w_profit=5.0)) is FREE_LONG_CALL
+
+
+def test_a_stock_leg_carrying_a_bookkeeping_strike_is_not_priced_from_it():
+    """The ``kind != "call"`` clause, pinned on its OWN merits.
+
+    Without it this structure reports a denominator of 9500 invented from a stock leg's
+    bookkeeping strike. The clause was reachable only via ``short_stock``, whose strike is None
+    and which the ``not leg.strike`` test catches one clause earlier -- so removing it changed
+    nothing observable, which is this module's recurring way of shipping a decorative guard.
+
+    A stock leg has no strike to be assigned at. Whatever number the field carries, it is not a
+    price, and reading it would put an invented figure on the same scale as measured ones.
+    """
+    context = ctx(structure_fn=short_stock_with_a_bookkeeping_strike)
+    assert _profit_and_risk(RICH, context)[1] is None
+    assert inapplicable_features([RICH, POOR], context) == ("rr",)
+    assert feature_matrix([RICH, POOR], context, only=["profit"])["profit"] == [1.0, 0.0]
 
 
 def test_one_unmeasurable_profit_among_measurable_peers_still_fails_closed():
@@ -388,6 +505,11 @@ def test_the_denominator_counts_the_multiplier_and_the_ratio():
     identically to 21000 in any two-candidate set -- the ordering cannot see the factor of two,
     only the number can. Understating the risk of the most dangerous shape on the board is
     exactly the direction of error that matters.
+
+    THAT IMPOSSIBILITY HOLDS ONLY BECAUSE ONE ``structure_fn`` BUILDS ONE SHAPE PER PICK, so the
+    ratio is a constant factor across the column and cancels out of every comparison. A closure
+    that varied ``ratio`` per candidate would break the tie and a ranking test would bite again
+    -- worth knowing before concluding from this comment that ordering can never see the term.
     """
     profit, risk = _profit_and_risk(RICH, ctx(structure_fn=call_ratio_spread))
     assert risk == pytest.approx(21000.0)      # 105 strike x 100 multiplier x 2 ratio

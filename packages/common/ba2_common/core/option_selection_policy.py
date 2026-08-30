@@ -357,7 +357,7 @@ def _reward_to_risk(profit: _PayoffValue, risk: Optional[float]) -> _PayoffValue
     """``max_profit / risk`` for one candidate.
 
     TAKES THE PAIR RATHER THAN THE CONTRACT so that both features can be served from a single
-    payoff pass — see ``_payoff_columns`` for why that matters.
+    payoff pass — see ``payoff_columns`` for why that matters.
 
     THE NUMERATOR'S STATE CARRIES THROUGH. An off-scale profit over a finite risk is an
     off-scale ratio, so it stays ``_OFF_SCALE`` and takes the whole column inert with it rather
@@ -372,6 +372,17 @@ def _reward_to_risk(profit: _PayoffValue, risk: Optional[float]) -> _PayoffValue
     broken quote — then the ratio is ABSENT rather than off-scale, and absent fails closed. A
     broken quote must not be able to take a whole column inert; that would let one crossed
     market disable a gene for every candidate beside it.
+
+    THAT IS A TRADE, AND THIS IS WHAT IT COSTS. A long call bought for 0.00 — an ordinary 0-bid
+    far strike, not a contrived input — is UNBOUNDED on profit and UNMEASURABLE on loss at the
+    same time, and this precedence DEMOTES it: it scores ``_WORST`` on ``rr`` while its bounded
+    peers score real ratios. That is the outcome the governing constraint forbids, arriving
+    through the candidate's own broken quote rather than through its unbounded profit, and the
+    effect on the pick is the same either way. It is accepted because the alternative fails in
+    KIND rather than in degree: one stale quote anywhere in the chain would disable the gene for
+    every candidate beside it, silently converting a data outage into a dead gene, whereas this
+    confines the damage to the candidate whose quote is actually broken. ``profit``, which reads
+    the UNBOUNDED state instead of the loss, still refuses to demote it.
 
     The ``risk <= 0`` guard is belt and braces. ``max_loss`` refuses to report an amount at or
     below ``MIN_MEASURABLE_LOSS`` and a synthetic denominator is a positive strike times a
@@ -389,8 +400,13 @@ def _reward_to_risk(profit: _PayoffValue, risk: Optional[float]) -> _PayoffValue
     return profit / risk
 
 
-def _payoff_columns(candidates: Sequence[OptionContract],
-                    ctx: PolicyContext) -> Tuple[List[_PayoffValue], List[_PayoffValue]]:
+#: What ``payoff_columns`` returns: the raw ``profit`` column and the raw ``rr`` column, each
+#: parallel to the candidate list. Named because it is now passed BETWEEN the two public entry
+#: points rather than being an internal detail of each.
+PayoffColumns = Tuple[List[_PayoffValue], List[_PayoffValue]]
+
+
+def payoff_columns(candidates: Sequence[OptionContract], ctx: PolicyContext) -> PayoffColumns:
     """The raw ``profit`` and ``rr`` columns, built in ONE pass over the candidates.
 
     ONE PASS IS THE POINT. Both features read the same two payoff evaluations, so computing them
@@ -399,6 +415,14 @@ def _payoff_columns(candidates: Sequence[OptionContract],
     symbol. A memo keyed on the contract is not available (``OptionContract`` is a mutable
     dataclass and therefore unhashable, so it cannot be a dict key by value); computing both
     columns together sidesteps the question entirely.
+
+    PUBLIC SO THAT ONE CALLER CAN FEED BOTH ``feature_matrix`` AND ``inapplicable_features``,
+    which is worth more than the saved microseconds. The two share ``_column_cannot_rank``, so
+    they cannot drift in their PREDICATE — but computing separately they would each invoke
+    ``structure_fn`` afresh, so a stateful or non-deterministic closure could still make the
+    report describe different numbers from the ones the ranking used. Passing one result to both
+    closes that hole as well as halving the work. Measured on a 200-row chain: 5039us for the
+    pass, so doing it twice is not a rounding error either.
     """
     pairs = [_profit_and_risk(c, ctx) for c in candidates]
     return ([profit for profit, _ in pairs],
@@ -482,7 +506,8 @@ def _minimise(values: Sequence[Optional[float]]) -> List[float]:
 
 
 def feature_matrix(candidates: Sequence[OptionContract], ctx: PolicyContext,
-                   only: Optional[Sequence[str]] = None) -> Dict[str, List[float]]:
+                   only: Optional[Sequence[str]] = None,
+                   payoff: Optional[PayoffColumns] = None) -> Dict[str, List[float]]:
     """Every feature for every candidate, each normalised to [0, 1] and oriented so that
     HIGHER IS BETTER. Keys are ``FEATURE_NAMES``; each value is a list parallel to
     ``candidates``.
@@ -499,6 +524,10 @@ def feature_matrix(candidates: Sequence[OptionContract], ctx: PolicyContext,
     defining property of a long call, and demoting it for that would answer "does long premium
     pay?" by construction instead of by measurement. ``_column_cannot_rank`` holds the two ways
     a payoff column gets there; ``inapplicable_features`` reports which ones did.
+
+    ``payoff`` accepts an already-computed ``payoff_columns`` result. Pass the SAME object to
+    ``inapplicable_features`` when you want both: it halves the work and, more importantly,
+    guarantees the report describes the very numbers this ranking used.
     """
     wanted = FEATURE_NAMES if only is None else tuple(only)
 
@@ -508,11 +537,15 @@ def feature_matrix(candidates: Sequence[OptionContract], ctx: PolicyContext,
     # both genes ARE live the two builders below would otherwise repeat the whole payoff pass.
     # A one-element list is the cell; ``nonlocal`` would need a def, and this stays local to the
     # call so nothing about ``PolicyContext`` has to become mutable or hashable.
-    memo: List[Optional[Tuple[List[Optional[float]], List[Optional[float]]]]] = [None]
+    #
+    # THE ANNOTATION SAYS ``_PayoffValue`` AND MUST KEEP SAYING IT. This is the spot a reader
+    # checks to answer "can an off-scale value reach the normaliser?", so an ``Optional[float]``
+    # here -- which is what it said once -- answers no while the value says yes.
+    memo: List[Optional[PayoffColumns]] = [payoff]
 
-    def _columns() -> Tuple[List[Optional[float]], List[Optional[float]]]:
+    def _columns() -> PayoffColumns:
         if memo[0] is None:
-            memo[0] = _payoff_columns(candidates, ctx)
+            memo[0] = payoff_columns(candidates, ctx)
         return memo[0]
 
     builders = {
@@ -528,8 +561,8 @@ def feature_matrix(candidates: Sequence[OptionContract], ctx: PolicyContext,
     return {name: builders[name]() for name in wanted}
 
 
-def inapplicable_features(candidates: Sequence[OptionContract],
-                          ctx: PolicyContext) -> Tuple[str, ...]:
+def inapplicable_features(candidates: Sequence[OptionContract], ctx: PolicyContext,
+                          payoff: Optional[PayoffColumns] = None) -> Tuple[str, ...]:
     """The features that cannot rank THIS candidate set at all, so their weights are inert.
 
     DISTINCT FROM A MISSING VALUE ON ONE CANDIDATE, which fails closed and scores ``_WORST``
@@ -558,8 +591,16 @@ def inapplicable_features(candidates: Sequence[OptionContract],
 
     An empty candidate list reports both features inapplicable, which is vacuously true and
     costs nothing: ``pick`` has already returned None before any weight is consulted.
+
+    ``payoff`` accepts an already-computed ``payoff_columns`` result, and a caller that also
+    wants a ``feature_matrix`` should pass one object to both. Without it this function makes a
+    SECOND full payoff pass (5039us on a 200-row chain, matching the matrix's own), and the two
+    passes call ``structure_fn`` independently — so a stateful closure could make this report
+    describe numbers the ranking never saw. Sharing ``_column_cannot_rank`` prevents the two
+    from drifting in their predicate; only sharing the columns prevents them drifting in their
+    input.
     """
-    profit_column, rr_column = _payoff_columns(candidates, ctx)
+    profit_column, rr_column = (payoff_columns(candidates, ctx) if payoff is None else payoff)
     columns = {"profit": profit_column, "rr": rr_column}
     return tuple(name for name in PAYOFF_FEATURES if _column_cannot_rank(columns[name]))
 
@@ -681,11 +722,14 @@ def score_all(candidates: Sequence[OptionContract], ctx: PolicyContext,
     # (building and normalising the box_center column) and is the number to attack if the GA hot
     # path ever needs it; it is per structure, per bar, per symbol.
     #
-    # THE SKIP MATTERS MORE NOW THAN IT DID WHEN THAT WAS MEASURED. `profit` and `rr` are not
-    # field reads: each costs a `structure_fn` call plus a full `max_profit` and `max_loss` scan
-    # per candidate, so they are the most expensive features here by a wide margin, and neither
-    # is computed at default weights. `feature_matrix` shares one payoff pass between them so
-    # that switching BOTH genes on costs one pass rather than two.
+    # THE SKIP MATTERS MORE NOW THAN IT DID WHEN THAT WAS MEASURED, and here is the figure.
+    # `profit` and `rr` are not field reads: each costs a `structure_fn` call plus a full
+    # `max_profit` and `max_loss` scan per candidate. Same 200-row chain, both payoff columns:
+    # 5039 us -- about 13x the 388.8 us of all five original genes together, and 186x the 27.1 us
+    # legacy selector. That ratio is what makes the zero-weight skip load-bearing rather than
+    # merely nice: at default weights neither column is computed at all, and `feature_matrix`
+    # shares ONE payoff pass between the two so that switching both genes on costs 5039 us
+    # rather than 10078 us.
     #
     # INDEXING `weights[name]` RATHER THAN `.get(name)` IS DELIBERATE. A feature added to
     # FEATURE_NAMES without a matching weight is a KeyError on the next pick, which is loud and
