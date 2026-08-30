@@ -54,7 +54,30 @@ def _load(db: str) -> tuple:
 
 
 def _hash_task_id(name: str) -> str:
-    return "ckpt-" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:24]
+    """The checkpoint key for a job name — MUST match
+    ``strategy_optimization_handler.checkpoint_task_id`` exactly.
+
+    THIS IS A DELIBERATE DUPLICATE, AND THAT IS THE RISK. This tool is stdlib-only on
+    purpose so it can run against a copied ``dl_forecasting.db`` on a machine with no
+    backend checkout, which rules out importing the real function. The cost is that the
+    key derivation now exists twice and can drift — and it already has: the tool used
+    ``sha256`` while the handler used ``sha1``, so every lookup missed and the report
+    printed "no completed generation yet" for jobs that had run for hours (fixed
+    2026-08-30).
+
+    That failure mode is what makes the duplication dangerous rather than merely ugly: a
+    mismatch does not raise, it silently reports NO DATA for a job that has plenty. There
+    is nothing in the output to distinguish "this job has not finished a generation" from
+    "this tool can no longer find the checkpoints".
+
+    ``test_stage1_gen_report_key_matches_the_handler`` pins the two together so the next
+    change to either one fails a test instead of silently blinding this report.
+
+    ``.strip()`` mirrors the handler's own normalisation. Without it a job name carrying
+    stray whitespace hashes differently here than where the checkpoint was written — the
+    same silent-no-data failure, through a different door.
+    """
+    return "ckpt-" + hashlib.sha1(name.strip().encode("utf-8")).hexdigest()[:24]
 
 
 def _metrics_for(all_results: Optional[List[Dict]], best_params: Optional[Dict]) -> Dict[str, Any]:

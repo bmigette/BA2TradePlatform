@@ -214,3 +214,51 @@ def test_saved_payload_survives_json_and_resumes(task_id):
     assert len(population) == 6
     assert fitnesses == [None] * 6             # never evaluated -> all re-run
     assert all(len(ind) == len(pop[0]) for ind in population)
+
+
+def test_stage1_gen_report_key_matches_the_handler():
+    """The reporting tool re-derives the checkpoint key instead of importing it, so the two
+    can drift -- and they DID: the tool used sha256 while the handler used sha1, so every
+    lookup missed and the report printed "no completed generation yet" for jobs that had been
+    running for hours (fixed 2026-08-30).
+
+    The duplication is deliberate -- tools/stage1_gen_report.py is stdlib-only so it can run
+    against a copied dl_forecasting.db on a box with no backend checkout -- so the guard has
+    to be a test rather than a shared import.
+
+    WHY THIS IS WORTH A TEST AT ALL, for a mere reporting tool: a mismatch does not raise. It
+    reports NO DATA for a job that has plenty, and nothing in the output distinguishes "this
+    job has not finished a generation yet" from "this tool can no longer find the
+    checkpoints". A silent wrong answer in the instrument you use to decide whether a
+    multi-day grid is healthy is worth more than a broken one, which is why it went unnoticed.
+
+    The whitespace case is not hypothetical padding: the handler .strip()s its key and the
+    tool did not, so a job name carrying a stray space hashed differently on the two sides --
+    the same silent-no-data failure through a different door.
+    """
+    import importlib.util
+    import os
+
+    # tests/ -> backend/ -> testplatform/ -> REPO ROOT. Four dirnames, not three: tools/
+    # lives at the repo root, not under testplatform/. Resolved off __file__ rather than a
+    # CWD-relative string because CI runs with working-directory testplatform/backend and a
+    # bare "tools/..." path resolves differently there than from the repo root -- the exact
+    # failure that broke the parity workflow on 2026-08-28 (dcd12237).
+    root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))))
+    tool_path = os.path.join(root, "tools", "stage1_gen_report.py")
+    spec = importlib.util.spec_from_file_location("stage1_gen_report", tool_path)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+
+    for name in ("optm-FMPRating-O_LC-st1",
+                 "scr-large-FMPRating-S1",
+                 "sen-S3-goal2020-risk_atr",
+                 "  padded-name  ",          # the .strip() divergence
+                 "a" * 200):                 # long names are truncated identically
+        assert tool._hash_task_id(name) == H.checkpoint_task_id(name, 1), name
+
+    # The handler's opt_id fallback has no counterpart in the tool, which only ever has a
+    # name. Pinned so nobody "fixes" the tool by inventing one: an unnamed job is simply not
+    # reportable, and that must stay a known gap rather than a wrong key.
+    assert H.checkpoint_task_id(None, 42) == H.checkpoint_task_id("opt-42", 42)
