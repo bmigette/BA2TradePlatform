@@ -39,6 +39,7 @@ from ba2_common.core.option_selection_policy import (
     _OFF_SCALE,
     _profit_and_risk,
     _reward_to_risk,
+    eligible,
     feature_matrix,
     inapplicable_features,
     payoff_columns,
@@ -639,3 +640,178 @@ def test_a_live_profit_weight_can_override_the_box_center():
     context = ctx(structure_fn=credit_vertical(5.0))
     assert pick(cands, context, SelectionPolicy()) is near_but_poor
     assert pick(cands, context, SelectionPolicy(w_profit=5.0)) is far_but_rich
+
+
+# ------------------------------------------------ the budget ceiling (max_loss_ceiling)
+#
+# WHAT THIS FILTER IS FOR. Sizing already refuses a structure it cannot afford, but it refuses
+# the ONE contract the picker handed it -- it never goes back and takes a cheaper strike that
+# WOULD have fitted. The ceiling moves the budget upstream of the choice so the picker cannot
+# choose what the budget cannot buy.
+#
+# EXPENSIVE and CHEAP are 5-wide credit verticals over a 0.10 wing, so the max loss is
+# ``(5.00 - credit) * 100``: 410 for the 0.90 credit, 210 for the 2.90 one. The EXPENSIVE one is
+# deliberately dead on the 0.30 delta target and therefore the DEFAULT winner, so any test below
+# that finds CHEAP has watched the ceiling move a pick rather than agree with one.
+
+EXPENSIVE = c(100, bid=0.90, ask=1.10, delta=0.30)     # (5.00 - 0.90) * 100 = 410 of max loss
+CHEAP = c(105, bid=2.90, ask=3.10, delta=0.25)         # (5.00 - 2.90) * 100 = 210 of max loss
+PAIR = [EXPENSIVE, CHEAP]
+
+
+def test_the_ceiling_and_the_permission_default_to_off():
+    assert ctx().max_loss_ceiling is None
+    assert ctx().allow_undefined_risk is False
+
+
+def test_a_contract_the_budget_cannot_afford_is_not_merely_sized_down_it_is_not_PICKED():
+    """THE POINT OF THE WHOLE FEATURE, asserted as a change of PICK and not of eligibility only.
+
+    Without the ceiling the 410-dollar structure wins on the box centre, sizing then computes
+    ``floor(budget / 410) == 0`` and the bar trades NOTHING -- while a 210-dollar structure two
+    strikes away fitted the same budget the whole time. With the ceiling the picker never sees
+    the one it cannot buy.
+    """
+    context = ctx(structure_fn=credit_vertical(5.0))
+    assert pick(PAIR, context, SelectionPolicy()) is EXPENSIVE          # the baseline
+    capped = ctx(structure_fn=credit_vertical(5.0), max_loss_ceiling=300.0)
+    assert eligible(PAIR, capped) == [CHEAP]
+    assert pick(PAIR, capped, SelectionPolicy()) is CHEAP
+
+
+def test_the_ceiling_is_inclusive_at_its_own_boundary():
+    """A structure risking EXACTLY the ceiling fits. ``<=``, not ``<``.
+
+    Pinned because the off-by-one is invisible in every other test here and the wrong direction
+    refuses a structure the budget can pay for to the cent.
+    """
+    context = ctx(structure_fn=credit_vertical(5.0), max_loss_ceiling=210.0)
+    assert eligible(PAIR, context) == [CHEAP]
+    assert eligible(PAIR, ctx(structure_fn=credit_vertical(5.0),
+                              max_loss_ceiling=209.99)) == []
+
+
+def test_a_ceiling_of_none_never_even_asks_the_builder():
+    """``max_loss_ceiling=None`` MUST be a provable no-op, not merely a permissive one.
+
+    The whole of ``tests/test_option_selection_policy_noop.py`` rests on ``eligible`` behaving
+    exactly as it did, and a filter that computed the charge and then compared it against
+    infinity would keep the RESULT identical while calling ``structure_fn`` once per candidate on
+    a path that runs per structure, per bar, per symbol -- and would take the pick down entirely
+    for the builders whose closures raise. Counting the calls is the only way to tell the two
+    apart.
+    """
+    def _explode(_cand):
+        raise AssertionError("structure_fn was called with no max_loss_ceiling set")
+
+    context = ctx(structure_fn=_explode)
+    assert eligible(PAIR, context) == PAIR
+    assert pick(PAIR, context, SelectionPolicy()) is EXPENSIVE
+
+
+def test_an_unmeasurable_loss_fails_closed_against_a_ceiling():
+    """Cannot prove it fits -> not admitted. A broken quote is NEVER priced by rule.
+
+    The arbitrage vertical's short call has a perfectly usable strike, so the synthetic figure is
+    right there for the taking; taking it would launder a crossed quote into a budget. The
+    ceiling here is 1e9 -- a billion dollars -- so nothing about SIZE is doing the refusing.
+    """
+    uncapped = ctx(structure_fn=arbitrage_vertical)
+    assert eligible(PAIR, uncapped) == PAIR            # admitted while no budget is asserted
+    capped = ctx(structure_fn=arbitrage_vertical, max_loss_ceiling=1e9)
+    assert eligible(PAIR, capped) == []
+    assert pick(PAIR, capped, SelectionPolicy()) is None
+
+
+def test_a_builder_that_declines_a_candidate_cannot_be_shown_to_fit():
+    """Declining is a missing VALUE when ranking, and ranking tolerates missing values by scoring
+    them worst. A BUDGET cannot: there is no "worst" that is also affordable, and a structure the
+    builder could not complete has no max loss to charge. Same fail-closed rule as a broken
+    quote, reached by a different road."""
+    def _declines_the_cheap_one(cand):
+        return None if cand.strike >= 105.0 else credit_vertical(5.0)(cand)
+
+    context = ctx(structure_fn=_declines_the_cheap_one, max_loss_ceiling=1e9)
+    assert eligible(PAIR, context) == [EXPENSIVE]
+
+
+def test_an_unbounded_loss_is_charged_and_admitted_when_undefined_risk_is_PERMITTED():
+    """A naked short CALL -- the only single-leg shape whose loss is genuinely unbounded. (A naked
+    short PUT is BOUNDED: the underlying cannot go below zero, so ``max_loss`` MEASURES it at
+    ``(strike - credit) * 100`` and a test written on one would exercise the measured path while
+    claiming to test this one.)
+
+    The charge is ``_risk_denominator``'s figure, ``strike x multiplier x ratio`` -- 10000 for the
+    100 strike, 10500 for the 105. DELIBERATELY THE SAME SYNTHETIC ``rr`` DIVIDES BY, rather than
+    the design's ``spot * 100``: ``spot`` does not vary across candidates, and two different
+    synthetic figures for one structure is how they drift apart.
+
+    BOTH DIRECTIONS ARE ASSERTED. A test that only proved the permitted case is admitted would
+    let the charge itself rot into a no-op -- "permitted" would come to mean "unmeasured".
+    """
+    permitted = dict(structure_fn=naked_short_call, allow_undefined_risk=True)
+    assert eligible(PAIR, ctx(**permitted, max_loss_ceiling=12000.0)) == PAIR
+    # ...tightened between the two synthetics: the 100 strike costs 10000 to be assigned on, the
+    # 105 strike 10500, so the ceiling can separate them. It is a real number, not a token.
+    assert eligible(PAIR, ctx(**permitted, max_loss_ceiling=10200.0)) == [EXPENSIVE]
+    assert eligible(PAIR, ctx(**permitted, max_loss_ceiling=9000.0)) == []
+
+
+def test_an_unbounded_loss_is_refused_for_want_of_PERMISSION_not_of_size():
+    """``allow_undefined_risk`` defaults to False, which is the design's default refusal of
+    undefined risk, and the ceiling must not be able to override it in either direction.
+
+    THE CEILING HERE IS A TRILLION DOLLARS. Nothing about size is doing the refusing; flipping
+    the one flag on the very same inputs admits both candidates. Collapsing UNBOUNDED into
+    "excluded" would make a PERMITTED naked short unselectable while the setting still read as
+    ON, and collapsing it the other way would sell undefined risk on an account that forbids it.
+    """
+    huge = 1e12
+    assert eligible(PAIR, ctx(structure_fn=naked_short_call, max_loss_ceiling=huge)) == []
+    assert eligible(PAIR, ctx(structure_fn=naked_short_call, max_loss_ceiling=huge,
+                              allow_undefined_risk=True)) == PAIR
+
+
+def test_permitted_undefined_risk_still_needs_a_strike_to_be_charged_against():
+    """PERMISSION IS NOT A NUMBER. A short stock leg's loss is unbounded and there is no strike to
+    price the assignment with, so ``_risk_denominator`` declines and the candidate is refused even
+    though undefined risk is allowed. The alternative is charging the budget an invented figure,
+    which is the one thing a budget must never be charged.
+    """
+    context = ctx(structure_fn=short_stock, allow_undefined_risk=True, max_loss_ceiling=1e12)
+    assert eligible(PAIR, context) == []
+
+
+def test_without_a_structure_fn_the_ceiling_is_inapplicable_rather_than_total():
+    """THE DECISION: no seam -> the filter does not apply, and every candidate is admitted.
+
+    NOT the fail-closed rule that governs a candidate whose own loss cannot be measured, and the
+    difference is which layer is broken. With a ``structure_fn`` present, an unmeasurable
+    candidate sits among peers that WERE measured: refusing it costs one contract. With no
+    ``structure_fn`` at all NOTHING can be measured, so fail-closed refuses 100% of every chain
+    -- an untaught builder handed a ceiling would silently stop trading altogether while the
+    setting read as configured. That is the exact failure ``_in_box`` refuses for
+    ``consensus_target``, and the same asymmetry ``_column_cannot_rank`` already draws: one
+    absent value is a defect in THAT candidate, an empty column is a defect in the QUESTION.
+
+    IT IS SAFE BECAUSE THE CEILING IS NOT THE ENFORCEMENT. Sizing still measures the real legs
+    and still refuses at ``contracts = 0``, so an unaffordable pick costs the bar's trade, never
+    the budget. Admitting can lose a trade the ceiling would have saved; refusing loses every
+    trade the builder would ever make. Only one of those two is recoverable by teaching the
+    builder its closure.
+    """
+    context = ctx(max_loss_ceiling=1.0)                # a one-dollar budget, and it binds nothing
+    assert eligible(PAIR, context) == PAIR
+    assert pick(PAIR, context, SelectionPolicy()) is EXPENSIVE
+
+
+def test_there_is_no_max_profit_ceiling():
+    """FAILS CLOSED ON LOSS ONLY, pinned so nobody adds the symmetric filter later.
+
+    An unmeasurable PROFIT costs a ranking signal; an unmeasurable LOSS can bankrupt the sleeve.
+    ``unpayable_debit_spread`` reports UNMEASURABLE max profit at every strike and a perfectly
+    measurable loss of 590 (a 6.00 debit against a 0.10 credit), so a profit-side filter would
+    empty the chain here while the loss-side one admits it.
+    """
+    context = ctx(structure_fn=unpayable_debit_spread, max_loss_ceiling=1000.0)
+    assert eligible(PAIR, context) == PAIR

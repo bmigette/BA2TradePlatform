@@ -181,6 +181,30 @@ class PolicyContext:
     #: ``_OptionEntryAction.execute`` already catches and names the knob — not to a silent
     #: except in the scoring loop.
     structure_fn: Optional[Callable[[OptionContract], Optional[Sequence[PayoffLeg]]]] = None
+    #: Dollars of max loss ONE contract may risk. None disables the filter entirely and is a
+    #: provable no-op -- ``eligible`` returns before the builder is asked anything.
+    #:
+    #: THIS IS ``min(instrument_left, structure_cap)``, NOT THE FULL BUDGET. ``book_left`` depends
+    #: on which structures this bar's greedy triage admits first, so it does not exist yet at
+    #: selection time; threading a number that does not exist would be a fiction. Triage still
+    #: sizes and refuses against the full budget afterwards, so this narrows the CHOICE without
+    #: becoming the enforcement.
+    #:
+    #: WHAT IT BUYS. Sizing already refuses a structure it cannot afford -- but it refuses the one
+    #: contract the picker handed it and never goes back for a cheaper strike that would have
+    #: fitted. The ceiling puts the budget upstream of the choice.
+    max_loss_ceiling: Optional[float] = None
+    #: Whether an UNBOUNDED-loss structure may be charged a synthetic figure and admitted at all.
+    #: False (the default) means undefined risk is NOT permitted here, which is the design's
+    #: default refusal.
+    #:
+    #: THIS EXISTS SO THE CEILING CANNOT SILENTLY OVERRIDE THE ACCOUNT'S SETTING. Collapsing
+    #: UNBOUNDED into "excluded" would make a PERMITTED naked short unselectable while
+    #: ``allow_undefined_risk_options`` still read as ON; collapsing it into "charged" would sell
+    #: undefined risk on an account that forbids it. The two refusals are different in KIND -- one
+    #: is a want of PERMISSION, the other a want of a NUMBER -- and ``_chargeable_max_loss`` keeps
+    #: them in separate branches for that reason.
+    allow_undefined_risk: bool = False
 
 
 def _mark(c: OptionContract) -> Optional[float]:
@@ -658,6 +682,62 @@ def _in_box(c: OptionContract, ctx: PolicyContext) -> bool:
     return True
 
 
+def _chargeable_max_loss(c: OptionContract, ctx: PolicyContext) -> float:
+    """Dollars this candidate's max loss is CHARGED against ``ctx.max_loss_ceiling``.
+
+    ONLY EVER CALLED WITH A ``structure_fn`` PRESENT -- ``eligible`` returns before this when
+    there is none. See its docstring for why an absent seam disables the filter instead of
+    emptying the chain.
+
+    THREE STATES, THREE ANSWERS -- collapsing any two is a bug:
+
+      * MEASURED     -> the measured amount.
+      * UNBOUNDED    -> the synthetic assignment cost when undefined risk is PERMITTED, else
+                        infinity -- refused for lack of PERMISSION, not for lack of a number.
+                        The distinction is not cosmetic: it is the difference between an account
+                        that forbids naked shorts and a naked short nobody can price, and a
+                        single "excluded" branch would report the second when the first is true.
+      * UNMEASURABLE -> infinity. A broken quote is NEVER priced by rule, exactly as
+                        ``_risk_denominator`` refuses to. The arbitrage vertical's short call has
+                        a perfectly usable strike, so the synthetic figure is right there for the
+                        taking; taking it would launder a crossed quote into a budget.
+
+    A BUILDER THAT DECLINES THE CANDIDATE ALSO GETS INFINITY. When ranking, a declined candidate
+    is one missing value among peers and scores worst; a budget has no "worst" that is also
+    affordable, and a structure the builder could not complete has no max loss to charge.
+
+    THE SYNTHETIC IS ``_risk_denominator``'s, DELIBERATELY, AND THIS DEVIATES FROM THE DESIGN.
+    Design section 8.3 words the budgeting substitute for undefined risk as ``spot * 100``; this
+    charges ``strike * multiplier * ratio`` instead. Two reasons. ``spot`` does not vary across
+    the candidates of one pick, so a spot-based charge would admit and refuse the whole chain
+    together and could never re-pick a cheaper strike -- which is the entire purpose of this
+    filter. And the codebase now has exactly ONE notion of what an unbounded structure risks;
+    a second synthetic for the same shape is how the two drift apart, with nothing downstream
+    able to say which figure a given refusal used.
+
+    RETURNS ``inf`` RATHER THAN ``None`` ON EVERY REFUSAL because the caller's test is a single
+    ``<= ceiling`` comparison, and ``inf <= x`` is False for every finite ``x``. An Optional would
+    put the fail-closed rule in the caller, where forgetting the ``is None`` branch fails OPEN.
+    """
+    # NOTE: called WITHOUT a try/except, exactly as ``_profit_and_risk`` calls it, and for the
+    # same reason. Declining is None or an empty list; an exception is a defect in the builder
+    # and propagates. See ``PolicyContext.structure_fn``.
+    legs = ctx.structure_fn(c)
+    if not legs:
+        return math.inf
+    loss = max_loss(legs)
+    if loss.state == MEASURED:
+        return float(loss.amount)
+    if loss.state == UNBOUNDED:
+        if not ctx.allow_undefined_risk:
+            return math.inf
+        # PERMISSION IS NOT A NUMBER. A short stock leg's risk is permitted here and still
+        # unpriceable, so ``_risk_denominator`` declines and the candidate is refused anyway.
+        synthetic = _risk_denominator(legs, loss)
+        return math.inf if synthetic is None else synthetic
+    return math.inf
+
+
 def eligible(candidates: Sequence[OptionContract],
              ctx: PolicyContext) -> List[OptionContract]:
     """The candidates the policy is allowed to choose between.
@@ -685,6 +765,26 @@ def eligible(candidates: Sequence[OptionContract],
         price, which ``select_single`` reaches with its default ``target_price=None``. Turning
         that into a raise would be a live behaviour change dressed up as a fix; if the silence
         is wrong, it is wrong in both and belongs in a later phase that changes both together.
+
+    THE BUDGET CEILING IS THE LAST FILTER AND IT FAILS CLOSED ON LOSS ONLY. There is deliberately
+    no max-PROFIT ceiling, now or ever: an unmeasurable profit costs a ranking signal, an
+    unmeasurable loss can bankrupt the sleeve. See ``_chargeable_max_loss`` for what each of the
+    three loss states is charged.
+
+    NO ``structure_fn`` MEANS THE CEILING DOES NOT APPLY, WHICH IS NOT THE SAME AS THE FAIL-CLOSED
+    RULE INSIDE IT, and the difference is which layer is broken. With a closure present, a
+    candidate whose own loss cannot be measured sits among peers that WERE measured, so refusing
+    it costs one contract. With no closure at all NOTHING can be measured, so fail-closed would
+    refuse 100% of every chain -- an untaught builder handed a ceiling would silently stop trading
+    while the setting still read as configured, which is precisely the failure ``_in_box`` refuses
+    for ``consensus_target``. It is the same asymmetry ``_column_cannot_rank`` already draws: one
+    absent value is a defect in THAT candidate, an empty column is a defect in the QUESTION.
+
+    THAT IS SAFE ONLY BECAUSE THIS FILTER IS NOT THE ENFORCEMENT, and the claim is worth stating
+    plainly. Sizing measures the REAL legs and still refuses at ``contracts = 0``, so an
+    unaffordable pick costs the bar's trade and never the budget. Admitting here can lose a trade
+    the ceiling would have saved; refusing here loses every trade that builder would ever make.
+    Only the first is recoverable by teaching the builder its closure.
     """
     _validate_box(ctx)
     out = list(candidates)
@@ -697,7 +797,15 @@ def eligible(candidates: Sequence[OptionContract],
     elif target_strike(ctx.strike_method, ctx.target, ctx.spot, ctx.target_price,
                        ctx.option_type) is None:
         return []
-    return [c for c in out if _in_box(c, ctx)]
+    boxed = [c for c in out if _in_box(c, ctx)]
+    # RETURN BEFORE ASKING THE BUILDER ANYTHING. The no-op guarantee is not merely that the RESULT
+    # is unchanged when no ceiling is set: computing every charge and then comparing it against
+    # infinity would give the same list while calling ``structure_fn`` once per candidate on a
+    # path that runs per structure, per bar, per symbol -- and would propagate the exception from
+    # any builder whose closure raises, taking down picks that never asked for a budget.
+    if ctx.max_loss_ceiling is None or ctx.structure_fn is None:
+        return boxed
+    return [c for c in boxed if _chargeable_max_loss(c, ctx) <= ctx.max_loss_ceiling]
 
 
 def score_all(candidates: Sequence[OptionContract], ctx: PolicyContext,
