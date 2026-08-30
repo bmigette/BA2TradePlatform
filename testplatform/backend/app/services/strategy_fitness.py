@@ -116,6 +116,17 @@ _OCAR_DD_EXPONENT = 2.0     # > 1 is what breaks the cancellation; 2 makes each 
 # The residual, stated plainly: below 5% drawdown this metric stops rewarding safety and leverage
 # pays again. That region is unreachable for a genome trading enough to clear the 12/yr floor.
 _OCAR_DD_FLOOR = 5.0
+# A measured total loss is a DISQUALIFICATION, not a penalty. Added 2026-08-29 after a stage-1
+# long-call genome printed total_return +3189% on max_drawdown -100% and still scored fitness
+# +1.6 under the squared penalty ((20/100)^2 = 0.04 on an enormous base stays positive): a
+# wiped-out account kept breeding into the population. The account_wiped_out flag is the
+# primary detector (entry guard in compute_fitness), but it only fires when the engine stops
+# the sim at NLV <= 0 -- a curve that asymptotes to zero (or ends exactly at it on the last
+# bar) measures dd = -100% WITHOUT the flag. So the measured drawdown itself must disqualify.
+# NOTE: lives in this metric only, not in compute_fitness, because the equity fleet is
+# mid-run and re-ranking its population mid-search invalidates banked results. Lift it into
+# the entry guard when no grid is running.
+_OCAR_WIPED_OUT_DD_PCT = 100.0
 _OCAR_ALIASES = ("option_consistent_annual_return", "option_car", "ocar")
 
 # fitness_metric (lower-cased) -> results-dict key. max_drawdown is handled
@@ -917,8 +928,10 @@ def _option_dd_penalty(dd: float) -> float:
 def _option_consistent_annual_return(results: dict) -> float:
     """OPTION-ONLY goal metric: ``base x dd_penalty x consistency x trade_gate``.
 
-    A near-copy of ``_consistent_annual_return`` differing in exactly ONE term -- the drawdown
-    factor is ``_option_dd_penalty`` (superlinear) rather than the linear, capped ``dd_guard``.
+    A near-copy of ``_consistent_annual_return`` differing in TWO terms -- the drawdown
+    factor is ``_option_dd_penalty`` (superlinear) rather than the linear, capped ``dd_guard``,
+    and a measured drawdown >= 100% returns WIPED_OUT_SENTINEL outright (2026-08-29: the
+    squared penalty alone still scored a bust genome +1.6).
     Every other term (the adjusted-base switch under profit caps, the proportional trade gate
     and its hard floor, the per-run cadence overrides, the calendar-year consistency factor and
     its missing-curve guard, the unfactored negative-base early return) is intentionally
@@ -1010,6 +1023,11 @@ def _option_consistent_annual_return(results: dict) -> float:
             f"option_consistent_annual_return: max_drawdown is not finite ({dd_raw!r}). The "
             f"run produced nonsense and is rejected rather than scored as risk-free."
         )
+    if dd >= _OCAR_WIPED_OUT_DD_PCT:
+        # Total loss is terminal. Ranked WORSE than never trading (ZERO_TRADE_SENTINEL), same
+        # as an engine-flagged wipeout. See _OCAR_WIPED_OUT_DD_PCT for why the flag alone
+        # does not catch this.
+        return WIPED_OUT_SENTINEL
     dd_penalty = _option_dd_penalty(dd)
 
     # --- yearly consistency -------------------------------------------------------------------
