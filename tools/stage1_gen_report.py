@@ -54,7 +54,7 @@ def _load(db: str) -> tuple:
 
 
 def _hash_task_id(name: str) -> str:
-    return "ckpt-" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:24]
+    return "ckpt-" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:24]
 
 
 def _metrics_for(all_results: Optional[List[Dict]], best_params: Optional[Dict]) -> Dict[str, Any]:
