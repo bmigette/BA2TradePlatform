@@ -600,13 +600,51 @@ def _cap_near_the_money(contracts: List[OptionContractMeta],
     return sorted(contracts, key=lambda c: (abs(c.strike - centre), c.occ_symbol))[:max_contracts]
 
 
+# One persistent background event loop per PROCESS, lazily started on first use and reused
+# for the rest of the process's life. _require_session() caches self._session (and, inside
+# it, the tastytrade SDK's Session with its long-lived httpx.AsyncClient / DXLink websocket)
+# across every call for as long as a provider instance lives -- warm_options_history.py
+# builds ONE provider and calls fetch_bars_detailed on it thousands of times. A socket
+# transport (what that cached client/websocket ultimately rests on) is bound to the event
+# loop that was running when it was opened; a FRESH `asyncio.run()` per call closes that loop
+# the instant the call returns, so the cached session's connection is dead before the very
+# next call touches it. Observed live as "RuntimeError: Event loop is closed" on every warm-up
+# batch after the first, across all 8 parallel workers (2026-08-30). Routing every call
+# through the SAME loop instead keeps the cached session's connection alive for as long as the
+# process runs, matching what run_option_warmup_parallel.py's own docstring already promises
+# ("its own asyncio event loop" -- one per worker, not one per call).
+import threading
+
+_bg_loop = None  # type: ignore[var-annotated]  # asyncio.AbstractEventLoop, once started
+_bg_loop_lock = threading.Lock()
+
+
+def _background_loop():  # pragma: no cover - network
+    """Lazily start (once) and return the persistent per-process background event loop."""
+    import asyncio
+    global _bg_loop
+    with _bg_loop_lock:
+        if _bg_loop is None:
+            loop = asyncio.new_event_loop()
+            thread = threading.Thread(
+                target=loop.run_forever, name="tastytrade-bg-loop", daemon=True)
+            thread.start()
+            _bg_loop = loop
+        return _bg_loop
+
+
 def _run_sync(coro):  # pragma: no cover - network
-    """Run a coroutine from sync code, tolerating an already-running loop."""
+    """Run a coroutine from sync code, on the ONE persistent background loop for this
+    process. Tolerates an already-running loop (the rare nested case: sync code called from
+    within already-async code) via a one-off thread-pool run, same as before -- that path
+    never touches the cached session, so it does not need the persistent loop."""
     import asyncio
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
+        pass
+    else:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(asyncio.run, coro).result()
+    return asyncio.run_coroutine_threadsafe(coro, _background_loop()).result()
