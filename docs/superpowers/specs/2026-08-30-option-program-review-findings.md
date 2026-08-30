@@ -272,5 +272,9 @@ JL/ratio reserves.
 3. **Before Tasks 7-10 resume:** purge F13's four stale claims (blocks Task 9); decide
    F15 (drop vs re-denominate rr — blocks Task 10); fold F12 into Task 7 or a small 6b.
 4. **Stage-2 substrate (F3) before any more stage-1 spend than the restart requires.**
-5. **Before ANY live option deployment:** F5 — wire or explicitly descope the rails and
-   breaker entry-gate; add a total committed-max-loss cap; F10 strangle reserve.
+5. **Before ANY live option deployment:** F5 — wire the rails and breaker entry-gate
+   into the SHARED decision path per the operator decision recorded 2026-08-30 in the
+   risk-manager design §4 (one `ba2_common` implementation invoked from
+   `TradeActions`/`_resolve()`, arming live and backtest in the same commit, PremiumSeller
+   stopgap deleted, parity gate extended to option decisions); add a total
+   committed-max-loss cap; F10 strangle reserve.
