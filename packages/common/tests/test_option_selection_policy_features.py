@@ -30,12 +30,13 @@ from datetime import date
 
 import pytest
 
-from ba2_common.core.option_payoff import PayoffLeg
+from ba2_common.core.option_payoff import MEASURED, PayoffLeg, max_loss
 from ba2_common.core.option_selection_policy import (
     FEATURE_NAMES,
     PAYOFF_FEATURES,
     PolicyContext,
     SelectionPolicy,
+    _profit_and_risk,
     feature_matrix,
     inapplicable_features,
     pick,
@@ -104,6 +105,39 @@ def naked_short_put(cand):
 def short_stock(cand):
     """Unbounded loss with NO strike to attribute it to -- the case that must NOT be guessed."""
     return [PayoffLeg(kind="stock", side=OrderDirection.SELL, premium=cand.mid, strike=None)]
+
+
+def call_ratio_spread(cand):
+    """Long 1x at the candidate's strike, short 2x five points up.
+
+    THE STRUCTURE THE ``multiplier * ratio`` TERM EXISTS FOR. Net short one call, so the loss is
+    UNBOUNDED, and the assignment cost is genuinely DOUBLED -- ``105 * 100 * 2 = 21000``, not the
+    10500 a hardcoded ``strike * 100`` would report for precisely the shape whose risk is worst.
+    """
+    return [PayoffLeg(kind="call", side=OrderDirection.BUY, premium=cand.mid,
+                      strike=cand.strike),
+            PayoffLeg(kind="call", side=OrderDirection.SELL, premium=1.00,
+                      strike=cand.strike + 5.0, ratio=2)]
+
+
+def two_short_calls(cand):
+    """Two separate short calls: unbounded, with NO single assignment cost to name."""
+    return [PayoffLeg(kind="call", side=OrderDirection.SELL, premium=cand.mid,
+                      strike=cand.strike),
+            PayoffLeg(kind="call", side=OrderDirection.SELL, premium=1.00,
+                      strike=cand.strike + 10.0)]
+
+
+def unpayable_debit_spread(cand):
+    """A 5-wide call spread bought for more than its width: ``max_profit`` is UNMEASURABLE.
+
+    UNMEASURABLE BY SHAPE, not by quote, which is what makes it the right foil for the
+    unbounded-profit case: both are properties of the strikes chosen, and only one of them may
+    make the column inert.
+    """
+    return [PayoffLeg(kind="call", side=OrderDirection.BUY, premium=6.00, strike=cand.strike),
+            PayoffLeg(kind="call", side=OrderDirection.SELL, premium=0.10,
+                      strike=cand.strike + 5.0)]
 
 
 def arbitrage_vertical(cand):
@@ -198,6 +232,70 @@ def test_an_inapplicable_feature_does_not_change_the_ranking():
     assert m["profit"] == [0.0, 0.0] and m["rr"] == [0.0, 0.0]
 
 
+# ------------------------------------------- MIXED shapes: the case that needs both rules
+
+def _mixed(unbounded_at, shaper):
+    """Completes ONE strike with ``shaper`` and every other candidate into a credit vertical."""
+    def _fn(cand):
+        if cand.strike == unbounded_at:
+            return shaper(cand)
+        return credit_vertical(5.0)(cand)
+    return _fn
+
+
+# The long call is deliberately the DEFAULT winner (delta dead on the 0.30 target) and the
+# poorest thing in the set on profit. If the column ranks at all, the pick moves off it.
+MIXED_VERTICAL_RICH = c(95, bid=3.90, ask=4.10, delta=0.50)
+MIXED_LONG_CALL = c(100, bid=2.90, ask=3.10, delta=0.30)
+MIXED_VERTICAL_POOR = c(105, bid=0.90, ask=1.10, delta=0.10)
+MIXED = [MIXED_VERTICAL_RICH, MIXED_LONG_CALL, MIXED_VERTICAL_POOR]
+
+
+def test_one_unbounded_profit_among_measurable_peers_makes_the_whole_column_inert():
+    """THE CASE THE COLUMN RULE ALONE COULD NOT DECIDE, and the reason UNBOUNDED and
+    UNMEASURABLE cannot share a representation.
+
+    Collapse both to "missing" and this set is a Rule 2 violation reached through the mechanism
+    Rule 3 mandates: the long call is the only candidate without a number, so it alone scores
+    ``_WORST`` while its peers score real values, ``inapplicable_features`` reports nothing
+    wrong, and ``w_profit`` quietly deletes long premium from a mixed chain. Measured before the
+    fix: profit column ``[0.0, 1.0, 0.0]`` and the pick moved off the long call.
+
+    You cannot min-max infinity against 300 on a normalised scale. Scoring it worst DEMOTES it;
+    scoring it best OVER-promotes it, so ``w_profit`` would always take the long call instead.
+    Neither is a measurement, so the column declines to rank at all.
+    """
+    context = ctx(structure_fn=_mixed(100.0, long_call))
+    assert set(inapplicable_features(MIXED, context)) == {"profit", "rr"}
+    m = feature_matrix(MIXED, context, only=["profit", "rr"])
+    assert m["profit"] == [0.0, 0.0, 0.0]
+    assert m["rr"] == [0.0, 0.0, 0.0]
+
+
+@pytest.mark.parametrize("policy", [SelectionPolicy(w_profit=5.0), SelectionPolicy(w_rr=5.0)])
+def test_a_long_call_among_verticals_is_not_demoted_by_either_payoff_weight(policy):
+    """The behavioural half of the test above: an inert column cannot move the pick, so the
+    long call still wins on the box centre exactly as it does at default weights."""
+    context = ctx(structure_fn=_mixed(100.0, long_call))
+    assert pick(MIXED, ctx(), SelectionPolicy()) is MIXED_LONG_CALL      # the baseline
+    assert pick(MIXED, context, policy) is MIXED_LONG_CALL
+
+
+def test_one_unmeasurable_profit_among_measurable_peers_still_fails_closed():
+    """The other half of the partition: UNMEASURABLE does NOT make the column inert.
+
+    A debit spread bought for more than its width cannot pay -- a defect in the strikes the
+    builder chose, not a shape whose value is off the scale -- so it loses to peers that can,
+    and the column keeps ranking. Same mixed-shape set, opposite verdict, which is the whole
+    reason the two states are now represented differently.
+    """
+    context = ctx(structure_fn=_mixed(100.0, unpayable_debit_spread))
+    assert "profit" not in inapplicable_features(MIXED, context)
+    m = feature_matrix(MIXED, context, only=["profit"])
+    assert m["profit"] == [1.0, 0.0, 0.0]      # rich vertical, dud, poor vertical
+    assert pick(MIXED, context, SelectionPolicy(w_profit=5.0)) is MIXED_VERTICAL_RICH
+
+
 # ------------------------------------------- the synthetic denominator for unbounded risk
 
 def test_a_naked_short_can_rank_on_rr_because_unbounded_risk_is_priced_not_refused():
@@ -222,15 +320,23 @@ def test_a_naked_short_put_ranks_on_rr_without_any_substitution():
     """A cash-secured put never reaches the synthetic path at all, and that is worth pinning.
 
     ``upside_slope`` is zero for a put-only structure, so ``max_loss`` MEASURES it at
-    ``(strike - credit) * 100`` -- 8600 here -- and ``rr`` is an ordinary measured ratio. A
-    reader who assumes "naked short" implies "unbounded" will mis-read every branch downstream;
-    only a short CALL or short stock makes the payoff run away.
+    ``(strike - credit) * 100`` -- 8600 here, NOT the 9000 a strike-based substitution would
+    produce. A reader who assumes "naked short" implies "unbounded" will mis-read every branch
+    downstream; only a short CALL or short stock makes the payoff run away.
+
+    ASSERTED ON THE AMOUNT, NOT ON THE RANKING, and that is the whole point of the test. An
+    earlier version compared normalised columns and pinned NOTHING: measured (8600) and
+    synthetic (9000) denominators cannot be told apart that way, because for a short put both
+    ``credit / (K - credit)`` and ``credit / K`` are monotone in ``K / credit``, so they order
+    every candidate set IDENTICALLY. No choice of strikes can make them disagree. Only the
+    number itself distinguishes them.
     """
-    rich = c(90, bid=3.90, ask=4.10, right=OptionRight.PUT)      # 400 / 8600 = 0.0465
-    poor = c(90, bid=0.90, ask=1.10, right=OptionRight.PUT)      # 100 / 8900 = 0.0112
-    context = ctx(structure_fn=naked_short_put)
-    assert inapplicable_features([rich, poor], context) == ()
-    assert feature_matrix([rich, poor], context, only=["rr"])["rr"] == [1.0, 0.0]
+    cand = c(90, bid=3.90, ask=4.10, right=OptionRight.PUT)      # 4.00 credit on the 90 put
+    legs = naked_short_put(cand)
+    loss = max_loss(legs)
+    assert loss.state == MEASURED and loss.amount == pytest.approx(8600.0)
+    assert _profit_and_risk(cand, ctx(structure_fn=naked_short_put)) == (
+        pytest.approx(400.0), pytest.approx(8600.0))
 
 
 def test_a_naked_short_scores_far_below_a_defined_risk_spread_on_rr():
@@ -275,6 +381,34 @@ def test_rr_is_not_a_rescaling_of_profit():
     assert m["rr"] == [1.0, 0.0]
 
 
+def test_the_denominator_counts_the_multiplier_and_the_ratio():
+    """A 1x2 call ratio spread owes TWO contracts on assignment, and the denominator says so.
+
+    Pinned as an AMOUNT because a hardcoded ``strike * 100`` produces 10500 here and ranks
+    identically to 21000 in any two-candidate set -- the ordering cannot see the factor of two,
+    only the number can. Understating the risk of the most dangerous shape on the board is
+    exactly the direction of error that matters.
+    """
+    profit, risk = _profit_and_risk(RICH, ctx(structure_fn=call_ratio_spread))
+    assert risk == pytest.approx(21000.0)      # 105 strike x 100 multiplier x 2 ratio
+    assert profit == pytest.approx(400.0)      # best case is at the short strike
+
+
+def test_two_short_calls_have_no_single_assignment_cost():
+    """The "exactly one short upside leg" guard, pinned on its OWN merits.
+
+    Both legs are short calls at DIFFERENT strikes, so there is no one assignment cost to name
+    and ``rr`` must decline rather than pick a leg. Without this the guard was only ever reached
+    via a short stock leg, which the ``kind`` check rejects a line later anyway -- so relaxing
+    it to "take the first" changed nothing observable and the guard was decorative.
+    """
+    context = ctx(structure_fn=two_short_calls)
+    assert _profit_and_risk(RICH, context)[1] is None
+    assert inapplicable_features([RICH, POOR], context) == ("rr",)
+    # ...and profit still ranks: the split stays per-feature.
+    assert feature_matrix([RICH, POOR], context, only=["profit"])["profit"] == [1.0, 0.0]
+
+
 def test_unbounded_risk_with_no_attributable_strike_is_refused_not_guessed():
     """Row 3 of the substitution table, and STILL the per-feature split.
 
@@ -315,9 +449,13 @@ def test_one_unmeasurable_candidate_fails_closed_without_disabling_the_column():
     unpriceable = c(110, bid=None, ask=None, delta=0.20)
     cands = [RICH, POOR, unpriceable]
     context = ctx(structure_fn=credit_vertical(5.0))
-    assert "profit" not in inapplicable_features(cands, context)
-    m = feature_matrix(cands, context, only=["profit"])
+    assert inapplicable_features(cands, context) == ()
+    m = feature_matrix(cands, context, only=["profit", "rr"])
     assert m["profit"] == [1.0, 0.0, 0.0]     # best, lowest-by-measurement, missing-fails-closed
+    # THE SAME ASSERTION ON `rr`. It shares `_maximise` with `profit`, so the behaviour follows
+    # -- but "follows from shared code" is not a pin, and the two features diverge elsewhere in
+    # this file precisely because they read different states.
+    assert m["rr"] == [1.0, 0.0, 0.0]         # 290/210, 90/410, unpriceable
 
 
 def test_a_builder_that_declines_a_candidate_is_a_missing_value_not_an_error():
@@ -332,9 +470,26 @@ def test_a_builder_that_declines_a_candidate_is_a_missing_value_not_an_error():
     cheaper = c(101, bid=1.90, ask=2.10, delta=0.28)
     cands = [RICH, cheaper, POOR]
     context = ctx(structure_fn=_declines_the_poor_one)
-    assert "profit" not in inapplicable_features(cands, context)
-    m = feature_matrix(cands, context, only=["profit"])
+    assert inapplicable_features(cands, context) == ()
+    m = feature_matrix(cands, context, only=["profit", "rr"])
     assert m["profit"] == [1.0, 0.0, 0.0]
+    assert m["rr"] == [1.0, 0.0, 0.0]         # 290/210, 190/310, declined
+
+
+def test_a_structure_fn_that_raises_takes_the_pick_down_with_it():
+    """DECLINING IS ``None``; RAISING IS A BUG, AND IT PROPAGATES. Deliberate, not an oversight.
+
+    A closure that raises has a defect in the builder -- it read a field that is not there, or
+    computed a wing from a None strike. Catching it here would convert a broken builder into
+    quietly worse selection on every bar, with nothing in the run naming the builder or the
+    line. That is the failure mode this codebase keeps having to remove, so the exception is
+    left to travel; ``_OptionEntryAction.execute`` is where an operator-facing refusal belongs.
+    """
+    def _broken(_cand):
+        raise ZeroDivisionError("builder computed a wing from a zero width")
+
+    with pytest.raises(ZeroDivisionError):
+        pick([RICH, POOR], ctx(structure_fn=_broken), SelectionPolicy(w_profit=1.0))
 
 
 # ---------------------------------------------------------------- the weights

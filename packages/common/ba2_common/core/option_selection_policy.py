@@ -21,7 +21,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import date
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from ba2_common.core.option_payoff import (
     MEASURED,
@@ -49,6 +49,42 @@ FEATURE_NAMES = ("box_center", "premium", "iv", "rvol", "spread", "profit", "rr"
 #: they exist only when ``PolicyContext.structure_fn`` can complete a candidate into its legs.
 #: They are the only features that can be INAPPLICABLE -- see ``inapplicable_features``.
 PAYOFF_FEATURES = ("profit", "rr")
+
+
+class _OffScale:
+    """A measurement that EXISTS but has no number: an UNBOUNDED payoff.
+
+    NOT THE SAME THING AS ``None``, AND THE DIFFERENCE IS THE WHOLE DESIGN. ``None`` means the
+    measurement is ABSENT -- a crossed quote, a leg that could not be priced -- and absent fails
+    closed, scoring ``_WORST``, because a contract whose peers report a value and which cannot
+    report its own deserves to lose to them. UNBOUNDED is the opposite situation: nothing is
+    missing, the shape is understood perfectly, and its value is simply off the end of the
+    scale.
+
+    THE TWO SHARED A REPRESENTATION ONCE AND IT COST A RULE. When UNBOUNDED collapsed to
+    ``None``, a long call sitting among credit verticals was the only candidate without a number
+    and so scored ``_WORST`` alone while its peers scored real values -- ``w_profit`` silently
+    deleting long premium from any mixed chain, with ``inapplicable_features`` reporting nothing
+    amiss because the COLUMN was not empty. Measured: profit column ``[0.0, 1.0, 0.0]`` and the
+    pick moved off the long call. Unbounded profit is the DEFINING property of a long call, and
+    the grid exists partly to measure whether long premium pays; demoting it answers that
+    question by construction.
+
+    Compared by IDENTITY (``is``), never by equality, so it can never be mistaken for a price.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:            # pragma: no cover - a debugging aid only
+        return "OFF_SCALE"
+
+
+#: The single instance. See ``_OffScale``.
+_OFF_SCALE = _OffScale()
+
+#: One entry of a raw payoff column: a number, ``None`` for an absent measurement, or
+#: ``_OFF_SCALE`` for one that is off the end of the scale.
+_PayoffValue = Union[float, None, _OffScale]
 
 
 @dataclass(frozen=True)
@@ -134,9 +170,16 @@ class PolicyContext:
     #: zero. See ``inapplicable_features``. That is what lets these features ship before all 17
     #: builders supply a closure: an untaught builder loses the feature VISIBLY.
     #:
-    #: The closure may also DECLINE a particular candidate by returning None or an empty list
-    #: (no wing left on the chain, say). That is one missing value, scored like any other
-    #: missing value, and not an error.
+    #: THE CLOSURE DECLINES BY RETURNING None OR AN EMPTY LIST — no wing left on the chain, say.
+    #: That is one missing value, scored like any other missing value, and not an error.
+    #:
+    #: AN EXCEPTION IS A DIFFERENT THING AND IT PROPAGATES, taking the whole pick down. That is
+    #: deliberate: a closure that RAISES has a defect in the builder (it read a field that is
+    #: not there, or computed a wing from a None strike), and catching it here would turn a
+    #: broken builder into quietly worse selection on every bar, with nothing in the run naming
+    #: the builder or the line. Refusals belong to the layer that can report them —
+    #: ``_OptionEntryAction.execute`` already catches and names the knob — not to a silent
+    #: except in the scoring loop.
     structure_fn: Optional[Callable[[OptionContract], Optional[Sequence[PayoffLeg]]]] = None
 
 
@@ -269,7 +312,7 @@ def _risk_denominator(legs: Sequence[PayoffLeg], loss: MaxLossResult) -> Optiona
 
 
 def _profit_and_risk(c: OptionContract,
-                     ctx: PolicyContext) -> Tuple[Optional[float], Optional[float]]:
+                     ctx: PolicyContext) -> Tuple[_PayoffValue, Optional[float]]:
     """``(max_profit, risk)`` in dollars for the structure this candidate would become.
 
     THE SECOND ELEMENT IS NOT THE MAX LOSS and must never be used as a sizing budget — that is
@@ -278,40 +321,57 @@ def _profit_and_risk(c: OptionContract,
     against it would treat a naked short call as risking its strike, which is the understatement
     ``option_payoff`` exists to refuse. Callers needing the real thing call ``max_loss``.
 
-    Either element is None when there is no number to rank on. On the profit side UNBOUNDED and
-    UNMEASURABLE collapse together HERE, because neither yields one; on the risk side they do
-    not, and ``_risk_denominator`` keeps them apart.
+    EACH OF THE THREE PAYOFF STATES GETS ITS OWN ANSWER ON THE PROFIT SIDE, and collapsing any
+    two of them loses a rule:
 
-    THE PROFIT/COLUMN DISTINCTION MATTERS ELSEWHERE. ``inapplicable_features`` asks whether the
-    WHOLE COLUMN came back empty, which is what tells a genuinely unbounded SHAPE (every
-    candidate None, the feature goes inert, ranking untouched) apart from one bad quote among
-    good ones (that candidate fails closed and scores worst). Both look identical at this level
-    and only the column can distinguish them.
+      * MEASURED     -> the amount.
+      * UNBOUNDED    -> ``_OFF_SCALE``. Not missing. Read that class's docstring before changing
+                        this line; it records what collapsing it into ``None`` cost.
+      * UNMEASURABLE -> ``None``. Genuinely absent, fails closed, scores ``_WORST``.
+
+    The risk side has no ``_OFF_SCALE`` because ``_risk_denominator`` already substitutes a
+    number for an unbounded loss, which is a stand-in the profit side has no honest equivalent
+    of: there is no finite figure that means "the upside is open-ended".
     """
     if ctx.structure_fn is None:
         return None, None
+    # NOTE: the closure is called WITHOUT a try/except, on purpose. Declining a candidate is
+    # None or an empty list; an exception is a defect in the builder and propagates. See
+    # ``PolicyContext.structure_fn``.
     legs = ctx.structure_fn(c)
     if not legs:
         # The builder declined this candidate — it could not complete the shape around it. A
         # missing VALUE, not an error: the remaining candidates still rank against each other.
         return None, None
     profit = max_profit(legs)
-    return (profit.amount if profit.state == MEASURED else None,
-            _risk_denominator(legs, max_loss(legs)))
+    if profit.state == MEASURED:
+        profit_value: _PayoffValue = profit.amount
+    elif profit.state == UNBOUNDED:
+        profit_value = _OFF_SCALE
+    else:
+        profit_value = None
+    return profit_value, _risk_denominator(legs, max_loss(legs))
 
 
-def _reward_to_risk(profit: Optional[float], risk: Optional[float]) -> Optional[float]:
-    """``max_profit / risk`` for one candidate, or None when the ratio has no meaning.
+def _reward_to_risk(profit: _PayoffValue, risk: Optional[float]) -> _PayoffValue:
+    """``max_profit / risk`` for one candidate.
 
     TAKES THE PAIR RATHER THAN THE CONTRACT so that both features can be served from a single
     payoff pass — see ``_payoff_columns`` for why that matters.
 
-    NONE UNLESS BOTH SIDES YIELDED A NUMBER. An unmeasurable PROFIT kills the ratio outright: a
-    long call's numerator is not a large number, it is not a number, and substituting some big
-    float would rank it as the most attractive thing on the chain precisely BECAUSE its upside
-    cannot be measured — the "unknown beats known" inversion this module exists to refuse. The
-    denominator is different, and only because ``_risk_denominator`` has already decided what an
-    unbounded loss is worth; nothing is invented here.
+    THE NUMERATOR'S STATE CARRIES THROUGH. An off-scale profit over a finite risk is an
+    off-scale ratio, so it stays ``_OFF_SCALE`` and takes the whole column inert with it rather
+    than being flattened into either a missing value or a very large one. Substituting a big
+    float would rank a long call as the most attractive thing on the chain precisely BECAUSE its
+    upside cannot be measured — the "unknown beats known" inversion this module exists to
+    refuse; substituting ``None`` would demote it, which is the same refusal wearing the
+    costume of fail-closed.
+
+    THE MISSING DENOMINATOR WINS OVER THE OFF-SCALE NUMERATOR, and the order of the guards below
+    says so. If the risk could not be established at all — an UNMEASURABLE max loss, i.e. a
+    broken quote — then the ratio is ABSENT rather than off-scale, and absent fails closed. A
+    broken quote must not be able to take a whole column inert; that would let one crossed
+    market disable a gene for every candidate beside it.
 
     The ``risk <= 0`` guard is belt and braces. ``max_loss`` refuses to report an amount at or
     below ``MIN_MEASURABLE_LOSS`` and a synthetic denominator is a positive strike times a
@@ -320,13 +380,17 @@ def _reward_to_risk(profit: Optional[float], risk: Optional[float]) -> Optional[
     every pick, and that failure mode has already been paid for once on the sizing path (see
     that constant's comment).
     """
-    if profit is None or risk is None or risk <= 0:
+    if risk is None or risk <= 0:
+        return None
+    if profit is _OFF_SCALE:
+        return _OFF_SCALE
+    if profit is None:
         return None
     return profit / risk
 
 
 def _payoff_columns(candidates: Sequence[OptionContract],
-                    ctx: PolicyContext) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+                    ctx: PolicyContext) -> Tuple[List[_PayoffValue], List[_PayoffValue]]:
     """The raw ``profit`` and ``rr`` columns, built in ONE pass over the candidates.
 
     ONE PASS IS THE POINT. Both features read the same two payoff evaluations, so computing them
@@ -339,6 +403,41 @@ def _payoff_columns(candidates: Sequence[OptionContract],
     pairs = [_profit_and_risk(c, ctx) for c in candidates]
     return ([profit for profit, _ in pairs],
             [_reward_to_risk(profit, risk) for profit, risk in pairs])
+
+
+def _column_cannot_rank(column: Sequence[_PayoffValue]) -> bool:
+    """Is this payoff column unable to rank the candidate set AT ALL?
+
+    TWO WAYS TO GET THERE, and they are not the same shape of problem:
+
+      * NOTHING IS PRESENT — every candidate is ``None``. An untaught builder (no
+        ``structure_fn``), or a chain where nothing could be priced.
+      * SOMETHING IS OFF THE SCALE — ANY candidate is ``_OFF_SCALE``. You cannot min-max
+        infinity against 300 on a normalised scale, and there is no honest place to put the
+        unbounded one: worst DEMOTES it (and demoting long calls is the one thing this design
+        forbids), best OVER-promotes it so the weight would always pick long premium in a mixed
+        set. Neither is a measurement, so the column declines to rank.
+
+    ONE ``_OFF_SCALE`` IS ENOUGH, WHERE ONE ``None`` IS NOT. That asymmetry is the entire point.
+    A single absent value is a defect in THAT candidate and it should lose to peers that can
+    report; a single off-scale value is a shape whose peers simply cannot be compared with it.
+    """
+    return any(v is _OFF_SCALE for v in column) or all(v is None for v in column)
+
+
+def _maximise_payoff(column: Sequence[_PayoffValue]) -> List[float]:
+    """``_maximise`` for a payoff column, plus the inert rule from ``_column_cannot_rank``.
+
+    Returning ``_WORST`` for EVERY candidate is what "inert" means mechanically: the weight
+    multiplies a constant, every score shifts by the same amount, and the ranking is untouched.
+    It is deliberately the same value ``_maximise`` already produces for an all-``None`` column,
+    so the two inert paths cannot drift apart.
+    """
+    if _column_cannot_rank(column):
+        return [_WORST] * len(column)
+    # Past the guard nothing is ``_OFF_SCALE``, so what remains is the ordinary
+    # ``Optional[float]`` column ``_maximise`` has always taken.
+    return _maximise(column)
 
 
 def _normalise(values: Sequence[Optional[float]]) -> List[Optional[float]]:
@@ -393,15 +492,13 @@ def feature_matrix(candidates: Sequence[OptionContract], ctx: PolicyContext,
     computed at all (see ``score_all`` for why `0.0 * nan` made that distinction matter).
     ``None`` means all of them, which is what the tests and any diagnostic caller want.
 
-    A WHOLLY UNRANKABLE COLUMN COMES OUT UNIFORM, NOT WORST-FOR-SOMEONE. When no candidate has a
-    value — an untaught builder, or a shape whose profit is unbounded at every strike —
-    ``_normalise`` returns all-``None`` and ``_maximise`` maps them all to ``_WORST``, i.e. every
-    candidate scores the same and the weight cannot move the ranking at all. That is the
-    intended INERT behaviour rather than an accident of the fail-closed rule, and it is the
-    difference between "this feature has nothing to say here" and "this structure is bad": an
-    UNBOUNDED max profit is the defining property of a long call, and demoting it for that would
-    answer "does long premium pay?" by construction instead of by measurement. Ask
-    ``inapplicable_features`` which columns are in that state.
+    AN UNRANKABLE COLUMN COMES OUT UNIFORM, NOT WORST-FOR-SOMEONE. Every candidate scores the
+    same and the weight cannot move the ranking at all. That is the intended INERT behaviour
+    rather than an accident of the fail-closed rule, and it is the difference between "this
+    feature has nothing to say here" and "this structure is bad": an UNBOUNDED max profit is the
+    defining property of a long call, and demoting it for that would answer "does long premium
+    pay?" by construction instead of by measurement. ``_column_cannot_rank`` holds the two ways
+    a payoff column gets there; ``inapplicable_features`` reports which ones did.
     """
     wanted = FEATURE_NAMES if only is None else tuple(only)
 
@@ -425,8 +522,8 @@ def feature_matrix(candidates: Sequence[OptionContract], ctx: PolicyContext,
         "rvol": lambda: _maximise([None if c.volume is None else float(c.volume)
                                    for c in candidates]),
         "spread": lambda: _minimise([c.spread_pct for c in candidates]),
-        "profit": lambda: _maximise(_columns()[0]),
-        "rr": lambda: _maximise(_columns()[1]),
+        "profit": lambda: _maximise_payoff(_columns()[0]),
+        "rr": lambda: _maximise_payoff(_columns()[1]),
     }
     return {name: builders[name]() for name in wanted}
 
@@ -436,9 +533,10 @@ def inapplicable_features(candidates: Sequence[OptionContract],
     """The features that cannot rank THIS candidate set at all, so their weights are inert.
 
     DISTINCT FROM A MISSING VALUE ON ONE CANDIDATE, which fails closed and scores ``_WORST``
-    exactly as it always has. A feature lands here only when the payoff SHAPE denies it a number
-    for EVERY candidate — a long call has unbounded profit whatever strike you choose — or when
-    no ``structure_fn`` was supplied at all.
+    exactly as it always has. A feature lands here when no ``structure_fn`` was supplied, when
+    no candidate could be priced at all, or when ANY candidate's value is off the scale — see
+    ``_column_cannot_rank`` for why one unbounded candidate is enough where one absent one is
+    not.
 
     AN UNBOUNDED LOSS NO LONGER LANDS HERE. ``rr`` prices it with a synthetic denominator (see
     ``_risk_denominator``), so a naked short call ranks LOW rather than refusing to rank; ``rr``
@@ -463,8 +561,7 @@ def inapplicable_features(candidates: Sequence[OptionContract],
     """
     profit_column, rr_column = _payoff_columns(candidates, ctx)
     columns = {"profit": profit_column, "rr": rr_column}
-    return tuple(name for name in PAYOFF_FEATURES
-                 if all(value is None for value in columns[name]))
+    return tuple(name for name in PAYOFF_FEATURES if _column_cannot_rank(columns[name]))
 
 
 def _validate_box(ctx: PolicyContext) -> None:
