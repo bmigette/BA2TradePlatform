@@ -730,11 +730,36 @@ def logs_tail(request: Request, file: str = "app.log", tail_lines: int = 500,
     return {"file": name, "total_lines": len(lines), "lines": lines[-tail_lines:]}
 
 
+# -- manifest cache ------------------------------------------------------------------------------
+# /cache/manifest rebuilt the full file list from disk on EVERY request: 312k files / 36GB takes
+# ~140s on remote150's Windows FS, and the master's 60s timeout made every pre-flight fail --
+# the worker was permanently excluded (2026-08-30). Trials only READ CACHE_FOLDER, so the only
+# mutations are /cache/push and /cache/prune below: invalidate there and the cache stays exact.
+_MANIFEST_LOCK = threading.Lock()
+_MANIFEST_CACHE: dict = {}  # {with_hash: manifest dict}
+
+
+def _cached_manifest(with_hash: bool = False) -> dict:
+    with _MANIFEST_LOCK:
+        hit = _MANIFEST_CACHE.get(with_hash)
+    if hit is not None:
+        return hit
+    m = cache_sync.build_manifest(with_hash=with_hash)
+    with _MANIFEST_LOCK:
+        _MANIFEST_CACHE[with_hash] = m
+    return m
+
+
+def _invalidate_manifest_cache() -> None:
+    with _MANIFEST_LOCK:
+        _MANIFEST_CACHE.clear()
+
+
 @worker_app.get("/cache/manifest")
 def cache_manifest(request: Request, with_hash: bool = False,
                    authorization: str = Header(default=None)):
     _verify(authorization, request)
-    return cache_sync.build_manifest(with_hash=with_hash)
+    return _cached_manifest(with_hash=with_hash)
 
 
 @worker_app.post("/cache/push")
@@ -752,6 +777,7 @@ async def cache_push(request: Request, authorization: str = Header(default=None)
         tmp.close()
         with open(tmp.name, "rb") as fh:
             result = cache_sync.extract_tar(fh)
+        _invalidate_manifest_cache()  # the tree changed -- the cached manifest is now wrong
         logger.info("cache push: %s", result)
         return result
     finally:
@@ -822,7 +848,9 @@ def cache_prune(req: PruneReq, request: Request, authorization: str = Header(def
     """Delete rel_paths the master's CURRENT manifest no longer lists (leftovers from a rebuild/
     compaction, e.g. old screener metric_store fragments) — the reverse of ``/cache/push``."""
     _verify(authorization, request)
-    return cache_sync.prune_paths(req.rel_paths)
+    out = cache_sync.prune_paths(req.rel_paths)
+    _invalidate_manifest_cache()  # the tree changed -- the cached manifest is now wrong
+    return out
 
 
 @worker_app.post("/secrets")
@@ -1078,6 +1106,11 @@ def run_worker_server(host: str, port: int, password: str, n_workers: int) -> No
 
     _install_orchestration_file_logging()
     _sweep_orphaned_spawn_children()
+    # Pre-warm the manifest cache in the background: the first /cache/manifest call after a
+    # restart would otherwise pay the full ~140s disk enumeration (remote150, 312k files) and
+    # blow the master's pre-flight timeout before the cache is ever warm.
+    threading.Thread(target=_cached_manifest, args=(False,),
+                     name="manifest-prewarm", daemon=True).start()
     _POOL_FACTORY = _make_pool
     _POOL = _make_pool()
     # Self-throttling: reclaim this worker's own pool memory when the box is starved. Daemon so
