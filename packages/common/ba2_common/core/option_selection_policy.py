@@ -21,11 +21,19 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import date
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+from ba2_common.core.option_payoff import (
+    MEASURED,
+    UNBOUNDED,
+    MaxLossResult,
+    PayoffLeg,
+    max_loss,
+    max_profit,
+)
 from ba2_common.core.option_selector import OptionSelectionConfigError, target_strike
 from ba2_common.core.option_types import OptionContract
-from ba2_common.core.types import OptionRight
+from ba2_common.core.types import OptionRight, OrderDirection
 
 #: The score a candidate gets on a feature it cannot answer. Features are MAXIMISED, so 0.0 is
 #: the worst possible value: unknown never beats known. Same direction as
@@ -35,21 +43,34 @@ _WORST = 0.0
 #: Calendar days per year, matching ``option_economics.DAYS_PER_YEAR``.
 _DAYS_PER_YEAR = 365.0
 
-FEATURE_NAMES = ("box_center", "premium", "iv", "rvol", "spread")
+FEATURE_NAMES = ("box_center", "premium", "iv", "rvol", "spread", "profit", "rr")
+
+#: The features whose value is a property of the WHOLE STRUCTURE rather than of one contract, so
+#: they exist only when ``PolicyContext.structure_fn`` can complete a candidate into its legs.
+#: They are the only features that can be INAPPLICABLE -- see ``inapplicable_features``.
+PAYOFF_FEATURES = ("profit", "rr")
 
 
 @dataclass(frozen=True)
 class SelectionPolicy:
     """The weights that decide which contract in the box wins. Each non-pinned weight is a gene.
 
-    ``w_box_center`` IS PINNED AT 1.0 AND IS NOT A GENE. Scaling all five weights by the same
-    factor changes no ranking, so leaving it free would hand the GA a degenerate direction to
-    wander in — budget spent exploring a difference that is not one.
+    ``w_box_center`` IS PINNED AT 1.0 AND IS NOT A GENE. Scaling EVERY weight by the same factor
+    changes no ranking, so leaving it free would hand the GA a degenerate direction to wander in
+    — budget spent exploring a difference that is not one.
 
     ``w_iv`` IS THE ONE SIGNED WEIGHT. Premium richness, relative volume and quote tightness have
     an unambiguous good direction. Implied volatility does not: premium SELLERS want rich vol and
     BUYERS want cheap vol, and which is right for a given strategy is exactly the sort of
     question the search should settle rather than inherit.
+
+    ``w_profit`` AND ``w_rr`` CAN BE INERT RATHER THAN ZERO, which no other weight can be. They
+    read the payoff of the whole structure, so a builder that has not been taught
+    ``PolicyContext.structure_fn`` — or a shape with unbounded PROFIT, which is every long call
+    — leaves them nothing to rank. ``inapplicable_features`` reports exactly when that is
+    happening, so the condition is visible instead of being a gene the GA can never move. An
+    unbounded LOSS is not one of those cases: ``rr`` prices it synthetically and scores it low,
+    because "low" is the honest answer for a naked short and "unknown" is not.
     """
 
     w_box_center: float = 1.0
@@ -57,12 +78,20 @@ class SelectionPolicy:
     w_iv: float = 0.0
     w_rvol: float = 0.0
     w_spread: float = 0.0
+    w_profit: float = 0.0
+    w_rr: float = 0.0
 
     @property
     def is_default(self) -> bool:
-        """True when this policy reproduces the pre-policy selector exactly."""
+        """True when this policy reproduces the pre-policy selector exactly.
+
+        EVERY WEIGHT MUST BE LISTED HERE. This property is what the no-op guarantee is asserted
+        through, so a weight it forgets to look at is a weight that can change a pick while the
+        policy still reports itself as changing nothing.
+        """
         return (self.w_box_center == 1.0 and self.w_premium == 0.0 and self.w_iv == 0.0
-                and self.w_rvol == 0.0 and self.w_spread == 0.0)
+                and self.w_rvol == 0.0 and self.w_spread == 0.0
+                and self.w_profit == 0.0 and self.w_rr == 0.0)
 
 
 @dataclass(frozen=True)
@@ -91,6 +120,24 @@ class PolicyContext:
     spot: Optional[float] = None
     target_price: Optional[float] = None    # for consensus_target
     option_type: Optional[OptionRight] = None
+    #: Turns a candidate contract into the FULL leg list of the structure it would become.
+    #: Supplied by the builder, which is the only thing that knows its own shape -- the policy
+    #: must not learn structure shapes and the builder must not learn scoring.
+    #:
+    #: THE SEAM EXISTS BECAUSE max_profit/max_loss ARE PROPERTIES OF A STRUCTURE, NOT OF A
+    #: CONTRACT. For a single-leg shape (long call, cash-secured put) the candidate IS the
+    #: structure, but for a vertical the policy picks one leg and the builder derives the wing
+    #: afterwards with ``select_wing`` -- so at the moment ``pick`` runs there is nothing to
+    #: measure unless the builder hands over a way to complete the shape.
+    #:
+    #: None means the profit/rr features are INAPPLICABLE for this pick, not that they score
+    #: zero. See ``inapplicable_features``. That is what lets these features ship before all 17
+    #: builders supply a closure: an untaught builder loses the feature VISIBLY.
+    #:
+    #: The closure may also DECLINE a particular candidate by returning None or an empty list
+    #: (no wing left on the chain, say). That is one missing value, scored like any other
+    #: missing value, and not an error.
+    structure_fn: Optional[Callable[[OptionContract], Optional[Sequence[PayoffLeg]]]] = None
 
 
 def _mark(c: OptionContract) -> Optional[float]:
@@ -155,6 +202,145 @@ def _premium_richness(c: OptionContract, ctx: PolicyContext) -> Optional[float]:
     return (mark / c.strike) * (_DAYS_PER_YEAR / dte)
 
 
+def _unbounded_risk_leg(legs: Sequence[PayoffLeg]) -> Optional[PayoffLeg]:
+    """The leg that CARRIES a structure's unbounded loss, or None when no single one does.
+
+    ``max_loss`` returns UNBOUNDED for exactly one reason: ``upside_slope`` is negative, i.e. the
+    structure is net short calls or short stock and the payoff falls without limit as the
+    underlying rises. So the leg to attribute the risk to is the short call/stock leg — for a
+    naked short call, its own strike.
+
+    DELIBERATELY NOT A GENERAL ATTRIBUTION ENGINE. Exactly one short upside leg with a usable
+    strike, or nothing. Two short calls at different strikes have no single assignment cost, and
+    a short STOCK leg has no strike at all; in both cases an invented denominator is worse than
+    an absent feature, because a made-up number competes on the same scale as measured ones and
+    nothing downstream can tell them apart afterwards.
+    """
+    exposed = [leg for leg in legs
+               if leg.side == OrderDirection.SELL and leg.kind in ("call", "stock")]
+    if len(exposed) != 1:
+        return None
+    leg = exposed[0]
+    if leg.kind != "call" or not leg.strike or leg.strike <= 0:
+        return None
+    return leg
+
+
+def _risk_denominator(legs: Sequence[PayoffLeg], loss: MaxLossResult) -> Optional[float]:
+    """The dollars of risk that ``rr`` divides by. NOT always the max loss — read on.
+
+    THREE ANSWERS, ONE PER STATE:
+
+      * MEASURED — the measured amount, and nothing clever.
+      * UNBOUNDED — a SYNTHETIC denominator: the assignment cost of the leg carrying the
+        unbounded risk, ``strike * multiplier * ratio``. A naked short's true reward-to-risk is
+        ``profit / infinity -> 0``, so LOW is the honest answer rather than UNKNOWN, and
+        refusing to rank these would hide the exact comparison the grid exists to make — how
+        undefined-risk premium selling scores against defined-risk premium selling. This reuses
+        the substitution the design already makes when undefined risk is permitted rather than
+        inventing a second convention for the same problem.
+      * UNMEASURABLE — None. A broken quote is NEVER priced by rule. The short call in an
+        arbitrage vertical has a perfectly usable strike, so the synthetic figure is right there
+        for the taking; taking it would launder a crossed or stale quote into a number that then
+        competes on the same scale as real ones.
+
+    THE DENOMINATOR IS ``strike``-BASED AND NOT ``spot``-BASED, AND THAT IS LOAD-BEARING. The
+    budgeting rule this borrows from is worded in terms of spot, but ``spot`` does not vary
+    between candidates within a single pick — so a spot-based denominator would make ``rr`` a
+    pure rescale of ``profit``, min-max normalisation would emit two IDENTICAL columns, and
+    ``w_rr`` would be perfectly collinear with ``w_profit``: two genes searching one dimension,
+    which is the dead-gene failure this module keeps legislating against. ``strike`` varies per
+    candidate, so ``rr`` stays genuinely distinct AND still means something real — credit per
+    dollar of assignment cost.
+
+    ``multiplier * ratio`` rather than a hardcoded ``* 100``: both default to the 100-share
+    contract, so every structure the platform builds today is unaffected, but a 1x2 ratio
+    spread's assignment cost really is doubled and hardcoding 100 would understate the risk of
+    precisely the shape whose risk is worst.
+    """
+    if loss.state == MEASURED:
+        return loss.amount
+    if loss.state != UNBOUNDED:
+        return None
+    leg = _unbounded_risk_leg(legs)
+    if leg is None:
+        return None
+    return float(leg.strike) * float(leg.multiplier) * float(leg.ratio)
+
+
+def _profit_and_risk(c: OptionContract,
+                     ctx: PolicyContext) -> Tuple[Optional[float], Optional[float]]:
+    """``(max_profit, risk)`` in dollars for the structure this candidate would become.
+
+    THE SECOND ELEMENT IS NOT THE MAX LOSS and must never be used as a sizing budget — that is
+    why this is not called ``_payoff_pair``. It is the ``rr`` DENOMINATOR, which for an unbounded
+    structure is a synthetic assignment cost standing in for a loss that has no number. Sizing
+    against it would treat a naked short call as risking its strike, which is the understatement
+    ``option_payoff`` exists to refuse. Callers needing the real thing call ``max_loss``.
+
+    Either element is None when there is no number to rank on. On the profit side UNBOUNDED and
+    UNMEASURABLE collapse together HERE, because neither yields one; on the risk side they do
+    not, and ``_risk_denominator`` keeps them apart.
+
+    THE PROFIT/COLUMN DISTINCTION MATTERS ELSEWHERE. ``inapplicable_features`` asks whether the
+    WHOLE COLUMN came back empty, which is what tells a genuinely unbounded SHAPE (every
+    candidate None, the feature goes inert, ranking untouched) apart from one bad quote among
+    good ones (that candidate fails closed and scores worst). Both look identical at this level
+    and only the column can distinguish them.
+    """
+    if ctx.structure_fn is None:
+        return None, None
+    legs = ctx.structure_fn(c)
+    if not legs:
+        # The builder declined this candidate — it could not complete the shape around it. A
+        # missing VALUE, not an error: the remaining candidates still rank against each other.
+        return None, None
+    profit = max_profit(legs)
+    return (profit.amount if profit.state == MEASURED else None,
+            _risk_denominator(legs, max_loss(legs)))
+
+
+def _reward_to_risk(profit: Optional[float], risk: Optional[float]) -> Optional[float]:
+    """``max_profit / risk`` for one candidate, or None when the ratio has no meaning.
+
+    TAKES THE PAIR RATHER THAN THE CONTRACT so that both features can be served from a single
+    payoff pass — see ``_payoff_columns`` for why that matters.
+
+    NONE UNLESS BOTH SIDES YIELDED A NUMBER. An unmeasurable PROFIT kills the ratio outright: a
+    long call's numerator is not a large number, it is not a number, and substituting some big
+    float would rank it as the most attractive thing on the chain precisely BECAUSE its upside
+    cannot be measured — the "unknown beats known" inversion this module exists to refuse. The
+    denominator is different, and only because ``_risk_denominator`` has already decided what an
+    unbounded loss is worth; nothing is invented here.
+
+    The ``risk <= 0`` guard is belt and braces. ``max_loss`` refuses to report an amount at or
+    below ``MIN_MEASURABLE_LOSS`` and a synthetic denominator is a positive strike times a
+    positive multiplier, so this cannot fire today; it is here because dividing by a sub-cent
+    denominator is how a floating-point artefact turns into an astronomical score that wins
+    every pick, and that failure mode has already been paid for once on the sizing path (see
+    that constant's comment).
+    """
+    if profit is None or risk is None or risk <= 0:
+        return None
+    return profit / risk
+
+
+def _payoff_columns(candidates: Sequence[OptionContract],
+                    ctx: PolicyContext) -> Tuple[List[Optional[float]], List[Optional[float]]]:
+    """The raw ``profit`` and ``rr`` columns, built in ONE pass over the candidates.
+
+    ONE PASS IS THE POINT. Both features read the same two payoff evaluations, so computing them
+    feature-by-feature would run ``structure_fn`` plus ``max_profit`` plus ``max_loss`` TWICE per
+    candidate whenever both genes are live — on a path that runs per structure, per bar, per
+    symbol. A memo keyed on the contract is not available (``OptionContract`` is a mutable
+    dataclass and therefore unhashable, so it cannot be a dict key by value); computing both
+    columns together sidesteps the question entirely.
+    """
+    pairs = [_profit_and_risk(c, ctx) for c in candidates]
+    return ([profit for profit, _ in pairs],
+            [_reward_to_risk(profit, risk) for profit, risk in pairs])
+
+
 def _normalise(values: Sequence[Optional[float]]) -> List[Optional[float]]:
     """Min-max each value onto [0, 1]. ``None`` stays ``None`` for the caller to fail closed.
 
@@ -206,8 +392,32 @@ def feature_matrix(candidates: Sequence[OptionContract], ctx: PolicyContext,
     non-zero-weighted ones: a disabled gene must not merely contribute zero, it must not be
     computed at all (see ``score_all`` for why `0.0 * nan` made that distinction matter).
     ``None`` means all of them, which is what the tests and any diagnostic caller want.
+
+    A WHOLLY UNRANKABLE COLUMN COMES OUT UNIFORM, NOT WORST-FOR-SOMEONE. When no candidate has a
+    value — an untaught builder, or a shape whose profit is unbounded at every strike —
+    ``_normalise`` returns all-``None`` and ``_maximise`` maps them all to ``_WORST``, i.e. every
+    candidate scores the same and the weight cannot move the ranking at all. That is the
+    intended INERT behaviour rather than an accident of the fail-closed rule, and it is the
+    difference between "this feature has nothing to say here" and "this structure is bad": an
+    UNBOUNDED max profit is the defining property of a long call, and demoting it for that would
+    answer "does long premium pay?" by construction instead of by measurement. Ask
+    ``inapplicable_features`` which columns are in that state.
     """
     wanted = FEATURE_NAMES if only is None else tuple(only)
+
+    # LAZY, MEMOISED, AND SHARED BY THE TWO PAYOFF FEATURES. Lazy because a caller who wants
+    # neither -- which is every default-policy pick, since ``score_all`` passes only the
+    # non-zero-weighted features -- must not call ``structure_fn`` at all. Memoised because when
+    # both genes ARE live the two builders below would otherwise repeat the whole payoff pass.
+    # A one-element list is the cell; ``nonlocal`` would need a def, and this stays local to the
+    # call so nothing about ``PolicyContext`` has to become mutable or hashable.
+    memo: List[Optional[Tuple[List[Optional[float]], List[Optional[float]]]]] = [None]
+
+    def _columns() -> Tuple[List[Optional[float]], List[Optional[float]]]:
+        if memo[0] is None:
+            memo[0] = _payoff_columns(candidates, ctx)
+        return memo[0]
+
     builders = {
         "box_center": lambda: _minimise([distance_from_target(c, ctx) for c in candidates]),
         "premium": lambda: _maximise([_premium_richness(c, ctx) for c in candidates]),
@@ -215,8 +425,46 @@ def feature_matrix(candidates: Sequence[OptionContract], ctx: PolicyContext,
         "rvol": lambda: _maximise([None if c.volume is None else float(c.volume)
                                    for c in candidates]),
         "spread": lambda: _minimise([c.spread_pct for c in candidates]),
+        "profit": lambda: _maximise(_columns()[0]),
+        "rr": lambda: _maximise(_columns()[1]),
     }
     return {name: builders[name]() for name in wanted}
+
+
+def inapplicable_features(candidates: Sequence[OptionContract],
+                          ctx: PolicyContext) -> Tuple[str, ...]:
+    """The features that cannot rank THIS candidate set at all, so their weights are inert.
+
+    DISTINCT FROM A MISSING VALUE ON ONE CANDIDATE, which fails closed and scores ``_WORST``
+    exactly as it always has. A feature lands here only when the payoff SHAPE denies it a number
+    for EVERY candidate — a long call has unbounded profit whatever strike you choose — or when
+    no ``structure_fn`` was supplied at all.
+
+    AN UNBOUNDED LOSS NO LONGER LANDS HERE. ``rr`` prices it with a synthetic denominator (see
+    ``_risk_denominator``), so a naked short call ranks LOW rather than refusing to rank; ``rr``
+    only goes inert on the risk side when no single strike carries the unbounded risk, e.g. a
+    short stock leg. That asymmetry is deliberate: one unpriceable quote
+    among good ones is a defect in that candidate and it should lose to its peers, whereas a
+    column with nothing in it is a defect in the QUESTION and must not sort anybody.
+
+    REPORTED RATHER THAN RAISED, and rather than silently contributing zero. Raising would crash
+    a perfectly valid long-call arm over a weight it should simply ignore; silence would leave
+    the GA burning budget on a gene that can never move a pick, with nothing in the run saying
+    so. Mirrors ``option_book.RailVerdict.evaluated``, which records that
+    ``undefined_risk_max_pct`` is genuinely dead for a debit arm instead of pretending it passed.
+
+    ONLY ``PAYOFF_FEATURES`` CAN APPEAR HERE. The other five read a field off the contract in
+    front of them, so they are always applicable in principle — a chain where every candidate
+    lacks an IV is a data outage, not a shape that has no IV, and conflating the two would let a
+    silent feed failure quietly disable a gene mid-run.
+
+    An empty candidate list reports both features inapplicable, which is vacuously true and
+    costs nothing: ``pick`` has already returned None before any weight is consulted.
+    """
+    profit_column, rr_column = _payoff_columns(candidates, ctx)
+    columns = {"profit": profit_column, "rr": rr_column}
+    return tuple(name for name in PAYOFF_FEATURES
+                 if all(value is None for value in columns[name]))
 
 
 def _validate_box(ctx: PolicyContext) -> None:
@@ -318,22 +566,34 @@ def score_all(candidates: Sequence[OptionContract], ctx: PolicyContext,
               policy: SelectionPolicy) -> List[float]:
     """The weighted score of each candidate. Higher wins."""
     weights = {"box_center": policy.w_box_center, "premium": policy.w_premium,
-               "iv": policy.w_iv, "rvol": policy.w_rvol, "spread": policy.w_spread}
+               "iv": policy.w_iv, "rvol": policy.w_rvol, "spread": policy.w_spread,
+               "profit": policy.w_profit, "rr": policy.w_rr}
     # SKIP ZERO WEIGHTS ENTIRELY -- do not compute the feature and do not multiply by it.
     #
     # `0.0 * x` looks like it removes a disabled gene from the decision. It does not: `0.0 * nan`
-    # is `nan`, so ONE non-finite value in ANY of the five source fields turned every score into
-    # NaN, `min()` compared NaN tuples (every comparison False) and returned candidate #0 BY LIST
+    # is `nan`, so ONE non-finite value in ANY of the source fields turned every score into NaN,
+    # `min()` compared NaN tuples (every comparison False) and returned candidate #0 BY LIST
     # ORDER. Four of those fields -- iv, volume, bid, ask -- are ones the selector this must
     # imitate never reads at all, so the no-op guarantee was silently conditional on data hygiene
     # in columns nobody was checking.
     #
     # Not computing the feature is also what makes the default policy affordable. Measured on a
-    # 200-contract chain, 2000 iterations: the legacy selector is 27.1 us/call, this with all
-    # five genes active is 388.8 us, and this at default weights is 99.5 us -- so the skip is
-    # worth 3.9x. The residual 3.7x over legacy is the cost of the mechanism itself (building
-    # and normalising the box_center column) and is the number to attack if the GA hot path
-    # ever needs it; it is per structure, per bar, per symbol.
+    # 200-contract chain, 2000 iterations, with the five ORIGINAL genes active: the legacy
+    # selector is 27.1 us/call, all five active is 388.8 us, and default weights is 99.5 us -- so
+    # the skip is worth 3.9x. The residual 3.7x over legacy is the cost of the mechanism itself
+    # (building and normalising the box_center column) and is the number to attack if the GA hot
+    # path ever needs it; it is per structure, per bar, per symbol.
+    #
+    # THE SKIP MATTERS MORE NOW THAN IT DID WHEN THAT WAS MEASURED. `profit` and `rr` are not
+    # field reads: each costs a `structure_fn` call plus a full `max_profit` and `max_loss` scan
+    # per candidate, so they are the most expensive features here by a wide margin, and neither
+    # is computed at default weights. `feature_matrix` shares one payoff pass between them so
+    # that switching BOTH genes on costs one pass rather than two.
+    #
+    # INDEXING `weights[name]` RATHER THAN `.get(name)` IS DELIBERATE. A feature added to
+    # FEATURE_NAMES without a matching weight is a KeyError on the next pick, which is loud and
+    # immediate; with a default it would be a feature that exists, normalises, and is then
+    # silently never scored -- the dead gene this module keeps legislating against.
     active = [name for name in FEATURE_NAMES if weights[name]]
     m = feature_matrix(candidates, ctx, only=active)
     return [sum(weights[name] * m[name][i] for name in active)
