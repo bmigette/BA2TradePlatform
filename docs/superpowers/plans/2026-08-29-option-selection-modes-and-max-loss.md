@@ -754,6 +754,27 @@ def test_every_emitted_weight_can_actually_move_the_pick():
 > The variance is correct behaviour — the alternative is demoting long calls — but it means the
 > two genes' effective search pressure is a function of chain composition, which is worth
 > knowing before reading GA results that use them.
+>
+> **Two further consequences for whoever wires `pick()` into `TradeActions`:**
+>
+> 3. **Compute `payoff_columns` ONCE and pass it to both** `feature_matrix` and
+>    `inapplicable_features` via their `payoff=` parameter. They are each a full payoff pass —
+>    measured 5039 µs and 5018 µs respectively on a 200-row chain — so a caller doing both
+>    without sharing pays twice. Sharing also closes an INPUT-drift hole that the shared
+>    predicate does not: the two entry points otherwise invoke `structure_fn` separately, so a
+>    stateful or non-deterministic closure can make the applicability report disagree with the
+>    behaviour it reports on.
+> 4. **Wire the runtime applicability report before the GA turns these weights up.** A builder
+>    that falls back to a bare long call when no wing is available silently takes the whole
+>    column inert for that pick, and today nothing records it. Without the report, an inert gene
+>    and a live-but-unhelpful one look identical in the results.
+>
+> **Cost note for grid planning:** with both weights non-zero the two features measure ~5039 µs
+> per pick on a 200-row chain, against 388.8 µs for all five original genes combined and 27.1 µs
+> for the legacy selector — roughly 13× all five together. `score_all` skips zero-weighted
+> features entirely, so the default policy and any trial leaving these at zero pay nothing; but
+> trials carrying them will be materially slower than trials that do not, which matters when
+> comparing wall-clock across a stage-2 population.
 
 Before wiring, **re-read `reference-trial-config-whitelist-drops-new-knobs`**:
 `_build_daily_trial_config` rebuilds the config key by key, so a knob missing there is inert while
