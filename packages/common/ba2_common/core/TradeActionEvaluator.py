@@ -47,6 +47,46 @@ _OPTION_ENTRY_PARAM_KEYS = (
 )
 
 
+#: Trigger event types that make a CLOSE_OPTION a FORCED (risk) exit rather than a
+#: discretionary one — see ``forced_option_exit``.
+_FORCED_EXIT_EVENT_TYPES = frozenset({
+    ExpertEventType.N_DAYS_TO_EXPIRY.value,
+})
+#: P&L trigger event types whose LOSS side (operator < / <=) is a stop-loss.
+_PL_EVENT_TYPES = frozenset({
+    ExpertEventType.N_PROFIT_LOSS_PERCENT.value,
+    ExpertEventType.N_PROFIT_LOSS_AMOUNT.value,
+})
+
+
+def forced_option_exit(event_action) -> bool:
+    """True when ``event_action``'s CLOSE_OPTION is a FORCED (risk) exit.
+
+    Review 2026-08-30 F7: a forced close crosses the whole modelled spread in the
+    backtest (a risk exit pays up) while a discretionary one concedes only the entry's
+    ``entry_cross`` fraction. The classification keys off the rule's TRIGGER SEMANTICS
+    — never its name, which is free text:
+
+      * a ``days_to_expiry`` trigger is the DTE/roll exit — forced;
+      * a ``profit_loss_percent`` / ``profit_loss_amount`` trigger with a ``<``/``<=``
+        operator is a loss-side stop — forced;
+      * everything else (TP ``>`` gates, time exits, sentiment/rating flags) is
+        discretionary.
+
+    The flag is inert in live by construction: only an account that models a spread
+    (``option_modelled_half_spread``) lets ``CloseOptionAction`` act on it.
+    """
+    for trigger in (getattr(event_action, "triggers", None) or {}).values():
+        if not isinstance(trigger, dict):
+            continue
+        event_type = trigger.get("event_type")
+        if event_type in _FORCED_EXIT_EVENT_TYPES:
+            return True
+        if event_type in _PL_EVENT_TYPES and trigger.get("operator") in ("<", "<="):
+            return True
+    return False
+
+
 def _sanitize_for_json(obj):
     """Recursively convert non-JSON-serialisable values (enums, datetimes) to primitives."""
     if isinstance(obj, dict):
@@ -913,7 +953,8 @@ class TradeActionEvaluator:
                 # Create TradeAction instance
                 trade_action = self._create_trade_action(
                     action_type, action_config, instrument_name,
-                    order_recommendation, existing_order, expert_recommendation
+                    order_recommendation, existing_order, expert_recommendation,
+                    event_action=event_action,
                 )
                 
                 if trade_action:
@@ -963,7 +1004,8 @@ class TradeActionEvaluator:
     def _create_trade_action(self, action_type: ExpertActionType, action_config: Dict[str, Any],
                            instrument_name: str, order_recommendation: OrderRecommendation,
                            existing_order: Optional[TradingOrder],
-                           expert_recommendation: ExpertRecommendation) -> Optional[TradeAction]:
+                           expert_recommendation: ExpertRecommendation,
+                           event_action: Any = None) -> Optional[TradeAction]:
         """
         Create a TradeAction instance from action configuration.
         
@@ -1009,6 +1051,12 @@ class TradeActionEvaluator:
                 if target_val is None:
                     logger.warning(f"DECREASE_INSTRUMENT_SHARE action has no 'value' configured — target_percent will be None and the action will fail at execution")
                 kwargs['target_percent'] = target_val
+            elif action_type == ExpertActionType.CLOSE_OPTION:
+                # FORCED vs DISCRETIONARY exit (review 2026-08-30 F7): classified from
+                # the firing rule's triggers so the backtest's close concession knows
+                # whether to cross the modelled spread fully (SL/DTE) or concede the
+                # entry's fraction. Inert in live (no modelled spread).
+                kwargs['forced_exit'] = forced_option_exit(event_action)
             elif action_type in _OPTION_ENTRY_ACTION_TYPES:
                 # Option ENTRY actions: pull strike/dte/sizing/liquidity/wing params from config.
                 # Only forward keys that are present so the action's own defaults apply otherwise.

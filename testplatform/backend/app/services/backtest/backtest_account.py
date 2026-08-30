@@ -1361,7 +1361,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # impossible above-upper print overstates it. Clamp into the same no-arb
             # bounds fills are guarded by; kept raw only when the bounds are
             # unresolvable (no spot: fail-open, like the guard). (Review 2026-08-30 F1.)
-            premium = float(bar["close"])
+            #
+            # A margin liquidation is a FORCED close: it crosses the modelled bid-ask
+            # spread fully (a buyback lifts the ask, ``close + half``) exactly like every
+            # other risk exit, THEN clamps into the no-arb bounds (review 2026-08-30 F7).
+            # With no spread model configured ``_option_cross`` is the identity.
+            premium = self._option_cross(float(bar["close"]), True, bar)
             if bounds is not None:
                 premium = min(max(premium, bounds[0]), bounds[1])
         else:

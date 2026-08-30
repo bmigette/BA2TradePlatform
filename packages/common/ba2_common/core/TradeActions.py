@@ -22,7 +22,8 @@ from ba2_common.core.option_economics import (
     ARC_FLOOR_REFUSAL, admits_credit_structure, annualized_return_on_collateral,
 )
 from ba2_common.core.option_entry_quote import (
-    ENTRY_CROSS_NEUTRAL, entry_limit_with_concession, quote_concession,
+    ENTRY_CROSS_FULL, ENTRY_CROSS_NEUTRAL, entry_limit_with_concession,
+    quote_concession,
 )
 from ba2_common.core.option_payoff import PayoffLeg
 from ba2_common.core.option_request import ResolvedStructure
@@ -2466,12 +2467,22 @@ class _OptionEntryAction(TradeAction):
             return self._result(False, f"Failed to submit {option_strategy} for {self.instrument_name}", data)
         order_id = getattr(order, "id", None)
         data["order_id"] = order_id
-        # Persist the short-premium reserve on the order so available BP reflects it.
-        if option_reserve is not None and order_id is not None:
+        # Persist the short-premium reserve on the order so available BP reflects it —
+        # and the entry-quote concession fraction, so a later DISCRETIONARY close can
+        # concede the SAME fraction this entry did (review 2026-08-30 F7; see
+        # CloseOptionAction._close_cross_fraction). Persisted whenever the gene is set
+        # (not only when it moved this particular quote); absent for the 0.0 default,
+        # so a default run's order row is byte-identical.
+        row_extra: Dict[str, Any] = {}
+        if option_reserve is not None:
+            row_extra["option_reserve"] = option_reserve
+        if self.entry_cross is not None and float(self.entry_cross) != ENTRY_CROSS_NEUTRAL:
+            row_extra["entry_cross"] = float(self.entry_cross)
+        if row_extra and order_id is not None:
             try:
                 stored = get_instance(TradingOrder, order_id)
                 if stored is not None:
-                    stored.data = {**(stored.data or {}), "option_reserve": option_reserve}
+                    stored.data = {**(stored.data or {}), **row_extra}
                     update_instance(stored)
             except Exception as e:
                 absorb_if_benign(e, InstanceNotFound)
@@ -3864,7 +3875,104 @@ def build_closing_legs(children, parent_quantity: int, quote_fn, held_qty=None) 
 
 
 class CloseOptionAction(TradeAction):
-    """Close an existing option position via account.close_option_position()."""
+    """Close an existing option position via account.close_option_position().
+
+    EXIT-QUOTE CONCESSION (review 2026-08-30 F7). In live, ``_close_limit_price`` quotes
+    the real crossing side (a long sells the bid, a short buys the ask) and nothing here
+    changes that. In the backtest the historical store synthesizes ``bid == ask == close``
+    (the MID), so the raw quote made every exit a FILTER: the fill engine crosses the
+    modelled spread first (``_option_cross``) and re-tests the limit, so a mid-quoted
+    close only filled after the mid drifted half a spread in the position's favor —
+    TP/SL/DTE exits slipped days and migrated to the spread-free expiry path. The fix
+    applies the SAME concession machinery entries use (``entry_limit_with_concession``),
+    keyed off the account's duck-typed ``option_modelled_half_spread`` seam, which only a
+    simulator that models a spread implements — so live is byte-identical by
+    construction:
+
+      * DISCRETIONARY closes (TP, time, sentiment, ...) concede the fraction the
+        position's ENTRY conceded (``data['entry_cross']`` on the entry/parent order —
+        the existing gene, no new one);
+      * FORCED closes (``forced_exit=True``: SL stop / DTE roll, classified from the
+        firing rule's triggers by ``TradeActionEvaluator.forced_option_exit``) cross the
+        modelled spread FULLY — a risk exit pays up.
+    """
+
+    def __init__(self, instrument_name: str, account: AccountInterface,
+                 order_recommendation: OrderRecommendation,
+                 existing_order: Optional[TradingOrder] = None,
+                 expert_recommendation: Optional[ExpertRecommendation] = None,
+                 forced_exit: bool = False, **kwargs):
+        super().__init__(instrument_name, account, order_recommendation,
+                         existing_order, expert_recommendation)
+        #: True when this close is a RISK exit (stop-loss / DTE roll) rather than a
+        #: discretionary one — a forced close crosses the modelled spread fully.
+        self.forced_exit = bool(forced_exit)
+
+    # -- exit-quote concession helpers (backtest-only by construction) -----------
+    def _modelled_half(self, contract_symbol: str) -> Optional[float]:
+        """The account's modelled half-spread for ``contract_symbol``, or None.
+
+        Duck-typed exactly like the entry concession's ``_modelled_half_spreads``: only
+        ``BacktestAccount`` publishes ``option_modelled_half_spread``, so on every live
+        account this answers None and the close quote is untouched."""
+        fn = getattr(self.account, "option_modelled_half_spread", None)
+        if not callable(fn):
+            return None
+        try:
+            half = fn(contract_symbol)
+        except Exception as e:  # noqa: BLE001 — a spread-model hiccup must not block a close
+            absorb_if_benign(e, InstanceNotFound)
+            logger.debug(f"option_modelled_half_spread failed for {contract_symbol}: {e}")
+            return None
+        return None if half is None else float(half)
+
+    def _close_cross_fraction(self, order: Optional[TradingOrder]) -> float:
+        """The fraction of the modelled spread THIS close gives up.
+
+        Forced -> the full cross. Discretionary -> the fraction the position's ENTRY
+        conceded, read from the entry (or its parent) order's persisted
+        ``data['entry_cross']`` — reusing the existing gene rather than adding one. An
+        entry that conceded nothing persisted nothing -> 0.0, today's mid quote."""
+        if self.forced_exit:
+            return ENTRY_CROSS_FULL
+        seen = 0
+        while order is not None and seen < 3:
+            data = getattr(order, "data", None) or {}
+            if data.get("entry_cross") is not None:
+                try:
+                    return float(data["entry_cross"])
+                except (TypeError, ValueError):
+                    return ENTRY_CROSS_NEUTRAL
+            parent_id = getattr(order, "parent_order_id", None)
+            order = get_instance(TradingOrder, parent_id) if parent_id else None
+            seen += 1
+        return ENTRY_CROSS_NEUTRAL
+
+    def _concede_close_limit(self, limit_price: Optional[float], legs: List[OptionLeg],
+                             fraction: float) -> Optional[float]:
+        """``limit_price`` after giving up ``fraction`` of each leg's modelled spread.
+
+        Reuses ``entry_limit_with_concession`` verbatim — the closing legs already carry
+        the CLOSING side, so "give up" points the right way for both shapes (a buy-back
+        quotes higher, a sell-to-close lower, a multi-leg net pays more debit / takes
+        less credit). Unchanged when the limit is None, the fraction is 0, or any leg's
+        spread is unmodellable (every live account)."""
+        if limit_price is None or float(fraction) == ENTRY_CROSS_NEUTRAL:
+            return limit_price
+        halves = []
+        for leg in legs:
+            half = self._modelled_half(leg.contract_symbol)
+            if half is None:
+                return limit_price
+            halves.append(half)
+        conceded = entry_limit_with_concession(float(limit_price), legs, halves, fraction)
+        if conceded != limit_price:
+            logger.debug(
+                f"close_option for {self.instrument_name}: "
+                f"{'forced' if self.forced_exit else 'discretionary'} exit concession "
+                f"({float(fraction):.2f} of modelled spread) moved the close limit "
+                f"{limit_price:+.4f} -> {conceded:+.4f}")
+        return conceded
 
     def execute(self) -> "TradeActionResult":
         try:
@@ -3962,20 +4070,36 @@ class CloseOptionAction(TradeAction):
 
     def _close_limit_price(self, position: OptionPosition, order: TradingOrder) -> Optional[float]:
         """Long(BUY) closes at the bid; short(SELL) closes at the ask. Use a fresh
-        quote when available, else fall back to the entry premium."""
+        quote when available, else fall back to the entry premium.
+
+        In the backtest the quote is a synthetic ``bid == ask == mid``, so the raw side
+        is NOT the touch — the close then concedes ``_close_cross_fraction`` of the
+        modelled spread (F7). Live quotes are real and the concession is inert (no
+        ``option_modelled_half_spread`` on any live account)."""
         quote = None
         try:
             quote = self.account.get_option_quote(position.contract_symbol)
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
             logger.debug(f"get_option_quote failed for {position.contract_symbol}: {e}")
+        close_side = (OrderDirection.SELL if position.side == OrderDirection.BUY
+                      else OrderDirection.BUY)
+        px = None
         if position.side == OrderDirection.BUY:
             if quote is not None and quote.bid is not None:
-                return quote.bid
+                px = quote.bid
         else:
             if quote is not None and quote.ask is not None:
-                return quote.ask
-        return order.open_price if order.open_price is not None else order.limit_price
+                px = quote.ask
+        if px is None:
+            return order.open_price if order.open_price is not None else order.limit_price
+        closing_leg = OptionLeg(
+            contract_symbol=position.contract_symbol, side=close_side,
+            position_intent="sell_to_close" if close_side == OrderDirection.SELL else "buy_to_close",
+            option_type=position.option_type, strike=position.strike,
+            expiry=position.expiry, underlying=position.underlying)
+        return self._concede_close_limit(
+            float(px), [closing_leg], self._close_cross_fraction(order))
 
     def _close_multi_leg(self, order: TradingOrder) -> "TradeActionResult":
         """Close a spread position by reversing its child leg orders as one
@@ -4043,6 +4167,12 @@ class CloseOptionAction(TradeAction):
         legs, net_limit = build_closing_legs(
             children, parent_quantity=quantity, quote_fn=self._safe_option_quote,
             held_qty=held_qty)
+        # F7: the synthetic net is a MID net — concede the exit fraction per leg (the
+        # +debit/-credit convention makes "give up" = net UP for every leg; see
+        # entry_limit_with_concession). No-op on live accounts and when net_limit is
+        # None (the entry-premium fallback below is not a quote to concede on).
+        net_limit = self._concede_close_limit(
+            net_limit, legs, self._close_cross_fraction(order))
         if not legs:
             return self.create_and_save_action_result(
                 action_type=ExpertActionType.CLOSE_OPTION.value, success=True,
