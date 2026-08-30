@@ -185,14 +185,19 @@ class PolicyContext:
     #: provable no-op -- ``eligible`` returns before the builder is asked anything.
     #:
     #: THIS IS ``min(instrument_left, structure_cap)``, NOT THE FULL BUDGET. ``book_left`` depends
-    #: on which structures this bar's greedy triage admits first, so it does not exist yet at
-    #: selection time; threading a number that does not exist would be a fiction. Triage still
-    #: sizes and refuses against the full budget afterwards, so this narrows the CHOICE without
-    #: becoming the enforcement.
+    #: on which structures a bar's greedy triage admits first, so it does not exist yet at
+    #: selection time; threading a number that does not exist would be a fiction.
     #:
-    #: WHAT IT BUYS. Sizing already refuses a structure it cannot afford -- but it refuses the one
-    #: contract the picker handed it and never goes back for a cheaper strike that would have
-    #: fitted. The ceiling puts the budget upstream of the choice.
+    #: NONE OF THOSE THREE QUANTITIES EXISTS IN THIS REPOSITORY YET -- ``book_left``,
+    #: ``instrument_left`` and ``structure_cap`` are design vocabulary with zero hits in the
+    #: code, and the triage that would compute them is unwritten. This field is therefore
+    #: PLUMBING AHEAD OF ITS CALLER, and the name records what the caller must eventually pass
+    #: rather than describing something that flows today. ``_resolve`` will supply it.
+    #:
+    #: WHAT IT WILL BUY. A max-loss budget refuses the ONE contract the picker handed it and
+    #: never goes back for a cheaper strike that would have fitted; the ceiling puts the budget
+    #: upstream of the choice so a cheaper strike can still be taken. Stated in the future tense
+    #: on purpose: see ``eligible`` for what does and does not enforce a budget today.
     max_loss_ceiling: Optional[float] = None
     #: Whether an UNBOUNDED-loss structure may be charged a synthetic figure and admitted at all.
     #: False (the default) means undefined risk is NOT permitted here, which is the design's
@@ -396,6 +401,12 @@ def _reward_to_risk(profit: _PayoffValue, risk: Optional[float]) -> _PayoffValue
     broken quote — then the ratio is ABSENT rather than off-scale, and absent fails closed. A
     broken quote must not be able to take a whole column inert; that would let one crossed
     market disable a gene for every candidate beside it.
+
+    THE CEILING FILTER TAKES THE OPPOSITE VIEW OF AN UNMEASURABLE LOSS, ON PURPOSE. Where this
+    function demotes such a candidate and keeps it in the set, ``_chargeable_max_loss`` charges it
+    infinity and removes it outright. Neither is the other's bug: a ranking can absorb an unknown
+    by scoring it worst, whereas a budget cannot spend one. Recorded in both places so that a
+    later "unify these two" refactor has to argue with the reason rather than discover it.
 
     THAT IS A TRADE, AND THIS IS WHAT IT COSTS. A long call bought for 0.00 — an ordinary 0-bid
     far strike, not a contrived input — is UNBOUNDED on profit and UNMEASURABLE on loss at the
@@ -702,6 +713,13 @@ def _chargeable_max_loss(c: OptionContract, ctx: PolicyContext) -> float:
                         a perfectly usable strike, so the synthetic figure is right there for the
                         taking; taking it would launder a crossed quote into a budget.
 
+    THIS DELIBERATELY DISAGREES WITH ``_reward_to_risk`` ON THAT LAST STATE, AND THE DISAGREEMENT
+    IS NOT AN OVERSIGHT TO UNIFY. Given an unmeasurable loss, ``rr`` DEMOTES the candidate and
+    KEEPS it -- because one crossed quote must not disable a gene for every candidate beside it,
+    and a ranking that loses one row still ranks. This REMOVES it, because a budget has no
+    equivalent of "scores worst": there is no charge that is both unknown and affordable. Same
+    input, opposite verdicts, because ranking can absorb an unknown and spending cannot.
+
     A BUILDER THAT DECLINES THE CANDIDATE ALSO GETS INFINITY. When ranking, a declined candidate
     is one missing value among peers and scores worst; a budget has no "worst" that is also
     affordable, and a structure the builder could not complete has no max loss to charge.
@@ -780,11 +798,30 @@ def eligible(candidates: Sequence[OptionContract],
     for ``consensus_target``. It is the same asymmetry ``_column_cannot_rank`` already draws: one
     absent value is a defect in THAT candidate, an empty column is a defect in the QUESTION.
 
-    THAT IS SAFE ONLY BECAUSE THIS FILTER IS NOT THE ENFORCEMENT, and the claim is worth stating
-    plainly. Sizing measures the REAL legs and still refuses at ``contracts = 0``, so an
-    unaffordable pick costs the bar's trade and never the budget. Admitting here can lose a trade
-    the ceiling would have saved; refusing here loses every trade that builder would ever make.
-    Only the first is recoverable by teaching the builder its closure.
+    THAT IS SAFE BECAUSE WITH NO CLOSURE THE FILTER IS INERT -- byte-identical to the pre-ceiling
+    pick, so nothing can regress. That argument needs no downstream layer, and it is the only one
+    available, because THE DOWNSTREAM LAYER DOES NOT EXIST. An earlier version of this note said
+    "sizing measures the real legs and still refuses at contracts = 0", in the present tense, and
+    it was false:
+
+      * there is no option-structure triage at all -- ``book_left``, ``instrument_left`` and
+        ``structure_cap`` have zero hits repo-wide and live only in the design;
+      * ``option_book.admit`` gates whole structures against absolute caps and has no quantity
+        field, so it cannot refuse a per-contract charge against a remaining budget;
+      * the ONLY place a budget becomes a contract count and refuses at zero is
+        ``TradeActions._size_by_cost``, and it divides by PREMIUM or RESERVE
+        (``option_request.SIZING_BASES``), never by max loss.
+
+    FOR A CREDIT SPREAD THOSE ARE NOT THE SAME NUMBER, and that is this feature's own motivating
+    case: a 5-wide vertical taken for a 2.90 credit has a premium OUTLAY of nothing and 210
+    dollars of max loss, so the refusal this filter's charge implies does not exist even in
+    principle today. WHEN A BUILDER IS TAUGHT ITS CLOSURE, THAT GAP MUST BE CLOSED WITH IT --
+    this is the paragraph to read at that moment, because teaching the closure is exactly when
+    the filter stops being inert.
+
+    Between the two, admitting can lose a trade the ceiling would have saved; refusing would lose
+    every trade that builder would ever make. Only the first is recoverable by teaching the
+    builder its closure.
     """
     _validate_box(ctx)
     out = list(candidates)

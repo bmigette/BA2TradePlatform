@@ -691,6 +691,45 @@ def test_the_ceiling_is_inclusive_at_its_own_boundary():
                               max_loss_ceiling=209.99)) == []
 
 
+def test_a_zero_ceiling_refuses_everything_rather_than_disabling_the_filter():
+    """0.0 IS THE EXHAUSTED-BUDGET VALUE, not "no budget set", and the two must not share a test.
+
+    The ceiling is ``min(instrument_left, structure_cap)``, so an instrument that has spent its
+    allowance arrives here as exactly 0.0. ``is None`` is therefore load-bearing against the
+    one-token simplification ``if not ctx.max_loss_ceiling``, which is result-identical for every
+    other input in this file and inverts the feature at precisely the moment it matters most: an
+    exhausted budget would admit the WHOLE chain. Nothing else here can catch it, because 0.0 is
+    the only falsy value the field can legitimately hold.
+    """
+    context = ctx(structure_fn=credit_vertical(5.0), max_loss_ceiling=0.0)
+    assert eligible(PAIR, context) == []
+    assert pick(PAIR, context, SelectionPolicy()) is None
+
+
+def test_the_builder_is_never_asked_about_a_candidate_the_box_rejected():
+    """ORDERING, NOT JUST RESULT -- the same class of pin as the ceiling-of-None test above, whose
+    technique this file applied to the ``None`` case and forgot to apply to position.
+
+    Running the ceiling BEFORE ``_in_box`` produces an identical list every time, so no assertion
+    on the result can tell the two apart. The box is the cheap filter (a field read) and the
+    ceiling is the expensive one (a structure build plus a full payoff scan), on a path that runs
+    per structure, per bar, per symbol -- and asking the builder about rows that are about to be
+    discarded also widens the surface on which a raising closure can take down a pick it was
+    never relevant to.
+    """
+    asked = []
+
+    def _counting(cand):
+        asked.append(cand.strike)
+        return credit_vertical(5.0)(cand)
+
+    far = c(300, bid=0.01, ask=0.03, delta=0.01)          # outside the delta box, cheap to build
+    context = ctx(structure_fn=_counting, max_loss_ceiling=1e9, box_min=0.20, box_max=0.35)
+    assert eligible([EXPENSIVE, CHEAP, far], context) == PAIR
+    assert 300.0 not in asked
+    assert asked == [100.0, 105.0]
+
+
 def test_a_ceiling_of_none_never_even_asks_the_builder():
     """``max_loss_ceiling=None`` MUST be a provable no-op, not merely a permissive one.
 
