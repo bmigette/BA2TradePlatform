@@ -82,7 +82,36 @@ The two new features are only *defined* for structures bounded on the side they 
 | credit spread, iron condor, butterfly | bounded | bounded | applies | applies |
 | debit vertical | bounded | bounded (debit) | applies | applies |
 | long call, long strangle | **UNBOUNDED** | bounded (debit) | inapplicable | inapplicable |
-| naked short put | bounded (credit) | **UNBOUNDED** | applies | inapplicable |
+| naked short **put** | bounded (credit) | bounded | applies | applies |
+| naked short **call** | bounded (credit) | **UNBOUNDED** | applies | synthetic, see below |
+| short **stock** | bounded | **UNBOUNDED** | applies | inapplicable — no strike |
+
+> **CORRECTION, 2026-08-30.** An earlier version of this table claimed a naked short PUT has
+> unbounded loss. **It does not.** A put's payoff is floored: the underlying cannot go below
+> zero, so the worst case is `(strike − credit) × 100` and `max_loss` returns `MEASURED`.
+> `upside_slope` — the only route to `UNBOUNDED` — sums calls and stock only, and a short put
+> contributes nothing to it. **Only a short call or short stock can run away.** The error
+> reached the design, the plan, and two implementation briefs before a test caught it; the
+> tests now pin it explicitly (`test_a_naked_short_put_ranks_on_rr_without_any_substitution`),
+> because it is exactly the kind of "everyone knows" claim that survives review by being
+> repeated confidently.
+
+**The synthetic `rr` denominator for genuinely unbounded loss.** A structure whose loss really is
+unbounded gets `rr = max_profit ÷ (strike × multiplier × ratio)` of the leg carrying that risk —
+the assignment cost, i.e. what the account would actually owe. Its true reward-to-risk is
+`profit ÷ ∞ → 0`, so "low" is the honest answer rather than "unknown", and this produces a low
+number without anyone choosing one.
+
+**It must NOT be `spot × 100`, even though §8.3 words the budgeting rule that way.** `spot` does
+not vary between candidates in a single pick, so a spot-based denominator makes `rr` a pure
+rescale of `profit`; after min-max normalisation the two columns are identical and `w_rr` is
+perfectly collinear with `w_profit` — two genes searching one dimension, the dead-gene failure
+this design guards against everywhere else. `strike` varies per candidate, so `rr` stays distinct
+and still ranks by credit-per-assignment-cost.
+
+Attribution is deliberately narrow: exactly one short call/stock leg with a usable strike, or the
+feature returns `None`. Short stock has no strike; two or more short upside legs have no single
+assignment cost. An invented denominator is worse than an absent feature.
 
 §7 says a feature no candidate publishes is a configuration error naming the weight. **That
 rule is right for a missing field and wrong for this.** A long call whose every candidate

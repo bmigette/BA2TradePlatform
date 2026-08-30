@@ -521,19 +521,14 @@ def test_an_unmeasurable_max_loss_fails_CLOSED_against_a_ceiling():
 
 
 def test_an_UNBOUNDED_max_loss_is_charged_notional_not_excluded():
-    """§8.3 CONFORMANCE. When undefined risk is permitted the design charges spot x 100 --
-    the cash-secured-put treatment -- rather than refusing. Excluding it here would make
-    the ceiling silently override allow_undefined_risk_options, so a permitted naked short
-    could never be selected at all and the setting would read as working while doing
-    nothing."""
-    def _naked_short_put(c):
-        return [PayoffLeg(kind="put", side=OrderDirection.SELL, premium=c.mid,
-                          strike=c.strike)]
-
+    """§8.3 CONFORMANCE. When undefined risk is permitted the design charges a notional --
+    rather than refusing. Excluding it here would make the ceiling silently override
+    allow_undefined_risk_options, so a permitted naked short could never be selected at
+    all and the setting would read as working while doing nothing."""
     cands = [_c(100, 2.90, 3.10, 0.30)]
     ctx = PolicyContext(strike_method="delta", today=date(2026, 1, 1), target=0.30,
-                        structure_fn=_naked_short_put, spot=100.0,
-                        undefined_risk_notional=10_000.0,   # spot x 100
+                        structure_fn=_naked_short_call, spot=100.0,
+                        undefined_risk_notional=10_000.0,
                         max_loss_ceiling=12_000.0)
     assert pick(cands, ctx, SelectionPolicy()) is not None
 
@@ -544,16 +539,26 @@ def test_an_UNBOUNDED_max_loss_is_charged_notional_not_excluded():
 def test_an_UNBOUNDED_max_loss_is_excluded_when_undefined_risk_is_NOT_permitted():
     """undefined_risk_notional=None is the default and means 'not permitted here', which
     is §8.3's default refusal -- not an oversight to be papered over with a guess."""
-    def _naked_short_put(c):
-        return [PayoffLeg(kind="put", side=OrderDirection.SELL, premium=c.mid,
-                          strike=c.strike)]
-
     cands = [_c(100, 2.90, 3.10, 0.30)]
     ctx = PolicyContext(strike_method="delta", today=date(2026, 1, 1), target=0.30,
-                        structure_fn=_naked_short_put, spot=100.0,
+                        structure_fn=_naked_short_call, spot=100.0,
                         max_loss_ceiling=1_000_000.0)
     assert pick(cands, ctx, SelectionPolicy()) is None
 ```
+
+> **USE A SHORT CALL, NOT A SHORT PUT, TO REACH THE UNBOUNDED BRANCH.** A naked short PUT's
+> loss is BOUNDED — the underlying cannot go below zero, so the worst case is
+> `(strike − credit) × 100` and `max_loss` returns `MEASURED`. `upside_slope`, the only route
+> to `UNBOUNDED`, sums calls and stock only; a short put contributes nothing to it. An earlier
+> draft of this plan used `_naked_short_put` here, which would have exercised the MEASURED path
+> while claiming to test the unbounded one — a test that passes for the wrong reason and leaves
+> the branch it names unpinned. Define the helper as:
+>
+> ```python
+> def _naked_short_call(c):
+>     return [PayoffLeg(kind="call", side=OrderDirection.SELL, premium=c.mid,
+>                       strike=c.strike)]
+> ```
 
 > **This pair of tests is a CORRECTION to the first draft of this plan, not an addition.**
 > The draft filtered on `_payoff_pair(c, ctx)[1] or float("inf")`, which collapses `UNBOUNDED`
