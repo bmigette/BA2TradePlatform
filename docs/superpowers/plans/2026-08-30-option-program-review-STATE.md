@@ -35,7 +35,11 @@ Full prefix: `C:\Users\basti\AppData\Local\Temp\claude\C--Users-basti-Documents-
 Agents survive session restarts and can be resumed/queried by SendMessage if incomplete
 (proven earlier this session with the Task-5 reviewer after a session exit).
 
-## Next steps, in order
+## STATUS UPDATE: all four reviews COMPLETE, findings written and pushed
+See docs/superpowers/specs/2026-08-30-option-program-review-findings.md (19 findings,
+P0-P2). Tasks 7-10 remain ON HOLD for operator review of that document.
+
+## Next steps, in order (original, now superseded by the findings doc's sequencing)
 
 1. Collect the four facet reports; dedupe against ALREADY-KNOWN findings (below).
 2. Synthesize into `docs/superpowers/specs/2026-08-30-option-program-review-findings.md`,
