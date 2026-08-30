@@ -354,10 +354,51 @@ def test_a_partition_fetched_over_a_WIDER_window_still_satisfies_a_narrower_requ
                                  date(2023, 1, 1), date(2026, 3, 1)) is PartitionState.COMPLETE
 
 
-def test_a_request_ending_later_than_the_fetched_window_is_stale(store):
-    store.write_partition("AAPL", date(2023, 1, 20), [_bar()],
+def test_a_request_ending_later_than_the_fetched_window_is_stale_for_a_LIVE_expiry(store):
+    """A contract that has NOT yet expired can still print new bars, so a later window end
+    genuinely asks for data the partition does not have.
+
+    The expiry here is deliberately AFTER both window ends. It used to be 2023-01-20 --
+    two years BEFORE the fetched end -- which made this test assert the bug below rather
+    than the rule it is named for."""
+    store.write_partition("AAPL", date(2026, 6, 19), [_bar()],
                           date(2023, 1, 1), date(2025, 1, 1), empty_contracts=[])
-    assert store.partition_state("AAPL", date(2023, 1, 20),
+    assert store.partition_state("AAPL", date(2026, 6, 19),
+                                 date(2023, 1, 1), date(2026, 3, 1)) is PartitionState.STALE
+
+
+def test_a_request_ending_after_an_EXPIRED_contract_does_NOT_restale_it(store):
+    """THE CACHE-DESTROYING BUG, pinned. A contract cannot print a bar after it expires, so
+    once a partition is fetched through its own expiry it is FINAL and a later window end
+    asks for days on which the contract did not exist.
+
+    Comparing against the raw window end instead is how the whole store re-downloaded
+    itself: the warmup defaults its end to TODAY, so every run moved the end forward, every
+    complete partition compared STALE, and the fetcher re-pulled everything -- measured
+    2026-08-30, 820 of 857 symbols and 1,576 partitions rewritten in ~35 minutes.
+
+    It is data LOSS, not just wasted bandwidth: write_partition DELETES the parquet when a
+    re-fetch returns no rows, and dxfeed routinely declines to resolve long-dead contracts.
+    Each pointless pass can therefore turn a good partition into status="empty"."""
+    exp = date(2023, 1, 20)
+    store.write_partition("AAPL", exp, [_bar()],
+                          date(2023, 1, 1), date(2025, 1, 1), empty_contracts=[])
+    # End moved YEARS past the fetch, as a to-today default does every single day.
+    assert store.partition_state("AAPL", exp,
+                                 date(2023, 1, 1), date(2026, 3, 1)) is PartitionState.COMPLETE
+    assert store.is_done("AAPL", exp, date(2023, 1, 1), date(2026, 3, 1))
+    # And it stays skipped tomorrow, and every day after.
+    assert store.pending_partitions("AAPL", [exp], date(2023, 1, 1), date(2030, 1, 1)) == []
+
+
+def test_a_partition_not_yet_fetched_through_its_expiry_is_still_stale(store):
+    """The other side of the same boundary -- the fix must not become "expired means done".
+    Fetched only to 2023-01-10 for a contract living until 2023-01-20, so ten days of its
+    life are genuinely missing and it must re-fetch."""
+    exp = date(2023, 1, 20)
+    store.write_partition("AAPL", exp, [_bar()],
+                          date(2023, 1, 1), date(2023, 1, 10), empty_contracts=[])
+    assert store.partition_state("AAPL", exp,
                                  date(2023, 1, 1), date(2026, 3, 1)) is PartitionState.STALE
 
 
