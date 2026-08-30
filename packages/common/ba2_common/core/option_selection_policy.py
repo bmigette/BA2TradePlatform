@@ -31,6 +31,14 @@ from ba2_common.core.option_payoff import (
     max_loss,
     max_profit,
 )
+from ba2_common.core.option_request import (
+    BUDGET_CEILING_REFUSAL,
+    EMPTY_BOX_REFUSAL,
+    EMPTY_CHAIN_REFUSAL,
+    MAX_LOSS_UNMEASURABLE_REFUSAL,
+    SELECTION_CONFIG_REFUSAL,
+    validate_refusal_phrase,
+)
 from ba2_common.core.option_selector import OptionSelectionConfigError, target_strike
 from ba2_common.core.option_types import OptionContract
 from ba2_common.core.types import OptionRight, OrderDirection
@@ -756,9 +764,95 @@ def _chargeable_max_loss(c: OptionContract, ctx: PolicyContext) -> float:
     return math.inf
 
 
+@dataclass(frozen=True)
+class SelectionRefusal:
+    """WHY the policy chose nothing. A reason, never a silent zero.
+
+    ``pick`` returns ``None`` for four different reasons and an operator can act on none of them
+    without knowing which: an empty chain is a DATA outage, an empty box is a mis-set band, an
+    unaimable strike method is a missing input on the recommendation, and a binding ceiling is a
+    budget smaller than the cheapest thing in the box. Design section 9 is explicit that "the
+    sleeve stopped trading" must be diagnosable, and an ``Optional[OptionContract]`` cannot say
+    any of it.
+
+    NOT ``option_request.StructureRefusal``, WHICH IT IS OTHERWISE A COPY OF. That one carries
+    the ``OptionStructureRequest`` the refusal belongs to, and this module is pure selection: it
+    is handed a candidate list and a ``PolicyContext``, and has never seen a request. The caller
+    that has both attaches one to the other. The PHRASES are deliberately the same registry --
+    ``validate_refusal_phrase`` is shared, not re-implemented -- because a caller greps for a
+    phrase and does not care which layer emitted it.
+    """
+
+    phrase: str
+    detail: str
+
+    def __post_init__(self):
+        validate_refusal_phrase(self.phrase)
+
+
+def _no_candidate_reason(candidates: Sequence[OptionContract],
+                         aimable: Sequence[OptionContract],
+                         ctx: PolicyContext) -> SelectionRefusal:
+    """Why the BOX ended up empty — before any budget was consulted.
+
+    THE CHAIN AND THE BOX ARE SEPARATED because their remedies do not overlap. An empty chain is
+    a feed or a DTE window that returned nothing, and widening the delta band will never fix it;
+    an empty box is a band nobody can fall inside, and re-fetching the chain will never fix that.
+
+    A CANDIDATE DROPPED FOR A MISSING DELTA GETS NO PHRASE OF ITS OWN, but it does get counted in
+    the detail. ``eligible`` excludes it exactly as ``_pick_by`` does, i.e. on the same footing as
+    a contract the box rejected, so inventing a separate cause would claim a distinction the
+    filter itself does not draw — while an operator staring at "none of 40 fell inside the box"
+    still needs to know that 40 of them never carried a delta to be measured with.
+    """
+    if not candidates:
+        return SelectionRefusal(
+            phrase=EMPTY_CHAIN_REFUSAL,
+            detail="the candidate list handed to the policy was empty")
+    dropped = len(candidates) - len(aimable)
+    detail = (f"none of {len(candidates)} candidates fell inside the box "
+              f"(strike_method={ctx.strike_method!r}, box_min={ctx.box_min}, "
+              f"box_max={ctx.box_max}, target={ctx.target})")
+    if dropped:
+        detail += f"; {dropped} of them carried no usable delta"
+    return SelectionRefusal(phrase=EMPTY_BOX_REFUSAL, detail=detail)
+
+
+def _ceiling_reason(charges: Sequence[float], ctx: PolicyContext) -> SelectionRefusal:
+    """Why the BUDGET emptied a box that was not empty. Called only when it did.
+
+    TWO CAUSES, AND THE SECOND IS NOT A BUDGET PROBLEM AT ALL. ``_chargeable_max_loss`` returns
+    infinity for every candidate it cannot prove affordable — an unmeasurable loss, a builder
+    that declined, an unbounded loss on an account that forbids undefined risk — so a box of
+    nothing but crossed quotes empties under a BILLION-dollar ceiling. Reporting that as a
+    ceiling that is too low would print "cheapest inf exceeds ceiling 1000000000.00" and send the
+    operator to raise a cap that is already a billion dollars. ``MAX_LOSS_UNMEASURABLE_REFUSAL``
+    names it, and it already existed; no new phrase is minted for a case the registry covers.
+
+    THE NUMBERS ARE THE POINT OF THE OTHER BRANCH. 210 against a 200 ceiling is one strike of
+    slack; 210 against a 20 ceiling is a structure this sleeve cannot afford at any strike in the
+    box. Both are "no", and only the first is worth widening a band for.
+    """
+    affordable = [charge for charge in charges if math.isfinite(charge)]
+    if not affordable:
+        return SelectionRefusal(
+            phrase=MAX_LOSS_UNMEASURABLE_REFUSAL,
+            detail=(f"no chargeable max loss could be computed for any of {len(charges)} "
+                    f"candidates in the box, so none can be shown to fit the "
+                    f"{ctx.max_loss_ceiling:.2f} ceiling"))
+    return SelectionRefusal(
+        phrase=BUDGET_CEILING_REFUSAL,
+        detail=(f"cheapest chargeable max loss {min(affordable):.2f} exceeds ceiling "
+                f"{ctx.max_loss_ceiling:.2f} ({len(charges)} candidates in the box)"))
+
+
 def eligible(candidates: Sequence[OptionContract],
              ctx: PolicyContext) -> List[OptionContract]:
     """The candidates the policy is allowed to choose between.
+
+    THE LIST ONLY. ``_eligible_and_reason`` does the work and also says WHY the list is empty
+    when it is; this drops the reason, because the existing callers and the whole no-op test
+    suite want a list and nothing else. See ``pick_with_reason`` for the reason.
 
     Under the ``delta`` method a contract with no delta is EXCLUDED, not scored worst.
     ``option_selector._pick_by`` does exactly that (``usable = [c for c in cands if c.delta is
@@ -823,6 +917,26 @@ def eligible(candidates: Sequence[OptionContract],
     every trade that builder would ever make. Only the first is recoverable by teaching the
     builder its closure.
     """
+    return _eligible_and_reason(candidates, ctx)[0]
+
+
+def _eligible_and_reason(
+        candidates: Sequence[OptionContract],
+        ctx: PolicyContext) -> Tuple[List[OptionContract], Optional[SelectionRefusal]]:
+    """``eligible``'s rules, plus WHY the result is empty when it is. See ``eligible``.
+
+    THE REASON IS BUILT INSIDE THE PASS THAT ALREADY FILTERED, never by a second one. The charge
+    column costs a ``structure_fn`` call plus a full ``max_loss`` scan per candidate (5039us on a
+    200-row chain), so a diagnostic that recomputed it would double the cost of exactly the path
+    that just refused -- and, as ``payoff_columns`` argues for ``feature_matrix`` and
+    ``inapplicable_features``, two independent passes let a stateful closure make the REPORT
+    describe numbers the FILTER never saw. Same precedent, same fix: compute once, hand it on.
+
+    THE ORDER OF THE CAUSES IS THE ORDER OF THE FILTERS, and that is what keeps them honest. Each
+    reason is produced at the point its own filter emptied the list, so a box that was never
+    populated cannot be blamed on a budget it never reached, and a budget that removed real
+    contracts cannot be reported as an empty box.
+    """
     _validate_box(ctx)
     out = list(candidates)
     if ctx.strike_method == "delta":
@@ -833,16 +947,31 @@ def eligible(candidates: Sequence[OptionContract],
         out = [c for c in out if c.delta is not None and math.isfinite(c.delta)]
     elif target_strike(ctx.strike_method, ctx.target, ctx.spot, ctx.target_price,
                        ctx.option_type) is None:
-        return []
+        # A CAUSE OF ITS OWN, not an empty box. ``_in_box`` admits every contract under
+        # ``consensus_target``, so the box cannot be what emptied this; the remedy is a target
+        # price on the recommendation, and no band or budget will ever supply one.
+        return [], SelectionRefusal(
+            phrase=SELECTION_CONFIG_REFUSAL,
+            detail=(f"strike_method={ctx.strike_method!r} yields no target strike "
+                    f"(target={ctx.target}, spot={ctx.spot}, target_price={ctx.target_price}), "
+                    f"so none of {len(candidates)} candidates can be aimed at"))
     boxed = [c for c in out if _in_box(c, ctx)]
+    if not boxed:
+        return [], _no_candidate_reason(candidates, out, ctx)
     # RETURN BEFORE ASKING THE BUILDER ANYTHING. The no-op guarantee is not merely that the RESULT
     # is unchanged when no ceiling is set: computing every charge and then comparing it against
     # infinity would give the same list while calling ``structure_fn`` once per candidate on a
     # path that runs per structure, per bar, per symbol -- and would propagate the exception from
-    # any builder whose closure raises, taking down picks that never asked for a budget.
+    # any builder whose closure raises, taking down picks that never asked for a budget. The
+    # reason machinery changes nothing about that: it never charges a candidate the filter did
+    # not already have to charge.
     if ctx.max_loss_ceiling is None or ctx.structure_fn is None:
-        return boxed
-    return [c for c in boxed if _chargeable_max_loss(c, ctx) <= ctx.max_loss_ceiling]
+        return boxed, None
+    charges = [_chargeable_max_loss(c, ctx) for c in boxed]
+    kept = [c for c, charge in zip(boxed, charges) if charge <= ctx.max_loss_ceiling]
+    if kept:
+        return kept, None
+    return [], _ceiling_reason(charges, ctx)
 
 
 def score_all(candidates: Sequence[OptionContract], ctx: PolicyContext,
@@ -900,11 +1029,36 @@ def pick(candidates: Sequence[OptionContract], ctx: PolicyContext,
     Implemented as ``min`` over ``(-score, strike, expiry)`` rather than ``max`` over score,
     because that makes the two tie-break terms read in their natural ascending direction and
     keeps them identical to the legacy key.
+
+    RETURNS THE CONTRACT ONLY, unchanged. ``pick_with_reason`` is the same computation and also
+    says why there was nothing to return.
     """
-    cands = eligible(candidates, ctx)
+    return pick_with_reason(candidates, ctx, policy)[0]
+
+
+def pick_with_reason(
+        candidates: Sequence[OptionContract], ctx: PolicyContext,
+        policy: SelectionPolicy) -> Tuple[Optional[OptionContract], Optional[SelectionRefusal]]:
+    """``pick``, plus a ``SelectionRefusal`` whenever it chose nothing.
+
+    THE SEAM ``_resolve()`` WILL USE. ``pick`` has no production caller yet, so this is designed
+    for the one that is coming rather than retrofitted around one that exists; it returns a pair
+    instead of raising because a refusal is DATA the risk manager triages beside every other
+    candidate on the bar, not an exception that unwinds the bar.
+
+    A SEPARATE ENTRY POINT RATHER THAN A WIDER RETURN ON ``pick``, because the no-op guarantees
+    of Tasks 1-5 all rest on ``pick`` being the very function the recorded-chain tests pin. Its
+    signature and its result are untouched here; the reason costs a caller one extra unpacking
+    and costs the existing callers nothing at all.
+
+    EXACTLY ONE OF THE TWO IS EVER SET. A contract and a reason together would teach callers to
+    read the contract and ignore the reason, which is how "a reason, never a silent drop" decays
+    into a field nobody looks at.
+    """
+    cands, refusal = _eligible_and_reason(candidates, ctx)
     if not cands:
-        return None
+        return None, refusal
     scores = score_all(cands, ctx, policy)
     best = min(range(len(cands)),
                key=lambda i: (-scores[i], cands[i].strike, cands[i].expiry))
-    return cands[best]
+    return cands[best], None

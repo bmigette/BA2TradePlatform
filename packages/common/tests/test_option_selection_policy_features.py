@@ -31,11 +31,19 @@ from datetime import date
 import pytest
 
 from ba2_common.core.option_payoff import MEASURED, PayoffLeg, max_loss
+from ba2_common.core.option_request import (
+    BUDGET_CEILING_REFUSAL,
+    EMPTY_BOX_REFUSAL,
+    EMPTY_CHAIN_REFUSAL,
+    MAX_LOSS_UNMEASURABLE_REFUSAL,
+    SELECTION_CONFIG_REFUSAL,
+)
 from ba2_common.core.option_selection_policy import (
     FEATURE_NAMES,
     PAYOFF_FEATURES,
     PolicyContext,
     SelectionPolicy,
+    SelectionRefusal,
     _OFF_SCALE,
     _profit_and_risk,
     _reward_to_risk,
@@ -44,6 +52,7 @@ from ba2_common.core.option_selection_policy import (
     inapplicable_features,
     payoff_columns,
     pick,
+    pick_with_reason,
 )
 from ba2_common.core.option_types import OptionContract
 from ba2_common.core.types import OptionRight, OrderDirection
@@ -854,3 +863,149 @@ def test_there_is_no_max_profit_ceiling():
     """
     context = ctx(structure_fn=unpayable_debit_spread, max_loss_ceiling=1000.0)
     assert eligible(PAIR, context) == PAIR
+
+
+# ------------------------------------------------ WHY nothing was picked (the refusal reason)
+#
+# ``pick`` returns None for four different reasons and an operator cannot act on any of them
+# without knowing which: an empty chain is a data outage, an empty box is a mis-set band, an
+# unaimable strike method is a missing input on the recommendation, and a binding ceiling is a
+# budget smaller than the cheapest thing in the box. The design's rule (section 9) is that a
+# refusal is A REASON, NEVER A SILENT ZERO -- "the sleeve stopped trading" must be diagnosable.
+#
+# THE PAIR THAT MATTERS IS (ceiling, empty box). They are the two a single ``if not cands`` would
+# collapse, and the two whose remedies are furthest apart: widen the band, versus raise the cap
+# or aim at cheaper strikes. Every test below that asserts one of them also asserts it is NOT the
+# other, so a collapse cannot pass by satisfying half of each.
+
+
+def test_a_ceiling_that_empties_the_box_is_named_as_the_ceiling_not_as_an_empty_box():
+    """THE POINT OF THE TASK. The box held two contracts; the ceiling removed both.
+
+    THE NUMBERS ARE PART OF THE REASON. "no" tells the operator nothing about how far off the
+    budget was; 210 against a 200 ceiling is a 5% miss (widen the box one strike) where 210
+    against a 20 ceiling is a structure this sleeve can never afford at this size.
+    """
+    context = ctx(structure_fn=credit_vertical(5.0), max_loss_ceiling=200.0)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None
+    assert pick(PAIR, context, SelectionPolicy()) is None        # ``pick`` itself is unchanged
+    assert refusal.phrase == BUDGET_CEILING_REFUSAL
+    assert refusal.phrase != EMPTY_BOX_REFUSAL
+    assert "210.00" in refusal.detail        # the cheapest candidate's chargeable max loss
+    assert "200.00" in refusal.detail        # the ceiling it exceeded
+
+
+def test_a_genuinely_empty_box_is_named_as_the_box_not_as_the_ceiling():
+    """THE OTHER HALF OF THE PAIR, and it carries a ceiling that WOULD have bound.
+
+    Both candidates sit at deltas 0.25 and 0.30 and the box asks for 0.60-0.90, so nothing
+    reaches the ceiling at all -- yet the ceiling is set to 200, which excludes both of them on
+    price too. A reporter that ran the ceiling first, or that named whichever filter it happened
+    to check last, would blame the budget for a band that was never populated.
+    """
+    context = ctx(structure_fn=credit_vertical(5.0), max_loss_ceiling=200.0,
+                  box_min=0.60, box_max=0.90)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == EMPTY_BOX_REFUSAL
+    assert refusal.phrase != BUDGET_CEILING_REFUSAL
+    assert "0.6" in refusal.detail and "0.9" in refusal.detail
+
+
+def test_a_successful_pick_carries_no_refusal():
+    """A reason is for the ABSENCE of a choice. Reporting one beside a contract would teach every
+    caller to read the contract first and ignore the reason, which is how a refusal becomes
+    decorative."""
+    context = ctx(structure_fn=credit_vertical(5.0), max_loss_ceiling=300.0)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is CHEAP
+    assert refusal is None
+
+
+def test_an_empty_chain_is_named_as_the_chain_not_as_the_box():
+    """A chain that came back empty is a DATA outage; an empty box is a mis-set band. Widening
+    the band does nothing for the first and is the whole remedy for the second."""
+    context = ctx(structure_fn=credit_vertical(5.0), max_loss_ceiling=200.0)
+    chosen, refusal = pick_with_reason([], context, SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == EMPTY_CHAIN_REFUSAL
+    assert refusal.phrase not in (EMPTY_BOX_REFUSAL, BUDGET_CEILING_REFUSAL)
+
+
+def test_an_unaimable_strike_method_names_the_parameter_not_the_box():
+    """``consensus_target`` on a recommendation carrying no target price. ``select_single``
+    reaches this with its default ``target_price=None``, so it is a live path, and the remedy is
+    on the RECOMMENDATION -- nothing about the box or the budget will ever fix it.
+
+    ``_in_box`` returns True for every contract under ``consensus_target``, so the box literally
+    cannot be the cause here; naming it would send the operator to the one knob that has no
+    effect at all for this method.
+    """
+    context = PolicyContext(strike_method="consensus_target", today=TODAY, spot=100.0,
+                            option_type=OptionRight.CALL, structure_fn=credit_vertical(5.0),
+                            max_loss_ceiling=200.0)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == SELECTION_CONFIG_REFUSAL
+    assert refusal.phrase not in (EMPTY_BOX_REFUSAL, BUDGET_CEILING_REFUSAL)
+
+
+def test_a_charge_nobody_could_compute_is_not_reported_as_a_ceiling_that_is_too_low():
+    """A BILLION-DOLLAR ceiling and nothing fits, because nothing could be PRICED against it.
+
+    ``arbitrage_vertical`` reports UNMEASURABLE max loss at every strike (a crossed quote), which
+    ``_chargeable_max_loss`` charges as infinity and the filter therefore refuses. Calling that a
+    ceiling that is too low would print "cheapest inf exceeds ceiling 1000000000.00" and send the
+    operator to raise a cap that is already a billion dollars, when the defect is in the quote.
+    ``MAX_LOSS_UNMEASURABLE_REFUSAL`` already names it exactly, so no new phrase is invented for
+    it either.
+    """
+    context = ctx(structure_fn=arbitrage_vertical, max_loss_ceiling=1e9)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == MAX_LOSS_UNMEASURABLE_REFUSAL
+    assert refusal.phrase != BUDGET_CEILING_REFUSAL
+    assert "inf" not in refusal.detail
+
+
+def test_reporting_a_reason_never_asks_the_builder_when_no_ceiling_is_set():
+    """THE TASK 5 NO-OP GUARANTEE MUST SURVIVE THE REPORTER. ``max_loss_ceiling=None`` still
+    reaches the builder zero times -- a diagnostic that charged every candidate just to have a
+    number ready in case it needed one would resurrect the exact cost the ceiling's early return
+    exists to avoid, and would take the pick down for every builder whose closure raises."""
+    def _explode(_cand):
+        raise AssertionError("structure_fn was called with no max_loss_ceiling set")
+
+    chosen, refusal = pick_with_reason(PAIR, ctx(structure_fn=_explode), SelectionPolicy())
+    assert chosen is EXPENSIVE
+    assert refusal is None
+
+
+def test_the_reason_does_not_buy_a_second_payoff_pass():
+    """ONE CHARGE PER CANDIDATE, not one to filter and another to explain.
+
+    ``_chargeable_max_loss`` runs the builder plus a full ``max_loss`` scan; the payoff pass was
+    measured at 5039us on a 200-row chain, so a reporter that recomputed it would double the cost
+    of the very path that just refused -- and, exactly as ``payoff_columns`` argues for
+    ``feature_matrix``/``inapplicable_features``, a second independent pass lets a stateful
+    closure make the REPORT describe numbers the FILTER never saw.
+    """
+    asked = []
+
+    def _counting(cand):
+        asked.append(cand.strike)
+        return credit_vertical(5.0)(cand)
+
+    context = ctx(structure_fn=_counting, max_loss_ceiling=200.0)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None and refusal.phrase == BUDGET_CEILING_REFUSAL
+    assert asked == [100.0, 105.0]
+
+
+def test_a_selection_refusal_cannot_carry_a_free_text_phrase():
+    """Same validation as ``StructureRefusal``, against deliberately the SAME registry: a reason
+    the caller cannot grep for is a reason nobody reads."""
+    SelectionRefusal(phrase=BUDGET_CEILING_REFUSAL, detail="")     # registered: fine
+    with pytest.raises(ValueError):
+        SelectionRefusal(phrase="the budget was a bit small", detail="")
