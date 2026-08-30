@@ -21,7 +21,7 @@ from ba2_providers import OPTIONS_PROVIDERS, get_provider
 from ba2_providers.options.tastytrade import (
     StreamInterrupted, TastyTradeOptionsProvider, candle_to_bar, expiry_calendar,
     is_empty_snapshot, occ_symbol, occ_to_streamer, parse_occ, strike_ladder,
-    streamer_to_occ, strip_candle_suffix,
+    streamer_to_occ, strip_candle_suffix, _run_sync,
 )
 
 # dxfeed IndexedEvent flags
@@ -704,3 +704,89 @@ def test_the_streamer_ssl_context_is_pinned_to_certifi():
     loaded = {c.get("subject") for c in ctx.get_ca_certs()}
     reference = __import__("ssl").create_default_context(cafile=certifi.where())
     assert loaded == {c.get("subject") for c in reference.get_ca_certs()}
+
+
+# --------------------------------------------------------------------------- #
+# _run_sync — the warm-up's "Event loop is closed" incident (2026-08-30)
+# --------------------------------------------------------------------------- #
+# _require_session() caches self._session (and, inside the tastytrade SDK's Session, a
+# long-lived httpx.AsyncClient) across every call for the life of a provider instance --
+# warm_options_history.py builds ONE provider and calls fetch_bars_detailed on it for
+# thousands of units. httpx.AsyncClient is not safe to reuse across different event loops:
+# whatever loop first touches its internal connection pool is the only loop it can ever be
+# used from again. A fresh `asyncio.run()` per _run_sync call creates AND CLOSES a new loop
+# every time, so the cached session's client is bound to a loop that no longer exists by the
+# second call -- observed live as "RuntimeError: Event loop is closed" on every batch after
+# the first, across all 8 warm-up workers. _run_sync must reuse ONE persistent loop per
+# process instead.
+def test_run_sync_reuses_one_persistent_loop_across_calls():
+    """The literal failure mode: a real socket transport (what the TastyTrade SDK's cached
+    session/DXLink websocket ultimately is) is bound to the event loop that was running when
+    it was opened. A fresh loop per _run_sync call (asyncio.run() each time) closes that loop
+    the moment the call returns, so reusing the transport from a LATER call breaks -- exactly
+    as observed live ("RuntimeError: Event loop is closed" on every warm-up batch after the
+    first). One persistent loop across calls keeps it usable."""
+    import asyncio
+
+    shared: dict = {}
+
+    async def handle(r, w):
+        while True:
+            data = await r.read(100)
+            if not data:
+                break
+            w.write(data)
+            await w.drain()
+
+    async def first():
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        shared["server"], shared["reader"], shared["writer"] = server, reader, writer
+        writer.write(b"hello")
+        await writer.drain()
+        return (await reader.read(100)).decode()
+
+    async def second():
+        shared["writer"].write(b"again")
+        await shared["writer"].drain()
+        return (await shared["reader"].read(100)).decode()
+
+    try:
+        assert _run_sync(first()) == "hello"
+        assert _run_sync(second()) == "again"
+    finally:
+        try:
+            shared["server"].close()
+        except Exception:  # noqa: BLE001 -- best-effort cleanup, never mask the assertion above
+            pass
+
+
+def test_run_sync_returns_the_coroutines_result():
+    async def coro():
+        return 42
+
+    assert _run_sync(coro()) == 42
+
+
+def test_run_sync_propagates_the_coroutines_exception():
+    async def boom():
+        raise ValueError("nope")
+
+    with pytest.raises(ValueError, match="nope"):
+        _run_sync(boom())
+
+
+def test_run_sync_still_works_when_called_from_inside_a_running_loop():
+    """The rare nested case (sync code called from within already-async code) must keep
+    working via the one-off thread-pool fallback -- only the no-running-loop path moves to
+    the persistent background loop."""
+    import asyncio
+
+    async def inner():
+        return "inner-ok"
+
+    async def outer():
+        return _run_sync(inner())
+
+    assert asyncio.run(outer()) == "inner-ok"
