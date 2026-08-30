@@ -314,19 +314,23 @@ def test_naked_reserve_uses_margin_not_full_cash():
     MLEG engine does NOT extend this discount to it."""
     acct = FakeAccount(spot=250.0)
     full_cash = 225.0 * 100.0 * 2
-    # short_straddle shorts BOTH rights at one strike -> worst case over both is reserved
-    # (no option_type needed); the single-sided strategies require the leg's right.
+    # short_straddle shorts BOTH rights at one strike -> the SUM over both rights is
+    # reserved (the maintenance model's per-leg sum, review 2026-08-30 F10; no
+    # option_type needed); short_strangle prices BOTH strikes by name; naked_put
+    # requires the leg's right.
     for strat in ("short_straddle", "short_strangle", "naked_put"):
-        kw = {} if strat == "short_straddle" else {"option_type": OptionRight.PUT}
+        kw = ({} if strat == "short_straddle"
+              else {"call_strike": 275.0} if strat == "short_strangle"
+              else {"option_type": OptionRight.PUT})
         r = acct.option_reserve_required(strat, 2, strike=225.0, spot=250.0, **kw)
         assert 0 < r < full_cash, f"{strat} reserve {r} should be margin (< full cash {full_cash})"
     # A naked strategy without option_type fails LOUDLY (no silent direction default)...
     with pytest.raises(ValueError):
         acct.option_reserve_required("naked_put", 1, strike=225.0, spot=250.0)
-    # ...except short_straddle, which reserves the worst case over both rights:
-    # max(call: OTM=0 -> 0.20*250, put: OTM=25 -> max(50-25,25)) *100*2 = 5000*2.
+    # ...except short_straddle, which reserves the SUM over both rights (F10):
+    # (call: OTM=0 -> 0.20*250 = 50) + (put: OTM=25 -> max(50-25,25) = 25) -> 7500*2.
     assert acct.option_reserve_required(
-        "short_straddle", 2, strike=225.0, spot=250.0) == pytest.approx(10000.0)
+        "short_straddle", 2, strike=225.0, spot=250.0) == pytest.approx(15000.0)
     # cash-secured put stays fully secured (full strike*100 by design).
     assert acct.option_reserve_required("cash_secured_put", 1, strike=225.0) == pytest.approx(22500.0)
 
@@ -457,7 +461,7 @@ def test_every_strategy_the_platform_can_submit_has_a_priced_reserve():
     acct = OptionsAccountInterface
     for strategy in sorted(_submitted_option_strategies()):
         acct.option_reserve_required(strategy, 1, strike=100.0, spread_width=5.0,
-                                     net_credit=1.0, spot=100.0,
+                                     net_credit=1.0, spot=100.0, call_strike=110.0,
                                      option_type=OptionRight.PUT)
 
 
@@ -473,10 +477,13 @@ def test_the_eight_reserving_builders_still_price_the_same_dollars():
                                         net_credit=1.5) == 350.0
     assert acct.option_reserve_required("credit_spread", 1, spread_width=5.0,
                                         net_credit=1.5) == 350.0
+    # Straddle/strangle reserve BOTH legs since review 2026-08-30 F10 (the sum the
+    # backtest maintenance model charges): straddle = (5,000 call + 2,500 put) x 2;
+    # strangle = 2,500 put (225) + 2,500 call (275, OTM 25 -> the 10% floor).
     assert acct.option_reserve_required("short_straddle", 2, strike=225.0,
-                                        spot=250.0) == pytest.approx(10_000.0)
+                                        spot=250.0) == pytest.approx(15_000.0)
     assert acct.option_reserve_required("short_strangle", 1, strike=225.0, spot=250.0,
-                                        option_type=OptionRight.PUT) == pytest.approx(2_500.0)
+                                        call_strike=275.0) == pytest.approx(5_000.0)
     assert acct.option_reserve_required("naked_put", 1, strike=225.0, spot=250.0,
                                         option_type=OptionRight.PUT) == pytest.approx(2_500.0)
     assert acct.option_reserve_required("iron_condor", 1, spread_width=5.0,
@@ -495,7 +502,7 @@ def test_the_two_strategy_lists_match_the_branches():
     assert not (acct.ZERO_RESERVE_STRATEGIES & acct.RESERVING_STRATEGIES)
     for strategy in sorted(acct.RESERVING_STRATEGIES):
         r = acct.option_reserve_required(strategy, 1, strike=100.0, spread_width=5.0,
-                                         net_credit=1.0, spot=100.0,
+                                         net_credit=1.0, spot=100.0, call_strike=110.0,
                                          option_type=OptionRight.PUT)
         assert r > 0.0, f"{strategy} is listed as reserving but priced {r}"
 
@@ -516,7 +523,8 @@ MISSING_SIZING_INPUT = [
     ("credit_spread", dict(spread_width=None, net_credit=1.0), "spread_width"),
     ("credit_spread", dict(spread_width=5.0, net_credit=None), "net_credit"),
     ("short_straddle", dict(strike=None), "strike"),
-    ("short_strangle", dict(strike=None, option_type=OptionRight.PUT), "strike"),
+    ("short_strangle", dict(strike=None, call_strike=110.0), "strike"),
+    ("short_strangle", dict(strike=100.0, call_strike=None), "call_strike"),
     ("naked_put", dict(strike=None, option_type=OptionRight.PUT), "strike"),
     ("put_ratio_spread", dict(strike=None, net_credit=1.0), "strike"),
     ("jade_lizard", dict(strike=None, spread_width=5.0, net_credit=1.0), "strike"),

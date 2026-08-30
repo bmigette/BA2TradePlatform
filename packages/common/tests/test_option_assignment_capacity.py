@@ -215,13 +215,14 @@ def test_a_short_strangle_book_owes_the_full_put_strike_not_the_reg_t_reserve():
     assert book.short_put_assignment == pytest.approx(22_500.0)
 
     # What the buying-power pool charges for the very same structure: Reg-T naked
-    # margin on a 250 spot — 20% of notional less the 25 points it is out of the money,
-    # which lands exactly on the 10% floor: 2,500. This is not wrong, it is a different
-    # question. But it was the ONLY number, and it is a NINTH of the delivery bill.
+    # margin on a 250 spot for BOTH legs (review 2026-08-30 F10) — each 25 points out
+    # of the money, each landing exactly on the 10% floor: 2,500 + 2,500. This is not
+    # wrong, it is a different question. But it was the ONLY number, and it is well
+    # under a QUARTER of the delivery bill.
     reg_t = OptionsAccountInterface.option_reserve_required(
-        "short_strangle", 1, strike=225.0, spot=250.0, option_type=OptionRight.PUT)
-    assert reg_t == pytest.approx(2_500.0)
-    assert book.short_put_assignment > 8 * reg_t
+        "short_strangle", 1, strike=225.0, call_strike=275.0, spot=250.0)
+    assert reg_t == pytest.approx(5_000.0)
+    assert book.short_put_assignment > 4 * reg_t
 
 
 def test_a_short_put_vertical_owes_the_full_short_strike_not_the_wing_width():

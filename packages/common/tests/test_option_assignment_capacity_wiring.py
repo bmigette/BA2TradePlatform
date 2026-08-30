@@ -19,10 +19,11 @@ WHY THE HEADLINE USES A STRUCTURE WHOSE RESERVE IS NOT THE STRIKE. For a plain
 (``strike x 100``) measured against the same balance, so the pre-existing
 buying-power gate already refuses the fifth and this gate adds nothing. The hole is in
 every structure whose reserve is *cheaper* than delivery — ``short_straddle`` /
-``short_strangle`` at Reg-T naked margin (~20% of notional) and ``iron_condor`` at its
-wing width. The headline therefore uses five short straddles: each carries one short
-100-strike put (a $10,000 delivery bill) but reserves only $2,000, so buying power says
-yes to all five while the account holds $45,000 against a $50,000 bill.
+``short_strangle`` at Reg-T naked margin (~20% of notional per leg, both legs summed
+since review 2026-08-30 F10) and ``iron_condor`` at its wing width. The headline
+therefore uses five short straddles: each carries one short 100-strike put (a $10,000
+delivery bill) but reserves only $4,000, so buying power says yes to all five while the
+account holds $45,000 against a $50,000 bill.
 """
 from datetime import date
 from itertools import count
@@ -90,7 +91,7 @@ def held_structure(strategy, reserve, *legs, symbol="XYZ"):
     return rows
 
 
-def held_short_put(strike=100.0, qty=1, reserve=2_000.0, strategy="short_straddle",
+def held_short_put(strike=100.0, qty=1, reserve=4_000.0, strategy="short_straddle",
                    symbol="XYZ"):
     """One held structure carrying ONE short put (and, for a straddle, a short call)."""
     legs = [(OptionRight.PUT, strike, qty, OrderDirection.SELL)]
@@ -202,11 +203,12 @@ def act(acct, action_type, **kw):
 
 
 #: 100-strike ATM short straddle: ONE short 100 put (10,000 of delivery) reserved at
-#: Reg-T naked margin (2,000). ``sizing`` is set so ONE contract is bought at every
-#: balance these tests use, so only the verdict moves, never the size.
+#: Reg-T naked margin, BOTH legs (4,000 — review 2026-08-30 F10). ``sizing`` is set so
+#: ONE contract is bought at every balance these tests use, so only the verdict moves,
+#: never the size.
 STRADDLE = dict(strike_method="percent_otm", strike_param=0.0,
-                dte_min=10, dte_max=40, sizing=5.0)
-STRADDLE_TIGHT = dict(STRADDLE, sizing=25.0)
+                dte_min=10, dte_max=40, sizing=10.0)
+STRADDLE_TIGHT = dict(STRADDLE, sizing=45.0)
 CSP = dict(strike_method="percent_otm", strike_param=0.0,
            dte_min=10, dte_max=40, sizing=25.0)
 #: Bull put CREDIT spread: SHORT the 95 put, LONG the 90 wing. Reserves the $5 width
@@ -227,7 +229,7 @@ def is_capacity_refusal(res):
 def test_five_short_puts_each_inside_buying_power_cannot_all_take_delivery(caplog=None):
     """45,000 of cash; five short 100-strike puts is a 50,000 delivery bill.
 
-    Each short straddle reserves Reg-T naked margin (2,000) and the buying-power gate
+    Each short straddle reserves Reg-T naked margin on both legs (4,000) and the buying-power gate
     says yes to every one of them — asserted below, so this cannot be mistaken for a
     buying-power refusal. Only the fifth is refused, and only by assignment capacity.
     """
@@ -239,15 +241,15 @@ def test_five_short_puts_each_inside_buying_power_cannot_all_take_delivery(caplo
         if res["success"]:
             sub = acct.submitted[-1]
             assert sub["quantity"] == 1, sub
-            acct.hold(held_short_put(strike=100.0, qty=1, reserve=2_000.0,
+            acct.hold(held_short_put(strike=100.0, qty=1, reserve=4_000.0,
                                      symbol=f"SYM{i + 1}"))
 
     assert [v[1] for v in verdicts] == [True, True, True, True, False], verdicts
     assert is_capacity_refusal(
         {"success": verdicts[4][1], "message": verdicts[4][2]}), verdicts[4][2]
     # ...and it is NOT a buying-power refusal: the pool still had ample room.
-    assert acct.check_option_buying_power(2_000.0) is True
-    assert acct.available_option_buying_power() == pytest.approx(45_000.0 - 4 * 2_000.0)
+    assert acct.check_option_buying_power(4_000.0) is True
+    assert acct.available_option_buying_power() == pytest.approx(45_000.0 - 4 * 4_000.0)
     # The bill the fifth would have created.
     assert acct.short_put_assignment_exposure().cost == pytest.approx(40_000.0)
 
@@ -270,7 +272,8 @@ def test_cash_exactly_equal_to_the_bill_admits(cash, admitted):
     other cap in this path admits at its line.
 
     One 100-strike short put, one contract: a 10,000 bill. Sized off Reg-T naked margin
-    (2,000) so the SIZE does not move between the two cash figures — only the verdict.
+    on both legs (4,000) so the SIZE does not move between the two cash figures — only
+    the verdict.
     """
     acct = FakeAccount(spot=100.0, balance=cash)
     res = act(acct, "open_short_straddle", **STRADDLE_TIGHT).execute()
@@ -284,7 +287,7 @@ def test_cash_exactly_equal_to_the_bill_admits(cash, admitted):
 # ==========================================================================
 def test_an_unmeasurable_book_refuses_and_names_the_order():
     acct = FakeAccount(spot=100.0, balance=1_000_000.0)
-    rows = held_short_put(strike=100.0, qty=1, reserve=2_000.0)
+    rows = held_short_put(strike=100.0, qty=1, reserve=4_000.0)
     rows[1].strike = None                       # the short put leg loses its strike
     acct.hold(rows)
     assert acct.short_put_assignment_exposure().cost is None
@@ -480,10 +483,13 @@ def test_check_assignment_capacity_still_answers_exactly_as_before():
 # WHAT THIS COMMIT STOPS ALLOWING — the two configurations that used to open
 # ==========================================================================
 @pytest.mark.parametrize("action,kw,bill", [
-    # 20% sizing off $1,000/contract of Reg-T naked margin = 20 short 90-strike puts.
+    # 30% sizing off $2,000/contract of Reg-T naked margin (both legs, F10) = 15 short
+    # 90-strike puts. (Before F10 the put-only reserve bought 20 of them at 20% sizing —
+    # the F10 sum halves the size the same budget buys, so the sizing is raised to keep
+    # this a configuration the CAPACITY gate, not the budget, refuses.)
     ("open_short_strangle",
      dict(strike_method="percent_otm", strike_param=10.0, dte_min=10, dte_max=40,
-          sizing=20.0), 180_000.0),
+          sizing=30.0), 135_000.0),
     # 5% sizing off a $460/contract wing = 43 condors, each with a short 90 put.
     ("open_iron_condor",
      dict(strike_method="percent_otm", strike_param=10.0, wing_width_pct=5.0,
@@ -621,7 +627,7 @@ MULTI_CONTRACT = [
     ("open_short_straddle", dict(strike_method="percent_otm", strike_param=0.0,
                                  dte_min=10, dte_max=40, sizing=1.0)),
     ("open_short_strangle", dict(strike_method="percent_otm", strike_param=10.0,
-                                 dte_min=10, dte_max=40, sizing=0.3)),
+                                 dte_min=10, dte_max=40, sizing=0.6)),
     ("open_iron_condor", dict(strike_method="percent_otm", strike_param=10.0,
                               wing_width_pct=5.0, dte_min=10, dte_max=40, sizing=0.15)),
     ("open_jade_lizard", dict(strike_method="percent_otm", strike_param=10.0,
@@ -668,7 +674,7 @@ def test_the_short_straddle_is_charged_its_STRIKE_not_the_spot():
     a 102 spot writes the 100 straddle, and the shares are put to us at 100.
     """
     kw = dict(strike_method="percent_otm", strike_param=0.0, dte_min=10, dte_max=40,
-              sizing=0.45)
+              sizing=0.8)
     opened = _leaving_room(1_000_000.0, spot=102.0)
     res = act(opened, "open_short_straddle", **kw).execute()
     assert res["success"], res["message"]
@@ -922,21 +928,22 @@ def test_the_capacity_gate_does_not_ALSO_spend_buying_power_on_the_same_dollars(
     available BUYING POWER as well quietly re-imposes the reserve pool on a budget that
     has nothing to do with it, and refuses a wheel the account can plainly fund.
 
-    balance 50,000; a held bear call spread reserves 40,000 and owes NO delivery.
-      buying power : 10,000 available; the candidate reserves 5,000            -> OK
+    balance 50,000; a held bear call spread reserves 35,000 and owes NO delivery.
+      buying power : 15,000 available; the candidate reserves 10,000 (F10: both
+                     legs, 2,000/contract)                                     -> OK
       capacity     : 0 owed + 45,000 for the candidate vs 50,000 of cash       -> OK
-    Charge the 45,000 delivery bill against the 10,000 of buying power and it refuses.
+    Charge the 45,000 delivery bill against the 15,000 of buying power and it refuses.
     """
     acct = FakeAccount(spot=100.0, balance=50_000.0)
-    acct.hold(held_structure("bear_call_spread", 40_000.0,
+    acct.hold(held_structure("bear_call_spread", 35_000.0,
                              (OptionRight.CALL, 110.0, 8, OrderDirection.SELL),
                              (OptionRight.CALL, 115.0, 8, OrderDirection.BUY)))
-    assert acct.available_option_buying_power() == pytest.approx(10_000.0)
+    assert acct.available_option_buying_power() == pytest.approx(15_000.0)
     assert acct.short_put_assignment_exposure().cost == pytest.approx(0.0)
 
     res = act(acct, "open_short_strangle",
               strike_method="percent_otm", strike_param=10.0, dte_min=10, dte_max=40,
-              sizing=10.0).execute()
+              sizing=20.0).execute()
     assert res["success"], res["message"]
     sub = acct.submitted[-1]
     assert sub["quantity"] == 5                       # 5 x 90 x 100 = 45,000 of delivery

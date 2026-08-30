@@ -1193,15 +1193,16 @@ class OptionsAccountInterface(ABC):
     @classmethod
     def option_reserve_required(cls, strategy: str, quantity: int, *, strike: float | None = None,
                                spread_width: float | None = None, net_credit: float | None = None,
-                               spot: float | None = None, option_type: OptionRight | None = None) -> float:
+                               spot: float | None = None, option_type: OptionRight | None = None,
+                               call_strike: float | None = None) -> float:
         """Cash/BP that a short-premium strategy must reserve. 0 for long/debit strategies.
 
         ``option_type`` is REQUIRED for the single-sided naked strategies
-        (``short_strangle``/``naked_put``/``put_ratio_spread``) — the Reg-T OTM amount
-        is direction-aware, so a missing right would silently misstate the reserve.
-        ``short_straddle`` needs none: it shorts BOTH rights at the same strike and
-        Reg-T margins a straddle at the GREATER of the two legs, so the worst case
-        over both rights is reserved.
+        (``naked_put``) — the Reg-T OTM amount is direction-aware, so a missing right
+        would silently misstate the reserve. The two-sided naked strategies price BOTH
+        legs by name instead: ``short_strangle`` takes the PUT strike in ``strike`` and
+        the call's in ``call_strike`` (both required); ``short_straddle`` shorts both
+        rights at ONE strike and needs only it.
 
         An **unrecognised** ``strategy`` raises ``ValueError``. It used to fall off the
         end of the branch chain into a bare ``return 0.0``, which meant that the one
@@ -1231,9 +1232,9 @@ class OptionsAccountInterface(ABC):
                         f"the capital this structure must set aside is UNKNOWN — and an "
                         f"unknown requirement must not be reported as zero (a zero "
                         f"reserve passes every buying-power gate).")
-                if field == "strike" and value <= 0:
+                if field in ("strike", "call_strike") and value <= 0:
                     raise ValueError(
-                        f"option_reserve_required({strategy!r}): strike is {value!r}. No "
+                        f"option_reserve_required({strategy!r}): {field} is {value!r}. No "
                         f"listed equity option has a non-positive strike, so this is an "
                         f"unpopulated field, and pricing it would reserve nothing.")
         # Validated BEFORE the quantity short-circuit: an unrecognised strategy is a
@@ -1268,11 +1269,29 @@ class OptionsAccountInterface(ABC):
             # NAKED short premium: reserve the Reg-T naked-option margin, not full cash.
             _require(strike=strike)
             if strategy == "short_straddle":
-                # Both a short call AND a short put at the SAME strike: reserve the
-                # worst-case leg (only one side can finish ITM; Reg-T charges the greater).
-                return max(
-                    cls.naked_margin_per_contract(strike, option_type=OptionRight.CALL, spot=spot),
-                    cls.naked_margin_per_contract(strike, option_type=OptionRight.PUT, spot=spot),
+                # Both a short call AND a short put at the SAME strike: reserve the SUM of
+                # the two legs' naked margins. It used to take max(call, put) — "only one
+                # side can finish ITM" — but the backtest's maintenance model
+                # (``BacktestAccount.maintenance_margin_requirement``) charges naked margin
+                # for EVERY held short lot, so a just-opened straddle held less than its
+                # own maintenance demand and could instantly breach (review 2026-08-30
+                # F10 sibling). The sum keeps entry >= maintenance at open, and is >= the
+                # Reg-T greater-leg-plus-other-premium convention a fortiori.
+                return (
+                    cls.naked_margin_per_contract(strike, option_type=OptionRight.CALL, spot=spot)
+                    + cls.naked_margin_per_contract(strike, option_type=OptionRight.PUT, spot=spot)
+                ) * quantity
+            if strategy == "short_strangle":
+                # A short call AND a short put at DIFFERENT strikes (``strike`` = the PUT
+                # strike, ``call_strike`` = the call's): reserve the SUM of both legs'
+                # naked margins, matching the maintenance model above. It used to price
+                # the PUT leg only (~half the margin maintenance demands of the open
+                # position), so O_SSTG opened what it immediately breached and was
+                # force-unwound at unguarded marks (review 2026-08-30 F10).
+                _require(call_strike=call_strike)
+                return (
+                    cls.naked_margin_per_contract(strike, option_type=OptionRight.PUT, spot=spot)
+                    + cls.naked_margin_per_contract(call_strike, option_type=OptionRight.CALL, spot=spot)
                 ) * quantity
             if option_type is None:
                 raise ValueError(
