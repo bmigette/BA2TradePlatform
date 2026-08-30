@@ -25,6 +25,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from ba2_common.core.option_payoff import (
     MEASURED,
+    MIN_MEASURABLE_LOSS,
     UNBOUNDED,
     MaxLossResult,
     PayoffLeg,
@@ -33,10 +34,12 @@ from ba2_common.core.option_payoff import (
 )
 from ba2_common.core.option_request import (
     BUDGET_CEILING_REFUSAL,
+    BUDGET_EXHAUSTED_REFUSAL,
     EMPTY_BOX_REFUSAL,
     EMPTY_CHAIN_REFUSAL,
     MAX_LOSS_UNMEASURABLE_REFUSAL,
     SELECTION_CONFIG_REFUSAL,
+    UNDEFINED_RISK_REFUSAL,
     validate_refusal_phrase,
 )
 from ba2_common.core.option_selector import OptionSelectionConfigError, target_strike
@@ -701,8 +704,57 @@ def _in_box(c: OptionContract, ctx: PolicyContext) -> bool:
     return True
 
 
-def _chargeable_max_loss(c: OptionContract, ctx: PolicyContext) -> float:
-    """Dollars this candidate's max loss is CHARGED against ``ctx.max_loss_ceiling``.
+#: WHY a charge came back infinite, or didn't. ``_ceiling_reason`` reads this to tell three
+#: fixable causes apart -- ``math.inf`` alone cannot, and F12 is exactly the bug that resulted:
+#: a permission refusal, a genuinely unpriceable candidate, and a real-but-too-rich charge all
+#: collapsed into one phrase that sent the operator to re-pull quotes when the fix was a SETTING.
+#:
+#:   * ``_CAUSE_PRICED``      -- a real dollar figure exists. MEASURED, or UNBOUNDED with
+#:                               ``allow_undefined_risk`` and a leg to price the assignment
+#:                               against. The remedy, if it was refused, is a bigger ceiling.
+#:   * ``_CAUSE_PERMISSION``  -- UNBOUNDED, priceable (a leg exists to charge it against), but
+#:                               ``allow_undefined_risk`` is False. The remedy is the SETTING, not
+#:                               the ceiling -- this is F12's whole point.
+#:   * ``_CAUSE_UNPRICEABLE`` -- nothing could be priced no matter what is granted: an
+#:                               UNMEASURABLE quote, a builder that declined the candidate, or an
+#:                               UNBOUNDED loss with no leg to attribute it to (a short stock
+#:                               leg). No setting or budget fixes this; only better data does.
+#:
+#: Compared by identity, never by equality -- see ``_OffScale`` for why that convention exists in
+#: this module.
+_CAUSE_PRICED = "PRICED"
+_CAUSE_PERMISSION = "PERMISSION"
+_CAUSE_UNPRICEABLE = "UNPRICEABLE"
+
+
+@dataclass(frozen=True)
+class _Charge:
+    """One candidate's answer from ``_chargeable_max_loss``: what it costs, and why, if it can't
+    be afforded.
+
+    ``amount`` IS THE ONLY FIELD THE ELIGIBILITY COMPARISON MAY READ. It is exactly what the old
+    bare ``float`` return used to be -- ``math.inf`` for every refusal, a real figure otherwise --
+    so ``charge.amount <= ctx.max_loss_ceiling`` is byte-identical to the pre-F12 comparison for
+    every admitted candidate. ``cause`` and ``would_be_charge`` exist purely for
+    ``_ceiling_reason`` to explain a refusal; nothing upstream of it may consult them.
+
+    ``would_be_charge`` IS THE ONE PLACE THIS CARRIES A NUMBER ``amount`` DOES NOT. For a
+    ``_CAUSE_PERMISSION`` candidate it is the synthetic assignment cost that WOULD have been
+    charged had ``allow_undefined_risk`` been True -- computed here, for free, because the leg
+    list and the loss are already in hand; recomputing it from ``_ceiling_reason`` would be a
+    second builder pass. It lets a mixed refusal compare "raise the ceiling to X" against "flip
+    the setting, which prices at Y" without ever calling ``structure_fn`` twice. None for every
+    other cause: a ``_CAUSE_PRICED`` charge already carries its number in ``amount``, and a
+    ``_CAUSE_UNPRICEABLE`` one has none to give under any remedy.
+    """
+
+    amount: float
+    cause: str
+    would_be_charge: Optional[float] = None
+
+
+def _chargeable_max_loss(c: OptionContract, ctx: PolicyContext) -> _Charge:
+    """This candidate's charge against ``ctx.max_loss_ceiling``, and why it is what it is.
 
     ONLY EVER CALLED WITH A ``structure_fn`` PRESENT -- ``eligible`` returns before this when
     there is none. See its docstring for why an absent seam disables the filter instead of
@@ -710,27 +762,35 @@ def _chargeable_max_loss(c: OptionContract, ctx: PolicyContext) -> float:
 
     THREE STATES, THREE ANSWERS -- collapsing any two is a bug:
 
-      * MEASURED     -> the measured amount.
-      * UNBOUNDED    -> the synthetic assignment cost when undefined risk is PERMITTED, else
-                        infinity -- refused for lack of PERMISSION, not for lack of a number.
-                        The distinction is not cosmetic: it is the difference between an account
-                        that forbids naked shorts and a naked short nobody can price, and a
-                        single "excluded" branch would report the second when the first is true.
-      * UNMEASURABLE -> infinity. A broken quote is NEVER priced by rule, exactly as
-                        ``_risk_denominator`` refuses to. The arbitrage vertical's short call has
-                        a perfectly usable strike, so the synthetic figure is right there for the
-                        taking; taking it would launder a crossed quote into a budget.
+      * MEASURED     -> ``_CAUSE_PRICED`` at the measured amount.
+      * UNBOUNDED    -> priceable (a leg to charge the assignment against) and
+                        ``allow_undefined_risk`` True -> ``_CAUSE_PRICED`` at the synthetic
+                        assignment cost. Priceable but the setting is False -> ``_CAUSE_PERMISSION``,
+                        infinite, carrying the synthetic as ``would_be_charge`` -- refused for
+                        lack of PERMISSION, not for lack of a number. Not priceable at all (no
+                        leg to attribute the risk to) -> ``_CAUSE_UNPRICEABLE``, infinite, no
+                        matter what the setting says. The distinction between the first two is
+                        not cosmetic: it is the difference between an account that forbids naked
+                        shorts and a naked short nobody can price, and a single "excluded" branch
+                        would report the second when the first is true -- F12.
+      * UNMEASURABLE -> ``_CAUSE_UNPRICEABLE``, infinite. A broken quote is NEVER priced by rule,
+                        exactly as ``_risk_denominator`` refuses to. The arbitrage vertical's
+                        short call has a perfectly usable strike, so the synthetic figure is
+                        right there for the taking; taking it would launder a crossed quote into
+                        a budget.
 
-    THIS DELIBERATELY DISAGREES WITH ``_reward_to_risk`` ON THAT LAST STATE, AND THE DISAGREEMENT
-    IS NOT AN OVERSIGHT TO UNIFY. Given an unmeasurable loss, ``rr`` DEMOTES the candidate and
-    KEEPS it -- because one crossed quote must not disable a gene for every candidate beside it,
-    and a ranking that loses one row still ranks. This REMOVES it, because a budget has no
-    equivalent of "scores worst": there is no charge that is both unknown and affordable. Same
-    input, opposite verdicts, because ranking can absorb an unknown and spending cannot.
+    THIS DELIBERATELY DISAGREES WITH ``_reward_to_risk`` ON THE UNMEASURABLE STATE, AND THE
+    DISAGREEMENT IS NOT AN OVERSIGHT TO UNIFY. Given an unmeasurable loss, ``rr`` DEMOTES the
+    candidate and KEEPS it -- because one crossed quote must not disable a gene for every
+    candidate beside it, and a ranking that loses one row still ranks. This REMOVES it, because a
+    budget has no equivalent of "scores worst": there is no charge that is both unknown and
+    affordable. Same input, opposite verdicts, because ranking can absorb an unknown and spending
+    cannot.
 
-    A BUILDER THAT DECLINES THE CANDIDATE ALSO GETS INFINITY. When ranking, a declined candidate
-    is one missing value among peers and scores worst; a budget has no "worst" that is also
-    affordable, and a structure the builder could not complete has no max loss to charge.
+    A BUILDER THAT DECLINES THE CANDIDATE ALSO GETS ``_CAUSE_UNPRICEABLE``. When ranking, a
+    declined candidate is one missing value among peers and scores worst; a budget has no "worst"
+    that is also affordable, and a structure the builder could not complete has no max loss to
+    charge, no matter what any setting says.
 
     THE SYNTHETIC IS ``_risk_denominator``'s, DELIBERATELY, AND THIS DEVIATES FROM THE DESIGN.
     Design section 8.3 words the budgeting substitute for undefined risk as ``spot * 100``; this
@@ -739,29 +799,35 @@ def _chargeable_max_loss(c: OptionContract, ctx: PolicyContext) -> float:
     together and could never re-pick a cheaper strike -- which is the entire purpose of this
     filter. And the codebase now has exactly ONE notion of what an unbounded structure risks;
     a second synthetic for the same shape is how the two drift apart, with nothing downstream
-    able to say which figure a given refusal used.
+    able to say which figure a given refusal used. It is computed HERE, ONCE, whether or not
+    permission is granted, precisely so a permission refusal can still report the number that
+    would have applied -- see ``would_be_charge``.
 
-    RETURNS ``inf`` RATHER THAN ``None`` ON EVERY REFUSAL because the caller's test is a single
-    ``<= ceiling`` comparison, and ``inf <= x`` is False for every finite ``x``. An Optional would
-    put the fail-closed rule in the caller, where forgetting the ``is None`` branch fails OPEN.
+    ``amount`` IS ``inf`` RATHER THAN ``None`` ON EVERY REFUSAL because the caller's test is a
+    single ``<= ceiling`` comparison, and ``inf <= x`` is False for every finite ``x``. An
+    Optional would put the fail-closed rule in the caller, where forgetting the ``is None``
+    branch fails OPEN.
     """
     # NOTE: called WITHOUT a try/except, exactly as ``_profit_and_risk`` calls it, and for the
     # same reason. Declining is None or an empty list; an exception is a defect in the builder
     # and propagates. See ``PolicyContext.structure_fn``.
     legs = ctx.structure_fn(c)
     if not legs:
-        return math.inf
+        return _Charge(math.inf, _CAUSE_UNPRICEABLE)
     loss = max_loss(legs)
     if loss.state == MEASURED:
-        return float(loss.amount)
+        return _Charge(float(loss.amount), _CAUSE_PRICED)
     if loss.state == UNBOUNDED:
-        if not ctx.allow_undefined_risk:
-            return math.inf
         # PERMISSION IS NOT A NUMBER. A short stock leg's risk is permitted here and still
-        # unpriceable, so ``_risk_denominator`` declines and the candidate is refused anyway.
+        # unpriceable, so ``_risk_denominator`` declines and the candidate is refused anyway --
+        # computed unconditionally, on purpose: see the docstring's note on ``would_be_charge``.
         synthetic = _risk_denominator(legs, loss)
-        return math.inf if synthetic is None else synthetic
-    return math.inf
+        if synthetic is None:
+            return _Charge(math.inf, _CAUSE_UNPRICEABLE)
+        if not ctx.allow_undefined_risk:
+            return _Charge(math.inf, _CAUSE_PERMISSION, would_be_charge=synthetic)
+        return _Charge(synthetic, _CAUSE_PRICED)
+    return _Charge(math.inf, _CAUSE_UNPRICEABLE)
 
 
 @dataclass(frozen=True)
@@ -818,32 +884,73 @@ def _no_candidate_reason(candidates: Sequence[OptionContract],
     return SelectionRefusal(phrase=EMPTY_BOX_REFUSAL, detail=detail)
 
 
-def _ceiling_reason(charges: Sequence[float], ctx: PolicyContext) -> SelectionRefusal:
+def _ceiling_reason(charges: Sequence[_Charge], ctx: PolicyContext) -> SelectionRefusal:
     """Why the BUDGET emptied a box that was not empty. Called only when it did.
 
-    TWO CAUSES, AND THE SECOND IS NOT A BUDGET PROBLEM AT ALL. ``_chargeable_max_loss`` returns
-    infinity for every candidate it cannot prove affordable — an unmeasurable loss, a builder
-    that declined, an unbounded loss on an account that forbids undefined risk — so a box of
-    nothing but crossed quotes empties under a BILLION-dollar ceiling. Reporting that as a
-    ceiling that is too low would print "cheapest inf exceeds ceiling 1000000000.00" and send the
-    operator to raise a cap that is already a billion dollars. ``MAX_LOSS_UNMEASURABLE_REFUSAL``
-    names it, and it already existed; no new phrase is minted for a case the registry covers.
+    FOUR CAUSES, AND ONLY ONE OF THEM IS ABOUT THE CEILING'S SIZE -- F12 is the bug this function
+    exists to fix: the other three used to collapse into ``MAX_LOSS_UNMEASURABLE_REFUSAL`` (or,
+    for the exhausted-budget value, into ``BUDGET_CEILING_REFUSAL``), sending the operator to
+    re-pull quotes or widen a box when the remedy was a SETTING or nothing was ever going to fit.
 
-    THE NUMBERS ARE THE POINT OF THE OTHER BRANCH. 210 against a 200 ceiling is one strike of
-    slack; 210 against a 20 ceiling is a structure this sleeve cannot afford at any strike in the
-    box. Both are "no", and only the first is worth widening a band for.
+    THE ORDER BELOW IS A PRIORITY LADDER, NOT A SEQUENCE OF INDEPENDENT CHECKS, and each step is
+    the answer to "of the causes present, which one's remedy is both KNOWN and CHEAPEST":
+
+      1. ``ctx.max_loss_ceiling < MIN_MEASURABLE_LOSS`` -> ``BUDGET_EXHAUSTED_REFUSAL``,
+         unconditionally, before any cause is even inspected. A MEASURED charge is always
+         strictly greater than ``MIN_MEASURABLE_LOSS`` (``max_loss``'s own invariant), so a
+         ceiling below it can never admit ANY priced candidate, on ANY chain, no matter what the
+         quotes say or what permission is granted. Reporting a cause below this line would sooner
+         or later send an operator to fix a quote or flip a setting and get refused again by a
+         budget that was never going to pay for anything.
+      2. A ``_CAUSE_PRICED`` candidate exists -> ``BUDGET_CEILING_REFUSAL``, at the cheapest such
+         charge. This is preferred over a live ``_CAUSE_PERMISSION`` candidate ON PURPOSE: a
+         priced charge is a REAL, ALREADY-KNOWN number, while an undefined-risk synthetic is
+         ``strike * multiplier * ratio`` -- an assignment notional, structurally the more
+         expensive remedy for the shapes this codebase builds (a vertical's few hundred dollars
+         of max loss against a naked short's five-figure assignment cost). Preferring the known,
+         typically-cheaper number over the unknown, typically-dearer one is the "cheapest
+         candidate" the mixed-cause rule asks for, without a second builder pass to compare them
+         exactly -- see ``_Charge.would_be_charge``.
+      3. No ``_CAUSE_PRICED`` candidate, but a ``_CAUSE_PERMISSION`` one with a real
+         ``would_be_charge`` exists -> ``UNDEFINED_RISK_REFUSAL``, at the cheapest such would-be
+         charge. This is F12's headline case: every exclusion left standing is a want of
+         PERMISSION, and the operator is sent to the setting, not to the chain.
+      4. Otherwise -> ``MAX_LOSS_UNMEASURABLE_REFUSAL``. Nothing left could be priced under any
+         remedy: broken quotes, declined builds, or an unbounded loss with no leg to attribute it
+         to. No setting or budget fixes this; only better data does.
+
+    THE NUMBERS ARE THE POINT OF STEPS 2 AND 3. 210 against a 200 ceiling is one strike of slack;
+    210 against a 20 ceiling is a structure this sleeve cannot afford at any strike in the box.
+    Both are "no", and only the first is worth widening a band for -- and the same is true of a
+    permission remedy's synthetic figure against the setting it is gated on.
     """
-    affordable = [charge for charge in charges if math.isfinite(charge)]
-    if not affordable:
+    if ctx.max_loss_ceiling < MIN_MEASURABLE_LOSS:
         return SelectionRefusal(
-            phrase=MAX_LOSS_UNMEASURABLE_REFUSAL,
-            detail=(f"no chargeable max loss could be computed for any of {len(charges)} "
-                    f"candidates in the box, so none can be shown to fit the "
-                    f"{ctx.max_loss_ceiling:.2f} ceiling"))
+            phrase=BUDGET_EXHAUSTED_REFUSAL,
+            detail=(f"max_loss_ceiling {ctx.max_loss_ceiling:.2f} is below the "
+                    f"{MIN_MEASURABLE_LOSS:.2f} floor every measured max loss clears, so no "
+                    f"contract could ever fit it regardless of quotes or permissions "
+                    f"({len(charges)} candidates in the box)"))
+    priced = [charge.amount for charge in charges if charge.cause == _CAUSE_PRICED]
+    if priced:
+        return SelectionRefusal(
+            phrase=BUDGET_CEILING_REFUSAL,
+            detail=(f"cheapest chargeable max loss {min(priced):.2f} exceeds ceiling "
+                    f"{ctx.max_loss_ceiling:.2f} ({len(charges)} candidates in the box)"))
+    would_be = [charge.would_be_charge for charge in charges
+               if charge.cause == _CAUSE_PERMISSION and charge.would_be_charge is not None]
+    if would_be:
+        return SelectionRefusal(
+            phrase=UNDEFINED_RISK_REFUSAL,
+            detail=(f"{len(would_be)} of {len(charges)} candidates in the box carry unbounded "
+                    f"loss priceable at {min(would_be):.2f} or more but "
+                    f"allow_undefined_risk is False -- permission, not the ceiling, is what "
+                    f"refuses them"))
     return SelectionRefusal(
-        phrase=BUDGET_CEILING_REFUSAL,
-        detail=(f"cheapest chargeable max loss {min(affordable):.2f} exceeds ceiling "
-                f"{ctx.max_loss_ceiling:.2f} ({len(charges)} candidates in the box)"))
+        phrase=MAX_LOSS_UNMEASURABLE_REFUSAL,
+        detail=(f"no chargeable max loss could be computed for any of {len(charges)} "
+                f"candidates in the box under any setting, so none can be shown to fit the "
+                f"{ctx.max_loss_ceiling:.2f} ceiling"))
 
 
 def eligible(candidates: Sequence[OptionContract],
@@ -968,7 +1075,7 @@ def _eligible_and_reason(
     if ctx.max_loss_ceiling is None or ctx.structure_fn is None:
         return boxed, None
     charges = [_chargeable_max_loss(c, ctx) for c in boxed]
-    kept = [c for c, charge in zip(boxed, charges) if charge <= ctx.max_loss_ceiling]
+    kept = [c for c, charge in zip(boxed, charges) if charge.amount <= ctx.max_loss_ceiling]
     if kept:
         return kept, None
     return [], _ceiling_reason(charges, ctx)

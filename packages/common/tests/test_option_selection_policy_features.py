@@ -26,17 +26,20 @@ UNKNOWN is not, and ``rr`` divides by a synthetic assignment cost instead of ref
 PROFIT has no such stand-in: there is no honest finite number for "the upside is open-ended", so
 that side really does go inert.
 """
+import math
 from datetime import date
 
 import pytest
 
-from ba2_common.core.option_payoff import MEASURED, PayoffLeg, max_loss
+from ba2_common.core.option_payoff import MEASURED, MIN_MEASURABLE_LOSS, PayoffLeg, max_loss
 from ba2_common.core.option_request import (
     BUDGET_CEILING_REFUSAL,
+    BUDGET_EXHAUSTED_REFUSAL,
     EMPTY_BOX_REFUSAL,
     EMPTY_CHAIN_REFUSAL,
     MAX_LOSS_UNMEASURABLE_REFUSAL,
     SELECTION_CONFIG_REFUSAL,
+    UNDEFINED_RISK_REFUSAL,
 )
 from ba2_common.core.option_selection_policy import (
     FEATURE_NAMES,
@@ -44,7 +47,12 @@ from ba2_common.core.option_selection_policy import (
     PolicyContext,
     SelectionPolicy,
     SelectionRefusal,
+    _CAUSE_PERMISSION,
+    _CAUSE_PRICED,
+    _CAUSE_UNPRICEABLE,
     _OFF_SCALE,
+    _ceiling_reason,
+    _chargeable_max_loss,
     _profit_and_risk,
     _reward_to_risk,
     eligible,
@@ -1016,3 +1024,149 @@ def test_a_selection_refusal_cannot_carry_a_free_text_phrase():
     SelectionRefusal(phrase=BUDGET_CEILING_REFUSAL, detail="")     # registered: fine
     with pytest.raises(ValueError):
         SelectionRefusal(phrase="the budget was a bit small", detail="")
+
+
+# ------------------------------------------------ F12: the refusal names its own remedy
+#
+# ``_chargeable_max_loss`` returns ``math.inf`` for THREE distinct causes -- a broken quote, a
+# builder that declined, and an UNBOUNDED loss refused for want of PERMISSION -- and before this
+# fix ``_ceiling_reason`` reported all three (plus the exhausted-budget value ``ceiling=0.0``) as
+# one of two phrases, sending the operator to re-pull quotes or widen a box when the real remedy
+# was a SETTING or nothing was ever going to fit. These tests pin the four-way ladder that
+# replaces it: each one below is precisely the test that fails if two of the ladder's causes were
+# collapsed back into one, which is the mutation this fix exists to make impossible.
+
+
+def test_chargeable_max_loss_tags_every_cause():
+    """The cause travelling with the charge, pinned directly -- one assertion per branch of
+    ``_chargeable_max_loss``, independent of anything ``_ceiling_reason`` does with it."""
+    measured = _chargeable_max_loss(EXPENSIVE, ctx(structure_fn=credit_vertical(5.0)))
+    assert measured.cause is _CAUSE_PRICED
+    assert measured.amount == pytest.approx(410.0)
+    assert measured.would_be_charge is None
+
+    permission_blocked = _chargeable_max_loss(EXPENSIVE, ctx(structure_fn=naked_short_call))
+    assert permission_blocked.cause is _CAUSE_PERMISSION
+    assert permission_blocked.amount == math.inf
+    assert permission_blocked.would_be_charge == pytest.approx(10000.0)   # 100 strike * 100
+
+    permitted = _chargeable_max_loss(
+        EXPENSIVE, ctx(structure_fn=naked_short_call, allow_undefined_risk=True))
+    assert permitted.cause is _CAUSE_PRICED
+    assert permitted.amount == pytest.approx(10000.0)
+
+    declined = _chargeable_max_loss(EXPENSIVE, ctx(structure_fn=lambda cand: None))
+    assert declined.cause is _CAUSE_UNPRICEABLE
+    assert declined.amount == math.inf
+    assert declined.would_be_charge is None
+
+    crossed_quote = _chargeable_max_loss(EXPENSIVE, ctx(structure_fn=arbitrage_vertical))
+    assert crossed_quote.cause is _CAUSE_UNPRICEABLE
+
+    no_strike_to_attribute = _chargeable_max_loss(
+        EXPENSIVE, ctx(structure_fn=short_stock, allow_undefined_risk=True))
+    assert no_strike_to_attribute.cause is _CAUSE_UNPRICEABLE
+    assert no_strike_to_attribute.would_be_charge is None
+
+
+def test_a_pure_permission_refusal_names_the_setting_not_the_quote():
+    """F12's headline case. Both candidates are naked short calls refused only because
+    ``allow_undefined_risk`` is False -- the ceiling is a billion dollars, so size is not the
+    story. Before this fix this reported ``MAX_LOSS_UNMEASURABLE_REFUSAL``, sending the operator
+    to re-pull quotes that were never the problem.
+    """
+    context = ctx(structure_fn=naked_short_call, max_loss_ceiling=1e9)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == UNDEFINED_RISK_REFUSAL
+    assert refusal.phrase not in (MAX_LOSS_UNMEASURABLE_REFUSAL, BUDGET_CEILING_REFUSAL,
+                                  BUDGET_EXHAUSTED_REFUSAL)
+    assert "allow_undefined_risk" in refusal.detail
+    assert "10000.00" in refusal.detail            # the cheaper candidate's would-be charge
+
+
+def test_a_pure_unpriceable_refusal_still_names_the_quote():
+    """The other half of the split this fix pins: when NOTHING carries a permission cause,
+    the phrase stays ``MAX_LOSS_UNMEASURABLE_REFUSAL`` exactly as before -- a builder that
+    declines both candidates outright, no crossed quote involved."""
+    context = ctx(structure_fn=lambda cand: None, max_loss_ceiling=1e9)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == MAX_LOSS_UNMEASURABLE_REFUSAL
+    assert refusal.phrase != UNDEFINED_RISK_REFUSAL
+
+
+def test_a_ceiling_below_the_measurable_floor_is_named_as_exhausted_not_as_a_low_ceiling():
+    """``ceiling=0.0`` is the EXHAUSTED-budget value (``min(instrument_left, structure_cap)`` when
+    an instrument has spent its whole allowance), not an ordinary small ceiling. Before this fix
+    it reported ``BUDGET_CEILING_REFUSAL`` -- "widen the box" -- for a budget that cannot ever be
+    widened into; only replenishment fixes it.
+    """
+    context = ctx(structure_fn=credit_vertical(5.0), max_loss_ceiling=0.0)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == BUDGET_EXHAUSTED_REFUSAL
+    assert refusal.phrase != BUDGET_CEILING_REFUSAL
+
+
+def test_the_exhausted_check_outranks_a_permission_cause_too():
+    """Not just the priced case: a ceiling under ``MIN_MEASURABLE_LOSS`` can never admit ANYTHING,
+    so it must win even when every candidate in the box is otherwise a pure permission refusal --
+    granting the setting would still refuse under a ceiling this low.
+    """
+    context = ctx(structure_fn=naked_short_call, max_loss_ceiling=0.005)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == BUDGET_EXHAUSTED_REFUSAL
+    assert refusal.phrase != UNDEFINED_RISK_REFUSAL
+
+
+def _priced_then_permission(cand):
+    """EXPENSIVE prices to a real (too-rich) charge; CHEAP is a naked short refused only for
+    permission."""
+    return credit_vertical(5.0)(cand) if cand.strike < 105.0 else naked_short_call(cand)
+
+
+def test_mixed_priced_and_permission_prefers_the_known_cheaper_number():
+    """MIXED CAUSES: documents the choice this fix makes when the box holds both a real (but too
+    rich) charge and a permission-blocked one. ``BUDGET_CEILING_REFUSAL`` wins because 410 is a
+    REAL, ALREADY-KNOWN dollar figure, while the naked short's synthetic (10500, an assignment
+    notional) is structurally the more expensive remedy for the shapes this codebase builds --
+    see ``_ceiling_reason``'s docstring for the reasoning this test pins.
+    """
+    context = ctx(structure_fn=_priced_then_permission, max_loss_ceiling=300.0)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == BUDGET_CEILING_REFUSAL
+    assert refusal.phrase != UNDEFINED_RISK_REFUSAL
+    assert "410.00" in refusal.detail
+
+
+def _permission_then_unpriceable(cand):
+    """EXPENSIVE is a naked short refused for permission; CHEAP is declined outright."""
+    return naked_short_call(cand) if cand.strike < 105.0 else None
+
+
+def test_mixed_permission_and_unpriceable_prefers_the_fixable_setting():
+    """MIXED CAUSES, the other pairing: no priced candidate exists, so between a permission
+    refusal (fixable with a setting) and a builder decline (fixable by nothing this layer
+    controls), the setting wins -- it is the only one of the two an operator can act on.
+    """
+    context = ctx(structure_fn=_permission_then_unpriceable, max_loss_ceiling=1e9)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == UNDEFINED_RISK_REFUSAL
+    assert refusal.phrase != MAX_LOSS_UNMEASURABLE_REFUSAL
+    assert "10000.00" in refusal.detail
+
+
+def test_the_admitted_path_is_unaffected_by_the_cause_ladder():
+    """TASK 5'S GUARANTEE MUST SURVIVE: a candidate that DOES fit the ceiling is picked exactly as
+    before -- the cause ladder only ever runs once ``kept`` is empty, so a mix of a priced
+    candidate that fits and a permission-blocked one that doesn't still simply admits the one
+    that fits, with no refusal at all.
+    """
+    context = ctx(structure_fn=_priced_then_permission, max_loss_ceiling=1e9)
+    chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
+    assert chosen is EXPENSIVE
+    assert refusal is None
