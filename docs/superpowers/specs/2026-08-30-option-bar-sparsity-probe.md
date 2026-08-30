@@ -97,19 +97,36 @@ the computed figure exactly.
 
 ## Read for F1/F2
 
-The headline number is not the ~46% median interior-gap rate alone — it is that the ITM bucket
-is the *worst* on both axes (59% median interior gap, 28% tail-gap rate) while carrying the
-*largest* dollar exposure per contract. F1's unclamped expiry settlement and F2's
-entry-premium-fallback both fire specifically on stale or absent bars, and this probe shows
-those are not rare edge cases: a held ITM contract is missing a fresh print on a majority of the
-business days it is open, and better than one in four ITM contracts go dark 5+ business days
-before their own expiry — with the tail of that distribution (p99 = 117 business days, max =
-611) showing contracts that effectively stopped printing months to years before expiring, so
-whatever price F1 settles them at, or F2 marks them at, is not a stale-by-a-day rounding error
-but frequently a snapshot from a wholly different regime of the underlying. F2's label in the
-findings doc — "VERIFIED path / SUSPECT frequency" — should be read as VERIFIED on both counts:
-the mechanism is real and the frequency is high, concentrated exactly where the dollar exposure
-is largest.
+**Correction on which bucket is worst where.** ITM is worst on *interior* gaps (59% median, the
+highest of the three buckets); OTM is worst on *tail* gaps (33.5%, ahead of ITM's 28.2% and far
+ahead of ATM's 5.3%) — the two axes do not point at the same bucket, and the table above should
+be read that way, not as "ITM worst on both." What both buckets share is that either failure mode
+is worst furthest from the money; ITM additionally carries the largest per-contract dollar
+exposure (it is the leg F1's intrinsic clamp is missing for), which is why it is still the bucket
+that matters most for severity even though it does not top the tail-gap column.
+
+**What this sample can and cannot say about HELD contracts.** The 76,203-contract population
+above is every listed contract in the sampled partitions — every strike TastyTrade ever quoted
+for that underlying and expiry, dominated by strikes nobody's strategy would ever select (deep
+OTM junk, single-print zombies). That population's gap rates are an *upper bound* on what a live
+book would see, not a measurement of it: the actual frequency for HELD contracts — the ones a
+delta-box or percent-OTM rule would actually pick — is not measured by this probe and remains an
+open question; a follow-up would need to replay real entry rules against the chain rather than
+count every listed strike.
+
+The bound still carries weight because of where it does NOT collapse. `ATM` — the bucket where a
+delta-box entry (the selection stack's own default) concentrates its picks — is the
+*most favourable* moneyness bucket in this data, by construction the closest this probe gets to
+"what a real strategy would hold," and it is still not clean: 29% median interior gap and a 5.3%
+tail-gap rate. So even under the most charitable reading — assume every held position looks like
+the ATM column, never the worse ITM/OTM tails a book drifts into as the underlying moves after
+entry — the typical held position still prints no fresh bar on roughly 3 in 10 of the business
+days it is open (the ATM median), and roughly 1 in 20 held positions go dark for the last week or
+more before their own expiry (the ATM tail-gap rate). F1's unclamped expiry settlement and F2's
+entry-premium fallback both fire specifically
+on stale or absent bars, so this floor is enough to upgrade F2's frequency qualifier from
+SUSPECT to VERIFIED-NONTRIVIAL — a real, non-rare rate of exposure — without claiming the
+precise held-contract number, which this probe does not measure.
 
 ## Reproduction
 

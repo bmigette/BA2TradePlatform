@@ -742,10 +742,12 @@ class _Charge:
     ``_CAUSE_PERMISSION`` candidate it is the synthetic assignment cost that WOULD have been
     charged had ``allow_undefined_risk`` been True -- computed here, for free, because the leg
     list and the loss are already in hand; recomputing it from ``_ceiling_reason`` would be a
-    second builder pass. It lets a mixed refusal compare "raise the ceiling to X" against "flip
-    the setting, which prices at Y" without ever calling ``structure_fn`` twice. None for every
-    other cause: a ``_CAUSE_PRICED`` charge already carries its number in ``amount``, and a
-    ``_CAUSE_UNPRICEABLE`` one has none to give under any remedy.
+    second builder pass. It lets ``_ceiling_reason`` test the EXACT question a mixed refusal
+    needs answered -- "does this candidate already fit the ceiling once permission is granted,
+    with no ceiling change at all" (``would_be_charge <= ctx.max_loss_ceiling``) -- without ever
+    calling ``structure_fn`` twice to find out. None for every other cause: a ``_CAUSE_PRICED``
+    charge already carries its number in ``amount``, and a ``_CAUSE_UNPRICEABLE`` one has none
+    to give under any remedy.
     """
 
     amount: float
@@ -887,13 +889,15 @@ def _no_candidate_reason(candidates: Sequence[OptionContract],
 def _ceiling_reason(charges: Sequence[_Charge], ctx: PolicyContext) -> SelectionRefusal:
     """Why the BUDGET emptied a box that was not empty. Called only when it did.
 
-    FOUR CAUSES, AND ONLY ONE OF THEM IS ABOUT THE CEILING'S SIZE -- F12 is the bug this function
-    exists to fix: the other three used to collapse into ``MAX_LOSS_UNMEASURABLE_REFUSAL`` (or,
+    FIVE STEPS, AND ONLY ONE OF THEM IS ABOUT THE CEILING'S SIZE -- F12 is the bug this function
+    exists to fix: every other cause used to collapse into ``MAX_LOSS_UNMEASURABLE_REFUSAL`` (or,
     for the exhausted-budget value, into ``BUDGET_CEILING_REFUSAL``), sending the operator to
     re-pull quotes or widen a box when the remedy was a SETTING or nothing was ever going to fit.
 
     THE ORDER BELOW IS A PRIORITY LADDER, NOT A SEQUENCE OF INDEPENDENT CHECKS, and each step is
-    the answer to "of the causes present, which one's remedy is both KNOWN and CHEAPEST":
+    the EXACT answer to "which remedy admits the cheapest candidate" -- not an approximation of
+    it, because both numbers a mixed box needs are already sitting in ``charges`` (see
+    ``_Charge.would_be_charge``): no second builder pass is needed to compare them precisely.
 
       1. ``ctx.max_loss_ceiling < MIN_MEASURABLE_LOSS`` -> ``BUDGET_EXHAUSTED_REFUSAL``,
          unconditionally, before any cause is even inspected. A MEASURED charge is always
@@ -902,27 +906,35 @@ def _ceiling_reason(charges: Sequence[_Charge], ctx: PolicyContext) -> Selection
          quotes say or what permission is granted. Reporting a cause below this line would sooner
          or later send an operator to fix a quote or flip a setting and get refused again by a
          budget that was never going to pay for anything.
-      2. A ``_CAUSE_PRICED`` candidate exists -> ``BUDGET_CEILING_REFUSAL``, at the cheapest such
-         charge. This is preferred over a live ``_CAUSE_PERMISSION`` candidate ON PURPOSE: a
-         priced charge is a REAL, ALREADY-KNOWN number, while an undefined-risk synthetic is
-         ``strike * multiplier * ratio`` -- an assignment notional, structurally the more
-         expensive remedy for the shapes this codebase builds (a vertical's few hundred dollars
-         of max loss against a naked short's five-figure assignment cost). Preferring the known,
-         typically-cheaper number over the unknown, typically-dearer one is the "cheapest
-         candidate" the mixed-cause rule asks for, without a second builder pass to compare them
-         exactly -- see ``_Charge.would_be_charge``.
-      3. No ``_CAUSE_PRICED`` candidate, but a ``_CAUSE_PERMISSION`` one with a real
-         ``would_be_charge`` exists -> ``UNDEFINED_RISK_REFUSAL``, at the cheapest such would-be
-         charge. This is F12's headline case: every exclusion left standing is a want of
-         PERMISSION, and the operator is sent to the setting, not to the chain.
-      4. Otherwise -> ``MAX_LOSS_UNMEASURABLE_REFUSAL``. Nothing left could be priced under any
+      2. A ``_CAUSE_PERMISSION`` candidate exists whose ``would_be_charge`` is already
+         ``<= ctx.max_loss_ceiling`` -> ``UNDEFINED_RISK_REFUSAL``. CHECKED FIRST, AHEAD OF ANY
+         PRICED CANDIDATE, because such a candidate needs NO ceiling change at all -- flipping
+         ``allow_undefined_risk`` alone admits it immediately at the ceiling already in place. A
+         permission candidate priced at 200 against a ceiling of 300, sitting beside a priced
+         candidate at 4800, is a case where "raise the ceiling above 4800" is not merely a worse
+         answer than "flip the setting" -- it asks for a budget increase the box does not need at
+         all. No comparison against the priced figures is required to see that: a remedy costing
+         zero additional ceiling always beats one that costs a raise, whatever the raise's size.
+      3. No candidate cleared step 2, but a ``_CAUSE_PRICED`` one exists -> ``BUDGET_CEILING_
+         REFUSAL``, at the cheapest such charge. Every permission candidate left at this point
+         needs its ``would_be_charge`` to exceed the ceiling too (step 2 would have caught it
+         otherwise), so a priced remedy -- a concrete, already-known raise to a specific number --
+         is preferred over asking for both a setting flip AND a further ceiling raise to an
+         amount that is still unknown until the setting is flipped.
+      4. No priced candidate either, but a ``_CAUSE_PERMISSION`` one with a real
+         ``would_be_charge`` exists (necessarily still above the ceiling, or step 2 would have
+         fired) -> ``UNDEFINED_RISK_REFUSAL``, at the cheapest such would-be charge. This is
+         F12's headline case: every exclusion left standing is a want of PERMISSION, and the
+         operator is sent to the setting, not to the chain -- even though the setting alone will
+         not be enough here; the detail says so.
+      5. Otherwise -> ``MAX_LOSS_UNMEASURABLE_REFUSAL``. Nothing left could be priced under any
          remedy: broken quotes, declined builds, or an unbounded loss with no leg to attribute it
          to. No setting or budget fixes this; only better data does.
 
-    THE NUMBERS ARE THE POINT OF STEPS 2 AND 3. 210 against a 200 ceiling is one strike of slack;
-    210 against a 20 ceiling is a structure this sleeve cannot afford at any strike in the box.
-    Both are "no", and only the first is worth widening a band for -- and the same is true of a
-    permission remedy's synthetic figure against the setting it is gated on.
+    THE NUMBERS ARE THE POINT OF STEPS 2, 3 AND 4. 210 against a 200 ceiling is one strike of
+    slack; 210 against a 20 ceiling is a structure this sleeve cannot afford at any strike in the
+    box. Both are "no", and only the first is worth widening a band for -- and the same is true
+    of a permission remedy's synthetic figure against the setting it is gated on.
     """
     if ctx.max_loss_ceiling < MIN_MEASURABLE_LOSS:
         return SelectionRefusal(
@@ -931,21 +943,30 @@ def _ceiling_reason(charges: Sequence[_Charge], ctx: PolicyContext) -> Selection
                     f"{MIN_MEASURABLE_LOSS:.2f} floor every measured max loss clears, so no "
                     f"contract could ever fit it regardless of quotes or permissions "
                     f"({len(charges)} candidates in the box)"))
+    would_be = [charge.would_be_charge for charge in charges
+               if charge.cause == _CAUSE_PERMISSION and charge.would_be_charge is not None]
+    free_permission_fix = [wb for wb in would_be if wb <= ctx.max_loss_ceiling]
+    if free_permission_fix:
+        return SelectionRefusal(
+            phrase=UNDEFINED_RISK_REFUSAL,
+            detail=(f"a candidate carrying unbounded loss prices at "
+                    f"{min(free_permission_fix):.2f}, which already fits the "
+                    f"{ctx.max_loss_ceiling:.2f} ceiling, but allow_undefined_risk is False -- "
+                    f"flipping that setting alone admits it, no larger ceiling needed"))
     priced = [charge.amount for charge in charges if charge.cause == _CAUSE_PRICED]
     if priced:
         return SelectionRefusal(
             phrase=BUDGET_CEILING_REFUSAL,
             detail=(f"cheapest chargeable max loss {min(priced):.2f} exceeds ceiling "
                     f"{ctx.max_loss_ceiling:.2f} ({len(charges)} candidates in the box)"))
-    would_be = [charge.would_be_charge for charge in charges
-               if charge.cause == _CAUSE_PERMISSION and charge.would_be_charge is not None]
     if would_be:
         return SelectionRefusal(
             phrase=UNDEFINED_RISK_REFUSAL,
             detail=(f"{len(would_be)} of {len(charges)} candidates in the box carry unbounded "
                     f"loss priceable at {min(would_be):.2f} or more but "
                     f"allow_undefined_risk is False -- permission, not the ceiling, is what "
-                    f"refuses them"))
+                    f"refuses them (the ceiling would still need raising to at least "
+                    f"{min(would_be):.2f} even after the setting is flipped)"))
     return SelectionRefusal(
         phrase=MAX_LOSS_UNMEASURABLE_REFUSAL,
         detail=(f"no chargeable max loss could be computed for any of {len(charges)} "

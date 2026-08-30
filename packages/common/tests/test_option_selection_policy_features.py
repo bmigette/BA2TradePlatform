@@ -854,8 +854,8 @@ def test_without_a_structure_fn_the_ceiling_is_inapplicable_rather_than_total():
     pre-ceiling pick, so nothing can regress. That argument needs no downstream layer, which is
     just as well, because none exists: there is no option-structure triage today (``book_left``,
     ``instrument_left`` and ``structure_cap`` have zero hits repo-wide and live only in the
-    design), and the one sizing step that does exist divides by PREMIUM or RESERVE
-    (``option_request.SIZING_BASES``), never by max loss -- so for a credit spread, whose premium
+    design), and the one sizing step that does exist divides by PREMIUM, RESERVE or
+    HELD_SHARES (``option_request.SIZING_BASES``), never by max loss -- so for a credit spread, whose premium
     outlay and max loss are different numbers, an unaffordable pick is NOT caught downstream by
     any "refuses at contracts = 0" mechanism. That claim was retracted from ``eligible``'s own
     docstring (3d676204) as false in the present tense; admitting here can therefore lose a real
@@ -1128,11 +1128,12 @@ def _priced_then_permission(cand):
 
 
 def test_mixed_priced_and_permission_prefers_the_known_cheaper_number():
-    """MIXED CAUSES: documents the choice this fix makes when the box holds both a real (but too
-    rich) charge and a permission-blocked one. ``BUDGET_CEILING_REFUSAL`` wins because 410 is a
-    REAL, ALREADY-KNOWN dollar figure, while the naked short's synthetic (10500, an assignment
-    notional) is structurally the more expensive remedy for the shapes this codebase builds --
-    see ``_ceiling_reason``'s docstring for the reasoning this test pins.
+    """MIXED CAUSES, THE CASE WHERE THE PERMISSION FIX IS NOT FREE. CHEAP's naked-short synthetic
+    is 10500 against a 300 ceiling -- flipping ``allow_undefined_risk`` alone would NOT admit it
+    (10500 > 300), so this is not step 2's free-fix case. ``BUDGET_CEILING_REFUSAL`` wins at 410,
+    the real already-known figure, because the only other candidate needs BOTH a setting flip AND
+    a further ceiling raise to an amount this test does not even have to say -- see
+    ``_ceiling_reason``'s docstring, step 3.
     """
     context = ctx(structure_fn=_priced_then_permission, max_loss_ceiling=300.0)
     chosen, refusal = pick_with_reason(PAIR, context, SelectionPolicy())
@@ -1140,6 +1141,40 @@ def test_mixed_priced_and_permission_prefers_the_known_cheaper_number():
     assert refusal.phrase == BUDGET_CEILING_REFUSAL
     assert refusal.phrase != UNDEFINED_RISK_REFUSAL
     assert "410.00" in refusal.detail
+
+
+def _free_permission_fix_vs_rich_priced(cand):
+    """The reviewer's counter-case, verbatim: a permission-blocked candidate whose synthetic
+    (200) already fits the ceiling (300), sitting beside a priced candidate the ceiling cannot
+    reach at all (4800). Strike 2.0 -> naked short call, synthetic 2.0 * 100 * 1 = 200. Strike
+    48.0 -> a 50-wide credit vertical at a 2.00 net credit, max_loss (50 - 2.00) * 100 = 4800.
+    """
+    if cand.strike == 2.0:
+        return naked_short_call(cand)
+    return [PayoffLeg(kind="call", side=OrderDirection.SELL, premium=cand.mid, strike=cand.strike),
+            PayoffLeg(kind="call", side=OrderDirection.BUY, premium=0.10,
+                      strike=cand.strike + 50.0)]
+
+
+def test_a_free_permission_fix_beats_a_cheaper_looking_priced_figure():
+    """THE REVIEWER'S COUNTER-CASE. Without step 2, the old ladder would report
+    ``BUDGET_CEILING_REFUSAL`` and imply the ceiling must rise above 4800 -- 16x the actual fix,
+    which is flipping ``allow_undefined_risk`` for a candidate that ALREADY fits the ceiling in
+    place (200 <= 300) and needs no larger budget at all. ``min(would_be)`` and ``min(priced)``
+    are both already in ``charges``; comparing ``would_be <= ceiling`` is the one comparison
+    that finds this exactly, with no second builder pass.
+    """
+    permission_candidate = c(2.0, bid=0.01, ask=0.03, delta=0.30)
+    priced_candidate = c(48.0, bid=2.00, ask=2.20, delta=0.25)
+    context = ctx(structure_fn=_free_permission_fix_vs_rich_priced, max_loss_ceiling=300.0)
+    chosen, refusal = pick_with_reason([permission_candidate, priced_candidate], context,
+                                       SelectionPolicy())
+    assert chosen is None
+    assert refusal.phrase == UNDEFINED_RISK_REFUSAL
+    assert refusal.phrase != BUDGET_CEILING_REFUSAL
+    assert "200.00" in refusal.detail
+    assert "300.00" in refusal.detail
+    assert "4800" not in refusal.detail          # never told to chase the rich figure
 
 
 def _permission_then_unpriceable(cand):
