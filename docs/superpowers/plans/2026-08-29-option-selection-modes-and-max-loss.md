@@ -730,6 +730,31 @@ def test_every_emitted_weight_can_actually_move_the_pick():
     twice (the dead roll gene; the trial-config whitelist dropping new knobs)."""
 ```
 
+> **APPLICABILITY IS PER-CHAIN, NOT PER-STRUCTURE — this changes how the guard test must be
+> written.** (Discovered building Tasks 2-4, 2026-08-30.)
+>
+> `inapplicable_features` is sensitive to a SINGLE candidate's payoff shape: if *any* candidate
+> in the set is off-scale, the whole column goes inert (that is the fix for the mixed-shape
+> demotion hole — see the design's applicability section). So `w_profit`/`w_rr` can flip between
+> live and inert for the same rule as the chain changes from bar to bar.
+>
+> Two consequences:
+>
+> 1. **The guard test must use a chain on which the feature is genuinely applicable**, or it
+>    fails for a reason that has nothing to do with the gene being dead. Assert applicability
+>    first (`inapplicable_features(...) == ()`), then assert the weight moves the pick. A guard
+>    test that cannot tell "dead gene" from "inert on this particular chain" is worse than none.
+> 2. **"Emit only where the payoff is bounded on the side they read" is a statement about the
+>    BUILDER's shape, not about any one chain.** A single-shape builder (every credit vertical
+>    completes to a credit vertical) has a stable answer and is what the emission rule keys on.
+>    Only a builder whose `structure_fn` returns different shapes per candidate has a varying
+>    one — no builder does that today, and if one is ever added, its genes need re-examining
+>    rather than the emission rule being loosened.
+>
+> The variance is correct behaviour — the alternative is demoting long calls — but it means the
+> two genes' effective search pressure is a function of chain composition, which is worth
+> knowing before reading GA results that use them.
+
 Before wiring, **re-read `reference-trial-config-whitelist-drops-new-knobs`**:
 `_build_daily_trial_config` rebuilds the config key by key, so a knob missing there is inert while
 every log claims it works. Add the seven weights there in the same commit.
