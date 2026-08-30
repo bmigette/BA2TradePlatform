@@ -2237,17 +2237,18 @@ class _OptionEntryAction(TradeAction):
         return self.create_and_save_action_result(
             action_type=self._action_type_value(), success=success, message=message, data=data or {})
 
-    def _refuse_if_cannot_take_delivery(self, option_strategy: str, *,
-                                        strike: Optional[float],
-                                        contracts: Optional[float]
-                                        ) -> Optional[Dict[str, Any]]:
-        """ENFORCING assignment-capacity gate. Returns a refusal, or None to proceed.
+    def _downsize_to_delivery_capacity(self, option_strategy: str, *,
+                                       strike: Optional[float],
+                                       quantity: Optional[int],
+                                       contracts_per_unit: int = 1,
+                                       ) -> "Tuple[Optional[int], Optional[Dict[str, Any]]]":
+        """ENFORCING assignment-capacity gate. Returns ``(admitted_quantity, refusal)``.
 
         Only structures carrying a SHORT PUT reach here, and they pass their short put
-        LEG (its strike and its total contract count across the whole order, ratios
-        included) rather than a dollar figure — the pricing lives in one place,
-        ``option_lifecycle.put_assignment_cost``, reached via
-        ``check_short_put_assignment_capacity``.
+        LEG (its strike, the order quantity in UNITS, and how many short-put contracts
+        one unit carries — 2 for the 1x2 put ratio spread) rather than a dollar figure —
+        the pricing lives in one place, ``option_lifecycle.put_assignment_cost``,
+        reached via ``check_short_put_assignment_capacity``.
 
         WHY THIS IS NOT THE BUYING-POWER GATE AGAIN. The reserve pool asks "can I set
         aside what this ONE structure needs?", priced the way a broker prices it —
@@ -2258,19 +2259,65 @@ class _OptionEntryAction(TradeAction):
         delivery than the account holds — measured, five 100-strike puts reserving
         $2,000 each against $45,000 of cash and a $50,000 bill.
 
+        DOWNSIZE, NOT REFUSE-ALL (review 2026-08-30 F6, operator-approved for the
+        SHARED live+backtest path). Refusing the whole entry made the gate the binding
+        constraint at small accounts: a $20k account's 6-unit iron condor was refused
+        outright when 2 units fit, so most of the sizing gene band was a zero-trade
+        region and stage-1 verdicts measured the gate, not the market. When the full
+        size does not fit but the shortfall is pure ARITHMETIC (held bill, candidate
+        cost and cash all measured), the quantity is clamped to
+        ``floor(remaining_capacity / per-unit delivery cost)`` — in UNITS, so a ratio
+        structure keeps its even short-put count — and the entry proceeds at that size.
+        The refusal remains for: even 1 unit does not fit (the existing message,
+        extended to say the downsize was attempted), and every UNMEASURABLE verdict
+        (no room figure exists to clamp to; unknown is still not 'fine').
+
         Placed AFTER ``check_option_buying_power`` deliberately: an entry that the
         pre-existing gate already refuses keeps the message it has always had, so no
-        decline already on record is re-labelled and the new refusal only ever appears
-        where something genuinely new is being caught.
+        decline already on record is re-labelled. A downsized entry needs LESS buying
+        power than the full size that already passed, so the earlier BP verdict holds a
+        fortiori (callers re-derive the reserve for the clamped size).
         """
+        total = None
+        if quantity is not None and contracts_per_unit:
+            total = contracts_per_unit * quantity
         verdict = self.account.check_short_put_assignment_capacity(
-            strike=strike, contracts=contracts)
+            strike=strike, contracts=total)
         if verdict.ok:
-            return None
+            return quantity, None
+        downsize_attempted = False
+        if (verdict.held_cost is not None and verdict.cash is not None
+                and verdict.candidate_cost is not None
+                and quantity is not None and quantity >= 1):
+            from ba2_common.core.option_lifecycle import put_assignment_cost
+
+            per_unit = put_assignment_cost(strike, contracts_per_unit, 100)
+            if per_unit is not None and per_unit > 0:
+                downsize_attempted = True
+                room = verdict.cash - verdict.held_cost
+                max_units = int(room // per_unit)
+                if max_units >= 1:
+                    # Belt and braces: re-verify the clamped size through the SAME gate
+                    # (the two must agree by construction; this keeps them honest).
+                    clamped = self.account.check_short_put_assignment_capacity(
+                        strike=strike, contracts=contracts_per_unit * max_units)
+                    if clamped.ok:
+                        logger.warning(
+                            f"{self._action_type_value()} for {self.instrument_name}: "
+                            f"{option_strategy} DOWNSIZED {quantity} -> {max_units} "
+                            f"unit(s) to fit assignment capacity "
+                            f"(room {room:,.2f} / {per_unit:,.2f} per unit; "
+                            f"held {verdict.held_cost:,.2f}, cash {verdict.cash:,.2f}).")
+                        return max_units, None
+        message = f"{verdict.reason}"
+        if downsize_attempted:
+            message += (" Downsizing was attempted, but not even one unit of this "
+                        "structure fits the remaining capacity.")
+        message += f" Refusing {option_strategy} on {self.instrument_name}."
         logger.warning(f"{self._action_type_value()} for {self.instrument_name}: "
                        f"{option_strategy} REFUSED — {verdict.reason}")
-        return self._result(
-            False, f"{verdict.reason} Refusing {option_strategy} on {self.instrument_name}.",
+        return quantity, self._result(
+            False, message,
             {"option_strategy": option_strategy,
              "assignment_held_cost": verdict.held_cost,
              "assignment_candidate_cost": verdict.candidate_cost,
@@ -2348,7 +2395,7 @@ class _OptionEntryAction(TradeAction):
         put a verdict; this is the ask-first path for the caller that does. The verdict's
         ``reason`` is the seam's own sentence verbatim, so both channels say one thing.
 
-        Placed AFTER sizing, like ``_refuse_if_cannot_take_delivery`` is placed after the
+        Placed AFTER sizing, like ``_downsize_to_delivery_capacity`` is placed after the
         buying-power gate: an entry the pre-existing "held equity below one contract lot"
         check already declines keeps the message it has always had.
         """
@@ -2951,10 +2998,11 @@ class SellCashSecuredPutAction(_OptionEntryAction):
                                 f"on {self.instrument_name} (available="
                                 f"{self.account.available_option_buying_power()})")
         # ONE short put, `quantity` contracts, at contract.strike.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "cash_secured_put", strike=contract.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "cash_secured_put", strike=contract.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required("cash_secured_put", quantity, strike=contract.strike)
         limit_price = contract.bid                          # sell at BID
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.SELL,
                         position_intent="sell_to_open", option_type=self.OPTION_TYPE,
@@ -3071,7 +3119,7 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
     strike.
 
     ASSIGNMENT. The short leg is a PUT, so this structure can have shares put to it and
-    is charged the full short strike by ``_refuse_if_cannot_take_delivery``. The long
+    is charged the full short strike by ``_downsize_to_delivery_capacity``. The long
     wing nets NOTHING off that bill — see the comment at the gate below.
     """
 
@@ -3161,10 +3209,12 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
         # TONIGHT, while exercising our own lower-strike put is a choice we make LATER —
         # after the shares have already been paid for. Netting the width here would price
         # a $9,500 obligation at $500 and wave every entry through.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "bull_put_spread", strike=short_c.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "bull_put_spread", strike=short_c.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "bull_put_spread", quantity, spread_width=width, net_credit=net_credit)
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
                               strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
@@ -3375,10 +3425,12 @@ class OpenShortStraddleAction(_OptionEntryAction):
         # ONE short put leg (put_c), `quantity` contracts. The short CALL at the same
         # strike consumes no PUT-assignment capacity: assigned, it delivers shares and
         # pays cash IN.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "short_straddle", strike=put_c.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "short_straddle", strike=put_c.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "short_straddle", quantity, strike=call_c.strike, spot=spot)
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
                              position_intent="sell_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
@@ -3458,10 +3510,12 @@ class OpenShortStrangleAction(_OptionEntryAction):
             return self._result(False, f"Insufficient BP for short strangle on {self.instrument_name}")
         # ONE short put leg (put_c, the lower strike), `quantity` contracts. The short
         # OTM call is not put-assignment capacity.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "short_strangle", strike=put_c.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "short_strangle", strike=put_c.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "short_strangle", quantity, strike=put_c.strike, call_strike=call_c.strike, spot=spot)
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
                              position_intent="sell_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
@@ -3541,10 +3595,12 @@ class OpenIronCondorAction(_OptionEntryAction):
         # put is a choice we make LATER — after the shares have already been paid for.
         # A condor is sized off its wing width, which is why it is the structure this
         # gate bites hardest.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "iron_condor", strike=sp.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "iron_condor", strike=sp.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "iron_condor", quantity, spread_width=width, net_credit=net_credit)
         legs = [
             OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
                       option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
@@ -3628,10 +3684,12 @@ class OpenJadeLizardAction(_OptionEntryAction):
             return self._result(False, f"Insufficient BP for jade lizard on {self.instrument_name}")
         # The NAKED short put leg (sp), `quantity` contracts. The other two legs are the
         # call credit spread, which owes shares rather than cash.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "jade_lizard", strike=sp.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "jade_lizard", strike=sp.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "jade_lizard", quantity, strike=sp.strike, spread_width=call_wing_width, net_credit=net_credit)
         legs = [
             OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
                       option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
@@ -3791,10 +3849,13 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         # TWO short puts per structure (`ratio_qty=2` on the short leg below), so the
         # delivery bill is 2 x quantity contracts at the SHORT strike. The single long
         # put at the higher strike nets nothing off, same as the condor's wing.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "put_ratio_spread", strike=short_p.strike, contracts=2 * quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "put_ratio_spread", strike=short_p.strike, quantity=quantity,
+            contracts_per_unit=2)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "put_ratio_spread", quantity, strike=short_p.strike, net_credit=net_credit)
         legs = [
             OptionLeg(contract_symbol=long_p.symbol, side=OrderDirection.BUY, ratio_qty=1,
                       position_intent="buy_to_open", option_type=OptionRight.PUT,
