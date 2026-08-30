@@ -207,9 +207,13 @@ Two independently toggleable rules avoid that entirely, and the GA still selects
 by toggling which rule is live, which is how `opt_tp`/`opt_time`/`opt_dte`/`opt_sl` already
 express on/off.
 
-**Per structure, defined-risk only.** This is "contracts that support it", enforced
-structurally rather than by a runtime check: a naked short's `max_loss` is `UNBOUNDED`, so
-there is no denominator, so the rule is never emitted for it. §4 of the grid design already
+**Per structure, MEASURED-max-loss only.** This is "contracts that support it", enforced
+structurally rather than by a runtime check: the rule is emitted exactly for members whose
+`max_loss` returns `MEASURED` — which INCLUDES a naked short put (its loss is floored at
+`(strike − credit) × 100`; only a short CALL or short STOCK is `UNBOUNDED` and thus has no
+denominator). An earlier version of this paragraph said "a naked short's max_loss is
+UNBOUNDED", repeating the corrected §4 error one section down from its headstone; the 2026-08-30
+program review caught it about to feed Task 9's implementation. §4 of the grid design already
 establishes per-structure condition tiers; no new mechanism.
 
 Both stops may be live at once — first match wins, as the OPEN_POSITIONS ruleset already
@@ -241,11 +245,28 @@ already carrying ~300. Instead:
   grid design's own logic (share on semantics, not convenience) and the launcher's existing
   `_DEBIT_OPTION_MEMBERS` / `_CREDIT_OPTION_MEMBERS` partition, which is already asserted
   total. That line is precisely where "which contract in the box" flips direction.
-* **`w_profit` and `w_rr` are emitted only where the payoff is bounded on the side they read**,
-  shared across that set. This deliberately does **not** follow the debit/credit split: a
-  debit vertical is bounded both ways, a long call neither, a naked short put on profit only.
-  Applicability is a property of the payoff shape, determined per structure from
-  `max_profit()`/`max_loss()` returning `MEASURED` — never assumed from the half.
+* **`w_profit` is emitted only where the payoff is bounded on the side it reads**, shared
+  across that set. This deliberately does **not** follow the debit/credit split: a debit
+  vertical is bounded both ways, a long call on neither side, a naked short put on BOTH
+  (its loss is floored — the "profit only" this bullet used to claim was the §4 error again),
+  a naked short CALL on profit only. Applicability is a property of the payoff shape,
+  determined per structure from `max_profit()`/`max_loss()` returning `MEASURED` — never
+  assumed from the half.
+
+> **DECISION (operator-delegated, 2026-08-30): `w_rr` is NOT emitted as a stage-2 gene.**
+> Two independent review measurements found `rr` near-perfectly collinear with `premium`
+> within a chain (Spearman 0.98–1.0 on synthetic BS chains; ρ = 1.000 on a realistic
+> descending-premium ladder even on the synthetic-denominator path): within one candidate
+> set, rr/profit/premium are all near-monotone in moneyness, so `w_rr` would be a second
+> gene searching the axis `w_premium` already owns — at ~5 ms/pick. The FEATURE stays in
+> `option_selection_policy` (pure, tested, usable programmatically and available for a
+> future cross-chain re-denomination, e.g. rr at fixed |delta|); only the GENE is withheld.
+> `w_profit` survives on the operator's original "profit mode" intent, but conditionally:
+> Task 10's dead-gene guard must demonstrate on a RECORDED chain that a `w_profit`-only
+> policy picks a different contract than a `w_premium`-only policy somewhere in the test
+> set. If it cannot — the review measured ρ ≈ 0.99 between them too — `w_profit` is
+> dropped at wiring time on the same evidence standard, and "profit mode" is documented as
+> already expressed by `w_premium` + the strike box.
 
 ---
 
