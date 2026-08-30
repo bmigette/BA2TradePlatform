@@ -107,6 +107,25 @@ def test_full_notional_structures_are_capped_at_100():
         assert L._OPTION_STRATS[kind]["screener_gate_base"] == {"price_max": 100.0}, kind
 
 
+def test_o_wheel_inherits_o_csps_cap():
+    """O_WHEEL has no _OPTION_STRATS row of its own -- _build_strategy_wheel's docstring says
+    the entry IS O_CSP's (same full-notional cash-secured-put entry, same assignment-capacity
+    gate) -- so its affordability cap must be O_CSP's too. Without the special case, the
+    lookup falls through to {}, which under --max-stock-price 0 (the mode stage1_run.sh
+    actually runs) is NO CAP AT ALL: worse than the old blanket $100 default it replaced.
+    Review fix, 2026-08-30."""
+    assert L._screener_gate_base_for_strategy("O_WHEEL") == {"price_max": 100.0}
+    assert (L._screener_gate_base_for_strategy("O_WHEEL")
+            == L._screener_gate_base_for_strategy("O_CSP"))
+
+
+def test_o_wheel_cap_stays_pinned_to_o_csp_even_if_o_csps_cap_ever_changes(monkeypatch):
+    """Not a copy frozen at import time -- an override on O_CSP must still reach O_WHEEL,
+    the same way a live grid config would see it."""
+    monkeypatch.setitem(L._OPTION_STRATS["O_CSP"], "screener_gate_base", {"price_max": 42.0})
+    assert L._screener_gate_base_for_strategy("O_WHEEL") == {"price_max": 42.0}
+
+
 def test_naked_vol_structures_are_capped_at_300():
     for kind in ("O_SSTD", "O_SSTG"):
         assert L._OPTION_STRATS[kind]["screener_gate_base"] == {"price_max": 300.0}, kind

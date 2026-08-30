@@ -2961,11 +2961,33 @@ def _option_overlay_action(action_type: str, *, strike_param: float,
 def _screener_gate_base_for_strategy(kind: str) -> dict:
     """Per-strategy gate-only screener overrides declared on _OPTION_STRATS members
     (``screener_gate_base``). A group (OS1-4) merges its ACTIVE members' dicts in order
-    (later member wins). Equity/unknown keys -> {}."""
+    (later member wins -- see the OS2/OS3 caveat this creates, at the merge loop below).
+    Equity/unknown keys -> {}.
+
+    ``O_WHEEL`` is a special case (review fix, 2026-08-30): it has no ``_OPTION_STRATS`` row of
+    its own -- ``_build_strategy_wheel``'s own docstring says the entry IS O_CSP's, same
+    full-notional cash-secured-put entry and the same assignment-capacity gate -- so its
+    affordability cap must be O_CSP's too. Without this, ``kind in _OPTION_STRATS`` is False,
+    the group loop finds no ``_OPTION_GROUPS["O_WHEEL"]`` either (it is not a group), and the
+    lookup falls through to ``{}`` -- under ``--max-stock-price 0`` (the blanket-cap-disabled
+    mode stage1_run.sh actually runs, relying on real per-strategy overrides to do the capping)
+    that is NO CAP AT ALL, strictly worse than the old blanket $100 default it replaced.
+    """
+    if kind == "O_WHEEL":
+        return dict(_OPTION_STRATS["O_CSP"].get("screener_gate_base") or {})
     if kind in _OPTION_STRATS:
         return dict(_OPTION_STRATS[kind].get("screener_gate_base") or {})
     merged: dict = {}
     for member in _OPTION_GROUPS.get(kind, []):
+        # CAVEAT (review fix, 2026-08-30): "later member wins" is a MERGE, not a per-member
+        # gate -- a capped member's price_max here would gate every OTHER active member's
+        # entries too, including an uncapped, defined-risk one. OS2 = [O_SSTG, O_SSTD, O_IC]:
+        # O_SSTG/O_SSTD now carry a real $300 cap, so OS2's merged block currently applies
+        # $300 to O_IC's entries as well, even though defined-risk O_IC is deliberately
+        # uncapped as a STANDALONE job (grid design §6). Inert TODAY -- stage 1 runs no groups
+        # (stage1_run.sh lists single-strategy keys only) -- but a stage that DOES run OS2/OS3
+        # would need a per-member gate, not this merge, before trusting O_IC's numbers inside
+        # the group.
         merged.update(_OPTION_STRATS[member].get("screener_gate_base") or {})
     return merged
 

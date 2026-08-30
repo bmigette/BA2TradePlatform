@@ -982,27 +982,22 @@ def _option_consistent_annual_return(results: dict) -> float:
     whose whole purpose is pricing drawdown -- cannot honestly score. A measured 0.0 is a real
     value and is scored via the floor, not treated as missing.
     """
-    # --- base: (adjusted) annualized return, %/yr ---------------------------------------------
-    if results.get("profit_cap_pct") or results.get("profit_share_cap_pct"):
-        base = results.get("adjusted_annualized_return")
-        if base is None:
-            base = results.get("annualized_return")
-    else:
-        base = results.get("annualized_return")
-    if base is None or (isinstance(base, float) and (math.isnan(base) or math.isinf(base))):
-        return ZERO_TRADE_SENTINEL
-    base = float(base)
-
-    # --- superlinear drawdown penalty: READ AND DISQUALIFY FIRST -------------------------------
-    # F9(a), 2026-08-30 (option-program-review-findings.md): this block used to sit AFTER the
-    # trade gate and the `base <= 0` early return below, which let a wiped-out genome escape
+    # --- superlinear drawdown penalty: READ AND DISQUALIFY FIRST, LITERALLY FIRST --------------
+    # F9(a), 2026-08-30 (option-program-review-findings.md): originally this sat AFTER the
+    # trade gate and the `base <= 0` early return below it, which let a wiped-out genome escape
     # WIPED_OUT_SENTINEL through either of them -- a dd>=100 genome with a losing return hit
     # `base <= 0` and returned an ordinary small negative (ranking ABOVE both sentinels), and a
     # dd>=100 genome under the trade floor hit LOW_TRADE_SENTINEL (-1e8), which numerically
     # OUTRANKS WIPED_OUT_SENTINEL (-2e9) and even ZERO_TRADE_SENTINEL (-1e9) -- "a 3-trade
-    # blow-up outranks never trading". A wiped account must rank WORST of all, including below
-    # ZERO_TRADE and LOW_TRADE, so this disqualification now runs before every other early
-    # return that follows `base`. The not-finite/absent guards are unchanged.
+    # blow-up outranks never trading". A first fix moved it ahead of both, but left it AFTER
+    # the `base` derivation's own ZERO_TRADE_SENTINEL return -- unreachable from any live
+    # producer (results._compute_metrics always emits max_drawdown, so an absent/NaN base
+    # combined with a valid, wiped drawdown cannot occur in practice), but it made the stated
+    # invariant -- a wiped account ranks WORST of all, ahead of every other early return in this
+    # function -- true only for the returns that happen to come after it, not literally. Review
+    # fix, 2026-08-30: moved to the top of the function body, ahead of `base` too, so the
+    # invariant holds unconditionally rather than by scope. The not-finite/absent guards are
+    # unchanged.
     dd_raw = results.get("max_drawdown")
     if dd_raw is None:
         raise ValueError(
@@ -1028,6 +1023,17 @@ def _option_consistent_annual_return(results: dict) -> float:
         # catch this, and the block comment above for why this check must run before both
         # early returns below it.
         return WIPED_OUT_SENTINEL
+
+    # --- base: (adjusted) annualized return, %/yr ---------------------------------------------
+    if results.get("profit_cap_pct") or results.get("profit_share_cap_pct"):
+        base = results.get("adjusted_annualized_return")
+        if base is None:
+            base = results.get("annualized_return")
+    else:
+        base = results.get("annualized_return")
+    if base is None or (isinstance(base, float) and (math.isnan(base) or math.isinf(base))):
+        return ZERO_TRADE_SENTINEL
+    base = float(base)
 
     # --- trade gate: proportional ramp, hard floor below it -----------------------------------
     # STRUCTURES per year, not legs (see _trades_per_year, which also carries the fallback to

@@ -381,6 +381,26 @@ def test_wipeout_ranks_worst_of_all_sentinels_by_construction():
     assert WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0
 
 
+def test_wipeout_outranks_even_an_absent_base_review_fix_2026_08_30():
+    """The invariant made LITERAL, not just scoped: the dd read now sits ahead of the `base`
+    derivation itself, so a wiped drawdown wins even against results a live producer would
+    never actually emit together (results._compute_metrics always emits annualized_return, so
+    this combination cannot occur in practice -- but the earlier ordering only happened to be
+    correct for every reachable case, not because the code said so). Before this fix the
+    `base is None`/NaN/inf check ran FIRST and returned ZERO_TRADE_SENTINEL before the dd read
+    was ever reached."""
+    r = _r(max_drawdown=-100.0)
+    r["annualized_return"] = None
+    assert compute_fitness(OCAR, r) == WIPED_OUT_SENTINEL
+    assert compute_fitness(OCAR, r) != ZERO_TRADE_SENTINEL
+
+    r_nan = _r(max_drawdown=-100.0, annualized_return=float("nan"))
+    assert compute_fitness(OCAR, r_nan) == WIPED_OUT_SENTINEL
+
+    r_inf = _r(max_drawdown=-100.0, annualized_return=float("inf"))
+    assert compute_fitness(OCAR, r_inf) == WIPED_OUT_SENTINEL
+
+
 def test_negative_base_returned_unfactored():
     """INHERITED, and deliberately so: multiplying a negative by a <1 factor would IMPROVE a
     losing genome. The consequence -- that no risk term ever touches a losing genome, so risk
