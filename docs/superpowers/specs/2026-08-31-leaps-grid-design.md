@@ -1,114 +1,152 @@
-# LEAPS Grid — Design
+# Options Grid 2 — LEAPS, PMCC, Earnings Vol, Backspreads, Calendars — Design
 
-Date: 2026-08-31. Validated section-by-section with the operator in-session.
-Status: DESIGNED — implementation starts after the `option-selection-modes` branch
-merges (depends on Task-8 max-loss stamps, delta viability, and the covered-call
-stock-leg fix queued on that branch).
+Date: 2026-08-31. Validated section-by-section with the operator in-session;
+scope extended same day: ONE grid, MANY strategy keys, each with its own gene
+set — the S1–S7 pattern the equity grids use, applied to option structures
+(operator: "1 grid many strat").
+Status: DESIGNED — implementation starts after the `option-selection-modes`
+branch merges (depends on Task-8 max-loss stamps, delta viability, the
+covered-call stock-leg fix).
 
-Companion: `2026-08-31-convex-harvest-grid-design.md` (the OTM convexity book —
-deliberately a SEPARATE grid with a different fitness; see §8 there for why).
+Companion: `2026-08-31-convex-harvest-grid-design.md` — `O_CONVEX` stays a
+SEPARATE grid because it needs a different fitness (`option_convex`) and a
+different reading of results. Everything in THIS grid runs under `option_car`.
 
 ## 1. Feasibility — measured, not assumed (2026-08-31, seed 7)
 
 The parquet cache (`TastyTradeOptionsProvider`, 857 underlyings, bars
-2023-01..2026-08) DOES carry LEAPS, but only where the market lists them:
+2023-01..2026-08) carries LEAPS where the market lists them:
 
 - LEAPS live on the **January cycles**. Sampled Jan-2025/Jan-2026 expiries carry
-  bars from **745–858 days** before expiry on liquid names (AXP, FUTU, CCJ, APLD),
-  with ~180 trading days inside a 270–540-DTE entry band.
-- **Split universe**: smaller names (SCI, NWG, HBM in sample) never list LEAPS —
-  their January partitions begin 52–246 days pre-expiry. 8/14 sampled January
-  expiries had any 1yr+ bars. Weekly expiries list ~6 weeks out and are irrelevant.
-- Bar density at LEAPS range ≈ 50–65% of trading days: sparser than near-dated,
-  workable for daily marks with a fallback.
-- Greeks: per-date bar iv/delta is 88.2% populated (see
-  `option_selector._publishes_spread` for the authoritative cache record), so
-  **delta-based selection is viable and causal** at LEAPS range.
+  bars from **745–858 days** before expiry on liquid names (AXP, FUTU, CCJ,
+  APLD), ~180 trading days inside a 270–540-DTE entry band.
+- **Split universe**: smaller names never list LEAPS (partitions begin 52–246
+  days pre-expiry). 8/14 sampled January expiries had any 1yr+ bars.
+- Bar density at LEAPS range ≈ 50–65% of trading days.
+- Per-date bar iv/delta is 88.2% populated (authoritative record:
+  `option_selector._publishes_spread`) → **delta selection is viable and
+  causal**, including at LEAPS range; iv is measurable for the earnings-crush
+  and iv-rank gates.
 
-## 2. Strategies and genes
+## 2. Strategy keys and genes (each its own searched space)
 
-Three pure-option strategy keys, `_OPTION_STRATS` style:
-
-**`O_LEAPC` — stock-replacement long call.** Selects by **delta** (new strike
-method, §5.1), not percent-OTM. Genes: target delta 0.70–0.90 step 0.05; entry
-DTE band 365–550; roll/exit DTE floor 90–240 (exit before the decay/gamma zone —
-the core LEAPS discipline); `opt_sl_ml` stop (max loss = debit, so it is a stop
-on the premium); sizing % of sleeve.
+### Long-dated family
+**`O_LEAPC` — stock-replacement long call.** Delta-selected (new strike method,
+§6.1). Genes: target delta 0.70–0.90 step 0.05; entry DTE 365–550; roll/exit
+DTE floor 90–240 (exit before the decay/gamma zone); `opt_sl_ml`; sizing.
 
 **`O_LEAPP` — bearish twin.** Same builder, `kind=put`, same genes. The grid's
-only bearish long-dated arm; cheap to carry, easy to drop from a matrix run.
+only bearish long-dated arm.
 
-**`O_PMCC` — poor man's covered call (diagonal, wheel-pattern lifecycle).**
-LEAPS leg delta 0.75–0.85, DTE ≥365 at entry. Short-call overlay delta
-0.15–0.30, DTE 30–45, rolled at expiry or at a buyback trigger (% of credit
-decayed — searched). Shares the LEAPS roll-floor gene with `O_LEAPC`.
+**`O_PMCC` — poor man's covered call** (diagonal, wheel-pattern lifecycle, §3–4).
+LEAPS leg delta 0.75–0.85, DTE ≥365; short-call overlay delta 0.15–0.30, DTE
+30–45, rolled at expiry or buyback trigger (% of credit decayed — searched);
+shares the LEAPS roll-floor gene.
 
-~7–9 genes per strategy: delta selection replaces the strike-param + box
-machinery.
+### Event family
+**`O_ERN` — earnings long vol.** Buy a straddle (or strangle — structure
+toggle gene) before earnings, exit after the move/crush. A DIFFERENT alpha
+source: event-driven, not screener-driven; long-only premium, so the no-naked
+rule is untouched. Genes: entry days-before-earnings 1–5; exit days-after 0–2;
+structure = straddle | strangle with strangle width delta 0.25–0.45; expiry
+selection DTE 7–30 (nearest with runway past the event); iv-rank entry gate
+(only when iv-rank ≤ X, X searched 30–70 or off — buying vol only when it is
+not already bid); sizing; `opt_sl_ml` searchable, default OFF (the thesis is
+binary; a stop mid-event amputates it). Uses the FMP earnings-dates provider
+(FMPEarningsDrift already consumes it). Daily-bar caveat: entries/exits pin to
+closes; the intraday earnings-day price is not modelled — stated, accepted.
 
-## 3. PMCC model — the operator's "both" decision
+### Convexity-financed family
+**`O_CBS` / `O_PBS` — call / put ratio backspreads** (sell 1 nearer, buy 2
+further out; 1×2 fixed). Convexity financed by the short — the convex-harvest
+thesis with the bleed reduced; `O_PBS` doubles as a crash hedge. Loss bounded
+(worst case pins between strikes); the payoff machinery already handles ratios
+(`O_RS` is the mirror). Genes: short-leg delta 0.35–0.50; long-leg delta
+0.15–0.30; DTE 60–180; exit DTE floor 20–45; take-profit multiple 2x–6x | to
+expiry; `opt_sl_ml` searchable default off; sizing. NOTE: these sit between
+the two fitness worlds — if they score uniformly thin under `option_car`, the
+right move is migrating them to the convex matrix, not tuning them here.
+Recorded so a future reader does not misread thin scores as "backspreads don't
+work."
 
-The payoff evaluator prices payoff AT EXPIRY; a PMCC has two expiries. Resolution:
+### Term-structure family
+**`O_CAL` — ATM calendar** (sell near-dated, own far-dated, same strike).
+Theta-differential harvesting; unlocked by the PMCC machinery (same two-expiry
+lifecycle, same intrinsic-floor risk basis and mark hierarchy). Genes: strike
+delta ~0.45–0.55; short-leg DTE 20–40; long-leg DTE 60–120; short roll like
+PMCC; exit when the long hits its DTE floor. **Phase-gated: runs only after
+PMCC's machinery is proven in this same matrix** (thinnest data support of the
+family — lives entirely on relative pricing between expiries, where sparsity
+and the guessed spread model hurt most).
 
-- **Risk math (max loss, rails, stops): intrinsic floor.** At the short's expiry
-  the LEAPS is always worth ≥ intrinsic, so valuing the cover at intrinsic gives a
-  conservative, MEASURABLE bound: max loss = LEAPS debit − net credits collected.
-  Stamped at submit (Task-8 seam), charged to the deployment cap (covered, not
-  naked), drives `opt_sl_ml` unchanged. Errs against the strategy, never for it.
-- **Daily marks: real bars first** (the cache has the LEAPS' own closes), under
-  the F1/F2 clamps.
-- **Black-Scholes on the bar's cached iv as the mark FALLBACK only** (~35–50% of
-  days at LEAPS range have no bar), clamped to no-arb bounds. **BS never touches
-  a risk number** — pinned by a mutation test. Hierarchy: bars → BS(iv) →
-  intrinsic/entry.
+## 3. PMCC / two-expiry model — the operator's "both" decision
 
-## 4. PMCC lifecycle mechanics
+Applies to `O_PMCC` and `O_CAL`:
+- **Risk math (max loss, rails, stops): intrinsic floor.** At the short's
+  expiry the long is worth ≥ intrinsic → conservative MEASURABLE bound (PMCC:
+  LEAPS debit − net credits). Stamped at submit (Task-8 seam), charged to the
+  deployment cap (covered), drives `opt_sl_ml`. Errs against the strategy.
+- **Daily marks: real bars first** (F1/F2 clamps).
+- **BS on the bar's cached iv as mark FALLBACK only**, no-arb clamped. **BS
+  never touches a risk number** — pinned by a mutation test.
+  Hierarchy: bars → BS(iv) → intrinsic/entry.
 
-- **Entry**: one decision opens the structure — buy the LEAPS, immediately sell
-  the first short call. Admission requires **short strike > LEAPS strike** (what
-  makes the pair bounded).
-- **Roll loop** (wheel pattern): at short expiry or buyback trigger — expired
-  worthless → sell the next; ITM → buy back at the modelled price (F7 concession)
-  and re-sell. Credits accumulate against the LEAPS basis.
-- **Structure exit**: LEAPS roll floor hit, `opt_sl_ml` fires, or LEAPS delta
-  falls below ~0.50 (stops behaving like stock — searched on/off). Any exit
-  closes BOTH legs. **The engine never leaves the short uncovered** — invariant
-  pinned by a named test (operator's no-naked rule).
+## 4. Two-expiry lifecycle mechanics (wheel pattern)
 
-## 5. Build items (dependency order)
+- **Entry**: one decision opens the structure — long leg first, short
+  immediately after. PMCC admission requires short strike > LEAPS strike.
+- **Roll loop**: at short expiry/buyback trigger — worthless → sell next;
+  ITM → buy back at modelled price (F7 concession), re-sell.
+- **Structure exit**: long-leg DTE floor, `opt_sl_ml`, or (PMCC) LEAPS delta
+  < ~0.50 (searched on/off). Any exit closes BOTH legs. **The engine never
+  leaves the short uncovered** — invariant pinned by a named test.
 
-1. **`option_strike_method: "delta"`** beside `percent_otm`, reading the bar's
-   delta. Small; eligibility already filters on delta.
-2. **BS mark fallback**: one pure function (price from iv, no-arb clamped), wired
-   only into the mark-fallback chain.
-3. **PMCC lifecycle builder**: wheel pattern with a long-call cover — extends the
-   covered-call stock-leg fix (same seam, cover kind = long call). Never-uncovered
-   invariant + strike-ordering guard tests.
-4. **Preflight probe tool** (the §1 measurement productionised) +
-   **`tools/run_leaps_matrix.py`** + the three strategy defs/genes + the explicit
-   lower trade floor.
+## 5. Universe
 
-## 6. Universe and matrix
+**Listed-depth ∩ stage-1 universe, measured at preflight** with a
+per-strategy DTE threshold: LEAPS/PMCC keys need January-cycle bars at
+DTE ≥365; O_CBS/O_PBS/O_CAL need DTE ≥180; O_ERN needs only earnings dates +
+DTE ≥7 chains (nearly the whole stage-1 universe). One probe tool, threshold
+parameterised; preflight prints kept/dropped per strategy — no silent
+no-contract trials.
 
-- **LEAPS-listed ∩ stage-1 universe**, measured at preflight: keep a symbol iff
-  it has a January-cycle expiry with bars at DTE ≥365 inside the window. Preflight
-  prints kept/dropped counts — no silent no-contract trials. Expect ~half the
-  stage-1 universe, skewed liquid.
-- **Jobs**: `run_leaps_matrix.py`, singles only ({O_LEAPC, O_LEAPP, O_PMCC} ×
-  stage-1's experts) — no group jobs in round one (a 3-member group only muddies
-  attribution). 6–9 jobs total.
-- **Fitness `option_car`**, window **2023-01 → 2025-12**, 2026 held out. LEAPS
-  trials trade rarely: the LEAPS jobs get an explicit, commented **lower
-  trade floor** in config — never a silent bypass of the 12-trade/yr rule.
-- **Pop 40 / gen 6, elitism 10%** — deliberately modest; the sample supports
-  "does any region work," not fine-tuning.
+## 6. Build items (dependency order)
 
-## 7. Limitations (read results through these)
+1. **`option_strike_method: "delta"`** beside `percent_otm` (bar delta).
+2. **BS mark fallback** (pure function, mark chain only).
+3. **Two-expiry lifecycle builder** (wheel pattern, long-option cover) —
+   extends the covered-call stock-leg fix; serves PMCC first, calendar later.
+4. **Earnings-event entry gating**: the earnings-dates provider surfaced as an
+   entry condition for `O_ERN` (days-to-earnings window), plus the iv-rank
+   entry gate reusing the existing `_IV_RANK_GATE` machinery.
+5. **Backspread builders** `O_CBS`/`O_PBS` (1×2, both legs delta-selected) —
+   near-free given `O_RS`.
+6. **Preflight probe tool** (parameterised threshold) +
+   **`tools/run_options2_matrix.py`** + strategy defs/genes + the commented
+   lower trade floor for the long-dated keys (O_ERN keeps the normal floor —
+   earnings events are frequent).
+7. Phase 2 (after PMCC proves the machinery in real runs): `O_CAL`.
 
-- **One regime.** 2023–2025 was mostly up; long calls flatter themselves. The
-  matrix answers "which configurations worked in this window" only.
-- **Spread costs at LEAPS range are a guess** — the percent-of-premium model was
-  set for near-dated; real LEAPS spreads are wider. Marginal winners are noise.
-- **~2.5 non-overlapping holding periods.** Directional evidence, not statistics.
-- Runs AFTER the selection-branch merge; never alongside a live grid in the main
-  tree (worktree discipline as usual).
+## 7. Matrix
+
+- Singles only, one job per (strategy × expert) — attribution stays clean, the
+  S1–S7 shape. Phase 1: {O_LEAPC, O_LEAPP, O_PMCC, O_ERN, O_CBS, O_PBS} ×
+  stage-1's experts → 12–18 jobs. Phase 2 adds O_CAL.
+- **Fitness `option_car`** for every key in this grid. Window 2023-01 →
+  2025-12, 2026 held out. Long-dated keys get the explicit commented lower
+  trade floor; O_ERN does not need it.
+- **Pop 40 / gen 6, elitism 10%** — modest by design: the sample supports
+  "does any region work," not fine-tuning. Group jobs (an OS5-style umbrella)
+  only if stage-2 seeding later wants them.
+
+## 8. Limitations (read results through these)
+
+- **One regime.** 2023–2025 was mostly up; long calls and PMCC flatter
+  themselves; O_PBS (crash hedge) will look useless in a window with no crash
+  — that is the window talking, not the structure.
+- **Spread costs at long-dated/OTM range are a guess** — the
+  percent-of-premium model was set near-dated. Marginal winners are noise.
+- **~2.5 non-overlapping holding periods** for the long-dated keys.
+  O_ERN is the exception: hundreds of independent events in-window, so it is
+  the one key whose result deserves statistical weight.
+- Runs AFTER the selection-branch merge; worktree discipline as usual.
