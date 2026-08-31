@@ -1403,8 +1403,11 @@ RESERVE_ROW_FMT = ('Unallocated (free buying power) — now ${current:,.2f} '
 #: MARKED AS THE TARGET SPLIT. Both halves are derived from the slider, not measured
 #: from the broker, so this answers "what would this setting hold back?" while the row
 #: below answers "what is actually free right now?".
+#: "OUT OF", so the investable figure is never read alone. Stating it beside the base
+#: it came from is what stops "$4,832.81 investable" being checked against the wrong
+#: denominator -- the whole class of confusion this card kept producing.
 RESERVE_CAPTION_FMT = ('{target_pct:g}% of the ${base:,.2f} base = ${reserved:,.2f} '
-                       'held back, leaving ${investable:,.2f} to allocate')
+                       'held back — ${investable:,.2f} investable out of ${base:,.2f}')
 
 #: WHAT THE BASE IS MADE OF, spelled out above the caption.
 #:

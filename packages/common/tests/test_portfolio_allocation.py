@@ -1704,7 +1704,7 @@ def test_one_share_outside_the_bound_is_refused_and_quotes_the_limit():
     assert qty == 0.0
     assert outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
     assert "1000% of target" in reason
-    assert "150% bump limit" in reason
+    assert "200% bump limit" in reason
     assert not reason.startswith("below")
     assert "held" not in reason
 
@@ -1789,23 +1789,41 @@ def test_the_four_dollar_slice_reaches_the_plan_as_a_real_order():
 
 
 def test_a_thirty_four_dollar_share_under_the_fractional_floor_skips_with_the_real_reason():
-    """The live case: a $3 slice of a $34 ETF. Even the cheapest order that clears
-    the floor -- 0.14706 shares for $5.00 -- is 167% of target, outside the 1.5x
-    guard, so it SKIPS. It must say the floor is why the small fraction was
-    unavailable, not "rounds to zero". One dollar more of target and this same case
-    becomes a legal order (see the 125% test above), which is exactly why the
-    quoted percentage has to come off the cheapest legal order and not off the
-    $34 whole share (1133%)."""
+    """A $2 slice of a $34 ETF. The cheapest order that clears the floor -- 0.14706
+    shares for $5.00 -- is 250% of target, outside the 2x guard, so it SKIPS. It must
+    say the FLOOR is why the small fraction was unavailable, not "rounds to zero".
+    A larger target and this same case becomes a legal order (see the 125% test
+    above), which is exactly why the quoted percentage has to come off the cheapest
+    legal order and not off the $34 whole share (1700%).
+
+    Was a $3 slice when the bound was 1.5x (167%, refused). At 2x that case now FILLS,
+    which is the widening the rounding rule bought -- see the test below.
+    """
     margin = MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
                         min_trade_increment=0.00001, min_fractional_notional=5.0)
-    qty, outcome, reason = pa.size_sub_unit_target(3.0, 34.0, margin,
+    qty, outcome, reason = pa.size_sub_unit_target(2.0, 34.0, margin,
                                                    allow_fractional=True)
     assert qty == 0.0
     assert outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
     assert "$5 fractional minimum" in reason
-    assert "167% of target" in reason
+    assert "250% of target" in reason
     assert "rounds to 0" not in reason
     assert not reason.startswith("below")
+
+
+def test_the_wider_bound_lets_a_three_dollar_slice_clear_the_fractional_floor():
+    """The other side of the same move. At 1.5x a $3 target could not reach the $5
+    broker minimum (167% > 150%) and the symbol got nothing; at 2x it does. The
+    constant governs BOTH escalations -- one whole share, and the cheapest fraction
+    that clears a notional floor -- and widening it widens both."""
+    margin = MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
+                        min_trade_increment=0.00001, min_fractional_notional=5.0)
+    qty, outcome, reason = pa.size_sub_unit_target(3.0, 34.0, margin,
+                                                   allow_fractional=True)
+
+    assert qty == pytest.approx(0.14706)
+    assert outcome == pa.SIZING_OUTCOME_BUMPED
+    assert "167% of target" in reason
 
 
 def test_the_engine_weighs_the_fractional_floor_before_it_suppresses_the_row():
@@ -1815,13 +1833,16 @@ def test_the_engine_weighs_the_fractional_floor_before_it_suppresses_the_row():
     margin = {"SCHD": MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
                                  min_trade_increment=0.00001,
                                  min_fractional_notional=5.0)}
-    row = pa.compute_allocation(3.0, 1_000_000.0, labels,
+    # $2, not $3: at the 2x bound a $3 target CLEARS the $5 floor (167%) and this
+    # test needs a row the bound still refuses, so that "the floor was weighed before
+    # the suppression" is what it is actually measuring.
+    row = pa.compute_allocation(2.0, 1_000_000.0, labels,
                                 {"SCHD": _pos("SCHD", 34.0)}, margin,
                                 allow_fractional=True, default_bp_factor=1.0,
                                 valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
     assert row.delta_quantity == 0.0
     assert row.sizing_outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
-    assert row.unmet_notional == pytest.approx(3.0)
+    assert row.unmet_notional == pytest.approx(2.0)
     reason = " ".join(row.reasons)
     assert "$5 fractional minimum" in reason
     assert pa.REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX not in reason
@@ -2071,13 +2092,13 @@ def test_the_bump_bound_survives_the_float_noise_of_a_percentage_chain():
     SKIPPED depending on the arithmetic that produced its target."""
     margin = MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)
     target = 924.1170589305282
-    # Exactly half again the target -- but reached by a different arithmetic route
-    # (a percentage chain, which is how the engine gets there), landing 2.3e-13
-    # ABOVE ``target * 1.5``. Without the tolerance this share is refused while an
-    # identical one written ``target * 1.5`` is bumped.
-    price = target * 15.0 / 10.0
-    assert price > target * 1.5                     # the noise is real, not imagined
-    assert price - target * 1.5 < 1e-9
+    # Exactly DOUBLE the target -- but reached by a different arithmetic route (a
+    # percentage chain, which is how the engine gets there), landing a few ulps ABOVE
+    # ``target * 2.0``. Without the tolerance this share is refused while an identical
+    # one written ``target * 2.0`` is bumped.
+    price = target * 54.0 / 27.0
+    assert price > target * 2.0                     # the noise is real, not imagined
+    assert price - target * 2.0 < 1e-9
     assert pa.size_sub_unit_target(target, price, margin,
                                    allow_fractional=True)[1] == pa.SIZING_OUTCOME_BUMPED
     # A hair of slack is all it gets: a genuinely larger share still skips.

@@ -1819,7 +1819,7 @@ def test_reserve_dollars_without_a_base_is_None_not_zero():
 
 def test_the_reserve_caption_states_the_money_and_what_is_left():
     assert format_reserve_caption(10_000.0, 25.0) == \
-        '25% of the $10,000.00 base = $2,500.00 held back, leaving $7,500.00 to allocate'
+        '25% of the $10,000.00 base = $2,500.00 held back — $7,500.00 investable out of $10,000.00'
 
 
 def test_the_reserve_caption_names_the_base_it_is_a_percentage_OF():
@@ -1835,7 +1835,7 @@ def test_the_reserve_caption_names_the_base_it_is_a_percentage_OF():
 
     assert '$5,369.79 base' in text, "the caption must name the base it divides"
     assert '$536.98 held back' in text
-    assert '$4,832.81 to allocate' in text
+    assert '$4,832.81 investable out of $5,369.79' in text
     # The whole point: the reader can now verify it without leaving the line.
     assert round(5_369.79 * 0.10, 2) == 536.98
     assert round(536.98 + 4_832.81, 2) == 5_369.79
@@ -4968,7 +4968,7 @@ def test_the_reserve_and_the_base_line_reconcile_on_screen():
 
     assert '$5,369.79' in base_line and '$5,369.79 base' in caption
     assert '$536.98 held back' in caption
-    assert '$4,832.81 to allocate' in caption
+    assert '$4,832.81 investable out of $5,369.79' in caption
     assert round(536.98 + 4_832.81, 2) == round(base, 2)
 
 

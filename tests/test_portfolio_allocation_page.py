@@ -3462,7 +3462,7 @@ def test_the_reserve_shows_its_dollar_figure_beside_the_slider(nicegui_client,
     root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=25.0),
                  reserve=25.0)
     assert any('$2,500.00 held back' in t for t in _texts(root))
-    assert any('$7,500.00 to allocate' in t for t in _texts(root))
+    assert any('$7,500.00 investable out of $10,000.00' in t for t in _texts(root))
 
 
 def test_dragging_the_reserve_slider_persists_it(nicegui_client, account_id):

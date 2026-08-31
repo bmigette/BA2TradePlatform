@@ -231,18 +231,33 @@ REASON_NEGATIVE_CLAMPED = "negative target clamped to 0"
 REASON_CLOSE_TO_ZERO = "target 0 - close position"
 
 #: How far ONE tradeable unit may overshoot a target before the bump is refused.
-#: 1.5 == "one share may cost at most 150% of what this symbol was allocated".
+#: 2.0 == "one share may cost at most 200% of what this symbol was allocated".
 #:
-#: ONE constant, quoted in the refusal message, never a scattered literal. The value
-#: is set so the two worked examples of the decision land on opposite sides of it: a
-#: 200 target on a 300 share (150%) is the case that must be filled and sits exactly
-#: ON the bound (the comparison is inclusive), and a 50 target on a 500 share (1000%)
-#: is the case that must be refused. It also bounds the damage: the worst bump
-#: over-allocates its symbol by 50% of that symbol's target, which is normally inside
-#: what ``redistribute_label_residuals`` can take back off the label's fractionable
-#: siblings. At 2x and above the excess routinely exceeds what the siblings hold and
-#: the label is left structurally over target with nothing able to fix it.
-BUMP_TO_ONE_SHARE_MAX_MULTIPLE = 1.5
+#: 2.0 IS THE ROUNDING RULE, stated as a multiple. Operator decision (2026-08-31):
+#: "we should have 1 share if the round of qty is >= 1 -- buy 1 share if we want to
+#: buy 0.6, but 0 if we want to buy 0.3". Round-half-up on the raw share count says
+#: bump when ``raw >= 0.5``, and one unit costs ``1 / raw`` of the target, so
+#: ``raw >= 0.5`` is exactly ``multiple <= 2.0``. Writing it as the multiple keeps ONE
+#: comparison in the sizing path and keeps the refusal message able to quote the bound;
+#: implementing it as a separate ``round()`` branch would be a second rule that agrees
+#: with this one only by coincidence. The bound is INCLUSIVE, which is what puts the
+#: exact 0.5 case (200%) on the "buy" side, as round-half-up requires.
+#:
+#: WAS 1.5, and the reason it changed is worth keeping. At 1.5 the worked examples were
+#: a 200 target on a 300 share (150%, filled, exactly on the bound) and a 50 target on a
+#: 500 share (1000%, refused) -- but it also refused ``raw = 0.6`` at 167%, which is the
+#: case the operator wanted filled: a symbol allocated two thirds of a share bought
+#: nothing at all.
+#:
+#: THE COST, stated plainly because the old comment warned about exactly this value:
+#: the worst bump now over-allocates its symbol by 100% of that symbol's target instead
+#: of 50%. ``redistribute_label_residuals`` takes the excess back off the label's
+#: FRACTIONABLE siblings, and at 2x that excess can exceed what the siblings hold, which
+#: leaves the label over target with nothing able to fix it. That is the trade the
+#: rounding rule buys, and it is bounded: it can only happen on a symbol whose whole
+#: allocation was under one share, so the absolute over-allocation is at most the price
+#: of a single share.
+BUMP_TO_ONE_SHARE_MAX_MULTIPLE = 2.0
 
 #: What the sizing rules DID to a row, so the dry run never has to pattern-match
 #: reason prose. A bump is a deliberate over-allocation and must be visible.
@@ -1229,8 +1244,9 @@ def size_sub_unit_target(target_notional: float, price: float,
     unit_notional = unit * px
     pct = unit_notional / target * 100.0
     limit_pct = BUMP_TO_ONE_SHARE_MAX_MULTIPLE * 100.0
-    # INCLUSIVE bound: exactly 150% bumps. MONEY_EPSILON absorbs the float noise of
-    # a target computed through two percentage multiplications.
+    # INCLUSIVE bound: exactly 200% bumps, which is the ``raw == 0.5`` case and is what
+    # makes this comparison round-half-up. MONEY_EPSILON absorbs the float noise of a
+    # target computed through two percentage multiplications.
     if unit_notional > target * BUMP_TO_ONE_SHARE_MAX_MULTIPLE + MONEY_EPSILON:
         if hit_floor:
             return 0.0, SIZING_OUTCOME_SKIPPED_TOO_LARGE, (

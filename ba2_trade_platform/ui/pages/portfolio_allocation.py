@@ -2340,11 +2340,14 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
         base_line = format_base_composition(
             base_notional=live['base_notional'],
             available_buying_power=live['available_buying_power'])
+        # ``text-sm``, not ``text-xs``: these two lines are the ones that say what
+        # every percentage on the card divides, and at caption size they read as
+        # footnotes to the slider rather than as the figures they are.
         live['base_composition'] = ui.label(base_line or '') \
-            .classes('text-xs text-secondary-custom').style(TABULAR_NUMS)
+            .classes('text-sm text-secondary-custom').style(TABULAR_NUMS)
         live['reserve_caption'] = ui.label(
             format_reserve_caption(live['base_notional'], live['unallocated_pct'])
-        ).classes('text-xs text-secondary-custom').style(TABULAR_NUMS)
+        ).classes('text-sm text-secondary-custom').style(TABULAR_NUMS)
         # THE ALLOCATION BAR, folded into the card that already owns the concept --
         # the slider is the TARGET, the row below is the ACTUAL, and the bar is the
         # gap between them. It used to be a separate blue callout under the labels.
