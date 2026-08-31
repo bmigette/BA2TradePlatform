@@ -535,7 +535,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
             bar = self._options.get_bar(lot.contract_symbol, self._as_of_date())
             if bar and bar.get("close") is not None:
+                # A bar EXISTS but the sparse cache carries junk prints (the arb guard's
+                # own documented class: a $0.01 call against $50+ of intrinsic). Clamp the
+                # mark into the same no-arb bounds the guard enforces on fills — kept
+                # as-is only when the bounds are unresolvable (no spot: fail-open, like
+                # the guard). Sane prints are inside the bounds -> byte-identical.
+                # (Review 2026-08-30 F1, the :537 mark twin.)
                 px = bar["close"]
+                bounds = self._lot_no_arb_bounds(lot.contract_symbol)
+                if bounds is not None:
+                    px = min(max(float(px), bounds[0]), bounds[1])
             elif is_defined_risk:
                 # (2a) NO premium bar for a defined-risk leg on this bar -> mark at INTRINSIC (not
                 # the stale entry premium / 0) so an open combo whose sparse cache lacks a bar this
@@ -544,7 +553,24 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 if px is None:
                     px = lot.avg_price
             else:
+                # (2c) NO premium bar for a NON-defined-risk lot: the intrinsic fallback
+                # extends to ALL option lots (review 2026-08-30 F2) as a FLOOR on the
+                # entry-premium mark — for a SHORT the liability is max(intrinsic, entry)
+                # (a deep-ITM naked short stops printing bars precisely when it matters;
+                # frozen at its entry credit it was the only found path around the
+                # dd>=100 wipeout sentinel), for a LONG the asset is likewise floored at
+                # intrinsic. While intrinsic is below entry (e.g. still OTM) the entry
+                # premium keeps the mark, exactly as before — but never ABOVE the
+                # no-arb upper bound (fast-follow to F2: a long call on a COLLAPSED
+                # underlying — spot 3.00, entry debit 5.00, no bar — must mark 3.00,
+                # not stay frozen at 5.00; the same cap the bar-exists clamp above
+                # applies). When SPOT itself is unresolvable this tick, the
+                # entry-premium mark is KEPT — the fix is for the no-OPTION-bar case,
+                # not the no-equity-bar case.
                 px = lot.avg_price
+                bounds = self._lot_no_arb_bounds(lot.contract_symbol)
+                if bounds is not None:
+                    px = bounds[0] if px is None else min(max(float(px), bounds[0]), bounds[1])
             if px is None:
                 continue
             contribution = lot.qty * px * lot.multiplier
@@ -754,13 +780,29 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     #: Reg-T maintenance margin fraction for a SHORT stock position (~30% of notional).
     SHORT_STOCK_MAINTENANCE_FRACTION = 0.30
 
+    #: Strategies whose two naked short legs are margined as a TRUE Reg-T PAIR — the
+    #: greater leg's naked margin + the OTHER leg's current premium — rather than as
+    #: two independent naked shorts (operator decision 2026-08-31, replacing the
+    #: review-F10 per-leg SUM).
+    REG_T_PAIRED_STRATEGIES = frozenset({"short_strangle", "short_straddle"})
+
     def maintenance_margin_requirement(self) -> float:
         """Total maintenance-margin dollars this book must hold against its SHORT risk.
 
         The requirement is the sum of the (unbounded-risk) short positions' broker
         maintenance margins:
 
-          * short OPTION legs -> ``naked_margin_per_contract(strike, option_type=right, spot)``
+          * a held short strangle/straddle PAIR (one short call + one short put grouped
+            by their opening order's ``option_strategy`` — see
+            ``REG_T_PAIRED_STRATEGIES``) -> TRUE Reg-T:
+            ``short_pair_margin_per_contract`` = the greater leg's naked margin + the
+            OTHER leg's current premium x 100, per paired contract — the SAME shared
+            formula the entry reserve prices, so entry and maintenance move together
+            and a just-opened pair cannot instantly breach. Contracts that cannot be
+            paired (a leg already bought back / liquidated / assigned, an asymmetric
+            residual, an unresolvable strike/right/premium) fall through to the per-leg
+            naked charge below — never a partial pair.
+          * other short OPTION legs -> ``naked_margin_per_contract(strike, option_type=right, spot)``
             x contracts (Reg-T naked ~20% of notional less the DIRECTION-AWARE OTM amount —
             0 for an ITM short — floored 10%) — the SAME model the entry
             reserve uses, so the maintenance check is consistent with sizing.
@@ -780,7 +822,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Short CALLs fully covered by long underlying shares (covered calls) carry ~zero
         # classic maintenance — exempt them like defined-risk legs.
         covered_calls = self._covered_short_call_contracts()
-        # Short option legs.
+        # Reg-T PAIRS first: a held short strangle/straddle's two legs are priced
+        # together (greater leg's naked margin + the other leg's premium), and the
+        # paired contracts are CONSUMED so the per-lot loop below charges only what is
+        # left unpaired.
+        pair_req, paired_consumed = self._reg_t_paired_requirement(defined_risk, covered_calls)
+        req += pair_req
+        # Short option legs (net of contracts already priced as a Reg-T pair).
         for lot in self._option_positions.values():
             if lot.qty >= 0:
                 continue  # only SHORT legs carry naked-margin risk here
@@ -788,6 +836,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 continue  # covered short leg of a defined-risk combo -> no naked margin
             if lot.contract_symbol in covered_calls:
                 continue  # short call covered by long shares -> no naked margin
+            unpaired_qty = abs(lot.qty) - paired_consumed.get(lot.contract_symbol, 0.0)
+            if unpaired_qty <= 0:
+                continue  # fully priced by its Reg-T pair
             strike, spot, right = self._lot_strike_spot_right(lot.contract_symbol)
             if strike is None:
                 # An unresolvable strike UNDERSTATES the requirement (this short leg
@@ -810,9 +861,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 req += max(
                     self.naked_margin_per_contract(strike, option_type=OptionRight.CALL, spot=spot),
                     self.naked_margin_per_contract(strike, option_type=OptionRight.PUT, spot=spot),
-                ) * abs(lot.qty)
+                ) * unpaired_qty
                 continue
-            req += self.naked_margin_per_contract(strike, option_type=right, spot=spot) * abs(lot.qty)
+            req += self.naked_margin_per_contract(strike, option_type=right, spot=spot) * unpaired_qty
         # Short stock.
         for p in self._positions.values():
             if p.qty >= 0:
@@ -825,6 +876,81 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if px:
                 req += self.SHORT_STOCK_MAINTENANCE_FRACTION * abs(p.qty) * float(px)
         return req
+
+    def _reg_t_paired_requirement(self, defined_risk: set, covered_calls: set):
+        """(dollars, consumed) for every held short strangle/straddle PAIR.
+
+        Pairs are resolved from the order-derived grouping ``_option_group_bounds``
+        already maintains for the MTM clamp (parent order id + ``option_strategy`` —
+        the transaction's strategy label travels on the opening parent order), so the
+        maintenance model sees the same structure the entry opened. A group pairs only
+        when it holds EXACTLY one short call and one short put whose strike, right and
+        current premium all resolve; ``min(|call qty|, |put qty|)`` contracts are
+        priced at ``short_pair_margin_per_contract`` (the greater leg's naked margin +
+        the other leg's current premium — the entry reserve's own formula) and recorded
+        in ``consumed`` (contract_symbol -> contracts), and the caller charges any
+        residual per-leg. Anything unpairable contributes nothing here and falls back
+        to the per-leg naked charge — the fallback is the plain single-leg model,
+        never a partial pair.
+        """
+        consumed: Dict[str, float] = {}
+        req = 0.0
+        contract_group, group_bounds = self._option_group_bounds()
+        for gkey, gb in group_bounds.items():
+            if gb["strategy"] not in self.REG_T_PAIRED_STRATEGIES:
+                continue
+            legs: Dict[Any, tuple] = {}
+            pairable = True
+            for cs, g in contract_group.items():
+                if g != gkey:
+                    continue
+                lot = self._option_positions.get(cs)
+                if lot is None or lot.qty >= 0:
+                    continue
+                if cs in defined_risk or cs in covered_calls:
+                    continue  # exempt legs keep their exemption; the rest goes per-leg
+                strike, spot, right = self._lot_strike_spot_right(cs)
+                if strike is None or right is None or right in legs:
+                    pairable = False  # unresolvable leg, or two lots of one right
+                    break
+                legs[right] = (lot, strike, spot)
+            if not pairable or OptionRight.PUT not in legs or OptionRight.CALL not in legs:
+                continue
+            put_lot, put_strike, spot = legs[OptionRight.PUT]
+            call_lot, call_strike, _ = legs[OptionRight.CALL]
+            put_prem = self._lot_maintenance_premium(put_lot)
+            call_prem = self._lot_maintenance_premium(call_lot)
+            if put_prem is None or call_prem is None:
+                continue
+            paired = min(abs(put_lot.qty), abs(call_lot.qty))
+            if paired <= 0:
+                continue
+            req += self.short_pair_margin_per_contract(
+                put_strike=put_strike, call_strike=call_strike,
+                put_premium=put_prem, call_premium=call_prem, spot=spot) * paired
+            consumed[put_lot.contract_symbol] = consumed.get(put_lot.contract_symbol, 0.0) + paired
+            consumed[call_lot.contract_symbol] = consumed.get(call_lot.contract_symbol, 0.0) + paired
+        return req, consumed
+
+    def _lot_maintenance_premium(self, lot) -> Optional[float]:
+        """Per-share CURRENT premium of a held lot, for the Reg-T pair's other-leg term.
+
+        The same premium discipline the equity mark uses: the current bar's close
+        clamped into the no-arb bounds when a bar exists; otherwise the entry premium
+        floored at intrinsic and capped at the no-arb upper (the F2 mark rule).
+        Never negative. None only when no number resolves at all — the caller then
+        refuses to pair and the legs are charged per-leg instead.
+        """
+        bar = self._options.get_bar(lot.contract_symbol, self._as_of_date()) if self._options else None
+        bounds = self._lot_no_arb_bounds(lot.contract_symbol)
+        px = None
+        if bar and bar.get("close") is not None:
+            px = float(bar["close"])
+        elif lot.avg_price is not None:
+            px = float(lot.avg_price)
+        if bounds is not None:
+            px = bounds[0] if px is None else min(max(px, bounds[0]), bounds[1])
+        return None if px is None else max(px, 0.0)
 
     def _defined_risk_contracts(self) -> set:
         """Set of currently-held contract_symbols that belong to a DEFINED-RISK combo.
@@ -883,6 +1009,51 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if spot is None:
                 spot = self._price.close_asof(o.underlying_symbol)
         return float(o.strike), (float(spot) if spot is not None else None), o.option_type
+
+    @staticmethod
+    def _no_arb_premium_bounds(strike, is_call: bool, spot):
+        """Per-share no-arbitrage premium bounds ``(intrinsic, upper)`` for one contract.
+
+        THE single definition of the bounds the arb fill guard
+        (``_arb_fill_reject_reason``) rejects junk prints against — floor at intrinsic
+        (``max(0, spot-strike)`` call / ``max(0, strike-spot)`` put: nobody sells below
+        immediate-exercise value), cap at the upper bound (a call can never cost more than
+        the stock, a put never more than its strike). Every NON-fill consumer of the
+        sparse premium cache (per-tick marks, expiry settlement, margin-liquidation
+        buybacks) clamps into these same bounds via ``_clamp_premium_to_no_arb`` so a junk
+        print is never realised into cash or equity (review 2026-08-30 F1) — one
+        implementation, no drift.
+
+        ``spot=None`` returns ``(None, upper-or-None)``: a put's upper bound (its strike)
+        is spot-independent; nothing else is derivable without spot.
+        """
+        strike = float(strike)
+        if spot is None:
+            return None, (None if is_call else strike)
+        spot = float(spot)
+        intrinsic = max(0.0, (spot - strike) if is_call else (strike - spot))
+        return intrinsic, (spot if is_call else strike)
+
+    @classmethod
+    def _clamp_premium_to_no_arb(cls, premium: float, strike, is_call: bool, spot) -> float:
+        """A cache premium clamped into ``_no_arb_premium_bounds`` (identity when spot is
+        None — without spot no bound is derivable and the print is kept as-is)."""
+        lo, hi = cls._no_arb_premium_bounds(strike, is_call, spot)
+        if lo is not None:
+            premium = max(float(premium), lo)
+        if hi is not None:
+            premium = min(float(premium), hi)
+        return premium
+
+    def _lot_no_arb_bounds(self, contract_symbol: str):
+        """``(intrinsic, upper)`` no-arb premium bounds for a HELD lot's contract at the
+        current underlying close, or None when strike / option right / spot cannot be
+        resolved (callers then keep their existing unbounded behaviour — the fix is for
+        the junk/no-OPTION-bar case, not the no-equity-bar case)."""
+        strike, spot, right = self._lot_strike_spot_right(contract_symbol)
+        if strike is None or spot is None or right is None:
+            return None
+        return self._no_arb_premium_bounds(strike, right == OptionRight.CALL, spot)
 
     def _covered_short_call_contracts(self) -> set:
         """Contract symbols of held SHORT CALL lots fully covered by LONG underlying shares.
@@ -1287,8 +1458,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     def _liquidate_option_lot(self, lot: "_OptionLot") -> bool:
         """Buy back a SHORT option lot at the current premium close; book cash + close the txn."""
         bar = self._options.get_bar(lot.contract_symbol, self._as_of_date()) if self._options else None
+        bounds = self._lot_no_arb_bounds(lot.contract_symbol)  # (intrinsic, upper) or None
         if bar and bar.get("close") is not None:
-            premium = float(bar["close"])
+            # The blow-up bar's print can be junk (the arb guard's documented class):
+            # a $0.01 buyback against $20 of intrinsic understates the blow-up, an
+            # impossible above-upper print overstates it. Clamp into the same no-arb
+            # bounds fills are guarded by; kept raw only when the bounds are
+            # unresolvable (no spot: fail-open, like the guard). (Review 2026-08-30 F1.)
+            #
+            # A margin liquidation is a FORCED close: it crosses the modelled bid-ask
+            # spread fully (a buyback lifts the ask, ``close + half``) exactly like every
+            # other risk exit, THEN clamps into the no-arb bounds (review 2026-08-30 F7).
+            # With no spread model configured ``_option_cross`` is the identity.
+            premium = self._option_cross(float(bar["close"]), True, bar)
+            if bounds is not None:
+                premium = min(max(premium, bounds[0]), bounds[1])
         else:
             # No premium bar on the liquidation bar. The entry premium books the buyback at
             # break-even — understating the loss at exactly the moment a breach implies the
@@ -1296,20 +1480,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # (a forced buyback is never booked BELOW entry mid-blow-up); the entry premium
             # remains the last resort when strike/spot/right are unresolvable.
             premium = lot.avg_price
-            o = self._lot_order(lot.contract_symbol)
-            if o is not None and o.option_type is not None:
-                spot = None
-                if o.underlying_symbol:
-                    spot = self._price.close_at(o.underlying_symbol)
-                    if spot is None:
-                        spot = self._price.close_asof(o.underlying_symbol)
-                if spot is not None:
-                    intrinsic = (
-                        max(0.0, float(spot) - float(o.strike))
-                        if o.option_type == OptionRight.CALL
-                        else max(0.0, float(o.strike) - float(spot))
-                    )
-                    premium = max(intrinsic, lot.avg_price)
+            if bounds is not None and premium is not None:
+                premium = max(bounds[0], premium)
         if premium is None:
             return False
         txn = self._option_transaction_for_contract(lot.contract_symbol)
@@ -2210,7 +2382,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         intent = (getattr(order, "position_intent", None) or "").lower()
         is_close = "close" in intent
         # The put upper bound needs no spot — check it before touching the price source.
-        if is_close and not is_call and fill_px > strike + _ARB_FILL_TOLERANCE:
+        # (``_no_arb_premium_bounds`` with spot=None is exactly the spot-free bound; the
+        # bounds themselves live THERE, shared with the mark/settlement clamps.)
+        _, upper_spotless = self._no_arb_premium_bounds(strike, is_call, None)
+        if is_close and upper_spotless is not None and fill_px > upper_spotless + _ARB_FILL_TOLERANCE:
             return (
                 f"put premium {fill_px:.4f} exceeds strike {strike:.2f} + tolerance "
                 f"{_ARB_FILL_TOLERANCE} (a put can never be worth more than its strike)"
@@ -2227,15 +2402,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 order.contract_symbol, underlying, fill_day,
             )
             return None
+        intrinsic, upper = self._no_arb_premium_bounds(strike, is_call, spot)
         if is_close:
-            # call close: a premium above the stock price itself is impossible.
-            if fill_px > spot + _ARB_FILL_TOLERANCE:
+            # call close: a premium above the stock price itself is impossible. (The put
+            # upper bound was already checked spot-free above.)
+            if is_call and fill_px > upper + _ARB_FILL_TOLERANCE:
                 return (
                     f"call premium {fill_px:.4f} exceeds spot {spot:.2f} + tolerance "
                     f"{_ARB_FILL_TOLERANCE} (a call can never cost more than the stock)"
                 )
             return None
-        intrinsic = max(0.0, (spot - strike) if is_call else (strike - spot))
         if fill_px < intrinsic - _ARB_FILL_TOLERANCE:
             return (
                 f"premium {fill_px:.4f} is below intrinsic {intrinsic:.4f} - tolerance "
@@ -2864,13 +3040,38 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     bar = self._options.get_bar(opening.contract_symbol, self._as_of_date())
                     exit_px = bar["close"] if bar and bar.get("close") is not None else None
                     if exit_px is None:
-                        logger.warning(
-                            "[backtest] round-trip recorder: no premium bar for open option "
-                            "%s at run end (%s) — marking open_at_end at the entry premium.",
-                            opening.contract_symbol,
-                            self._as_of_date(),
-                        )
-                        exit_px = entry_px
+                        # No premium bar at run end: the same intrinsic-floored fallback
+                        # the equity curve's mark uses (review 2026-08-30 F2 twin) —
+                        # max(intrinsic, entry premium), so a deep-ITM short still open
+                        # at run end books its liability instead of a break-even row.
+                        # Entry premium remains the mark when strike / right / spot are
+                        # unresolvable (the fix is for the no-OPTION-bar case, not the
+                        # no-equity-bar case).
+                        intr = upper = None
+                        if opening.strike is not None and opening.option_type is not None:
+                            und = getattr(opening, "underlying_symbol", None) or opening.symbol
+                            spot = self._price.close_asof(und)
+                            if spot is not None:
+                                intr, upper = self._no_arb_premium_bounds(
+                                    opening.strike,
+                                    opening.option_type == OptionRight.CALL,
+                                    spot,
+                                )
+                        if intr is not None:
+                            # Floor at intrinsic AND cap at the upper bound (fast-follow
+                            # to F2: a collapsed underlying must not leave the entry
+                            # debit standing as an above-no-arb break-even mark). With
+                            # spot resolved the upper bound always resolves too.
+                            exit_px = min(max(float(entry_px), intr), upper)
+                        else:
+                            logger.warning(
+                                "[backtest] round-trip recorder: no premium bar for open option "
+                                "%s at run end (%s) and no resolvable intrinsic — marking "
+                                "open_at_end at the entry premium.",
+                                opening.contract_symbol,
+                                self._as_of_date(),
+                            )
+                            exit_px = entry_px
                 else:
                     # VALUATION (not a fill): forward-fill the last KNOWN close, exactly like the
                     # equity curve's MTM. ``close_at`` needs an EXACT bar on the run-end clock, but
@@ -3601,7 +3802,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # the premium converges to intrinsic). Cash is credited at the premium; NO share
         # position is created.
         bar = self._options.get_bar(position.contract_symbol, self._as_of_date()) if self._options else None
-        premium = float(bar["close"]) if (bar and bar.get("close") is not None) else float(intrinsic)
+        if bar and bar.get("close") is not None:
+            # The expiry bar's print can be junk (the arb guard's own documented class: a
+            # $0.01 call against $50+ of intrinsic) and this credit is REALISED cash, not
+            # a mark — clamp it into the same no-arb bounds the guard enforces on fills
+            # (floor at intrinsic, cap at spot for a call / strike for a put). Spot is a
+            # parameter here, so the bounds always resolve. (Review 2026-08-30 F1.)
+            premium = self._clamp_premium_to_no_arb(float(bar["close"]), strike, is_call, spot)
+        else:
+            premium = float(intrinsic)
         self._cash += premium * multiplier * contracts
         logger.warning(
             "[backtest] long %s %s ITM at expiry — sold to close at %.4f (backtests never "

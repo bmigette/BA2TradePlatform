@@ -435,9 +435,18 @@ def test_the_engines_STEP_ORDER_cannot_sell_shares_out_from_under_a_written_call
     import inspect
     from app.services.backtest import daily_engine as de
 
-    src = inspect.getsource(de.DailyBacktestEngine.run)
+    # F8 extracted run()'s bar tail (steps 4..4b) into _fills_and_settlements, so the
+    # order under test now spans the two: the manage pass (step 3, in run) must precede
+    # run's CALL into the tail, and the liquidation lives in that tail. Concatenating
+    # run + the tail in call order preserves the original single-source assertion.
+    src = (inspect.getsource(de.DailyBacktestEngine.run)
+           + inspect.getsource(de.DailyBacktestEngine._fills_and_settlements))
     manage = src.index("_manage_open_positions")
     liquidate = src.index("process_pending_assignment_liquidations")
+    run_src = inspect.getsource(de.DailyBacktestEngine.run)
+    assert manage < run_src.index("_fills_and_settlements("), (
+        "step order changed: the manage pass no longer precedes the bar tail "
+        "(_fills_and_settlements) that runs the assignment liquidation.")
     assert manage < liquidate, (
         "step order changed: the manage pass no longer precedes the assignment liquidation. "
         "That is not automatically a bug, but this test and the wheel's safety both rest on "

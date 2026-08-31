@@ -22,7 +22,8 @@ from ba2_common.core.option_economics import (
     ARC_FLOOR_REFUSAL, admits_credit_structure, annualized_return_on_collateral,
 )
 from ba2_common.core.option_entry_quote import (
-    ENTRY_CROSS_NEUTRAL, entry_limit_with_concession, quote_concession,
+    ENTRY_CROSS_FULL, ENTRY_CROSS_NEUTRAL, entry_limit_with_concession,
+    quote_concession,
 )
 from ba2_common.core.option_payoff import PayoffLeg
 from ba2_common.core.option_request import ResolvedStructure
@@ -2236,17 +2237,18 @@ class _OptionEntryAction(TradeAction):
         return self.create_and_save_action_result(
             action_type=self._action_type_value(), success=success, message=message, data=data or {})
 
-    def _refuse_if_cannot_take_delivery(self, option_strategy: str, *,
-                                        strike: Optional[float],
-                                        contracts: Optional[float]
-                                        ) -> Optional[Dict[str, Any]]:
-        """ENFORCING assignment-capacity gate. Returns a refusal, or None to proceed.
+    def _downsize_to_delivery_capacity(self, option_strategy: str, *,
+                                       strike: Optional[float],
+                                       quantity: Optional[int],
+                                       contracts_per_unit: int = 1,
+                                       ) -> "Tuple[Optional[int], Optional[Dict[str, Any]]]":
+        """ENFORCING assignment-capacity gate. Returns ``(admitted_quantity, refusal)``.
 
         Only structures carrying a SHORT PUT reach here, and they pass their short put
-        LEG (its strike and its total contract count across the whole order, ratios
-        included) rather than a dollar figure — the pricing lives in one place,
-        ``option_lifecycle.put_assignment_cost``, reached via
-        ``check_short_put_assignment_capacity``.
+        LEG (its strike, the order quantity in UNITS, and how many short-put contracts
+        one unit carries — 2 for the 1x2 put ratio spread) rather than a dollar figure —
+        the pricing lives in one place, ``option_lifecycle.put_assignment_cost``,
+        reached via ``check_short_put_assignment_capacity``.
 
         WHY THIS IS NOT THE BUYING-POWER GATE AGAIN. The reserve pool asks "can I set
         aside what this ONE structure needs?", priced the way a broker prices it —
@@ -2257,19 +2259,70 @@ class _OptionEntryAction(TradeAction):
         delivery than the account holds — measured, five 100-strike puts reserving
         $2,000 each against $45,000 of cash and a $50,000 bill.
 
+        DOWNSIZE, NOT REFUSE-ALL (review 2026-08-30 F6, operator-approved for the
+        SHARED live+backtest path). Refusing the whole entry made the gate the binding
+        constraint at small accounts: a $20k account's 6-unit iron condor was refused
+        outright when 2 units fit, so most of the sizing gene band was a zero-trade
+        region and stage-1 verdicts measured the gate, not the market. When the full
+        size does not fit but the shortfall is pure ARITHMETIC (held bill, candidate
+        cost and cash all measured), the quantity is clamped to
+        ``floor(remaining_capacity / per-unit delivery cost)`` — in UNITS, so a ratio
+        structure keeps its even short-put count — and the entry proceeds at that size.
+        The refusal remains for: even 1 unit does not fit (the existing message,
+        extended to say the downsize was attempted), and every UNMEASURABLE verdict
+        (no room figure exists to clamp to; unknown is still not 'fine').
+
         Placed AFTER ``check_option_buying_power`` deliberately: an entry that the
         pre-existing gate already refuses keeps the message it has always had, so no
-        decline already on record is re-labelled and the new refusal only ever appears
-        where something genuinely new is being caught.
+        decline already on record is re-labelled. A downsized entry needs LESS buying
+        power than the full size that already passed, so the earlier BP verdict holds a
+        fortiori (callers re-derive the reserve for the clamped size).
         """
+        total = None
+        if quantity is not None and contracts_per_unit:
+            total = contracts_per_unit * quantity
         verdict = self.account.check_short_put_assignment_capacity(
-            strike=strike, contracts=contracts)
+            strike=strike, contracts=total)
         if verdict.ok:
-            return None
+            return quantity, None
+        downsize_attempted = False
+        if (verdict.held_cost is not None and verdict.cash is not None
+                and verdict.candidate_cost is not None
+                and quantity is not None and quantity >= 1):
+            from ba2_common.core.option_lifecycle import put_assignment_cost
+
+            per_unit = put_assignment_cost(strike, contracts_per_unit, 100)
+            if per_unit is not None and per_unit > 0:
+                downsize_attempted = True
+                room = verdict.cash - verdict.held_cost
+                max_units = int(room // per_unit)
+                # Belt and braces: re-verify the clamped size through the SAME gate
+                # (the two must agree by construction; this keeps them honest). If the
+                # floor division landed ON the boundary and float rounding makes the
+                # re-verify disagree by a hair, step DOWN one unit and re-verify once —
+                # so the refusal's "not even one unit fits" is only said when true.
+                for units in (max_units, max_units - 1):
+                    if units < 1:
+                        break
+                    clamped = self.account.check_short_put_assignment_capacity(
+                        strike=strike, contracts=contracts_per_unit * units)
+                    if clamped.ok:
+                        logger.warning(
+                            f"{self._action_type_value()} for {self.instrument_name}: "
+                            f"{option_strategy} DOWNSIZED {quantity} -> {units} "
+                            f"unit(s) to fit assignment capacity "
+                            f"(room {room:,.2f} / {per_unit:,.2f} per unit; "
+                            f"held {verdict.held_cost:,.2f}, cash {verdict.cash:,.2f}).")
+                        return units, None
+        message = f"{verdict.reason}"
+        if downsize_attempted:
+            message += (" Downsizing was attempted, but not even one unit of this "
+                        "structure fits the remaining capacity.")
+        message += f" Refusing {option_strategy} on {self.instrument_name}."
         logger.warning(f"{self._action_type_value()} for {self.instrument_name}: "
                        f"{option_strategy} REFUSED — {verdict.reason}")
-        return self._result(
-            False, f"{verdict.reason} Refusing {option_strategy} on {self.instrument_name}.",
+        return quantity, self._result(
+            False, message,
             {"option_strategy": option_strategy,
              "assignment_held_cost": verdict.held_cost,
              "assignment_candidate_cost": verdict.candidate_cost,
@@ -2347,7 +2400,7 @@ class _OptionEntryAction(TradeAction):
         put a verdict; this is the ask-first path for the caller that does. The verdict's
         ``reason`` is the seam's own sentence verbatim, so both channels say one thing.
 
-        Placed AFTER sizing, like ``_refuse_if_cannot_take_delivery`` is placed after the
+        Placed AFTER sizing, like ``_downsize_to_delivery_capacity`` is placed after the
         buying-power gate: an entry the pre-existing "held equity below one contract lot"
         check already declines keeps the message it has always had.
         """
@@ -2466,12 +2519,22 @@ class _OptionEntryAction(TradeAction):
             return self._result(False, f"Failed to submit {option_strategy} for {self.instrument_name}", data)
         order_id = getattr(order, "id", None)
         data["order_id"] = order_id
-        # Persist the short-premium reserve on the order so available BP reflects it.
-        if option_reserve is not None and order_id is not None:
+        # Persist the short-premium reserve on the order so available BP reflects it —
+        # and the entry-quote concession fraction, so a later DISCRETIONARY close can
+        # concede the SAME fraction this entry did (review 2026-08-30 F7; see
+        # CloseOptionAction._close_cross_fraction). Persisted whenever the gene is set
+        # (not only when it moved this particular quote); absent for the 0.0 default,
+        # so a default run's order row is byte-identical.
+        row_extra: Dict[str, Any] = {}
+        if option_reserve is not None:
+            row_extra["option_reserve"] = option_reserve
+        if self.entry_cross is not None and float(self.entry_cross) != ENTRY_CROSS_NEUTRAL:
+            row_extra["entry_cross"] = float(self.entry_cross)
+        if row_extra and order_id is not None:
             try:
                 stored = get_instance(TradingOrder, order_id)
                 if stored is not None:
-                    stored.data = {**(stored.data or {}), "option_reserve": option_reserve}
+                    stored.data = {**(stored.data or {}), **row_extra}
                     update_instance(stored)
             except Exception as e:
                 absorb_if_benign(e, InstanceNotFound)
@@ -2940,10 +3003,11 @@ class SellCashSecuredPutAction(_OptionEntryAction):
                                 f"on {self.instrument_name} (available="
                                 f"{self.account.available_option_buying_power()})")
         # ONE short put, `quantity` contracts, at contract.strike.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "cash_secured_put", strike=contract.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "cash_secured_put", strike=contract.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required("cash_secured_put", quantity, strike=contract.strike)
         limit_price = contract.bid                          # sell at BID
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.SELL,
                         position_intent="sell_to_open", option_type=self.OPTION_TYPE,
@@ -3060,7 +3124,7 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
     strike.
 
     ASSIGNMENT. The short leg is a PUT, so this structure can have shares put to it and
-    is charged the full short strike by ``_refuse_if_cannot_take_delivery``. The long
+    is charged the full short strike by ``_downsize_to_delivery_capacity``. The long
     wing nets NOTHING off that bill — see the comment at the gate below.
     """
 
@@ -3150,10 +3214,12 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
         # TONIGHT, while exercising our own lower-strike put is a choice we make LATER —
         # after the shares have already been paid for. Netting the width here would price
         # a $9,500 obligation at $500 and wave every entry through.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "bull_put_spread", strike=short_c.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "bull_put_spread", strike=short_c.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "bull_put_spread", quantity, spread_width=width, net_credit=net_credit)
         short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
                               position_intent="sell_to_open", option_type=self.OPTION_TYPE,
                               strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
@@ -3307,8 +3373,9 @@ class OpenShortStraddleAction(_OptionEntryAction):
     """Short straddle: SELL an ATM call AND an ATM put at the SAME strike (credit).
 
     Short-volatility: collect both premiums (sold at BID). Net premium is a CREDIT
-    (limit price negative). Naked on both sides; reserve a conservative strike*100
-    per contract proxy and size off it."""
+    (limit price negative). Naked on both sides; reserve the TRUE Reg-T pair (the
+    greater leg's naked margin + the other leg's premium — the same shared formula
+    the maintenance model charges) and size off it."""
 
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_SHORT_STRADDLE.value
@@ -3344,30 +3411,37 @@ class OpenShortStraddleAction(_OptionEntryAction):
         # why the floor for a naked structure is not the floor for a defined-risk one.
         refusal = self._refuse_if_arc_below_floor(
             "short_straddle", net_credit=net_credit, expiry=call_c.expiry,
-            strike=call_c.strike, spot=spot)
+            strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         if refusal is not None:
             return refusal
-        # NAKED both sides: reserve Reg-T naked margin (not full strike*100 cash) so the
-        # structure is sizeable on a realistic account. Both legs share the strike; a
-        # straddle is margined at the GREATER of the two legs -> worst case over both rights.
-        per_contract_reserve = max(
-            self.account.naked_margin_per_contract(call_c.strike, option_type=OptionRight.CALL, spot=spot),
-            self.account.naked_margin_per_contract(call_c.strike, option_type=OptionRight.PUT, spot=spot),
-        )
+        # NAKED both sides: reserve the TRUE Reg-T pair — the greater leg's naked
+        # margin + the OTHER leg's premium (operator decision 2026-08-31, replacing the
+        # review-F10 per-leg sum) — through the same shared formula the backtest's
+        # maintenance model charges the open position, so entry and maintenance move
+        # together. Both legs share the strike; the leg premiums are the bids the legs
+        # are sold at.
+        per_contract_reserve = self.account.option_reserve_required(
+            "short_straddle", 1, strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False, f"Insufficient budget to size short straddle for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
-            "short_straddle", quantity, strike=call_c.strike, spot=spot)
+            "short_straddle", quantity, strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for short straddle on {self.instrument_name}")
         # ONE short put leg (put_c), `quantity` contracts. The short CALL at the same
         # strike consumes no PUT-assignment capacity: assigned, it delivers shares and
         # pays cash IN.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "short_straddle", strike=put_c.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "short_straddle", strike=put_c.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "short_straddle", quantity, strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
                              position_intent="sell_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
@@ -3385,8 +3459,9 @@ class OpenShortStrangleAction(_OptionEntryAction):
     """Short strangle: SELL an OTM call AND an OTM put at DIFFERENT strikes (credit).
 
     Both legs OTM by ``strike_param`` percent (default 10%), sold at BID. Net credit
-    (limit negative). Naked both sides; reserve strike*100 of the SHORT PUT per
-    contract proxy and size off it."""
+    (limit negative). Naked both sides; reserve the TRUE Reg-T pair (the greater
+    leg's naked margin + the other leg's premium — the same shared formula the
+    maintenance model charges) and size off it."""
 
     DEFAULT_OTM_PCT = 10.0
 
@@ -3425,30 +3500,39 @@ class OpenShortStrangleAction(_OptionEntryAction):
         net_credit = round(call_c.bid + put_c.bid, 4)
         if net_credit <= 0:
             return self._result(False, f"Non-positive credit for {self.instrument_name} short strangle")
-        # PREMIUM RICHNESS (OPT-C1). Reserved on the PUT side's Reg-T bracket, matching the
+        # PREMIUM RICHNESS (OPT-C1). Reserved on the Reg-T PAIR, matching the
         # option_reserve_required call below — collateral must be the same number twice.
         refusal = self._refuse_if_arc_below_floor(
             "short_strangle", net_credit=net_credit, expiry=put_c.expiry,
-            strike=put_c.strike, spot=spot, option_type=OptionRight.PUT)
+            strike=put_c.strike, call_strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         if refusal is not None:
             return refusal
-        # NAKED both sides: reserve Reg-T naked margin on the (richer) put side, not full
-        # strike*100 cash, so the structure is sizeable on a realistic account.
-        per_contract_reserve = self.account.naked_margin_per_contract(
-            put_c.strike, option_type=OptionRight.PUT, spot=spot)
+        # NAKED both sides: reserve the TRUE Reg-T pair — the greater leg's naked
+        # margin + the OTHER leg's premium (operator decision 2026-08-31, replacing the
+        # review-F10 per-leg sum; before F10, put-leg-only sizing opened ~2x what
+        # maintenance tolerated and was instantly force-unwound) — through the same
+        # shared formula the backtest's maintenance model charges the open position.
+        per_contract_reserve = self.account.option_reserve_required(
+            "short_strangle", 1, strike=put_c.strike, call_strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False, f"Insufficient budget to size short strangle for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
-            "short_strangle", quantity, strike=put_c.strike, spot=spot, option_type=OptionRight.PUT)
+            "short_strangle", quantity, strike=put_c.strike, call_strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for short strangle on {self.instrument_name}")
         # ONE short put leg (put_c, the lower strike), `quantity` contracts. The short
         # OTM call is not put-assignment capacity.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "short_strangle", strike=put_c.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "short_strangle", strike=put_c.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "short_strangle", quantity, strike=put_c.strike, call_strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
                              position_intent="sell_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
@@ -3528,10 +3612,12 @@ class OpenIronCondorAction(_OptionEntryAction):
         # put is a choice we make LATER — after the shares have already been paid for.
         # A condor is sized off its wing width, which is why it is the structure this
         # gate bites hardest.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "iron_condor", strike=sp.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "iron_condor", strike=sp.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "iron_condor", quantity, spread_width=width, net_credit=net_credit)
         legs = [
             OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
                       option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
@@ -3615,10 +3701,12 @@ class OpenJadeLizardAction(_OptionEntryAction):
             return self._result(False, f"Insufficient BP for jade lizard on {self.instrument_name}")
         # The NAKED short put leg (sp), `quantity` contracts. The other two legs are the
         # call credit spread, which owes shares rather than cash.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "jade_lizard", strike=sp.strike, contracts=quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "jade_lizard", strike=sp.strike, quantity=quantity)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "jade_lizard", quantity, strike=sp.strike, spread_width=call_wing_width, net_credit=net_credit)
         legs = [
             OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
                       option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
@@ -3778,10 +3866,13 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         # TWO short puts per structure (`ratio_qty=2` on the short leg below), so the
         # delivery bill is 2 x quantity contracts at the SHORT strike. The single long
         # put at the higher strike nets nothing off, same as the condor's wing.
-        refusal = self._refuse_if_cannot_take_delivery(
-            "put_ratio_spread", strike=short_p.strike, contracts=2 * quantity)
+        quantity, refusal = self._downsize_to_delivery_capacity(
+            "put_ratio_spread", strike=short_p.strike, quantity=quantity,
+            contracts_per_unit=2)
         if refusal is not None:
             return refusal
+        reserve = self.account.option_reserve_required(
+            "put_ratio_spread", quantity, strike=short_p.strike, net_credit=net_credit)
         legs = [
             OptionLeg(contract_symbol=long_p.symbol, side=OrderDirection.BUY, ratio_qty=1,
                       position_intent="buy_to_open", option_type=OptionRight.PUT,
@@ -3862,7 +3953,111 @@ def build_closing_legs(children, parent_quantity: int, quote_fn, held_qty=None) 
 
 
 class CloseOptionAction(TradeAction):
-    """Close an existing option position via account.close_option_position()."""
+    """Close an existing option position via account.close_option_position().
+
+    EXIT-QUOTE CONCESSION (review 2026-08-30 F7). In live, ``_close_limit_price`` quotes
+    the real crossing side (a long sells the bid, a short buys the ask) and nothing here
+    changes that. In the backtest the historical store synthesizes ``bid == ask == close``
+    (the MID), so the raw quote made every exit a FILTER: the fill engine crosses the
+    modelled spread first (``_option_cross``) and re-tests the limit, so a mid-quoted
+    close only filled after the mid drifted half a spread in the position's favor —
+    TP/SL/DTE exits slipped days and migrated to the spread-free expiry path. The fix
+    applies the SAME concession machinery entries use (``entry_limit_with_concession``),
+    keyed off the account's duck-typed ``option_modelled_half_spread`` seam, which only a
+    simulator that models a spread implements — so live is byte-identical by
+    construction:
+
+      * DISCRETIONARY closes (TP, time, sentiment, ...) concede the fraction the
+        position's ENTRY conceded (``data['entry_cross']`` on the entry/parent order —
+        the existing gene, no new one);
+      * FORCED closes (``forced_exit=True``: SL stop / DTE roll, classified from the
+        firing rule's triggers by ``TradeActionEvaluator.forced_option_exit``) cross the
+        modelled spread FULLY — a risk exit pays up.
+
+    RESIDUAL OPTIMISM, RECORDED (operator-delegated design, 2026-08-30): live closes
+    always pay the full real touch, while a backtest DISCRETIONARY close concedes only
+    the fraction its entry conceded — an ``entry_cross=0`` genome therefore keeps
+    filter-flattered TP/time exits. Watch-item: if discretionary exits still migrate
+    to expiry en masse for low-entry_cross genomes, the entry-fraction design gets
+    revisited.
+    """
+
+    def __init__(self, instrument_name: str, account: AccountInterface,
+                 order_recommendation: OrderRecommendation,
+                 existing_order: Optional[TradingOrder] = None,
+                 expert_recommendation: Optional[ExpertRecommendation] = None,
+                 forced_exit: bool = False, **kwargs):
+        super().__init__(instrument_name, account, order_recommendation,
+                         existing_order, expert_recommendation)
+        #: True when this close is a RISK exit (stop-loss / DTE roll) rather than a
+        #: discretionary one — a forced close crosses the modelled spread fully.
+        self.forced_exit = bool(forced_exit)
+
+    # -- exit-quote concession helpers (backtest-only by construction) -----------
+    def _modelled_half(self, contract_symbol: str) -> Optional[float]:
+        """The account's modelled half-spread for ``contract_symbol``, or None.
+
+        Duck-typed exactly like the entry concession's ``_modelled_half_spreads``: only
+        ``BacktestAccount`` publishes ``option_modelled_half_spread``, so on every live
+        account this answers None and the close quote is untouched."""
+        fn = getattr(self.account, "option_modelled_half_spread", None)
+        if not callable(fn):
+            return None
+        try:
+            half = fn(contract_symbol)
+        except Exception as e:  # noqa: BLE001 — a spread-model hiccup must not block a close
+            absorb_if_benign(e, InstanceNotFound)
+            logger.debug(f"option_modelled_half_spread failed for {contract_symbol}: {e}")
+            return None
+        return None if half is None else float(half)
+
+    def _close_cross_fraction(self, order: Optional[TradingOrder]) -> float:
+        """The fraction of the modelled spread THIS close gives up.
+
+        Forced -> the full cross. Discretionary -> the fraction the position's ENTRY
+        conceded, read from the entry (or its parent) order's persisted
+        ``data['entry_cross']`` — reusing the existing gene rather than adding one. An
+        entry that conceded nothing persisted nothing -> 0.0, today's mid quote."""
+        if self.forced_exit:
+            return ENTRY_CROSS_FULL
+        seen = 0
+        while order is not None and seen < 3:
+            data = getattr(order, "data", None) or {}
+            if data.get("entry_cross") is not None:
+                try:
+                    return float(data["entry_cross"])
+                except (TypeError, ValueError):
+                    return ENTRY_CROSS_NEUTRAL
+            parent_id = getattr(order, "parent_order_id", None)
+            order = get_instance(TradingOrder, parent_id) if parent_id else None
+            seen += 1
+        return ENTRY_CROSS_NEUTRAL
+
+    def _concede_close_limit(self, limit_price: Optional[float], legs: List[OptionLeg],
+                             fraction: float) -> Optional[float]:
+        """``limit_price`` after giving up ``fraction`` of each leg's modelled spread.
+
+        Reuses ``entry_limit_with_concession`` verbatim — the closing legs already carry
+        the CLOSING side, so "give up" points the right way for both shapes (a buy-back
+        quotes higher, a sell-to-close lower, a multi-leg net pays more debit / takes
+        less credit). Unchanged when the limit is None, the fraction is 0, or any leg's
+        spread is unmodellable (every live account)."""
+        if limit_price is None or float(fraction) == ENTRY_CROSS_NEUTRAL:
+            return limit_price
+        halves = []
+        for leg in legs:
+            half = self._modelled_half(leg.contract_symbol)
+            if half is None:
+                return limit_price
+            halves.append(half)
+        conceded = entry_limit_with_concession(float(limit_price), legs, halves, fraction)
+        if conceded != limit_price:
+            logger.debug(
+                f"close_option for {self.instrument_name}: "
+                f"{'forced' if self.forced_exit else 'discretionary'} exit concession "
+                f"({float(fraction):.2f} of modelled spread) moved the close limit "
+                f"{limit_price:+.4f} -> {conceded:+.4f}")
+        return conceded
 
     def execute(self) -> "TradeActionResult":
         try:
@@ -3960,20 +4155,36 @@ class CloseOptionAction(TradeAction):
 
     def _close_limit_price(self, position: OptionPosition, order: TradingOrder) -> Optional[float]:
         """Long(BUY) closes at the bid; short(SELL) closes at the ask. Use a fresh
-        quote when available, else fall back to the entry premium."""
+        quote when available, else fall back to the entry premium.
+
+        In the backtest the quote is a synthetic ``bid == ask == mid``, so the raw side
+        is NOT the touch — the close then concedes ``_close_cross_fraction`` of the
+        modelled spread (F7). Live quotes are real and the concession is inert (no
+        ``option_modelled_half_spread`` on any live account)."""
         quote = None
         try:
             quote = self.account.get_option_quote(position.contract_symbol)
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
             logger.debug(f"get_option_quote failed for {position.contract_symbol}: {e}")
+        close_side = (OrderDirection.SELL if position.side == OrderDirection.BUY
+                      else OrderDirection.BUY)
+        px = None
         if position.side == OrderDirection.BUY:
             if quote is not None and quote.bid is not None:
-                return quote.bid
+                px = quote.bid
         else:
             if quote is not None and quote.ask is not None:
-                return quote.ask
-        return order.open_price if order.open_price is not None else order.limit_price
+                px = quote.ask
+        if px is None:
+            return order.open_price if order.open_price is not None else order.limit_price
+        closing_leg = OptionLeg(
+            contract_symbol=position.contract_symbol, side=close_side,
+            position_intent="sell_to_close" if close_side == OrderDirection.SELL else "buy_to_close",
+            option_type=position.option_type, strike=position.strike,
+            expiry=position.expiry, underlying=position.underlying)
+        return self._concede_close_limit(
+            float(px), [closing_leg], self._close_cross_fraction(order))
 
     def _close_multi_leg(self, order: TradingOrder) -> "TradeActionResult":
         """Close a spread position by reversing its child leg orders as one
@@ -4041,6 +4252,12 @@ class CloseOptionAction(TradeAction):
         legs, net_limit = build_closing_legs(
             children, parent_quantity=quantity, quote_fn=self._safe_option_quote,
             held_qty=held_qty)
+        # F7: the synthetic net is a MID net — concede the exit fraction per leg (the
+        # +debit/-credit convention makes "give up" = net UP for every leg; see
+        # entry_limit_with_concession). No-op on live accounts and when net_limit is
+        # None (the entry-premium fallback below is not a quote to concede on).
+        net_limit = self._concede_close_limit(
+            net_limit, legs, self._close_cross_fraction(order))
         if not legs:
             return self.create_and_save_action_result(
                 action_type=ExpertActionType.CLOSE_OPTION.value, success=True,
