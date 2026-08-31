@@ -82,6 +82,16 @@ STORE="$HOME/Documents/ba2/common/cache/screener/metric_store"
 # ever genuinely wanted.
 WORKERS="${WORKERS-remote227}"
 
+# REMOTE-ONLY: no local GA consumers. The driver's own --parallel default is 4 (each local
+# consumer holds a ~5GB OHLCV cache in RAM), which run_matrix never overrode -- so every job
+# quietly ran WITH 4 local consumers alongside its remote slots, not the remote-only run this
+# grid is meant to be. Harmless on its own, but it is exactly the extra local load that turned
+# a wrong-worker mistake (2026-08-31, see the WORKERS comment above) into a real problem: 4
+# local consumers here PLUS another job's own local consumers on the same box together dropped
+# free RAM to 9GB/64GB. Opt into local consumers explicitly (PARALLEL=4 ./grid_goal2020.sh) if
+# that is ever genuinely wanted.
+PARALLEL="${PARALLEL-0}"
+
 # Sweep orphaned multiprocessing.spawn pool workers from any PREVIOUS run before starting.
 # On Windows those children are detached: killing a grid leaves them alive holding their full
 # working set, and they match neither the driver nor the launcher in a process filter. Measured
@@ -289,7 +299,7 @@ run_matrix() {                      # $1=mode  $2=name-suffix  $3...=extra drive
       stress_args=(--stress-spread-bps "$st")
     fi
     echo; echo "=== $mode / $band  (spread ${sp} bps round-trip${st:+, stress +${st}})  $(date)"
-    "$PY" "$DRIVER" "${COMMON[@]}"       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       "${stress_args[@]}" "${robust_args[@]}"       --name-suffix="$suffix"       "$@"
+    "$PY" "$DRIVER" "${COMMON[@]}"       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       "${stress_args[@]}" "${robust_args[@]}"       --name-suffix="$suffix"       --parallel "$PARALLEL"       "$@"
     echo "=== $mode / $band  done rc=$? $(date)"
   done
 }
