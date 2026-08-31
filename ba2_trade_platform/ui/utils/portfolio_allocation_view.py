@@ -637,6 +637,13 @@ class SymbolRow:
     mode for exactly that reason.
     """
     symbol: str
+    #: The instrument's human name (``Instrument.company_name``), for the ⓘ tooltip.
+    #: ``None`` when the row's instrument carries no name -- roughly two thirds of the
+    #: table, because the two DB-only creation helpers
+    #: (``utils.add_symbols_to_label`` / ``JobManager.ensure_instrument_exists``) have no
+    #: provider to ask. The tooltip shows the symbol alone in that case; it never
+    #: substitutes the ticker FOR the name, which would read as a fact.
+    company_name: Optional[str] = None
     labels: List[str] = field(default_factory=list)
     quantity: float = 0.0
     cost_basis: float = 0.0
@@ -726,6 +733,7 @@ def build_label_views(managed,
                       base_notional: Optional[float] = None,
                       symbol_weights=None,
                       symbol_previous_weights=None,
+                      company_names=None,
                       unallocated_pct: float = 0.0) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
@@ -763,6 +771,11 @@ def build_label_views(managed,
             ``None`` rather than falling back to the CURRENT weight -- the whole
             point of the figure is that it may differ from what is on screen, and
             "there is no last" is what the page's Load-last button reads.
+        company_names: ``{SYMBOL: company_name}`` from the instrument table; optional.
+            A symbol absent here, or mapped to a blank, keeps ``company_name=None`` —
+            "this instrument has no stored name" and "it is named after its ticker" are
+            different facts, and only the first is true of the ~two thirds of rows the
+            DB-only creation helpers insert without one.
         unallocated_pct: the account's stored cash reserve, 0-100. It scales the
             TARGET money only -- ``target_value`` on the label and on every symbol
             row -- because the label percentages divide what the reserve LEFT.
@@ -889,6 +902,10 @@ def build_label_views(managed,
             row_value = _value_of(sym)
             rows.append(SymbolRow(
                 symbol=sym,
+                # Blank -> None: an empty string would render as a name that is simply
+                # missing from the tooltip, which reads the same as "unnamed" but sorts
+                # and compares differently everywhere else.
+                company_name=((company_names or {}).get(sym) or None),
                 labels=list(membership.get(sym, [entry.label])),
                 quantity=quantity,
                 cost_basis=cost_basis,

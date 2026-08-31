@@ -691,6 +691,60 @@ class TradeActionResult(SQLModel, table=True):
     expert_recommendation: "ExpertRecommendation" = Relationship(back_populates="trade_action_results")
 
 
+class RiskManagerRun(SQLModel, table=True):
+    """One execution of a NON-smart risk manager, with its per-symbol reasoning.
+
+    The smart (agentic) risk manager already has ``SmartRiskManagerJob``; the classic
+    and option managers had nothing comparable. The classic manager logged an
+    ``ActivityLogType.RISK_MANAGER_RAN`` row carrying only COUNTS ("reviewed 42,
+    updated 7"), which answers "how many" and never "which, and why not" -- so the one
+    question asked of it in practice ("why was AAPL skipped?") could only be answered by
+    grepping the process log, if it was still on disk.
+
+    WHY A JSON COLUMN RATHER THAN A CHILD TABLE. The decisions are read as a set, always
+    for one run, and never aggregated across runs -- the UI opens a single run and lists
+    it. A child table would add one INSERT per symbol per run (a 200-symbol screener
+    universe run daily is ~73k rows/expert/year) to support a query nothing makes. This
+    mirrors ``SmartRiskManagerJob.graph_state``, which stores its own actions_log the
+    same way for the same reason.
+
+    ``mode`` is a first-class column, not a detail buried in the JSON, because it is what
+    the UI filters on and what makes this table serve both managers.
+
+    NOT WRITTEN DURING A BACKTEST. ``TradeRiskManagement`` is shared code: the GA's daily
+    engine calls the very same sizing entry point, thousands of times per trial. See
+    ``risk_manager_run.record_run``, which refuses when ``inmem_trades_active()``.
+    """
+    __tablename__ = "risk_manager_run"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+
+    expert_instance_id: int = Field(foreign_key="expertinstance.id", index=True, ondelete="CASCADE")
+    account_id: Optional[int] = Field(default=None, foreign_key="accountdefinition.id",
+                                      nullable=True, index=True, ondelete="CASCADE")
+
+    run_date: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+    #: "classic" or "options" -- the manager that produced this run. Deliberately NOT
+    #: "smart": that one has its own table and its own detail view.
+    mode: str = Field(index=True, description="classic | options")
+    status: str = Field(default="COMPLETED", description="COMPLETED, FAILED")
+    error_message: Optional[str] = Field(default=None)
+    duration_seconds: float = Field(default=0.0)
+
+    #: Counts, denormalised off ``decisions`` so the table view needs no JSON parsing.
+    symbols_received: int = Field(default=0)
+    symbols_funded: int = Field(default=0)
+
+    #: ``[{symbol, outcome, reason, quantity, ...}]`` -- one entry per symbol the manager
+    #: RECEIVED, funded or not. The refused ones are the point of the record.
+    decisions: List[Dict[str, Any]] = Field(sa_column=Column(JSON), default_factory=list)
+
+    #: The run's inputs worth showing beside the decisions (available balance, the
+    #: per-instrument cap, the permissions in force). Free-form on purpose: the two
+    #: managers weigh different things and neither should be flattened into the other's.
+    context: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict)
+
+
 class SmartRiskManagerJob(SQLModel, table=True):
     """
     Tracks Smart Risk Manager execution sessions.

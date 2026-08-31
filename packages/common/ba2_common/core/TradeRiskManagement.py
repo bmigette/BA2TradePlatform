@@ -5,6 +5,7 @@ This module implements comprehensive risk management for pending orders,
 including profit-based prioritization, position sizing, and diversification.
 """
 
+import time
 from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 from datetime import datetime, timezone
 
@@ -133,7 +134,10 @@ class TradeRiskManagement:
             List of TradingOrder objects that were updated with quantities
         """
         updated_orders = []
-        
+        # Monotonic, so the recorded duration cannot jump if the wall clock is adjusted
+        # mid-run. Taken before ANY work so the figure covers the whole pass.
+        run_started_at = time.monotonic()
+
         try:
             from ba2_common.core.instance_resolver import get_instance_resolver
 
@@ -234,6 +238,30 @@ class TradeRiskManagement:
             self.logger.info(f"Risk management completed for expert {expert_instance_id}: "
                            f"updated {len(updated_orders)} orders, deleted {len(orders_to_delete) if orders_to_delete else 0} unfunded orders")
             
+            # The per-SYMBOL record. The activity row below carries counts, which answer
+            # "how many" and never "which, and why not" -- the only question anyone
+            # actually brings to this manager. Every drop point above is represented:
+            # the permission filter, the missing-recommendation gate, and the sizing
+            # core's funded/unfunded split. Nothing is written during a BACKTEST; see
+            # risk_manager_run.record_run.
+            self._record_classic_run(
+                expert_instance_id=expert_instance_id,
+                account_id=expert_instance.account_id,
+                started_at=run_started_at,
+                pending_orders=pending_orders,
+                dropped_by_permission=dropped_by_permission,
+                orders_with_recommendations=orders_with_recommendations,
+                orders_to_update=orders_to_update,
+                orders_to_delete=orders_to_delete,
+                symbol_prices=symbol_prices,
+                context={
+                    "available_balance": total_virtual_balance,
+                    "max_per_instrument": max_equity_per_instrument,
+                    "enable_buy": enable_buy,
+                    "enable_sell": enable_sell,
+                },
+            )
+
             # Log activity for risk manager execution
             try:
                 from ba2_common.core.db import log_activity
@@ -488,6 +516,114 @@ class TradeRiskManagement:
         self.logger.info(f"Filtered {len(filtered_orders)} orders from {len(orders)} based on permissions")
         return filtered_orders
     
+    def _record_classic_run(self, *, expert_instance_id, account_id, started_at,
+                            pending_orders, dropped_by_permission,
+                            orders_with_recommendations, orders_to_update,
+                            orders_to_delete, symbol_prices, context) -> None:
+        """Turn this pass's drop points into one ``RiskManagerRun``.
+
+        Keyed by ORDER ID, not by symbol. Two pending orders can carry the same symbol
+        (two recommendations, or a reversal), and collapsing them by ticker would report
+        one outcome for two different decisions -- and silently hide whichever lost.
+        The symbol is carried alongside for display.
+
+        Ordered by the RECEIVED list, so the record reads in the order the manager
+        actually worked rather than in the order the outcomes happened to be collected.
+        """
+        try:
+            # The backtest check comes FIRST, before any decision is built. record_run
+            # refuses in a backtest too, but by then this method would already have walked
+            # every pending order and formatted a sentence for each -- per bar, per expert,
+            # per GA trial. The guard is only cheap if it is asked first.
+            from ba2_common.core.trade_store import inmem_trades_active
+            if inmem_trades_active():
+                return
+
+            from ba2_common.core.risk_manager_run import (
+                MODE_CLASSIC, OUTCOME_FUNDED, OUTCOME_NO_RECOMMENDATION,
+                OUTCOME_PERMISSION, OUTCOME_UNFUNDED, decision, record_run)
+
+            permission_ids = {o.id for o in (dropped_by_permission or [])}
+            recommended_ids = {o.id for o, _rec in (orders_with_recommendations or [])}
+            funded_by_id = {o.id: o for o in (orders_to_update or [])}
+            unfunded_ids = {o.id for o in (orders_to_delete or [])}
+            prices = symbol_prices or {}
+            cap = context.get("max_per_instrument")
+
+            decisions = []
+            for order in (pending_orders or []):
+                symbol = order.symbol
+                side = getattr(order.side, "value", order.side)
+                if order.id in permission_ids:
+                    decisions.append(decision(
+                        symbol, OUTCOME_PERMISSION,
+                        f"{side} entries are disabled for this expert", side=side))
+                elif order.id not in recommended_ids:
+                    decisions.append(decision(
+                        symbol, OUTCOME_NO_RECOMMENDATION,
+                        "no linked recommendation, so the order could not be ranked "
+                        "against the others", side=side))
+                elif order.id in funded_by_id:
+                    funded = funded_by_id[order.id]
+                    raw_qty = funded.quantity
+                    if raw_qty is None:
+                        # UNMEASURABLE, not zero. The sizing pass put this order in the
+                        # FUNDED list, so it will be submitted; a 0 here would record it
+                        # as "funded at nothing" -- a size the reader could reconcile
+                        # against the cap and believe. The quantity key is omitted
+                        # entirely, and the defect is named instead. Not raised: this
+                        # method is wrapped, and a raise would lose the record for every
+                        # OTHER symbol in the run.
+                        decisions.append(decision(
+                            symbol, OUTCOME_FUNDED,
+                            "funded, but the order carries no quantity — the size is "
+                            "UNMEASURABLE (not zero); repair the order's quantity",
+                            side=side))
+                        continue
+                    qty = float(raw_qty)
+                    price = prices.get(symbol)
+                    # The cost is stated because the cap it is measured against is in the
+                    # run's context -- a funded row the reader can check, beside the
+                    # refused ones they came for.
+                    cost = None if price is None else round(qty * float(price), 2)
+                    decisions.append(decision(
+                        symbol, OUTCOME_FUNDED,
+                        (f"funded at {qty:g}" if cost is None
+                         else f"funded at {qty:g} (~{cost:,.2f})"),
+                        quantity=qty, side=side, price=price, cost=cost))
+                elif order.id in unfunded_ids:
+                    price = prices.get(symbol)
+                    # UNMEASURABLE stays unmeasurable: with no price there is no way to
+                    # say which limit bound this order, and naming one would be a guess.
+                    if price is None:
+                        why = ("sized to zero; no price was available, so the binding "
+                               "limit cannot be identified")
+                    elif cap is not None and float(price) > float(cap):
+                        why = (f"one share at {float(price):,.2f} exceeds the "
+                               f"{float(cap):,.2f} per-instrument cap")
+                    else:
+                        why = ("sized to zero; the remaining budget did not cover one "
+                               f"share at {float(price):,.2f}")
+                    decisions.append(decision(symbol, OUTCOME_UNFUNDED, why,
+                                              side=side, price=price))
+                else:
+                    # Reached the sizing core and came back neither funded nor deleted --
+                    # possible when automated opening is on but the delete pass was
+                    # skipped. Recorded as unexplained rather than dropped, so an
+                    # uninstrumented path is visible instead of silently absent.
+                    decisions.append(decision(
+                        symbol, OUTCOME_UNFUNDED,
+                        "not funded by the sizing pass and not queued for deletion",
+                        side=side))
+
+            record_run(expert_instance_id=expert_instance_id, account_id=account_id,
+                       mode=MODE_CLASSIC, decisions=decisions, context=context,
+                       started_at=started_at)
+        except Exception as e:  # noqa: BLE001 -- observability must not fail the sizing pass
+            self.logger.warning(
+                f"Failed to record classic risk-manager run for expert "
+                f"{expert_instance_id}: {e}")
+
     def _get_orders_with_recommendations(self, orders: List[TradingOrder]) -> List[Tuple[TradingOrder, ExpertRecommendation]]:
         """Get orders with their linked recommendations.
 

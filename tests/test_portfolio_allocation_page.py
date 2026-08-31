@@ -2728,7 +2728,7 @@ def _listener_types(element):
 
 
 def _views(labels, symbols_by_label, *, base=10_000.0, reserve=0.0, weights=None,
-           prices=None, positions=None, previous_weights=None):
+           prices=None, positions=None, previous_weights=None, company_names=None):
     """Build LabelViews the way ``_load_view_payload`` does, with live prices."""
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
 
@@ -2740,7 +2740,8 @@ def _views(labels, symbols_by_label, *, base=10_000.0, reserve=0.0, weights=None
                              quotes, valuation_mode=VALUATION_MODE_MARKET,
                              base_notional=base, unallocated_pct=reserve,
                              symbol_weights=weights,
-                             symbol_previous_weights=previous_weights)
+                             symbol_previous_weights=previous_weights,
+                             company_names=company_names)
 
 
 def _draw(client, account_id, views, *, base=10_000.0, buying_power=1_000.0,
@@ -2756,11 +2757,13 @@ def _draw(client, account_id, views, *, base=10_000.0, buying_power=1_000.0,
 
 
 def _one_label(account_id, label='ARK26', target=40.0, symbols=('AAPL', 'MSFT'),
-               *, base=10_000.0, reserve=0.0, weights=None, color=None):
+               *, base=10_000.0, reserve=0.0, weights=None, color=None,
+               company_names=None):
     return _views([ManagedLabel(label, target, color=color)],
                   {label: list(symbols)}, base=base, reserve=reserve,
                   weights={label: dict(weights or {s: 100.0 / len(symbols)
-                                                   for s in symbols})})
+                                                   for s in symbols})},
+                  company_names=company_names)
 
 
 # -- the symbol table's TARGET % column is an input --------------------------
@@ -5135,6 +5138,58 @@ def test_the_info_control_says_what_it_will_show(nicegui_client, account_id):
     template = _tables(root)[0].slots['body-cell-info'].template
 
     assert 'Holdings, dividends and total return' in template
+
+
+def test_the_info_tooltip_names_the_symbol_and_the_instrument(nicegui_client, account_id):
+    """The ⓘ hover identifies WHICH row it belongs to. Reading the company name off
+    ``props.row`` (not a second lookup) is what lets one rendered slot serve every row --
+    the same constraint that makes ``symbolInfo`` carry the symbol in its emit."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-info'].template
+
+    assert 'props.row.symbol' in template
+    assert 'props.row.company_name' in template
+
+
+def test_the_info_tooltip_is_readable_rather_than_the_quasar_default(nicegui_client,
+                                                                    account_id):
+    """Quasar's default tooltip is ~10px. This one carries three lines and has to be
+    legible, so it sets its own size and a width to wrap a long company name against."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-info'].template
+
+    assert 'font-size' in template
+    assert 'max-width' in template
+
+
+def test_an_unnamed_instrument_shows_no_blank_name_line(nicegui_client, account_id):
+    """``v-if`` on the name, so a row whose instrument has none draws two lines rather
+    than one empty one -- the tooltip must not print ``null`` or a stray gap."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-info'].template
+
+    assert 'v-if="props.row.company_name"' in template
+
+
+def test_the_company_name_reaches_the_row_the_tooltip_reads(nicegui_client, account_id):
+    """End to end through the payload: a name supplied to the view builder must arrive
+    on the table's row data, because the template can only read what is there."""
+    views = _one_label(account_id, symbols=('AAPL',),
+                       company_names={'AAPL': 'Apple Inc.'})
+    root = _draw(nicegui_client, account_id, views)
+    row = _tables(root)[0].rows[0]
+
+    assert row['symbol'] == 'AAPL'
+    assert row['company_name'] == 'Apple Inc.'
+
+
+def test_an_unnamed_instrument_carries_an_empty_name_not_none(nicegui_client, account_id):
+    """Quasar prints a bare ``null`` if handed one, so the row normalises to ''."""
+    views = _one_label(account_id, symbols=('AAPL',), company_names={})
+    root = _draw(nicegui_client, account_id, views)
+    row = _tables(root)[0].rows[0]
+
+    assert row['company_name'] == ''
 
 
 def test_every_label_gets_its_own_info_column(nicegui_client, account_id):

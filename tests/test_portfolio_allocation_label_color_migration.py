@@ -84,9 +84,18 @@ def test_the_revision_chains_off_the_current_head():
 
 
 def test_alembic_still_has_exactly_one_head():
-    """Two heads is not cosmetic: ``alembic upgrade head`` refuses to pick one."""
+    """Two heads is not cosmetic: ``alembic upgrade head`` refuses to pick one.
+
+    Asserts the COUNT, which is what the docstring has always been about, rather than
+    pinning a particular revision id. The pin named ``c4d7e2b18a93`` — the head at the
+    time this file was written — so every later migration broke a test about label
+    COLOURS, and the only way to read that failure was as "someone forked the chain".
+    A revision that genuinely forks it still fails here, which is the point.
+    """
     script = ScriptDirectory.from_config(Config(str(REPO_ROOT / "alembic.ini")))
-    assert list(script.get_heads()) == ["c4d7e2b18a93"]
+    heads = list(script.get_heads())
+
+    assert len(heads) == 1, f"the migration chain has forked: {heads}"
 
 
 # ---------------------------------------------------------------------------
