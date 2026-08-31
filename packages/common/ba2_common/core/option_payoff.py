@@ -166,6 +166,15 @@ MEASURED = "MEASURED"
 UNBOUNDED = "UNBOUNDED"
 UNMEASURABLE = "UNMEASURABLE"
 
+#: EVERY ``reason`` STRING IN THIS MODULE MUST BE PURE ASCII — stated here, at the definition
+#: of the state that carries one, because that is upstream of all of them. These strings are
+#: refusals, so they travel to logs and consoles; on Windows a cp1252 stream raises
+#: UnicodeEncodeError on an em dash, which turns a clean refusal into a crash on the error
+#: path — the one path that must never have its own failure mode. The surrounding COMMENTS use
+#: em dashes freely and are safe; only the runtime strings are constrained, which is exactly
+#: why copying a dash from a neighbouring comment into a message is easy and unguarded.
+#: ``test_every_refusal_reason_is_ascii`` enforces this.
+
 #: Below this many dollars, a computed loss is floating-point noise around zero rather than a
 #: risk budget, and it is treated as UNMEASURABLE.
 #:
@@ -183,12 +192,26 @@ UNMEASURABLE = "UNMEASURABLE"
 #: One cent is far below any real structure's per-unit max loss and far above the noise.
 MIN_MEASURABLE_LOSS = 0.01
 
-#: Slope magnitudes are sums of ``ratio * multiplier``, so a genuinely negative slope is at
+#: Slope magnitudes are sums of ``ratio * multiplier``, so a genuinely non-zero slope is at
 #: least 1.0 in magnitude. Anything closer to zero than this is floating-point dust from mixed
-#: multipliers and means a flat payoff, not an unbounded one. Erring here is not free in either
-#: direction: a spurious UNBOUNDED does not merely refuse, it SUBSTITUTES a notional-based
-#: budget when undefined risk is permitted, so a bounded structure would be sized by the wrong
-#: rule rather than blocked.
+#: multipliers and means a flat payoff, not an unbounded one.
+#:
+#: THIS CONSTANT NOW GATES TWO FUNCTIONS AND ERRING COSTS SOMETHING DIFFERENT IN EACH — widening
+#: it to buy safety in one direction spends it in the other, so neither reading may be dropped
+#: from this comment.
+#:
+#:   * In ``max_loss``, a SPURIOUS UNBOUNDED does not merely refuse: it SUBSTITUTES a
+#:     notional-based budget when undefined risk is permitted, so a bounded structure is sized
+#:     by the wrong rule rather than blocked.
+#:   * In ``max_profit``, the failure runs the OTHER WAY. A genuinely unbounded structure whose
+#:     slope reads under the epsilon returns MEASURED with the best value on ``[0, K_max]``,
+#:     which for long premium is the near-worthless tail rather than the open-ended upside. That
+#:     number then becomes the numerator of ``w_rr = max_profit / max_loss``, so the structure
+#:     is not refused — it is RANKED, on an understated score, against peers scored correctly.
+#:     A silent mis-ranking is harder to notice than a refusal.
+#:
+#: The practical risk on the second is low while ``multiplier`` defaults to 100.0 and ratios are
+#: small integers; it is stated because nothing in the type system keeps them that way.
 _SLOPE_EPSILON = 1e-9
 
 
@@ -274,11 +297,157 @@ def max_loss(legs: Sequence[PayoffLeg]) -> MaxLossResult:
     # constant for the measurement and for why a sub-cent "max loss" is not a small number but
     # an unbounded contract count.
     if worst >= -MIN_MEASURABLE_LOSS:
+        # TWO CAUSES, TWO REMEDIES. This branch fires for ANY non-losing worst case, but an
+        # earlier version described every one of them as "within 0.01 of break-even ... a stale
+        # or crossed quote". A structure whose WORST outcome is +300 is not within a cent of
+        # anything; it is a textbook arbitrage, and the thing to check is how the legs were
+        # built, not how fresh the quote is.
+        #
+        # THE SPLIT IS SOUND HERE AND IS NOT MIRRORED IN `max_profit` — see the long note at
+        # that function's refusal for why. In one line: a guaranteed PROFIT at every price
+        # cannot exist in a live chain, so a decisively positive worst case really does imply
+        # a bad leg set; whereas a guaranteed LOSS can be bought for real money any day, so on
+        # the profit side magnitude implies nothing about cause and a split there would give
+        # two identical faults opposite diagnoses a cent apart.
+        #
+        # THE BREAK-EVEN HALF RESTS ON A SECOND ASSUMPTION, stated because it is about the
+        # CALLERS and not about arithmetic: that no builder emits a zero-risk-AND-zero-reward
+        # structure. Nothing in `TradeActions.py` currently can — the same-strike pairs that
+        # would do it (`long 100c @2.00 / short 100c @2.00`) are not a shape any builder
+        # constructs — so within this codebase a flat payoff really is a quote artefact. If a
+        # box, conversion or reversal builder ever lands, that stops being true and this half
+        # of the split acquires exactly the defect `max_profit`'s did: it would tell the reader
+        # "a zero-risk structure at real prices is a stale or crossed quote" about a builder
+        # degeneracy with a perfectly good chain behind it. REVISIT THIS BRANCH THEN.
+        if worst <= MIN_MEASURABLE_LOSS:
+            return MaxLossResult(
+                UNMEASURABLE,
+                reason=(f"structure's worst outcome is break-even (worst payoff {worst:.4f} at "
+                        f"expiry, within {MIN_MEASURABLE_LOSS} of zero): there is no risk "
+                        f"budget to size against, and a zero-risk structure at real prices is "
+                        f"a stale or crossed quote rather than free money -- re-pull the chain "
+                        f"before trusting this price"))
         return MaxLossResult(
             UNMEASURABLE,
-            reason=(f"structure shows no meaningful losing outcome (worst payoff {worst:.4f} at "
-                    f"expiry, within {MIN_MEASURABLE_LOSS} of break-even); a risk-free structure "
-                    f"is an arbitrage, so this is a stale or crossed quote rather than free "
-                    f"money"))
+            reason=(f"structure PROFITS at every underlying price (worst payoff {worst:.4f} at "
+                    f"expiry): a risk-free arbitrage of this size does not survive in a live "
+                    f"chain, so the leg set or the premium signs are wrong -- check how these "
+                    f"legs were built before re-quoting"))
 
     return MaxLossResult(MEASURED, amount=-worst)
+
+
+#: Mirror of MIN_MEASURABLE_LOSS. A structure whose best outcome is under a cent is not a
+#: trade with a thin edge; it is a structure that cannot pay. Same magnitude for the same
+#: reason -- one cent is far below any real structure's per-unit profit and far above the
+#: floating-point dust a DEBIT-equals-width subtraction leaves behind. (Debit, not credit:
+#: the loss-side constant is the one that reasons about a credit. The two sides meet at
+#: zero from opposite directions and the wrong word here sends a reader to the wrong half.)
+MIN_MEASURABLE_PROFIT = 0.01
+
+
+@dataclass(frozen=True)
+class MaxProfitResult:
+    """A max-profit answer, in the same three explicitly named states as MaxLossResult.
+
+    A SEPARATE TYPE rather than reusing MaxLossResult, whose docstring promises ``amount``
+    is "POSITIVE dollars of LOSS". One dataclass carrying both meanings is how a caller
+    ends up sizing a budget off a profit.
+
+    ``amount`` is set iff ``state == MEASURED`` and is POSITIVE dollars of profit.
+    ``reason`` is set iff ``state == UNMEASURABLE``.
+    """
+
+    state: str
+    amount: Optional[float] = None
+    reason: Optional[str] = None
+
+
+def max_profit(legs: Sequence[PayoffLeg]) -> MaxProfitResult:
+    """The best-case profit of ONE structure unit at expiry, as POSITIVE dollars.
+
+    The mirror of ``max_loss``: same critical-points scan, ``max`` where that takes ``min``,
+    and the SAME NON-NEGOTIABLE GUARD ORDER for the mirrored reason. A long call is
+    non-positive across the whole of ``[0, K_max]`` -- it is simply the debit -- so running
+    the "cannot profit" test before the slope test would report every ordinary long call as
+    UNMEASURABLE, exactly as running the arbitrage test first reports every naked short call
+    that way in ``max_loss``.
+
+    THE LOAD-BEARING PREMISE OF THE SCAN, stated because it is a fact about the leg kinds and
+    not about this function: once the slope guard has ruled out unbounded upside, the maximum
+    over the bounded region ``[0, K_max]`` IS the global maximum, because profit is never
+    unbounded BELOW. The underlying cannot go under zero, and at zero every leg's value is
+    already capped — a long put is worth at most ``strike * multiplier``, a short stock leg at
+    most its entry ``price * multiplier``, and calls are worthless. This is the counterpart of
+    the note in ``upside_slope`` that losses run away above and never below, and it is the
+    assumption a future leg kind would break: anything whose value grows without limit as the
+    underlying FALLS makes this scan silently return a finite answer for an unbounded profit.
+    """
+    problem = validate_legs(legs)
+    if problem is not None:
+        return MaxProfitResult(UNMEASURABLE, reason=problem)
+
+    # THE ORDER OF THESE TWO GUARDS IS NOT NEGOTIABLE — the mirror of the identical note in
+    # `max_loss`. A POSITIVE upside slope means the payoff rises without limit as the
+    # underlying rises, so no scan of [0, K_max] can name a best case. Run the "cannot
+    # profit" test first and every ordinary long call comes back UNMEASURABLE, because a
+    # long call's payoff really is non-positive across that whole bounded region: it is the
+    # debit below the strike and only crosses zero above the break-even, which lies outside
+    # the scan. Unbounded profit is the DEFINING property of long premium, not a defect in
+    # it, and a selection mode that quietly demoted every long call would answer "does long
+    # premium pay?" by construction rather than by measurement.
+    if upside_slope(legs) > _SLOPE_EPSILON:
+        return MaxProfitResult(UNBOUNDED)
+
+    best = max(payoff_at(legs, s) for s in critical_points(legs))
+
+    # The comparison carries MIN_MEASURABLE_PROFIT rather than testing `<= 0` for the same
+    # reason `max_loss` carries MIN_MEASURABLE_LOSS: with ordinary two-decimal premiums the
+    # debit-equals-width subtraction lands a few ULPs on either side of zero, and landing just
+    # ABOVE it is the harmful direction here. Swept over the same grid the loss-side test uses
+    # (widths 0.5/1.0/2.5/5.0 x every two-decimal debit from 0.01, 800 pairs), 120 of them —
+    # 15%, the same rate the loss-side constant reports — come out strictly positive, e.g.
+    # 6.217e-15 for a 0.57/0.07 half-dollar vertical. A bare `<= 0` admits every one of those
+    # as MEASURED, and that number then feeds `w_rr = max_profit / max_loss`, where a 1e-15
+    # numerator is not a thin score but a rounding artefact ranked against real ones.
+    if best <= MIN_MEASURABLE_PROFIT:
+        # ONE MESSAGE, DELIBERATELY — and NOT the two-way magnitude split that `max_loss` uses
+        # thirty lines above. THE ASYMMETRY IS THE POINT; do not "restore symmetry" here.
+        #
+        # `max_loss` may infer cause from magnitude because on that side magnitude really does
+        # imply cause: a worst case of decisively POSITIVE dollars is a guaranteed profit at
+        # every price, and a live chain does not offer one, so the leg set or the signs must be
+        # wrong. That is a sound claim about the market.
+        #
+        # On the profit side the same inference is FALSE. A 5.00-wide vertical paid exactly
+        # 5.00 and the same vertical paid 5.01 have the IDENTICAL cause — a builder that chose
+        # strikes which cannot pay — yet a magnitude split puts them in different branches and
+        # gives them opposite diagnoses one cent apart. Worse, both readings are individually
+        # plausible for BOTH magnitudes: a deep-ITM vertical genuinely quotes at about its
+        # width, so crossing the ask pays width or a shade over on a perfectly good chain,
+        # while a stale chain can just as easily print either. The payoff curve at expiry
+        # cannot distinguish an unpayable structure from a broken quote, because the two
+        # produce the same curve.
+        #
+        # So the message names the ambiguity and both remedies rather than asserting one cause
+        # and sending the reader to hunt a defect that may not exist. A refusal that says "I
+        # cannot tell which of these two it is" is worth more than a confident wrong answer.
+        #
+        # "MEANINGFULLY" IS LOAD-BEARING, not padding. This branch fires on
+        # `best <= MIN_MEASURABLE_PROFIT`, so it also admits STRICTLY POSITIVE best cases up to
+        # a cent — the 0.57/0.07 half-dollar vertical that profits by 6.2e-15 lands here. A
+        # flat "cannot profit at any underlying price" would be false for that whole band, and
+        # a refusal that states a falsehood about the very number it is printing is worse than
+        # one that hedges. `max_loss` is careful in exactly this way: it reserves its
+        # unconditional "PROFITS at every underlying price" for `worst > MIN_MEASURABLE_LOSS`
+        # and hedges inside the band.
+        return MaxProfitResult(
+            UNMEASURABLE,
+            reason=(f"structure cannot profit meaningfully at any underlying price (best "
+                    f"payoff {best:.4f} at expiry): the strikes and premiums chosen cannot "
+                    f"pay. That is either a "
+                    f"builder picking an unpayable structure or a stale or crossed chain, and "
+                    f"the expiry payoff alone cannot tell them apart -- check the strikes the "
+                    f"builder chose, and re-pull the quote, before trusting this price"))
+
+    return MaxProfitResult(MEASURED, amount=best)

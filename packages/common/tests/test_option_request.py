@@ -10,7 +10,8 @@ import dataclasses
 import pytest
 
 from ba2_common.core.option_request import (
-    BUDGET_EXHAUSTED_REFUSAL, BUYING_POWER_REFUSAL, CONFIDENCE_UNMEASURABLE_REFUSAL,
+    BUDGET_CEILING_REFUSAL, BUDGET_EXHAUSTED_REFUSAL, BUYING_POWER_REFUSAL,
+    CONFIDENCE_UNMEASURABLE_REFUSAL,
     EMPTY_BOX_REFUSAL, EMPTY_CHAIN_REFUSAL, MAX_LOSS_UNMEASURABLE_REFUSAL,
     MISSING_QUOTE_REFUSAL, NEGATIVE_EXPECTANCY_REFUSAL, NON_POSITIVE_NET_REFUSAL,
     NO_LIQUID_CONTRACT_REFUSAL, REFUSAL_PHRASES, SELECTION_CONFIG_REFUSAL,
@@ -46,7 +47,8 @@ def test_all_refusal_phrases_are_registered_and_distinct():
                NEGATIVE_EXPECTANCY_REFUSAL, BUYING_POWER_REFUSAL,
                BUDGET_EXHAUSTED_REFUSAL, EMPTY_BOX_REFUSAL,
                EMPTY_CHAIN_REFUSAL, NO_LIQUID_CONTRACT_REFUSAL, MISSING_QUOTE_REFUSAL,
-               NON_POSITIVE_NET_REFUSAL, SELECTION_CONFIG_REFUSAL]
+               NON_POSITIVE_NET_REFUSAL, SELECTION_CONFIG_REFUSAL,
+               BUDGET_CEILING_REFUSAL]
     assert len(set(phrases)) == len(phrases)
     assert set(phrases) == set(REFUSAL_PHRASES)
 
@@ -129,3 +131,31 @@ def test_an_unknown_sizing_basis_is_refused():
                           option_strategy="long_call", dte=30, reserve_kwargs={},
                           reserve_per_contract=0.0, cost_per_contract=100.0,
                           sizing_basis="vibes")
+
+
+# --- added for the budget ceiling -------------------------------------------------------------
+
+
+def test_the_budget_ceiling_refusal_is_registered_and_round_trips():
+    """A phrase that exists but was never registered is INVISIBLE: ``StructureRefusal`` raises on
+    it, so the one caller that tried to report it would crash instead of naming the cause."""
+    assert BUDGET_CEILING_REFUSAL in REFUSAL_PHRASES
+    r = StructureRefusal(request=a_request(), phrase=BUDGET_CEILING_REFUSAL,
+                         detail="cheapest chargeable max loss 410.00 exceeds ceiling 300.00")
+    assert r.phrase == BUDGET_CEILING_REFUSAL
+
+
+def test_the_ceiling_refusal_is_not_the_exhausted_one_because_the_REMEDIES_DIFFER():
+    """The two are one word apart in English and opposite in what an operator should DO.
+
+    ``BUDGET_EXHAUSTED_REFUSAL`` means there is nothing left to spend: wait, or close something.
+    ``BUDGET_CEILING_REFUSAL`` means there IS budget and it is smaller than the cheapest contract
+    in the box: widen the box toward cheaper strikes, or raise the per-structure cap. Merging
+    them would tell the operator to wait for room that is already there.
+
+    It is not ``EMPTY_BOX_REFUSAL`` either -- the box was NOT empty; it held contracts and the
+    ceiling excluded them.
+    """
+    assert BUDGET_CEILING_REFUSAL != BUDGET_EXHAUSTED_REFUSAL
+    assert BUDGET_CEILING_REFUSAL != EMPTY_BOX_REFUSAL
+    assert "exhaust" not in BUDGET_CEILING_REFUSAL
