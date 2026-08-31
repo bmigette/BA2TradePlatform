@@ -16,7 +16,7 @@ Nothing self-heals that state:
 
 ``open_option_orders_book_wide`` keeps every non-terminal option order whose transaction is
 not CLOSED/FAILED, so a stranded SHORT PUT child is counted as live assignment exposure for
-ever, and ``_refuse_if_cannot_take_delivery`` then blocks bear put spread, bull put spread,
+ever, and ``_downsize_to_delivery_capacity`` then blocks bear put spread, bull put spread,
 cash-secured put, short straddle, short strangle, iron condor, jade lizard and put ratio
 spread — account-wide, across every expert, until someone intervenes by hand.
 

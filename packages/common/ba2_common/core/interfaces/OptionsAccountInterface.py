@@ -417,7 +417,7 @@ class OptionsAccountInterface(ABC):
         The cost is not cosmetic. ``open_option_orders_book_wide`` keeps every non-terminal
         option order whose transaction is not CLOSED/FAILED, so a stranded SHORT PUT child is
         counted as live delivery obligation for ever — measured at $24,000 on a 2-lot 120-strike
-        bull put spread the broker had REJECTED — and ``_refuse_if_cannot_take_delivery`` then
+        bull put spread the broker had REJECTED — and ``_downsize_to_delivery_capacity`` then
         refuses bear put spread, bull put spread, cash-secured put, short straddle, short
         strangle, iron condor, jade lizard and put ratio spread, account-wide across every
         expert, until someone repairs it by hand.
@@ -1147,6 +1147,51 @@ class OptionsAccountInterface(ABC):
         floor = cls.NAKED_MARGIN_FLOOR_FRACTION * spot
         return max(primary, floor) * 100.0
 
+    @classmethod
+    def short_pair_margin_per_contract(cls, *, put_strike: float, call_strike: float,
+                                       put_premium: float, call_premium: float,
+                                       spot: float | None = None) -> float:
+        """TRUE Reg-T requirement for ONE short call + ONE short put held as a pair
+        (a short STRANGLE when the strikes differ, a short STRADDLE when they
+        coincide)::
+
+            (the GREATER leg's naked margin) + (the OTHER leg's premium x 100)
+
+        where "greater" compares the two legs' ``naked_margin_per_contract`` brackets
+        (premium excluded there by this file's convention — the collected premium
+        already sits in cash) and the premiums are PER-SHARE. When the two brackets
+        TIE (an exactly-ATM straddle does this every time), "the other leg" is
+        ambiguous and the tie is resolved CONSERVATIVELY: the larger premium is the
+        one added.
+
+        Operator decision 2026-08-31, replacing the review-F10 per-leg SUM (which was
+        deliberately conservative to stop entries instantly breaching maintenance).
+        This is THE shared implementation: ``option_reserve_required`` prices the
+        entry through it and the backtest maintenance model
+        (``BacktestAccount.maintenance_margin_requirement``) prices the held pair
+        through it, so entry and maintenance move together and the F10 invariant — a
+        just-opened pair never breaches its own maintenance — holds by construction.
+
+        Fail-closed like everything around it: a missing or negative premium raises
+        (an unknown Reg-T other-leg term must not be priced as zero); an unusable
+        strike raises inside ``naked_margin_per_contract``.
+        """
+        for name, value in (("put_premium", put_premium), ("call_premium", call_premium)):
+            if value is None or value < 0:
+                raise ValueError(
+                    f"short_pair_margin_per_contract: {name} is {value!r} — the Reg-T "
+                    f"other-leg premium term is UNKNOWN without it, and an unknown "
+                    f"requirement must not be priced as a partial one.")
+        margin_put = cls.naked_margin_per_contract(
+            put_strike, option_type=OptionRight.PUT, spot=spot)
+        margin_call = cls.naked_margin_per_contract(
+            call_strike, option_type=OptionRight.CALL, spot=spot)
+        if margin_put > margin_call:
+            return margin_put + float(call_premium) * 100.0
+        if margin_call > margin_put:
+            return margin_call + float(put_premium) * 100.0
+        return margin_put + max(float(put_premium), float(call_premium)) * 100.0
+
     #: Strategies whose reserve is GENUINELY zero, named one by one.
     #:
     #: Every one of these is long/debit (the maximum loss is the premium already paid
@@ -1193,15 +1238,22 @@ class OptionsAccountInterface(ABC):
     @classmethod
     def option_reserve_required(cls, strategy: str, quantity: int, *, strike: float | None = None,
                                spread_width: float | None = None, net_credit: float | None = None,
-                               spot: float | None = None, option_type: OptionRight | None = None) -> float:
+                               spot: float | None = None, option_type: OptionRight | None = None,
+                               call_strike: float | None = None,
+                               put_premium: float | None = None,
+                               call_premium: float | None = None) -> float:
         """Cash/BP that a short-premium strategy must reserve. 0 for long/debit strategies.
 
         ``option_type`` is REQUIRED for the single-sided naked strategies
-        (``short_strangle``/``naked_put``/``put_ratio_spread``) — the Reg-T OTM amount
-        is direction-aware, so a missing right would silently misstate the reserve.
-        ``short_straddle`` needs none: it shorts BOTH rights at the same strike and
-        Reg-T margins a straddle at the GREATER of the two legs, so the worst case
-        over both rights is reserved.
+        (``naked_put``) — the Reg-T OTM amount is direction-aware, so a missing right
+        would silently misstate the reserve. The two-sided naked strategies price the
+        PAIR by name instead (``short_pair_margin_per_contract``: the greater leg's
+        naked margin + the other leg's premium): ``short_strangle`` takes the PUT
+        strike in ``strike`` and the call's in ``call_strike``; ``short_straddle``
+        shorts both rights at ONE strike and needs only it. BOTH need the two legs'
+        per-share premiums (``put_premium`` / ``call_premium``) — the Reg-T other-leg
+        term is a premium, and a missing one refuses rather than pricing a partial
+        number.
 
         An **unrecognised** ``strategy`` raises ``ValueError``. It used to fall off the
         end of the branch chain into a bare ``return 0.0``, which meant that the one
@@ -1231,11 +1283,16 @@ class OptionsAccountInterface(ABC):
                         f"the capital this structure must set aside is UNKNOWN — and an "
                         f"unknown requirement must not be reported as zero (a zero "
                         f"reserve passes every buying-power gate).")
-                if field == "strike" and value <= 0:
+                if field in ("strike", "call_strike") and value <= 0:
                     raise ValueError(
-                        f"option_reserve_required({strategy!r}): strike is {value!r}. No "
+                        f"option_reserve_required({strategy!r}): {field} is {value!r}. No "
                         f"listed equity option has a non-positive strike, so this is an "
                         f"unpopulated field, and pricing it would reserve nothing.")
+                if field in ("put_premium", "call_premium") and value < 0:
+                    raise ValueError(
+                        f"option_reserve_required({strategy!r}): {field} is {value!r}. A "
+                        f"negative premium is an unpopulated/broken field, not a price — "
+                        f"pricing it would understate the Reg-T other-leg term.")
         # Validated BEFORE the quantity short-circuit: an unrecognised strategy is a
         # code defect, and a defect does not stop being one at size zero.
         if (strategy not in cls.ZERO_RESERVE_STRATEGIES
@@ -1268,11 +1325,30 @@ class OptionsAccountInterface(ABC):
             # NAKED short premium: reserve the Reg-T naked-option margin, not full cash.
             _require(strike=strike)
             if strategy == "short_straddle":
-                # Both a short call AND a short put at the SAME strike: reserve the
-                # worst-case leg (only one side can finish ITM; Reg-T charges the greater).
-                return max(
-                    cls.naked_margin_per_contract(strike, option_type=OptionRight.CALL, spot=spot),
-                    cls.naked_margin_per_contract(strike, option_type=OptionRight.PUT, spot=spot),
+                # Both a short call AND a short put at the SAME strike: TRUE Reg-T pair —
+                # the greater leg's naked margin + the OTHER leg's premium (operator
+                # decision 2026-08-31, replacing the review-F10 per-leg SUM; before F10 it
+                # was max(call, put) with no premium term, which sat below maintenance).
+                # ``short_pair_margin_per_contract`` is the ONE shared implementation the
+                # backtest maintenance model also prices the held pair with, so entry and
+                # maintenance move together and a just-opened straddle cannot instantly
+                # breach.
+                _require(put_premium=put_premium, call_premium=call_premium)
+                return cls.short_pair_margin_per_contract(
+                    put_strike=strike, call_strike=strike,
+                    put_premium=put_premium, call_premium=call_premium, spot=spot,
+                ) * quantity
+            if strategy == "short_strangle":
+                # A short call AND a short put at DIFFERENT strikes (``strike`` = the PUT
+                # strike, ``call_strike`` = the call's): the same TRUE Reg-T pair through
+                # the same shared implementation (operator decision 2026-08-31, replacing
+                # the review-F10 per-leg SUM; before F10 it priced the PUT leg only and
+                # O_SSTG opened what it immediately breached).
+                _require(call_strike=call_strike,
+                         put_premium=put_premium, call_premium=call_premium)
+                return cls.short_pair_margin_per_contract(
+                    put_strike=strike, call_strike=call_strike,
+                    put_premium=put_premium, call_premium=call_premium, spot=spot,
                 ) * quantity
             if option_type is None:
                 raise ValueError(

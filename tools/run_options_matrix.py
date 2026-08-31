@@ -142,9 +142,10 @@ def main() -> int:
     ap.add_argument("--fitness", default=None,
                     help="Fitness metric forced on EVERY job. Default: omitted, so each job "
                          "gets ba2test_launcher's per-strategy-kind auto-resolution "
-                         "(consistent_annual_return for pure-option kinds OS1-4/O_*, "
-                         "sharpe_ratio for O_CC/O_PP/O_STK) -- passing this flag here "
-                         "overrides that auto-resolution uniformly for the whole matrix.")
+                         "(option_consistent_annual_return for pure-option kinds OS1-4/O_* "
+                         "AND the equity-entry overlays O_CC/O_PP, sharpe_ratio for O_STK -- "
+                         "see _resolve_fitness/_OPTION_CAR_STRATEGIES) -- passing this flag "
+                         "here overrides that auto-resolution uniformly for the whole matrix.")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f} — options "
                          "need more headroom than the equity grid's 10k).")
@@ -234,8 +235,9 @@ def main() -> int:
         cmd += _gate_passthrough(args)
         if args.fitness:
             # Explicit override forces this metric uniformly; omitted (default) lets
-            # ba2test_launcher's _resolve_fitness() pick per-strategy-kind (pure-option ->
-            # option_consistent_annual_return, O_CC/O_PP/O_STK -> sharpe_ratio).
+            # ba2test_launcher's _resolve_fitness() pick per-strategy-kind (pure-option AND
+            # the equity-entry overlays O_CC/O_PP -> option_consistent_annual_return, O_STK ->
+            # sharpe_ratio).
             cmd += ["--fitness", args.fitness]
         if args.early_stop is not None:
             cmd += ["--early-stop", str(args.early_stop)]

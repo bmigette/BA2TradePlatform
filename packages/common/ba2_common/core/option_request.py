@@ -41,6 +41,19 @@ MISSING_QUOTE_REFUSAL = "the selected contract carries no usable quote"
 NON_POSITIVE_NET_REFUSAL = "the structure prices to a non-positive net"
 SELECTION_CONFIG_REFUSAL = "a selection parameter can never select anything"
 
+# THIS IS NOT ``BUDGET_EXHAUSTED_REFUSAL`` AND THE TWO MUST NEVER BE MERGED. They are one word
+# apart in English and opposite in what an operator should DO. Exhausted means there is nothing
+# left to spend, so the remedy is to wait or to close something. This one means there IS budget
+# and it is smaller than the cheapest contract in the box, so the remedy is to widen the box
+# toward cheaper strikes or to raise the per-structure cap. Reporting the first when the second
+# is true tells the operator to wait for room that was there the whole time.
+#
+# NOR IS IT ``EMPTY_BOX_REFUSAL``: the box was NOT empty. It held contracts and the budget
+# ceiling excluded them, and the phrase says "the cheapest contract in the box" precisely because
+# there IS one. Those two are the pair a single "nothing survived the filters" would collapse,
+# and telling them apart is the whole reason this constant exists.
+BUDGET_CEILING_REFUSAL = "the cheapest contract in the box exceeds the max-loss ceiling"
+
 #: Every phrase above. ``StructureRefusal`` validates against this so a free-text reason cannot
 #: creep in — the phrases are only useful if they are exhaustive and stable.
 REFUSAL_PHRASES = (
@@ -57,7 +70,23 @@ REFUSAL_PHRASES = (
     MISSING_QUOTE_REFUSAL,
     NON_POSITIVE_NET_REFUSAL,
     SELECTION_CONFIG_REFUSAL,
+    BUDGET_CEILING_REFUSAL,
 )
+
+
+def validate_refusal_phrase(phrase: str) -> None:
+    """Raise unless ``phrase`` is registered above.
+
+    A FUNCTION RATHER THAN A COPY OF THE CHECK, because ``StructureRefusal`` is no longer the
+    only refusal object: ``option_selection_policy.SelectionRefusal`` reports the same phrases
+    from a layer that has no ``OptionStructureRequest`` to attach them to. Two copies of the rule
+    is how one of them ends up accepting free text -- and a reason nobody can grep for is a
+    reason nobody reads, which is the failure the registry exists to abolish.
+    """
+    if phrase not in REFUSAL_PHRASES:
+        raise ValueError(
+            f"Unregistered refusal phrase {phrase!r}. Callers grep for these, so a "
+            f"free-text reason is invisible to them; add it to REFUSAL_PHRASES.")
 
 
 @dataclass(frozen=True)
@@ -173,7 +202,4 @@ class StructureRefusal:
     detail: str
 
     def __post_init__(self):
-        if self.phrase not in REFUSAL_PHRASES:
-            raise ValueError(
-                f"Unregistered refusal phrase {self.phrase!r}. Callers grep for these, so a "
-                f"free-text reason is invisible to them; add it to REFUSAL_PHRASES.")
+        validate_refusal_phrase(self.phrase)

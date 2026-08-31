@@ -74,13 +74,17 @@ def test_all_equal_values_contribute_nothing_rather_than_dividing_by_zero():
 
 
 def test_single_candidate_does_not_crash():
+    # The names are spelled out rather than compared against FEATURE_NAMES: this is the test
+    # that notices a feature quietly appearing or disappearing, and asserting a constant against
+    # itself would notice nothing. `profit`/`rr` are present with no `structure_fn` on the
+    # context -- INAPPLICABLE, which is a uniform column, not an absent one.
     m = feature_matrix([c(100)], ctx())
-    assert set(m) == {"box_center", "premium", "iv", "rvol", "spread"}
+    assert set(m) == {"box_center", "premium", "iv", "rvol", "spread", "profit", "rr"}
     assert all(len(v) == 1 for v in m.values())
 
 
 def test_default_policy_weights_only_the_box_center():
     p = SelectionPolicy()
     assert p.w_box_center == 1.0
-    assert (p.w_premium, p.w_iv, p.w_rvol, p.w_spread) == (0.0, 0.0, 0.0, 0.0)
+    assert (p.w_premium, p.w_iv, p.w_rvol, p.w_spread, p.w_profit, p.w_rr) == (0.0,) * 6
     assert p.is_default

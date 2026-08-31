@@ -216,7 +216,7 @@ def test_sell_covered_call_short_of_cover_returns_a_refusal_and_never_raises(
     ``TradeActionResult`` is written for any of them — and a routine condition (a feed
     outage, a second call on the same lot, shares not yet visible at the broker) logs a
     stack trace at ERROR. The two money rails on this same path
-    (``check_option_buying_power``, ``_refuse_if_cannot_take_delivery``) both return a
+    (``check_option_buying_power``, ``_downsize_to_delivery_capacity``) both return a
     verdict; this is the third.
 
     The double publishes 300 shares to the platform and 100 to the BROKER, which is a
