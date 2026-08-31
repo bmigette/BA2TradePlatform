@@ -71,7 +71,9 @@ def forced_option_exit(event_action) -> bool:
       * a ``profit_loss_percent`` / ``profit_loss_amount`` trigger with a ``<``/``<=``
         operator is a loss-side stop — forced;
       * everything else (TP ``>`` gates, time exits, sentiment/rating flags) is
-        discretionary.
+        discretionary. The ``days_opened`` time exit is DELIBERATELY discretionary —
+        the F7 brief's forced list was SL / DTE / breaker / margin only (the breaker
+        is deferred to F5's shared-rails work) — recorded so it is not re-litigated.
 
     The flag is inert in live by construction: only an account that models a spread
     (``option_modelled_half_spread``) lets ``CloseOptionAction`` act on it.

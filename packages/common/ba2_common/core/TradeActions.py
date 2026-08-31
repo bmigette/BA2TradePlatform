@@ -2296,19 +2296,24 @@ class _OptionEntryAction(TradeAction):
                 downsize_attempted = True
                 room = verdict.cash - verdict.held_cost
                 max_units = int(room // per_unit)
-                if max_units >= 1:
-                    # Belt and braces: re-verify the clamped size through the SAME gate
-                    # (the two must agree by construction; this keeps them honest).
+                # Belt and braces: re-verify the clamped size through the SAME gate
+                # (the two must agree by construction; this keeps them honest). If the
+                # floor division landed ON the boundary and float rounding makes the
+                # re-verify disagree by a hair, step DOWN one unit and re-verify once —
+                # so the refusal's "not even one unit fits" is only said when true.
+                for units in (max_units, max_units - 1):
+                    if units < 1:
+                        break
                     clamped = self.account.check_short_put_assignment_capacity(
-                        strike=strike, contracts=contracts_per_unit * max_units)
+                        strike=strike, contracts=contracts_per_unit * units)
                     if clamped.ok:
                         logger.warning(
                             f"{self._action_type_value()} for {self.instrument_name}: "
-                            f"{option_strategy} DOWNSIZED {quantity} -> {max_units} "
+                            f"{option_strategy} DOWNSIZED {quantity} -> {units} "
                             f"unit(s) to fit assignment capacity "
                             f"(room {room:,.2f} / {per_unit:,.2f} per unit; "
                             f"held {verdict.held_cost:,.2f}, cash {verdict.cash:,.2f}).")
-                        return max_units, None
+                        return units, None
         message = f"{verdict.reason}"
         if downsize_attempted:
             message += (" Downsizing was attempted, but not even one unit of this "
@@ -3956,6 +3961,13 @@ class CloseOptionAction(TradeAction):
       * FORCED closes (``forced_exit=True``: SL stop / DTE roll, classified from the
         firing rule's triggers by ``TradeActionEvaluator.forced_option_exit``) cross the
         modelled spread FULLY — a risk exit pays up.
+
+    RESIDUAL OPTIMISM, RECORDED (operator-delegated design, 2026-08-30): live closes
+    always pay the full real touch, while a backtest DISCRETIONARY close concedes only
+    the fraction its entry conceded — an ``entry_cross=0`` genome therefore keeps
+    filter-flattered TP/time exits. Watch-item: if discretionary exits still migrate
+    to expiry en masse for low-entry_cross genomes, the entry-fraction design gets
+    revisited.
     """
 
     def __init__(self, instrument_name: str, account: AccountInterface,

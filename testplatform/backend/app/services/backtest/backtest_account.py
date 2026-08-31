@@ -560,13 +560,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # frozen at its entry credit it was the only found path around the
                 # dd>=100 wipeout sentinel), for a LONG the asset is likewise floored at
                 # intrinsic. While intrinsic is below entry (e.g. still OTM) the entry
-                # premium keeps the mark, exactly as before. When SPOT itself is
-                # unresolvable this tick, the entry-premium mark is KEPT — the fix is for
-                # the no-OPTION-bar case, not the no-equity-bar case.
+                # premium keeps the mark, exactly as before — but never ABOVE the
+                # no-arb upper bound (fast-follow to F2: a long call on a COLLAPSED
+                # underlying — spot 3.00, entry debit 5.00, no bar — must mark 3.00,
+                # not stay frozen at 5.00; the same cap the bar-exists clamp above
+                # applies). When SPOT itself is unresolvable this tick, the
+                # entry-premium mark is KEPT — the fix is for the no-OPTION-bar case,
+                # not the no-equity-bar case.
                 px = lot.avg_price
                 bounds = self._lot_no_arb_bounds(lot.contract_symbol)
                 if bounds is not None:
-                    px = bounds[0] if px is None else max(float(px), bounds[0])
+                    px = bounds[0] if px is None else min(max(float(px), bounds[0]), bounds[1])
             if px is None:
                 continue
             contribution = lot.qty * px * lot.multiplier
@@ -2943,18 +2947,22 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                         # Entry premium remains the mark when strike / right / spot are
                         # unresolvable (the fix is for the no-OPTION-bar case, not the
                         # no-equity-bar case).
-                        intr = None
+                        intr = upper = None
                         if opening.strike is not None and opening.option_type is not None:
                             und = getattr(opening, "underlying_symbol", None) or opening.symbol
                             spot = self._price.close_asof(und)
                             if spot is not None:
-                                intr, _ = self._no_arb_premium_bounds(
+                                intr, upper = self._no_arb_premium_bounds(
                                     opening.strike,
                                     opening.option_type == OptionRight.CALL,
                                     spot,
                                 )
                         if intr is not None:
-                            exit_px = max(float(entry_px), intr)
+                            # Floor at intrinsic AND cap at the upper bound (fast-follow
+                            # to F2: a collapsed underlying must not leave the entry
+                            # debit standing as an above-no-arb break-even mark). With
+                            # spot resolved the upper bound always resolves too.
+                            exit_px = min(max(float(entry_px), intr), upper)
                         else:
                             logger.warning(
                                 "[backtest] round-trip recorder: no premium bar for open option "

@@ -417,7 +417,7 @@ class OptionsAccountInterface(ABC):
         The cost is not cosmetic. ``open_option_orders_book_wide`` keeps every non-terminal
         option order whose transaction is not CLOSED/FAILED, so a stranded SHORT PUT child is
         counted as live delivery obligation for ever — measured at $24,000 on a 2-lot 120-strike
-        bull put spread the broker had REJECTED — and ``_refuse_if_cannot_take_delivery`` then
+        bull put spread the broker had REJECTED — and ``_downsize_to_delivery_capacity`` then
         refuses bear put spread, bull put spread, cash-secured put, short straddle, short
         strangle, iron condor, jade lizard and put ratio spread, account-wide across every
         expert, until someone repairs it by hand.

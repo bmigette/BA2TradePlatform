@@ -363,3 +363,123 @@ def test_open_at_end_trade_row_uses_intrinsic_fallback(tmp_path):
         assert row["pnl"] == pytest.approx((2.0 - 50.0) * 100.0, abs=1.0)
     finally:
         ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# F1 refactor PIN — the close guard caps a PUT at its STRIKE, not at spot
+# ---------------------------------------------------------------------------
+def _put_close_guard_account(tmp_path, tag):
+    """A crashed name: AMD at 60 against an 80-strike put (used only for the guard's
+    spot lookup — the orders below are synthetic)."""
+    bars = [_ubar(datetime(2024, 3, 5), 60), _ubar(datetime(2024, 3, 6), 60)]
+    ps = _make_ps("AMD", bars, datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, tag, ps, "AMD", [], [])
+    return acct, ctx
+
+
+def test_put_close_between_spot_and_strike_is_accepted(tmp_path):
+    """PIN of a deliberate behaviour change in the F1 refactor (fast-follow #1).
+
+    The PRE-F1 guard applied ``fill_px > spot + tol -> reject`` to ALL closes; on a
+    crashed name that wrongly rejected a legitimate deep-ITM PUT close — with strike
+    140 over a 60 spot, the put is honestly worth ~(strike - spot) = 80, ABOVE spot.
+    The refactored guard caps a call at SPOT and a put at its STRIKE, so this close now
+    FILLS. This changes which exits fill on crashed names relative to every pre-branch
+    baseline, and it is pinned here so nobody 'fixes' it back.
+    """
+    from types import SimpleNamespace
+
+    acct, ctx = _put_close_guard_account(tmp_path, "f1putpin")
+    try:
+        order = SimpleNamespace(
+            strike=140.0, option_type=OptionRight.PUT, position_intent="buy_to_close",
+            underlying_symbol="AMD", symbol="AMD",
+            contract_symbol="AMD240315P00140000", side=OrderDirection.BUY)
+        bar = {"close": 80.0, "volume": 1_000, "strike": 140.0, "option_type": OptionRight.PUT}
+        # Premium 80 in (spot 60, strike 140]: legitimate, must be admitted.
+        assert acct._arb_fill_reject_reason(
+            order, 80.0, date(2024, 3, 5), True, bar) is None
+        # At the strike exactly (boundary): still admitted.
+        assert acct._arb_fill_reject_reason(
+            order, 140.0, date(2024, 3, 5), True, bar) is None
+        # Above strike + tolerance: impossible (a put can never be worth more than its
+        # strike) — rejected, and the reason names the strike bound.
+        reason = acct._arb_fill_reject_reason(
+            order, 140.0 + 0.06, date(2024, 3, 5), True, bar)
+        assert reason is not None and "strike" in reason
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_call_close_is_still_capped_at_spot(tmp_path):
+    """The mirror direction is unchanged: a CALL close above spot + tol stays junk."""
+    from types import SimpleNamespace
+
+    acct, ctx = _put_close_guard_account(tmp_path, "f1callpin")
+    try:
+        order = SimpleNamespace(
+            strike=40.0, option_type=OptionRight.CALL, position_intent="sell_to_close",
+            underlying_symbol="AMD", symbol="AMD",
+            contract_symbol="AMD240315C00040000", side=OrderDirection.SELL)
+        bar = {"close": 65.0, "volume": 1_000, "strike": 40.0, "option_type": OptionRight.CALL}
+        reason = acct._arb_fill_reject_reason(
+            order, 65.0, date(2024, 3, 5), True, bar)   # spot 60: 65 is impossible
+        assert reason is not None and "spot" in reason
+        assert acct._arb_fill_reject_reason(
+            order, 59.0, date(2024, 3, 5), True, bar) is None
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# F2's LONG half (fast-follow #2) — the no-bar fallback caps at the upper bound too
+# ---------------------------------------------------------------------------
+def _collapsed_long_call_account(tmp_path, tag):
+    """Buy 1 AMD 80 call @5.0 (spot 85), then AMD COLLAPSES to 3.00 with no premium
+    bars after the entry day. The lot's no-arb maximum is the 3.00 spot."""
+    bars = [
+        _ubar(datetime(2024, 3, 5), 85),
+        _ubar(datetime(2024, 3, 6), 85),
+        _ubar(datetime(2024, 3, 7), 3.0),
+    ]
+    ps = _make_ps("AMD", bars, datetime(2024, 3, 5))
+    chain = [_c("AMD240315C00080000", 80.0)]
+    bar_rows = [_bar("AMD240315C00080000", "2024-03-06", 5.0, "call", 80.0, underlying="AMD")]
+    acct, ctx = _account(tmp_path, tag, ps, "AMD", chain, bar_rows)
+    acct.submit_option_order(
+        legs=[_leg("AMD240315C00080000", OrderDirection.BUY, OptionRight.CALL, 80.0,
+                   underlying="AMD")],
+        quantity=1, order_type="market", option_strategy="long_call",
+    )
+    acct.refresh_orders()
+    acct.refresh_transactions()
+    assert acct._cash == pytest.approx(10_000.0 - 500.0, abs=1.0)
+    return acct, ps, ctx
+
+
+def test_long_call_no_bar_mark_capped_at_no_arb_upper(tmp_path):
+    """A long call on a COLLAPSED underlying (spot 3.00, entry debit 5.00, no premium
+    bar) marks at its no-arb maximum 3.00 — a call can never be worth more than the
+    stock — not frozen at the 5.00 entry debit (equity overstated)."""
+    acct, ps, ctx = _collapsed_long_call_account(tmp_path, "f2longcap")
+    try:
+        ps.set_clock(datetime(2024, 3, 7))          # spot 3.00, no premium bar
+        assert acct._option_positions_mtm() == pytest.approx(300.0, abs=1.0)
+        assert acct.equity() == pytest.approx(9_500.0 + 300.0, abs=1.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_round_trip_open_at_end_mark_capped_at_no_arb_upper(tmp_path):
+    """The run-end twin: the open_at_end row's exit mark is clamped the same way —
+    min(max(entry, intrinsic), upper) = 3.00, not the 5.00 break-even fiction."""
+    acct, ps, ctx = _collapsed_long_call_account(tmp_path, "f2rtcap")
+    try:
+        ps.set_clock(datetime(2024, 3, 7))
+        rows = [t for t in acct.get_round_trip_trades()
+                if t.get("contract_symbol") == "AMD240315C00080000"]
+        assert len(rows) == 1
+        assert rows[0]["exit_reason"] == "open_at_end"
+        assert rows[0]["exit_price"] == pytest.approx(3.0)
+    finally:
+        ctx.__exit__(None, None, None)
