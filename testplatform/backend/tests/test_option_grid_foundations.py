@@ -13,13 +13,24 @@ DERIVES from expected_profit_percent when absent -- the model's own field descri
 so the two are the same signal and one gate replaces four.
 """
 import importlib.util
+import os
 import sys
 
 import pytest
 
 
+# tests/ -> backend/ -> testplatform/, then the launcher beside backend/. Resolved off
+# __file__ rather than a CWD-relative string because CI runs with working-directory
+# testplatform/backend and a bare "testplatform/ba2test_launcher.py" resolves differently
+# there than from the repo root -- the exact failure that broke the parity workflow on
+# 2026-08-28 (dcd12237). Every other launcher-loading test in this directory already
+# resolves off __file__ (e.g. test_bull_put_spread_grid.py); this file was the one holdout.
+_LAUNCHER_PATH = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "ba2test_launcher.py")
+
+
 def _launcher():
-    spec = importlib.util.spec_from_file_location("lch", "testplatform/ba2test_launcher.py")
+    spec = importlib.util.spec_from_file_location("lch", _LAUNCHER_PATH)
     m = importlib.util.module_from_spec(spec)
     sys.modules["lch"] = m
     try:
@@ -392,7 +403,7 @@ def test_the_gates_off_flag_exists_on_the_optimize_command():
     import subprocess
 
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
-    out = subprocess.run([sys.executable, "testplatform/ba2test_launcher.py", "optimize", "--help"],
+    out = subprocess.run([sys.executable, _LAUNCHER_PATH, "optimize", "--help"],
                          capture_output=True, text=True, env=env, timeout=300)
     assert "--gates-off" in out.stdout, out.stdout[-2000:] + out.stderr[-2000:]
 
