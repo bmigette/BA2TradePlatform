@@ -126,6 +126,19 @@ _OCAR_DD_FLOOR = 5.0
 # NOTE: lives in this metric only, not in compute_fitness, because the equity fleet is
 # mid-run and re-ranking its population mid-search invalidates banked results. Lift it into
 # the entry guard when no grid is running.
+#
+# ORDERING (F9(a), 2026-08-30, option-program-review-findings.md): the dd>=100 check inside
+# the function body runs FIRST -- before the trade-count gate and before the `base <= 0` early
+# return -- and this is a deliberate ranking decision, not just a bugfix. Checking it later let
+# a wiped genome escape through either of those returns: a losing return hit `base <= 0` and
+# scored an ordinary small negative (ABOVE both sentinels); a thin-trade wipeout hit
+# LOW_TRADE_SENTINEL (-1e8), which is numerically ABOVE WIPED_OUT_SENTINEL (-2e9) and even
+# ABOVE ZERO_TRADE_SENTINEL (-1e9) -- "a 3-trade blow-up outranks never trading". The decided
+# invariant is that a measured wipeout ranks WORST of every other disqualification the metric
+# produces, full stop: WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0. A
+# wiped account teaches the GA nothing a losing-but-alive or merely-thin-data genome would, and
+# collapsing it into either of those buckets would let the search read it as "somewhat bad"
+# instead of "never do this again".
 _OCAR_WIPED_OUT_DD_PCT = 100.0
 _OCAR_ALIASES = ("option_consistent_annual_return", "option_car", "ocar")
 
@@ -969,6 +982,48 @@ def _option_consistent_annual_return(results: dict) -> float:
     whose whole purpose is pricing drawdown -- cannot honestly score. A measured 0.0 is a real
     value and is scored via the floor, not treated as missing.
     """
+    # --- superlinear drawdown penalty: READ AND DISQUALIFY FIRST, LITERALLY FIRST --------------
+    # F9(a), 2026-08-30 (option-program-review-findings.md): originally this sat AFTER the
+    # trade gate and the `base <= 0` early return below it, which let a wiped-out genome escape
+    # WIPED_OUT_SENTINEL through either of them -- a dd>=100 genome with a losing return hit
+    # `base <= 0` and returned an ordinary small negative (ranking ABOVE both sentinels), and a
+    # dd>=100 genome under the trade floor hit LOW_TRADE_SENTINEL (-1e8), which numerically
+    # OUTRANKS WIPED_OUT_SENTINEL (-2e9) and even ZERO_TRADE_SENTINEL (-1e9) -- "a 3-trade
+    # blow-up outranks never trading". A first fix moved it ahead of both, but left it AFTER
+    # the `base` derivation's own ZERO_TRADE_SENTINEL return -- unreachable from any live
+    # producer (results._compute_metrics always emits max_drawdown, so an absent/NaN base
+    # combined with a valid, wiped drawdown cannot occur in practice), but it made the stated
+    # invariant -- a wiped account ranks WORST of all, ahead of every other early return in this
+    # function -- true only for the returns that happen to come after it, not literally. Review
+    # fix, 2026-08-30: moved to the top of the function body, ahead of `base` too, so the
+    # invariant holds unconditionally rather than by scope. The not-finite/absent guards are
+    # unchanged.
+    dd_raw = results.get("max_drawdown")
+    if dd_raw is None:
+        raise ValueError(
+            "option_consistent_annual_return requires results['max_drawdown'] and it is "
+            "absent or None. An unmeasurable drawdown is not a zero drawdown: defaulting it "
+            "would hand this genome the largest multiplier the metric can produce."
+        )
+    try:
+        dd = abs(float(dd_raw))
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"option_consistent_annual_return: max_drawdown is not numeric: {dd_raw!r}"
+        ) from e
+    if not math.isfinite(dd):
+        raise ValueError(
+            f"option_consistent_annual_return: max_drawdown is not finite ({dd_raw!r}). The "
+            f"run produced nonsense and is rejected rather than scored as risk-free."
+        )
+    if dd >= _OCAR_WIPED_OUT_DD_PCT:
+        # Total loss is terminal. Ranked WORSE than never trading (ZERO_TRADE_SENTINEL) and
+        # worse than a data-thin disqualification (LOW_TRADE_SENTINEL), same as an
+        # engine-flagged wipeout. See _OCAR_WIPED_OUT_DD_PCT for why the flag alone does not
+        # catch this, and the block comment above for why this check must run before both
+        # early returns below it.
+        return WIPED_OUT_SENTINEL
+
     # --- base: (adjusted) annualized return, %/yr ---------------------------------------------
     if results.get("profit_cap_pct") or results.get("profit_share_cap_pct"):
         base = results.get("adjusted_annualized_return")
@@ -1004,30 +1059,6 @@ def _option_consistent_annual_return(results: dict) -> float:
     if base <= 0:
         return base  # unfactored: penalty factors on a negative would flip its sign
 
-    # --- superlinear drawdown penalty ---------------------------------------------------------
-    dd_raw = results.get("max_drawdown")
-    if dd_raw is None:
-        raise ValueError(
-            "option_consistent_annual_return requires results['max_drawdown'] and it is "
-            "absent or None. An unmeasurable drawdown is not a zero drawdown: defaulting it "
-            "would hand this genome the largest multiplier the metric can produce."
-        )
-    try:
-        dd = abs(float(dd_raw))
-    except (TypeError, ValueError) as e:
-        raise ValueError(
-            f"option_consistent_annual_return: max_drawdown is not numeric: {dd_raw!r}"
-        ) from e
-    if not math.isfinite(dd):
-        raise ValueError(
-            f"option_consistent_annual_return: max_drawdown is not finite ({dd_raw!r}). The "
-            f"run produced nonsense and is rejected rather than scored as risk-free."
-        )
-    if dd >= _OCAR_WIPED_OUT_DD_PCT:
-        # Total loss is terminal. Ranked WORSE than never trading (ZERO_TRADE_SENTINEL), same
-        # as an engine-flagged wipeout. See _OCAR_WIPED_OUT_DD_PCT for why the flag alone
-        # does not catch this.
-        return WIPED_OUT_SENTINEL
     dd_penalty = _option_dd_penalty(dd)
 
     # --- yearly consistency -------------------------------------------------------------------

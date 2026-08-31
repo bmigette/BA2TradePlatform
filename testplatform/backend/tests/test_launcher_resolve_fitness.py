@@ -26,6 +26,13 @@ _spec.loader.exec_module(mod)
 _OPTION_METRIC = "option_consistent_annual_return"
 #: Kinds the launcher handles that are NOT pure-option: equity-entry overlays + plain equity.
 _EQUITY_KINDS = sorted(mod._OPTION_STRATEGY_KEYS - mod._PURE_OPTION_STRATEGIES)
+#: F4(b) (option-program-review-findings.md, 2026-08-30): O_CC/O_PP are equity-ENTRY overlays
+#: (no row in _OPTION_STRATS/_OPTION_GROUPS, hence absent from _PURE_OPTION_STRATEGIES) but
+#: they carry a real option leg and belong to the same searched population/seeding target as
+#: every pure-option job -- they now rank on option_car too. O_STK is the plain-equity BASELINE
+#: control the option arms are measured against (see _rm_opt_for's docstring for the same O_STK
+#: carve-out reasoning on a different knob) and is the only equity kind left on the stock default.
+_OPTION_CAR_JOINS = ["O_CC", "O_PP"]
 
 
 @pytest.mark.parametrize("kind", sorted(mod._PURE_OPTION_STRATEGIES))
@@ -33,12 +40,28 @@ def test_pure_option_kinds_default_to_the_option_metric(kind):
     assert mod._resolve_fitness(None, kind, "sharpe_ratio") == _OPTION_METRIC
 
 
-@pytest.mark.parametrize("kind", _EQUITY_KINDS + ["S1", "S2", "S7"])
+@pytest.mark.parametrize("kind", ["O_STK", "S1", "S2", "S7"])
 def test_everything_else_keeps_the_command_default(kind):
-    """Equity-entry overlays (O_CC / O_PP / O_STK) and the stock strategies must reach the
-    caller's own default, unchanged."""
+    """The plain-equity control (O_STK) and the stock strategies must reach the caller's own
+    default, unchanged."""
     for default in ("sharpe_ratio", "calmar_ratio", "consistent_annual_return"):
         assert mod._resolve_fitness(None, kind, default) == default
+
+
+@pytest.mark.parametrize("kind", _OPTION_CAR_JOINS)
+def test_equity_entry_option_overlays_now_default_to_the_option_metric(kind):
+    """F4(b): O_CC/O_PP used to keep the caller's stock default (sharpe_ratio for `optimize`) --
+    a different metric FAMILY from every other stage-1 job, which breaks stage-2 seeding
+    coherence (their "winners" are never scored the way the composition that seeds from them
+    will rank them). Investigated (not just flipped): _trades_per_year's structures-not-legs
+    accounting only collapses MULTIPLE option legs sharing one transaction_id into one bet
+    (see _structure_count) -- O_CC/O_PP write a single option leg per overlay event, so there is
+    nothing to collapse, and the equity entry is deliberately never folded into an option leg's
+    count (the same equity carve-out _structure_count documents for O_CC's own shares). The
+    metric therefore reads a sane, uninflated trade-frequency number for these two kinds -- no
+    trade-counting defect blocks the switch."""
+    for default in ("sharpe_ratio", "calmar_ratio", "consistent_annual_return"):
+        assert mod._resolve_fitness(None, kind, default) == _OPTION_METRIC
 
 
 def test_the_equity_half_is_non_empty():
