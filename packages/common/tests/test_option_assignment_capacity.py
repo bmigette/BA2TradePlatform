@@ -214,14 +214,15 @@ def test_a_short_strangle_book_owes_the_full_put_strike_not_the_reg_t_reserve():
     book = book_totals([short_strangle(1, "XYZ", qty=1.0, put=225.0, call=275.0)])
     assert book.short_put_assignment == pytest.approx(22_500.0)
 
-    # What the buying-power pool charges for the very same structure: Reg-T naked
-    # margin on a 250 spot for BOTH legs (review 2026-08-30 F10) — each 25 points out
-    # of the money, each landing exactly on the 10% floor: 2,500 + 2,500. This is not
-    # wrong, it is a different question. But it was the ONLY number, and it is well
-    # under a QUARTER of the delivery bill.
+    # What the buying-power pool charges for the very same structure: the TRUE Reg-T
+    # pair (operator decision 2026-08-31) — both legs 25 points out of the money land
+    # exactly on the 10% floor (2,500 each, a tie), plus the larger premium
+    # (2.00 x 100): 2,700. This is not wrong, it is a different question. But it was
+    # the ONLY number, and it is well under a QUARTER of the delivery bill.
     reg_t = OptionsAccountInterface.option_reserve_required(
-        "short_strangle", 1, strike=225.0, call_strike=275.0, spot=250.0)
-    assert reg_t == pytest.approx(5_000.0)
+        "short_strangle", 1, strike=225.0, call_strike=275.0, spot=250.0,
+        put_premium=2.00, call_premium=1.00)
+    assert reg_t == pytest.approx(2_700.0)
     assert book.short_put_assignment > 4 * reg_t
 
 

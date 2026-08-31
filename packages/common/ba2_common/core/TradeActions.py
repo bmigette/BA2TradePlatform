@@ -3373,8 +3373,9 @@ class OpenShortStraddleAction(_OptionEntryAction):
     """Short straddle: SELL an ATM call AND an ATM put at the SAME strike (credit).
 
     Short-volatility: collect both premiums (sold at BID). Net premium is a CREDIT
-    (limit price negative). Naked on both sides; reserve the SUM of both legs' Reg-T
-    naked margins (the maintenance model's per-leg sum) and size off it."""
+    (limit price negative). Naked on both sides; reserve the TRUE Reg-T pair (the
+    greater leg's naked margin + the other leg's premium — the same shared formula
+    the maintenance model charges) and size off it."""
 
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_SHORT_STRADDLE.value
@@ -3410,21 +3411,25 @@ class OpenShortStraddleAction(_OptionEntryAction):
         # why the floor for a naked structure is not the floor for a defined-risk one.
         refusal = self._refuse_if_arc_below_floor(
             "short_straddle", net_credit=net_credit, expiry=call_c.expiry,
-            strike=call_c.strike, spot=spot)
+            strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         if refusal is not None:
             return refusal
-        # NAKED both sides: reserve Reg-T naked margin (not full strike*100 cash) so the
-        # structure is sizeable on a realistic account. Both legs share the strike; the
-        # reserve is the SUM over both rights — the same per-leg sum the backtest's
-        # maintenance model charges the open position (review 2026-08-30 F10 sibling;
-        # the old GREATER-leg reserve sat below maintenance from the first bar).
+        # NAKED both sides: reserve the TRUE Reg-T pair — the greater leg's naked
+        # margin + the OTHER leg's premium (operator decision 2026-08-31, replacing the
+        # review-F10 per-leg sum) — through the same shared formula the backtest's
+        # maintenance model charges the open position, so entry and maintenance move
+        # together. Both legs share the strike; the leg premiums are the bids the legs
+        # are sold at.
         per_contract_reserve = self.account.option_reserve_required(
-            "short_straddle", 1, strike=call_c.strike, spot=spot)
+            "short_straddle", 1, strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False, f"Insufficient budget to size short straddle for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
-            "short_straddle", quantity, strike=call_c.strike, spot=spot)
+            "short_straddle", quantity, strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for short straddle on {self.instrument_name}")
         # ONE short put leg (put_c), `quantity` contracts. The short CALL at the same
@@ -3435,7 +3440,8 @@ class OpenShortStraddleAction(_OptionEntryAction):
         if refusal is not None:
             return refusal
         reserve = self.account.option_reserve_required(
-            "short_straddle", quantity, strike=call_c.strike, spot=spot)
+            "short_straddle", quantity, strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
                              position_intent="sell_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
@@ -3453,8 +3459,9 @@ class OpenShortStrangleAction(_OptionEntryAction):
     """Short strangle: SELL an OTM call AND an OTM put at DIFFERENT strikes (credit).
 
     Both legs OTM by ``strike_param`` percent (default 10%), sold at BID. Net credit
-    (limit negative). Naked both sides; reserve the SUM of both legs' Reg-T naked
-    margins (the maintenance model's per-leg sum) and size off it."""
+    (limit negative). Naked both sides; reserve the TRUE Reg-T pair (the greater
+    leg's naked margin + the other leg's premium — the same shared formula the
+    maintenance model charges) and size off it."""
 
     DEFAULT_OTM_PCT = 10.0
 
@@ -3493,24 +3500,28 @@ class OpenShortStrangleAction(_OptionEntryAction):
         net_credit = round(call_c.bid + put_c.bid, 4)
         if net_credit <= 0:
             return self._result(False, f"Non-positive credit for {self.instrument_name} short strangle")
-        # PREMIUM RICHNESS (OPT-C1). Reserved on BOTH legs' Reg-T brackets, matching the
+        # PREMIUM RICHNESS (OPT-C1). Reserved on the Reg-T PAIR, matching the
         # option_reserve_required call below — collateral must be the same number twice.
         refusal = self._refuse_if_arc_below_floor(
             "short_strangle", net_credit=net_credit, expiry=put_c.expiry,
-            strike=put_c.strike, call_strike=call_c.strike, spot=spot)
+            strike=put_c.strike, call_strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         if refusal is not None:
             return refusal
-        # NAKED both sides: reserve Reg-T naked margin for BOTH short legs (not full
-        # strike*100 cash), the same per-leg sum the backtest's maintenance model charges
-        # the open position — put-leg-only sizing opened ~2x what maintenance tolerates
-        # and was instantly force-unwound (review 2026-08-30 F10).
+        # NAKED both sides: reserve the TRUE Reg-T pair — the greater leg's naked
+        # margin + the OTHER leg's premium (operator decision 2026-08-31, replacing the
+        # review-F10 per-leg sum; before F10, put-leg-only sizing opened ~2x what
+        # maintenance tolerated and was instantly force-unwound) — through the same
+        # shared formula the backtest's maintenance model charges the open position.
         per_contract_reserve = self.account.option_reserve_required(
-            "short_strangle", 1, strike=put_c.strike, call_strike=call_c.strike, spot=spot)
+            "short_strangle", 1, strike=put_c.strike, call_strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False, f"Insufficient budget to size short strangle for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
-            "short_strangle", quantity, strike=put_c.strike, call_strike=call_c.strike, spot=spot)
+            "short_strangle", quantity, strike=put_c.strike, call_strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for short strangle on {self.instrument_name}")
         # ONE short put leg (put_c, the lower strike), `quantity` contracts. The short
@@ -3520,7 +3531,8 @@ class OpenShortStrangleAction(_OptionEntryAction):
         if refusal is not None:
             return refusal
         reserve = self.account.option_reserve_required(
-            "short_strangle", quantity, strike=put_c.strike, call_strike=call_c.strike, spot=spot)
+            "short_strangle", quantity, strike=put_c.strike, call_strike=call_c.strike, spot=spot,
+            put_premium=put_c.bid, call_premium=call_c.bid)
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
                              position_intent="sell_to_open", option_type=OptionRight.CALL,
                              strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)

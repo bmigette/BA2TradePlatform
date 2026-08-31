@@ -780,13 +780,29 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     #: Reg-T maintenance margin fraction for a SHORT stock position (~30% of notional).
     SHORT_STOCK_MAINTENANCE_FRACTION = 0.30
 
+    #: Strategies whose two naked short legs are margined as a TRUE Reg-T PAIR — the
+    #: greater leg's naked margin + the OTHER leg's current premium — rather than as
+    #: two independent naked shorts (operator decision 2026-08-31, replacing the
+    #: review-F10 per-leg SUM).
+    REG_T_PAIRED_STRATEGIES = frozenset({"short_strangle", "short_straddle"})
+
     def maintenance_margin_requirement(self) -> float:
         """Total maintenance-margin dollars this book must hold against its SHORT risk.
 
         The requirement is the sum of the (unbounded-risk) short positions' broker
         maintenance margins:
 
-          * short OPTION legs -> ``naked_margin_per_contract(strike, option_type=right, spot)``
+          * a held short strangle/straddle PAIR (one short call + one short put grouped
+            by their opening order's ``option_strategy`` — see
+            ``REG_T_PAIRED_STRATEGIES``) -> TRUE Reg-T:
+            ``short_pair_margin_per_contract`` = the greater leg's naked margin + the
+            OTHER leg's current premium x 100, per paired contract — the SAME shared
+            formula the entry reserve prices, so entry and maintenance move together
+            and a just-opened pair cannot instantly breach. Contracts that cannot be
+            paired (a leg already bought back / liquidated / assigned, an asymmetric
+            residual, an unresolvable strike/right/premium) fall through to the per-leg
+            naked charge below — never a partial pair.
+          * other short OPTION legs -> ``naked_margin_per_contract(strike, option_type=right, spot)``
             x contracts (Reg-T naked ~20% of notional less the DIRECTION-AWARE OTM amount —
             0 for an ITM short — floored 10%) — the SAME model the entry
             reserve uses, so the maintenance check is consistent with sizing.
@@ -806,7 +822,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Short CALLs fully covered by long underlying shares (covered calls) carry ~zero
         # classic maintenance — exempt them like defined-risk legs.
         covered_calls = self._covered_short_call_contracts()
-        # Short option legs.
+        # Reg-T PAIRS first: a held short strangle/straddle's two legs are priced
+        # together (greater leg's naked margin + the other leg's premium), and the
+        # paired contracts are CONSUMED so the per-lot loop below charges only what is
+        # left unpaired.
+        pair_req, paired_consumed = self._reg_t_paired_requirement(defined_risk, covered_calls)
+        req += pair_req
+        # Short option legs (net of contracts already priced as a Reg-T pair).
         for lot in self._option_positions.values():
             if lot.qty >= 0:
                 continue  # only SHORT legs carry naked-margin risk here
@@ -814,6 +836,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 continue  # covered short leg of a defined-risk combo -> no naked margin
             if lot.contract_symbol in covered_calls:
                 continue  # short call covered by long shares -> no naked margin
+            unpaired_qty = abs(lot.qty) - paired_consumed.get(lot.contract_symbol, 0.0)
+            if unpaired_qty <= 0:
+                continue  # fully priced by its Reg-T pair
             strike, spot, right = self._lot_strike_spot_right(lot.contract_symbol)
             if strike is None:
                 # An unresolvable strike UNDERSTATES the requirement (this short leg
@@ -836,9 +861,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 req += max(
                     self.naked_margin_per_contract(strike, option_type=OptionRight.CALL, spot=spot),
                     self.naked_margin_per_contract(strike, option_type=OptionRight.PUT, spot=spot),
-                ) * abs(lot.qty)
+                ) * unpaired_qty
                 continue
-            req += self.naked_margin_per_contract(strike, option_type=right, spot=spot) * abs(lot.qty)
+            req += self.naked_margin_per_contract(strike, option_type=right, spot=spot) * unpaired_qty
         # Short stock.
         for p in self._positions.values():
             if p.qty >= 0:
@@ -851,6 +876,81 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if px:
                 req += self.SHORT_STOCK_MAINTENANCE_FRACTION * abs(p.qty) * float(px)
         return req
+
+    def _reg_t_paired_requirement(self, defined_risk: set, covered_calls: set):
+        """(dollars, consumed) for every held short strangle/straddle PAIR.
+
+        Pairs are resolved from the order-derived grouping ``_option_group_bounds``
+        already maintains for the MTM clamp (parent order id + ``option_strategy`` —
+        the transaction's strategy label travels on the opening parent order), so the
+        maintenance model sees the same structure the entry opened. A group pairs only
+        when it holds EXACTLY one short call and one short put whose strike, right and
+        current premium all resolve; ``min(|call qty|, |put qty|)`` contracts are
+        priced at ``short_pair_margin_per_contract`` (the greater leg's naked margin +
+        the other leg's current premium — the entry reserve's own formula) and recorded
+        in ``consumed`` (contract_symbol -> contracts), and the caller charges any
+        residual per-leg. Anything unpairable contributes nothing here and falls back
+        to the per-leg naked charge — the fallback is the plain single-leg model,
+        never a partial pair.
+        """
+        consumed: Dict[str, float] = {}
+        req = 0.0
+        contract_group, group_bounds = self._option_group_bounds()
+        for gkey, gb in group_bounds.items():
+            if gb["strategy"] not in self.REG_T_PAIRED_STRATEGIES:
+                continue
+            legs: Dict[Any, tuple] = {}
+            pairable = True
+            for cs, g in contract_group.items():
+                if g != gkey:
+                    continue
+                lot = self._option_positions.get(cs)
+                if lot is None or lot.qty >= 0:
+                    continue
+                if cs in defined_risk or cs in covered_calls:
+                    continue  # exempt legs keep their exemption; the rest goes per-leg
+                strike, spot, right = self._lot_strike_spot_right(cs)
+                if strike is None or right is None or right in legs:
+                    pairable = False  # unresolvable leg, or two lots of one right
+                    break
+                legs[right] = (lot, strike, spot)
+            if not pairable or OptionRight.PUT not in legs or OptionRight.CALL not in legs:
+                continue
+            put_lot, put_strike, spot = legs[OptionRight.PUT]
+            call_lot, call_strike, _ = legs[OptionRight.CALL]
+            put_prem = self._lot_maintenance_premium(put_lot)
+            call_prem = self._lot_maintenance_premium(call_lot)
+            if put_prem is None or call_prem is None:
+                continue
+            paired = min(abs(put_lot.qty), abs(call_lot.qty))
+            if paired <= 0:
+                continue
+            req += self.short_pair_margin_per_contract(
+                put_strike=put_strike, call_strike=call_strike,
+                put_premium=put_prem, call_premium=call_prem, spot=spot) * paired
+            consumed[put_lot.contract_symbol] = consumed.get(put_lot.contract_symbol, 0.0) + paired
+            consumed[call_lot.contract_symbol] = consumed.get(call_lot.contract_symbol, 0.0) + paired
+        return req, consumed
+
+    def _lot_maintenance_premium(self, lot) -> Optional[float]:
+        """Per-share CURRENT premium of a held lot, for the Reg-T pair's other-leg term.
+
+        The same premium discipline the equity mark uses: the current bar's close
+        clamped into the no-arb bounds when a bar exists; otherwise the entry premium
+        floored at intrinsic and capped at the no-arb upper (the F2 mark rule).
+        Never negative. None only when no number resolves at all — the caller then
+        refuses to pair and the legs are charged per-leg instead.
+        """
+        bar = self._options.get_bar(lot.contract_symbol, self._as_of_date()) if self._options else None
+        bounds = self._lot_no_arb_bounds(lot.contract_symbol)
+        px = None
+        if bar and bar.get("close") is not None:
+            px = float(bar["close"])
+        elif lot.avg_price is not None:
+            px = float(lot.avg_price)
+        if bounds is not None:
+            px = bounds[0] if px is None else min(max(px, bounds[0]), bounds[1])
+        return None if px is None else max(px, 0.0)
 
     def _defined_risk_contracts(self) -> set:
         """Set of currently-held contract_symbols that belong to a DEFINED-RISK combo.

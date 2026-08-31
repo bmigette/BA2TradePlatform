@@ -211,9 +211,10 @@ def act(acct, action_type, **kw):
 
 
 #: 100-strike ATM short straddle: ONE short 100 put (10,000 of delivery) reserved at
-#: Reg-T naked margin, BOTH legs (4,000 — review 2026-08-30 F10). ``sizing`` is set so
-#: ONE contract is bought at every balance these tests use, so only the verdict moves,
-#: never the size.
+#: the TRUE Reg-T pair (2,000 tied brackets + the 5.00 bid x 100 = 2,500 — operator
+#: decision 2026-08-31, replacing the F10 both-legs sum of 4,000). ``sizing`` is set
+#: so ONE contract is bought at every balance these tests use, so only the verdict
+#: moves, never the size.
 STRADDLE = dict(strike_method="percent_otm", strike_param=0.0,
                 dte_min=10, dte_max=40, sizing=10.0)
 STRADDLE_TIGHT = dict(STRADDLE, sizing=45.0)
@@ -713,9 +714,14 @@ def test_the_short_straddle_is_charged_its_STRIKE_not_the_spot():
     """FOUND BY MUTATION B39. Every other straddle test puts spot exactly on a listed
     strike, where "the strike" and "the spot" are the same number. Strikes are discrete;
     a 102 spot writes the 100 straddle, and the shares are put to us at 100.
+
+    SIZING 0.8 -> 0.6 with the 2026-08-31 Reg-T pair reserve: the 100 straddle at a
+    102 spot reserves 2,040 (ITM call, the greater leg) + 4.84 put bid x 100 = 2,524
+    per contract (the F10 sum was 3,880), so 0.8% of 1,000,000 started buying 3.
+    0.6% (6,000) buys the 2 this test's capacity arithmetic is built on.
     """
     kw = dict(strike_method="percent_otm", strike_param=0.0, dte_min=10, dte_max=40,
-              sizing=0.8)
+              sizing=0.6)
     opened = _leaving_room(1_000_000.0, spot=102.0)
     res = act(opened, "open_short_straddle", **kw).execute()
     assert res["success"], res["message"]
