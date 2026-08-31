@@ -3,8 +3,8 @@ error, not a silent zero-result (2026-08-23).
 
 WHY: ``passes_liquidity`` fails CLOSED on ``None`` — correct when the field is published
 and this one contract lacks it, catastrophic when NO contract publishes it. Measured
-against the real 10 GB options cache: ``option_chain.open_interest`` is NULL for all
-6,757,055 rows, so ``min_open_interest=100`` — the LIVE UI DEFAULT, present on all 14 live
+against the real options cache: ``option_chain.open_interest`` is NULL for all
+1,440,782 rows, so ``min_open_interest=100`` — the LIVE UI DEFAULT, present on all 14 live
 option entry actions — rejected 16/16 structures on 16/16 symbol-date-capital combinations
 and reported "No liquid <structure>", indistinguishable from a genuinely illiquid chain.
 
@@ -101,12 +101,12 @@ def test_the_error_is_a_selection_config_error():
 # a field that is PRESENT but constant-zero is a placeholder, not published data
 # --------------------------------------------------------------------------- #
 def test_a_chain_whose_every_quote_is_zero_width_does_not_publish_a_spread():
-    """THE PLACEHOLDER CASE (2026-08-23). Measured read-only on the real 10 GB cache:
-    ``SELECT sum(bid<>ask) FROM option_chain`` -> 0 across all 6,757,055 rows, so every
+    """THE PLACEHOLDER CASE. Measured read-only on the real cache:
+    ``SELECT sum(bid<>ask) FROM option_chain`` -> 0 across all 1,440,782 rows, so every
     quoted contract has bid == ask and ``spread_pct`` is exactly 0.0. That is non-None, so
     a ``is not None`` probe green-lights the gate — after which ``max_spread_pct`` measures
     nothing (0 <= any ceiling) yet still rejects every contract with no two-sided quote
-    (2,428,468 of those rows). A field the source writes the same constant into for the
+    (357,211 of those rows). A field the source writes the same constant into for the
     whole dataset is a placeholder, and must be treated exactly like an absent one."""
     chain = [_c(95.0, bid=1.25, ask=1.25), _c(100.0, bid=2.50, ask=2.50),
              _c(105.0, bid=0.80, ask=0.80)]

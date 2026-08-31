@@ -163,6 +163,94 @@ def test_the_payoff_pass_is_computed_once_and_shared(monkeypatch):
     assert sum(calls) == 1, f"payoff pass ran {sum(calls)}x; report and ranking may diverge"
 
 
+def _count_payoff_passes(monkeypatch):
+    """Patch ``payoff_columns`` to record the candidate-set SIZE of every pass."""
+    from ba2_common.core import option_selection_policy as osp
+
+    sizes = []
+    real = osp.payoff_columns
+
+    def _counting(cands, ctx):
+        sizes.append(len(cands))
+        return real(cands, ctx)
+
+    monkeypatch.setattr(osp, "payoff_columns", _counting)
+    return sizes
+
+
+def _long_call_legs(cand):
+    return [PayoffLeg(kind="call", side=OrderDirection.BUY, premium=cand.mid,
+                      strike=cand.strike)]
+
+
+#: THE NARROWING CHAIN. ``method="delta"`` excludes a contract with no delta (``eligible``),
+#: so 3 candidates go in and 2 are ranked. CHAIN cannot catch this: every one of its
+#: contracts has a delta, so nothing narrows and the raw and eligible sets are identical.
+NARROWING_CHAIN = [c(100, 2.80, delta=0.45), c(105, 1.55, delta=None),
+                   c(110, 0.80, delta=0.22)]
+
+
+def test_the_shared_payoff_pass_survives_eligibility_narrowing(monkeypatch):
+    """STILL ONE PASS when ``eligible`` narrows the set — the case the non-narrowing test
+    above cannot see.
+
+    Before the fix ``_policy_pick`` computed the payoff over all 3 raw candidates, then
+    ``pick_with_reason`` saw 2 != 3, dropped it as misaligned, and ``score_all`` computed a
+    SECOND pass over the 2 — exactly the duplicated ~5ms work the sharing exists to avoid,
+    and two independent ``structure_fn`` walks where the docstring promises one.
+    """
+    sizes = _count_payoff_passes(monkeypatch)
+    select_single(NARROWING_CHAIN, **ARGS, policy=SelectionPolicy(w_profit=1.0),
+                  structure_fn=_long_call_legs)
+    assert len(sizes) == 1, (
+        f"payoff pass ran {len(sizes)}x over sets {sizes}; the shared pass was discarded by "
+        f"the narrowing guard and recomputed")
+
+
+def test_the_shared_payoff_describes_the_RANKED_set_not_the_raw_one(monkeypatch):
+    """The one pass must cover the ELIGIBLE candidates, not the superset.
+
+    Kills the mutant that keeps a single pass by computing it over the raw list: the count
+    would still be 1 while the applicability report described a contract the ranking never
+    scored. 2 is the eligible size; 3 is the raw one.
+    """
+    sizes = _count_payoff_passes(monkeypatch)
+    select_single(NARROWING_CHAIN, **ARGS, policy=SelectionPolicy(w_profit=1.0),
+                  structure_fn=_long_call_legs)
+    assert sizes == [2], (
+        f"payoff computed over {sizes}, expected [2] — the delta-less contract is not "
+        f"eligible, so scoring or reporting it describes a pick that never happened")
+
+
+def test_the_inapplicability_report_counts_only_eligible_candidates(monkeypatch, caplog):
+    """The report's own candidate count must be the ranked set's.
+
+    With no ``structure_fn`` the payoff column cannot rank, so the report fires — and it
+    must say 2, the number of contracts actually in the running, not 3. A report that
+    describes a superset is the F17 defect wearing a different hat: it attributes an
+    inert/live verdict to candidates that were never eligible.
+    """
+    monkeypatch.setattr(logging.getLogger("ba2_common"), "propagate", True)
+    with caplog.at_level(logging.INFO, logger="ba2_common.core.option_selector"):
+        select_single(NARROWING_CHAIN, **ARGS, policy=SelectionPolicy(w_profit=2.0))
+    reports = [r.getMessage() for r in caplog.records if "inapplicable" in r.getMessage()]
+    assert reports, "the applicability report did not fire"
+    assert "2 candidates" in reports[0], (
+        f"report describes the RAW candidate set, not the ranked one: {reports[0]!r}")
+
+
+def test_narrowing_still_picks_what_the_unshared_path_picks():
+    """The optimisation must not move a pick. Same chain, same policy, with and without a
+    live payoff weight forcing the shared-pass path."""
+    baseline = select_single(NARROWING_CHAIN, **ARGS,
+                             policy=SelectionPolicy(w_premium=1.0))
+    shared = select_single(NARROWING_CHAIN, **ARGS,
+                           policy=SelectionPolicy(w_premium=1.0, w_profit=1.0),
+                           structure_fn=_long_call_legs)
+    assert baseline is not None and shared is not None
+    assert shared is baseline, "sharing the payoff pass changed the pick"
+
+
 # =========================================================================== #
 # 4. the vertical seam
 # =========================================================================== #

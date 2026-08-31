@@ -1,8 +1,10 @@
 """TastyTrade/dxfeed historical-options provider — everything except the socket.
 
-Context. The incumbent cache has ``delta``, ``iv`` and ``open_interest`` NULL across all
-6,757,055 chain rows, so ``method="delta"`` selects nothing and ``min_open_interest``
-rejects the whole chain. A read-only probe (``test_files/probe_tastytrade_option_history.py``)
+Context. The incumbent cache has ``open_interest`` NULL across all 1,440,782 chain rows, so
+``min_open_interest`` rejects the whole chain and no bar column recovers it. (Its ``delta``
+and ``iv`` are thin, NOT absent — 46% of chain rows, 88.2% of bar rows — so the older claim
+that ``method="delta"`` selects nothing there was wrong; see
+``ba2_common.core.option_selector._publishes_spread``.) A read-only probe (``test_files/probe_tastytrade_option_history.py``)
 established that dxfeed DOES serve daily candles for contracts that have already EXPIRED and
 that those candles carry ``imp_volatility`` and ``open_interest`` — the two fields that cannot
 be recovered from OHLC. This provider turns that into a cache builder.
@@ -226,7 +228,7 @@ def test_a_candle_carries_iv_and_open_interest_through_to_the_bar():
 
 def test_the_bar_carries_no_synthetic_bid_ask():
     """There is no historical bid/ask for dead contracts. The incumbent cache set
-    ``bid = ask = close``, which is why ZERO of 4,328,587 quoted rows have ask > bid.
+    ``bid = ask = close``, which is why ZERO of 1,083,571 quoted rows have ask > bid.
     Absent is honest; a zero-width spread is a lie the arb guard cannot see."""
     c = _candle(".AAPL230120C150{=1d,tho=true}", time_ms=_day_ms(2023, 1, 3))
     bar = candle_to_bar(c, "AAPL230120C00150000")

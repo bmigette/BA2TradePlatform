@@ -50,16 +50,16 @@ class OptionLiquidityDataUnavailable(OptionSelectionConfigError):
     to stop. But fail-closed is only meaningful when the field is PUBLISHED AT ALL. When the
     data source emits it for nobody, "unknown" no longer distinguishes contracts — the gate
     rejects 100% of them and reports the same "No liquid <structure>" as a genuinely thin
-    chain. Measured 2026-08-23 against the real cache: ``option_chain.open_interest`` is
-    NULL for all 6,757,055 rows, so ``min_open_interest=100`` (the LIVE UI DEFAULT, set on
-    all 14 live option entry actions) rejected 16/16 structures on 16/16 symbol-date-capital
-    combinations. So the three states are: published-and-good (pass), published-and-thin
+    chain. Measured against the real cache: ``option_chain.open_interest`` is NULL for ALL
+    of its rows (0 populated -- see THE CACHE, MEASURED below), so ``min_open_interest=100``
+    (the LIVE UI DEFAULT, set on all 14 live option entry actions) rejected 16/16 structures
+    on 16/16 symbol-date-capital combinations. So the three states are: published-and-good (pass), published-and-thin
     (reject), and not-published-by-anyone (THIS — a configuration error, not a verdict on
     any contract).
 
     "Not published" includes PRESENT-BUT-DEGENERATE, not just absent: the same cache has
-    ``bid == ask`` on all 6,757,055 rows, so ``spread_pct`` is a non-None constant 0.0 that
-    grades nothing. See ``_publishes_spread``."""
+    ``bid == ask`` on every one of its QUOTED rows, so ``spread_pct`` is a non-None constant
+    0.0 that grades nothing. See ``_publishes_spread``."""
 
     def __init__(self, field: str, gate_value, underlying: Optional[str] = None):
         self.field = field
@@ -117,14 +117,43 @@ class OptionDteWindowError(OptionSelectionConfigError):
 def _publishes_spread(c: OptionContract) -> bool:
     """Does this contract carry a spread the ``max_spread_pct`` gate can actually measure?
 
-    A PRESENT-BUT-CONSTANT-ZERO FIELD IS A PLACEHOLDER, NOT DATA (2026-08-23). ``spread_pct``
-    is DERIVED — ``(ask - bid) / mid`` — so it is non-None whenever both columns are non-None,
-    even when the source wrote the same number into both. Measured read-only against the real
-    10 GB cache: ``SELECT sum(bid <> ask) FROM option_chain`` returns 0 over all 6,757,055
-    rows, so ``spread_pct`` is exactly 0.0 for every quoted contract there. An ``is not None``
-    probe therefore green-lit the gate, after which ``max_spread_pct`` measured nothing (0 is
-    under every ceiling) while STILL fail-closing the 2,428,468 rows that carry no quote at
-    all — a knob that silently drops a chunk of the chain and grades none of it.
+    A PRESENT-BUT-CONSTANT-ZERO FIELD IS A PLACEHOLDER, NOT DATA. ``spread_pct`` is DERIVED
+    — ``(ask - bid) / mid`` — so it is non-None whenever both columns are non-None, even when
+    the source wrote the same number into both. On the cache below ``SELECT sum(bid <> ask)
+    FROM option_chain`` returns 0, so ``spread_pct`` is exactly 0.0 for every quoted contract
+    there. An ``is not None`` probe therefore green-lit the gate, after which
+    ``max_spread_pct`` measured nothing (0 is under every ceiling) while STILL fail-closing
+    the 357,211 rows that carry no quote at all — a knob that silently drops a chunk of the
+    chain and grades none of it.
+
+    THE CACHE, MEASURED — the ONE re-verified record; cite this, do not re-derive it.
+    Re-measured 2026-08-31 against the only ``options_history.sqlite`` that ``CACHE_FOLDER``
+    resolves to (4.12 GB; no WAL, ``page_count * page_size`` equals the file size, so this is
+    the whole file). It REPLACES a "6,757,055 rows / 10 GB / three as_of snapshots" figure
+    that had been copied into ~20 docstrings across the repo and matches nothing in this file
+    — treat any surviving copy as stale.
+
+      ``option_chain``  1,440,782 rows, 101 underlyings, and a SINGLE ``as_of`` snapshot
+                        (2024-02-01) — not three.
+                          * ``open_interest``  0 populated (100% NULL) — genuinely dead, and
+                            ``option_bar`` has no such column, so nothing recovers it.
+                          * ``volume``         0 populated (100% NULL) IN THE CHAIN. NOT dead
+                            downstream: ``HistoricalOptionsProvider`` reads volume from the
+                            BAR (see ``options_provider``'s VOLUME note), where it is 100%
+                            populated. "NULL in option_chain" and "absent from the selector"
+                            are different claims and were being conflated.
+                          * ``bid``/``ask``/``last``  1,083,571 populated (75.2%); the other
+                            357,211 (24.8%) are NULL. ``bid <> ask`` on 0 rows.
+                          * ``iv``/``delta``/``gamma``/``theta``/``vega``  663,111 populated
+                            (46.0%) — NOT "NULL on every row", as several docstrings still
+                            claim. Present on 98 of 101 underlyings.
+      ``option_bar``    19,484,995 rows over 2024-02-01..2026-07-07 (608 dates).
+                          * ``volume`` 100% populated; ``iv``/greeks 88.2% (17,185,281),
+                            present for all 101 underlyings.
+
+    So on THIS cache delta selection is not dead and volume-based ranking is not dead; only
+    ``open_interest`` is. The vendor-switch rationale recorded elsewhere in the repo overstates
+    the first two — see the note in ``ba2_providers.options.tastytrade``.
 
     So "published" means a spread that is present AND non-degenerate: strictly positive. Zero
     means bid == ask (no market was quoted, only a close was copied into both sides), and
@@ -317,12 +346,36 @@ def _policy_pick(method, cands, strike_param, spot, target_price, option_type, t
     An inapplicable feature is INERT, never a demotion: the pick below still ranks every
     candidate identically on that column, and the log line is what separates "this gene is
     dead for this builder" from "this gene is live and unhelpful" in a grid post-mortem.
+
+    THE PAYOFF PASS IS BUILT ON THE ELIGIBLE SET, NOT THE RAW ONE, and that ordering is the
+    whole reason the sharing works. ``pick`` narrows through ``eligible`` before it scores,
+    so a payoff computed over the RAW candidates describes a superset of what gets ranked.
+    ``pick_with_reason`` defends the alignment (it drops a payoff whose length no longer
+    matches), so the scores were never wrong — but the defence costs the very thing the
+    sharing exists to buy: on any narrowing chain the shared pass was thrown away and
+    ``score_all`` computed a SECOND one, 2 passes where the docstring promised 1. And the
+    REPORT above, which is not length-checked, went on describing the superset while the
+    ranking scored the narrowed set — an inert/live verdict about candidates that were never
+    in the running. Narrowing is not hypothetical: under ``method="delta"`` a single contract
+    with no delta is enough.
+
+    Calling ``eligible`` here and handing the result to ``pick`` is safe because the filter is
+    a per-candidate predicate and therefore IDEMPOTENT — ``pick`` re-runs it on an already
+    filtered list and gets the same list back, so the length check now always passes and the
+    payoff survives. The re-run is free unless a ``max_loss_ceiling`` AND a ``structure_fn``
+    are both set (``_eligible_and_reason`` returns before charging anything otherwise), and
+    even then it recharges only the already-narrowed survivors.
     """
     from ba2_common.core import option_selection_policy as _osp
 
     ctx = _osp.PolicyContext(strike_method=method, today=today, target=strike_param,
                              spot=spot, target_price=target_price, option_type=option_type,
                              structure_fn=structure_fn)
+    cands = _osp.eligible(cands, ctx)
+    if not cands:
+        # ``pick`` would also return None here; returning early keeps the payoff pass and the
+        # report off an empty set rather than computing both to describe nothing.
+        return None
     payoff = None
     if policy.w_profit or policy.w_rr:
         payoff = _osp.payoff_columns(cands, ctx)
@@ -396,7 +449,42 @@ def select_wing(chain, *, center_strike, width_pct, option_type,
                 min_volume=None) -> Optional[OptionContract]:
     """Pick the wing contract nearest ``center_strike`` moved ``width_pct`` percent
     farther OTM (calls: up; puts: down). When ``expiry`` is given, restrict to that
-    expiry (wings must share the short leg's expiry)."""
+    expiry (wings must share the short leg's expiry).
+
+    DELIBERATELY NOT POLICY-GOVERNED, and this is the record of that exclusion (2026-08-31 —
+    the decision was implicit before, which is why it is written down here rather than
+    inferred from a missing kwarg). ``select_single`` and ``select_vertical_spread`` both take
+    a ``policy`` and route non-default ones through ``_policy_pick``; this function takes none,
+    so the FIVE ``TradeActions`` call sites that reach it choose their wing outside the searched
+    ranking. They are the iron condor's two wings, the call-side wing of the broken-wing
+    butterfly's neighbour structure, the butterfly's upper wing, and the put ratio spread's
+    short leg.
+
+    THE RATIONALE IS THAT A WING HAS NO BOX TO RANK INSIDE. Every other pick is "the best
+    contract within a band", which is what a ``SelectionPolicy`` grades: ``_in_box`` bounds the
+    candidates and ``distance_from_target`` scores them. A wing is not a band — it is ONE
+    derived strike, ``center_strike`` moved ``width_pct`` percent, and the width is itself a
+    searched gene. Handing the same choice to a policy would put two search dimensions on one
+    axis and let the weights pull the wing off the width the GA just chose: the degenerate
+    double-search the design rejects for ``w_box_center`` (a uniform rescale changes no
+    ranking) and for ``w_rr`` (collinear with ``w_premium``). Nearest-strike-to-a-derived-target
+    is the whole intent, so there is nothing left for a weight to express.
+
+    THE ONE SITE WHERE THAT ARGUMENT IS WEAKEST is ``_OpenPutRatioSpreadAction``: its SHORT put
+    — the 2x leg carrying the structure's risk — is a ``select_wing``, so it is ungoverned while
+    its long leg is not. That is structurally the same shape as the vertical defect this track
+    already fixed (wiring only the long leg leaves "the leg that carries the thesis" outside the
+    searched choosing — see ``select_vertical_spread``). It is left as-is here ON PURPOSE and
+    not by oversight: a vertical's short leg has its OWN ``short_param`` target and therefore a
+    band to rank within, whereas the ratio's short leg is defined only as a width from the long
+    strike. Governing it would mean either giving ``select_wing`` a policy and a box (an API
+    change touching all five sites) or re-modelling O_RS's short leg as a target-based pick (a
+    live behaviour change). Both are real options and neither is a docstring fix; if the ratio
+    spread ever underperforms in a way that points at its short strike, THIS is the paragraph to
+    reopen.
+
+    Liquidity gates DO still apply (``_candidates`` runs them), so an ungoverned wing is still
+    a tradable one; only the RANKING is excluded."""
     cands = _candidates(chain, option_type, dte_min, dte_max, today,
                         min_open_interest, max_spread_pct, min_volume)
     if expiry is not None:

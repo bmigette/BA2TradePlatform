@@ -47,11 +47,44 @@ from app.services.strategy_param_space import (  # noqa: E402
 
 WEIGHTS = ("w_premium", "w_iv", "w_rvol")
 MEMBERS = sorted(L._OPTION_STRATS)
-GROUP_HALVES = [("OS1", "debit"), ("OS2", "credit"), ("OS3", "credit"), ("OS4", "debit")]
 
 
 def _half_of(member):
     return "debit" if member in L._DEBIT_OPTION_MEMBERS else "credit"
+
+
+def _group_halves():
+    """Every group and its half, DERIVED — a new group is covered without editing this file.
+
+    Hardcoding ``[("OS1", "debit"), ...]`` made ``MEMBERS`` (derived) and the groups (not)
+    disagree about what "all of them" means: adding OS5 to ``_OPTION_GROUPS`` would have left
+    every group assertion below silently testing the old four, which is the dead-coverage
+    failure this suite exists to catch in the launcher.
+
+    The half comes from the group's own MEMBERS rather than from ``_DEBIT_OPTION_KINDS``,
+    which would just be a second hardcoded table: a group IS its members, so its half is
+    theirs. A group whose members straddle the debit/credit line has no single half to share a
+    gene on, so it fails here rather than picking one — that is a real defect in the grouping,
+    not a case to tolerate.
+    """
+    out = []
+    for key, members in sorted(L._OPTION_GROUPS.items()):
+        halves = {_half_of(m) for m in members}
+        assert len(halves) == 1, (
+            f"group {key} straddles the debit/credit line ({sorted(halves)}); its members "
+            f"cannot share one selection-weight gene")
+        out.append((key, halves.pop()))
+    return out
+
+
+GROUP_HALVES = _group_halves()
+
+
+def test_the_group_halves_are_the_four_expected_ones():
+    """Pins the DERIVATION against the table it replaced, so deriving it did not quietly
+    change what is covered. Update this only when a group is genuinely added or removed."""
+    assert GROUP_HALVES == [("OS1", "debit"), ("OS2", "credit"),
+                            ("OS3", "credit"), ("OS4", "debit")]
 
 
 def _optsel(space):
@@ -180,6 +213,29 @@ def test_a_weight_flag_without_a_half_is_a_loud_config_error():
                               {"option_w_premium_optimize": True,
                                "option_w_premium_min": -2.0, "option_w_premium_max": 2.0,
                                "option_w_premium_step": 0.5}, out)
+
+
+def test_an_unknown_member_is_refused_rather_than_stamped_credit():
+    """THE OTHER END OF THE SAME REFUSAL. ``_collect_action_genes`` (above) refuses a weight
+    flag with no half; the launcher's stamper must refuse a member with no half, instead of
+    defaulting it.
+
+    ``_DEBIT_OPTION_MEMBERS | _CREDIT_OPTION_MEMBERS`` is asserted total at import, so this
+    can never fire in a real run — which is exactly why it needs a test: an
+    ``else "credit"`` is invisible while the assertion holds and silently gives a new member
+    the wrong half's premium thesis the moment it does not. Nothing else in the suite can
+    reach that branch, because every real member is in the partition by construction.
+    """
+    with pytest.raises(ValueError, match="neither the debit nor the credit"):
+        L._apply_option_selection_weight_genes({}, "O_NOT_A_REAL_MEMBER")
+
+
+def test_the_stamper_still_gives_every_real_member_its_partition_half():
+    """The refusal must not have narrowed the accepted set: every member still stamps, and
+    stamps the half the partition says."""
+    for m in MEMBERS:
+        cfg = L._apply_option_selection_weight_genes({}, m)
+        assert cfg["option_selection_half"] == _half_of(m), m
 
 
 # ------------------------------------------------------------------------------------------ #

@@ -748,6 +748,26 @@ Use `@superpowers:verification-before-completion`. Evidence, not assertions:
    worker, and `reference-distributed-optimize-traps` records that breaking the version match
    mid-run kills the run.
 
+   > **STATUS 2026-08-31 — THE BUMP IS DEFERRED AND STILL OWED. It has NOT been done on this
+   > branch, deliberately.**
+   >
+   > Every commit on `option-selection-modes` touches `packages/` and `testplatform/` and none
+   > of them bumps `TEST_APP_VERSION`. That is the caveat in the rule above being exercised, not
+   > the rule being forgotten: a grid run is live, and distributed workers decide whether to
+   > self-update by comparing `TEST_APP_VERSION` alone
+   > (`worker_client.ensure_synced`), so bumping while this branch sits unmerged would re-sync
+   > every worker onto a branch the run was not launched from.
+   >
+   > **WHO OWES IT: the merger, in the merge commit.** Bump `TEST_APP_VERSION` as part of
+   > merging this branch — not before, and not in a follow-up commit. The window that makes the
+   > deferral safe closes the moment the branch lands, because from then on the workers' code
+   > and the master's differ with nothing in the version string to say so. That is the silent
+   > trial-reproducibility break `CLAUDE.md` warns about: workers running different `ba2_common`
+   > code from the master while both report the same version.
+   >
+   > Do NOT treat the absent bump as an oversight to "fix" on the branch — re-deferring it is
+   > the whole point until merge time.
+
 ---
 
 ## Out of scope

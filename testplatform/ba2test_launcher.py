@@ -2907,12 +2907,30 @@ def _apply_option_entry_cross_gene(cfg: dict) -> dict:
 #
 # WHAT IS DELIBERATELY NOT IN THIS TABLE (each withheld on recorded evidence, the F15
 # standard — a gene the GA can never move is budget burned on a dead search dimension):
-#   * ``w_spread`` — reads ``spread_pct``, and BOTH grid stores make that column degenerate
-#     for every candidate: the sqlite cache carries bid == ask on all 6,757,055 rows (a
-#     constant 0.0 grades nothing — measured 2026-08-23, see option_selector._publishes_spread)
-#     and the parquet store has no bid/ask column at all (None for everyone fails closed
-#     uniformly). A uniform column cannot move any pick, so the gene cannot apply on this
-#     data. The WEIGHT stays in SelectionPolicy — live chains carry real spreads.
+#   * ``w_spread`` — reads ``spread_pct``, which is degenerate on the store this grid
+#     actually reads. THE LOAD-BEARING PREMISE IS WHICH STORE THAT IS, and the earlier
+#     version of this note never stated it: an option job here runs on PARQUET, not sqlite.
+#     ``tools/run_options_matrix.py`` defaults ``--start 2023-01-01`` and
+#     ``daily_backtest_handler.validate_options_window`` enforces the history floor of the
+#     vendor serving the run's store (Alpaca 2024-01-18), so an option job left on the
+#     DEFAULT sqlite store RAISES before it runs; only ``options_store=parquet``
+#     (TastyTrade/dxfeed, floor 2022-10-01) can serve that window at all.
+#     ON PARQUET THE COLUMN FAILS OPEN, NOT CLOSED — the correction that matters, because
+#     the direction was recorded backwards. ``parquet_options_provider`` gets no vendor
+#     bid/ask (dxfeed serves no historical NBBO for dead contracts) and SYNTHESISES
+#     ``bid = ask = close`` (see its ``contract()``), so ``spread_pct`` is a constant 0.0
+#     for every candidate; ``_minimise`` maps that degenerate range to 0.0 and inverts it to
+#     1.0 — the BEST score — for all of them. Uniformly best, never uniformly rejected.
+#     ON SQLITE (unreachable for this grid, recorded so the two stores are not conflated)
+#     the column is NOT uniform. Measured 2026-08-31 against the only cache
+#     ``CACHE_FOLDER`` resolves to: ``option_chain`` holds 1,440,782 rows in a SINGLE
+#     ``as_of`` snapshot (2024-02-01), ``bid <> ask`` on 0 of them, and 357,211 (24.8%)
+#     carry NULL bid/ask/last. So ``spread_pct`` is 0.0 where quoted and None where not,
+#     which through ``_minimise`` becomes 1.0 / 0.0 — a binary "was this contract quoted in
+#     that one snapshot" flag, never a comparison of spreads.
+#     EITHER WAY THE GENE CANNOT GRADE A SPREAD, which is what withholds it — the
+#     conclusion is unchanged, only its reasoning is now true. The WEIGHT stays in
+#     SelectionPolicy: live chains carry real spreads.
 #   * ``w_rr`` — operator decision 2026-08-30 (design §7): Spearman(rr, premium) 0.98-1.0
 #     within real chains, a second gene searching the axis w_premium already owns.
 #   * ``w_profit`` — needs ``PolicyContext.structure_fn`` to score anything, and NO entry
@@ -2926,6 +2944,39 @@ def _apply_option_entry_cross_gene(cfg: dict) -> dict:
 #     w_profit becomes worth emitting FOR THAT BUILDER, on that recorded evidence.
 #   * ``w_box_center`` — pinned 1.0, not a gene: scaling every weight by one factor changes
 #     no ranking, so a free box_center is a degenerate search direction (design §7).
+#
+# WHAT THE EMITTED THREE WERE ACTUALLY MEASURED ON (added 2026-08-31, correcting an
+# overstatement rather than a decision). The three above were emitted on a DEAD-GENE GUARD
+# that feeds synthetic ladders through the policy. That proves the PLUMBING — a weight change
+# reaches the pick — and it does not prove APPLICABILITY: that the column varies on the data
+# a grid job will actually see. Those are the two different failures F15 and F17 are about,
+# and only the first had been tested.
+#
+# Nor does the run-time report close the gap. ``option_selection_policy.inapplicable_features``
+# can only ever name ``profit`` and ``rr`` (see its docstring) — the two weights withheld
+# BELOW. It will never say a word about ``w_premium``/``w_iv``/``w_rvol``, so "an inert gene
+# and a live-but-unhelpful one stop looking identical" holds for the withheld pair and for
+# none of the emitted three. This block is the substitute, and it is a per-STORE claim
+# because applicability is a property of the store, not of the gene.
+#
+# MEASURED ON PARQUET — the store an option job actually reads (see w_spread below for why
+# sqlite is unreachable here). 20 random underlyings, one chain each (one ``bar_date`` of one
+# expiry partition), 2026-08-31:
+#   * ``w_iv``   — vendor ``iv`` takes >1 distinct value in 19/20 chains (the miss is a
+#                  2-row chain whose iv is NULL on both). LIVE.
+#                  NB the selector ranks on the INVERTED iv the reader derives per bar, not
+#                  on this column; the vendor column is the dispersion proxy, and a derived
+#                  iv cannot be constant where the closes it is inverted from are not.
+#   * ``w_rvol`` — ``volume`` takes >1 distinct value in 20/20 chains. LIVE.
+#   * ``w_premium`` — ranks on ``close``, >1 distinct value in every chain sampled (85 of 150
+#                  rows distinct in the AAPL partition inspected). LIVE, and it is the one
+#                  weight whose column cannot degenerate without the bars themselves being
+#                  constant.
+# ON SQLITE (recorded only so the two stores are not conflated — no option job can run there)
+# ``w_rvol`` is NOT safe: ``option_chain.volume`` is 100% NULL, and what the selector sees is
+# ``option_bar.volume``, so a chain whose contracts have no bar that day collapses to a
+# constant 0. Reported dead in 14/20 chains by the Task 7/10 review; not re-measured here,
+# because the store is unreachable for this grid and the number changes nothing.
 _OPTION_SELECTION_WEIGHT_BANDS = {
     #  weight: (min, max, step)
     "w_premium": (-2.0, 2.0, 0.5),   # SIGNED — the Task 7 sign fix, see above
@@ -2951,8 +3002,24 @@ def _apply_option_selection_weight_genes(cfg: dict, member: str) -> dict:
     so they have no half to share with — their option leg keeps the default policy, which is
     the proven no-op.
     """
-    cfg.setdefault("option_selection_half",
-                   "debit" if member in _DEBIT_OPTION_MEMBERS else "credit")
+    # REFUSE AN UNKNOWN MEMBER, do not default it to "credit". The partition below is
+    # asserted total (``_DEBIT_OPTION_MEMBERS | _CREDIT_OPTION_MEMBERS == _OPTION_STRATS``),
+    # so this cannot fire today -- but an ``else "credit"`` makes the safety come from that
+    # assertion holding rather than from this line, and a member added to _OPTION_STRATS on a
+    # branch where the assertion is relaxed would silently join the credit half and share its
+    # premium gene with the wrong thesis. ``strategy_param_space`` already refuses the exact
+    # mirror of this (a weight flag with no half); the two ends of one feature should not
+    # disagree about whether an unknown half is an error.
+    if member in _DEBIT_OPTION_MEMBERS:
+        half = "debit"
+    elif member in _CREDIT_OPTION_MEMBERS:
+        half = "credit"
+    else:
+        raise ValueError(
+            f"{member!r} is in neither the debit nor the credit option half, so it has no "
+            f"selection-weight gene to share; add it to _DEBIT_OPTION_KINDS or to "
+            f"_OPTION_STRATS' credit side before giving it selection weights")
+    cfg.setdefault("option_selection_half", half)
     for w, (lo, hi, step) in _OPTION_SELECTION_WEIGHT_BANDS.items():
         cfg.setdefault(f"option_{w}_optimize", True)
         cfg.setdefault(f"option_{w}_min", lo)

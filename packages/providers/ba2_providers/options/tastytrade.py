@@ -1,9 +1,21 @@
 """Historical option data from TastyTrade / dxfeed.
 
-WHY THIS EXISTS. The offline options cache has ``delta``, ``iv`` and ``open_interest`` NULL
-across all 6,757,055 chain rows, and its quoted rows were written with ``bid = ask = close``,
-so not one of 4,328,587 has ``ask > bid``. Consequently ``method="delta"`` selects nothing,
-``min_open_interest`` rejects entire chains, and there is no spread to model. Alpaca cannot
+WHY THIS EXISTS. The offline options cache is missing liquidity data and has no real quotes:
+its rows were written with ``bid = ask = close``, so not one of its 1,083,571 quoted chain
+rows has ``ask > bid`` and there is no spread to model, and ``open_interest`` is NULL on all
+1,440,782 chain rows so ``min_open_interest`` rejects entire chains.
+
+THAT CLAIM USED TO BE WIDER THAN THE DATA SUPPORTS, and the correction is recorded here
+rather than quietly dropped (re-measured 2026-08-31; full record in
+``ba2_common.core.option_selector._publishes_spread``). This note previously said ``delta``
+and ``iv`` were also NULL "across all 6,757,055 chain rows", and that ``method="delta"``
+therefore selects nothing. Neither half is true of the cache on disk: the row count matches
+no table in the file, and greeks are populated on 46% of the 1,440,782 chain rows and on
+88.2% of the 19,484,995 ``option_bar`` rows, covering all 101 underlyings. Delta selection
+works there. ``open_interest`` -- with no bar column to recover it -- is the one field that
+is genuinely dead, and it alone is what this vendor switch was needed for. dxfeed's IV is
+still worth having (a vendor IV beats a Black-Scholes inversion of the same bar's close),
+but it is an improvement, not a rescue. Alpaca cannot
 fix that (its history floors at a measured 2024-01-18 and its bars carry no IV), and
 ThetaData needs a paid local terminal. A read-only probe
 (``test_files/probe_tastytrade_option_history.py``) established that dxfeed can:

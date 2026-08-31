@@ -635,6 +635,30 @@ def inapplicable_features(candidates: Sequence[OptionContract], ctx: PolicyConte
     lacks an IV is a data outage, not a shape that has no IV, and conflating the two would let a
     silent feed failure quietly disable a gene mid-run.
 
+    SO THE F17 CLAIM THIS FUNCTION BACKS IS NARROWER THAN IT SOUNDS, and the limit belongs next
+    to the rule that causes it. "An inert gene and a live-but-unhelpful one stop looking
+    identical" is TRUE ONLY OF ``profit`` AND ``rr`` — the two weights the grid WITHHOLDS. It is
+    false, by construction, of the three the grid actually EMITS (``premium``, ``iv``,
+    ``rvol``) and of ``spread``: this function can never name them, so a run in which one of
+    them is constant across every candidate — inert in exactly the sense that matters to a GA —
+    reports nothing at all. Whoever reads a grid post-mortem for "was this gene dead?" gets an
+    answer for the withheld pair and silence for the emitted three.
+
+    WHY IT IS NOT SIMPLY WIDENED (considered and declined 2026-08-31). Detecting an inert
+    emitted column is trivial — after ``_normalise`` a degenerate column is already constant, so
+    it is an O(n) test on numbers ``score_all`` has computed anyway. The cost is the plumbing:
+    the matrix lives inside ``score_all`` and the report is raised in
+    ``option_selector._policy_pick``, so honest reuse means threading a precomputed matrix
+    through ``score_all``/``pick``/``pick_with_reason`` — the exact widening of ``pick`` that
+    the Tasks 1-5 no-op guarantees rest on NOT happening (see ``pick_with_reason``'s "A SEPARATE
+    ENTRY POINT RATHER THAN A WIDER RETURN ON ``pick``"). Recomputing the columns instead would
+    reintroduce the second-pass defect that the shared payoff exists to remove. And a
+    per-pick log would fire per structure, per bar, per symbol — a single-candidate box makes
+    EVERY column constant, so the common case is noise, not signal. The question "can this gene
+    move a pick on this data?" is a once-per-RUN question about the store, and it is answered
+    that way in the launcher's ``_OPTION_SELECTION_WEIGHT_BANDS``, which records a measurement
+    per weight per store. That is where to look, and where to add to.
+
     An empty candidate list reports both features inapplicable, which is vacuously true and
     costs nothing: ``pick`` has already returned None before any weight is consulted.
 
@@ -1197,12 +1221,20 @@ def pick_with_reason(
     cands, refusal = _eligible_and_reason(candidates, ctx)
     if not cands:
         return None, refusal
-    # NOTE: ``payoff`` was computed over the FULL candidate list, and ``eligible`` can
-    # narrow it. Today the two agree whenever a payoff column is live -- the ceiling is the
-    # only narrowing filter that consults the builder, no seam passes both a ceiling and a
-    # shared payoff, and the delta/box filters run before anything payoff-shaped exists -- but
-    # a mismatch would misalign every column with the candidates being scored, so it is
-    # checked rather than assumed.
+    # A LENGTH MISMATCH MEANS THE PAYOFF DESCRIBES A DIFFERENT SET, SO IT IS DROPPED.
+    # ``eligible`` above can narrow the list, and a payoff computed over the wider one would
+    # misalign every column with the candidates actually being scored.
+    #
+    # This is a BACKSTOP, not the normal path, and the earlier note here justified it with a
+    # claim about its own callers that was false: it said "the delta/box filters run before
+    # anything payoff-shaped exists", when ``option_selector._policy_pick`` -- the only
+    # production caller that passes a shared ``payoff`` -- computed that payoff BEFORE this
+    # narrowing ran. On a narrowing chain the shared pass was therefore discarded here and
+    # ``score_all`` recomputed it: 2 passes, not the 1 the sharing promises. ``_policy_pick``
+    # now narrows FIRST and builds the payoff on the eligible set, so the lengths match and
+    # this branch does not fire for it. The check stays for any future caller that has not
+    # been taught the ordering -- silently scoring misaligned columns is far worse than
+    # paying for a second pass.
     if payoff is not None and len(cands) != len(candidates):
         payoff = None
     scores = score_all(cands, ctx, policy, payoff=payoff)

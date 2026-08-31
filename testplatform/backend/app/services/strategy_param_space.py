@@ -65,9 +65,11 @@ logger = logging.getLogger(__name__)
 SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 #: The SelectionPolicy weights emitted as shared per-half genes (``optsel:<half>:<w>``).
-#: Deliberately NOT w_spread (degenerate on both grid stores), NOT w_rr (F15: collinear with
-#: premium within a chain), NOT w_profit (needs a structure_fn no builder supplies yet) --
-#: see the launcher's _OPTION_SELECTION_WEIGHT_BANDS for the evidence trail.
+#: Deliberately NOT w_spread (the parquet store this grid reads synthesises bid == ask, so
+#: spread_pct is a constant 0.0 that scores uniformly BEST -- it fails OPEN, not closed),
+#: NOT w_rr (F15: collinear with premium within a chain), NOT w_profit (needs a structure_fn
+#: no builder supplies yet) -- see the launcher's _OPTION_SELECTION_WEIGHT_BANDS for the
+#: full evidence trail, including why an option job cannot run on the sqlite store at all.
 OPTION_SELECTION_WEIGHTS = ("w_premium", "w_iv", "w_rvol")
 
 # Actions that must NEVER be dropped by a per-action toggle: removing the open action would

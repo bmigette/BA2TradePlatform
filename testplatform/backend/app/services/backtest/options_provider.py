@@ -241,11 +241,14 @@ def _to_contract(r: dict, greeks_row: Optional[dict] = None) -> OptionContract:
         last=last, implied_volatility=g.get("iv"), delta=g.get("delta"),
         gamma=g.get("gamma"), theta=g.get("theta"), vega=g.get("vega"),
         open_interest=r.get("open_interest"),
-        # VOLUME comes from the BAR, not the chain row (2026-07-25). option_chain.volume is
-        # NULL for every row a fetch_options build writes (verified: 0 of 958,024 populated) —
+        # VOLUME comes from the BAR, not the chain row. option_chain.volume is NULL for every
+        # row a fetch_options build writes (re-measured 2026-08-31: 0 of 1,440,782 populated) —
         # Alpaca exposes no as-of volume for a past date, so the chain snapshot never gets one.
-        # option_bar.volume IS populated for every bar (13,729,262 of 13,729,262), because a
-        # bar only exists for a contract that actually traded that day. Reading the chain
+        # option_bar.volume IS populated for every bar (19,484,995 of 19,484,995), because a
+        # bar only exists for a contract that actually traded that day. THIS IS WHY "volume is
+        # NULL in the cache" is a claim about the CHAIN TABLE ONLY: what the selector sees is
+        # the bar's volume, so a volume-ranked weight is live here even though the chain
+        # column is empty. Reading the chain
         # column left OptionContract.volume permanently None, so any selector-side liquidity
         # gate keyed on volume silently passed EVERYTHING while the fill engine's
         # participation cap (_OPTION_FILL_MAX_VOLUME_PARTICIPATION) — which reads the bar

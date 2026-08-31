@@ -6,9 +6,9 @@ tests pin the *absence* as hard as the presence:
 
   * the legacy Alpaca sqlite stores ``bid == ask == close`` in every quoted row —
     a synthesised placeholder, NOT a quote — so it must never be presented as a spread;
-  * its ``iv`` / ``delta`` / ``gamma`` / ``theta`` / ``vega`` / ``open_interest`` /
-    ``volume`` chain columns are NULL in all 6,757,055 rows, and NULL must render as
-    "n/a" with a reason, never as ``0.00``;
+  * its ``open_interest`` / ``volume`` chain columns are NULL in all 1,440,782 rows and
+    its ``iv`` / ``delta`` / ``gamma`` / ``theta`` / ``vega`` are NULL in 54% of them, and
+    NULL must render as "n/a" with a reason, never as ``0.00``;
   * greeks are computable only where an IV *and* a spot exist, and a computed greek is
     model output, not exchange data — it must say so;
   * the as-of picker may only offer dates that exist (the legacy chain table holds three
@@ -74,7 +74,7 @@ def _seed_legacy(path: str) -> None:
         3.3, 3.3, 3.3, None, None, None, None, None, None, None,
     ))
     # SYNTHETIC, and deliberately unlike the real file: bid != ask != last. ZERO of the
-    # 4,328,587 quoted rows in the production cache look like this. It exists only to pin
+    # 1,083,571 quoted rows in the production cache look like this. It exists only to pin
     # WHICH column the single "Close" reads — the last trade, not the bid — so that a
     # differently-built cache cannot silently start showing a bid under a Close header.
     rows.append((
@@ -87,7 +87,7 @@ def _seed_legacy(path: str) -> None:
         7.7, 7.7, 7.7, None, None, None, None, None, None, None,
     ))
     # A contract present in the snapshot but with NO price at all. This is NOT an edge case:
-    # 2,428,468 of the real file's 6,757,055 chain rows have NULL bid/ask/last. "Listed in
+    # 357,211 of the real file's 1,440,782 chain rows have NULL bid/ask/last. "Listed in
     # the chain" and "priced" are different claims.
     rows.append((
         "AAPL", AS_OF, _occ("AAPL", EXPIRY_NEAR, "C", 220.0), "call", 220.0, EXPIRY_NEAR,
@@ -449,7 +449,7 @@ def test_a_listed_but_unpriced_contract_shows_no_price_not_a_zero_price(legacy_o
     leg = {r["strike"]: r for r in body["expiries"][0]["rows"]}[220.0]["call"]
     assert leg["close"]["value"] is None
     assert leg["close"]["source"] == "unavailable"
-    assert "2,428,468" in leg["close"]["reason"]
+    assert "357,211" in leg["close"]["reason"]
     # the contract is still LISTED — it just has no price
     assert leg["occ_symbol"].endswith("C00220000")
 

@@ -642,8 +642,11 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
 
     3. IV/OPEN_INTEREST/VOLUME NON-NULL RATE (sampled, from symbols that actually have data): the
        entire reason this store exists over the incumbent options_history.sqlite is that
-       ``imp_volatility``/``open_interest`` were NULL across all 6,757,055 of ITS rows (see
-       parquet_store.py's COLUMNS docstring and warm_options_history.py's module docstring). A
+       ``open_interest`` is NULL across all 1,440,782 of ITS chain rows, with no bar column to
+       recover it (``imp_volatility`` is thin there rather than absent -- 46% of chain rows,
+       88.2% of bar rows -- re-measured 2026-08-31; see
+       ba2_common.core.option_selector._publishes_spread, parquet_store.py's COLUMNS docstring
+       and warm_options_history.py's module docstring). A
        silently-regressed fetch that stopped populating these fields would pass every other check
        here (files exist, non-empty, right shape) while quietly reproducing the exact defect this
        pipeline was built to fix. ``open``/``high``/``low``/``close`` are NOT sampled here: they

@@ -8,8 +8,11 @@ The whole reason this store exists is a multi-HOUR download that will be interru
   * "already downloaded" is distinguishable from "downloaded and genuinely EMPTY",
     so a contract with no bars is a recorded fact rather than an eternal retry,
   * a re-run skips finished work without re-fetching it,
-  * ``iv`` and ``open_interest`` survive the round trip — they are the entire point of
-    switching vendors (both are NULL across all 6,757,055 rows of the incumbent cache).
+  * ``iv`` and ``open_interest`` survive the round trip — ``open_interest`` is the field
+    the switch was actually needed for (NULL across all 1,440,782 chain rows of the
+    incumbent cache, with no bar column to recover it); the incumbent's ``iv`` is thin
+    rather than absent (46% of chain rows, 88.2% of bar rows), so a vendor IV is an
+    improvement there, not a rescue. See ``option_selector._publishes_spread``.
 
 Time is frozen to a fixed instant (never ``today``) via an injected clock.
 """

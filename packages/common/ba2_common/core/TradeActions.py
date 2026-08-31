@@ -3852,6 +3852,11 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
                                today=self._today(), policy=self.selection_policy, **liq)
         if long_p is None:
             return self._result(False, f"No liquid long put for ratio spread on {self.instrument_name}")
+        # NOT policy-governed, unlike the long leg above: a wing is a width-derived strike,
+        # not a box, so there is no band for the weights to rank inside. This is the site where
+        # that exclusion is least comfortable -- the short put is the 2x leg -- and
+        # ``option_selector.select_wing``'s docstring records both the reasoning and what it
+        # would take to change it.
         short_p = select_wing(chain, center_strike=long_p.strike, width_pct=wing,
                               option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
                               today=self._today(), expiry=long_p.expiry,
