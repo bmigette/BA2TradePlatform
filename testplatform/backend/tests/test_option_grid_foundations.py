@@ -72,12 +72,17 @@ def test_the_expected_profit_gate_is_searchable_and_toggleable(key):
 
 
 def test_the_swap_shrinks_every_structure_genome():
-    """The point is not only correctness: 8 genes out, 2 in, on every structure."""
+    """The point is not only correctness: 8 genes out, 2 in, on every structure.
+
+    The cap moved 26 -> 28 when ``opt_sl_ml`` landed (Task 9): every MEASURED-max-loss
+    structure deliberately gained exactly two genes (``exit:opt_sl_ml:enabled`` +
+    ``cond:sl_ml:value``). The budget still bites -- an accidental third gene anywhere
+    fails it."""
     m = _launcher()
     for key in PURE:
-        assert len(_space(m, key)) <= 26, (
-            f"{key} genome is {len(_space(m, key))}; the price-gate swap should put every "
-            f"structure at or under 26 genes")
+        assert len(_space(m, key)) <= 28, (
+            f"{key} genome is {len(_space(m, key))}; the price-gate swap (and the two "
+            f"opt_sl_ml genes) should put every structure at or under 28 genes")
 
 
 def test_the_group_genome_shrinks_too():
@@ -552,3 +557,186 @@ def test_the_hold_set_is_explicit_about_which_kinds_manage_stock():
     assert m._hold_assigned_stock("O_CSP") is False
     assert m._hold_assigned_stock(None) is False, \
         "bypass experts ignore --strategy; their account settings must not inherit it"
+
+
+# ==============================================================================================
+# Task 9 -- opt_sl_ml: a stop at a % of the structure's MEASURED max loss (design 2026-08-29 S6)
+# ==============================================================================================
+#
+# THE EMISSION PREDICATE IS "MEASURED max_loss", NOT "defined-risk spread" AND NOT "no naked
+# short" (the corrected S6 rule, 2026-08-30): a cash-secured put is bounded below -- strike
+# minus credit, at an underlying of zero -- so it IS measured and DOES carry the rule; only a
+# net-uncovered short CALL (short strangle / straddle) is genuinely unbounded. Emission is a
+# strategy-level APPLICABILITY gate, not the safety mechanism: even where emitted, the
+# condition self-disarms on any position whose parent order lacks the persisted
+# max_loss_per_contract stamp (test_max_loss_persisted_at_submit.py pins that submit-side
+# guarantee), so a composite like the wheel may carry the rule and it simply never fires on
+# the unstamped covered-call legs.
+
+SL_ML_RULE_ID = "opt_sl_ml"
+SL_ML_COND_ID = "sl_ml"
+
+
+def _exit_rule(m, kind, rule_id):
+    for r in m._option_exit_rules(kind):
+        if r["id"] == rule_id:
+            return r
+    raise AssertionError(f"{kind}: exit rule {rule_id!r} not found "
+                         f"(have {[r['id'] for r in m._option_exit_rules(kind)]})")
+
+
+def test_opt_sl_ml_is_never_emitted_for_a_member_whose_max_loss_is_unbounded():
+    """Asserted over ALL members, not spot-checked (plan Task 9's 'test that matters most')."""
+    m = _launcher()
+    for kind in m._OPTION_STRATS:
+        ids = {r["id"] for r in m._option_exit_rules(kind)}
+        if kind in m._UNDEFINED_RISK_MEMBERS:
+            assert SL_ML_RULE_ID not in ids, f"{kind} has no max loss to take a fraction of"
+        else:
+            assert SL_ML_RULE_ID in ids, f"{kind} has a MEASURED max loss and no {SL_ML_RULE_ID}"
+
+
+def test_the_unbounded_set_is_exactly_the_uncovered_short_call_structures():
+    """The corrected S6 rule, pinned as data: a short strangle and a short straddle each carry
+    a short call no other leg of the order covers; NOTHING else in the taxonomy does. In
+    particular O_CSP (short put: bounded at strike minus credit), O_JL (its short call is
+    covered by the long wing) and O_RS (all puts) are MEASURED -- listing any of them here is
+    the stale pre-correction table row this branch explicitly retired."""
+    m = _launcher()
+    assert m._UNDEFINED_RISK_MEMBERS == {"O_SSTG", "O_SSTD"}
+
+
+def test_a_cash_secured_put_carries_the_max_loss_stop():
+    """THE CORRECTED-RULE CASE. A naked short put is not 'undefined risk': its loss is bounded
+    at (strike - credit) x 100, the submit path stamps that measurement
+    (test_a_naked_short_put_submit_STAMPS_its_measured_max_loss_corrected_s6), and so the
+    stop's denominator exists. Emit-for-CSP is the assertion the stale design table would
+    have failed."""
+    m = _launcher()
+    assert SL_ML_RULE_ID in {r["id"] for r in m._option_exit_rules("O_CSP")}
+
+
+def test_the_rule_body_matches_design_s6_exactly():
+    """Field, op, default, band and both toggles -- the shape design S6 spells out verbatim.
+    op is '>' on a POSITIVE loss percentage (the condition negates the P&L), value_step 5
+    against opt_sl's 25: max-loss fractions are scale-free so the finer grid is affordable."""
+    m = _launcher()
+    rule = _exit_rule(m, "O_VERT", SL_ML_RULE_ID)
+    assert rule["action_type"] == "close_option"
+    assert rule["toggle_optimize"] is True
+    leaves = rule["conditions"]["conditions"]
+    assert [c["field"] for c in leaves] == ["loss_pct_of_max_loss"]
+    leaf = leaves[0]
+    assert leaf["id"] == SL_ML_COND_ID
+    assert leaf["op"] == ">"
+    assert leaf["value"] == 50
+    assert leaf["optimize"] is True
+    assert (leaf["value_min"], leaf["value_max"], leaf["value_step"]) == (25, 75, 5)
+
+
+def test_the_rule_is_identical_across_every_carrying_member():
+    """One shape, no per-member drift: the threshold is scale-free BECAUSE the denominator is
+    each structure's own max loss, so nothing about the band may vary by structure."""
+    m = _launcher()
+    reference = _exit_rule(m, "O_VERT", SL_ML_RULE_ID)
+    for kind in m._OPTION_STRATS:
+        if kind not in m._UNDEFINED_RISK_MEMBERS:
+            assert _exit_rule(m, kind, SL_ML_RULE_ID) == reference, kind
+
+
+def test_a_group_with_any_measured_member_carries_the_rule_once():
+    """Groups share ONE exit list. OS2 mixes unbounded members (O_SSTG/O_SSTD) with a
+    measured one (O_IC): the rule must still be emitted -- on the unbounded members' orders
+    it self-disarms for want of a stamp (Task 8's absence guarantee), while dropping it would
+    deny O_IC the stop entirely. A group is excluded only when built SOLELY of unbounded
+    structures."""
+    m = _launcher()
+    for group in m._OPTION_GROUPS:
+        ids = [r["id"] for r in m._option_exit_rules(group)]
+        assert ids.count(SL_ML_RULE_ID) == 1, (group, ids)
+
+
+def test_a_hypothetical_all_unbounded_group_would_not_carry_it(monkeypatch):
+    """The group predicate is 'any member measured', so a family of nothing but naked short
+    calls emits no rule -- pinned against the cheap regression of emitting unconditionally
+    for every group key."""
+    m = _launcher()
+    monkeypatch.setitem(m._OPTION_GROUPS, "OS_TEST_UNBOUNDED", ["O_SSTG", "O_SSTD"])
+    ids = {r["id"] for r in m._option_exit_rules("OS_TEST_UNBOUNDED")}
+    assert SL_ML_RULE_ID not in ids
+
+
+def test_the_wheel_inherits_the_rule_from_o_csp():
+    """The mixed-strategy case from the plan: the wheel's CSP entry stamps a measured max
+    loss, its covered-call overlay does not -- the rule rides along and Task 8's absence
+    gate keeps it inert on the unstamped legs."""
+    m = _launcher()
+    s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
+    assert SL_ML_RULE_ID in [r.get("id") for r in s.exit_rules]
+
+
+def test_both_stops_coexist_on_a_credit_carrier():
+    """Design S6: two independently toggleable rules, not a basis gene on opt_sl -- the GA
+    selects the basis by toggling which rule is live. A measured CREDIT structure therefore
+    carries BOTH stops."""
+    m = _launcher()
+    ids = [r["id"] for r in m._option_exit_rules("O_IC")]
+    assert "opt_sl" in ids and SL_ML_RULE_ID in ids
+
+
+# ---------------------------------------------------------------------------
+# genome -> ruleset: the genes exist where (and only where) the rule does, and they MOVE it
+# ---------------------------------------------------------------------------
+
+def test_the_genes_are_emitted_for_measured_strategies_only():
+    m = _launcher()
+    for kind in ["O_VERT", "O_CSP", "O_IC"]:
+        space = _space(m, kind)
+        assert space[f"exit:{SL_ML_RULE_ID}:enabled"] == {
+            "type": "int", "min": 0, "max": 1, "step": 1}, kind
+        assert space[f"cond:{SL_ML_COND_ID}:value"] == {
+            "type": "float", "min": 25.0, "max": 75.0, "step": 5.0}, kind
+    for kind in ["O_SSTG", "O_SSTD"]:
+        space = _space(m, kind)
+        assert f"exit:{SL_ML_RULE_ID}:enabled" not in space, kind
+        assert f"cond:{SL_ML_COND_ID}:value" not in space, kind
+
+
+def test_the_threshold_gene_decodes_onto_the_condition():
+    """Kills the hardcoded-threshold mutant: a decoded 30 must land on the leaf, not be
+    shadowed by the literal 50."""
+    from app.services.strategy_param_space import decode_params
+
+    m = _launcher()
+    s = m._build_strategy_option("O_VERT")
+    decoded = decode_params(s, {f"cond:{SL_ML_COND_ID}:value": 30})
+    rule = next(r for r in decoded["exit_rules"] if r["id"] == SL_ML_RULE_ID)
+    leaf = next(c for c in rule["conditions"]["conditions"] if c["id"] == SL_ML_COND_ID)
+    assert leaf["value"] == 30
+    assert leaf["field"] == "loss_pct_of_max_loss"
+    assert leaf["op"] == ">"
+
+
+def test_toggling_the_rule_off_drops_it_and_spares_the_siblings():
+    from app.services.strategy_param_space import decode_params
+
+    m = _launcher()
+    s = m._build_strategy_option("O_IC")
+    assert SL_ML_RULE_ID in [r["id"] for r in s.exit_rules]
+    decoded = decode_params(s, {f"exit:{SL_ML_RULE_ID}:enabled": 0})
+    ids = [r["id"] for r in decoded["exit_rules"]]
+    assert SL_ML_RULE_ID not in ids
+    assert "opt_sl" in ids and "opt_tp" in ids
+
+
+def test_the_sl_ml_leaf_becomes_a_real_engine_trigger():
+    """A field missing from rule_builders' FIELD_EVENT map is silently DROPPED by
+    triggers_from_condition_tree and the GA tunes a gene the engine cannot see -- the exact
+    dead-gene failure the OS1 price gates shipped. Prove the leaf survives seeding."""
+    from ba2_common.core.rule_builders import triggers_from_condition_tree
+
+    m = _launcher()
+    rule = _exit_rule(m, "O_VERT", SL_ML_RULE_ID)
+    triggers = triggers_from_condition_tree(rule["conditions"])
+    assert [t["event_type"] for t in triggers.values()] == ["loss_pct_of_max_loss"]
+    assert list(triggers.values())[0]["operator"] == ">"

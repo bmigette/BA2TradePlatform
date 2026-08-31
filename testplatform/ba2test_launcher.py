@@ -2985,6 +2985,28 @@ _CREDIT_OPTION_MEMBERS = set(_OPTION_STRATS) - _DEBIT_OPTION_MEMBERS
 if _DEBIT_OPTION_MEMBERS | _CREDIT_OPTION_MEMBERS != set(_OPTION_STRATS):
     raise RuntimeError("option members are not partitioned into debit/credit halves")
 
+# Members whose worst case is UNBOUNDED -- ``option_payoff.max_loss`` has no number for them,
+# so the submit path stamps no ``max_loss_per_contract`` and ``loss_pct_of_max_loss`` has no
+# denominator: the ``opt_sl_ml`` exit rule is never emitted for a strategy built solely of
+# these (design 2026-08-29 S6).
+#
+# THE PREDICATE IS THE MEASURED PAYOFF, NOT "is this a naked short" (the corrected S6 rule,
+# 2026-08-30): only a net-uncovered short CALL is genuinely unbounded, because only the
+# upside is infinite. Concretely, per structure:
+#   * O_SSTG / O_SSTD -- a short call no other leg of the order covers: UNBOUNDED. In here.
+#   * O_CSP -- a naked short PUT is bounded below at (strike - credit) x 100, the underlying
+#     stopping at zero: MEASURED, stamped, carries the rule. (The pre-correction design table
+#     called this unbounded; packages/common/tests/test_max_loss_persisted_at_submit.py pins
+#     the corrected behaviour at the stamping seam.)
+#   * O_JL -- its short call is covered by the long wing, its short put bounded at zero:
+#     MEASURED (worst of the two sides).
+#   * O_RS -- all puts (1x2): bounded at an underlying of zero: MEASURED.
+#   * everything else is a debit or defined-risk structure: MEASURED trivially.
+# This set is the strategy-level APPLICABILITY gate only -- the safety mechanism is Task 8's
+# absence rule (no stamp => the condition can never fire), which is what keeps the rule
+# harmless on a group's unbounded members and on the wheel's unstamped covered-call legs.
+_UNDEFINED_RISK_MEMBERS = {"O_SSTG", "O_SSTD"}
+
 
 def _option_exit_rules(kind: str):
     """Close the held option at a premium-profit TP, an ELAPSED-time exit and a
@@ -3020,6 +3042,10 @@ def _option_exit_rules(kind: str):
     +/-10 half-width), so a higher threshold only buys a degenerate open-and-immediately-
     close region that burns GA budget. Step 3 lands exactly on the conventional 21 / 14 /
     7 / 0 points without inflating the search.
+
+    ``opt_sl_ml`` (``loss_pct_of_max_loss > N``) is the max-loss-scaled stop, emitted only
+    for strategies with at least one MEASURED-max-loss structure — see the inline comment at
+    its append site and ``_UNDEFINED_RISK_MEMBERS`` for the applicability derivation.
     """
     debit = kind in _DEBIT_OPTION_KINDS
     tp = ({"value": 100, "value_min": 25, "value_max": 200, "value_step": 25} if debit
@@ -3049,6 +3075,30 @@ def _option_exit_rules(kind: str):
              "conditions": {"type": "AND", "conditions": [
                  {"id": "sl", "field": "profit_loss_percent", "op": "<", "value": -100,
                   "optimize": True, "value_min": -200, "value_max": -50, "value_step": 25}]}})
+    # ``opt_sl_ml`` -- close when the loss reaches N% of the structure's MEASURED max loss
+    # (design 2026-08-29 S6). A SEPARATE rule, not a "basis" gene on ``opt_sl``: the sensible
+    # threshold range differs by basis (-200..-50% of credit vs 25..75% of max loss), so one
+    # threshold gene would need a domain conditional on another gene; two independently
+    # toggleable rules let the GA select the basis the way it already selects
+    # opt_tp/opt_time/opt_dte/opt_sl -- by toggling which rule is live. Both stops may be live
+    # at once; first match wins, as the OPEN_POSITIONS ruleset already does. They are
+    # correlated but not redundant: N% of max loss is scale-free (always that fraction of the
+    # defined risk) while -100% of credit drifts with however much credit the trial collected.
+    #
+    # Emitted only where at least one of the strategy's structures has a MEASURED max loss
+    # (see _UNDEFINED_RISK_MEMBERS for the corrected per-structure derivation). A group emits
+    # it if ANY member is measured -- the exit list is shared, and on an unbounded member's
+    # positions the condition self-disarms for want of a persisted max_loss_per_contract, so
+    # dropping the rule would deny the measured members a stop to protect the ones that never
+    # had a denominator anyway.
+    members = _OPTION_GROUPS.get(kind, [kind])
+    if any(m not in _UNDEFINED_RISK_MEMBERS for m in members):
+        rules.append(
+            {"id": "opt_sl_ml", "action_type": "close_option", "toggle_optimize": True,
+             "conditions": {"type": "AND", "conditions": [
+                 {"id": "sl_ml", "field": "loss_pct_of_max_loss", "op": ">",
+                  "value": 50, "optimize": True,
+                  "value_min": 25, "value_max": 75, "value_step": 5}]}})
     return rules
 
 
