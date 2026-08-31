@@ -334,6 +334,22 @@ def get_event_type_documentation() -> dict:
             ),
             "type": "numeric",
             "example": "Roll/close the structure when days_to_expiry <= 21"
+        },
+        ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value: {
+            "name": "Loss as % of Max Loss (defined-risk stop)",
+            "description": (
+                "For open OPTION structures whose maximum loss was MEASURED at entry: the "
+                "current unrealized loss as a percentage of that defined max loss. Positive "
+                "while losing, +100 when the entire defined risk is gone, negative while "
+                "profitable. Scale-free: 50% always means half the defined risk, for any "
+                "contract count -- unlike a %-of-credit stop, which drifts with however much "
+                "credit was collected. The denominator is the max_loss_per_contract persisted "
+                "on the entry order at submit; structures with no measured max loss (e.g. a "
+                "short call) never persist one, so for them the condition is unevaluable and "
+                "does NOT fire in either direction -- absence is never read as a number."
+            ),
+            "type": "numeric",
+            "example": "Stop out once half the defined risk is gone: loss_pct_of_max_loss > 50"
         }
     }
 

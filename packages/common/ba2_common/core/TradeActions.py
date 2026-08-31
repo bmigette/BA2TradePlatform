@@ -24,7 +24,12 @@ from ba2_common.core.option_economics import (
 from ba2_common.core.option_entry_quote import (
     ENTRY_CROSS_NEUTRAL, entry_limit_with_concession, quote_concession,
 )
-from ba2_common.core.option_payoff import PayoffLeg
+from ba2_common.core.option_payoff import (
+    MEASURED as _PAYOFF_MEASURED,
+    PayoffLeg,
+    max_loss as _payoff_max_loss,
+    _numeric as _payoff_numeric,
+)
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selector import (
@@ -1871,6 +1876,86 @@ class DecreaseInstrumentShareAction(TradeAction):
         return f"Decrease {self.instrument_name} position to {self.target_percent}% of virtual equity"
 
 
+def _entry_payoff_legs(legs: List[OptionLeg], limit_price) -> Optional[List[PayoffLeg]]:
+    """``PayoffLeg``s equivalent to ONE contract of an entry order, or None when underivable.
+
+    Per-leg premiums are gone by the time the order is assembled -- builders price the
+    structure as ONE net limit -- but the payoff at expiry depends on the individual
+    premiums only through that net: every premium term in ``payoff_at`` is a
+    spot-independent cash flow. So the net is carried on ONE carrier leg (a BUY leg for a
+    net debit, a SELL leg for a net credit, divided by that leg's ratio) and every other
+    leg is priced at zero; the payoff CURVE -- and therefore ``max_loss`` -- is identical
+    to the true structure's.
+
+    Sign conventions are the submit path's own: a MULTI-leg limit is the signed net
+    (positive debit, negative credit -- the Alpaca MLEG convention every multi-leg
+    builder follows), while a SINGLE-leg limit is the positive premium with the
+    direction on the leg's side.
+
+    None -- no derivation, NEVER a guess -- when any leg is missing its right or strike,
+    the limit is not a finite number (or a negative single-leg premium, which the
+    convention cannot mean), or no leg points the way the net does. The caller stamps
+    nothing in that case; absence must never become a fabricated number downstream.
+    """
+    net = _payoff_numeric(limit_price)
+    if net is None or not legs:
+        return None
+    if len(legs) == 1:
+        if net < 0:
+            return None                     # single-leg limits are positive by convention
+        if legs[0].side == OrderDirection.SELL:
+            net = -net                      # a sold single leg is a credit
+    carrier = None
+    if net != 0.0:
+        want = OrderDirection.BUY if net > 0 else OrderDirection.SELL
+        for i, leg in enumerate(legs):
+            if leg.side == want:
+                carrier = i
+                break
+        if carrier is None:
+            return None                     # a net no leg's direction can express
+    out: List[PayoffLeg] = []
+    for i, leg in enumerate(legs):
+        strike = _payoff_numeric(leg.strike)
+        if leg.option_type not in (OptionRight.CALL, OptionRight.PUT) or strike is None:
+            return None                     # cannot price a leg with no right or strike
+        ratio = int(leg.ratio_qty or 1)
+        out.append(PayoffLeg(
+            kind="call" if leg.option_type == OptionRight.CALL else "put",
+            side=leg.side,
+            premium=(abs(net) / ratio) if i == carrier else 0.0,
+            strike=strike, ratio=ratio))
+    return out
+
+
+def _measured_max_loss_per_contract(legs: List[OptionLeg], limit_price) -> Optional[float]:
+    """Dollars ONE contract of this order can lose -- ONLY when that is a measurement.
+
+    ``option_payoff.max_loss`` is tri-state and only ``MEASURED`` yields a number.
+    UNBOUNDED (a short call with no cover among the order's own legs) and UNMEASURABLE
+    (an underivable leg set, a broken quote) both return None here and the submit path
+    stamps NOTHING: absence of ``data["max_loss_per_contract"]`` is the "contracts that
+    support it" gate for the ``loss_pct_of_max_loss`` exit condition, enforced by data
+    rather than by a runtime special case at evaluation time.
+
+    THE CORRECTED S6 RULE (2026-08-30): the predicate is the MEASURED payoff, never
+    "is this structure a naked short". A naked short PUT is bounded below -- strike
+    minus credit, at an underlying of zero -- so it IS measured and IS stamped; only
+    short calls (and short stock) are genuinely unbounded.
+
+    A covered call's stock cover lives OUTSIDE the order's legs, so its short call
+    reads UNBOUNDED here and stamps nothing. That errs toward absence -- the exit simply
+    cannot fire for it -- never toward a wrong denominator.
+    """
+    payoff_legs = _entry_payoff_legs(legs, limit_price)
+    if payoff_legs is None:
+        return None
+    result = _payoff_max_loss(payoff_legs)
+    if result.state != _PAYOFF_MEASURED:
+        return None
+    return result.amount
+
+
 # Factory function to create actions based on action type
 class _OptionEntryAction(TradeAction):
     """Shared base for option-entry actions (BuyCall / BullCallSpread / CoveredCall).
@@ -2453,6 +2538,14 @@ class _OptionEntryAction(TradeAction):
         limit_price = quoted
         if option_reserve is not None:
             data["option_reserve"] = option_reserve
+        # Design 2026-08-29 S8.2: persist the structure's measured max loss beside
+        # option_reserve so the loss_pct_of_max_loss exit can read it BACK -- no leg
+        # reconstruction, no OCC parsing at evaluation time. Stamped ONLY when MEASURED
+        # (absence is the "contracts that support it" gate); computed from the
+        # concession-adjusted limit because that is the order actually submitted.
+        max_loss_per_contract = _measured_max_loss_per_contract(legs, limit_price)
+        if max_loss_per_contract is not None:
+            data["max_loss_per_contract"] = max_loss_per_contract
         if not self.submit_to_broker:
             logger.info(f"_OptionEntryAction: submit disabled for {self.instrument_name} "
                         f"{option_strategy} - recording informational result")
@@ -2466,16 +2559,21 @@ class _OptionEntryAction(TradeAction):
             return self._result(False, f"Failed to submit {option_strategy} for {self.instrument_name}", data)
         order_id = getattr(order, "id", None)
         data["order_id"] = order_id
-        # Persist the short-premium reserve on the order so available BP reflects it.
-        if option_reserve is not None and order_id is not None:
+        # Persist the entry facts on the order row: the short-premium reserve (so
+        # available BP reflects it) and the measured max loss (so the
+        # loss_pct_of_max_loss exit can read its denominator back off the row).
+        entry_facts = {k: data[k] for k in ("option_reserve", "max_loss_per_contract")
+                       if k in data}
+        if entry_facts and order_id is not None:
             try:
                 stored = get_instance(TradingOrder, order_id)
                 if stored is not None:
-                    stored.data = {**(stored.data or {}), "option_reserve": option_reserve}
+                    stored.data = {**(stored.data or {}), **entry_facts}
                     update_instance(stored)
             except Exception as e:
                 absorb_if_benign(e, InstanceNotFound)
-                logger.error(f"Failed to persist option_reserve on order {order_id}: {e}", exc_info=True)
+                logger.error(f"Failed to persist entry facts {sorted(entry_facts)} on "
+                             f"order {order_id}: {e}", exc_info=True)
         return self._result(True, f"Submitted {option_strategy} for {self.instrument_name}", data)
 
     def _build_and_submit(self) -> Dict[str, Any]:

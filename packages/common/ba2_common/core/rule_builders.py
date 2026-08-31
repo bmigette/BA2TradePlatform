@@ -33,6 +33,10 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     # Exit (open_positions) numeric conditions.
     "profit_loss_percent": ExpertEventType.N_PROFIT_LOSS_PERCENT,
     "profit_loss_amount": ExpertEventType.N_PROFIT_LOSS_AMOUNT,
+    # Loss as a % of the persisted max_loss_per_contract (defined-risk stop, design
+    # 2026-08-29 S6/S8.2). UNEVALUABLE -- fires in neither direction -- when the submit
+    # path stamped no measured max loss on the parent order.
+    "loss_pct_of_max_loss": ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS,
     "days_opened": ExpertEventType.N_DAYS_OPENED,
     # Remaining option life (expiry - the evaluation date), the complement of days_opened.
     # MUST be listed here or the leaf is silently dropped by triggers_from_condition_tree

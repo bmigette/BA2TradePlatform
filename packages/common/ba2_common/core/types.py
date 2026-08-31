@@ -439,6 +439,14 @@ class ExpertEventType(str, Enum):
     # roll point) and it is the only exit criterion a 0DTE structure can have. Negative past
     # expiry; UNEVALUABLE (never 0, never infinity) when the expiry cannot be determined.
     N_DAYS_TO_EXPIRY = "days_to_expiry"
+    # Unrealized LOSS as a % of the structure's own DEFINED maximum loss (positive while
+    # losing, +100 when the whole defined risk is gone). The denominator is the
+    # max_loss_per_contract the submit path persisted on the parent order's data (design
+    # 2026-08-29 S8.2) times the contract count -- read back, never reconstructed from legs.
+    # Scale-free where a %-of-credit stop drifts with however much credit a trial collected.
+    # Structures whose max loss was not MEASURED at submit (short calls) have no persisted
+    # value, and the condition is then UNEVALUABLE: it never fires in either direction.
+    N_LOSS_PCT_OF_MAX_LOSS = "loss_pct_of_max_loss"
 
 
 class ExpertActionType(str, Enum):
@@ -563,7 +571,8 @@ def get_numeric_event_values():
         ExpertEventType.N_RELATIVE_VOLUME.value,
         ExpertEventType.N_IV_TO_REALIZED_VOL.value,
         ExpertEventType.N_DAYS_TO_EARNINGS.value,
-        ExpertEventType.N_DAYS_TO_EXPIRY.value
+        ExpertEventType.N_DAYS_TO_EXPIRY.value,
+        ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value
     ]
 
 

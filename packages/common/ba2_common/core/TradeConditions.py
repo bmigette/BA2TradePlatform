@@ -1835,6 +1835,93 @@ class ProfitLossPercentCondition(CompareCondition):
             return None
         return f"{self.calculated_value:.2f}%"
 
+
+class LossPctOfMaxLossCondition(CompareCondition):
+    """Unrealized LOSS as a percentage of the position's persisted DEFINED maximum loss.
+
+    value = -pnl_amount / (max_loss_per_contract x contracts) x 100 -- POSITIVE while
+    losing, +100 when the whole defined risk is gone, NEGATIVE while profitable (so a
+    ``>`` stop can never fire on a winner). Scale-free by construction: the denominator
+    carries the same contract count the P&L already does, so 1 contract and 5 read the
+    same percentage -- the property a %-of-credit stop (``opt_sl``) does not have.
+
+    THE DENOMINATOR IS READ BACK, NEVER RECONSTRUCTED. ``TradeActions._submit_option_order``
+    persisted ``max_loss_per_contract`` onto the parent order's ``data`` beside
+    ``option_reserve`` (design 2026-08-29 S8.2), and ONLY when ``option_payoff.max_loss``
+    returned MEASURED. A structure with no measured max loss (a short call; a broken
+    quote) has NO key, which is "contracts that support it" enforced by the data: this
+    condition then refuses to evaluate rather than special-casing structure shapes here.
+
+    UNKNOWN NEVER FIRES -- the ``DaysToExpiryCondition`` discipline. An absent key, a
+    zero/negative/stringly-typed/NaN persisted value, an unknowable contract count, or a
+    P&L that cannot be resolved each leave ``calculated_value`` None and ``evaluate()``
+    False for EVERY operator. The two defaults specifically refused:
+
+    * absence read as some number -> a stop fires on a position whose risk was never
+      measured (the worst available failure: it closes positions on sight);
+    * unevaluable read as 0 % -> any ``<`` gate fires for every position we merely
+      failed to price, while looking configured.
+    """
+
+    def _defined_risk_dollars(self) -> Optional[float]:
+        """``max_loss_per_contract x contracts`` in dollars, or None -- no measurement.
+
+        The number-or-None reading reuses ``option_payoff._numeric``, the module rule for
+        "is this a usable quantity" (rejects bool, str, NaN, infinity) -- the persisted
+        value must never be *parsed* into firing, only read.
+        """
+        from ba2_common.core.option_payoff import _numeric
+
+        order = self.existing_order
+        data = getattr(order, "data", None)
+        per_contract = _numeric((data or {}).get("max_loss_per_contract"))
+        if per_contract is None or per_contract <= 0:
+            return None
+        contracts = _numeric(getattr(order, "filled_qty", None))
+        if contracts is None or contracts == 0:
+            contracts = _numeric(getattr(order, "quantity", None))
+        if contracts is None or contracts == 0:
+            return None
+        return per_contract * abs(contracts)
+
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                self.calculated_value = None
+                return False
+
+            # Denominator FIRST: it is a pure row read, while the P&L fetches option
+            # quotes -- and a structure that never persisted a max loss should cost
+            # nothing per bar.
+            denominator = self._defined_risk_dollars()
+            if denominator is None:
+                self.calculated_value = None
+                return False
+
+            pnl = _get_pnl_for_condition(self)
+            if pnl is None:
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = -pnl['amount'] / denominator * 100.0
+            return self.operator_func(self.calculated_value, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating loss_pct_of_max_loss condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if unrealized loss for {self.instrument_name} is "
+                f"{self.operator_str} {self.value}% of the structure's max loss")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.2f}% of max loss"
+
+
 # Confidence Condition Implementation
 class ConfidenceCondition(CompareCondition):
     """Compare expert confidence value."""
@@ -3275,6 +3362,7 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_NEW_TARGET_PERCENT: NewTargetPercentCondition,
     ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
     ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
+    ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS: LossPctOfMaxLossCondition,
     ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
     ExpertEventType.N_DAYS_SINCE_LAST_CLOSE: DaysSinceLastCloseCondition,
     ExpertEventType.N_DAYS_SINCE_LAST_PROFITABLE_CLOSE: DaysSinceLastProfitableCloseCondition,
