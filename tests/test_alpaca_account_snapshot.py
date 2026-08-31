@@ -123,15 +123,92 @@ def test_snapshot_on_auth_failure_is_all_unknown_not_all_zero():
 
 
 def test_snapshot_still_returns_the_money_when_account_configurations_fails():
-    """A failing capability probe must not lose the balances we did get."""
+    """A failing capability probe must not lose the balances we did get. Both the typed
+    SDK call AND the raw fallback fail here -- see the raw-fallback tests below for the
+    case where the raw read recovers what the typed call couldn't."""
     acct = _bare_account()
     acct.client.get_account.return_value = _trade_account()
     acct.client.get_account_configurations.side_effect = Exception("500 server error")
+    acct.client.get.side_effect = Exception("500 server error")
 
     snap = acct.get_account_snapshot()
 
     assert snap.buying_power == 50000.00
     assert snap.supports_fractional is False
+
+
+# ---------------------------------------------------------------------------
+# Raw fallback when the SDK's typed AccountConfiguration parse fails.
+#
+# alpaca.trading.models.AccountConfiguration requires dtbp_check/pdt_check with no
+# default -- observed live (2026-08-31) failing across all 3 dev accounts simultaneously
+# with "2 validation errors for AccountConfiguration: dtbp_check / pdt_check Field
+# required", even though the raw JSON response DOES carry fractional_trading (the only
+# field this snapshot actually needs). The typed call is tried first because it is the
+# supported, documented path; the raw GET to the same endpoint is only a fallback for
+# when Alpaca's response omits fields the SDK's model demands but this snapshot doesn't.
+# ---------------------------------------------------------------------------
+def test_snapshot_recovers_fractional_via_raw_fallback_when_the_typed_parse_fails():
+    acct = _bare_account()
+    acct.client.get_account.return_value = _trade_account()
+    acct.client.get_account_configurations.side_effect = Exception(
+        "2 validation errors for AccountConfiguration\ndtbp_check\n  Field required")
+    acct.client.get.return_value = {
+        "dtbp_check": None, "pdt_check": None,  # what's actually missing/malformed
+        "fractional_trading": True, "trade_confirm_email": "all",
+    }
+
+    snap = acct.get_account_snapshot()
+
+    assert snap.supports_fractional is True
+    assert snap.buying_power == 50000.00
+    acct.client.get.assert_called_once_with("/account/configurations")
+
+
+def test_snapshot_raw_fallback_reports_false_for_a_genuinely_non_fractional_account():
+    acct = _bare_account()
+    acct.client.get_account.return_value = _trade_account()
+    acct.client.get_account_configurations.side_effect = Exception("validation error")
+    acct.client.get.return_value = {"fractional_trading": False}
+
+    assert acct.get_account_snapshot().supports_fractional is False
+
+
+def test_snapshot_raw_fallback_that_also_fails_still_reports_the_money():
+    """Both reads failing (not just the typed one) must land exactly where the old
+    single-path failure did: supports_fractional=False, balances intact."""
+    acct = _bare_account()
+    acct.client.get_account.return_value = _trade_account()
+    acct.client.get_account_configurations.side_effect = Exception("500 server error")
+    acct.client.get.side_effect = Exception("500 server error")
+
+    snap = acct.get_account_snapshot()
+
+    assert snap.supports_fractional is False
+    assert snap.buying_power == 50000.00
+
+
+def test_snapshot_raw_fallback_with_no_fractional_key_at_all_reports_false():
+    """A raw response missing fractional_trading entirely (not just malformed) is the
+    same as not having an answer -- False, not a KeyError."""
+    acct = _bare_account()
+    acct.client.get_account.return_value = _trade_account()
+    acct.client.get_account_configurations.side_effect = Exception("validation error")
+    acct.client.get.return_value = {"trade_confirm_email": "all"}
+
+    assert acct.get_account_snapshot().supports_fractional is False
+
+
+def test_snapshot_does_not_try_the_raw_fallback_when_the_typed_call_succeeds():
+    """The raw GET is a fallback, not a second opinion -- it must not fire on the
+    happy path."""
+    acct = _bare_account()
+    acct.client.get_account.return_value = _trade_account()
+    acct.client.get_account_configurations.return_value = MagicMock(fractional_trading=True)
+
+    acct.get_account_snapshot()
+
+    acct.client.get.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
