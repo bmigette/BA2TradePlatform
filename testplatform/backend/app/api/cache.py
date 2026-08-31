@@ -97,8 +97,10 @@ def option_symbols(
 def option_dates(symbol: str = Query(..., min_length=1)):
     """The as-of dates that actually hold rows for this symbol, per store.
 
-    The picker is populated from this. The legacy chain table holds three snapshot dates
-    in the entire file, so a free calendar over it would miss on almost every click.
+    The picker is populated from this. The legacy chain table holds a SINGLE snapshot date
+    in the entire file (2024-02-01) — this docstring used to say three — so a free calendar
+    over it would miss on all but one click. See
+    ``ba2_common.core.option_selector._publishes_spread``, the one re-verified record.
     """
     return ocr.available_dates(symbol)
 

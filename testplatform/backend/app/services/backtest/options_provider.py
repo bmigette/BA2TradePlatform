@@ -426,10 +426,17 @@ class HistoricalOptionsProvider:
             #
             # Why not stamp the row with its inversion date and refuse it when that date is
             # after `as_of`? That needs a new option_chain column, and no existing cache has
-            # one (the shared 10.9 GB file predates even the iv/delta columns), so every row
-            # would read "provenance unknown" and be refused anyway -- the same behaviour as
-            # this, plus a migration and a second thing to keep correct. The provenance is
-            # not recoverable retrospectively; absent is the honest reading.
+            # one, so every row would read "provenance unknown" and be refused anyway -- the
+            # same behaviour as this, plus a migration and a second thing to keep correct.
+            # The provenance is not recoverable retrospectively; absent is the honest reading.
+            #
+            # THE MISSING COLUMN IS THE INVERSION DATE, NOT THE GREEKS. This note used to say
+            # "the shared 10.9 GB file predates even the iv/delta columns", which is wrong on
+            # both counts: the file is 4.12 GB, and `option_chain` and `option_bar` both
+            # DECLARE and POPULATE iv/delta (46.0% and 88.2% of rows respectively -- see
+            # `option_selector._publishes_spread`, the one re-verified record). The greeks
+            # being present is exactly why the clamp above has anything to clamp; what no
+            # schema records is WHEN each one was inverted.
             #
             # Fails CLOSED, which the stack already copes with: this returns None when no
             # in-window call has a usable clamped iv+delta, and IVRankCondition treats an

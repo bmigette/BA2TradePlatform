@@ -165,6 +165,10 @@ delta differs across as-of dates.
 Measured: cold chain load 56-273 ms/underlying, warm 0.5-1.5 ms (~60-100x). GOOG @2023-01-17
 returns 180 contracts over 6 expiries, monotone delta, put/call parity on iv, and REAL
 open_interest — the field the sqlite store has NULL on all 6,757,055 of its chain rows.
+<sup>[superseded 2026-08-31: the conclusion holds — `open_interest` is NULL on **every** sqlite
+chain row, and it is the *only* genuinely dead field there — but the row count is wrong. The
+store has 1,440,782 chain rows, not 6,757,055. See
+`ba2_common.core.option_selector._publishes_spread` for the re-verified record.]</sup>
 
 ### Structure sweep — 19 kinds, 9 symbols, 2023-01-10..2023-03-28, $100k, gates-off
 **0 errors, 16 of 19 traded.** Wall 0.3-1.6 s per backtest.

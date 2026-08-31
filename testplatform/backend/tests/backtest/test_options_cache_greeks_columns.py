@@ -1,7 +1,7 @@
 """OptionsHistoryCache must ADD the greeks columns to a pre-greeks cache file.
 
-The shipped 10 GB cache on this machine has an ``option_bar`` table whose on-disk DDL
-predates the greeks feature:
+The shared cache on this machine ONCE had an ``option_bar`` table whose on-disk DDL
+predated the greeks feature:
 
     (occ_symbol, date, open, high, low, close, volume, underlying, option_type, strike, expiry)
 
@@ -11,9 +11,18 @@ unchanged and the first ``write_bar_rows`` died with
 
     OperationalError: table option_bar has no column named iv
 
-That is what blocked re-fetching the cache with computed IV — and with no IV in the
-cache, ``get_atm_iv`` returns None for every symbol and date, so the backtest's IV rank
-can never be anything but None no matter how correct the rank code is.
+That is what blocked re-fetching the cache with computed IV, and while it was blocked
+``get_atm_iv`` returned None for every symbol and date, so the backtest's IV rank could
+never be anything but None no matter how correct the rank code was.
+
+THAT MIGRATION HAS SINCE RUN, and the sentence above is history, not a description of the
+store: the shared file (4.12 GB, not 10) now carries iv and the four greeks on 17,185,281
+of 19,484,995 ``option_bar`` rows (88.2%) and 663,111 of 1,440,782 ``option_chain`` rows
+(46.0%) — see ``ba2_common.core.option_selector._publishes_spread``, the one re-verified
+record. The test below stays load-bearing regardless: it runs against its own
+``_OLD_BAR_DDL`` fixture, and what it pins is that the constructor MIGRATES a pre-greeks
+file rather than dying on it. Any cache built before the feature still needs that, and a
+regression would be silent until the next write.
 """
 from __future__ import annotations
 

@@ -11,8 +11,10 @@ tests pin the *absence* as hard as the presence:
     NULL must render as "n/a" with a reason, never as ``0.00``;
   * greeks are computable only where an IV *and* a spot exist, and a computed greek is
     model output, not exchange data — it must say so;
-  * the as-of picker may only offer dates that exist (the legacy chain table holds three
-    snapshot dates in total), and asking for one with no data must say which do.
+  * the as-of picker may only offer dates that exist — the real chain table holds ONE
+    snapshot date in total (2024-02-01; see
+    ``ba2_common.core.option_selector._publishes_spread``, the one re-verified record; this
+    header used to say three) — and asking for one with no data must say which do.
 
 Everything here runs against fixtures. Nothing in the viewer may write to any cache.
 """
@@ -26,10 +28,14 @@ from datetime import date
 import pytest
 from fastapi.testclient import TestClient
 
-# The legacy cache file's REAL schema, dumped read-only from the 10.9 GB
-# ~/Documents/ba2/common/cache/options/options_history.sqlite on 2026-08-25.
-# Note what option_bar does NOT have: iv/delta/gamma/theta/vega. That file predates
-# options_cache._GREEK_COLS, so the viewer must introspect columns, never assume them.
+# A PRE-GREEKS schema shape, kept ON PURPOSE and NOT a picture of today's file. Note what
+# this option_bar does NOT have: iv/delta/gamma/theta/vega. A cache written before
+# options_cache._GREEK_COLS keeps that layout (CREATE TABLE IF NOT EXISTS is a no-op on an
+# existing table), so the viewer must INTROSPECT columns and never assume them — which is the
+# only thing this fixture exists to prove.
+# The real ~/Documents/ba2/common/cache/options/options_history.sqlite is NOT like this: it is
+# 4.12 GB (not 10.9), its option_bar declares all five and populates them on 88.2% of rows, and
+# its option_chain populates them on 46.0%. See option_selector._publishes_spread.
 _LEGACY_CHAIN_DDL = """CREATE TABLE option_chain(
   underlying TEXT, as_of TEXT, occ_symbol TEXT, option_type TEXT, strike REAL, expiry TEXT,
   bid REAL, ask REAL, last REAL, iv REAL, delta REAL, gamma REAL, theta REAL, vega REAL,
@@ -38,7 +44,12 @@ _LEGACY_BAR_DDL = """CREATE TABLE option_bar(
   occ_symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL,
   underlying TEXT, option_type TEXT, strike REAL, expiry TEXT, PRIMARY KEY(occ_symbol, date))"""
 
-AS_OF = "2026-06-09"          # a real snapshot date in the legacy cache. Never "today".
+# FIXTURE DATES, not cache dates — every test seeds them itself via _seed_legacy, so nothing
+# here depends on either existing in the real file. (This comment used to call AS_OF "a real
+# snapshot date in the legacy cache"; it is not one. The real file's ONLY snapshot is
+# 2024-02-01 — OTHER_AS_OF, which is real by coincidence, not by design.) What matters is that
+# both are FIXED: a viewer that quietly answered for "today" would pass on any date.
+AS_OF = "2026-06-09"          # Never "today".
 OTHER_AS_OF = "2024-02-01"    # ditto
 NEXT_DAY = "2026-06-10"       # a bar date that is NOT a chain snapshot date
 EXPIRY_NEAR = "2026-06-19"    # 10 DTE from AS_OF
@@ -51,7 +62,8 @@ def _occ(sym: str, expiry: str, right: str, strike: float) -> str:
 
 
 def _seed_legacy(path: str) -> None:
-    """A miniature of the real file: quotes with bid==ask==last, every greek NULL."""
+    """The real file's QUOTE shape (bid==ask==last) on the PRE-GREEKS schema above. The
+    all-NULL greeks are the fixture's doing, not the store's — see the DDL note."""
     cx = sqlite3.connect(path)
     cx.execute(_LEGACY_CHAIN_DDL)
     cx.execute(_LEGACY_BAR_DDL)
@@ -740,7 +752,7 @@ def test_the_connection_itself_is_read_only(legacy_only):
 def test_reader_does_not_use_the_writing_cache_class(legacy_only):
     """OptionsHistoryCache.__init__ runs CREATE TABLE / ALTER TABLE / CREATE INDEX on the
     file it is handed. Importing it here would put a write path one typo away from the
-    10.9 GB production cache."""
+    4.12 GB production cache."""
     import inspect
 
     from app.services import option_cache_reader

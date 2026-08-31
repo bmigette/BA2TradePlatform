@@ -2458,32 +2458,39 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    A run still cannot span two vendors: one reader is built, and
 #    `backtest_options_provider()` answers for that one.
 #
-#    Do NOT instead lower the Alpaca number: measured on the shared 10.9 GB cache (2026-08-26)
-#    it holds 0 bars before 2024-01-18, its earliest bar is 2024-02-01, and its only three
-#    chain snapshots are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it, and a
-#    floor that lies produces a backtest that trades on nothing and reports it as a result —
-#    strictly worse than this refusal.
+#    Do NOT instead lower the Alpaca number: the sqlite cache holds 0 bars before 2024-01-18,
+#    its earliest bar is 2024-02-01, and it carries a SINGLE chain snapshot (2024-02-01) — not
+#    the three this note used to name, and the file is 4.12 GB, not 10.9. Cite
+#    `option_selector._publishes_spread` for the store's measured shape; it is the one
+#    re-verified record and every other count in this file defers to it. What matters here is
+#    unchanged: there is no 2023 in it, and a floor that lies produces a backtest that trades
+#    on nothing and reports it as a result — strictly worse than this refusal.
 #
 #    (Noted in passing: even Alpaca's 2024-01-18 is ~2 weeks optimistic against that store,
-#    whose first chain snapshot is 2024-02-01. A vendor floor bounds what COULD have been
+#    whose only chain snapshot is 2024-02-01. A vendor floor bounds what COULD have been
 #    fetched, not what was.)
 #
-# 2. THE GREEKS ARE NOT IN THE CACHE YET.  ** WASTES THE RUN **
+# 2. THE GREEKS ARE IN BOTH STORES.  ** WITHDRAWN — this was a ** WASTES THE RUN ** banner
+#    standing on a measurement that was never true of the file it named. **
 #    `iv_rank` and `iv_to_realized_vol` became live genes on 2026-08-26 (OPT-C1, OPT-C3). Both
-#    fail CLOSED when implied volatility cannot be measured, which is correct — but the current
-#    option cache carries no greeks at all, so `get_atm_iv` returns None on every bar. With each
-#    gate independently enabled at p=0.5, roughly 75% of every generation will score the
-#    zero-trade sentinel, and a plain (non-optimize) option backtest will trade nothing at all.
-#    The search recovers once the data lands; until then the run is mostly burning CPU on
-#    -1e9. TastyTrade collection was in progress on another machine — confirm it finished,
-#    AND that the run actually reads it (see precondition 1: the parquet store is readable
-#    now, but only when `options_store: "parquet"` is selected; the sqlite default still has
-#    no greeks). On the parquet store `get_atm_iv` DOES return a number — the greeks are
-#    Black-Scholes-inverted per bar at read time (`option_greeks.compute_iv_and_greeks`,
-#    the same function that filled the sqlite store's) rather than baked in at build time.
-#    Sharper since 2026-08-26: `_compute_atm_iv` no longer falls back to the frozen
-#    chain-snapshot row, so where a stale row used to supply a number it now honestly supplies
-#    None. That removes a lookahead, and it also removes the last thing masking this gap.
+#    fail CLOSED when implied volatility cannot be measured, and this note used to say that was
+#    the normal case: "the current option cache carries no greeks at all, so `get_atm_iv`
+#    returns None on every bar", therefore ~75% of every generation scores the zero-trade
+#    sentinel. THAT PREMISE IS FALSE. On the sqlite store `option_bar` carries iv and the four
+#    greeks on 17,185,281 of 19,484,995 rows (88.2%, all 101 underlyings), and
+#    `option_chain` on 663,111 of 1,440,782 (46.0%, 98 of 101) — see
+#    `option_selector._publishes_spread`, the single re-verified record. `_compute_atm_iv`
+#    reads the BAR, so `get_atm_iv` returns a number on the overwhelming majority of them.
+#    On the parquet store it returns a number too, by a different route: the greeks are
+#    Black-Scholes-inverted per bar at read time (`option_greeks.compute_iv_and_greeks`, the
+#    same function that filled the sqlite store's) rather than baked in at build time.
+#    THE OPERATOR ACTION IS THEREFORE NIL — neither store needs waiting on, and no store
+#    choice can be justified by "the other one has no greeks". Pick the store on the WINDOW
+#    it can serve (precondition 1), which is the only axis that actually separates them.
+#    Still true, and the part worth keeping: `_compute_atm_iv` no longer falls back to the
+#    frozen chain-snapshot row (2026-08-26), so a contract with no bar on or before the clock
+#    honestly supplies None instead of an IV inverted from a future price. That removes a
+#    lookahead. It removes no data that the bars did not already carry.
 #
 #    RELATED, AND IT WILL BITE THE LONG TERMS SPECIFICALLY: `fetch_options._EXPIRY_TAIL_DAYS`
 #    is 60, so the cache only holds contracts expiring within 60 days of the run's END date.
@@ -2960,23 +2967,49 @@ def _apply_option_entry_cross_gene(cfg: dict) -> dict:
 # because applicability is a property of the store, not of the gene.
 #
 # MEASURED ON PARQUET — the store an option job actually reads (see w_spread below for why
-# sqlite is unreachable here). 20 random underlyings, one chain each (one ``bar_date`` of one
-# expiry partition), 2026-08-31:
-#   * ``w_iv``   — vendor ``iv`` takes >1 distinct value in 19/20 chains (the miss is a
-#                  2-row chain whose iv is NULL on both). LIVE.
-#                  NB the selector ranks on the INVERTED iv the reader derives per bar, not
-#                  on this column; the vendor column is the dispersion proxy, and a derived
-#                  iv cannot be constant where the closes it is inverted from are not.
-#   * ``w_rvol`` — ``volume`` takes >1 distinct value in 20/20 chains. LIVE.
-#   * ``w_premium`` — ranks on ``close``, >1 distinct value in every chain sampled (85 of 150
-#                  rows distinct in the AAPL partition inspected). LIVE, and it is the one
-#                  weight whose column cannot degenerate without the bars themselves being
-#                  constant.
+# sqlite is unreachable here).
+#
+# METHOD, so the next reader can reproduce it rather than trust it. ``random.Random(7)``;
+# N=200 draws; each draw picks an underlying uniformly from the 857 in
+# ``CACHE_FOLDER/TastyTradeOptionsProvider``, then an ``exp=`` partition uniformly within it,
+# then a ``bar_date`` uniformly within that partition — one CHAIN being one bar_date of one
+# expiry partition, the same unit the selector scores. A column is LIVE for a chain when it
+# takes >1 distinct NON-NULL value there. Measured 2026-08-31.
+#
+# READ THE >=3-ROW LINE, NOT THE HEADLINE. 36 of the 200 chains hold 1 or 2 rows, and a
+# 1-row chain is degenerate on EVERY column by arithmetic — including ``close``, which
+# cannot degenerate for any real reason. Those chains are not evidence about a column; they
+# are chains the ranking has nothing to rank. The restricted figure is the one that speaks
+# to whether a weight can discriminate:
+#                                       all N=200        >=3 rows (n=164)
+#   * ``w_iv``       vendor ``iv``        167/200            157/164   LIVE
+#   * ``w_rvol``     ``volume``           182/200            164/164   LIVE
+#   * ``w_premium``  ``close``            183/200            164/164   LIVE
+#   versus ``spread_pct``, degenerate on 200/200 and 164/164 BY CONSTRUCTION (the reader
+#   synthesises bid = ask = close; see w_spread below). That contrast is the point: the
+#   three emitted weights fail to discriminate only where NOTHING could, and the withheld
+#   one fails everywhere.
+#
+# IT REPRODUCES, which the figure it replaces did not. Reran at seeds 1/3/7/11/42, N=200:
+# on the >=3-row subset iv 147-157 of 154-164 (95-96%), volume 151-164 (98-100%), close
+# 154-164 (100% at every seed). The previous note recorded a single un-seeded draw of 20 as
+# a per-STORE property ("iv 19/20, volume 20/20"); re-drawing moved those numbers by up to 7
+# of 20, so the sample was reporting its own draw. An un-seeded n=20 statistic used to
+# justify keeping three GA genes is the same defect this whole line of work exists to remove.
+#
+# NB on ``w_iv``: the selector ranks on the INVERTED iv the reader derives per bar, not on
+# this vendor column; the vendor column is the dispersion PROXY, and a derived iv cannot be
+# constant where the closes it is inverted from are not (``close``: 100% live at >=3 rows).
+# NB on ``w_premium``: it is the one weight whose column cannot degenerate without the bars
+# themselves being constant, which is what the 164/164 says.
 # ON SQLITE (recorded only so the two stores are not conflated — no option job can run there)
 # ``w_rvol`` is NOT safe: ``option_chain.volume`` is 100% NULL, and what the selector sees is
 # ``option_bar.volume``, so a chain whose contracts have no bar that day collapses to a
-# constant 0. Reported dead in 14/20 chains by the Task 7/10 review; not re-measured here,
-# because the store is unreachable for this grid and the number changes nothing.
+# constant 0. Reported dead in 14/20 chains by the Task 7/10 review — an un-seeded n=20 of
+# the kind replaced above, so read it as "often" and not as a rate. Not re-measured, because
+# the store is unreachable for this grid and no number would change the conclusion: the
+# mechanism (chain volume 100% NULL, bar volume absent for an untraded contract) is a schema
+# fact, not a sampling one.
 _OPTION_SELECTION_WEIGHT_BANDS = {
     #  weight: (min, max, step)
     "w_premium": (-2.0, 2.0, 0.5),   # SIGNED — the Task 7 sign fix, see above
@@ -3333,6 +3366,15 @@ _IV_RANK_STEP = 5.0
 
 def _iv_rank_gate(m: str, member: str) -> dict:
     """The iv_rank entry gate leaf for member prefix ``m`` (see above)."""
+    # SCOPE NOTE, LATENT AND DELIBERATELY NOT FIXED (2026-08-31). This bare boolean index is
+    # the same fail-open shape ``_apply_option_selection_weight_genes`` refuses by raising:
+    # a member in NEITHER half indexes False and silently takes the CREDIT thesis ("sell vol
+    # when it is expensive"), which is backwards for a long-premium structure such as O_PP.
+    # It is unreachable today — the debit/credit partition over ``_OPTION_STRATS`` is asserted
+    # total at import, and O_CC/O_PP are overlays outside ``_OPTION_STRATS`` that build via
+    # their own equity-entry builders and never reach ``_option_entry_rule`` — so this stays a
+    # note rather than a behaviour change: closing it belongs with whatever relaxes the
+    # partition, not with a docs pass. ``_iv_rv_gate`` carries the identical shape.
     spec = _IV_RANK_GATE[member in _DEBIT_OPTION_MEMBERS]
     return {"id": f"{m}-iv_rank", "field": "iv_rank", "op": spec["op"],
             "value": spec["value"], "optimize": True,
@@ -3389,6 +3431,9 @@ def _relative_volume_gate() -> dict:
 
 def _iv_rv_gate(m: str, member: str) -> dict:
     """The IV/realised-vol entry gate leaf for member prefix ``m``."""
+    # Same latent fail-open as ``_iv_rank_gate`` — an unclassified member indexes False and
+    # takes the credit thesis. See that function's SCOPE NOTE; unreachable for the same
+    # reason, and left unchanged for the same reason.
     spec = _IV_RV_GATE[member in _DEBIT_OPTION_MEMBERS]
     return {"id": f"{m}-iv_rv", "field": "iv_to_realized_vol", "op": spec["op"],
             "value": spec["value"], "optimize": True, "toggle_optimize": True,

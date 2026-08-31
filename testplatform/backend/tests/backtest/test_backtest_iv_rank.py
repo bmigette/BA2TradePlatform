@@ -153,11 +153,20 @@ def test_min_samples_is_enforced_and_none_means_unknown(make_account):
 
 
 def test_a_dataless_cache_yields_none_not_zero(make_account):
-    """TODAY'S REALITY on the shipped 10 GB cache: option_chain.iv is NULL on all
-    6.7M rows and option_bar has no iv column at all, so get_atm_iv returns None for
-    every symbol and date. The rank must therefore be None — which keeps
-    IVRankCondition failing closed — and must NOT be 0.0, which would open every
-    "IV is low" gate on a cache that simply has no IV in it."""
+    """A provider that returns no IV must produce "no rank", not "the cheapest IV of the
+    year". None keeps IVRankCondition failing closed; 0.0 would open every "IV is low"
+    gate on a sample that contains no IV at all.
+
+    THE PREMISE IS THE PROVIDER, NOT THE CACHE. This docstring used to justify itself as
+    "TODAY'S REALITY on the shipped 10 GB cache: option_chain.iv is NULL on all 6.7M rows
+    and option_bar has no iv column at all". All three of those are false — the file is
+    4.12 GB, option_chain.iv is populated on 663,111 of 1,440,782 rows (46.0%) and
+    option_bar DOES declare iv, populated on 17,185,281 of 19,484,995 (88.2%); see
+    ``ba2_common.core.option_selector._publishes_spread``, the one re-verified record.
+    Nothing in this test ever touched that cache: the sample here is ``_StubProvider({})``,
+    and the invariant it pins (empty sample -> None, never 0.0) is exactly as load-bearing
+    when the real store is full as when it is empty — arguably more so, since a partially
+    populated store hits this path per-symbol rather than never."""
     acct = make_account(_StubProvider({}))
     assert acct.get_iv_rank("AAPL", min_samples=5) is None
 

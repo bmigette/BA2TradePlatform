@@ -70,12 +70,15 @@ def backtest_options_provider(config: Optional[Dict[str, Any]] = None) -> str:
     ``BACKTEST_OPTIONS_STORE``, default ``sqlite``) is the ONLY input here — there is still no
     knob that moves the vendor independently of the store being read.
 
-    Corroborated on the shared sqlite cache (measured 2026-08-26,
-    ``~/Documents/ba2/common/cache/options/options_history.sqlite``): 0 bars dated before
-    2024-01-18, earliest bar 2024-02-01, and the only three chain snapshots in the whole file
-    are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it. The parquet tree
-    measured 2026-08-28 holds 686 underlyings / 9,587 partitions over 2023-01-03..2023-03-31,
-    i.e. exactly the window the sqlite cannot serve.
+    Corroborated on the shared sqlite cache
+    (``~/Documents/ba2/common/cache/options/options_history.sqlite``): 0 bars dated before
+    2024-01-18, earliest bar 2024-02-01, and a SINGLE chain snapshot in the whole file —
+    2024-02-01. (This docstring previously named three, 2024-02-01 / 2026-03-23 / 2026-06-09;
+    that count was wrong. The store's measured shape is recorded once, in
+    ``ba2_common.core.option_selector._publishes_spread`` — cite that, do not re-derive it.)
+    Either way there is no 2023 in it. The parquet tree measured 2026-08-28 holds 686
+    underlyings / 9,587 partitions over 2023-01-03..2023-03-31, i.e. exactly the window the
+    sqlite cannot serve.
     """
     from app.services.backtest.options_store import STORE_VENDOR, resolve_options_store
 

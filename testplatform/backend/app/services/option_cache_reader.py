@@ -1,7 +1,7 @@
 """READ-ONLY reader behind the option-cache chain viewer.
 
 Purpose: when a backtest produces no trades the first question is always "was the data
-even there?", and until now the only way to answer it was to write SQL against a 10.9 GB
+even there?", and until now the only way to answer it was to write SQL against a 4.12 GB
 sqlite. This module answers it, laid out the way a broker shows a chain.
 
 THREE STORES, NOT ONE. They differ in what they can honestly say, so they are surfaced
@@ -147,7 +147,7 @@ def open_legacy_readonly(path: str):
 
     ``mode=ro`` makes any INSERT/CREATE/ALTER raise; ``immutable=1`` additionally stops
     sqlite touching the file at all (no -wal/-shm sidecars, no locking) — which matters
-    because this file is 10.9 GB of irreplaceable download.
+    because this file is 4.12 GB of irreplaceable download.
     """
     uri = "file:" + urllib.parse.quote(path) + "?mode=ro&immutable=1"
     cx = sqlite3.connect(uri, uri=True)
@@ -161,7 +161,7 @@ def open_legacy_readonly(path: str):
 def _legacy_db_path() -> str:
     # Imported at CALL time, never bound at import: tests rebind the attribute on
     # ba2_common.config, and an import-time capture would send every read at the real
-    # 10.9 GB file.
+    # 4.12 GB file.
     import ba2_common.config as cfg
     return cfg.OPTIONS_CACHE_DB
 

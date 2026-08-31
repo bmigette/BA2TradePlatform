@@ -25,11 +25,17 @@ _BAR_COLS = ["occ_symbol","date","open","high","low","close","volume","underlyin
 # Columns added AFTER the tables first shipped. CREATE TABLE IF NOT EXISTS is a no-op on
 # an existing table, so a cache file built before the greeks feature keeps the old layout
 # and the first write_bar_rows dies with "table option_bar has no column named iv" --
-# which is what blocked re-fetching the 10 GB cache WITH computed IV, which in turn is
-# why get_atm_iv (and therefore the backtest's IV rank) returns None for everything.
+# which is what once blocked re-fetching the shared cache WITH computed IV.
 # ALTER ... ADD COLUMN is cheap in sqlite (a header rewrite, not a table copy) and leaves
 # existing rows with NULL in the new columns -- honest: those greeks were never fetched,
 # and every reader already treats a NULL iv/delta as unusable.
+#
+# THAT MIGRATION HAS RUN, so do not read the paragraph above as a description of the store.
+# This note used to end "which in turn is why get_atm_iv (and therefore the backtest's IV
+# rank) returns None for everything" -- no longer true, and it outlived its own fix. The
+# shared cache now carries iv and the four greeks on 88.2% of option_bar rows and 46.0% of
+# option_chain rows; get_atm_iv reads the BAR and returns a number on the great majority of
+# them. See ba2_common.core.option_selector._publishes_spread, the one re-verified record.
 _GREEK_COLS = ("iv", "delta", "gamma", "theta", "vega")
 
 
