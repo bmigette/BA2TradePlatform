@@ -118,6 +118,11 @@ class JobMonitoringTab:
         self.smart_risk_total_records = 0
         self.smart_risk_status_filter = 'all'  # Filter by status (RUNNING, COMPLETED, FAILED)
         self.smart_risk_expert_filter = 'all'  # Filter by expert
+        # Which MANAGER produced the run. The table shows all three -- the agentic one
+        # (smartriskmanagerjob) plus the classic and option managers (risk_manager_run) --
+        # because "why did nothing trade today?" is one question, not three, and the
+        # answer lives in whichever manager the expert happened to be configured with.
+        self.smart_risk_type_filter = 'all'  # all | smart | classic | options
         self.smart_risk_pagination_container = None  # Container for Smart Risk Manager pagination controls
         
         # Smart Risk Manager Jobs caching
@@ -402,17 +407,24 @@ class JobMonitoringTab:
             {'name': 'id', 'label': 'Job ID', 'field': 'id', 'sortable': True, 'style': 'width: 80px'},
             {'name': 'account', 'label': 'Account', 'field': 'account_name', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'expert', 'label': 'Expert', 'field': 'expert_name', 'sortable': True, 'style': 'width: 150px'},
+            {'name': 'type', 'label': 'Type', 'field': 'type_label', 'sortable': True, 'style': 'width: 100px'},
             {'name': 'status', 'label': 'Status', 'field': 'status_display', 'sortable': True, 'style': 'width: 120px'},
             {'name': 'run_date', 'label': 'Run Date', 'field': 'run_date_local', 'sortable': True, 'style': 'width: 160px'},
             {'name': 'duration', 'label': 'Duration', 'field': 'duration_display', 'sortable': True, 'style': 'width: 100px'},
+            # SMART runs iterate an agent loop; the classic/option managers do not, so
+            # this column reads "-" for them rather than 0 -- they did not iterate zero
+            # times, the concept does not apply.
             {'name': 'iterations', 'label': 'Iterations', 'field': 'iteration_count', 'sortable': True, 'style': 'width: 100px'},
-            {'name': 'actions', 'label': 'Actions Taken', 'field': 'actions_taken_count', 'sortable': True, 'style': 'width: 120px'},
+            # Smart: actions executed. Classic/options: symbols funded out of received,
+            # which is the same question ("what did it actually do?") asked of a manager
+            # that sizes rather than acts.
+            {'name': 'actions', 'label': 'Actions / Funded', 'field': 'actions_taken_count', 'sortable': True, 'style': 'width: 130px'},
             {'name': 'detail', 'label': '', 'field': 'detail', 'sortable': False, 'style': 'width: 80px'}
         ]
         
         with ui.card().classes('w-full'):
             with ui.row().classes('w-full justify-between items-center mb-2'):
-                ui.label('Smart Risk Manager Jobs').classes('text-md font-bold')
+                ui.label('Risk Manager Runs').classes('text-md font-bold')
                 ui.button('Refresh', on_click=self.refresh_smart_risk_data, icon='refresh').props('flat dense')
             
             # Filters row
@@ -441,13 +453,31 @@ class JobMonitoringTab:
                         label='Expert Filter'
                     ).classes('w-full')
                     self.smart_risk_expert_select.on_value_change(self._on_smart_risk_expert_filter_change)
-            
+
+                with ui.column().classes('w-48'):
+                    # Manager type filter. "Options" is listed even while no expert runs
+                    # that manager yet: an empty result under an offered filter reads as
+                    # "none of these ran", which is true and useful; hiding the option
+                    # would instead read as "this manager does not exist".
+                    self.smart_risk_type_select = ui.select(
+                        options={
+                            'all': 'All Types',
+                            'smart': 'Smart (Agentic)',
+                            'classic': 'Classic (Rules)',
+                            'options': 'Options',
+                        },
+                        value=self.smart_risk_type_filter,
+                        label='Type Filter'
+                    ).classes('w-full')
+                    self.smart_risk_type_select.on_value_change(self._on_smart_risk_type_filter_change)
+
+
             # Get initial data
             smart_risk_data, total_records = self._get_smart_risk_manager_data()
             
             # Info row showing total records and current page info
             with ui.row().classes('w-full justify-between items-center mb-2'):
-                ui.label(f'Total: {total_records} jobs | Page {self.smart_risk_current_page} of {self.smart_risk_total_pages}').classes('text-sm text-gray-600')
+                ui.label(f'Total: {total_records} runs | Page {self.smart_risk_current_page} of {self.smart_risk_total_pages}').classes('text-sm text-gray-600')
                 if total_records > 0:
                     start_record = (self.smart_risk_current_page - 1) * self.smart_risk_page_size + 1
                     end_record = min(self.smart_risk_current_page * self.smart_risk_page_size, total_records)
@@ -456,7 +486,10 @@ class JobMonitoringTab:
             self.smart_risk_table = ui.table(
                 columns=columns,
                 rows=smart_risk_data,
-                row_key='id'
+                # NOT 'id': the table unions two source tables whose ids both start at 1,
+                # so smart job 7 and classic run 7 would collide and Quasar would render
+                # one of them. 'row_key' carries the type prefix.
+                row_key='row_key'
             ).classes('w-full')
             
             # Add status badge slot
@@ -467,12 +500,15 @@ class JobMonitoringTab:
             ''')
             
             # Add detail button slot
+            # The emit carries the ROW KEY ('smart:34' / 'classic:12'), not the bare id:
+            # the handler has to know WHICH table to open, and the two managers have
+            # different detail views (a LangGraph state versus a decision list).
             self.smart_risk_table.add_slot('body-cell-detail', '''
                 <q-td :props="props">
-                    <q-btn flat dense icon="visibility" 
-                           color="primary" 
-                           @click="$parent.$emit('view_smart_risk_detail', props.row.id)">
-                        <q-tooltip>View Job Details</q-tooltip>
+                    <q-btn flat dense icon="visibility"
+                           color="primary"
+                           @click="$parent.$emit('view_smart_risk_detail', props.row.row_key)">
+                        <q-tooltip>View Run Details</q-tooltip>
                     </q-btn>
                 </q-td>
             ''')
@@ -498,12 +534,13 @@ class JobMonitoringTab:
             current_filter_state = (
                 self.smart_risk_status_filter,
                 self.smart_risk_expert_filter,
+                self.smart_risk_type_filter,
                 get_selected_account_id()  # Include global account filter
             )
             
             if not self.smart_risk_cache_valid or self.last_smart_risk_filter_state != current_filter_state:
                 # Cache is invalid - fetch and format ALL matching records (no pagination in query)
-                self.cached_smart_risk_data = self._fetch_all_smart_risk_jobs()
+                self.cached_smart_risk_data = self._fetch_all_risk_manager_rows()
                 self.smart_risk_cache_valid = True
                 self.last_smart_risk_filter_state = current_filter_state
             
@@ -527,6 +564,149 @@ class JobMonitoringTab:
             logger.error(f"Error getting Smart Risk Manager jobs data: {e}", exc_info=True)
             return [], 0
     
+    def _fetch_all_risk_manager_rows(self) -> List[dict]:
+        """Every risk-manager run matching the filters, from BOTH sources, newest first.
+
+        Two tables back this view because the two managers are genuinely different
+        machines: the agentic one keeps a LangGraph state (``smartriskmanagerjob``), the
+        classic and option managers keep a per-symbol decision list
+        (``risk_manager_run``). They are shown together because the question put to this
+        screen -- "why did nothing trade today?" -- does not know or care which manager
+        the expert was configured with.
+
+        Sorted here in Python rather than by the database: a UNION across two tables with
+        different columns would have to be spelled out column by column and would still
+        need this normalisation afterwards. The page already caches the whole filtered
+        set and paginates in memory, so this sorts the same list it was going to hold.
+        """
+        rows: List[dict] = []
+        if self.smart_risk_type_filter in ('all', 'smart'):
+            rows.extend(self._fetch_all_smart_risk_jobs())
+        if self.smart_risk_type_filter in ('all', 'classic', 'options'):
+            rows.extend(self._fetch_all_risk_manager_runs())
+
+        def _sort_key(row):
+            # A run with no date sorts LAST rather than crashing the comparison; naive
+            # and aware datetimes cannot be compared, so everything is normalised to UTC.
+            value = row.get('run_date')
+            if value is None:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value
+
+        rows.sort(key=_sort_key, reverse=True)
+        return rows
+
+    def _fetch_all_risk_manager_runs(self) -> List[dict]:
+        """The classic/option managers' runs, shaped like the smart ones.
+
+        Same row shape on purpose: one table, one set of columns, one detail button. The
+        columns that mean nothing for a sizing manager say so rather than reading 0 --
+        ``iteration_count`` is "-" because these managers do not iterate, which is a
+        different statement from "iterated zero times".
+        """
+        try:
+            from ba2_common.core.models import RiskManagerRun
+            from ...core.models import AccountDefinition, ExpertInstance
+            from sqlmodel import select, desc, and_
+
+            with get_db() as session:
+                statement = select(RiskManagerRun)
+                filters = []
+
+                selected_account_id = get_selected_account_id()
+                account_expert_ids = get_expert_ids_for_account(selected_account_id)
+                if account_expert_ids is not None:
+                    if account_expert_ids:
+                        filters.append(RiskManagerRun.expert_instance_id.in_(account_expert_ids))
+                    else:
+                        return []
+
+                if self.smart_risk_status_filter != 'all':
+                    filters.append(RiskManagerRun.status == self.smart_risk_status_filter)
+                if self.smart_risk_expert_filter != 'all':
+                    filters.append(RiskManagerRun.expert_instance_id == int(self.smart_risk_expert_filter))
+                # 'all' spans both modes; a specific choice narrows to it.
+                if self.smart_risk_type_filter in ('classic', 'options'):
+                    filters.append(RiskManagerRun.mode == self.smart_risk_type_filter)
+
+                if filters:
+                    statement = statement.where(and_(*filters))
+                statement = statement.order_by(desc(RiskManagerRun.run_date))
+                runs = session.exec(statement).all()
+                if not runs:
+                    return []
+
+                expert_ids = {r.expert_instance_id for r in runs}
+                expert_instances = {}
+                account_names = {}
+                if expert_ids:
+                    stmt = select(ExpertInstance).where(ExpertInstance.id.in_(expert_ids))
+                    for expert in session.scalars(stmt):
+                        expert_instances[expert.id] = expert
+                    account_ids = {e.account_id for e in expert_instances.values() if e.account_id}
+                    if account_ids:
+                        stmt = select(AccountDefinition).where(AccountDefinition.id.in_(account_ids))
+                        for acc in session.scalars(stmt):
+                            account_names[acc.id] = acc.name
+
+                rows = []
+                for run in runs:
+                    expert_name = "Unknown"
+                    account_name = ""
+                    expert_instance = expert_instances.get(run.expert_instance_id)
+                    if expert_instance:
+                        expert_name = (expert_instance.alias
+                                       or f"{expert_instance.expert} (ID: {expert_instance.id})")
+                        if expert_instance.account_id:
+                            account_name = account_names.get(expert_instance.account_id, '')
+
+                    rows.append({
+                        'row_key': f'{run.mode}:{run.id}',
+                        'id': run.id,
+                        'run_type': run.mode,
+                        'type_label': 'Classic' if run.mode == 'classic' else 'Options',
+                        'account_name': account_name,
+                        'expert_name': expert_name,
+                        'expert_instance_id': run.expert_instance_id,
+                        'status': run.status,
+                        'status_display': run.status,
+                        'status_color': ('positive' if run.status == 'COMPLETED'
+                                         else ('negative' if run.status == 'FAILED' else 'warning')),
+                        'run_date': run.run_date,
+                        'run_date_local': self._format_run_date(run.run_date),
+                        'duration_display': self._format_duration(run.duration_seconds),
+                        # NOT 0: these managers have no iteration loop, so the column does
+                        # not apply to them. A 0 would invite the reader to compare it
+                        # against a smart run's 7.
+                        'iteration_count': '-',
+                        # "7 / 42" answers the same question the smart row's action count
+                        # does -- what came out, against what went in.
+                        'actions_taken_count': f'{run.symbols_funded} / {run.symbols_received}',
+                        'detail': 'detail',
+                    })
+                return rows
+        except Exception as e:
+            logger.error(f"Error fetching risk manager runs: {e}", exc_info=True)
+            return []
+
+    @staticmethod
+    def _format_run_date(value) -> str:
+        """UTC (or naive-treated-as-UTC) -> the viewer's local time, matching the smart rows."""
+        if not value:
+            return "N/A"
+        utc_time = value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+        return utc_time.astimezone().strftime('%Y-%m-%d %H:%M:%S')
+
+    @staticmethod
+    def _format_duration(seconds) -> str:
+        if seconds is None:
+            return "N/A"
+        if seconds < 60:
+            return f"{seconds}s"
+        return f"{seconds // 60}m {seconds % 60}s"
+
     def _fetch_all_smart_risk_jobs(self) -> List[dict]:
         """Fetch all Smart Risk Manager jobs matching current filters (no pagination)."""
         try:
@@ -638,13 +818,21 @@ class JobMonitoringTab:
                             actions_display = f"{total_actions} ({failed} Failed)"
                     
                     rows.append({
+                        # UNIQUE ACROSS THE UNION. The table now shows two source tables
+                        # whose ids both start at 1, so the plain `id` cannot be the row
+                        # key -- Quasar would treat smart job 7 and classic run 7 as the
+                        # same row and render one of them.
+                        'row_key': f'smart:{job.id}',
                         'id': job.id,
+                        'run_type': 'smart',
+                        'type_label': 'Smart',
                         'account_name': account_name,
                         'expert_name': expert_name,
                         'expert_instance_id': job.expert_instance_id,
                         'status': job.status,
                         'status_display': job.status,
                         'status_color': status_color,
+                        'run_date': job.run_date,   # sort key for the union; not displayed
                         'run_date_local': run_date_local,
                         'duration_display': duration_display,
                         'iteration_count': job.iteration_count or 0,
@@ -659,29 +847,107 @@ class JobMonitoringTab:
             return []
     
     def view_smart_risk_detail(self, event_data):
-        """Open the Smart Risk Manager job detail dialog."""
-        job_id = None
+        """Open the detail view for whichever manager produced this row.
+
+        The emit carries a ROW KEY -- ``'<type>:<id>'`` -- because the table unions two
+        tables and the two managers have different stories to tell: the agentic one has a
+        LangGraph state, the classic/option ones have a per-symbol decision list.
+        """
+        row_key = None
         try:
-            # Extract job_id from event data
-            if hasattr(event_data, 'args') and hasattr(event_data.args, '__len__') and len(event_data.args) > 0:
-                job_id = int(event_data.args[0])
-            elif isinstance(event_data, int):
-                job_id = event_data
-            elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
-                job_id = event_data.args
+            if hasattr(event_data, 'args') and hasattr(event_data.args, '__len__') \
+                    and not isinstance(event_data.args, (str, bytes)) and len(event_data.args) > 0:
+                row_key = event_data.args[0]
+            elif hasattr(event_data, 'args'):
+                row_key = event_data.args
             else:
-                logger.error(f"Invalid event data for view_smart_risk_detail: {event_data}")
-                ui.notify("Invalid event data", type='negative')
-                return
-            
-            # Open the detail dialog (lazy initialization)
-            if not hasattr(self, '_smart_risk_dialog'):
-                self._smart_risk_dialog = SmartRiskManagerDetailDialog()
-            self._smart_risk_dialog.open(job_id)
-            
+                row_key = event_data
+
+            run_type, _, raw_id = str(row_key).partition(':')
+            if not raw_id:
+                # A bare id predates the union; it can only have been a smart job.
+                run_type, raw_id = 'smart', str(row_key)
+            run_id = int(raw_id)
+
+            if run_type == 'smart':
+                # Lazy initialization, as before.
+                if not hasattr(self, '_smart_risk_dialog'):
+                    self._smart_risk_dialog = SmartRiskManagerDetailDialog()
+                self._smart_risk_dialog.open(run_id)
+            else:
+                self._show_risk_manager_run_detail(run_id)
+
         except Exception as e:
-            logger.error(f"Error opening Smart Risk Manager detail {job_id if job_id else 'unknown'}: {e}", exc_info=True)
+            logger.error(f"Error opening risk manager detail {row_key or 'unknown'}: {e}",
+                         exc_info=True)
             ui.notify(f"Error opening details: {str(e)}", type='negative')
+
+    def _show_risk_manager_run_detail(self, run_id: int):
+        """The classic/option manager's per-symbol reasoning for one run.
+
+        Every symbol the manager RECEIVED is listed, funded or not, because the point of
+        the record is the ones that were not. Refusals are shown FIRST: a reader who
+        opens this is asking why something did not trade, and making them scroll past the
+        successes to find out is the same as not answering.
+        """
+        from ba2_common.core.db import get_instance
+        from ba2_common.core.models import RiskManagerRun
+
+        run = get_instance(RiskManagerRun, run_id)
+        if run is None:
+            ui.notify(f"Risk manager run {run_id} not found", type='negative')
+            return
+
+        with ui.dialog() as dialog, ui.card().classes('w-full max-w-5xl'):
+            with ui.row().classes('w-full justify-between items-center'):
+                ui.label(f'{"Classic" if run.mode == "classic" else "Options"} Risk Manager '
+                         f'— run {run.id}').classes('text-h6')
+                ui.button(icon='close', on_click=dialog.close).props('flat round dense')
+            ui.label(f'{self._format_run_date(run.run_date)} · '
+                     f'{run.symbols_funded} funded of {run.symbols_received} received · '
+                     f'{self._format_duration(run.duration_seconds)}'
+                     ).classes('text-sm text-gray-600')
+            if run.error_message:
+                ui.label(run.error_message).classes('text-sm text-red-500')
+
+            if run.context:
+                with ui.row().classes('w-full gap-4 mt-2'):
+                    for key, value in run.context.items():
+                        pretty = key.replace('_', ' ')
+                        shown = f'{value:,.2f}' if isinstance(value, float) else str(value)
+                        ui.label(f'{pretty}: {shown}').classes('text-xs text-gray-500')
+
+            decisions = list(run.decisions or [])
+            # Refusals first, then the funded ones; each group keeps the order the manager
+            # worked in, so the ranking it applied is still legible.
+            refused = [d for d in decisions if d.get('outcome') != 'FUNDED']
+            funded = [d for d in decisions if d.get('outcome') == 'FUNDED']
+            rows = [{
+                'symbol': d.get('symbol', ''),
+                'outcome': d.get('outcome', ''),
+                # '-' not 0: a refused symbol has no quantity at all.
+                'quantity': ('-' if d.get('quantity') is None else f"{d['quantity']:g}"),
+                'reason': d.get('reason', ''),
+            } for d in refused + funded]
+
+            ui.table(
+                columns=[
+                    {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True,
+                     'align': 'left', 'style': 'width: 90px'},
+                    {'name': 'outcome', 'label': 'Outcome', 'field': 'outcome', 'sortable': True,
+                     'align': 'left', 'style': 'width: 200px'},
+                    {'name': 'quantity', 'label': 'Qty', 'field': 'quantity',
+                     'align': 'right', 'style': 'width: 80px'},
+                    {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'align': 'left'},
+                ],
+                rows=rows,
+                row_key='symbol',
+            ).classes('w-full mt-2').props('dense wrap-cells')
+
+            if not rows:
+                ui.label('This run received no symbols.').classes('text-sm text-gray-500 mt-2')
+
+        dialog.open()
     
     def _create_smart_risk_pagination_controls(self):
         """Create pagination controls for Smart Risk Manager jobs."""
@@ -792,6 +1058,12 @@ class JobMonitoringTab:
     def _on_smart_risk_expert_filter_change(self, event):
         """Handle expert filter change for Smart Risk Manager jobs."""
         self.smart_risk_expert_filter = event.value
+        self.smart_risk_current_page = 1  # Reset to first page when filtering
+        self.refresh_smart_risk_data()
+
+    def _on_smart_risk_type_filter_change(self, event):
+        """Handle manager-type filter change (smart / classic / options)."""
+        self.smart_risk_type_filter = event.value
         self.smart_risk_current_page = 1  # Reset to first page when filtering
         self.refresh_smart_risk_data()
     
