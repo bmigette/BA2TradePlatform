@@ -211,12 +211,12 @@ def test_the_dead_selection_is_cleared_from_storage_and_from_the_mirror(
     """
     doomed = create_account_definition(name='Tasty', provider='MockAccount')
     afc.set_selected_account_id(doomed.id)
-    assert storage[afc.ACCOUNT_FILTER_KEY] == doomed.id      # precondition
+    assert storage[afc.account_filter_storage_key()] == doomed.id      # precondition
     delete_instance(doomed)
 
     _render_a_page(nicegui_client)
 
-    assert storage[afc.ACCOUNT_FILTER_KEY] is None
+    assert storage[afc.account_filter_storage_key()] is None
     assert afc._last_known_account_id is None
     assert afc.get_selected_account_id() is None
 
@@ -255,7 +255,7 @@ def test_a_valid_selection_is_preserved_exactly(nicegui_client, storage, clock):
     select = _account_select(nicegui_client)
     assert select.value == tasty.id
     assert select.options[select.value] == 'Tasty (MockAccount)'
-    assert storage[afc.ACCOUNT_FILTER_KEY] == tasty.id
+    assert storage[afc.account_filter_storage_key()] == tasty.id
     assert afc._last_known_account_id == tasty.id
 
 
@@ -294,7 +294,7 @@ def test_an_account_created_inside_the_60s_cache_window_is_not_treated_as_dead(
     select = _account_select(nicegui_client)
     assert select.value == newborn.id
     assert select.options[select.value] == 'Tasty (MockAccount)'
-    assert storage[afc.ACCOUNT_FILTER_KEY] == newborn.id
+    assert storage[afc.account_filter_storage_key()] == newborn.id
     assert warnings == []
 
 
@@ -324,7 +324,7 @@ def test_a_database_that_will_not_answer_never_erases_the_selection(
     _render_a_page(nicegui_client)            # must not raise
 
     assert _account_select(nicegui_client).value == 'all'
-    assert storage[afc.ACCOUNT_FILTER_KEY] == tasty.id     # NOT cleared
+    assert storage[afc.account_filter_storage_key()] == tasty.id     # NOT cleared
     assert afc._last_known_account_id == tasty.id
 
     # ... and the next healthy page load restores it, no user action needed.

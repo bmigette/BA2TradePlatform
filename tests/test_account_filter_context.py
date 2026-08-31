@@ -72,7 +72,7 @@ def test_ui_context_get_refreshes_cache(monkeypatch):
     read reflects a selection that was persisted (e.g. across restart) without an
     explicit set in this process."""
     _reset_cache()
-    monkeypatch.setattr(afc, "app", _FakeApp(_DictStorage({afc.ACCOUNT_FILTER_KEY: 1})))
+    monkeypatch.setattr(afc, "app", _FakeApp(_DictStorage({afc.account_filter_storage_key(): 1})))
     assert afc.get_selected_account_id() == 1
     monkeypatch.setattr(afc, "app", _FakeApp(_RaisingStorage()))
     assert afc.get_selected_account_id() == 1
@@ -107,8 +107,8 @@ def test_set_persists_the_coerced_value_so_storage_and_the_mirror_agree(monkeypa
 
     afc.set_selected_account_id("2")
 
-    assert store[afc.ACCOUNT_FILTER_KEY] == 2
-    assert isinstance(store[afc.ACCOUNT_FILTER_KEY], int)    # the int 2, not the string
+    assert store[afc.account_filter_storage_key()] == 2
+    assert isinstance(store[afc.account_filter_storage_key()], int)    # the int 2, not the string
     assert afc._last_known_account_id == 2
 
 
@@ -120,7 +120,7 @@ def test_set_persists_none_for_all_rather_than_a_sentinel_string(monkeypatch, ra
 
     afc.set_selected_account_id(raw)        # a legacy/"stringified" All
 
-    assert store[afc.ACCOUNT_FILTER_KEY] is None
+    assert store[afc.account_filter_storage_key()] is None
     assert afc.get_selected_account_id() is None
 
 

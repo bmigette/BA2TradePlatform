@@ -12,8 +12,52 @@ from ..core.models import AccountDefinition
 from ..logger import logger
 
 
-# Storage key for the selected account filter
+# Base storage key for the selected account filter. The key ACTUALLY used is per-instance
+# -- see ``account_filter_storage_key``.
 ACCOUNT_FILTER_KEY = 'selected_account_id'
+
+
+def account_filter_storage_key() -> str:
+    """The ``app.storage.user`` key for THIS instance's account filter.
+
+    WHY THE PORT IS IN THE KEY. Two instances of this app on different ports share one
+    account filter, and changing it in either moved both. That is not a NiceGUI bug and
+    it is not fixable by choosing a different storage backend:
+
+      * HTTP cookies are NOT scoped by port (RFC 6265 §8.5 -- "cookies do not provide
+        isolation by port"). A cookie set by ``localhost:8080`` is sent to
+        ``localhost:9090`` and vice versa.
+      * ``app.storage.user`` is keyed off that cookie, and both instances sign it with
+        the same hardcoded ``STORAGE_SECRET``, so each accepts the other's cookie and
+        resolves it to the SAME user identity.
+      * Run from one working directory they then read and write one
+        ``.nicegui/storage-user-<id>.json``.
+
+    Namespacing the KEY is what actually separates them, because it is the only part of
+    that chain this app controls. (Per-instance storage secrets would also work, but
+    would log the operator out of both instances on every change and would still leave
+    one shared storage file.)
+
+    THE PORT, specifically, because it is the one property two concurrently running
+    instances cannot share -- the OS guarantees it. This matters more than tidiness:
+    ``cli.py`` documents running a second instance with its own ``--db-file``, and
+    account IDS ARE DATABASE-SCOPED. Sharing the filter across two databases does not
+    merely reset the dropdown, it silently selects a DIFFERENT account -- id 2 in dev is
+    not id 2 in prod. The existing deleted-account check does not catch that case,
+    because id 2 exists in both.
+
+    Read LAZILY, never imported at module scope: ``main.py`` assigns
+    ``config.HTTP_PORT = args.port`` at runtime, so a ``from ..config import HTTP_PORT``
+    here would capture the 8080 default at import time and both instances would agree
+    again -- reintroducing the bug in a form that only shows up with ``--port``.
+    """
+    from .. import config
+    port = getattr(config, 'HTTP_PORT', None)
+    if not port:
+        # No port to namespace by. Fall back to the bare key rather than inventing one:
+        # a made-up suffix would silently orphan a selection that is already stored.
+        return ACCOUNT_FILTER_KEY
+    return f'{ACCOUNT_FILTER_KEY}:{port}'
 
 # Cache for accounts list (60-second TTL)
 _accounts_cache: Dict[str, Any] = {
@@ -118,7 +162,7 @@ def get_selected_account_id() -> Optional[int]:
     """
     global _last_known_account_id
     try:
-        account_id = _coerce_account_id(app.storage.user.get(ACCOUNT_FILTER_KEY, None))
+        account_id = _coerce_account_id(app.storage.user.get(account_filter_storage_key(), None))
         _last_known_account_id = account_id  # keep the thread-readable mirror fresh
         return account_id
     except Exception as e:
@@ -144,7 +188,7 @@ def set_selected_account_id(account_id: Optional[int]) -> None:
     coerced = _coerce_account_id(account_id)
     _last_known_account_id = coerced  # mirror first (always succeeds)
     try:
-        app.storage.user[ACCOUNT_FILTER_KEY] = coerced
+        app.storage.user[account_filter_storage_key()] = coerced
         logger.debug(f"Set account filter to: {coerced}")
     except Exception as e:
         logger.warning(f"Error setting selected account ID: {e}")
