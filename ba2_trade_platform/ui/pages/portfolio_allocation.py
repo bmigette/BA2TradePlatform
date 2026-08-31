@@ -243,7 +243,8 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
         PositionFetchFailed: the broker position fetch failed (NOT a flat account).
         RuntimeError: the account could not be instantiated.
     """
-    from ...core.utils import get_account_instance_from_id, get_symbols_by_label
+    from ...core.utils import (get_account_instance_from_id, get_company_names,
+                               get_symbols_by_label)
 
     # ``previous_target_pct`` travels with the label, NULL and all: it is what the
     # row prints as "last N%" and what the page's Load-last reads, and a ``or 0.0``
@@ -337,6 +338,10 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
                                    base_notional=base_notional,
                                    symbol_weights=weights,
                                    symbol_previous_weights=previous_weights,
+                                   # One indexed query over the managed set, not one per
+                                   # row: the ⓘ tooltip is the only consumer and it is
+                                   # not worth a lookup per cell.
+                                   company_names=get_company_names(symbols),
                                    unallocated_pct=unallocated_pct),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
@@ -1994,6 +1999,10 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     rows = [{
         'flag': '⚠' if r.multi_label else '',
         'symbol': r.symbol,
+        # '' rather than None: the ⓘ template tests it with ``v-if`` to decide whether
+        # there is a second line to draw, and Quasar prints a bare ``null`` if it is
+        # handed one. An unnamed instrument shows the symbol alone.
+        'company_name': r.company_name or '',
         # KEPT although the Labels COLUMN is gone: the ⚠ cell's tooltip is now the
         # only place a symbol's other managed labels are named, and it reads this.
         'labels': ', '.join(r.labels),
@@ -2103,8 +2112,11 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         <q-td :props="props">
             <q-btn dense flat round size="sm" icon="info" color="grey-5"
                    @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
-                <q-tooltip>Holdings, dividends and total return for
-                    {{ props.row.symbol }}</q-tooltip>
+                <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                    <div class="text-weight-bold">{{ props.row.symbol }}</div>
+                    <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
+                    <div>Holdings, dividends and total return</div>
+                </q-tooltip>
             </q-btn>
         </q-td>
     ''')
