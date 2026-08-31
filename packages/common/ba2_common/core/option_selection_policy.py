@@ -1103,8 +1103,15 @@ def _eligible_and_reason(
 
 
 def score_all(candidates: Sequence[OptionContract], ctx: PolicyContext,
-              policy: SelectionPolicy) -> List[float]:
-    """The weighted score of each candidate. Higher wins."""
+              policy: SelectionPolicy,
+              payoff: Optional[PayoffColumns] = None) -> List[float]:
+    """The weighted score of each candidate. Higher wins.
+
+    ``payoff`` accepts an already-computed ``payoff_columns`` result and is forwarded into
+    ``feature_matrix``'s memo. A caller that also runs ``inapplicable_features`` for the same
+    pick (the ``select_single`` seam's applicability report) passes ONE object to both, so the
+    report describes the very numbers the ranking used and the 5039us pass runs once, not
+    twice. None — every caller that wants no report — computes lazily as before."""
     weights = {"box_center": policy.w_box_center, "premium": policy.w_premium,
                "iv": policy.w_iv, "rvol": policy.w_rvol, "spread": policy.w_spread,
                "profit": policy.w_profit, "rr": policy.w_rr}
@@ -1138,13 +1145,14 @@ def score_all(candidates: Sequence[OptionContract], ctx: PolicyContext,
     # immediate; with a default it would be a feature that exists, normalises, and is then
     # silently never scored -- the dead gene this module keeps legislating against.
     active = [name for name in FEATURE_NAMES if weights[name]]
-    m = feature_matrix(candidates, ctx, only=active)
+    m = feature_matrix(candidates, ctx, only=active, payoff=payoff)
     return [sum(weights[name] * m[name][i] for name in active)
             for i in range(len(candidates))]
 
 
 def pick(candidates: Sequence[OptionContract], ctx: PolicyContext,
-         policy: SelectionPolicy) -> Optional[OptionContract]:
+         policy: SelectionPolicy,
+         payoff: Optional[PayoffColumns] = None) -> Optional[OptionContract]:
     """The single best contract in the box, or None when the box is empty.
 
     THE TIE-BREAK IS THE EXISTING ONE. Ties resolve to the LOWEST STRIKE and then the EARLIEST
@@ -1161,18 +1169,21 @@ def pick(candidates: Sequence[OptionContract], ctx: PolicyContext,
     RETURNS THE CONTRACT ONLY, unchanged. ``pick_with_reason`` is the same computation and also
     says why there was nothing to return.
     """
-    return pick_with_reason(candidates, ctx, policy)[0]
+    return pick_with_reason(candidates, ctx, policy, payoff=payoff)[0]
 
 
 def pick_with_reason(
         candidates: Sequence[OptionContract], ctx: PolicyContext,
-        policy: SelectionPolicy) -> Tuple[Optional[OptionContract], Optional[SelectionRefusal]]:
+        policy: SelectionPolicy, payoff: Optional[PayoffColumns] = None,
+) -> Tuple[Optional[OptionContract], Optional[SelectionRefusal]]:
     """``pick``, plus a ``SelectionRefusal`` whenever it chose nothing.
 
-    THE SEAM ``_resolve()`` WILL USE. ``pick`` has no production caller yet, so this is designed
-    for the one that is coming rather than retrofitted around one that exists; it returns a pair
-    instead of raising because a refusal is DATA the risk manager triages beside every other
-    candidate on the bar, not an exception that unwinds the bar.
+    THE SEAM ``_resolve()`` WILL USE for triage. ``pick`` now has a production caller --
+    ``option_selector.select_single`` / ``select_vertical_spread`` route every non-default
+    policy through it (``_policy_pick``), which is what makes the GA-wired weights govern real
+    entry picks -- but the REASON half still waits for the risk manager's triage; it returns a
+    pair instead of raising because a refusal is DATA the risk manager triages beside every
+    other candidate on the bar, not an exception that unwinds the bar.
 
     A SEPARATE ENTRY POINT RATHER THAN A WIDER RETURN ON ``pick``, because the no-op guarantees
     of Tasks 1-5 all rest on ``pick`` being the very function the recorded-chain tests pin. Its
@@ -1186,7 +1197,15 @@ def pick_with_reason(
     cands, refusal = _eligible_and_reason(candidates, ctx)
     if not cands:
         return None, refusal
-    scores = score_all(cands, ctx, policy)
+    # NOTE: ``payoff`` was computed over the FULL candidate list, and ``eligible`` can
+    # narrow it. Today the two agree whenever a payoff column is live -- the ceiling is the
+    # only narrowing filter that consults the builder, no seam passes both a ceiling and a
+    # shared payoff, and the delta/box filters run before anything payoff-shaped exists -- but
+    # a mismatch would misalign every column with the candidates being scored, so it is
+    # checked rather than assumed.
+    if payoff is not None and len(cands) != len(candidates):
+        payoff = None
+    scores = score_all(cands, ctx, policy, payoff=payoff)
     best = min(range(len(cands)),
                key=lambda i: (-scores[i], cands[i].strike, cands[i].expiry))
     return cands[best], None

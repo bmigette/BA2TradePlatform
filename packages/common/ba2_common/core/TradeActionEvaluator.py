@@ -44,6 +44,11 @@ _OPTION_ENTRY_PARAM_KEYS = (
     # gives up when it quotes. Absent or 0.0 leaves the builder's quote untouched, and a live
     # account -- which models no spread -- ignores it entirely. See core.option_entry_quote.
     'entry_cross',
+    # SELECTION-POLICY WEIGHTS (design 2026-08-29 §7): the GA-wired choosing inside the box.
+    # Absent or all-zero builds no policy and the selector keeps its legacy path byte for
+    # byte. w_profit/w_rr are deliberately not forwarded until a builder supplies the
+    # structure_fn they need -- see _OptionEntryAction.__init__.
+    'w_premium', 'w_iv', 'w_rvol',
 )
 
 

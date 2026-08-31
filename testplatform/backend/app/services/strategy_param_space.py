@@ -41,6 +41,12 @@ Namespacing:
   exit:<rid>:a<i>:option_entry_cross  fraction of the contract's own MODELLED bid-ask
                                    spread the entry gives up when it quotes (0 = mid,
                                    1 = the far touch the fill engine models)
+  optsel:<half>:<w>                a SelectionPolicy weight (w_premium | w_iv | w_rvol),
+                                   SHARED across every option entry action of one
+                                   debit/credit half (keyed on the action's stamped
+                                   option_selection_half, NOT on the rule id) -- one gene
+                                   per half per weight, identical keys in single-member and
+                                   group jobs so stage-1 winners seed the stage-2 space
   schedule:<day>                   ON/OFF toggle for that weekday's entry scan
   screener:<setting>               screener settings
 
@@ -57,6 +63,12 @@ logger = logging.getLogger(__name__)
 
 # Fixed order so the gene list (and therefore reproducibility) is stable across runs.
 SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+#: The SelectionPolicy weights emitted as shared per-half genes (``optsel:<half>:<w>``).
+#: Deliberately NOT w_spread (degenerate on both grid stores), NOT w_rr (F15: collinear with
+#: premium within a chain), NOT w_profit (needs a structure_fn no builder supplies yet) --
+#: see the launcher's _OPTION_SELECTION_WEIGHT_BANDS for the evidence trail.
+OPTION_SELECTION_WEIGHTS = ("w_premium", "w_iv", "w_rvol")
 
 # Actions that must NEVER be dropped by a per-action toggle: removing the open action would
 # turn an entry rule into a no-op bracket; guards must stay. (Rule-level toggles can still
@@ -283,6 +295,31 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
             action.get("option_entry_cross_max"),
             action.get("option_entry_cross_step"), is_int=False,
         )
+    # SELECTION-POLICY WEIGHTS, SHARED PER HALF. The key is ``optsel:<half>:<w>`` -- built
+    # from the action's stamped ``option_selection_half``, NOT from ``prefix`` -- so every
+    # member action of one half collapses onto ONE gene per weight (dict identity), and a
+    # single-member job emits exactly the keys the group job searches (the seeding
+    # requirement; encode_params silently drops keys the target space lacks). Two guards:
+    # a flag with no half has nothing to share on and must not silently fall back to a
+    # per-rule key shape, and two members declaring different domains for one shared key
+    # would otherwise resolve by dict-overwrite, last member silently winning.
+    for w in OPTION_SELECTION_WEIGHTS:
+        if not action.get(f"option_{w}_optimize"):
+            continue
+        half = action.get("option_selection_half")
+        if half not in ("debit", "credit"):
+            raise ValueError(
+                f"{prefix}: option_{w}_optimize is set but option_selection_half is "
+                f"{half!r}; a selection-weight gene is shared per debit/credit half and "
+                f"cannot be emitted without one")
+        key = f"optsel:{half}:{w}"
+        spec = _range_entry(action.get(f"option_{w}_min"), action.get(f"option_{w}_max"),
+                            action.get(f"option_{w}_step"), is_int=False)
+        if key in out and out[key] != spec:
+            raise ValueError(
+                f"{prefix}: conflicting domains for shared gene {key}: {out[key]} vs "
+                f"{spec}; members of one half must declare identical bands")
+        out[key] = spec
 
 
 def _collect_rule_list(rules, ns: str, out: Dict[str, Any]) -> None:
@@ -507,10 +544,11 @@ def _apply_option_strike(action: Dict[str, Any], agenes: Dict[str, Any]) -> None
 
 def _decode_rule_list(rules, ns: str,
                       rule_genes: Dict[str, Dict[str, Any]],
-                      cond_by_id: Dict[str, Dict[str, Any]]):
+                      cond_by_id: Dict[str, Dict[str, Any]],
+                      optsel_by_half: Optional[Dict[str, Dict[str, Any]]] = None):
     """Deep-copy ONE TradeRule list applying decoded genes: drop toggle-disabled rules,
     substitute per-action values / option params, drop toggle-disabled (non-open) actions,
-    and substitute condition values."""
+    apply the shared per-half selection-weight genes, and substitute condition values."""
     out = []
     for rule in copy.deepcopy(rules or []):
         if not isinstance(rule, dict):
@@ -541,6 +579,13 @@ def _decode_rule_list(rules, ns: str,
                 action["option_min_arc"] = agenes["option_min_arc"]
             if "option_entry_cross" in agenes:
                 action["option_entry_cross"] = agenes["option_entry_cross"]
+            # Shared per-half selection weights: applied to EVERY action stamped with the
+            # matching half (that is what "shared" means mechanically); an action with no
+            # stamp -- every equity action, and the O_CC/O_PP overlays -- is untouched.
+            half = action.get("option_selection_half")
+            if optsel_by_half and half in optsel_by_half:
+                for w, wval in optsel_by_half[half].items():
+                    action[f"option_{w}"] = wval
             actions.append(action)
         rule["actions"] = actions
         if rule.get("conditions"):
@@ -571,6 +616,7 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     expert_overrides: Dict[str, Any] = {}
     screener_overrides: Dict[str, Any] = {}
     schedule_by_day: Dict[str, Any] = {}
+    optsel_by_half: Dict[str, Dict[str, Any]] = {}
 
     def _rule_gene(store: Dict[str, Dict[str, Any]], rid: str, rest: str, val: Any) -> None:
         genes = store.setdefault(rid, {})
@@ -598,6 +644,9 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         elif key.startswith("exit:"):
             _, rid, rest = key.split(":", 2)
             _rule_gene(exit_genes, rid, rest, val)
+        elif key.startswith("optsel:"):
+            _, half, w = key.split(":", 2)
+            optsel_by_half.setdefault(half, {})[w] = val
         else:
             raise ValueError(f"Unknown decoded param namespace: {key!r}")
 
@@ -610,9 +659,11 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     # signal as "no template" the way `[] or []` truthiness checks would.
     _template_entry = getattr(strategy, "entry_rules", None)
     _template_exit = getattr(strategy, "exit_rules", None)
-    entry_rules = (_decode_rule_list(_template_entry, "entry", entry_genes, cond_by_id)
+    entry_rules = (_decode_rule_list(_template_entry, "entry", entry_genes, cond_by_id,
+                                     optsel_by_half)
                    if _template_entry else None)
-    exit_rules = (_decode_rule_list(_template_exit, "exit", exit_genes, cond_by_id)
+    exit_rules = (_decode_rule_list(_template_exit, "exit", exit_genes, cond_by_id,
+                                    optsel_by_half)
                   if _template_exit else None)
 
     # Repair, don't reject: an all-days-OFF individual would never scan for entries at all (a

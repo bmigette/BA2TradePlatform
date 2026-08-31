@@ -236,6 +236,14 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     # engine already models). Absent or 0.0 is the pre-F3 quote EXACTLY. See
     # ``core.option_entry_quote``.
     ("entry_cross", ("option_entry_cross",)),
+    # SELECTION-POLICY WEIGHTS (design 2026-08-29 §7): which contract inside the rule's box
+    # wins. GA genes, shared per debit/credit half by the launcher; absent means the default
+    # policy, which is a proven no-op over the legacy selector. w_profit/w_rr are deliberately
+    # unmapped -- no builder supplies the structure_fn they need, so mapping them would
+    # forward a knob the pick cannot see (the silently-inert-gene defect).
+    ("w_premium", ("option_w_premium",)),
+    ("w_iv", ("option_w_iv",)),
+    ("w_rvol", ("option_w_rvol",)),
 )
 
 

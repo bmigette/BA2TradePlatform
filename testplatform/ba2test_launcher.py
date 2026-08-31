@@ -2657,6 +2657,7 @@ def _option_entry_action_for(kind: str) -> dict:
     _apply_option_sizing_gene(cfg)
     _apply_option_min_arc_gene(cfg)
     _apply_option_entry_cross_gene(cfg)
+    _apply_option_selection_weight_genes(cfg, kind)
     return cfg
 
 
@@ -2915,9 +2916,14 @@ def _apply_option_entry_cross_gene(cfg: dict) -> dict:
 #   * ``w_rr`` — operator decision 2026-08-30 (design §7): Spearman(rr, premium) 0.98-1.0
 #     within real chains, a second gene searching the axis w_premium already owns.
 #   * ``w_profit`` — needs ``PolicyContext.structure_fn`` to score anything, and NO entry
-#     builder supplies one yet (teaching them is explicitly out of the plan's scope), so the
-#     gene would be inert on every real pick; see test_option_selection_weight_genes.py for
-#     the recorded discrimination evidence the F15 decision demanded.
+#     builder supplies one yet (teaching them is explicitly out of the plan's scope, and each
+#     closure must close the _size_by_cost premium-vs-max-loss gap with it), so the gene's
+#     emission set is empty today: provably inert on every real pick. The F15 discrimination
+#     evidence is nonetheless recorded in test_option_selection_weight_genes.py: within one
+#     expiry it is collinear with w_premium (the review's rho 0.98-1.0), but across the
+#     multi-expiry candidate sets every grid DTE window produces, the annualisation
+#     denominator makes them genuinely diverge — so when a builder is taught its closure,
+#     w_profit becomes worth emitting FOR THAT BUILDER, on that recorded evidence.
 #   * ``w_box_center`` — pinned 1.0, not a gene: scaling every weight by one factor changes
 #     no ranking, so a free box_center is a degenerate search direction (design §7).
 _OPTION_SELECTION_WEIGHT_BANDS = {
@@ -2926,6 +2932,33 @@ _OPTION_SELECTION_WEIGHT_BANDS = {
     "w_iv": (-2.0, 2.0, 0.5),        # signed — the design's original signed weight
     "w_rvol": (0.0, 2.0, 0.5),
 }
+
+
+def _apply_option_selection_weight_genes(cfg: dict, member: str) -> dict:
+    """Make the SelectionPolicy weights searchable, in place, SHARED per debit/credit half.
+
+    The sharing tier (design §7): the gene key is ``optsel:<half>:<w>`` — derived from the
+    ``option_selection_half`` stamped here, NOT from the rule id — so every member of a half
+    collapses onto ONE gene per weight (OS1: 3 genes, not 15) and a stage-1 single-member
+    winner carries exactly the keys the stage-2 group space searches (encode_params drops
+    unknown keys silently, so a per-member key shape would strand every seed).
+
+    The halves are the launcher's own asserted-total partition: which way "good premium"
+    points is precisely what flips at the debit/credit line, and the two halves get two
+    independent genes rather than one averaged compromise.
+
+    Members only. The O_CC/O_PP overlays sit outside the partition (no _OPTION_STRATS row),
+    so they have no half to share with — their option leg keeps the default policy, which is
+    the proven no-op.
+    """
+    cfg.setdefault("option_selection_half",
+                   "debit" if member in _DEBIT_OPTION_MEMBERS else "credit")
+    for w, (lo, hi, step) in _OPTION_SELECTION_WEIGHT_BANDS.items():
+        cfg.setdefault(f"option_{w}_optimize", True)
+        cfg.setdefault(f"option_{w}_min", lo)
+        cfg.setdefault(f"option_{w}_max", hi)
+        cfg.setdefault(f"option_{w}_step", step)
+    return cfg
 
 
 def _apply_option_min_volume(cfg: dict) -> dict:

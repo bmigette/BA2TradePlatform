@@ -32,6 +32,7 @@ from ba2_common.core.option_payoff import (
 )
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
+from ba2_common.core.option_selection_policy import SelectionPolicy
 from ba2_common.core.option_selector import (
     select_single, select_vertical_spread, select_wing, passes_liquidity,
     check_liquidity_data_available, OptionDteWindowError, OptionSelectionConfigError,
@@ -1998,6 +1999,9 @@ class _OptionEntryAction(TradeAction):
                  wing_width_pct: Optional[float] = None,
                  min_arc: Optional[float] = None,
                  entry_cross: Optional[float] = None,
+                 w_premium: Optional[float] = None,
+                 w_iv: Optional[float] = None,
+                 w_rvol: Optional[float] = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
@@ -2026,6 +2030,17 @@ class _OptionEntryAction(TradeAction):
         # pre-F3 quote exactly. Only a simulator that models a spread can answer it, so in
         # live it is inert by construction -- see core.option_entry_quote.
         self.entry_cross = entry_cross
+        # SELECTION-POLICY WEIGHTS (the GA-wired genes, design 2026-08-29 §7). Built HERE,
+        # EXPLICITLY, because this ctor ends in **kwargs: a weight forwarded under a name this
+        # block does not store would be swallowed silently, and the gene would look wired at
+        # every upstream layer while every pick ran the default policy. None/0.0 across the
+        # board yields policy None -- the selector's legacy 27us path, byte-identical picks.
+        # w_profit/w_rr are deliberately NOT accepted yet: no builder supplies the
+        # structure_fn they need, so accepting them would create exactly the silently-inert
+        # knob this comment warns about (see the launcher's weight-band table).
+        weights = {"w_premium": w_premium, "w_iv": w_iv, "w_rvol": w_rvol}
+        present = {k: float(v) for k, v in weights.items() if v is not None}
+        self.selection_policy = SelectionPolicy(**present) if any(present.values()) else None
 
     # --- helpers ----------------------------------------------------------
     def _action_type_value(self) -> str:
@@ -2683,7 +2698,7 @@ class BuyCallAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if contract is None:
             return self._result(False, f"No liquid call contract for {self.instrument_name}")
         if contract.ask is None or contract.ask <= 0:
@@ -2727,7 +2742,7 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if pair is None:
             return self._result(False, f"No liquid bull call spread for {self.instrument_name}")
         long_c, short_c = pair
@@ -2789,7 +2804,7 @@ class BuyPutAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if contract is None:
             return self._result(False, f"No liquid put contract for {self.instrument_name}")
         if contract.ask is None or contract.ask <= 0:
@@ -2833,7 +2848,7 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if pair is None:
             return self._result(False, f"No liquid bear put spread for {self.instrument_name}")
         # For a PUT debit spread the selector returns (long, short) with long.strike > short.strike.
@@ -2913,7 +2928,7 @@ class SellCoveredCallAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if contract is None:
             return self._result(False, f"No liquid call contract for covered call on {self.instrument_name}")
         if contract.bid is None or contract.bid <= 0:
@@ -2970,7 +2985,7 @@ class BuyProtectivePutAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if contract is None:
             return self._result(False, f"No liquid put contract for protective put on {self.instrument_name}")
         if contract.ask is None or contract.ask <= 0:
@@ -3009,7 +3024,7 @@ class SellCashSecuredPutAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if contract is None:
             return self._result(False, f"No liquid put contract for cash-secured put on {self.instrument_name}")
         if contract.bid is None or contract.bid <= 0:
@@ -3089,7 +3104,7 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if pair is None:
             return self._result(False, f"No liquid bear call spread for {self.instrument_name}")
         # For a CALL spread the selector returns (lo, hi) ordered by strike.
@@ -3188,7 +3203,7 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if pair is None:
             return self._result(False, f"No liquid bull put spread for {self.instrument_name}")
         # For a PUT chain the selector returns its DEBIT ordering: (higher, lower) =
@@ -3290,7 +3305,7 @@ class OpenStraddleAction(_OptionEntryAction):
             call_chain, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            **liq)
+            policy=self.selection_policy, **liq)
         if call_c is None:
             return self._result(False, f"No liquid ATM call for straddle on {self.instrument_name}")
         # Force the put to the SAME strike + expiry as the chosen call leg.
@@ -3300,7 +3315,7 @@ class OpenStraddleAction(_OptionEntryAction):
             put_candidates, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            **liq)
+            policy=self.selection_policy, **liq)
         if put_c is None:
             return self._result(False,
                                 f"No liquid ATM put at strike {call_c.strike} for straddle "
@@ -3361,14 +3376,14 @@ class OpenStrangleAction(_OptionEntryAction):
             call_chain, method="percent_otm", strike_param=otm_pct, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            **liq)
+            policy=self.selection_policy, **liq)
         if call_c is None:
             return self._result(False, f"No liquid OTM call for strangle on {self.instrument_name}")
         put_c = select_single(
             put_chain, method="percent_otm", strike_param=otm_pct, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            **liq)
+            policy=self.selection_policy, **liq)
         if put_c is None:
             return self._result(False, f"No liquid OTM put for strangle on {self.instrument_name}")
         if call_c.ask is None or put_c.ask is None:
@@ -3421,7 +3436,7 @@ class OpenShortStraddleAction(_OptionEntryAction):
         call_c = select_single(
             call_chain, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), **liq)
+            today=self._today(), policy=self.selection_policy, **liq)
         if call_c is None:
             return self._result(False, f"No liquid ATM call for short straddle on {self.instrument_name}")
         put_candidates = [c for c in put_chain
@@ -3429,7 +3444,7 @@ class OpenShortStraddleAction(_OptionEntryAction):
         put_c = select_single(
             put_candidates, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), **liq)
+            today=self._today(), policy=self.selection_policy, **liq)
         if put_c is None:
             return self._result(False, f"No liquid ATM put for short straddle on {self.instrument_name}")
         if call_c.bid is None or put_c.bid is None:
@@ -3502,11 +3517,11 @@ class OpenShortStrangleAction(_OptionEntryAction):
         call_c = select_single(
             call_chain, method="percent_otm", strike_param=otm, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), **liq)
+            today=self._today(), policy=self.selection_policy, **liq)
         put_c = select_single(
             put_chain, method="percent_otm", strike_param=otm, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), **liq)
+            today=self._today(), policy=self.selection_policy, **liq)
         if call_c is None or put_c is None:
             return self._result(False, f"No liquid OTM legs for short strangle on {self.instrument_name}")
         # Pin both legs to the same expiry (use the call's expiry).
@@ -3515,7 +3530,7 @@ class OpenShortStrangleAction(_OptionEntryAction):
                 [c for c in put_chain if c.expiry == call_c.expiry],
                 method="percent_otm", strike_param=otm, spot=spot,
                 option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                today=self._today(), **liq)
+                today=self._today(), policy=self.selection_policy, **liq)
             if put_c is None:
                 return self._result(False, f"No same-expiry OTM put for short strangle on {self.instrument_name}")
         if call_c.bid is None or put_c.bid is None:
@@ -3583,10 +3598,10 @@ class OpenIronCondorAction(_OptionEntryAction):
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), **liq)
+                           today=self._today(), policy=self.selection_policy, **liq)
         sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), **liq)
+                           today=self._today(), policy=self.selection_policy, **liq)
         if sc is None or sp is None:
             return self._result(False, f"No liquid short legs for iron condor on {self.instrument_name}")
         # Wings farther OTM, same expiry as the matching short leg.
@@ -3670,10 +3685,10 @@ class OpenJadeLizardAction(_OptionEntryAction):
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), **liq)
+                           today=self._today(), policy=self.selection_policy, **liq)
         sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), **liq)
+                           today=self._today(), policy=self.selection_policy, **liq)
         if sc is None or sp is None:
             return self._result(False, f"No liquid short legs for jade lizard on {self.instrument_name}")
         lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
@@ -3754,7 +3769,7 @@ class OpenCallButterflyAction(_OptionEntryAction):
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         body = select_single(chain, method="percent_otm", strike_param=body_otm, spot=spot,
                              option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                             today=self._today(), **liq)
+                             today=self._today(), policy=self.selection_policy, **liq)
         if body is None:
             return self._result(False, f"No liquid body call for butterfly on {self.instrument_name}")
         upper = select_wing(chain, center_strike=body.strike, width_pct=wing,
@@ -3834,7 +3849,7 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         long_p = select_single(chain, method="percent_otm", strike_param=otm, spot=spot,
                                option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                               today=self._today(), **liq)
+                               today=self._today(), policy=self.selection_policy, **liq)
         if long_p is None:
             return self._result(False, f"No liquid long put for ratio spread on {self.instrument_name}")
         short_p = select_wing(chain, center_strike=long_p.strike, width_pct=wing,

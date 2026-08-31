@@ -76,18 +76,25 @@ def test_the_swap_shrinks_every_structure_genome():
 
     The cap moved 26 -> 28 when ``opt_sl_ml`` landed (Task 9): every MEASURED-max-loss
     structure deliberately gained exactly two genes (``exit:opt_sl_ml:enabled`` +
-    ``cond:sl_ml:value``). The budget still bites -- an accidental third gene anywhere
-    fails it."""
+    ``cond:sl_ml:value``). It moved 28 -> 31 when the three SelectionPolicy weight genes
+    landed (Task 10): every pure-option member gains EXACTLY its half's shared
+    ``optsel:<half>:{w_premium,w_iv,w_rvol}`` -- 3 genes, hand-derived, never more, because
+    the sharing tier collapses them per half rather than per member. The budget still
+    bites -- an accidental fourth gene anywhere fails it."""
     m = _launcher()
     for key in PURE:
-        assert len(_space(m, key)) <= 28, (
-            f"{key} genome is {len(_space(m, key))}; the price-gate swap (and the two "
-            f"opt_sl_ml genes) should put every structure at or under 28 genes")
+        assert len(_space(m, key)) <= 31, (
+            f"{key} genome is {len(_space(m, key))}; the price-gate swap plus the two "
+            f"opt_sl_ml genes plus the three shared selection-weight genes should put "
+            f"every structure at or under 31 genes")
 
 
 def test_the_group_genome_shrinks_too():
+    """95 -> 98 with Task 10's weight genes: a GROUP also gains exactly 3 (every launcher
+    group is single-half, so the shared tier adds one set, not one per member -- OS1
+    measured 81 before, 84 after)."""
     m = _launcher()
-    assert len(_space(m, "OS1")) <= 95, "OS1 should fall from 120 to ~90 after the swap"
+    assert len(_space(m, "OS1")) <= 98, "OS1 should sit at ~84: 81 + the 3 shared weights"
 
 
 def test_no_value_offset_from_survives_in_an_option_entry_rule():

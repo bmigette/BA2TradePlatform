@@ -9,11 +9,14 @@ cache this is computed via Black-Scholes inversion of each contract's own daily 
 `HistoricalOptionsProvider.get_chain`'s per-as-of-date bar overlay) — not vendor-supplied, but
 real point-in-time delta, not a snapshot fixed at the cache build's start date.
 """
+import logging
 from datetime import date
 from typing import List, Optional, Tuple
 
 from ba2_common.core.option_types import OptionContract
 from ba2_common.core.types import OptionRight
+
+logger = logging.getLogger(__name__)
 
 
 # Absolute floor on a contract's mark, in premium dollars per share. A contract marked below
@@ -298,22 +301,75 @@ def _pick_by(method, cands, strike_param, spot, target_price, option_type):
     return min(cands, key=lambda c: (abs(c.strike - ts), *_tie(c)))
 
 
+def _policy_pick(method, cands, strike_param, spot, target_price, option_type, today,
+                 policy, structure_fn):
+    """Route ONE box pick through ``SelectionPolicy`` — the F17 production seam.
+
+    Only ever called with a NON-DEFAULT policy: the caller's guard is what preserves both the
+    no-op guarantee (a default policy is byte-identical to ``_pick_by``, proven in
+    ``test_option_selection_policy_noop.py``) and the legacy path's 27us cost for every trial
+    that leaves the weights alone.
+
+    THE APPLICABILITY REPORT IS WIRED HERE, NOT LEFT AS DECORATION (F17). When a payoff
+    weight is live, one ``payoff_columns`` pass is computed and handed to BOTH
+    ``inapplicable_features`` and ``pick`` — the report then describes the very numbers the
+    ranking used (a stateful closure cannot make them disagree) and the ~5ms pass runs once.
+    An inapplicable feature is INERT, never a demotion: the pick below still ranks every
+    candidate identically on that column, and the log line is what separates "this gene is
+    dead for this builder" from "this gene is live and unhelpful" in a grid post-mortem.
+    """
+    from ba2_common.core import option_selection_policy as _osp
+
+    ctx = _osp.PolicyContext(strike_method=method, today=today, target=strike_param,
+                             spot=spot, target_price=target_price, option_type=option_type,
+                             structure_fn=structure_fn)
+    payoff = None
+    if policy.w_profit or policy.w_rr:
+        payoff = _osp.payoff_columns(cands, ctx)
+        inert = _osp.inapplicable_features(cands, ctx, payoff=payoff)
+        if inert:
+            logger.info(
+                "option selection: features %s are inapplicable for this pick (%d "
+                "candidates, structure_fn %s) — their weights are inert, not demoting",
+                ", ".join(inert), len(cands),
+                "supplied" if structure_fn is not None else "absent")
+    return _osp.pick(cands, ctx, policy, payoff=payoff)
+
+
 def select_single(chain, *, method, strike_param, spot, option_type, dte_min, dte_max, today,
                   target_price=None, min_open_interest=None, max_spread_pct=None,
-                  min_volume=None) -> Optional[OptionContract]:
+                  min_volume=None, policy=None, structure_fn=None) -> Optional[OptionContract]:
     cands = _candidates(chain, option_type, dte_min, dte_max, today, min_open_interest,
                         max_spread_pct, min_volume)
+    # A None or DEFAULT policy takes the legacy path. Not an optimisation only: the default
+    # policy is PROVABLY the same answer (the no-op suite), so the branch cannot change a
+    # result — but `is_default` is the property every weight must be listed in, so routing on
+    # it keeps "policy present but all-zero" byte-identical AND at the legacy 27us.
+    if policy is not None and not policy.is_default:
+        return _policy_pick(method, cands, strike_param, spot, target_price, option_type,
+                            today, policy, structure_fn)
     return _pick_by(method, cands, strike_param, spot, target_price, option_type)
 
 
 def select_vertical_spread(chain, *, method, long_param, short_param, spot, option_type,
                            dte_min, dte_max, today, target_price=None,
-                           min_open_interest=None, max_spread_pct=None, min_volume=None
+                           min_open_interest=None, max_spread_pct=None, min_volume=None,
+                           policy=None, structure_fn=None
                            ) -> Optional[Tuple[OptionContract, OptionContract]]:
     cands = _candidates(chain, option_type, dte_min, dte_max, today, min_open_interest,
                         max_spread_pct, min_volume)
     if len(cands) < 2:
         return None
+
+    # BOTH legs are box picks, so BOTH route through the policy (same non-default guard as
+    # ``select_single``). Wiring only the long leg would leave the short strike — the leg that
+    # carries a credit vertical's whole thesis — outside the searched choosing.
+    def _leg(legs_, param):
+        if policy is not None and not policy.is_default:
+            return _policy_pick(method, legs_, param, spot, target_price, option_type,
+                                today, policy, structure_fn)
+        return _pick_by(method, legs_, param, spot, target_price, option_type)
+
     # Work within a single expiry: the earliest expiry in the window that has >=2 strikes.
     by_expiry = {}
     for c in cands:
@@ -322,9 +378,8 @@ def select_vertical_spread(chain, *, method, long_param, short_param, spot, opti
         legs = by_expiry[expiry]
         if len(legs) < 2:
             continue
-        long_leg = _pick_by(method, legs, long_param, spot, target_price, option_type)
-        short_leg = _pick_by(method, [c for c in legs if c is not long_leg],
-                             short_param, spot, target_price, option_type)
+        long_leg = _leg(legs, long_param)
+        short_leg = _leg([c for c in legs if c is not long_leg], short_param)
         if not long_leg or not short_leg or long_leg.strike == short_leg.strike:
             continue
         # For a debit CALL spread, long is the lower strike. Order so long<short.
