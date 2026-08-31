@@ -2459,9 +2459,10 @@ class _OptionEntryAction(TradeAction):
         an ordinary condition — a feed outage, a second call on the same lot, shares not
         yet visible on the broker's side — logs a stack trace at ERROR.
 
-        The seam's raise STAYS as the backstop for direct callers
-        (``PremiumSeller.rebalance``, ``OptionPortfolioManager``), which have nowhere to
-        put a verdict; this is the ask-first path for the caller that does. The verdict's
+        The seam's raise STAYS as the backstop for direct ``submit_option_order``
+        callers, which have nowhere to put a verdict (historically
+        ``PremiumSeller.rebalance`` — deleted 2026-08-31 — and any future direct
+        caller); this is the ask-first path for the caller that does. The verdict's
         ``reason`` is the seam's own sentence verbatim, so both channels say one thing.
 
         Placed AFTER sizing, like ``_refuse_if_cannot_take_delivery`` is placed after the

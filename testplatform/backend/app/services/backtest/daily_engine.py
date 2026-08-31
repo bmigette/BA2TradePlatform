@@ -234,34 +234,12 @@ def _schedule_allows_entry(as_of_dt: datetime, schedule: Optional[Dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# BYPASS-expert seams (spec §3.3): manager-class resolution + run cadence.
+# BYPASS experts run their ENTRY pass on entry bars and rebalance through
+# FactorRanker's FactorPortfolioManager. (The spec §3.3 seams that let an expert
+# declare its own manager class — ``portfolio_manager_classpath`` — and a
+# manage-bar exit pass — ``manages_between_entries`` — were deleted 2026-08-31
+# with their sole producer, PremiumSeller; option-model plan Task 12.)
 # ---------------------------------------------------------------------------
-def _resolve_bypass_manager_class(expert) -> Any:
-    """Portfolio-manager class for a bypass expert.
-
-    Experts may declare ``portfolio_manager_classpath`` (dotted path); the
-    default is FactorRanker's FactorPortfolioManager — byte-identical for every
-    existing bypass expert (spec §3.3.1)."""
-    import importlib
-    classpath = getattr(expert, "portfolio_manager_classpath", None)
-    if not classpath:
-        from ba2_experts.FactorRanker.portfolio import FactorPortfolioManager
-        return FactorPortfolioManager
-    module, _, name = classpath.rpartition(".")
-    return getattr(importlib.import_module(module), name)
-
-
-def _bypass_run_kind(expert, entry_ok: bool, manage_ok: bool) -> Optional[str]:
-    """Which pass a bypass expert runs this bar: "entry" on entry bars (always),
-    "manage" on manage bars ONLY when the expert declares
-    ``manages_between_entries`` (default False — FactorRanker unchanged)."""
-    if entry_ok:
-        return "entry"
-    if manage_ok and getattr(expert, "manages_between_entries", False):
-        return "manage"
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Option expiry / exercise / assignment
 # ---------------------------------------------------------------------------
@@ -412,7 +390,7 @@ class DailyBacktestEngine:
         # set only changes per scan date (weekly cadence), so it's computed once per scan date and
         # reused for every bar in that period (vs recomputing the full-store filter every 5min bar).
         self._screened_cache: Dict[str, List[str]] = {}
-        # BYPASS-expert (FactorRanker/PremiumSeller) per-run manager cache. The portfolio manager
+        # BYPASS-expert (FactorRanker) per-run manager cache. The portfolio manager
         # holds only run-CONSTANT state (the resolver expert/account instances + ids), so building
         # it ONCE per expert avoids an ExpertInstance DB query on every rebalance bar.
         # (``_bypass_veq_pct`` lived here too until 2026-08-06; it existed solely to feed the
@@ -434,18 +412,16 @@ class DailyBacktestEngine:
     def _bypass_manager(self, expert_id: int) -> Any:
         """Lazily build + cache the portfolio manager for a bypass expert (run-constant).
 
-        The manager class comes from ``_resolve_bypass_manager_class`` (default:
-        FactorRanker's FactorPortfolioManager; PremiumSeller declares its
-        OptionPortfolioManager via ``portfolio_manager_classpath``).
+        Always FactorRanker's FactorPortfolioManager (the per-expert manager-class seam
+        went with PremiumSeller, 2026-08-31 — see the module-level note).
 
         The manager is stable for the whole run; it reads live account state on every call.
         """
         pm = self._bypass_pm.get(expert_id)
         if pm is None:
-            from ba2_common.core.instance_resolver import get_instance_resolver
+            from ba2_experts.FactorRanker.portfolio import FactorPortfolioManager
 
-            expert = get_instance_resolver().get_expert_instance(expert_id)
-            pm = _resolve_bypass_manager_class(type(expert))(expert_id)
+            pm = FactorPortfolioManager(expert_id)
             self._bypass_pm[expert_id] = pm
         return pm
 
@@ -668,22 +644,11 @@ class DailyBacktestEngine:
                     analyzed_manage_days.add(_day_key)
                 book_dirty = True  # an analysis/management pass runs -> orders may be created
                 if getattr(expert, "bypasses_classic_rm", False):
-                    # Bypass experts rebalance on their ENTRY cadence; experts that
-                    # declare manages_between_entries (PremiumSeller) also run a
-                    # manage pass on MANAGE bars (exits only). Default: entry-only
-                    # (FactorRanker byte-identical).
-                    kind = _bypass_run_kind(expert, entry_ok, manage_ok)
-                    if kind == "entry":
+                    # Bypass experts rebalance on their ENTRY cadence only (FactorRanker
+                    # byte-identical). The manage-bar exit pass (manages_between_entries)
+                    # was deleted with its sole producer, PremiumSeller — 2026-08-31.
+                    if entry_ok:
                         self._run_bypass_expert_bar(expert, expert_id, settings, as_of_dt)
-                    elif kind == "manage":
-                        try:
-                            self._bypass_manager(expert_id).manage_open(as_of_dt)
-                        except Exception as e:  # noqa: BLE001 — one bar must not abort the run
-                            from app.services.backtest.price_source import BacktestCacheMiss
-                            from ba2_providers.fmp_common import FMPHistoryCacheMiss
-                            if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
-                                raise
-                            self._log(f"bypass manage_open failed for expert {expert_id} @ {as_of_dt:%Y-%m-%d}: {e}")
                     continue
                 if getattr(expert, "analyzes_as_basket", False):
                     # Basket experts (e.g. FMPSenateTraderWeight/FMPSenateTraderCopy) call

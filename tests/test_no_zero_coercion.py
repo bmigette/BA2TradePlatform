@@ -452,16 +452,16 @@ BASELINE: dict = {
     "packages/experts/ba2_experts/FactorRanker/portfolio.py": 1,
     "packages/experts/ba2_experts/PennyMomentumTrader/monitoring.py": 1,
     "packages/experts/ba2_experts/PennyMomentumTrader/screening.py": 1,
-    # 4 -> 2: two went with the deleted ``_txn_metrics`` rails stopgap (design 2026-08-27
-    # S4); the two left are in _tested / _close_structure, which this work does not touch.
-    "packages/experts/ba2_experts/PremiumSeller/portfolio.py": 2,
+    # PremiumSeller/portfolio.py (2, in _tested / _close_structure) left the register
+    # 2026-08-31: the whole expert was deleted (plan Task 12), coercions and all. The
+    # total below drops by exactly those 2.
     "packages/providers/ba2_providers/fundamentals/overview/FMPCompanyOverviewProvider.py": 1,
     "packages/providers/ba2_providers/insider/FMPInsiderProvider.py": 4,
     "testplatform/backend/app/services/backtest/backtest_account.py": 26,
     "testplatform/backend/app/services/backtest_handler.py": 1,
     "testplatform/backend/app/services/strategy_optimization_handler.py": 1,
 }
-BASELINE_TOTAL = 174
+BASELINE_TOTAL = 172
 
 
 # =========================================================================== #

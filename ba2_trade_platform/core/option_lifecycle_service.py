@@ -105,9 +105,10 @@ entry seam already refuses to write a covered call whose cover it cannot find), 
 EXITS. A book that has lost its cover must above all still be able to CLOSE, so a
 cover-lost structure is submitted for closing like any other, an unmeasurable cover
 stops nothing on any OTHER structure, and neither ever aborts the pass.
-``packages/experts/.../PremiumSeller`` still pins the opposite in
-``test_circuit_breaker_flattens_and_halts``; that expert is deleted in Task 12 and its
-behaviour is deliberately NOT treated as a specification here.
+``packages/experts/.../PremiumSeller`` pinned the opposite in
+``test_circuit_breaker_flattens_and_halts``; that expert (and the pin) was deleted
+2026-08-31 (option-model plan Task 12) and its behaviour was deliberately NOT treated
+as a specification here.
 
 
 The breaker peak is process state

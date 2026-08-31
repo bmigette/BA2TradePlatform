@@ -147,7 +147,8 @@ The platform includes multiple AI trading experts with different strategies and 
 | **PennyMomentumTrader** | Live intraday penny-stock momentum trader | Market data, screener, social/news catalysts | Self-executing live expert, screener universe, staged exits |
 | **FactorRanker** | Cross-sectional multi-factor equity ranker | FMP fundamentals & prices, StockScreener | momentum / value / quality / PEAD factors, static or screener universe, self-rebalancing top-N (no recommendations) |
 | **DeterministicScorer** | LLM-free multi-section scorer — reproduces a TradingAgents-style verdict with pure local math, zero LLM calls | FMP/FinnHub fundamentals, prices, ratings, FRED macro | Technical + fundamental + analyst + macro sections, `tanh`-bounded composite score, Altman-Z hard veto, fully deterministic and free to run |
-| **PremiumSeller** | Systematic short-premium options income | Alpaca/ThetaData option chains, FMP ratings | Defined-risk put credit spreads (naked puts / strangles behind stricter rails), IVR & IV-HV entry gates, profit-capture / tested-delta / roll-DTE exits, bypasses classic RM |
+
+*PremiumSeller (systematic short-premium options income) was removed 2026-08-31 — its rails and exit lifecycle now serve every option position via the shared option risk manager (see EXPERTS.md §8).*
 
 📖 **For detailed documentation on all experts, their settings, and configuration options, see [EXPERTS.md](EXPERTS.md)** — and the dedicated [FactorRanker guide](docs/FACTORRANKER_EXPERT.md).
 

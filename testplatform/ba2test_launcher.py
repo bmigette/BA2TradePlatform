@@ -1058,8 +1058,9 @@ def _daily_manage_schedule() -> dict:
 
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
-    the expert's own universe setting when the spec names one (PremiumSeller's static_universe —
-    it reads its universe from that setting, not from enabled_instruments).
+    the expert's own universe setting when the spec names one (``universe_setting`` — for an
+    expert that reads its universe from a setting, not from enabled_instruments; no current
+    spec names one since PremiumSeller's removal, 2026-08-31).
 
     ``overrides`` wins over fixed_settings. Used by ``--sizing-mode`` so the SAME expert spec can
     be run once per sizing mode without editing _EXPERT_OPT: sizing_mode is a 2-value categorical
@@ -1115,8 +1116,9 @@ def _apply_options_store(args, backtest_block: dict) -> None:
 
 def _bypass_gene_space(spec: dict) -> dict:
     """GA gene space for a BYPASS expert: its expert_params plus the narrow _BYPASS_RM_OPT block
-    UNLESS the spec opts out (no_bypass_rm — PremiumSeller's manager owns its exits, so the
-    engine stop pass has no reader for risk_per_trade_pct and the gene would be dead weight)."""
+    UNLESS the spec opts out (no_bypass_rm — for a bypass expert whose manager owns its exits,
+    leaving risk_per_trade_pct with no reader; no current spec sets it since PremiumSeller's
+    removal, 2026-08-31)."""
     return {**spec["expert_params"], **({} if spec.get("no_bypass_rm") else _BYPASS_RM_OPT)}
 
 
@@ -1298,42 +1300,10 @@ _EXPERT_OPT = {
         "fixed_settings": {"universe_source": "static", "weighting": "equal"},
         "bypass": True,
     },
-    # PremiumSeller is a BYPASS *options* income expert (design: docs/superpowers/specs/
-    # 2026-07-24-premium-seller-expert-design.md): it sells defined-risk put credit spreads on
-    # large caps and manages its own exits on manage bars (OptionPortfolioManager.manage_open).
-    # options=True  -> the run gets the offline options-cache seam (options_cache_db forwarded
-    #                  per-trial by _build_daily_trial_config).
-    # universe_setting -> --universe is injected into its static_universe setting (it reads its
-    #                  universe from that setting, NOT from enabled_instruments).
-    # no_bypass_rm  -> _BYPASS_RM_OPT's risk_per_trade_pct has no reader for it: the gene prices
-    #                  FactorRanker's resting protective stop (protective_stop_price), and
-    #                  PremiumSeller's OptionPortfolioManager has no such stop (it owns its exits
-    #                  via manage_open), so the gene would be dead weight.
-    "PremiumSeller": {
-        "expert_params": {
-            "iv_rank_min": {"optimize": True, "min": 20.0, "max": 60.0, "step": 10.0, "type": "float"},
-            "iv_hv_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
-            "trend_filter_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
-            "target_delta": {"optimize": True, "min": 0.15, "max": 0.40, "step": 0.05, "type": "float"},
-            "target_dte": {"optimize": True, "min": 21, "max": 45, "step": 6, "type": "int"},
-            "spread_width": {"optimize": True, "min": 2.5, "max": 10.0, "step": 2.5, "type": "float"},
-            "min_credit_ratio": {"optimize": True, "min": 0.05, "max": 0.20, "step": 0.05, "type": "float"},
-            "profit_capture_pct": {"optimize": True, "min": 25.0, "max": 75.0, "step": 25.0, "type": "float"},
-            "roll_dte": {"optimize": True, "min": 14, "max": 28, "step": 7, "type": "int"},
-            "risk_per_structure_pct": {"optimize": True, "min": 1.0, "max": 5.0, "step": 1.0, "type": "float"},
-            "max_deployment_pct": {"optimize": True, "min": 20.0, "max": 60.0, "step": 10.0, "type": "float"},
-            "dr_stop_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
-            "dr_stop_credit_mult": {"optimize": True, "min": 1.5, "max": 3.0, "step": 0.5, "type": "float"},
-            "tested_delta_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
-        },
-        # Naked structures stay OFF in v1 (defined-risk only); the earnings filter stays pinned ON.
-        "fixed_settings": {"enable_short_put": False, "enable_short_strangle": False,
-                           "earnings_filter_enabled": True},
-        "bypass": True,
-        "options": True,
-        "universe_setting": "static_universe",
-        "no_bypass_rm": True,
-    },
+    # PremiumSeller's grid entry was REMOVED 2026-08-31 (operator decision; option-model plan
+    # Task 12): the expert is deleted, so `ba2-test optimize --expert PremiumSeller` now refuses
+    # loudly via the "not configured" exit below. Its promoted rails/lifecycle logic serve every
+    # option position through ba2_common.option_book / option_lifecycle and the option RM.
 }
 
 
@@ -2540,6 +2510,8 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    option positions with no TradeAction and no risk manager at all (its only rails are
 #    `_within_rails` / `_book_totals`). A grid arm using PremiumSeller is not exercising any of
 #    the option RM work.
+#    [2026-08-31: the fourth path is GONE — PremiumSeller was deleted (option-model plan Task 12,
+#    operator decision); every option entry now goes through a path the option RM covers.]
 #
 # CLOSED 2026-08-26: `_option_consistent_annual_return` -- the DEFAULT fitness for pure-option
 # grids -- now takes its trade frequency from `_trades_per_year` (STRUCTURES) instead of
@@ -3962,7 +3934,7 @@ def _cmd_optimize(args) -> int:
     spec = _EXPERT_OPT.get(expert)
     if spec is None:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
-    # Pure-option kinds AND options experts (PremiumSeller — --strategy is ignored for it)
+    # Pure-option kinds AND options experts (spec key `options` — --strategy is ignored)
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
                                "consistent_annual_return" if spec.get("options") else "sharpe_ratio")
@@ -4316,8 +4288,8 @@ def _cmd_optimize_batch(args) -> int:
         spec = _EXPERT_OPT[expert]
         bypass = bool(spec.get("bypass"))
         prefix = args.name_prefix or "phase1"
-        # Per-job resolution: pure-option kinds AND options experts (PremiumSeller — bypass,
-        # so strat_kind is "FACTOR" and carries no option-kind default) default to
+        # Per-job resolution: pure-option kinds AND options experts (spec key `options` — a
+        # bypass one's strat_kind is "FACTOR" and carries no option-kind default) default to
         # consistent_annual_return; stock kinds keep this command's historical calmar_ratio
         # default.
         fitness = _resolve_fitness(args.fitness, strat_kind,
@@ -4390,11 +4362,11 @@ def _cmd_optimize_batch(args) -> int:
                 "earlyStoppingGenerations": int(args.early_stop),
                 "elitismPercent": 0.1, "seed": int(args.seed),
                 "parallelIndividuals": int(args.parallel),
-                # Bypass experts (FactorRanker, PremiumSeller) size their own portfolio and skip
+                # Bypass experts (FactorRanker) size their own portfolio and skip
                 # the full RM block + per-day schedule genes, but carry _BYPASS_RM_OPT
                 # (risk_per_trade_pct, which prices FactorRanker's resting protective stop)
-                # UNLESS the spec opts out via no_bypass_rm (PremiumSeller's manager owns its
-                # exits — the gene would be dead weight); ruleset experts get the full
+                # UNLESS the spec opts out via no_bypass_rm (a manager that owns its exits
+                # leaves the gene dead weight — no current spec); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
                                   else {**spec["expert_params"], **_rm_opt_for(strat_kind),
@@ -5222,7 +5194,7 @@ def main(argv: "list | None" = None) -> int:
                          "use_atr_stop) are inert and drift random, so a crossover that flipped "
                          "the mode would score it with unselected parameters and bias the "
                          "comparison toward whichever mode dominates the population. No effect "
-                         "on bypass experts (FactorRanker, PremiumSeller) — they skip "
+                         "on bypass experts (FactorRanker) — they skip "
                          "TradeRiskManagement entirely, so sizing_mode is never read. ALWAYS "
                          "give the two runs different --name suffixes, or the second is SKIPped "
                          "as an already-completed run.")

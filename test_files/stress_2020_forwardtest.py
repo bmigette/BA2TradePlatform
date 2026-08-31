@@ -45,6 +45,8 @@ NEW_SUFFIX = "-2020"
 NEW_LABEL = "Stress2020"
 
 # Experts whose data cannot reach 2020 (options cache floors at 2024-01-18).
+# PremiumSeller was DELETED 2026-08-31 (plan Task 12); it stays listed so HISTORICAL source
+# backtest rows naming it are still skipped here instead of failing expert resolution.
 OPTION_EXPERTS = {"PremiumSeller"}
 
 

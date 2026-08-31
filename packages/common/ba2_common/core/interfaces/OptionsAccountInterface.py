@@ -48,7 +48,8 @@ COVER_REFUSAL = "UNCOVERED SHORT CALL"
 #: this account holds". The cover guard REFUSES on exactly that promise and no other:
 #:
 #: * a ``short_strangle``/``short_put`` is DELIBERATELY undefined-risk and is gated by
-#:   PremiumSeller's ``undefined_risk_max_pct`` rail, not by share inventory;
+#:   the ``undefined_risk_max_pct`` book rail (``ba2_common.core.option_book``), not by
+#:   share inventory;
 #: * a ``bear_call_spread`` answers for its short call with a LONG CALL rather than with
 #:   shares, so it is never refused HERE — but it is not outside the cover ledger either:
 #:   ``shares_pledged_to_short_calls`` counts its short leg as pledging shares like any
@@ -57,7 +58,7 @@ COVER_REFUSAL = "UNCOVERED SHORT CALL"
 #:   short call really can have 100 shares called away), and a real constraint: two such
 #:   sleeves on one ticker will not both write;
 #: * every close path submits under ``"close"`` (``option_lifecycle_service``,
-#:   ``PremiumSeller.portfolio``, ``close_option_position``), so flattening is never
+#:   ``close_option_position``), so flattening is never
 #:   gated on a cover reading — a refusal there would strand an open position.
 COVERED_CALL_STRATEGY = "covered_call"
 
@@ -284,8 +285,8 @@ class OptionsAccountInterface(ABC):
         # Transaction to carry per-leg expiries — this refusal is the reminder.
         #
         # A leg whose expiry is None is UNKNOWN, not a second expiry, and is not counted:
-        # the close paths rebuild legs from stored order rows (PremiumSeller/portfolio.py
-        # reads `getattr(o, "expiry", None)`), and refusing there would strand an open
+        # the close paths rebuild legs from stored order rows (reading
+        # `getattr(o, "expiry", None)`), and refusing there would strand an open
         # position that can no longer be flattened — much worse than an incomplete intent.
         expiries = sorted({leg.expiry for leg in legs if leg.expiry is not None})
         if len(expiries) > 1:
@@ -479,9 +480,9 @@ class OptionsAccountInterface(ABC):
         and turns the same sentence into a failed ``TradeActionResult``, so nothing is
         raised on the path where a refusal is an ordinary outcome.
 
-        This raise stays because not every caller has such a channel.
-        ``PremiumSeller.rebalance``, ``OptionPortfolioManager`` and any future direct
-        caller reach ``submit_option_order`` with nowhere to put a verdict, and for them
+        This raise stays because not every caller has such a channel. Any direct
+        caller (historically ``PremiumSeller.rebalance``, deleted 2026-08-31; any
+        future one) reaches ``submit_option_order`` with nowhere to put a verdict, and for them
         the alternative to an exception is a silent naked write. It is a backstop and
         not the primary channel: reaching it means a caller did not ask first.
 
@@ -505,8 +506,8 @@ class OptionsAccountInterface(ABC):
         WHY THIS LIVES AT THE SEAM AND NOT IN THE ACTION. ``SellCoveredCallAction``
         checks cover too, and it stays — but it was the ONLY caller that did.
         ``submit_option_order`` validated a non-empty leg list, a 4-leg ceiling and a
-        single expiry, so ``PremiumSeller.rebalance``, ``OptionPortfolioManager`` and any
-        future caller could write a naked short call under the ``covered_call`` tag with
+        single expiry, so a direct caller (``PremiumSeller.rebalance``, until its
+        2026-08-31 deletion) could write a naked short call under the ``covered_call`` tag with
         nothing in the repo to notice. A promise enforced at one of five call sites is a
         convention, not an invariant.
 
@@ -893,8 +894,8 @@ class OptionsAccountInterface(ABC):
     def plausible_atm_iv(cls, iv) -> Optional[float]:
         """``float(iv)`` when it can be a real annualised ATM IV, else None.
 
-        THE single definition, shared by the live recorder, the live rank, the backtest
-        rank and PremiumSeller's gate, so "what counts as a possible IV" cannot fork the
+        THE single definition, shared by the live recorder, the live rank and the backtest
+        rank, so "what counts as a possible IV" cannot fork the
         way the two IV-rank implementations did. Returning None (not a clamped value, not
         0.0) is the whole point: every caller already treats None as "unknown" and fails
         closed, and clamping would manufacture exactly the fabricated sample the recorder

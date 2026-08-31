@@ -833,8 +833,8 @@ def print_options_cache_report(universe_path: Optional[str], iv_sample: int,
 # local copy rather than an import so this tool stays runnable without the backtest package on
 # the path; if the engine's table changes, update here too).
 _WARMUP_BARS_BY_EXPERT = {
-    "FactorRanker": 252,          # momentum_12_1 (12 months) -- the deepest non-option lookback
-    "PremiumSeller": 300,         # SMA-200/HV floor (options expert; excluded from equity grids)
+    "FactorRanker": 252,          # momentum_12_1 (12 months) -- the deepest lookback
+    # PremiumSeller (300 bars) removed 2026-08-31 with the expert's deletion (plan Task 12).
     "FMPRating": 10,
     "FMPEarningsDrift": 10,
     "FMPInsiderClusterBuy": 10,
@@ -922,8 +922,8 @@ def check_warmup_coverage(store_dir: str, provider_dir: str, interval: str, star
 
 # Experts the warmup-dependency check sizes against: every non-option expert a goal2020-style
 # equity grid runs. FactorRanker's 252-bar momentum dominates, so this is the deepest requirement
-# any equity job will derive. PremiumSeller (options, 300 bars) is excluded -- the options cache
-# floors at 2024 anyway, so it can never run a 2020 window.
+# any equity job will derive. (PremiumSeller — options, 300 bars — was excluded here until its
+# deletion, 2026-08-31: the options cache floors at 2024, so it could never run a 2020 window.)
 _warmup_experts = ["FactorRanker", "FMPRating", "FMPEarningsDrift",
                    "FMPInsiderClusterBuy", "FMPSenateTraderWeight"]
 

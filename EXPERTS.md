@@ -152,22 +152,10 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 
 📖 **Full guide:** [docs/FACTORRANKER_EXPERT.md](docs/FACTORRANKER_EXPERT.md)
 
-### 8. PremiumSeller (backtest-only)
-**Systematic option premium seller — defined-risk put credit spreads on large caps**
+### 8. PremiumSeller — REMOVED 2026-08-31
+**Deleted** (operator decision; option-model plan Task 12, `docs/superpowers/plans/2026-08-24-option-model-and-lifecycle.md`). The systematic short-premium expert's capabilities were promoted into shared code and now serve **every** option position: book rails and circuit breaker in `ba2_common.core.option_book`, exit lifecycle (profit capture, tested-delta, roll-DTE, stops) in `ba2_common.core.option_lifecycle`, enforced by the option risk manager. The launcher refuses `ba2-test optimize --expert PremiumSeller` loudly; historical backtest/optimization rows naming it remain readable.
 
-- **Type**: Systematic options income expert (self-executing bypass expert, no classic RM)
-- **Methodology**: Sells put credit spreads (optionally naked puts / short strangles under stricter sub-rails) on a static large-cap universe; harvests the volatility risk premium
-- **Data Sources**: OPRA options history (offline cache), FMP daily prices, FMP earnings calendar, FMP grades/ratings
-- **Instrument Selection**: Expert-driven via its own `static_universe` setting (comma-separated underlyings, **required**)
-- **Key Features**:
-  - Entry signals — IVR gate, IV-HV spread, SMA trend filter, earnings exclusion, FMP-rating floor — all GA-tunable expert settings
-  - Exit signals — profit capture, tested-delta, roll-DTE, credit-multiple stops, circuit breaker — all GA-tunable expert settings
-  - Lifecycle owned by `OptionPortfolioManager` (entries on entry bars, exit management on manage bars) — **no `ExpertRecommendation`, no classic RM**
-  - Backtest-only in v1 (`run_analysis` raises `NotImplementedError`); GA-optimizable via the launcher grid (`ba2-test optimize --expert PremiumSeller`, fitness defaults to `consistent_annual_return`)
-
-**Key Settings**: `static_universe`, `iv_rank_min`, `iv_hv_min_pp`, `trend_sma`, `target_delta`, `target_dte`, `spread_width`, `min_credit_ratio`, `risk_per_structure_pct`, `profit_capture_pct`, `roll_dte`, `max_deployment_pct`, `circuit_breaker_pct` (+ naked-structure rails `enable_short_put` / `enable_short_strangle`).
-
-📖 **Spec:** [docs/superpowers/specs/2026-07-24-premium-seller-expert-design.md](docs/superpowers/specs/2026-07-24-premium-seller-expert-design.md)
+📖 **Historical spec:** [docs/superpowers/specs/2026-07-24-premium-seller-expert-design.md](docs/superpowers/specs/2026-07-24-premium-seller-expert-design.md)
 
 ## Expert Properties Comparison
 
@@ -180,7 +168,6 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 | FMPSenateTraderCopy | **Yes** | No | Simple government trade copying |
 | PennyMomentumTrader | **Yes** | **Yes** | Live intraday penny-stock momentum |
 | FactorRanker | **Yes** | **Yes** | Systematic multi-factor equity ranking |
-| PremiumSeller | **Yes** (own setting) | **Yes** | Systematic option premium selling (backtest-only) |
 
 ¹ *Self-executing* experts place and manage their own orders via a dedicated manager (no `ExpertRecommendation`, no SmartRiskManager); order/expert attribution flows through `Transaction.expert_id`.
 

@@ -738,6 +738,15 @@ git commit -m "test(options): live and backtest decide identically, from one imp
 
 ### Task 12: Delete PremiumSeller and OptionPortfolioManager
 
+> **DONE 2026-08-31** (operator decision): the full removal was executed WITHOUT waiting for
+> the Task 11 parity work / the `option_lifecycle.decide` replacement — verified that
+> `_should_close` had no caller outside the deleted expert and its deleted tests. Scope as
+> below, plus: the launcher grid entry, the daily_engine `manages_between_entries` /
+> `portfolio_manager_classpath` seams (sole producer), and the `_SUPPORTED_EXPERTS` /
+> warmup-table entries. Absence is pinned by
+> `packages/experts/tests/test_premium_seller_removed.py` and
+> `testplatform/backend/tests/test_launcher_premium_seller_removed.py`.
+
 **Files:**
 - Delete: `packages/experts/ba2_experts/PremiumSeller/` (924 lines, 4 files)
 - Delete: its tests
@@ -747,12 +756,12 @@ git commit -m "test(options): live and backtest decide identically, from one imp
 
 Do this **last**, once Tasks 6-11 prove the capability survives elsewhere.
 
-- [ ] **Step 1: Prove the logic is gone before deleting the source.** Grep every promoted behaviour
+- [x] **Step 1: Prove the logic is gone before deleting the source.** Grep every promoted behaviour
   — book rails, breaker, tested-delta, roll — and confirm each now has a test in
   `packages/common/tests/`. List them in the commit message. If any has no home, **stop** and add it
   first.
 
-- [ ] **Step 2: Check for live callers**
+- [x] **Step 2: Check for live callers**
 
 ```bash
 grep -rn "PremiumSeller\|OptionPortfolioManager\|bypasses_classic_rm" \
@@ -761,11 +770,11 @@ grep -rn "PremiumSeller\|OptionPortfolioManager\|bypasses_classic_rm" \
 
 Expected: only the two `daily_engine.py` sites. Anything else, stop and report.
 
-- [ ] **Step 3: Delete, and remove the `bypasses_classic_rm` branch** if nothing else uses it.
+- [x] **Step 3: Delete, and remove the `bypasses_classic_rm` branch** if nothing else uses it.
 
-- [ ] **Step 4: Run everything** — all four suites plus the backtest suite. Report every count.
+- [x] **Step 4: Run everything** — all four suites plus the backtest suite. Report every count.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git commit -m "refactor(options): delete PremiumSeller - its capabilities now serve every position"
