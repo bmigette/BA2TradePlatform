@@ -143,6 +143,7 @@ from ..utils.portfolio_allocation_view import (
     fill_label_to_100, fill_rest_symbol_shares,
     format_allocation_footer, format_label_header,
     format_label_target_tooltip,
+    format_base_composition,
     format_reserve_caption,
     format_reserve_row, label_color_contrast_warning,
     ALLOCATION_BAR_LEGEND, allocation_bar, band_color, RESERVE_SELL_WARNING,
@@ -2271,6 +2272,14 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
         # rendering in the same white as the captions around it.
         ui.label(RESERVE_SELL_WARNING).classes('text-xs text-orange-400') \
             .style(class_color_style('text-orange-400'))
+        # WHAT THE BASE IS, before anything is stated as a percentage of it. Drawn
+        # above the caption because it is the addition every other figure on the card
+        # divides, and it was the only one never shown.
+        base_line = format_base_composition(
+            base_notional=live['base_notional'],
+            available_buying_power=live['available_buying_power'])
+        live['base_composition'] = ui.label(base_line or '') \
+            .classes('text-xs text-secondary-custom').style(TABULAR_NUMS)
         live['reserve_caption'] = ui.label(
             format_reserve_caption(live['base_notional'], live['unallocated_pct'])
         ).classes('text-xs text-secondary-custom').style(TABULAR_NUMS)

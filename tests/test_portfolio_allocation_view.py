@@ -27,6 +27,7 @@ from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
     bar_scale_pct, build_label_bars, format_allocation_footer,
     sort_label_views,
     format_label_header, format_label_target_tooltip, format_label_total_notice,
+    format_base_composition,
     format_reserve_caption,
     format_reserve_row,
     label_color_options, normalise_label_color, resolve_label_icon_color,
@@ -1815,7 +1816,26 @@ def test_reserve_dollars_without_a_base_is_None_not_zero():
 
 def test_the_reserve_caption_states_the_money_and_what_is_left():
     assert format_reserve_caption(10_000.0, 25.0) == \
-        '= $2,500.00 held back, $7,500.00 investable'
+        '25% of the $10,000.00 base = $2,500.00 held back, leaving $7,500.00 to allocate'
+
+
+def test_the_reserve_caption_names_the_base_it_is_a_percentage_OF():
+    """The reported confusion: "$536.98 held back, $4,832.81 investable" invites the
+    obvious sanity check, and that check is the wrong one -- 10% of the 4,832.81 you can
+    SEE is 483, not 537, so the page looks broken. It is not: the reserve is a share of
+    the GROSS base, and reserved is DEFINED as ``base - investable``, so the two halves
+    sum to the base exactly. Naming the base makes the division checkable on screen.
+
+    A reserve measured against the REMAINDER would be circular -- the remainder is what
+    is left after the reserve -- and would break that identity."""
+    text = format_reserve_caption(5_369.79, 10.0)
+
+    assert '$5,369.79 base' in text, "the caption must name the base it divides"
+    assert '$536.98 held back' in text
+    assert '$4,832.81 to allocate' in text
+    # The whole point: the reader can now verify it without leaving the line.
+    assert round(5_369.79 * 0.10, 2) == 536.98
+    assert round(536.98 + 4_832.81, 2) == 5_369.79
 
 
 def test_the_reserve_caption_says_so_when_there_is_no_base_instead_of_showing_zero():
@@ -1827,8 +1847,27 @@ def test_the_reserve_caption_says_so_when_there_is_no_base_instead_of_showing_ze
 def test_the_reserve_row_line_is_the_string_the_page_has_always_drawn():
     text = format_reserve_row(base_notional=10_000.0, available_buying_power=1_000.0,
                               unallocated_pct=25.0)
-    assert text == ('Unallocated (free buying power) — $1,000.00 (10.0% of base, '
-                    'target 25.00% of base = $2,500.00)')
+    assert text == ('Unallocated (free buying power) — now $1,000.00 (10.0% of base) '
+                    '· target $2,500.00 (25.00% of base)')
+
+
+def test_each_percentage_sits_beside_the_dollars_it_describes():
+    """The reported bug. The old line read
+    "$542.61 (10.1% of base, target 10.00% of base = $536.98)", which put the ACTUAL
+    percentage next to the TARGET dollars -- and directly under a caption that had just
+    said "$536.98 held back". It read as "$536.98 is 10.1%", and the page looked like it
+    could not add up. It could: base 5,369.79, target 10.00% = 536.98, actual 542.61 =
+    10.1049%. Nothing was wrong except which number the eye bound the percentage to.
+    """
+    text = format_reserve_row(base_notional=5_369.79, available_buying_power=542.61,
+                              unallocated_pct=10.0)
+
+    # Each amount is immediately followed by ITS OWN percentage.
+    assert '$542.61 (10.1% of base)' in text
+    assert '$536.98 (10.00% of base)' in text
+    # And each is labelled as measured or wanted.
+    assert 'now $542.61' in text
+    assert 'target $536.98' in text
 
 
 def test_the_reserve_row_line_is_None_when_there_is_nothing_to_divide_by():
@@ -1843,7 +1882,7 @@ def test_the_reserve_row_line_is_None_when_there_is_nothing_to_divide_by():
 def test_the_reserve_row_line_follows_the_reserve_box():
     text = format_reserve_row(base_notional=10_000.0, available_buying_power=1_000.0,
                               unallocated_pct=60.0)
-    assert 'target 60.00% of base = $6,000.00' in text
+    assert 'target $6,000.00 (60.00% of base)' in text
 
 
 # ---------------------------------------------------------------------------
@@ -4872,3 +4911,59 @@ def test_no_warnings_produce_no_lines():
 
     assert plan_warning_lines([]) == []
     assert plan_warning_lines(None) == []
+
+
+# ---------------------------------------------------------------------------
+# THE BASE, SPELLED OUT
+#
+# The card states a dozen figures "of base" and never showed the base. Both
+# reported confusions came from that one omission:
+#   1. "10% of total investable 4832 is 482, not 537" -- the reserve is 10% of the
+#      BASE (5,369.79), not of the remainder it leaves.
+#   2. "we have $4,827.18 managed and $4,832.81 investable ... total investable
+#      should be managed + BP" -- managed + BP IS the base (5,369.79); the 4,832.81
+#      is that base MINUS the reserve. The two differ by exactly the reserve, and
+#      neither the base nor the reserve was on screen to check against.
+# ---------------------------------------------------------------------------
+
+def test_the_base_line_shows_the_addition_every_percentage_divides():
+    text = format_base_composition(base_notional=5_369.79, available_buying_power=542.61)
+
+    assert text == 'base $5,369.79 = $4,827.18 managed + $542.61 buying power'
+
+
+def test_the_managed_term_is_derived_so_the_addition_cannot_disagree():
+    """base - buying_power, never a second sum of the positions. Re-summing them here
+    would be a second computation of a number the page already has, and the two would
+    drift the first time a valuation mode changed on one side only."""
+    for base, bp in ((10_000.0, 2_500.0), (5_369.79, 542.61), (1_000.0, 1_000.0)):
+        text = format_base_composition(base_notional=base,
+                                       available_buying_power=bp)
+        managed = float(text.split('= $')[1].split(' managed')[0].replace(',', ''))
+
+        assert round(managed + bp, 2) == round(base, 2)
+
+
+def test_the_base_line_is_absent_rather_than_guessed_when_a_term_is_unknown():
+    """0.00 for an unreported buying power would publish a base short by that amount --
+    and every percentage on the page divides this number, so a wrong base makes all of
+    them wrong AND plausible."""
+    assert format_base_composition(base_notional=10_000.0,
+                                   available_buying_power=None) is None
+    assert format_base_composition(base_notional=None,
+                                   available_buying_power=500.0) is None
+    assert format_base_composition(base_notional=0.0,
+                                   available_buying_power=500.0) is None
+
+
+def test_the_reserve_and_the_base_line_reconcile_on_screen():
+    """The end-to-end property the reader needs: base = managed + free, reserve is a
+    share of THAT base, and reserve + to-allocate is the base again."""
+    base, bp = 5_369.79, 542.61
+    base_line = format_base_composition(base_notional=base, available_buying_power=bp)
+    caption = format_reserve_caption(base, 10.0)
+
+    assert '$5,369.79' in base_line and '$5,369.79 base' in caption
+    assert '$536.98 held back' in caption
+    assert '$4,832.81 to allocate' in caption
+    assert round(536.98 + 4_832.81, 2) == round(base, 2)

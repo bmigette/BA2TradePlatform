@@ -2261,7 +2261,10 @@ def test_the_reserve_and_the_labels_do_not_print_two_denominators_as_one_column(
         header = ' | '.join(_expansion_headers(nicegui_client.layout))
         tips = _tooltip_texts(nicegui_client.layout)
 
-    assert 'target 25.00% of base' in reserve_row, reserve_row
+    # The target and its denominator, now bound to the dollars they describe:
+    # "target $2,500.00 (25.00% of base)" rather than a bare "target 25.00% of
+    # base" sitting next to a DIFFERENT amount.
+    assert 'target $2,500.00 (25.00% of base)' in reserve_row, reserve_row
     # The reserve row is the ONE line still measured against the gross base, and it
     # says so; every label below divides the investable pool and says THAT. The two
     # denominators are NAMED rather than left to be inferred from matching grammar.
@@ -3459,7 +3462,7 @@ def test_the_reserve_shows_its_dollar_figure_beside_the_slider(nicegui_client,
     root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=25.0),
                  reserve=25.0)
     assert any('$2,500.00 held back' in t for t in _texts(root))
-    assert any('$7,500.00 investable' in t for t in _texts(root))
+    assert any('$7,500.00 to allocate' in t for t in _texts(root))
 
 
 def test_dragging_the_reserve_slider_persists_it(nicegui_client, account_id):
@@ -3505,7 +3508,7 @@ def test_moving_the_reserve_recomputes_the_reserve_line(nicegui_client, account_
     _drive_value(slider, 40.0)
 
     row = next(t for t in _texts(root) if 'free buying power' in t)
-    assert 'target 40.00% of base = $4,000.00' in row
+    assert 'target $4,000.00 (40.00% of base)' in row
     assert any('$4,000.00 held back' in t for t in _texts(root))
 
 
@@ -6728,7 +6731,7 @@ def test_the_reserve_card_keeps_every_word_the_blue_panel_carried(nicegui_client
     texts = _texts(_marked(root, page.MARKER_RESERVE_CARD)[0])
 
     assert any('Unallocated (free buying power)' in t for t in texts)
-    assert any('of base, target 10.00% of base' in t for t in texts)
+    assert any('(10.00% of base)' in t for t in texts)
     assert _view_mod().RESERVE_BASIS_NOTE in texts
     assert _view_mod().RESERVE_SELL_WARNING in texts
     assert _view_mod().ALLOCATION_BAR_LEGEND in texts
