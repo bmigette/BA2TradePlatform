@@ -150,3 +150,64 @@ no-contract trials.
   O_ERN is the exception: hundreds of independent events in-window, so it is
   the one key whose result deserves statistical weight.
 - Runs AFTER the selection-branch merge; worktree discipline as usual.
+
+## 9. The event expert — `FMPEarningsEvent` (operator-requested 2026-08-31)
+
+`O_ERN` chains behind a NEW expert that ranks upcoming earnings events; the
+existing pipeline does the chaining for free (expert emits `ExpertRecommendation`
+with confidence 1–100 → the strategy's `gate_confidence` gene thresholds it).
+
+**Timing split (design rule):** the EXPERT owns the ranking, the STRATEGY owns
+the timing. The expert surfaces every event inside a fixed look-ahead (setting
+`earnings_days_look`, default 10 — a plain setting, NOT a gene) and stamps
+`days_to_earnings` + its feature values onto the recommendation; `O_ERN`'s
+searched entry gene (1–5 days before) reads `days_to_earnings` as an entry
+condition. One timing knob, owned by one side.
+
+### Field coverage — MEASURED 2026-08-31 against the backtest's own FMP disk
+cache (`fmp_history`, ~5,000 symbols; sample = 23 names across the three bands):
+
+- **`past_earnings_quarterly`** (dates + eps/epsEstimated): 11–12 events per
+  symbol in 2023–2025, eps+estimate populated ≥90% on 21/23 names, ALL bands
+  (outliers: SBET 1/12 — no coverage; ARM/GOTU minor holes). → event dates,
+  historical moves (dates × our OHLCV) and surprise history are SOLID.
+- **`earnings_estimates_quarterly`** (dispersion, analyst counts): high/low
+  spreads populated where present, BUT only ~3 rows per symbol fall inside the
+  whole 3-year window — the endpoint looks forward-biased, so HISTORICAL
+  point-in-time dispersion is thin and a lookahead risk. Median analyst counts:
+  large 10–26, mid 1–8, small 1–10; several mid/small names sit at exactly 1
+  analyst (degenerate high==low).
+- **`price_target`**: the known windowed/degenerate trap CONFIRMED in this
+  window — mid/small run 0–3 targets/quarter with frequent one-analyst
+  quarters (DRS: 5 of them; AMR/SKE: zero targets at all).
+
+### Genes — emission decided BY the measurements (the w_spread discipline)
+
+EMIT:
+- `w_hist_move` — avg abs % earnings-day move over past events (dates from
+  past_earnings_quarterly × our OHLCV). Solid everywhere.
+- `w_surprise_vol` — std of past EPS surprises. Solid everywhere.
+- `w_vol_cheapness` — historical move ÷ current implied move (straddle price
+  from the options cache; bar iv 88% populated, measured). The only feature
+  comparing what you PAY to what you GET — the prior favourite.
+- `min_analysts` (1–5, searchable gate) and `allow_unconfirmed_dates` (on/off —
+  estimated dates slip; a slipped date buys vol for nothing).
+
+WITHHELD until verified point-in-time (recorded, not silently dropped):
+- `w_dispersion` — ~3 in-window estimate rows/symbol and 1-analyst degeneracy
+  in mid/small; emitting it now would be a dead-or-lookahead gene. Emit only
+  after a point-in-time replay proves the estimate rows were available BEFORE
+  each event.
+- `w_revision` (estimate/grade momentum) — same point-in-time caveat.
+- Any price-target-based expected move for mid/small — the measured 0–3
+  targets/quarter makes it noise below large-cap; if used at all it takes the
+  `min_price_targets_per_quarter`-style guard verbatim.
+
+FIXED SETTINGS (not genes): `earnings_days_look` (10), `min_hist_events` (4 —
+below it the features are a coin flip; SBET-class names fail here naturally),
+provider cache TTLs.
+
+### Universe caveat (standing memory)
+FMPEarningsDrift's edge lives small/midcap; large-cap earnings data was its
+weak spot. O_ERN × FMPEarningsEvent jobs run on the mid/small bands first; a
+large-cap job is read skeptically.
