@@ -2175,7 +2175,16 @@ _OPTION_STRATS = {
         "option_strike_param_max": 6.0, "option_strike_param_step": 2.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
         "option_dte_max_range": 60, "option_dte_step": 5},
-    "O_SSTG": {  # short strangle (credit)
+    "O_SSTG": {  # short strangle (credit) -- OUT OF THE SEARCHED SET since 2026-08-31
+        # (operator decision, AskUserQuestion: "Only truly unbounded"): its short call has no
+        # covering leg, so its worst case is UNBOUNDED (_UNDEFINED_RISK_MEMBERS) and the grid
+        # no longer searches it; an explicit --strategy/--strategies request refuses loudly.
+        # THIS RISK DECISION SUPERSEDES THE F4 AFFORDABILITY STANCE (F4, 2026-08-30, on dev:
+        # "capped, not excluded" -- a $300 Reg-T screener_gate_base cap so stage 1 could
+        # measure the structure without confounding quality with affordability). F4 answered
+        # "can the account afford it?"; 2026-08-31 answers "may the grid risk it?" -- and the
+        # answer is no even where it is affordable, so on a merge the exclusion wins. The row
+        # itself STAYS: builder, reserve math, settlement and tests remain fully supported.
         "action_type": "open_short_strangle", "option_strike_method": "percent_otm",
         "option_strike_param": 12.0, "option_dte_min": 25, "option_dte_max": 45,
         "option_sizing": 20.0,
@@ -2183,7 +2192,8 @@ _OPTION_STRATS = {
         "option_strike_param_max": 20.0, "option_strike_param_step": 2.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
         "option_dte_max_range": 50, "option_dte_step": 5},
-    "O_SSTD": {  # short straddle (credit)
+    "O_SSTD": {  # short straddle (credit) -- OUT OF THE SEARCHED SET since 2026-08-31,
+        # same unbounded short call and same supersession of F4's cap as O_SSTG above.
         "action_type": "open_short_straddle", "option_strike_method": "percent_otm",
         "option_strike_param": 0.0, "option_dte_min": 25, "option_dte_max": 45,
         "option_sizing": 20.0,
@@ -2343,6 +2353,56 @@ _OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
 # --initial-capital to ~$100k) to search them again.
 _FULL_NOTIONAL_OPTION_KINDS = {"O_CSP", "O_JL", "O_RS"}
 
+# Members whose worst case is UNBOUNDED -- ``option_payoff.max_loss`` has no number for them,
+# so the submit path stamps no ``max_loss_per_contract`` and ``loss_pct_of_max_loss`` has no
+# denominator: the ``opt_sl_ml`` exit rule is never emitted for a strategy built solely of
+# these (design 2026-08-29 S6).
+#
+# THE PREDICATE IS THE MEASURED PAYOFF, NOT "is this a naked short" (the corrected S6 rule,
+# 2026-08-30): only a net-uncovered short CALL is genuinely unbounded, because only the
+# upside is infinite. Concretely, per structure:
+#   * O_SSTG / O_SSTD -- a short call no other leg of the order covers: UNBOUNDED. In here.
+#   * O_CSP -- a naked short PUT is bounded below at (strike - credit) x 100, the underlying
+#     stopping at zero: MEASURED, stamped, carries the rule. (The pre-correction design table
+#     called this unbounded; packages/common/tests/test_max_loss_persisted_at_submit.py pins
+#     the corrected behaviour at the stamping seam.)
+#   * O_JL -- its short call is covered by the long wing, its short put bounded at zero:
+#     MEASURED (worst of the two sides).
+#   * O_RS -- all puts (1x2): bounded at an underlying of zero: MEASURED.
+#   * everything else is a debit or defined-risk structure: MEASURED trivially.
+#
+# TWO CONSUMERS, ONE DEFINITION -- deliberately, so "what counts as unbounded" can never
+# drift between them:
+#   1. the ``opt_sl_ml`` emission gate in ``_option_exit_rules`` (design 2026-08-29 S6).
+#      That half is the strategy-level APPLICABILITY gate only -- the safety mechanism is
+#      Task 8's absence rule (no stamp => the condition can never fire). (The wheel's
+#      covered-call legs were in that unstamped category until 2026-08-31: the builder now
+#      supplies its verified stock cover, the CC phase stamps (spot - credit) x 100, and
+#      opt_sl_ml can drive it.)
+#   2. the grouped-search filter over ``_OPTION_GROUPS_ALL`` below (operator decision
+#      2026-08-31, AskUserQuestion: "Only truly unbounded"): these members LEAVE the
+#      SEARCHED set entirely, the same way ``_FULL_NOTIONAL_OPTION_KINDS`` already filters
+#      it. An explicit single-strategy request (--strategy/--strategies O_SSTG or O_SSTD)
+#      refuses loudly in the optimize commands -- never silently runs, never silently
+#      skips. The structures stay fully SUPPORTED in code (builders, reserve math,
+#      settlement, tests untouched) -- only what the grid searches shrinks.
+_UNDEFINED_RISK_MEMBERS = {"O_SSTG", "O_SSTD"}
+
+
+def _refuse_unbounded_strategy_request(command: str, strategy_keys) -> None:
+    """Loud refusal for an EXPLICIT request to run an unbounded-risk single (consumer 2
+    above). Never silently runs, never silently skips: one bad key exits the whole
+    command so the operator sees the decision rather than a quietly thinner grid."""
+    bad = sorted(set(strategy_keys or ()) & _UNDEFINED_RISK_MEMBERS)
+    if bad:
+        sys.exit(
+            f"ba2-test {command}: {', '.join(bad)} left the SEARCHED set on 2026-08-31 "
+            f"(operator decision, AskUserQuestion: 'Only truly unbounded'): a net-uncovered "
+            f"short call has UNBOUNDED risk (_UNDEFINED_RISK_MEMBERS). The builders and "
+            f"reserve math remain fully supported in code; re-admitting the structures to a "
+            f"run is a reviewed change to _UNDEFINED_RISK_MEMBERS' consumers, not a flag.")
+
+
 # GROUPED option strategies: ONE optimize job searching a FAMILY of similar structures.
 # Each member becomes its own toggleable entry TradeRule (entry:<member>-entry:enabled gene)
 # carrying its own option action + option_* genes, so the GA can turn structures on/off and
@@ -2362,7 +2422,8 @@ _OPTION_GROUPS_ALL = {
     "OS4": ["O_STRD", "O_STRG"],                            # volatility DEBIT (non-directional)
 }
 _OPTION_GROUPS = {
-    key: [m for m in members if m not in _FULL_NOTIONAL_OPTION_KINDS]
+    key: [m for m in members if m not in _FULL_NOTIONAL_OPTION_KINDS
+          and m not in _UNDEFINED_RISK_MEMBERS]     # risk exclusion, 2026-08-31 -- see above
     for key, members in _OPTION_GROUPS_ALL.items()
 }
 # A group whose every member was filtered out would silently produce a job with no entries
@@ -2370,8 +2431,10 @@ _OPTION_GROUPS = {
 _empty_groups = [k for k, v in _OPTION_GROUPS.items() if not v]
 if _empty_groups:
     raise RuntimeError(
-        f"_OPTION_GROUPS {_empty_groups} have no affordable members left after excluding "
-        f"{sorted(_FULL_NOTIONAL_OPTION_KINDS)}; drop the group or relax the exclusion.")
+        f"_OPTION_GROUPS {_empty_groups} have no searchable members left after excluding "
+        f"{sorted(_FULL_NOTIONAL_OPTION_KINDS)} (affordability) and "
+        f"{sorted(_UNDEFINED_RISK_MEMBERS)} (unbounded risk, 2026-08-31); drop the group "
+        f"or relax an exclusion.")
 
 # Pure-option strategy keys (entry is the option action; no equity leg). O_CC/O_STK are equity.
 #
@@ -3136,30 +3199,6 @@ _CREDIT_OPTION_MEMBERS = set(_OPTION_STRATS) - _DEBIT_OPTION_MEMBERS
 # credit half's iv_rank gate (the wrong thesis) with nothing to notice it.
 if _DEBIT_OPTION_MEMBERS | _CREDIT_OPTION_MEMBERS != set(_OPTION_STRATS):
     raise RuntimeError("option members are not partitioned into debit/credit halves")
-
-# Members whose worst case is UNBOUNDED -- ``option_payoff.max_loss`` has no number for them,
-# so the submit path stamps no ``max_loss_per_contract`` and ``loss_pct_of_max_loss`` has no
-# denominator: the ``opt_sl_ml`` exit rule is never emitted for a strategy built solely of
-# these (design 2026-08-29 S6).
-#
-# THE PREDICATE IS THE MEASURED PAYOFF, NOT "is this a naked short" (the corrected S6 rule,
-# 2026-08-30): only a net-uncovered short CALL is genuinely unbounded, because only the
-# upside is infinite. Concretely, per structure:
-#   * O_SSTG / O_SSTD -- a short call no other leg of the order covers: UNBOUNDED. In here.
-#   * O_CSP -- a naked short PUT is bounded below at (strike - credit) x 100, the underlying
-#     stopping at zero: MEASURED, stamped, carries the rule. (The pre-correction design table
-#     called this unbounded; packages/common/tests/test_max_loss_persisted_at_submit.py pins
-#     the corrected behaviour at the stamping seam.)
-#   * O_JL -- its short call is covered by the long wing, its short put bounded at zero:
-#     MEASURED (worst of the two sides).
-#   * O_RS -- all puts (1x2): bounded at an underlying of zero: MEASURED.
-#   * everything else is a debit or defined-risk structure: MEASURED trivially.
-# This set is the strategy-level APPLICABILITY gate only -- the safety mechanism is Task 8's
-# absence rule (no stamp => the condition can never fire), which is what keeps the rule
-# harmless on a group's unbounded members. (The wheel's covered-call legs were in that
-# unstamped category until 2026-08-31: the builder now supplies its verified stock cover,
-# the CC phase stamps (spot - credit) x 100, and opt_sl_ml can drive it.)
-_UNDEFINED_RISK_MEMBERS = {"O_SSTG", "O_SSTD"}
 
 
 def _option_exit_rules(kind: str):
@@ -3936,6 +3975,7 @@ def _cmd_optimize(args) -> int:
     spec = _EXPERT_OPT.get(expert)
     if spec is None:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
+    _refuse_unbounded_strategy_request("optimize", [args.strategy])
     # Pure-option kinds AND options experts (spec key `options` — --strategy is ignored)
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
@@ -4261,6 +4301,7 @@ def _cmd_optimize_batch(args) -> int:
     for e in experts:
         if e not in _EXPERT_OPT:
             sys.exit(f"optimize-batch: expert {e!r} not configured; have {sorted(_EXPERT_OPT)}")
+    _refuse_unbounded_strategy_request("optimize-batch", strategies)
     # Build the (expert, strategy) job grid. Bypass experts (FactorRanker) have no enter/exit
     # rulesets, so they run ONCE (their factor-model params), not per strategy variant.
     jobs = []  # (expert, strategy_kind)
@@ -5025,10 +5066,11 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--strategy", choices=sorted(_STRATEGY_BUILDERS), default="S2",
                     help="Strategy/exit variant for a ruleset expert: S1 live-import / S2 bracket / "
                          "S3 trailing / S4 target-anchored; or an option/equity strategy "
-                         "(O_LC long-call, O_VERT bear-put, O_SSTG short-strangle, O_SSTD "
-                         "short-straddle, O_IC iron-condor, O_JL jade-lizard, O_BF call-butterfly, "
-                         "O_RS put-ratio-spread, O_CC covered-call, O_STK equity). "
-                         "Ignored for bypass experts (FactorRanker).")
+                         "(O_LC long-call, O_VERT bear-put, O_IC iron-condor, O_JL jade-lizard, "
+                         "O_BF call-butterfly, O_RS put-ratio-spread, O_CC covered-call, "
+                         "O_STK equity). O_SSTG/O_SSTD are UNBOUNDED-risk and refuse "
+                         "(operator decision 2026-08-31). Ignored for bypass experts "
+                         "(FactorRanker).")
     op.add_argument("--universe", required=True, help="Comma-separated symbols.")
     op.add_argument("--start", required=True, help="ISO start date.")
     op.add_argument("--end", required=True, help="ISO end date.")
@@ -5245,7 +5287,8 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--strategies", default="S1,S2,S3",
                     help="Comma-separated strategy variants per ruleset expert (S1 live-import / "
                          "S2 bracket / S3 trailing / S4 target-anchored; or option/equity strategies "
-                         "O_LC,O_VERT,O_SSTG,O_SSTD,O_IC,O_JL,O_BF,O_RS,O_CC,O_STK). Each is "
+                         "O_LC,O_VERT,O_IC,O_JL,O_BF,O_RS,O_CC,O_STK -- O_SSTG/O_SSTD are "
+                         "UNBOUNDED-risk and refuse, operator decision 2026-08-31). Each is "
                          "dispatched through _build_strategy. Bypass experts (FactorRanker) ignore this.")
     ob.add_argument("--universe", required=True, help="Comma-separated symbols (shared by all jobs).")
     ob.add_argument("--start", required=True, help="ISO start date.")

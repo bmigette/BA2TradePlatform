@@ -615,6 +615,76 @@ def test_the_unbounded_set_is_exactly_the_uncovered_short_call_structures():
     assert m._UNDEFINED_RISK_MEMBERS == {"O_SSTG", "O_SSTD"}
 
 
+# ==============================================================================================
+# The grid stops SEARCHING unbounded structures (operator decision 2026-08-31,
+# AskUserQuestion: "Only truly unbounded"). O_SSTG/O_SSTD leave the searched set; everything
+# else stays (CSP/wheel stay -- the rails size them as uncovered risk). The structures remain
+# fully SUPPORTED in code: builders, reserve math and settlement are untouched, and an
+# EXPLICIT single request refuses loudly instead of silently running or silently skipping.
+# ==============================================================================================
+def test_no_searched_group_contains_an_unbounded_structure():
+    """The searched set, member by member. Hand-derived from _OPTION_GROUPS_ALL:
+    OS1 [O_LC,O_LP,O_VERT,O_BF,O_BULLCS] loses nothing; OS2 [O_SSTG,O_SSTD,O_IC,O_CSP]
+    loses O_SSTG/O_SSTD (risk, 2026-08-31) AND O_CSP (affordability,
+    _FULL_NOTIONAL_OPTION_KINDS -- a standing, separate decision) leaving [O_IC];
+    OS3 [O_JL,O_RS,O_BEARCS,O_BULLPS] loses O_JL/O_RS (affordability) leaving
+    [O_BEARCS,O_BULLPS]; OS4 [O_STRD,O_STRG] loses nothing."""
+    m = _launcher()
+    for group, members in m._OPTION_GROUPS.items():
+        assert not set(members) & m._UNDEFINED_RISK_MEMBERS, (group, members)
+    assert m._OPTION_GROUPS["OS2"] == ["O_IC"]
+    assert m._OPTION_GROUPS["OS3"] == ["O_BEARCS", "O_BULLPS"]
+    # The TAXONOMY keeps them: the exclusion shrinks what is searched, never what exists.
+    assert set(m._OPTION_GROUPS_ALL["OS2"]) >= {"O_SSTG", "O_SSTD"}
+
+
+def test_the_search_exclusion_is_driven_by_the_one_unbounded_definition():
+    """No second hand-written list: the searched groups are exactly _OPTION_GROUPS_ALL
+    minus the two named sets. A mutant that forks its own idea of 'unbounded' (or of
+    'unaffordable') diverges from this recomputation and dies."""
+    m = _launcher()
+    assert m._OPTION_GROUPS == {
+        key: [mem for mem in members
+              if mem not in m._FULL_NOTIONAL_OPTION_KINDS
+              and mem not in m._UNDEFINED_RISK_MEMBERS]
+        for key, members in m._OPTION_GROUPS_ALL.items()
+    }
+
+
+@pytest.mark.parametrize("bad", ["O_SSTG", "O_SSTD"])
+def test_an_explicit_unbounded_single_refuses_loudly(bad):
+    """`ba2-test optimize --strategy O_SSTG` dies citing the decision -- BEFORE any DB
+    row is created. Never silently runs, never silently skips."""
+    from types import SimpleNamespace as NS
+
+    m = _launcher()
+    with pytest.raises(SystemExit) as e:
+        m._cmd_optimize(NS(expert="FMPRating", strategy=bad))
+    msg = str(e.value)
+    assert bad in msg and "2026-08-31" in msg and "Only truly unbounded" in msg
+
+
+def test_the_batch_command_refuses_the_same_keys_with_the_same_message():
+    m = _launcher()
+    with pytest.raises(SystemExit) as e:
+        m._refuse_unbounded_strategy_request("optimize-batch", ["S2", "O_SSTD"])
+    assert "O_SSTD" in str(e.value) and "2026-08-31" in str(e.value)
+    # A request with no unbounded key passes through untouched.
+    assert m._refuse_unbounded_strategy_request("optimize-batch", ["S2", "O_IC"]) is None
+
+
+def test_the_builders_stay_fully_supported():
+    """Only the SEARCH shrank. The rows, builders and genome derivation for the excluded
+    structures are untouched -- an explicit non-grid consumer (or a future re-admission)
+    finds them exactly as they were."""
+    m = _launcher()
+    for kind in ("O_SSTG", "O_SSTD"):
+        assert kind in m._OPTION_STRATS
+        assert kind in m._STRATEGY_BUILDERS
+        s = m._build_strategy(kind, f"g-{kind}", "FMPRating")
+        assert s.entry_rules, kind
+
+
 def test_a_cash_secured_put_carries_the_max_loss_stop():
     """THE CORRECTED-RULE CASE. A naked short put is not 'undefined risk': its loss is bounded
     at (strike - credit) x 100, the submit path stamps that measurement
@@ -654,11 +724,11 @@ def test_the_rule_is_identical_across_every_carrying_member():
 
 
 def test_a_group_with_any_measured_member_carries_the_rule_once():
-    """Groups share ONE exit list. OS2 mixes unbounded members (O_SSTG/O_SSTD) with a
-    measured one (O_IC): the rule must still be emitted -- on the unbounded members' orders
-    it self-disarms for want of a stamp (Task 8's absence guarantee), while dropping it would
-    deny O_IC the stop entirely. A group is excluded only when built SOLELY of unbounded
-    structures."""
+    """Groups share ONE exit list, and every SEARCHED group now consists of measured
+    members only (the unbounded O_SSTG/O_SSTD left the searched set 2026-08-31 -- when
+    OS2 still mixed them with O_IC, the rule was emitted and self-disarmed on the
+    unstamped orders via Task 8's absence guarantee). The any-member-measured predicate
+    is retained and pinned by the hypothetical-group test below."""
     m = _launcher()
     for group in m._OPTION_GROUPS:
         ids = [r["id"] for r in m._option_exit_rules(group)]

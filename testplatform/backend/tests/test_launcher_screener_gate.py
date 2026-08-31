@@ -60,9 +60,17 @@ def test_per_strategy_override_wins(monkeypatch):
 
 
 def test_group_merges_active_member_overrides(monkeypatch):
-    monkeypatch.setitem(L._OPTION_STRATS["O_SSTG"], "screener_gate_base", {"price_max": 55.0})
-    # OS2's active members include O_SSTG; the merge picks its override up.
+    monkeypatch.setitem(L._OPTION_STRATS["O_IC"], "screener_gate_base", {"price_max": 55.0})
+    # OS2's active members include O_IC; the merge picks its override up.
     assert L._screener_gate_base_for_strategy("OS2")["price_max"] == 55.0
+
+
+def test_an_excluded_members_override_never_reaches_its_group(monkeypatch):
+    """The merge reads ACTIVE members only. O_SSTG left the searched set 2026-08-31
+    (unbounded risk -- _UNDEFINED_RISK_MEMBERS), so an override on its row must not leak
+    into OS2's gate settings."""
+    monkeypatch.setitem(L._OPTION_STRATS["O_SSTG"], "screener_gate_base", {"price_max": 55.0})
+    assert "price_max" not in L._screener_gate_base_for_strategy("OS2")
 
 
 def test_base_json_beats_cli_default_and_loses_to_strategy(tmp_path, monkeypatch):
