@@ -2881,6 +2881,53 @@ def _apply_option_entry_cross_gene(cfg: dict) -> dict:
     return cfg
 
 
+# --- SelectionPolicy weights as genes (Task 7/10, design 2026-08-29 §7-§8) ------------------
+#
+# ``SelectionPolicy`` chooses WHICH contract inside a rule's box wins; its weights were built
+# as genes from day one and searched by nothing (F17: none GA-wired). This table is their gene
+# domains. Emission/sharing lives in ``_apply_option_selection_weight_genes`` (Task 10); the
+# table is declared separately because ONE row of it is itself a behaviour change:
+#
+# ``w_premium`` IS SIGNED (-2.0..2.0), THE DESIGN'S §9.5 CORRECTION (§8). The original domain
+# was 0.0..2.0 on the claim that premium richness has an unambiguous good direction. It does
+# not: a premium SELLER wants rich premium and a BUYER wants cheap — the identical asymmetry
+# that made ``w_iv`` the one signed weight ("selling structures want rich vol and buying
+# structures want cheap vol"). Unsigned, a debit member could only ever express "prefer
+# richer", so the gene would be half dead across the entire debit half. The signed weights are
+# now exactly those whose good direction depends on whether the structure is long or short
+# premium: ``w_premium`` and ``w_iv``. ``w_rvol`` stays unsigned — nobody wants an illiquid
+# contract.
+#
+# STEP 0.5 puts 0.0 exactly on the lattice. 0.0 is the no-op level (``score_all`` skips
+# zero-weight features entirely, so a weight at 0.0 costs nothing and changes nothing), which
+# gives the GA the same control arm every other option gene has and keeps the un-searched run
+# reproducible as a sampled trial. 9 levels for the signed weights, 5 for the unsigned one —
+# the same order of resolution as option_entry_cross's 5.
+#
+# WHAT IS DELIBERATELY NOT IN THIS TABLE (each withheld on recorded evidence, the F15
+# standard — a gene the GA can never move is budget burned on a dead search dimension):
+#   * ``w_spread`` — reads ``spread_pct``, and BOTH grid stores make that column degenerate
+#     for every candidate: the sqlite cache carries bid == ask on all 6,757,055 rows (a
+#     constant 0.0 grades nothing — measured 2026-08-23, see option_selector._publishes_spread)
+#     and the parquet store has no bid/ask column at all (None for everyone fails closed
+#     uniformly). A uniform column cannot move any pick, so the gene cannot apply on this
+#     data. The WEIGHT stays in SelectionPolicy — live chains carry real spreads.
+#   * ``w_rr`` — operator decision 2026-08-30 (design §7): Spearman(rr, premium) 0.98-1.0
+#     within real chains, a second gene searching the axis w_premium already owns.
+#   * ``w_profit`` — needs ``PolicyContext.structure_fn`` to score anything, and NO entry
+#     builder supplies one yet (teaching them is explicitly out of the plan's scope), so the
+#     gene would be inert on every real pick; see test_option_selection_weight_genes.py for
+#     the recorded discrimination evidence the F15 decision demanded.
+#   * ``w_box_center`` — pinned 1.0, not a gene: scaling every weight by one factor changes
+#     no ranking, so a free box_center is a degenerate search direction (design §7).
+_OPTION_SELECTION_WEIGHT_BANDS = {
+    #  weight: (min, max, step)
+    "w_premium": (-2.0, 2.0, 0.5),   # SIGNED — the Task 7 sign fix, see above
+    "w_iv": (-2.0, 2.0, 0.5),        # signed — the design's original signed weight
+    "w_rvol": (0.0, 2.0, 0.5),
+}
+
+
 def _apply_option_min_volume(cfg: dict) -> dict:
     """Stamp the tradability floor onto ANY option action config, in place.
 
