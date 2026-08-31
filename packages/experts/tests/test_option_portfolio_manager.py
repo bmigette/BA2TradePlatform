@@ -7,8 +7,11 @@ from datetime import date, datetime
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
+from ba2_common.core.option_lifecycle import LifecycleLeg, OptionStructure
 from ba2_common.core.option_types import OptionLeg
-from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus
+from ba2_common.core.types import (
+    AssetClass, OptionRight, OrderDirection, OrderStatus,
+)
 from ba2_experts.PremiumSeller import portfolio as ps_portfolio_mod
 from ba2_experts.PremiumSeller.portfolio import OptionPortfolioManager
 from ba2_experts.PremiumSeller.structures import StructureSpec
@@ -42,6 +45,12 @@ class StubAccount:
         self.submitted: List[Dict[str, Any]] = []
 
     def get_balance(self):
+        return self._balance
+
+    def cash_available_for_delivery(self):
+        # Every real OptionsAccountInterface publishes this; the sleeve's assignment rail
+        # DECLINES on a None, so a stub that withheld it would refuse every short put for
+        # a reason that has nothing to do with the rail under test.
         return self._balance
 
     def submit_option_order(self, *, legs, quantity, order_type="limit", limit_price=None,
@@ -92,9 +101,22 @@ def test_rails_open_within_caps(monkeypatch):
 
 
 def test_rails_one_structure_per_underlying(monkeypatch):
+    """The held book now comes from ``OptionRiskManagement.sleeve_structures`` -- the SAME
+    reader the shared entry gate and the live exit pass use -- rather than from this
+    manager's private ``get_option_holdings``. That is the point of the migration: one
+    definition of "what this sleeve holds", so the rails cannot disagree with the pass."""
     pm = make_manager()
-    held_txn = SimpleNamespace(id=7, symbol="XYZ")
-    monkeypatch.setattr(pm, "get_option_holdings", lambda: {7: (held_txn, SimpleNamespace())})
+    held = OptionStructure(
+        transaction_id=7, underlying="XYZ", strategy="put_credit_spread",
+        legs=(LifecycleLeg(contract_symbol="XYZP95", net_qty=-1.0, strike=95.0,
+                           option_type=OptionRight.PUT, expiry=date(2024, 2, 9),
+                           underlying="XYZ"),
+              LifecycleLeg(contract_symbol="XYZP90", net_qty=1.0, strike=90.0,
+                           option_type=OptionRight.PUT, expiry=date(2024, 2, 9),
+                           underlying="XYZ")),
+        quantity=1.0, multiplier=100, entry_net_premium=-0.5)
+    monkeypatch.setattr(ps_portfolio_mod.option_rm, "sleeve_structures",
+                        lambda eid: ([held], []))
     pm.rebalance({"structures": [_spec("XYZ"), _spec("ABC")]})
     assert len(pm.account.submitted) == 1
     assert pm.account.submitted[0]["legs"][0].underlying == "ABC"
@@ -589,3 +611,54 @@ def test_a_halted_sleeve_still_manages_nothing_but_the_recovery_test_still_runs(
     pm.account._balance = 9_500.0           # ...and the recovery is still noticed
     pm.manage_open(datetime(2024, 1, 5))
     assert pm._halted is False
+
+
+# ---------------------------------------------------------------------------
+# The stopgap is GONE (design 2026-08-27 §4, operator decision 2026-08-30)
+# ---------------------------------------------------------------------------
+def test_the_private_rails_stopgap_no_longer_exists():
+    """``_within_rails`` / ``_txn_metrics`` / ``_book_totals`` were a SECOND implementation
+    of the sleeve rails, carrying defects the shared modules document as fixed (no netting,
+    a vertical width that was negative for every call spread, and ``(True, 0.0, 0.0)`` for
+    a structure it could not see -- an unknown reading as a free trade).
+
+    Design §4: "deleted, not migrated -- replaced by the shared modules. No second
+    implementation survives." This fails the moment one is re-added under any of its names.
+    """
+    for name in ("_within_rails", "_txn_metrics", "_book_totals"):
+        assert not hasattr(OptionPortfolioManager, name), name
+
+
+def test_the_rails_this_manager_runs_are_option_books_own(monkeypatch):
+    """Not "equivalent to": the same function. A re-implementation here is exactly how the
+    two sides diverged before, so the call itself is pinned."""
+    pm = make_manager()
+    seen = []
+    real = ps_portfolio_mod.admit
+    monkeypatch.setattr(ps_portfolio_mod, "admit",
+                        lambda *a, **k: seen.append(real) or real(*a, **k))
+    pm.rebalance({"structures": [_spec()]})
+    from ba2_common.core.option_book import admit as shared_admit
+    assert seen == [shared_admit]
+
+
+def test_the_breaker_latch_is_the_one_the_entry_gate_reads(monkeypatch):
+    """The whole point of moving the latch into the shared store: a stand-down decided by
+    this manager's exit pass must decline entries in ``option_book.check_rails`` too. While
+    ``_halted`` was an attribute on this object, only this object could see it."""
+    import ba2_common.core.OptionRiskManagement as option_rm
+
+    pm = make_manager(balance=7_000.0)
+    pm._peak_equity = 10_000.0
+    monkeypatch.setattr(pm, "get_option_holdings", lambda: _one_holding())
+    monkeypatch.setattr(pm, "_close_structure", lambda txn, parent: None)
+    pm.manage_open(datetime(2024, 1, 3))
+
+    assert option_rm.get_breaker_state(pm.expert_instance_id).halted is True
+    # ... and the SHARED entry gate declines against that same latch.
+    verdict = option_rm.admit_option_entry(
+        expert=pm.expert, account=pm.account, expert_instance_id=pm.expert_instance_id,
+        underlying="ZZZ", option_strategy="cash_secured_put",
+        legs=_spec("ZZZ").legs, quantity=1, max_loss_per_contract=10.0)
+    assert verdict.allowed is False
+    assert verdict.reason == "circuit_breaker_halted"

@@ -58,6 +58,16 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         class_name = self.__class__.__name__.lower()
         return f"{class_name}-{self.id}"
     
+    @staticmethod
+    def _valid_risk_manager_modes():
+        """The admitted ``risk_manager_mode`` values, from their ONE definition.
+
+        Imported lazily (inside the settings builder, which runs long after import) so this
+        interface module keeps no load-time edge to the risk-manager module.
+        """
+        from ba2_common.core.OptionRiskManagement import VALID_RISK_MANAGER_MODES
+        return VALID_RISK_MANAGER_MODES
+
     @classmethod
     def _ensure_builtin_settings(cls):
         """Ensure builtin settings are initialized for the class."""
@@ -328,11 +338,39 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "tooltip": "The model used for dynamic AI-powered instrument selection with web search capabilities. Format: Provider/ModelName or Provider/ModelName{param:value}. Optimized for market research: GPT-5 (best general search), GPT-4o-search (web-optimized), Grok-4 (real-time with X/Twitter integration), Gemini 3 Pro (advanced thinking). Supports reasoning_effort parameter for NagaAC GPT-5/5.1 and Gemini 3 models (low/medium/high). You can also enter custom model names."
                 },
                 "risk_manager_mode": {
+                    # The admitted set is imported, never spelled again: a second copy is how
+                    # "classic_options" came to be un-selectable while every document said it
+                    # existed. See OptionRiskManagement.VALID_RISK_MANAGER_MODES.
                     "type": "str", "required": True, "default": "classic",
                     "description": "Risk Manager Mode",
-                    "valid_values": ["classic", "smart"],
-                    "help": "Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management using the configured risk_manager_model.",
-                    "tooltip": "Classic (Rules): Traditional rule-based risk management using automation rulesets you configure. Smart (Agentic): AI-powered intelligent risk management that uses the risk_manager_model to make dynamic decisions based on market conditions and portfolio state."
+                    "valid_values": list(cls._valid_risk_manager_modes()),
+                    "help": "Classic: Rule-based risk management using automation rulesets. Smart: AI-powered agentic risk management using the configured risk_manager_model. Classic + Options: as Classic, plus the option sleeve rails and drawdown breaker gate every option entry.",
+                    "tooltip": "Classic (Rules): Traditional rule-based risk management using automation rulesets you configure. Smart (Agentic): AI-powered intelligent risk management that uses the risk_manager_model to make dynamic decisions based on market conditions and portfolio state. Classic + Options (classic_options): the Classic rules PLUS the option risk manager -- max_deployment_pct, max_notional_leverage, undefined_risk_max_pct, max_concurrent_structures, one-per-underlying, assignment capacity and the drawdown circuit breaker are enforced on every option entry."
+                },
+                # THE OPTION SLEEVE RAILS (design 2026-08-27 SS8.2 / SS11). Declared on the base
+                # class so ANY expert can be switched to classic_options and configured in the
+                # UI -- before this they existed only on PremiumSeller, so the rails were
+                # unreachable for every other expert. They are INERT in classic and smart mode:
+                # nothing reads them unless risk_manager_mode == "classic_options".
+                "max_deployment_pct": {
+                    "type": "float", "required": False, "default": 40.0,
+                    "description": "Option sleeve: max deployment %",
+                    "tooltip": "Ceiling on the TOTAL max loss of all open option structures, as a percent of the sleeve's equity. This is the aggregate committed-max-loss cap. Only used when risk_manager_mode is 'classic_options'."
+                },
+                "undefined_risk_max_pct": {
+                    "type": "float", "required": False, "default": 20.0,
+                    "description": "Option sleeve: max undefined-risk %",
+                    "tooltip": "Sub-cap on the share of the sleeve committed to structures with undefined (unbounded) risk, as a percent of equity. Only used when risk_manager_mode is 'classic_options'."
+                },
+                "max_notional_leverage": {
+                    "type": "float", "required": False, "default": 3.0,
+                    "description": "Option sleeve: max notional leverage",
+                    "tooltip": "Ceiling on SHORT-side notional (short strike x 100 x contracts) as a multiple of the sleeve's equity. A long option carries none -- it cannot be assigned against you. Only used when risk_manager_mode is 'classic_options'."
+                },
+                "max_concurrent_structures": {
+                    "type": "int", "required": False, "default": 10,
+                    "description": "Option sleeve: max concurrent structures",
+                    "tooltip": "How many open option structures the sleeve may hold at once. Only used when risk_manager_mode is 'classic_options'."
                 },
                 "smart_risk_manager_user_instructions": {
                     "type": "str", "required": False, "default": (

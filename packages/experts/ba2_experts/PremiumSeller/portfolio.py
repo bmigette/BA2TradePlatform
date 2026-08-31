@@ -12,13 +12,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import ba2_common.core.OptionRiskManagement as option_rm
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.instance_resolver import get_instance_resolver
 from ba2_common.core.models import ExpertInstance, Transaction
+from ba2_common.core.option_book import BreakerState, CandidateStructure, admit, update_breaker
+from ba2_common.core.option_lifecycle import put_assignment_cost
 from ba2_common.core.option_types import OptionLeg
 from ba2_common.core.trade_store import orders_where
 from ba2_common.core.types import (
-    AssetClass, OrderDirection, OrderStatus, TransactionStatus,
+    AssetClass, OptionRight, OrderDirection, OrderStatus, TransactionStatus,
 )
 from ba2_common.logger import logger
 
@@ -31,12 +34,44 @@ class OptionPortfolioManager:
         instance = get_instance(ExpertInstance, expert_instance_id)
         self.account_id = instance.account_id
         self.account = resolver.get_account_instance(instance.account_id)
-        self._peak_equity: Optional[float] = None
-        self._halted: bool = False
 
     # -- settings ------------------------------------------------------
     def _s(self, name: str):
         return self.expert.get_setting_with_interface_default(name, log_warning=False)
+
+    # -- the drawdown breaker: ONE state, shared with the entry gate ----
+    # ``_peak_equity`` and ``_halted`` used to be attributes on this manager, which meant a
+    # breaker only this expert could see. They are now VIEWS on
+    # ``OptionRiskManagement``'s per-sleeve store -- the same map ``option_book.check_rails``
+    # reads to decline every candidate while the sleeve stands down, and the same one the
+    # live exit pass writes. The arithmetic is ``option_book.update_breaker``'s and is not
+    # reproduced here; these accessors exist so a caller can read or seed the latch.
+    @property
+    def _breaker(self) -> BreakerState:
+        return option_rm.get_breaker_state(self.expert_instance_id)
+
+    @property
+    def _peak_equity(self) -> Optional[float]:
+        return self._breaker.peak_equity
+
+    @_peak_equity.setter
+    def _peak_equity(self, value: Optional[float]) -> None:
+        state = self._breaker
+        option_rm.set_breaker_state(
+            self.expert_instance_id,
+            BreakerState(value, state.halted, state.tripped, state.detail, state.blind))
+
+    @property
+    def _halted(self) -> bool:
+        return self._breaker.halted
+
+    @_halted.setter
+    def _halted(self, value: bool) -> None:
+        state = self._breaker
+        option_rm.set_breaker_state(
+            self.expert_instance_id,
+            BreakerState(state.peak_equity, bool(value), state.tripped, state.detail,
+                         state.blind))
 
     # -- holdings ------------------------------------------------------
     def get_option_holdings(self) -> Dict[int, Tuple[Transaction, Any]]:
@@ -69,63 +104,47 @@ class OptionPortfolioManager:
                     break
         return out
 
-    # -- per-structure metrics (rails inputs) --------------------------
-    def _txn_metrics(self, txn) -> Tuple[bool, float, float]:
-        """(is_defined_risk, notional_$, committed_$) for a held structure.
-
-        notional = max short strike x 100 x max short net qty (per-side stress basis).
-        committed = notional for naked structures; width x 100 x qty for defined-risk
-        (conservative: credit received is NOT netted out)."""
-        executed = OrderStatus.get_executed_statuses()
-        shorts: Dict[str, Tuple[float, float]] = {}
-        longs: Dict[str, Tuple[float, float]] = {}
-        for o in orders_where(transaction_id=txn.id):
-            if getattr(o, "asset_class", None) != AssetClass.OPTION or not getattr(o, "contract_symbol", None):
-                continue
-            if o.status not in executed:
-                continue
-            qty = float(o.filled_qty or o.quantity or 0.0)
-            strike = float(o.strike or 0.0)
-            book = shorts if o.side == OrderDirection.SELL else longs
-            q, s = book.get(o.contract_symbol, (0.0, strike))
-            book[o.contract_symbol] = (q + qty, s)
-        if not shorts:
-            return (True, 0.0, 0.0)
-        max_qty = max(q for q, _ in shorts.values())
-        notional = max(s for _, s in shorts.values()) * 100.0 * max_qty
-        if not longs:
-            return (False, notional, notional)
-        width = min(s for _, s in shorts.values()) - max(s for _, s in longs.values())
-        if width <= 0:
-            return (False, notional, notional)
-        return (True, notional, width * 100.0 * max_qty)
-
-    def _book_totals(self, holdings) -> Tuple[float, float, float]:
-        """(total_committed, naked_committed, total_notional) over held structures."""
-        total_committed = naked_committed = total_notional = 0.0
-        for txn, _parent in holdings.values():
-            defined, notional, committed = self._txn_metrics(txn)
-            total_committed += committed
-            total_notional += notional
-            if not defined:
-                naked_committed += committed
-        return total_committed, naked_committed, total_notional
-
     # -- rails ---------------------------------------------------------
-    def _within_rails(self, spec, holdings, book) -> bool:
-        equity = self.account.get_balance()
-        if equity is None or equity <= 0:
-            logger.warning("PremiumSeller: no account balance — declining new structure")
-            return False
-        committed, naked_committed, notional = book
-        if committed + spec.max_loss > float(self._s("max_deployment_pct")) / 100.0 * equity:
-            return False
-        if notional + spec.notional > float(self._s("max_notional_leverage")) * equity:
-            return False
-        if spec.strategy in ("short_put", "short_strangle"):
-            if naked_committed + spec.max_loss > float(self._s("undefined_risk_max_pct")) / 100.0 * equity:
-                return False
-        return True
+    # THE STOPGAP IS GONE. ``_txn_metrics`` / ``_book_totals`` / ``_within_rails`` used to
+    # live here: a private, second implementation of the sleeve rails carrying defects the
+    # shared modules document as FIXED — it bucketed legs by order side and never netted
+    # (so a buy-to-close raised committed capital instead of lowering it), it computed a
+    # vertical's width as ``min(short) - max(long)`` (right only for a put vertical, and it
+    # booked every call vertical and iron condor as naked at full notional), it returned
+    # ``(True, 0.0, 0.0)`` for a structure whose legs it could not see (an unknown reading
+    # as a free trade), and it enforced neither the concurrent cap ordering, the
+    # one-per-underlying rule as part of the same pass, nor assignment capacity at all.
+    #
+    # Design 2026-08-27 SS4 (operator decision, 2026-08-30): "PremiumSeller's stopgap is
+    # DELETED, not migrated — replaced by the shared modules. No second implementation
+    # survives." What replaces it is ``option_book.admit`` over ``OptionRiskManagement``'s
+    # book — the same call the shared entry gate makes for every other expert, so this
+    # sleeve and a ``classic_options`` sleeve are now measured by one implementation.
+    def _rails(self):
+        """(the rails this expert declares, the required ones it does not)."""
+        return option_rm.rail_settings(self.expert)
+
+    def _candidate(self, spec) -> CandidateStructure:
+        """One ``StructureSpec``, as the value the rails price.
+
+        ``max_loss`` and ``notional`` are the spec's own measured numbers (the builders
+        compute them from real quotes). ``short_put_assignment`` is
+        ``option_lifecycle.put_assignment_cost`` per short put leg — the single shared
+        definition, so the sleeve rail and the account-wide gate cannot fork.
+        """
+        assignment = 0.0
+        for leg in spec.legs:
+            if leg.side != OrderDirection.SELL or leg.option_type != OptionRight.PUT:
+                continue
+            cost = put_assignment_cost(leg.strike, spec.qty, 100)
+            if cost is None:
+                assignment = None
+                break
+            assignment += cost
+        return CandidateStructure(
+            underlying=spec.underlying, strategy=spec.strategy,
+            max_loss=spec.max_loss, notional=spec.notional,
+            short_put_assignment=assignment)
 
     # -- entry (engine: rebalance) --------------------------------------
     def rebalance(self, targets: Dict) -> List[Any]:
@@ -144,22 +163,33 @@ class OptionPortfolioManager:
         neither an entry (unreachable now that entry is gated: that is the deadlock) nor
         a bar count (the peak is kept, so a sleeve re-armed under water re-trips at once
         and the cycle merely runs slower)."""
-        if self._halted:
-            logger.info(f"PremiumSeller[{self.expert_instance_id}]: standing down after "
-                        f"the circuit breaker — opening no new structures")
+        specs = list((targets or {}).get("structures") or [])
+        if not specs:
             return []
-        structures = (targets or {}).get("structures") or []
-        holdings = self.get_option_holdings()
-        held_underlyings = {txn.symbol for txn, _ in holdings.values()}
+        rails, missing = self._rails()
+        if missing:
+            logger.error(f"PremiumSeller[{self.expert_instance_id}]: no {', '.join(missing)} "
+                         f"declared — refusing to open structures rather than substituting "
+                         f"a default for a risk rail")
+            return []
+
+        held, unbuildable = option_rm.sleeve_structures(self.expert_instance_id)
+        book = option_rm.sleeve_book_from(held, unbuildable)
+        equity = self.account.get_balance()
+        cash = option_rm.assignment_cash(self.account, self.expert_instance_id)
+        breaker = option_rm.get_breaker_state(self.expert_instance_id)
+
+        # ONE call, one verdict per spec, in order — the stand-down, the two caps, the
+        # three percentage rails and assignment capacity, each charged to the RUNNING
+        # sleeve so N individually-affordable structures cannot collectively breach a cap.
+        verdicts = admit([self._candidate(spec) for spec in specs], book, equity, rails,
+                         breaker, cash)
+
         submitted: List[Any] = []
-        book = list(self._book_totals(holdings))
-        for spec in structures:
-            if len(holdings) + len(submitted) >= int(self._s("max_concurrent_structures")):
-                break
-            if spec.underlying in held_underlyings:
-                continue
-            if not self._within_rails(spec, holdings, tuple(book)):
-                logger.info(f"PremiumSeller: rails decline {spec.strategy} on {spec.underlying}")
+        for spec, verdict in zip(specs, verdicts):
+            if not verdict.allowed:
+                logger.info(f"PremiumSeller: rails decline {spec.strategy} on "
+                            f"{spec.underlying} — {verdict.reason}: {verdict.detail}")
                 continue
             # Pre-create an expert-attributed transaction so the structure is
             # recognised as this expert's holding on the next cycle (same
@@ -178,76 +208,45 @@ class OptionPortfolioManager:
                 transaction_id=txn_id)
             if order is not None:
                 submitted.append(order)
-                held_underlyings.add(spec.underlying)
-                book[0] += spec.max_loss
-                book[2] += spec.notional
-                if spec.strategy in ("short_put", "short_strangle"):
-                    book[1] += spec.max_loss
         logger.info(f"PremiumSeller[{self.expert_instance_id}]: opened {len(submitted)} structures")
         return submitted
 
     # -- exits (engine: manage_open) ------------------------------------
     def manage_open(self, as_of: datetime) -> List[Any]:
-        """Per-structure exit rules in spec §5 priority order; circuit breaker first."""
+        """Per-structure exit rules in spec §5 priority order; circuit breaker first.
+
+        THE BREAKER ARITHMETIC IS NOT HERE. ``option_book.update_breaker`` owns the peak
+        ratchet, the peak-to-trough test, the latch and the recovery line, and this method
+        is one of its two callers (the live exit pass is the other). What was here before —
+        a hand-rolled ratchet, a hand-rolled trip and a hand-rolled re-arm at half the trip
+        depth — was a second implementation of the same three rules, and the constant it
+        pinned by hand (0.5) had to be kept in step with
+        ``BREAKER_REARM_DEPTH_FRACTION`` by a test rather than by construction.
+
+        The state it produces is stored where the ENTRY gate reads it, so a stand-down
+        decided on this bar declines every structure ``rebalance`` would open on the next.
+        """
         holdings = self.get_option_holdings()
-        # Ratchet the peak on EVERY evaluation, INCLUDING a flat sleeve — this must stay
-        # above the `not holdings` early return. A sleeve the breaker just flattened is
-        # flat, so returning first stopped it tracking its peak entirely and it would then
-        # measure its next drawdown from wherever equity stood on re-entry (i.e. from the
-        # trough), which is no drawdown at all. Same rule as option_book.update_breaker.
-        balance = self.account.get_balance()
-        if balance is not None:
-            self._peak_equity = balance if self._peak_equity is None else max(self._peak_equity, balance)
-        breaker = float(self._s("circuit_breaker_pct"))
-        # Clearing a stand-down: a RECOVERY, and nothing else. This also has to sit above
-        # the `not holdings` early return — a standing-down sleeve is flat by definition
-        # (the breaker just flattened it) and rebalance now opens nothing while halted, so
-        # a clear evaluated only on a sleeve that holds something could never be reached.
-        #
-        # Why not the alternatives:
-        #   * a successful entry (what 46195b1 used) is unreachable once entry is gated:
-        #     blocked because halted, halted because never entered. That is the deadlock.
-        #   * a bar count / cool-off re-arms a sleeve that is still under water, and the
-        #     peak is deliberately KEPT, so it trips again on its first managed bar — the
-        #     same open/flatten cycle, just slower.
-        #   * an operator reset alone leaves the only exit outside the system.
-        # A recovery is the one condition under which resuming does not immediately
-        # re-trip. The re-arm line is HALF the trip depth (trip -20% -> re-arm -10%):
-        # re-arming on the trip line itself leaves no hysteresis and the sleeve flaps.
-        # Kept numerically identical to option_book.BREAKER_REARM_DEPTH_FRACTION (0.5),
-        # which Task 8 rewires onto; test_the_stopgap_and_option_book_agree_on_the_rearm_line
-        # fails if the two ever drift.
-        if self._halted:
-            peak = self._peak_equity
-            if (balance is not None and peak is not None and peak > 0
-                    and balance >= peak * (1.0 - 0.5 * breaker / 100.0)):
-                logger.info(f"PremiumSeller[{self.expert_instance_id}]: circuit-breaker "
-                            f"stand-down cleared — equity {balance} recovered to within "
-                            f"{0.5 * breaker}% of peak {peak}")
-                self._halted = False
+        # Every evaluation ratchets and tests, INCLUDING a flat one. Returning early on an
+        # empty book stopped the sleeve tracking its peak, so a just-flattened sleeve
+        # measured its next drawdown from the trough — i.e. from no drawdown at all.
+        state = update_breaker(self._breaker, self.account.get_balance(),
+                               {"circuit_breaker_pct": float(self._s("circuit_breaker_pct"))})
+        option_rm.set_breaker_state(self.expert_instance_id, state)
         if not holdings:
             return []
-        if self._halted:
-            return []
-        # BOTH operands are Optional[float] and BOTH are tested explicitly — never by
-        # truthiness, which cannot tell "not measured" from a legitimate 0.0:
-        #   balance is None -> equity was not measured; blind, and blind is not a trip.
-        #   balance == 0.0  -> a 100% drawdown, the deepest there is. It MUST trip.
-        # A peak-to-trough drawdown is likewise only defined against a POSITIVE peak
-        # (`and self._peak_equity` read a peak of exactly 0.0 as "no breaker", and a
-        # negative peak as a usable baseline — against which `peak x 0.8` sits ABOVE
-        # the peak and fired on a phantom drawdown). Same three-way split as
-        # option_book.update_breaker: unknown / unusable-peak / measured.
-        peak = self._peak_equity
-        if (balance is not None and peak is not None and peak > 0
-                and balance <= peak * (1.0 - breaker / 100.0)):
-            logger.warning(f"PremiumSeller: circuit breaker hit (dd>{breaker}%) — flattening book")
-            self._halted = True
+        if state.tripped:
+            # The EDGE, not the latch: the bar the book is flattened on. A sleeve already
+            # standing down has a flat book, and re-issuing closes every bar would pay the
+            # spread on nothing.
+            logger.warning(f"PremiumSeller[{self.expert_instance_id}]: {state.detail}")
             # Filter Nones like the normal path below: _close_structure returns None
             # when a structure has nothing left to offset (already flat).
             return [o for o in (self._close_structure(txn, parent)
                                 for txn, parent in holdings.values())
                     if o is not None]
+        if state.halted:
+            return []
         closed: List[Any] = []
         for txn, parent in holdings.values():
             if self._should_close(txn, parent, as_of):

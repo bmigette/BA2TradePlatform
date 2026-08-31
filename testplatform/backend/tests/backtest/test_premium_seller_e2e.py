@@ -15,7 +15,17 @@ the D2 quotes close +/- half-spread and shift the capture boundary):
     = 1.50 - 0.90 = 0.60 -> rebalance records txn.open_price = -0.60, so the 50%
     capture threshold on the net spread value is 0.30.
   * qty = floor(risk_per_structure_pct% x balance / ((width - credit) x 100))
-        = floor(10% x 10_000 / ((5.0 - 0.60) x 100)) = floor(1000 / 440) = 2.
+        = floor(5% x 10_000 / ((5.0 - 0.60) x 100)) = floor(500 / 440) = 1.
+
+    THE 5% IS NOT ARBITRARY, AND THE 10% IT REPLACES NO LONGER OPENS. The sleeve rails now
+    run ``option_book.admit`` (the shared implementation), which enforces ASSIGNMENT
+    CAPACITY: a short put can be assigned tonight while its long wing is not exercised
+    until expiry, so a put vertical's delivery bill is the FULL short strike, 95 x 100 per
+    contract. Two contracts owe 19,000 against 10,000 of cash and are refused; one owes
+    9,500 and fits. That is finding F6 in miniature -- most of the 5-30% sizing band is a
+    zero-trade region for put-side credit at small account sizes -- and it is a real
+    constraint the account-wide gate already applied to every OTHER option entry path.
+    PremiumSeller was simply exempt from it while it ran its own private rails.
   * D2 net close = 1.02 - 0.75 = 0.27 < 0.30 -> (0.60 - 0.27) / 0.60 = +55%
     captured — CLEARLY past the 50% rule (an exact 0.30 would be a float-boundary
     coin flip).
@@ -41,7 +51,7 @@ SETTINGS = {
     "fmp_rating_floor_enabled": False, "fmp_rating_min": 3.0,
     "target_delta": 0.30, "target_dte": 38, "spread_width": 5.0, "min_credit_ratio": 0.05,
     "enable_put_credit_spread": True, "enable_short_put": False, "enable_short_strangle": False,
-    "risk_per_structure_pct": 10.0,
+    "risk_per_structure_pct": 5.0,
     "profit_capture_pct": 50.0, "strangle_capture_pct": 25.0,
     "tested_delta_enabled": False, "tested_delta": 0.30, "roll_dte": 21,
     "dr_stop_enabled": False, "dr_stop_credit_mult": 2.0,
@@ -121,7 +131,7 @@ def test_open_then_capture_close(env):
     rec = expert.analyze_as_of(AS_OF, bt_ctx)
     specs = rec.raw_outputs["targets"]["structures"]
     assert len(specs) == 1 and specs[0].strategy == "put_credit_spread"
-    assert specs[0].qty == 2                    # floor(1000 / ((5.0 - 0.60) x 100)) = 2
+    assert specs[0].qty == 1                    # floor(500 / ((5.0 - 0.60) x 100)) = 1
 
     opened = pm.rebalance(rec.raw_outputs["targets"])
     assert len(opened) == 1

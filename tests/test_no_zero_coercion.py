@@ -379,13 +379,14 @@ ALLOWLIST: dict = {
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:1537":
+    "packages/common/ba2_common/core/TradeActions.py:1546":
         "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
         "SETTING, a configured cap rather than a measurement of anything "
         "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "
         "resolve split added the option_request import; :1533 before it added the "
         "option_payoff import; :1534 before the F3 entry-quote gene added the "
-        "option_entry_quote import)",
+        "option_entry_quote import; :1537 before the option risk manager wiring added "
+        "the OptionRiskManagement import and the _option_risk_manager helper)",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",
@@ -412,7 +413,9 @@ BASELINE: dict = {
     "ba2_trade_platform/core/ModelBillingUsage.py": 12,
     "ba2_trade_platform/core/SmartRiskManagerGraph.py": 6,
     "ba2_trade_platform/core/SmartRiskManagerToolkit.py": 2,
-    "ba2_trade_platform/core/option_lifecycle_service.py": 3,
+    # option_lifecycle_service.py is GONE from this register: its 3 coercions moved with
+    # ``_build_structure`` into ba2_common.core.OptionRiskManagement (the shared sleeve
+    # reader, listed below at the same count), and the service now delegates.
     "ba2_trade_platform/core/portfolio_allocation_service.py": 3,
     "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 11,
     "ba2_trade_platform/modules/accounts/IBKRAccount.py": 2,
@@ -437,6 +440,11 @@ BASELINE: dict = {
     "packages/common/ba2_common/core/utils.py": 2,
     "packages/common/ba2_common/core/position_sizing.py": 2,
     "packages/experts/ba2_experts/DeterministicScorer/__init__.py": 3,
+    # The three PROMOTED sleeve-reader coercions, moved verbatim out of
+    # option_lifecycle_service (whose entry above drops to 0 by exactly this amount): a
+    # filled/ordered quantity, a transaction quantity and the contract multiplier, each
+    # read off a persisted row. Net repo change: zero.
+    "packages/common/ba2_common/core/OptionRiskManagement.py": 3,
     "packages/experts/ba2_experts/FMPRating.py": 1,
     "packages/experts/ba2_experts/FMPSenateTraderCopy.py": 1,
     "packages/experts/ba2_experts/FMPSenateTraderWeight.py": 3,
@@ -444,14 +452,16 @@ BASELINE: dict = {
     "packages/experts/ba2_experts/FactorRanker/portfolio.py": 1,
     "packages/experts/ba2_experts/PennyMomentumTrader/monitoring.py": 1,
     "packages/experts/ba2_experts/PennyMomentumTrader/screening.py": 1,
-    "packages/experts/ba2_experts/PremiumSeller/portfolio.py": 4,
+    # 4 -> 2: two went with the deleted ``_txn_metrics`` rails stopgap (design 2026-08-27
+    # S4); the two left are in _tested / _close_structure, which this work does not touch.
+    "packages/experts/ba2_experts/PremiumSeller/portfolio.py": 2,
     "packages/providers/ba2_providers/fundamentals/overview/FMPCompanyOverviewProvider.py": 1,
     "packages/providers/ba2_providers/insider/FMPInsiderProvider.py": 4,
     "testplatform/backend/app/services/backtest/backtest_account.py": 26,
     "testplatform/backend/app/services/backtest_handler.py": 1,
     "testplatform/backend/app/services/strategy_optimization_handler.py": 1,
 }
-BASELINE_TOTAL = 176
+BASELINE_TOTAL = 174
 
 
 # =========================================================================== #

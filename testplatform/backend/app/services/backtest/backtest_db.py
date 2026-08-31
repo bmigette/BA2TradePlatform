@@ -140,10 +140,25 @@ def backtest_trading_db(run_id: int | str, in_memory: bool = True) -> Iterator[s
     # nothing needs persisting. File-backed runs stay on SQLite (rows must survive on disk).
     store_ctx = (trade_store.inmem_trades()
                  if (in_memory and _inmem_trades_enabled()) else nullcontext())
+    # The option risk manager keeps per-sleeve PROCESS state -- the drawdown breaker latch,
+    # the charges for structures submitted but not yet visible in the book, and the decision
+    # journal. It is keyed per thread while a backtest trade store is active, so CONCURRENT
+    # trials cannot see each other; SEQUENTIAL trials on one worker thread would still
+    # inherit the previous trial's latch, and a run whose sleeve starts halted because an
+    # earlier genome drew down is not reproducible. Cleared at both ends of the run: on the
+    # way in so this trial starts clean, and on the way out so nothing leaks into live code
+    # paths on this thread.
+    from ba2_common.core import OptionRiskManagement as option_rm
     try:
         with store_ctx:
             yield target
     finally:
+        # Sequential trials on ONE worker thread share a sleeve key (both in-memory, same
+        # thread), so without this the next genome inherits this one is latch and its
+        # in-flight charges -- a trial that opens nothing because an EARLIER trial drew
+        # down is not reproducible. Clearing on the way OUT also stops the state leaking
+        # into live code paths on this thread.
+        option_rm.reset_state()
         # Drop THIS thread's override so the backtest DB never leaks into subsequent (live) code
         # paths or other trials on this thread. (A file DB is left on disk for post-mortem; the
         # in-memory DB is freed when its engine is disposed by clear_threadlocal_db.)

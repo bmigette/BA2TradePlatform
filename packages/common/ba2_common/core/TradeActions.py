@@ -30,6 +30,9 @@ from ba2_common.core.option_payoff import (
     max_loss as _payoff_max_loss,
     _numeric as _payoff_numeric,
 )
+from ba2_common.core.OptionRiskManagement import (
+    admit_option_entry, option_risk_manager_enabled, record_submitted,
+)
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selection_policy import SelectionPolicy
@@ -2513,6 +2516,51 @@ class _OptionEntryAction(TradeAction):
                 f"(modelled concession {quote_concession(legs, halves, fraction):.4f}/share)")
         return quoted
 
+    def _option_risk_manager(self):
+        """(expert, expert_instance_id) when this expert runs the option risk manager.
+
+        ``(None, None)`` otherwise, and that is the overwhelmingly common answer: an action
+        with no recommendation, no instance, or an expert in ``classic``/``smart`` mode
+        never touches ``OptionRiskManagement`` at all. THAT is what makes design SS11's
+        "nothing existing changes until an expert is switched over" a property of the code
+        rather than a hope, and ``test_a_default_expert_never_reaches_the_option_risk_manager``
+        pins it.
+
+        The one place this cannot fail closed is a resolver that raises: the mode lives in
+        the expert's settings, so an expert we cannot resolve is an expert whose mode we do
+        not know, and refusing on that would refuse every legacy CLASSIC option entry too.
+        It is logged at ERROR naming the instance -- for a ``classic_options`` expert that
+        log line is the signal that its rails did not run.
+        """
+        instance_id = (self.expert_recommendation.instance_id
+                       if self.expert_recommendation else None)
+        if not instance_id:
+            return None, None
+        from ba2_common.core.instance_resolver import (
+            InstanceResolverNotConfigured, get_instance_resolver,
+        )
+        try:
+            expert = get_instance_resolver().get_expert_instance(instance_id)
+        except InstanceResolverNotConfigured:
+            # No host has injected a resolver: a unit-test process, never a trading one.
+            # Both live startup and the backtest seam wiring inject one, so this branch
+            # cannot be reached by an expert that could have been configured at all.
+            return None, None
+        except Exception as e:  # noqa: BLE001 -- the resolver is INJECTED; it can fail in
+            # ways this module cannot enumerate. See the docstring: this is the one branch
+            # that cannot fail closed without refusing every classic-mode option entry.
+            absorb_if_benign(e, Exception)
+            logger.error(f"_option_risk_manager: could not resolve expert {instance_id} "
+                         f"({e}) -- if that expert runs risk_manager_mode='classic_options' "
+                         f"its sleeve rails did NOT run for {self.instrument_name}",
+                         exc_info=True)
+            return None, None
+        if expert is None:
+            return None, None
+        if not option_risk_manager_enabled(getattr(expert, "settings", None)):
+            return None, None
+        return expert, instance_id
+
     def _submit_option_order(self, legs: List[OptionLeg], quantity: int,
                              limit_price: float, option_strategy: str,
                              option_reserve: Optional[float] = None) -> Dict[str, Any]:
@@ -2561,6 +2609,27 @@ class _OptionEntryAction(TradeAction):
         max_loss_per_contract = _measured_max_loss_per_contract(legs, limit_price)
         if max_loss_per_contract is not None:
             data["max_loss_per_contract"] = max_loss_per_contract
+        # THE OPTION RISK MANAGER (design 2026-08-27 SS4, review finding F5). This is the one
+        # choke point all seventeen builders reach, and it is reached identically by the live
+        # pass (TradeManager -> TradeActionEvaluator) and by the backtest engine
+        # (daily_engine -> TradeActionEvaluator), so ONE call arms both runtimes -- which is
+        # the whole content of SS4's operator decision. Ahead of the submit_to_broker branch
+        # deliberately: a rail decision is a decision, and a "manual review" preview that
+        # showed a structure the rails would refuse would be advertising a trade that cannot
+        # happen. The measured max loss is HANDED to the RM, never re-derived there: no leg
+        # reconstruction, no OCC parsing, exactly the value stamped above.
+        rm_expert, rm_instance_id = self._option_risk_manager()
+        rm_candidate = None
+        if rm_expert is not None:
+            verdict = admit_option_entry(
+                expert=rm_expert, account=self.account, expert_instance_id=rm_instance_id,
+                underlying=self.instrument_name, option_strategy=option_strategy,
+                legs=legs, quantity=quantity,
+                max_loss_per_contract=max_loss_per_contract)
+            if not verdict.allowed:
+                data["option_rm_rail"] = verdict.reason
+                return self._result(False, verdict.message, data)
+            rm_candidate = verdict.candidate
         if not self.submit_to_broker:
             logger.info(f"_OptionEntryAction: submit disabled for {self.instrument_name} "
                         f"{option_strategy} - recording informational result")
@@ -2574,6 +2643,14 @@ class _OptionEntryAction(TradeAction):
             return self._result(False, f"Failed to submit {option_strategy} for {self.instrument_name}", data)
         order_id = getattr(order, "id", None)
         data["order_id"] = order_id
+        if rm_candidate is not None:
+            # Charge the sleeve for what is now on the wire. Its transaction is WAITING with
+            # no executed leg, so book_totals cannot see it until it fills, and without this
+            # every later candidate in the same cycle would measure the book as if this
+            # structure did not exist -- the concentrated book F5 says the rails exist to
+            # stop. The charge is dropped again the moment the transaction becomes visible.
+            record_submitted(rm_instance_id, getattr(order, "transaction_id", None),
+                             rm_candidate)
         # Persist the entry facts on the order row: the short-premium reserve (so
         # available BP reflects it) and the measured max loss (so the
         # loss_pct_of_max_loss exit can read its denominator back off the row).
