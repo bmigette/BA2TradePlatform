@@ -130,6 +130,26 @@ def test_the_bands_cover_exactly_the_emitted_weights():
     assert set(L._OPTION_SELECTION_WEIGHT_BANDS) == {"w_premium", "w_iv", "w_rvol"}
 
 
+def test_the_searched_domain_is_the_domain_the_LIVE_EDITOR_ENFORCES():
+    """ONE SOURCE OF TRUTH for the weight domains, across two trees.
+
+    The launcher samples inside these bounds and the live rule editor
+    (``ui/pages/settings.py``) refuses outside them, reading
+    ``option_selection_policy.WIRED_WEIGHT_BANDS``. If the two drift, one of two things is
+    true and neither is visible from either side alone: the GA can produce a genome the live
+    editor would reject (a winner that cannot be deployed), or a human can type a weight no
+    genome could contain (a live rule no backtest can reproduce). The steps stay the
+    launcher's own -- a lattice is a search concern and the editor has no opinion on it.
+    """
+    from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
+
+    assert set(L._OPTION_SELECTION_WEIGHT_BANDS) == set(WIRED_WEIGHT_BANDS)
+    for name, (lo, hi, _step) in L._OPTION_SELECTION_WEIGHT_BANDS.items():
+        assert (lo, hi) == WIRED_WEIGHT_BANDS[name], (
+            f"{name}: the GA searches [{lo}, {hi}] but the live editor enforces "
+            f"{WIRED_WEIGHT_BANDS[name]}")
+
+
 # ------------------------------------------------------------------------------------------ #
 # Task 10 §1 — emission and the sharing tier
 # ------------------------------------------------------------------------------------------ #

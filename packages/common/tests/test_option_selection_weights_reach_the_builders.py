@@ -225,3 +225,58 @@ def test_a_zero_weight_survives_the_rule_builder_exactly_like_entry_cross_does()
 
     rule = {"action_type": "buy_call", "option_w_premium": 0.0}
     assert action_from_rule(rule)["act"]["w_premium"] == 0.0
+
+
+# =========================================================================== #
+# 5. the band guard: a weight the search could never have emitted
+# =========================================================================== #
+# WIRED_WEIGHT_BANDS is the domain the launcher samples AND the domain the live rule editor
+# enforces, so a value outside it is a rule no backtest can reproduce. Refusing is the fail-
+# closed choice: clamping would show one number and rank on another.
+def test_a_weight_inside_its_band_is_accepted():
+    """The control arm -- a guard that refuses everything would pass every test below."""
+    from ba2_common.core.option_selection_policy import validate_wired_weights
+
+    validate_wired_weights({"w_premium": -2.0, "w_iv": 2.0, "w_rvol": 0.0})
+
+
+@pytest.mark.parametrize("weights", [
+    {"w_premium": 2.5},      # past the signed ceiling
+    {"w_premium": -2.5},     # past the signed floor
+    {"w_iv": 100.0},
+    {"w_rvol": -0.5},        # UNSIGNED by design: nobody wants an illiquid contract
+])
+def test_a_weight_outside_its_band_is_refused(weights):
+    from ba2_common.core.option_selection_policy import (
+        SelectionWeightOutOfBand, validate_wired_weights,
+    )
+
+    with pytest.raises(SelectionWeightOutOfBand):
+        validate_wired_weights(weights)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_weight_is_refused(value):
+    """NaN compares False against everything, so a NaN weight does not error the pick -- it
+    silently collapses it to list order, which looks exactly like a working policy."""
+    from ba2_common.core.option_selection_policy import (
+        SelectionWeightOutOfBand, validate_wired_weights,
+    )
+
+    with pytest.raises(SelectionWeightOutOfBand):
+        validate_wired_weights({"w_premium": value})
+
+
+def test_a_weight_the_ga_does_not_emit_is_refused_even_though_the_field_exists():
+    """``w_profit`` and ``w_spread`` ARE real SelectionPolicy fields, which is what makes this
+    the dangerous case: forwarding one would look wired at every layer and rank on nothing
+    (no builder supplies the structure_fn w_profit needs; neither grid store can answer
+    w_spread). They must be refused here until something emits them, not accepted because the
+    dataclass happens to have the attribute."""
+    from ba2_common.core.option_selection_policy import (
+        SelectionWeightOutOfBand, validate_wired_weights,
+    )
+
+    for name in ("w_profit", "w_spread", "w_rr", "w_box_center"):
+        with pytest.raises(SelectionWeightOutOfBand):
+            validate_wired_weights({name: 1.0})

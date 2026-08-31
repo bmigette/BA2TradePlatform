@@ -9,6 +9,7 @@ from ...core.db import get_db, get_all_instances, delete_instance, add_instance,
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
+from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_arc_floor, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
@@ -5070,12 +5071,16 @@ class TradeSettingsTab:
                 max_spread_input = None
                 wing_width_input = None
                 min_arc_input = None
+                w_premium_input = None
+                w_iv_input = None
+                w_rvol_input = None
 
                 def update_action_inputs():
                     nonlocal value_input, reference_select, target_percent_input
                     nonlocal strike_method_select, strike_param_input, dte_min_input
                     nonlocal dte_max_input, sizing_input, min_oi_input, max_spread_input
                     nonlocal wing_width_input, min_arc_input
+                    nonlocal w_premium_input, w_iv_input, w_rvol_input
 
                     action_value_container.clear()
                     # clear() deletes the widgets; these names must forget them too. The save
@@ -5093,6 +5098,7 @@ class TradeSettingsTab:
                     dte_min_input = dte_max_input = sizing_input = None
                     min_oi_input = max_spread_input = wing_width_input = None
                     min_arc_input = None
+                    w_premium_input = w_iv_input = w_rvol_input = None
 
                     selected_type = action_select.value
 
@@ -5235,6 +5241,76 @@ class TradeSettingsTab:
                                         'Minimum annualised return on the collateral this '
                                         'structure reserves, per contract. Leave blank for '
                                         'no floor (any positive net credit is accepted).')
+                                # SELECTION-POLICY WEIGHTS: which contract INSIDE the box the
+                                # rule states actually gets bought. The rule above owns the
+                                # box (a put, this delta band, this DTE window); these decide
+                                # which of the contracts in it wins.
+                                #
+                                # THEY ARE HERE BECAUSE THE GA TUNES THEM AND THE TUNED GENOME
+                                # IS DEPLOYED TO A LIVE INSTANCE. rule_builders maps
+                                # option_w_* onto these keys, rules_convert carries them
+                                # through the backtest->live deploy, and the evaluator
+                                # forwards them to the ctor -- so without a field here the
+                                # live rule editor was the one layer that could not express
+                                # them. That is not merely a missing convenience: opening a
+                                # DEPLOYED rule and saving it rebuilds action_config key by
+                                # key, so an editor with no weight widgets would have WIPED
+                                # the weights the GA chose, leaving a rule that no longer
+                                # matches the backtest that justified deploying it. This
+                                # project has already shipped GA-tuned weights that were inert
+                                # live once (FactorRanker); the same defect, twice, is a
+                                # pattern rather than an accident.
+                                #
+                                # OFFERED FOR EVERY ENTRY ACTION, unlike wing width and the
+                                # ARC floor: all twenty select_single calls in TradeActions
+                                # pass policy=self.selection_policy, so there is no entry
+                                # structure whose pick ignores them. (The five select_wing
+                                # calls take no policy BY DESIGN -- a wing is one derived
+                                # strike, not a box to rank inside; see select_wing's note.)
+                                #
+                                # ZERO IS THE DEFAULT AND ZERO IS A PROVABLE NO-OP -- all
+                                # three at 0.0 build no policy at all (_OptionEntryAction
+                                # maps all-zero to None) and the selector keeps its legacy
+                                # path, pick for pick. So unlike min_arc, where a configured
+                                # 0 is a GATE and an absent one is not, here a pre-filled 0
+                                # and a blank field mean the identical thing, which is why
+                                # these are pre-filled rather than clearable.
+                                _wp = action_config.get('w_premium') if action_config else None
+                                w_premium_input = ui.number(
+                                    label='W Premium',
+                                    value=float(_wp) if _wp is not None else 0.0,
+                                    min=WIRED_WEIGHT_BANDS['w_premium'][0],
+                                    max=WIRED_WEIGHT_BANDS['w_premium'][1],
+                                    step=0.5,
+                                    format='%.2f'
+                                ).classes('w-32').props('dense').tooltip(
+                                    'Prefer contracts whose premium is rich (positive) or '
+                                    'cheap (negative) relative to the rest of the chain. '
+                                    '0 = no preference.')
+                                _wi = action_config.get('w_iv') if action_config else None
+                                w_iv_input = ui.number(
+                                    label='W IV',
+                                    value=float(_wi) if _wi is not None else 0.0,
+                                    min=WIRED_WEIGHT_BANDS['w_iv'][0],
+                                    max=WIRED_WEIGHT_BANDS['w_iv'][1],
+                                    step=0.5,
+                                    format='%.2f'
+                                ).classes('w-32').props('dense').tooltip(
+                                    'Prefer rich implied volatility (positive) or cheap '
+                                    '(negative). Sellers usually want rich, buyers cheap. '
+                                    '0 = no preference.')
+                                _wr = action_config.get('w_rvol') if action_config else None
+                                w_rvol_input = ui.number(
+                                    label='W Rel Volume',
+                                    value=float(_wr) if _wr is not None else 0.0,
+                                    min=WIRED_WEIGHT_BANDS['w_rvol'][0],
+                                    max=WIRED_WEIGHT_BANDS['w_rvol'][1],
+                                    step=0.5,
+                                    format='%.2f'
+                                ).classes('w-32').props('dense').tooltip(
+                                    'Prefer the more actively traded contracts on the chain. '
+                                    'Unsigned by design -- nobody wants an illiquid '
+                                    'contract. 0 = no preference.')
                             else:
                                 ui.label('Closes the held option position (no parameters).').classes('text-sm text-gray-500')
 
@@ -5257,7 +5333,10 @@ class TradeSettingsTab:
                     'min_oi_input': lambda: min_oi_input,
                     'max_spread_input': lambda: max_spread_input,
                     'wing_width_input': lambda: wing_width_input,
-                    'min_arc_input': lambda: min_arc_input
+                    'min_arc_input': lambda: min_arc_input,
+                    'w_premium_input': lambda: w_premium_input,
+                    'w_iv_input': lambda: w_iv_input,
+                    'w_rvol_input': lambda: w_rvol_input
                 }
     
     def _remove_action_row(self, action_id, action_card):
@@ -5345,6 +5424,11 @@ class TradeSettingsTab:
                         msp = action_refs['max_spread_input']()
                         wwp = action_refs['wing_width_input']()
                         maf = action_refs['min_arc_input']()
+                        weight_widgets = (
+                            ('w_premium', action_refs['w_premium_input']()),
+                            ('w_iv', action_refs['w_iv_input']()),
+                            ('w_rvol', action_refs['w_rvol_input']()),
+                        )
 
                         # THE SECOND RAIL, and it is not redundant (OPT-S2). The widget is
                         # only rendered for actions that read strike_method, so `sm` is
@@ -5386,6 +5470,36 @@ class TradeSettingsTab:
                         # on the widget, for the reason spelled out at strike_method above.
                         if uses_arc_floor(action_type) and maf and maf.value is not None:
                             action_config['min_arc'] = float(maf.value) / 100.0
+                        # SELECTION-POLICY WEIGHTS. Persisted for every entry action --
+                        # every select_single call in TradeActions is policy-governed, so
+                        # there is no structure on which these are a decoy. 0.0 is written
+                        # rather than omitted because for THESE keys a configured zero and an
+                        # absent key are provably the same thing: _OptionEntryAction maps
+                        # all-zero to policy None and the selector runs its legacy path
+                        # unchanged. (Contrast min_arc above, where 0 is a real gate.)
+                        #
+                        # REFUSED, NOT CLAMPED, outside the band the GA searches. A live rule
+                        # carrying a weight no genome could have produced is a rule no
+                        # backtest can reproduce, and silently clamping would show the user
+                        # one number while the picker ranked on another. WIRED_WEIGHT_BANDS
+                        # is the same table the launcher samples, so the two cannot drift.
+                        # _OptionEntryAction re-checks this; the check here exists only so
+                        # the user is told, instead of saving a rule that builds no action.
+                        for _wkey, _wwidget in weight_widgets:
+                            if _wwidget is None or _wwidget.value is None:
+                                continue
+                            try:
+                                _wval = float(_wwidget.value)
+                            except (TypeError, ValueError):
+                                ui.notify(f'{_wkey} must be a number for action {action_type}',
+                                          type='negative')
+                                return
+                            _lo, _hi = WIRED_WEIGHT_BANDS[_wkey]
+                            if not (_lo <= _wval <= _hi):
+                                ui.notify(f'{_wkey} must be between {_lo} and {_hi} for '
+                                          f'action {action_type}', type='negative')
+                                return
+                            action_config[_wkey] = _wval
                         # NOTE: min_volume is deliberately NOT offered here. AlpacaAccount's
                         # chain comes from the option SNAPSHOT endpoint, whose payload
                         # (alpaca.data.models.snapshots.OptionsSnapshot) carries no bar at

@@ -141,6 +141,70 @@ class SelectionPolicy:
                 and self.w_profit == 0.0 and self.w_rr == 0.0)
 
 
+#: The admissible range of every weight the GA ACTUALLY EMITS, and therefore the only range a
+#: rule reaching the live path can honestly claim. ONE SOURCE OF TRUTH, deliberately: the
+#: launcher's ``_OPTION_SELECTION_WEIGHT_BANDS`` samples inside these bounds and the live rule
+#: editor refuses outside them, so every weight a human can type is a weight the search could
+#: have produced. A live-only value would be a rule NO backtest can reproduce -- the exact
+#: backtest/live divergence this whole seam exists to prevent.
+#:
+#: The signs are the design's, not an accident. ``w_premium`` and ``w_iv`` are SIGNED because
+#: sellers want rich premium/vol and buyers want cheap, and which is right is the question the
+#: search settles. ``w_rvol`` is UNSIGNED because nobody wants an illiquid contract: a negative
+#: value would ask the picker to prefer the thinnest contract on the chain, which is not a
+#: strategy, it is a fill failure waiting to happen.
+#:
+#: ``w_box_center`` is absent because it is PINNED at 1.0 and is not a gene; ``w_spread``,
+#: ``w_profit`` and ``w_rr`` are absent because nothing emits them yet -- see the launcher's
+#: table for the evidence withholding each one.
+WIRED_WEIGHT_BANDS: Dict[str, Tuple[float, float]] = {
+    "w_premium": (-2.0, 2.0),
+    "w_iv": (-2.0, 2.0),
+    "w_rvol": (0.0, 2.0),
+}
+
+
+class SelectionWeightOutOfBand(ValueError):
+    """A selection weight outside ``WIRED_WEIGHT_BANDS``.
+
+    Its own type, not a bare ValueError, so a caller can name it in an ``except`` rather than
+    swallowing every ValueError the construction path can raise (BA2_ERROR_MODE is enforce:
+    a broad handler propagates unless the site names the type).
+    """
+
+
+def validate_wired_weights(weights: Dict[str, float]) -> None:
+    """Refuse a weight outside its band -- which includes NaN and the infinities.
+
+    FAIL CLOSED, and refuse at CONFIG time rather than silently clamping. Clamping would let a
+    rule display -5.0 while the picker ranked on -2.0, which is the "knob that lies" defect the
+    surrounding module is built to avoid; and a NaN weight scores every candidate NaN, whose
+    comparisons are all False, so the pick would silently collapse to list order.
+
+    An unknown key is refused too: ``w_profit`` forwarded here would name a real
+    ``SelectionPolicy`` field that no builder can rank on, so it would look wired and do
+    nothing.
+    """
+    for name, value in weights.items():
+        band = WIRED_WEIGHT_BANDS.get(name)
+        if band is None:
+            raise SelectionWeightOutOfBand(
+                f"{name!r} is not a wired selection weight; the GA emits only "
+                f"{sorted(WIRED_WEIGHT_BANDS)}")
+        lo, hi = band
+        # NaN AND THE INFINITIES FALL OUT OF THIS COMPARISON, and deliberately so rather than
+        # through a separate isfinite check: every comparison against NaN is False, so the
+        # chain is False and the guard fires. A dedicated branch for them was written first
+        # and killed no test, because this one already refuses all three -- so it was dead
+        # code dressed as a second rail. It matters that they ARE refused: a NaN weight does
+        # not error the pick, it scores every candidate NaN and silently collapses the choice
+        # to list order, which looks exactly like a policy that is working.
+        if not (lo <= value <= hi):
+            raise SelectionWeightOutOfBand(
+                f"{name}={value} is outside the searched band [{lo}, {hi}], so no backtest "
+                f"could have produced it and none can reproduce this rule")
+
+
 @dataclass(frozen=True)
 class PolicyContext:
     """Everything about the request that is not the candidate list.

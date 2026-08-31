@@ -35,7 +35,7 @@ from ba2_common.core.OptionRiskManagement import (
 )
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
-from ba2_common.core.option_selection_policy import SelectionPolicy
+from ba2_common.core.option_selection_policy import SelectionPolicy, validate_wired_weights
 from ba2_common.core.option_selector import (
     select_single, select_vertical_spread, select_wing, passes_liquidity,
     check_liquidity_data_available, OptionDteWindowError, OptionSelectionConfigError,
@@ -2043,6 +2043,20 @@ class _OptionEntryAction(TradeAction):
         # knob this comment warns about (see the launcher's weight-band table).
         weights = {"w_premium": w_premium, "w_iv": w_iv, "w_rvol": w_rvol}
         present = {k: float(v) for k, v in weights.items() if v is not None}
+        # THE HARD RAIL, and it is here rather than in the editor because the editor is not the
+        # only producer: a GA genome arrives through rule_builders, a deploy through
+        # rules_convert, and a hand-edited EventAction row through neither. Every one of them
+        # lands on this ctor, so this is the one place that can refuse a weight the search
+        # could never have emitted. The editor validates too, ahead of this, only so the user
+        # gets a message instead of a rule that saves and then builds no action.
+        validate_wired_weights(present)
+        # Stored as passed, so the three params are readable back off the action exactly like
+        # every other forwarded selection param. WITHOUT this the keys would reach the ctor and
+        # vanish into the signature, and an audit walking the action would report the rule as
+        # carrying no weights while the policy below quietly ranked on them.
+        self.w_premium = w_premium
+        self.w_iv = w_iv
+        self.w_rvol = w_rvol
         self.selection_policy = SelectionPolicy(**present) if any(present.values()) else None
 
     # --- helpers ----------------------------------------------------------
