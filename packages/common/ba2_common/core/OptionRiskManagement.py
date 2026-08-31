@@ -383,7 +383,8 @@ def sleeve_structures(expert_instance_id: int) -> Tuple[List[OptionStructure], L
 # ---------------------------------------------------------------------------
 def candidate_from_entry(*, underlying: str, option_strategy: str, legs: Sequence[Any],
                          quantity: int, max_loss_per_contract: Optional[float],
-                         multiplier: int = 100) -> CandidateStructure:
+                         multiplier: int = 100,
+                         stock_cover_price: Optional[float] = None) -> CandidateStructure:
     """The ``CandidateStructure`` for one entry order about to be submitted.
 
     ``max_loss_per_contract`` is what ``_submit_option_order`` has ALREADY measured and is
@@ -398,6 +399,15 @@ def candidate_from_entry(*, underlying: str, option_strategy: str, legs: Sequenc
     formula for short-side notional is precisely the divergence ``structure_metrics`` was
     promoted to end. ``short_put_assignment`` is ``put_assignment_cost`` per short put leg,
     the single shared definition.
+
+    ``stock_cover_price`` is the covered-call seam (2026-08-31, operator decision): the
+    submitting builder has VERIFIED the account holds the covering shares and priced them
+    at current spot (the same value the max-loss stamp used). ``structure_metrics`` sees
+    only the ORDER's option legs, so from those alone a covered call's short call reads
+    as naked; the declared cover overrides that to COVERED, which is what routes the
+    candidate's (measured) max loss to the deployment cap instead of the
+    ``undefined_risk_max_pct`` sub-cap (``option_book._is_undefined_risk`` honours the
+    explicit ``is_defined_risk`` declaration).
     """
     lifecycle_legs = []
     for leg in legs:
@@ -415,6 +425,11 @@ def candidate_from_entry(*, underlying: str, option_strategy: str, legs: Sequenc
                                strategy=option_strategy, legs=tuple(lifecycle_legs),
                                quantity=float(quantity), multiplier=multiplier)
     metrics = structure_metrics(structure)
+    is_defined_risk = metrics.is_defined_risk
+    if stock_cover_price is not None and is_defined_risk is False:
+        # The verified held-stock cover (docstring above): covered, not naked. Applied
+        # only over a measured False -- an unmeasurable metrics answer stays None.
+        is_defined_risk = True
 
     assignment: Optional[float] = 0.0
     for leg in structure.held_legs:
@@ -439,7 +454,7 @@ def candidate_from_entry(*, underlying: str, option_strategy: str, legs: Sequenc
         max_loss=max_loss,
         notional=metrics.notional,
         short_put_assignment=assignment,
-        is_defined_risk=metrics.is_defined_risk,
+        is_defined_risk=is_defined_risk,
     )
 
 
@@ -609,7 +624,8 @@ def reset_state() -> None:
 def admit_option_entry(*, expert, account, expert_instance_id: int,
                        underlying: str, option_strategy: str, legs: Sequence[Any],
                        quantity: int, max_loss_per_contract: Optional[float],
-                       multiplier: int = 100) -> OptionEntryVerdict:
+                       multiplier: int = 100,
+                       stock_cover_price: Optional[float] = None) -> OptionEntryVerdict:
     """May this option entry reach the broker? The rails' first production caller.
 
     One caller, two runtimes: ``_OptionEntryAction._submit_option_order`` reaches this from
@@ -620,6 +636,10 @@ def admit_option_entry(*, expert, account, expert_instance_id: int,
     :param account:  the sleeve's account, for equity and the cash that would fund delivery.
     :param max_loss_per_contract: what the submit path has already measured (§8.2). ``None``
                      is UNBOUNDED or UNMEASURABLE and declines.
+    :param stock_cover_price: the verified held-stock cover, when the submitting builder
+                     supplied one (covered call; see ``candidate_from_entry``). Marks the
+                     candidate COVERED so its measured max loss charges the deployment
+                     cap, not the undefined-risk sub-cap.
     """
     rails, missing = rail_settings(expert)
     if missing:
@@ -635,7 +655,7 @@ def admit_option_entry(*, expert, account, expert_instance_id: int,
     candidate = candidate_from_entry(
         underlying=underlying, option_strategy=option_strategy, legs=legs,
         quantity=quantity, max_loss_per_contract=max_loss_per_contract,
-        multiplier=multiplier)
+        multiplier=multiplier, stock_cover_price=stock_cover_price)
 
     structures, unbuildable = sleeve_structures(expert_instance_id)
     book = sleeve_book_from(structures, unbuildable)

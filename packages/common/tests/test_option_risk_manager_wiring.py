@@ -569,3 +569,76 @@ def test_a_fresh_run_starts_from_a_clean_sleeve():
     assert rm.get_breaker_state(7) == BreakerState()
     assert rm.pending_charges(7) == ()
     assert rm.journal(7) == ()
+
+
+# ---------------------------------------------------------------------------
+# 8. the verified stock cover: a covered call PASSES the rails (2026-08-31)
+# ---------------------------------------------------------------------------
+# Operator decision 2026-08-31: a covered call's cover is held stock OUTSIDE the
+# order's legs, so the legs alone measured it UNBOUNDED (no stamp) and, worse, the
+# candidate metrics read it as NAKED. The builder that VERIFIED the shares now
+# supplies ``stock_cover_price`` (current spot -- the same value the max-loss stamp
+# used), and the candidate becomes COVERED: its measured max loss charges the
+# deployment cap, never the ``undefined_risk_max_pct`` sub-cap.
+def short_call_legs(strike: float = 105.0, symbol: str = "AAPL") -> List[OptionLeg]:
+    return [OptionLeg(contract_symbol=f"{symbol}260116C{int(strike)}",
+                      side=OrderDirection.SELL, ratio_qty=1,
+                      option_type=OptionRight.CALL, strike=strike,
+                      expiry=date(2026, 1, 16), underlying=symbol)]
+
+
+def test_a_covered_call_with_verified_cover_is_admitted_as_COVERED_risk(empty_sleeve):
+    """The rails-passing covered call: measured max loss, deployment-cap charge, and a
+    zero naked charge -- the overlay lane is reachable."""
+    verdict = rm.admit_option_entry(
+        expert=FakeExpert(), account=FakeAccount(), expert_instance_id=7,
+        underlying="AAPL", option_strategy="covered_call", legs=short_call_legs(),
+        quantity=1, max_loss_per_contract=9_700.0, stock_cover_price=100.0)
+    assert verdict.allowed is True, verdict.detail
+    assert verdict.candidate.is_defined_risk is True
+    book = verdict.verdict.book_after
+    assert book.committed == pytest.approx(9_700.0)
+    assert book.naked_committed == pytest.approx(0.0)
+
+
+def test_the_undefined_risk_subcap_never_binds_on_a_verified_covered_call(empty_sleeve):
+    """Side by side under a 1% naked sub-cap: the covered call (cover supplied) is
+    admitted while a naked short put of the SAME max loss declines on that very rail --
+    covered risk is charged to the deployment cap, not the sub-cap."""
+    rails = dict(RAILS, undefined_risk_max_pct=1.0)      # 1% of 100k = 1,000
+    covered = rm.admit_option_entry(
+        expert=FakeExpert(rails=rails), account=FakeAccount(), expert_instance_id=7,
+        underlying="AAPL", option_strategy="covered_call", legs=short_call_legs(),
+        quantity=1, max_loss_per_contract=9_700.0, stock_cover_price=100.0)
+    naked = rm.admit_option_entry(
+        expert=FakeExpert(rails=rails), account=FakeAccount(), expert_instance_id=7,
+        underlying="MSFT", option_strategy="short_put",
+        legs=short_put_legs(symbol="MSFT"), quantity=1,
+        max_loss_per_contract=9_700.0)
+    assert covered.allowed is True, covered.detail
+    assert naked.allowed is False
+    assert naked.reason == RAIL_UNDEFINED_RISK
+
+
+def test_a_covered_call_with_NO_cover_still_declines(empty_sleeve):
+    """The guard, at the RM: no cover supplied means the submit path measured the bare
+    short call UNBOUNDED, handed over ``max_loss_per_contract=None``, and the candidate
+    metrics still read NAKED -- the strategy NAME buys nothing."""
+    verdict = rm.admit_option_entry(
+        expert=FakeExpert(), account=FakeAccount(), expert_instance_id=7,
+        underlying="AAPL", option_strategy="covered_call", legs=short_call_legs(),
+        quantity=1, max_loss_per_contract=None)
+    assert verdict.allowed is False
+    assert verdict.candidate.is_defined_risk is False
+
+
+def test_the_cover_declaration_never_overrides_an_UNMEASURABLE_metrics_answer():
+    """``stock_cover_price`` flips only a MEASURED False to True. Legs the metrics cannot
+    read (no strike) stay ``is_defined_risk=None`` -- unknown is not covered."""
+    unreadable = [OptionLeg(contract_symbol="AAPL260116C105", side=OrderDirection.SELL,
+                            ratio_qty=1, option_type=OptionRight.CALL, strike=None,
+                            expiry=date(2026, 1, 16), underlying="AAPL")]
+    candidate = rm.candidate_from_entry(
+        underlying="AAPL", option_strategy="covered_call", legs=unreadable, quantity=1,
+        max_loss_per_contract=9_700.0, stock_cover_price=100.0)
+    assert candidate.is_defined_risk is None

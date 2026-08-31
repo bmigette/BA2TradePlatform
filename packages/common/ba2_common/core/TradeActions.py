@@ -1932,28 +1932,43 @@ def _entry_payoff_legs(legs: List[OptionLeg], limit_price) -> Optional[List[Payo
     return out
 
 
-def _measured_max_loss_per_contract(legs: List[OptionLeg], limit_price) -> Optional[float]:
+def _measured_max_loss_per_contract(legs: List[OptionLeg], limit_price,
+                                    stock_cover_price=None) -> Optional[float]:
     """Dollars ONE contract of this order can lose -- ONLY when that is a measurement.
 
     ``option_payoff.max_loss`` is tri-state and only ``MEASURED`` yields a number.
-    UNBOUNDED (a short call with no cover among the order's own legs) and UNMEASURABLE
-    (an underivable leg set, a broken quote) both return None here and the submit path
-    stamps NOTHING: absence of ``data["max_loss_per_contract"]`` is the "contracts that
-    support it" gate for the ``loss_pct_of_max_loss`` exit condition, enforced by data
-    rather than by a runtime special case at evaluation time.
+    UNBOUNDED (a short call with no cover among the order's own legs or supplied
+    beside them) and UNMEASURABLE (an underivable leg set, a broken quote) both return
+    None here and the submit path stamps NOTHING: absence of
+    ``data["max_loss_per_contract"]`` is the "contracts that support it" gate for the
+    ``loss_pct_of_max_loss`` exit condition, enforced by data rather than by a runtime
+    special case at evaluation time.
 
     THE CORRECTED S6 RULE (2026-08-30): the predicate is the MEASURED payoff, never
     "is this structure a naked short". A naked short PUT is bounded below -- strike
     minus credit, at an underlying of zero -- so it IS measured and IS stamped; only
     short calls (and short stock) are genuinely unbounded.
 
-    A covered call's stock cover lives OUTSIDE the order's legs, so its short call
-    reads UNBOUNDED here and stamps nothing. That errs toward absence -- the exit simply
-    cannot fire for it -- never toward a wrong denominator.
+    THE STOCK COVER (2026-08-31, operator decision): a covered call's cover is held
+    stock OUTSIDE the order's legs, so from the legs alone its short call reads
+    UNBOUNDED and stamped nothing. A builder that has VERIFIED the account actually
+    holds (or simultaneously acquires) the covering shares passes
+    ``stock_cover_price`` -- the per-share price of the one 100-share lot backing each
+    contract -- and the evaluator (which already supports stock legs; see
+    ``PayoffLeg``) then measures the true structure: (cover price - credit) x 100.
+    An unmeasurable cover price refuses to measure (None), never fabricates. The seam
+    NEVER infers cover from the strategy name -- a bare short call submitted under the
+    ``covered_call`` tag with no cover supplied still reads UNBOUNDED.
     """
     payoff_legs = _entry_payoff_legs(legs, limit_price)
     if payoff_legs is None:
         return None
+    if stock_cover_price is not None:
+        cover = _payoff_numeric(stock_cover_price)
+        if cover is None or cover <= 0:
+            return None                     # an unmeasurable cover cannot measure the structure
+        payoff_legs = payoff_legs + [PayoffLeg(kind="stock", side=OrderDirection.BUY,
+                                               premium=cover)]
     result = _payoff_max_loss(payoff_legs)
     if result.state != _PAYOFF_MEASURED:
         return None
@@ -2578,12 +2593,20 @@ class _OptionEntryAction(TradeAction):
 
     def _submit_option_order(self, legs: List[OptionLeg], quantity: int,
                              limit_price: float, option_strategy: str,
-                             option_reserve: Optional[float] = None) -> Dict[str, Any]:
+                             option_reserve: Optional[float] = None,
+                             stock_cover_price: Optional[float] = None) -> Dict[str, Any]:
         """Submit (or defer) the assembled option order, honoring submit_to_broker.
 
         When `option_reserve` is provided (short-premium strategies: CSP / credit
         spread), it is persisted on the parent order's `data["option_reserve"]` so
         `OptionsAccountInterface.reserved_option_buying_power()` can account for it.
+
+        `stock_cover_price` is the held-stock cover seam (2026-08-31, operator
+        decision): the covered-call builder passes the underlying's CURRENT SPOT here
+        after verifying the shares are actually held, so the max-loss measurement and
+        the option RM see the true covered structure instead of a naked short call.
+        See the comment at the stamp below for the ratified valuation choice. Callers
+        that supply no cover are byte-identical to before.
 
         THE ENTRY-QUOTE CONCESSION IS APPLIED HERE (F3), the one choke point all seventeen
         builders reach, so no builder can be forgotten and none needs to know about it.
@@ -2621,7 +2644,20 @@ class _OptionEntryAction(TradeAction):
         # reconstruction, no OCC parsing at evaluation time. Stamped ONLY when MEASURED
         # (absence is the "contracts that support it" gate); computed from the
         # concession-adjusted limit because that is the order actually submitted.
-        max_loss_per_contract = _measured_max_loss_per_contract(legs, limit_price)
+        #
+        # THE STOCK COVER LEG (2026-08-31, OPERATOR-RATIFIED VALUATION): when the builder
+        # supplied `stock_cover_price` (covered call -- the cover is held stock OUTSIDE the
+        # order's legs), the cover leg is priced at the CURRENT SPOT at decision time, NOT
+        # the shares' historical cost basis. The stamp is a forward-looking risk
+        # denominator -- the max loss from HERE -- and folding the stock's unrealized P&L
+        # into it would corrupt the loss_pct_of_max_loss stop (a deep-profit lot would
+        # inflate the denominator, a deep-loss lot would shrink it, and the same short call
+        # would stop at different premiums for reasons that have nothing to do with its
+        # risk). Covered call: (spot - credit) x 100 per contract, MEASURED -> stamped ->
+        # opt_sl_ml can drive it -> the RM charges it to the deployment cap as COVERED
+        # risk (candidate_from_entry), never to the naked/uncovered sub-cap.
+        max_loss_per_contract = _measured_max_loss_per_contract(
+            legs, limit_price, stock_cover_price=stock_cover_price)
         if max_loss_per_contract is not None:
             data["max_loss_per_contract"] = max_loss_per_contract
         # THE OPTION RISK MANAGER (design 2026-08-27 SS4, review finding F5). This is the one
@@ -2640,7 +2676,8 @@ class _OptionEntryAction(TradeAction):
                 expert=rm_expert, account=self.account, expert_instance_id=rm_instance_id,
                 underlying=self.instrument_name, option_strategy=option_strategy,
                 legs=legs, quantity=quantity,
-                max_loss_per_contract=max_loss_per_contract)
+                max_loss_per_contract=max_loss_per_contract,
+                stock_cover_price=stock_cover_price)
             if not verdict.allowed:
                 data["option_rm_rail"] = verdict.reason
                 return self._result(False, verdict.message, data)
@@ -3038,7 +3075,15 @@ class SellCoveredCallAction(_OptionEntryAction):
         refusal = self._refuse_if_cover_is_short([leg], quantity, "covered_call")
         if refusal is not None:
             return refusal
-        return self._submit_option_order([leg], quantity, limit_price, "covered_call")
+        # THE STOCK COVER (2026-08-31, operator decision): both holding checks have now
+        # passed -- this expert's own filled buys hold >= 100 shares/contract AND the
+        # account-wide cover verdict is ok -- so the cover leg may be supplied to the
+        # max-loss measurement and the option RM. Priced at CURRENT SPOT, not cost basis
+        # (the ratified forward-looking-denominator choice; see _submit_option_order).
+        # A path that has NOT verified the shares must never pass this argument: the
+        # seam does not infer cover from the "covered_call" name.
+        return self._submit_option_order([leg], quantity, limit_price, "covered_call",
+                                         stock_cover_price=spot)
 
     def get_description(self) -> str:
         return f"Sell covered call on {self.instrument_name}"
@@ -3086,6 +3131,13 @@ class BuyProtectivePutAction(_OptionEntryAction):
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
                         position_intent="buy_to_open", option_type=self.OPTION_TYPE,
                         strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+        # NO stock cover leg here, deliberately (checked with the covered-call fix,
+        # 2026-08-31): the protective put also rides held stock, but a long put on its
+        # own is already loss-bounded -- its max loss IS the debit, which is both what
+        # the RM design charges a protective put against the budget (S8.1 lane 2) and
+        # the denominator the opt_sl_ml stop should manage on the put itself. Folding
+        # the stock in would inflate that denominator ~(spot - strike + debit)/debit-fold
+        # and effectively disarm the stop on the hedge.
         return self._submit_option_order([leg], quantity, limit_price, "protective_put")
 
     def get_description(self) -> str:

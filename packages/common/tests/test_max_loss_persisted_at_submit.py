@@ -208,14 +208,100 @@ def test_the_stamp_reaches_the_stored_order_row_beside_option_reserve():
 def test_a_naked_short_call_submit_stamps_nothing_THE_MEASURED_GATE():
     """UNBOUNDED loss -> no number -> NO KEY. Mutation target: a persist path that stamps
     whatever ``max_loss`` returned (or a made-up default) writes a key here, and an
-    absent-denominator downstream would read a fabricated risk. The seam is exercised
-    directly because the only naked-short-call builder (covered call) carries its stock
-    cover outside the order's own legs."""
+    absent-denominator downstream would read a fabricated risk.
+
+    SINCE 2026-08-31 THIS IS ALSO THE COVER-GUARD MUTATION KILL: the covered-call
+    builder now supplies its verified stock cover through ``stock_cover_price`` (and
+    stamps -- see the tests below), but the seam must NEVER infer cover from the
+    ``covered_call`` strategy name. This call submits a bare short call UNDER THAT NAME
+    with no cover supplied: a mutant that keys the cover off the name stamps here and
+    dies."""
     acct = FakeAccount()
     a = act(acct, "open_bull_put_spread", **BPS)
     res = a._submit_option_order([_short_call_leg()], 1, 3.0, "covered_call")
     assert res["success"], res["message"]
     assert "max_loss_per_contract" not in res["data"]
+
+
+# ==========================================================================
+# the held-stock cover seam (2026-08-31, operator decision): a covered call
+# whose cover the builder VERIFIED is MEASURED -- (spot - credit) x 100 -- and
+# stamps; the cover is priced at CURRENT SPOT, never cost basis (the stamp is
+# a forward-looking risk denominator; unrealized stock P&L must not move it).
+# ==========================================================================
+def test_a_covered_call_with_verified_cover_STAMPS_spot_minus_credit():
+    """The rails-passing covered call: cover supplied -> the payoff evaluator sees the
+    stock leg -> max loss is the stock riding to zero net of the credit, MEASURED."""
+    acct = FakeAccount(spot=100.0)
+    a = act(acct, "open_bull_put_spread", **BPS)
+    res = a._submit_option_order([_short_call_leg(105.0)], 1, 3.0, "covered_call",
+                                 stock_cover_price=100.0)
+    assert res["success"], res["message"]
+    assert res["data"]["max_loss_per_contract"] == pytest.approx((100.0 - 3.0) * 100.0)
+
+
+def test_the_same_short_call_with_and_without_cover_side_by_side():
+    """Only the supplied cover separates MEASURED from UNBOUNDED -- same leg, same
+    credit, same strategy tag, same seam."""
+    acct = FakeAccount(spot=100.0)
+    a = act(acct, "open_bull_put_spread", **BPS)
+    covered = a._submit_option_order([_short_call_leg(105.0)], 1, 3.0, "covered_call",
+                                     stock_cover_price=100.0)
+    bare = a._submit_option_order([_short_call_leg(105.0)], 1, 3.0, "covered_call")
+    assert covered["data"]["max_loss_per_contract"] == pytest.approx(9700.0)
+    assert "max_loss_per_contract" not in bare["data"]
+
+
+def test_an_unmeasurable_cover_price_stamps_nothing_never_a_guess():
+    """A cover whose price cannot be read refuses to measure -- absence, not a number.
+    (A stringly-typed or non-positive spot is a bug to surface, not to parse.)"""
+    acct = FakeAccount()
+    a = act(acct, "open_bull_put_spread", **BPS)
+    for bad in ("100", 0.0, -5.0, float("nan")):
+        res = a._submit_option_order([_short_call_leg(105.0)], 1, 3.0, "covered_call",
+                                     stock_cover_price=bad)
+        assert "max_loss_per_contract" not in res["data"], repr(bad)
+
+
+def test_the_real_covered_call_builder_supplies_its_verified_cover(monkeypatch):
+    """End to end through ``SellCoveredCallAction``: 100 held shares (seeded rows, the
+    builder's own sizer) + an ok account-wide cover verdict -> the submitted order
+    stamps (spot - credit) x 100. This is the O_WHEEL covered-call phase's entry path
+    too (its ``cc_sell`` overlay fires this action), previously absent-by-design in
+    Task 8 and reversed by the 2026-08-31 decision."""
+    from ba2_common.core import trade_store as ts
+    from ba2_common.core.models import TradingOrder as TO, Transaction as Txn
+    from ba2_common.core.types import AssetClass, OrderStatus, OrderType, TransactionStatus
+
+    from ba2_common.core.db import add_instance
+
+    with ts.inmem_trades():
+        acct = FakeAccount(spot=100.0)
+        action = act(acct, "sell_covered_call", strike_method="percent_otm",
+                     strike_param=5.0, dte_min=10, dte_max=40)
+        # 100 filled shares under this expert's own transactions (what sizes the call).
+        inst = 4242
+        action.expert_recommendation.instance_id = inst
+        txn_id = add_instance(Txn(symbol="XYZ", quantity=100.0, side=OrderDirection.BUY,
+                                  status=TransactionStatus.OPENED, expert_id=inst))
+        add_instance(TO(account_id=1, symbol="XYZ", quantity=100.0, filled_qty=100.0,
+                        side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                        status=OrderStatus.FILLED, transaction_id=txn_id,
+                        asset_class=AssetClass.EQUITY))
+        # The account-wide cover verdict: ok (the builder must still have ASKED).
+        from ba2_common.core.interfaces.OptionsAccountInterface import CoverCapacity
+        asked = []
+        monkeypatch.setattr(acct, "check_cover_for_covered_call",
+                            lambda legs, q, s: (asked.append((q, s)) or
+                                                CoverCapacity(ok=True)),
+                            raising=False)
+        res = action.execute()
+        assert res["success"], res["message"]
+        assert asked, "the builder submitted without asking the cover verdict"
+        credit = res["data"]["limit_price"]
+        assert credit > 0
+        assert res["data"]["max_loss_per_contract"] == pytest.approx(
+            (acct._spot - credit) * 100.0)
 
 
 def test_a_naked_short_put_submit_STAMPS_its_measured_max_loss_corrected_s6():

@@ -3156,7 +3156,9 @@ if _DEBIT_OPTION_MEMBERS | _CREDIT_OPTION_MEMBERS != set(_OPTION_STRATS):
 #   * everything else is a debit or defined-risk structure: MEASURED trivially.
 # This set is the strategy-level APPLICABILITY gate only -- the safety mechanism is Task 8's
 # absence rule (no stamp => the condition can never fire), which is what keeps the rule
-# harmless on a group's unbounded members and on the wheel's unstamped covered-call legs.
+# harmless on a group's unbounded members. (The wheel's covered-call legs were in that
+# unstamped category until 2026-08-31: the builder now supplies its verified stock cover,
+# the CC phase stamps (spot - credit) x 100, and opt_sl_ml can drive it.)
 _UNDEFINED_RISK_MEMBERS = {"O_SSTG", "O_SSTD"}
 
 
