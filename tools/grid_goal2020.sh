@@ -69,7 +69,18 @@ STORE="$HOME/Documents/ba2/common/cache/screener/metric_store"
 #
 # The worker syncs by `git pull`, so the master's commit MUST be pushed before launching or every
 # trial is retry-excluded for the whole run.
-WORKERS="${WORKERS-remote150}"
+#
+# DEFAULT IS remote227, NOT remote150 (changed 2026-08-31). This script is matrix 1/2's own
+# wrapper -- matrix 3 has its own separate WORKERS default in grid_goal2020_matrix3.sh, so
+# there is no shared-default reason to point here at BT's worker. remote150 as the default
+# repeatedly sent MY jobs there by accident whenever this was launched without an explicit
+# WORKERS= override (silent, no warning -- see the DISTRIBUTE BY DEFAULT comment above for why
+# the omitted-entirely case already gets one; a WRONG worker gets none), most recently
+# 2026-08-31 when a restart landed scr-small-FMPEarningsDrift-S3 on remote150 alongside BT's
+# own concurrent job, doubling up local --parallel 4 pools on one box and dropping free RAM to
+# 9 GB/64 GB. Opt into remote150 explicitly (WORKERS=remote150 ./grid_goal2020.sh) if that is
+# ever genuinely wanted.
+WORKERS="${WORKERS-remote227}"
 
 # Sweep orphaned multiprocessing.spawn pool workers from any PREVIOUS run before starting.
 # On Windows those children are detached: killing a grid leaves them alive holding their full
