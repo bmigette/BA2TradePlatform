@@ -10,6 +10,7 @@ stack); ``ui/utils/`` holds only perf_logger and imports in milliseconds.
 """
 import math
 import re
+from collections import namedtuple
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -1491,6 +1492,81 @@ def format_label_target_tooltip(*, target_pct: float,
         target_pct=target_pct,
         target_value=(investable_notional(base_notional, unallocated_pct)
                       * float(target_pct or 0.0) / 100.0))
+
+
+#: What a symbol's row would CHANGE BY if the current targets were executed: the share
+#: the user just typed against the share the account actually holds, and the money and
+#: quantity that implies. Rendered green/red beside the figures themselves.
+#:
+#: Each field is INDEPENDENTLY optional, and ``None`` means UNMEASURABLE, never "no
+#: change". A symbol with no price has no quantity delta even though its money delta is
+#: perfectly well defined, and printing 0.00 there would say the position keeps its size
+#: while its value moves -- which is the one thing that cannot happen.
+SymbolDelta = namedtuple('SymbolDelta', 'share value quantity')
+
+
+def symbol_delta(*, weight_pct: Optional[float], pct_of_label: Optional[float],
+                 target_value: Optional[float], current_value: Optional[float],
+                 quantity: Optional[float], price: Optional[float]) -> SymbolDelta:
+    """The three live deltas for one row: share points, money, and shares. Pure.
+
+    ``share`` is in PERCENTAGE POINTS of the label (typed target minus held share), not
+    a percentage change of a percentage -- "26.25% -> 27.09%" is +0.84 points, and
+    calling that +3.2% would be a second, invisible denominator on a page that already
+    has two.
+
+    ``quantity`` is derived from the MONEY, ``target_value / price - quantity``, rather
+    than from the share: the money is what the engine actually solves for, and dividing
+    the same number the TARGET VALUE column prints is what keeps the two columns from
+    disagreeing by a rounding step.
+
+    A ZERO delta is a real answer and is returned as 0.0, distinct from ``None``. "You
+    typed the share you already hold" is worth showing; "we cannot tell" is not the same
+    statement and must not borrow its colour.
+    """
+    share = (None if weight_pct is None or pct_of_label is None
+             else float(weight_pct) - float(pct_of_label))
+    value = (None if target_value is None or current_value is None
+             else float(target_value) - float(current_value))
+    if target_value is None or price is None or not price or quantity is None:
+        qty = None
+    else:
+        qty = float(target_value) / float(price) - float(quantity)
+    return SymbolDelta(share=share, value=value, quantity=qty)
+
+
+def format_delta(value: Optional[float], *, places: int = 2, suffix: str = '') -> str:
+    """``+1.23`` / ``-4.56`` / ``''``. The SIGN is always explicit on a non-zero delta.
+
+    An unsigned "1.23" beside a number is indistinguishable from the number's own
+    second column, and this one is drawn in green or red on the strength of that sign.
+    Empty string for ``None`` -- an unmeasurable delta draws nothing at all, rather than
+    a dash the eye reads as a value.
+    """
+    if value is None:
+        return ''
+    rounded = round(float(value), places)
+    if rounded == 0:
+        # Not "+0.00": nothing is moving, and a signed zero invites the reader to look
+        # for the direction it is claiming.
+        return f'0{suffix}' if not places else f'{0:.{places}f}{suffix}'
+    return f'{rounded:+,.{places}f}{suffix}'
+
+
+def delta_color(value: Optional[float]) -> str:
+    """Quasar colour name for a delta: green up, red down, neutral otherwise.
+
+    Neutral covers BOTH zero and unmeasurable, deliberately. Neither is a direction, and
+    the only thing green/red is allowed to mean here is which way the position moves.
+    """
+    if value is None:
+        return 'grey-5'
+    rounded = round(float(value), 6)
+    if rounded > 0:
+        return 'positive'
+    if rounded < 0:
+        return 'negative'
+    return 'grey-5'
 
 
 def symbol_target_values(weights, *, label_target_pct: float,

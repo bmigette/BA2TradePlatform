@@ -27,8 +27,11 @@ from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
     bar_scale_pct, build_label_bars, format_allocation_footer,
     sort_label_views,
     format_label_header, format_label_target_tooltip, format_label_total_notice,
+    delta_color,
     format_base_composition,
+    format_delta,
     format_reserve_caption,
+    symbol_delta,
     format_reserve_row,
     label_color_options, normalise_label_color, resolve_label_icon_color,
     store_color_value,
@@ -4967,3 +4970,89 @@ def test_the_reserve_and_the_base_line_reconcile_on_screen():
     assert '$536.98 held back' in caption
     assert '$4,832.81 to allocate' in caption
     assert round(536.98 + 4_832.81, 2) == round(base, 2)
+
+
+# ---------------------------------------------------------------------------
+# LIVE DELTAS
+#
+# What each row would CHANGE BY if the current targets were executed. Reported:
+# "putting same numbers in target share than current share gives different
+# amount" -- AAOI held 38.34% of the label and 38.34% was typed, yet the target
+# value came out $184.83 against $529.30 held. Nothing is wrong: the two
+# percentages divide different pots (what the label HOLDS vs what it is
+# TARGETED), and that label was over its target. The deltas say so on the row:
+# share 0.00pp, value -344.47, qty -3.2540.
+# ---------------------------------------------------------------------------
+
+def test_the_same_share_can_still_move_real_money():
+    """The reported case. A zero share delta beside a large negative money delta is
+    the correct reading of an over-allocated label, and it is the pair that explains
+    it -- either number alone looks like a bug."""
+    d = symbol_delta(weight_pct=38.34, pct_of_label=38.34,
+                     target_value=184.83, current_value=529.30,
+                     quantity=5, price=105.86)
+
+    assert d.share == pytest.approx(0.0)
+    assert d.value == pytest.approx(-344.47)
+    assert d.quantity == pytest.approx(184.83 / 105.86 - 5)
+
+
+def test_the_share_delta_is_in_percentage_POINTS():
+    """26.25% -> 27.09% is +0.84 POINTS. Reporting it as +3.2% (a percentage of a
+    percentage) would be a third denominator on a page that already has two."""
+    d = symbol_delta(weight_pct=27.09, pct_of_label=26.25, target_value=None,
+                     current_value=None, quantity=None, price=None)
+
+    assert d.share == pytest.approx(0.84)
+
+
+def test_the_quantity_delta_is_derived_from_the_money_the_column_prints():
+    """target_value / price, not share x something: the money is what the engine
+    solves for, so dividing the same number the TARGET VALUE cell shows is what keeps
+    the two columns from disagreeing by a rounding step."""
+    d = symbol_delta(weight_pct=50.0, pct_of_label=50.0, target_value=1_000.0,
+                     current_value=800.0, quantity=8.0, price=100.0)
+
+    assert d.quantity == pytest.approx(2.0)      # 10 target shares - 8 held
+
+
+def test_an_unmeasurable_delta_is_None_and_never_zero():
+    """A symbol with no price has NO quantity delta even though its money delta is
+    perfectly well defined. A 0.00 there would claim the position keeps its size while
+    its value moves, which cannot happen."""
+    d = symbol_delta(weight_pct=50.0, pct_of_label=40.0, target_value=1_000.0,
+                     current_value=800.0, quantity=8.0, price=None)
+
+    assert d.share == pytest.approx(10.0)
+    assert d.value == pytest.approx(200.0)
+    assert d.quantity is None
+
+
+def test_a_zero_price_does_not_divide():
+    d = symbol_delta(weight_pct=50.0, pct_of_label=50.0, target_value=1_000.0,
+                     current_value=800.0, quantity=8.0, price=0.0)
+
+    assert d.quantity is None
+
+
+def test_a_delta_prints_its_sign_but_a_zero_does_not():
+    """The sign is what the colour is keyed on, so an unsigned delta beside a number
+    is indistinguishable from a second column of that number. A signed ZERO, though,
+    invites the reader to look for a direction it is not claiming."""
+    assert format_delta(12.3456) == '+12.35'
+    assert format_delta(-12.3456) == '-12.35'
+    assert format_delta(0.0) == '0.00'
+    assert format_delta(None) == ''
+
+
+def test_an_unmeasurable_delta_draws_nothing_at_all():
+    """Empty, not a dash: a dash in a numeric column reads as a value."""
+    assert format_delta(None) == ''
+    assert format_delta(None, places=4) == ''
+
+
+def test_green_is_up_red_is_down_and_neither_claims_a_direction_it_lacks():
+    assert delta_color(1.0) == 'positive'
+    assert delta_color(-1.0) == 'negative'
+    assert delta_color(0.0) == 'grey-5'
+    assert delta_color(None) == 'grey-5', "unmeasurable must not be coloured as a move"

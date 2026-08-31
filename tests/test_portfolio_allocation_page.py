@@ -7444,3 +7444,64 @@ def test_the_leverage_line_still_sits_under_the_account_value(nicegui_client,
 
     assert texts[index + 1] == '$2,511.90'
     assert texts[index + 2] == 'managed positions are 2.02x this'
+
+
+# ---------------------------------------------------------------------------
+# LIVE DELTAS ON THE ROW
+#
+# "put live changes in this table for share of label, value, qty as we adjust
+# the share compared to the current %. Positive = green, negative = red."
+#
+# Drawn INSIDE the existing cells rather than in three more columns: the same
+# request asked for the table to get narrower, and it already carries fourteen.
+# ---------------------------------------------------------------------------
+
+def test_the_row_carries_a_delta_for_share_value_and_quantity(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id, symbols=('AAPL',)))
+    row = _tables(root)[0].rows[0]
+
+    for key in ('share_delta', 'value_delta', 'qty_delta'):
+        assert key in row, key
+        assert key + '_color' in row, key
+
+
+def test_a_positive_change_is_green_and_a_negative_one_red(nicegui_client, account_id):
+    """The colour is keyed on the SIGN, which is why the formatter always prints it."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import delta_color
+
+    assert delta_color(5.0) == 'positive'
+    assert delta_color(-5.0) == 'negative'
+
+
+def test_the_delta_is_rewritten_when_a_share_is_edited(nicegui_client, account_id):
+    """One writer for the initial render AND the edit path, so a delta can never be
+    left describing a figure that has since moved."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, symbols=('AAPL',)))
+    table = _tables(root)[0]
+    before = dict(table.rows[0])
+
+    table.rows[0]['weight_pct'] = 12.5
+    table.rows[0]['target_value'] = 1.0
+    page._write_row_deltas(table.rows[0])
+
+    assert table.rows[0]['value_delta'] != before['value_delta']
+
+
+def test_the_share_column_is_narrowed(nicegui_client, account_id):
+    """The cell holds a number box, not prose; at its natural width the HEADER TEXT
+    set the column and pushed the money columns off to the right."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    col = next(c for c in _tables(root)[0].columns if c['name'] == 'weight_pct')
+
+    assert 'width' in col.get('style', ''), col
+
+
+def test_the_delta_markup_reads_its_colour_off_the_row(nicegui_client, account_id):
+    """Precomputed in Python and merely printed by the template: "unmeasurable versus
+    zero" is a decision, and decisions do not belong in a Quasar cell slot."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    slots = _tables(root)[0].slots
+
+    assert "props.row.value_delta_color" in slots['body-cell-target_value'].template
+    assert "props.row.qty_delta_color" in slots['body-cell-quantity'].template
+    assert "props.row.share_delta_color" in slots['body-cell-weight_pct'].template
