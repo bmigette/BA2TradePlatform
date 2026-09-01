@@ -110,8 +110,19 @@ def forced_option_exit(event_action) -> bool:
         losing);
       * everything else (TP gates, time exits, sentiment/rating flags) is
         discretionary. The ``days_opened`` time exit is DELIBERATELY discretionary —
-        the F7 brief's forced list was SL / DTE / breaker / margin only (the breaker
-        is deferred to F5's shared-rails work) — recorded so it is not re-litigated.
+        the F7 brief's forced list was SL / DTE / breaker / margin only — recorded so
+        it is not re-litigated.
+
+    THE BREAKER AND THE MARGIN CALL ARE NOT MISSING FROM THAT LIST — they never reach
+    this function. F5's shared-rails work has since landed (``update_sleeve_breaker`` is
+    called per bar by ``daily_engine._update_option_breakers`` and by the live
+    ``run_option_lifecycle_pass``), and a breaker stand-down flattens the book through
+    ``option_lifecycle.decide``'s ``LIFECYCLE_BREAKER`` while a margin call goes through
+    the account's liquidation — neither is a RULE, so neither has ``triggers`` for this
+    classifier to read. There is no ``ExpertEventType`` for either, and adding one is not
+    what forced classification needs: those paths choose their own quoting. (Review
+    2026-08-30 dev-merge, FIX 6 — the earlier note said the breaker was "deferred to F5",
+    which has been true of nothing since 2026-09-01.)
 
     The flag is inert in live by construction: only an account that models a spread
     (``option_modelled_half_spread``) lets ``CloseOptionAction`` act on it.

@@ -729,8 +729,18 @@ class DailyBacktestEngine:
             #     never re-armed: ``RAIL_BREAKER_HALTED`` was unreachable here and a
             #     classic_options backtest was systematically MORE PERMISSIVE than live.
             #     This is the same shared function live calls -- one implementation, two
-            #     callers -- and it reads the sleeve's equity through the one shared
-            #     definition (``AccountSnapshot.equity``).
+            #     callers -- and it reads the sleeve's equity through
+            #     ``sleeve_true_equity`` -> ``ReadOnlyAccountInterface.true_equity``, NOT
+            #     through ``AccountSnapshot.equity`` (review 2026-08-30 dev-merge, FIX 6:
+            #     the earlier wording named the snapshot and would invite putting it back).
+            #     The distinction is the whole point of the 2026-09-01 fix: on
+            #     ``BacktestAccount`` the snapshot resolves to
+            #     ``deployed_equity() = min(cap, equity())``, and that clamp is ONE-SIDED --
+            #     it compresses peaks and never troughs, so a capped account falling
+            #     100k -> 64k reports a 0.0 % drawdown and never stands down. Live, where
+            #     there is no cap, ``true_equity`` and the snapshot are the same number and
+            #     nothing changes. The sizing rails keep the capped reader
+            #     (``sleeve_equity``); only this LOSS measurement looks past it.
             #
             #     HERE, deliberately: after the expiry settlement and the margin-call
             #     liquidation have marked this bar and BEFORE ``snapshot_equity``, so the

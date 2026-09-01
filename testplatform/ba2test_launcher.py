@@ -3212,15 +3212,31 @@ def _screener_gate_base_for_strategy(kind: str) -> dict:
         return dict(_OPTION_STRATS[kind].get("screener_gate_base") or {})
     merged: dict = {}
     for member in _OPTION_GROUPS.get(kind, []):
-        # CAVEAT (review fix, 2026-08-30): "later member wins" is a MERGE, not a per-member
-        # gate -- a capped member's price_max here would gate every OTHER active member's
-        # entries too, including an uncapped, defined-risk one. OS2 = [O_SSTG, O_SSTD, O_IC]:
-        # O_SSTG/O_SSTD now carry a real $300 cap, so OS2's merged block currently applies
-        # $300 to O_IC's entries as well, even though defined-risk O_IC is deliberately
-        # uncapped as a STANDALONE job (grid design §6). Inert TODAY -- stage 1 runs no groups
-        # (stage1_run.sh lists single-strategy keys only) -- but a stage that DOES run OS2/OS3
-        # would need a per-member gate, not this merge, before trusting O_IC's numbers inside
-        # the group.
+        # "Later member wins" is a MERGE, not a per-member gate: a capped member's price_max
+        # here would gate every OTHER active member's entries too, including an uncapped
+        # defined-risk one. That hazard is REAL IN SHAPE and UNREACHABLE IN FACT on this tree,
+        # and the distinction matters because the previous note here claimed the opposite.
+        #
+        # MEASURED 2026-09-01 (review 2026-08-30 dev-merge, FIX 3): every gate-carrying row is
+        # a full-notional or naked-vol structure -- O_CSP / O_JL / O_RS ($100) and O_SSTG /
+        # O_SSTD ($300) -- and ``_OPTION_GROUPS`` filters all five out of every group, so all
+        # four groups resolve to ``{}``:
+        #
+        #     OS1 [O_LC, O_LP, O_VERT, O_BF, O_BULLCS] -> {}
+        #     OS2 [O_IC]                               -> {}
+        #     OS3 [O_BEARCS, O_BULLPS]                 -> {}
+        #     OS4 [O_STRD, O_STRG]                     -> {}
+        #
+        # The earlier caveat read "OS2 = [O_SSTG, O_SSTD, O_IC], so O_SSTG's $300 currently
+        # applies to O_IC's entries" -- true before the naked-vol structures left the searched
+        # set on 2026-08-31 (``_UNDEFINED_RISK_MEMBERS``), and false since: OS2 is [O_IC]
+        # alone. ``test_an_excluded_members_override_never_reaches_its_group`` in
+        # ``testplatform/backend/tests/test_launcher_screener_gate.py`` pins exactly that -- an
+        # override placed on the EXCLUDED O_SSTG row must not appear in OS2's block.
+        #
+        # So the note to carry forward is not "O_IC is mis-priced today" but "if a defined-risk
+        # member is ever grouped WITH a gate-carrying one, this merge would need to become a
+        # per-member gate first".
         merged.update(_OPTION_STRATS[member].get("screener_gate_base") or {})
     return merged
 

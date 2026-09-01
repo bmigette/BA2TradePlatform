@@ -492,9 +492,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         Each lot contributes ``premium_close x signed_qty x multiplier`` (mirroring how an
         equity position contributes ``close x qty``, scaled by the contract multiplier).
-        When no premium bar exists for the lot's contract on the current bar, the lot is
-        valued at its entry premium (``avg_price``) so a held option is never silently
-        dropped to zero on a day the cache lacks a bar.
+
+        WHEN NO PREMIUM BAR EXISTS on the current bar, the entry premium (``avg_price``) is
+        the STARTING mark and is then bounded by INTRINSIC — a floor, and the no-arb upper
+        bound as a ceiling — for every lot, defined-risk or not (review 2026-08-30 F2 and
+        its fast-follow; see the branches below). The pre-F2 prose here said the lot was
+        simply "valued at its entry premium", which is what left a deep-ITM naked short
+        frozen at its entry credit — the only found path around the dd>=100 wipeout
+        sentinel — and a long call frozen at 5.00 on a collapsed 3.00 underlying. The
+        entry premium still stands where intrinsic is below it (an option still OTM), and
+        it is kept unchanged when SPOT itself cannot be read this tick: the fix is for the
+        no-OPTION-bar case, not the no-equity-bar case.
 
         DEFINED-RISK multi-leg groups (butterflies / vertical spreads / iron condors) are
         marked as a GROUP and their net contribution is CLAMPED to the structure's theoretical
@@ -3055,8 +3063,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     # would record the share price as the exit (the run-782 NVDA defect:
                     # 200.09 spot instead of the 0.10 premium close). Mark at the
                     # contract's premium close via the same ``_options.get_bar`` path the
-                    # equity curve's option MTM uses. No premium bar -> entry premium
-                    # (breakeven), NEVER the underlying close.
+                    # equity curve's option MTM uses. No premium bar -> the
+                    # intrinsic-floored entry premium (the block immediately below), and
+                    # NEVER the underlying close. (Pre-F2 this line read "entry premium
+                    # (breakeven)" flat; review 2026-08-30 F2 replaced that with the floor
+                    # and the wording is corrected here to match what runs.)
                     bar = self._options.get_bar(opening.contract_symbol, self._as_of_date())
                     exit_px = bar["close"] if bar and bar.get("close") is not None else None
                     if exit_px is None:

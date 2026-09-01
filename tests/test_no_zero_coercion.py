@@ -386,8 +386,11 @@ ALLOWLIST: dict = {
         "resolve split added the option_request import; :1533 before it added the "
         "option_payoff import; :1534 before the F3 entry-quote gene added the "
         "option_entry_quote import; :1537 at the two option lineages' common base; "
-        ":1546 after the option risk manager wiring added the OptionRiskManagement "
-        "import and the _option_risk_manager helper (+9); :1547 after the F7 close "
+        ":1546 after three IMPORT-BLOCK additions above it (+9): the option_payoff "
+        "import expanding to a multi-line form (+5), the OptionRiskManagement import "
+        "(+3) and the option_selection_policy import (+1) — NOT the "
+        "_option_risk_manager helper, which sits ~1,100 lines BELOW this line and "
+        "cannot shift it (review 2026-08-30 dev-merge, FIX 4); :1547 after the F7 close "
         "concession wrapped that option_entry_quote import onto a second line to pull "
         "in ENTRY_CROSS_FULL (+1))",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
