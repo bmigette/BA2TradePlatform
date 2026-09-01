@@ -1037,8 +1037,13 @@ class SymbolInfoPanel:
 
     def __init__(self, symbols: Sequence[str], *, api_key: str, as_of: date,
                  windows: Sequence[str] = WINDOWS,
-                 fetch: Optional[Callable[..., Mapping[str, SymbolInfo]]] = None):
+                 fetch: Optional[Callable[..., Mapping[str, SymbolInfo]]] = None,
+                 display_names: Optional[Mapping[str, str]] = None):
         self.symbols = _requested_order(symbols)
+        #: ``{SYMBOL: company name}``, for the title and the overview heading. A symbol
+        #: absent here shows its TICKER ALONE -- never a guessed or prettified name, and
+        #: never the ticker presented as though it were the company.
+        self.display_names = dict(display_names or {})
         self.api_key = api_key
         self.as_of = as_of
         self.windows = tuple(windows)
@@ -1063,7 +1068,7 @@ class SymbolInfoPanel:
                         panel_card_style(len(self.symbols))):
                 with ui.row().classes(
                         "w-full items-center justify-between p-2 shrink-0"):
-                    ui.label(f"Symbol info — {', '.join(self.symbols)}").classes(
+                    ui.label(f"Symbol info — {self._titled(self.symbols)}").classes(
                         "text-lg font-bold")
                     ui.button(icon="close", on_click=self.close).props("flat round")
                 # THE CONTENT SCROLLS, not the dialog. ``min-h-0`` again, for the
@@ -1089,6 +1094,18 @@ class SymbolInfoPanel:
         with self.body:
             ui.spinner(size="lg")
             ui.label("Loading…").style(_MUTED)
+
+    def _titled(self, symbols: Sequence[str]) -> str:
+        """``AAPL (Apple Inc.)`` for each symbol, or the bare ticker when unnamed.
+
+        The ticker LEADS: it is what was clicked, what the row says, and what the rest
+        of the panel is keyed on. The name is the annotation, not the identity.
+        """
+        parts = []
+        for symbol in symbols:
+            name = (self.display_names.get(symbol) or "").strip()
+            parts.append(f"{symbol} ({name})" if name else symbol)
+        return ", ".join(parts)
 
     def open(self) -> None:
         self.dialog.open()
@@ -1136,7 +1153,8 @@ class SymbolInfoPanel:
 
 def open_symbol_info(symbols: Sequence[str], *, api_key: str, as_of: date,
                      windows: Sequence[str] = WINDOWS,
-                     fetch: Optional[Callable[..., Mapping[str, SymbolInfo]]] = None
+                     fetch: Optional[Callable[..., Mapping[str, SymbolInfo]]] = None,
+                     display_names: Optional[Mapping[str, str]] = None
                      ) -> SymbolInfoPanel:
     """Open the symbol-info dialog for one or more symbols.
 
@@ -1147,7 +1165,7 @@ def open_symbol_info(symbols: Sequence[str], *, api_key: str, as_of: date,
     UI itself does not need to.
     """
     panel = SymbolInfoPanel(symbols, api_key=api_key, as_of=as_of, windows=windows,
-                            fetch=fetch)
+                            fetch=fetch, display_names=display_names)
     panel.open()
     panel.load_task = asyncio.create_task(panel.load())
     return panel

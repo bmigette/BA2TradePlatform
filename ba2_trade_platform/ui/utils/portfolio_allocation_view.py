@@ -1508,6 +1508,31 @@ def format_label_target_tooltip(*, target_pct: float,
 SymbolDelta = namedtuple('SymbolDelta', 'share value quantity')
 
 
+def emitted_value(event) -> Any:
+    """The ONE value carried by a single-argument Vue emit. Pure.
+
+    NiceGUI does not wrap a lone emitted value in a list: ``$emit('x', 'HSPH')`` arrives
+    as ``args == 'HSPH'``, while ``$emit('x', a, b)`` arrives as ``args == [a, b]``. So
+    the ``e.args[0]`` that is correct for the two-argument handlers INDEXES THE STRING
+    for the one-argument ones, and returns its first character.
+
+    That is how clicking ⓘ on HSPH opened "Symbol info — H" — and it did not stop at the
+    title: 'H' is Hyatt Hotels, a real listed symbol, so the panel fetched and charted
+    ANOTHER COMPANY'S price, dividends and total return under the ticker the user asked
+    about. A wrong answer that looks entirely plausible.
+
+    Strings and bytes are the trap and are checked FIRST: both are sequences, so a
+    ``len``/subscript test cannot tell them from a real argument list.
+    ``LazyTable._on_row_props`` guards the same ambiguity the same way.
+    """
+    args = getattr(event, 'args', event)
+    if isinstance(args, (str, bytes)):
+        return args
+    if isinstance(args, (list, tuple)):
+        return args[0] if args else None
+    return args
+
+
 def symbol_delta(*, weight_pct: Optional[float], pct_of_label: Optional[float],
                  target_value: Optional[float], current_value: Optional[float],
                  quantity: Optional[float], price: Optional[float]) -> SymbolDelta:

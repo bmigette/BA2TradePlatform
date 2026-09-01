@@ -105,6 +105,7 @@ from sqlmodel import select
 from ...config import get_app_setting
 from ...core import portfolio_allocation_service as svc
 from ...core.db import get_db
+from ...core.instrument_enrichment import enrich_instruments
 from ...core.models import ExpertInstance
 from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
@@ -144,6 +145,7 @@ from ..utils.portfolio_allocation_view import (
     format_allocation_footer, format_label_header,
     format_label_target_tooltip,
     delta_color,
+    emitted_value,
     format_base_composition,
     format_delta,
     format_reserve_caption,
@@ -1626,6 +1628,17 @@ async def _add_symbols_from_input(account_id: int, label: str, raw: str,
         ui.notify(f'Could not add: {e}', type='negative')
         return
     ui.notify(f"Added {added} symbol(s) to '{label}'", type='positive')
+    # ENRICH WHAT WE JUST CREATED. ``add_symbols_to_label`` is a pure DB helper with no
+    # provider to ask -- correctly, since it must not turn a database write into a
+    # network call -- so a symbol added here arrived with no company name, no sector and
+    # no type, and stayed that way until someone pressed a button on the Settings page.
+    # Done AFTER the success notice and on a worker thread: the row exists and the label
+    # is correct whether or not the provider answers, so a slow or dead feed must not
+    # hold the dialog open or make the add look like it failed.
+    try:
+        await asyncio.to_thread(enrich_instruments, known)
+    except Exception as e:  # noqa: BLE001 -- the add SUCCEEDED; this is decoration
+        logger.warning(f"Could not fetch info for {known}: {e}")
     await on_success()
 
 
@@ -1971,7 +1984,37 @@ def _open_symbol_info(symbols) -> None:
     if not symbols:
         ui.notify('Select at least one symbol first', type='warning')
         return
-    open_symbol_info(symbols, api_key=api_key, as_of=date.today())
+    open_symbol_info(symbols, api_key=api_key, as_of=date.today(),
+                     display_names=_display_names_for(symbols))
+
+
+def _display_names_for(symbols) -> Dict[str, str]:
+    """``{SYMBOL: company name}`` for the info panel, fetching what is not on file.
+
+    Reads the instrument table first, and only reaches a provider for the symbols it
+    could not name -- which, after ``enrich_instruments`` runs on add, should be none.
+    The fetch is a NETWORK call on the click path, so it is bounded to the handful of
+    symbols in the dialog and its failure is swallowed: an unnamed symbol shows its
+    ticker alone, which is what the panel did for every symbol before this existed.
+    """
+    # Local import, matching the other call site: ``core.utils`` reaches back into the
+    # live registries and importing it at module scope here is circular.
+    from ...core.utils import get_company_names
+    try:
+        known = get_company_names(symbols)
+    except Exception as e:  # noqa: BLE001 -- a label is never worth failing the dialog
+        logger.warning(f"Could not read company names for {symbols}: {e}")
+        return {}
+    missing = [s for s in symbols if s not in known]
+    if not missing:
+        return known
+    try:
+        # Stores as well as returns, so the next open is a database read.
+        enrich_instruments(missing)
+        known.update(get_company_names(missing))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Could not fetch company names for {missing}: {e}")
+    return known
 
 
 # ---------------------------------------------------------------------------
@@ -2167,7 +2210,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
             </q-btn>
         </q-td>
     ''')
-    table.on('symbolInfo', lambda e: _open_symbol_info([e.args[0]]))
+    table.on('symbolInfo', lambda e: _open_symbol_info([emitted_value(e)]))
     # THE DELTA IS THE INPUT'S ``hint``, not a sibling div. A sibling right-aligns to
     # the CELL's edge while the input's number right-aligns to the INPUT's content box,
     # and the two are not the same edge -- the delta hung a dozen pixels past the box it

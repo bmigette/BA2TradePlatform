@@ -7549,3 +7549,93 @@ def test_the_share_delta_is_the_inputs_hint_so_it_lines_up_with_the_digits(
 
     assert 'v-slot:hint' in template
     assert 'props.row.share_delta' in template
+
+
+# ---------------------------------------------------------------------------
+# The ⓘ emit carried ONE argument, and one argument is not a list
+# ---------------------------------------------------------------------------
+
+def test_a_single_emitted_symbol_is_not_indexed_as_a_string():
+    """Clicking ⓘ on HSPH opened "Symbol info — H". NiceGUI does not wrap a lone
+    emitted value in a list, so the ``e.args[0]`` that is right for the two-argument
+    handlers indexed the STRING and returned its first character.
+
+    It did not stop at the title: 'H' is Hyatt Hotels, a real listed symbol, so the
+    panel fetched and charted ANOTHER COMPANY's price, dividends and total return under
+    the ticker the user asked about."""
+    from types import SimpleNamespace
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import emitted_value
+
+    assert emitted_value(SimpleNamespace(args='HSPH')) == 'HSPH'
+
+
+def test_a_multi_argument_emit_still_yields_its_first_argument():
+    from types import SimpleNamespace
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import emitted_value
+
+    assert emitted_value(SimpleNamespace(args=['AAPL', 12.5])) == 'AAPL'
+    assert emitted_value(SimpleNamespace(args=['HSPH'])) == 'HSPH'
+
+
+def test_an_empty_emit_is_None_rather_than_an_IndexError():
+    from types import SimpleNamespace
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import emitted_value
+
+    assert emitted_value(SimpleNamespace(args=[])) is None
+
+
+def test_a_non_string_scalar_survives_unchanged():
+    """Ids are emitted as numbers elsewhere; subscripting one would raise."""
+    from types import SimpleNamespace
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import emitted_value
+
+    assert emitted_value(SimpleNamespace(args=34)) == 34
+
+
+def test_the_info_button_is_wired_through_the_helper(nicegui_client, account_id):
+    """Pinning the WIRING, not just the helper: the bug was at the call site."""
+    import inspect
+    from ba2_trade_platform.ui.pages import portfolio_allocation as page_mod
+
+    source = inspect.getsource(page_mod)
+    assert "table.on('symbolInfo', lambda e: _open_symbol_info([emitted_value(e)]))" in source
+    assert "_open_symbol_info([e.args[0]])" not in source
+
+
+def test_the_info_panel_titles_a_symbol_with_its_company_name():
+    """"Symbol info — HSPH" alone does not say what HSPH IS. The ticker leads (it is
+    what was clicked and what the rest of the panel is keyed on); the name annotates."""
+    from ba2_trade_platform.ui.components.symbol_info_panel import SymbolInfoPanel
+    from datetime import date
+
+    panel = SymbolInfoPanel.__new__(SymbolInfoPanel)
+    panel.display_names = {'HSPH': 'Health In Tech, Inc.'}
+
+    assert panel._titled(['HSPH']) == 'HSPH (Health In Tech, Inc.)'
+
+
+def test_an_unnamed_symbol_shows_its_ticker_alone_not_a_guess():
+    from ba2_trade_platform.ui.components.symbol_info_panel import SymbolInfoPanel
+
+    panel = SymbolInfoPanel.__new__(SymbolInfoPanel)
+    panel.display_names = {}
+
+    assert panel._titled(['HSPH']) == 'HSPH'
+
+
+def test_several_symbols_are_each_annotated():
+    from ba2_trade_platform.ui.components.symbol_info_panel import SymbolInfoPanel
+
+    panel = SymbolInfoPanel.__new__(SymbolInfoPanel)
+    panel.display_names = {'AAPL': 'Apple Inc.'}
+
+    assert panel._titled(['AAPL', 'MSFT']) == 'AAPL (Apple Inc.), MSFT'
+
+
+def test_a_blank_stored_name_is_treated_as_no_name():
+    from ba2_trade_platform.ui.components.symbol_info_panel import SymbolInfoPanel
+
+    panel = SymbolInfoPanel.__new__(SymbolInfoPanel)
+    panel.display_names = {'AAPL': '   '}
+
+    assert panel._titled(['AAPL']) == 'AAPL'

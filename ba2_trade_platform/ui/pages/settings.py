@@ -1,3 +1,5 @@
+import asyncio
+
 from nicegui import ui
 from typing import Optional, List
 from sqlmodel import select
@@ -6,6 +8,8 @@ from sqlmodel import select
 from ...core.models import AccountDefinition, AccountSetting, AppSetting, Instrument, ExpertInstance, EventAction, Ruleset
 from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
+from ...core.instrument_enrichment import enrich_instruments
+from ba2_common.core.instrument_info import needs_instrument_info
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
@@ -164,183 +168,74 @@ class InstrumentSettingsTab:
         return False
 
     async def fetch_info(self):
+        """Re-fetch company name, sector and TYPE for EVERY instrument.
+
+        Delegates to ``core.instrument_enrichment``, which is the one place that
+        knows how to turn a provider's answer into ``Instrument`` fields. This method
+        and ``fetch_missing_info`` used to carry near-identical copies of that logic,
+        and neither copy ever wrote ``instrument_type`` -- which is why half the table
+        rendered a blank Type column that no button could fill.
+        """
         logger.debug('Fetching info for all instruments (batch mode)')
-        
-        # Set loading state
         self.fetch_info_btn.props('loading')
-        
-        session = get_db()
-        statement = select(Instrument)
-        results = session.exec(statement)
-        instruments = results.all()
-        session.close()
-
-        if not instruments:
-            logger.info('No instruments found to fetch info for.')
-            ui.notify('No instruments found.', type='warning')
-            self.fetch_info_btn.props(remove='loading')
-            return
-
-        symbol_to_instrument = {inst.name: inst for inst in instruments}
-        symbols = list(symbol_to_instrument.keys())
-        updated = 0
-        errors = 0
-
         try:
-            ticker = Ticker(symbols)
-            profiles = ticker.asset_profile
-            prices = ticker.price
-
-            for symbol, instrument in symbol_to_instrument.items():
-                local_session = get_db()
-                db_instrument = local_session.get(Instrument, instrument.id)
-                updated_flag = False
-                try:
-                    profile_data = profiles.get(symbol.upper())
-                    if profile_data and isinstance(profile_data, dict):
-                        sector = profile_data.get("sector")
-                        if sector:
-                            if self._add_to_list_field(db_instrument, 'categories', sector, local_session):
-                                logger.debug(f'Added sector {sector} to instrument {symbol}')
-                                local_session.commit()
-                                updated_flag = True
-                        else:
-                            logger.debug(f'No sector found for instrument {symbol}')
-                    else:
-                        self._add_to_list_field(db_instrument, 'labels', 'not_found', local_session)
-                        logger.warning(f'Instrument {symbol} not found in asset profile')
-                        local_session.commit()
-
-                    price_info = prices.get(symbol.upper())
-                    longname = price_info.get("longName") if isinstance(price_info, dict) else None
-                    if longname:
-                        db_instrument.company_name = longname
-                        local_session.add(db_instrument)
-                        local_session.commit()
-                        logger.debug(f'Updated company_name for {symbol}: {longname}')
-                        updated_flag = True
-
-                    if updated_flag:
-                        if db_instrument.labels and 'not_found' in db_instrument.labels:
-                            labels = list(db_instrument.labels)
-                            labels.remove('not_found')
-                            db_instrument.labels = labels
-                            local_session.add(db_instrument)
-                            local_session.commit()
-                        updated += 1
-                except Exception as e:
-                    self._add_to_list_field(db_instrument, 'labels', 'not_found', local_session)
-                    logger.error(f"Error fetching info for {symbol}: {e}", exc_info=True)
-                    local_session.commit()
-                    errors += 1
-                finally:
-                    local_session.close()
+            with get_db() as session:
+                symbols = [i.name for i in session.exec(select(Instrument)).all()]
+            if not symbols:
+                logger.info('No instruments found to fetch info for.')
+                ui.notify('No instruments found.', type='warning')
+                return
+            # only_missing=False: this button's whole purpose is to REFRESH, so it must
+            # consider rows that already look complete.
+            updated, errors = await asyncio.to_thread(
+                enrich_instruments, symbols, only_missing=False)
+            logger.info(f'Fetched info for {updated} instruments. Errors: {errors}')
+            ui.notify(f'Fetched info for {updated} instruments. Errors: {errors}',
+                      type='positive' if errors == 0 else 'warning')
+            self._update_table_rows()
         except Exception as e:
             logger.error(f"Error fetching batch info: {e}", exc_info=True)
             ui.notify(f'Error fetching batch info: {e}', type='negative')
+        finally:
             self.fetch_info_btn.props(remove='loading')
-            return
-
-        logger.info(f'Fetched info for {updated} instruments. Errors: {errors}')
-        ui.notify(f'Fetched info for {updated} instruments. Errors: {errors}', type='positive' if errors == 0 else 'warning')
-        self._update_table_rows()
-        self.fetch_info_btn.props(remove='loading')
 
     async def fetch_missing_info(self):
-        """Fetch info only for instruments missing company_name or categories"""
+        """Fetch info only for instruments MISSING company name, categories or TYPE.
+
+        The type counts. The old predicate asked about the name and the categories
+        only, so a row that had both but no type -- 35 on the live database, and every
+        row a successful fetch had just updated -- reported as complete and could never
+        be selected. The blank Type cell was therefore permanent: the only button that
+        would have filled it did not consider it missing. ``needs_instrument_info``
+        now owns that question.
+        """
         logger.debug('Fetching info for instruments with missing data')
-        
-        # Set loading state
         self.fetch_missing_btn.props('loading')
-        
-        session = get_db()
-        statement = select(Instrument)
-        results = session.exec(statement)
-        all_instruments = results.all()
-        session.close()
-
-        if not all_instruments:
-            logger.info('No instruments found.')
-            ui.notify('No instruments found.', type='warning')
-            self.fetch_missing_btn.props(remove='loading')
-            return
-
-        # Filter to only instruments missing data
-        missing_instruments = [
-            inst for inst in all_instruments 
-            if not inst.company_name or not inst.categories or len(inst.categories) == 0
-        ]
-
-        if not missing_instruments:
-            logger.info('No instruments with missing data found.')
-            ui.notify('All instruments already have company name and categories.', type='info')
-            self.fetch_missing_btn.props(remove='loading')
-            return
-
-        symbol_to_instrument = {inst.name: inst for inst in missing_instruments}
-        symbols = list(symbol_to_instrument.keys())
-        updated = 0
-        errors = 0
-
-        logger.info(f'Fetching info for {len(symbols)} instruments with missing data')
-
         try:
-            ticker = Ticker(symbols)
-            profiles = ticker.asset_profile
-            prices = ticker.price
-
-            for symbol, instrument in symbol_to_instrument.items():
-                local_session = get_db()
-                db_instrument = local_session.get(Instrument, instrument.id)
-                updated_flag = False
-                try:
-                    profile_data = profiles.get(symbol.upper())
-                    if profile_data and isinstance(profile_data, dict):
-                        sector = profile_data.get("sector")
-                        if sector and (not db_instrument.categories or len(db_instrument.categories) == 0):
-                            if self._add_to_list_field(db_instrument, 'categories', sector, local_session):
-                                logger.debug(f'Added sector {sector} to instrument {symbol}')
-                                local_session.commit()
-                                updated_flag = True
-                    else:
-                        self._add_to_list_field(db_instrument, 'labels', 'not_found', local_session)
-                        logger.warning(f'Instrument {symbol} not found in asset profile')
-                        local_session.commit()
-
-                    price_info = prices.get(symbol.upper())
-                    longname = price_info.get("longName") if isinstance(price_info, dict) else None
-                    if longname and not db_instrument.company_name:
-                        db_instrument.company_name = longname
-                        local_session.add(db_instrument)
-                        local_session.commit()
-                        logger.debug(f'Updated company_name for {symbol}: {longname}')
-                        updated_flag = True
-
-                    if updated_flag:
-                        if db_instrument.labels and 'not_found' in db_instrument.labels:
-                            labels = list(db_instrument.labels)
-                            labels.remove('not_found')
-                            db_instrument.labels = labels
-                            local_session.add(db_instrument)
-                            local_session.commit()
-                        updated += 1
-                except Exception as e:
-                    self._add_to_list_field(db_instrument, 'labels', 'not_found', local_session)
-                    logger.error(f"Error fetching info for {symbol}: {e}", exc_info=True)
-                    local_session.commit()
-                    errors += 1
-                finally:
-                    local_session.close()
+            with get_db() as session:
+                missing = [
+                    i.name for i in session.exec(select(Instrument)).all()
+                    if needs_instrument_info(company_name=i.company_name,
+                                             categories=i.categories,
+                                             instrument_type=i.instrument_type)
+                ]
+            if not missing:
+                logger.info('No instruments with missing data found.')
+                ui.notify('All instruments already have a name, categories and a type.',
+                          type='info')
+                return
+            logger.info(f'Fetching info for {len(missing)} instruments with missing data')
+            updated, errors = await asyncio.to_thread(
+                enrich_instruments, missing, only_missing=True)
+            ui.notify(f'Fetched info for {updated} of {len(missing)} instruments. '
+                      f'Errors: {errors}',
+                      type='positive' if errors == 0 else 'warning')
+            self._update_table_rows()
         except Exception as e:
-            logger.error(f"Error fetching batch info: {e}", exc_info=True)
-            ui.notify(f'Error fetching batch info: {e}', type='negative')
+            logger.error(f"Error fetching missing info: {e}", exc_info=True)
+            ui.notify(f'Error fetching missing info: {e}', type='negative')
+        finally:
             self.fetch_missing_btn.props(remove='loading')
-            return
-
-        logger.info(f'Fetched missing info for {updated}/{len(symbols)} instruments. Errors: {errors}')
-        ui.notify(f'Fetched missing info for {updated}/{len(symbols)} instruments. Errors: {errors}', type='positive' if errors == 0 else 'warning')
-        self._update_table_rows()
-        self.fetch_missing_btn.props(remove='loading')
 
     def import_instruments(self):
         logger.debug('Opening import instruments dialog')

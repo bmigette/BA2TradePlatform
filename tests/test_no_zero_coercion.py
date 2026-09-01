@@ -361,12 +361,13 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:3851":
+    "ba2_trade_platform/ui/pages/settings.py:3746":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
-        "measurement of anything",
-    "ba2_trade_platform/ui/pages/settings.py:3899":
+        "measurement of anything (was :3851 before fetch_info/fetch_missing_info were "
+        "collapsed onto core.instrument_enrichment)",
+    "ba2_trade_platform/ui/pages/settings.py:3794":
         "same settings-import default; the comment above the line records why the fallback was "
-        "deliberately restored",
+        "deliberately restored (was :3899, same shift)",
     "ba2_trade_platform/ui/components/performance_charts.py:412":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
         "right answer for an unmeasured trade",
