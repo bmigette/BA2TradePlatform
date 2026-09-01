@@ -79,7 +79,10 @@ import pytest as _pytest
 _ROOT = pathlib.Path(__file__).resolve().parents[4]
 
 _RAILS = {"max_concurrent_structures": 10, "max_deployment_pct": 40.0,
-          "max_notional_leverage": 3.0, "undefined_risk_max_pct": 20.0}
+          "max_notional_leverage": 3.0, "undefined_risk_max_pct": 20.0,
+          # A REQUIRED rail since 2026-09-01: the entry gate consults the latch this
+          # setting produces, and the breaker now transitions in BOTH runtimes.
+          "circuit_breaker_pct": 20.0}
 
 
 class _ParityExpert:
@@ -109,6 +112,7 @@ class _ParityResolver:
 def _parity_account(with_clock: bool):
     """A broker-shaped account, or a simulator-shaped one (it publishes ``_as_of_date``)."""
     from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
 
     class _Acct(OptionsAccountInterface):
         def __init__(self):
@@ -117,6 +121,14 @@ def _parity_account(with_clock: bool):
 
         def get_balance(self):
             return 100_000.0
+
+        def get_account_info(self):
+            """The sleeve equity read: ONE definition for both runtimes since 2026-09-01
+            (AccountSnapshot.equity), reached through the tolerant
+            ReadOnlyAccountInterface probe this double does not override."""
+            return {"equity": 100_000.0, "cash": 100_000.0, "balance": 100_000.0}
+
+        get_account_snapshot = ReadOnlyAccountInterface.get_account_snapshot
 
         def cash_available_for_delivery(self):
             return 100_000.0

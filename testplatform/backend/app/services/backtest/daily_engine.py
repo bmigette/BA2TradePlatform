@@ -22,6 +22,10 @@ uses (BA2TradePlatform/.../core/TradeManager.py lines ~901-1190):
             ``get_latest_atr``), then ``account.submit_order(order)`` for each sized order;
     4. ``account.refresh_orders()`` (the fill engine) + ``account.refresh_transactions()``
        (inherited WAITING->OPENED->CLOSED lifecycle) roll the bar's order/transaction state;
+    4c. for a ``classic_options`` sleeve ONLY: ``update_sleeve_breaker`` — the SAME shared
+       transition the live exit pass calls — ratchets the sleeve's peak equity and trips or
+       re-arms its drawdown breaker, whose latch the entry gate then reads on the next bar.
+       An equity trial never reaches it (see ``_option_sleeves``);
     5. ``account.snapshot_equity(as_of)`` records the per-bar equity curve point.
 
 The decision logic is NOT perturbed: ``analyze_as_of`` is byte-identical to the Phase-1
@@ -58,6 +62,9 @@ from ba2_common.core.types import (
     RiskLevel,
     TimeHorizon,
     TransactionStatus,
+)
+from ba2_common.core.OptionRiskManagement import (
+    option_risk_manager_enabled, update_sleeve_breaker,
 )
 from ba2_common.core.regime_overlay import reset_stressed, set_stressed
 from ba2_common.logger import logger
@@ -409,6 +416,13 @@ class DailyBacktestEngine:
             a = ea.get("action_type") or ea.get("action") or ea.get("option_strategy")
             self._entry_is_option = bool(a and is_option_action(str(a)))
 
+        # The option sleeves whose drawdown breaker this run transitions per bar, as
+        # (expert, expert_instance_id). Filled in by ``run()`` from the SAME
+        # ``option_risk_manager_enabled`` dispatch the entry gate uses, and EMPTY for every
+        # equity run -- which is what keeps the option risk manager out of an equity trial
+        # entirely rather than merely making it cheap.
+        self._option_sleeves: List[Tuple[Any, int]] = []
+
     def _bypass_manager(self, expert_id: int) -> Any:
         """Lazily build + cache the portfolio manager for a bypass expert (run-constant).
 
@@ -523,6 +537,21 @@ class DailyBacktestEngine:
             return any(_schedule_allows_entry(aw, s, _is_intraday, _ctx) for s in _scheds)
 
         analysis_idx = [j for j, a in enumerate(days) if _day_is_analysis(a)]
+
+        # THE option-sleeve gate, evaluated ONCE per run rather than once per bar. The check
+        # is ``option_risk_manager_enabled`` over ``expert.settings`` -- byte for byte the
+        # dispatch ``TradeActions._option_risk_manager`` uses for the ENTRY gate, so the bar
+        # loop's breaker and the entry rails engage on exactly the same experts. An equity
+        # trial leaves this list EMPTY and therefore makes ZERO calls to the option risk
+        # manager per bar (pinned by call count, not by timing). ``risk_manager_mode`` cannot
+        # change mid-run, so hoisting the check out of the loop changes no answer -- it only
+        # keeps the hot path a single truthiness test.
+        self._option_sleeves = [
+            (expert, expert_id)
+            for expert, expert_id, _settings, _ruleset in self.experts
+            if option_risk_manager_enabled(getattr(expert, "settings", None),
+                                           expert_instance_id=expert_id)
+        ]
 
         i = 0
         n_days = len(days)
@@ -757,6 +786,24 @@ class DailyBacktestEngine:
             #     touched orders this bar, reload the cache so the next bar's fill engine sees them.
             if filled:
                 self.account.invalidate_order_cache()
+
+            # 4c. the option sleeve's drawdown circuit breaker, once per bar, for a
+            #     ``classic_options`` expert and no other. Until 2026-09-01 the breaker
+            #     TRANSITIONED only in the live tree (``option_lifecycle_service``, off
+            #     ``JobManager``), so a backtest never ratcheted the peak, never tripped and
+            #     never re-armed: ``RAIL_BREAKER_HALTED`` was unreachable here and a
+            #     classic_options backtest was systematically MORE PERMISSIVE than live.
+            #     This is the same shared function live calls -- one implementation, two
+            #     callers -- and it reads the sleeve's equity through the one shared
+            #     definition (``AccountSnapshot.equity``).
+            #
+            #     HERE, deliberately: after the expiry settlement and the margin-call
+            #     liquidation have marked this bar and BEFORE ``snapshot_equity``, so the
+            #     breaker measures exactly the equity the reported curve records. The entry
+            #     pass (step 3) reads the latch on the NEXT bar, which is the same ordering
+            #     live has (the exit pass transitions; the next entry cycle is gated).
+            if self._option_sleeves:
+                self._update_option_breakers()
 
             # 5. record per-bar equity / drawdown point.
             self.account.snapshot_equity(as_of_dt)
@@ -1444,6 +1491,28 @@ class DailyBacktestEngine:
                 self._log(
                     f"option expiry failed for {pos.contract_symbol} @ {as_of_date}: {e}"
                 )
+
+    def _update_option_breakers(self) -> None:
+        """Transition every ``classic_options`` sleeve's drawdown breaker for this bar.
+
+        ONE line of real work per sleeve, and it is a call into the SHARED
+        ``OptionRiskManagement.update_sleeve_breaker`` -- the function the live exit pass
+        calls. The engine deliberately owns no breaker arithmetic of its own: a backtest-only
+        copy of the transition is precisely the divergence this wiring exists to remove, and
+        ``test_the_backtest_engine_carries_no_option_risk_manager_of_its_own`` fails if one
+        appears here.
+
+        Never aborts the run. A sleeve whose equity cannot be read leaves the breaker BLIND
+        (``update_breaker`` says so and refuses to report a drawdown it did not measure), and
+        an unexpected failure is logged and the bar continues -- a bookkeeping fault must not
+        invalidate a trial that has already traded.
+        """
+        for expert, expert_id in self._option_sleeves:
+            try:
+                update_sleeve_breaker(expert=expert, account=self.account,
+                                      expert_instance_id=expert_id)
+            except Exception as e:  # noqa: BLE001 — see the docstring
+                self._log(f"option breaker update failed for expert {expert_id}: {e}")
 
     def _size_and_submit(self, expert_id: int, indicator_provider: Any,
                          as_of_dt: Optional[datetime] = None) -> None:

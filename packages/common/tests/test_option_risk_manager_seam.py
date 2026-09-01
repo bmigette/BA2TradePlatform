@@ -28,6 +28,7 @@ import ba2_common.core.OptionRiskManagement as rm
 import ba2_common.core.TradeActions as ta
 from ba2_common.core.instance_resolver import set_instance_resolver
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from ba2_common.core.option_request import OPTION_RAIL_REFUSAL
 from ba2_common.core.option_types import OptionLeg
 from ba2_common.core.types import OptionRight, OrderDirection
@@ -39,6 +40,7 @@ RAILS: Dict[str, Any] = {
     "max_deployment_pct": 40.0,
     "max_notional_leverage": 3.0,
     "undefined_risk_max_pct": 20.0,
+    "circuit_breaker_pct": 20.0,      # a REQUIRED rail since 2026-09-01
 }
 
 
@@ -79,6 +81,16 @@ class _LiveShapedAccount(OptionsAccountInterface):
     # -- the bits the submit seam touches
     def get_balance(self):
         return self._balance
+
+    def get_account_info(self):
+        """What ``ReadOnlyAccountInterface.get_account_snapshot`` probes for the sleeve's
+        equity. This double holds no positions, so its cash and its equity coincide."""
+        return {"equity": self._balance, "cash": self._balance, "balance": self._balance}
+
+    #: THE real reader, borrowed as a function rather than imitated: ``OptionsAccountInterface``
+    #: is a mixin and does not inherit it, but every real account does, so ``sleeve_equity``
+    #: must reach equity down the same tolerant ``get_account_info()`` probe here.
+    get_account_snapshot = ReadOnlyAccountInterface.get_account_snapshot
 
     def cash_available_for_delivery(self):
         return self._cash
@@ -424,10 +436,26 @@ def test_the_one_wiring_point_guard_would_actually_catch_a_second_one():
 
 def test_the_backtest_engine_carries_no_option_risk_manager_of_its_own():
     """``daily_engine`` bypassed the risk manager for options (``if self._entry_is_option``)
-    and that is still how it stages an option entry — but the DECISION now happens inside
-    the shared action. The engine must not grow a rails implementation beside it."""
+    and that is still how it stages an option entry — but the DECISION happens inside the
+    shared code. The engine must not grow an implementation beside it.
+
+    CALLING the shared risk manager is not carrying one, and since 2026-09-01 the engine
+    does exactly that: one call per bar to ``OptionRiskManagement.update_sleeve_breaker``,
+    the SAME transition the live exit pass makes, so the drawdown breaker means the same
+    thing in both runtimes. What it must never do is reach past that into the pure
+    primitives — ``option_book``'s rails, book totals, candidate model or the ``update_breaker``
+    transition itself — because a second call site for those is a second implementation
+    waiting to drift. The guard is on CALLS (and on the import), so prose naming the shared
+    function it delegates to does not trip it.
+    """
     root = pathlib.Path(__file__).resolve().parents[3]
     engine = (root / "testplatform/backend/app/services/backtest/daily_engine.py"
               ).read_text(encoding="utf-8", errors="ignore")
-    for forbidden in ("check_rails", "book_totals", "update_breaker", "CandidateStructure"):
+    assert "option_book" not in engine, "the engine imported the pure rail primitives"
+    for forbidden in ("check_rails(", "book_totals(", "update_breaker(",
+                      "CandidateStructure("):
         assert forbidden not in engine, forbidden
+    # ...and the ONE call it is allowed to make is there. Without this half the guard is
+    # equally satisfied by an engine that simply dropped the breaker again, which is the
+    # state this whole seam exists to leave behind.
+    assert "update_sleeve_breaker(expert=" in engine

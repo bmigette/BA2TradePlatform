@@ -520,14 +520,16 @@ Within a `classic_options` expert:
 
 ## 11.5 What `classic_options` actually gates in each runtime (2026-09-01)
 
-Recorded because §4's "one implementation, both runtimes" is true of the ENTRY GATE and not
-yet true of the BREAKER, and the prose in `EXPERTS.md` and `README.md` had generalised it.
+Recorded because §4's "one implementation, both runtimes" was true of the ENTRY GATE and not
+of the BREAKER, and the prose in `EXPERTS.md` and `README.md` had generalised it. **Resolved
+the same day — see §11.6 for the ruling and what shipped.** The table below is the state as
+found, kept because the reasoning that follows it is the reasoning the ruling answered.
 
-| | live | backtest |
+| | live | backtest (as found) |
 |---|---|---|
 | entry rails (`check_rails`: deployment, undefined-risk sub-cap, notional leverage, concurrency, one-per-underlying, assignment capacity) | yes | yes — the same `admit_option_entry` at the same `TradeActions` choke point |
 | breaker LATCH consulted on entry | yes | yes |
-| breaker TRANSITIONS (`update_breaker`: ratchet the peak, trip, re-arm) | yes | **no** |
+| breaker TRANSITIONS (`update_breaker`: ratchet the peak, trip, re-arm) | yes | **no** → **yes**, since §11.6 |
 | exit/servicing pass (profit capture, tested delta, roll-DTE, stops) | yes (`option_lifecycle_service`) | expressed as the strategy's `close_option` exit rules, which the GA searches |
 
 `option_lifecycle_service` is the only production caller of `update_breaker`, it lives in
@@ -592,6 +594,63 @@ no expert. They are still read by exact key from stored settings, so an operator
 them gets the documented behaviour, but nothing declares or renders them. Deciding where
 they are declared (and, per §4 / review finding M1, that a risk threshold carries no
 default) is part of the same piece of work.
+
+## 11.6 The ruling, and what shipped (2026-09-01)
+
+**One definition of the sleeve's equity, for the breaker AND for the rails that already fed
+off it: `account.get_account_snapshot().equity`.** Candidate (6) of §11.5, taken.
+
+Semantics verified on both concrete implementations before adopting it, because "they mean
+the same thing" is the whole property being relied on:
+
+* **Alpaca.** `AlpacaAccount.get_account_snapshot` overrides the base and maps
+  `TradeAccount.equity` through `float()`. `AlpacaAccount.get_balance` returns
+  `float(account.equity)` — the SAME field. So live's rails and breaker read exactly the
+  number they read before; nothing about live behaviour changes.
+* **Backtest.** `BacktestAccount` does not override `get_account_snapshot`, so it resolves
+  through `ReadOnlyAccountInterface`'s tolerant probe to `get_account_info()["equity"]`,
+  which is `deployed_equity()` = `min(cap, equity())` = `min(cap, _cash + mark-to-market of
+  open positions)`. `AccountSnapshot.equity`'s own contract is "cash plus positions marked to
+  market", so this is the same CONCEPT, clamped by the configured equity cap — and that cap
+  is the seam every sizer already looks through (`deployed_equity`'s docstring: "every money
+  accessor routes through here so the cap is enforced at ONE seam"), so the rails keep
+  measuring the dollars the sizer actually spends.
+
+`get_balance()` had no such property: EQUITY on Alpaca, spendable CASH on `BacktestAccount`.
+
+**This RE-BASES the existing rails in the backtest.** `max_deployment_pct` and
+`max_notional_leverage` divided by cash there and now divide by equity, so an option grid run
+before and after this change is measuring a different rail. That is a ratification, and it is
+acceptable now only because there are no users to break: no shipped expert spec selects a
+risk-manager mode (`test_no_shipped_expert_spec_selects_a_risk_manager_mode` pins it), and the
+settings dialog renders none of the sleeve rails, so no UI path configures a live
+`classic_options` sleeve either.
+
+**The breaker transitions in both runtimes, through one function.**
+`OptionRiskManagement.update_sleeve_breaker` reads the sleeve equity, ratchets the peak, tests
+the drawdown and stores the latch the entry gate reads. Live calls it from
+`run_option_lifecycle_pass`; the backtest calls it once per bar from `daily_engine`, between
+the expiry/margin settlement and `snapshot_equity` — so the breaker measures exactly the
+equity the reported curve records, and the entry pass reads the latch on the next bar (the
+same ordering live has). The call sits behind the engine's `_option_sleeves` list, resolved
+once per run from the same `option_risk_manager_enabled` dispatch the entry gate uses: an
+equity trial makes **zero** calls, pinned by call count.
+
+**The lifecycle thresholds are declared, with no defaults.** `circuit_breaker_pct`,
+`profit_capture_pct`, `roll_dte`, `tested_delta_enabled`, `dr_stop_enabled`,
+`ur_stop_enabled` and the four conditional ones now live on `MarketExpertInterface` beside the
+four sleeve rails, and none of them carries a `default` (the M1 treatment). `circuit_breaker_pct`
+additionally joined `REQUIRED_RAIL_SETTINGS`: the entry gate consults the latch that setting
+produces, so an undeclared breaker is a latch that can never trip — an entry rail that is
+silently absent — and it refuses the entry by name. The other five are NOT rails: nothing on
+the entry path reads them, the live exit pass already refuses to manage a sleeve missing any of
+them by name, and a backtest expresses its exits as the strategy's own `close_option` rules.
+Requiring them to open a position would be a rail that measures nothing.
+
+**Still open, and unchanged by this ruling:** every one of these figures is ACCOUNT-WIDE while
+the rail it feeds is PER-SLEEVE, so two `classic_options` sleeves on one account each measure
+the whole account. Same flag as `assignment_cash`; a real split needs a definition of what
+share of account equity a sleeve owns.
 
 ## 12. Deferred, with reasons
 

@@ -27,6 +27,7 @@ from ba2_common.core.interfaces.ExtendableSettingsInterface import (
     ExtendableSettingsInterface,
 )
 from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from ba2_common.core.option_book import (
     RAIL_BREAKER_HALTED, RAIL_MAX_CONCURRENT, RAIL_MAX_DEPLOYMENT,
     RAIL_MAX_NOTIONAL_LEVERAGE, RAIL_ONE_PER_UNDERLYING, RAIL_UNDEFINED_RISK,
@@ -46,6 +47,9 @@ RAILS: Dict[str, Any] = {
     "max_deployment_pct": 40.0,
     "max_notional_leverage": 3.0,
     "undefined_risk_max_pct": 20.0,
+    # A REQUIRED rail since 2026-09-01: the entry gate consults the latch it produces in
+    # both runtimes, so a sleeve that declares no breaker has one that can never trip.
+    "circuit_breaker_pct": 20.0,
 }
 
 
@@ -63,13 +67,29 @@ class FakeExpert:
 
 
 class FakeAccount:
+    """An account that answers the two reads the rails make, through the REAL accessors.
+
+    ``get_account_snapshot`` is ``ReadOnlyAccountInterface``'s own implementation, borrowed
+    as a function rather than imitated (the style commit 50ea80cc established): that is the
+    tolerant ``get_account_info()`` probe every account which does not override it uses --
+    ``BacktestAccount`` included -- so ``sleeve_equity`` here reads equity down the same
+    chain a backtest does. A hand-written stub returning an ``AccountSnapshot`` would pass
+    whether or not that chain still worked.
+    """
+
     def __init__(self, balance: Optional[float] = 100_000.0,
                  cash: Optional[float] = 100_000.0):
+        self.id = 1
         self._balance = balance
         self._cash = cash
 
-    def get_balance(self):
-        return self._balance
+    def get_account_info(self):
+        # ``equity`` is what the sleeve rails read (cash plus positions marked to market);
+        # this double holds no positions, so the two coincide.
+        return {"equity": self._balance, "cash": self._balance,
+                "balance": self._balance}
+
+    get_account_snapshot = ReadOnlyAccountInterface.get_account_snapshot
 
     def cash_available_for_delivery(self):
         return self._cash
@@ -467,6 +487,153 @@ def test_the_base_interface_declares_every_rail_and_defaults_none_of_them():
     for key in rm.REQUIRED_RAIL_SETTINGS + (rm.UNDEFINED_RISK_SETTING,):
         assert key in MarketExpertInterface._builtin_settings, key
         assert MarketExpertInterface._builtin_settings[key].get("default") is None, key
+
+
+def test_an_expert_that_declares_no_circuit_breaker_refuses_the_entry_naming_it(
+        empty_sleeve):
+    """The breaker is a RAIL, and an undeclared one refuses like the other three.
+
+    A ``classic_options`` sleeve is gated on the breaker LATCH in both runtimes. Declare no
+    ``circuit_breaker_pct`` and that latch can never trip: the sleeve trades on through any
+    drawdown, with nothing to say the breaker was never armed. So the entry is refused by
+    name -- the same treatment M1 gave the other rails.
+
+    MUTATION KILL: drop ``BREAKER_SETTING`` out of ``REQUIRED_RAIL_SETTINGS`` (or give the
+    interface a ``default`` for it) and this entry is admitted with no breaker at all.
+    """
+    no_breaker = {k: v for k, v in RAILS.items() if k != rm.BREAKER_SETTING}
+    verdict = gate(expert=InterfaceExpert(
+        {"risk_manager_mode": "classic_options", **no_breaker}))
+    assert verdict.allowed is False
+    assert verdict.phrase == OPTION_RAILS_UNCONFIGURED_REFUSAL
+    assert rm.BREAKER_SETTING in verdict.detail
+    # ...and ONLY that one is named: the other three are configured.
+    for key in ("max_deployment_pct", "max_notional_leverage",
+                "max_concurrent_structures"):
+        assert key not in verdict.detail
+
+
+def test_the_base_interface_declares_every_lifecycle_threshold_and_defaults_none_of_them():
+    """The breaker and the exit thresholds left the tree with PremiumSeller's settings block
+    and were declared by NO expert (design 11.5). They are declared on the base class now --
+    any expert can be switched to classic_options -- and, exactly like the rails, none of
+    them carries a ``default``: a risk threshold nobody stated is not a threshold."""
+    MarketExpertInterface._ensure_builtin_settings()
+    lifecycle = ("circuit_breaker_pct", "profit_capture_pct", "roll_dte",
+                 "tested_delta_enabled", "dr_stop_enabled", "ur_stop_enabled",
+                 "strangle_capture_pct", "tested_delta", "dr_stop_credit_mult",
+                 "ur_stop_credit_mult")
+    for key in lifecycle:
+        assert key in MarketExpertInterface._builtin_settings, key
+        assert MarketExpertInterface._builtin_settings[key].get("default") is None, key
+
+
+# ---------------------------------------------------------------------------
+# 4b. ONE definition of the sleeve equity, and ONE transition that reads it
+# ---------------------------------------------------------------------------
+class _CashAndPositionsAccount:
+    """An account whose spendable CASH and whose EQUITY are different numbers.
+
+    That is the shape of every account holding anything -- and specifically the shape of
+    ``BacktestAccount``, whose ``get_balance()`` returns ``_cash`` while its
+    ``get_account_info()["equity"]`` returns ``deployed_equity()`` = cash + positions marked
+    to market. The two readings coincide only on a flat book, which is why a double that
+    reports one number for both cannot tell the two definitions apart.
+    """
+
+    id = 1
+
+    def __init__(self, cash: float, position_value: float):
+        self._cash = cash
+        self._position_value = position_value
+
+    def get_balance(self):
+        return self._cash
+
+    def get_account_info(self):
+        return {"cash": self._cash, "balance": self._cash,
+                "equity": self._cash + self._position_value}
+
+    get_account_snapshot = ReadOnlyAccountInterface.get_account_snapshot
+
+    def cash_available_for_delivery(self):
+        return self._cash
+
+
+def test_the_sleeve_equity_is_the_snapshot_EQUITY_not_the_spendable_cash():
+    """THE ruling of 2026-09-01, as a number.
+
+    ``sleeve_equity`` feeds the drawdown breaker AND the denominators of
+    ``max_deployment_pct`` / ``max_notional_leverage``. It must read
+    ``AccountSnapshot.equity`` -- cash plus positions marked to market -- because
+    ``get_balance()`` meant EQUITY on Alpaca and spendable CASH on ``BacktestAccount``, so
+    the rails measured a different quantity in each runtime and a breaker built on it would
+    have tripped on DEPLOYING capital.
+
+    MUTATION KILL: restore ``return account.get_balance()`` and this reads 40,000 -- a 60%
+    "drawdown" produced by buying something.
+    """
+    account = _CashAndPositionsAccount(cash=40_000.0, position_value=60_000.0)
+    assert rm.sleeve_equity(account, 7) == 100_000.0
+    assert account.get_balance() == 40_000.0      # the number it must NOT be
+
+
+def test_an_equity_the_broker_did_not_publish_declines_rather_than_defaulting():
+    """``AccountSnapshot`` fields are ``None`` when the broker said nothing, and ``None``
+    means unknown, never zero. A fabricated 0.0 is a measured 100% drawdown."""
+    class _Silent:
+        id = 1
+
+        def get_account_info(self):
+            return {}
+
+        get_account_snapshot = ReadOnlyAccountInterface.get_account_snapshot
+
+    assert rm.sleeve_equity(_Silent(), 7) is None
+
+
+def test_update_sleeve_breaker_is_the_transition_and_it_stores_the_latch(empty_sleeve):
+    """ONE function, two callers (live's exit pass and the backtest's per-bar flow). It
+    ratchets the peak, trips on the drawdown, and writes the latch the ENTRY gate reads --
+    so a sleeve that has drawn down opens nothing, whichever runtime measured it."""
+    expert = InterfaceExpert({"risk_manager_mode": "classic_options", **RAILS})
+    flat = _CashAndPositionsAccount(cash=100_000.0, position_value=0.0)
+
+    first = rm.update_sleeve_breaker(expert=expert, account=flat, expert_instance_id=7)
+    assert first.peak_equity == 100_000.0 and first.halted is False
+    assert gate(expert=expert, account=flat).allowed is True
+
+    drawn_down = _CashAndPositionsAccount(cash=40_000.0, position_value=39_000.0)
+    tripped = rm.update_sleeve_breaker(expert=expert, account=drawn_down,
+                                       expert_instance_id=7)
+    assert tripped.tripped is True and tripped.halted is True
+    assert rm.get_breaker_state(7).halted is True          # ...and it was STORED
+    refused = gate(expert=expert, account=drawn_down)
+    assert refused.allowed is False
+    assert refused.reason == RAIL_BREAKER_HALTED
+
+
+def test_a_sleeve_that_declares_no_breaker_transitions_nothing_and_says_so_once(
+        monkeypatch, empty_sleeve):
+    """It must not raise out of a per-bar loop, and it must not substitute a threshold.
+
+    The same missing key already refuses every entry by name (it is a REQUIRED rail), so a
+    sleeve with no declared breaker can open nothing to stand down from. One ERROR per
+    instance, not one per bar -- ``update_sleeve_breaker`` runs on every bar of a backtest.
+    """
+    rm.reset_mode_warnings()
+    errors = []
+    monkeypatch.setattr(rm.logger, "error", lambda msg, *a, **k: errors.append(str(msg)))
+    no_breaker = {k: v for k, v in RAILS.items() if k != rm.BREAKER_SETTING}
+    expert = InterfaceExpert({"risk_manager_mode": "classic_options", **no_breaker})
+    account = _CashAndPositionsAccount(cash=100_000.0, position_value=0.0)
+
+    for _ in range(5):
+        assert rm.update_sleeve_breaker(expert=expert, account=account,
+                                        expert_instance_id=7) is None
+    assert rm.get_breaker_state(7) == BreakerState()       # nothing stored
+    assert len(errors) == 1
+    assert rm.BREAKER_SETTING in errors[0]
 
 
 # ---------------------------------------------------------------------------

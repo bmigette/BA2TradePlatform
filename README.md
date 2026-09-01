@@ -148,7 +148,7 @@ The platform includes multiple AI trading experts with different strategies and 
 | **FactorRanker** | Cross-sectional multi-factor equity ranker | FMP fundamentals & prices, StockScreener | momentum / value / quality / PEAD factors, static or screener universe, self-rebalancing top-N (no recommendations) |
 | **DeterministicScorer** | LLM-free multi-section scorer — reproduces a TradingAgents-style verdict with pure local math, zero LLM calls | FMP/FinnHub fundamentals, prices, ratings, FRED macro | Technical + fundamental + analyst + macro sections, `tanh`-bounded composite score, Altman-Z hard veto, fully deterministic and free to run |
 
-*PremiumSeller (systematic short-premium options income) was removed 2026-08-31 — its rails and exit lifecycle were promoted into shared code, so ANY expert can now be switched to `risk_manager_mode: classic_options` and have its option ENTRIES gated by them. The exit/servicing pass is live-only today; see EXPERTS.md §8 for what is and is not wired.*
+*PremiumSeller (systematic short-premium options income) was removed 2026-08-31 — its rails and exit lifecycle were promoted into shared code, so ANY expert can now be switched to `risk_manager_mode: classic_options` and have its option ENTRIES gated by them, with the drawdown circuit breaker transitioning identically in live and in the backtest. The exit/servicing pass is live-only by design; see EXPERTS.md §8 for what is and is not wired.*
 
 📖 **For detailed documentation on all experts, their settings, and configuration options, see [EXPERTS.md](EXPERTS.md)** — and the dedicated [FactorRanker guide](docs/FACTORRANKER_EXPERT.md).
 

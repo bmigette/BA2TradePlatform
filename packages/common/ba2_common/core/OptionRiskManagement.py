@@ -64,35 +64,33 @@ measurement function. The sleeve's committed capital comes from
 The breaker peak is process state, and there is only one of it
 --------------------------------------------------------------
 ``BreakerState`` is a value and something must carry it between evaluations. It lives in a
-module-level map keyed by expert instance, here, so the **entry** gate and the **exit** pass
-read one latch: ``option_lifecycle_service`` (the live exit pass) owns the transitions via
-``update_breaker`` and stores them here; this module only READS. That asymmetry is
-deliberate and load bearing — ``update_breaker`` reports ``tripped`` as an *edge*, so an
-entry gate that also updated the state could consume the edge on a bar where the exit pass
-had not yet run, and the flatten would never be signalled at all. A process restart forgets
-the peak (persisting it needs a migration); that is stated rather than hidden.
+module-level map keyed by expert instance, here, so the **entry** gate and the **transition**
+pass read one latch. ``update_sleeve_breaker`` below owns the transitions; the entry gate
+only READS. That asymmetry is deliberate and load bearing — ``update_breaker`` reports
+``tripped`` as an *edge*, so an entry gate that also updated the state could consume the edge
+on a bar where the transition pass had not yet run, and the flatten would never be signalled
+at all. A process restart forgets the peak (persisting it needs a migration); that is stated
+rather than hidden.
 
-LIMITATION: in a BACKTEST this module gates ENTRIES and nothing else
---------------------------------------------------------------------
-The breaker LATCH is shared -- ``check_rails`` refuses every candidate while ``halted``,
-in both runtimes -- but the TRANSITIONS are not. ``option_lifecycle_service`` is the only
-production caller of ``option_book.update_breaker``, it lives in the live tree, and it is
-reached only from ``JobManager``. A backtest therefore never ratchets the peak, never
-trips and never clears: ``get_breaker_state`` answers ``BreakerState()`` on every bar and
-``RAIL_BREAKER_HALTED`` is unreachable there. A ``classic_options`` backtest models the
-sleeve RAILS faithfully and the drawdown breaker not at all, so it is systematically MORE
-PERMISSIVE than live and must not be read as evidence about the breaker.
+The breaker transitions in BOTH runtimes, through one function
+---------------------------------------------------------------
+``update_sleeve_breaker`` is that function. Live reaches it from
+``option_lifecycle_service`` (the exit pass, on the ``JobManager`` schedule); the backtest
+reaches it from ``daily_engine``'s per-bar flow, behind the SAME
+``option_risk_manager_enabled`` check the entry gate dispatches on, so an equity trial makes
+zero calls. Until 2026-09-01 the live pass was the only caller, so a backtest never ratcheted
+the peak, never tripped and never cleared: ``RAIL_BREAKER_HALTED`` was unreachable there and
+a ``classic_options`` backtest was systematically MORE PERMISSIVE than live.
 
-This is agreed work, not a design position -- the operator's standing rule is that the two
-runtimes run the same code and behave the same. It is BLOCKED on one question that must be
-answered before the wiring can be written, because the same ambiguity already affects the
-entry rails: **what is the option sleeve's equity, per bar?** ``sleeve_equity`` below calls
-``account.get_balance()``, and that method does not mean the same thing on both sides --
-``AlpacaAccount.get_balance`` returns account EQUITY, while ``BacktestAccount.get_balance``
-returns spendable CASH (``_cash``, capped). A drawdown breaker measured on cash would trip
-on deploying capital and clear on closing a position, irrespective of P&L. The candidates,
-and the per-sleeve-versus-account-wide question that goes with them, are recorded in the
-design doc's deferred section.
+What made that fix a ruling rather than a refactor: **what is the option sleeve's equity?**
+``sleeve_equity`` used to call ``account.get_balance()``, which does not mean the same thing
+on the two sides — ``AlpacaAccount.get_balance`` returns account EQUITY, while
+``BacktestAccount.get_balance`` returns spendable CASH (``_cash``, capped). A drawdown
+breaker measured on cash trips on DEPLOYING capital and clears on CLOSING a position,
+irrespective of P&L, and the same mismatch was already the denominator of
+``max_deployment_pct`` and ``max_notional_leverage``. The operator's ruling (2026-09-01) is
+ONE definition for the breaker and for those rails, in both runtimes:
+``account.get_account_snapshot().equity`` — see ``sleeve_equity``.
 
 The exit/servicing half (profit capture, tested delta, roll-DTE, the stops) is live-only for
 a different and deliberate reason: a backtest expresses those as ``close_option`` exit rules
@@ -118,7 +116,7 @@ from typing import Any, Deque, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ba2_common.core.option_book import (
     RAIL_OK, BookTotals, BreakerState, CandidateStructure, RailVerdict, admit, book_totals,
-    rearm,
+    rearm, update_breaker,
 )
 from ba2_common.core.option_lifecycle import (
     LifecycleLeg, OptionStructure, put_assignment_cost, structure_metrics,
@@ -184,10 +182,16 @@ def normalise_risk_manager_mode(settings: Optional[Mapping[str, Any]]) -> str:
 #: warning would bury the log under one identical line per action.
 _WARNED_UNADMITTED_MODES: set = set()
 
+#: Instances already told they declare no ``circuit_breaker_pct``. Same reason, and worse:
+#: ``update_sleeve_breaker`` runs once per BAR, so the un-deduplicated line would be one per
+#: bar for the length of a backtest.
+_WARNED_UNDECLARED_BREAKER: set = set()
+
 
 def reset_mode_warnings() -> None:
     """Forget which unadmitted modes have been warned about. Tests, and a fresh process."""
     _WARNED_UNADMITTED_MODES.clear()
+    _WARNED_UNDECLARED_BREAKER.clear()
 
 
 def option_risk_manager_enabled(settings: Optional[Mapping[str, Any]],
@@ -236,10 +240,17 @@ def option_risk_manager_enabled(settings: Optional[Mapping[str, Any]],
 # ---------------------------------------------------------------------------
 # the rails the expert must declare
 # ---------------------------------------------------------------------------
+#: The sleeve's drawdown circuit breaker, in percent of the peak. ``update_breaker``
+#: ``_require``s it and ``update_sleeve_breaker`` reads it; it is a REQUIRED rail because the
+#: entry gate consults the latch that setting produces, in both runtimes (2026-09-01). A
+#: sleeve that declares no breaker has a latch that can never trip, which is not a breaker.
+BREAKER_SETTING = "circuit_breaker_pct"
+
 #: Read on EVERY candidate. ``option_book.check_rails`` raises on a missing one; this module
 #: refuses one step earlier so the operator sees which knob is missing in the UI.
 REQUIRED_RAIL_SETTINGS: Tuple[str, ...] = (
     "max_concurrent_structures", "max_deployment_pct", "max_notional_leverage",
+    BREAKER_SETTING,
 )
 #: Read only when the candidate measures (or declares) as undefined risk.
 UNDEFINED_RISK_SETTING = "undefined_risk_max_pct"
@@ -258,6 +269,18 @@ def rail_settings(expert) -> Tuple[Dict[str, Any], List[str]]:
     reached by a test double that raised where no real expert does — i.e. the "never a
     substituted default for a risk rail" rule was documented, tested against a fake, and
     enforced nowhere. A risk limit nobody stated is not a risk limit.
+
+    ``circuit_breaker_pct`` joined ``REQUIRED_RAIL_SETTINGS`` on 2026-09-01, when the breaker
+    started transitioning in BOTH runtimes. The entry gate consults the latch that setting
+    produces (``RAIL_BREAKER_HALTED``), so an undeclared breaker is a latch that can never
+    trip — an entry rail that is silently absent, which is the exact shape of the defect M1
+    was about. It refuses the entry by name like the other three. The remaining lifecycle
+    thresholds (``profit_capture_pct``, ``roll_dte``, ``tested_delta_enabled``,
+    ``dr_stop_enabled``, ``ur_stop_enabled``) are declared on ``MarketExpertInterface`` with
+    no default for the same reason but are NOT rails: nothing on the ENTRY path reads them,
+    the live exit pass already refuses to manage a sleeve missing any of them by name, and a
+    backtest expresses its exits as the strategy's own ``close_option`` rules. Requiring them
+    to open a position would be a rail that measures nothing.
     """
     settings: Dict[str, Any] = {}
     missing: List[str] = []
@@ -313,8 +336,9 @@ def get_breaker_state(expert_instance_id: int) -> BreakerState:
 def set_breaker_state(expert_instance_id: int, state: BreakerState) -> None:
     """Store the state ``option_book.update_breaker`` just produced.
 
-    ONLY the exit pass calls this. The entry gate reads; it must never write, because
-    ``tripped`` is an edge and a consumer that is not the flatten would swallow it.
+    ONLY ``update_sleeve_breaker`` calls this (live's exit pass and the backtest's per-bar
+    flow both reach it through that one function). The entry gate reads; it must never write,
+    because ``tripped`` is an edge and a consumer that is not the flatten would swallow it.
     """
     if not isinstance(state, BreakerState):
         raise TypeError(
@@ -860,17 +884,97 @@ def sleeve_book_from(structures: Sequence[OptionStructure],
 
 
 def sleeve_equity(account, expert_instance_id: int) -> Optional[float]:
-    """The balance the sleeve sizes against, or ``None`` — never a fabricated 0.0.
+    """The equity the sleeve sizes against, or ``None`` — never a fabricated 0.0.
 
     ``None`` DECLINES in ``check_rails``; that is the one thing ``_within_rails`` already got
     right and it is kept.
+
+    ONE DEFINITION, BOTH RUNTIMES: ``AccountSnapshot.equity`` -- "cash plus positions marked
+    to market" (its own contract). Operator ruling, 2026-09-01. It replaces
+    ``account.get_balance()``, which was NOT one definition:
+
+      * ``AlpacaAccount.get_balance``   -> ``TradeAccount.equity``  (account EQUITY)
+      * ``BacktestAccount.get_balance`` -> ``self._cash``, or ``min(cash, deployed_equity())``
+                                           under an equity cap  (spendable CASH)
+
+    So the rails' denominator was cash in a backtest and equity live, and a drawdown breaker
+    built on it would have tripped on DEPLOYING capital and cleared on CLOSING a position
+    regardless of P&L. ``get_account_snapshot().equity`` is the same CONCEPT on both sides:
+    Alpaca overrides it and maps ``TradeAccount.equity``; ``BacktestAccount`` inherits
+    ``ReadOnlyAccountInterface``'s tolerant probe, which reads ``get_account_info()["equity"]``
+    = ``deployed_equity()`` = ``min(cap, cash + mark-to-market of open positions)``. The cap is
+    the seam every sizer already looks through, so the rails keep measuring the same dollars
+    the sizer spends.
+
+    THIS RE-BASES THE EXISTING RAILS. ``max_deployment_pct`` and ``max_notional_leverage``
+    read this function, so in a BACKTEST their denominator moves from cash to equity. That is
+    a ratification, not a refactor -- an option grid run before and after measures a different
+    rail -- and it is acceptable now only because nothing selects the mode yet: no shipped
+    expert spec does (``test_no_shipped_expert_spec_selects_a_risk_manager_mode``) and the
+    settings dialog renders none of the sleeve rails, so there is no live ``classic_options``
+    sleeve either.
+
+    STILL ACCOUNT-WIDE, while the rail it feeds is per-sleeve -- the same approximation
+    ``assignment_cash`` documents, and unchanged by this ruling: two ``classic_options``
+    sleeves on one account each measure the whole account.
     """
     try:
-        return account.get_balance()
+        snapshot = account.get_account_snapshot()
     except Exception as e:  # noqa: BLE001 — any broker failure is the same fact
-        logger.error(f"Option RM: could not read the balance for expert "
+        logger.error(f"Option RM: could not read the account snapshot for expert "
                      f"{expert_instance_id} ({e}) — declining the entry", exc_info=True)
         return None
+    equity = getattr(snapshot, "equity", None)
+    if equity is None:
+        logger.error(f"Option RM: the account snapshot for expert {expert_instance_id} "
+                     f"reports no equity — declining the entry rather than sizing against a "
+                     f"number the broker did not publish")
+        return None
+    try:
+        return float(equity)
+    except (TypeError, ValueError):
+        logger.error(f"Option RM: the account snapshot for expert {expert_instance_id} "
+                     f"reports a non-numeric equity {equity!r} — declining the entry")
+        return None
+
+
+def update_sleeve_breaker(*, expert, account,
+                          expert_instance_id: int) -> Optional[BreakerState]:
+    """Ratchet this sleeve's peak, test the drawdown, STORE the new latch. Two callers.
+
+    THE shared transition (operator ruling, 2026-09-01). Live calls it from
+    ``option_lifecycle_service.run_option_lifecycle_pass``; the backtest calls it from
+    ``daily_engine``'s per-bar flow, behind the same ``option_risk_manager_enabled`` check
+    the entry gate dispatches on. One implementation, one equity definition
+    (``sleeve_equity``), one store — which is the whole content of "the breaker means the
+    same thing in a backtest as it does live".
+
+    Returns the new state, or ``None`` when the sleeve declares no ``circuit_breaker_pct``.
+    That case does NOT substitute a threshold and does not raise out of a per-bar loop: the
+    same missing key already refuses every entry by name through ``rail_settings``
+    (it is in ``REQUIRED_RAIL_SETTINGS``), so a sleeve with no declared breaker can open
+    nothing to stand down from. It is logged ONCE per instance rather than once per bar.
+    """
+    try:
+        pct = expert.get_setting_with_interface_default(BREAKER_SETTING, log_warning=False)
+    except Exception:  # noqa: BLE001 — ValueError today; any lookup failure is "absent"
+        pct = None
+    if pct is None:
+        if expert_instance_id not in _WARNED_UNDECLARED_BREAKER:
+            _WARNED_UNDECLARED_BREAKER.add(expert_instance_id)
+            logger.error(f"Option RM: expert instance {expert_instance_id} runs the option "
+                         f"risk manager but declares no {BREAKER_SETTING} — the drawdown "
+                         f"breaker is NOT evaluated, and every option entry is refused by "
+                         f"name for the same reason")
+        return None
+
+    equity = sleeve_equity(account, expert_instance_id)
+    # Ratchet on EVERY evaluation, including a flat sleeve: a just-flattened sleeve that
+    # stopped tracking its peak would re-arm against a stale one.
+    state = update_breaker(get_breaker_state(expert_instance_id), equity,
+                           {BREAKER_SETTING: pct})
+    set_breaker_state(expert_instance_id, state)
+    return state
 
 
 def assignment_cash(account, expert_instance_id: int) -> Optional[float]:

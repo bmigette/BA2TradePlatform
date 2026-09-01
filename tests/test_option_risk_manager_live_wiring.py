@@ -66,12 +66,31 @@ def test_the_live_tree_reaches_the_shared_option_risk_manager_not_a_copy():
     assert svc.reset_breaker_states is shared.reset_breaker_states
 
 
-def test_the_live_lifecycle_pass_stores_the_latch_where_entry_reads_it():
-    """``update_breaker`` decides the stand-down here; ``check_rails`` declines against it
-    over there. Two stores would mean a breaker that flattens the book and gates nothing —
-    which is exactly what review finding F5 recorded."""
+def test_the_live_lifecycle_pass_reaches_the_breaker_through_the_SHARED_transition():
+    """The stand-down is decided in one place and read in another, and both places must be
+    the shared module's.
+
+    ``update_sleeve_breaker`` reads the sleeve equity, ratchets the peak, tests the drawdown
+    and STORES the latch that ``check_rails`` declines against; ``daily_engine`` calls the
+    same function once per bar. Two implementations — or a live-only store — would mean a
+    breaker that flattens the book here and gates nothing there, which is exactly what
+    review finding F5 recorded, and a backtest whose breaker never trips at all, which is
+    what the 2026-09-01 parity ruling was about.
+
+    MUTATION KILL: inline the transition back into this pass (``update_breaker(...)`` plus a
+    ``set_breaker_state``) and the shared function is no longer the one the live pass calls
+    — the identity assertions below fail even though the pass still behaves correctly, which
+    is the point: the live behaviour was never the thing at risk.
+    """
+    import ba2_common.core.OptionRiskManagement as shared
     import ba2_trade_platform.core.option_lifecycle_service as svc
 
+    assert svc.update_sleeve_breaker is shared.update_sleeve_breaker
     source = inspect.getsource(svc.run_option_lifecycle_pass)
-    assert "_rm.set_breaker_state(" in source
+    assert "update_sleeve_breaker(" in source
+    # The pass must not keep a transition or a store of its own beside it.
+    assert "update_breaker(" not in source
+    assert "set_breaker_state(" not in source
     assert not re.search(r"_BREAKER_STATE\[", source)
+    # And the shared function is what writes the latch the entry gate reads.
+    assert "set_breaker_state(" in inspect.getsource(shared.update_sleeve_breaker)

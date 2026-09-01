@@ -383,6 +383,79 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Option sleeve: max concurrent structures",
                     "tooltip": "How many open option structures the sleeve may hold at once. REQUIRED when risk_manager_mode is 'classic_options' (there is no default -- an unset rail refuses the entry); ignored otherwise."
                 },
+                # ---- the option sleeve's LIFECYCLE thresholds ----------------------------
+                # ORPHANED UNTIL 2026-09-01: these ten left the tree with PremiumSeller's
+                # settings block and were declared by NO expert. They were still read by
+                # exact key from stored settings (ExtendableSettingsInterface checks
+                # self.settings BEFORE the interface definitions), so an operator who set one
+                # got the documented behaviour -- but nothing declared them, nothing rendered
+                # them, and `get_setting_with_interface_default` RAISED for anyone who had
+                # not. Declared here, on the base class, for the same reason the four sleeve
+                # rails are: any expert can be switched to classic_options.
+                #
+                # DELIBERATELY NO ``default``, exactly like the rails above (review finding
+                # M1). A risk threshold nobody stated is not a threshold. The consequences of
+                # an absent one are stated, per key, and differ:
+                #   * circuit_breaker_pct is a RAIL -- it is in
+                #     OptionRiskManagement.REQUIRED_RAIL_SETTINGS, because the entry gate
+                #     consults the latch it produces in BOTH runtimes, so an undeclared
+                #     breaker refuses every option entry by name.
+                #   * the five REQUIRED lifecycle thresholds are read by the LIVE exit pass
+                #     (option_lifecycle_service.REQUIRED_SETTINGS): a sleeve missing any of
+                #     them is refused management, loudly and by name, rather than managed
+                #     against a substituted number.
+                #   * the four CONDITIONAL ones are read only by the rule that needs them
+                #     (option_lifecycle.decide), which reports the missing key by name.
+                "circuit_breaker_pct": {
+                    "type": "float", "required": False,
+                    "description": "Option sleeve: drawdown circuit breaker %",
+                    "tooltip": "Peak-to-trough drawdown of the sleeve's equity (cash plus positions marked to market) that stands the sleeve down: every option entry is refused until equity recovers to within half of it. REQUIRED when risk_manager_mode is 'classic_options' (there is no default -- an unset breaker refuses the entry); ignored otherwise."
+                },
+                "profit_capture_pct": {
+                    "type": "float", "required": False,
+                    "description": "Option sleeve: profit capture %",
+                    "tooltip": "Close a short-premium structure once this percent of the entry credit has been captured. Read by the LIVE lifecycle pass; a backtest expresses the same exit as its strategy's close_option rules. No default -- a sleeve that does not declare it is not managed."
+                },
+                "roll_dte": {
+                    "type": "int", "required": False,
+                    "description": "Option sleeve: roll at DTE",
+                    "tooltip": "Days to expiry at which a short structure is rolled/closed rather than carried into gamma risk. Read by the LIVE lifecycle pass. No default -- a sleeve that does not declare it is not managed."
+                },
+                "tested_delta_enabled": {
+                    "type": "bool", "required": False,
+                    "description": "Option sleeve: defend a tested short",
+                    "tooltip": "Whether to close a short leg whose delta has run past 'tested_delta'. Read by the LIVE lifecycle pass. No default -- a sleeve that does not declare it is not managed."
+                },
+                "dr_stop_enabled": {
+                    "type": "bool", "required": False,
+                    "description": "Option sleeve: defined-risk stop",
+                    "tooltip": "Whether a DEFINED-risk structure is stopped out at 'dr_stop_credit_mult' times the entry credit. Read by the LIVE lifecycle pass. No default -- a sleeve that does not declare it is not managed."
+                },
+                "ur_stop_enabled": {
+                    "type": "bool", "required": False,
+                    "description": "Option sleeve: undefined-risk stop",
+                    "tooltip": "Whether an UNDEFINED-risk structure is stopped out at 'ur_stop_credit_mult' times the entry credit. Read by the LIVE lifecycle pass. No default -- a sleeve that does not declare it is not managed."
+                },
+                "strangle_capture_pct": {
+                    "type": "float", "required": False,
+                    "description": "Option sleeve: strangle profit capture %",
+                    "tooltip": "Profit capture for a two-sided short structure, which is normally tighter than the single-sided 'profit_capture_pct'. Read only for such a structure; absent means the rule reports it by name rather than substituting one."
+                },
+                "tested_delta": {
+                    "type": "float", "required": False,
+                    "description": "Option sleeve: tested delta threshold",
+                    "tooltip": "The short-leg delta past which the leg counts as tested. Read only when 'tested_delta_enabled' is on; absent means the rule reports it by name rather than substituting one."
+                },
+                "dr_stop_credit_mult": {
+                    "type": "float", "required": False,
+                    "description": "Option sleeve: defined-risk stop multiple",
+                    "tooltip": "Multiple of the entry credit at which a DEFINED-risk structure is stopped out. Read only when 'dr_stop_enabled' is on; absent means the rule reports it by name rather than substituting one."
+                },
+                "ur_stop_credit_mult": {
+                    "type": "float", "required": False,
+                    "description": "Option sleeve: undefined-risk stop multiple",
+                    "tooltip": "Multiple of the entry credit at which an UNDEFINED-risk structure is stopped out. Read only when 'ur_stop_enabled' is on; absent means the rule reports it by name rather than substituting one."
+                },
                 "smart_risk_manager_user_instructions": {
                     "type": "str", "required": False, "default": (
                         "Maximize short term profit with medium risk taking.\n\n"

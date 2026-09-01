@@ -12,7 +12,8 @@ What the pass does, in order, for ONE expert sleeve:
    ``OptionStructure`` values;
 3. fetch one option chain per (underlying, expiry) and index it by contract symbol;
 4. total the sleeve (``book_totals``) and ratchet/test the drawdown breaker
-   (``update_breaker``), feeding its EDGE into the decision via ``breaker_signal``;
+   (``update_sleeve_breaker`` -- the SHARED transition the backtest's per-bar flow also
+   calls), feeding its EDGE into the decision via ``breaker_signal``;
 5. measure the shares still covering every ``covered_call`` (``held_shares_for_cover``),
    one position read per ticker;
 6. ask ``option_lifecycle.decide`` for exactly one decision per structure;
@@ -130,8 +131,9 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import ba2_common.core.OptionRiskManagement as _rm
 from ba2_common.core.option_book import (
-    BookTotals, BreakerState, book_totals, breaker_signal, update_breaker,
+    BookTotals, BreakerState, book_totals, breaker_signal,
 )
+from ba2_common.core.OptionRiskManagement import update_sleeve_breaker
 from ba2_common.core.option_lifecycle import (
     COVER_REQUIREMENT_UNMEASURABLE, COVERED_CALL_STRATEGY, LIFECYCLE_COVER_LOST,
     LIFECYCLE_UNKNOWN, LifecycleDecision, LifecycleLeg, OptionStructure, decide,
@@ -143,7 +145,8 @@ from ..logger import logger
 _EPS = 1e-9
 
 #: Thresholds ``option_lifecycle.decide`` reads on EVERY structure, plus the one
-#: ``option_book.update_breaker`` needs. An expert missing any of these cannot be managed,
+#: ``option_book.update_breaker`` needs (declared on ``MarketExpertInterface``, with no
+#: defaults -- see that block). An expert missing any of these cannot be managed,
 #: and that is a loud configuration error rather than a substituted risk threshold.
 REQUIRED_SETTINGS: Tuple[str, ...] = (
     "profit_capture_pct", "roll_dte", "tested_delta_enabled", "dr_stop_enabled",
@@ -217,11 +220,16 @@ class LifecyclePassResult:
 # ---------------------------------------------------------------------------
 # ONE LATCH, TWO CONSUMERS. The store moved to ``ba2_common.core.OptionRiskManagement``
 # when the entry rails were finally wired (design 2026-08-27 SS4, finding F5): this pass
-# owns the TRANSITIONS (it is the only caller of ``update_breaker``), and the shared entry
-# gate READS the same map to decline every candidate while the sleeve stands down. Two maps
-# would have meant a breaker that flattens the book here and gates nothing there, which is
-# precisely the defect F5 recorded. These names stay as the module's public surface —
-# ``JobManager`` and the tests call them — but they are now views on the shared store.
+# owns the TRANSITIONS and the shared entry gate READS the same map to decline every
+# candidate while the sleeve stands down. Two maps would have meant a breaker that flattens
+# the book here and gates nothing there, which is precisely the defect F5 recorded. These
+# names stay as the module's public surface — ``JobManager`` and the tests call them — but
+# they are now views on the shared store.
+#
+# The transition itself moved to the shared module on 2026-09-01
+# (``OptionRiskManagement.update_sleeve_breaker``) so that ``daily_engine`` could call the
+# SAME one per bar. This pass is no longer the only caller of it; it is still the only LIVE
+# caller.
 reset_breaker_states = _rm.reset_breaker_states
 get_breaker_state = _rm.get_breaker_state
 
@@ -336,14 +344,21 @@ def run_option_lifecycle_pass(expert_instance_id: int,
                        f"committed capital is UNMEASURABLE (entry rails will decline): "
                        + "; ".join(result.book.unmeasurable))
 
-    equity = _sleeve_equity(account, expert_instance_id)
-    # Ratchet on EVERY evaluation, including a flat sleeve. `manage_open` returned before
+    # THE shared transition (2026-09-01): it reads the sleeve's equity, ratchets the peak,
+    # tests the drawdown and STORES the latch where the ENTRY gate reads it, so a stand-down
+    # decided here declines every option entry in ``option_book.check_rails`` on the next
+    # cycle. The backtest's per-bar flow calls the SAME function — one implementation, two
+    # callers — which is what makes the breaker mean the same thing in both runtimes.
+    # It ratchets on EVERY evaluation, including a flat sleeve: `manage_open` returned before
     # ratcheting on `not holdings`, so a just-flattened sleeve stopped tracking its peak and
     # would re-arm against a stale one.
-    result.breaker = update_breaker(get_breaker_state(expert_instance_id), equity, settings)
-    # Store it where the ENTRY gate reads it: a stand-down decided here declines every
-    # option entry in ``option_book.check_rails`` on the next cycle.
-    _rm.set_breaker_state(expert_instance_id, result.breaker)
+    # ``settings`` is not passed: the function reads ``circuit_breaker_pct`` through the same
+    # accessor ``_lifecycle_settings`` just used, and ``missing`` above has already proved it
+    # is declared here, so the value is identical and there is one reader of it.
+    breaker = update_sleeve_breaker(expert=expert, account=account,
+                                    expert_instance_id=expert_instance_id)
+    if breaker is not None:
+        result.breaker = breaker
     if result.breaker.blind:
         logger.warning(f"Option lifecycle: the drawdown breaker for expert "
                        f"{expert_instance_id} could not be evaluated — "
@@ -444,19 +459,15 @@ def _broker_can_answer(account, expert_instance_id: int,
     return True
 
 
-def _sleeve_equity(account, expert_instance_id: int) -> Optional[float]:
-    """The balance the sleeve sizes against, or ``None`` — never a fabricated 0.0.
-
-    ``None`` leaves the breaker blind (it says so) rather than reporting a 100% drawdown
-    it never measured.
-    """
-    try:
-        return account.get_balance()
-    except Exception as e:  # noqa: BLE001
-        logger.error(f"Option lifecycle: could not read the balance for expert "
-                     f"{expert_instance_id} ({e}) — the drawdown breaker is blind this "
-                     f"pass", exc_info=True)
-        return None
+#: THE SHARED READER of the sleeve's equity, exposed here under its old name because this
+#: module documented it (2026-09-01). It used to be a SECOND implementation of
+#: ``account.get_balance()`` — which is EQUITY on Alpaca and spendable CASH on
+#: ``BacktestAccount``, the divergence the breaker-parity work exists to remove. There is now
+#: one definition, ``AccountSnapshot.equity``, read by both runtimes through
+#: ``OptionRiskManagement.sleeve_equity``; ``update_sleeve_breaker`` is what this pass calls
+#: and this is the reader behind it. ``None`` leaves the breaker blind (it says so) rather
+#: than reporting a 100% drawdown it never measured.
+_sleeve_equity = _rm.sleeve_equity
 
 
 # ---------------------------------------------------------------------------
