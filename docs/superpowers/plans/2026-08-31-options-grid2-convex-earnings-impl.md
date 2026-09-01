@@ -226,6 +226,32 @@ premium-vs-max-loss gap — close it for these builders and say so). Mutations:
 ratio flipped (2 short 1 long = unbounded — must REFUSE, kill by test); wrong
 leg delta ordering.
 
+### Task 6-PRE (opus): per-leg expiries on the Transaction -- the PMCC/calendar prerequisite
+
+**Runs AFTER Task 14. The riskiest task in the plan: a migration on `Transaction`,
+a LIVE money record, consumed by both runtimes.** Requirements (each pinned):
+1. **Additive, nullable**: per-leg expiry storage designed from how legs are
+   already persisted (the parent order's `legs` list is the likely home; if the
+   `Transaction` row needs a column it is nullable, with an alembic migration
+   AND a downgrade). `Transaction.expiry` KEEPS its single-value meaning for
+   every existing single-expiry structure -- byte-identical behaviour for all
+   current builders (pin: golden equity fingerprint unmoved; every option suite
+   at baseline).
+2. **The single-expiry guard in `submit_option_order` stays the DEFAULT**,
+   relaxed only for an explicitly declared multi-expiry strategy set
+   (fail-closed: an undeclared two-expiry submit still refuses).
+3. **The three DTE readers get a per-leg answer with NAMED rules**:
+   `option_lifecycle._dte` and `DaysToExpiryCondition` -- structure DTE = the
+   SHORT leg for roll-window questions, the LONG leg for roll-floor/structure-
+   exit questions; `opt_time`/`opt_dte` state which leg they read. Ambiguity
+   was the guard's whole reason to exist -- make the rule explicit, tested from
+   both legs.
+4. **Both runtimes**: live and backtest read/write the per-leg fields through
+   ONE shared accessor; parity-style test.
+5. Migration tested forward AND backward on a fixture DB with existing
+   single-expiry rows; those rows read identically after upgrade.
+Model: opus. Two-stage review, with the migration reviewed by a second agent.
+
 ### Task 6 (opus): two-expiry lifecycle builder (PMCC first)
 
 > **RESEQUENCED 2026-09-01 (controller decision after a designed STOP).** The
@@ -308,6 +334,38 @@ convention explicitly).
 ## Phase D — grids
 
 ### Task 10 (sonnet): Grid-2 launcher wiring + matrix script
+
+> **FRESH-EYES AMENDMENTS (controller review 2026-09-01, after Task 9):**
+> 1. **Fixed method, delta-domain params -- the dead-gene trap.** The launcher's
+>    existing strike-method machinery makes the METHOD a categorical gene sharing
+>    ONE `strike_param` domain; a percent-OTM domain (0-8) read as a DELTA target
+>    is nonsense and refuses every genome. For every grid-2 key the method is
+>    FIXED to `"delta"` (never searched) and `option_strike_param`'s domain is the
+>    key's DELTA band from design section 2 (O_LEAPC 0.70-0.90 step 0.05; the
+>    backspread pair-shape per leg). Pin: no grid-2 key emits a strike-method
+>    gene; every strike_param band lies in (0,1).
+> 2. **O_ERN expiry-after-event constraint.** The straddle's expiry must land
+>    AFTER the print. Today that is only implicit (dte_min >= 7 > days-before
+>    <= 5). Pin it as an explicit gene-space constraint (dte_min floor > the
+>    entry-days-before ceiling) with a test that a violating genome is refused
+>    at decode, never emitted.
+> 3. **Field name**: the entry leaf is `rec_days_to_earnings` (stamp-sourced),
+>    NOT `days_to_earnings` (the calendar-fetching legacy condition).
+> 4. **Registration**: add `FMPEarningsEvent` to `_SUPPORTED_EXPERTS` /
+>    `_EXPERT_WARMUP_BARS` (the class declares `BACKTEST_WARMUP_BARS = 620`;
+>    the table must agree -- pin equality).
+> 5. **Debit/credit partition**: every new key joins the debit or credit set
+>    explicitly by its iv-rank THESIS (long-vol keys = debit set; backspreads by
+>    the same rule). The import-time partition assertion must stay total.
+> 6. **End-to-end engine pins (deferred here by the Task 9 review):** (a) an
+>    O_ERN run through `DailyBacktestEngine`: expert stamps -> entry gate fires at
+>    rec_days_to_earnings <= X -> straddle submitted -> `days_after_event` exit
+>    closes it (the whole chain the unit tests only proved synthetically); (b) an
+>    O_LEAPC run at LEAPS-range bar sparsity (~50% bar density on a DTE>=365
+>    expiry) proving the BS fallback marks the position and the DTE-floor exit
+>    fires -- nothing tests that path today.
+> 7. **Golden equity fingerprint unmoved** (results-identity criterion); the
+>    lower trade floor is CONFIG naming the long-dated keys only (never O_ERN).
 **Files:** `testplatform/ba2test_launcher.py` (`_OPTION_STRATS` entries
 O_LEAPC/O_LEAPP/O_PMCC/O_ERN/O_CBS/O_PBS with the design-§2 gene tables;
 NO group key in round one), `tools/run_options2_matrix.py` (phase-1 job list,
@@ -322,6 +380,13 @@ test per gene family. Mutations: a gene dropped by the settings whitelist;
 trade floor applied to O_ERN (must NOT be).
 
 ### Task 11 (sonnet): expert genes for FMPEarningsEvent
+
+> **AMENDMENT (2026-09-01):** `min_analysts` gene range is **0-5 with 0 = gate
+> OFF** (measured: default 3 refuses 66% of the universe at a 2023 as-of, 47%
+> at 2025 -- decaying strictness that tilts the traded universe across the
+> window). Lower the expert's DEFAULT to 1 (a data-quality floor, not a
+> selection filter) and record the measurement beside it. Add
+> `allow_unconfirmed_dates` as a boolean gene.
 **Files:** launcher `_EXPERT_OPT` wiring for the three weights +
 min_analysts + allow_unconfirmed_dates (only for jobs whose expert is
 FMPEarningsEvent), threading through `_build_daily_trial_config`'s expert
@@ -329,6 +394,16 @@ settings (THE WHITELIST TRAP — prove the value reaches the expert with a
 recorded-chain test per gene); mutation: whitelist drop.
 
 ### Task 12 (opus): `option_convex` fitness
+
+> **AMENDMENT (2026-09-01) -- the equity-cap masking lesson, second
+> application.** Option grids run with `equity_cap`; capped equity reports ZERO
+> P&L above the cap (`equity_cap.py`), so a 5x convex winner would read as
+> nothing -- masking exactly the outcomes this fitness exists to find. The
+> return term MUST be **uncapped cumulative P&L / starting capital**, and the
+> drawdown term MUST use the `capped_drawdown_curve` definition (peak-to-trough
+> on cumulative P&L / cap), never peak-to-trough on the capped equity series.
+> Pin with a fixture where the cap binds: a run whose uncapped P&L is +400% must
+> score above one at +40% (mutation: rank on capped equity -> the test fails).
 **Files:** `testplatform/backend/app/services/strategy_fitness.py` (or the
 module the registry lives in — find `_OPTION_CAR_STRATEGIES` routing and
 mirror it), config for the breadth floor + dd threshold; tests: frozen-
@@ -354,6 +429,20 @@ threshold, jobs O_CONVEX × experts). The tail-hedge put arm = a
 cross-score); sl_ml default genuinely off in the emitted ruleset.
 
 ### Task 14 (sonnet): docs + STATE + phase-2 stub
+
+> **AMENDMENTS (2026-09-01):** (a) PRE-LAUNCH PERF: time ONE real-cache option
+> trial (parquet store, a grid-2 key, a real universe symbol) against one real
+> equity trial of comparable bars -- criterion 2 has only ever been measured on
+> fixtures; record both numbers. (b) RESULTS-COMPARABILITY NOTE: the Task-3 BS
+> mark fallback changes OPTION results vs the 0058 deploy; stage-1 numbers run
+> before this branch merges and grid-2 numbers after are DIFFERENT BASELINES --
+> record it the way the CAR-scale change was recorded; never compare across it.
+> (c) carries: Task 2's 3 doc nits; the aliased-import limitation of getsource
+> pins (codebase-wide); perf_sample_bt's orders/run=0 repair; option_greeks BS
+> unification; chase dev's newer commits (worker memory reclaim + 2026.09.0001
+> bump) in a cheap merge; the days_after_event(forced)-vs-days_opened
+> (discretionary) classification recorded as DELIBERATE (event terminal date vs
+> staleness exit -- controller recommendation: keep).
 Record `O_CAL` as phase-gated (stub entry refusing loudly with the design
 reference, like the naked exclusion); update EXPERTS.md for FMPEarningsEvent;
 write the plan's completion STATE note; verify ALL suites one last time and
