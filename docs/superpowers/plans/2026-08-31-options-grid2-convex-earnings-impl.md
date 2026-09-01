@@ -66,6 +66,19 @@ explicit paths, message ends with the standard co-author/session trailer.
 re-measured by the task that writes it, with seed and method stated
 (the w_spread lesson; see `option_selector._publishes_spread` for the pattern).
 
+**Performance acceptance criteria (operator, 2026-09-01) — apply to EVERY task:**
+1. Option code must not impact stock-backtest performance: a pure-equity trial
+   does ZERO additional per-bar/per-action work from option machinery. Every
+   option path sits behind a mode/structure check equity trials never enter —
+   pinned structurally (call-count zero in an equity trial), plus a wall-clock
+   sanity against the pre-task baseline on one representative equity trial
+   (>~5% regression = STOP-and-report).
+2. Option trial runtime stays comparable to equity trial runtime. Any task
+   adding per-bar or per-candidate work (BS fallback, two-expiry lifecycle,
+   delta selection, earnings features) MEASURES its cost on one representative
+   option trial and reports before/after — never assumed. A task that makes
+   option trials a runtime class slower than equity trials is not done.
+
 **Model routing** (controller sets `model` at dispatch):
 - **opus**: Tasks 5, 6, 7, 9, 12 (lifecycle, fitness, expert core).
 - **sonnet**: Tasks 1, 2, 3, 4, 8, 10, 11, 13, 14 (mechanical/mirrored work).
