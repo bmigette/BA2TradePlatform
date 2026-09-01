@@ -368,10 +368,10 @@ ALLOWLIST: dict = {
     "ba2_trade_platform/ui/pages/settings.py:3794":
         "same settings-import default; the comment above the line records why the fallback was "
         "deliberately restored (was :3899, same shift)",
-    "ba2_trade_platform/ui/components/performance_charts.py:412":
+    "ba2_trade_platform/ui/components/performance_charts.py:458":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
-        "right answer for an unmeasured trade",
-    "ba2_trade_platform/ui/components/performance_charts.py:413":
+        "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl was added above it)",
+    "ba2_trade_platform/ui/components/performance_charts.py:459":
         "loss half of the same win-rate count; 0 is excluded from both tallies rather than "
         "scored as either",
     "testplatform/backend/app/services/data_build_handler.py:157":
