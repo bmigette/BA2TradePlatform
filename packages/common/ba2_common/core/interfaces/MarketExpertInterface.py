@@ -352,25 +352,36 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 # UI -- before this they existed only on PremiumSeller, so the rails were
                 # unreachable for every other expert. They are INERT in classic and smart mode:
                 # nothing reads them unless risk_manager_mode == "classic_options".
+                #
+                # DELIBERATELY NO ``default`` (design SS4; review finding M1, 2026-09-01).
+                # They shipped with defaults of 40/20/3/10, and OptionRiskManagement's
+                # "never a substituted default for a risk rail" refusal was therefore
+                # UNREACHABLE: get_setting_with_interface_default always found a number, so
+                # ``missing`` was always empty and the branch could only be reached by a test
+                # double that raised where no real expert does. A rail is a risk limit the
+                # operator has to state; an absent one means UNDECLARED and refuses the
+                # entry naming the setting (rail_settings -> admit_option_entry). Adding a
+                # default back here silently re-arms every sleeve at somebody's guess and
+                # fails test_an_expert_that_declares_no_rails_refuses_the_entry.
                 "max_deployment_pct": {
-                    "type": "float", "required": False, "default": 40.0,
+                    "type": "float", "required": False,
                     "description": "Option sleeve: max deployment %",
-                    "tooltip": "Ceiling on the TOTAL max loss of all open option structures, as a percent of the sleeve's equity. This is the aggregate committed-max-loss cap. Only used when risk_manager_mode is 'classic_options'."
+                    "tooltip": "Ceiling on the TOTAL max loss of all open option structures, as a percent of the sleeve's equity. This is the aggregate committed-max-loss cap. REQUIRED when risk_manager_mode is 'classic_options' (there is no default -- an unset rail refuses the entry); ignored otherwise."
                 },
                 "undefined_risk_max_pct": {
-                    "type": "float", "required": False, "default": 20.0,
+                    "type": "float", "required": False,
                     "description": "Option sleeve: max undefined-risk %",
-                    "tooltip": "Sub-cap on the share of the sleeve committed to structures with undefined (unbounded) risk, as a percent of equity. Only used when risk_manager_mode is 'classic_options'."
+                    "tooltip": "Sub-cap on the share of the sleeve committed to structures with undefined (unbounded) risk, as a percent of equity. Read only when a candidate measures (or declares) as undefined risk, under risk_manager_mode 'classic_options'. No default -- unset means the sleeve takes no undefined risk it cannot price."
                 },
                 "max_notional_leverage": {
-                    "type": "float", "required": False, "default": 3.0,
+                    "type": "float", "required": False,
                     "description": "Option sleeve: max notional leverage",
-                    "tooltip": "Ceiling on SHORT-side notional (short strike x 100 x contracts) as a multiple of the sleeve's equity. A long option carries none -- it cannot be assigned against you. Only used when risk_manager_mode is 'classic_options'."
+                    "tooltip": "Ceiling on SHORT-side notional (short strike x 100 x contracts) as a multiple of the sleeve's equity. A long option carries none -- it cannot be assigned against you. REQUIRED when risk_manager_mode is 'classic_options' (there is no default -- an unset rail refuses the entry); ignored otherwise."
                 },
                 "max_concurrent_structures": {
-                    "type": "int", "required": False, "default": 10,
+                    "type": "int", "required": False,
                     "description": "Option sleeve: max concurrent structures",
-                    "tooltip": "How many open option structures the sleeve may hold at once. Only used when risk_manager_mode is 'classic_options'."
+                    "tooltip": "How many open option structures the sleeve may hold at once. REQUIRED when risk_manager_mode is 'classic_options' (there is no default -- an unset rail refuses the entry); ignored otherwise."
                 },
                 "smart_risk_manager_user_instructions": {
                     "type": "str", "required": False, "default": (

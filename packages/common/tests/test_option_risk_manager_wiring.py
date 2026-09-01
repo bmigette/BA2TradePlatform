@@ -23,6 +23,10 @@ from typing import Any, Dict, List, Optional
 import pytest
 
 import ba2_common.core.OptionRiskManagement as rm
+from ba2_common.core.interfaces.ExtendableSettingsInterface import (
+    ExtendableSettingsInterface,
+)
+from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 from ba2_common.core.option_book import (
     RAIL_BREAKER_HALTED, RAIL_MAX_CONCURRENT, RAIL_MAX_DEPLOYMENT,
     RAIL_MAX_NOTIONAL_LEVERAGE, RAIL_ONE_PER_UNDERLYING, RAIL_UNDEFINED_RISK,
@@ -168,8 +172,6 @@ def test_classic_options_is_an_admitted_risk_manager_mode():
 
 def test_the_settings_definition_offers_the_option_mode_from_one_list():
     """The UI dropdown and the code must not carry two copies of the admitted set."""
-    from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
-
     MarketExpertInterface._ensure_builtin_settings()
     values = MarketExpertInterface._builtin_settings["risk_manager_mode"]["valid_values"]
     assert values == list(rm.VALID_RISK_MANAGER_MODES)
@@ -402,14 +404,51 @@ def test_rearm_is_the_operator_override_and_keeps_the_peak():
 # ---------------------------------------------------------------------------
 # 4. rails that are not configured refuse rather than defaulting
 # ---------------------------------------------------------------------------
-def test_an_expert_with_no_declared_rails_refuses_the_entry(empty_sleeve):
-    """NEVER a substituted default for a risk rail. The refusal names the missing knobs so
-    'this sleeve stopped trading' is diagnosable instead of mysterious."""
-    verdict = gate(expert=FakeExpert(rails={}))
+class InterfaceExpert:
+    """An expert read through the REAL settings machinery, not a raising double.
+
+    ``ExtendableSettingsInterface.get_setting_with_interface_default`` over
+    ``MarketExpertInterface``'s own declarations — the exact pair a live expert uses. The
+    two tests below used ``FakeExpert(rails={})``, which RAISES on an undeclared key; real
+    experts did not, because the interface shipped the four rails WITH defaults, so the
+    refusal those tests claimed to pin was unreachable in production (review finding M1,
+    2026-09-01). A double that raises where the real accessor returns is how that stayed
+    invisible, so this one borrows the real functions instead of imitating them.
+    """
+    id = 7
+
+    get_setting_with_interface_default = (
+        ExtendableSettingsInterface.get_setting_with_interface_default)
+    get_merged_settings_definitions = (
+        MarketExpertInterface.get_merged_settings_definitions)
+
+    def __init__(self, settings: Optional[Dict[str, Any]] = None):
+        self.settings = dict(settings or {})
+
+
+def test_an_expert_that_declares_no_rails_refuses_the_entry(empty_sleeve):
+    """NEVER a substituted default for a risk rail — through the REAL accessor.
+
+    A classic_options expert with nothing configured is the state every expert is in the
+    moment it is switched over, and it must refuse, naming the knobs, rather than run at
+    somebody's guess. MUTATION KILL: put ``"default": 40.0`` (or any of the other three)
+    back on ``MarketExpertInterface`` and the named key stops appearing in the detail."""
+    verdict = gate(expert=InterfaceExpert({"risk_manager_mode": "classic_options"}))
     assert verdict.allowed is False
     assert verdict.phrase == OPTION_RAILS_UNCONFIGURED_REFUSAL
     for key in rm.REQUIRED_RAIL_SETTINGS:
         assert key in verdict.detail
+
+
+def test_an_expert_that_declares_all_four_rails_is_admitted(empty_sleeve):
+    """The other half of the same machinery: CONFIGURED rails are found and the candidate
+    is judged on them. Without this, "refuses when unconfigured" could be satisfied by a
+    reader that never finds anything."""
+    expert = InterfaceExpert({"risk_manager_mode": "classic_options", **RAILS})
+    rails, missing = rm.rail_settings(expert)
+    assert missing == []
+    assert rails == RAILS
+    assert gate(expert=expert).allowed is True
 
 
 def test_the_unconfigured_refusal_is_not_the_rail_refusal():
@@ -420,14 +459,14 @@ def test_the_unconfigured_refusal_is_not_the_rail_refusal():
     assert OPTION_RAILS_UNCONFIGURED_REFUSAL in REFUSAL_PHRASES
 
 
-def test_the_base_interface_declares_every_required_rail():
-    """Any expert can be switched to classic_options, so the rails must be configurable on
-    the base class — before this they existed only on PremiumSeller."""
-    from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
-
+def test_the_base_interface_declares_every_rail_and_defaults_none_of_them():
+    """Any expert can be switched to classic_options, so the four must be CONFIGURABLE on
+    the base class — and none of them may carry a ``default``, which is what makes the
+    refusal above reachable at all (design §4; review finding M1)."""
     MarketExpertInterface._ensure_builtin_settings()
     for key in rm.REQUIRED_RAIL_SETTINGS + (rm.UNDEFINED_RISK_SETTING,):
         assert key in MarketExpertInterface._builtin_settings, key
+        assert MarketExpertInterface._builtin_settings[key].get("default") is None, key
 
 
 # ---------------------------------------------------------------------------

@@ -218,8 +218,14 @@ def rail_settings(expert) -> Tuple[Dict[str, Any], List[str]]:
 
     Read through ``get_setting_with_interface_default`` — the same accessor every other
     expert setting uses, and the same shape ``option_lifecycle_service._lifecycle_settings``
-    uses — so a configured value wins, a declared default is honoured, and a key the
-    expert's interface does not define at all is reported by name rather than filled in.
+    uses — so a configured value wins and anything else is UNDECLARED.
+
+    ABSENT MEANS UNDECLARED, and that is why ``MarketExpertInterface`` gives these four no
+    ``default`` (review finding M1, 2026-09-01). While it did, the accessor always returned
+    a number, ``missing`` was structurally always empty, and the refusal below could only be
+    reached by a test double that raised where no real expert does — i.e. the "never a
+    substituted default for a risk rail" rule was documented, tested against a fake, and
+    enforced nowhere. A risk limit nobody stated is not a risk limit.
     """
     settings: Dict[str, Any] = {}
     missing: List[str] = []
