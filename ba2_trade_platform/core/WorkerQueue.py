@@ -1561,11 +1561,14 @@ class WorkerQueue:
                             # Use classic TradeManager for automated processing
                             logger.info(f"[RISK_MGR_TRIGGER] Expert {expert_instance_id} using CLASSIC risk manager mode, triggering TradeManager")
                             
-                            from datetime import datetime as _dt, timezone as _tz
+                            import time as _time
 
                             from .TradeManager import get_trade_manager
                             trade_manager = get_trade_manager()
-                            rm_started_at = _dt.now(_tz.utc)
+                            # MONOTONIC, matching risk_manager_run.record_run and the
+                            # classic manager: the run's duration must not jump when the
+                            # system clock is adjusted mid-pass.
+                            rm_started_at = _time.monotonic()
                             
                             if use_case == AnalysisUseCase.ENTER_MARKET:
                                 logger.debug(f"[RISK_MGR_TRIGGER] Processing ENTER_MARKET recommendations")
@@ -1584,21 +1587,23 @@ class WorkerQueue:
                                 logger.debug(f"[RISK_MGR_TRIGGER] No orders created by automated processing for expert {expert_instance_id}")
                             # THE OPTION RUN RECORD. Everything the option risk manager
                             # decided this pass -- every admission and every refused rail --
-                            # is written as one row in the SAME table the runs view already
-                            # reads, so an options run appears under its existing expert /
-                            # status filter with no UI work. Until classic_options existed
-                            # nothing could produce one. A failure to record must never
-                            # unwind trades that have already been placed, which is why it
-                            # is caught here rather than left to the caller's guard.
+                            # is written as ONE ``RiskManagerRun`` row with mode="options",
+                            # which is the record the runs view's Options filter queries
+                            # (review 2026-08-30 FIX 2: it used to write a
+                            # SmartRiskManagerJob, which that filter cannot see, so option
+                            # runs surfaced mislabelled under Smart). Until classic_options
+                            # existed nothing could produce one. A failure to record must
+                            # never unwind trades that have already been placed, which is
+                            # why it is caught here rather than left to the caller's guard.
                             if risk_manager_mode == "classic_options":
                                 try:
                                     from ba2_common.core.OptionRiskManagement import flush_option_rm_run
-                                    job_id = flush_option_rm_run(
+                                    run_id = flush_option_rm_run(
                                         expert_instance_id, expert_instance_record.account_id,
                                         started_at=rm_started_at)
-                                    if job_id is not None:
+                                    if run_id is not None:
                                         logger.info(f"[RISK_MGR_TRIGGER] Recorded option risk "
-                                                    f"manager run {job_id} for expert {expert_instance_id}")
+                                                    f"manager run {run_id} for expert {expert_instance_id}")
                                 except Exception as e:
                                     logger.error(f"[RISK_MGR_TRIGGER] Failed to record the option "
                                                  f"risk manager run for expert {expert_instance_id}: {e}",

@@ -770,6 +770,13 @@ def test_a_backtest_writes_no_run_record(empty_sleeve, monkeypatch):
 
 
 def test_the_run_record_is_the_shape_the_runs_table_reads(empty_sleeve, monkeypatch):
+    """Review 2026-08-30 FIX 2: a ``RiskManagerRun`` with ``mode="options"`` — the record
+    the runs table's Options filter queries. It used to be a ``SmartRiskManagerJob`` with
+    ``model_used="classic_options"``, which no filter looks at."""
+    from ba2_common.core.models import RiskManagerRun
+    from ba2_common.core.risk_manager_run import (MODE_OPTIONS, OUTCOME_FUNDED,
+                                                  OUTCOME_RAIL)
+
     gate(underlying="AAPL", max_loss_per_contract=1_000.0)
     gate(underlying="MSFT", legs=short_put_legs(symbol="MSFT"),
          max_loss_per_contract=99_000_000.0)
@@ -779,16 +786,65 @@ def test_the_run_record_is_the_shape_the_runs_table_reads(empty_sleeve, monkeypa
                         lambda obj: (written.append(obj), 55)[1])
 
     assert rm.flush_option_rm_run(7, 3) == 55
-    job = written[0]
-    assert job.expert_instance_id == 7 and job.account_id == 3
-    assert job.model_used == "classic_options"
-    assert job.status == "COMPLETED"
-    assert job.actions_taken_count == 1              # one admitted, one refused
-    assert len(job.graph_state["actions_log"]) == 2
-    # The renderer reads action_type / success / arguments.symbol out of each entry.
-    assert job.graph_state["actions_log"][0]["arguments"]["symbol"] == "AAPL"
+    run = written[0]
+    assert isinstance(run, RiskManagerRun)
+    assert run.expert_instance_id == 7 and run.account_id == 3
+    assert run.mode == MODE_OPTIONS                  # what the Options filter matches on
+    assert run.status == "COMPLETED"
+    assert run.symbols_received == 2 and run.symbols_funded == 1
+    assert [d["outcome"] for d in run.decisions] == [OUTCOME_FUNDED, OUTCOME_RAIL]
+    assert [d["symbol"] for d in run.decisions] == ["AAPL", "MSFT"]
+    # A refusal NAMES ITS RAIL: "refused" on its own is the non-answer this record replaces.
+    assert run.decisions[1]["rail"] == RAIL_MAX_DEPLOYMENT
+    assert RAIL_MAX_DEPLOYMENT in run.decisions[1]["reason"]
+    # The admitted row carries the size; the refused one carries no quantity at all.
+    assert run.decisions[0]["quantity"] == 1
+    assert "quantity" not in run.decisions[1]
+    # Per-entry facts the four rendered columns do not show still ride in the JSON.
+    assert run.decisions[0]["option_strategy"] == "cash_secured_put"
+    assert run.decisions[0]["timestamp"]
+    assert run.context["risk_manager_mode"] == "classic_options"
     # Drained: a second flush must not re-write the same decisions.
     assert rm.flush_option_rm_run(7, 3) is None
+
+
+def test_the_option_run_is_the_ONLY_row_written_and_no_smart_job_is(empty_sleeve, monkeypatch):
+    """One run, one row. The SmartRiskManagerJob write was REPLACED, not kept beside the
+    new one: two rows for one pass would double-count it in a table that unions both
+    sources, and would leave the mislabelled Smart row the filter fix exists to remove."""
+    from ba2_common.core.models import RiskManagerRun, SmartRiskManagerJob
+
+    gate(underlying="AAPL", max_loss_per_contract=1_000.0)
+    monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: False)
+    written = []
+    monkeypatch.setattr("ba2_common.core.db.add_instance",
+                        lambda obj: (written.append(obj), 1)[1])
+
+    rm.flush_option_rm_run(7, 3)
+    assert len(written) == 1
+    assert isinstance(written[0], RiskManagerRun)
+    assert not any(isinstance(o, SmartRiskManagerJob) for o in written)
+
+
+def test_a_halted_sleeve_explains_itself_once_in_the_run_context(empty_sleeve, monkeypatch):
+    """A stand-down explains an ENTIRE run of refusals, so it belongs in the run's context
+    rather than repeated on every decision row."""
+    rm.set_breaker_state(7, BreakerState(peak_equity=100_000.0, halted=True,
+                                         detail="drawdown 25.0% past the 20.0% line"))
+    try:
+        gate(underlying="AAPL", max_loss_per_contract=1_000.0)
+        monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: False)
+        written = []
+        monkeypatch.setattr("ba2_common.core.db.add_instance",
+                            lambda obj: (written.append(obj), 1)[1])
+        rm.flush_option_rm_run(7, 3)
+        ctx = written[0].context
+        assert ctx["breaker_halted"] is True
+        assert "20.0%" in ctx["breaker_detail"]
+        # And the entry itself was refused by the breaker rail, named on its own row.
+        assert written[0].decisions[0]["rail"] == RAIL_BREAKER_HALTED
+    finally:
+        rm.reset_breaker_states()
 
 
 def test_the_journal_cannot_grow_without_bound(empty_sleeve):

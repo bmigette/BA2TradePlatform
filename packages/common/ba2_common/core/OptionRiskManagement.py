@@ -1170,25 +1170,75 @@ def assignment_cash(account, expert_instance_id: int) -> Optional[float]:
 # ---------------------------------------------------------------------------
 # the run record
 # ---------------------------------------------------------------------------
-#: What a ``classic_options`` run stores where the runs table reads ``model_used``. The runs
-#: table filters on expert and status, so an option run needs no UI work to appear — it
-#: needed a record, and until now nothing could write one because ``risk_manager_mode``
-#: admitted only ``classic`` and ``smart``.
-OPTION_RUN_MODEL = RISK_MANAGER_MODE_CLASSIC_OPTIONS
+def _decision_from_journal_entry(entry: Dict[str, Any]):
+    """One journal entry -> one ``risk_manager_run.decision`` row.
+
+    The journal is keyed per ENTRY ATTEMPT, not per symbol: one pass can weigh two
+    structures on the same underlying, and both get a row. ``symbol`` therefore is not
+    unique within a run — the strategy that distinguishes them rides along as
+    ``option_strategy``, the way the classic manager carries its ``side``.
+    """
+    from ba2_common.core.risk_manager_run import OUTCOME_FUNDED, OUTCOME_RAIL, decision
+
+    args = entry.get("arguments") or {}
+    result = entry.get("result") or {}
+    symbol = args.get("symbol") or result.get("symbol") or "?"
+    strategy = args.get("option_strategy") or ""
+    quantity = args.get("quantity")
+    if entry.get("success"):
+        detail = result.get("detail") or "admitted by the sleeve rails"
+        return decision(symbol, OUTCOME_FUNDED,
+                        f"{strategy}: {detail}" if strategy else detail,
+                        quantity=quantity, option_strategy=strategy,
+                        rail=result.get("rail"), timestamp=entry.get("timestamp"))
+    # ``reason`` names the RAIL that spoke, because "refused" on its own is the non-answer
+    # the whole record exists to replace. ``quantity`` stays absent: a refused entry has no
+    # size, and the size it ASKED for is a different fact, recorded under its own key.
+    detail = result.get("detail") or result.get("phrase") or "refused by the sleeve rails"
+    return decision(symbol, OUTCOME_RAIL, detail, option_strategy=strategy,
+                    rail=result.get("rail"), phrase=result.get("phrase"),
+                    requested_quantity=quantity, timestamp=entry.get("timestamp"))
 
 
 def flush_option_rm_run(expert_instance_id: int, account_id: int,
-                        started_at: Optional[datetime] = None) -> Optional[int]:
-    """Write this expert's option-RM pass as a run record and clear the journal.
+                        started_at: Optional[float] = None) -> Optional[int]:
+    """Write this expert's option-RM pass as a ``RiskManagerRun`` and clear the journal.
 
-    Same record shape the runs table already reads (``SmartRiskManagerJob``): the decisions
-    go into ``graph_state["actions_log"]`` in the shape the renderer expects, so an option
-    run shows up under the existing expert/status filter with no UI change.
+    THE RECORD SHAPE IS ``RiskManagerRun`` WITH ``mode=MODE_OPTIONS`` — the row the runs
+    table's Options filter already queries (``marketanalysis._fetch_all_risk_manager_runs``,
+    ``RiskManagerRun.mode == 'options'``). Review 2026-08-30 (dev-merge) FIX 2: this
+    previously wrote a ``SmartRiskManagerJob`` with ``model_used="classic_options"``, a
+    column no filter looks at — so the Options filter returned nothing and every option run
+    surfaced mislabelled under **Smart**, beside LLM jobs it has nothing in common with.
+    Both renderers were read before switching, and the ``RiskManagerRun`` one is strictly
+    the better fit for this manager:
+
+      * it has ``mode``, which is what the table filters and labels on — the whole
+        handshake;
+      * its detail view lists REFUSALS FIRST with a ``reason`` column, which is exactly
+        what a rail decision is, where the smart renderer's per-action expansions are
+        built for a LangGraph tool call (iteration, confidence, model, graph-state viewer)
+        and would read as empty fields for a rail;
+      * ``symbols_funded / symbols_received`` is the admitted-of-weighed count the smart
+        shape could only express as a bare ``actions_taken_count``.
+
+    Nothing the smart renderer shows is lost that this manager produces: it has no
+    LangGraph state, no iterations, no model and no portfolio snapshot. Per-entry
+    ``timestamp`` and ``option_strategy`` are carried on each decision row (persisted in
+    the JSON beside the four columns the detail table renders). **One row, one table** —
+    the ``SmartRiskManagerJob`` write is REPLACED, not duplicated, so a run can never be
+    counted twice across the two sources the table unions.
+
+    ``started_at`` is a ``time.monotonic()`` reading from the top of the pass, matching
+    ``risk_manager_run.record_run`` and the classic manager: monotonic so the duration
+    cannot jump when the system clock is adjusted mid-run.
 
     Returns the new row id, or ``None`` when there was nothing to record. **Skipped entirely
     under the backtest's in-memory trade store**: a backtest has no runs table to read and
     tens of thousands of passes to write, and a shared implementation that wrote rows during
-    a grid would put grid noise into the live database.
+    a grid would put grid noise into the live database. (``record_run`` refuses on the same
+    seam; the check is repeated here so the journal is never drained by a call that was
+    never going to write.)
     """
     from ba2_common.core.trade_store import inmem_trades_active
 
@@ -1204,26 +1254,24 @@ def flush_option_rm_run(expert_instance_id: int, account_id: int,
     if not entries:
         return None
 
-    from ba2_common.core.db import add_instance
-    from ba2_common.core.models import SmartRiskManagerJob
+    from ba2_common.core.risk_manager_run import MODE_OPTIONS, record_run
 
-    started = started_at or datetime.now(timezone.utc)
-    admitted = sum(1 for e in entries if e.get("success"))
-    refused = len(entries) - admitted
-    summary = (f"Option risk manager: {admitted} entr{'y' if admitted == 1 else 'ies'} "
-               f"admitted, {refused} refused by the sleeve rails")
-    job = SmartRiskManagerJob(
-        expert_instance_id=expert_instance_id,
-        account_id=account_id,
-        run_date=started,
-        model_used=OPTION_RUN_MODEL,
-        user_instructions="",
-        graph_state={"actions_log": entries, "final_summary": summary},
-        actions_taken_count=admitted,
-        actions_summary=summary,
-        status="COMPLETED",
-    )
-    return add_instance(job)
+    breaker = get_breaker_state(expert_instance_id)
+    # The run's sleeve-wide inputs, shown beside the per-entry decisions. The breaker is
+    # here because a halted sleeve explains an ENTIRE run of refusals at once, where
+    # repeating it per row would say the same thing N times.
+    context = {
+        "risk_manager_mode": RISK_MANAGER_MODE_CLASSIC_OPTIONS,
+        "breaker_halted": breaker.halted,
+        "breaker_blind": breaker.blind,
+    }
+    if breaker.detail:
+        context["breaker_detail"] = breaker.detail
+
+    return record_run(expert_instance_id=expert_instance_id, account_id=account_id,
+                      mode=MODE_OPTIONS,
+                      decisions=[_decision_from_journal_entry(e) for e in entries],
+                      context=context, started_at=started_at)
 
 
 # Guard the two phrases at import: a typo'd constant would otherwise surface as an

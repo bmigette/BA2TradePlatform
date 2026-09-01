@@ -37,8 +37,10 @@ def test_classic_options_is_dispatched_down_the_classic_branch():
 
 
 def test_the_option_run_record_is_written_from_that_branch():
-    """The runs table reads ``SmartRiskManagerJob`` rows and filters by expert and status,
-    so an option run needs no UI work — it needed a writer. This is the writer."""
+    """The runs table already had an Options filter (``RiskManagerRun.mode == 'options'``),
+    so an option run needs no UI work — it needed a writer. This is the writer. What it
+    writes is pinned in ``tests/test_risk_manager_runs_table.py`` (review 2026-08-30
+    FIX 2: it used to write a ``SmartRiskManagerJob``, which that filter cannot see)."""
     source = _dispatch_source()
     assert "flush_option_rm_run" in source
     assert 'if risk_manager_mode == "classic_options":' in source
