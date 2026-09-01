@@ -1268,9 +1268,21 @@ def flush_option_rm_run(expert_instance_id: int, account_id: int,
     if breaker.detail:
         context["breaker_detail"] = breaker.detail
 
+    # The MAPPING is guarded, not just the write. ``decision()`` RAISES on a row it cannot
+    # explain (no symbol, no reason) and ``record_run``'s own guard starts after its
+    # arguments are built, so an unmappable journal entry would escape this function --
+    # which recording must never do: the entries it describes are already on the wire, and
+    # the caller is a risk manager that has finished its real work. Same discipline as
+    # ``TradeRiskManagement._record_classic_run``.
+    try:
+        decisions = [_decision_from_journal_entry(e) for e in entries]
+    except Exception as e:  # noqa: BLE001 -- observability must not fail the entry pass
+        logger.warning(f"Failed to build the option risk-manager run record for expert "
+                       f"{expert_instance_id}: {e}")
+        return None
+
     return record_run(expert_instance_id=expert_instance_id, account_id=account_id,
-                      mode=MODE_OPTIONS,
-                      decisions=[_decision_from_journal_entry(e) for e in entries],
+                      mode=MODE_OPTIONS, decisions=decisions,
                       context=context, started_at=started_at)
 
 
