@@ -175,11 +175,17 @@ def test_the_grid_emitted_exit_rules_classify_per_the_review_table():
         {"c0": {"event_type": "days_to_expiry", "operator": "<=", "value": 21}})
     opt_tp = _event_action(
         {"c0": {"event_type": "profit_loss_percent", "operator": ">", "value": 50}})
+    # Task 4: the debit-structure take-profit multiple. A PROFIT-side gate like opt_tp --
+    # must classify discretionary, never forced (it is deliberately absent from
+    # _LOSS_SIDE_STOP_OPERATORS; see that table's docstring).
+    opt_tp_mult = _event_action(
+        {"c0": {"event_type": "profit_multiple_of_premium", "operator": ">=", "value": 3.0}})
 
     assert forced_option_exit(opt_sl_ml) is True    # loss-side of an INVERTED-sign field
     assert forced_option_exit(opt_sl) is True       # loss-side of a signed-P&L field
     assert forced_option_exit(opt_dte) is True      # the DTE/roll exit
     assert forced_option_exit(opt_tp) is False      # a take-profit is discretionary
+    assert forced_option_exit(opt_tp_mult) is False  # profit-multiple TP is discretionary
 
 
 def test_loss_pct_of_max_loss_take_profit_side_stays_discretionary():

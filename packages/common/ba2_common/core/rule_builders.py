@@ -37,6 +37,10 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     # 2026-08-29 S6/S8.2). UNEVALUABLE -- fires in neither direction -- when the submit
     # path stamped no measured max loss on the parent order.
     "loss_pct_of_max_loss": ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS,
+    # Take-profit for a LONG (debit) option structure, scaled to what it cost: current
+    # value / entry premium. UNEVALUABLE for a credit (SELL) entry -- see the condition
+    # class docstring. A PROFIT-side gate, never a stop.
+    "profit_multiple_of_premium": ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM,
     "days_opened": ExpertEventType.N_DAYS_OPENED,
     # Remaining option life (expiry - the evaluation date), the complement of days_opened.
     # MUST be listed here or the leaf is silently dropped by triggers_from_condition_tree

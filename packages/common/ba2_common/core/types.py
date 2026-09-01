@@ -447,6 +447,17 @@ class ExpertEventType(str, Enum):
     # Structures whose max loss was not MEASURED at submit (short calls) have no persisted
     # value, and the condition is then UNEVALUABLE: it never fires in either direction.
     N_LOSS_PCT_OF_MAX_LOSS = "loss_pct_of_max_loss"
+    # Current structure value as a MULTIPLE of the entry premium paid on a LONG (debit)
+    # option position or spread: value = current_value / entry_premium = 1 + (profit_loss
+    # _percent / 100), riding the same _get_pnl_for_condition plumbing as
+    # loss_pct_of_max_loss. Scale-free: 1 and 5 contracts read the identical multiple.
+    # Meaningless for a credit (SELL) entry -- there is no "multiple of premium paid" when
+    # no premium was paid -- so it is UNEVALUABLE (never fires, in EITHER direction) for a
+    # credit structure, an order with no resolvable transaction, or a P&L the option-quote
+    # machinery cannot price. A PROFIT-side gate (like profit_loss_percent's ">" reading),
+    # never a stop -- see TradeActionEvaluator._LOSS_SIDE_STOP_OPERATORS, which
+    # deliberately omits it.
+    N_PROFIT_MULTIPLE_OF_PREMIUM = "profit_multiple_of_premium"
 
 
 class ExpertActionType(str, Enum):
@@ -572,7 +583,8 @@ def get_numeric_event_values():
         ExpertEventType.N_IV_TO_REALIZED_VOL.value,
         ExpertEventType.N_DAYS_TO_EARNINGS.value,
         ExpertEventType.N_DAYS_TO_EXPIRY.value,
-        ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value
+        ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value,
+        ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value
     ]
 
 

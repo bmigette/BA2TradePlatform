@@ -37,6 +37,7 @@ _FIELD_ABBR: Dict[str, str] = {
     "days_to_earnings": "toEarn",
     "days_to_expiry": "toExp",
     "loss_pct_of_max_loss": "lossOfMax",
+    "profit_multiple_of_premium": "tpMult",
     "percent_below_recent_high": "belowHigh",
     "percent_above_recent_low": "aboveLow",
     "instrument_account_share": "acctShare",

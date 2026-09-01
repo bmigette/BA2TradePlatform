@@ -350,6 +350,22 @@ def get_event_type_documentation() -> dict:
             ),
             "type": "numeric",
             "example": "Stop out once half the defined risk is gone: loss_pct_of_max_loss > 50"
+        },
+        ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value: {
+            "name": "Profit Multiple of Premium (take-profit)",
+            "description": (
+                "For an open LONG (debit) option position or spread: the current structure "
+                "value as a multiple of the entry premium PAID -- current_value / "
+                "entry_premium. A value of 3.0 means the position is now worth 3x what it "
+                "cost. Scale-free: 1 contract and 5 contracts read the identical multiple, "
+                "for any contract count. Meaningless for a CREDIT (SELL) entry -- there is "
+                "no multiple of a premium that was never paid -- so on a credit structure, "
+                "an order with no resolvable transaction, or a P&L that cannot be priced "
+                "(missing quote/multiplier) the condition is unevaluable and does NOT fire "
+                "in either direction. A profit-side (take-profit) gate, not a stop."
+            ),
+            "type": "numeric",
+            "example": "Take profit at 3x the entry premium: profit_multiple_of_premium >= 3.0"
         }
     }
 

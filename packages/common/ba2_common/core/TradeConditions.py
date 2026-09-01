@@ -1922,6 +1922,91 @@ class LossPctOfMaxLossCondition(CompareCondition):
         return f"{self.calculated_value:.2f}% of max loss"
 
 
+class ProfitMultipleOfPremiumCondition(CompareCondition):
+    """Current structure value as a MULTIPLE of the entry premium paid (LONG/debit only).
+
+    value = current_structure_value / entry_premium. ``_get_pnl_for_condition`` (single-leg
+    via ``TransactionHelper.calculate_option_pnl``, multi-leg via
+    ``_get_spread_pnl_via_transaction``) already computes ``pnl_pct = pnl_amount /
+    (entry_premium x contracts x multiplier) x 100`` for both paths, and
+    ``current_structure_value = entry_premium + pnl_amount / (contracts x multiplier)``, so:
+
+        multiple = current_structure_value / entry_premium = 1 + pnl_pct / 100
+
+    SCALE-FREE by the same construction as ``LossPctOfMaxLossCondition``: the denominator
+    the P&L machinery divides by already carries the same contract count the numerator
+    does, so 1 contract and 5 contracts read the identical multiple.
+
+    A "multiple of premium PAID" is only a coherent number for a DEBIT entry (a long
+    option, or a net-debit spread) -- there is no such multiple for a credit RECEIVED. The
+    persisted ``open_price`` is always an absolute magnitude (see
+    ``_get_spread_pnl_via_transaction``'s docstring: "a stored absolute value prices
+    identically"); the SIGN lives entirely in ``transaction.side`` -- BUY == debit ==
+    positive premium, SELL == credit == negative. So this condition refuses to evaluate,
+    NEVER firing in EITHER operator direction, whenever the transaction is not a BUY.
+    That check is a pure row read, done BEFORE the P&L fetch (which hits live option
+    quotes) -- mirroring ``LossPctOfMaxLossCondition``'s "denominator first" ordering, so a
+    credit structure costs nothing extra per bar.
+
+    UNKNOWN NEVER FIRES -- the ``DaysToExpiryCondition``/``LossPctOfMaxLossCondition``
+    discipline. No ``existing_order``, no resolvable transaction, a credit (SELL) entry, or
+    a P&L ``_get_pnl_for_condition`` cannot resolve (missing quote, missing multiplier, an
+    already-flat structure) each leave ``calculated_value`` None and ``evaluate()`` False
+    for EVERY operator. The two defaults specifically refused:
+
+    * a credit structure reads as firing (denominator sign mishandled) -> a TP fires on a
+      position that never paid a premium to be "worth a multiple of";
+    * unevaluable read as 0 -> ``profit_multiple_of_premium < N`` fires on sight for any
+      position we merely failed to price.
+
+    This is a PROFIT-side gate (like ``profit_loss_percent``'s ``>`` reading), never a
+    stop -- see ``TradeActionEvaluator._LOSS_SIDE_STOP_OPERATORS``, which deliberately
+    omits it so a rule naming this field classifies DISCRETIONARY, not forced.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                self.calculated_value = None
+                return False
+
+            from ba2_common.core.types import OrderDirection
+
+            transaction = _get_transaction_for_order(self.existing_order)
+            if transaction is None:
+                self.calculated_value = None
+                return False
+
+            # Side FIRST -- a pure row read, cheaper than the option-quote fetch
+            # _get_pnl_for_condition does, and a credit entry never qualifies.
+            if transaction.side != OrderDirection.BUY:
+                self.calculated_value = None
+                return False
+
+            pnl = _get_pnl_for_condition(self)
+            if pnl is None:
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = 1.0 + pnl['percent'] / 100.0
+            return self.operator_func(self.calculated_value, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating profit_multiple_of_premium condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if current value for {self.instrument_name} is "
+                f"{self.operator_str} {self.value}x the entry premium paid")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.2f}x"
+
+
 # Confidence Condition Implementation
 class ConfidenceCondition(CompareCondition):
     """Compare expert confidence value."""
@@ -3363,6 +3448,7 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
     ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
     ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS: LossPctOfMaxLossCondition,
+    ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM: ProfitMultipleOfPremiumCondition,
     ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
     ExpertEventType.N_DAYS_SINCE_LAST_CLOSE: DaysSinceLastCloseCondition,
     ExpertEventType.N_DAYS_SINCE_LAST_PROFITABLE_CLOSE: DaysSinceLastProfitableCloseCondition,
