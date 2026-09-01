@@ -16,8 +16,8 @@ from ...logger import logger
 from types import SimpleNamespace
 
 from ..utils.chart_helpers import (
-    axis_format, fullscreen_button, grid_options, legend_options, mode_toggle,
-    pct_of_invested,
+    axis_format, fullscreen_button, fullscreen_content_button, grid_options,
+    label_series_colors, legend_options, mode_toggle, pct_of_invested,
 )
 from ..utils.perf_logger import PerfLogger
 from ..utils.protective_stop import resolve_protective_legs
@@ -5154,6 +5154,32 @@ def _build_qty_timeline(current_qty, filled_trades, all_dates, dividends=None):
     return qty_by_date, first_purchase_date
 
 
+
+def _stored_label_colors() -> dict:
+    """``{label: stored colour}`` for the selected account, or ``{}``.
+
+    Read once per render and passed down, rather than queried per label: the charts draw
+    dozens of series and this is a single indexed read either way.
+
+    Swallowed on failure and logged: a label's COLOUR is decoration, and a chart that
+    refuses to draw because a preference could not be read is a worse outcome than one
+    drawn in the fallback palette.
+    """
+    try:
+        from ...core.portfolio_allocation_store import get_managed_labels
+        account_id = get_selected_account_id()
+        if account_id is None:
+            # "All accounts" — several accounts may colour the same label name
+            # differently and there is no basis for choosing between them, so nothing
+            # is claimed and the palette decides.
+            return {}
+        return {row.label: row.color for row in get_managed_labels(account_id)
+                if getattr(row, 'color', None)}
+    except Exception as e:  # noqa: BLE001 -- decoration must not break a chart
+        logger.warning(f"Could not read label colours: {e}")
+        return {}
+
+
 class AccountGrowthTab:
     """Account Growth tab showing balance history and dividend income charts."""
 
@@ -5285,8 +5311,8 @@ class AccountGrowthTab:
                     self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
                     self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
                     self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
-                    self._render_dividend_history_table(all_dividends)
                     self._render_per_position_section(all_positions, account_map, all_filled_trades, all_dividends)
+                    self._render_dividend_history_table(all_dividends)
             except RuntimeError:
                 return
 
@@ -5595,7 +5621,13 @@ class AccountGrowthTab:
     def _render_total_growth_chart(self, balance_history, dividends, all_filled_trades=None):
         """Render the total account growth line chart with price growth, cumulative dividends, and P/L %."""
         with ui.card().classes('w-full mb-4 p-4'):
-            ui.label('Total Account Growth').classes('text-md font-bold mb-2')
+            # The row is opened here and the fullscreen button added at the BOTTOM, once
+            # ``chart_options`` exists: this panel builds its options in one pass rather
+            # than in a rebuildable closure, so there is nothing for the button to call
+            # until then.
+            header_row = ui.row().classes('w-full items-center justify-between')
+            with header_row:
+                ui.label('Total Account Growth').classes('text-md font-bold mb-2')
 
             if not balance_history and not dividends:
                 ui.label('No balance history or dividend data available.').classes('text-sm text-gray-500')
@@ -5863,6 +5895,7 @@ class AccountGrowthTab:
                 'backgroundColor': 'transparent',
                 'tooltip': {
                     'trigger': 'axis',
+                    'order': 'valueDesc',   # highest first, not series order
                     'backgroundColor': 'rgba(37, 43, 59, 0.95)',
                     'borderColor': 'rgba(255, 255, 255, 0.1)',
                     'textStyle': {'color': '#ffffff'},
@@ -5884,6 +5917,10 @@ class AccountGrowthTab:
             }
 
             ui.echart(chart_options).classes('w-full h-96')
+            # Static options -- this panel has no toggles -- so the closure cannot go
+            # stale and a plain capture is honest here.
+            with header_row:
+                fullscreen_button(lambda: chart_options, title='Total Account Growth')
 
     def _render_growth_by_label_charts(self, all_positions, historical_prices=None, all_dividends=None, all_filled_trades=None):
         """Render historical growth line chart grouped by instrument labels."""
@@ -6075,8 +6112,18 @@ class AccountGrowthTab:
         has_any_invested = any(label_cum_invested[l][-1] > 0 for l in all_labels) if all_dates else False
 
         # Color palette for labels
-        colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0',
-                  '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
+        palette = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0',
+                   '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
+        # A label the user has COLOURED on Portfolio Allocation keeps that colour here.
+        # Cycling the palette by position meant the same label was blue on one page and
+        # orange on the other, and changed colour on THIS page as soon as another label
+        # sorted above it. Keyed by label, so it survives both.
+        stored_label_colors = _stored_label_colors()
+        colors = label_series_colors(all_labels, palette, stored_label_colors)
+        # ``colors`` is now indexed by the label's position in ``all_labels``, not by the
+        # loop's index over the VISIBLE subset -- otherwise hiding a label would recolour
+        # every one below it.
+        color_by_label = dict(zip(all_labels, colors))
 
         with ui.card().classes('w-full mb-4 p-4'):
             with ui.row().classes('w-full items-center justify-between'):
@@ -6099,7 +6146,7 @@ class AccountGrowthTab:
                 pct = mode.value == '%'
 
                 for i, label in enumerate(visible_labels):
-                    color = colors[i % len(colors)]
+                    color = color_by_label.get(label, palette[i % len(palette)])
                     # Total value = holdings value only. Dividends are NOT added: reinvested
                     # dividends are already in the share value (and counted in invested),
                     # so adding them would double-count. The dividend amount is shown as its
@@ -6171,6 +6218,10 @@ class AccountGrowthTab:
                     'backgroundColor': 'transparent',
                     'tooltip': {
                         'trigger': 'axis',
+                        # Highest value first. With five symbols x three series the list
+                        # runs to twenty rows in SERIES order, so finding the mover meant
+                        # reading all of it.
+                        'order': 'valueDesc',
                         'backgroundColor': 'rgba(37, 43, 59, 0.95)',
                         'borderColor': 'rgba(255, 255, 255, 0.1)',
                         'textStyle': {'color': '#ffffff'},
@@ -6348,7 +6399,18 @@ class AccountGrowthTab:
             start_qty = qty_timeline.get(all_dates[0], 0) if all_dates else 0
             base_invested = start_qty * cost_per_share
             sym_trades = [t for t in (all_filled_trades or []) if t.get('symbol') == sym]
-            trade_deltas = [0.0] * len(all_dates)
+            # A SELL REDUCES COST BASIS BY THE COST OF THE SHARES SOLD, at the running
+            # average — NOT by the sale proceeds. Subtracting proceeds from a COST
+            # accumulator mixes two different quantities: a profitable exit removes more
+            # than was ever put in, and a full liquidation at a gain drives "invested"
+            # NEGATIVE. That is what a margin call did here, and in % mode the resulting
+            # `value / -8 * 100` was a finite -1,200% that rescaled the chart and
+            # flattened every other series onto the axis.
+            #
+            # `_render_position_growth_chart_from_data` has always done it this way
+            # ("For sells, reduce cost at current running avg (not sale price)"); this
+            # chart is the copy that did not.
+            events_by_idx = {}
             for t in sym_trades:
                 date_val = t.get('date')
                 if not date_val:
@@ -6356,15 +6418,35 @@ class AccountGrowthTab:
                 t_date = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
                 if t_date not in date_to_idx_pos:
                     continue
-                idx = date_to_idx_pos[t_date]
-                cost = float(t.get('qty', 0)) * float(t.get('price', 0))
-                if t.get('side') == 'BUY':
-                    trade_deltas[idx] += cost
-                elif t.get('side') == 'SELL':
-                    trade_deltas[idx] -= cost
+                events_by_idx.setdefault(date_to_idx_pos[t_date], []).append(t)
             running = base_invested
+            running_shares = float(start_qty)
             for i in range(len(all_dates)):
-                running += trade_deltas[i]
+                for t in events_by_idx.get(i, []):
+                    raw_qty, raw_price = t.get('qty'), t.get('price')
+                    if raw_qty is None or raw_price is None:
+                        # A fill with no size or no price cannot be applied to a cost
+                        # basis. Reading either as 0 would silently book a free trade —
+                        # a BUY that adds shares at no cost, or a SELL of nothing — and
+                        # every later average would carry the error.
+                        logger.warning(
+                            f"Skipping {sym} trade with no qty/price in the invested "
+                            f"series: qty={raw_qty!r} price={raw_price!r}")
+                        continue
+                    qty = float(raw_qty)
+                    price = float(raw_price)
+                    if t.get('side') == 'BUY':
+                        running += qty * price
+                        running_shares += qty
+                    elif t.get('side') == 'SELL':
+                        # Clamped to what is on file: a sell of more shares than this
+                        # reconstruction knows about is a gap in the trade history, and
+                        # honouring it literally would push cost below zero — the very
+                        # state this rewrite exists to make unreachable.
+                        if running_shares > 0:
+                            sold = min(qty, running_shares)
+                            running -= sold * (running / running_shares)
+                            running_shares -= sold
                 sym_cum_invested[sym][i] = round(running, 2)
 
         colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0',
@@ -6473,6 +6555,10 @@ class AccountGrowthTab:
                     'backgroundColor': 'transparent',
                     'tooltip': {
                         'trigger': 'axis',
+                        # Highest value first. With five symbols x three series the list
+                        # runs to twenty rows in SERIES order, so finding the mover meant
+                        # reading all of it.
+                        'order': 'valueDesc',
                         'backgroundColor': 'rgba(37, 43, 59, 0.95)',
                         'borderColor': 'rgba(255, 255, 255, 0.1)',
                         'textStyle': {'color': '#ffffff'},
@@ -6590,21 +6676,39 @@ class AccountGrowthTab:
             {'name': 'account', 'label': 'Account', 'field': 'account', 'sortable': True, 'align': 'left'},
         ]
 
-        with ui.card().classes('w-full mb-4 p-4'):
-            ui.label('Dividend History (Last 6 Months)').classes('text-md font-bold mb-2')
-            total_gross = sum(r['amount'] for r in rows)
-            total_tax = sum(r['tax'] for r in rows)
-            total_net = round(total_gross - total_tax, 2)
+        total_gross = sum(r['amount'] for r in rows)
+        total_tax = sum(r['tax'] for r in rows)
+        total_net = round(total_gross - total_tax, 2)
+
+        def _body(rows_per_page: int) -> None:
+            """The panel's contents, drawn into whatever container is current.
+
+            Shared by the card and its full-screen copy, so the two cannot drift. The
+            page size is the ONE thing that differs: ten rows suit the card, and a
+            maximised dialog that still paginated at ten would be a full screen of
+            whitespace.
+            """
             if total_tax > 0:
-                ui.label(f'Gross: ${total_gross:,.2f} | Tax: ${total_tax:,.2f} | Net: ${total_net:,.2f} — {len(rows)} dividends').classes('text-sm text-gray-400 mb-2')
+                ui.label(f'Gross: ${total_gross:,.2f} | Tax: ${total_tax:,.2f} | '
+                         f'Net: ${total_net:,.2f} — {len(rows)} dividends'
+                         ).classes('text-sm text-gray-400 mb-2')
             else:
-                ui.label(f'Total: ${total_gross:,.2f} across {len(rows)} dividends').classes('text-sm text-gray-400 mb-2')
+                ui.label(f'Total: ${total_gross:,.2f} across {len(rows)} dividends'
+                         ).classes('text-sm text-gray-400 mb-2')
             ui.table(
                 columns=columns,
                 rows=rows,
                 row_key='id',
-                pagination={'rowsPerPage': 10, 'sortBy': 'date', 'descending': True},
+                pagination={'rowsPerPage': rows_per_page, 'sortBy': 'date',
+                            'descending': True},
             ).classes('w-full').props('dense')
+
+        with ui.card().classes('w-full mb-4 p-4'):
+            with ui.row().classes('w-full items-center justify-between'):
+                ui.label('Dividend History (Last 6 Months)').classes('text-md font-bold mb-2')
+                fullscreen_content_button(lambda: _body(50),
+                                          title='Dividend History (Last 6 Months)')
+            _body(10)
 
     def _render_per_position_section(self, all_positions, account_map, all_filled_trades=None,
                                      all_dividends=None):
@@ -6639,13 +6743,23 @@ class AccountGrowthTab:
             # THE SELECTOR SITS ABOVE THE CHART, like every other panel on this page.
             # It was below, so the control that decides what the chart shows was read
             # after the chart it decides.
+            #: The options of whatever is CURRENTLY drawn. A mutable holder rather than
+            #: a closure over a local, because this panel loads asynchronously: the
+            #: fullscreen button exists from page build, while the chart it reopens does
+            #: not arrive until a symbol's history has been fetched, and changes again
+            #: on every symbol change. `fullscreen_button` says so politely when it is
+            #: still None.
+            latest_options = {'value': None}
             with ui.row().classes('w-full items-center justify-between'):
                 ui.label('Per-Position Growth').classes('text-md font-bold mb-2')
-                symbol_select = ui.select(
-                    options=symbol_options,
-                    value=symbol_options[0] if symbol_options else None,
-                    label='Select Symbol'
-                ).classes('w-64')
+                with ui.row().classes('items-center gap-2'):
+                    symbol_select = ui.select(
+                        options=symbol_options,
+                        value=symbol_options[0] if symbol_options else None,
+                        label='Select Symbol'
+                    ).classes('w-64')
+                    fullscreen_button(lambda: latest_options['value'],
+                                      title='Per-Position Growth')
             chart_container = ui.column().classes('w-full')
 
             async def _load_position_chart(container, account_inst, symbol):
@@ -6680,7 +6794,7 @@ class AccountGrowthTab:
                     qty = position_qty.get(symbol, 0)
                     avg_price = position_avg_price.get(symbol, 0)
                     with container:
-                        self._render_position_growth_chart_from_data(
+                        latest_options['value'] = self._render_position_growth_chart_from_data(
                             symbol, dividends, hist_prices, qty,
                             filled_trades=filled_trades, avg_entry_price=avg_price
                         )
@@ -6689,6 +6803,10 @@ class AccountGrowthTab:
 
             def on_symbol_change(e):
                 chart_container.clear()
+                # Dropped BEFORE the fetch starts: between the click and the data
+                # arriving, the button would otherwise reopen the PREVIOUS symbol's
+                # chart under the new symbol's title.
+                latest_options['value'] = None
                 if not e.value:
                     return
                 selected_symbol = e.value
@@ -7002,6 +7120,7 @@ class AccountGrowthTab:
             },
             'tooltip': {
                 'trigger': 'axis',
+                'order': 'valueDesc',   # highest first, not series order
                 'backgroundColor': 'rgba(37, 43, 59, 0.95)',
                 'textStyle': {'color': '#ffffff'},
             },
@@ -7021,6 +7140,10 @@ class AccountGrowthTab:
         }
 
         ui.echart(chart_options).classes('w-full h-80')
+        # Handed back so the PANEL (which owns the fullscreen button and is built
+        # long before this async load finishes) can reopen exactly what is on
+        # screen, for whichever symbol is currently selected.
+        return chart_options
 
 
 def content() -> None:

@@ -420,7 +420,9 @@ BASELINE: dict = {
     "ba2_trade_platform/modules/accounts/IBKRAccount.py": 2,
     "ba2_trade_platform/modules/accounts/TastyTradeAccount.py": 5,
     "ba2_trade_platform/ui/pages/marketanalysishistory.py": 1,
-    "ba2_trade_platform/ui/pages/overview.py": 17,
+    # 17 -> 16: the invested-series accumulator now SKIPS a trade with no qty or
+    # price instead of reading either as 0, which would book a free trade.
+    "ba2_trade_platform/ui/pages/overview.py": 16,
     "ba2_trade_platform/ui/pages/settings.py": 2,
     "ba2_trade_platform/ui/pages/tools.py": 1,
     "ba2_trade_platform/ui/utils/portfolio_allocation_view.py": 3,
@@ -453,7 +455,7 @@ BASELINE: dict = {
     "testplatform/backend/app/services/backtest_handler.py": 1,
     "testplatform/backend/app/services/strategy_optimization_handler.py": 1,
 }
-BASELINE_TOTAL = 176
+BASELINE_TOTAL = 175
 
 
 # =========================================================================== #

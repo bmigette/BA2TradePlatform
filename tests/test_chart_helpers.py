@@ -9,6 +9,7 @@ import pytest
 
 from ba2_trade_platform.ui.utils.chart_helpers import (
     AXIS_FORMAT_MONEY,
+    label_series_colors,
     AXIS_FORMAT_PCT,
     LEGEND_SCROLL_THRESHOLD,
     axis_format,
@@ -101,3 +102,67 @@ def test_a_paginated_legend_needs_only_one_rows_worth_of_space():
     three_hundred = grid_options([f'L{i}' for i in range(300)])
 
     assert thirty['top'] == three_hundred['top']
+
+
+# ---------------------------------------------------------------------------
+# A NEGATIVE denominator — the margin-call spike
+# ---------------------------------------------------------------------------
+
+def test_a_negative_invested_base_is_a_gap_not_a_huge_negative_percent():
+    """Reported: one day dropped to -1,200% and flattened every other series onto the
+    axis. A cost accumulator that reduced on a sale by the PROCEEDS rather than by the
+    cost of the shares sold went below zero on a profitable forced liquidation, and
+    ``value / -8 * 100`` is a perfectly finite -1,200%.
+
+    A percentage OF a negative capital base is not a large number; it is not a quantity.
+    """
+    assert pct_of_invested([100.0], [-8.0]) == [None]
+
+
+def test_the_series_around_the_gap_is_untouched():
+    """Only the unmeasurable point breaks; the chart keeps its scale."""
+    values = [110.0, 120.0, 100.0, 130.0]
+    invested = [100.0, 100.0, -8.0, 100.0]
+
+    assert pct_of_invested(values, invested) == [110.0, 120.0, None, 130.0]
+
+
+# ---------------------------------------------------------------------------
+# Label colours shared with Portfolio Allocation
+# ---------------------------------------------------------------------------
+
+PALETTE = ['#111111', '#222222', '#333333']
+
+
+def test_a_label_coloured_on_the_allocation_page_keeps_that_colour():
+    colors = label_series_colors(['A', 'B'], PALETTE, {'A': '#FF9800'})
+
+    assert colors[0] == '#FF9800'
+
+
+def test_an_uncoloured_label_falls_back_to_the_palette_by_position():
+    colors = label_series_colors(['A', 'B', 'C'], PALETTE, {})
+
+    assert colors == PALETTE
+
+
+def test_a_stored_colour_does_not_shift_the_palette_for_its_neighbours():
+    """Position-based fallback stays keyed on the label's own index, so colouring one
+    label cannot recolour the ones after it."""
+    colors = label_series_colors(['A', 'B', 'C'], PALETTE, {'B': '#FF9800'})
+
+    assert colors == ['#111111', '#FF9800', '#333333']
+
+
+def test_an_unparseable_stored_colour_uses_the_palette_rather_than_grey():
+    """``resolve_label_icon_color`` answers the neutral grey for anything it cannot
+    parse -- right for an icon, wrong for a chart, where three unparseable labels would
+    become three identical grey lines."""
+    colors = label_series_colors(['A', 'B'], PALETTE, {'A': 'not-a-colour',
+                                                       'B': 'also-bad'})
+
+    assert colors == ['#111111', '#222222']
+
+
+def test_no_stored_colours_at_all_is_the_plain_palette():
+    assert label_series_colors(['A', 'B'], PALETTE, None) == ['#111111', '#222222']
