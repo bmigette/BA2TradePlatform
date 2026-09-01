@@ -521,19 +521,14 @@ def test_an_unmeasurable_max_loss_fails_CLOSED_against_a_ceiling():
 
 
 def test_an_UNBOUNDED_max_loss_is_charged_notional_not_excluded():
-    """§8.3 CONFORMANCE. When undefined risk is permitted the design charges spot x 100 --
-    the cash-secured-put treatment -- rather than refusing. Excluding it here would make
-    the ceiling silently override allow_undefined_risk_options, so a permitted naked short
-    could never be selected at all and the setting would read as working while doing
-    nothing."""
-    def _naked_short_put(c):
-        return [PayoffLeg(kind="put", side=OrderDirection.SELL, premium=c.mid,
-                          strike=c.strike)]
-
+    """§8.3 CONFORMANCE. When undefined risk is permitted the design charges a notional --
+    rather than refusing. Excluding it here would make the ceiling silently override
+    allow_undefined_risk_options, so a permitted naked short could never be selected at
+    all and the setting would read as working while doing nothing."""
     cands = [_c(100, 2.90, 3.10, 0.30)]
     ctx = PolicyContext(strike_method="delta", today=date(2026, 1, 1), target=0.30,
-                        structure_fn=_naked_short_put, spot=100.0,
-                        undefined_risk_notional=10_000.0,   # spot x 100
+                        structure_fn=_naked_short_call, spot=100.0,
+                        undefined_risk_notional=10_000.0,
                         max_loss_ceiling=12_000.0)
     assert pick(cands, ctx, SelectionPolicy()) is not None
 
@@ -544,16 +539,26 @@ def test_an_UNBOUNDED_max_loss_is_charged_notional_not_excluded():
 def test_an_UNBOUNDED_max_loss_is_excluded_when_undefined_risk_is_NOT_permitted():
     """undefined_risk_notional=None is the default and means 'not permitted here', which
     is §8.3's default refusal -- not an oversight to be papered over with a guess."""
-    def _naked_short_put(c):
-        return [PayoffLeg(kind="put", side=OrderDirection.SELL, premium=c.mid,
-                          strike=c.strike)]
-
     cands = [_c(100, 2.90, 3.10, 0.30)]
     ctx = PolicyContext(strike_method="delta", today=date(2026, 1, 1), target=0.30,
-                        structure_fn=_naked_short_put, spot=100.0,
+                        structure_fn=_naked_short_call, spot=100.0,
                         max_loss_ceiling=1_000_000.0)
     assert pick(cands, ctx, SelectionPolicy()) is None
 ```
+
+> **USE A SHORT CALL, NOT A SHORT PUT, TO REACH THE UNBOUNDED BRANCH.** A naked short PUT's
+> loss is BOUNDED — the underlying cannot go below zero, so the worst case is
+> `(strike − credit) × 100` and `max_loss` returns `MEASURED`. `upside_slope`, the only route
+> to `UNBOUNDED`, sums calls and stock only; a short put contributes nothing to it. An earlier
+> draft of this plan used `_naked_short_put` here, which would have exercised the MEASURED path
+> while claiming to test the unbounded one — a test that passes for the wrong reason and leaves
+> the branch it names unpinned. Define the helper as:
+>
+> ```python
+> def _naked_short_call(c):
+>     return [PayoffLeg(kind="call", side=OrderDirection.SELL, premium=c.mid,
+>                       strike=c.strike)]
+> ```
 
 > **This pair of tests is a CORRECTION to the first draft of this plan, not an addition.**
 > The draft filtered on `_payoff_pair(c, ctx)[1] or float("inf")`, which collapses `UNBOUNDED`
@@ -724,6 +729,52 @@ def test_every_emitted_weight_can_actually_move_the_pick():
     GA burns budget on and can never move -- the failure this codebase has already paid for
     twice (the dead roll gene; the trial-config whitelist dropping new knobs)."""
 ```
+
+> **APPLICABILITY IS PER-CHAIN, NOT PER-STRUCTURE — this changes how the guard test must be
+> written.** (Discovered building Tasks 2-4, 2026-08-30.)
+>
+> `inapplicable_features` is sensitive to a SINGLE candidate's payoff shape: if *any* candidate
+> in the set is off-scale, the whole column goes inert (that is the fix for the mixed-shape
+> demotion hole — see the design's applicability section). So `w_profit`/`w_rr` can flip between
+> live and inert for the same rule as the chain changes from bar to bar.
+>
+> Two consequences:
+>
+> 1. **The guard test must use a chain on which the feature is genuinely applicable**, or it
+>    fails for a reason that has nothing to do with the gene being dead. Assert applicability
+>    first (`inapplicable_features(...) == ()`), then assert the weight moves the pick. A guard
+>    test that cannot tell "dead gene" from "inert on this particular chain" is worse than none.
+> 2. **"Emit only where the payoff is bounded on the side they read" is a statement about the
+>    BUILDER's shape, not about any one chain.** A single-shape builder (every credit vertical
+>    completes to a credit vertical) has a stable answer and is what the emission rule keys on.
+>    Only a builder whose `structure_fn` returns different shapes per candidate has a varying
+>    one — no builder does that today, and if one is ever added, its genes need re-examining
+>    rather than the emission rule being loosened.
+>
+> The variance is correct behaviour — the alternative is demoting long calls — but it means the
+> two genes' effective search pressure is a function of chain composition, which is worth
+> knowing before reading GA results that use them.
+>
+> **Two further consequences for whoever wires `pick()` into `TradeActions`:**
+>
+> 3. **Compute `payoff_columns` ONCE and pass it to both** `feature_matrix` and
+>    `inapplicable_features` via their `payoff=` parameter. They are each a full payoff pass —
+>    measured 5039 µs and 5018 µs respectively on a 200-row chain — so a caller doing both
+>    without sharing pays twice. Sharing also closes an INPUT-drift hole that the shared
+>    predicate does not: the two entry points otherwise invoke `structure_fn` separately, so a
+>    stateful or non-deterministic closure can make the applicability report disagree with the
+>    behaviour it reports on.
+> 4. **Wire the runtime applicability report before the GA turns these weights up.** A builder
+>    that falls back to a bare long call when no wing is available silently takes the whole
+>    column inert for that pick, and today nothing records it. Without the report, an inert gene
+>    and a live-but-unhelpful one look identical in the results.
+>
+> **Cost note for grid planning:** with both weights non-zero the two features measure ~5039 µs
+> per pick on a 200-row chain, against 388.8 µs for all five original genes combined and 27.1 µs
+> for the legacy selector — roughly 13× all five together. `score_all` skips zero-weighted
+> features entirely, so the default policy and any trial leaving these at zero pay nothing; but
+> trials carrying them will be materially slower than trials that do not, which matters when
+> comparing wall-clock across a stage-2 population.
 
 Before wiring, **re-read `reference-trial-config-whitelist-drops-new-knobs`**:
 `_build_daily_trial_config` rebuilds the config key by key, so a knob missing there is inert while

@@ -716,76 +716,11 @@ class DailyBacktestEngine:
             if book_dirty:
                 self.account.invalidate_order_cache()
 
-            # 4. fills on THIS bar's working orders; roll order state into transactions.
-            #     A transaction changes state when one of its orders fills, when a bracket
-            #     crosses, OR when an option DAY-limit EXPIRES unfilled (refresh_orders folds
-            #     the expiry sweep into its signal — the roll is what releases the parent
-            #     WAITING Transaction so the dup gate frees the symbol; F1). On a bar with none
-            #     of those the roll + bracket pass are no-ops; on a 5-minute fill clock almost
-            #     every bar qualifies, and the roll (incl. the ba2_common base
-            #     sync_transaction_orders) + bracket pass were ~half of per-bar runtime
-            #     (profiled), so gate them on the change signal.
-            filled = self.account.refresh_orders()
-            if filled:
-                self.account.refresh_transactions()
-
-            # 4a-pre. Post-assignment liquidation from a PRIOR bar's expiry: a short option
-            #     is always PHYSICALLY assigned, and the assigned stock is unmanaged in a
-            #     backtest — close ALL of it at THIS bar's open (before this bar's expiries
-            #     settle). One dict check when nothing is pending; equity-only runs never
-            #     schedule any.
-            #
-            #     THIS RUNS AFTER THE MANAGE PASS (step 3), which is why the wheel needs
-            #     ``hold_assigned_stock``: the overlay writes a covered call against the
-            #     assigned shares in step 3 and this would sell them on the same bar,
-            #     leaving a naked short call. With the switch on nothing is ever scheduled,
-            #     so this stays the same single dict check.
-            if hasattr(self.account, "process_pending_assignment_liquidations"):
-                try:
-                    self.account.process_pending_assignment_liquidations()
-                except Exception as e:  # noqa: BLE001 — cleanup failure must not abort the run
-                    self._log(f"assignment liquidation failed @ {as_of_dt}: {e}")
-
-            # 4a. resolve any option positions reaching expiry on THIS bar (no-orphaned-stock
-            #     backtest policy — see BacktestAccount.settle_single_leg_expiry): OTM ->
-            #     worthless; ITM long -> NEVER exercised, sold to close at the expiry
-            #     premium (intrinsic fallback) — no shares; ITM short -> ALWAYS physically
-            #     assigned (shares at the strike), with the assigned stock liquidated at
-            #     the next bar's open (4a-pre above).
-            #     Defined-risk combos unit-settle as a group instead. Runs after the
-            #     transaction roll (so freshly-OPENED option positions are visible) and before
-            #     snapshot_equity (so the resulting equity position is marked this bar).
-            #     Date-driven (an option can expire on a no-fill bar), so it runs every bar —
-            #     but get_option_positions() short-circuits to [] for equity-only runs (no
-            #     options provider), so this is ~free there. Early American assignment is NOT
-            #     modelled — options resolve at expiry.
-            self._apply_option_expiry(as_of_dt)
-
-            # 4a-bis. Broker-style maintenance-margin check + forced liquidation. After marking
-            #     this bar, if net-liquidating-value has fallen below the book's maintenance-margin
-            #     requirement (or below zero), force-close the unbounded SHORT exposure at the
-            #     current bar so equity cannot blow arbitrarily negative (the -256% drawdown).
-            #     Gated behind the account's own breach check (no work on healthy bars), so it adds
-            #     no per-bar DB churn on the common no-breach path. Runs BEFORE snapshot_equity so
-            #     the bounded post-liquidation equity is what the curve records.
-            if getattr(self.account, "supports_options", False) and hasattr(
-                self.account, "maybe_margin_call_liquidation"
-            ):
-                try:
-                    if self.account.maybe_margin_call_liquidation():
-                        self.account.invalidate_order_cache()
-                except Exception as e:  # noqa: BLE001 — a liquidation failure must not abort the run
-                    self._log(f"margin-call liquidation failed @ {as_of_dt}: {e}")
-
-            # 4b. (removed) The engine no longer attaches a baseline "Position protection" TP/SL
-            #     bracket on entry. Exits are driven SOLELY by the strategy's exit conditions
-            #     (adjust_take_profit / adjust_stop_loss / close / sell), evaluated by the SAME
-            #     shared engine the LIVE platform uses — where TP/SL are CREATED on demand when an
-            #     adjust rule fires (AlpacaAccount.adjust_tp_sl creates/updates), not pre-bracketed.
-            #     A strategy with no exit conditions therefore holds (matches live). If the roll
-            #     touched orders this bar, reload the cache so the next bar's fill engine sees them.
-            if filled:
-                self.account.invalidate_order_cache()
+            # 4..4b. fills on THIS bar, the settlement passes (assignment
+            #     liquidation / option expiry / margin call) and the transaction
+            #     roll — extracted into _fills_and_settlements so the bar tail is
+            #     testable on its own.
+            self._fills_and_settlements(as_of_dt)
 
             # 4c. the option sleeve's drawdown circuit breaker, once per bar, for a
             #     ``classic_options`` expert and no other. Until 2026-09-01 the breaker
@@ -1411,8 +1346,108 @@ class DailyBacktestEngine:
             self._log(f"bypass rebalance failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
 
     # -- option expiry / exercise / assignment ------------------------------
-    def _apply_option_expiry(self, as_of: datetime) -> None:
+    def _fills_and_settlements(self, as_of_dt: datetime) -> None:
+        """Steps 4..4b of one bar: fills, settlement passes, and the transaction roll.
+
+        Extracted verbatim from ``run()`` so the bar tail is testable on its own.
+        """
+        # 4. fills on THIS bar's working orders; roll order state into transactions.
+        #     A transaction changes state when one of its orders fills, when a bracket
+        #     crosses, OR when an option DAY-limit EXPIRES unfilled (refresh_orders folds
+        #     the expiry sweep into its signal — the roll is what releases the parent
+        #     WAITING Transaction so the dup gate frees the symbol; F1). On a bar with none
+        #     of those the roll + bracket pass are no-ops; on a 5-minute fill clock almost
+        #     every bar qualifies, and the roll (incl. the ba2_common base
+        #     sync_transaction_orders) + bracket pass were ~half of per-bar runtime
+        #     (profiled), so gate them on the change signal.
+        filled = self.account.refresh_orders()
+        if filled:
+            self.account.refresh_transactions()
+
+        # Settlement change signal (review 2026-08-30 F8). The three passes below run
+        # AFTER the roll above and write synthetic FILLED orders of their own — the
+        # assignment paths in particular book a closing fill on an offsetting EQUITY
+        # transaction and rely on the roll to CLOSE it. Gating the roll on ``filled``
+        # alone left that transaction OPENED on a quiet bar until any later fill
+        # anywhere, and ``_has_open_or_waiting_position`` locked the symbol out of
+        # re-entry for an arbitrary time (O_CC/O_WHEEL arms). Mirror of the F1
+        # precedent: each pass reports whether it changed the book, and a second roll
+        # runs after 4a-bis when any did. A fills-only bar keeps the single roll above.
+        settled = False
+
+        # 4a-pre. Post-assignment liquidation from a PRIOR bar's expiry: a short option
+        #     is always PHYSICALLY assigned, and the assigned stock is unmanaged in a
+        #     backtest — close ALL of it at THIS bar's open (before this bar's expiries
+        #     settle). One dict check when nothing is pending; equity-only runs never
+        #     schedule any.
+        #
+        #     THIS RUNS AFTER THE MANAGE PASS (step 3), which is why the wheel needs
+        #     ``hold_assigned_stock``: the overlay writes a covered call against the
+        #     assigned shares in step 3 and this would sell them on the same bar,
+        #     leaving a naked short call. With the switch on nothing is ever scheduled,
+        #     so this stays the same single dict check.
+        if hasattr(self.account, "process_pending_assignment_liquidations"):
+            try:
+                if self.account.process_pending_assignment_liquidations():
+                    settled = True
+            except Exception as e:  # noqa: BLE001 — cleanup failure must not abort the run
+                self._log(f"assignment liquidation failed @ {as_of_dt}: {e}")
+
+        # 4a. resolve any option positions reaching expiry on THIS bar (no-orphaned-stock
+        #     backtest policy — see BacktestAccount.settle_single_leg_expiry): OTM ->
+        #     worthless; ITM long -> NEVER exercised, sold to close at the expiry
+        #     premium (intrinsic fallback) — no shares; ITM short -> ALWAYS physically
+        #     assigned (shares at the strike), with the assigned stock liquidated at
+        #     the next bar's open (4a-pre above).
+        #     Defined-risk combos unit-settle as a group instead. Runs after the
+        #     transaction roll (so freshly-OPENED option positions are visible) and before
+        #     snapshot_equity (so the resulting equity position is marked this bar).
+        #     Date-driven (an option can expire on a no-fill bar), so it runs every bar —
+        #     but get_option_positions() short-circuits to [] for equity-only runs (no
+        #     options provider), so this is ~free there. Early American assignment is NOT
+        #     modelled — options resolve at expiry.
+        if self._apply_option_expiry(as_of_dt):
+            settled = True
+
+        # 4a-bis. Broker-style maintenance-margin check + forced liquidation. After marking
+        #     this bar, if net-liquidating-value has fallen below the book's maintenance-margin
+        #     requirement (or below zero), force-close the unbounded SHORT exposure at the
+        #     current bar so equity cannot blow arbitrarily negative (the -256% drawdown).
+        #     Gated behind the account's own breach check (no work on healthy bars), so it adds
+        #     no per-bar DB churn on the common no-breach path. Runs BEFORE snapshot_equity so
+        #     the bounded post-liquidation equity is what the curve records.
+        if getattr(self.account, "supports_options", False) and hasattr(
+            self.account, "maybe_margin_call_liquidation"
+        ):
+            try:
+                if self.account.maybe_margin_call_liquidation():
+                    settled = True
+                    self.account.invalidate_order_cache()
+            except Exception as e:  # noqa: BLE001 — a liquidation failure must not abort the run
+                self._log(f"margin-call liquidation failed @ {as_of_dt}: {e}")
+
+        # 4b. (removed) The engine no longer attaches a baseline "Position protection" TP/SL
+        #     bracket on entry. Exits are driven SOLELY by the strategy's exit conditions
+        #     (adjust_take_profit / adjust_stop_loss / close / sell), evaluated by the SAME
+        #     shared engine the LIVE platform uses — where TP/SL are CREATED on demand when an
+        #     adjust rule fires (AlpacaAccount.adjust_tp_sl creates/updates), not pre-bracketed.
+        #     A strategy with no exit conditions therefore holds (matches live). If the roll
+        #     touched orders this bar, reload the cache so the next bar's fill engine sees them.
+        # F8: the settlement passes wrote synthetic FILLED orders — roll them into
+        # their transactions NOW (same bar), not on the next unrelated fill. After
+        # 4a-bis so ONE roll covers all three passes; a fills-only bar keeps the single
+        # roll at the top (no double roll), and a no-event bar still rolls nothing.
+        if settled:
+            self.account.refresh_transactions()
+        if filled or settled:
+            self.account.invalidate_order_cache()
+
+    def _apply_option_expiry(self, as_of: datetime) -> bool:
         """Resolve every held option position that has reached its expiry.
+
+        Returns True when at least one position/combo actually settled (synthetic
+        orders/transactions were written) — ``_fills_and_settlements`` feeds this into
+        the transaction-roll change signal (review 2026-08-30 F8).
 
         For each held option whose ``expiry <= as_of.date()`` the engine reads the
         underlying's bar CLOSE; defined-risk combos unit-settle as a group, everything else
@@ -1434,6 +1469,7 @@ class DailyBacktestEngine:
         caught + logged so one bad expiry cannot abort the run (matching the per-bar style).
         """
         as_of_date = as_of.date() if isinstance(as_of, datetime) else as_of
+        settled_any = False
         positions = self.account.get_option_positions()
 
         # DEFINED-RISK multi-leg combos (butterfly / verticals / iron condor) must settle as a
@@ -1469,7 +1505,8 @@ class DailyBacktestEngine:
                         f"(combo {legs[0].contract_symbol}) @ {as_of_date} — skipped"
                     )
                     continue
-                self.account.settle_defined_risk_combo_expiry(legs, float(spot))
+                if self.account.settle_defined_risk_combo_expiry(legs, float(spot)):
+                    settled_any = True
             except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run
                 self._log(f"combo option expiry failed @ {as_of_date}: {e}")
 
@@ -1486,11 +1523,13 @@ class DailyBacktestEngine:
                 # sell-to-close, never exercise / short ITM -> physical assignment with the
                 # stock liquidated at the next bar's open) — see
                 # BacktestAccount.settle_single_leg_expiry.
-                self.account.settle_single_leg_expiry(pos, float(spot))
+                if self.account.settle_single_leg_expiry(pos, float(spot)):
+                    settled_any = True
             except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run
                 self._log(
                     f"option expiry failed for {pos.contract_symbol} @ {as_of_date}: {e}"
                 )
+        return settled_any
 
     def _update_option_breakers(self) -> None:
         """Transition every ``classic_options`` sleeve's drawdown breaker for this bar.

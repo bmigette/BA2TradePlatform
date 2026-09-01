@@ -60,8 +60,8 @@ def test_the_collateral_comes_from_the_reserve_helper_not_a_second_formula():
     for kwargs in (
         {"strategy": "cash_secured_put", "strike": 50.0},
         {"strategy": "bear_call_spread", "spread_width": 5.0, "net_credit": 1.0},
-        {"strategy": "short_strangle", "strike": 100.0, "spot": 100.0,
-         "option_type": OptionRight.PUT},
+        {"strategy": "short_strangle", "strike": 100.0, "call_strike": 110.0,
+         "spot": 100.0, "put_premium": 2.0, "call_premium": 1.5},
         {"strategy": "jade_lizard", "strike": 290.0, "spread_width": 17.5, "net_credit": 3.04},
     ):
         strategy = kwargs.pop("strategy")

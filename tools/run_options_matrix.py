@@ -132,6 +132,9 @@ def main() -> int:
                          "walk-forward holdout and the launcher refuses to search into it).")
     ap.add_argument("--population", type=int, default=40)
     ap.add_argument("--generations", type=int, default=8)
+    ap.add_argument("--early-stop", type=int, default=None,
+                    help="Generations without improvement before a job stops (spec stage 1: 8). "
+                         "Omitted -> launcher default.")
     ap.add_argument("--mutation-prob", type=float, default=None,
                     help="Per-gene mutation probability passthrough (default: launcher's).")
     ap.add_argument("--interval", default="1d",
@@ -139,9 +142,10 @@ def main() -> int:
     ap.add_argument("--fitness", default=None,
                     help="Fitness metric forced on EVERY job. Default: omitted, so each job "
                          "gets ba2test_launcher's per-strategy-kind auto-resolution "
-                         "(consistent_annual_return for pure-option kinds OS1-4/O_*, "
-                         "sharpe_ratio for O_CC/O_PP/O_STK) -- passing this flag here "
-                         "overrides that auto-resolution uniformly for the whole matrix.")
+                         "(option_consistent_annual_return for pure-option kinds OS1-4/O_* "
+                         "AND the equity-entry overlays O_CC/O_PP, sharpe_ratio for O_STK -- "
+                         "see _resolve_fitness/_OPTION_CAR_STRATEGIES) -- passing this flag "
+                         "here overrides that auto-resolution uniformly for the whole matrix.")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f} — options "
                          "need more headroom than the equity grid's 10k).")
@@ -182,6 +186,10 @@ def main() -> int:
     ap.add_argument("--fitness-win-rate-factor", action="store_true",
                     help="Multiply a positive fitness by 2 x win_rate_fraction. Passed through "
                          "to `ba2-test optimize`.")
+    ap.add_argument("--launcher", default=None,
+                    help="Path to the launcher executable (or ba2test_launcher.py). Default: "
+                         "the ba2-test installed next to the Python interpreter. Point this at "
+                         "a WORKTREE launcher to run code different from the editable install.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--screener-gate-store", default=None,
                     help="Attach this parquet metric store as a GATE-ONLY per-bar entry gate on "
@@ -195,10 +203,12 @@ def main() -> int:
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     universe = _universe()
-    exe = os.path.join(os.path.dirname(sys.executable), "ba2-test.exe")
-    if not os.path.exists(exe):
-        exe = os.path.join(os.path.dirname(sys.executable), "ba2-test")
 
+    launcher = args.launcher
+    if not launcher:
+        launcher = os.path.join(os.path.dirname(sys.executable), "ba2-test.exe")
+        if not os.path.exists(launcher):
+            launcher = os.path.join(os.path.dirname(sys.executable), "ba2-test")
     jobs = list(_jobs(experts, strategies, args.name_suffix))
     done = _completed_names()
     print(f"options matrix: {len(jobs)} jobs (experts={experts}, strategies={strategies}, "
@@ -213,7 +223,7 @@ def main() -> int:
         if name in _completed_names():   # re-read each loop (resumable)
             print(f"[{i}/{len(jobs)}] SKIP {name} (already completed)", flush=True)
             continue
-        cmd = [exe, "optimize", "--expert", expert, "--universe", universe,
+        cmd = ([sys.executable, launcher] if launcher.endswith(".py") else [launcher]) + ["optimize", "--expert", expert, "--universe", universe,
                "--strategy", strat,
                "--start", args.start, "--end", args.end,
                "--interval", args.interval, "--population", str(args.population),
@@ -225,9 +235,12 @@ def main() -> int:
         cmd += _gate_passthrough(args)
         if args.fitness:
             # Explicit override forces this metric uniformly; omitted (default) lets
-            # ba2test_launcher's _resolve_fitness() pick per-strategy-kind (pure-option ->
-            # option_consistent_annual_return, O_CC/O_PP/O_STK -> sharpe_ratio).
+            # ba2test_launcher's _resolve_fitness() pick per-strategy-kind (pure-option AND
+            # the equity-entry overlays O_CC/O_PP -> option_consistent_annual_return, O_STK ->
+            # sharpe_ratio).
             cmd += ["--fitness", args.fitness]
+        if args.early_stop is not None:
+            cmd += ["--early-stop", str(args.early_stop)]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
         # "Pass 0 to disable" (see the --profit-cap-pct help): a 0 must be FORWARDED, because

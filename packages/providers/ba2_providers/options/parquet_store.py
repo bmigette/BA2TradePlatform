@@ -153,7 +153,25 @@ class OptionHistoryParquetStore:
         got_start, got_end = m.get("start"), m.get("end")
         if not got_start or not got_end:
             return PartitionState.STALE
-        if got_start > start.isoformat() or got_end < end.isoformat():
+        # THE END WE NEED IS min(end, expiry), NOT end. A contract cannot print a bar
+        # after it expires, so once a partition has been fetched through its own expiry
+        # it is FINAL -- a later window end asks for days on which this contract did not
+        # exist, and re-fetching them can only return the same rows or fewer.
+        #
+        # Comparing against the raw `end` instead is how a whole cache re-downloads
+        # itself. The warmup defaults its window end to TODAY, so every run moved `end`
+        # forward, every already-complete partition compared STALE, and the fetcher
+        # re-pulled the entire store: measured 2026-08-30, 820 of 857 symbols and 1,576
+        # partitions rewritten in ~35 minutes of a run nobody asked for.
+        #
+        # That is not merely wasted bandwidth. `write_partition` DELETES the existing
+        # parquet when a re-fetch returns no rows, so a partition that was good becomes
+        # `status="empty"` the moment the vendor declines to resolve its (long-dead)
+        # contracts -- which dxfeed routinely does for expired options. Staleness that
+        # cannot be satisfied is a data-loss loop: it re-fetches forever and degrades a
+        # little more each pass.
+        needed_end = min(end, expiry)
+        if got_start > start.isoformat() or got_end < needed_end.isoformat():
             # Covers less than what is being asked for now.
             return PartitionState.STALE
         status = m.get("status")

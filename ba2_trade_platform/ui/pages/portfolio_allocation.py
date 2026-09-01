@@ -143,6 +143,9 @@ from ..utils.portfolio_allocation_view import (
     fill_label_to_100, fill_rest_symbol_shares,
     format_allocation_footer, format_label_header,
     format_label_target_tooltip,
+    delta_color,
+    format_base_composition,
+    format_delta,
     format_reserve_caption,
     format_reserve_row, label_color_contrast_warning,
     ALLOCATION_BAR_LEGEND, allocation_bar, band_color, RESERVE_SELL_WARNING,
@@ -156,6 +159,7 @@ from ..utils.portfolio_allocation_view import (
     positions_by_symbol,
     resolve_label_icon_color, resolve_symbol_weights,
     sort_label_views, store_color_value,
+    symbol_delta,
     symbol_target_values,
     validate_label_target_edit, validate_reserve_edit, validate_symbol_weight_edit,
     wipe_symbol_shares, working_orders_notice,
@@ -243,7 +247,8 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
         PositionFetchFailed: the broker position fetch failed (NOT a flat account).
         RuntimeError: the account could not be instantiated.
     """
-    from ...core.utils import get_account_instance_from_id, get_symbols_by_label
+    from ...core.utils import (get_account_instance_from_id, get_company_names,
+                               get_symbols_by_label)
 
     # ``previous_target_pct`` travels with the label, NULL and all: it is what the
     # row prints as "last N%" and what the page's Load-last reads, and a ``or 0.0``
@@ -337,6 +342,10 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
                                    base_notional=base_notional,
                                    symbol_weights=weights,
                                    symbol_previous_weights=previous_weights,
+                                   # One indexed query over the managed set, not one per
+                                   # row: the ⓘ tooltip is the only consumer and it is
+                                   # not worth a lookup per cell.
+                                   company_names=get_company_names(symbols),
                                    unallocated_pct=unallocated_pct),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
@@ -854,6 +863,31 @@ def _label_targets(live: Dict[str, Any]) -> Dict[str, float]:
     return {v.label: float(v.target_pct or 0.0) for v in live['views']}
 
 
+def _write_row_deltas(row: Dict[str, Any]) -> None:
+    """Stamp one table row with its three live deltas, formatted and coloured. In place.
+
+    ONE writer, called from the initial row build AND from every recalculation, so a
+    delta can never be left describing a figure that has since moved. Formatting happens
+    here rather than in the Quasar template because "which of these is unmeasurable" is
+    a decision, and decisions do not belong in a cell slot -- the template only picks a
+    colour and prints a string.
+    """
+    delta = symbol_delta(weight_pct=row.get('weight_pct'),
+                         pct_of_label=row.get('pct_of_label'),
+                         target_value=row.get('target_value'),
+                         current_value=row.get('current_value'),
+                         quantity=row.get('quantity'),
+                         price=row.get('price'))
+    row['share_delta'] = format_delta(delta.share, suffix='pp')
+    row['share_delta_color'] = delta_color(delta.share)
+    row['value_delta'] = format_delta(delta.value)
+    row['value_delta_color'] = delta_color(delta.value)
+    # 4dp on the quantity: these are fractional-share accounts (the screenshot's own
+    # rows hold 25.4595 and 3.7515), and 2dp would round a real change to +0.00.
+    row['qty_delta'] = format_delta(delta.quantity, places=4)
+    row['qty_delta_color'] = delta_color(delta.quantity)
+
+
 def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
     """Rewrite one label's Share-of-label % and Target value cells. In place.
 
@@ -880,6 +914,9 @@ def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
         row['weight_pct'] = round(float(weights[symbol]), 2)
         value = values.get(symbol)
         row['target_value'] = None if value is None else round(value, 2)
+        # The live deltas, recomputed from the SAME two numbers the cells above were
+        # just written from, so the figure and the change beside it cannot disagree.
+        _write_row_deltas(row)
     table.update()
     # The label's own share-of-100 bar, from the SAME map the cells were written
     # from -- so the picture and the column cannot disagree about the total.
@@ -1994,6 +2031,10 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     rows = [{
         'flag': '⚠' if r.multi_label else '',
         'symbol': r.symbol,
+        # '' rather than None: the ⓘ template tests it with ``v-if`` to decide whether
+        # there is a second line to draw, and Quasar prints a bare ``null`` if it is
+        # handed one. An unnamed instrument shows the symbol alone.
+        'company_name': r.company_name or '',
         # KEPT although the Labels COLUMN is gone: the ⚠ cell's tooltip is now the
         # only place a symbol's other managed labels are named, and it reads this.
         'labels': ', '.join(r.labels),
@@ -2025,6 +2066,11 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         'comment': r.comment or '',
     } for r in view.rows]
 
+    # The deltas, stamped through the SAME writer the edit path uses, so the first
+    # render and every later one agree about what a change looks like.
+    for row in rows:
+        _write_row_deltas(row)
+
     # The LABELS column is gone. Every row inside a label's own section repeated the
     # same value, and the section header already says which label this is; the one
     # case where the value differs -- a symbol carrying two managed labels -- is
@@ -2044,7 +2090,12 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # "Share of label %", not "Target %": the label header above prints a target
         # too, and that one is a share of the PORTFOLIO. Two different quantities
         # under one word is what made "target 0.0%" over a column of 20s look wrong.
-        {'name': 'weight_pct', 'label': 'Share of label %', 'field': 'weight_pct', 'sortable': True, 'align': 'right'},
+        # NARROWED. The cell holds a number box, not prose, and at its natural width the
+        # header text was setting the column -- pushing the money columns, which the eye
+        # actually compares down the page, off to the right.
+        {'name': 'weight_pct', 'label': 'Share of label %', 'field': 'weight_pct',
+         'sortable': True, 'align': 'right', 'style': 'width: 108px',
+         'headerStyle': 'width: 108px; white-space: normal'},
         # "Last %", immediately after the box it is the history OF. Its denominator
         # is the same one -- a share of THIS label -- so it needs no clause of its
         # own; a blank cell means the symbol has never been allocated.
@@ -2103,8 +2154,11 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         <q-td :props="props">
             <q-btn dense flat round size="sm" icon="info" color="grey-5"
                    @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
-                <q-tooltip>Holdings, dividends and total return for
-                    {{ props.row.symbol }}</q-tooltip>
+                <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                    <div class="text-weight-bold">{{ props.row.symbol }}</div>
+                    <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
+                    <div>Holdings, dividends and total return</div>
+                </q-tooltip>
             </q-btn>
         </q-td>
     ''')
@@ -2120,6 +2174,27 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                      type="number" dense borderless input-class="text-right"
                      debounce="''' + str(TARGET_DEBOUNCE_MS) + r'''"
                      @update:model-value="(val) => $parent.$emit('weightChange', props.row.symbol, val)" />
+            <div v-if="props.row.share_delta" class="text-caption text-right"
+                 :class="'text-' + props.row.share_delta_color">{{ props.row.share_delta }}</div>
+        </q-td>
+    ''')
+    # THE LIVE CHANGE, beside the figure it applies to rather than in three more
+    # columns: this table already carries fourteen and the request that added these
+    # also asked for it to get NARROWER. Each delta is precomputed and coloured in
+    # Python (``_write_row_deltas``); the template only prints what it is handed, so
+    # "unmeasurable versus zero" is decided once, in one place, not in Vue.
+    table.add_slot('body-cell-target_value', r'''
+        <q-td :props="props">
+            <div>{{ props.value }}</div>
+            <div v-if="props.row.value_delta" class="text-caption"
+                 :class="'text-' + props.row.value_delta_color">{{ props.row.value_delta }}</div>
+        </q-td>
+    ''')
+    table.add_slot('body-cell-quantity', r'''
+        <q-td :props="props">
+            <div>{{ props.value }}</div>
+            <div v-if="props.row.qty_delta" class="text-caption"
+                 :class="'text-' + props.row.qty_delta_color">{{ props.row.qty_delta }}</div>
         </q-td>
     ''')
     table.on('weightChange',
@@ -2259,9 +2334,20 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
         # rendering in the same white as the captions around it.
         ui.label(RESERVE_SELL_WARNING).classes('text-xs text-orange-400') \
             .style(class_color_style('text-orange-400'))
+        # WHAT THE BASE IS, before anything is stated as a percentage of it. Drawn
+        # above the caption because it is the addition every other figure on the card
+        # divides, and it was the only one never shown.
+        base_line = format_base_composition(
+            base_notional=live['base_notional'],
+            available_buying_power=live['available_buying_power'])
+        # ``text-sm``, not ``text-xs``: these two lines are the ones that say what
+        # every percentage on the card divides, and at caption size they read as
+        # footnotes to the slider rather than as the figures they are.
+        live['base_composition'] = ui.label(base_line or '') \
+            .classes('text-sm text-secondary-custom').style(TABULAR_NUMS)
         live['reserve_caption'] = ui.label(
             format_reserve_caption(live['base_notional'], live['unallocated_pct'])
-        ).classes('text-xs text-secondary-custom').style(TABULAR_NUMS)
+        ).classes('text-sm text-secondary-custom').style(TABULAR_NUMS)
         # THE ALLOCATION BAR, folded into the card that already owns the concept --
         # the slider is the TARGET, the row below is the ACTUAL, and the bar is the
         # gap between them. It used to be a separate blue callout under the labels.

@@ -10,6 +10,7 @@ stack); ``ui/utils/`` holds only perf_logger and imports in milliseconds.
 """
 import math
 import re
+from collections import namedtuple
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -637,6 +638,13 @@ class SymbolRow:
     mode for exactly that reason.
     """
     symbol: str
+    #: The instrument's human name (``Instrument.company_name``), for the ⓘ tooltip.
+    #: ``None`` when the row's instrument carries no name -- roughly two thirds of the
+    #: table, because the two DB-only creation helpers
+    #: (``utils.add_symbols_to_label`` / ``JobManager.ensure_instrument_exists``) have no
+    #: provider to ask. The tooltip shows the symbol alone in that case; it never
+    #: substitutes the ticker FOR the name, which would read as a fact.
+    company_name: Optional[str] = None
     labels: List[str] = field(default_factory=list)
     quantity: float = 0.0
     cost_basis: float = 0.0
@@ -726,6 +734,7 @@ def build_label_views(managed,
                       base_notional: Optional[float] = None,
                       symbol_weights=None,
                       symbol_previous_weights=None,
+                      company_names=None,
                       unallocated_pct: float = 0.0) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
@@ -763,6 +772,11 @@ def build_label_views(managed,
             ``None`` rather than falling back to the CURRENT weight -- the whole
             point of the figure is that it may differ from what is on screen, and
             "there is no last" is what the page's Load-last button reads.
+        company_names: ``{SYMBOL: company_name}`` from the instrument table; optional.
+            A symbol absent here, or mapped to a blank, keeps ``company_name=None`` —
+            "this instrument has no stored name" and "it is named after its ticker" are
+            different facts, and only the first is true of the ~two thirds of rows the
+            DB-only creation helpers insert without one.
         unallocated_pct: the account's stored cash reserve, 0-100. It scales the
             TARGET money only -- ``target_value`` on the label and on every symbol
             row -- because the label percentages divide what the reserve LEFT.
@@ -889,6 +903,10 @@ def build_label_views(managed,
             row_value = _value_of(sym)
             rows.append(SymbolRow(
                 symbol=sym,
+                # Blank -> None: an empty string would render as a name that is simply
+                # missing from the tooltip, which reads the same as "unnamed" but sorts
+                # and compares differently everywhere else.
+                company_name=((company_names or {}).get(sym) or None),
                 labels=list(membership.get(sym, [entry.label])),
                 quantity=quantity,
                 cost_basis=cost_basis,
@@ -1354,13 +1372,61 @@ LABEL_TOOLTIP_STYLE = 'white-space: pre-line; max-width: 28rem; font-size: 0.85r
 #: label headers use ``.1f``, and "of base" said out loud in both, because the two
 #: percentages have DIFFERENT denominators and in identical grammar they read as
 #: one column that sums past 100.
-RESERVE_ROW_FMT = ('Unallocated (free buying power) — ${current:,.2f} '
-                   '({pct_of_base:.1f}% of base, target {target_pct:.2f}% of base '
-                   '= ${target_value:,.2f})')
+#: EACH PERCENTAGE SITS BESIDE THE DOLLARS IT DESCRIBES, and each figure says whether
+#: it is measured or wanted. The previous wording put both in one parenthetical --
+#: "$542.61 (10.1% of base, target 10.00% of base = $536.98)" -- so the 10.1% ended up
+#: adjacent to the TARGET dollars rather than to the actual ones it belongs to. Read
+#: straight after the slider caption, which had just said "$536.98 held back", it
+#: reported that $536.98 was 10.1%, and the arithmetic looked broken when it was not.
+#: (It reconciles exactly: base 5,369.79; 10.00% target = 536.98; actual 542.61 =
+#: 10.1049%.) "now" and "target" lead each half because which is which is the entire
+#: content of the line.
+RESERVE_ROW_FMT = ('Unallocated (free buying power) — now ${current:,.2f} '
+                   '({pct_of_base:.1f}% of base) · target ${target_value:,.2f} '
+                   '({target_pct:.2f}% of base)')
 
 #: Beside the reserve slider. States BOTH halves: what is held back and what is
 #: left, because the slider's whole job is to make that trade visible.
-RESERVE_CAPTION_FMT = '= ${reserved:,.2f} held back, ${investable:,.2f} investable'
+#:
+#: THE BASE IS NAMED, so the arithmetic checks itself. Without it the line read
+#: "$536.98 held back, $4,832.81 investable" and the obvious sanity check is the wrong
+#: one: 10% of the 4,832.81 you can see is 483, not 537, and the page looks broken.
+#: The reserve is a share of the GROSS base -- reserved is DEFINED as
+#: ``base - investable`` (see ``reserved_notional_for``), so the two halves always sum
+#: to the base exactly. Naming that base turns an apparent contradiction into a
+#: division anyone can do: 10% of 5,369.79 IS 536.98, and 536.98 + 4,832.81 IS 5,369.79.
+#:
+#: A reserve defined against the REMAINDER instead would be circular -- the remainder
+#: is what is left after the reserve -- and would break that identity. RESERVE_BASIS_NOTE
+#: below says so in words; this line makes it arithmetic.
+#:
+#: MARKED AS THE TARGET SPLIT. Both halves are derived from the slider, not measured
+#: from the broker, so this answers "what would this setting hold back?" while the row
+#: below answers "what is actually free right now?".
+#: "OUT OF", so the investable figure is never read alone. Stating it beside the base
+#: it came from is what stops "$4,832.81 investable" being checked against the wrong
+#: denominator -- the whole class of confusion this card kept producing.
+RESERVE_CAPTION_FMT = ('{target_pct:g}% of the ${base:,.2f} base = ${reserved:,.2f} '
+                       'held back — ${investable:,.2f} investable out of ${base:,.2f}')
+
+#: WHAT THE BASE IS MADE OF, spelled out above the caption.
+#:
+#: The page states a dozen figures "of base" and never showed the base, so the reader
+#: had to infer it -- and the natural inference is wrong twice over. Reported: "we have
+#: $4,827.18 managed and $4,832.81 investable, that does not make sense either, total
+#: investable should be managed + BP". It IS managed + BP, but that sum is the BASE
+#: ($5,369.79), not the investable remainder ($4,832.81) -- the two differ by exactly
+#: the reserve, and neither number was on screen to check against.
+#:
+#: "to allocate" replaces "investable" in the caption for the same reason: "investable"
+#: reads as "everything I could invest", which is the base; the figure it labels is what
+#: the LABELS may divide, i.e. the base minus the reserve.
+#: "buying power", NOT "free buying power": the reserve row below is titled
+#: "Unallocated (free buying power)", and two lines carrying that exact phrase are one
+#: line too many for a reader scanning for it -- and for anything else selecting the row
+#: by its wording.
+BASE_COMPOSITION_FMT = ('base ${base:,.2f} = ${managed:,.2f} managed '
+                        '+ ${buying_power:,.2f} buying power')
 #: Said instead when the broker published no buying power. A "$0.00 held back"
 #: there would be a statement about money rather than an absence of one.
 RESERVE_CAPTION_NO_BASE = ('no base notional yet — the broker published no buying '
@@ -1429,6 +1495,81 @@ def format_label_target_tooltip(*, target_pct: float,
         target_pct=target_pct,
         target_value=(investable_notional(base_notional, unallocated_pct)
                       * float(target_pct or 0.0) / 100.0))
+
+
+#: What a symbol's row would CHANGE BY if the current targets were executed: the share
+#: the user just typed against the share the account actually holds, and the money and
+#: quantity that implies. Rendered green/red beside the figures themselves.
+#:
+#: Each field is INDEPENDENTLY optional, and ``None`` means UNMEASURABLE, never "no
+#: change". A symbol with no price has no quantity delta even though its money delta is
+#: perfectly well defined, and printing 0.00 there would say the position keeps its size
+#: while its value moves -- which is the one thing that cannot happen.
+SymbolDelta = namedtuple('SymbolDelta', 'share value quantity')
+
+
+def symbol_delta(*, weight_pct: Optional[float], pct_of_label: Optional[float],
+                 target_value: Optional[float], current_value: Optional[float],
+                 quantity: Optional[float], price: Optional[float]) -> SymbolDelta:
+    """The three live deltas for one row: share points, money, and shares. Pure.
+
+    ``share`` is in PERCENTAGE POINTS of the label (typed target minus held share), not
+    a percentage change of a percentage -- "26.25% -> 27.09%" is +0.84 points, and
+    calling that +3.2% would be a second, invisible denominator on a page that already
+    has two.
+
+    ``quantity`` is derived from the MONEY, ``target_value / price - quantity``, rather
+    than from the share: the money is what the engine actually solves for, and dividing
+    the same number the TARGET VALUE column prints is what keeps the two columns from
+    disagreeing by a rounding step.
+
+    A ZERO delta is a real answer and is returned as 0.0, distinct from ``None``. "You
+    typed the share you already hold" is worth showing; "we cannot tell" is not the same
+    statement and must not borrow its colour.
+    """
+    share = (None if weight_pct is None or pct_of_label is None
+             else float(weight_pct) - float(pct_of_label))
+    value = (None if target_value is None or current_value is None
+             else float(target_value) - float(current_value))
+    if target_value is None or price is None or not price or quantity is None:
+        qty = None
+    else:
+        qty = float(target_value) / float(price) - float(quantity)
+    return SymbolDelta(share=share, value=value, quantity=qty)
+
+
+def format_delta(value: Optional[float], *, places: int = 2, suffix: str = '') -> str:
+    """``+1.23`` / ``-4.56`` / ``''``. The SIGN is always explicit on a non-zero delta.
+
+    An unsigned "1.23" beside a number is indistinguishable from the number's own
+    second column, and this one is drawn in green or red on the strength of that sign.
+    Empty string for ``None`` -- an unmeasurable delta draws nothing at all, rather than
+    a dash the eye reads as a value.
+    """
+    if value is None:
+        return ''
+    rounded = round(float(value), places)
+    if rounded == 0:
+        # Not "+0.00": nothing is moving, and a signed zero invites the reader to look
+        # for the direction it is claiming.
+        return f'0{suffix}' if not places else f'{0:.{places}f}{suffix}'
+    return f'{rounded:+,.{places}f}{suffix}'
+
+
+def delta_color(value: Optional[float]) -> str:
+    """Quasar colour name for a delta: green up, red down, neutral otherwise.
+
+    Neutral covers BOTH zero and unmeasurable, deliberately. Neither is a direction, and
+    the only thing green/red is allowed to mean here is which way the position moves.
+    """
+    if value is None:
+        return 'grey-5'
+    rounded = round(float(value), 6)
+    if rounded > 0:
+        return 'positive'
+    if rounded < 0:
+        return 'negative'
+    return 'grey-5'
 
 
 def symbol_target_values(weights, *, label_target_pct: float,
@@ -3101,8 +3242,35 @@ def format_reserve_caption(base_notional: Optional[float],
     if not base_notional:
         return RESERVE_CAPTION_NO_BASE
     return RESERVE_CAPTION_FMT.format(
+        target_pct=unallocated_pct,
+        base=float(base_notional),
         reserved=reserved_notional_for(base_notional, unallocated_pct),
         investable=investable_notional(base_notional, unallocated_pct))
+
+
+def format_base_composition(*, base_notional: Optional[float],
+                            available_buying_power: Optional[float]) -> Optional[str]:
+    """``base $X = $Y managed + $Z free buying power``, or ``None``. Pure.
+
+    THE MANAGED TERM IS DERIVED, ``base - buying_power``, not summed independently.
+    ``compute_base_notional`` defines the base as exactly those two terms, so deriving
+    the one makes this line an identity: it cannot print an addition that disagrees with
+    the base every other figure on the page divides. Re-summing the managed positions
+    here would be a second computation of a number the page already has, and the two
+    would drift the first time a valuation mode or a membership rule changed on one side
+    only -- which is the same class of bug as the caption this sits above.
+
+    ``None`` -- the line is simply not drawn -- when either term is unknown. Filling in
+    0.00 for a buying power the broker did not report would publish a base short by
+    exactly that amount, and since every percentage on the page divides this number, a
+    wrong one makes all of them wrong AND plausible.
+    """
+    if not base_notional or available_buying_power is None:
+        return None
+    return BASE_COMPOSITION_FMT.format(
+        base=float(base_notional),
+        managed=float(base_notional) - float(available_buying_power),
+        buying_power=float(available_buying_power))
 
 
 def format_reserve_row(*, base_notional: Optional[float],

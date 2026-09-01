@@ -2261,7 +2261,10 @@ def test_the_reserve_and_the_labels_do_not_print_two_denominators_as_one_column(
         header = ' | '.join(_expansion_headers(nicegui_client.layout))
         tips = _tooltip_texts(nicegui_client.layout)
 
-    assert 'target 25.00% of base' in reserve_row, reserve_row
+    # The target and its denominator, now bound to the dollars they describe:
+    # "target $2,500.00 (25.00% of base)" rather than a bare "target 25.00% of
+    # base" sitting next to a DIFFERENT amount.
+    assert 'target $2,500.00 (25.00% of base)' in reserve_row, reserve_row
     # The reserve row is the ONE line still measured against the gross base, and it
     # says so; every label below divides the investable pool and says THAT. The two
     # denominators are NAMED rather than left to be inferred from matching grammar.
@@ -2728,7 +2731,7 @@ def _listener_types(element):
 
 
 def _views(labels, symbols_by_label, *, base=10_000.0, reserve=0.0, weights=None,
-           prices=None, positions=None, previous_weights=None):
+           prices=None, positions=None, previous_weights=None, company_names=None):
     """Build LabelViews the way ``_load_view_payload`` does, with live prices."""
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
 
@@ -2740,7 +2743,8 @@ def _views(labels, symbols_by_label, *, base=10_000.0, reserve=0.0, weights=None
                              quotes, valuation_mode=VALUATION_MODE_MARKET,
                              base_notional=base, unallocated_pct=reserve,
                              symbol_weights=weights,
-                             symbol_previous_weights=previous_weights)
+                             symbol_previous_weights=previous_weights,
+                             company_names=company_names)
 
 
 def _draw(client, account_id, views, *, base=10_000.0, buying_power=1_000.0,
@@ -2756,11 +2760,13 @@ def _draw(client, account_id, views, *, base=10_000.0, buying_power=1_000.0,
 
 
 def _one_label(account_id, label='ARK26', target=40.0, symbols=('AAPL', 'MSFT'),
-               *, base=10_000.0, reserve=0.0, weights=None, color=None):
+               *, base=10_000.0, reserve=0.0, weights=None, color=None,
+               company_names=None):
     return _views([ManagedLabel(label, target, color=color)],
                   {label: list(symbols)}, base=base, reserve=reserve,
                   weights={label: dict(weights or {s: 100.0 / len(symbols)
-                                                   for s in symbols})})
+                                                   for s in symbols})},
+                  company_names=company_names)
 
 
 # -- the symbol table's TARGET % column is an input --------------------------
@@ -3456,7 +3462,7 @@ def test_the_reserve_shows_its_dollar_figure_beside_the_slider(nicegui_client,
     root = _draw(nicegui_client, account_id, _one_label(account_id, reserve=25.0),
                  reserve=25.0)
     assert any('$2,500.00 held back' in t for t in _texts(root))
-    assert any('$7,500.00 investable' in t for t in _texts(root))
+    assert any('$7,500.00 investable out of $10,000.00' in t for t in _texts(root))
 
 
 def test_dragging_the_reserve_slider_persists_it(nicegui_client, account_id):
@@ -3502,7 +3508,7 @@ def test_moving_the_reserve_recomputes_the_reserve_line(nicegui_client, account_
     _drive_value(slider, 40.0)
 
     row = next(t for t in _texts(root) if 'free buying power' in t)
-    assert 'target 40.00% of base = $4,000.00' in row
+    assert 'target $4,000.00 (40.00% of base)' in row
     assert any('$4,000.00 held back' in t for t in _texts(root))
 
 
@@ -5137,6 +5143,58 @@ def test_the_info_control_says_what_it_will_show(nicegui_client, account_id):
     assert 'Holdings, dividends and total return' in template
 
 
+def test_the_info_tooltip_names_the_symbol_and_the_instrument(nicegui_client, account_id):
+    """The ⓘ hover identifies WHICH row it belongs to. Reading the company name off
+    ``props.row`` (not a second lookup) is what lets one rendered slot serve every row --
+    the same constraint that makes ``symbolInfo`` carry the symbol in its emit."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-info'].template
+
+    assert 'props.row.symbol' in template
+    assert 'props.row.company_name' in template
+
+
+def test_the_info_tooltip_is_readable_rather_than_the_quasar_default(nicegui_client,
+                                                                    account_id):
+    """Quasar's default tooltip is ~10px. This one carries three lines and has to be
+    legible, so it sets its own size and a width to wrap a long company name against."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-info'].template
+
+    assert 'font-size' in template
+    assert 'max-width' in template
+
+
+def test_an_unnamed_instrument_shows_no_blank_name_line(nicegui_client, account_id):
+    """``v-if`` on the name, so a row whose instrument has none draws two lines rather
+    than one empty one -- the tooltip must not print ``null`` or a stray gap."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-info'].template
+
+    assert 'v-if="props.row.company_name"' in template
+
+
+def test_the_company_name_reaches_the_row_the_tooltip_reads(nicegui_client, account_id):
+    """End to end through the payload: a name supplied to the view builder must arrive
+    on the table's row data, because the template can only read what is there."""
+    views = _one_label(account_id, symbols=('AAPL',),
+                       company_names={'AAPL': 'Apple Inc.'})
+    root = _draw(nicegui_client, account_id, views)
+    row = _tables(root)[0].rows[0]
+
+    assert row['symbol'] == 'AAPL'
+    assert row['company_name'] == 'Apple Inc.'
+
+
+def test_an_unnamed_instrument_carries_an_empty_name_not_none(nicegui_client, account_id):
+    """Quasar prints a bare ``null`` if handed one, so the row normalises to ''."""
+    views = _one_label(account_id, symbols=('AAPL',), company_names={})
+    root = _draw(nicegui_client, account_id, views)
+    row = _tables(root)[0].rows[0]
+
+    assert row['company_name'] == ''
+
+
 def test_every_label_gets_its_own_info_column(nicegui_client, account_id):
     """One table per label, so one wiring per label -- exactly as ``weightChange``
     and ``commentChange`` are wired."""
@@ -6673,7 +6731,7 @@ def test_the_reserve_card_keeps_every_word_the_blue_panel_carried(nicegui_client
     texts = _texts(_marked(root, page.MARKER_RESERVE_CARD)[0])
 
     assert any('Unallocated (free buying power)' in t for t in texts)
-    assert any('of base, target 10.00% of base' in t for t in texts)
+    assert any('(10.00% of base)' in t for t in texts)
     assert _view_mod().RESERVE_BASIS_NOTE in texts
     assert _view_mod().RESERVE_SELL_WARNING in texts
     assert _view_mod().ALLOCATION_BAR_LEGEND in texts
@@ -7386,3 +7444,64 @@ def test_the_leverage_line_still_sits_under_the_account_value(nicegui_client,
 
     assert texts[index + 1] == '$2,511.90'
     assert texts[index + 2] == 'managed positions are 2.02x this'
+
+
+# ---------------------------------------------------------------------------
+# LIVE DELTAS ON THE ROW
+#
+# "put live changes in this table for share of label, value, qty as we adjust
+# the share compared to the current %. Positive = green, negative = red."
+#
+# Drawn INSIDE the existing cells rather than in three more columns: the same
+# request asked for the table to get narrower, and it already carries fourteen.
+# ---------------------------------------------------------------------------
+
+def test_the_row_carries_a_delta_for_share_value_and_quantity(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id, symbols=('AAPL',)))
+    row = _tables(root)[0].rows[0]
+
+    for key in ('share_delta', 'value_delta', 'qty_delta'):
+        assert key in row, key
+        assert key + '_color' in row, key
+
+
+def test_a_positive_change_is_green_and_a_negative_one_red(nicegui_client, account_id):
+    """The colour is keyed on the SIGN, which is why the formatter always prints it."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import delta_color
+
+    assert delta_color(5.0) == 'positive'
+    assert delta_color(-5.0) == 'negative'
+
+
+def test_the_delta_is_rewritten_when_a_share_is_edited(nicegui_client, account_id):
+    """One writer for the initial render AND the edit path, so a delta can never be
+    left describing a figure that has since moved."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id, symbols=('AAPL',)))
+    table = _tables(root)[0]
+    before = dict(table.rows[0])
+
+    table.rows[0]['weight_pct'] = 12.5
+    table.rows[0]['target_value'] = 1.0
+    page._write_row_deltas(table.rows[0])
+
+    assert table.rows[0]['value_delta'] != before['value_delta']
+
+
+def test_the_share_column_is_narrowed(nicegui_client, account_id):
+    """The cell holds a number box, not prose; at its natural width the HEADER TEXT
+    set the column and pushed the money columns off to the right."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    col = next(c for c in _tables(root)[0].columns if c['name'] == 'weight_pct')
+
+    assert 'width' in col.get('style', ''), col
+
+
+def test_the_delta_markup_reads_its_colour_off_the_row(nicegui_client, account_id):
+    """Precomputed in Python and merely printed by the template: "unmeasurable versus
+    zero" is a decision, and decisions do not belong in a Quasar cell slot."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    slots = _tables(root)[0].slots
+
+    assert "props.row.value_delta_color" in slots['body-cell-target_value'].template
+    assert "props.row.qty_delta_color" in slots['body-cell-quantity'].template
+    assert "props.row.share_delta_color" in slots['body-cell-weight_pct'].template

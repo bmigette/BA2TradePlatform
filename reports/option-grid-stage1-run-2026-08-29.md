@@ -1,0 +1,41 @@
+# BA2 Option-Grid Stage 1 Run — 2026-08-29
+
+36-job GA matrix (18 option structures x 2 experts, pop 200, gen 60, early-stop 8)
+under ba2-stage1.service (MemoryMax=24G, CPUQuota=250%, --parallel 2).
+Branch: stage1-trial-metrics @ /home/debian/ba2-grid/repo.
+
+## Progress log
+- 2026-08-29 17:01 UTC | active=yes mem=8.0GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 best=7.1042 ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 17:31 UTC | active=yes mem=8.9GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 best=13.8222 ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 18:00 UTC | active=yes mem=7.8GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 98/200 best=13.8222 ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 18:31 UTC | active=yes mem=8.2GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 133/200 best=13.8222 ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 19:01 UTC | active=yes mem=7.4GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 164/200 best=13.8222 ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 19:30 UTC | active=yes mem=9.5GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 180/200 best=13.8222 ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 20:01 UTC | active=yes mem=8.7GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 198/200 best=13.8222 ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 20:30 UTC | active=yes mem=7.9GB | job 1/36 optm-FMPRating-O_LC-st1 gen 2/60 (gen1 done best=13.8222) ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 21:02 UTC | active=yes mem=7.1GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 (mem gen 1/60 ind 6/200) best=n/a (fresh run, no gen completed) ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 21:02 UTC | NOTE: service stopped+restarted twice 20:50-20:56 UTC (deliberate, NRestarts=0). Before 1st stop: repeated 'FMP API key not configured' worker errors (~20:50:47). Current incarnation (since 20:55:46 UTC) started job 1 from scratch (strategy #1, no checkpoint resume); earlier gen 1-2 progress discarded. No OOM (mem.events max=0), fleet untouched.
+- 2026-08-29 21:31 UTC | active=yes mem=7.5GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 56/200 best=n/a (gen1 not done yet) ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 22:02 UTC | active=yes mem=7.8GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 72/200 best=13.8222 (gen1 in progress) ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 22:31 UTC | active=yes mem=3.4GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 120/200 best=13.8222 (gen1 in progress, no ckpt history yet) ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 23:01 UTC | active=yes mem=7.0GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 150/200 best=13.8222 (gen1 in progress) ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-29 23:31 UTC | active=yes mem=7.4GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind ~173/200 best=13.8222 (gen1 in progress, no ckpt history yet) ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-30 00:01 UTC | NOTE: journal shows benign Python multiprocessing finalizer noise ('Exception ignored ... sem_unlink FileNotFoundError') at worker-pool recycle; run continues normally, not a failure.
+- 2026-08-30 00:01 UTC | active=yes mem=7.6GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 185/200 best=13.8222 (gen1 in progress) ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-30 00:31 UTC | active=yes mem=7.4GB | job 1/36 optm-FMPRating-O_LC-st1 gen 1/60 ind 199/200 best=13.8222 (gen1 in progress) ret=n/a dd=n/a | completed=0 failed=0
+- 2026-08-30 01:02 UTC | active=yes job 1/36 optm-FMPRating-O_LC-st1 gen 0/60 best=? ret=?% dd=?% completed=0 failed=0
+- 2026-08-30 01:04 UTC | active=yes job 1/36 optm-FMPRating-O_LC-st1 gen 0/60 best=13.8222 ret=?% dd=?% trades=? completed=0 failed=0
+- 2026-08-30 01:30 UTC | active=yes mem=8.1GB | job 1/36 optm-FMPRating-O_LC-st1 gen 2/60 (ind 30/151) best=13.8222 ret=n/a dd=n/a (gen1 just finished, no history rows yet) | completed=0 failed=0
+- 2026-08-30 02:01 UTC | active=yes mem=7.3GB | job 1/36 optm-FMPRating-O_LC-st1 gen 2/60 (ind 52/151) best=13.8222 ret=n/a dd=n/a (no completed-gen history rows yet; gen1 finished, gen2 in progress) | completed=0 failed=0
+- 2026-08-30 02:31 UTC | active=yes mem=8.3GB | job 1/36 optm-FMPRating-O_LC-st1 gen 2/60 best=13.8222 ret=n/a dd=n/a (gen2 in progress ind 66/151; no completed-gen history rows yet) | completed=0 failed=0
+- 2026-08-30 03:02 UTC | active=yes mem=8.0GB | job 1/36 optm-FMPRating-O_LC-st1 gen 2/60 (ind 101/151) best=13.8222 ret=n/a dd=n/a (no history table in DB; per-gen detail only via journal) | completed=0 failed=0
+- 2026-08-30 03:31 UTC | active=yes mem=8.1GB | job 1/36 optm-FMPRating-O_LC-st1 gen 2/60 (ind 116/151) best=13.8222 ret=n/a dd=n/a (no checkpoint history rows yet; gen1 done, gen2 ~77%) | completed=0 failed=0
+- 2026-08-30 04:02 UTC | active=yes mem=8.3GB | job 1/36 optm-FMPRating-O_LC-st1 gen 2/60 (ind 126/151) best=13.8222 ret=n/a dd=n/a (gen2 ~83%; no completed-gen history rows yet) | completed=0 failed=0
+- 2026-08-30 04:31 UTC | active=yes mem=8.1GB | job 1/36 optm-FMPRating-O_LC-st1 gen 3/60 (ind 6/140) best=13.8222 ret=n/a dd=n/a (gen2 done 04:25; no completed-gen history rows yet) | completed=0 failed=0
+- 2026-08-30 05:00 UTC | active=yes mem=8.2GB | job 1/36 optm-FMPRating-O_LC-st1 gen 3/60 (ind 14/140) best=13.8222 ret=n/a dd=n/a (gen2 done 04:25; no completed-gen history rows yet) | completed=0 failed=0
+- 2026-08-30 05:32 UTC | active=yes mem=8.0GB | job 1/36 optm-FMPRating-O_LC-st1 gen 3/60 (ind ~18/140) best=13.8222 ret=760.54% dd=-46.28% trades=243 | completed=0 failed=0
+- 2026-08-30 06:01 UTC | active=yes mem=8.0GB | job 1/36 optm-FMPRating-O_LC-st1 gen 3/60 (ind 31/140) best=13.8222 ret=760.54% dd=-46.28% trades=243 | completed=0 failed=0
+- 2026-08-30 06:10 UTC | active=yes mem=8.3GB | job 1/36 optm-FMPRating-O_LC-st1 gen 3/60 (ind 35/140) best=13.8222 ret=760.54% dd=-46.28% trades=243 | completed=0 failed=0
+- 2026-08-30 07:04 UTC | active=yes mem=8.4GB | job 1/36 optm-FMPRating-O_LC-st1 gen 3/60 (ind 36/140) best=13.8222 ret=760.54% dd=-46.28% trades=243 | completed=0 failed=0
+- 2026-08-30 07:30 UTC | active=yes mem=7.0GB | job 1/36 optm-FMPRating-O_LC-st1 gen 3/60 (ind 40/140) best=13.8222 ret=760.54% dd=-46.28% trades=243 | completed=0 failed=0
+- 2026-08-30 08:00 UTC | active=yes mem=6.5GB | job 1/36 optm-FMPRating-O_LC-st1 gen 3/60 (ind 48/140) best=13.8222 ret=760.54% dd=-46.28% trades=243 | completed=0 failed=0

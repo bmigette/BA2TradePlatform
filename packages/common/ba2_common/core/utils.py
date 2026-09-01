@@ -146,6 +146,43 @@ def remove_label_from_instruments(symbols, label: str) -> int:
     return changed
 
 
+def get_company_names(symbols) -> Dict[str, str]:
+    """Return ``{SYMBOL: company_name}`` for the requested symbols, names only.
+
+    A symbol with NO stored name is ABSENT from the result rather than mapped to its
+    own ticker or to ``''``. The caller therefore learns "this instrument has no name
+    on file", which is true of roughly two thirds of the table: ``Instrument`` is
+    created with a ``company_name`` only by ``InstrumentAutoAdder``, which has a
+    provider to ask. The two DB-only helpers -- ``add_symbols_to_label`` here and
+    ``JobManager.ensure_instrument_exists`` -- insert a bare row, and neither can fetch
+    a name without turning a database write into a network call.
+
+    Echoing the ticker back as the name would erase that distinction at exactly the
+    place a UI decides whether it has something extra to show.
+
+    Symbols are normalised on the way in (the stored ``name`` already is, via
+    ``Instrument.__setattr__``), so a caller may pass whatever case it holds.
+    """
+    from ba2_common.core.models import Instrument
+    # ``or []`` on the ARGUMENT, matching ``get_symbols_by_label``'s ``labels or []``:
+    # "no symbols were asked about" is an empty request, not an unmeasurable one, and
+    # the empty dict is the honest answer to it. (This is not the zero-coercion the
+    # house rule forbids -- nothing here is a quantity, and no name is invented.)
+    wanted = _normalized_symbols(symbols or [])
+    if not wanted:
+        return {}
+    out: Dict[str, str] = {}
+    with get_db() as session:
+        rows = session.exec(
+            select(Instrument.name, Instrument.company_name)
+            .where(Instrument.name.in_(wanted))).all()
+    for name, company_name in rows:
+        text = (company_name or "").strip()
+        if text:
+            out[name] = text
+    return out
+
+
 def get_symbols_by_label(labels) -> Dict[str, List[str]]:
     """Return ``{label: [symbols]}`` for each requested label.
 

@@ -430,7 +430,10 @@ def test_dry_run_rows_shows_a_sub_minimum_fractional_target_as_suppressed():
     instead of dropping the symbol silently."""
     margin = MarginInfo(symbol="PENNY", bp_factor=1.0, fractionable=True,
                         min_trade_increment=0.00001, min_fractional_notional=5.0)
-    plan = _one_symbol_plan(price=3.0, target_notional=1.95, margin=margin,
+    # $1.20, not $1.95: at the 2x bound one whole $3 share is 154% of a $1.95 target
+    # and now FILLS, so that target no longer produces the suppressed row this test
+    # is about. $1.20 puts one share at 250%, still outside the bound.
+    plan = _one_symbol_plan(price=3.0, target_notional=1.20, margin=margin,
                             allow_fractional=True)
 
     rows = dry_run_rows(plan)
@@ -440,10 +443,10 @@ def test_dry_run_rows_shows_a_sub_minimum_fractional_target_as_suppressed():
     assert row["quantity"] == 0.0
     assert row["side"] == ""            # no order, so no side
     # D1 owns this case now and prices it: no fraction can be sent under the $5
-    # floor, and one whole share of a $3 stock is 154% of a $1.95 target -- just
-    # outside the 1.5x bump guard.
+    # floor, and one whole share of a $3 stock is 250% of a $1.20 target -- outside
+    # the 2x bump guard.
     assert "$5 fractional minimum" in row["reasons"]
-    assert "154% of target" in row["reasons"]
+    assert "250% of target" in row["reasons"]
 
 
 def test_dry_run_rows_shows_a_below_min_order_size_row_as_suppressed():
@@ -484,7 +487,7 @@ def test_dry_run_rows_of_a_suppressed_row_is_not_counted_by_filter_plan_rows():
     """Ticking a suppressed symbol must not add money to the totals."""
     margin = MarginInfo(symbol="PENNY", bp_factor=1.0, fractionable=True,
                         min_trade_increment=0.00001, min_fractional_notional=5.0)
-    plan = _one_symbol_plan(price=3.0, target_notional=1.95, margin=margin,
+    plan = _one_symbol_plan(price=3.0, target_notional=1.20, margin=margin,
                             allow_fractional=True)
     filtered = filter_plan_rows(plan, ["PENNY"])
     assert filtered.total_buy_value == pytest.approx(0.0)
@@ -1718,7 +1721,7 @@ def test_no_order_notice_names_the_count_the_money_and_the_bump_limit():
     notice = no_order_notice(fractional_summary(_mixed_eligibility_plan()))
     assert "1 symbol" in notice
     assert "260,000.00" in notice
-    assert "150%" in notice
+    assert "200%" in notice
 
 
 def test_redistribution_notice_tells_the_user_their_weights_moved():

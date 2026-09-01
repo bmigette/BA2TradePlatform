@@ -2199,21 +2199,27 @@ _OPTION_STRATS = {
         # measure the structure without confounding quality with affordability). F4 answered
         # "can the account afford it?"; 2026-08-31 answers "may the grid risk it?" -- and the
         # answer is no even where it is affordable, so on a merge the exclusion wins. The row
-        # itself STAYS: builder, reserve math, settlement and tests remain fully supported.
+        # itself STAYS: builder, reserve math, settlement and tests remain fully supported --
+        # and so does F4's $300 cap below, now INERT (the grouped search never reads an
+        # excluded member's row), kept so re-admitting the structure restores a measured
+        # affordability bracket rather than an unbounded-price one.
         "action_type": "open_short_strangle", "option_strike_method": "percent_otm",
         "option_strike_param": 12.0, "option_dte_min": 25, "option_dte_max": 45,
         "option_sizing": 20.0,
         "option_strike_param_optimize": True, "option_strike_param_min": 6.0,
         "option_strike_param_max": 20.0, "option_strike_param_step": 2.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
-        "option_dte_max_range": 50, "option_dte_step": 5},
+        "option_dte_max_range": 50, "option_dte_step": 5,
+        "screener_gate_base": {"price_max": 300.0}},
     "O_SSTD": {  # short straddle (credit) -- OUT OF THE SEARCHED SET since 2026-08-31,
-        # same unbounded short call and same supersession of F4's cap as O_SSTG above.
+        # same unbounded short call and same supersession of F4's cap as O_SSTG above; its
+        # $300 cap likewise stays on the row as inert record.
         "action_type": "open_short_straddle", "option_strike_method": "percent_otm",
         "option_strike_param": 0.0, "option_dte_min": 25, "option_dte_max": 45,
         "option_sizing": 20.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
-        "option_dte_max_range": 50, "option_dte_step": 5},
+        "option_dte_max_range": 50, "option_dte_step": 5,
+        "screener_gate_base": {"price_max": 300.0}},
     "O_IC": {  # iron condor (credit, defined risk)
         "action_type": "open_iron_condor", "option_strike_method": "percent_otm",
         "option_strike_param": 12.0, "option_dte_min": 25, "option_dte_max": 45,
@@ -2224,7 +2230,9 @@ _OPTION_STRATS = {
         "option_wing_width_max": 8.0, "option_wing_width_step": 1.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
         "option_dte_max_range": 50, "option_dte_step": 5},
-    "O_JL": {  # jade lizard (credit)
+    "O_JL": {  # jade lizard (credit) -- FULL-NOTIONAL (see _FULL_NOTIONAL_OPTION_KINDS below):
+        # spot cap $100 (grid design §6 -- unreachable above ~$60-100 even with the
+        # per-instrument cap gene raised to 50%). F4, 2026-08-30.
         "action_type": "open_jade_lizard", "option_strike_method": "percent_otm",
         "option_strike_param": 10.0, "option_dte_min": 25, "option_dte_max": 45,
         "option_sizing": 20.0, "option_wing_width_pct": 5.0,
@@ -2233,7 +2241,8 @@ _OPTION_STRATS = {
         "option_wing_width_optimize": True, "option_wing_width_min": 3.0,
         "option_wing_width_max": 8.0, "option_wing_width_step": 1.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
-        "option_dte_max_range": 50, "option_dte_step": 5},
+        "option_dte_max_range": 50, "option_dte_step": 5,
+        "screener_gate_base": {"price_max": 100.0}},
     "O_BF": {  # long call butterfly (debit)
         "action_type": "open_call_butterfly", "option_strike_method": "percent_otm",
         "option_strike_param": 0.0, "option_dte_min": 25, "option_dte_max": 45,
@@ -2249,7 +2258,8 @@ _OPTION_STRATS = {
         "option_strike_param_max": 6.0, "option_strike_param_step": 2.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
         "option_dte_max_range": 60, "option_dte_step": 5},
-    "O_RS": {  # put ratio spread (credit/even)
+    "O_RS": {  # put ratio spread (credit/even) -- FULL-NOTIONAL, same $100 cap as O_CSP/O_JL.
+        # F4, 2026-08-30.
         "action_type": "open_put_ratio_spread", "option_strike_method": "percent_otm",
         "option_strike_param": 5.0, "option_dte_min": 25, "option_dte_max": 45,
         "option_sizing": 15.0, "option_wing_width_pct": 5.0,
@@ -2258,7 +2268,8 @@ _OPTION_STRATS = {
         "option_wing_width_optimize": True, "option_wing_width_min": 3.0,
         "option_wing_width_max": 8.0, "option_wing_width_step": 1.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
-        "option_dte_max_range": 50, "option_dte_step": 5},
+        "option_dte_max_range": 50, "option_dte_step": 5,
+        "screener_gate_base": {"price_max": 100.0}},
     "O_LP": {  # long put (debit) — the bearish mirror of O_LC; entry gates on the BEARISH
         # signal (see _OPTION_ENTRY_GATE), matching the live OPT-LongPut example which fired
         # on current_rating_negative. Needs the expert's sell signals enabled to ever trade.
@@ -2307,13 +2318,16 @@ _OPTION_STRATS = {
     "O_CSP": {  # cash-secured put (credit, income) — sized off strike*100 reserve, not
         # premium (see SellCashSecuredPutAction). Further OTM than O_LP's debit purchase
         # is typical (reduce assignment risk while still collecting premium).
+        # FULL-NOTIONAL: spot cap $100 -- see _FULL_NOTIONAL_OPTION_KINDS below.
+        # F4, 2026-08-30.
         "action_type": "sell_cash_secured_put", "option_strike_method": "percent_otm",
         "option_strike_param": 10.0, "option_dte_min": 25, "option_dte_max": 45,
         "option_sizing": 20.0,
         "option_strike_param_optimize": True, "option_strike_param_min": 5.0,
         "option_strike_param_max": 20.0, "option_strike_param_step": 2.5,
         "option_dte_optimize": True, "option_dte_min_range": 20,
-        "option_dte_max_range": 50, "option_dte_step": 5},
+        "option_dte_max_range": 50, "option_dte_step": 5,
+        "screener_gate_base": {"price_max": 100.0}},
     "O_STRD": {  # long straddle (debit, non-directional) — profits from a big move EITHER
         # way (e.g. ahead of earnings). OpenStraddleAction always selects ATM internally
         # (ignores strike_param), so only dte/sizing matter here.
@@ -2652,15 +2666,40 @@ def _assert_option_window_excludes_holdout(strat_kinds, end) -> None:
             f"change -- there is no flag for this.")
 
 
+# F4(b) (option-program-review-findings.md, 2026-08-30): O_CC/O_PP now join _resolve_fitness's
+# option-metric branch. They are excluded from _PURE_OPTION_STRATEGIES on purpose (they are NOT
+# a row in _OPTION_STRATS/_OPTION_GROUPS, and the two REAL consumers of that set -- the holdout
+# rail and the set itself -- must not change), so this is a SEPARATE derived set, scoped to
+# _resolve_fitness alone.
+#
+# WHY THE SWITCH IS SAFE (investigated, not assumed -- the review flagged this as a risk to
+# check, not a known-good change): _trades_per_year's "structures, not legs" accounting
+# (_structure_count) only COLLAPSES multiple option legs that share one transaction_id into a
+# single bet -- built for multi-leg combos (iron condor, strangle, vertical...) where the raw
+# leg count triple- or quadruple-counts one bet. O_CC/O_PP write exactly ONE option leg per
+# overlay event (one short call, one long put), so there is nothing to collapse -- the
+# structures-per-year number these two produce is the same, uninflated per-event rate a plain
+# leg count would give. The equity entry itself is never folded into an option leg's count
+# either way (_structure_count's own equity carve-out, documented there against
+# under-counting), so it is measured too. No trade-counting defect blocks the switch.
+#
+# O_STK (the plain-equity BASELINE control) stays OUT: it has no option leg and must remain
+# comparable to S2 and to every prior O_STK run (see _rm_opt_for's docstring for the same
+# carve-out reasoning on a different knob) -- widening the fitness in the name of the option
+# arms would corrupt the control the option arms are measured against.
+_OPTION_CAR_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
+
+
 def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: str) -> str:
     """Effective fitness metric for an optimize job. An explicit --fitness always wins.
-    Otherwise PURE-OPTION kinds (O_* except the equity-entry O_CC/O_PP/O_STK, and the
-    OS1-OS4 groups) default to ``option_consistent_annual_return`` — the option-specific
-    variant of the ~30%/yr goal metric (annualized return x drawdown guard x
-    worst-year/mean-year consistency x trade-frequency gate). Calmar/sharpe on option books
-    rewards barely-trading low-drawdown configs (v6 OS runs on calmar: 2-27 trades, TR
-    3.6-18%). STOCK kinds (and the equity-entry option overlays) keep the command's
-    historical default (``stock_default``) so equity tuning is untouched.
+    Otherwise every option-bearing kind (O_* pure-option kinds, the OS1-OS4 groups, and the
+    equity-entry overlays O_CC/O_PP -- everything in ``_OPTION_CAR_STRATEGIES``) defaults to
+    ``option_consistent_annual_return`` — the option-specific variant of the ~30%/yr goal
+    metric (annualized return x drawdown guard x worst-year/mean-year consistency x
+    trade-frequency gate). Calmar/sharpe on option books rewards barely-trading low-drawdown
+    configs (v6 OS runs on calmar: 2-27 trades, TR 3.6-18%). Only the plain-equity control
+    ``O_STK`` keeps the command's historical default (``stock_default``) so its role as the
+    fixed baseline the option arms are measured against is untouched.
 
     WHY A SEPARATE METRIC RATHER THAN A FLAG INSIDE ``consistent_annual_return``. There are
     non-option backtests running against the equity metric right now, and their scores must
@@ -2674,7 +2713,7 @@ def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: st
     """
     if cli_fitness:
         return cli_fitness
-    return ("option_consistent_annual_return" if strat_kind in _PURE_OPTION_STRATEGIES
+    return ("option_consistent_annual_return" if strat_kind in _OPTION_CAR_STRATEGIES
             else stock_default)
 
 
@@ -3155,11 +3194,33 @@ def _option_overlay_action(action_type: str, *, strike_param: float,
 def _screener_gate_base_for_strategy(kind: str) -> dict:
     """Per-strategy gate-only screener overrides declared on _OPTION_STRATS members
     (``screener_gate_base``). A group (OS1-4) merges its ACTIVE members' dicts in order
-    (later member wins). Equity/unknown keys -> {}."""
+    (later member wins -- see the OS2/OS3 caveat this creates, at the merge loop below).
+    Equity/unknown keys -> {}.
+
+    ``O_WHEEL`` is a special case (review fix, 2026-08-30): it has no ``_OPTION_STRATS`` row of
+    its own -- ``_build_strategy_wheel``'s own docstring says the entry IS O_CSP's, same
+    full-notional cash-secured-put entry and the same assignment-capacity gate -- so its
+    affordability cap must be O_CSP's too. Without this, ``kind in _OPTION_STRATS`` is False,
+    the group loop finds no ``_OPTION_GROUPS["O_WHEEL"]`` either (it is not a group), and the
+    lookup falls through to ``{}`` -- under ``--max-stock-price 0`` (the blanket-cap-disabled
+    mode stage1_run.sh actually runs, relying on real per-strategy overrides to do the capping)
+    that is NO CAP AT ALL, strictly worse than the old blanket $100 default it replaced.
+    """
+    if kind == "O_WHEEL":
+        return dict(_OPTION_STRATS["O_CSP"].get("screener_gate_base") or {})
     if kind in _OPTION_STRATS:
         return dict(_OPTION_STRATS[kind].get("screener_gate_base") or {})
     merged: dict = {}
     for member in _OPTION_GROUPS.get(kind, []):
+        # CAVEAT (review fix, 2026-08-30): "later member wins" is a MERGE, not a per-member
+        # gate -- a capped member's price_max here would gate every OTHER active member's
+        # entries too, including an uncapped, defined-risk one. OS2 = [O_SSTG, O_SSTD, O_IC]:
+        # O_SSTG/O_SSTD now carry a real $300 cap, so OS2's merged block currently applies
+        # $300 to O_IC's entries as well, even though defined-risk O_IC is deliberately
+        # uncapped as a STANDALONE job (grid design §6). Inert TODAY -- stage 1 runs no groups
+        # (stage1_run.sh lists single-strategy keys only) -- but a stage that DOES run OS2/OS3
+        # would need a per-member gate, not this merge, before trusting O_IC's numbers inside
+        # the group.
         merged.update(_OPTION_STRATS[member].get("screener_gate_base") or {})
     return merged
 
@@ -4214,7 +4275,7 @@ def _cmd_optimize(args) -> int:
             "generations": int(args.generations),
             "crossoverProb": 0.6, "mutationProb": float(args.mutation_prob),
             "earlyStoppingGenerations": int(args.early_stop),
-            "elitismPercent": 0.1, "seed": int(args.seed),
+            "elitismPercent": float(args.elitism_percent), "seed": int(args.seed),
             "parallelIndividuals": int(args.parallel),
             # Expert decision params (+ classic-RM sizing for ruleset experts; bypass experts size
             # their own portfolio so they carry only the narrow _BYPASS_RM_OPT block — unless the
@@ -4421,7 +4482,7 @@ def _cmd_optimize_batch(args) -> int:
                 "generations": int(args.generations),
                 "crossoverProb": 0.6, "mutationProb": float(args.mutation_prob),
                 "earlyStoppingGenerations": int(args.early_stop),
-                "elitismPercent": 0.1, "seed": int(args.seed),
+                "elitismPercent": float(args.elitism_percent), "seed": int(args.seed),
                 "parallelIndividuals": int(args.parallel),
                 # Bypass experts (FactorRanker) size their own portfolio and skip
                 # the full RM block + per-day schedule genes, but carry _BYPASS_RM_OPT
@@ -5095,8 +5156,9 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--fitness", default=None,
                     help="Fitness metric. Default: 'option_consistent_annual_return' (aliases "
                          "'option_car'/'ocar') for pure-option strategies (OS1-OS4 + O_* option "
-                         "entries; NOT the equity-entry O_CC/O_PP/O_STK), 'sharpe_ratio' for "
-                         "stock strategies. "
+                         "entries) AND the equity-entry overlays O_CC/O_PP (F4(b), 2026-08-30 "
+                         "-- rank on the same metric as the rest of the option grid, not "
+                         "O_STK's), 'sharpe_ratio' for O_STK and stock strategies. "
                          "'consistent_annual_return' (aliases 'car'/'goal') targets ~30%%/yr "
                          "EVERY year: (adjusted) annualized return, hard >=30 trades/yr gate, "
                          "soft drawdown penalty beyond 20%%, x worst-year/mean-year consistency "
@@ -5108,6 +5170,12 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--early-stop", type=int, default=4)
     op.add_argument("--mutation-prob", type=float, default=0.3,
                     help="Per-gene mutation probability (higher = more exploration). Default 0.3.")
+    op.add_argument("--elitism-percent", type=float, default=10.0,
+                    help="Percent of the population preserved unchanged each generation "
+                         "(genetic.py/genetic_optimizer_base.py engine default: 10.0). F4, "
+                         "2026-08-30: this used to be hardcoded to 0.1 here -- floor(0.1%% of "
+                         "population, min 1) is exactly ONE elite regardless of population "
+                         "size, not the intended 10%%.")
     op.add_argument("--save-top", type=int, default=5,
                     help="Persist the top-N distinct param sets as saved Backtests (default 5).")
     op.add_argument("--seed", type=int, default=42, help="RNG seed (determinism).")
@@ -5320,14 +5388,19 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--fitness", default=None,
                     help="Fitness metric, resolved PER JOB when omitted: "
                          "'option_consistent_annual_return' for pure-option kinds "
-                         "(OS1-OS4/O_*), 'calmar_ratio' for stock kinds (the historical batch "
-                         "default). See optimize --fitness for what those metrics mean. Equity-ENTRY option kinds (O_CC/O_PP/O_STK) are excluded from that and keep the stock default, matching _resolve_fitness.")
+                         "(OS1-OS4/O_*) AND the equity-entry overlays O_CC/O_PP, "
+                         "'calmar_ratio' for O_STK and stock kinds (the historical batch "
+                         "default). See optimize --fitness for what those metrics mean; "
+                         "matches _resolve_fitness / _OPTION_CAR_STRATEGIES.")
     ob.add_argument("--generations", type=int, default=8)
     ob.add_argument("--population", type=int, default=40)
     ob.add_argument("--parallel", type=int, default=6, help="Process-pool workers per job.")
     ob.add_argument("--early-stop", type=int, default=4)
     ob.add_argument("--mutation-prob", type=float, default=0.3,
                     help="Per-gene mutation probability (higher = more exploration). Default 0.3.")
+    ob.add_argument("--elitism-percent", type=float, default=10.0,
+                    help="Percent of the population preserved unchanged each generation "
+                         "(engine default: 10.0). See optimize --elitism-percent.")
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)

@@ -242,7 +242,7 @@ def test_switching_the_account_persists_the_choice_and_reloads_the_browser(
 
     _run(_switch)
 
-    assert stored[afc.ACCOUNT_FILTER_KEY] == 2
+    assert stored[afc.account_filter_storage_key()] == 2
     _assert_reloaded_fire_and_forget(nicegui_client)
 
 
@@ -250,7 +250,7 @@ def test_switching_to_all_accounts_also_reloads(monkeypatch, nicegui_client):
     """'All' is the sentinel ``"all"`` in the widget and ``None`` in storage."""
     import ba2_trade_platform.ui.account_filter_context as afc
 
-    stored = {afc.ACCOUNT_FILTER_KEY: 1}
+    stored = {afc.account_filter_storage_key(): 1}
     accounts = [('All', None), ('Alcapa Live (Alpaca)', 1), ('Tasty (TastyTrade)', 2)]
     scenario = _render_selector(monkeypatch, nicegui_client, accounts, stored)
 
@@ -261,7 +261,7 @@ def test_switching_to_all_accounts_also_reloads(monkeypatch, nicegui_client):
 
     _run(_switch)
 
-    assert stored[afc.ACCOUNT_FILTER_KEY] is None
+    assert stored[afc.account_filter_storage_key()] is None
     _assert_reloaded_fire_and_forget(nicegui_client)
 
 
@@ -270,7 +270,7 @@ def test_the_selector_opens_on_the_account_that_is_actually_stored(
     """The widget must not disagree with the value the pages will read."""
     import ba2_trade_platform.ui.account_filter_context as afc
 
-    stored = {afc.ACCOUNT_FILTER_KEY: 2}
+    stored = {afc.account_filter_storage_key(): 2}
     accounts = [('All', None), ('Alcapa Live (Alpaca)', 1), ('Tasty (TastyTrade)', 2)]
     scenario = _render_selector(monkeypatch, nicegui_client, accounts, stored)
 

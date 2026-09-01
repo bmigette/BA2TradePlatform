@@ -438,17 +438,19 @@ def test_a_csp_reserving_the_full_strike_is_not_charged_twice(mock_account):
 
 def test_a_strangle_reserves_a_fraction_of_what_it_would_owe_on_assignment(mock_account):
     """The gap this feature exists to close, measured on one account: the reserve pool
-    holds back 2,500 of Reg-T naked margin for a short put that costs 22,500 to take
-    delivery on."""
+    holds back 2,700 of TRUE Reg-T pair margin (tied 2,500 brackets on the 225/275
+    strangle at spot 250, plus the larger 2.00 premium x 100 — operator decision
+    2026-08-31) for a short put that costs 22,500 to take delivery on."""
     from ba2_trade_platform.core.interfaces.OptionsAccountInterface import (
         OptionsAccountInterface as OAI)
 
     mock_account._balance = 100_000.0
     reserve = OAI.option_reserve_required("short_strangle", 1, strike=225.0, spot=250.0,
-                                          option_type=OptionRight.PUT)
+                                          call_strike=275.0,
+                                          put_premium=2.00, call_premium=1.00)
     short_put_order(mock_account, strike=225.0, txn_id=open_txn("AAPL"), reserve=reserve)
 
-    assert mock_account.reserved_option_buying_power() == pytest.approx(2_500.0)
+    assert mock_account.reserved_option_buying_power() == pytest.approx(2_700.0)
     assert mock_account.short_put_assignment_exposure().cost == pytest.approx(22_500.0)
 
 

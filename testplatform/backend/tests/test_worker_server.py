@@ -41,6 +41,8 @@ def client(monkeypatch):
     # Fresh job registry per test (module-level dicts would otherwise bleed state across tests).
     monkeypatch.setattr(ws, "_JOBS", {})
     monkeypatch.setattr(ws, "_JOBS_SUBMITTED_AT", {})
+    # Fresh manifest cache per test (it is module-global; CACHE_FOLDER is re-pointed per test).
+    monkeypatch.setattr(ws, "_MANIFEST_CACHE", {})
     return TestClient(ws.worker_app)
 
 
@@ -271,6 +273,49 @@ def test_cache_manifest_with_hash(client, tmp_path, monkeypatch):
 
     r = client.get("/cache/manifest", headers=H, params={"with_hash": "true"})
     assert r.status_code == 200 and "crc32" in r.json()["files"][0]
+
+
+def test_cache_manifest_is_cached(client, tmp_path, monkeypatch):
+    # Second call must be served from the module cache, not rebuilt from disk.
+    dst = tmp_path / "worker_cache"
+    dst.mkdir(parents=True)
+    (dst / "a.parquet").write_bytes(b"content")
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(dst))
+
+    assert client.get("/cache/manifest", headers=H).json()["count"] == 1
+
+    # Add a file on disk WITHOUT going through /cache/push: a cached manifest must NOT see it.
+    (dst / "b.parquet").write_bytes(b"more")
+    assert client.get("/cache/manifest", headers=H).json()["count"] == 1  # served from cache
+
+    # ...and a plain disk change must invalidate the next call once push/prune runs.
+
+
+def test_cache_push_invalidates_manifest(client, tmp_path, monkeypatch):
+    dst = tmp_path / "worker_cache"
+    dst.mkdir(parents=True)
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(dst))
+    src = tmp_path / "master_cache"
+    (src / "FMPOHLCVProvider").mkdir(parents=True)
+    (src / "FMPOHLCVProvider" / "AAPL_1d.parquet").write_bytes(b"data")
+    tar_bytes = b"".join(cache_sync.iter_tar(["FMPOHLCVProvider/AAPL_1d.parquet"], str(src)))
+
+    assert client.get("/cache/manifest", headers=H).json()["count"] == 0   # cold, empty
+    assert client.post("/cache/push", headers=H, content=tar_bytes).json()["extracted"] == 1
+    assert client.get("/cache/manifest", headers=H).json()["count"] == 1   # push invalidated
+
+
+def test_cache_prune_invalidates_manifest(client, tmp_path, monkeypatch):
+    dst = tmp_path / "worker_cache"
+    (dst / "screener").mkdir(parents=True)
+    stale = dst / "screener" / "old.parquet"
+    stale.write_bytes(b"stale")
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(dst))
+
+    assert client.get("/cache/manifest", headers=H).json()["count"] == 1
+    r = client.post("/cache/prune", headers=H, json={"rel_paths": ["screener/old.parquet"]})
+    assert r.json() == {"pruned": 1, "skipped": 0}
+    assert client.get("/cache/manifest", headers=H).json()["count"] == 0   # prune invalidated
 
 
 def test_submit_trial_full_then_poll_returns_complete_results(client):

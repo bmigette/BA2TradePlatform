@@ -87,6 +87,35 @@ only enter through the recommendation's own view, which is why D4's numerator is
 
 ## 4. Architecture
 
+> **DECISION (operator, 2026-08-30): the option risk manager SHARES ONE IMPLEMENTATION
+> between live and backtest, exactly like the classic RM.** This was always the intent
+> the module docstrings claimed ("the live pass and the backtest engine run one
+> implementation of each rail") and the 2026-08-30 program review (findings doc, F5)
+> proved it false on both sides: live calls no entry rail at all, and backtest
+> PremiumSeller runs a private `_within_rails` stopgap carrying defects the shared
+> modules document as fixed.
+>
+> Binding consequences for the remaining phases:
+>
+> 1. **The wiring point is the SHARED decision path** — `TradeActions`/
+>    `TradeActionEvaluator` in `ba2_common`, behind the `AccountInterface` seam —
+>    never `daily_engine.py` (backtest-only) and never `JobManager` (live-only). The
+>    classic pattern to copy: `TradeRiskManagement` is one `ba2_common` module consumed
+>    by live `TradeManager` and by `backtest_account` through the same evaluator.
+> 2. **P3's `OptionRiskManagement` (triage, rails, breaker entry-gate) lands in
+>    `ba2_common` and is invoked from `_resolve()`/`execute()`**, so wiring it once
+>    arms BOTH sides in the same commit. `option_book.check_rails`/`admit` and the
+>    breaker's halted-gate get their first production caller there — one caller, two
+>    runtimes.
+> 3. **PremiumSeller's `_within_rails`/`_txn_metrics`/`_should_close` stopgap is
+>    deleted, not migrated** — replaced by the shared modules or removed with
+>    PremiumSeller itself. No second implementation survives P3.
+> 4. **The CI parity gate grows option coverage when P3 lands**: the golden
+>    live<->backtest decision-identity test (`test_parity_golden.py`) must replay at
+>    least one option entry decision through both paths, or the sharing claim is once
+>    again prose.
+
+
 ### 4.1 Approach
 
 **Request → resolve → triage.** The option actions stop submitting and become *resolvers*. A new

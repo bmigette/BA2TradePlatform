@@ -291,7 +291,11 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
     ``cache_sync.diff_stale``). Returns ``{pushed, pruned, ...}``.
     """
     base, headers = _base(worker), _headers(worker)
-    with httpx.Client(timeout=60.0) as c:
+    # Manifest GET: a worker with a very large cache (remote150: 312k files / 36GB) enumerates
+    # from disk on a cold call (~140s on Windows FS). Warm workers answer in ms; this timeout
+    # just has to survive the cold case after a restart. (Workers >= 2026.08.0054 cache the
+    # manifest server-side, so this is belt-and-braces.)
+    with httpx.Client(timeout=300.0) as c:
         r = c.get(f"{base}/cache/manifest", headers=headers)
         r.raise_for_status()
         remote = r.json()

@@ -27,7 +27,11 @@ from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
     bar_scale_pct, build_label_bars, format_allocation_footer,
     sort_label_views,
     format_label_header, format_label_target_tooltip, format_label_total_notice,
+    delta_color,
+    format_base_composition,
+    format_delta,
     format_reserve_caption,
+    symbol_delta,
     format_reserve_row,
     label_color_options, normalise_label_color, resolve_label_icon_color,
     store_color_value,
@@ -1815,7 +1819,26 @@ def test_reserve_dollars_without_a_base_is_None_not_zero():
 
 def test_the_reserve_caption_states_the_money_and_what_is_left():
     assert format_reserve_caption(10_000.0, 25.0) == \
-        '= $2,500.00 held back, $7,500.00 investable'
+        '25% of the $10,000.00 base = $2,500.00 held back — $7,500.00 investable out of $10,000.00'
+
+
+def test_the_reserve_caption_names_the_base_it_is_a_percentage_OF():
+    """The reported confusion: "$536.98 held back, $4,832.81 investable" invites the
+    obvious sanity check, and that check is the wrong one -- 10% of the 4,832.81 you can
+    SEE is 483, not 537, so the page looks broken. It is not: the reserve is a share of
+    the GROSS base, and reserved is DEFINED as ``base - investable``, so the two halves
+    sum to the base exactly. Naming the base makes the division checkable on screen.
+
+    A reserve measured against the REMAINDER would be circular -- the remainder is what
+    is left after the reserve -- and would break that identity."""
+    text = format_reserve_caption(5_369.79, 10.0)
+
+    assert '$5,369.79 base' in text, "the caption must name the base it divides"
+    assert '$536.98 held back' in text
+    assert '$4,832.81 investable out of $5,369.79' in text
+    # The whole point: the reader can now verify it without leaving the line.
+    assert round(5_369.79 * 0.10, 2) == 536.98
+    assert round(536.98 + 4_832.81, 2) == 5_369.79
 
 
 def test_the_reserve_caption_says_so_when_there_is_no_base_instead_of_showing_zero():
@@ -1827,8 +1850,27 @@ def test_the_reserve_caption_says_so_when_there_is_no_base_instead_of_showing_ze
 def test_the_reserve_row_line_is_the_string_the_page_has_always_drawn():
     text = format_reserve_row(base_notional=10_000.0, available_buying_power=1_000.0,
                               unallocated_pct=25.0)
-    assert text == ('Unallocated (free buying power) — $1,000.00 (10.0% of base, '
-                    'target 25.00% of base = $2,500.00)')
+    assert text == ('Unallocated (free buying power) — now $1,000.00 (10.0% of base) '
+                    '· target $2,500.00 (25.00% of base)')
+
+
+def test_each_percentage_sits_beside_the_dollars_it_describes():
+    """The reported bug. The old line read
+    "$542.61 (10.1% of base, target 10.00% of base = $536.98)", which put the ACTUAL
+    percentage next to the TARGET dollars -- and directly under a caption that had just
+    said "$536.98 held back". It read as "$536.98 is 10.1%", and the page looked like it
+    could not add up. It could: base 5,369.79, target 10.00% = 536.98, actual 542.61 =
+    10.1049%. Nothing was wrong except which number the eye bound the percentage to.
+    """
+    text = format_reserve_row(base_notional=5_369.79, available_buying_power=542.61,
+                              unallocated_pct=10.0)
+
+    # Each amount is immediately followed by ITS OWN percentage.
+    assert '$542.61 (10.1% of base)' in text
+    assert '$536.98 (10.00% of base)' in text
+    # And each is labelled as measured or wanted.
+    assert 'now $542.61' in text
+    assert 'target $536.98' in text
 
 
 def test_the_reserve_row_line_is_None_when_there_is_nothing_to_divide_by():
@@ -1843,7 +1885,7 @@ def test_the_reserve_row_line_is_None_when_there_is_nothing_to_divide_by():
 def test_the_reserve_row_line_follows_the_reserve_box():
     text = format_reserve_row(base_notional=10_000.0, available_buying_power=1_000.0,
                               unallocated_pct=60.0)
-    assert 'target 60.00% of base = $6,000.00' in text
+    assert 'target $6,000.00 (60.00% of base)' in text
 
 
 # ---------------------------------------------------------------------------
@@ -4872,3 +4914,145 @@ def test_no_warnings_produce_no_lines():
 
     assert plan_warning_lines([]) == []
     assert plan_warning_lines(None) == []
+
+
+# ---------------------------------------------------------------------------
+# THE BASE, SPELLED OUT
+#
+# The card states a dozen figures "of base" and never showed the base. Both
+# reported confusions came from that one omission:
+#   1. "10% of total investable 4832 is 482, not 537" -- the reserve is 10% of the
+#      BASE (5,369.79), not of the remainder it leaves.
+#   2. "we have $4,827.18 managed and $4,832.81 investable ... total investable
+#      should be managed + BP" -- managed + BP IS the base (5,369.79); the 4,832.81
+#      is that base MINUS the reserve. The two differ by exactly the reserve, and
+#      neither the base nor the reserve was on screen to check against.
+# ---------------------------------------------------------------------------
+
+def test_the_base_line_shows_the_addition_every_percentage_divides():
+    text = format_base_composition(base_notional=5_369.79, available_buying_power=542.61)
+
+    assert text == 'base $5,369.79 = $4,827.18 managed + $542.61 buying power'
+
+
+def test_the_managed_term_is_derived_so_the_addition_cannot_disagree():
+    """base - buying_power, never a second sum of the positions. Re-summing them here
+    would be a second computation of a number the page already has, and the two would
+    drift the first time a valuation mode changed on one side only."""
+    for base, bp in ((10_000.0, 2_500.0), (5_369.79, 542.61), (1_000.0, 1_000.0)):
+        text = format_base_composition(base_notional=base,
+                                       available_buying_power=bp)
+        managed = float(text.split('= $')[1].split(' managed')[0].replace(',', ''))
+
+        assert round(managed + bp, 2) == round(base, 2)
+
+
+def test_the_base_line_is_absent_rather_than_guessed_when_a_term_is_unknown():
+    """0.00 for an unreported buying power would publish a base short by that amount --
+    and every percentage on the page divides this number, so a wrong base makes all of
+    them wrong AND plausible."""
+    assert format_base_composition(base_notional=10_000.0,
+                                   available_buying_power=None) is None
+    assert format_base_composition(base_notional=None,
+                                   available_buying_power=500.0) is None
+    assert format_base_composition(base_notional=0.0,
+                                   available_buying_power=500.0) is None
+
+
+def test_the_reserve_and_the_base_line_reconcile_on_screen():
+    """The end-to-end property the reader needs: base = managed + free, reserve is a
+    share of THAT base, and reserve + to-allocate is the base again."""
+    base, bp = 5_369.79, 542.61
+    base_line = format_base_composition(base_notional=base, available_buying_power=bp)
+    caption = format_reserve_caption(base, 10.0)
+
+    assert '$5,369.79' in base_line and '$5,369.79 base' in caption
+    assert '$536.98 held back' in caption
+    assert '$4,832.81 investable out of $5,369.79' in caption
+    assert round(536.98 + 4_832.81, 2) == round(base, 2)
+
+
+# ---------------------------------------------------------------------------
+# LIVE DELTAS
+#
+# What each row would CHANGE BY if the current targets were executed. Reported:
+# "putting same numbers in target share than current share gives different
+# amount" -- AAOI held 38.34% of the label and 38.34% was typed, yet the target
+# value came out $184.83 against $529.30 held. Nothing is wrong: the two
+# percentages divide different pots (what the label HOLDS vs what it is
+# TARGETED), and that label was over its target. The deltas say so on the row:
+# share 0.00pp, value -344.47, qty -3.2540.
+# ---------------------------------------------------------------------------
+
+def test_the_same_share_can_still_move_real_money():
+    """The reported case. A zero share delta beside a large negative money delta is
+    the correct reading of an over-allocated label, and it is the pair that explains
+    it -- either number alone looks like a bug."""
+    d = symbol_delta(weight_pct=38.34, pct_of_label=38.34,
+                     target_value=184.83, current_value=529.30,
+                     quantity=5, price=105.86)
+
+    assert d.share == pytest.approx(0.0)
+    assert d.value == pytest.approx(-344.47)
+    assert d.quantity == pytest.approx(184.83 / 105.86 - 5)
+
+
+def test_the_share_delta_is_in_percentage_POINTS():
+    """26.25% -> 27.09% is +0.84 POINTS. Reporting it as +3.2% (a percentage of a
+    percentage) would be a third denominator on a page that already has two."""
+    d = symbol_delta(weight_pct=27.09, pct_of_label=26.25, target_value=None,
+                     current_value=None, quantity=None, price=None)
+
+    assert d.share == pytest.approx(0.84)
+
+
+def test_the_quantity_delta_is_derived_from_the_money_the_column_prints():
+    """target_value / price, not share x something: the money is what the engine
+    solves for, so dividing the same number the TARGET VALUE cell shows is what keeps
+    the two columns from disagreeing by a rounding step."""
+    d = symbol_delta(weight_pct=50.0, pct_of_label=50.0, target_value=1_000.0,
+                     current_value=800.0, quantity=8.0, price=100.0)
+
+    assert d.quantity == pytest.approx(2.0)      # 10 target shares - 8 held
+
+
+def test_an_unmeasurable_delta_is_None_and_never_zero():
+    """A symbol with no price has NO quantity delta even though its money delta is
+    perfectly well defined. A 0.00 there would claim the position keeps its size while
+    its value moves, which cannot happen."""
+    d = symbol_delta(weight_pct=50.0, pct_of_label=40.0, target_value=1_000.0,
+                     current_value=800.0, quantity=8.0, price=None)
+
+    assert d.share == pytest.approx(10.0)
+    assert d.value == pytest.approx(200.0)
+    assert d.quantity is None
+
+
+def test_a_zero_price_does_not_divide():
+    d = symbol_delta(weight_pct=50.0, pct_of_label=50.0, target_value=1_000.0,
+                     current_value=800.0, quantity=8.0, price=0.0)
+
+    assert d.quantity is None
+
+
+def test_a_delta_prints_its_sign_but_a_zero_does_not():
+    """The sign is what the colour is keyed on, so an unsigned delta beside a number
+    is indistinguishable from a second column of that number. A signed ZERO, though,
+    invites the reader to look for a direction it is not claiming."""
+    assert format_delta(12.3456) == '+12.35'
+    assert format_delta(-12.3456) == '-12.35'
+    assert format_delta(0.0) == '0.00'
+    assert format_delta(None) == ''
+
+
+def test_an_unmeasurable_delta_draws_nothing_at_all():
+    """Empty, not a dash: a dash in a numeric column reads as a value."""
+    assert format_delta(None) == ''
+    assert format_delta(None, places=4) == ''
+
+
+def test_green_is_up_red_is_down_and_neither_claims_a_direction_it_lacks():
+    assert delta_color(1.0) == 'positive'
+    assert delta_color(-1.0) == 'negative'
+    assert delta_color(0.0) == 'grey-5'
+    assert delta_color(None) == 'grey-5', "unmeasurable must not be coloured as a move"
