@@ -56,6 +56,22 @@ _OPTION_ENTRY_PARAM_KEYS = (
 #: discretionary one — see ``forced_option_exit``.
 _FORCED_EXIT_EVENT_TYPES = frozenset({
     ExpertEventType.N_DAYS_TO_EXPIRY.value,
+    # `days_after_event` -- the O_ERN post-print exit (design 2026-08-31 leaps-grid S9).
+    #
+    # THIS IS CLASSIFIED OPPOSITE TO `days_opened`, DELIBERATELY, AND THE DIFFERENCE IS NOT
+    # "both count days". `days_opened` is a STALENESS exit: nothing about the position
+    # changed, the thesis simply has not paid, and the close can wait for a decent quote --
+    # that is what makes it discretionary, and it stays discretionary (pinned by test).
+    # `days_after_event` is the terminal date of a BINARY EVENT trade. The position is long
+    # premium bought for one announcement; once that announcement has passed and the searched
+    # number of days has elapsed, the thesis is over and what remains is a decaying option
+    # nobody chose to own. There is no waiting for a better print -- theta and the post-event
+    # vol crush are both running against it every day it stays on -- so the exit pays up, the
+    # same reading `days_to_expiry` gets. Classifying it discretionary would let a trial book
+    # its event exits at the entry concession fraction instead of the modelled spread, which
+    # is the filter-flattering exit F7 exists to remove, on the ONE grid key whose result the
+    # design says deserves statistical weight (hundreds of independent events in-window).
+    ExpertEventType.N_DAYS_AFTER_EVENT.value,
 })
 #: LOSS-SIDE STOP TRIGGERS, keyed by the field's SIGN CONVENTION.
 #:

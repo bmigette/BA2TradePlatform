@@ -431,6 +431,28 @@ class ExpertEventType(str, Enum):
     # history and says nothing about whether the stock is earning that IV.
     N_IV_TO_REALIZED_VOL = "iv_to_realized_vol"
     N_DAYS_TO_EARNINGS = "days_to_earnings"                    # Calendar days until the next earnings announcement
+    # THE SAME QUANTITY, DIFFERENT SOURCE (design 2026-08-31 leaps-grid S9, the TIMING SPLIT).
+    # Days-to-earnings AS THE RANKING EXPERT MEASURED IT, read back off
+    # ExpertRecommendation.data["FMPEarningsEvent"]["days_to_earnings"] -- never a second
+    # calendar fetch. O_ERN chains behind FMPEarningsEvent: the expert owns the RANKING and
+    # already resolved the event date to score the symbol, so the strategy's entry gene must
+    # gate on THAT number or the two sides can disagree about when the event is. Point-in-time
+    # consistent with the rank, and free (no provider call per bar per symbol).
+    #
+    # It does NOT replace N_DAYS_TO_EARNINGS, which fetches the calendar itself and stays the
+    # answer for UNCHAINED uses (any expert, no stamp required). The two differ where it
+    # matters: this one is UNEVALUABLE -- fires in NEITHER direction -- when there is no stamp,
+    # which is every recommendation from every other expert. Reading an absent stamp as 0 would
+    # satisfy "<= X" for the whole universe.
+    N_REC_DAYS_TO_EARNINGS = "rec_days_to_earnings"
+    # Calendar days SINCE the stamped event, for an open position: the exit half of the same
+    # timing split ("exit Y days after the print", Y searched 0-2). The reference is the event
+    # date the ENTRY order carried forward (TradingOrder.data["earnings_event_date"], stamped at
+    # submit beside max_loss_per_contract), NOT the current recommendation -- by exit time that
+    # is a different, later one. 0 ON the event day, 1 the next calendar day. UNEVALUABLE when
+    # the entry order carries no event date, which is every order not opened off an
+    # earnings-event recommendation.
+    N_DAYS_AFTER_EVENT = "days_after_event"
     # Calendar days of option life REMAINING (expiry - the evaluation date). The complement of
     # N_DAYS_OPENED, which counts days ELAPSED: with the entry DTE window itself a tuned gene,
     # "21 days after opening" and "21 days before expiry" are different quantities. This is what
@@ -588,6 +610,8 @@ def get_numeric_event_values():
         ExpertEventType.N_RELATIVE_VOLUME.value,
         ExpertEventType.N_IV_TO_REALIZED_VOL.value,
         ExpertEventType.N_DAYS_TO_EARNINGS.value,
+        ExpertEventType.N_REC_DAYS_TO_EARNINGS.value,
+        ExpertEventType.N_DAYS_AFTER_EVENT.value,
         ExpertEventType.N_DAYS_TO_EXPIRY.value,
         ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value,
         ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value

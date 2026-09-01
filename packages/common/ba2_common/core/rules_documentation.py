@@ -319,6 +319,36 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Enter a straddle into earnings: days_to_earnings <= 5"
         },
+        ExpertEventType.N_REC_DAYS_TO_EARNINGS.value: {
+            "name": "Days to Earnings (expert-stamped)",
+            "description": (
+                "The same quantity as days_to_earnings, but READ BACK off the recommendation "
+                "the ranking expert produced instead of fetched again. Use this when the "
+                "strategy runs behind an earnings-event expert: that expert already resolved "
+                "the event date to score the symbol, so gating on its number keeps the entry "
+                "timing point-in-time consistent with the rank (one timing knob, not two that "
+                "can disagree). A recommendation carrying no earnings stamp -- i.e. every "
+                "recommendation from every other expert -- leaves this UNEVALUABLE and it does "
+                "NOT fire in either direction; it is never read as 0 days away."
+            ),
+            "type": "numeric",
+            "example": "Enter the straddle 1-5 days before the print: rec_days_to_earnings <= 3"
+        },
+        ExpertEventType.N_DAYS_AFTER_EVENT.value: {
+            "name": "Days after the Event",
+            "description": (
+                "For an open position opened off an earnings-event recommendation: calendar "
+                "days since that event. 0 on the event day itself, 1 the next calendar day, "
+                "and negative while the event is still ahead (the entry is taken days BEFORE "
+                "the print). The reference is the event date the ENTRY order carried forward, "
+                "not whatever recommendation is in hand now. Use it to take the post-print "
+                "move and volatility crush a fixed number of days after the announcement. A "
+                "position whose entry order carries no event date is UNEVALUABLE and does NOT "
+                "fire in either direction."
+            ),
+            "type": "numeric",
+            "example": "Close the straddle the day after the print: days_after_event >= 1"
+        },
         ExpertEventType.N_DAYS_TO_EXPIRY.value: {
             "name": "Days to Expiry (remaining option life)",
             "description": (

@@ -71,6 +71,13 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     "relative_volume": ExpertEventType.N_RELATIVE_VOLUME,
     "iv_to_realized_vol": ExpertEventType.N_IV_TO_REALIZED_VOL,
     "days_to_earnings": ExpertEventType.N_DAYS_TO_EARNINGS,
+    # The O_ERN TIMING SPLIT (design 2026-08-31 leaps-grid S9). Entry: days-to-earnings as
+    # the ranking expert STAMPED it on the recommendation -- not a second calendar fetch.
+    # Exit: calendar days since the event date the entry order carried forward. Both are
+    # UNEVALUABLE (fire in NEITHER direction) without their stamp, which is every
+    # recommendation and every position that did not come from an earnings-event expert.
+    "rec_days_to_earnings": ExpertEventType.N_REC_DAYS_TO_EARNINGS,
+    "days_after_event": ExpertEventType.N_DAYS_AFTER_EVENT,
 }
 
 # Flag (boolean) condition fields -> ExpertEventType (no operator/value). Used by exit

@@ -21,6 +21,13 @@ from ba2_common.core.failure_modes import absorb_if_benign
 # than re-invented so the engine, the live service, the UI and the conditions all raise
 # and catch the same class. See its docstring for the 2026-07-03 incident.
 from ba2_common.core.portfolio_allocation import PositionFetchFailed
+# The earnings-event STAMP CONTRACT (design 2026-08-31 leaps-grid S9): the key paths the
+# ranking expert writes and the two O_ERN timing conditions below read back. Shared with
+# TradeActions, which stamps the event date onto the entry order at submit.
+from ba2_common.core.earnings_stamp import (
+    order_event_date,
+    stamped_days_to_earnings,
+)
 
 
 # --- Provider-injection seam -------------------------------------------------
@@ -2885,6 +2892,12 @@ class DaysToEarningsCondition(CompareCondition):
     Unknown is never a value: with no usable evaluation date or no upcoming earnings from
     either source, ``calculated_value`` stays None and ``evaluate()`` returns False for every
     operator.
+
+    NOT the condition a CHAINED earnings strategy should use. When the entry runs behind an
+    expert that already ranked the event (``FMPEarningsEvent``), the gate belongs on
+    ``rec_days_to_earnings`` -- the distance THAT expert stamped on the recommendation --
+    so the timing and the rank cannot disagree (design 2026-08-31 leaps-grid S9). This one
+    stays the answer for UNCHAINED uses: any expert, no stamp required.
     """
 
     #: How far past the evaluation bar to read the earnings calendar. Comfortably more than
@@ -3025,6 +3038,155 @@ class DaysToEarningsCondition(CompareCondition):
         if self.calculated_value is None:
             return None
         return f"{int(self.calculated_value)}d"
+
+
+class RecommendationDaysToEarningsCondition(CompareCondition):
+    """Days to earnings AS THE RANKING EXPERT STAMPED IT -- the chained-entry timing gate.
+
+    ``calculated_value = expert_recommendation.data["FMPEarningsEvent"]["days_to_earnings"]``,
+    read back, never recomputed. This is ``O_ERN``'s entry gene (``rec_days_to_earnings <= X``,
+    X searched 1-5 -- design 2026-08-31 leaps-grid S9).
+
+    WHY THIS EXISTS BESIDE ``DaysToEarningsCondition``
+    -------------------------------------------------
+    The design's TIMING SPLIT is: the EXPERT owns the ranking, the STRATEGY owns the timing,
+    and there is ONE timing knob. ``FMPEarningsEvent`` already resolved the event date to
+    score the symbol at that bar; it stamps the distance it measured. A strategy that gated
+    on a SECOND, independently fetched calendar read could disagree with the rank it is
+    acting on -- a different date (the calendar moves, a print is delayed, the annual-estimate
+    fallback fires), or the same date measured against a different clock. So the chained gate
+    reads the STAMP and nothing else.
+
+    ``DaysToEarningsCondition`` (``days_to_earnings``) is NOT changed and NOT deprecated: it
+    fetches the FMP calendar itself and is the answer for UNCHAINED uses -- any expert, no
+    stamp required (e.g. "do not open anything that would straddle an earnings print").
+    Making THAT condition stamp-first-with-a-calendar-fallback was considered and rejected:
+    a fallback is exactly the second timing source this split exists to remove, it cannot
+    satisfy "absent stamp never fires" (it would fire off the calendar instead), and it would
+    silently change the meaning of every ruleset already using the field.
+
+    ABSENT STAMP NEVER FIRES -- the ``DaysToExpiryCondition`` / ``LossPctOfMaxLoss``
+    discipline, and here it is load-bearing rather than defensive. Every recommendation from
+    every other expert has no ``FMPEarningsEvent`` payload, so if absence read as ``0`` the
+    gate ``rec_days_to_earnings <= 5`` would pass for the ENTIRE universe and the strategy
+    would buy a straddle on everything while looking timed. ``calculated_value`` therefore
+    stays ``None`` and ``evaluate()`` returns False for EVERY operator when the stamp is
+    missing, non-dict, or not a real number (bool/str/NaN are refused, not parsed).
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            days = stamped_days_to_earnings(self.expert_recommendation)
+            if days is None:
+                # DEBUG, not warning: on any non-event expert this is the normal case for
+                # every symbol on every bar, and a warning per symbol per bar is noise.
+                logger.debug(
+                    f"rec_days_to_earnings for {self.instrument_name} is unevaluable: the "
+                    f"recommendation carries no FMPEarningsEvent days_to_earnings stamp")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = days
+            return self.operator_func(days, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating rec_days_to_earnings condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the expert's stamped days-to-earnings for {self.instrument_name} "
+                f"is {self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{int(self.calculated_value)}d"
+
+
+class DaysAfterEventCondition(CompareCondition):
+    """Calendar days SINCE the stamped event -- the exit half of the O_ERN timing split.
+
+    ``calculated_value = (the evaluation bar) - (the event date the ENTRY order carries)``.
+    ``O_ERN``'s exit gene is ``days_after_event >= Y``, Y searched 0-2 (design 2026-08-31
+    leaps-grid S9): hold the straddle through the print, then take whatever the move and the
+    vol crush left, Y days later.
+
+    THE REFERENCE DATE COMES OFF THE ORDER, NOT THE RECOMMENDATION
+    --------------------------------------------------------------
+    By exit time the recommendation in hand is a DIFFERENT, later one -- possibly for the
+    NEXT quarter's print, possibly from another expert entirely. The date that matters is
+    the one the position was opened for, so ``TradeActions._submit_option_order`` carries it
+    forward onto the parent order's ``data["earnings_event_date"]`` at submit, beside
+    ``max_loss_per_contract`` and ``option_reserve``. Same seam, same read-back-never-
+    reconstruct rule (design 2026-08-29 S8.2). The alternative -- re-reading the entry
+    recommendation through ``TradingOrder.expert_recommendation_id`` -- was rejected: it is a
+    row fetch per open position per bar for a value that never changes after entry.
+
+    THE DATE CONVENTION, PINNED
+    ---------------------------
+    Two ``date`` objects subtracted -- no timezone arithmetic, no wall clock, no partial
+    days. "Today" is ``self._evaluation_date()``: the SIMULATED bar in a backtest, the wall
+    clock in live (``DaysToExpiryCondition``'s clock, for the same reason -- a backtest's
+    wall clock is years past the last bar). The event day itself reads ``0``; the next
+    calendar day reads ``1``. So on a Monday event, ``days_after_event >= 1`` first passes on
+    the Tuesday bar, and ``>= 0`` passes on the Monday bar itself. Negative before the event
+    -- a real state, since the entry is taken 1-5 days BEFORE the print -- and NOT clamped,
+    because clamping to 0 would make ``>= 0`` fire the moment the position opened.
+
+    UNKNOWN NEVER FIRES, in either direction. No order, no ``data`` dict, no
+    ``earnings_event_date``, an unparseable one, or an unreadable simulated clock each leave
+    ``calculated_value`` ``None`` and ``evaluate()`` False for EVERY operator. Absence is the
+    normal case for every position not opened off an earnings-event recommendation, and the
+    default specifically refused is "absent reads as today" (``0``), which would fire
+    ``>= 0`` on sight and flatten every option position in the book.
+
+    FORCED, NOT DISCRETIONARY, when it closes an option structure -- registered in
+    ``TradeActionEvaluator._FORCED_EXIT_EVENT_TYPES`` beside ``days_to_expiry``. See the
+    note there for why this time exit is classified opposite to ``days_opened``.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                self.calculated_value = None
+                return False
+
+            # Row read FIRST: a position with no event stamp -- every equity position and
+            # every option position from any other expert -- must cost nothing per bar.
+            event_day = order_event_date(self.existing_order)
+            if event_day is None:
+                self.calculated_value = None
+                return False
+
+            as_of = self._evaluation_date()
+            if as_of is None:
+                # A backtest account whose simulated clock is unreadable. Substituting
+                # date.today() here is the DaysToEarningsCondition bug, in a position exit.
+                logger.warning(
+                    f"days_after_event for {self.instrument_name} is unevaluable: no usable "
+                    f"evaluation date")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = (as_of - event_day).days
+            return self.operator_func(self.calculated_value, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating days_after_event condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if calendar days since {self.instrument_name}'s stamped event is "
+                f"{self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{int(self.calculated_value)}d after event"
 
 
 class DaysToExpiryCondition(CompareCondition):
@@ -3465,6 +3627,8 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_RELATIVE_VOLUME: RelativeVolumeCondition,
     ExpertEventType.N_IV_TO_REALIZED_VOL: IVToRealizedVolCondition,
     ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
+    ExpertEventType.N_REC_DAYS_TO_EARNINGS: RecommendationDaysToEarningsCondition,
+    ExpertEventType.N_DAYS_AFTER_EVENT: DaysAfterEventCondition,
     ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
     ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
     ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,

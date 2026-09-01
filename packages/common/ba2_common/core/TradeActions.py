@@ -34,6 +34,7 @@ from ba2_common.core.option_payoff import (
 from ba2_common.core.OptionRiskManagement import (
     admit_option_entry, option_risk_manager_enabled, record_submitted,
 )
+from ba2_common.core.earnings_stamp import ORDER_EVENT_DATE_KEY, stamped_event_date
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selection_policy import SelectionPolicy, validate_wired_weights
@@ -2871,6 +2872,22 @@ class _OptionEntryAction(TradeAction):
         max_loss_per_contract = _measured_max_loss_per_contract(legs, limit_price)
         if max_loss_per_contract is not None:
             data["max_loss_per_contract"] = max_loss_per_contract
+        # THE EVENT-CLOCK CARRY-FORWARD (design 2026-08-31 leaps-grid S9, the TIMING SPLIT).
+        # Same seam and same discipline as the max-loss stamp above: the EXIT needs the date
+        # of the event this ENTRY was taken for, and by exit time the recommendation in hand
+        # is a DIFFERENT, later one (next quarter's print, or another expert entirely). The
+        # order row is the only thing that travels with the position, so the date rides it and
+        # ``days_after_event`` reads it BACK -- no re-fetch of the earnings calendar, no second
+        # timing source that could disagree with the one the entry was timed on.
+        #
+        # STAMPED ONLY WHEN THE RECOMMENDATION CARRIES ONE. Absence of the key is the gate:
+        # every order not opened off an earnings-event recommendation has no key, and
+        # ``days_after_event`` is then UNEVALUABLE for that position rather than reading the
+        # event as "today" and flattening it on sight. ISO string, not a ``date``: ``data`` is
+        # a JSON column.
+        event_day = stamped_event_date(self.expert_recommendation)
+        if event_day is not None:
+            data[ORDER_EVENT_DATE_KEY] = event_day.isoformat()
         # THE RM'S DENOMINATOR IS A DIFFERENT QUESTION and keeps the cover (2026-08-31,
         # OPERATOR-RATIFIED VALUATION). The rails ask "how much of the sleeve does this
         # structure commit", which IS the whole position -- stock included -- so a verified
@@ -2937,17 +2954,26 @@ class _OptionEntryAction(TradeAction):
             # stop. The charge is dropped again the moment the transaction becomes visible.
             record_submitted(rm_instance_id, getattr(order, "transaction_id", None),
                              rm_candidate)
-        # Persist the entry facts on the order row. Three of them, from two lineages:
+        # Persist the entry facts on the order row. FOUR of them, from three lineages:
         #   - option_reserve       -- the short-premium reserve, so available BP reflects it;
         #   - max_loss_per_contract -- the measured max loss, so the loss_pct_of_max_loss exit
         #     can read its denominator back off the row (design 2026-08-29 S8.2);
+        #   - earnings_event_date  -- the stamped event this entry was timed on, so the
+        #     days_after_event exit can read it back (design 2026-08-31 leaps-grid S9);
         #   - entry_cross          -- the entry-quote concession fraction, so a later
         #     DISCRETIONARY close can concede the SAME fraction this entry did (review
         #     2026-08-30 F7; see CloseOptionAction._close_cross_fraction).
         # entry_cross is persisted whenever the gene is set (not only when it moved this
         # particular quote) and is absent for the 0.0 default, so a default run's order row
         # is byte-identical to before.
-        entry_facts = {k: data[k] for k in ("option_reserve", "max_loss_per_contract")
+        #
+        # THIS TUPLE IS A WHITELIST, AND THAT IS THE TRAP. A key written into ``data`` above
+        # but missing HERE reaches the TradeActionResult (so every log and every UI row shows
+        # it) and never reaches the ORDER, which is where the exit conditions read. The stamp
+        # would look configured and be inert -- the ``days_after_event`` gene would be a dead
+        # gene the GA tuned for a whole campaign. Named by constant, not spelled again.
+        entry_facts = {k: data[k] for k in ("option_reserve", "max_loss_per_contract",
+                                            ORDER_EVENT_DATE_KEY)
                        if k in data}
         if self.entry_cross is not None and float(self.entry_cross) != ENTRY_CROSS_NEUTRAL:
             entry_facts["entry_cross"] = float(self.entry_cross)

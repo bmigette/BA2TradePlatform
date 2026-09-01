@@ -35,6 +35,8 @@ _FIELD_ABBR: Dict[str, str] = {
     "relative_volume": "relVol",
     "iv_to_realized_vol": "ivOverRv",
     "days_to_earnings": "toEarn",
+    "rec_days_to_earnings": "recToEarn",
+    "days_after_event": "afterEvent",
     "days_to_expiry": "toExp",
     "loss_pct_of_max_loss": "lossOfMax",
     "profit_multiple_of_premium": "tpMult",
