@@ -13,6 +13,12 @@ from ...core.TransactionHelper import TransactionHelper
 from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
 from ...logger import logger
+from types import SimpleNamespace
+
+from ..utils.chart_helpers import (
+    axis_format, fullscreen_button, grid_options, legend_options, mode_toggle,
+    pct_of_invested,
+)
 from ..utils.perf_logger import PerfLogger
 from ..utils.protective_stop import resolve_protective_legs
 from ..utils.growth_label_storage import (
@@ -5468,7 +5474,10 @@ class AccountGrowthTab:
         with ui.card().classes('w-full mb-4 p-4'):
             with ui.row().classes('w-full items-center justify-between'):
                 ui.label('Monthly Realized Income').classes('text-md font-bold mb-2')
-                mode = ui.toggle(['$', '%'], value='$').props('dense')
+                with ui.row().classes('items-center gap-1'):
+                    mode = ui.toggle(['$', '%'], value='$').props('dense')
+                    fullscreen_button(lambda: build(),
+                                      title='Monthly Realized Income')
             if not months:
                 ui.label('No closed trades or dividend income yet.').classes('text-sm text-gray-500')
                 return
@@ -5520,7 +5529,10 @@ class AccountGrowthTab:
         with ui.card().classes('w-full mb-4 p-4'):
             with ui.row().classes('w-full items-center justify-between'):
                 ui.label('Monthly Closed Profit + Dividends by Label').classes('text-md font-bold mb-2')
-                mode = ui.toggle(['$', '%'], value='$').props('dense')
+                with ui.row().classes('items-center gap-1'):
+                    mode = ui.toggle(['$', '%'], value='$').props('dense')
+                    fullscreen_button(lambda: build(),
+                                      title='Monthly Closed Profit + Dividends by Label')
             if not months or not labels:
                 ui.label('No closed trades yet.').classes('text-sm text-gray-500')
                 return
@@ -6067,12 +6079,24 @@ class AccountGrowthTab:
                   '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
 
         with ui.card().classes('w-full mb-4 p-4'):
-            ui.label('Growth by Label').classes('text-md font-bold mb-2')
+            with ui.row().classes('w-full items-center justify-between'):
+                ui.label('Growth by Label').classes('text-md font-bold mb-2')
+                with ui.row().classes('items-center gap-1'):
+                    mode = mode_toggle()
+                    fullscreen_button(lambda: build_chart_options(
+                        sorted(list(label_select.value)) if label_select.value else [],
+                        show_total_cb.value, show_div_cb.value, show_inv_cb.value),
+                        title='Growth by Label')
 
             def build_chart_options(visible_labels, show_total=True, show_dividends=True, show_invested=True):
                 series = []
                 legend_data = []
                 single = len(visible_labels) == 1  # gain/loss band only for a single label (avoid colour mush)
+                # % MODE IS A RATIO OF INVESTED CAPITAL AT EACH DATE, not a rebase to the
+                # first point: a label that took contributions would otherwise look like
+                # one that made a return. It also makes Invested a flat 100% line, which
+                # is the reference the other two are read against.
+                pct = mode.value == '%'
 
                 for i, label in enumerate(visible_labels):
                     color = colors[i % len(colors)]
@@ -6082,14 +6106,26 @@ class AccountGrowthTab:
                     # own informational line below.
                     total_data = [round(v, 2) for v in label_daily_values[label]]
                     inv_data = [round(v, 2) for v in label_cum_invested[label]]
+                    div_data = list(label_cum_divs[label])
                     has_div = has_any_dividends and label_cum_divs[label][-1] > 0
                     has_inv = has_any_invested and label_cum_invested[label][-1] > 0
+                    if pct:
+                        # Converted BEFORE the band is computed, so "above/below the
+                        # invested line" keeps meaning the same thing in both modes.
+                        denom = list(inv_data)
+                        total_data = pct_of_invested(total_data, denom)
+                        div_data = pct_of_invested(div_data, denom)
+                        inv_data = pct_of_invested(denom, denom)
 
                     # Gain/loss band between Total and Invested (single label only).
                     # Two stacked bands: green where Total >= Invested, red where Invested > Total.
                     if single and show_total and show_invested and has_inv:
-                        gain = [round(max(0.0, t - iv), 2) for t, iv in zip(total_data, inv_data)]
-                        loss = [round(max(0.0, iv - t), 2) for t, iv in zip(total_data, inv_data)]
+                        # ``None`` in either series is a date with no invested capital;
+                        # the band has nothing to span there and must break, not read 0.
+                        gain = [None if (t is None or iv is None) else round(max(0.0, t - iv), 2)
+                                for t, iv in zip(total_data, inv_data)]
+                        loss = [None if (t is None or iv is None) else round(max(0.0, iv - t), 2)
+                                for t, iv in zip(total_data, inv_data)]
                         band_base = {'type': 'line', 'smooth': False, 'symbol': 'none', 'silent': True,
                                      'lineStyle': {'opacity': 0}, 'tooltip': {'show': False}, 'z': 0}
                         # green band: base = invested, fill up to total
@@ -6115,7 +6151,7 @@ class AccountGrowthTab:
                     if show_dividends and has_div:
                         div_name = f'{label} (Dividends)'
                         series.append({
-                            'name': div_name, 'type': 'line', 'data': label_cum_divs[label], 'smooth': True,
+                            'name': div_name, 'type': 'line', 'data': div_data, 'smooth': True,
                             'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
                             'itemStyle': {'color': color}, 'showSymbol': False, 'z': 2,
                         })
@@ -6139,12 +6175,12 @@ class AccountGrowthTab:
                         'borderColor': 'rgba(255, 255, 255, 0.1)',
                         'textStyle': {'color': '#ffffff'},
                     },
-                    'legend': {
-                        'data': legend_data,
-                        'textStyle': {'color': '#a0aec0'},
-                        'top': 5,
-                    },
-                    'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                    # Legend and grid from ONE input, so they cannot drift: past a
+                    # handful of entries the legend paginates instead of wrapping, and
+                    # the plot starts below whichever shape it took. Unpaginated, thirty
+                    # series names wrapped onto four rows and covered the top gridline.
+                    'legend': legend_options(legend_data),
+                    'grid': grid_options(legend_data),
                     'xAxis': {
                         'type': 'category',
                         'data': all_dates,
@@ -6153,7 +6189,7 @@ class AccountGrowthTab:
                     },
                     'yAxis': {
                         'type': 'value',
-                        'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                        'axisLabel': {'color': '#a0aec0', 'formatter': axis_format(pct)},
                         'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
                     },
                     'series': series,
@@ -6192,6 +6228,7 @@ class AccountGrowthTab:
             show_total_cb.on_value_change(lambda e: rebuild_label_chart())
             show_div_cb.on_value_change(lambda e: rebuild_label_chart())
             show_inv_cb.on_value_change(lambda e: rebuild_label_chart())
+            mode.on_value_change(lambda e: rebuild_label_chart())
 
     def _render_growth_by_position_in_label_charts(self, all_positions, historical_prices=None, all_dividends=None, all_filled_trades=None):
         """Render historical growth line chart for individual positions within a selected label."""
@@ -6334,7 +6371,13 @@ class AccountGrowthTab:
                   '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
 
         with ui.card().classes('w-full mb-4 p-4'):
-            ui.label('Growth by Position (within Label)').classes('text-md font-bold mb-2')
+            with ui.row().classes('w-full items-center justify-between'):
+                ui.label('Growth by Position (within Label)').classes('text-md font-bold mb-2')
+                with ui.row().classes('items-center gap-1'):
+                    pos_mode = mode_toggle()
+                    fullscreen_button(
+                        lambda: build_position_chart_options(label_select.value),
+                        title='Growth by Position (within Label)')
 
             def get_symbols_for_label(label):
                 return sorted([sym for sym, info in symbol_info.items() if label in info['labels']])
@@ -6351,6 +6394,15 @@ class AccountGrowthTab:
                     any(sym_cum_invested[sym][-1] > 0 for sym in symbols if sym in sym_cum_invested)
                     if all_dates else False
                 )
+                # As with Growth by Label: a ratio of the position's OWN invested
+                # capital at each date, so Invested reads as a flat 100% baseline.
+                pct = pos_mode.value == '%'
+
+                def _conv(values, sym):
+                    if not pct:
+                        return [round(v, 2) for v in values]
+                    return pct_of_invested(values, sym_cum_invested.get(sym) or [])
+
                 for i, sym in enumerate(symbols):
                     if sym not in sym_daily_values:
                         continue
@@ -6358,7 +6410,7 @@ class AccountGrowthTab:
                     series.append({
                         'name': sym,
                         'type': 'line',
-                        'data': [round(v, 2) for v in sym_daily_values[sym]],
+                        'data': _conv(sym_daily_values[sym], sym),
                         'smooth': True,
                         'lineStyle': {'width': 2, 'color': color},
                         'itemStyle': {'color': color},
@@ -6376,7 +6428,7 @@ class AccountGrowthTab:
                             series.append({
                                 'name': div_name,
                                 'type': 'line',
-                                'data': sym_cum_divs[sym],
+                                'data': _conv(sym_cum_divs[sym], sym),
                                 'smooth': True,
                                 'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
                                 'itemStyle': {'color': color},
@@ -6387,7 +6439,7 @@ class AccountGrowthTab:
                             # Total = holdings value only. Dividends are shown separately and
                             # not added (reinvested dividends are already in value + invested).
                             total_name = f'{sym} (Total)'
-                            total_data = [round(v, 2) for v in sym_daily_values[sym]]
+                            total_data = _conv(sym_daily_values[sym], sym)
                             series.append({
                                 'name': total_name,
                                 'type': 'line',
@@ -6409,7 +6461,7 @@ class AccountGrowthTab:
                             series.append({
                                 'name': inv_name,
                                 'type': 'line',
-                                'data': sym_cum_invested[sym],
+                                'data': _conv(sym_cum_invested[sym], sym),
                                 'smooth': False,
                                 'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotdash'},
                                 'itemStyle': {'color': color},
@@ -6425,12 +6477,8 @@ class AccountGrowthTab:
                         'borderColor': 'rgba(255, 255, 255, 0.1)',
                         'textStyle': {'color': '#ffffff'},
                     },
-                    'legend': {
-                        'data': legend_data,
-                        'textStyle': {'color': '#a0aec0'},
-                        'top': 5,
-                    },
-                    'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                    'legend': legend_options(legend_data),
+                    'grid': grid_options(legend_data),
                     'xAxis': {
                         'type': 'category',
                         'data': all_dates,
@@ -6439,7 +6487,7 @@ class AccountGrowthTab:
                     },
                     'yAxis': {
                         'type': 'value',
-                        'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                        'axisLabel': {'color': '#a0aec0', 'formatter': axis_format(pct)},
                         'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
                     },
                     'series': series,
@@ -6465,6 +6513,10 @@ class AccountGrowthTab:
                     ui.echart(build_position_chart_options(e.value)).classes('w-full h-80')
 
             label_select.on_value_change(on_position_label_change)
+            # The toggle redraws the CURRENT label, so it reuses the same handler with
+            # the selector's value rather than the event's.
+            pos_mode.on_value_change(
+                lambda e: on_position_label_change(SimpleNamespace(value=label_select.value)))
 
     def _render_dividend_history_table(self, dividends):
         """Render a paginated table of dividend history for the last 6 months."""
@@ -6583,9 +6635,17 @@ class AccountGrowthTab:
                 trades_by_symbol.setdefault(sym, []).append(t)
 
         with ui.card().classes('w-full mb-4 p-4'):
-            ui.label('Per-Position Growth').classes('text-md font-bold mb-2')
-
             symbol_options = sorted(set(pos.symbol for pos in all_positions))
+            # THE SELECTOR SITS ABOVE THE CHART, like every other panel on this page.
+            # It was below, so the control that decides what the chart shows was read
+            # after the chart it decides.
+            with ui.row().classes('w-full items-center justify-between'):
+                ui.label('Per-Position Growth').classes('text-md font-bold mb-2')
+                symbol_select = ui.select(
+                    options=symbol_options,
+                    value=symbol_options[0] if symbol_options else None,
+                    label='Select Symbol'
+                ).classes('w-64')
             chart_container = ui.column().classes('w-full')
 
             async def _load_position_chart(container, account_inst, symbol):
@@ -6639,11 +6699,7 @@ class AccountGrowthTab:
                     return
                 asyncio.create_task(_load_position_chart(chart_container, account_inst, selected_symbol))
 
-            ui.select(
-                options=symbol_options,
-                value=symbol_options[0] if symbol_options else None,
-                label='Select Symbol'
-            ).on_value_change(on_symbol_change).classes('w-64 mb-4')
+            symbol_select.on_value_change(on_symbol_change)
 
             if symbol_options:
                 initial_symbol = symbol_options[0]
@@ -6743,6 +6799,12 @@ class AccountGrowthTab:
         #   (no separate "purchased only" line) plus a dedicated "DRIP Invested" $ line.
         # P&L % = ((price - running_avg) / running_avg) * 100 — evolves with cost basis
         values = []
+        #: Cumulative COST of the shares held, per date -- the "amount purchased" line
+        #: the account-growth chart carries. It is ``running_cost``, which this loop
+        #: already maintains for the P&L%, sampled once per date rather than recomputed:
+        #: a second accumulation would be a second definition of cost basis, and the two
+        #: would disagree the first time the sell-side handling changed on one of them.
+        invested_data = []
         pnl_pct_data = []
         cumulative_divs = []
         drip_quantities = []
@@ -6779,6 +6841,10 @@ class AccountGrowthTab:
                     running_shares += evt['qty_delta']
 
             qty_at_date = qty_by_date.get(d, 0)
+            # ``None`` before the first purchase, so the line STARTS at the first buy
+            # instead of running along zero from the left edge -- the same treatment the
+            # value line gets, and for the same reason: nothing was held there.
+            invested_data.append(round(running_cost, 2) if running_shares > 0 else None)
             if qty_at_date > 0 and last_price:
                 values.append(round(qty_at_date * last_price, 2))
                 if running_shares > 0:
@@ -6825,6 +6891,24 @@ class AccountGrowthTab:
                 }
             },
         }]
+
+        # AMOUNT PURCHASED — cumulative cost of the shares held, on the same $ axis as
+        # Value, so the gap between the two IS the unrealised gain. Dotted and thinner
+        # than Value: it is the reference the headline is read against, not a second
+        # headline. Matches the account-growth chart, which has carried this line all
+        # along; this panel was the one place a position's value was shown with nothing
+        # to measure it against.
+        if any(v is not None for v in invested_data):
+            series.append({
+                'name': 'Invested',
+                'type': 'line',
+                'yAxisIndex': 0,
+                'data': invested_data,
+                'smooth': False,
+                'showSymbol': False,
+                'lineStyle': {'width': 1.5, 'color': '#FF9800', 'type': 'dotted'},
+                'itemStyle': {'color': '#FF9800'},
+            })
 
         # DRIP Invested ($) — cumulative reinvested dollars, on the same $ axis.
         if has_drip:
