@@ -205,6 +205,23 @@ ratio flipped (2 short 1 long = unbounded — must REFUSE, kill by test); wrong
 leg delta ordering.
 
 ### Task 6 (opus): two-expiry lifecycle builder (PMCC first)
+
+> **RESEQUENCED 2026-09-01 (controller decision after a designed STOP).** The
+> codebase refuses two-expiry structures at three independent, test-pinned
+> sites (`submit_option_order`'s single-expiry guard, `option_lifecycle._dte`'s
+> conflicting-expiries rule, `DaysToExpiryCondition`'s union check) because
+> `Transaction.expiry` is a single value "valid ONLY because every supported
+> structure is single-expiry". The guard's own comment prescribes the entry
+> price: teach the Transaction per-leg expiries first. Therefore: Tasks 7-13
+> run BEFORE this task; then a NEW prerequisite task (6-PRE: per-leg expiry
+> semantics + migration + the three DTE readers' per-leg answers — structure
+> DTE = short leg for the roll window, long leg for the roll floor) lands;
+> then this task as written. `O_PMCC` is phase-gated beside `O_CAL` until
+> then — grid-2 phase 1 searches {O_LEAPC, O_LEAPP, O_ERN, O_CBS, O_PBS}.
+> The wheel-shaped workaround (linked transactions) was REJECTED: it
+> re-litigates the M3 stamp ruling on a second structure and charges the
+> PMCC short naked in the meantime.
+
 **Files:** `packages/common/ba2_common/core/TradeActions.py` +
 `packages/common/ba2_common/core/option_lifecycle.py` (the shared lifecycle
 promoted by the RM work — extend, don't fork); tests
