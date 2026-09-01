@@ -165,11 +165,24 @@ def backtest_trading_db(run_id: int | str, in_memory: bool = True) -> Iterator[s
         # in-flight charges -- a trial that opens nothing because an EARLIER trial drew
         # down is not reproducible. Clearing on the way OUT also stops the state leaking
         # into live code paths on this thread.
-        option_rm.reset_thread_state()
-        # Drop THIS thread's override so the backtest DB never leaks into subsequent (live) code
-        # paths or other trials on this thread. (A file DB is left on disk for post-mortem; the
-        # in-memory DB is freed when its engine is disposed by clear_threadlocal_db.)
-        common_db.clear_threadlocal_db()
+        #
+        # NESTED try/finally, so the DB override is dropped even if the sleeve reset raises.
+        # It did: ``reset_thread_state`` iterated the shared stores unsynchronised and a
+        # sibling trial's write made it raise ``RuntimeError: dictionary changed size during
+        # iteration`` -- and because it is the FIRST statement here, that raise skipped
+        # ``clear_threadlocal_db()`` and left this worker thread pointed at the finished
+        # run's database for every later piece of work, live paths included. The race itself
+        # is fixed at source (``OptionRiskManagement._STATE_LOCK``); this ordering is what
+        # stops ANY future failure in the reset from mis-routing a thread's database. The
+        # exception still propagates -- nothing here swallows it.
+        try:
+            option_rm.reset_thread_state()
+        finally:
+            # Drop THIS thread's override so the backtest DB never leaks into subsequent (live)
+            # code paths or other trials on this thread. (A file DB is left on disk for
+            # post-mortem; the in-memory DB is freed when its engine is disposed by
+            # clear_threadlocal_db.)
+            common_db.clear_threadlocal_db()
 
 
 def seed_account_definition(

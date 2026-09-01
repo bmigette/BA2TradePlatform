@@ -206,6 +206,39 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             raw=dict(info) if isinstance(info, dict) else {},
         )
 
+    def true_equity(self) -> Optional[float]:
+        """This account's REAL equity: cash plus positions marked to market, UNCAPPED.
+
+        CONCRETE, and for every real broker it is exactly
+        ``get_account_snapshot().equity`` -- a broker publishes one equity and there is
+        nothing to un-cap. Overriding it is a simulator's job.
+
+        WHY THE SEAM EXISTS (review finding, 2026-09-01). ``BacktestAccount`` may be run
+        under a fixed-notional equity cap, and every money accessor it publishes is deliberately
+        clamped to ``deployed_equity() = min(cap, cash + mark-to-market)`` so that sizing,
+        buying power and margin all spend the capped dollars. That clamp is ONE-SIDED: it
+        compresses peaks and never troughs. A drawdown measured on it is therefore not a
+        drawdown at all -- a 50k-capped account that goes 100k -> 64k, a true -36%, reads
+        50k -> 50k and 0.0%, so a risk breaker built on the capped figure never fires in a
+        backtest and fires live. The backtest's equity-cap module states the same rule for the metrics
+        ("feeding the capped figure into scoring would report zero P&L for every period
+        spent above the cap") and ships ``capped_drawdown_curve`` for exactly that reason.
+
+        TWO QUESTIONS, TWO ANSWERS, and callers must not confuse them:
+
+          * *how many dollars may I deploy?* -> ``get_account_snapshot().equity``, the
+            capped seam. Sizing rails (``max_deployment_pct``, ``max_notional_leverage``)
+            keep reading it: a sizer must respect the cap.
+          * *how much have I actually lost from my peak?* -> this. The drawdown breaker
+            reads it, in both runtimes, through one shared function
+            (``OptionRiskManagement.update_sleeve_breaker``). The runtime difference lives
+            HERE, in the account's honest answer, not in forked breaker logic.
+
+        ``None`` means UNKNOWN and never zero, exactly as on ``AccountSnapshot``: a
+        fabricated 0.0 is a measured 100% drawdown.
+        """
+        return self.get_account_snapshot().equity
+
     def get_cash_transfers(
         self,
         start_date: Optional[date] = None,

@@ -1529,6 +1529,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return self._cash
         return min(self._cash, self.deployed_equity())
 
+    def true_equity(self) -> Optional[float]:
+        """The UNCAPPED equity: ``equity()`` = cash + mark-to-market. Overrides the interface.
+
+        ``ReadOnlyAccountInterface.true_equity`` answers ``get_account_snapshot().equity``,
+        which on this account resolves to ``deployed_equity() = min(cap, equity())``. That is
+        right for every SIZER -- the cap is what may be spent -- and wrong for anything
+        measuring a LOSS, because the clamp is one-sided: it compresses peaks and never
+        troughs. Under a 50k cap an account going 100k -> 64k (a true -36%) reports 50k on
+        both bars and a 0.0% drawdown, so the option sleeve's circuit breaker would never
+        trip in a backtest while tripping live at -20% on the identical path (review finding,
+        2026-09-01). ``equity_cap.py`` records the same hazard for the metrics and ships
+        ``capped_drawdown_curve`` rather than differencing the capped figure.
+
+        This is the ONLY accessor on this account that looks past ``deployed_equity()``, and
+        it exists for measurement, never for sizing:
+        ``test_the_sizing_rails_still_read_the_CAPPED_equity`` fails if a rail is moved onto
+        it.
+        """
+        return self.equity()
+
     def get_account_info(self) -> Dict[str, Any]:
         """Account info dict; exposes ``.equity`` (read by _validate_position_size_limits)."""
         eq = self.deployed_equity()

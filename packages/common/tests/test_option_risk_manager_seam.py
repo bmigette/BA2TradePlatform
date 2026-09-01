@@ -91,6 +91,8 @@ class _LiveShapedAccount(OptionsAccountInterface):
     #: is a mixin and does not inherit it, but every real account does, so ``sleeve_equity``
     #: must reach equity down the same tolerant ``get_account_info()`` probe here.
     get_account_snapshot = ReadOnlyAccountInterface.get_account_snapshot
+    #: ...and the reader the BREAKER uses, borrowed for the same reason.
+    true_equity = ReadOnlyAccountInterface.true_equity
 
     def cash_available_for_delivery(self):
         return self._cash

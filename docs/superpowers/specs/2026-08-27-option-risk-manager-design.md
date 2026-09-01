@@ -652,6 +652,67 @@ the rail it feeds is PER-SLEEVE, so two `classic_options` sleeves on one account
 the whole account. Same flag as `assignment_cash`; a real split needs a definition of what
 share of account equity a sleeve owns.
 
+## 11.7 Amendment: the equity cap masks the breaker (review, 2026-09-01)
+
+§11.6's ruling settled the SIZING question and, in doing so, gave the breaker the wrong
+number. On `BacktestAccount` the snapshot equity is `deployed_equity()` = `min(cap, cash +
+mark-to-market)`, and **that clamp is one-sided: it compresses peaks and never troughs.** A
+50k-capped account that falls 100k -> 64k — a true -36% — reports 50k on both bars, a 0.0%
+drawdown and no stand-down, while the identical path live (no cap) stands the sleeve down at
+-20%. The backtest was silently the more permissive runtime again, in the one rail whose job
+is to stop a loss. The codebase already says so about the same figure elsewhere: the
+backtest's equity-cap module warns that feeding the capped figure into scoring "would report
+zero P&L for every period spent above the cap", and ships a capped drawdown curve rather than
+differencing the capped series.
+
+**The ruling.** The clamp is CORRECT for the sizing rails and WRONG for the breaker.
+
+| question | reader | on a capped backtest |
+|---|---|---|
+| how many dollars may this sleeve deploy? (`max_deployment_pct`, `max_notional_leverage`) | `sleeve_equity` | CAPPED — a sizer must respect the cap |
+| how much has this sleeve lost from its peak? (the drawdown breaker) | `sleeve_true_equity` | UNCAPPED |
+
+**It is still ONE breaker function over ONE store.** `update_sleeve_breaker` is unchanged in
+shape and both runtimes still reach it; the difference lives in the ACCOUNT's own answer to
+"what is your true equity". `ReadOnlyAccountInterface.true_equity` is concrete and answers
+`get_account_snapshot().equity` — for every real broker there is no cap to look past, so live
+behaviour is byte-identical — and `BacktestAccount` overrides it with its uncapped `equity()`
+(cash + mark-to-market). It is the only accessor on that account that looks past
+`deployed_equity()`, and it exists for measurement, never for sizing.
+
+Pinned in both directions by
+`backend/tests/backtest/test_option_breaker_sees_past_the_capped_equity.py`, on a real
+`BacktestAccount` under a 20k cap whose true equity runs 20k -> 30k -> 16k: the breaker stands
+down at evaluation 4 (the true -23.3%), the capped reader would have waited until evaluation 7
+(three bars and 7k of real losses later), and the same run with the cap lifted transitions
+bar-for-bar identically. `test_the_sizing_rails_still_read_the_CAPPED_equity` fails if a rail
+is moved onto the uncapped figure.
+
+## 11.8 The sleeve state stores are lock-guarded (review, 2026-09-01)
+
+`reset_thread_state` cleared a thread's keys by iterating the three shared dicts, which
+sibling GA trial threads write to; under `--parallel > 1` CPython raised `RuntimeError:
+dictionary changed size during iteration` out of it. It is the FIRST statement of
+`backtest_trading_db`'s `finally`, so the raise also skipped `clear_threadlocal_db()` and left
+the finished run's DB override installed on that worker thread — a dict race that mis-routed a
+whole thread's database.
+
+One module-level `RLock` (`OptionRiskManagement._STATE_LOCK`) now guards every writer of the
+three stores and the key scan that clears them. Reads that are a single `dict.get` stay
+lock-free (atomic under the GIL, and on the hot entry path); the cold readers that iterate a
+per-key container take it. A per-thread key REGISTRY was considered and rejected: it removes
+the scan but not the need for a lock, and two structures that must agree about which keys
+exist is a second bug waiting for the first writer that forgets one. The ledger read inside
+`_prune_pending` deliberately happens OUTSIDE the lock, and the store is then edited by
+splicing out the charges that pass decided against, so a sibling's concurrent
+`record_submitted` cannot be overwritten. `backtest_trading_db`'s `finally` additionally nests
+the reset inside its own `try`, so no future failure there can skip the DB cleanup.
+
+Pinned by `packages/common/tests/test_option_rm_state_is_thread_safe.py`: 4 writer threads and
+4 resetter threads over a 4,000-key pre-seed, asserting both that nothing raises and that a
+reset still takes exactly its own keys while every sibling's survives. Removing the lock from
+`_clear_this_threads_keys` fails it with the original `RuntimeError`.
+
 ## 12. Deferred, with reasons
 
 - **Calendar and diagonal spreads.** Genuinely different economics (long vega, profit from

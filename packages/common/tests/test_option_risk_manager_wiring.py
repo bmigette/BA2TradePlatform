@@ -90,6 +90,11 @@ class FakeAccount:
                 "balance": self._balance}
 
     get_account_snapshot = ReadOnlyAccountInterface.get_account_snapshot
+    #: The BREAKER's reader. Borrowed too, and for the same reason: the interface answers it
+    #: with the snapshot equity (every real broker has no cap to look past), and only
+    #: ``BacktestAccount`` overrides it. A double that hand-wrote a number here would pass
+    #: whether or not that default still existed.
+    true_equity = ReadOnlyAccountInterface.true_equity
 
     def cash_available_for_delivery(self):
         return self._cash
@@ -555,6 +560,11 @@ class _CashAndPositionsAccount:
                 "equity": self._cash + self._position_value}
 
     get_account_snapshot = ReadOnlyAccountInterface.get_account_snapshot
+    #: No cap on this double, so the breaker's reader and the sizer's reader coincide -- which
+    #: is exactly the LIVE relationship. The capped case, where they must not, is a
+    #: ``BacktestAccount`` fact and is pinned in
+    #: ``backend/tests/backtest/test_option_breaker_sees_past_the_capped_equity.py``.
+    true_equity = ReadOnlyAccountInterface.true_equity
 
     def cash_available_for_delivery(self):
         return self._cash
@@ -576,6 +586,36 @@ def test_the_sleeve_equity_is_the_snapshot_EQUITY_not_the_spendable_cash():
     account = _CashAndPositionsAccount(cash=40_000.0, position_value=60_000.0)
     assert rm.sleeve_equity(account, 7) == 100_000.0
     assert account.get_balance() == 40_000.0      # the number it must NOT be
+
+
+def test_the_breakers_reader_is_the_SAME_number_live_where_no_cap_exists():
+    """The other half of the 2026-09-01 review finding, from the LIVE side.
+
+    The breaker reads ``sleeve_true_equity`` and the sizing rails read ``sleeve_equity``,
+    because ``BacktestAccount`` clamps the second one to a fixed-notional cap that compresses
+    peaks without compressing troughs. On a real broker there is no cap to look past, so
+    ``ReadOnlyAccountInterface.true_equity`` answers with the same ``AccountSnapshot.equity``
+    the sizer reads and NOTHING about live behaviour changes -- which is what makes the split
+    a runtime property of the account rather than a fork in the breaker.
+
+    MUTATION KILL: give the interface default any other body (``get_balance()``, a cap, a
+    constant) and this reads something other than 100,000.
+    """
+    account = _CashAndPositionsAccount(cash=40_000.0, position_value=60_000.0)
+    assert rm.sleeve_true_equity(account, 7) == 100_000.0
+    assert rm.sleeve_true_equity(account, 7) == rm.sleeve_equity(account, 7)
+
+
+def test_an_unreadable_true_equity_leaves_the_breaker_blind_not_flat():
+    """``None``, never 0.0. Against a ratcheted peak a fabricated zero is a 100% drawdown,
+    and the breaker would flatten a healthy sleeve on an account it simply could not read."""
+    class _Broken:
+        id = 1
+
+        def true_equity(self):
+            raise RuntimeError("the equity endpoint is down")
+
+    assert rm.sleeve_true_equity(_Broken(), 7) is None
 
 
 def test_an_equity_the_broker_did_not_publish_declines_rather_than_defaulting():

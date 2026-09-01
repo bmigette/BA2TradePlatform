@@ -203,6 +203,9 @@ def _live_account(state: _State):
 
     from alpaca.trading.models import TradeAccount
 
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import (
+        ReadOnlyAccountInterface,
+    )
     from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
 
     # The BROKER's arithmetic, done here from the state -- never copied from the other side.
@@ -234,6 +237,12 @@ def _live_account(state: _State):
     )
     # THE live reader, borrowed rather than imitated.
     account.get_account_snapshot = lambda: AlpacaAccount.get_account_snapshot(account)
+    # ...and the reader the BREAKER asks for, likewise borrowed. On a real broker
+    # ``ReadOnlyAccountInterface.true_equity`` IS ``get_account_snapshot().equity``: there is
+    # no cap to look past, so the split introduced for ``BacktestAccount``'s ``equity_cap``
+    # (review finding, 2026-09-01) leaves live behaviour byte-identical, and this side of the
+    # parity must reach it down the same chain rather than through a hand-written number.
+    account.true_equity = lambda: ReadOnlyAccountInterface.true_equity(account)
     return account
 
 

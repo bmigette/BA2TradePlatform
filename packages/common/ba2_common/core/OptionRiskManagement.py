@@ -89,8 +89,20 @@ on the two sides — ``AlpacaAccount.get_balance`` returns account EQUITY, while
 breaker measured on cash trips on DEPLOYING capital and clears on CLOSING a position,
 irrespective of P&L, and the same mismatch was already the denominator of
 ``max_deployment_pct`` and ``max_notional_leverage``. The operator's ruling (2026-09-01) is
-ONE definition for the breaker and for those rails, in both runtimes:
-``account.get_account_snapshot().equity`` — see ``sleeve_equity``.
+``account.get_account_snapshot().equity`` in both runtimes — see ``sleeve_equity``.
+
+That settled the SIZING question. The review then found that it is the wrong answer to the
+BREAKER's question, for one reason: on ``BacktestAccount`` the snapshot is
+``deployed_equity() = min(the configured cap, cash + mark-to-market)``, and that clamp is
+ONE-SIDED.
+It compresses peaks and never troughs, so a 50k-capped account falling 100k -> 64k — a true
+-36% — reports 50k on both bars, 0.0% drawdown, no stand-down, while the identical path live
+(no cap) stands the sleeve down at -20%. A sizer must respect the cap; a loss measurement
+must not. So there are two questions and two readers: ``sleeve_equity`` (capped, for
+``max_deployment_pct`` / ``max_notional_leverage``) and ``sleeve_true_equity`` (uncapped, for
+the breaker and nothing else). It is still ONE breaker function over ONE store — the runtime
+difference lives in the account's own answer, ``ReadOnlyAccountInterface.true_equity``, which
+every real broker answers with that same snapshot field.
 
 The exit/servicing half (profit capture, tested delta, roll-DTE, the stops) is live-only for
 a different and deliberate reason: a backtest expresses those as ``close_option`` exit rules
@@ -325,11 +337,43 @@ def _sleeve_key(expert_instance_id: int) -> Tuple[Optional[int], int]:
     return (None, expert_instance_id)
 
 
+#: ONE lock over ALL THREE stores, held by every writer and by the key scan that clears a
+#: thread's own keys. It exists because ``_clear_this_threads_keys`` has to ITERATE the store
+#: to find its keys, and under ``--parallel > 1`` a sibling trial's insert lands inside that
+#: iteration: CPython then raises ``RuntimeError: dictionary changed size during iteration``
+#: out of ``reset_thread_state`` -- which is the FIRST statement of ``backtest_trading_db``'s
+#: ``finally``, so the raise also skipped ``clear_threadlocal_db()`` and left the finishing
+#: trial's DB override installed on that worker thread (review finding, 2026-09-01).
+#:
+#: ONE lock rather than three: the three stores are keyed alike, cleared together, and the
+#: contention is nil (a handful of dict operations per bar), so three locks would buy nothing
+#: and add an ordering rule to get wrong. It is an ``RLock`` because the guarded functions
+#: legitimately call one another -- ``reset_state`` -> ``reset_breaker_states``,
+#: ``update_sleeve_breaker`` -> ``set_breaker_state``.
+#:
+#: The alternative considered and rejected was a per-thread key REGISTRY popped without
+#: iterating. It removes the scan but not the need for a lock: the registry is itself shared
+#: mutable state, every writer would have to maintain it in step with the store it mirrors,
+#: and two structures that must agree about which keys exist is a second bug waiting for the
+#: first writer that forgets one. The scan is O(keys) on a dict of at most a few hundred
+#: sleeve keys, once per RUN, so it costs nothing worth that risk.
+#:
+#: READS are deliberately NOT guarded: ``get_breaker_state`` is consulted once per candidate
+#: and is a single ``dict.get``, which is atomic under the GIL -- it cannot observe a torn
+#: state, only a slightly stale one, and it could observe a stale one with the lock too. The
+#: cold readers that iterate a per-key container (``journal``, ``pending_charges``) ARE
+#: guarded, because iterating a deque or list while a sibling appends is the same defect one
+#: level down.
+_STATE_LOCK = threading.RLock()
+
 _BREAKER_STATE: Dict[Tuple[Optional[int], int], BreakerState] = {}
 
 
 def get_breaker_state(expert_instance_id: int) -> BreakerState:
-    """The sleeve's breaker as it stands. A sleeve nobody has evaluated is un-halted."""
+    """The sleeve's breaker as it stands. A sleeve nobody has evaluated is un-halted.
+
+    Lock-free on purpose: one atomic ``dict.get`` (see ``_STATE_LOCK``), on the hot path.
+    """
     return _BREAKER_STATE.get(_sleeve_key(expert_instance_id), BreakerState())
 
 
@@ -343,12 +387,15 @@ def set_breaker_state(expert_instance_id: int, state: BreakerState) -> None:
     if not isinstance(state, BreakerState):
         raise TypeError(
             f"set_breaker_state requires a BreakerState, got {type(state).__name__}")
-    _BREAKER_STATE[_sleeve_key(expert_instance_id)] = state
+    key = _sleeve_key(expert_instance_id)
+    with _STATE_LOCK:
+        _BREAKER_STATE[key] = state
 
 
 def reset_breaker_states() -> None:
     """Forget every sleeve's breaker. Tests, and an operator starting clean."""
-    _BREAKER_STATE.clear()
+    with _STATE_LOCK:
+        _BREAKER_STATE.clear()
 
 
 def rearm_breaker(expert_instance_id: int) -> BreakerState:
@@ -357,8 +404,10 @@ def rearm_breaker(expert_instance_id: int) -> BreakerState:
     Nothing calls this automatically — it re-risks a sleeve that has not recovered. The peak
     is deliberately KEPT, so the drawdown that caused the stand-down is not erased.
     """
-    state = rearm(get_breaker_state(expert_instance_id))
-    _BREAKER_STATE[_sleeve_key(expert_instance_id)] = state
+    key = _sleeve_key(expert_instance_id)
+    with _STATE_LOCK:
+        state = rearm(_BREAKER_STATE.get(key, BreakerState()))
+        _BREAKER_STATE[key] = state
     logger.warning(f"Option RM: circuit-breaker stand-down for expert "
                    f"{expert_instance_id} cleared by an explicit re-arm")
     return state
@@ -597,21 +646,25 @@ _PENDING: Dict[Tuple[Optional[int], int], List[_PendingCharge]] = {}
 
 def reset_pending_charges() -> None:
     """Forget every sleeve's in-flight charges. Tests, and a fresh backtest."""
-    _PENDING.clear()
+    with _STATE_LOCK:
+        _PENDING.clear()
 
 
 def pending_charges(expert_instance_id: int) -> Tuple[CandidateStructure, ...]:
-    return tuple(p.candidate for p in _PENDING.get(_sleeve_key(expert_instance_id), ()))
+    key = _sleeve_key(expert_instance_id)
+    with _STATE_LOCK:
+        return tuple(p.candidate for p in _PENDING.get(key, ()))
 
 
 def record_submitted(expert_instance_id: int, transaction_id: Optional[int],
                      candidate: CandidateStructure) -> None:
     """Remember what was just put on the wire so the NEXT candidate is charged for it."""
     key = _sleeve_key(expert_instance_id)
-    charges = _PENDING.setdefault(key, [])
-    charges.append(_PendingCharge(transaction_id, candidate))
-    if len(charges) > _PENDING_LIMIT:
-        del charges[:-_PENDING_LIMIT]
+    with _STATE_LOCK:
+        charges = _PENDING.setdefault(key, [])
+        charges.append(_PendingCharge(transaction_id, candidate))
+        if len(charges) > _PENDING_LIMIT:
+            del charges[:-_PENDING_LIMIT]
 
 
 def _live_transaction_ids(expert_instance_id: int) -> Optional[set]:
@@ -649,9 +702,21 @@ def _prune_pending(expert_instance_id: int,
 
     A charge whose transaction id was never captured is KEPT (it really was submitted); the
     FIFO ``_PENDING_LIMIT`` is what stops those accumulating.
+
+    THE LEDGER READ HAPPENS OUTSIDE ``_STATE_LOCK``, and the store is then edited by REMOVING
+    the charges this pass decided against rather than by overwriting the list wholesale.
+    ``_live_transaction_ids`` issues a SELECT; holding a lock every writer needs across a
+    database round trip would serialise the sleeve on I/O for no benefit. The consequence of
+    dropping the lock in between is that a sibling worker thread may ``record_submitted`` a
+    NEW charge while this read is in flight, and an overwrite would silently discard it -- the
+    charge would be forgotten and the structure never counted. Splicing by identity leaves it
+    in place. The value RETURNED is still what this pass measured: a charge that arrived after
+    the ledger read was never tested against it, and charging the current candidate for it
+    would be a number this evaluation cannot justify. It is charged on the next candidate.
     """
     key = _sleeve_key(expert_instance_id)
-    charges = _PENDING.get(key)
+    with _STATE_LOCK:
+        charges = list(_PENDING.get(key, ()))
     if not charges:
         return []
     seen = {s.transaction_id for s in visible}
@@ -666,10 +731,14 @@ def _prune_pending(expert_instance_id: int,
         if live is not None and charge.transaction_id not in live:
             continue
         kept.append(charge)
-    if kept:
-        _PENDING[key] = kept
-    else:
-        _PENDING.pop(key, None)
+    dropped = {id(c) for c in charges} - {id(c) for c in kept}
+    with _STATE_LOCK:
+        current = _PENDING.get(key, ())
+        remaining = [c for c in current if id(c) not in dropped]
+        if remaining:
+            _PENDING[key] = remaining
+        else:
+            _PENDING.pop(key, None)
     return [c.candidate for c in kept]
 
 
@@ -706,18 +775,20 @@ _JOURNAL: Dict[Tuple[Optional[int], int], Deque[Dict[str, Any]]] = {}
 
 
 def journal(expert_instance_id: int) -> Tuple[Dict[str, Any], ...]:
-    return tuple(_JOURNAL.get(_sleeve_key(expert_instance_id), ()))
+    key = _sleeve_key(expert_instance_id)
+    with _STATE_LOCK:
+        return tuple(_JOURNAL.get(key, ()))
 
 
 def reset_journal() -> None:
-    _JOURNAL.clear()
+    with _STATE_LOCK:
+        _JOURNAL.clear()
 
 
 def _journal_entry(expert_instance_id: int, verdict: OptionEntryVerdict,
                    underlying: str, option_strategy: str, quantity: int) -> None:
-    entries = _JOURNAL.setdefault(_sleeve_key(expert_instance_id),
-                                  deque(maxlen=_JOURNAL_LIMIT))
-    entries.append({
+    key = _sleeve_key(expert_instance_id)
+    entry = {
         "action_type": f"option_rm:{option_strategy}",
         "success": verdict.allowed,
         "status": "success" if verdict.allowed else "error",
@@ -727,7 +798,9 @@ def _journal_entry(expert_instance_id: int, verdict: OptionEntryVerdict,
         "result": {"symbol": underlying, "allowed": verdict.allowed,
                    "rail": verdict.reason, "phrase": verdict.phrase,
                    "detail": verdict.detail},
-    })
+    }
+    with _STATE_LOCK:
+        _JOURNAL.setdefault(key, deque(maxlen=_JOURNAL_LIMIT)).append(entry)
 
 
 def reset_state() -> None:
@@ -744,10 +817,20 @@ def reset_state() -> None:
 
 
 def _clear_this_threads_keys(store: Dict[Tuple[Optional[int], int], Any]) -> None:
-    """Drop the entries filed under ``(this thread's id, ...)`` and nothing else."""
+    """Drop the entries filed under ``(this thread's id, ...)`` and nothing else.
+
+    UNDER ``_STATE_LOCK``, because the scan for those keys has to iterate a dict that sibling
+    GA trial threads are writing to. Unlocked, a sibling's ``set_breaker_state`` landing
+    inside the comprehension raised ``RuntimeError: dictionary changed size during
+    iteration`` out of :func:`reset_thread_state` -- and that runs first in
+    ``backtest_trading_db``'s ``finally``, so the raise ALSO skipped
+    ``clear_threadlocal_db()`` and left the finished run's DB override installed on the
+    worker thread. Pinned by ``test_option_rm_state_is_thread_safe.py``.
+    """
     me = threading.get_ident()
-    for key in [k for k in store if k[0] == me]:
-        del store[key]
+    with _STATE_LOCK:
+        for key in [k for k in store if k[0] == me]:
+            del store[key]
 
 
 def reset_thread_state() -> None:
@@ -775,6 +858,11 @@ def reset_thread_state() -> None:
     runs already shared one process-wide key with each other and with live; giving a
     backtest permission to wipe live latches to fix that would be the worse trade.
     """
+    # THREE separate acquisitions, one per store, and deliberately not one around all three.
+    # A sibling can only ever read or write keys under ITS OWN thread id, so it cannot
+    # observe this thread half-cleared; making the boundary atomic across the three stores
+    # would buy nothing and would put the lock in two places, leaving the one that actually
+    # guards the iteration (``_clear_this_threads_keys``) removable without a test noticing.
     _clear_this_threads_keys(_BREAKER_STATE)
     _clear_this_threads_keys(_PENDING)
     _clear_this_threads_keys(_JOURNAL)
@@ -897,6 +985,12 @@ def sleeve_equity(account, expert_instance_id: int) -> Optional[float]:
       * ``BacktestAccount.get_balance`` -> ``self._cash``, or ``min(cash, deployed_equity())``
                                            under an equity cap  (spendable CASH)
 
+    THE SIZING QUESTION ONLY. This is *how many dollars may the sleeve deploy*, and the
+    answer is deliberately the CAPPED one on a backtest. The breaker asks a different
+    question -- *how much has the sleeve lost from its peak* -- and reads
+    :func:`sleeve_true_equity` instead, because the cap is one-sided and would mask the very
+    drawdown the breaker exists to catch. Read that function before moving either caller.
+
     So the rails' denominator was cash in a backtest and equity live, and a drawdown breaker
     built on it would have tripped on DEPLOYING capital and cleared on CLOSING a position
     regardless of P&L. ``get_account_snapshot().equity`` is the same CONCEPT on both sides:
@@ -918,23 +1012,75 @@ def sleeve_equity(account, expert_instance_id: int) -> Optional[float]:
     ``assignment_cash`` documents, and unchanged by this ruling: two ``classic_options``
     sleeves on one account each measure the whole account.
     """
+    return _read_equity(lambda: getattr(account.get_account_snapshot(), "equity", None),
+                        expert_instance_id, "the account snapshot's equity",
+                        "declining the entry")
+
+
+def sleeve_true_equity(account, expert_instance_id: int) -> Optional[float]:
+    """The sleeve's TRUE equity, for the DRAWDOWN BREAKER only. Never fabricated.
+
+    THE SECOND QUESTION (review finding, 2026-09-01). ``sleeve_equity`` above answers *how
+    many dollars may this sleeve deploy*, and on ``BacktestAccount`` under a fixed-notional cap
+    that is deliberately ``min(cap, cash + mark-to-market)`` -- the seam every sizer looks
+    through. The breaker asks something else: *how much has this sleeve lost from its peak*,
+    and the cap is the wrong instrument for that because it is ONE-SIDED. It compresses peaks
+    and never troughs, so an account capped at 50k that falls 100k -> 64k (a true -36%)
+    reports 50k on both bars, a 0.0% drawdown and no stand-down -- while the identical path
+    live, where no cap exists, stands the sleeve down at -20%. The backtest was silently the
+    more permissive runtime again, in the one rail whose whole job is to stop a loss.
+    The backtest's equity-cap module states the same hazard for the metrics ("report zero P&L for every
+    period spent above the cap") and ships ``capped_drawdown_curve`` instead of differencing
+    the capped figure.
+
+    STILL ONE SHARED FUNCTION AND ONE STORE. ``update_sleeve_breaker`` is unchanged in shape
+    and is the only caller of this: the runtime difference lives in the ACCOUNT's answer to
+    "what is your true equity" (``ReadOnlyAccountInterface.true_equity``, which every real
+    broker answers with the SAME snapshot field this module already read, and which
+    ``BacktestAccount`` overrides with its uncapped ``equity()``), never in forked breaker
+    logic. Live behaviour is byte-identical: no cap exists there, so both readers return the
+    same number.
+
+    THE SIZING RAILS ARE NOT MOVED ONTO THIS. ``max_deployment_pct`` and
+    ``max_notional_leverage`` keep reading ``sleeve_equity`` -- a sizer must respect the cap,
+    or a capped backtest would deploy capital it does not have. Pinned in both directions:
+    ``test_the_breaker_trips_at_the_TRUE_drawdown_on_a_capped_account`` and
+    ``test_the_sizing_rails_still_read_the_CAPPED_equity``.
+
+    ``None`` leaves the breaker BLIND (``update_breaker`` says so and refuses to report a
+    drawdown it did not measure); it never becomes 0.0, which against a ratcheted peak is a
+    measured 100% drawdown.
+    """
+    return _read_equity(lambda: account.true_equity(), expert_instance_id,
+                        "the account's true (uncapped) equity",
+                        "the drawdown breaker is blind this evaluation")
+
+
+def _read_equity(read, expert_instance_id: int, what: str, consequence: str
+                 ) -> Optional[float]:
+    """One reader for both equity questions: read, refuse to invent, coerce, or ``None``.
+
+    Shared so the two callers cannot drift on the part that is genuinely identical -- an
+    unread, absent or non-numeric equity is UNKNOWN in both, and unknown must never become
+    zero. What differs is only which question was asked and what ``None`` costs, and both
+    are said in the log line rather than in a second copy of this body.
+    """
     try:
-        snapshot = account.get_account_snapshot()
+        equity = read()
     except Exception as e:  # noqa: BLE001 — any broker failure is the same fact
-        logger.error(f"Option RM: could not read the account snapshot for expert "
-                     f"{expert_instance_id} ({e}) — declining the entry", exc_info=True)
+        logger.error(f"Option RM: could not read {what} for expert {expert_instance_id} "
+                     f"({e}) — {consequence}", exc_info=True)
         return None
-    equity = getattr(snapshot, "equity", None)
     if equity is None:
-        logger.error(f"Option RM: the account snapshot for expert {expert_instance_id} "
-                     f"reports no equity — declining the entry rather than sizing against a "
-                     f"number the broker did not publish")
+        logger.error(f"Option RM: {what} for expert {expert_instance_id} is not published "
+                     f"— {consequence}, rather than substituting a number the account did "
+                     f"not state")
         return None
     try:
         return float(equity)
     except (TypeError, ValueError):
-        logger.error(f"Option RM: the account snapshot for expert {expert_instance_id} "
-                     f"reports a non-numeric equity {equity!r} — declining the entry")
+        logger.error(f"Option RM: {what} for expert {expert_instance_id} is non-numeric "
+                     f"({equity!r}) — {consequence}")
         return None
 
 
@@ -945,9 +1091,15 @@ def update_sleeve_breaker(*, expert, account,
     THE shared transition (operator ruling, 2026-09-01). Live calls it from
     ``option_lifecycle_service.run_option_lifecycle_pass``; the backtest calls it from
     ``daily_engine``'s per-bar flow, behind the same ``option_risk_manager_enabled`` check
-    the entry gate dispatches on. One implementation, one equity definition
-    (``sleeve_equity``), one store — which is the whole content of "the breaker means the
-    same thing in a backtest as it does live".
+    the entry gate dispatches on. One implementation, one equity reader
+    (``sleeve_true_equity``), one store — which is the whole content of "the breaker means
+    the same thing in a backtest as it does live".
+
+    IT READS ``sleeve_true_equity``, NOT ``sleeve_equity`` (review finding, 2026-09-01). The
+    sizing reader is the CAPPED figure on a backtest, and a cap compresses peaks without
+    compressing troughs, so a breaker built on it measures a drawdown that did not happen and
+    misses the one that did. The rails that size keep the capped reader; the rail that
+    measures a loss takes the account's true equity. Live the two are the same number.
 
     Returns the new state, or ``None`` when the sleeve declares no ``circuit_breaker_pct``.
     That case does NOT substitute a threshold and does not raise out of a per-bar loop: the
@@ -968,12 +1120,19 @@ def update_sleeve_breaker(*, expert, account,
                          f"name for the same reason")
         return None
 
-    equity = sleeve_equity(account, expert_instance_id)
+    equity = sleeve_true_equity(account, expert_instance_id)
     # Ratchet on EVERY evaluation, including a flat sleeve: a just-flattened sleeve that
     # stopped tracking its peak would re-arm against a stale one.
-    state = update_breaker(get_breaker_state(expert_instance_id), equity,
-                           {BREAKER_SETTING: pct})
-    set_breaker_state(expert_instance_id, state)
+    #
+    # Read-ratchet-store under ONE acquisition of ``_STATE_LOCK`` (re-entrant, so
+    # ``set_breaker_state`` nests freely): the peak is a running maximum, and two callers
+    # interleaving read/write would let the lower of two concurrent equities overwrite the
+    # higher and silently un-ratchet the peak. The equity read is deliberately OUTSIDE it --
+    # it can reach a broker.
+    with _STATE_LOCK:
+        state = update_breaker(get_breaker_state(expert_instance_id), equity,
+                               {BREAKER_SETTING: pct})
+        set_breaker_state(expert_instance_id, state)
     return state
 
 
@@ -1039,7 +1198,9 @@ def flush_option_rm_run(expert_instance_id: int, account_id: int,
     # explicitly done nothing. Reordering is free: both branches return None.
     if inmem_trades_active():
         return None
-    entries = list(_JOURNAL.pop(_sleeve_key(expert_instance_id), ()))
+    key = _sleeve_key(expert_instance_id)
+    with _STATE_LOCK:
+        entries = list(_JOURNAL.pop(key, ()))
     if not entries:
         return None
 

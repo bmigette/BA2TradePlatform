@@ -464,9 +464,15 @@ def _broker_can_answer(account, expert_instance_id: int,
 #: ``account.get_balance()`` — which is EQUITY on Alpaca and spendable CASH on
 #: ``BacktestAccount``, the divergence the breaker-parity work exists to remove. There is now
 #: one definition, ``AccountSnapshot.equity``, read by both runtimes through
-#: ``OptionRiskManagement.sleeve_equity``; ``update_sleeve_breaker`` is what this pass calls
-#: and this is the reader behind it. ``None`` leaves the breaker blind (it says so) rather
-#: than reporting a 100% drawdown it never measured.
+#: ``OptionRiskManagement.sleeve_equity``.
+#:
+#: THIS IS THE SIZING READER, not the breaker's. ``update_sleeve_breaker`` is what this pass
+#: calls, and since the 2026-09-01 review it reads ``sleeve_true_equity`` -- the account's
+#: UNCAPPED equity, because ``BacktestAccount``'s cap compresses peaks without compressing
+#: troughs and would hide the drawdown from the one rail whose job is to catch it. Live the
+#: two readers return the same number (there is no cap to look past), so nothing about this
+#: pass's behaviour changed. ``None`` from either leaves the breaker blind (it says so)
+#: rather than reporting a 100% drawdown it never measured.
 _sleeve_equity = _rm.sleeve_equity
 
 
