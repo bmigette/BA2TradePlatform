@@ -682,18 +682,26 @@ def get_arc_floor_action_values():
     """Option action types whose builder reads ``min_arc`` (the premium-richness floor).
 
     These EIGHT are the CREDIT structures -- the ones that post collateral, so that
-    "annualised return on collateral" has a denominator at all. They are exactly the reserve
-    table's ``RESERVING_STRATEGIES`` that have a builder of their own (``credit_spread`` /
-    ``naked_put`` / ``debit_spread`` are pricing aliases with no action), and each calls
+    "annualised return on collateral" has a denominator at all. Each calls
     ``_refuse_if_arc_below_floor`` beside its ``net_credit <= 0`` check.
 
-    Every OTHER option action is in ``ZERO_RESERVE_STRATEGIES`` and reserves nothing -- a
-    long call, a butterfly, and notably a COVERED CALL, which collects a credit but is
-    collateralised by SHARES. For those the ratio is undefined, ``option_economics`` returns
-    None, and a configured floor turns None into a REFUSAL. So offering the field there
-    would not merely be a decoy (the ``wing_width_pct`` failure mode) -- it would be a field
-    whose every value silently deletes the structure. Kept next to the action enum, not in
-    the UI, so a producer renders it for exactly the actions that consume it.
+    "EXACTLY THE RESERVING STRATEGIES WITH A BUILDER" WAS THE RULE UNTIL 2026-09-01 and is
+    no longer, so do not re-derive this list from ``RESERVING_STRATEGIES`` and a
+    no-builder test. Two exemptions now exist, for two different reasons, and BOTH are
+    enumerated in ``option_economics.ARC_FLOOR_EXEMPT_STRATEGIES`` (the one list the two
+    drift guards read): ``credit_spread`` / ``naked_put`` / ``debit_spread`` are pricing
+    aliases with no action at all, and the two 1x2 BACKSPREADS reserve and have builders
+    but deliberately never consult the gate -- their net is near zero by design and may be
+    a debit, so a floor would refuse exactly the structures design 2026-08-31 SS2 searches.
+
+    Every other option action EXCEPT THOSE TWO is in ``ZERO_RESERVE_STRATEGIES`` and
+    reserves nothing -- a long call, a butterfly, and notably a COVERED CALL, which
+    collects a credit but is collateralised by SHARES. For those the ratio is undefined,
+    ``option_economics`` returns None, and a configured floor turns None into a REFUSAL.
+    So offering the field there would not merely be a decoy (the ``wing_width_pct``
+    failure mode) -- it would be a field whose every value silently deletes the structure.
+    Kept next to the action enum, not in the UI, so a producer renders it for exactly the
+    actions that consume it.
     """
     return [
         ExpertActionType.SELL_CASH_SECURED_PUT.value,
@@ -738,7 +746,7 @@ def get_strike_method_action_values():
     Kept next to the action enum rather than in the UI for the same reason as
     ``get_wing_width_action_values``: a producer must render exactly the fields its consumer
     reads. Two independent drift guards, written against different consumers and arriving by
-    different routes, agree on this same set of nine --
+    different routes, agree on this same set of eleven --
     ``packages/common/tests/test_option_strike_method_honoured.py`` runs each builder and
     watches which method the selector was actually handed, and
     ``packages/common/tests/test_strike_method_registry.py`` derives the set from the action

@@ -98,13 +98,19 @@ class FakeAccount(OptionsAccountInterface):
     the short's bid is fixed at 3.00 by the table above.
     """
 
-    def __init__(self, balance=1_000_000.0, long_ask=None, deltas=True):
+    def __init__(self, balance=1_000_000.0, long_ask=None, deltas=True,
+                 half_spread=None):
         self.id = 1
         self._balance = balance
         self._long_ask = long_ask
         self._deltas = deltas
         self.submitted = []
         self.bp_checks = []
+        if half_spread is not None:
+            # The BACKTEST-only seam ``_modelled_half_spreads`` duck-types. Attached to the
+            # INSTANCE, not the class, so every other test here stays a live-shaped account
+            # that models no spread and concedes nothing.
+            self.option_modelled_half_spread = lambda symbol: half_spread
 
     def _as_of_date(self):
         return TODAY
@@ -300,6 +306,49 @@ def test_the_measured_max_loss_is_stamped_on_the_order_row(action_type):
     assert stored.data["max_loss_per_contract"] == pytest.approx(900.0)
     assert stored.data["option_reserve"] == pytest.approx(
         900.0 * acct.submitted[-1]["quantity"])
+
+
+def test_the_stamp_is_the_CONCEDED_measurement_and_sizing_is_the_unconceded_one():
+    """The entry-quote concession makes the stamp and the sizing divisor DIFFERENT NUMBERS,
+    deliberately, and the comment beside the stamp says so -- this is that comment, executed.
+
+    ``_quote_with_concession`` runs inside ``_submit_option_order``, AFTER the builder has
+    sized and reserved (that ordering is the F3 decision: the concession is a quote gene, not
+    a size gene). So with the gene live:
+
+        modelled half-spread     0.10/leg, entry_cross 1.0
+        conceded amount          1.0 x (0.10 x 1 short + 0.10 x 2 long) = 0.30/share
+        limit                   -1.00 credit -> -0.70 (a credit CONCEDES by shrinking)
+        sized + reserved on      (10 - 1.00) x 100 = 900   <- unconceded
+        STAMPED                  (10 - 0.70) x 100 = 930   <- conceded, and LARGER
+
+    The stamp is the conservative one in both directions (a debit rises, a credit shrinks),
+    the gap is exactly the conceded amount x 100, and it is zero at the 0.0 default -- which
+    is why every other test in this file reads one number for all three.
+    """
+    acct, res = run(CALL_BS, acct=FakeAccount(half_spread=0.10), entry_cross=1.0)
+    assert res["success"], res["message"]
+    sub = submitted(acct)
+    assert sub["limit_price"] == pytest.approx(-0.70)
+    assert res["data"]["max_loss_per_contract"] == pytest.approx(930.0)
+    # ...sized and reserved on the UNCONCEDED 900, not on the 930 that got stamped.
+    assert sub["quantity"] == 11                       # floor(10,000 / 900)
+    assert res["data"]["option_reserve"] == pytest.approx(900.0 * 11)
+    assert res["data"]["max_loss_per_contract"] > 900.0, (
+        "the concession must never make the stamped risk SMALLER than the number the "
+        "structure was sized against")
+
+
+def test_without_the_concession_the_three_numbers_are_one():
+    """The default, and the reason the rest of this file can read a single number: no
+    modelled spread (every live account, and any backtest at entry_cross 0.0) means the
+    stamp, the sizing divisor and the reserve are the same measurement AND the same value."""
+    acct, res = run(CALL_BS, entry_cross=1.0)           # gene on, but nothing models a spread
+    assert res["success"], res["message"]
+    sub = submitted(acct)
+    assert sub["limit_price"] == pytest.approx(-1.00)
+    assert res["data"]["max_loss_per_contract"] == pytest.approx(900.0)
+    assert res["data"]["option_reserve"] == pytest.approx(900.0 * sub["quantity"])
 
 
 # ======================================================================================

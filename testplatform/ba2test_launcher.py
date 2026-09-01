@@ -2796,11 +2796,17 @@ _ARC_FULL_NOTIONAL = (0.0, 0.30, 0.05)
 _ARC_REG_T_NAKED = (0.0, 6.0, 1.0)
 _ARC_DEFINED_RISK = (0.0, 3.0, 0.5)
 
-#: option ACTION TYPE -> (reserve-table strategy name, ARC band). Only the CREDIT builders
-#: appear: those are the ones that consult the gate, and they are exactly the reserve table's
-#: `RESERVING_STRATEGIES` that have a builder of their own (`credit_spread` / `naked_put` /
-#: `debit_spread` are pricing aliases with no action). A DEBIT structure posts no collateral,
-#: so a floor there would refuse every one of them -- see the ZERO_RESERVE note below.
+#: option ACTION TYPE -> (reserve-table strategy name, ARC band). Only the builders that
+#: CONSULT the gate appear. A DEBIT structure posts no collateral, so a floor there would
+#: refuse every one of them -- see the ZERO_RESERVE note below.
+#:
+#: NOT "exactly the RESERVING_STRATEGIES that have a builder" -- that was the rule until
+#: 2026-09-01 and is no longer. The exemptions are enumerated in
+#: `ba2_common.core.option_economics.ARC_FLOOR_EXEMPT_STRATEGIES`, which
+#: `test_option_min_arc_gene.test_the_band_table_covers_every_credit_builder` subtracts:
+#: the three pricing aliases (`credit_spread` / `naked_put` / `debit_spread`, no action at
+#: all) and the two 1x2 BACKSPREADS, which reserve and have builders but deliberately never
+#: consult the gate (near-zero-or-debit net by design; a floor would delete them).
 _OPTION_ARC_BANDS = {
     "sell_cash_secured_put": ("cash_secured_put", _ARC_FULL_NOTIONAL),
     "open_jade_lizard": ("jade_lizard", _ARC_FULL_NOTIONAL),

@@ -2852,6 +2852,22 @@ class _OptionEntryAction(TradeAction):
         # only by the stock's gain, so a ratio of option-leg loss over a stock-inclusive
         # max loss could only reach its threshold when the underlying moved FAVOURABLY for
         # the position as a whole -- a stop that fires on good news and never on bad.
+        #
+        # MEASURED FROM THE CONCEDED LIMIT, WHICH IS NOT ALWAYS THE NUMBER A BUILDER SIZED
+        # AND RESERVED AGAINST (stated exactly, 2026-09-01 review finding D). A builder that
+        # measures its own max loss to size by it -- the two 1x2 backspreads do -- measures
+        # BEFORE the concession, because `_quote_with_concession` is applied here, after
+        # sizing, deliberately (see the note at the top of this method). So on a trial with
+        # `entry_cross > 0` the STAMP is the more conservative of the two: the concession
+        # moves the limit against the entry by at most the ratio-weighted sum of the legs'
+        # modelled half-spreads, which for a debit RAISES the measured max loss and for a
+        # credit lowers the credit and so raises it too. The gap is exactly the conceded
+        # amount x 100 per contract -- `quote_concession`'s ratio-weighted sum of modelled
+        # half-spreads, i.e. at most one half-spread per leg (2.5% of premium at the grid's
+        # --option-spread-pct 5.0). It is zero at the 0.0 default and on every live account
+        # (none models a spread), and it errs against the strategy in both directions. What
+        # it is NOT is "one measurement shared by sizing, reserve and stop": those three
+        # agree exactly only when the concession is inert.
         max_loss_per_contract = _measured_max_loss_per_contract(legs, limit_price)
         if max_loss_per_contract is not None:
             data["max_loss_per_contract"] = max_loss_per_contract
@@ -4412,10 +4428,14 @@ class _BackspreadAction(_OptionEntryAction):
                          f"{shape}")
             return self._result(False, f"{shape} on {self.instrument_name}")
         # THE RISK NUMBER, from the payoff evaluator over these same legs and this same
-        # net. Not a formula written out here: this is the number the submit path will
-        # stamp as ``max_loss_per_contract`` (design 2026-08-29 S8.2), so sizing, the
-        # reserve and the ``opt_sl_ml`` denominator are the SAME measurement by
-        # construction rather than by three formulas agreeing.
+        # net. Not a formula written out here: sizing, the reserve and the stamp are one
+        # MEASUREMENT (the payoff evaluator) rather than three formulas that happen to
+        # agree -- but they are not always the same NUMBER. This one is measured from the
+        # UNCONCEDED net, because `_submit_option_order` applies `entry_cross` after
+        # sizing; with the gene set, the stamp it writes is measured from the conceded
+        # limit and is the larger, more conservative of the two, by at most one modelled
+        # half-spread per leg. Zero difference at the 0.0 default and on every live
+        # account. See the note beside the stamp.
         max_loss_per_contract = _measured_max_loss_per_contract(legs, net)
         if max_loss_per_contract is None or max_loss_per_contract <= 0:
             return self._result(

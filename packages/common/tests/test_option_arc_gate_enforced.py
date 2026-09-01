@@ -247,20 +247,94 @@ def test_the_builder_table_covers_every_reserving_strategy():
                                     - ARC_FLOOR_EXEMPT_STRATEGIES)
 
 
-def test_the_exempt_list_is_exactly_the_strategies_with_no_arc_gated_builder():
-    """The exemption cannot be a dumping ground: every name on it must be either a pricing
-    alias (no action class) or a builder that really does not call the gate."""
+def _builder_source_for(strategy: str):
+    """The source of every entry-action class whose OWN code names ``strategy``, or [].
+
+    "Own code" is the class plus its bases up to (not including) ``_OptionEntryAction`` --
+    the same MRO walk ``test_strike_method_registry`` makes, and for the same reason: a
+    builder's behaviour can live on a shared base (the two 1x2 backspreads keep theirs on
+    ``_BackspreadAction``), and a per-class read would report it as absent.
+
+    A strategy is "named" by a class when its quoted literal appears in that source, which
+    is how every builder states the name it submits under -- either inline at the
+    ``_submit_option_order`` call or as the ``OPTION_STRATEGY`` constant. Nothing else in
+    ``TradeActions`` mentions the three reserve-table ALIASES, so they resolve to no class,
+    which is precisely the fact this distinguishes.
+    """
     import inspect
 
     from ba2_common.core import TradeActions as TA
+
+    out = []
+    for _name, obj in vars(TA).items():
+        if not inspect.isclass(obj) or not issubclass(obj, TA._OptionEntryAction):
+            continue
+        if obj is TA._OptionEntryAction:
+            continue
+        chunks = []
+        for klass in obj.__mro__:
+            if klass is TA._OptionEntryAction:
+                break
+            try:
+                chunks.append(inspect.getsource(klass))
+            except (OSError, TypeError):
+                continue
+        src = "\n".join(chunks)
+        if f'"{strategy}"' in src:
+            out.append((obj.__name__, src))
+    return out
+
+
+def test_the_exempt_list_is_exactly_the_strategies_with_no_arc_gated_builder():
+    """The exemption cannot become a dumping ground -- DERIVED, not spot-checked.
+
+    An earlier version named ``call_backspread`` / ``put_backspread`` as literals, which
+    proved those two are honest and said nothing about the next name someone adds. This
+    walks EVERY member of the list and requires one of the two legitimate shapes:
+
+      * NO builder class names it -- a pricing alias, exempt because nothing builds it; or
+      * a builder names it and its own code does NOT call ``_refuse_if_arc_below_floor``.
+
+    So an ARC-GATED strategy added to the exemption fails here (its builder does call the
+    gate), which is the scenario that would otherwise pass both drift guards: the band
+    tables would stop covering it and no test would notice, because the exemption subtracts
+    it from the very set the coverage is measured against.
+    """
     from ba2_common.core.option_economics import ARC_FLOOR_EXEMPT_STRATEGIES
 
     assert ARC_FLOOR_EXEMPT_STRATEGIES <= set(OptionsAccountInterface.RESERVING_STRATEGIES)
-    for cls in (TA.OpenCallBackspreadAction, TA.OpenPutBackspreadAction,
-                TA._BackspreadAction):
-        assert "_refuse_if_arc_below_floor" not in inspect.getsource(cls)
-    for strategy in ("call_backspread", "put_backspread"):
-        assert strategy in ARC_FLOOR_EXEMPT_STRATEGIES
+    assert ARC_FLOOR_EXEMPT_STRATEGIES, "an empty exemption list would make this vacuous"
+    for strategy in sorted(ARC_FLOOR_EXEMPT_STRATEGIES):
+        builders = _builder_source_for(strategy)
+        for class_name, src in builders:
+            assert "_refuse_if_arc_below_floor" not in src, (
+                f"{strategy!r} is exempted from the ARC floor, but {class_name} DOES call "
+                f"_refuse_if_arc_below_floor for it -- so the gate is live on that builder "
+                f"while both band tables have stopped covering it, and neither drift guard "
+                f"can see the hole (the exemption subtracts it from the set they compare)")
+
+
+def test_the_derivation_can_tell_the_two_exempt_shapes_apart():
+    """Guards the mutation that makes the test above vacuous by finding no builder for
+    anything -- then every exemption would look like a harmless alias."""
+    from ba2_common.core.option_economics import ARC_FLOOR_EXEMPT_STRATEGIES
+
+    aliases = {"credit_spread", "naked_put", "debit_spread"}
+    for alias in aliases:
+        assert _builder_source_for(alias) == [], (
+            f"{alias} is exempted as a pricing alias with no builder, but a builder names "
+            f"it -- the exemption needs the other justification, or the alias is now built")
+    for built in sorted(ARC_FLOOR_EXEMPT_STRATEGIES - aliases):
+        assert _builder_source_for(built), (
+            f"{built} is exempted but no builder names it -- if it is now an alias, move "
+            f"it to the alias half of the reasoning at ARC_FLOOR_EXEMPT_STRATEGIES")
+
+    # ...and the probe really does find a GATED builder when there is one, so "no call to
+    # _refuse_if_arc_below_floor" above is a measurement rather than a permanently-true
+    # statement about a probe that reads nothing.
+    gated = _builder_source_for("cash_secured_put")
+    assert gated, "the probe found no builder for cash_secured_put -- it is broken"
+    assert any("_refuse_if_arc_below_floor" in src for _n, src in gated)
 
 
 @pytest.mark.parametrize("strategy", sorted(CREDIT_BUILDERS))
