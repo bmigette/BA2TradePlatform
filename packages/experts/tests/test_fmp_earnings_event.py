@@ -318,11 +318,14 @@ def test_unconfirmed_date_is_admitted_when_the_setting_allows_it():
 
 
 # ------------------------------------------------------ point-in-time / leak ---
-def test_the_upcoming_event_never_contributes_to_the_features():
-    """MUTATION (c): the cache file is a present-day snapshot, so the FUTURE row
-    already carries its eventual actual EPS. Splitting past/future on the as-of is
-    what keeps it out of surprise_vol; without the split this monstrous surprise
-    would dominate the feature."""
+def test_a_future_amc_print_has_no_reacting_bar_and_so_cannot_be_priced():
+    """DEFENCE IN DEPTH, not the point-in-time split (which
+    test_a_bmo_print_on_the_as_of_day_cannot_leak_into_the_features owns). An 'amc'
+    print dated after the as-of reacts on a session the price window does not reach,
+    so even if it were mis-sorted into the history it could contribute no move -- and
+    with no move it contributes no surprise either, however monstrous its cached EPS.
+    Pins that second barrier explicitly, so a refactor cannot quietly remove the one
+    the split-mutation test does not exercise."""
     rows, df = _healthy_rows()
     clean = _run(rows, df=df)[0].raw_outputs["FMPEarningsEvent"]
 
@@ -615,3 +618,166 @@ def test_every_setting_declares_a_default_and_a_description():
     for key, spec in FMPEarningsEvent.get_settings_definitions().items():
         assert "default" in spec, key
         assert spec["description"], key
+
+
+# ------------------------------------------------- the coerced-zero surprise ---
+def _bars_for(days, jump=104.0):
+    """Ascending [(day, close)] with the reacting session of each amc print moved."""
+    df = _bars_df({_next_weekday(d): jump for d in days})
+    return list(zip(df["Date"].dt.strftime("%Y-%m-%d"), df["Close"].astype(float)))
+
+
+def test_an_unreported_quarter_contributes_no_surprise():
+    """The provider maps a MISSING eps leg to 0.0 and then refuses to state a surprise
+    on that row. Recomputing from the coerced legs would invent a -100% 'total miss'
+    out of a quarter nobody has reported yet -- the exact trap
+    ba2_experts.earnings_surprise.surprise_history guards against."""
+    days = PAST_DAYS[:3]
+    # THE EXACT ROW THE PROVIDER EMITS for a scheduled-but-unreported quarter: the
+    # missing actual arrives here already COERCED to 0.0, with surprise_percent left
+    # None. Recomputing (0.0 - 1.30)/|1.30| gives -100.0 -- a total miss, invented.
+    rows = [_prow(days[0], eps=0.0, est=1.30, slot="amc"),
+            _prow(days[1], eps=1.10, est=1.00, slot="amc"),
+            _prow(days[2], eps=1.30, est=1.00, slot="amc")]
+    out = compute_features(rows, _bars_for(days))
+    assert out["usable_events"] == 3     # it IS priceable; only the SURPRISE is absent
+    assert out["surprises"] == pytest.approx([10.0, 30.0])
+    assert -100.0 not in out["surprises"]
+    # ACCEPTED COST, same as the shared helper's: a genuine 0.00 EPS print is
+    # indistinguishable from a coerced one downstream, so it is dropped too.
+    assert compute_features([_prow(days[0], eps=0.0, est=1.30, slot="amc")],
+                            _bars_for(days))["surprises"] == []
+
+
+def test_a_zero_coerced_leg_never_reaches_the_composite_through_the_provider():
+    """End-to-end through the REAL provider mapping, which is what does the coercing:
+    one scheduled-but-unreported past quarter must not distort surprise_vol."""
+    import statistics
+    rows, df = _healthy_rows(n_past=8)
+    with_hole = list(rows)
+    # _healthy_rows alternates +10%/+30% surprises; blanking the NEWEST past print's
+    # actual leaves 3x10% and 4x30% behind it.
+    with_hole[1] = _row(PAST_DAYS[0], eps=None, est=1.00, slot="amc")
+    got = _run(with_hole, df=df)[0].raw_outputs["FMPEarningsEvent"]
+    assert got["usable_events"] == 8      # still priceable, only unscoreable
+    assert got["surprise_vol"] == pytest.approx(
+        statistics.stdev([10.0, 30.0, 10.0, 30.0, 10.0, 30.0, 30.0]), abs=0.01)
+
+
+def test_a_genuinely_present_pair_still_yields_its_surprise():
+    """The guard must not throw the baby out: real legs are still scored, including a
+    real MISS (which is what a fabricated -100 would otherwise be mistaken for)."""
+    days = PAST_DAYS[:2]
+    out = compute_features(
+        [_prow(days[0], eps=1.25, est=1.00, slot="amc"),
+         _prow(days[1], eps=0.80, est=1.00, slot="amc")],
+        _bars_for(days))
+    assert out["surprises"] == pytest.approx([25.0, -20.0])
+
+
+# ------------------------------------------------------- interior-gap guard ---
+def test_a_reacting_pair_across_an_interior_hole_is_not_a_move():
+    """A bmo print whose previous bar is 19 days back is reading a HOLE, not a
+    reaction; the whole gap's drift is not this announcement's doing."""
+    bars = [("2024-05-29", 100.0), ("2024-06-17", 140.0), ("2024-06-18", 141.0)]
+    assert earnings_day_move_pct(bars, "2024-06-17", "bmo") is None
+
+
+def test_an_amc_pair_across_an_interior_hole_is_not_a_move():
+    bars = [("2024-06-17", 100.0), ("2024-07-08", 140.0)]
+    assert earnings_day_move_pct(bars, "2024-06-17", "amc") is None
+
+
+def test_a_normal_holiday_weekend_pair_is_still_a_move():
+    """The guard must admit every real weekend/holiday span (Fri -> Tue = 4 days),
+    or it would quietly delete a chunk of ordinary history."""
+    bars = [("2024-05-24", 100.0), ("2024-05-28", 106.0)]          # Memorial Day
+    assert earnings_day_move_pct(bars, "2024-05-28", "bmo") == pytest.approx(6.0)
+    amc = [("2024-05-24", 100.0), ("2024-05-28", 106.0)]
+    assert earnings_day_move_pct(amc, "2024-05-24", "amc") == pytest.approx(6.0)
+
+
+def test_a_gapped_event_does_not_count_toward_min_hist_events():
+    """End-to-end: the gap guard must make the event UNUSABLE, not merely move-less,
+    or min_hist_events would admit a symbol on unpriceable history."""
+    rows = [_prow(d, eps=1.10, est=1.00, slot="bmo") for d in PAST_DAYS[:4]]
+    bars = sorted((d, 130.0) for d in PAST_DAYS[:4])   # only the event days exist
+    assert compute_features(rows, bars)["usable_events"] == 0
+
+
+# ------------------------------------------ the window is filled with USABLE ---
+def test_the_history_window_is_filled_with_usable_events_not_newest_rows():
+    """8 newest prints unslotted + 4 older good ones: the good ones must still be
+    found. Slicing to _MAX_HIST_EVENTS BEFORE attrition would see only the 8 bad rows
+    and refuse the symbol -- and the generous _CALENDAR_PERIODS fetch that pays for
+    those older rows would be pointless."""
+    rows = [_prow(d, eps=1.10, est=1.00, slot="--") for d in PAST_DAYS[:8]]
+    rows += [_prow(d, eps=(1.10 if i % 2 == 0 else 1.30), est=1.00, slot="amc")
+             for i, d in enumerate(PAST_DAYS[8:12])]
+    out = compute_features(rows, _bars_for(PAST_DAYS[8:12], jump=105.0))
+    assert out["usable_events"] == 4
+    assert out["features"]["hist_move"] == pytest.approx(5.0)
+
+
+def test_the_window_still_caps_at_max_hist_events():
+    """The fill is bounded: more usable events than the window does not widen it."""
+    rows = [_prow(d, eps=1.10, est=1.00, slot="amc") for d in PAST_DAYS[:12]]
+    assert compute_features(rows, _bars_for(PAST_DAYS[:12], jump=105.0))[
+        "usable_events"] == 8
+
+
+def test_surprise_vol_is_measured_over_the_same_usable_events_as_the_move():
+    """The documented coupling: an event that could not be priced contributes no
+    surprise either, so both features describe ONE event population and cannot report
+    a move profile from 4 prints beside a surprise profile from 12."""
+    rows = [_prow(PAST_DAYS[0], eps=99.0, est=1.00, slot="--")]    # wild, unpriceable
+    rows += [_prow(d, eps=(1.10 if i % 2 == 0 else 1.30), est=1.00, slot="amc")
+             for i, d in enumerate(PAST_DAYS[1:5])]
+    out = compute_features(rows, _bars_for(PAST_DAYS[1:5]))
+    assert out["usable_events"] == 4
+    assert out["surprises"] == pytest.approx([10.0, 30.0, 10.0, 30.0])
+
+
+# ----------------------------------------------------------- warmup contract ---
+def test_backtest_warmup_bars_covers_the_price_window_it_asks_for():
+    """The handler converts BARS -> calendar days and pre-warms that much history. If
+    it falls short of _OHLCV_LOOKBACK_DAYS the earliest bars of a run silently see
+    fewer usable events and get refused -- a crippled universe that reads as a quiet
+    expert."""
+    from ba2_experts.FMPEarningsEvent import _OHLCV_LOOKBACK_DAYS
+    bars = FMPEarningsEvent.BACKTEST_WARMUP_BARS
+    assert isinstance(bars, int)
+    warmup_calendar_days = int(bars * 1.45) + 10       # daily_backtest_handler formula
+    assert warmup_calendar_days >= _OHLCV_LOOKBACK_DAYS, (
+        f"{bars} bars -> {warmup_calendar_days}d < the {_OHLCV_LOOKBACK_DAYS}d window")
+
+
+def test_the_warmup_formula_pinned_above_is_the_handlers_own():
+    """Re-derive the conversion from the handler instead of trusting the comment: if
+    the handler's arithmetic changes, the test above is measuring nothing."""
+    import os
+    import re
+    # ba2_experts ships as an independent package (BA2TradeExperts); the handler only
+    # exists when the suite runs inside the monorepo, so this re-derivation SKIPS
+    # rather than fails when it does not.
+    root = os.path.abspath(__file__)
+    for _ in range(4):
+        root = os.path.dirname(root)
+    src_path = os.path.join(root, "testplatform", "backend", "app", "services",
+                            "backtest", "daily_backtest_handler.py")
+    if not os.path.exists(src_path):
+        pytest.skip("daily_backtest_handler not present (package checked out standalone)")
+    src = open(src_path, encoding="utf-8").read()
+    assert "_BARS_TO_CALDAYS = 1.45" in src
+    assert re.search(r"int\(max_bars \* _BARS_TO_CALDAYS\) \+ 10", src)
+    # And the registration this expert still needs from Task 10 is genuinely absent,
+    # so the class attribute above is documented as inert rather than assumed live.
+    assert '"FMPEarningsEvent"' not in src
+
+
+# ------------------------------------------------------------------ settings ---
+def test_setting_keys_matches_the_settings_definitions_exactly():
+    """_SETTING_KEYS is what live run_analysis resolves. A setting missing from it is
+    inert live while the UI field for it claims it works."""
+    assert set(FMPEarningsEvent._SETTING_KEYS) == set(
+        FMPEarningsEvent.get_settings_definitions())

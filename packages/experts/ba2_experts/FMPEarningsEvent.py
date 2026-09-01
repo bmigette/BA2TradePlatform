@@ -18,9 +18,20 @@ Features (design §9 "Genes — emission decided BY the measurements")
                      ``past_earnings_quarterly`` × our OHLCV closes.
 * ``surprise_vol`` — std of past EPS surprise % (reported vs estimated).
 * ``vol_cheapness``— hist_move ÷ implied move. **Task 8**; its WEIGHT already exists
-                     here, its FEATURE does not yet (see ``_composite`` — an absent
-                     feature never demotes, the composite renormalizes over the
+                     here, its FEATURE does not yet (see ``composite_confidence`` — an
+                     absent feature never demotes, the composite renormalizes over the
                      present ones).
+
+HOW SEVERE IS THE DEFAULT ``min_analysts=3``? Measured 2026-09-01 over a random 600
+of the 4,728 cached ``earnings_estimates_quarterly`` payloads, replaying this
+expert's own gate (nearest estimate row on/after the as-of, plural analyst key,
+0 read as "no count"): it REFUSES 66% of symbols at a 2023-06-10 as-of and 47% at
+2025-06-10. Coverage thins going back because the endpoint is forward-biased. So the
+default is deliberately strict, not accidentally so — it discards roughly half the
+universe at recent dates and two thirds at older ones. Task 10 should pick the gene
+range with those two numbers in front of it: a range that never reaches low values
+would leave most of the mid/small bands unreachable, which is exactly where design
+§9 says O_ERN runs FIRST.
 
 WITHHELD, deliberately not implemented (design §9, recorded not silently dropped)
 --------------------------------------------------------------------------------
@@ -79,11 +90,14 @@ MEAN over the features that are PRESENT (``Σ w·n / Σ w``), so:
 
 Provider seam / point-in-time discipline
 ----------------------------------------
-Every read goes through ``ProviderBundle`` + ``ba2_providers.cache.cached_get``
-(``past_earnings_get`` / ``ohlcv_get``), i.e. the same ``fmp_history_disk_cached``
-TTL-frozen + hermetic machinery every other expert uses: a backtest reads the
-pre-warmed disk cache (a missing symbol disables that symbol, many abort the run),
-live hits the API. No raw HTTP, no direct cache-file reads.
+Every read goes through ``ProviderBundle``. The calendar and the price history use
+the ``ba2_providers.cache.cached_get`` alias layer (``past_earnings_get`` /
+``ohlcv_get``); the analyst count calls ``get_earnings_estimates`` on the same
+bundle-resolved provider directly, because that category has no alias in
+``cached_get``. All three land on the SAME ``fmp_history_disk_cached`` TTL-frozen +
+hermetic machinery every other expert uses: a backtest reads the pre-warmed disk
+cache (a missing symbol disables that symbol, many abort the run), live hits the
+API. No raw HTTP, no direct cache-file reads.
 
 FEATURES ARE COMPUTED STRICTLY FROM EVENTS DATED BEFORE ``as_of``. The upcoming
 event is found by asking the calendar for rows up to ``as_of + earnings_days_look``
@@ -93,6 +107,16 @@ that future row contributes ONLY its date and slot. Its ``eps`` is an actual in 
 cache file; letting it reach ``surprise_vol`` would be a textbook lookahead leak,
 so the past/future split happens once, explicitly, in ``_split_events``.
 
+THE MOST RECENT PAST EVENT reads the as-of close. An 'amc' print dated as_of-1
+reacts during the as-of session, so its post-close IS ``Close(as_of)`` -- the very
+bar every expert on this platform already prices its decisions at. That is
+platform-consistent, not a leak: the as-of close is the decision-time information
+set, and refusing it here would make this expert's history end a day earlier than
+everyone else's for no gain. LIVE CAVEAT: intraday, that as-of "close" is a PARTIAL
+bar (whatever the provider last stamped), so a same-session amc move can move as the
+day goes on -- it settles at the real close and matters only for the single newest
+observation of an eight-event average.
+
 KNOWN, ACCEPTED LIMIT: the cache file is a present-day snapshot, so a backtest sees
 the event date as it was FINALLY recorded, not as it was announced at ``as_of``.
 That is inherent to backtesting an earnings CALENDAR and is the same compromise
@@ -101,6 +125,7 @@ that lets the GA decide how much of that risk it will take. It touches the DATE
 only — never a feature value.
 """
 
+import math
 from datetime import datetime, timedelta, timezone
 from statistics import stdev
 from typing import Any, Dict, List, Optional, Tuple
@@ -125,6 +150,14 @@ _CONFIRMED_SLOTS = ("bmo", "amc")
 #: truncates to this count, so it must span the upcoming event PLUS enough history to
 #: fill _MAX_HIST_EVENTS after the unknown-slot/no-price attrition. 16 quarters = 4y.
 _CALENDAR_PERIODS = 16
+
+#: Maximum calendar-day span the reacting PAIR of closes may straddle. A normal pair
+#: is consecutive sessions (1 day), 3 across a weekend, up to ~5 across a holiday
+#: weekend. Anything wider is a HOLE in the series -- a halt, a quotation gap, an
+#: illiquid stretch with no prints -- and attributing that whole gap's drift to the
+#: earnings announcement would credit the print with days of unrelated movement.
+#: 7 admits every real weekend/holiday combination and excludes the holes.
+_MAX_REACTION_GAP_DAYS = 7
 
 #: How many of the most recent USABLE past events feed the features. 8 quarters = 2
 #: years: long enough to average out one freak print, short enough that the company
@@ -223,7 +256,9 @@ def earnings_day_move_pct(bars: List[Tuple[str, float]], event_day: str,
 
     ``bars`` is [(YYYY-MM-DD, close)] ascending. See the module docstring for the
     convention; an unknown slot yields None BY DESIGN (not a guessed default), and so
-    does a missing bar on either side of the reacting session.
+    does a missing bar on either side of the reacting session, or a reacting pair whose
+    two closes sit more than ``_MAX_REACTION_GAP_DAYS`` apart (an interior hole in the
+    series, whose whole drift is not this announcement's doing).
     """
     day = _parse_day(event_day)
     if day is None or not bars:
@@ -250,8 +285,14 @@ def earnings_day_move_pct(bars: List[Tuple[str, float]], event_day: str,
         post_i = pre_i + 1
     else:
         return None  # unknown slot -> not usable (module docstring)
-    pre_close = bars[pre_i][1]
-    post_close = bars[post_i][1]
+    pre_day, pre_close = bars[pre_i]
+    post_day, post_close = bars[post_i]
+    # INTERIOR-GAP GUARD. 'The session before' is only meaningful if it really was the
+    # session before: with a hole in the series the neighbouring bar can be weeks away,
+    # and the whole gap's drift would be booked as the earnings reaction.
+    gap = _parse_day(post_day) - _parse_day(pre_day)
+    if gap.days > _MAX_REACTION_GAP_DAYS:
+        return None
     if not pre_close or pre_close <= 0 or post_close is None or post_close <= 0:
         return None
     return abs(post_close / pre_close - 1.0) * 100.0
@@ -293,17 +334,29 @@ def compute_features(past_events: List[Dict[str, Any]],
 
     Returns {'features': {name: raw}, 'usable_events': int, 'moves': [...],
     'surprises': [...]}. ``usable_events`` counts events whose earnings-day move was
-    computable (a confirmed slot AND bars on both sides) -- that is the population the
-    ``min_hist_events`` floor is about, since an event we cannot price tells us nothing
-    about how this name trades its prints.
+    computable (a confirmed slot, bars on both sides, no interior gap) -- that is the
+    population the ``min_hist_events`` floor is about, since an event we cannot price
+    tells us nothing about how this name trades its prints.
 
-    ``surprise_vol`` needs at least TWO surprises to have a standard deviation at all;
-    with fewer the feature is ABSENT (dropped from the dict), not 0.0 -- a zero would
-    read as "this name never surprises", the strongest possible statement, from no data.
+    THE WINDOW IS FILLED WITH USABLE EVENTS, not with the newest rows. ``past_events``
+    is walked newest-first and the first ``_MAX_HIST_EVENTS`` that survive attrition are
+    kept, so a name whose recent prints are unslotted still gets a full history from the
+    older ones instead of being starved by them. This is what the deliberately generous
+    ``_CALENDAR_PERIODS`` fetch is FOR.
+
+    ``surprise_vol`` IS DELIBERATELY COUPLED to that same usable set: only an event that
+    contributed a move contributes a surprise. The two features then describe ONE event
+    population, so a symbol cannot report a move profile from 4 prints and a surprise
+    profile from 12 -- and the ``min_hist_events`` floor governs both. It needs at least
+    TWO surprises to have a standard deviation at all; with fewer the feature is ABSENT
+    (dropped from the dict), not 0.0 -- a zero would read as "this name never
+    surprises", the strongest possible statement, from no data.
     """
     moves: List[float] = []
     surprises: List[float] = []
-    for row in past_events[:_MAX_HIST_EVENTS]:
+    for row in past_events:
+        if len(moves) >= _MAX_HIST_EVENTS:
+            break
         day = row.get("report_date") or row.get("fiscal_date_ending")
         move = earnings_day_move_pct(bars, day, row.get("time"))
         if move is None:
@@ -311,8 +364,17 @@ def compute_features(past_events: List[Dict[str, Any]],
         moves.append(move)
         sp = row.get("surprise_percent")
         if sp is None:
-            sp = _surprise_percent(row.get("reported_eps"), row.get("estimated_eps"))
-        if sp is not None:
+            reported, estimated = row.get("reported_eps"), row.get("estimated_eps")
+            # THE COERCED-ZERO TRAP. The provider maps a MISSING eps leg to 0.0 and, on
+            # exactly those rows, refuses to state a surprise (surprise_percent=None).
+            # Recomputing from the coerced legs turns that refusal into a fabricated
+            # -100% "total miss" -- and a scheduled-but-unreported quarter is the single
+            # most common way a leg goes missing. A real 0.0 print is indistinguishable
+            # downstream, so the row contributes NO surprise. Same guard, same reason as
+            # ba2_experts.earnings_surprise.surprise_history.
+            sp = (_surprise_percent(reported, estimated)
+                  if (reported and estimated) else None)
+        if sp is not None and math.isfinite(float(sp)):
             surprises.append(float(sp))
 
     features: Dict[str, float] = {}
@@ -326,6 +388,22 @@ def compute_features(past_events: List[Dict[str, Any]],
 
 class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
     """Ranks the UPCOMING earnings event for one symbol (design §9)."""
+
+    #: Trading bars of price history this expert needs warmed up before the FIRST
+    #: analysis bar. Derived, not guessed: ``_OHLCV_LOOKBACK_DAYS`` (900 calendar days,
+    #: itself sized to reach the oldest of _MAX_HIST_EVENTS=8 quarterly prints plus its
+    #: reference session) must be COVERED by the warmup the handler derives, and
+    #: ``daily_backtest_handler.derive_warmup_days`` converts bars -> calendar days as
+    #: ``int(bars * 1.45) + 10``. Solving for 900: (900 - 10) / 1.45 = 613.8 bars, so
+    #: 620 -> int(620*1.45)+10 = 909 calendar days, covering the window with margin.
+    #: Without this the earliest bars of a run silently see fewer usable events and get
+    #: refused by min_hist_events -- a crippled universe that looks like a quiet expert.
+    #:
+    #: TASK 10 STILL OWES THE REGISTRATION. ``derive_warmup_days`` only consults this
+    #: attribute for classes listed in ``_SUPPORTED_EXPERTS``; until Task 10 adds
+    #: "FMPEarningsEvent" there (and, optionally, to the ``_EXPERT_WARMUP_BARS`` table)
+    #: this number is inert and the handler falls back to the 20-bar default.
+    BACKTEST_WARMUP_BARS: int = 620
 
     RENDER_PENDING_MESSAGE = 'Earnings-event analysis for {symbol} is queued'
     RENDER_RUNNING_MESSAGE = 'Scoring the next earnings event for {symbol}...'
