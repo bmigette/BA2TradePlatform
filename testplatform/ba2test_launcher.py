@@ -1068,10 +1068,25 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     deliberately compared as two separate runs rather than made a gene — under notional the five
     ATR genes face no selection pressure and drift random, so a crossover that flips the mode
     would judge it with unselected parameters and bias the comparison toward whichever mode
-    happens to dominate the population."""
+    happens to dominate the population.
+
+    ``risk_manager_mode`` (review finding M5, 2026-09-01) is plumbed here and NOWHERE ELSE:
+    a spec that names one has it written onto the run's expert settings, from which
+    ``strategy_optimization_handler._build_daily_trial_config`` carries it into every trial
+    (that dict passes expert settings through wholesale, so nothing downstream drops it) and
+    ``daily_backtest_handler`` reads it. Until this existed the ``classic_options`` mode was
+    selectable by a live expert and by a hand-written config, but by no GRID JOB -- the
+    option risk manager could not be searched at all.
+
+    ABSENT IS THE DEFAULT and stays absent: a spec that does not name the key produces the
+    same settings dict it always did, byte for byte, so every existing job is unchanged.
+    ``test_no_shipped_expert_spec_selects_a_risk_manager_mode`` pins that.
+    """
     settings = dict(spec["fixed_settings"])
     if spec.get("universe_setting"):
         settings[spec["universe_setting"]] = ",".join(universe)
+    if spec.get("risk_manager_mode"):
+        settings["risk_manager_mode"] = spec["risk_manager_mode"]
     if overrides:
         settings.update(overrides)
     return settings

@@ -821,3 +821,67 @@ def test_the_sl_ml_leaf_becomes_a_real_engine_trigger():
     triggers = triggers_from_condition_tree(rule["conditions"])
     assert [t["event_type"] for t in triggers.values()] == ["loss_pct_of_max_loss"]
     assert list(triggers.values())[0]["operator"] == ">"
+
+
+# =============================================================================
+# THE RISK-MANAGER MODE REACHES A TRIAL (review finding M5, 2026-09-01)
+#
+# classic_options was selectable by a live expert and by a hand-written config,
+# and by NO GRID JOB: nothing in the launcher ever wrote risk_manager_mode onto
+# an expert's run settings, so the option risk manager could not be searched at
+# all. _expert_run_settings is the one plumbing point; absent stays the default.
+# =============================================================================
+def test_no_shipped_expert_spec_selects_a_risk_manager_mode():
+    """THE GOLDEN NO-OP. Every expert the grid ships must produce the settings dict it
+    always did -- no risk_manager_mode key at all, so every existing job is byte-identical.
+    A spec that wants the option rails has to say so, deliberately, one expert at a time."""
+    m = _launcher()
+    for name, spec in m._EXPERT_OPT.items():
+        assert "risk_manager_mode" not in spec, name
+        settings = m._expert_run_settings(spec, ["AAPL", "MSFT"])
+        assert "risk_manager_mode" not in settings, name
+
+
+def test_a_spec_that_names_classic_options_reaches_the_TRIAL_config():
+    """THE RECORDED CHAIN, end to end: spec -> _expert_run_settings -> the run's experts
+    block -> _build_daily_trial_config -> the per-trial expert settings the engine feeds to
+    the expert. The middle step is a WHITELIST that rebuilds the trial config key by key, so
+    "the launcher wrote it" is not evidence that a trial ever sees it.
+
+    MUTATION KILL: drop the two-line plumbing in _expert_run_settings and the key is gone
+    from the trial config."""
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+
+    m = _launcher()
+    spec = {**m._EXPERT_OPT["FMPRating"], "risk_manager_mode": "classic_options"}
+    settings = m._expert_run_settings(spec, ["AAPL"])
+    assert settings["risk_manager_mode"] == "classic_options"
+
+    backtest_cfg = {
+        "backtest_id": "m5-chain",
+        "start_date": "2024-01-02",
+        "end_date": "2024-03-01",
+        "enabled_instruments": ["AAPL"],
+        "experts": [{"class": "FMPRating", "settings": settings}],
+        "initial_capital": 100_000.0,
+        "account_settings": {},
+        "warmup_days": 0,
+        "seed": 1,
+    }
+    trial = _build_daily_trial_config(backtest_cfg, {}, None)
+    assert trial["experts"][0]["settings"]["risk_manager_mode"] == "classic_options"
+
+
+def test_the_mode_the_grid_can_select_is_the_one_the_gate_engages_on():
+    """One spelling, checked against the gate rather than against a second copy of the
+    string: the H2 dispatch engages on EXACTLY this value and treats anything else as
+    legacy, so a typo'd spec would search a mode that does nothing."""
+    from ba2_common.core.OptionRiskManagement import (
+        RISK_MANAGER_MODE_CLASSIC_OPTIONS, option_risk_manager_enabled,
+    )
+
+    m = _launcher()
+    spec = {**m._EXPERT_OPT["FMPRating"],
+            "risk_manager_mode": RISK_MANAGER_MODE_CLASSIC_OPTIONS}
+    settings = m._expert_run_settings(spec, ["AAPL"])
+    assert option_risk_manager_enabled(settings) is True
