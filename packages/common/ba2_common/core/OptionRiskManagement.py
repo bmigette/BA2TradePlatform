@@ -72,6 +72,32 @@ entry gate that also updated the state could consume the edge on a bar where the
 had not yet run, and the flatten would never be signalled at all. A process restart forgets
 the peak (persisting it needs a migration); that is stated rather than hidden.
 
+LIMITATION: in a BACKTEST this module gates ENTRIES and nothing else
+--------------------------------------------------------------------
+The breaker LATCH is shared -- ``check_rails`` refuses every candidate while ``halted``,
+in both runtimes -- but the TRANSITIONS are not. ``option_lifecycle_service`` is the only
+production caller of ``option_book.update_breaker``, it lives in the live tree, and it is
+reached only from ``JobManager``. A backtest therefore never ratchets the peak, never
+trips and never clears: ``get_breaker_state`` answers ``BreakerState()`` on every bar and
+``RAIL_BREAKER_HALTED`` is unreachable there. A ``classic_options`` backtest models the
+sleeve RAILS faithfully and the drawdown breaker not at all, so it is systematically MORE
+PERMISSIVE than live and must not be read as evidence about the breaker.
+
+This is agreed work, not a design position -- the operator's standing rule is that the two
+runtimes run the same code and behave the same. It is BLOCKED on one question that must be
+answered before the wiring can be written, because the same ambiguity already affects the
+entry rails: **what is the option sleeve's equity, per bar?** ``sleeve_equity`` below calls
+``account.get_balance()``, and that method does not mean the same thing on both sides --
+``AlpacaAccount.get_balance`` returns account EQUITY, while ``BacktestAccount.get_balance``
+returns spendable CASH (``_cash``, capped). A drawdown breaker measured on cash would trip
+on deploying capital and clear on closing a position, irrespective of P&L. The candidates,
+and the per-sleeve-versus-account-wide question that goes with them, are recorded in the
+design doc's deferred section.
+
+The exit/servicing half (profit capture, tested delta, roll-DTE, the stops) is live-only for
+a different and deliberate reason: a backtest expresses those as ``close_option`` exit rules
+the GA searches, which is the engine's own settlement machinery, not a fork of this one.
+
 Charging what is submitted but not yet visible
 ----------------------------------------------
 A structure submitted this cycle is a ``WAITING`` transaction with no executed leg, so

@@ -518,6 +518,81 @@ Within a `classic_options` expert:
 - A bare `strike_param` degenerates the box to a single point, giving selection identical to today.
 - Experts in `classic` mode keep the current path in full.
 
+## 11.5 What `classic_options` actually gates in each runtime (2026-09-01)
+
+Recorded because §4's "one implementation, both runtimes" is true of the ENTRY GATE and not
+yet true of the BREAKER, and the prose in `EXPERTS.md` and `README.md` had generalised it.
+
+| | live | backtest |
+|---|---|---|
+| entry rails (`check_rails`: deployment, undefined-risk sub-cap, notional leverage, concurrency, one-per-underlying, assignment capacity) | yes | yes — the same `admit_option_entry` at the same `TradeActions` choke point |
+| breaker LATCH consulted on entry | yes | yes |
+| breaker TRANSITIONS (`update_breaker`: ratchet the peak, trip, re-arm) | yes | **no** |
+| exit/servicing pass (profit capture, tested delta, roll-DTE, stops) | yes (`option_lifecycle_service`) | expressed as the strategy's `close_option` exit rules, which the GA searches |
+
+`option_lifecycle_service` is the only production caller of `update_breaker`, it lives in
+the live tree and it is reached only from `JobManager`. So in a backtest
+`get_breaker_state` answers `BreakerState()` on every bar and `RAIL_BREAKER_HALTED` is
+unreachable: a `classic_options` backtest is systematically **more permissive** than live.
+
+**The operator's ruling (2026-09-01) is that this must be fixed in CODE** — same shared
+`update_breaker`, one function, two callers, gated on the `classic_options` mode so an
+equity trial never reaches it. It is blocked on one question, which the entry rails already
+have and which the breaker would make worse:
+
+### What IS the option sleeve's equity, per bar?
+
+`OptionRiskManagement.sleeve_equity` and `option_lifecycle_service._sleeve_equity` both call
+`account.get_balance()`. That method does **not** mean the same thing on the two sides:
+
+* `AlpacaAccount.get_balance()` — the account's **equity** (its own docstring).
+* `BacktestAccount.get_balance()` — **spendable cash**: `self._cash`, or
+  `min(cash, deployed_equity())` when an equity cap is configured.
+
+A peak-to-trough breaker on cash trips when the sleeve DEPLOYS capital and clears when it
+CLOSES a position, regardless of P&L. The same mismatch is already the denominator of
+`max_deployment_pct` and `max_notional_leverage` today.
+
+Candidates for the backtest side, none of them chosen here:
+
+1. `account.get_balance()` — status quo; cash, not equity. Rejected on the above unless live
+   is redefined to match.
+2. `account.equity()` — `cash + mark-to-market of open positions`, i.e. net liquidating
+   value. Matches what live `get_balance()` MEANS, but by a different method name.
+3. `account.deployed_equity()` — `min(cap, equity())`; the number every sizer already sees,
+   so it keeps the rails' denominator consistent with sizing under an equity cap.
+4. `account.get_account_info()["equity"]` — equals (3), but it is an accessor both runtimes
+   expose, so a genuinely shared reader could use it without a runtime check.
+5. the `snapshot_equity` curve's `net_liquidating_value` — the series the reported drawdown
+   is computed from, i.e. the number an operator would expect the breaker to agree with.
+6. **`account.get_account_snapshot().equity`** — the recommendation, offered rather than
+   taken. `AccountSnapshot` already exists for exactly this problem: it is the
+   broker-agnostic cash / equity / buying-power view, `equity` is defined there as "cash
+   plus positions marked to market", `ReadOnlyAccountInterface` ships a concrete tolerant
+   base implementation so every account answers, and Alpaca and TastyTrade override it
+   properly. On the backtest side it resolves through `get_account_info()` to
+   `deployed_equity()`; on Alpaca to `TradeAccount.equity`. Those two MEAN the same thing,
+   which is the property `get_balance()` does not have.
+
+**Why this is not a free change, and why it is not being made here.** Adopting (2)–(6)
+moves the denominator of `max_deployment_pct` and `max_notional_leverage` in the BACKTEST
+from cash to equity. Every option grid run under `classic_options` before and after that
+change would be measuring a different rail, so it is a ratification, not a refactor. It
+also touches live: `sleeve_equity` is shared, so whatever is chosen is what live's rails
+read too.
+
+And the orthogonal question, the same one flagged for `assignment_cash`: every candidate is
+**account-wide**, while the rail it feeds is **per-sleeve**. Two `classic_options` experts
+on one account each measure the whole account.
+
+A second blocker, smaller: `circuit_breaker_pct` — and the five other lifecycle thresholds
+(`profit_capture_pct`, `roll_dte`, `tested_delta_enabled`, `dr_stop_enabled`,
+`ur_stop_enabled`) — left the tree with PremiumSeller's settings block and are declared by
+no expert. They are still read by exact key from stored settings, so an operator who sets
+them gets the documented behaviour, but nothing declares or renders them. Deciding where
+they are declared (and, per §4 / review finding M1, that a risk threshold carries no
+default) is part of the same piece of work.
+
 ## 12. Deferred, with reasons
 
 - **Calendar and diagonal spreads.** Genuinely different economics (long vega, profit from
