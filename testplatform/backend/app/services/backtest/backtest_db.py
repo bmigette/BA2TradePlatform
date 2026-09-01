@@ -145,10 +145,17 @@ def backtest_trading_db(run_id: int | str, in_memory: bool = True) -> Iterator[s
     # journal. It is keyed per thread while a backtest trade store is active, so CONCURRENT
     # trials cannot see each other; SEQUENTIAL trials on one worker thread would still
     # inherit the previous trial's latch, and a run whose sleeve starts halted because an
-    # earlier genome drew down is not reproducible. Cleared at both ends of the run: on the
-    # way in so this trial starts clean, and on the way out so nothing leaks into live code
-    # paths on this thread.
+    # earlier genome drew down is not reproducible. Cleared at BOTH ends of the run (the two
+    # calls below): on the way in so this trial starts clean, and on the way out so nothing
+    # leaks into live code paths on this thread.
+    #
+    # reset_thread_state, NOT reset_state: the latter is a bare .clear() on three
+    # process-wide dicts, so under --parallel > 1 the first trial to finish wiped every
+    # sibling's latch, charges and journal and left them trading against a sleeve the rails
+    # believed was empty. This clears only the keys THIS thread filed and never the live
+    # (None, expert) keys.
     from ba2_common.core import OptionRiskManagement as option_rm
+    option_rm.reset_thread_state()
     try:
         with store_ctx:
             yield target
@@ -158,7 +165,7 @@ def backtest_trading_db(run_id: int | str, in_memory: bool = True) -> Iterator[s
         # in-flight charges -- a trial that opens nothing because an EARLIER trial drew
         # down is not reproducible. Clearing on the way OUT also stops the state leaking
         # into live code paths on this thread.
-        option_rm.reset_state()
+        option_rm.reset_thread_state()
         # Drop THIS thread's override so the backtest DB never leaks into subsequent (live) code
         # paths or other trials on this thread. (A file DB is left on disk for post-mortem; the
         # in-memory DB is freed when its engine is disposed by clear_threadlocal_db.)

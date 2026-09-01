@@ -202,7 +202,7 @@ def _sleeve_key(expert_instance_id: int) -> Tuple[Optional[int], int]:
     signal every other dual-path accessor keys on.
 
     Sequential trials on ONE worker thread still share a key, which is why
-    ``backtest_trading_db`` calls :func:`reset_state` at the start of every run.
+    ``backtest_trading_db`` calls :func:`reset_thread_state` at both ends of every run.
     """
     from ba2_common.core.trade_store import inmem_trades_active
 
@@ -612,10 +612,52 @@ def _journal_entry(expert_instance_id: int, verdict: OptionEntryVerdict,
 
 
 def reset_state() -> None:
-    """Forget breaker latches, pending charges and the journal. One call for a fresh run."""
+    """Forget EVERY thread's breaker latches, pending charges and journals.
+
+    Process-wide, deliberately: this is the test fixture's and the operator's reset, the one
+    that must leave nothing behind anywhere. A **running trial must never call it** -- see
+    :func:`reset_thread_state`, which is what a backtest run boundary uses.
+    """
     reset_breaker_states()
     reset_pending_charges()
     reset_journal()
+
+
+def _clear_this_threads_keys(store: Dict[Tuple[Optional[int], int], Any]) -> None:
+    """Drop the entries filed under ``(this thread's id, ...)`` and nothing else."""
+    me = threading.get_ident()
+    for key in [k for k in store if k[0] == me]:
+        del store[key]
+
+
+def reset_thread_state() -> None:
+    """Forget only what THIS thread filed. The backtest run boundary's reset.
+
+    A backtest keys its sleeve state per THREAD (see :func:`_sleeve_key`) precisely so
+    concurrent GA trials cannot see each other. ``reset_state`` -- a bare ``.clear()`` on
+    three process-wide dicts -- then undoes that at every run boundary: with
+    ``--parallel > 1`` the FIRST trial to finish wipes the breaker latches, the in-flight
+    charges and the journals of every sibling still running, and those siblings then trade
+    on from a sleeve the rails believe is empty and un-halted. Scoping the clear to this
+    thread's own keys is what makes the per-thread key mean anything.
+
+    TWO KINDS OF KEY ARE DELIBERATELY LEFT ALONE:
+
+    * ``(other thread id, expert)`` -- another trial's state, the whole point;
+    * ``(None, expert)`` -- the LIVE keys. A backtest thread must never clear live breaker
+      latches, and it would: this runs from ``backtest_trading_db``'s ``finally``, AFTER the
+      in-memory trade store has been exited, so ``_sleeve_key`` would answer ``(None, ...)``
+      here. The scope is therefore read off the KEY SHAPE, never off the ambient store.
+
+    Consequence, stated rather than hidden: a FILE-backed run (``in_memory=False``, the
+    persisted top-N re-runs) never activates the in-memory trade store, so its sleeve state
+    is filed under the live ``(None, expert)`` keys and this reset does not touch it. Those
+    runs already shared one process-wide key with each other and with live; giving a
+    backtest permission to wipe live latches to fix that would be the worse trade.
+    """
+    _clear_this_threads_keys(_BREAKER_STATE)
+    _clear_this_threads_keys(_PENDING)
+    _clear_this_threads_keys(_JOURNAL)
 
 
 # ---------------------------------------------------------------------------
