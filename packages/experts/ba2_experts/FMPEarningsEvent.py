@@ -140,7 +140,18 @@ event is found by asking the calendar for rows up to ``as_of + earnings_days_loo
 ``historical_earning_calendar`` also returns already-SCHEDULED future prints), and
 that future row contributes ONLY its date and slot. Its ``eps`` is an actual in the
 cache file; letting it reach ``surprise_vol`` would be a textbook lookahead leak,
-so the past/future split happens once, explicitly, in ``_split_events``.
+so the past/future split is done EXPLICITLY, in ``_split_events`` -- never inferred
+from field order or a raw date compare.
+
+``_split_events`` is in fact called TWICE per analysis (``_process`` for the ranking
+decision, ``_gather`` for Task 8's implied-leg date), on the SAME ``rows``/
+``look_days``. In backtest both calls share one caller-supplied ``as_of``, so they
+always agree. LIVE CAVEAT: both call sites pass ``as_of=None`` and each
+independently resolves ``now = datetime.now(timezone.utc)``, so the two calls could
+in principle straddle a UTC-midnight boundary and read a different ``as_of_day``
+string -- a single-digit-millisecond window, and a live analysis run sits nowhere
+near UTC midnight (that's the middle of the US trading day), so this is a real but
+negligible edge, not a practical concern.
 
 THE MOST RECENT PAST EVENT reads the as-of close. An 'amc' print dated as_of-1
 reacts during the as-of session, so its post-close IS ``Close(as_of)`` -- the very
@@ -744,6 +755,14 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
         """
         try:
             from ba2_common.core.instance_resolver import get_instance_resolver
+            # self.instance is whatever _load_expert_instance(id) read at __init__ --
+            # NOT re-fetched here. If this expert instance is ever re-parented to a
+            # different account after construction, a long-lived process (this
+            # object outliving that change) would keep resolving the OLD
+            # account_id until the instance cache recycles it. No different from
+            # every other self.instance.* read in this class today; noted because
+            # Task 8 is the first one that turns it into an OUTBOUND call (a chain
+            # read) rather than a settings/label lookup.
             return get_instance_resolver().get_account_instance(self.instance.account_id)
         except Exception as e:
             self._log_no_chain_capability_once(str(e))

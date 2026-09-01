@@ -31,8 +31,8 @@ from ba2_common.core.instance_resolver import set_instance_resolver
 from ba2_common.core.option_types import OptionContract
 from ba2_common.core.types import OptionRight, OrderRecommendation
 from ba2_experts.FMPEarningsEvent import (
-    FMPEarningsEvent, composite_confidence, compute_features, earnings_day_move_pct,
-    implied_move_pct, normalize_feature,
+    _IMPLIED_LEG_EXPIRY_WINDOW_DAYS, FMPEarningsEvent, composite_confidence,
+    compute_features, earnings_day_move_pct, implied_move_pct, normalize_feature,
 )
 from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import (
     FMPCompanyDetailsProvider,
@@ -200,11 +200,24 @@ class _StubAccount:
     """Duck-typed Task 8 chain seam test double -- publishes ONLY get_option_chain,
     exactly like the real duck-typed contract this expert consumes. Records every
     call so the PERF ("one chain read per symbol-with-upcoming-event") and
-    point-in-time claims can be pinned by counting/inspecting ``calls``."""
+    point-in-time claims can be pinned by counting/inspecting ``calls``.
 
-    def __init__(self, contracts=None, raises: Exception = None):
+    ``honor_bounds`` (default True) makes the stub filter its canned contracts by
+    ``expiry_min <= expiry <= expiry_max`` -- INCLUSIVE on both ends, matching every
+    real chain provider (``parquet_options_provider.get_chain``:
+    ``c_expiry_ord >= expiry_min... & c_expiry_ord <= expiry_max...``). This is what
+    lets the window-boundary tests below actually exercise
+    ``_IMPLIED_LEG_EXPIRY_WINDOW_DAYS`` instead of a stub that hands back everything
+    regardless of what was asked. ``honor_bounds=False`` simulates a NON-compliant
+    provider that ignores the filter it was given, which is what
+    ``test_nearest_expiry_with_runway_skips_an_expiry_before_the_event`` needs to
+    reach the expert's OWN defensive re-check (``_nearest_expiry_with_runway``'s
+    ``>= event_date`` filter) rather than the stub's."""
+
+    def __init__(self, contracts=None, raises: Exception = None, honor_bounds: bool = True):
         self._contracts = contracts if contracts is not None else []
         self._raises = raises
+        self._honor_bounds = honor_bounds
         self.calls = []
 
     def get_option_chain(self, underlying, expiry_min, expiry_max, option_type=None,
@@ -212,7 +225,9 @@ class _StubAccount:
         self.calls.append((underlying, expiry_min, expiry_max))
         if self._raises is not None:
             raise self._raises
-        return self._contracts
+        if not self._honor_bounds:
+            return self._contracts
+        return [c for c in self._contracts if expiry_min <= c.expiry <= expiry_max]
 
 
 class _NoChainAccount:
@@ -883,7 +898,14 @@ def test_nearest_expiry_with_runway_skips_an_expiry_before_the_event():
     expiry ON/AFTER it, and a THIRD, later expiry that must lose to the nearer one.
     Only the correct (middle) expiry's straddle (call 5 + put 5 = 10, spot 100 ->
     implied 10%) may reach the composite; the too-early expiry's much cheaper
-    straddle (which would read as a much HIGHER vol_cheapness) must never be picked."""
+    straddle (which would read as a much HIGHER vol_cheapness) must never be picked.
+
+    ``honor_bounds=False``: a REAL chain provider would already exclude ``too_early``
+    via its own ``expiry_min`` filter (see ``_StubAccount``'s docstring), which would
+    let this test pass even if the expert's OWN ``_nearest_expiry_with_runway``
+    re-check were deleted. Using a non-compliant stub here means the ``too_early``
+    row actually reaches the expert's code, so this test pins the expert's OWN
+    defensive filter, not the provider's."""
     rows, df = _healthy_rows(jump_pct=10.0)
     too_early = EVENT_DATE - timedelta(days=3)     # no runway -- must be skipped
     correct = EVENT_DATE                            # first expiry >= event date
@@ -896,7 +918,7 @@ def test_nearest_expiry_with_runway_skips_an_expiry_before_the_event():
         _opt(100.0, too_late, OptionRight.CALL, price=20.00),
         _opt(100.0, too_late, OptionRight.PUT, price=20.00),
     ]
-    account = _StubAccount(contracts=contracts)
+    account = _StubAccount(contracts=contracts, honor_bounds=False)
     rec, _ = _run(rows, df=df, account=account)
     assert not rec.skip, rec.skip_reason
     payload = rec.raw_outputs["FMPEarningsEvent"]
@@ -921,6 +943,30 @@ def test_atm_strike_is_the_one_nearest_spot_among_two_sided_quotes():
     assert not rec.skip, rec.skip_reason
     # ATM (100-strike) straddle = 3.00 -> implied 3.0% -> cheapness 6/3 = 2.0. The
     # 90-strike straddle (13.00 -> implied 13%) would have produced ~0.46 instead.
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] == pytest.approx(2.0)
+
+
+def test_atm_selection_skips_a_one_sided_nearest_strike_for_the_next_two_sided_one():
+    """MUTATION target: the nearest-by-RAW-DISTANCE strike (99, distance 1 from spot
+    100) publishes only a CALL -- no put ever traded there. The correct selection
+    walks PAST it to the next-nearest strike that has BOTH legs (105, distance 5),
+    never fabricating a straddle from the one-sided nearer quote. A regression that
+    picks the nearest strike from the UNION of call/put strikes (rather than their
+    INTERSECTION) before checking two-sidedness would pick 99 and then have no put
+    price to pair it with."""
+    rows, df = _healthy_rows(jump_pct=11.0)
+    contracts = [
+        _opt(99.0, EVENT_DATE, OptionRight.CALL, price=2.00),    # nearest, ONE-SIDED
+        _opt(105.0, EVENT_DATE, OptionRight.CALL, price=3.00),   # two-sided pair,
+        _opt(105.0, EVENT_DATE, OptionRight.PUT, price=2.50),    # farther from spot
+    ]
+    account = _StubAccount(contracts=contracts)
+    rec, _ = _run(rows, df=df, account=account)
+    assert not rec.skip, rec.skip_reason
+    # 105-strike straddle: 3.00+2.50=5.50 -> implied 5.5% -> cheapness 11/5.5=2.0.
+    # A broken selection reaching for the 99-strike CALL alone has no put to add to
+    # it, so it could only produce a KeyError/crash or (if guarded) a different,
+    # wrong number -- never this value.
     assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] == pytest.approx(2.0)
 
 
@@ -954,12 +1000,69 @@ def test_no_strike_quoted_on_both_legs_is_absent():
 
 
 def test_no_expiry_with_runway_is_absent():
-    """Every expiry the chain offers is BEFORE the event -- no usable straddle."""
+    """Every expiry the chain offers is BEFORE the event -- no usable straddle. With
+    the stub honoring bounds (default), a compliant provider's OWN filter already
+    excludes ``stale``; see test_nearest_expiry_with_runway_skips_an_expiry_before_
+    the_event for the non-compliant-provider variant that reaches the expert's own
+    defensive re-check instead."""
     rows, df = _healthy_rows(jump_pct=6.0)
     stale = EVENT_DATE - timedelta(days=1)
     account = _StubAccount(contracts=[
         _opt(100.0, stale, OptionRight.CALL, price=2.00),
         _opt(100.0, stale, OptionRight.PUT, price=1.00),
+    ])
+    rec, _ = _run(rows, df=df, account=account)
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] is None
+
+
+# --------------------------------------------------- runway window (MEDIUM 2) ---
+def test_the_runway_window_constant_is_45_days_one_monthly_cycle_of_slack():
+    """Standard monthly listed-option cycles are ~30-35 calendar days apart, so a
+    name whose only listed cycle is monthly still has an expiry inside a 45-day
+    search window even measured from the WORST-CASE point right after a monthly
+    expiry (see the constant's own docstring in FMPEarningsEvent.py). This pins the
+    VALUE the two boundary tests below depend on, so a silent widen/narrow shows up
+    here even if it happens to dodge both of them."""
+    assert _IMPLIED_LEG_EXPIRY_WINDOW_DAYS == 45
+
+
+def test_expiry_at_exactly_the_window_cap_is_kept_boundary_inclusive():
+    """Real chain providers filter ``expiry_max`` INCLUSIVELY (see ``_StubAccount``'s
+    docstring, matching ``parquet_options_provider.get_chain``'s
+    ``c_expiry_ord <= expiry_max.toordinal()``). An expiry landing EXACTLY on
+    ``event_date + _IMPLIED_LEG_EXPIRY_WINDOW_DAYS`` must still be found and priced,
+    not dropped by an off-by-one at the boundary."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    boundary_expiry = EVENT_DATE + timedelta(days=_IMPLIED_LEG_EXPIRY_WINDOW_DAYS)
+    account = _StubAccount(contracts=[
+        _opt(100.0, boundary_expiry, OptionRight.CALL, price=2.00),
+        _opt(100.0, boundary_expiry, OptionRight.PUT, price=1.00),
+    ])
+    rec, _ = _run(rows, df=df, account=account)
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] == pytest.approx(2.0)
+
+
+def test_the_only_runway_expiry_two_days_past_the_window_cap_is_absent():
+    """MUTATION target: a silently WIDENED window would hide this. The search window
+    is a real, documented COST -- a name whose only listed expiry with runway lands
+    just past ``event_date + _IMPLIED_LEG_EXPIRY_WINDOW_DAYS`` is invisible to this
+    feature (a rare shape: it means the name has no monthly/weekly cycle inside 45
+    days of the event at all), and that is the accepted trade-off, not a bug.
+
+    ``47`` is HARDCODED here, deliberately NOT derived as
+    ``_IMPLIED_LEG_EXPIRY_WINDOW_DAYS + 2``: a relative offset moves in lockstep
+    with a mutated constant (a silent 45->60 widen would still see 47 land 13 days
+    INSIDE the new window and never fail). The companion value-pin test above
+    (``test_the_runway_window_constant_is_45_days...``) catches a bare constant
+    change; this one is what would ALSO have to be edited to hide a regression that
+    widens the window while claiming nothing changed."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    too_late = EVENT_DATE + timedelta(days=47)     # 45 (documented cap) + 2
+    account = _StubAccount(contracts=[
+        _opt(100.0, too_late, OptionRight.CALL, price=2.00),
+        _opt(100.0, too_late, OptionRight.PUT, price=1.00),
     ])
     rec, _ = _run(rows, df=df, account=account)
     assert not rec.skip, rec.skip_reason
