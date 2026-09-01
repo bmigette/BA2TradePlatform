@@ -2006,11 +2006,24 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             supports_fractional = bool(getattr(self.client.get_account_configurations(),
                                                'fractional_trading', False))
         except Exception as e:
-            logger.warning(
-                f"[Account {self.id}] Could not read account configurations ({e}) — "
-                f"reporting supports_fractional=False; this run will size whole shares "
-                f"even if the account is fractional-capable"
-            )
+            # alpaca-py's AccountConfiguration model requires dtbp_check/pdt_check with no
+            # default; observed live (2026-08-31) failing across ALL 3 dev accounts at once
+            # with "2 validation errors ... Field required" even though the raw JSON DOES
+            # carry fractional_trading -- the only field this snapshot actually needs. A raw
+            # GET to the same endpoint sidesteps the SDK's stricter-than-necessary parse.
+            try:
+                raw = self.client.get("/account/configurations")
+                supports_fractional = bool((raw or {}).get('fractional_trading', False))
+                logger.warning(
+                    f"[Account {self.id}] Typed account-configurations read failed ({e}); "
+                    f"recovered fractional_trading={supports_fractional} via raw fallback"
+                )
+            except Exception as e2:
+                logger.warning(
+                    f"[Account {self.id}] Could not read account configurations ({e}), raw "
+                    f"fallback also failed ({e2}) — reporting supports_fractional=False; this "
+                    f"run will size whole shares even if the account is fractional-capable"
+                )
 
         snapshot = AccountSnapshot(
             cash=_f('cash'),

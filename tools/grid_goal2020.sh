@@ -69,7 +69,28 @@ STORE="$HOME/Documents/ba2/common/cache/screener/metric_store"
 #
 # The worker syncs by `git pull`, so the master's commit MUST be pushed before launching or every
 # trial is retry-excluded for the whole run.
-WORKERS="${WORKERS-remote150}"
+#
+# DEFAULT IS remote227, NOT remote150 (changed 2026-08-31). This script is matrix 1/2's own
+# wrapper -- matrix 3 has its own separate WORKERS default in grid_goal2020_matrix3.sh, so
+# there is no shared-default reason to point here at BT's worker. remote150 as the default
+# repeatedly sent MY jobs there by accident whenever this was launched without an explicit
+# WORKERS= override (silent, no warning -- see the DISTRIBUTE BY DEFAULT comment above for why
+# the omitted-entirely case already gets one; a WRONG worker gets none), most recently
+# 2026-08-31 when a restart landed scr-small-FMPEarningsDrift-S3 on remote150 alongside BT's
+# own concurrent job, doubling up local --parallel 4 pools on one box and dropping free RAM to
+# 9 GB/64 GB. Opt into remote150 explicitly (WORKERS=remote150 ./grid_goal2020.sh) if that is
+# ever genuinely wanted.
+WORKERS="${WORKERS-remote227}"
+
+# REMOTE-ONLY: no local GA consumers. The driver's own --parallel default is 4 (each local
+# consumer holds a ~5GB OHLCV cache in RAM), which run_matrix never overrode -- so every job
+# quietly ran WITH 4 local consumers alongside its remote slots, not the remote-only run this
+# grid is meant to be. Harmless on its own, but it is exactly the extra local load that turned
+# a wrong-worker mistake (2026-08-31, see the WORKERS comment above) into a real problem: 4
+# local consumers here PLUS another job's own local consumers on the same box together dropped
+# free RAM to 9GB/64GB. Opt into local consumers explicitly (PARALLEL=4 ./grid_goal2020.sh) if
+# that is ever genuinely wanted.
+PARALLEL="${PARALLEL-0}"
 
 # Sweep orphaned multiprocessing.spawn pool workers from any PREVIOUS run before starting.
 # On Windows those children are detached: killing a grid leaves them alive holding their full
@@ -278,7 +299,7 @@ run_matrix() {                      # $1=mode  $2=name-suffix  $3...=extra drive
       stress_args=(--stress-spread-bps "$st")
     fi
     echo; echo "=== $mode / $band  (spread ${sp} bps round-trip${st:+, stress +${st}})  $(date)"
-    "$PY" "$DRIVER" "${COMMON[@]}"       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       "${stress_args[@]}" "${robust_args[@]}"       --name-suffix="$suffix"       "$@"
+    "$PY" "$DRIVER" "${COMMON[@]}"       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       "${stress_args[@]}" "${robust_args[@]}"       --name-suffix="$suffix"       --parallel "$PARALLEL"       "$@"
     echo "=== $mode / $band  done rc=$? $(date)"
   done
 }

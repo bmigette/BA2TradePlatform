@@ -242,6 +242,19 @@ def _sweep_orphaned_jobs() -> None:
 _MEM_FLOOR_PCT = float(os.getenv("BT_WORKER_MEM_FLOOR_PCT", "10"))
 _MEM_POLL_S = float(os.getenv("BT_WORKER_MEM_POLL_S", "60"))
 
+# EMERGENCY floor, stricter than _MEM_FLOOR_PCT: the wait-and-refuse behaviour above assumes a
+# busy trial's own memory footprint is roughly stable, so draining naturally wins the race. That
+# assumption fails for a job whose individual trials GROW their own RSS over their runtime
+# (observed live 2026-08-31/09-01, FMPEarningsDrift-S3: individuals still running past 1900s
+# with a still-rising bar/memo count) -- remote227 went from 68GB free to under 1GB free in a
+# few minutes while every trial was still "busy", and stayed there until a human SSH'd in and
+# SIGKILL'd the top RSS consumers by hand. Below this line, _maybe_reclaim_under_pressure
+# automates exactly that manual recovery instead of waiting indefinitely.
+_MEM_EMERGENCY_PCT = float(os.getenv("BT_WORKER_MEM_EMERGENCY_PCT", "5"))
+# Same budget fraction distributed_eval._target_pool_size uses on the master, mirrored here so
+# an emergency self-resize sizes the pool the SAME way a graceful master-driven one would.
+_POOL_BUDGET = float(os.getenv("BT_REMOTE_POOL_BUDGET", "0.85"))
+
 
 class _MemoryPressure(Exception):
     """Reason handed to _rebuild_pool when the pool is recycled for memory, not for a crash."""
@@ -265,33 +278,131 @@ def _busy_job_count() -> int:
         return sum(1 for f in _JOBS.values() if not f.done())
 
 
+def _local_target_pool_size(peak_mb: float) -> int:
+    """How many pool children THIS box can actually hold, sized on the peak child RSS --
+    this worker's own version of distributed_eval._target_pool_size, using the same budget
+    fraction so an emergency self-resize lands on the same number a graceful master-driven
+    one would have computed from this worker's /diag/memory.
+
+    No peak to size on (an empty or unreadable children list) shrinks by one instead of
+    guessing -- a safe, small step that the next poll can refine once real data exists.
+    """
+    import psutil
+    if not peak_mb:
+        return max(1, _CAPACITY - 1)
+    vm = psutil.virtual_memory()
+    server_rss_mb = psutil.Process(os.getpid()).memory_info().rss / 1048576
+    budget = vm.total / 1048576 * _POOL_BUDGET - server_rss_mb
+    return max(1, int(budget // peak_mb))
+
+
+def _emergency_reclaim(free_pct: float) -> None:
+    """Last resort: memory is critically low (below _MEM_EMERGENCY_PCT) AND trials are running.
+
+    Two cases, both ending in ONE pool rebuild -- any single killed child already breaks the
+    WHOLE ProcessPoolExecutor (Python fails every pending future on the pool, not just the dead
+    child's own), so there is no partial-kill path that preserves unaffected trials; a rebuild
+    is the correct outcome either way, and the master's existing BrokenProcessPool-is-retryable
+    handling requeues every lost trial cleanly (proven live by the manual SSH recovery this
+    automates):
+
+      * actual running children > the CURRENT target (_CAPACITY) -- something (a prior graceful
+        resize that only ever trimmed the TARGET, never the live count -- see _rebuild_pool's
+        cancel_futures docstring) left more processes running than the pool is nominally sized
+        for. The target itself was fine; kill the excess down to it.
+      * actual running children <= _CAPACITY -- there is no excess to trim relative to the
+        target, so the target itself is too big for what this box can hold right now. Compute a
+        smaller one with the same peak-child-RSS budget formula the master's own governor uses,
+        lower _CAPACITY to it, and kill down to that. Lowering the global here is what makes the
+        master aware of the resize: /health already reads _CAPACITY, so the master's own
+        periodic poll picks up the new number with no push needed (the same mechanism
+        /pool/resize already relies on for a master-driven resize).
+    """
+    import psutil
+    global _CAPACITY
+    try:
+        me = psutil.Process(os.getpid())
+        kids = sorted(me.children(recursive=True),
+                     key=lambda k: k.memory_info().rss, reverse=True)
+    except Exception as e:  # noqa: BLE001 -- a probe failure must not crash the watchdog
+        logger.error("emergency reclaim: could not enumerate pool children (%r)", e)
+        return
+
+    actual = len(kids)
+    if actual > _CAPACITY:
+        target = _CAPACITY
+        reason = f"{actual} running > {_CAPACITY}-slot target"
+    else:
+        peak_mb = max((k.memory_info().rss for k in kids), default=0) / 1048576
+        target = min(_CAPACITY, _local_target_pool_size(peak_mb))
+        reason = f"{actual} running <= {_CAPACITY}-slot target; lowering target to {target}"
+        _CAPACITY = target
+
+    to_kill = kids[:max(0, actual - target)]
+    logger.warning(
+        "EMERGENCY: %.1f%% free < %.0f%% floor with %d trial(s) running (%s) -- killing %d "
+        "top-RSS pool child(ren) and rebuilding at %d slot(s)",
+        free_pct, _MEM_EMERGENCY_PCT, _busy_job_count(), reason, len(to_kill), _CAPACITY)
+    for k in to_kill:
+        try:
+            rss_mb = k.memory_info().rss // 1048576
+            k.kill()
+            logger.warning("  killed pid %s (%d MB RSS)", k.pid, rss_mb)
+        except Exception as e:  # noqa: BLE001 -- best-effort; move on to the next
+            logger.warning("  could not kill pid %s (%r)", k.pid, e)
+
+    _rebuild_pool(_MemoryPressure(f"emergency reclaim at {free_pct:.1f}% free"))
+
+
+def _maybe_reclaim_under_pressure(free_pct: float) -> None:
+    """Called from _memory_watchdog's busy branch (below _MEM_FLOOR_PCT, trials running):
+    escalates to _emergency_reclaim only once free memory crosses the stricter
+    _MEM_EMERGENCY_PCT line. Between the two floors, the existing wait-and-refuse behaviour is
+    unchanged -- this only ever adds a MORE severe response at a MORE severe threshold."""
+    if free_pct < _MEM_EMERGENCY_PCT:
+        _emergency_reclaim(free_pct)
+
+
+def _memory_watchdog_tick() -> None:
+    """One poll of the memory watchdog -- split out from _memory_watchdog's infinite loop so
+    the branching (idle vs busy, floor vs emergency) is directly callable from a test instead
+    of only reachable through a live sleep loop."""
+    free_pct = _free_mem_pct()
+    if free_pct is None or free_pct >= _MEM_FLOOR_PCT:
+        return
+    busy = _busy_job_count()
+    if busy:
+        logger.warning(
+            "memory %.1f%% free < %.0f%% floor, but %d trial(s) running -- NOT recycling "
+            "the pool (that would discard live work); new submits are being refused and "
+            "the pool is reclaimed once they drain", free_pct, _MEM_FLOOR_PCT, busy)
+        # Only escalates past _MEM_EMERGENCY_PCT, a stricter line than the one that got us
+        # into this branch -- idle never reaches here at all (it takes the branch below).
+        _maybe_reclaim_under_pressure(free_pct)
+        return
+    logger.warning(
+        "memory %.1f%% free < %.0f%% floor and pool is IDLE -- recycling %d-slot pool to "
+        "return every child's working set to the OS", free_pct, _MEM_FLOOR_PCT, _CAPACITY)
+    _rebuild_pool(_MemoryPressure(f"{free_pct:.1f}% free"))
+
+
 def _memory_watchdog() -> None:
     """Reclaim this worker's OWN pool memory when the box drops under the floor.
 
     Rebuilding the pool is the only thing that actually returns an idle child's working set to
     the OS, and it is safe ONLY when nothing is running -- so a busy worker is left alone and
-    reclaimed on a later poll once its trials drain. Combined with the admission check in
-    _submit_job (which stops new work landing meanwhile), a starved box empties out and recovers
-    instead of sitting pinned until someone restarts the daemon by hand.
+    reclaimed on a later poll once its trials drain, UNLESS free memory has also crossed the
+    stricter _MEM_EMERGENCY_PCT line, in which case _maybe_reclaim_under_pressure escalates to
+    killing the top RSS consumers outright (waiting has already lost that race). Combined with
+    the admission check in _submit_job (which stops new work landing meanwhile), a starved box
+    empties out and recovers instead of sitting pinned until someone restarts the daemon by
+    hand -- or, below the emergency line, until someone does exactly that by hand over SSH.
     """
     import time as _time
     while True:
         _time.sleep(_MEM_POLL_S)
         try:
-            free_pct = _free_mem_pct()
-            if free_pct is None or free_pct >= _MEM_FLOOR_PCT:
-                continue
-            busy = _busy_job_count()
-            if busy:
-                logger.warning(
-                    "memory %.1f%% free < %.0f%% floor, but %d trial(s) running -- NOT recycling "
-                    "the pool (that would discard live work); new submits are being refused and "
-                    "the pool is reclaimed once they drain", free_pct, _MEM_FLOOR_PCT, busy)
-                continue
-            logger.warning(
-                "memory %.1f%% free < %.0f%% floor and pool is IDLE -- recycling %d-slot pool to "
-                "return every child's working set to the OS", free_pct, _MEM_FLOOR_PCT, _CAPACITY)
-            _rebuild_pool(_MemoryPressure(f"{free_pct:.1f}% free"))
+            _memory_watchdog_tick()
         except Exception as e:  # noqa: BLE001 -- the watchdog must outlive any single failure
             logger.error("memory watchdog poll failed: %r", e)
 
