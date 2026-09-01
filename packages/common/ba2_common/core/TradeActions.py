@@ -39,7 +39,7 @@ from ba2_common.core.option_selection_policy import SelectionPolicy, validate_wi
 from ba2_common.core.option_selector import (
     select_single, select_vertical_spread, select_wing, passes_liquidity,
     check_liquidity_data_available, OptionDteWindowError, OptionSelectionConfigError,
-    OptionLiquidityDataMissingToday)
+    OptionLiquidityDataMissingToday, describe_pick_failure)
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.db import InstanceNotFound
@@ -2183,6 +2183,24 @@ class _OptionEntryAction(TradeAction):
                                            source=source, **gates)
         return gates
 
+    def _pick_refusal_message(self, chain: List[OptionContract], *, option_type: OptionRight,
+                              liq: Dict[str, Any], generic_message: str) -> str:
+        """The text for a ``select_single``/``select_vertical_spread`` refusal (``None`` pick).
+
+        ``generic_message`` is each call site's OWN, already-worded "No liquid <structure>"
+        string -- passed in, not reconstructed here -- so every existing method's refusal stays
+        BYTE-IDENTICAL: this only ever substitutes a more specific cause, never rephrases the
+        fallback. See ``option_selector.describe_pick_failure`` for the one cause it currently
+        names (the ``delta`` method's chain-wide missing-delta case) and why every other cause
+        still reads as ``generic_message``. One seam for all nine ``strike_method``-honouring
+        builders, instead of nine hand-written cause checks that could each drift from it."""
+        reason = describe_pick_failure(
+            chain, method=self.strike_method, option_type=option_type,
+            dte_min=self.dte_min, dte_max=self.dte_max, today=self._today(), **liq)
+        if reason:
+            return f"{reason} for {self.instrument_name}"
+        return generic_message
+
     def _virtual_equity(self) -> Optional[float]:
         """balance * virtual_equity_pct/100 (defaults to balance when unknown)."""
         balance = self.account.get_balance()
@@ -2867,7 +2885,9 @@ class BuyCallAction(_OptionEntryAction):
             today=self._today(), target_price=self._consensus_target(),
             policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, f"No liquid call contract for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid call contract for {self.instrument_name}"))
         if contract.ask is None or contract.ask <= 0:
             return self._result(False, f"No ask price for {contract.symbol}")
         limit_price = contract.ask                          # buy at ASK
@@ -2911,7 +2931,9 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
             today=self._today(), target_price=self._consensus_target(),
             policy=self.selection_policy, **liq)
         if pair is None:
-            return self._result(False, f"No liquid bull call spread for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid bull call spread for {self.instrument_name}"))
         long_c, short_c = pair
         if long_c.ask is None or short_c.bid is None:
             return self._result(False, f"Missing quote for spread legs on {self.instrument_name}")
@@ -2973,7 +2995,9 @@ class BuyPutAction(_OptionEntryAction):
             today=self._today(), target_price=self._consensus_target(),
             policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, f"No liquid put contract for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid put contract for {self.instrument_name}"))
         if contract.ask is None or contract.ask <= 0:
             return self._result(False, f"No ask price for {contract.symbol}")
         limit_price = contract.ask                          # buy at ASK
@@ -3017,7 +3041,9 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
             today=self._today(), target_price=self._consensus_target(),
             policy=self.selection_policy, **liq)
         if pair is None:
-            return self._result(False, f"No liquid bear put spread for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid bear put spread for {self.instrument_name}"))
         # For a PUT debit spread the selector returns (long, short) with long.strike > short.strike.
         long_c, short_c = pair
         if long_c.ask is None or short_c.bid is None:
@@ -3097,7 +3123,9 @@ class SellCoveredCallAction(_OptionEntryAction):
             today=self._today(), target_price=self._consensus_target(),
             policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, f"No liquid call contract for covered call on {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid call contract for covered call on {self.instrument_name}"))
         if contract.bid is None or contract.bid <= 0:
             return self._result(False, f"No bid price for {contract.symbol}")
         limit_price = contract.bid                          # sell at BID
@@ -3162,7 +3190,9 @@ class BuyProtectivePutAction(_OptionEntryAction):
             today=self._today(), target_price=self._consensus_target(),
             policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, f"No liquid put contract for protective put on {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid put contract for protective put on {self.instrument_name}"))
         if contract.ask is None or contract.ask <= 0:
             return self._result(False, f"No ask price for {contract.symbol}")
         limit_price = contract.ask                          # buy at ASK
@@ -3208,7 +3238,9 @@ class SellCashSecuredPutAction(_OptionEntryAction):
             today=self._today(), target_price=self._consensus_target(),
             policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, f"No liquid put contract for cash-secured put on {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid put contract for cash-secured put on {self.instrument_name}"))
         if contract.bid is None or contract.bid <= 0:
             return self._result(False, f"No bid price for {contract.symbol}")
         if contract.strike is None or contract.strike <= 0:
@@ -3288,7 +3320,9 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
             today=self._today(), target_price=self._consensus_target(),
             policy=self.selection_policy, **liq)
         if pair is None:
-            return self._result(False, f"No liquid bear call spread for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid bear call spread for {self.instrument_name}"))
         # For a CALL spread the selector returns (lo, hi) ordered by strike.
         # Bear CALL CREDIT spread: SHORT = lo (lower strike), LONG = hi (higher strike).
         lo_c, hi_c = pair
@@ -3387,7 +3421,9 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
             today=self._today(), target_price=self._consensus_target(),
             policy=self.selection_policy, **liq)
         if pair is None:
-            return self._result(False, f"No liquid bull put spread for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid bull put spread for {self.instrument_name}"))
         # For a PUT chain the selector returns its DEBIT ordering: (higher, lower) =
         # (long, short) for a bear put spread. A bull put CREDIT spread is the mirror —
         # SHORT the higher strike, LONG the lower one.

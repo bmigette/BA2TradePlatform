@@ -305,6 +305,47 @@ def _candidates(chain, option_type, dte_min, dte_max, today, min_oi, max_spread,
     return out
 
 
+def describe_pick_failure(chain, *, method, option_type, dte_min, dte_max, today,
+                          min_open_interest=None, max_spread_pct=None,
+                          min_volume=None) -> Optional[str]:
+    """Why a ``select_single``/``select_vertical_spread`` pick returned ``None``, when the
+    cause is worth naming instead of the caller's own generic "No liquid <structure>" message.
+
+    THE ONE CAUSE THIS NAMES (2026-09-01, F12 exact-cause discipline): the ``delta`` method's
+    chain-wide missing-delta refusal. An ``O_LEAPC``-style job hitting a symbol whose chain
+    carries no greeks must read as "no delta data on this chain", never as generic illiquidity
+    -- a grid post-mortem cannot tell "nobody quotes this name" from "this vendor never
+    publishes delta for this name" apart from the message text, and the two point at opposite
+    remedies (skip the symbol vs. skip the method). ``option_selection_policy._no_candidate_reason``
+    already draws this exact distinction for the (opt-in, non-default) ``SelectionPolicy`` path;
+    this is the same distinction for the LEGACY path every builder actually runs under today.
+
+    EVERY OTHER CAUSE RETURNS ``None`` ON PURPOSE -- an unrecognised method, a DTE/liquidity
+    window that filtered the chain to nothing, or (non-default policy only) a box/ceiling that
+    admitted no candidate. Those already have an honest generic message at the call site; this
+    function only ever ADDS a reason, never removes the caller's fallback.
+
+    GATED ON ``method == 'delta'`` FIRST -- the perf-acceptance rule. The re-filter below is a
+    second ``_candidates`` pass, so a non-delta pick (the overwhelming majority of refusals)
+    never pays for it, and a SUCCESSFUL delta pick never calls this at all: every call site
+    invokes it only from inside its existing ``if contract is None`` / ``if pair is None``
+    branch, i.e. only once, only on an already-failed pick.
+
+    A candidate that merely lacks delta while its chain-mates carry one is NOT this cause --
+    ``_pick_by`` already skips it and picks among the rest, so ``None`` is never reached for
+    that chain. This only fires when the chain is non-empty after DTE/liquidity filtering and
+    LITERALLY NONE of the survivors carry a delta."""
+    if method != "delta":
+        return None
+    cands = _candidates(chain, option_type, dte_min, dte_max, today, min_open_interest,
+                        max_spread_pct, min_volume)
+    if cands and all(c.delta is None for c in cands):
+        return (f"strike_method='delta' but none of the {len(cands)} candidate contracts in "
+                f"the chain carry a delta — refusing rather than silently falling back to "
+                f"another strike method")
+    return None
+
+
 # Expiry is the FINAL tie-break on every pick (2026-08-23). The cache lists the same strike
 # in more than one in-window expiry, so candidates routinely tie on BOTH the distance metric
 # and the strike, and ``min()`` then resolved them by INPUT-LIST ORDER — reversing the chain
