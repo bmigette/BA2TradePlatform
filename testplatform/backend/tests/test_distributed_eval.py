@@ -133,6 +133,111 @@ def test_max_remote_slots_per_worker_caps_dispatcher_count(monkeypatch):
     assert all(by_idx[i]["fitness"] == i * 2.0 for i in range(10))
 
 
+def test_flaky_health_check_is_retried_and_the_exception_is_logged(monkeypatch):
+    """A /health call that fails ONCE (transient timeout/blip) must not be treated as gospel
+    and permanently pin the job to 1 slot -- opt 420's real-world failure mode: the bare
+    ``except Exception: capacity = 1`` swallowed the error silently and never retried. Here the
+    second attempt succeeds and reports the worker's real capacity, which must win."""
+    calls = {"health": 0}
+    logs = []
+
+    def flaky_health(w, **k):
+        calls["health"] += 1
+        if calls["health"] == 1:
+            raise TimeoutError("read timed out")
+        return {"capacity": 24, "capacity_max": 24}
+
+    monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: True)
+    monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
+    monkeypatch.setattr(de.worker_client, "push_secrets", lambda w, s, **k: {"set": 0})
+    monkeypatch.setattr(de.worker_client, "health", flaky_health)
+    monkeypatch.setattr(de.worker_client, "run_trial",
+                        lambda w, config, metric, **kw: {"ok": True, "fitness": _fitness(config),
+                                                          "trades": 1, "error": None})
+
+    workers = [{"id": 1, "name": "remote227", "url": "http://x", "password": "p"}]
+    ev = DistributedEvaluator(_FakePool(), "sharpe", n_consumers=0, optimization_id="t",
+                              workers=workers, master_version="abc", log=logs.append)
+    ev.start()
+    try:
+        assert calls["health"] == 2  # retried once after the first failure
+        assert ev._active_workers[0]["capacity"] == 24  # the real value, not the 1-slot fallback
+        assert ev._active_workers[0]["capacity_max"] == 24
+        remote_threads = [t for t in ev._threads if t.name.startswith("remote-remote227-")]
+        assert len(remote_threads) == 24
+        assert any("timed out" in m or "TimeoutError" in m for m in logs), \
+            "the /health failure must be logged, not silently swallowed"
+    finally:
+        ev.stop()
+
+
+def test_health_permanently_down_falls_back_to_the_workers_configured_max(monkeypatch):
+    """When /health never recovers (both attempts fail), the job must not be pinned to a bare
+    1-slot guess -- it should discover the worker's actual configured ceiling via a pool-resize
+    probe (the worker clamps an oversized request to its own daemon --workers ceiling and
+    reports the real number back), and log why /health was unusable."""
+    logs = []
+
+    def always_fails(w, **k):
+        raise TimeoutError("read timed out")
+
+    def resize_reports_ceiling(w, workers, **k):
+        # The worker clamps any request to its real daemon ceiling (here 24) and always answers
+        # truthfully with its current capacity, even when it refuses the resize outright.
+        return {"ok": True, "capacity": 24, "changed": True}
+
+    monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: True)
+    monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
+    monkeypatch.setattr(de.worker_client, "push_secrets", lambda w, s, **k: {"set": 0})
+    monkeypatch.setattr(de.worker_client, "health", always_fails)
+    monkeypatch.setattr(de.worker_client, "resize_pool", resize_reports_ceiling)
+    monkeypatch.setattr(de.worker_client, "run_trial",
+                        lambda w, config, metric, **kw: {"ok": True, "fitness": _fitness(config),
+                                                          "trades": 1, "error": None})
+
+    workers = [{"id": 1, "name": "remote227", "url": "http://x", "password": "p"}]
+    ev = DistributedEvaluator(_FakePool(), "sharpe", n_consumers=0, optimization_id="t",
+                              workers=workers, master_version="abc", log=logs.append)
+    ev.start()
+    try:
+        assert ev._active_workers[0]["capacity"] == 24  # discovered, not a bare 1-slot guess
+        remote_threads = [t for t in ev._threads if t.name.startswith("remote-remote227-")]
+        assert len(remote_threads) == 24
+        assert any("health" in m.lower() and ("timed out" in m or "TimeoutError" in m)
+                   for m in logs), "the persistent /health failure must be logged"
+    finally:
+        ev.stop()
+
+
+def test_health_and_resize_both_down_falls_back_to_one_slot_with_a_clear_log(monkeypatch):
+    """The true last resort (nothing about the worker is discoverable at all) still keeps the
+    worker usable at 1 slot rather than excluding it outright -- but must say so loudly, unlike
+    the old silent ``except Exception: capacity = 1``."""
+    logs = []
+
+    def always_fails(w, **k):
+        raise TimeoutError("read timed out")
+
+    monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: True)
+    monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
+    monkeypatch.setattr(de.worker_client, "push_secrets", lambda w, s, **k: {"set": 0})
+    monkeypatch.setattr(de.worker_client, "health", always_fails)
+    monkeypatch.setattr(de.worker_client, "resize_pool", always_fails)
+    monkeypatch.setattr(de.worker_client, "run_trial",
+                        lambda w, config, metric, **kw: {"ok": True, "fitness": _fitness(config),
+                                                          "trades": 1, "error": None})
+
+    workers = [{"id": 1, "name": "remote227", "url": "http://x", "password": "p"}]
+    ev = DistributedEvaluator(_FakePool(), "sharpe", n_consumers=0, optimization_id="t",
+                              workers=workers, master_version="abc", log=logs.append)
+    ev.start()
+    try:
+        assert ev._active_workers[0]["capacity"] == 1
+        assert any("1 slot" in m or "1-slot" in m for m in logs)
+    finally:
+        ev.stop()
+
+
 def test_unsynced_worker_excluded(monkeypatch):
     """A worker that can't be version-matched is dropped; the run proceeds local-only."""
     monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: False)
