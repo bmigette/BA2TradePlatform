@@ -1,4 +1,4 @@
-"""``strike_method="delta"`` — the LEGACY-PATH cause-naming gap (2026-09-01).
+"""``strike_method="delta"`` — the missing-delta cause-naming gap (2026-09-01).
 
 Delta strike selection itself is NOT new: ``_pick_by``'s ``method == "delta"`` branch
 (nearest ``|delta|`` to ``|target|``, ties broken by ``option_selector._tie`` — strike then
@@ -10,9 +10,8 @@ FILE DOES NOT RE-PROVE ANY OF THAT — see those modules for general nearest-pic
 and the shared tie-break contract every method uses.
 
 What IS new here (Task 1, redefined 2026-09-01 after the original brief turned out to
-describe already-shipped work): on the LEGACY path (``policy=None``/default — what every one
-of the nine ``strike_method``-honouring builders actually runs under; the ``SelectionPolicy``
-weights are opt-in and off by default), a ``None`` pick used to collapse into the SAME generic
+describe already-shipped work): a ``None`` pick from ``select_single``/
+``select_vertical_spread`` under ``method="delta"`` used to collapse into the SAME generic
 "No liquid <structure>" message regardless of WHY it failed — an empty/DTE-filtered/illiquid
 chain and a chain that carries no delta data at all were indistinguishable, so a grid
 post-mortem on an O_LEAPC-style job could not tell "skip this symbol" (a data outage) from
@@ -23,12 +22,24 @@ FIRST so nothing else pays for the re-filter) plus
 their existing ``if contract/pair is None`` branch, instead of nine hand-written cause checks
 that could each drift from each other).
 
+NOT LEGACY-PATH-ONLY (corrected 2026-09-01, caught in review of the first version of this
+file): ``_pick_refusal_message`` is called from the SAME ``if contract/pair is None`` branch
+whether the ``None`` came from the legacy ``_pick_by`` call (``policy`` is ``None``/default)
+or from an ACTIVE, non-default ``SelectionPolicy`` routed through ``_policy_pick``/
+``eligible`` — ``select_single``'s internal branch on ``policy.is_default`` is invisible from
+the caller, and ``describe_pick_failure`` answers the same missing-delta question either way
+by re-deriving the DTE/liquidity-filtered candidate set directly, not by reading off which
+route produced the ``None``. Proved with a real active policy (``w_profit=0.5``) below —
+this is also, as far as the reviewer could find, the FIRST test anywhere that exercises
+``TradeAction.execute()`` with an active (non-default) ``SelectionPolicy`` end to end.
+
 Covers, and ONLY covers:
-  * cause-naming — an all-null-delta chain names the method; a merely-illiquid/DTE-filtered
-    chain does not (it still gets the generic message).
+  * cause-naming — an all-null-delta chain names the method, on BOTH the legacy pick and an
+    active-``SelectionPolicy`` pick; a merely-illiquid/DTE-filtered chain does not (it still
+    gets the generic message).
   * partial-null skip — a null-delta candidate is dropped, never scored as ``delta == 0``.
-  * the tie rule the legacy delta path uses (documented and pinned explicitly, since the
-    other suites pin it only via the ``SelectionPolicy`` no-op equivalence).
+  * the tie rule the legacy ``_pick_by`` delta path uses (documented and pinned explicitly,
+    since the other suites pin it only via the ``SelectionPolicy`` no-op equivalence).
   * the byte-identical pin — every non-delta refusal is untouched, verbatim, by this change.
 """
 from datetime import date, timedelta
@@ -196,6 +207,33 @@ def test_buy_call_names_delta_as_the_cause_when_the_chain_has_none():
     chain = [_c(95, OptionRight.CALL, delta=None, expiry=today + timedelta(days=30)),
              _c(105, OptionRight.CALL, delta=None, expiry=today + timedelta(days=30))]
     result = _buy_call(chain).execute()
+    assert result["success"] is False
+    assert "delta" in result["message"]
+    assert "strike_method" in result["message"]
+
+
+def test_buy_call_names_delta_under_an_active_selection_policy():
+    """NOT LEGACY-PATH-ONLY (review of d02d6018 caught this file and its docstrings claiming
+    otherwise). ``w_premium`` is the one ``SelectionPolicy`` weight ``_OptionEntryAction``'s
+    ctor actually accepts today (``w_profit``/``w_rr`` need a ``structure_fn`` no builder
+    supplies yet — see the ctor's own comment), so ``w_premium=0.5`` is enough to flip
+    ``policy.is_default`` to ``False`` and route the pick through ``_policy_pick``/``eligible``
+    instead of the legacy ``_pick_by``. Under ``eligible``, the ``delta`` method excludes a
+    null-delta candidate exactly like ``_pick_by`` does (see
+    ``option_selection_policy.eligible``'s own docstring — the two are deliberately mirrored
+    on this point), so an all-null-delta chain still ends up at ``select_single`` returning
+    ``None`` — and ``_pick_refusal_message`` must name the cause here exactly as it does on
+    the legacy path, because it is called from the SAME ``if contract is None`` branch and is
+    not gated on ``self.selection_policy`` at all. As far as this review could find, this is
+    also the FIRST test anywhere that exercises ``TradeAction.execute()`` end to end with an
+    ACTIVE (non-default) ``SelectionPolicy``."""
+    today = date.today()
+    chain = [_c(95, OptionRight.CALL, delta=None, expiry=today + timedelta(days=30)),
+             _c(105, OptionRight.CALL, delta=None, expiry=today + timedelta(days=30))]
+    action = _buy_call(chain, w_premium=0.5)
+    assert action.selection_policy is not None
+    assert action.selection_policy.is_default is False   # the premise this test needs
+    result = action.execute()
     assert result["success"] is False
     assert "delta" in result["message"]
     assert "strike_method" in result["message"]

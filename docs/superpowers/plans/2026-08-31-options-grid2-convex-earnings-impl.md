@@ -87,46 +87,63 @@ re-measured by the task that writes it, with seed and method stated
 
 ## Phase A — shared machinery
 
-### Task 1 (sonnet): legacy-path cause-naming for `option_strike_method: "delta"`
-**CORRECTED 2026-09-01** — the original text below described `delta` strike
-selection as new work. It is not: `_pick_by`'s `method == "delta"` branch
-(nearest BAR delta to the target, absolute value for puts, ties broken by
-`option_selector._tie` — strike then expiry) and the `SelectionPolicy` path's
-own named refusal (`_no_candidate_reason`) both shipped with
-`option-selection-modes`, before this plan was written, and are already
-covered by `test_option_selection_pick.py`, `test_option_selection_policy_noop.py`,
-`test_option_selection_policy_features.py` and `test_strike_method_registry.py`.
-An implementer who took the text below at face value would either re-prove
-already-shipped behaviour or, worse, risk destabilizing it. The plan lied to
-its own next reader; this is the correction, not the original brief.
+### Task 1 (sonnet): missing-delta cause-naming for `option_strike_method: "delta"`
+**CORRECTED 2026-09-01, twice.** First correction: the original text below
+described `delta` strike selection as new work. It is not: `_pick_by`'s
+`method == "delta"` branch (nearest BAR delta to the target, absolute value
+for puts, ties broken by `option_selector._tie` — strike then expiry) and the
+`SelectionPolicy` path's own named refusal (`_no_candidate_reason`) both
+shipped with `option-selection-modes`, before this plan was written, and are
+already covered by `test_option_selection_pick.py`,
+`test_option_selection_policy_noop.py`, `test_option_selection_policy_features.py`
+and `test_strike_method_registry.py`. An implementer who took the text below
+at face value would either re-prove already-shipped behaviour or, worse, risk
+destabilizing it.
 
-**What Task 1 actually is:** on the LEGACY path (`policy=None`/default — what
-all nine `strike_method`-honouring builders run under; `SelectionPolicy`
-weights are opt-in and off by default), a `None` pick used to collapse into
-the SAME generic "No liquid `<structure>`" message regardless of cause — an
+Second correction (review of commit d02d6018): the first correction's own
+text scoped the fix to "the LEGACY path (`policy=None`/default)". That claim
+is FALSE and was caught in review — `_pick_refusal_message` fires from the
+same `if contract/pair is None` branch regardless of which internal route
+produced the `None`, so it names the missing-delta cause equally on the
+legacy `_pick_by` route AND on an ACTIVE, non-default `SelectionPolicy`
+route (`_policy_pick`/`eligible`), proved empirically with `w_profit=0.5` in
+review. The behavior was always correct; only this doc's (and the original
+commit message's) claim about it was wrong. Not scoping it down — the
+message is factually accurate on both paths.
+
+**What Task 1 actually is:** a `None` pick from `select_single`/
+`select_vertical_spread` under `method="delta"` used to collapse into the
+SAME generic "No liquid `<structure>`" message regardless of cause — an
 empty/DTE-filtered/illiquid chain and a chain that carries no delta data at
 all were indistinguishable, so a grid post-mortem on an `O_LEAPC`-style job
-could not tell "skip this symbol" from "skip this method" apart (the F12
-exact-cause discipline, already applied on the `SelectionPolicy` side but not
-this one). **Files:** `packages/common/ba2_common/core/option_selector.py`
-(new pure helper `describe_pick_failure` — gated on `method == "delta"`
-FIRST, so nothing pays for the extra chain re-filter on any other pick),
-`packages/common/ba2_common/core/TradeActions.py` (`_pick_refusal_message`, one
-seam all nine builders call from inside their existing `if contract/pair is
-None` branch instead of nine hand-written cause checks), tests in
+could not tell "skip this symbol" from "skip this method" apart. This is
+true whether the pick took the legacy route or an active `SelectionPolicy`
+route (that path already draws the distinction internally via
+`_no_candidate_reason`, but the CALLER-SIDE message TradeActions actually
+returns did not, on either route, until this task). **Files:**
+`packages/common/ba2_common/core/option_selector.py` (new pure helper
+`describe_pick_failure` — gated on `method == "delta"` FIRST, so nothing
+pays for the extra chain re-filter on any other pick; policy-agnostic by
+construction, since it re-derives the DTE/liquidity-filtered candidate set
+directly rather than reading off whichever internal route produced the
+`None`), `packages/common/ba2_common/core/TradeActions.py`
+(`_pick_refusal_message`, one seam all nine builders call from inside their
+existing `if contract/pair is None` branch instead of nine hand-written
+cause checks — NOT gated on `self.selection_policy`), tests in
 `packages/common/tests/test_option_delta_strike_method.py`. Eligibility/
-spread/policy machinery and the `SelectionPolicy` seam (`policy=None` legacy
-path) are untouched for every existing method — this only adds a reason
-string to one specific `None` case. Tests (deliberately NOT re-proving
-nearest-pick correctness, which the suites named above already cover): the
-new cause-naming (all-null-delta chain names the method; a merely-illiquid/
-DTE-filtered chain does not), partial-null skip (a null delta is dropped,
-never scored as 0), the tie rule the legacy delta path uses (documented and
-pinned explicitly), and a byte-identical pin of every non-delta refusal.
-Mutations: (a) the all-null refusal silently falls back to the generic
-message → named cause-naming tests fail; (b) a null delta scored as 0 →
-named partial-null-skip tests fail; (c) a non-delta method's refusal message
-changes → the named byte-identical pin fails.
+spread/policy machinery and the `SelectionPolicy` seam's own no-op guarantee
+are untouched for every existing method — this only adds a reason string to
+one specific `None` case, on whichever route produced it. Tests
+(deliberately NOT re-proving nearest-pick correctness, which the suites
+named above already cover): the new cause-naming (all-null-delta chain names
+the method on BOTH the legacy and an active-`SelectionPolicy` pick;
+a merely-illiquid/DTE-filtered chain does not), partial-null skip (a null
+delta is dropped, never scored as 0), the tie rule the legacy `_pick_by`
+delta path uses (documented and pinned explicitly), and a byte-identical pin
+of every non-delta refusal. Mutations: (a) the all-null refusal silently
+falls back to the generic message → named cause-naming tests fail; (b) a
+null delta scored as 0 → named partial-null-skip tests fail; (c) a non-delta
+method's refusal message changes → the named byte-identical pin fails.
 
 ### Task 2 (sonnet): chain-depth preflight probe tool
 **Files:** create `tools/probe_option_chain_depth.py` + backend test

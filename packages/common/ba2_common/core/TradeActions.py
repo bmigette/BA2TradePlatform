@@ -2193,7 +2193,15 @@ class _OptionEntryAction(TradeAction):
         fallback. See ``option_selector.describe_pick_failure`` for the one cause it currently
         names (the ``delta`` method's chain-wide missing-delta case) and why every other cause
         still reads as ``generic_message``. One seam for all nine ``strike_method``-honouring
-        builders, instead of nine hand-written cause checks that could each drift from it."""
+        builders, instead of nine hand-written cause checks that could each drift from it.
+
+        NOT GATED ON ``self.selection_policy`` (corrected 2026-09-01, caught in review): this
+        is called from the SAME ``if contract/pair is None`` branch whether that ``None`` came
+        from the legacy ``_pick_by`` call or from an ACTIVE, non-default ``SelectionPolicy``
+        routed through ``_policy_pick`` -- ``select_single``'s internal branch on
+        ``policy.is_default`` is invisible from here, and ``describe_pick_failure`` answers the
+        same missing-delta question either way. See
+        ``test_option_delta_strike_method.test_buy_call_names_delta_under_an_active_selection_policy``."""
         reason = describe_pick_failure(
             chain, method=self.strike_method, option_type=option_type,
             dte_min=self.dte_min, dte_max=self.dte_max, today=self._today(), **liq)

@@ -317,8 +317,22 @@ def describe_pick_failure(chain, *, method, option_type, dte_min, dte_max, today
     -- a grid post-mortem cannot tell "nobody quotes this name" from "this vendor never
     publishes delta for this name" apart from the message text, and the two point at opposite
     remedies (skip the symbol vs. skip the method). ``option_selection_policy._no_candidate_reason``
-    already draws this exact distinction for the (opt-in, non-default) ``SelectionPolicy`` path;
-    this is the same distinction for the LEGACY path every builder actually runs under today.
+    already draws this exact distinction for the (opt-in, non-default) ``SelectionPolicy`` path.
+
+    NOT LEGACY-ONLY (corrected 2026-09-01 -- an earlier version of this docstring, the commit
+    message that introduced it, and the plan doc all claimed this only covers the ``policy is
+    None``/default path, which is FALSE and was caught in review). ``TradeActions.
+    _pick_refusal_message`` calls this from inside the SAME ``if contract/pair is None`` branch
+    regardless of which internal route ``select_single``/``select_vertical_spread`` took to get
+    there -- the legacy ``_pick_by`` call and the active ``SelectionPolicy`` call
+    (``_policy_pick``) both funnel into that one branch. This function answers a question that
+    is true or false of the CHAIN independent of either route ("after DTE/liquidity filtering,
+    does ANY surviving candidate carry a delta at all?"), re-derived directly via
+    ``_candidates`` rather than read off whichever path produced the ``None`` -- so it is
+    exactly as correct when a live ``w_profit``/``w_rr`` weight routed the pick through
+    ``eligible()`` and emptied the box on the same missing-delta chain. Proved empirically in
+    review and pinned by
+    ``test_option_delta_strike_method.test_buy_call_names_delta_under_an_active_selection_policy``.
 
     EVERY OTHER CAUSE RETURNS ``None`` ON PURPOSE -- an unrecognised method, a DTE/liquidity
     window that filtered the chain to nothing, or (non-default policy only) a box/ceiling that
