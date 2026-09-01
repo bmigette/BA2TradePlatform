@@ -1188,6 +1188,8 @@ class TradeActionEvaluator:
                 'OpenJadeLizardAction': ExpertActionType.OPEN_JADE_LIZARD,
                 'OpenCallButterflyAction': ExpertActionType.OPEN_CALL_BUTTERFLY,
                 'OpenPutRatioSpreadAction': ExpertActionType.OPEN_PUT_RATIO_SPREAD,
+                'OpenCallBackspreadAction': ExpertActionType.OPEN_CALL_BACKSPREAD,
+                'OpenPutBackspreadAction': ExpertActionType.OPEN_PUT_BACKSPREAD,
                 'CloseOptionAction': ExpertActionType.CLOSE_OPTION,
             }
             

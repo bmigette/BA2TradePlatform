@@ -1933,6 +1933,88 @@ def _entry_payoff_legs(legs: List[OptionLeg], limit_price) -> Optional[List[Payo
     return out
 
 
+#: Greppable marker on every refusal ``_backspread_shape_refusal`` emits, so the ratio
+#: invariant can be told apart in a log from a thin chain or an exhausted budget. Same
+#: discipline as ``option_economics.ARC_FLOOR_REFUSAL`` and
+#: ``OptionsAccountInterface.ASSIGNMENT_CAPACITY_REFUSAL``.
+BACKSPREAD_SHAPE_REFUSAL = "not a covered 1x2 backspread"
+
+#: The 1x2 ratio, as two named numbers rather than two literals sprinkled through the two
+#: builders. ONE short against TWO longs is the whole structure: it is what makes the short
+#: covered, what makes the upside slope positive on the call version, and what puts the
+#: worst case at the LONG strike instead of at infinity. Changing either number without
+#: changing ``_backspread_shape_refusal`` is the mutation the shape guard exists to catch.
+BACKSPREAD_SHORT_RATIO = 1
+BACKSPREAD_LONG_RATIO = 2
+
+
+def _backspread_shape_refusal(legs: List[OptionLeg], *, option_type: OptionRight
+                              ) -> Optional[str]:
+    """Why ``legs`` is NOT a covered 1x2 backspread -- or ``None`` when it is.
+
+    THE INVERTED RATIO IS THE FAILURE THIS EXISTS FOR. Swap the two ratios and a call
+    backspread becomes 2 SHORT calls against 1 long: a net-uncovered short call, whose loss
+    at expiry grows without limit as the underlying rises. That structure must never reach
+    the broker, and "must never" has to be a check on the LEGS rather than a promise in a
+    docstring -- the legs are the only artefact the submit path actually sends.
+
+    Structural, and deliberately not a payoff question. ``option_payoff.max_loss`` also
+    refuses the flipped CALL shape (its ``upside_slope`` guard reports UNBOUNDED), but it
+    cannot refuse the flipped PUT shape: 2 short puts against 1 long put is bounded below --
+    UNBOUNDED is a fact about short calls, not about naked-ness -- so it would come back
+    MEASURED and submit as a structure whose short leg nobody covers. That shape already has
+    a builder of its own (``OpenPutRatioSpreadAction``, the FRONTspread), which reserves the
+    full short-strike notional for exactly that reason; arriving at it through this builder
+    would reserve the wing width instead. So the ratio is checked here, and the payoff gate
+    runs as well, and neither is redundant with the other.
+
+    Every clause is an admission requirement, not a preference:
+
+    * exactly two legs, same right, same expiry -- the payoff derivation and the reserve
+      both price a single-expiry two-strike structure;
+    * exactly one SELL leg at ratio 1 and one BUY leg at ratio 2 (``BACKSPREAD_*_RATIO``);
+    * the LONG leg further OTM than the short (calls: higher strike; puts: lower), which is
+      what puts the trough between the strikes and makes the structure long convexity.
+    """
+    if len(legs) != 2:
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: {len(legs)} legs (a 1x2 backspread has "
+                f"exactly 2)")
+    for leg in legs:
+        if leg.option_type != option_type:
+            return (f"{BACKSPREAD_SHAPE_REFUSAL}: leg {leg.contract_symbol} is "
+                    f"{leg.option_type}, not {option_type}")
+        if leg.strike is None or leg.expiry is None:
+            return (f"{BACKSPREAD_SHAPE_REFUSAL}: leg {leg.contract_symbol} carries no "
+                    f"strike/expiry, so the ratio cannot be verified")
+    if legs[0].expiry != legs[1].expiry:
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: legs expire on different dates "
+                f"({legs[0].expiry} vs {legs[1].expiry})")
+    shorts = [l for l in legs if l.side == OrderDirection.SELL]
+    longs = [l for l in legs if l.side == OrderDirection.BUY]
+    if len(shorts) != 1 or len(longs) != 1:
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: {len(shorts)} short and {len(longs)} long "
+                f"legs (a 1x2 backspread has one of each)")
+    short, long_ = shorts[0], longs[0]
+    n_short = int(short.ratio_qty or 1)
+    n_long = int(long_.ratio_qty or 1)
+    if n_long <= n_short:
+        # The inverted ratio, named for what it IS rather than for the arithmetic: on calls
+        # this is an uncovered short call and the loss is unbounded above; on puts it is an
+        # uncovered short put priced as if it were a spread.
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: {n_short} short x {n_long} long is a "
+                f"net-UNCOVERED short {option_type.value} -- the loss is UNBOUNDED above "
+                f"on calls and reserved at the wrong basis on puts; refusing to submit it")
+    if n_short != BACKSPREAD_SHORT_RATIO or n_long != BACKSPREAD_LONG_RATIO:
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: ratio is {n_short}x{n_long}, not "
+                f"{BACKSPREAD_SHORT_RATIO}x{BACKSPREAD_LONG_RATIO}")
+    further_out = (long_.strike > short.strike if option_type == OptionRight.CALL
+                   else long_.strike < short.strike)
+    if not further_out:
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: the long {option_type.value} strike "
+                f"{long_.strike} is not further OTM than the short's {short.strike}")
+    return None
+
+
 def _measured_max_loss_per_contract(legs: List[OptionLeg], limit_price,
                                     stock_cover_price=None) -> Optional[float]:
     """Dollars ONE contract of this order can lose -- ONLY when that is a measurement.
@@ -2209,6 +2291,25 @@ class _OptionEntryAction(TradeAction):
         if reason:
             return f"{reason} for {self.instrument_name}"
         return generic_message
+
+    def _spread_params(self) -> Tuple[Any, Any]:
+        """Split strike_param into (long, short) params for the two legs.
+
+        PROMOTED to the base 2026-09-01 (it was four byte-identical copies on the four
+        vertical builders, and the backspread pair would have made six). Nothing else
+        changed -- the four inherit the same body they used to define -- so every structure
+        that selects TWO legs by method expresses a per-leg target the same way:
+        ``{"long": .., "short": ..}`` or a 2-element sequence, one value for both legs
+        otherwise (``select_vertical_spread`` excludes the first pick before making the
+        second, so a single value still yields two DIFFERENT strikes).
+        """
+        sp = self.strike_param
+        if isinstance(sp, dict):
+            return sp.get("long"), sp.get("short")
+        if isinstance(sp, (list, tuple)) and len(sp) == 2:
+            return sp[0], sp[1]
+        # Single value: use the same param for both legs (selector dedups by strike).
+        return sp, sp
 
     def _virtual_equity(self) -> Optional[float]:
         """balance * virtual_equity_pct/100 (defaults to balance when unknown)."""
@@ -2704,7 +2805,7 @@ class _OptionEntryAction(TradeAction):
         See the comment at the stamp below for the ratified valuation choice. Callers
         that supply no cover are byte-identical to before.
 
-        THE ENTRY-QUOTE CONCESSION IS APPLIED HERE (F3), the one choke point all seventeen
+        THE ENTRY-QUOTE CONCESSION IS APPLIED HERE (F3), the one choke point all nineteen
         builders reach, so no builder can be forgotten and none needs to know about it.
         ``entry_cross`` = the fraction of each leg's own modelled spread this entry gives up;
         at the default 0.0 (or on any account with no spread model, i.e. every live one) the
@@ -2775,7 +2876,7 @@ class _OptionEntryAction(TradeAction):
                                  f"{option_strategy} for {self.instrument_name} (manual review, not submitted)",
                                  data)
         # THE OPTION RISK MANAGER (design 2026-08-27 SS4, review finding F5). This is the one
-        # choke point all seventeen builders reach, and it is reached identically by the live
+        # choke point all nineteen builders reach, and it is reached identically by the live
         # pass (TradeManager -> TradeActionEvaluator) and by the backtest engine
         # (daily_engine -> TradeActionEvaluator), so ONE call arms both runtimes -- which is
         # the whole content of SS4's operator decision.
@@ -3031,16 +3132,6 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
                 f"(net_debit={net_debit})"),
             reserve_kwargs={})
 
-    def _spread_params(self) -> Tuple[Any, Any]:
-        """Split strike_param into (long, short) params for the two legs."""
-        sp = self.strike_param
-        if isinstance(sp, dict):
-            return sp.get("long"), sp.get("short")
-        if isinstance(sp, (list, tuple)) and len(sp) == 2:
-            return sp[0], sp[1]
-        # Single value: use the same param for both legs (selector dedups by strike).
-        return sp, sp
-
     def get_description(self) -> str:
         return f"Open bull call spread on {self.instrument_name}"
 
@@ -3141,16 +3232,6 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
                 f"Insufficient budget to size bear_put_spread for {self.instrument_name} "
                 f"(net_debit={net_debit})"),
             reserve_kwargs={})
-
-    def _spread_params(self) -> Tuple[Any, Any]:
-        """Split strike_param into (long, short) params for the two legs."""
-        sp = self.strike_param
-        if isinstance(sp, dict):
-            return sp.get("long"), sp.get("short")
-        if isinstance(sp, (list, tuple)) and len(sp) == 2:
-            return sp[0], sp[1]
-        # Single value: use the same param for both legs (selector dedups by strike).
-        return sp, sp
 
     def get_description(self) -> str:
         return f"Open bear put spread on {self.instrument_name}"
@@ -3368,16 +3449,6 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_BEAR_CALL_SPREAD.value
 
-    def _spread_params(self) -> Tuple[Any, Any]:
-        """Split strike_param into (long, short) params for the two legs."""
-        sp = self.strike_param
-        if isinstance(sp, dict):
-            return sp.get("long"), sp.get("short")
-        if isinstance(sp, (list, tuple)) and len(sp) == 2:
-            return sp[0], sp[1]
-        # Single value: use the same param for both legs (selector dedups by strike).
-        return sp, sp
-
     def _build_and_submit(self) -> Dict[str, Any]:
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
@@ -3468,16 +3539,6 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
 
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_BULL_PUT_SPREAD.value
-
-    def _spread_params(self) -> Tuple[Any, Any]:
-        """Split strike_param into (long, short) params for the two legs."""
-        sp = self.strike_param
-        if isinstance(sp, dict):
-            return sp.get("long"), sp.get("short")
-        if isinstance(sp, (list, tuple)) and len(sp) == 2:
-            return sp[0], sp[1]
-        # Single value: use the same param for both legs (selector dedups by strike).
-        return sp, sp
 
     def _build_and_submit(self) -> Dict[str, Any]:
         chain = self._chain(self.OPTION_TYPE)
@@ -4231,6 +4292,230 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         return f"Open put ratio spread on {self.instrument_name}"
 
 
+class _BackspreadAction(_OptionEntryAction):
+    """Ratio BACKSPREAD, 1x2: SELL 1 nearer-delta leg, BUY 2 further-OTM legs.
+
+    One expiry, one right, a FIXED 1x2 ratio (``BACKSPREAD_SHORT_RATIO`` /
+    ``BACKSPREAD_LONG_RATIO``). The convexity-financed family of design 2026-08-31 SS2:
+    the short leg pays for most of the two longs, so the structure buys convexity with the
+    bleed of long premium largely removed. ``O_PBS`` is additionally a crash hedge -- below
+    the long strike the two puts outrun the one short.
+
+    THE MIRROR OF ``OpenPutRatioSpreadAction``, and the two must not be confused. That one
+    is a FRONTspread (BUY 1, SELL 2): net SHORT an option, reserved at the full short-strike
+    notional because Alpaca margins it as a naked short put. This one is net LONG an option,
+    covered by construction, and reserved at its defined max loss.
+
+    RISK, MEASURED, NEVER ASSUMED. The payoff is a V with its trough at the LONG strike --
+    at expiry there the short is fully ITM and the longs are worthless -- so the max loss is
+    ``(width - net_credit) x 100`` per contract, where a net DEBIT is a negative credit and
+    therefore ADDS. Both rights, one formula. Above the break-even the longs' 2x slope wins
+    and the profit is UNBOUNDED on the call version; that is the point of the structure and
+    it demotes nothing (``max_profit`` reporting UNBOUNDED is an inapplicable answer, and an
+    inapplicable answer never counts against a candidate).
+
+    The number is taken from ``_measured_max_loss_per_contract`` -- the payoff evaluator,
+    the same MEASURED source the submit stamp uses -- and never from a formula written out
+    here; ``option_reserve_required`` then re-derives it in closed form for the reserve, and
+    ``test_backspread_builders`` pins the two against hand-derived dollars. A structure the
+    evaluator cannot measure (UNBOUNDED, or a crossed quote it reads as an arbitrage) is
+    REFUSED rather than submitted with the stamp missing.
+
+    SIZING IS BY MAX LOSS, NOT BY PREMIUM -- and for this structure that is not a
+    refinement (see ``_size_by_cost`` at the call site).
+
+    NET CREDIT AND NET DEBIT ARE BOTH ADMISSIBLE. Which one a given pair of delta targets
+    produces is a fact about the skew on the day, not a property of the strategy, so there
+    is no sign refusal in either direction; the SIGN of the limit still has to be right,
+    and it follows the house MLEG convention (negative = credit).
+
+    PER ENTRY, NOT PER BAR. Everything here runs once, inside one entry action's
+    ``execute()``: one chain fetch, one ``select_vertical_spread`` call, one payoff
+    evaluation over 3 critical points. Nothing in this class is reachable from the per-bar
+    loop, and an equity trial never constructs it.
+    """
+
+    #: Set by the two concrete subclasses; both are used by name in
+    #: ``OptionsAccountInterface.RESERVING_STRATEGIES`` and priced by its defined-risk
+    #: branch.
+    OPTION_STRATEGY: str = ""
+
+    def _legs_from_pair(self, pair) -> "Tuple[OptionContract, OptionContract]":
+        """``(short_contract, long_contract)`` out of ``select_vertical_spread``'s pair.
+
+        The selector returns its pair ordered for a DEBIT vertical -- ``(lo, hi)`` for
+        calls, ``(hi, lo)`` for puts, i.e. (long, short) under THAT convention. A backspread
+        sells the nearer leg and buys the further one, which is the opposite assignment on
+        both rights, so the legs are re-derived from the STRIKES rather than from tuple
+        position (the same thing ``OpenBearCallSpreadAction`` does for the same reason).
+        """
+        lo, hi = sorted(pair, key=lambda c: c.strike)
+        if self.OPTION_TYPE == OptionRight.CALL:
+            return lo, hi          # calls: sell the LOWER strike, buy the HIGHER
+        return hi, lo              # puts: sell the HIGHER strike, buy the LOWER
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
+        spot = self._spot()
+        long_param, short_param = self._spread_params()
+        # ONE selector call for both legs, not two: ``select_vertical_spread`` is the idiom
+        # for "two strikes, one expiry, each picked by the configured method", it pins both
+        # legs to a single expiry by construction (a backspread whose legs expire on
+        # different days is a different structure), and it routes BOTH picks through the
+        # SelectionPolicy. ``select_wing`` -- the ratio FRONTspread's idiom -- would place
+        # the second leg a fixed % away from the first, which cannot express a delta target
+        # at all, and delta is what design SS2 searches on both legs of this structure.
+        pair = select_vertical_spread(
+            chain, method=self.strike_method, long_param=long_param,
+            short_param=short_param, spot=spot, option_type=self.OPTION_TYPE,
+            dte_min=self.dte_min, dte_max=self.dte_max, today=self._today(),
+            target_price=self._consensus_target(), policy=self.selection_policy, **liq)
+        if pair is None:
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=(f"No liquid {self.OPTION_STRATEGY} for "
+                                 f"{self.instrument_name}")))
+        short_c, long_c = self._legs_from_pair(pair)
+        if short_c.bid is None or long_c.ask is None:
+            return self._result(
+                False, f"Missing quote for {self.OPTION_STRATEGY} legs on "
+                       f"{self.instrument_name}")
+        width = round(abs(long_c.strike - short_c.strike), 4)
+        if width <= 0:
+            return self._result(
+                False, f"Non-positive strike width ({width}) for {self.OPTION_STRATEGY} "
+                       f"on {self.instrument_name}")
+        # SIGNED NET, the house MLEG convention: positive = net debit, negative = net
+        # credit. Sell the short leg at its BID, buy each long at its ASK -- the same touch
+        # every other builder quotes at. A backspread prices to either sign and BOTH are
+        # admitted; what must never happen is the sign being wrong, because
+        # ``_submit_option_order`` hands this straight to the broker as the MLEG limit.
+        net = round(BACKSPREAD_LONG_RATIO * long_c.ask
+                    - BACKSPREAD_SHORT_RATIO * short_c.bid, 4)
+        legs = [
+            OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
+                      ratio_qty=BACKSPREAD_SHORT_RATIO, position_intent="sell_to_open",
+                      option_type=self.OPTION_TYPE, strike=short_c.strike,
+                      expiry=short_c.expiry, underlying=short_c.underlying),
+            OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
+                      ratio_qty=BACKSPREAD_LONG_RATIO, position_intent="buy_to_open",
+                      option_type=self.OPTION_TYPE, strike=long_c.strike,
+                      expiry=long_c.expiry, underlying=long_c.underlying),
+        ]
+        # THE RATIO INVARIANT, checked on the legs that would actually be sent.
+        shape = _backspread_shape_refusal(legs, option_type=self.OPTION_TYPE)
+        if shape is not None:
+            logger.error(f"{self._action_type_value()} for {self.instrument_name}: "
+                         f"{shape}")
+            return self._result(False, f"{shape} on {self.instrument_name}")
+        # THE RISK NUMBER, from the payoff evaluator over these same legs and this same
+        # net. Not a formula written out here: this is the number the submit path will
+        # stamp as ``max_loss_per_contract`` (design 2026-08-29 S8.2), so sizing, the
+        # reserve and the ``opt_sl_ml`` denominator are the SAME measurement by
+        # construction rather than by three formulas agreeing.
+        max_loss_per_contract = _measured_max_loss_per_contract(legs, net)
+        if max_loss_per_contract is None or max_loss_per_contract <= 0:
+            return self._result(
+                False, f"Max loss for {self.OPTION_STRATEGY} on {self.instrument_name} is "
+                       f"not MEASURED (unbounded, or a quote the payoff evaluator reads "
+                       f"as risk-free) -- refusing rather than sizing against an unknown")
+        # SIZING BY MAX LOSS, AND HERE THAT IS LOAD-BEARING (the known premium-vs-max-loss
+        # gap, closed for these two builders). Every premium-sized builder divides the
+        # budget by what it PAYS; a backspread's net is near zero by design (the short
+        # finances the longs) and can be a credit, so premium sizing would divide by ~0 --
+        # unbounded contracts on a structure that genuinely risks (width - credit) x 100
+        # each -- or by a negative. The max loss is the only quantity that is both positive
+        # and meaningful for both signs, which is why ``_size_by_cost`` (dollars ONE
+        # contract consumes) is called with it directly rather than through
+        # ``_size``/``_size_by_reserve``.
+        quantity = self._size_by_cost(max_loss_per_contract, self.sizing)
+        if quantity < 1:
+            return self._result(
+                False, f"Insufficient budget to size {self.OPTION_STRATEGY} for "
+                       f"{self.instrument_name} (max_loss={max_loss_per_contract})")
+        # A net DEBIT is a NEGATIVE credit and the reserve branch subtracts it, so the
+        # collateral is (width + debit) x 100 -- more than the width, which is correct: the
+        # debit is money already spent that the worst case does not give back.
+        net_credit = round(-net, 4)
+        reserve = self.account.option_reserve_required(
+            self.OPTION_STRATEGY, quantity, spread_width=width, net_credit=net_credit)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(
+                False, f"Insufficient buying power to reserve {reserve} for "
+                       f"{self.OPTION_STRATEGY} on {self.instrument_name} (available="
+                       f"{self.account.available_option_buying_power()})")
+        quantity, refusal = self._assignment_capacity(short_c, quantity)
+        if refusal is not None:
+            return refusal
+        reserve = self.account.option_reserve_required(
+            self.OPTION_STRATEGY, quantity, spread_width=width, net_credit=net_credit)
+        return self._submit_option_order(legs, quantity, net, self.OPTION_STRATEGY,
+                                         option_reserve=reserve)
+
+    def _assignment_capacity(self, short_c, quantity):
+        """The short-put delivery gate, for the right that has one. ``(quantity, refusal)``.
+
+        Overridden by the PUT subclass. A CALL backspread's short leg is a CALL: assignment
+        delivers shares and pays cash IN, so it consumes no delivery capacity -- charging it
+        would refuse entries for an obligation that does not exist.
+        """
+        return quantity, None
+
+
+class OpenCallBackspreadAction(_BackspreadAction):
+    """``O_CBS`` -- call ratio backspread: SELL 1 nearer call, BUY 2 further-OTM calls.
+
+    Long convexity to the UPSIDE, financed by the short. The worst case is a pin at the
+    long strike; above the break-even the two longs outrun the one short and the profit is
+    unbounded. ``upside_slope`` is +1 contract of calls, so the LOSS is bounded -- which is
+    exactly what the inverted ratio would destroy.
+    """
+
+    OPTION_TYPE = OptionRight.CALL
+    OPTION_STRATEGY = "call_backspread"
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_CALL_BACKSPREAD.value
+
+    def get_description(self) -> str:
+        return f"Open call backspread on {self.instrument_name}"
+
+
+class OpenPutBackspreadAction(_BackspreadAction):
+    """``O_PBS`` -- put ratio backspread: SELL 1 nearer put, BUY 2 further-OTM puts.
+
+    The crash-hedge arm of the family (design 2026-08-31 SS2). No call leg at all, so
+    ``upside_slope`` is 0 and the payoff is flat above the short strike; the worst case is
+    the pin at the long strike, and below it the two longs outrun the one short all the way
+    to an underlying of zero.
+    """
+
+    OPTION_TYPE = OptionRight.PUT
+    OPTION_STRATEGY = "put_backspread"
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_PUT_BACKSPREAD.value
+
+    def _assignment_capacity(self, short_c, quantity):
+        """CHARGED, exactly like every other builder carrying a short put.
+
+        One short put per unit (``BACKSPREAD_SHORT_RATIO``), and the two long puts net
+        NOTHING off the delivery bill -- the same fact the bull put spread's wing is pinned
+        on: a long put is OUR right, exercisable on a LATER day, after the shares have
+        already been paid for at the short strike tonight. So the bill is
+        ``short strike x 100 x units`` and the gate downsizes to what the cash can deliver.
+        """
+        return self._downsize_to_delivery_capacity(
+            self.OPTION_STRATEGY, strike=short_c.strike, quantity=quantity,
+            contracts_per_unit=BACKSPREAD_SHORT_RATIO)
+
+    def get_description(self) -> str:
+        return f"Open put backspread on {self.instrument_name}"
+
+
 def build_closing_legs(children, parent_quantity: int, quote_fn, held_qty=None) -> "tuple[List[OptionLeg], Optional[float]]":
     """Build reversed legs (and a net limit price) that close a spread's child legs.
 
@@ -4692,6 +4977,8 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.OPEN_JADE_LIZARD: OpenJadeLizardAction,
         ExpertActionType.OPEN_CALL_BUTTERFLY: OpenCallButterflyAction,
         ExpertActionType.OPEN_PUT_RATIO_SPREAD: OpenPutRatioSpreadAction,
+        ExpertActionType.OPEN_CALL_BACKSPREAD: OpenCallBackspreadAction,
+        ExpertActionType.OPEN_PUT_BACKSPREAD: OpenPutBackspreadAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     

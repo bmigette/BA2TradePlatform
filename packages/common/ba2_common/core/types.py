@@ -487,6 +487,12 @@ class ExpertActionType(str, Enum):
     OPEN_JADE_LIZARD = "open_jade_lizard"
     OPEN_CALL_BUTTERFLY = "open_call_butterfly"
     OPEN_PUT_RATIO_SPREAD = "open_put_ratio_spread"
+    # RATIO BACKSPREADS (1x2), the convexity-financed pair -- SELL 1 nearer leg, BUY 2
+    # further-out legs of the SAME right and expiry. The mirror image of
+    # OPEN_PUT_RATIO_SPREAD above, which is a FRONTspread (BUY 1, SELL 2) and therefore
+    # net short; these are net LONG options and are covered by construction.
+    OPEN_CALL_BACKSPREAD = "open_call_backspread"
+    OPEN_PUT_BACKSPREAD = "open_put_backspread"
     CLOSE_OPTION = "close_option"
 
 class MarketAnalysisStatus(str, Enum):
@@ -624,6 +630,8 @@ def get_option_action_values():
         ExpertActionType.OPEN_JADE_LIZARD.value,
         ExpertActionType.OPEN_CALL_BUTTERFLY.value,
         ExpertActionType.OPEN_PUT_RATIO_SPREAD.value,
+        ExpertActionType.OPEN_CALL_BACKSPREAD.value,
+        ExpertActionType.OPEN_PUT_BACKSPREAD.value,
         ExpertActionType.CLOSE_OPTION.value,
     ]
 
@@ -707,7 +715,7 @@ def uses_arc_floor(action_value):
 def get_strike_method_action_values():
     """Option action types whose builder actually READS ``strike_method``.
 
-    These NINE of the seventeen ``_OptionEntryAction`` subclasses pass
+    These ELEVEN of the nineteen ``_OptionEntryAction`` subclasses pass
     ``method=self.strike_method`` into the selector. The other eight -- straddle, strangle,
     short straddle, short strangle, iron condor, jade lizard, call butterfly, put ratio
     spread -- hard-code ``method="percent_otm"`` at every selection site, so
@@ -748,6 +756,15 @@ def get_strike_method_action_values():
         ExpertActionType.SELL_CASH_SECURED_PUT.value,
         ExpertActionType.OPEN_BEAR_CALL_SPREAD.value,
         ExpertActionType.OPEN_BULL_PUT_SPREAD.value,
+        # The two 1x2 BACKSPREADS (2026-09-01). Both legs are box picks routed through
+        # ``select_vertical_spread`` with ``method=self.strike_method`` -- the same call the
+        # four verticals above make -- so the delta method reaches BOTH the short leg and the
+        # long pair. They are the first structures DESIGNED around ``delta`` (design
+        # 2026-08-31 SS2 searches the short leg at 0.35-0.50 and the longs at 0.15-0.30), and
+        # a per-leg target is expressed the way every vertical already expresses one: a
+        # 2-element ``strike_param`` read by ``_spread_params`` as ``(long, short)``.
+        ExpertActionType.OPEN_CALL_BACKSPREAD.value,
+        ExpertActionType.OPEN_PUT_BACKSPREAD.value,
     ]
 
 

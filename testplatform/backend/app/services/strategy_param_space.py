@@ -228,7 +228,7 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
     # proposition -- while delta is normalised across symbols and is the live default. Emitted
     # only where the producer asked for it; the producer is responsible for asking only on
     # actions whose builder actually reads strike_method (types.honours_strike_method), since
-    # eight of the seventeen builders hard-code percent_otm and would make this gene inert.
+    # eight of the nineteen builders hard-code percent_otm and would make this gene inert.
     if action.get("option_strike_method_optimize"):
         choices = list(action["option_strike_method_choices"])
         if len(choices) < 2:

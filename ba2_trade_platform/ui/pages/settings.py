@@ -5139,7 +5139,7 @@ class TradeSettingsTab:
                             is_close = selected_type == ExpertActionType.CLOSE_OPTION.value
                             if not is_close:
                                 # STRIKE METHOD IS OFFERED ONLY WHERE THE BUILDER READS IT
-                                # (OPT-S2). Eight of the seventeen entry builders hard-code
+                                # (OPT-S2). Eight of the nineteen entry builders hard-code
                                 # method="percent_otm" at every selection site, so
                                 # self.strike_method is a dead attribute on them. This select
                                 # used to be rendered for all of them and DEFAULTED to

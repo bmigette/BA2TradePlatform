@@ -102,7 +102,7 @@ def test_delta_capable_structures_search_the_strike_method(kind):
 
 @pytest.mark.parametrize("kind", _DELTA_BLIND)
 def test_structures_whose_builder_ignores_strike_method_get_no_method_gene(kind):
-    """Eight of the seventeen builders hard-code ``method="percent_otm"`` (OPT-S2). A method
+    """Eight of the nineteen builders hard-code ``method="percent_otm"`` (OPT-S2). A method
     gene there would be search budget spent on a dimension the simulation cannot see -- the
     exact defect this track exists to remove."""
     space = collect_param_space(_build(kind))

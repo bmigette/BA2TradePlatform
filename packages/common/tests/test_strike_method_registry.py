@@ -1,9 +1,9 @@
 """``types.get_strike_method_action_values`` must equal what the builders actually do.
 
-Only NINE of the seventeen ``_OptionEntryAction`` subclasses pass ``method=self.strike_method``
+Only ELEVEN of the nineteen ``_OptionEntryAction`` subclasses pass ``method=self.strike_method``
 to the selector; the other eight hard-code ``method="percent_otm"`` and leave
 ``self.strike_method`` a dead attribute (OPT-S2). Anything that OFFERS a strike-method choice
--- the rule editor, or the GA's strike-method gene -- must offer it for exactly those nine, or
+-- the rule editor, or the GA's strike-method gene -- must offer it for exactly those eleven, or
 it hands out a knob that silently does nothing (a 0.30 "delta" becomes a strike 0.30 PERCENT
 OTM, i.e. at the money).
 
@@ -48,9 +48,32 @@ def _entry_action_classes():
 
 
 def _source_honours(cls) -> bool:
-    """True when the class body passes ``self.strike_method`` to a selector."""
-    src = inspect.getsource(cls)
-    return "method=self.strike_method" in src
+    """True when the action's OWN code passes ``self.strike_method`` to a selector.
+
+    WALKS THE MRO, stopping at ``_OptionEntryAction`` (2026-09-01). Reading only
+    ``inspect.getsource(cls)`` assumed one class per builder, which stopped being true when
+    the two 1x2 backspreads landed: they share ``_BackspreadAction``, whose ``_build_and_submit``
+    holds the single ``select_vertical_spread`` call both of them make, so the concrete classes'
+    own bodies carry no selector call at all and the derivation silently reported them as
+    NOT honouring a method they demonstrably follow (the sibling
+    ``test_option_strike_method_honoured.py``, which RUNS each builder and watches the
+    selector, disagreed -- which is the whole point of having both).
+
+    THE STOP IS LOAD-BEARING. ``_OptionEntryAction`` itself contains the string, in
+    ``_pick_refusal_message``'s ``describe_pick_failure`` call, so walking all the way up
+    would make every entry action "honour" it and turn this guard into a tautology --
+    ``test_the_split_is_non_trivial_in_both_directions`` is what would catch that.
+    """
+    for klass in cls.__mro__:
+        if klass is TradeActions._OptionEntryAction:
+            break
+        try:
+            src = inspect.getsource(klass)
+        except (OSError, TypeError):
+            continue
+        if "method=self.strike_method" in src:
+            return True
+    return False
 
 
 def test_the_probe_finds_every_option_entry_action():

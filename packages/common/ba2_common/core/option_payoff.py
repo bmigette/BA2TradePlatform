@@ -7,7 +7,7 @@ reserves ``strike * 100`` but can only lose ``(strike - credit) * 100``. A jade 
 the put strike PLUS the call wing, though its loss is bounded by the put side alone. Both remain
 correct as margin; neither is max loss.
 
-A second hand-maintained table would be a second thing to keep correct against seventeen builders,
+A second hand-maintained table would be a second thing to keep correct against nineteen builders,
 and it drifts easily: the intuitive max loss for a covered call is "basis minus strike minus
 credit", which is WRONG — the strike caps the upside, not the downside, and the real answer is
 "basis minus credit" (the stock going to zero). Derived from the legs, it cannot be got wrong

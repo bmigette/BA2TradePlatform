@@ -6,7 +6,7 @@ that before and the program review (F5) found it false in both directions, so th
 pinned here as tests that a future divergence must break:
 
 * ``_OptionEntryAction._submit_option_order`` is the ONE wiring point — the choke point all
-  seventeen builders end at — and ``admit_option_entry`` is called from nowhere else in
+  nineteen builders end at — and ``admit_option_entry`` is called from nowhere else in
   production code. A hook added to ``daily_engine`` (backtest-only) or ``JobManager``
   (live-only) fails ``test_the_option_risk_manager_has_exactly_one_production_wiring_point``.
 * A live-shaped account and a backtest-shaped account driven through that seam reach the

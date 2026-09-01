@@ -1,6 +1,6 @@
 """OPT-S2 — ``get_strike_method_action_values()`` must match what the BUILDERS read.
 
-Nine of the seventeen entry builders pass ``method=self.strike_method`` into the selector.
+Eleven of the nineteen entry builders pass ``method=self.strike_method`` into the selector.
 The other eight hard-code ``method="percent_otm"`` at every selection site, so
 ``self.strike_method`` is set on the shared base and never read.
 
@@ -183,5 +183,5 @@ def test_the_strike_method_list_matches_what_the_builder_reads(action_type, spy)
 def test_the_list_is_a_strict_subset_of_the_entry_actions():
     """A name on the list that is not an entry action would silently offer nothing."""
     assert set(get_strike_method_action_values()) <= set(ENTRY_ACTION_VALUES)
-    assert len(get_strike_method_action_values()) == 9
+    assert len(get_strike_method_action_values()) == 11
     assert len(set(ENTRY_ACTION_VALUES) - set(get_strike_method_action_values())) == 8

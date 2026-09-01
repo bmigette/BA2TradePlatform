@@ -29,14 +29,19 @@ DEBIT_KINDS = sorted(set(L._OPTION_STRATS) - set(CREDIT_KINDS))
 def test_the_band_table_covers_every_credit_builder():
     """DRIFT GUARD. A structure in ``RESERVING_STRATEGIES`` posts collateral, so it has an
     ARC and its builder consults the gate; without a band here it would keep a frozen floor
-    of None (gate off) while every sibling searched one. ``credit_spread`` / ``naked_put`` /
-    ``debit_spread`` are pricing aliases with no builder, named so the exemption is explicit.
+    of None (gate off) while every sibling searched one. The exemptions -- the three pricing
+    aliases with no builder, and the two backspreads whose builders deliberately do not
+    consult the gate -- are named ONCE, in
+    ``ba2_common.core.option_economics.ARC_FLOOR_EXEMPT_STRATEGIES``, so this guard and its
+    packages/common sibling cannot drift apart.
     """
     from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 
-    aliases = {"credit_spread", "naked_put", "debit_spread"}
+    from ba2_common.core.option_economics import ARC_FLOOR_EXEMPT_STRATEGIES
+
     named = {strategy for strategy, _band in L._OPTION_ARC_BANDS.values()}
-    assert named == set(OptionsAccountInterface.RESERVING_STRATEGIES) - aliases
+    assert named == (set(OptionsAccountInterface.RESERVING_STRATEGIES)
+                     - ARC_FLOOR_EXEMPT_STRATEGIES)
 
 
 def test_every_band_starts_at_zero_and_is_a_usable_range():

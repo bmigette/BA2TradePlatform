@@ -16,7 +16,7 @@ breaker flattened the book once and then gated nothing — the next entry cycle 
 at the bottom of the drawdown. This module is those rails' first production caller.
 
 It is reached from ONE place: ``_OptionEntryAction._submit_option_order``, the single choke
-point all seventeen option builders end at. Wiring it there arms the live pass
+point all nineteen option builders end at. Wiring it there arms the live pass
 (``TradeManager`` -> ``TradeActionEvaluator``) and the backtest engine (``daily_engine`` ->
 ``TradeActionEvaluator``) in the same commit, because both construct the *same*
 ``ba2_common`` evaluator and run the *same* action classes. There is deliberately no hook in

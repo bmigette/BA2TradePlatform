@@ -354,7 +354,7 @@ def test_the_deliberate_omission_is_documented_where_someone_would_add_it(settin
 # --------------------------------------------------------------------------- #
 # OPT-S2: strike_method — the editor must not OFFER what the builder ignores
 # --------------------------------------------------------------------------- #
-# Eight of the seventeen entry builders hard-code ``method="percent_otm"`` at every
+# Eight of the nineteen entry builders hard-code ``method="percent_otm"`` at every
 # selection site, so ``self.strike_method`` is a dead attribute on them. The editor
 # nevertheless rendered the Strike Method select for EVERY non-close option action,
 # DEFAULTED it to ``delta``, placeholdered Strike Param as ``0.30``, and persisted the
@@ -402,7 +402,7 @@ def test_strike_method_is_offered_for_exactly_the_actions_that_read_it(
     entries = [a.value for a in ExpertActionType
                if settings_module.is_option_action(a.value)
                and a is not ExpertActionType.CLOSE_OPTION]
-    assert len(entries) == 17, entries
+    assert len(entries) == 19, entries
 
     for action_type in entries:
         with nicegui_client:

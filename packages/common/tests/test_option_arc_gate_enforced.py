@@ -235,10 +235,32 @@ CREDIT_BUILDERS = {
 def test_the_builder_table_covers_every_reserving_strategy():
     """Drift guard. A structure added to ``RESERVING_STRATEGIES`` posts collateral, so it
     has an ARC and must be gated; this table is what the parametrised tests below walk.
-    ``credit_spread``/``naked_put``/``debit_spread`` are reserve-table aliases with no
-    builder of their own -- named here so the exemption is explicit."""
-    aliases = {"credit_spread", "naked_put", "debit_spread"}
-    assert set(CREDIT_BUILDERS) == set(OptionsAccountInterface.RESERVING_STRATEGIES) - aliases
+
+    The exemptions are NAMED, in one place -- ``option_economics.ARC_FLOOR_EXEMPT_STRATEGIES``
+    -- rather than re-listed here and again in the launcher's band guard, which is how two
+    lists of the same fact drift apart. It covers the three reserve-table ALIASES (no builder
+    at all) and the two BACKSPREADS (a deliberate design decision, reasoned at the constant).
+    """
+    from ba2_common.core.option_economics import ARC_FLOOR_EXEMPT_STRATEGIES
+
+    assert set(CREDIT_BUILDERS) == (set(OptionsAccountInterface.RESERVING_STRATEGIES)
+                                    - ARC_FLOOR_EXEMPT_STRATEGIES)
+
+
+def test_the_exempt_list_is_exactly_the_strategies_with_no_arc_gated_builder():
+    """The exemption cannot be a dumping ground: every name on it must be either a pricing
+    alias (no action class) or a builder that really does not call the gate."""
+    import inspect
+
+    from ba2_common.core import TradeActions as TA
+    from ba2_common.core.option_economics import ARC_FLOOR_EXEMPT_STRATEGIES
+
+    assert ARC_FLOOR_EXEMPT_STRATEGIES <= set(OptionsAccountInterface.RESERVING_STRATEGIES)
+    for cls in (TA.OpenCallBackspreadAction, TA.OpenPutBackspreadAction,
+                TA._BackspreadAction):
+        assert "_refuse_if_arc_below_floor" not in inspect.getsource(cls)
+    for strategy in ("call_backspread", "put_backspread"):
+        assert strategy in ARC_FLOOR_EXEMPT_STRATEGIES
 
 
 @pytest.mark.parametrize("strategy", sorted(CREDIT_BUILDERS))

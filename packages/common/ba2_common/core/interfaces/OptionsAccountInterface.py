@@ -1207,7 +1207,7 @@ class OptionsAccountInterface(ABC):
     #: bought for a net DEBIT and its maximum loss is that debit, already paid at entry —
     #: the design spec classes it as a debit structure and every other debit structure is
     #: on this list. It was mis-listed as reserving while ``OpenCallButterflyAction``,
-    #: alone among the 17 entry builders, submitted it with no ``option_reserve=``. One
+    #: alone among the 19 entry builders, submitted it with no ``option_reserve=``. One
     #: open fly therefore made ``reserved_option_buying_power_detail`` UNMEASURABLE, so
     #: ``available_option_buying_power()`` returned ``None`` and
     #: ``check_option_buying_power(>0)`` returned False for all EIGHT credit structures,
@@ -1232,6 +1232,12 @@ class OptionsAccountInterface(ABC):
         "bear_call_spread", "bull_put_spread", "credit_spread",
         "short_straddle", "short_strangle", "naked_put",
         "put_ratio_spread",
+        # The 1x2 BACKSPREADS (2026-09-01), priced by the DEFINED-RISK branch below with
+        # the credit verticals -- NOT by the ``put_ratio_spread`` full-notional branch two
+        # names up, which exists because a FRONTspread is net SHORT an option. A backspread
+        # is net LONG one: its single short is covered by two longs, so nothing about it is
+        # naked and its whole risk is the (width - net_credit) pin between the strikes.
+        "call_backspread", "put_backspread",
         "jade_lizard",
         "iron_condor", "debit_spread",
     })
@@ -1313,12 +1319,22 @@ class OptionsAccountInterface(ABC):
             # shares is set aside): reserve the full assignment cost.
             _require(strike=strike)
             return strike * 100.0 * quantity
-        if strategy in ("bear_call_spread", "bull_put_spread", "credit_spread"):
+        if strategy in ("bear_call_spread", "bull_put_spread", "credit_spread",
+                        "call_backspread", "put_backspread"):
             # Defined-risk credit VERTICALS: the broker margins them at their textbook max
             # loss (the two-leg case Alpaca's MLEG engine does recognise — unlike the
             # jade_lizard / put_ratio_spread shapes below). Identical arithmetic on either
             # right: the call spread's risk is (higher - lower) above the short call, the
             # put spread's is (higher - lower) below the short put.
+            #
+            # THE TWO 1x2 BACKSPREADS SHARE THIS BRANCH, and the arithmetic is theirs
+            # unchanged rather than by analogy: sell 1 at K_s, buy 2 at K_l, and at expiry
+            # the payoff bottoms out at K_l -- the short fully ITM by the width, the longs
+            # worthless -- for exactly (width - net_credit) x 100 of loss, which is what
+            # this line computes. A net DEBIT arrives as a NEGATIVE net_credit and is
+            # therefore ADDED, which is right: the debit is money already spent that the
+            # worst case does not give back. Verified against the payoff evaluator (not
+            # just against itself) in ``test_backspread_builders``.
             _require(spread_width=spread_width, net_credit=net_credit)
             max_loss = (spread_width - net_credit)
             return max(0.0, max_loss) * 100.0 * quantity

@@ -2,7 +2,7 @@
 
 ``call_butterfly`` — a DEBIT structure — sat in ``RESERVING_STRATEGIES`` while
 ``OpenCallButterflyAction`` submitted it with no ``option_reserve=``. It was the only one
-of the 17 entry builders to do so, and the consequence was account-wide:
+of the (then) 17 entry builders to do so, and the consequence was account-wide:
 ``reserved_option_buying_power_detail`` treats "listed as reserving, no reserve recorded"
 as UNMEASURABLE, so one open butterfly made ``available_option_buying_power()`` return
 ``None`` and ``check_option_buying_power(>0)`` return False for ALL EIGHT credit builders,

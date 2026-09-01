@@ -746,13 +746,51 @@ def test_the_short_straddle_is_charged_its_STRIKE_not_the_spot():
 # THE SCOPE OF THE GATE, scanned out of the source (mutations D12/D13/D14)
 # ==========================================================================
 def _gated_strategies():
-    """Every strategy name handed to ``_downsize_to_delivery_capacity``, by ``ast``."""
+    """Every strategy name handed to ``_downsize_to_delivery_capacity``, by ``ast``.
+
+    RESOLVES ``self.<CONST>`` AGAINST THE ENCLOSING CLASS (2026-09-01). The scan used to
+    read string LITERALS only, which was complete while every builder spelled its strategy
+    out at the call site. The 1x2 backspreads carry theirs as a class constant
+    (``OPTION_STRATEGY``, shared by the reserve call, the capacity call and the submit call
+    so the three cannot disagree), so a literal-only scan reported the put backspread as
+    UNGATED while it was in fact charged on every entry -- a false NEGATIVE, i.e. the guard
+    quietly shrinking instead of failing. Anything the scan cannot resolve is reported and
+    fails the assertion below: a call this test cannot read is a call it is not guarding.
+    """
     import ast
     import inspect
     from ba2_common.core import TradeActions
 
     tree = ast.parse(inspect.getsource(TradeActions))
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def enclosing_class(node):
+        while node is not None:
+            node = parents.get(node)
+            if isinstance(node, ast.ClassDef):
+                return node
+        return None
+
+    def string_constants(cls):
+        """``NAME = "literal"`` in this class body (not in its methods)."""
+        out = {}
+        if cls is None:
+            return out
+        for stmt in cls.body:
+            targets = (stmt.targets if isinstance(stmt, ast.Assign)
+                       else [stmt.target] if isinstance(stmt, ast.AnnAssign) else [])
+            value = getattr(stmt, "value", None)
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        out[t.id] = value.value
+        return out
+
     found = set()
+    unresolved = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -760,10 +798,22 @@ def _gated_strategies():
         name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
         if name != "_downsize_to_delivery_capacity":
             continue
+        cls = enclosing_class(node)
+        consts = string_constants(cls)
         for arg in list(node.args) + [kw.value for kw in node.keywords]:
             if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
                 found.add(arg.value)
-    assert found, "the ast scan found no gated strategies — the scan itself is broken"
+            elif (isinstance(arg, ast.Attribute)
+                  and isinstance(arg.value, ast.Name) and arg.value.id == "self"):
+                if arg.attr in consts:
+                    found.add(consts[arg.attr])
+                else:
+                    unresolved.append(
+                        f"{getattr(cls, 'name', '<module>')}.{arg.attr}")
+    assert not unresolved, (
+        f"the ast scan could not resolve the strategy handed to the capacity gate at "
+        f"{unresolved} -- an unreadable call is an unguarded one")
+    assert found, "the ast scan found no gated strategies -- the scan itself is broken"
     return found
 
 
@@ -781,8 +831,16 @@ def test_only_the_builders_that_carry_a_SHORT_PUT_call_the_capacity_gate():
     jade_lizard         ``SELL`` naked put + ``SELL`` call + ``BUY`` call wing -> YES
     put_ratio_spread    ``BUY`` 1 put + ``SELL`` 2 puts (``ratio_qty=2``)    -> YES
     bull_put_spread     ``SELL`` higher put + ``BUY`` lower put wing         -> YES
+    put_backspread      ``SELL`` 1 higher put + ``BUY`` 2 lower puts         -> YES
     bear_call_spread    ``SELL`` lower call + ``BUY`` higher call            -> NO
+    call_backspread     ``SELL`` 1 lower call + ``BUY`` 2 higher calls       -> NO
     ==================  ============================================================
+
+    The 1x2 PUT BACKSPREAD (2026-09-01) is charged for the same reason the bull put spread
+    is, and its two long puts net NOTHING off the bill for the same reason that spread's one
+    wing does not: the long is OUR right, exercisable on a LATER day, after the shares have
+    already been paid for at the short strike tonight. Its CALL twin is not charged -- an
+    assigned short call delivers shares and takes cash IN.
 
     KNOWN AND REPORTED, deliberately out of this commit's scope: ``bear_put_spread``
     (``BUY`` the higher-strike put, ``SELL`` the lower one) also carries a short put and
@@ -793,6 +851,7 @@ def test_only_the_builders_that_carry_a_SHORT_PUT_call_the_capacity_gate():
     assert _gated_strategies() == {
         "cash_secured_put", "short_straddle", "short_strangle",
         "iron_condor", "jade_lizard", "put_ratio_spread", "bull_put_spread",
+        "put_backspread",
     }
 
 
@@ -812,6 +871,10 @@ def test_only_the_builders_that_carry_a_SHORT_PUT_call_the_capacity_gate():
     ("open_call_butterfly", dict(strike_method="percent_otm", strike_param=0.0,
                                  wing_width_pct=10.0, dte_min=10, dte_max=40,
                                  sizing=20.0)),
+    # The CALL backspread: its only short leg is a CALL, so a book at full delivery
+    # capacity must not stop it. (Its PUT twin IS charged -- see the table above.)
+    ("open_call_backspread", dict(strike_method="percent_otm", strike_param=[10.0, 5.0],
+                                  dte_min=10, dte_max=40, sizing=20.0)),
 ])
 def test_a_structure_with_no_short_put_opens_on_a_book_at_full_capacity(full_book,
                                                                         action, kw):

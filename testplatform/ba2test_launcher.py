@@ -2900,7 +2900,7 @@ def _apply_option_sizing_gene(cfg: dict) -> dict:
 # precisely the OPT-C3 naming bug). ``strategy_param_space._apply_option_strike`` writes
 # whichever one matches the decoded method.
 #
-# ONLY where the builder honours it. Eight of the seventeen ``_OptionEntryAction`` subclasses
+# ONLY where the builder honours it. Eight of the nineteen ``_OptionEntryAction`` subclasses
 # hard-code ``method="percent_otm"`` and leave ``strike_method`` a dead attribute (OPT-S2), so
 # offering the choice there would be a gene the simulation cannot see -- the exact defect this
 # whole track is fixing. ``types.honours_strike_method`` is the registry, drift-guarded against
@@ -2967,7 +2967,7 @@ _OPTION_ENTRY_CROSS_BAND = (0.0, 1.0, 0.25)
 def _apply_option_entry_cross_gene(cfg: dict) -> dict:
     """Make the entry-quote concession searchable, in place, on ANY option entry action.
 
-    No exemption list, deliberately: every one of the seventeen entry builders ends at
+    No exemption list, deliberately: every one of the nineteen entry builders ends at
     ``_OptionEntryAction._submit_option_order``, which is where the concession is applied, so
     there is no builder for which this gene is inert -- the failure mode that forced
     ``_apply_option_sizing_gene`` and ``_apply_option_min_arc_gene`` to carry one.
