@@ -64,9 +64,13 @@ _FORCED_EXIT_EVENT_TYPES = frozenset({
 #: conventions in the registry today point in OPPOSITE directions, so the classifier
 #: cannot key on a single operator set:
 #:
-#:   * SIGNED RESULT (``profit_loss_percent`` / ``profit_loss_amount``): the position's
-#:     own P&L — NEGATIVE while losing. Worse == smaller, so ``<`` / ``<=`` is the stop
-#:     and ``>`` / ``>=`` is the take-profit.
+#:   * SIGNED RESULT (``profit_loss_percent`` / ``profit_loss_amount`` /
+#:     ``profit_multiple_of_premium``): the position's own P&L, or an affine transform of
+#:     it — NEGATIVE (or, for the multiple, below 1.0) while losing. Worse == smaller, so
+#:     ``<`` / ``<=`` is the stop and ``>`` / ``>=`` is the take-profit.
+#:     ``profit_multiple_of_premium < 1.0`` reads "worth less than what was paid" — the
+#:     same de-facto stop as ``profit_loss_percent < 0``, just rescaled (``multiple = 1 +
+#:     percent / 100``), so it takes the identical operator set.
 #:   * LOSS MAGNITUDE (``loss_pct_of_max_loss``, design 2026-08-29 S8.2): unrealized loss
 #:     as a % of the structure's DEFINED max loss — POSITIVE while losing, +100 when the
 #:     whole defined risk is gone, negative while profitable. INVERTED vs the P&L fields:
@@ -79,17 +83,29 @@ _FORCED_EXIT_EVENT_TYPES = frozenset({
 #: kinds it is the ONLY stop (``opt_sl`` is credit-only), so 100 % of its firings were
 #: misclassified.
 #:
+#: Review 2026-09-01 (Task 4 follow-up): ``profit_multiple_of_premium`` was registered in
+#: ``CONDITION_MAP``/``FIELD_EVENT`` without a row here, so its loss-side reading
+#: (``< 1.0``) classified as discretionary — a real stop paying only the entry's
+#: concession fraction instead of crossing the full modelled spread, the same defect FIX 1
+#: fixed for ``loss_pct_of_max_loss``. It joins the SIGNED-RESULT bucket (its take-profit
+#: side, ``>=``, was already correctly discretionary and stays that way).
+#:
 #: A NEW loss-side field is registered by adding its convention HERE, not by adding a
 #: branch below. Keeping the mechanism a lookup was deliberate: ``loss_pct_of_max_loss``
-#: is the only inverted-sign field in ``ExpertEventType`` today (audited against
-#: ``get_number_event_values()``: every other numeric event is a signed P&L, a distance,
-#: a count of days, or an unsigned market statistic that is not a stop at all), but the
-#: S8.2 family it belongs to — "loss as a fraction of a measured risk budget" — is the
-#: shape a second such field would take.
+#: is the only INVERTED-sign field in ``ExpertEventType`` today (audited against
+#: ``get_number_event_values()``: every other numeric event that IS a stop follows the
+#: signed-result convention above; the rest are distances, counts of days, or unsigned
+#: market statistics that are not stops at all), but the S8.2 family it belongs to —
+#: "loss as a fraction of a measured risk budget" — is the shape a second inverted field
+#: would take.
 _LOSS_SIDE_STOP_OPERATORS = {
     ExpertEventType.N_PROFIT_LOSS_PERCENT.value: frozenset({"<", "<="}),
     ExpertEventType.N_PROFIT_LOSS_AMOUNT.value: frozenset({"<", "<="}),
     ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value: frozenset({">", ">="}),
+    # multiple = 1 + profit_loss_percent / 100 -- same signed-result convention as the
+    # profit_loss_* pair above: below 1.0 (worth less than paid) is the stop, at/above the
+    # searched threshold is the take-profit. See the module docstring above.
+    ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value: frozenset({"<", "<="}),
 }
 
 

@@ -309,13 +309,17 @@ def test_it_is_in_the_numeric_field_registry():
 
 
 def test_classified_as_discretionary_not_forced():
-    """A PROFIT-side exit -- like ``opt_tp`` -- is discretionary; it must never be listed
-    in TradeActionEvaluator._LOSS_SIDE_STOP_OPERATORS (that would make it pay the full
-    modelled spread on close like a real risk stop)."""
-    from ba2_common.core.TradeActionEvaluator import _LOSS_SIDE_STOP_OPERATORS, forced_option_exit
+    """The PROFIT side (``>=``) -- like ``opt_tp`` -- is discretionary, independently of
+    whatever the LOSS side (``<``) is registered as. The LOSS side is a de-facto stop,
+    affine-identical to ``profit_loss_percent < 0`` (``multiple = 1 + percent / 100``),
+    registered in TradeActionEvaluator._LOSS_SIDE_STOP_OPERATORS under the SAME "<"/"<="
+    convention as the ``profit_loss_*`` pair -- pinned separately by
+    test_option_close_concession.py's review-table extension and
+    test_profit_multiple_of_premium_below_one_classifies_as_forced, so the two directions
+    are independently verified (this test must keep passing even if that row were
+    dropped -- only the ``<`` behavior would break, never this one)."""
+    from ba2_common.core.TradeActionEvaluator import forced_option_exit
     from types import SimpleNamespace
-
-    assert "profit_multiple_of_premium" not in _LOSS_SIDE_STOP_OPERATORS
 
     action = SimpleNamespace(name="rule", triggers={
         "c0": {"event_type": "profit_multiple_of_premium", "operator": ">=", "value": 3.0}},
