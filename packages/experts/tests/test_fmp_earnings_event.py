@@ -1,4 +1,5 @@
-"""FMPEarningsEvent — the cache-fed core (options-grid2 Task 7, design §9).
+"""FMPEarningsEvent — the cache-fed core (options-grid2 Task 7) plus the implied-move
+leg (Task 8), design §9.
 
 The fixtures mirror the SHAPES measured against the real FMP disk cache on
 2026-08-31 / verified again 2026-09-01:
@@ -19,17 +20,19 @@ Everything runs through the REAL ``FMPCompanyDetailsProvider`` with only
 row mapping and (new) announcement-slot passthrough are exercised rather than
 re-implemented by a fake.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pandas as pd
 import pytest
 
 from ba2_common.core.backtest_context import BacktestContext
-from ba2_common.core.types import OrderRecommendation
+from ba2_common.core.instance_resolver import set_instance_resolver
+from ba2_common.core.option_types import OptionContract
+from ba2_common.core.types import OptionRight, OrderRecommendation
 from ba2_experts.FMPEarningsEvent import (
     FMPEarningsEvent, composite_confidence, compute_features, earnings_day_move_pct,
-    normalize_feature,
+    implied_move_pct, normalize_feature,
 )
 from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import (
     FMPCompanyDetailsProvider,
@@ -133,8 +136,13 @@ class _Bundle:
         return 100.0
 
 
-def _run(earnings_rows, *, settings=None, df=None, estimates=None, as_of=AS_OF):
-    """Drive the real _gather + _process with the provider's disk layer patched."""
+def _run(earnings_rows, *, settings=None, df=None, estimates=None, as_of=AS_OF,
+        account=None):
+    """Drive the real _gather + _process with the provider's disk layer patched.
+
+    ``account`` (Task 8) becomes ``context.account`` -- exactly what a real backtest
+    run would pass. Omitted (None), it reproduces the pre-Task-8 environment: no
+    chain capability, so vol_cheapness stays absent."""
     settings = {**BASE_SETTINGS, **(settings or {})}
     bundle = _Bundle(df if df is not None else _bars_df())
 
@@ -150,7 +158,7 @@ def _run(earnings_rows, *, settings=None, df=None, estimates=None, as_of=AS_OF):
     with patch("ba2_providers.fundamentals.details.FMPCompanyDetailsProvider."
                "fmp_history_disk_cached", side_effect=_fake_cache):
         ctx = BacktestContext(providers=bundle, settings=settings, as_of=as_of,
-                              extra={"symbol": "TSTX"})
+                              extra={"symbol": "TSTX"}, account=account)
         rec = e.analyze_as_of(as_of, ctx)
     return rec, bundle
 
@@ -169,6 +177,57 @@ def _healthy_rows(*, upcoming_slot="amc", n_past=8, jump_pct=4.0):
         rows.append(_row(day, eps=eps, est=est, slot="amc"))
         jumps[_next_weekday(day)] = 100.0 * (1.0 + jump_pct / 100.0)
     return rows, _bars_df(jumps)
+
+
+#: date(UPCOMING_DAY) -- the event date every Task 8 fixture below prices its
+#: straddle "at or after".
+EVENT_DATE = date(2025, 6, 16)
+
+
+def _opt(strike, expiry, right, *, price=None, bid=None, ask=None):
+    """One ``OptionContract`` chain row. ``price`` sets bid==ask (a usable two-sided
+    mid); passing neither ``price`` nor ``bid``/``ask`` leaves both None, i.e. an
+    unusable ('missing leg') quote -- exactly the shape a real feed produces for a
+    strike with no market."""
+    if price is not None:
+        bid = ask = price
+    return OptionContract(symbol=f"TSTX{expiry.isoformat()}{right.value}{strike:g}",
+                          underlying="TSTX", option_type=right, strike=float(strike),
+                          expiry=expiry, bid=bid, ask=ask)
+
+
+class _StubAccount:
+    """Duck-typed Task 8 chain seam test double -- publishes ONLY get_option_chain,
+    exactly like the real duck-typed contract this expert consumes. Records every
+    call so the PERF ("one chain read per symbol-with-upcoming-event") and
+    point-in-time claims can be pinned by counting/inspecting ``calls``."""
+
+    def __init__(self, contracts=None, raises: Exception = None):
+        self._contracts = contracts if contracts is not None else []
+        self._raises = raises
+        self.calls = []
+
+    def get_option_chain(self, underlying, expiry_min, expiry_max, option_type=None,
+                         strike_min=None, strike_max=None):
+        self.calls.append((underlying, expiry_min, expiry_max))
+        if self._raises is not None:
+            raise self._raises
+        return self._contracts
+
+
+class _NoChainAccount:
+    """An account that plainly does not support options -- no get_option_chain at
+    all, the same shape a stock-only broker account has."""
+
+
+#: A single ATM straddle at the event date: call 2.00 + put 1.00 = 3.00 on spot 100
+#: -> implied_move_pct = 3.0. Paired with hist_move=6.0 (via _healthy_rows(jump_pct=
+#: 6.0)) this is EXACTLY the plan's hand-derived example: vol_cheapness = 6/3 = 2.0,
+#: n(2.0) = 2/(2+1) = 2/3 at k=1.0.
+GOOD_STRADDLE_CONTRACTS = [
+    _opt(100.0, EVENT_DATE, OptionRight.CALL, price=2.00),
+    _opt(100.0, EVENT_DATE, OptionRight.PUT, price=1.00),
+]
 
 
 # ------------------------------------------------------------- happy path ---
@@ -494,9 +553,11 @@ def test_w_vol_cheapness_moves_the_rank_once_task8_supplies_the_feature():
     assert composite_confidence(a, high) < composite_confidence(b, high)
 
 
-def test_vol_cheapness_is_absent_and_inert_in_this_task():
-    """Task 7 emits no implied leg, so the weight must be provably INERT rather than
-    quietly demoting every symbol (which a 0.0-valued feature would do)."""
+def test_vol_cheapness_is_absent_and_inert_without_chain_capability():
+    """MUTATION (d) anchor: with no ``context.account`` (the default -- every OTHER
+    test in this file runs this way) there is no chain seam, so the implied leg can
+    never be computed and the weight must be provably INERT rather than quietly
+    demoting every symbol (which a 0.0-valued feature would do)."""
     rows, df = _healthy_rows()
     base = _run(rows, df=df)[0]
     assert base.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] is None
@@ -781,3 +842,360 @@ def test_setting_keys_matches_the_settings_definitions_exactly():
     inert live while the UI field for it claims it works."""
     assert set(FMPEarningsEvent._SETTING_KEYS) == set(
         FMPEarningsEvent.get_settings_definitions())
+
+
+# ============================================================ Task 8: vol_cheapness =
+# The implied-move leg: a duck-typed option-chain seam, fail-to-absent throughout.
+# ======================================================================================
+def test_implied_move_pct_hand_derived():
+    """The plan's own worked example, at the pure-arithmetic layer: straddle 3.00 on
+    spot 100 -> implied_move_pct 3.0 (a PERCENT, matching hist_move's unit)."""
+    leg = {"call_mid": 2.00, "put_mid": 1.00, "strike": 100.0, "expiry": EVENT_DATE}
+    assert implied_move_pct(leg, 100.0) == pytest.approx(3.0)
+
+
+def test_implied_move_pct_is_absent_for_every_unusable_input():
+    leg = {"call_mid": 2.00, "put_mid": 1.00, "strike": 100.0, "expiry": EVENT_DATE}
+    assert implied_move_pct(None, 100.0) is None                 # no leg at all
+    assert implied_move_pct(leg, None) is None                   # no spot
+    assert implied_move_pct(leg, 0.0) is None                    # zero spot
+    assert implied_move_pct(leg, -50.0) is None                  # negative spot
+    zero_straddle = {"call_mid": 0.0, "put_mid": 0.0, "strike": 100.0, "expiry": EVENT_DATE}
+    assert implied_move_pct(zero_straddle, 100.0) is None        # zero straddle
+
+
+def test_hand_derived_cheapness_hist6_straddle3_spot100_end_to_end():
+    """The plan's own worked example, driven through the REAL _gather+_process with a
+    stub chain: hist 6% / implied 3% -> vol_cheapness 2.0 -> n(2.0) = 2/3 at k=1.0."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    account = _StubAccount(contracts=GOOD_STRADDLE_CONTRACTS)
+    rec, _ = _run(rows, df=df, account=account)
+    assert not rec.skip, rec.skip_reason
+    payload = rec.raw_outputs["FMPEarningsEvent"]
+    assert payload["hist_move"] == pytest.approx(6.0)
+    assert payload["vol_cheapness"] == pytest.approx(2.0)
+    assert normalize_feature("vol_cheapness", payload["vol_cheapness"]) == pytest.approx(2.0 / 3.0)
+
+
+def test_nearest_expiry_with_runway_skips_an_expiry_before_the_event():
+    """MUTATION (b): the chain carries an expiry BEFORE the event (no runway -- the
+    contract is already dead by the time the print happens), the correct nearest
+    expiry ON/AFTER it, and a THIRD, later expiry that must lose to the nearer one.
+    Only the correct (middle) expiry's straddle (call 5 + put 5 = 10, spot 100 ->
+    implied 10%) may reach the composite; the too-early expiry's much cheaper
+    straddle (which would read as a much HIGHER vol_cheapness) must never be picked."""
+    rows, df = _healthy_rows(jump_pct=10.0)
+    too_early = EVENT_DATE - timedelta(days=3)     # no runway -- must be skipped
+    correct = EVENT_DATE                            # first expiry >= event date
+    too_late = EVENT_DATE + timedelta(days=30)       # exists, but is not the nearest
+    contracts = [
+        _opt(100.0, too_early, OptionRight.CALL, price=0.50),
+        _opt(100.0, too_early, OptionRight.PUT, price=0.50),
+        _opt(100.0, correct, OptionRight.CALL, price=5.00),
+        _opt(100.0, correct, OptionRight.PUT, price=5.00),
+        _opt(100.0, too_late, OptionRight.CALL, price=20.00),
+        _opt(100.0, too_late, OptionRight.PUT, price=20.00),
+    ]
+    account = _StubAccount(contracts=contracts)
+    rec, _ = _run(rows, df=df, account=account)
+    assert not rec.skip, rec.skip_reason
+    payload = rec.raw_outputs["FMPEarningsEvent"]
+    # implied_move_pct from the CORRECT expiry's straddle: (5+5)/100*100 = 10.0%.
+    # hist_move is 10.0% too, so vol_cheapness == 1.0 -- distinct from what either
+    # wrong expiry would have produced (too_early: 1.0/100*100=1.0% implied ->
+    # cheapness 10.0; too_late: 40.0% implied -> cheapness 0.25).
+    assert payload["vol_cheapness"] == pytest.approx(1.0)
+
+
+def test_atm_strike_is_the_one_nearest_spot_among_two_sided_quotes():
+    """Two strikes both have call+put quoted; the one FARTHER from spot must lose."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    contracts = [
+        _opt(90.0, EVENT_DATE, OptionRight.CALL, price=12.00),   # far strike, cheap
+        _opt(90.0, EVENT_DATE, OptionRight.PUT, price=1.00),
+        _opt(100.0, EVENT_DATE, OptionRight.CALL, price=2.00),   # ATM strike
+        _opt(100.0, EVENT_DATE, OptionRight.PUT, price=1.00),
+    ]
+    account = _StubAccount(contracts=contracts)
+    rec, _ = _run(rows, df=df, account=account)
+    assert not rec.skip, rec.skip_reason
+    # ATM (100-strike) straddle = 3.00 -> implied 3.0% -> cheapness 6/3 = 2.0. The
+    # 90-strike straddle (13.00 -> implied 13%) would have produced ~0.46 instead.
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------- fail-to-absent paths ---
+def test_missing_leg_priced_as_zero_is_absent_not_a_fabricated_cheapness():
+    """MUTATION (a): a strike with a CALL quote but no usable PUT quote (bid=ask=None,
+    i.e. the leg simply never traded) must leave vol_cheapness absent. Reading the
+    missing leg as 0.0 would fabricate a straddle price of just the call's mid and a
+    wildly wrong (too CHEAP) cheapness instead of no feature at all."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    contracts = [
+        _opt(100.0, EVENT_DATE, OptionRight.CALL, price=2.00),
+        _opt(100.0, EVENT_DATE, OptionRight.PUT, bid=None, ask=None),   # unusable
+    ]
+    account = _StubAccount(contracts=contracts)
+    rec, _ = _run(rows, df=df, account=account)
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] is None
+
+
+def test_no_strike_quoted_on_both_legs_is_absent():
+    rows, df = _healthy_rows(jump_pct=6.0)
+    contracts = [
+        _opt(100.0, EVENT_DATE, OptionRight.CALL, price=2.00),     # call only @100
+        _opt(105.0, EVENT_DATE, OptionRight.PUT, price=1.00),      # put only @105
+    ]
+    account = _StubAccount(contracts=contracts)
+    rec, _ = _run(rows, df=df, account=account)
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] is None
+
+
+def test_no_expiry_with_runway_is_absent():
+    """Every expiry the chain offers is BEFORE the event -- no usable straddle."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    stale = EVENT_DATE - timedelta(days=1)
+    account = _StubAccount(contracts=[
+        _opt(100.0, stale, OptionRight.CALL, price=2.00),
+        _opt(100.0, stale, OptionRight.PUT, price=1.00),
+    ])
+    rec, _ = _run(rows, df=df, account=account)
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] is None
+
+
+def test_empty_chain_is_absent():
+    rows, df = _healthy_rows(jump_pct=6.0)
+    rec, _ = _run(rows, df=df, account=_StubAccount(contracts=[]))
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] is None
+
+
+def test_chain_read_failure_is_absent_not_fatal():
+    rows, df = _healthy_rows(jump_pct=6.0)
+    account = _StubAccount(raises=RuntimeError("broker outage"))
+    rec, _ = _run(rows, df=df, account=account)
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] is None
+
+
+def test_no_chain_capability_in_the_context_is_absent():
+    """The account exists but publishes no get_option_chain -- a stock-only broker,
+    the exact shape a real non-options AccountDefinition has."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    rec, _ = _run(rows, df=df, account=_NoChainAccount())
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] is None
+
+
+def test_no_account_at_all_is_absent():
+    """``context.account`` is None -- the golden/most-tests default -- and must be
+    exactly as absent as a stock-only account, never an error."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    rec, _ = _run(rows, df=df, account=None)
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] is None
+
+
+def test_zero_or_negative_spot_is_absent():
+    """A spot of 0 (or less) makes 'straddle / spot' meaningless; the implied leg is
+    never even fetched for it (spot gates the fetch itself, per _fetch_implied_leg)."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    account = _StubAccount(contracts=GOOD_STRADDLE_CONTRACTS)
+
+    class _ZeroPriceBundle(_Bundle):
+        def price_at_date(self, symbol, as_of):
+            return 0.0
+
+    settings = {**BASE_SETTINGS}
+    e = FMPEarningsEvent.__new__(FMPEarningsEvent)
+    e.id = 1
+    bundle = _ZeroPriceBundle(df)
+
+    def _fake_cache(namespace, symbol, fetch_fn, *a, **kw):
+        if namespace.startswith("past_earnings"):
+            return rows
+        if namespace.startswith("earnings_estimates"):
+            return _estimates_payload()
+        raise AssertionError(namespace)
+
+    with patch("ba2_providers.fundamentals.details.FMPCompanyDetailsProvider."
+               "fmp_history_disk_cached", side_effect=_fake_cache):
+        ctx = BacktestContext(providers=bundle, settings=settings, as_of=AS_OF,
+                              extra={"symbol": "TSTX"}, account=account)
+        rec = e.analyze_as_of(AS_OF, ctx)
+    # A zero current_price also means no usable Recommendation.current_price, but
+    # what THIS test pins is that the implied leg never fires for it (no chain call).
+    assert account.calls == []
+
+
+def test_absent_implied_never_demotes_the_composite():
+    """MUTATION (d): reading an absent implied leg as 0.0 instead of leaving it out of
+    `features` would DEMOTE every symbol vol_cheapness cannot be computed for. With no
+    chain capability the confidence must be identical whatever w_vol_cheapness is."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    base = _run(rows, df=df, account=_NoChainAccount())[0]
+    for w in (0.0, 1.0, 25.0, 500.0):
+        rec, _ = _run(rows, df=df, account=_NoChainAccount(), settings={"w_vol_cheapness": w})
+        assert rec.confidence == pytest.approx(base.confidence)
+
+
+# --------------------------------------------------------- point-in-time / leak ---
+def test_the_straddle_is_divided_by_the_decision_date_close_not_the_event_date():
+    """MUTATION (c): the spot vol_cheapness divides the straddle by is ``current_price``
+    -- the AS-OF (decision-date) close every other feature in this file uses -- never
+    a price read AT the event date. A price provider that answers differently for the
+    two dates catches a regression that swapped one for the other."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    account = _StubAccount(contracts=GOOD_STRADDLE_CONTRACTS)   # call 2 + put 1 = 3.00
+
+    class _DatedPriceBundle(_Bundle):
+        def price_at_date(self, symbol, as_of):
+            # Decision date (AS_OF, 2025-06-10) -> 100.0 (implied 3.0%, cheapness 2.0).
+            # Event date (2025-06-16) -> 30.0, which would read as implied 10.0% and
+            # cheapness 0.6 instead -- a completely different, WRONG number.
+            return 30.0 if as_of is not None and as_of.date() == EVENT_DATE else 100.0
+
+    settings = {**BASE_SETTINGS}
+    e = FMPEarningsEvent.__new__(FMPEarningsEvent)
+    e.id = 1
+    bundle = _DatedPriceBundle(df)
+
+    def _fake_cache(namespace, symbol, fetch_fn, *a, **kw):
+        if namespace.startswith("past_earnings"):
+            return rows
+        if namespace.startswith("earnings_estimates"):
+            return _estimates_payload()
+        raise AssertionError(namespace)
+
+    with patch("ba2_providers.fundamentals.details.FMPCompanyDetailsProvider."
+               "fmp_history_disk_cached", side_effect=_fake_cache):
+        ctx = BacktestContext(providers=bundle, settings=settings, as_of=AS_OF,
+                              extra={"symbol": "TSTX"}, account=account)
+        rec = e.analyze_as_of(AS_OF, ctx)
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] == pytest.approx(2.0)
+
+
+def test_the_chain_query_is_bounded_by_the_event_date_not_the_decision_date():
+    """The chain query's ``expiry_min`` is the EVENT date (a contract expiring before
+    it has no runway), which is deliberately a DIFFERENT date than the as-of decision
+    date (2025-06-10 vs 2025-06-16) -- pinning that the two are not conflated."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    account = _StubAccount(contracts=GOOD_STRADDLE_CONTRACTS)
+    _run(rows, df=df, account=account)
+    assert len(account.calls) == 1
+    underlying, expiry_min, expiry_max = account.calls[0]
+    assert underlying == "TSTX"
+    assert expiry_min == EVENT_DATE
+    assert expiry_min != AS_OF.date()
+    assert expiry_max > expiry_min
+
+
+# --------------------------------------------------------------------- PERF ---
+def test_one_chain_read_per_symbol_with_upcoming_event():
+    """Perf acceptance: at most ONE get_option_chain call per symbol per analysis
+    run, however many contracts/expiries it returns."""
+    rows, df = _healthy_rows(jump_pct=6.0)
+    account = _StubAccount(contracts=GOOD_STRADDLE_CONTRACTS)
+    _run(rows, df=df, account=account)
+    assert len(account.calls) == 1
+
+
+def test_no_upcoming_event_never_reads_the_chain():
+    """No event inside the look window -> zero chain reads, not merely zero USABLE
+    ones: the analyst/hist-move gates all short-circuit before Task 8 even asks."""
+    rows, df = _healthy_rows()
+    rows[0] = _row("2025-07-21", eps=None, est=1.30)     # 41 days out, past the window
+    account = _StubAccount(contracts=GOOD_STRADDLE_CONTRACTS)
+    rec, _ = _run(rows, df=df, account=account)
+    assert rec.skip
+    assert account.calls == []
+
+
+# -------------------------------------------------------- capability logging ---
+def test_no_chain_capability_is_logged_only_once_per_instance():
+    rows, df = _healthy_rows(jump_pct=6.0)
+    settings = {**BASE_SETTINGS}
+    bundle = _Bundle(df)
+    e = FMPEarningsEvent.__new__(FMPEarningsEvent)
+    e.id = 1
+
+    class _Logger:
+        def __init__(self):
+            self.infos = []
+
+        def info(self, msg):
+            self.infos.append(msg)
+
+    e.logger = _Logger()
+
+    def _fake_cache(namespace, symbol, fetch_fn, *a, **kw):
+        if namespace.startswith("past_earnings"):
+            return rows
+        if namespace.startswith("earnings_estimates"):
+            return _estimates_payload()
+        raise AssertionError(namespace)
+
+    with patch("ba2_providers.fundamentals.details.FMPCompanyDetailsProvider."
+               "fmp_history_disk_cached", side_effect=_fake_cache):
+        for _ in range(3):
+            ctx = BacktestContext(providers=bundle, settings=settings, as_of=AS_OF,
+                                  extra={"symbol": "TSTX"}, account=_NoChainAccount())
+            e.analyze_as_of(AS_OF, ctx)
+    capability_msgs = [m for m in e.logger.infos if "no option-chain capability" in m]
+    assert len(capability_msgs) == 1
+
+
+# -------------------------------------------------------------- live seam ---
+@pytest.fixture
+def _restore_instance_resolver():
+    """The instance resolver is a process-wide global (``ba2_common.core.
+    instance_resolver``); any test that arms it MUST put the unconfigured resolver
+    back, or a later, unrelated test in the same pytest run inherits a live stub."""
+    from ba2_common.core.instance_resolver import _UnconfiguredResolver
+    yield
+    set_instance_resolver(_UnconfiguredResolver())
+
+
+def test_run_analysis_resolves_the_live_account_through_the_instance_resolver(
+        _restore_instance_resolver):
+    """Live's duck-typed chain source: the account this expert instance's OWN
+    ExpertInstance.account_id resolves to, via the SAME instance-resolver seam
+    _get_current_price already uses -- not a new account-interface hook."""
+    account = _StubAccount(contracts=GOOD_STRADDLE_CONTRACTS)
+    resolved = {}
+
+    class _Resolver:
+        def get_expert_instance(self, expert_id):
+            raise AssertionError("not needed for this seam")
+
+        def get_account_instance(self, account_id):
+            resolved["account_id"] = account_id
+            return account
+
+        def get_account_instance_from_transaction(self, transaction):
+            raise AssertionError("not needed for this seam")
+
+    e = FMPEarningsEvent.__new__(FMPEarningsEvent)
+    e.id = 1
+    e.instance = type("I", (), {"account_id": 42})()
+    set_instance_resolver(_Resolver())
+    got = e._resolve_live_account()
+    assert got is account
+    assert resolved["account_id"] == 42
+
+
+def test_live_seam_absent_when_the_resolver_is_unwired(_restore_instance_resolver):
+    """An InstanceResolverNotConfigured (or any other resolution failure) must be
+    caught here and turned into 'no capability', never propagate out of run_analysis
+    setup and abort the whole analysis over a missing chain feature."""
+    from ba2_common.core.instance_resolver import _UnconfiguredResolver
+
+    e = FMPEarningsEvent.__new__(FMPEarningsEvent)
+    e.id = 1
+    e.instance = type("I", (), {"account_id": 42})()
+    set_instance_resolver(_UnconfiguredResolver())
+    assert e._resolve_live_account() is None

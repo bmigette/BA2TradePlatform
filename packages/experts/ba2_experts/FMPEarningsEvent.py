@@ -17,10 +17,18 @@ Features (design §9 "Genes — emission decided BY the measurements")
 * ``hist_move``    — avg |earnings-day % move| over past events. Event dates from
                      ``past_earnings_quarterly`` × our OHLCV closes.
 * ``surprise_vol`` — std of past EPS surprise % (reported vs estimated).
-* ``vol_cheapness``— hist_move ÷ implied move. **Task 8**; its WEIGHT already exists
-                     here, its FEATURE does not yet (see ``composite_confidence`` — an
-                     absent feature never demotes, the composite renormalizes over the
-                     present ones).
+* ``vol_cheapness``— hist_move ÷ implied move (Task 8). Implied move is the ATM
+                     straddle's mid-price sum divided by spot, ×100, read from an
+                     option chain via a DUCK-TYPED seam: whatever object offers
+                     ``get_option_chain(underlying, expiry_min, expiry_max, ...)`` on
+                     the same shape ``OptionsAccountInterface`` declares answers it —
+                     ``context.account`` (already as-of-scoped) in backtest, the live
+                     account resolved through ``ba2_common.core.instance_resolver`` in
+                     ``run_analysis``. No capability, no expiry with runway, no strike
+                     quoted on both legs, or a non-positive mid → the feature is
+                     ABSENT, never 0 (see ``_fetch_implied_leg``/``implied_move_pct`` —
+                     an absent feature never demotes, ``composite_confidence``
+                     renormalizes over the present ones).
 
 HOW SEVERE IS THE DEFAULT ``min_analysts=3``? Measured 2026-09-01 over a random 600
 of the 4,728 cached ``earnings_estimates_quarterly`` payloads, replaying this
@@ -99,6 +107,33 @@ hermetic machinery every other expert uses: a backtest reads the pre-warmed disk
 cache (a missing symbol disables that symbol, many abort the run), live hits the
 API. No raw HTTP, no direct cache-file reads.
 
+THE ONE EXCEPTION IS THE IMPLIED LEG (Task 8). Options are not a ``ProviderBundle``
+category, so ``vol_cheapness`` reads the chain through the ACCOUNT instead:
+``context.account`` in backtest (a ``BacktestAccount``, already scoped to the run's
+as-of date by whoever built it) and, in ``run_analysis``, the account resolved for
+THIS expert instance via
+``ba2_common.core.instance_resolver.get_instance_resolver().get_account_instance``
+— the same seam ``_get_current_price`` already uses. Both answer the same
+``get_option_chain(underlying, expiry_min, expiry_max, ...)`` shape
+``OptionsAccountInterface`` declares, so the expert never has to know which runtime
+it is in: DUCK-TYPED, any object offering that method works, and one that does not
+(a stock-only account, an unwired resolver, ``account=None``) simply means the
+feature is absent, logged once (``_log_no_chain_capability_once``). The expert reads
+the chain's own marks (``OptionContract.mid``; bid==ask==close in the backtest
+store) and NEVER the engine's Black-Scholes mark fallback (Task 3) — that facility
+exists to price a STRUCTURE the platform is about to TRADE when the store has no
+quote; this expert only RANKS, and a rank built on a synthesized price would be
+scoring its own guess. No OCC parsing anywhere: only ``OptionContract``'s typed
+fields (``strike``/``expiry``/``option_type``/``mid``).
+
+POINT-IN-TIME, TWO DIFFERENT DATES. ``expiry_min`` for the chain query is the EVENT
+date (a contract expiring before it has no runway through the print), but the CHAIN
+ITSELF — which contracts exist, what they are marked at — is read at the DECISION
+date (``context.account``'s own as-of clock in backtest; "now" live), and the spot
+the straddle is divided by is ``current_price``, the same as-of close every other
+feature in this file uses. Nothing here ever reads a chain or a price AT the event
+date.
+
 FEATURES ARE COMPUTED STRICTLY FROM EVENTS DATED BEFORE ``as_of``. The upcoming
 event is found by asking the calendar for rows up to ``as_of + earnings_days_look``
 (the same trick ``DaysToEarningsCondition`` uses — FMP's
@@ -126,7 +161,7 @@ only — never a feature value.
 """
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from statistics import stdev
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -135,7 +170,8 @@ from ba2_common.core.db import add_instance, get_db, update_instance
 from ba2_common.core.interfaces import MarketExpertInterface
 from ba2_common.core.models import AnalysisOutput, ExpertRecommendation, MarketAnalysis
 from ba2_common.core.types import (
-    MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel, TimeHorizon,
+    MarketAnalysisStatus, OptionRight, OrderRecommendation, Recommendation, RiskLevel,
+    TimeHorizon,
 )
 from ba2_common.logger import get_expert_logger
 from ba2_experts.earnings_surprise import surprise_percent as _surprise_percent
@@ -188,12 +224,22 @@ _NORM_SCALE = {"hist_move": 5.0, "surprise_vol": 25.0, "vol_cheapness": 1.0}
 _FEATURE_WEIGHT_SETTING = {
     "hist_move": "w_hist_move",
     "surprise_vol": "w_surprise_vol",
-    # TASK 8 SEAM: the weight is already a setting (and already read below); the
-    # FEATURE is produced by Task 8's implied-move leg. Until then 'vol_cheapness'
-    # is simply never present in the features dict and _composite renormalizes
-    # without it -- inert, never demoting. Task 8 adds the feature, nothing here.
+    # Task 8's implied-move leg (_fetch_implied_leg / implied_move_pct) supplies this
+    # when the chain seam answers; whenever it cannot (no capability, no expiry with
+    # runway, no two-sided ATM quote) 'vol_cheapness' is simply never added to the
+    # features dict and _composite renormalizes without it -- inert, never demoting.
     "vol_cheapness": "w_vol_cheapness",
 }
+
+#: Calendar-day span PAST the event to search for an expiry that has not yet happened
+#: by the time the print lands ("runway"). Standard monthly option cycles are listed
+#: roughly every 30-35 calendar days, so a name whose only cycle is monthly still has
+#: one inside this window even from the worst-case point right after a monthly
+#: expiry; a weekly-enabled name has several. This is a SEARCH window only -- the
+#: selected expiry is still the EARLIEST one found at or after the event date (see
+#: ``_nearest_expiry_with_runway``), never just "whatever is soonest after this many
+#: days".
+_IMPLIED_LEG_EXPIRY_WINDOW_DAYS = 45
 
 
 def normalize_feature(name: str, raw: float) -> float:
@@ -386,6 +432,76 @@ def compute_features(past_events: List[Dict[str, Any]],
             "moves": moves, "surprises": surprises}
 
 
+# ---------------------------------------------------------------------------------
+# Task 8: the implied-move leg. Three pure functions -- expiry selection, ATM-strike
+# straddle selection, and the final ratio -- kept separate from the chain FETCH
+# (``FMPEarningsEvent._fetch_implied_leg``, provider I/O) so each is directly
+# testable against canned ``OptionContract`` rows with no account/context in play.
+# ---------------------------------------------------------------------------------
+def _nearest_expiry_with_runway(contracts: List[Any], event_date: date) -> Optional[date]:
+    """The EARLIEST expiry at/after ``event_date`` among ``contracts``, or None.
+
+    Filters defensively even though the caller already bounds the chain query to
+    ``expiry_min=event_date``: a chain provider (or a test double) is free to return
+    rows outside the filter it was asked for, and an expiry BEFORE the event has no
+    runway -- the contract would already be dead by the time the print it is meant
+    to price actually happens, so picking it would price a straddle on nothing.
+    """
+    expiries = {c.expiry for c in contracts
+               if getattr(c, "expiry", None) is not None and c.expiry >= event_date}
+    return min(expiries) if expiries else None
+
+
+def _atm_straddle_mids(contracts: List[Any], expiry: date,
+                       spot: float) -> Optional[Dict[str, Any]]:
+    """{'call_mid', 'put_mid', 'strike', 'expiry'} for the ATM straddle at ``expiry``,
+    or None when it cannot be honestly priced.
+
+    ATM = the strike NEAREST ``spot`` that has a usable (finite, positive) mid on
+    BOTH the call and the put at ``expiry`` -- a straddle needs both legs, and a
+    strike quoted on only one side cannot price one. Reads only the chain objects'
+    own typed fields (``strike``/``option_type``/``mid``); no OCC parsing, no
+    Black-Scholes fallback (module docstring) -- a missing/zero/negative mid on
+    either leg is a missing leg, not a leg priced at 0.
+    """
+    calls: Dict[float, float] = {}
+    puts: Dict[float, float] = {}
+    for c in contracts:
+        if getattr(c, "expiry", None) != expiry:
+            continue
+        mid = c.mid
+        if mid is None or mid <= 0:
+            continue
+        if c.option_type == OptionRight.CALL:
+            calls[c.strike] = mid
+        elif c.option_type == OptionRight.PUT:
+            puts[c.strike] = mid
+    common_strikes = set(calls) & set(puts)
+    if not common_strikes:
+        return None
+    strike = min(common_strikes, key=lambda s: abs(s - spot))
+    return {"call_mid": calls[strike], "put_mid": puts[strike],
+            "strike": strike, "expiry": expiry}
+
+
+def implied_move_pct(implied_leg: Optional[Dict[str, Any]],
+                     spot: Optional[float]) -> Optional[float]:
+    """ATM straddle mid-price sum ÷ spot × 100, or None when either input is unusable.
+
+    ``implied_leg`` is the dict ``_atm_straddle_mids`` returns (or None). ``spot`` is
+    ``current_price`` -- the SAME as-of close every other feature in this module is
+    computed against (design §9: "implied = ATM straddle price ÷ spot from the
+    options store at decision date"). A non-positive spot or a non-positive straddle
+    sum is unusable and returns None, never a divide-by-zero or a fabricated value.
+    """
+    if implied_leg is None or spot is None or spot <= 0:
+        return None
+    straddle = implied_leg["call_mid"] + implied_leg["put_mid"]
+    if straddle <= 0:
+        return None
+    return straddle / spot * 100.0
+
+
 class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
     """Ranks the UPCOMING earnings event for one symbol (design §9)."""
 
@@ -416,6 +532,9 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
         super().__init__(id)
         self._load_expert_instance(id)
         self.logger = get_expert_logger("FMPEarningsEvent", id)
+        # Task 8: whether "no option-chain capability" has already been logged once
+        # for this instance -- see _log_no_chain_capability_once.
+        self._chain_capability_warned = False
 
     @classmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
@@ -462,10 +581,12 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
             "w_vol_cheapness": {
                 "type": "float", "required": True, "default": 1.0,
                 "description": "Weight on historical move divided by the option-implied move -- "
-                               "what you GET versus what you PAY. The implied leg is Task 8 of "
-                               "the options-grid2 plan; until it ships the feature is absent for "
-                               "every symbol and this weight is inert (an absent feature is "
-                               "renormalized out, it never demotes a symbol).",
+                               "what you GET versus what you PAY. The implied leg reads an ATM "
+                               "straddle from an option chain via a duck-typed seam (backtest: "
+                               "the run's account; live: the account resolved for this expert "
+                               "instance); a deployment with no options-capable account never "
+                               "computes the feature, and the weight stays inert for it (an "
+                               "absent feature is renormalized out, it never demotes a symbol).",
             },
             # DELIBERATELY ABSENT: w_dispersion, w_revision. See the module docstring
             # -- design §9 withheld them on measured coverage (~3 in-window estimate
@@ -484,6 +605,7 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         symbol = self._gather_symbol
         now = as_of or datetime.now(timezone.utc)
+        as_of_day = now.strftime("%Y-%m-%d")
         look_days = int(self._gather_earnings_days_look)
 
         # ONE calendar read covering [oldest history .. now + look_days]: the provider
@@ -496,6 +618,12 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
             providers.fundamentals_details(), symbol, as_of=horizon,
             frequency="quarterly", lookback_periods=_CALENDAR_PERIODS, format_type="dict")
         rows = earnings.get("earnings") or [] if isinstance(earnings, dict) else []
+
+        # RECOMPUTED here (a second, cheap, pure call -- _process does its own for the
+        # skip logic) ONLY to learn whether there is an upcoming event and, if so, its
+        # date: that is what the Task 8 implied-move leg needs to know whether/where to
+        # read a chain. _gather stays provider-I/O-only; this is not decision logic.
+        upcoming, _past_ignored = _split_events(rows, as_of_day, look_days)
 
         # Daily closes up to `now` ONLY -- never to the horizon. The moves are historical;
         # a bar dated after the decision date has no business being in this window.
@@ -524,8 +652,102 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
 
         current_price = (self._get_current_price(symbol) if as_of is None
                          else providers.price_at_date(symbol, as_of))
+
+        # Task 8: the implied-move leg. ONE chain read, only for a symbol that HAS an
+        # upcoming event -- see _fetch_implied_leg for the duck-typed seam and every
+        # fail-to-absent path.
+        implied_leg = self._fetch_implied_leg(upcoming, symbol, current_price)
+
         return {"symbol": symbol, "earnings_rows": rows, "bars": bars,
-                "analyst_count": analyst_count, "current_price": current_price}
+                "analyst_count": analyst_count, "current_price": current_price,
+                "implied_leg": implied_leg}
+
+    def _fetch_implied_leg(self, upcoming: Optional[Dict[str, Any]], symbol: str,
+                           spot: Optional[float]) -> Optional[Dict[str, Any]]:
+        """The Task 8 implied leg's ONE provider I/O step: read a chain, pick the
+        nearest expiry with runway, price the ATM straddle. Returns
+        ``_atm_straddle_mids``'s dict, or None -- FAIL-TO-ABSENT at every step, never
+        an exception escaping to the caller for anything short of a programming error.
+        """
+        if upcoming is None or spot is None or spot <= 0:
+            return None
+        account = getattr(self, "_gather_account", None)
+        chain_fn = getattr(account, "get_option_chain", None)
+        if not callable(chain_fn):
+            # DUCK-TYPED CAPABILITY CHECK. `account` may be None (no context.account in
+            # backtest, an unresolvable live account) or a real account that simply does
+            # not support options -- both mean the same thing here: no chain, no feature.
+            self._log_no_chain_capability_once()
+            return None
+
+        event_day = str(upcoming.get("report_date") or upcoming.get("fiscal_date_ending"))
+        event_dt = _parse_day(event_day)
+        if event_dt is None:
+            return None
+        event_date = event_dt.date()
+        expiry_max = event_date + timedelta(days=_IMPLIED_LEG_EXPIRY_WINDOW_DAYS)
+        try:
+            contracts = chain_fn(symbol, event_date, expiry_max) or []
+        except Exception as e:
+            self._log_chain_read_failure(symbol, e)
+            return None
+
+        expiry = _nearest_expiry_with_runway(contracts, event_date)
+        if expiry is None:
+            logger = getattr(self, "logger", None)
+            if logger is not None:
+                logger.info(
+                    f"FMPEarningsEvent: no expiry with runway past "
+                    f"{event_date.isoformat()} in the {symbol} chain -- vol_cheapness "
+                    f"stays absent for this symbol")
+            return None
+        return _atm_straddle_mids(contracts, expiry, spot)
+
+    def _log_no_chain_capability_once(self, detail: str = "") -> None:
+        """'absent capability -> feature absent, logged once' (design §9 Task 8): a
+        structurally options-incapable deployment (no account, an account with no
+        options support, an unwired live resolver) must not spam this once per symbol
+        per analysis run for the whole life of the instance."""
+        # getattr-guarded (not self._chain_capability_warned directly) so this also
+        # works for a bare-constructed test double that skipped __init__ -- same
+        # reason _log_skip reads self.logger via getattr rather than assuming it.
+        if getattr(self, "_chain_capability_warned", False):
+            return
+        self._chain_capability_warned = True
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.info(
+                "FMPEarningsEvent: no option-chain capability available for the "
+                "vol_cheapness implied leg" + (f" ({detail})" if detail else "") +
+                " -- the feature stays absent for every symbol this instance analyzes.")
+
+    def _log_chain_read_failure(self, symbol: str, error: Exception) -> None:
+        """A per-symbol chain-read failure (broker error, transient outage) -- logged
+        every time like _log_skip, since it is an ordinary per-symbol data condition,
+        not the structural "this deployment has no chain capability at all" case
+        _log_no_chain_capability_once guards."""
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.info(f"FMPEarningsEvent: option chain read failed for {symbol} "
+                       f"(vol_cheapness implied leg stays absent): {error}")
+
+    def _resolve_live_account(self) -> Optional[Any]:
+        """Best-effort LIVE account resolution for the Task 8 implied leg.
+
+        Same seam ``MarketExpertInterface._get_current_price`` already uses
+        (``ba2_common.core.instance_resolver``), reused rather than duplicated. NEVER
+        fatal: an unwired resolver, an unresolvable account id, or any other failure
+        here all mean the same thing -- no chain capability, so the feature stays
+        absent (module docstring, 'Live seam'). run_analysis calls this ONCE per
+        analysis, not the resolver directly, so a future account-shaped source needs
+        to change only here.
+        """
+        try:
+            from ba2_common.core.instance_resolver import get_instance_resolver
+            return get_instance_resolver().get_account_instance(self.instance.account_id)
+        except Exception as e:
+            self._log_no_chain_capability_once(str(e))
+            return None
 
     def _process(self, data_bundle: Dict[str, Any], settings: Dict[str, Any],
                  as_of: Optional[datetime] = None) -> Recommendation:
@@ -578,6 +800,16 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
                          f"< min_hist_events={min_hist_events}")
 
         features = computed["features"]
+        # Task 8: hist_move / implied_move. PURE arithmetic here -- the implied leg
+        # itself (the chain read) already happened in _gather; implied_move_pct and
+        # this division never touch a provider or an account. Needs BOTH legs: an
+        # absent implied move (no chain capability, no runway expiry, no two-sided ATM
+        # quote) OR an absent hist_move (min_hist_events==0 admitted a symbol with zero
+        # usable moves) leaves 'vol_cheapness' out of `features` entirely -- never 0.0.
+        implied_pct = implied_move_pct(data_bundle.get("implied_leg"), current_price)
+        if implied_pct is not None and "hist_move" in features:
+            features["vol_cheapness"] = features["hist_move"] / implied_pct
+
         weights = {name: float(settings[key])
                    for name, key in _FEATURE_WEIGHT_SETTING.items()}
         confidence = composite_confidence(features, weights)
@@ -632,10 +864,13 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
 
         _gather reads _gather_symbol/_gather_earnings_days_look/_gather_min_analysts,
         which the live orchestrator sets; sourced from the context here too (same
-        pattern as FMPEarningsDrift/FMPRating)."""
+        pattern as FMPEarningsDrift/FMPRating). _gather_account (Task 8) is
+        ``context.account`` itself -- the BacktestAccount the run already built,
+        already scoped to THIS bar's as-of date; nothing is re-resolved here."""
         self._gather_symbol = context.extra.get("symbol", getattr(self, "_gather_symbol", None))
         self._gather_earnings_days_look = int(context.settings["earnings_days_look"])
         self._gather_min_analysts = int(context.settings["min_analysts"])
+        self._gather_account = context.account
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, context.settings, as_of)
 
@@ -653,6 +888,7 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
             self._gather_symbol = symbol
             self._gather_earnings_days_look = int(settings["earnings_days_look"])
             self._gather_min_analysts = int(settings["min_analysts"])
+            self._gather_account = self._resolve_live_account()
             bundle = self._gather(self._live_providers(), as_of=None)
             if not bundle["current_price"]:
                 raise ValueError(f"Unable to get current price for {symbol}")
