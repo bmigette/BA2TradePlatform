@@ -27,8 +27,16 @@
 #      not to increase the blast radius on a box that runs live trading.
 #
 # This script matches ONLY `multiprocessing.spawn` children AND explicitly excludes anything
-# running from the trade venv, belt and braces. Anything running a legitimate pool WILL be
-# killed -- that is the point; do not run it mid-grid.
+# running from the trade venv, belt and braces.
+#
+#   3. An ORPHAN is a spawn child whose stated parent is GONE. Every spawn child carries its
+#      parent in its own command line (`spawn_main(parent_pid=N, ...)`); if that PID is still
+#      alive the child is a legitimate worker of a RUNNING pool and must be left alone. Measured
+#      2026-09-01: grid_goal2020.sh runs this sweep at every (re)launch, and two relaunches at
+#      20:25 and 20:28 each killed matrix3's four live local trial children ("killing 4 spawn
+#      orphan(s) holding 20945 MB") -- the master logged `local pool broken`, rebuilt the pool
+#      and requeued the trials, but up to an hour of in-flight work per slot was thrown away
+#      each time. Same rule as worker_server._sweep_orphaned_spawn_children on the workers.
 
 $TRADE_VENV = 'ba2-venvs\\trade'
 
@@ -37,6 +45,14 @@ $orphans = Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
         $_.CommandLine -and
         $_.CommandLine -match 'multiprocessing\.spawn' -and
         $_.CommandLine -notmatch [regex]::Escape($TRADE_VENV)
+    } |
+    Where-Object {
+        # parent_pid alive -> a running pool's worker, NOT an orphan. No parent_pid in the
+        # cmdline -> cannot prove it is orphaned -> leave it (fail closed).
+        $m = [regex]::Match($_.CommandLine, 'parent_pid=(\d+)')
+        if (-not $m.Success) { return $false }
+        $parentAlive = [bool](Get-Process -Id ([int]$m.Groups[1].Value) -ErrorAction SilentlyContinue)
+        return (-not $parentAlive)
     }
 
 # Refuse to run if the live platform is not answering -- if it is already down, cleaning up
