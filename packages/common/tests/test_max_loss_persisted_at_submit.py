@@ -210,12 +210,11 @@ def test_a_naked_short_call_submit_stamps_nothing_THE_MEASURED_GATE():
     whatever ``max_loss`` returned (or a made-up default) writes a key here, and an
     absent-denominator downstream would read a fabricated risk.
 
-    SINCE 2026-08-31 THIS IS ALSO THE COVER-GUARD MUTATION KILL: the covered-call
-    builder now supplies its verified stock cover through ``stock_cover_price`` (and
-    stamps -- see the tests below), but the seam must NEVER infer cover from the
-    ``covered_call`` strategy name. This call submits a bare short call UNDER THAT NAME
-    with no cover supplied: a mutant that keys the cover off the name stamps here and
-    dies."""
+    The strategy tag is ``covered_call`` on purpose: the seam must never infer cover
+    from a NAME. A mutant that stamps because the tag says "covered" dies here. (Since
+    review finding M3, 2026-09-01, a covered call with a REAL verified cover stamps
+    nothing either -- see the block below -- so this test no longer separates the two;
+    the side-by-side test does.)"""
     acct = FakeAccount()
     a = act(acct, "open_bull_put_spread", **BPS)
     res = a._submit_option_order([_short_call_leg()], 1, 3.0, "covered_call")
@@ -224,51 +223,78 @@ def test_a_naked_short_call_submit_stamps_nothing_THE_MEASURED_GATE():
 
 
 # ==========================================================================
-# the held-stock cover seam (2026-08-31, operator decision): a covered call
-# whose cover the builder VERIFIED is MEASURED -- (spot - credit) x 100 -- and
-# stamps; the cover is priced at CURRENT SPOT, never cost basis (the stamp is
-# a forward-looking risk denominator; unrealized stock P&L must not move it).
+# THE HELD-STOCK COVER, AND WHICH QUESTION IT ANSWERS.
+#
+# The cover seam (2026-08-31, operator decision) is kept; review finding M3
+# (2026-09-01) SCOPES it to the risk manager's admission path. The ORDER STAMP
+# goes back to ABSENT on a covered call, because it is loss_pct_of_max_loss's
+# DENOMINATOR and that condition's NUMERATOR is the option position's own P&L:
+# an option-leg loss over a stock-inclusive max loss is not a ratio of anything
+# -- the short call's loss is bounded only by the stock's gain, so the stop
+# could only fire on a FAVOURABLE move. Absence disarms the condition (Task 8's
+# absence guarantee), which is the coherent behaviour.
+#
+# The RM keeps the measurement, and the tests for THAT half live in
+# test_option_risk_manager_wiring.py (the candidate is COVERED and its
+# (spot - credit) x 100 charges the deployment cap, not the naked sub-cap).
 # ==========================================================================
-def test_a_covered_call_with_verified_cover_STAMPS_spot_minus_credit():
-    """The rails-passing covered call: cover supplied -> the payoff evaluator sees the
-    stock leg -> max loss is the stock riding to zero net of the credit, MEASURED."""
+def test_a_covered_call_with_verified_cover_STAMPS_NOTHING():
+    """M3. The cover reaches the RM, never the order row. MUTATION KILL: thread
+    ``stock_cover_price`` back into the stamp's measurement and a key appears here --
+    re-arming an incoherent stop on every covered call and every wheel CC leg."""
     acct = FakeAccount(spot=100.0)
     a = act(acct, "open_bull_put_spread", **BPS)
     res = a._submit_option_order([_short_call_leg(105.0)], 1, 3.0, "covered_call",
                                  stock_cover_price=100.0)
     assert res["success"], res["message"]
-    assert res["data"]["max_loss_per_contract"] == pytest.approx((100.0 - 3.0) * 100.0)
+    assert "max_loss_per_contract" not in res["data"]
 
 
 def test_the_same_short_call_with_and_without_cover_side_by_side():
-    """Only the supplied cover separates MEASURED from UNBOUNDED -- same leg, same
-    credit, same strategy tag, same seam."""
+    """The supplied cover changes NOTHING about what the order row carries -- same leg,
+    same credit, same strategy tag, same seam, same absence. (It does change what the
+    rails are handed; that is a different assertion in a different file.)"""
     acct = FakeAccount(spot=100.0)
     a = act(acct, "open_bull_put_spread", **BPS)
     covered = a._submit_option_order([_short_call_leg(105.0)], 1, 3.0, "covered_call",
                                      stock_cover_price=100.0)
     bare = a._submit_option_order([_short_call_leg(105.0)], 1, 3.0, "covered_call")
-    assert covered["data"]["max_loss_per_contract"] == pytest.approx(9700.0)
+    assert "max_loss_per_contract" not in covered["data"]
     assert "max_loss_per_contract" not in bare["data"]
 
 
-def test_an_unmeasurable_cover_price_stamps_nothing_never_a_guess():
+def test_the_cover_still_measures_where_it_is_ASKED_FOR():
+    """The measurement itself is intact -- M3 moved WHO asks, it did not delete the
+    answer. Called with a cover, ``_measured_max_loss_per_contract`` still returns
+    (spot - credit) x 100, and that is the number the RM's denominator carries. Without
+    this, "the stamp is absent" could be satisfied by a cover seam that had rotted."""
+    from ba2_common.core.TradeActions import _measured_max_loss_per_contract
+
+    legs = [_short_call_leg(105.0)]
+    assert _measured_max_loss_per_contract(legs, 3.0) is None
+    assert _measured_max_loss_per_contract(
+        legs, 3.0, stock_cover_price=100.0) == pytest.approx((100.0 - 3.0) * 100.0)
+
+
+def test_an_unmeasurable_cover_price_measures_nothing_never_a_guess():
     """A cover whose price cannot be read refuses to measure -- absence, not a number.
-    (A stringly-typed or non-positive spot is a bug to surface, not to parse.)"""
-    acct = FakeAccount()
-    a = act(acct, "open_bull_put_spread", **BPS)
+    (A stringly-typed or non-positive spot is a bug to surface, not to parse.) Asserted
+    on the measurement the RM is handed, since the order row stamps nothing either way."""
+    from ba2_common.core.TradeActions import _measured_max_loss_per_contract
+
+    legs = [_short_call_leg(105.0)]
     for bad in ("100", 0.0, -5.0, float("nan")):
-        res = a._submit_option_order([_short_call_leg(105.0)], 1, 3.0, "covered_call",
-                                     stock_cover_price=bad)
-        assert "max_loss_per_contract" not in res["data"], repr(bad)
+        assert _measured_max_loss_per_contract(
+            legs, 3.0, stock_cover_price=bad) is None, repr(bad)
 
 
 def test_the_real_covered_call_builder_supplies_its_verified_cover(monkeypatch):
     """End to end through ``SellCoveredCallAction``: 100 held shares (seeded rows, the
-    builder's own sizer) + an ok account-wide cover verdict -> the submitted order
-    stamps (spot - credit) x 100. This is the O_WHEEL covered-call phase's entry path
-    too (its ``cc_sell`` overlay fires this action), previously absent-by-design in
-    Task 8 and reversed by the 2026-08-31 decision."""
+    builder's own sizer) + an ok account-wide cover verdict -> the builder ASKS for the
+    verdict and submits. This is the O_WHEEL covered-call phase's entry path too (its
+    ``cc_sell`` overlay fires this action). The order row stamps nothing (M3, 2026-09-01)
+    -- Task 8's absent-by-design, restored -- so ``opt_sl_ml`` self-disarms on the CC leg
+    while the RM still sees the covered structure."""
     from ba2_common.core import trade_store as ts
     from ba2_common.core.models import TradingOrder as TO, Transaction as Txn
     from ba2_common.core.types import AssetClass, OrderStatus, OrderType, TransactionStatus
@@ -300,8 +326,7 @@ def test_the_real_covered_call_builder_supplies_its_verified_cover(monkeypatch):
         assert asked, "the builder submitted without asking the cover verdict"
         credit = res["data"]["limit_price"]
         assert credit > 0
-        assert res["data"]["max_loss_per_contract"] == pytest.approx(
-            (acct._spot - credit) * 100.0)
+        assert "max_loss_per_contract" not in res["data"]
 
 
 def test_a_naked_short_put_submit_STAMPS_its_measured_max_loss_corrected_s6():

@@ -663,11 +663,19 @@ def test_a_fresh_run_starts_from_a_clean_sleeve():
 # 8. the verified stock cover: a covered call PASSES the rails (2026-08-31)
 # ---------------------------------------------------------------------------
 # Operator decision 2026-08-31: a covered call's cover is held stock OUTSIDE the
-# order's legs, so the legs alone measured it UNBOUNDED (no stamp) and, worse, the
-# candidate metrics read it as NAKED. The builder that VERIFIED the shares now
-# supplies ``stock_cover_price`` (current spot -- the same value the max-loss stamp
-# used), and the candidate becomes COVERED: its measured max loss charges the
-# deployment cap, never the ``undefined_risk_max_pct`` sub-cap.
+# order's legs, so the legs alone measured it UNBOUNDED and, worse, the candidate
+# metrics read it as NAKED. The builder that VERIFIED the shares supplies
+# ``stock_cover_price`` (current spot), and the candidate becomes COVERED: its
+# measured max loss charges the deployment cap, never the ``undefined_risk_max_pct``
+# sub-cap.
+#
+# THIS IS NOW THE ONLY CONSUMER OF THE COVER (review finding M3, 2026-09-01). The
+# order row's ``max_loss_per_contract`` stamp went back to ABSENT on a covered call:
+# it is ``loss_pct_of_max_loss``'s denominator against an option-legs-only numerator,
+# and a stop scaled to a stock-inclusive max loss could only fire on a FAVOURABLE
+# move. The RAILS ask a different question -- how much of the sleeve the whole
+# position commits -- and the stock is part of that, so the measurement belongs here
+# and nowhere else. ``test_max_loss_persisted_at_submit.py`` pins the absent stamp.
 def short_call_legs(strike: float = 105.0, symbol: str = "AAPL") -> List[OptionLeg]:
     return [OptionLeg(contract_symbol=f"{symbol}260116C{int(strike)}",
                       side=OrderDirection.SELL, ratio_qty=1,

@@ -577,10 +577,11 @@ def test_the_hold_set_is_explicit_about_which_kinds_manage_stock():
 # strategy-level APPLICABILITY gate, not the safety mechanism: even where emitted, the
 # condition self-disarms on any position whose parent order lacks the persisted
 # max_loss_per_contract stamp (test_max_loss_persisted_at_submit.py pins that submit-side
-# guarantee). [2026-08-31: the wheel's covered-call legs, unstamped by design in Task 8, now
-# STAMP -- the builder supplies its verified stock cover, so the CC phase measures
-# (spot - credit) x 100 and opt_sl_ml can drive it. The self-disarm remains the safety net
-# for any genuinely unstamped order.]
+# guarantee), so a composite like the wheel may carry the rule and it simply never fires on
+# the unstamped covered-call legs. [2026-08-31 made the CC stamp; review finding M3,
+# 2026-09-01, reversed that -- the stamp is measured from the order's OWN legs, so a covered
+# call stamps nothing and the self-disarm is again what keeps the rule inert on it. The
+# verified cover still reaches the option RM's admission, a different question.]
 
 SL_ML_RULE_ID = "opt_sl_ml"
 SL_ML_COND_ID = "sl_ml"
@@ -747,10 +748,9 @@ def test_a_hypothetical_all_unbounded_group_would_not_carry_it(monkeypatch):
 
 def test_the_wheel_inherits_the_rule_from_o_csp():
     """The mixed-strategy case from the plan: the wheel's CSP entry stamps a measured max
-    loss, and -- since the 2026-08-31 covered-call decision -- so does its covered-call
-    overlay (the builder supplies its verified stock cover; (spot - credit) x 100). The
-    rule rides along and drives BOTH phases; Task 8's absence gate remains the safety net
-    for any genuinely unstamped order."""
+    loss, its covered-call overlay does not -- the rule rides along and Task 8's absence
+    gate keeps it inert on the unstamped legs. (2026-08-31 briefly made the CC stamp;
+    review finding M3, 2026-09-01, put it back, so this is again the original reading.)"""
     m = _launcher()
     s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
     assert SL_ML_RULE_ID in [r.get("id") for r in s.exit_rules]

@@ -49,9 +49,15 @@ Fail closed, loudly
 
 Nothing is reconstructed that was persisted
 -------------------------------------------
-The candidate's max loss is the value ``_submit_option_order`` already stamps on the order
-row (``data["max_loss_per_contract"]``, design §8.2) — this module is handed it, and never
-re-derives it from legs or parses an OCC symbol. The sleeve's committed capital comes from
+The candidate's max loss is measured ONCE, by ``_submit_option_order``, and handed here —
+this module never re-derives it from legs and never parses an OCC symbol. On every
+structure but one it is exactly the value stamped on the order row
+(``data["max_loss_per_contract"]``, design §8.2). The exception is a verified COVERED CALL
+(review finding M3, 2026-09-01): the order stamps nothing there, because the stamp is
+``loss_pct_of_max_loss``'s denominator against an option-legs-only numerator, while the
+rails ask what the WHOLE position commits — so the RM is handed the cover-inclusive
+(spot − credit) × 100 and the exit condition self-disarms. Two questions, two answers, one
+measurement function. The sleeve's committed capital comes from
 ``option_lifecycle.structure_metrics`` over netted order rows, the single definition
 ``option_book`` already consumes.
 
@@ -446,11 +452,14 @@ def candidate_from_entry(*, underlying: str, option_strategy: str, legs: Sequenc
                          stock_cover_price: Optional[float] = None) -> CandidateStructure:
     """The ``CandidateStructure`` for one entry order about to be submitted.
 
-    ``max_loss_per_contract`` is what ``_submit_option_order`` has ALREADY measured and is
-    about to persist on the order row (design §8.2). It arrives as an argument rather than
-    being re-derived here: one definition, one place, and no leg reconstruction. ``None``
-    means the payoff evaluator returned UNBOUNDED or UNMEASURABLE, and it stays ``None`` all
-    the way into ``check_rails``, which declines it — design §8.3's default refusal for
+    ``max_loss_per_contract`` is what ``_submit_option_order`` has ALREADY measured for the
+    RAILS' question. It arrives as an argument rather than being re-derived here: one
+    definition, one place, and no leg reconstruction. On every structure but a verified
+    covered call it is also the value persisted on the order row (design §8.2); on a covered
+    call the order persists nothing and this is the cover-inclusive measurement (review
+    finding M3, 2026-09-01 — the two questions have different numerators). ``None`` means
+    the payoff evaluator returned UNBOUNDED or UNMEASURABLE, and it stays ``None`` all the
+    way into ``check_rails``, which declines it — design §8.3's default refusal for
     undefined risk, and the only honest answer for a broken quote.
 
     ``notional`` and ``is_defined_risk`` come from ``structure_metrics`` over the candidate's
@@ -461,7 +470,8 @@ def candidate_from_entry(*, underlying: str, option_strategy: str, legs: Sequenc
 
     ``stock_cover_price`` is the covered-call seam (2026-08-31, operator decision): the
     submitting builder has VERIFIED the account holds the covering shares and priced them
-    at current spot (the same value the max-loss stamp used). ``structure_metrics`` sees
+    at current spot (the same value ``max_loss_per_contract`` above was measured with).
+    ``structure_metrics`` sees
     only the ORDER's option legs, so from those alone a covered call's short call reads
     as naked; the declared cover overrides that to COVERED, which is what routes the
     candidate's (measured) max loss to the deployment cap instead of the
@@ -736,8 +746,10 @@ def admit_option_entry(*, expert, account, expert_instance_id: int,
 
     :param expert:   the expert instance, for its declared rails.
     :param account:  the sleeve's account, for equity and the cash that would fund delivery.
-    :param max_loss_per_contract: what the submit path has already measured (§8.2). ``None``
-                     is UNBOUNDED or UNMEASURABLE and declines.
+    :param max_loss_per_contract: what the submit path has already measured (§8.2) --
+                     including the verified stock cover where one was supplied, which is why
+                     this can be a number on a covered call whose ORDER stamps none (M3).
+                     ``None`` is UNBOUNDED or UNMEASURABLE and declines.
     :param stock_cover_price: the verified held-stock cover, when the submitting builder
                      supplied one (covered call; see ``candidate_from_entry``). Marks the
                      candidate COVERED so its measured max loss charges the deployment

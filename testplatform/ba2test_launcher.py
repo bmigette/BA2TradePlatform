@@ -2375,10 +2375,13 @@ _FULL_NOTIONAL_OPTION_KINDS = {"O_CSP", "O_JL", "O_RS"}
 # drift between them:
 #   1. the ``opt_sl_ml`` emission gate in ``_option_exit_rules`` (design 2026-08-29 S6).
 #      That half is the strategy-level APPLICABILITY gate only -- the safety mechanism is
-#      Task 8's absence rule (no stamp => the condition can never fire). (The wheel's
-#      covered-call legs were in that unstamped category until 2026-08-31: the builder now
-#      supplies its verified stock cover, the CC phase stamps (spot - credit) x 100, and
-#      opt_sl_ml can drive it.)
+#      Task 8's absence rule (no stamp => the condition can never fire), which is also what
+#      keeps it inert on the wheel's covered-call legs: a CC's cover is held stock OUTSIDE
+#      the order, and the stamp is measured from the order's OWN legs, so a CC stamps
+#      nothing. (2026-08-31 briefly made it stamp (spot - credit) x 100; review finding M3,
+#      2026-09-01, reversed that -- an option-legs-only numerator over a stock-inclusive
+#      denominator is not a ratio of anything. The verified cover still reaches the option
+#      RM's admission, which asks what the WHOLE position commits.)
 #   2. the grouped-search filter over ``_OPTION_GROUPS_ALL`` below (operator decision
 #      2026-08-31, AskUserQuestion: "Only truly unbounded"): these members LEAVE the
 #      SEARCHED set entirely, the same way ``_FULL_NOTIONAL_OPTION_KINDS`` already filters

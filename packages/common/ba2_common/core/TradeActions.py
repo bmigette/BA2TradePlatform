@@ -1949,16 +1949,23 @@ def _measured_max_loss_per_contract(legs: List[OptionLeg], limit_price,
     minus credit, at an underlying of zero -- so it IS measured and IS stamped; only
     short calls (and short stock) are genuinely unbounded.
 
-    THE STOCK COVER (2026-08-31, operator decision): a covered call's cover is held
-    stock OUTSIDE the order's legs, so from the legs alone its short call reads
-    UNBOUNDED and stamped nothing. A builder that has VERIFIED the account actually
-    holds (or simultaneously acquires) the covering shares passes
+    THE STOCK COVER (2026-08-31, operator decision; SCOPED by review finding M3,
+    2026-09-01): a covered call's cover is held stock OUTSIDE the order's legs, so from
+    the legs alone its short call reads UNBOUNDED. A caller that has VERIFIED the
+    account actually holds (or simultaneously acquires) the covering shares may pass
     ``stock_cover_price`` -- the per-share price of the one 100-share lot backing each
-    contract -- and the evaluator (which already supports stock legs; see
-    ``PayoffLeg``) then measures the true structure: (cover price - credit) x 100.
-    An unmeasurable cover price refuses to measure (None), never fabricates. The seam
-    NEVER infers cover from the strategy name -- a bare short call submitted under the
-    ``covered_call`` tag with no cover supplied still reads UNBOUNDED.
+    contract -- and the evaluator (which already supports stock legs; see ``PayoffLeg``)
+    then measures the true structure: (cover price - credit) x 100. An unmeasurable
+    cover price refuses to measure (None), never fabricates. The seam NEVER infers cover
+    from the strategy name -- a bare short call submitted under the ``covered_call`` tag
+    with no cover supplied still reads UNBOUNDED.
+
+    WHO ASKS WITH A COVER, AND WHO DOES NOT. Only the RISK MANAGER's denominator
+    (``_submit_option_order`` -> ``admit_option_entry``): the rails ask how much of the
+    sleeve the whole position commits, and the stock is part of that position. The ORDER
+    STAMP (``data["max_loss_per_contract"]``) asks the cover-free question and gets the
+    cover-free answer, because it is ``loss_pct_of_max_loss``'s denominator against a
+    numerator that is the OPTION legs' P&L alone -- see the comment at the stamp.
     """
     payoff_legs = _entry_payoff_legs(legs, limit_price)
     if payoff_legs is None:
@@ -2655,21 +2662,33 @@ class _OptionEntryAction(TradeAction):
         # (absence is the "contracts that support it" gate); computed from the
         # concession-adjusted limit because that is the order actually submitted.
         #
-        # THE STOCK COVER LEG (2026-08-31, OPERATOR-RATIFIED VALUATION): when the builder
-        # supplied `stock_cover_price` (covered call -- the cover is held stock OUTSIDE the
-        # order's legs), the cover leg is priced at the CURRENT SPOT at decision time, NOT
-        # the shares' historical cost basis. The stamp is a forward-looking risk
-        # denominator -- the max loss from HERE -- and folding the stock's unrealized P&L
-        # into it would corrupt the loss_pct_of_max_loss stop (a deep-profit lot would
-        # inflate the denominator, a deep-loss lot would shrink it, and the same short call
-        # would stop at different premiums for reasons that have nothing to do with its
-        # risk). Covered call: (spot - credit) x 100 per contract, MEASURED -> stamped ->
-        # opt_sl_ml can drive it -> the RM charges it to the deployment cap as COVERED
-        # risk (candidate_from_entry), never to the naked/uncovered sub-cap.
-        max_loss_per_contract = _measured_max_loss_per_contract(
-            legs, limit_price, stock_cover_price=stock_cover_price)
+        # THE STAMP IS MEASURED FROM THE ORDER'S OWN LEGS ONLY (review finding M3,
+        # 2026-09-01). A covered call therefore stamps NOTHING: its short call is unbounded
+        # among the legs the order actually carries, and `opt_sl_ml` self-disarms on it.
+        # That is the coherent answer, and the 2026-08-31 decision to stamp
+        # (spot - credit) x 100 here is reversed. The stamp is `loss_pct_of_max_loss`'s
+        # DENOMINATOR, and the condition's NUMERATOR is the option position's own P&L: on a
+        # covered call the two measure different books. The short call's loss is bounded
+        # only by the stock's gain, so a ratio of option-leg loss over a stock-inclusive
+        # max loss could only reach its threshold when the underlying moved FAVOURABLY for
+        # the position as a whole -- a stop that fires on good news and never on bad.
+        max_loss_per_contract = _measured_max_loss_per_contract(legs, limit_price)
         if max_loss_per_contract is not None:
             data["max_loss_per_contract"] = max_loss_per_contract
+        # THE RM'S DENOMINATOR IS A DIFFERENT QUESTION and keeps the cover (2026-08-31,
+        # OPERATOR-RATIFIED VALUATION). The rails ask "how much of the sleeve does this
+        # structure commit", which IS the whole position -- stock included -- so a verified
+        # covered call is measurable there: (spot - credit) x 100 per contract, the cover
+        # priced at CURRENT SPOT at decision time and never at the shares' historical cost
+        # basis (folding unrealized stock P&L into a forward-looking risk number would make
+        # the same short call charge differently for reasons that have nothing to do with
+        # its risk). This is what keeps the covered call and the wheel's CC phase ADMISSIBLE
+        # to the rails, charged to the deployment cap as COVERED risk
+        # (candidate_from_entry), never to the naked/uncovered sub-cap.
+        rm_max_loss_per_contract = (
+            max_loss_per_contract if stock_cover_price is None
+            else _measured_max_loss_per_contract(legs, limit_price,
+                                                 stock_cover_price=stock_cover_price))
         # THE OPTION RISK MANAGER (design 2026-08-27 SS4, review finding F5). This is the one
         # choke point all seventeen builders reach, and it is reached identically by the live
         # pass (TradeManager -> TradeActionEvaluator) and by the backtest engine
@@ -2677,8 +2696,10 @@ class _OptionEntryAction(TradeAction):
         # the whole content of SS4's operator decision. Ahead of the submit_to_broker branch
         # deliberately: a rail decision is a decision, and a "manual review" preview that
         # showed a structure the rails would refuse would be advertising a trade that cannot
-        # happen. The measured max loss is HANDED to the RM, never re-derived there: no leg
-        # reconstruction, no OCC parsing, exactly the value stamped above.
+        # happen. The max loss is HANDED to the RM, never re-derived there: no leg
+        # reconstruction, no OCC parsing. It equals the stamped value on every structure
+        # except a verified covered call, where the stamp is absent (see above) and the RM
+        # is given the cover-inclusive measurement instead.
         rm_expert, rm_instance_id = self._option_risk_manager()
         rm_candidate = None
         if rm_expert is not None:
@@ -2686,7 +2707,7 @@ class _OptionEntryAction(TradeAction):
                 expert=rm_expert, account=self.account, expert_instance_id=rm_instance_id,
                 underlying=self.instrument_name, option_strategy=option_strategy,
                 legs=legs, quantity=quantity,
-                max_loss_per_contract=max_loss_per_contract,
+                max_loss_per_contract=rm_max_loss_per_contract,
                 stock_cover_price=stock_cover_price)
             if not verdict.allowed:
                 data["option_rm_rail"] = verdict.reason

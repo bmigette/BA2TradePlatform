@@ -237,6 +237,48 @@ def test_an_action_with_no_expert_instance_never_reaches_it(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# the two questions the cover answers, and the one it does not
+# ---------------------------------------------------------------------------
+def test_the_stock_cover_reaches_the_RAILS_and_not_the_ORDER_ROW(opted_in, monkeypatch):
+    """Review finding M3, 2026-09-01, at the seam that decides both.
+
+    ONE measurement function, TWO questions. The rails ask what the whole position
+    commits, so a verified covered call is measurable there -- (spot - credit) x 100 --
+    and stays admissible. The ORDER STAMP asks ``loss_pct_of_max_loss``'s denominator,
+    whose numerator is the option legs' P&L alone, so it must be ABSENT and the stop
+    self-disarms. MUTATION KILL: hand the RM the cover-free value and the rails go back to
+    declining every covered call as unmeasurable; stamp the cover-inclusive one and an
+    incoherent stop re-arms on every CC and every wheel CC leg."""
+    seen = []
+    monkeypatch.setattr(ta, "admit_option_entry",
+                        lambda **kw: seen.append(kw) or rm.admit_option_entry(**kw))
+    legs = [OptionLeg(contract_symbol="XYZ260320C105", side=OrderDirection.SELL,
+                      position_intent="sell_to_open", option_type=OptionRight.CALL,
+                      strike=105.0, expiry=EXPIRY, underlying="XYZ")]
+    account = _LiveShapedAccount()
+    result = _action(account)._submit_option_order(legs, 1, 3.0, "covered_call",
+                                                   stock_cover_price=100.0)
+    assert result["success"] is True, result["message"]
+    assert "max_loss_per_contract" not in result["data"]
+    assert seen and seen[0]["max_loss_per_contract"] == pytest.approx(9700.0)
+    assert seen[0]["stock_cover_price"] == 100.0
+
+
+def test_without_a_cover_the_two_questions_get_the_SAME_answer(opted_in, monkeypatch):
+    """The split is not a second measurement path: on every structure but a verified
+    covered call the RM is handed exactly what the row was stamped with."""
+    seen = []
+    monkeypatch.setattr(ta, "admit_option_entry",
+                        lambda **kw: seen.append(kw) or rm.admit_option_entry(**kw))
+    account = _LiveShapedAccount()
+    result = _action(account)._submit_option_order(_spread_legs(), 1, -1.5,
+                                                   "bull_put_spread")
+    assert result["success"] is True, result["message"]
+    assert seen[0]["max_loss_per_contract"] == pytest.approx(
+        result["data"]["max_loss_per_contract"])
+
+
+# ---------------------------------------------------------------------------
 # the gate bites at the choke point
 # ---------------------------------------------------------------------------
 def test_the_rails_refuse_at_the_submit_choke_point(opted_in):
