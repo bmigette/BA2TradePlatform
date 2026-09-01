@@ -79,6 +79,28 @@ re-measured by the task that writes it, with seed and method stated
    option trial and reports before/after — never assumed. A task that makes
    option trials a runtime class slower than equity trials is not done.
 
+**Results-identity acceptance criterion (operator, 2026-09-01) — apply to EVERY
+task:** non-option backtest results are BIT-IDENTICAL, proven by
+`testplatform/backend/tests/backtest/test_equity_golden_run.py`'s pinned
+fingerprint (`tests/backtest/golden/equity_golden_run.json`) — a real
+`DailyBacktestEngine.run()` equity run over a synthetic fixture, every trade
+pinned at full float precision through the whole order path (entries, sized
+orders, next-bar fills, TP/SL bracket exits, per-bar equity). Any task that
+moves that fingerprint is NOT done until the movement is explained and the
+golden is DELIBERATELY regenerated with operator-visible justification —
+never adjusted-until-green. This criterion is what makes criterion 1's
+"equity trials do zero extra work" claim checkable at the RESULT level rather
+than argued from scoping. Retrospective cross-check (2026-09-01): the same
+harness run against `abcee41f^` = `8109dca3` (the parent of the first option
+merge into dev) and against `a901e360` gave the identical fingerprint
+`f6226a66e47a15f17c9c5a85e2dde91d07489dd1baffb974b938e90aa163f067` — VERDICT
+EQUAL, so the 89 commits in between (all four option merges `abcee41f`,
+`3176f4d5`, `06de5148`, `70603e3a` plus their fix rounds) left equity results
+untouched. Scope caveat: the reference tree already carries the earlier option
+engine (`options_provider.py`, `option_greeks.py`, `OptionsAccountInterface`),
+so the pin covers the option program-review era onward, not the option engine's
+original introduction.
+
 **Model routing** (controller sets `model` at dispatch):
 - **opus**: Tasks 5, 6, 7, 9, 12 (lifecycle, fitness, expert core).
 - **sonnet**: Tasks 1, 2, 3, 4, 8, 10, 11, 13, 14 (mechanical/mirrored work).
