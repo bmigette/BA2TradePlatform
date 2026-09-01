@@ -54,6 +54,20 @@ def parse_stamp_day(value: Any) -> Optional[date]:
     round-trips there round-trips here. ``date``/``datetime`` are accepted as-is because a
     live path may hand the object rather than its serialisation; anything else that does
     not parse is UNKNOWN, never a guessed day.
+
+    THE TIMEZONE CONVENTION: an announcement date is a CALENDAR DAY IN ITS OWN OFFSET,
+    never an instant converted to UTC. A tz-aware ``datetime`` therefore yields
+    ``value.date()`` as written -- ``2024-06-04T02:00+09:00`` is 2024-06-04, not the
+    2024-06-03 that instant is in UTC. The string branch agrees by construction (it takes
+    the text before the ``T`` and ignores any offset), which is what keeps the two input
+    shapes interchangeable. Converting to UTC first would shift an Asian-morning or
+    US-evening stamp by a full day and move ``days_after_event`` by one on the exit that
+    decides the whole O_ERN trade.
+
+    Nothing reaches the aware branch today: FMP's ``report_date`` is a bare 'YYYY-MM-DD'
+    and the expert re-serialises it as one. The convention is written down and tested
+    anyway, because the branch is REACHABLE (any live path handing the object through) and
+    a silent one-day shift is exactly the kind of defect that is only found in P&L.
     """
     if isinstance(value, datetime):
         return value.date()

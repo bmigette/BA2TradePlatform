@@ -490,3 +490,52 @@ def test_both_fields_describe_themselves_without_a_measurement():
     for cond in (entry, exit_):
         assert cond.get_description()
         assert cond.get_actual_value_display() is None
+
+
+# ======================================================================================
+# THE TIMEZONE CONVENTION (review 2026-09-01, finding 4)
+#
+# An announcement date is a CALENDAR DAY IN ITS OWN OFFSET, never an instant converted to
+# UTC. Unreachable today -- FMP serves a bare 'YYYY-MM-DD' and the expert re-serialises it
+# as one -- but the aware branch EXISTS (a live path may hand the object through), and a
+# UTC conversion there would shift an Asian-morning or US-evening stamp by a full day,
+# moving days_after_event by one on the exit that decides the whole O_ERN trade.
+# ======================================================================================
+def test_an_aware_datetime_stamp_is_the_calendar_day_in_its_OWN_offset():
+    """2024-06-04T02:00+09:00 is 2024-06-04 -- NOT the 2024-06-03 that instant is in UTC."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    from ba2_common.core.earnings_stamp import parse_stamp_day
+
+    tokyo_morning = _dt(2024, 6, 4, 2, 0, tzinfo=_tz(_td(hours=9)))
+    assert tokyo_morning.astimezone(_tz.utc).date() == date(2024, 6, 3), (
+        "fixture check: this instant IS the 3rd in UTC, which is the answer we refuse")
+    assert parse_stamp_day(tokyo_morning) == date(2024, 6, 4)
+
+    # ...and the mirror case on the other side of UTC: a US evening print.
+    ny_evening = _dt(2024, 6, 3, 20, 0, tzinfo=_tz(_td(hours=-4)))
+    assert ny_evening.astimezone(_tz.utc).date() == date(2024, 6, 4)
+    assert parse_stamp_day(ny_evening) == date(2024, 6, 3)
+
+
+def test_the_string_and_object_forms_agree_on_the_offset_convention():
+    """The two input shapes must be interchangeable, or the same event reads as two
+    different days depending on whether it went through JSON."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    from ba2_common.core.earnings_stamp import parse_stamp_day
+
+    aware = _dt(2024, 6, 4, 2, 0, tzinfo=_tz(_td(hours=9)))
+    assert parse_stamp_day(aware.isoformat()) == parse_stamp_day(aware) == date(2024, 6, 4)
+
+
+def test_the_exit_gate_reads_an_aware_stamp_the_same_way_end_to_end():
+    """Through the condition, not just the parser: a Tokyo-morning Monday print seen on
+    the Tuesday bar is 1 day after -- 2 would mean the parser converted to UTC."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    order = _order({ORDER_EVENT_DATE_KEY: _dt(2024, 6, 3, 2, 0,
+                                              tzinfo=_tz(_td(hours=9)))})
+    cond = _exit_cond(order, as_of=TUE, op=">=", value=1.0)
+    assert cond.evaluate() is True
+    assert cond.calculated_value == 1

@@ -178,6 +178,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.db import add_instance, get_db, update_instance
+# THE STAMP CONTRACT, IMPORTED RATHER THAN RE-SPELLED (review 2026-09-01, finding 1).
+# This module is the WRITER; ba2_common.core.TradeConditions' two O_ERN timing gates are
+# the READERS. When both sides spelled the key path by hand, a rename on either side
+# desynced them SILENTLY -- every suite green, both gates permanently unevaluable, which
+# is exactly the dead-gene failure the whitelist note in TradeActions warns about. One
+# definition now, and test_fmp_earnings_event.py pins the emitted payload's keys against
+# it so a future hand-spelled key fails loudly. (experts -> common is contract-legal;
+# see packages/experts/.importlinter.)
+from ba2_common.core.earnings_stamp import (
+    DAYS_TO_EARNINGS_KEY,
+    EARNINGS_STAMP_NAMESPACE,
+    EVENT_DATE_KEY,
+)
 from ba2_common.core.interfaces import MarketExpertInterface
 from ba2_common.core.models import AnalysisOutput, ExpertRecommendation, MarketAnalysis
 from ba2_common.core.types import (
@@ -837,8 +850,8 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
 
         days_to_earnings = (_parse_day(event_day) - _parse_day(as_of_day)).days
         payload = {
-            "days_to_earnings": days_to_earnings,
-            "event_date": event_day,
+            DAYS_TO_EARNINGS_KEY: days_to_earnings,
+            EVENT_DATE_KEY: event_day,
             "event_time": upcoming.get("time"),
             "event_time_confirmed": confirmed,
             "usable_events": computed["usable_events"],
@@ -867,8 +880,9 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
                 # Nested under the expert name so the SAME key path works live (where
                 # run_analysis stamps ExpertRecommendation.data itself) and in backtest
                 # (where the engine copies raw_outputs wholesale into .data). Task 9's
-                # days_to_earnings condition reads exactly this path.
-                "FMPEarningsEvent": payload,
+                # rec_days_to_earnings condition reads exactly this path -- from the same
+                # constant, not from a second spelling of it.
+                EARNINGS_STAMP_NAMESPACE: payload,
             })
 
     def _log_skip(self, symbol: str, reason: str) -> None:
@@ -926,8 +940,10 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
                     risk_level=RiskLevel.MEDIUM,
                     time_horizon=TimeHorizon.SHORT_TERM,
                     market_analysis_id=market_analysis.id,
-                    # Same key path the backtest engine produces from raw_outputs.
-                    data={"FMPEarningsEvent": rec.raw_outputs["FMPEarningsEvent"]},
+                    # Same key path the backtest engine produces from raw_outputs -- and
+                    # from the SAME constant, so the two producers cannot drift apart.
+                    data={EARNINGS_STAMP_NAMESPACE:
+                          rec.raw_outputs[EARNINGS_STAMP_NAMESPACE]},
                     created_at=datetime.now(timezone.utc),
                 ))
 
@@ -951,7 +967,8 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
                         "signal": rec.signal.value,
                         "confidence": rec.confidence,
                     },
-                    "event": None if rec.skip else rec.raw_outputs["FMPEarningsEvent"],
+                    "event": (None if rec.skip
+                              else rec.raw_outputs[EARNINGS_STAMP_NAMESPACE]),
                     "expert_recommendation_id": recommendation_id,
                     "current_price": rec.current_price,
                     "analysis_timestamp": datetime.now(timezone.utc).isoformat(),
@@ -993,7 +1010,8 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
             with ui.row().classes('gap-8 mt-2'):
                 ui.label(f"Signal: {rec.get('signal', 'N/A')}").classes('text-h6')
                 ui.label(f"Confidence: {rec.get('confidence', 0):.1f}%")
-                ui.label(f"Event: {ev.get('event_date')} ({ev.get('days_to_earnings')}d)")
+                ui.label(f"Event: {ev.get(EVENT_DATE_KEY)} "
+                         f"({ev.get(DAYS_TO_EARNINGS_KEY)}d)")
             ui.label(f"Avg |move|: {ev.get('hist_move')} | "
                      f"Surprise vol: {ev.get('surprise_vol')} | "
                      f"Usable events: {ev.get('usable_events')}").classes('text-grey-8 mt-2')

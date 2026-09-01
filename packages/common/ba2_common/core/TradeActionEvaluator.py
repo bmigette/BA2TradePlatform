@@ -134,16 +134,22 @@ def forced_option_exit(event_action) -> bool:
     — never its name, which is free text:
 
       * a ``days_to_expiry`` trigger is the DTE/roll exit — forced;
+      * a ``days_after_event`` trigger is the O_ERN post-print exit — forced. See the
+        note on its entry in ``_FORCED_EXIT_EVENT_TYPES`` above for why this ONE time
+        exit is classified opposite to ``days_opened``;
       * a numeric trigger whose operator points at the LOSS side of its own field is a
         stop — forced. Which operators those are is per-field and looked up in
         ``_LOSS_SIDE_STOP_OPERATORS``, because the two sign conventions disagree: a
         ``profit_loss_*`` stop is ``<``/``<=`` (P&L is negative while losing) while a
         ``loss_pct_of_max_loss`` stop is ``>``/``>=`` (a loss MAGNITUDE, positive while
         losing);
-      * everything else (TP gates, time exits, sentiment/rating flags) is
+      * everything else (TP gates, the REMAINING time exits, sentiment/rating flags) is
         discretionary. The ``days_opened`` time exit is DELIBERATELY discretionary —
         the F7 brief's forced list was SL / DTE / breaker / margin only — recorded so
-        it is not re-litigated.
+        it is not re-litigated. "Time exits are discretionary" is therefore NOT the
+        rule and never was: ``days_after_event`` is the counter-example, and the two
+        are pinned side by side in
+        ``packages/common/tests/test_earnings_event_timing_gates.py``.
 
     THE BREAKER AND THE MARGIN CALL ARE NOT MISSING FROM THAT LIST — they never reach
     this function. F5's shared-rails work has since landed (``update_sleeve_breaker`` is

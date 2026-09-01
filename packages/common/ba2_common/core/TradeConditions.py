@@ -3065,6 +3065,30 @@ class RecommendationDaysToEarningsCondition(CompareCondition):
     satisfy "absent stamp never fires" (it would fire off the calendar instead), and it would
     silently change the meaning of every ruleset already using the field.
 
+    WHY THE STAMPED INTEGER AND NOT ``stamped event_date - the evaluation bar``
+    -----------------------------------------------------------------------
+    The recommendation carries BOTH, so the distance could be recomputed here against
+    this bar instead of read. Rejected, and the difference is worth stating because it is
+    not zero:
+
+    * In a BACKTEST the two are identical by construction -- the recommendation is
+      produced on the SAME simulated bar the entry rule then evaluates -- so the choice
+      buys nothing there and costs a subtraction per symbol per bar.
+    * In LIVE they diverge exactly when an analysis is older than the evaluation (a
+      skipped or failed scheduled run, or a manage pass reusing an earlier
+      recommendation). The stamp then reads the distance AS OF THE ANALYSIS DAY, which is
+      LARGER than the true remaining distance -- and against this field's ``<=`` gate a
+      larger number REFUSES the entry. The stale reading is the conservative one: it
+      declines to open a pre-earnings straddle on a signal that has aged, rather than
+      opening it a day or two late off a rank nobody recomputed. Recomputing would take
+      that trade.
+    * And recomputing re-introduces a second clock into the one place the timing split
+      exists to keep single-sourced. The integer IS what the rank was computed against.
+
+    ``days_after_event`` makes the opposite choice (it recomputes from a stamped DATE)
+    for the opposite reason: an exit has no "the analysis is stale" reading -- the event
+    is in the past and the number must grow every day the position stays on.
+
     ABSENT STAMP NEVER FIRES -- the ``DaysToExpiryCondition`` / ``LossPctOfMaxLoss``
     discipline, and here it is load-bearing rather than defensive. Every recommendation from
     every other expert has no ``FMPEarningsEvent`` payload, so if absence read as ``0`` the

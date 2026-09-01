@@ -1302,3 +1302,101 @@ def test_live_seam_absent_when_the_resolver_is_unwired(_restore_instance_resolve
     e.instance = type("I", (), {"account_id": 42})()
     set_instance_resolver(_UnconfiguredResolver())
     assert e._resolve_live_account() is None
+
+
+# ==========================================================================
+# THE STAMP CONTRACT (review 2026-09-01, finding 1)
+#
+# This expert is the WRITER of the payload ba2_common's two O_ERN timing gates READ
+# (`rec_days_to_earnings`, `days_after_event`). Until now both sides spelled the key path
+# by hand, so a rename on EITHER side desynced them SILENTLY: every suite green, both
+# gates permanently unevaluable, the GA tuning two genes the engine cannot see -- the
+# dead-gene failure `TradeActions`' entry_facts whitelist note warns about.
+#
+# The writer now imports `ba2_common.core.earnings_stamp`'s constants. That alone is not
+# enough, because a test written as "keys == constants" passes a rename of the CONSTANT
+# too (both sides move together while every already-persisted row and the design doc do
+# not). So both halves are pinned here: the constants carry their LITERAL wire values,
+# and the emitted payload carries exactly those keys.
+# ==========================================================================
+def test_the_stamp_constants_carry_their_literal_wire_values():
+    """The wire format, pinned as literals. These strings appear in persisted
+    ExpertRecommendation.data rows, in design 2026-08-31 leaps-grid S9, and in the
+    launcher's O_ERN rule leaves -- renaming a constant renames NONE of those."""
+    from ba2_common.core.earnings_stamp import (
+        DAYS_TO_EARNINGS_KEY,
+        EARNINGS_STAMP_NAMESPACE,
+        EVENT_DATE_KEY,
+    )
+
+    assert EARNINGS_STAMP_NAMESPACE == "FMPEarningsEvent"
+    assert DAYS_TO_EARNINGS_KEY == "days_to_earnings"
+    assert EVENT_DATE_KEY == "event_date"
+
+
+def test_the_emitted_payload_uses_the_shared_stamp_constants_not_hand_spellings():
+    """The writer half. A future edit that hand-spells one of these keys (or renames a
+    constant on one side only) fails HERE rather than in a live O_ERN run six weeks
+    later, where the only symptom is a gate that never fires."""
+    from ba2_common.core.earnings_stamp import (
+        DAYS_TO_EARNINGS_KEY,
+        EARNINGS_STAMP_NAMESPACE,
+        EVENT_DATE_KEY,
+        earnings_payload,
+        stamped_days_to_earnings,
+        stamped_event_date,
+    )
+
+    rows, df = _healthy_rows()
+    rec, _ = _run(rows, df=df)
+    assert not rec.skip, rec.skip_reason
+
+    assert EARNINGS_STAMP_NAMESPACE in rec.raw_outputs
+    payload = rec.raw_outputs[EARNINGS_STAMP_NAMESPACE]
+    assert DAYS_TO_EARNINGS_KEY in payload and EVENT_DATE_KEY in payload
+
+    # ... and the READERS resolve it end to end off a recommendation-shaped object, so
+    # the pin covers the whole path rather than the dict alone.
+    class _Rec:
+        data = dict(rec.raw_outputs)                   # daily_engine._persist does this
+
+    assert stamped_days_to_earnings(_Rec()) == 6       # 2025-06-10 -> 2025-06-16
+    assert stamped_event_date(_Rec()).isoformat() == UPCOMING_DAY
+    assert earnings_payload(_Rec()) == payload
+
+
+def test_the_LIVE_persist_site_hand_spells_no_stamp_key_either_STRUCTURAL():
+    """There are TWO producers of the read key path, and the test above only exercises
+    ONE. ``_process`` fills ``raw_outputs`` (which the backtest engine copies wholesale
+    into ``ExpertRecommendation.data``); ``run_analysis`` writes ``.data`` ITSELF on the
+    live path, and no unit test reaches it because it needs a database. A hand-spelled key
+    there desyncs LIVE ONLY -- backtests green, the GA's two O_ERN genes tuned against
+    results the live account will never reproduce -- which is the worst shape this defect
+    can take. So the live site is pinned from SOURCE instead.
+
+    WHAT THIS CANNOT SEE, same qualification as the equity STRUCTURAL count in
+    ``packages/common/tests/test_earnings_event_date_persisted_at_submit.py``: it reads
+    TEXT. A key assembled at runtime (``"FMP" + "EarningsEvent"``), or read from a local
+    alias, passes. And writing one of these names in a COMMENT inside either function
+    fails it for no behavioural reason. It is a proxy for "nobody re-spelled the contract",
+    not a proof -- kept because a pasted literal is the realistic regression and it is the
+    only reach this side has into the live writer.
+    """
+    import inspect
+
+    from ba2_common.core.earnings_stamp import (
+        DAYS_TO_EARNINGS_KEY,
+        EARNINGS_STAMP_NAMESPACE,
+        EVENT_DATE_KEY,
+    )
+
+    from ba2_experts.FMPEarningsEvent import FMPEarningsEvent
+
+    for fn in ("_process", "run_analysis"):
+        src = inspect.getsource(getattr(FMPEarningsEvent, fn))
+        for key in (EARNINGS_STAMP_NAMESPACE, DAYS_TO_EARNINGS_KEY, EVENT_DATE_KEY):
+            for literal in (f'"{key}"', f"'{key}'"):
+                assert literal not in src, (
+                    f"{fn} spells the stamp key {literal} by hand; import the constant "
+                    f"from ba2_common.core.earnings_stamp instead -- a rename on the "
+                    f"reader side would not reach this spelling")

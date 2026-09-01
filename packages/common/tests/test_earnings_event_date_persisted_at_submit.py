@@ -243,6 +243,23 @@ def test_the_stamp_costs_a_pure_equity_trial_nothing_STRUCTURAL():
 
     Counted from source rather than asserted in prose: if a later change adds a reference
     from an equity path (or from a per-bar loop), the count moves and this fails.
+
+    WHAT THIS PIN CANNOT SEE, stated so nobody reads it as stronger than it is:
+
+    * ALIASING. It counts TOKENS. ``_sed = stamped_event_date`` at module scope, or
+      ``from ba2_common.core import earnings_stamp`` + ``earnings_stamp.stamped_event_date``,
+      reaches the same function under a name this test does not count -- the counts hold
+      and an equity path could call it.
+    * COMMENT BRITTLENESS, both directions. Writing either name in a COMMENT or docstring
+      raises the count and fails this test for no behavioural reason; deleting a real call
+      and adding a comment mentioning it keeps the count and passes. It is a proxy for
+      reachability, not a call graph.
+
+    It is kept because the cheap thing it does catch -- a new call site pasted somewhere
+    else in this 5,000-line module -- is the realistic regression, and because the
+    RESULT-level guarantee does not depend on it: the equity golden run's fingerprint
+    (testplatform/backend/tests/backtest/test_equity_golden_run.py) is what actually
+    proves an equity trial is untouched, byte for byte.
     """
     import inspect
 

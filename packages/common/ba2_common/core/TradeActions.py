@@ -4641,12 +4641,18 @@ class CloseOptionAction(TradeAction):
     simulator that models a spread implements — so live is byte-identical by
     construction:
 
-      * DISCRETIONARY closes (TP, time, sentiment, ...) concede the fraction the
-        position's ENTRY conceded (``data['entry_cross']`` on the entry/parent order —
-        the existing gene, no new one);
-      * FORCED closes (``forced_exit=True``: SL stop / DTE roll, classified from the
-        firing rule's triggers by ``TradeActionEvaluator.forced_option_exit``) cross the
-        modelled spread FULLY — a risk exit pays up.
+      * DISCRETIONARY closes (TP, the ``days_opened`` staleness exit, sentiment, ...)
+        concede the fraction the position's ENTRY conceded (``data['entry_cross']`` on
+        the entry/parent order — the existing gene, no new one);
+      * FORCED closes (``forced_exit=True``: SL stop / DTE roll / the O_ERN
+        ``days_after_event`` post-print exit, classified from the firing rule's triggers
+        by ``TradeActionEvaluator.forced_option_exit``) cross the modelled spread FULLY
+        — a risk exit pays up.
+
+    "Time exit" does not decide this, and the two time exits land on OPPOSITE sides:
+    ``days_opened`` is discretionary, ``days_after_event`` is forced. The reasoning lives
+    once, on ``_FORCED_EXIT_EVENT_TYPES``' ``days_after_event`` entry — read it there
+    rather than re-deriving it here.
 
     RESIDUAL OPTIMISM, RECORDED (operator-delegated design, 2026-08-30): live closes
     always pay the full real touch, while a backtest DISCRETIONARY close concedes only
