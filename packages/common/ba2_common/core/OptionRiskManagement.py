@@ -824,9 +824,13 @@ def sleeve_book_from(structures: Sequence[OptionStructure],
         f"transaction {tid}: OPENED option position with no executed option order row — it "
         f"cannot be netted or priced, so the sleeve's committed capital is unmeasurable"
         for tid in unbuildable)
-    return BookTotals(None, None, None, None, None,
-                      totals.structure_count + len(unbuildable),
-                      totals.underlyings, blind)
+    # Keyword-constructed on purpose: BookTotals carries FIVE consecutive Optional[float]
+    # money fields, so a positional call is five unlabelled Nones that any field reorder
+    # would silently permute into the wrong slots.
+    return BookTotals(committed=None, naked_committed=None, notional=None,
+                      premium_outlay=None, short_put_assignment=None,
+                      structure_count=totals.structure_count + len(unbuildable),
+                      underlyings=totals.underlyings, unmeasurable=blind)
 
 
 def sleeve_equity(account, expert_instance_id: int) -> Optional[float]:
@@ -850,6 +854,17 @@ def assignment_cash(account, expert_instance_id: int) -> Optional[float]:
     used by the account-wide ``assignment_capacity`` gate. It is deliberately NOT buying
     power net of the reserve pool: the pool has already subtracted the CSP strikes this
     total is charging, and netting the two double-charges the same cash.
+
+    ACCOUNT-WIDE, WHILE THE RAIL IT FEEDS IS PER-SLEEVE, and ``expert_instance_id`` is
+    therefore used only for the log line. That is deliberate and it is also an approximation
+    worth naming: delivery cash is a property of the BROKER ACCOUNT, not of one expert's
+    sleeve, so two classic_options sleeves on one account each measure the whole account's
+    cash and can each admit a short put the account could not both fund. It is the SAFE
+    direction for the single-sleeve case this branch ships (the same number the account-wide
+    ``assignment_capacity`` gate already enforces downstream, so nothing here can admit past
+    it) and the wrong one for a shared account. A real per-sleeve split needs a definition of
+    what share of account cash a sleeve owns -- design work, not a comment -- and is flagged
+    rather than guessed at here.
     """
     reader = getattr(account, "cash_available_for_delivery", None)
     if not callable(reader):
@@ -888,10 +903,14 @@ def flush_option_rm_run(expert_instance_id: int, account_id: int,
     """
     from ba2_common.core.trade_store import inmem_trades_active
 
+    # The BACKTEST check comes FIRST, before the pop. Popping and then declining to write
+    # destroys the run record in the one case the caller was told nothing would be written,
+    # so a backtest that later wanted ``journal()`` found it emptied by a function that had
+    # explicitly done nothing. Reordering is free: both branches return None.
+    if inmem_trades_active():
+        return None
     entries = list(_JOURNAL.pop(_sleeve_key(expert_instance_id), ()))
     if not entries:
-        return None
-    if inmem_trades_active():
         return None
 
     from ba2_common.core.db import add_instance

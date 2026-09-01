@@ -311,6 +311,29 @@ def test_a_submitted_structure_is_charged_to_the_sleeve_for_the_next_one(opted_i
     assert len(rm.pending_charges(7)) == 1
 
 
+def test_a_PREVIEW_never_consults_the_rails_and_never_journals(opted_in, monkeypatch):
+    """``submit_to_broker=False`` is a "manual review" preview: nothing is sent, so nothing
+    may be charged to the sleeve and nothing may be written into the entry journal. The gate
+    ran AHEAD of this branch until 2026-09-01, so a preview recorded an "admitted" decision
+    for a structure the book never took, and consumed headroom against the next real entry.
+
+    MUTATION KILL: move the gate back ahead of the submit_to_broker branch -- the journal
+    stops being empty."""
+    calls = []
+    monkeypatch.setattr(ta, "admit_option_entry",
+                        lambda **kw: calls.append(kw) or rm.admit_option_entry(**kw))
+    account = _LiveShapedAccount()
+    action = _action(account)
+    action.submit_to_broker = False
+    result = action._submit_option_order(_spread_legs(), 1, -1.5, "bull_put_spread")
+    assert result["success"] is True
+    assert "not submitted" in result["message"]
+    assert calls == []
+    assert rm.journal(7) == ()
+    assert rm.pending_charges(7) == ()
+    assert account.submitted == []
+
+
 def test_a_refused_entry_is_never_charged(opted_in):
     account = _LiveShapedAccount(balance=1_000.0)
     _action(account)._submit_option_order(_spread_legs(), 1, -1.5, "bull_put_spread")
@@ -349,6 +372,20 @@ def test_live_and_backtest_reach_the_SAME_option_risk_manager(opted_in, monkeypa
     assert live_result["success"] == bt_result["success"] is True
 
 
+#: A CALL to the gate, in any shape production code could reach it.
+#:
+#: The first version of this guard was ``^\s*(verdict\s*=\s*)?admit_option_entry\(``, which
+#: only ever matched the ONE call it was written against: a line-start anchor plus a single
+#: hard-coded assignment prefix. ``rm.admit_option_entry(...)`` (the module-qualified form
+#: every other file in the tree uses), a call nested in an expression or an argument, one
+#: bound to a name and invoked later — every second wiring point anyone would actually write
+#: passed the guard silently. Two patterns now: the CALL in any dotted / nested position, and
+#: the ALIAS form (a bare reference stashed on a name), which is how a call site hides from a
+#: call-shaped regex. ``def admit_option_entry(`` — the definition itself — is excluded.
+_GATE_CALL = re.compile(r"(?<!def )\b(?:\w+\s*\.\s*)*admit_option_entry\s*\(")
+_GATE_ALIAS = re.compile(r"=\s*(?:\w+\s*\.\s*)*admit_option_entry\b(?!\s*\()")
+
+
 def test_the_option_risk_manager_has_exactly_one_production_wiring_point():
     """A second call site is a second implementation waiting to happen — a backtest-only
     hook in ``daily_engine`` or a live-only one in ``JobManager`` is exactly how the two
@@ -362,9 +399,27 @@ def test_the_option_risk_manager_has_exactly_one_production_wiring_point():
                for p in parts):
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
-        if re.search(r"^\s*(verdict\s*=\s*)?admit_option_entry\(", text, re.M):
+        if _GATE_CALL.search(text) or _GATE_ALIAS.search(text):
             callers.add(path.relative_to(root).as_posix())
     assert callers == {"packages/common/ba2_common/core/TradeActions.py"}, callers
+
+
+def test_the_one_wiring_point_guard_would_actually_catch_a_second_one():
+    """The guard is a regex, and a regex that matches nothing passes forever. These are the
+    shapes a second wiring point would REALLY be written in — the module-qualified call the
+    rest of the tree uses, a nested one, an aliased one — every one of which the original
+    line-anchored pattern let through."""
+    for smuggled in (
+        "    rm.admit_option_entry(expert=e)\n",
+        "    v = ba2_common.core.OptionRiskManagement.admit_option_entry(expert=e)\n",
+        "    if not admit_option_entry(expert=e).allowed:\n",
+        "    results.append(rm.admit_option_entry(expert=e))\n",
+        "admit_option_entry(\n    expert=e)\n",
+    ):
+        assert _GATE_CALL.search(smuggled), smuggled
+    assert _GATE_ALIAS.search("    _gate = rm.admit_option_entry\n")
+    # ...and it must not flag the definition, or the module that owns it fails its own guard.
+    assert not _GATE_CALL.search("def admit_option_entry(*, expert, account):\n")
 
 
 def test_the_backtest_engine_carries_no_option_risk_manager_of_its_own():

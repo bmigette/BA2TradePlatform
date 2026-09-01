@@ -2689,17 +2689,30 @@ class _OptionEntryAction(TradeAction):
             max_loss_per_contract if stock_cover_price is None
             else _measured_max_loss_per_contract(legs, limit_price,
                                                  stock_cover_price=stock_cover_price))
+        if not self.submit_to_broker:
+            logger.info(f"_OptionEntryAction: submit disabled for {self.instrument_name} "
+                        f"{option_strategy} - recording informational result")
+            return self._result(True,
+                                 f"{option_strategy} for {self.instrument_name} (manual review, not submitted)",
+                                 data)
         # THE OPTION RISK MANAGER (design 2026-08-27 SS4, review finding F5). This is the one
         # choke point all seventeen builders reach, and it is reached identically by the live
         # pass (TradeManager -> TradeActionEvaluator) and by the backtest engine
         # (daily_engine -> TradeActionEvaluator), so ONE call arms both runtimes -- which is
-        # the whole content of SS4's operator decision. Ahead of the submit_to_broker branch
-        # deliberately: a rail decision is a decision, and a "manual review" preview that
-        # showed a structure the rails would refuse would be advertising a trade that cannot
-        # happen. The max loss is HANDED to the RM, never re-derived there: no leg
-        # reconstruction, no OCC parsing. It equals the stamped value on every structure
-        # except a verified covered call, where the stamp is absent (see above) and the RM
-        # is given the cover-inclusive measurement instead.
+        # the whole content of SS4's operator decision.
+        #
+        # BEHIND the submit_to_broker branch, deliberately (it was ahead of it until
+        # 2026-09-01). The gate is not a read: it JOURNALS its verdict and, on an admission,
+        # the caller CHARGES the sleeve for what is now in flight. Run on a preview, it wrote
+        # "admitted" into the run record for a structure that was never sent, and the run
+        # report then showed entries the operator's book never took. A preview is not an
+        # entry, so it does not consume the sleeve's headroom and does not appear in the
+        # entry journal.
+        #
+        # The max loss is HANDED to the RM, never re-derived there: no leg reconstruction, no
+        # OCC parsing. It equals the stamped value on every structure except a verified
+        # covered call, where the stamp is absent (see above) and the RM is given the
+        # cover-inclusive measurement instead.
         rm_expert, rm_instance_id = self._option_risk_manager()
         rm_candidate = None
         if rm_expert is not None:
@@ -2713,12 +2726,6 @@ class _OptionEntryAction(TradeAction):
                 data["option_rm_rail"] = verdict.reason
                 return self._result(False, verdict.message, data)
             rm_candidate = verdict.candidate
-        if not self.submit_to_broker:
-            logger.info(f"_OptionEntryAction: submit disabled for {self.instrument_name} "
-                        f"{option_strategy} - recording informational result")
-            return self._result(True,
-                                 f"{option_strategy} for {self.instrument_name} (manual review, not submitted)",
-                                 data)
         order = self.account.submit_option_order(
             legs=legs, quantity=quantity, order_type="limit", limit_price=limit_price,
             option_strategy=option_strategy, expert_recommendation_id=expert_rec_id)
