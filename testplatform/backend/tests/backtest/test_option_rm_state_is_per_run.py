@@ -128,10 +128,16 @@ def test_a_backtest_run_boundary_never_clears_the_LIVE_sleeve_keys():
     breaker has stood the book down must not be re-armed by a backtest finishing on the
     same thread."""
     live = BreakerState(peak_equity=250_000.0, halted=True)
-    option_rm.set_breaker_state(4242, live)                 # no store active -> a LIVE key
+    # The live key is written BY SHAPE rather than through set_breaker_state, because
+    # _sleeve_key answers according to whether a backtest trade store happens to be active
+    # on this thread -- and in a full-suite run an earlier test can leave one active, which
+    # would file this "live" write under a thread key and make the test assert nothing. The
+    # property under test IS the key shape, so naming the tuple is the honest way to state
+    # it, not a shortcut around the accessor.
+    option_rm._BREAKER_STATE[(None, 4242)] = live
     try:
         with backtest_trading_db("rm-state-live-keys"):
             option_rm.set_breaker_state(4242, BreakerState(peak_equity=9.0, halted=True))
-        assert option_rm.get_breaker_state(4242) == live
+        assert option_rm._BREAKER_STATE.get((None, 4242)) == live
     finally:
         option_rm.reset_state()
