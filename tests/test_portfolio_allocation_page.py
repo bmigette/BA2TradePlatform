@@ -7505,3 +7505,47 @@ def test_the_delta_markup_reads_its_colour_off_the_row(nicegui_client, account_i
     assert "props.row.value_delta_color" in slots['body-cell-target_value'].template
     assert "props.row.qty_delta_color" in slots['body-cell-quantity'].template
     assert "props.row.share_delta_color" in slots['body-cell-weight_pct'].template
+
+
+# ---------------------------------------------------------------------------
+# P&L colour, and the delta's alignment with the box it describes
+# ---------------------------------------------------------------------------
+
+def test_pnl_is_coloured_with_the_same_two_colours_as_the_deltas(nicegui_client,
+                                                                 account_id):
+    """It was the only purely gain-or-loss column not saying so."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-pnl'].template
+
+    assert "props.row.pnl_color" in template
+
+
+def test_the_pnl_colour_comes_from_the_amount_not_the_rendered_string(nicegui_client,
+                                                                     account_id):
+    """The string can be "-" (unmeasurable) or carry a "no cost basis" note, so a
+    leading '-' in it is not reliably a loss. The colour is decided on the number."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        UnrealisedPnL, delta_color)
+
+    assert delta_color(UnrealisedPnL(amount=None).amount) == 'grey-5'
+    assert delta_color(12.0) == 'positive'
+    assert delta_color(-12.0) == 'negative'
+
+
+def test_every_row_carries_a_pnl_colour(nicegui_client, account_id):
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+
+    for row in _tables(root)[0].rows:
+        assert 'pnl_color' in row
+
+
+def test_the_share_delta_is_the_inputs_hint_so_it_lines_up_with_the_digits(
+        nicegui_client, account_id):
+    """A sibling div right-aligns to the CELL's edge; the input's number right-aligns
+    to the INPUT's content box. They are different edges, and the delta hung past the
+    box it describes. Quasar renders a hint inside the control's own box."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-weight_pct'].template
+
+    assert 'v-slot:hint' in template
+    assert 'props.row.share_delta' in template

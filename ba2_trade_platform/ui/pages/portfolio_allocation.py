@@ -2055,6 +2055,11 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # "may this be shown at all" branch -- blank versus 0.00, a percentage
         # versus "no cost basis" -- is a decision, and decisions are not Quasar's.
         'pnl': format_unrealised_pnl(r.pnl),
+        # Coloured from the AMOUNT, never by parsing the rendered string: that string
+        # can be "-" (unmeasurable) or carry a "no cost basis" note, and a leading '-'
+        # in it is not always a loss. ``delta_color`` is the same function the live
+        # deltas use, so the two greens and the two reds are the same two colours.
+        'pnl_color': delta_color(r.pnl.amount),
         # Bumped when an edit is REFUSED, and used as the ``:key`` of the cell's
         # input so the refusal actually puts the typed text back -- see
         # ``_revert_symbol_cell``.
@@ -2163,6 +2168,14 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         </q-td>
     ''')
     table.on('symbolInfo', lambda e: _open_symbol_info([e.args[0]]))
+    # THE DELTA IS THE INPUT'S ``hint``, not a sibling div. A sibling right-aligns to
+    # the CELL's edge while the input's number right-aligns to the INPUT's content box,
+    # and the two are not the same edge -- the delta hung a dozen pixels past the box it
+    # describes. Quasar renders a hint inside ``q-field__bottom``, which shares the
+    # control's box, so ``text-right`` there lands under the digits. It also reserves
+    # its space unconditionally, which keeps every row the same height whether or not
+    # that row has a measurable delta.
+    #
     # ``:key`` is load-bearing, not decoration: the input is bound to
     # ``props.value``, so Vue's watcher only fires when THAT changes -- and a
     # REFUSED edit leaves it unchanged by definition. Bumping the key remounts the
@@ -2172,10 +2185,14 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         <q-td :props="props">
             <q-input :key="props.row.weight_key" :model-value="props.value"
                      type="number" dense borderless input-class="text-right"
+                     class="full-width"
                      debounce="''' + str(TARGET_DEBOUNCE_MS) + r'''"
-                     @update:model-value="(val) => $parent.$emit('weightChange', props.row.symbol, val)" />
-            <div v-if="props.row.share_delta" class="text-caption text-right"
-                 :class="'text-' + props.row.share_delta_color">{{ props.row.share_delta }}</div>
+                     @update:model-value="(val) => $parent.$emit('weightChange', props.row.symbol, val)">
+                <template v-slot:hint>
+                    <div class="text-right"
+                         :class="'text-' + props.row.share_delta_color">{{ props.row.share_delta }}</div>
+                </template>
+            </q-input>
         </q-td>
     ''')
     # THE LIVE CHANGE, beside the figure it applies to rather than in three more
@@ -2195,6 +2212,13 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
             <div>{{ props.value }}</div>
             <div v-if="props.row.qty_delta" class="text-caption"
                  :class="'text-' + props.row.qty_delta_color">{{ props.row.qty_delta }}</div>
+        </q-td>
+    ''')
+    # P&L in the SAME two colours as the deltas above it. It was plain white, which
+    # made the one column that is purely a gain-or-loss the only one not saying so.
+    table.add_slot('body-cell-pnl', r'''
+        <q-td :props="props">
+            <span :class="'text-' + props.row.pnl_color">{{ props.value }}</span>
         </q-td>
     ''')
     table.on('weightChange',
