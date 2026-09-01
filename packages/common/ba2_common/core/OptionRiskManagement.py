@@ -33,9 +33,13 @@ pins it.
 
 Fail closed, loudly
 -------------------
-* An **unknown** ``risk_manager_mode`` raises ``OptionRiskManagerModeError`` naming the mode
-  and the admitted set. It does not fall back to ``classic``: a typo that silently disables
-  a risk manager is the exact shape of defect this program keeps finding.
+* An **unknown** ``risk_manager_mode`` does NOT engage the option gate, and says so at
+  WARNING naming the instance, the value and the admitted set (once per instance, not once
+  per action). The DISPATCH question is the one thing here that fails open, deliberately:
+  it used to raise from outside the guarded path, and one expert carrying the literal
+  string ``"None"`` then aborted the whole Phase-1 entry pass under
+  ``BA2_ERROR_MODE=enforce`` -- taking down unrelated experts' entries that had worked
+  before the branch existed. See ``option_risk_manager_enabled``.
 * A rail setting the expert does not declare **refuses the entry** and names the setting. It
   is never defaulted — ``option_book._require`` already refuses to substitute a default for a
   risk rail, and this module refuses one bar earlier so the operator gets a readable
@@ -143,9 +147,58 @@ def normalise_risk_manager_mode(settings: Optional[Mapping[str, Any]]) -> str:
     return mode
 
 
-def option_risk_manager_enabled(settings: Optional[Mapping[str, Any]]) -> bool:
-    """Does this expert route its option entries through the option risk manager?"""
-    return normalise_risk_manager_mode(settings) == RISK_MANAGER_MODE_CLASSIC_OPTIONS
+#: ``(expert instance id, offending raw mode)`` already logged. The entry gate is consulted
+#: once per candidate STRUCTURE and a Phase-1 pass evaluates many, so an un-deduplicated
+#: warning would bury the log under one identical line per action.
+_WARNED_UNADMITTED_MODES: set = set()
+
+
+def reset_mode_warnings() -> None:
+    """Forget which unadmitted modes have been warned about. Tests, and a fresh process."""
+    _WARNED_UNADMITTED_MODES.clear()
+
+
+def option_risk_manager_enabled(settings: Optional[Mapping[str, Any]],
+                                expert_instance_id: Optional[int] = None) -> bool:
+    """Does this expert route its option entries through the option risk manager?
+
+    **THE DISPATCH QUESTION FAILS OPEN, and only the dispatch question** (review finding
+    H2, 2026-09-01). The gate engages on ``classic_options`` and on nothing else: any other
+    string -- ``classic``, ``smart``, or garbage -- answers ``False``, and the entry then
+    takes the legacy path it took before this module existed, byte for byte.
+
+    It used to RAISE on an unadmitted string, from a call site OUTSIDE the guarded path, so
+    one expert carrying the literal string ``"None"`` (``ExtendableSettingsInterface`` line
+    87 documents that population: ``str(None)`` was once written to the settings table)
+    aborted the whole Phase-1 entry pass under ``BA2_ERROR_MODE=enforce`` -- killing the
+    remaining actions of experts that had nothing to do with options, where before the
+    branch the same value read as ``classic`` and traded normally. A risk manager that
+    cannot be selected by a typo is worth having; a typo that stops OTHER experts trading
+    is not, and it is the same leniency ``utils.get_risk_manager_mode`` already documents
+    for the same reason.
+
+    The garbage is not swallowed: it is logged at WARNING naming the instance, the value and
+    the admitted set, ONCE per (instance, value) rather than once per action.
+
+    FAIL-CLOSED STAYS INSIDE THE OPTION PATH. An expert that *did* select
+    ``classic_options`` and cannot produce its sleeve rails still refuses the entry
+    (``admit_option_entry`` -> ``rail_settings``). What is fail-open here is only *whether
+    the option risk manager is the thing being asked*.
+    """
+    try:
+        return normalise_risk_manager_mode(settings) == RISK_MANAGER_MODE_CLASSIC_OPTIONS
+    except OptionRiskManagerModeError as e:
+        raw = (settings or {}).get("risk_manager_mode") if isinstance(settings, Mapping) else None
+        key = (expert_instance_id, str(raw))
+        if key not in _WARNED_UNADMITTED_MODES:
+            _WARNED_UNADMITTED_MODES.add(key)
+            logger.warning(
+                f"Option RM: expert instance {expert_instance_id} declares "
+                f"risk_manager_mode {raw!r}, which is not one of "
+                f"{list(VALID_RISK_MANAGER_MODES)} -- the option risk manager is NOT "
+                f"engaged and this expert keeps its legacy (classic) entry behaviour. "
+                f"Fix the setting if the sleeve rails were meant to run. ({e})")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -612,7 +665,7 @@ def _journal_entry(expert_instance_id: int, verdict: OptionEntryVerdict,
 
 
 def reset_state() -> None:
-    """Forget EVERY thread's breaker latches, pending charges and journals.
+    """Forget EVERY thread's breaker latches, pending charges, journals and mode warnings.
 
     Process-wide, deliberately: this is the test fixture's and the operator's reset, the one
     that must leave nothing behind anywhere. A **running trial must never call it** -- see
@@ -621,6 +674,7 @@ def reset_state() -> None:
     reset_breaker_states()
     reset_pending_charges()
     reset_journal()
+    reset_mode_warnings()
 
 
 def _clear_this_threads_keys(store: Dict[Tuple[Optional[int], int], Any]) -> None:

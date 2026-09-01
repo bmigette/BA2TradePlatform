@@ -2561,6 +2561,15 @@ class _OptionEntryAction(TradeAction):
         not know, and refusing on that would refuse every legacy CLASSIC option entry too.
         It is logged at ERROR naming the instance -- for a ``classic_options`` expert that
         log line is the signal that its rails did not run.
+
+        The MODE READ obeys the same rule (review finding H2, 2026-09-01): a string that is
+        not an admitted mode answers "not engaged" and logs a WARNING once per instance,
+        instead of raising out of this method. It raised here until 2026-09-01, OUTSIDE the
+        guarded path, so a single expert whose ``risk_manager_mode`` held the literal
+        ``"None"`` aborted the remaining actions of the whole Phase-1 pass under
+        ``BA2_ERROR_MODE=enforce``. Fail-closed lives INSIDE the option path -- an expert
+        that really did select ``classic_options`` and cannot produce its rails still has
+        its entry refused by ``admit_option_entry``.
         """
         instance_id = (self.expert_recommendation.instance_id
                        if self.expert_recommendation else None)
@@ -2587,7 +2596,8 @@ class _OptionEntryAction(TradeAction):
             return None, None
         if expert is None:
             return None, None
-        if not option_risk_manager_enabled(getattr(expert, "settings", None)):
+        if not option_risk_manager_enabled(getattr(expert, "settings", None),
+                                           expert_instance_id=instance_id):
             return None, None
         return expert, instance_id
 

@@ -189,6 +189,42 @@ def test_a_default_expert_never_reaches_the_option_risk_manager(classic, monkeyp
     assert len(account.submitted) == 1
 
 
+def test_a_NON_ADMITTED_mode_takes_the_LEGACY_path_byte_for_byte(monkeypatch):
+    """Review finding H2 (blocker), 2026-09-01. THE REAL POPULATION: an expert whose
+    ``risk_manager_mode`` holds the literal string ``"None"`` (see
+    ``ExtendableSettingsInterface`` line 87 -- ``str(None)`` was written to the settings
+    table). The mode read happened OUTSIDE the guarded path and RAISED, so under
+    ``BA2_ERROR_MODE=enforce`` that one row aborted the rest of the Phase-1 entry pass --
+    entries that, before this branch existed, read the same value as classic and went out.
+
+    The entry gate engages on EXACTLY ``classic_options``; every other string is the legacy
+    path, and this compares the two results field for field rather than asserting a weaker
+    "it did not crash". MUTATION KILL: make the mode read raise (or fail closed) and the
+    garbage run stops matching the classic run."""
+    calls = []
+    monkeypatch.setattr(ta, "admit_option_entry",
+                        lambda **kw: calls.append(kw) or pytest.fail("reached"))
+
+    def _run(mode: str):
+        gen = _with_mode(mode)
+        next(gen)
+        try:
+            account = _LiveShapedAccount()
+            result = _action(account)._submit_option_order(_spread_legs(), 2, -1.5,
+                                                           "bull_put_spread")
+            return result, account.submitted
+        finally:
+            next(gen, None)
+
+    reference, ref_submitted = _run("classic")
+    garbage, garbage_submitted = _run("None")
+    assert calls == []                                  # the RM was never consulted
+    assert garbage["success"] is True
+    assert garbage["data"] == reference["data"]
+    assert garbage["message"] == reference["message"]
+    assert len(garbage_submitted) == len(ref_submitted) == 1
+
+
 def test_an_action_with_no_expert_instance_never_reaches_it(monkeypatch):
     """Rulesets fired from the UI test bench carry no instance id."""
     calls = []

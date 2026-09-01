@@ -175,14 +175,63 @@ def test_the_settings_definition_offers_the_option_mode_from_one_list():
     assert values == list(rm.VALID_RISK_MANAGER_MODES)
 
 
-def test_an_unknown_risk_manager_mode_refuses_loudly():
-    """FAIL CLOSED. A typo'd mode must not read as ``classic``: a risk manager silently
-    switched off by a spelling mistake is the defect class this program keeps finding."""
-    with pytest.raises(rm.OptionRiskManagerModeError) as excinfo:
-        rm.option_risk_manager_enabled({"risk_manager_mode": "classic-options"})
-    message = str(excinfo.value)
+@pytest.fixture
+def warnings_logged(monkeypatch):
+    """The WARNING lines this module emits.
+
+    Not ``caplog``: the project logger does not propagate to the root handler pytest
+    captures, so a caplog assertion here passes whether or not anything was logged."""
+    recorded: List[str] = []
+    monkeypatch.setattr(rm.logger, "warning",
+                        lambda msg, *a, **k: recorded.append(str(msg)))
+    return recorded
+
+
+def test_an_unadmitted_mode_does_not_engage_the_gate_and_does_not_raise(warnings_logged):
+    """THE DISPATCH QUESTION FAILS OPEN (review finding H2, 2026-09-01), and only it.
+
+    ``option_risk_manager_enabled`` is called from ``_option_risk_manager``, OUTSIDE the
+    guarded option path. While it RAISED, one expert whose ``risk_manager_mode`` held an
+    unadmitted string aborted the remaining actions of the whole Phase-1 entry pass under
+    ``BA2_ERROR_MODE=enforce`` -- entries that had worked before the branch existed, on
+    experts with no option in them. The gate engages on ``classic_options`` and nothing
+    else; anything else keeps the legacy path and says so, loudly, in the log."""
+    assert rm.option_risk_manager_enabled({"risk_manager_mode": "classic-options"},
+                                          expert_instance_id=11) is False
+    message = " | ".join(warnings_logged)
     assert "classic-options" in message           # names the offending value
     assert "classic_options" in message           # names what was admitted instead
+    assert "11" in message                        # names the instance to fix
+
+
+def test_the_string_None_reads_as_no_setting_at_all(warnings_logged):
+    """THE REAL POPULATION. ``ExtendableSettingsInterface`` line 87 documents it: ``str(None)``
+    was once written to the settings table, so live rows carry the literal ``"None"``. Under
+    the raising gate that value killed the entry pass of a CLASSIC expert; it must be
+    indistinguishable from having no setting at all, except for the warning."""
+    assert rm.option_risk_manager_enabled({"risk_manager_mode": "None"},
+                                          expert_instance_id=12) is False
+    assert rm.option_risk_manager_enabled({}) is False          # the reference behaviour
+    assert "'None'" in " | ".join(warnings_logged)
+
+
+def test_the_unadmitted_mode_warning_is_once_per_instance_not_once_per_action(
+        warnings_logged):
+    """A Phase-1 pass consults this gate once per candidate STRUCTURE. One line per action
+    is how a real warning becomes log noise nobody reads."""
+    for _ in range(5):
+        rm.option_risk_manager_enabled({"risk_manager_mode": "None"},
+                                       expert_instance_id=13)
+    rm.option_risk_manager_enabled({"risk_manager_mode": "None"},
+                                   expert_instance_id=14)
+    assert len(warnings_logged) == 2, warnings_logged
+
+
+def test_the_admitted_set_is_still_a_closed_list():
+    """The leniency is about DISPATCH, not about what counts as a mode. ``normalise_``
+    still raises, and it is still the single reader of ``VALID_RISK_MANAGER_MODES``."""
+    with pytest.raises(rm.OptionRiskManagerModeError):
+        rm.normalise_risk_manager_mode({"risk_manager_mode": "classic-options"})
 
 
 def test_an_absent_mode_is_classic_and_never_the_option_risk_manager():
