@@ -57,11 +57,40 @@ _OPTION_ENTRY_PARAM_KEYS = (
 _FORCED_EXIT_EVENT_TYPES = frozenset({
     ExpertEventType.N_DAYS_TO_EXPIRY.value,
 })
-#: P&L trigger event types whose LOSS side (operator < / <=) is a stop-loss.
-_PL_EVENT_TYPES = frozenset({
-    ExpertEventType.N_PROFIT_LOSS_PERCENT.value,
-    ExpertEventType.N_PROFIT_LOSS_AMOUNT.value,
-})
+#: LOSS-SIDE STOP TRIGGERS, keyed by the field's SIGN CONVENTION.
+#:
+#: A numeric trigger is a stop-loss when it fires as the position gets WORSE, and which
+#: operators mean "worse" depends entirely on which way the field is signed. The two
+#: conventions in the registry today point in OPPOSITE directions, so the classifier
+#: cannot key on a single operator set:
+#:
+#:   * SIGNED RESULT (``profit_loss_percent`` / ``profit_loss_amount``): the position's
+#:     own P&L — NEGATIVE while losing. Worse == smaller, so ``<`` / ``<=`` is the stop
+#:     and ``>`` / ``>=`` is the take-profit.
+#:   * LOSS MAGNITUDE (``loss_pct_of_max_loss``, design 2026-08-29 S8.2): unrealized loss
+#:     as a % of the structure's DEFINED max loss — POSITIVE while losing, +100 when the
+#:     whole defined risk is gone, negative while profitable. INVERTED vs the P&L fields:
+#:     worse == bigger, so ``>`` / ``>=`` is the stop and there is no take-profit reading.
+#:
+#: Review 2026-08-30 (dev-merge, FIX 1): the classifier previously enumerated only the
+#: signed-result convention, so the grid-wide ``opt_sl_ml`` stop (``loss_pct_of_max_loss``
+#: with ``>``) matched no test and was classified like a take-profit — a discretionary
+#: mid-quote close, exactly the filter-flattered exit F7 exists to remove. On the 9 debit
+#: kinds it is the ONLY stop (``opt_sl`` is credit-only), so 100 % of its firings were
+#: misclassified.
+#:
+#: A NEW loss-side field is registered by adding its convention HERE, not by adding a
+#: branch below. Keeping the mechanism a lookup was deliberate: ``loss_pct_of_max_loss``
+#: is the only inverted-sign field in ``ExpertEventType`` today (audited against
+#: ``get_number_event_values()``: every other numeric event is a signed P&L, a distance,
+#: a count of days, or an unsigned market statistic that is not a stop at all), but the
+#: S8.2 family it belongs to — "loss as a fraction of a measured risk budget" — is the
+#: shape a second such field would take.
+_LOSS_SIDE_STOP_OPERATORS = {
+    ExpertEventType.N_PROFIT_LOSS_PERCENT.value: frozenset({"<", "<="}),
+    ExpertEventType.N_PROFIT_LOSS_AMOUNT.value: frozenset({"<", "<="}),
+    ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value: frozenset({">", ">="}),
+}
 
 
 def forced_option_exit(event_action) -> bool:
@@ -73,9 +102,13 @@ def forced_option_exit(event_action) -> bool:
     — never its name, which is free text:
 
       * a ``days_to_expiry`` trigger is the DTE/roll exit — forced;
-      * a ``profit_loss_percent`` / ``profit_loss_amount`` trigger with a ``<``/``<=``
-        operator is a loss-side stop — forced;
-      * everything else (TP ``>`` gates, time exits, sentiment/rating flags) is
+      * a numeric trigger whose operator points at the LOSS side of its own field is a
+        stop — forced. Which operators those are is per-field and looked up in
+        ``_LOSS_SIDE_STOP_OPERATORS``, because the two sign conventions disagree: a
+        ``profit_loss_*`` stop is ``<``/``<=`` (P&L is negative while losing) while a
+        ``loss_pct_of_max_loss`` stop is ``>``/``>=`` (a loss MAGNITUDE, positive while
+        losing);
+      * everything else (TP gates, time exits, sentiment/rating flags) is
         discretionary. The ``days_opened`` time exit is DELIBERATELY discretionary —
         the F7 brief's forced list was SL / DTE / breaker / margin only (the breaker
         is deferred to F5's shared-rails work) — recorded so it is not re-litigated.
@@ -89,7 +122,8 @@ def forced_option_exit(event_action) -> bool:
         event_type = trigger.get("event_type")
         if event_type in _FORCED_EXIT_EVENT_TYPES:
             return True
-        if event_type in _PL_EVENT_TYPES and trigger.get("operator") in ("<", "<="):
+        loss_side = _LOSS_SIDE_STOP_OPERATORS.get(event_type)
+        if loss_side is not None and trigger.get("operator") in loss_side:
             return True
     return False
 
