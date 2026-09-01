@@ -846,9 +846,20 @@ def test_the_warmup_formula_pinned_above_is_the_handlers_own():
     src = open(src_path, encoding="utf-8").read()
     assert "_BARS_TO_CALDAYS = 1.45" in src
     assert re.search(r"int\(max_bars \* _BARS_TO_CALDAYS\) \+ 10", src)
-    # And the registration this expert still needs from Task 10 is genuinely absent,
-    # so the class attribute above is documented as inert rather than assumed live.
-    assert '"FMPEarningsEvent"' not in src
+    # THE REGISTRATION LANDED (plan Task 10, amendment 4, 2026-09-01). This assertion
+    # used to read ``'"FMPEarningsEvent"' not in src`` -- a deliberate INVERTED pin from
+    # Task 9, recording that the class attribute above was still inert because the
+    # handler did not know the expert yet. Task 10 registers it in BOTH tables, so the
+    # pin flips to the state it was always waiting for: the expert is a supported
+    # backtest expert AND the handler's warmup table agrees with the class attribute.
+    # The equality itself is pinned inside the monorepo by
+    # ``test_option_grid_foundations.test_the_earnings_expert_warmup_table_matches_the_class``;
+    # here it is re-derived from the SOURCE, which is what this test does for the formula.
+    bars = FMPEarningsEvent.BACKTEST_WARMUP_BARS
+    assert '"FMPEarningsEvent": "ba2_experts.FMPEarningsEvent"' in src
+    assert re.search(r'"FMPEarningsEvent":\s*%d\b' % bars, src), (
+        f"the handler's _EXPERT_WARMUP_BARS must carry {bars} for FMPEarningsEvent, "
+        f"matching BACKTEST_WARMUP_BARS")
 
 
 # ------------------------------------------------------------------ settings ---

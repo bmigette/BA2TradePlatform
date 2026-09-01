@@ -32,7 +32,11 @@ Namespacing:
   exit:<rid>:a<i>:option_strike_param  option strike PERCENT-OTM (option actions; was
                                        misnamed option_delta, still accepted on decode)
   exit:<rid>:a<i>:option_strike_method strike selection method (choice: percent_otm | delta)
-  exit:<rid>:a<i>:option_strike_delta  option strike DELTA (used when the method is delta)
+  exit:<rid>:a<i>:option_strike_delta  option strike DELTA (used when the method is delta;
+                                   the SHORT leg when a _long companion is declared)
+  exit:<rid>:a<i>:option_strike_delta_long  the LONG leg's DELTA for a two-leg builder that
+                                   targets its legs independently (backspreads)
+  exit:<rid>:a<i>:option_structure which option ACTION TYPE the entry submits (choice)
   exit:<rid>:a<i>:option_dte       option DTE window center
   exit:<rid>:a<i>:option_wing_width  option wing width %
   exit:<rid>:a<i>:option_sizing    option position size (% of equity per structure)
@@ -252,6 +256,52 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
             action.get("option_strike_delta_max"),
             action.get("option_strike_delta_step"), is_int=False,
         )
+    # THE SECOND LEG's delta, for the two-leg builders that target the legs INDEPENDENTLY.
+    #
+    # ``option_strike_delta`` alone cannot express a backspread (grid-2 O_CBS/O_PBS, design
+    # 2026-08-31 §2: short leg 0.35-0.50, long leg 0.15-0.30). ``_spread_params`` on the
+    # builder side already accepts a per-leg pair -- ``[long, short]`` or
+    # ``{"long":..,"short":..}`` -- and every vertical/backspread builder reads it; what was
+    # missing was a GENE for the second target, so a single value had to serve both legs and
+    # the selector merely picked the two nearest strikes to ONE delta. That is not the
+    # structure the design searches.
+    #
+    # ``option_strike_delta`` is the SHORT leg and this is the LONG leg whenever both are
+    # declared (see ``_apply_option_strike``); a builder declaring only the first is
+    # unchanged, so no existing action's genome moves.
+    if action.get("option_strike_delta_long_optimize"):
+        out[f"{prefix}:option_strike_delta_long"] = _range_entry(
+            action.get("option_strike_delta_long_min"),
+            action.get("option_strike_delta_long_max"),
+            action.get("option_strike_delta_long_step"), is_int=False,
+        )
+    # STRUCTURE as a categorical gene: which option ACTION TYPE the entry submits.
+    #
+    # Grid-2's ``O_ERN`` searches "straddle or strangle" (design §2), which is a choice
+    # between two BUILDERS rather than between two parameter values. Expressed as one choice
+    # gene on the action rather than as two toggleable entry rules because the alternative
+    # duplicates the entry rule's whole gate set (signal/iv_rank/iv_rv/expected_profit) for a
+    # single either/or, and both rules' ``has_no_position`` guard means only one could ever
+    # fire anyway -- so the second copy would be pure gene budget at a population of 40.
+    #
+    # The producer is responsible for offering only OPTION action types (the decode below
+    # writes ``action_type`` verbatim); ``_UNDROPPABLE_ACTIONS`` and the rest of the action
+    # machinery are keyed off that field, so an equity value here would be a category error.
+    if action.get("option_structure_optimize"):
+        choices = list(action["option_structure_choices"])
+        if len(choices) < 2:
+            raise ValueError(
+                f"{prefix}: option_structure_optimize needs >= 2 choices, got {choices}")
+        from ba2_common.core.types import is_option_action
+        non_option = [c for c in choices if not is_option_action(str(c))]
+        if non_option:
+            raise ValueError(
+                f"{prefix}: option_structure_choices must all be OPTION action types; "
+                f"{non_option} are not")
+        out[f"{prefix}:option_structure"] = {
+            "type": "choice", "choices": choices,
+            "min": 0, "max": len(choices) - 1, "step": 1,
+        }
     if action.get("option_dte_optimize"):
         out[f"{prefix}:option_dte"] = _range_entry(
             action.get("option_dte_min_range"),
@@ -518,6 +568,14 @@ def _apply_option_strike(action: Dict[str, Any], agenes: Dict[str, Any]) -> None
     ``option_delta`` is the LEGACY gene name for the percent param (it never carried a delta,
     despite the name -- OPT-C3). Accepted so persisted best-params blobs and warm starts from
     older optimizations still decode to what they meant.
+
+    PER-LEG TARGETS. A two-leg builder that aims its legs INDEPENDENTLY (the grid-2
+    backspreads: short 0.35-0.50, long 0.15-0.30) declares BOTH ``option_strike_delta`` (the
+    SHORT leg) and ``option_strike_delta_long``; the decoded pair is written as the
+    ``[long, short]`` sequence ``TradeActions._spread_params`` already destructures -- the
+    ordering it has used since it was promoted to the base class, and the ordering
+    ``test_backspread_builders``'s ``DELTAS = [0.20, 0.40]`` pins. A single value stays a
+    single value, so no existing action's decode moves.
     """
     method = agenes.get("option_strike_method")
     if method is not None:
@@ -525,6 +583,17 @@ def _apply_option_strike(action: Dict[str, Any], agenes: Dict[str, Any]) -> None
     effective = str(method if method is not None
                     else (action.get("option_strike_method") or "percent_otm"))
     if effective == "delta":
+        long_delta = agenes.get("option_strike_delta_long",
+                                action.get("option_strike_delta_long"))
+        if long_delta is not None:
+            short_delta = agenes.get("option_strike_delta",
+                                     action.get("option_strike_delta"))
+            if short_delta is None:
+                raise ValueError(
+                    f"option action {action.get('action_type')!r} declares a LONG-leg delta "
+                    f"but no short-leg delta; a per-leg pair needs both targets")
+            action["option_strike_param"] = [long_delta, short_delta]
+            return
         if "option_strike_delta" in agenes:
             action["option_strike_param"] = agenes["option_strike_delta"]
         elif action.get("option_strike_delta") is not None:
@@ -570,6 +639,10 @@ def _decode_rule_list(rules, ns: str,
             if "action_value" in agenes:
                 action["action_value"] = agenes["action_value"]
                 action["value"] = agenes["action_value"]
+            # STRUCTURE first: the action TYPE decides which builder the rest of the
+            # option params are read by, so it must be settled before they are written.
+            if "option_structure" in agenes:
+                action["action_type"] = agenes["option_structure"]
             _apply_option_strike(action, agenes)
             if "option_dte" in agenes:
                 _apply_option_dte(action, agenes["option_dte"])

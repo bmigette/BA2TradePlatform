@@ -257,6 +257,11 @@ _SUPPORTED_EXPERTS = {
     # (provider filing-date filter) + causal OHLCV slicing. Macro degrades to the
     # index-trend input when FRED is not wired into the backtest bundle.
     "DeterministicScorer": "ba2_experts.DeterministicScorer",
+    # Earnings-EVENT ranker (grid 2's O_ERN chain, design 2026-08-31 §9). Ranks upcoming
+    # earnings events from the FMP disk cache (past_earnings_quarterly x OHLCV) and stamps
+    # the event date + days-to-earnings onto its recommendations, which is what the strategy's
+    # rec_days_to_earnings / days_after_event timing gates read. No LLM, analyze_as_of-driven.
+    "FMPEarningsEvent": "ba2_experts.FMPEarningsEvent",
 }
 
 
@@ -272,6 +277,14 @@ _EXPERT_WARMUP_BARS = {
     "FMPSenateTraderWeight": 10,  # recent congressional trades; ATR floor governs warmup
     "FMPSenateTraderCopy": 10,
     "DeterministicScorer": 260,   # 12-1 momentum (252) + SMA200 trend inputs
+    # 620 = the class's own BACKTEST_WARMUP_BARS. Its features are computed over PAST earnings
+    # events (min_hist_events of them), and events are quarterly: 4+ quarters of history plus
+    # the earnings-day move measured off OHLCV needs ~2.5 years of bars. The table and the
+    # class attribute must AGREE -- ``derive_warmup_days`` prefers the class and falls back to
+    # this table on an import failure, so a disagreement is a silently different warmup on the
+    # exact runs where the import is broken. Pinned equal by
+    # test_option_grid_foundations.test_the_earnings_expert_warmup_table_matches_the_class.
+    "FMPEarningsEvent": 620,
 }
 _WARMUP_FLOOR_DAYS = 60           # never warm up less than this (ATR + safety)
 _BARS_TO_CALDAYS = 1.45           # trading bars -> calendar days (≈252 bars/year -> ~365 days)
@@ -904,11 +917,25 @@ def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float
     several experts naming a value the TIGHTEST wins, so a mixed run can never be scored more
     leniently than its strictest member. Returns {} when nobody declares one -- the fitness reader
     then falls back to its module defaults, i.e. pre-existing behaviour exactly.
+
+    AN EXPLICIT RUN-LEVEL VALUE WINS OVER THE EXPERT SCAN, and it is the one place the
+    "tightest wins" rule is deliberately not applied. The cadence a config can reach is set by
+    the STRUCTURE's holding period, not by the expert: the same expert driving a 400-DTE LEAPS
+    call and a 35-DTE long call produces trade rates an order of magnitude apart, and no class
+    attribute on the expert can tell those two runs apart. So a run that states its objective
+    (``ba2test_launcher._apply_option_trade_floor``, grid 2's long-dated keys) has stated it
+    ON PURPOSE, and taking the max with an expert's number would silently discard exactly the
+    lowering it exists to perform. Absent (every existing run) -> the expert scan below,
+    unchanged.
     """
     import importlib
 
     out: Dict[str, float] = {}
     for key in ("car_hard_min_trades_per_year", "car_min_trades_per_year"):
+        explicit = config.get(key)
+        if explicit is not None:
+            out[key] = float(explicit)
+            continue
         best = None
         for spec in config.get("experts", []) or []:
             class_name = spec.get("class") if isinstance(spec, dict) else spec

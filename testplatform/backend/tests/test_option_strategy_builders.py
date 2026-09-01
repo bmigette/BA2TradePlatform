@@ -186,12 +186,50 @@ def test_os4_is_non_directional_volatility_group():
     assert mod._OPTION_GROUPS["OS4"] == ["O_STRD", "O_STRG"]
 
 
-def test_every_pure_option_action_type_is_unique_across_groups():
-    """Sanity: no two _OPTION_STRATS keys should collide on the same underlying action_type
-    (that would mean a structure got accidentally duplicated instead of a new one added)."""
-    action_types = [v["action_type"] for v in mod._OPTION_STRATS.values()]
-    assert len(action_types) == len(set(action_types)), \
-        f"duplicate action_type in _OPTION_STRATS: {action_types}"
+def test_no_two_keys_search_the_SAME_structure_the_same_way():
+    """The copy-paste guard, restated on what it was always protecting (2026-09-01, grid 2).
+
+    It used to demand that every ``action_type`` in ``_OPTION_STRATS`` be UNIQUE. That held
+    while every key was a distinct structure, and grid 2 broke it DELIBERATELY: ``O_LEAPC``
+    is ``buy_call`` like ``O_LC``, ``O_LEAPP`` is ``buy_put`` like ``O_LP``, ``O_ERN`` is
+    ``open_straddle`` like ``O_STRD``. Those are not duplicated structures -- they are the
+    same BUILDER searched over a different proposition: O_LC buys a 25-45-DTE call a couple of
+    percent OTM, O_LEAPC buys a 365-550-DTE call at 0.80 delta. One is a short-dated premium
+    bet, the other is stock replacement, and the design (2026-08-31 §2) wants both.
+
+    So the invariant becomes what the docstring always MEANT: a key must not be another key's
+    twin. Two keys sharing a builder must differ in the space they SEARCH -- the strike
+    selection (method + band) or the DTE window. A genuine copy-paste, which keeps the donor's
+    action_type AND its ranges, still fails here; that is the defect the original was written
+    for, and it is still caught.
+    """
+    def _search_signature(cfg):
+        # ``option_strike_param`` may be a per-leg LIST (the backspreads' [long, short] delta
+        # pair), so it is rendered rather than used raw -- a list is unhashable.
+        return (
+            cfg["action_type"],
+            str(cfg.get("option_strike_method") or "percent_otm"),
+            repr(cfg.get("option_strike_param")),
+            cfg.get("option_strike_delta_min"), cfg.get("option_strike_delta_max"),
+            cfg.get("option_strike_param_min"), cfg.get("option_strike_param_max"),
+            cfg.get("option_dte_min_range"), cfg.get("option_dte_max_range"),
+        )
+
+    seen = {}
+    for key, cfg in mod._OPTION_STRATS.items():
+        sig = _search_signature(cfg)
+        assert sig not in seen, (
+            f"{key} and {seen[sig]} search the SAME structure over the SAME strike and DTE "
+            f"space ({sig}) -- one of them is a copy-paste that will simply re-run the other")
+        seen[sig] = key
+
+    # And the reuse above is REAL, not hypothetical -- if it ever stops being, this test has
+    # quietly become the weaker version of the one it replaced and should go back.
+    from collections import Counter
+    shared = [a for a, n in Counter(v["action_type"]
+                                    for v in mod._OPTION_STRATS.values()).items() if n > 1]
+    assert shared, ("no action_type is shared by two keys any more; restore the stricter "
+                    "uniqueness assertion this test replaced")
 
 
 # --------------------------------------------------------------------------- #

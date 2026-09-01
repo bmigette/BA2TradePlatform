@@ -36,9 +36,34 @@ from app.services.strategy_param_space import (  # noqa: E402
 )
 
 _SINGLES = sorted(mod._OPTION_STRATS)
+
+
+def _authored_method(kind):
+    return str(mod._OPTION_STRATS[kind].get("option_strike_method") or "percent_otm")
+
+
+# THREE-WAY, not two (2026-09-01, grid 2). The split used to be "the builder honours
+# strike_method" vs "it does not". A third case now exists and it is a DECISION rather than a
+# builder limit: a row that AUTHORS ``option_strike_method: "delta"`` has fixed its unit.
+#
+# Why those rows must NOT search the method. The method is a CATEGORICAL gene sharing ONE
+# ``option_strike_param`` domain with the percent-OTM alternative, so a key whose band is a
+# delta (O_LEAPC: 0.70-0.90) would, on any genome that sampled ``percent_otm``, be read as
+# 0.70-0.90 PERCENT out of the money -- at the money, on a key whose entire thesis is a deep
+# 0.80-delta stock replacement. There is no domain that is right under both methods, which is
+# why the launcher refuses to emit the gene for a fixed-method row
+# (``_apply_option_strike_method_gene``) and grid 2's design (2026-08-31 §2, plan Task 10
+# amendment 1) fixes the method instead of searching it.
+#
+# The original two-way claim is UNCHANGED for every key it was written about: a percent-OTM
+# row whose builder honours the method still searches it, and a builder that ignores the
+# method still gets no gene.
+_FIXED_METHOD = sorted(k for k in _SINGLES if _authored_method(k) != "percent_otm")
 _DELTA_CAPABLE = sorted(k for k in _SINGLES
-                        if honours_strike_method(mod._OPTION_STRATS[k]["action_type"]))
-_DELTA_BLIND = sorted(set(_SINGLES) - set(_DELTA_CAPABLE))
+                        if honours_strike_method(mod._OPTION_STRATS[k]["action_type"])
+                        and k not in _FIXED_METHOD)
+_DELTA_BLIND = sorted(k for k in _SINGLES
+                      if not honours_strike_method(mod._OPTION_STRATS[k]["action_type"]))
 
 
 def _build(kind):
@@ -199,6 +224,37 @@ def test_a_delta_choice_with_no_delta_anywhere_is_rejected_not_guessed():
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("kind", _SINGLES)
 def test_the_authored_method_and_param_are_untouched(kind):
+    """The UN-DECODED template must survive the gene-application pass unchanged.
+
+    Reads the row's OWN authored method (2026-09-01) instead of asserting the literal
+    ``"percent_otm"``: with grid 2 that literal stopped being "what every row authors" and
+    became "what most rows author", and a test that hard-codes the majority value stops
+    checking the invariant (nothing overwrites the authored method) the moment a minority
+    exists. Both halves of the claim are still made, per row.
+    """
     action = _entry_action(_build(kind))
-    assert action["option_strike_method"] == "percent_otm"
+    assert action["option_strike_method"] == _authored_method(kind)
     assert action["option_strike_param"] == mod._OPTION_STRATS[kind]["option_strike_param"]
+
+
+@pytest.mark.parametrize("kind", _FIXED_METHOD)
+def test_a_fixed_method_row_never_gets_a_method_gene(kind):
+    """The third case, asserted rather than merely excluded above: a row that authors a
+    non-percent method must emit NO method gene at all -- and the delta it searches instead
+    must be a real delta, in (0,1), so the two units can never be confused."""
+    space = collect_param_space(_build(kind))
+    m = kind.lower()
+    assert f"entry:{m}-entry:a0:option_strike_method" not in space
+    assert f"entry:{m}-entry:a0:option_strike_param" not in space, (
+        f"{kind} fixes the method to {_authored_method(kind)!r} but still searches the "
+        f"PERCENT-OTM param, which that method would read as a delta target")
+    deltas = {k: v for k, v in space.items() if ":option_strike_delta" in k}
+    assert deltas, f"{kind} fixes the method to delta but searches no delta"
+    for name, spec in deltas.items():
+        assert 0.0 < spec["min"] < spec["max"] < 1.0, f"{name} is not a delta band: {spec}"
+
+
+def test_all_three_cases_of_the_split_are_non_empty():
+    """Otherwise one of the three parametrized tests above is vacuous."""
+    assert _DELTA_CAPABLE and _DELTA_BLIND and _FIXED_METHOD, (
+        _DELTA_CAPABLE, _DELTA_BLIND, _FIXED_METHOD)

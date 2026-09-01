@@ -134,7 +134,15 @@ def test_the_two_halves_are_both_non_empty_and_disjoint_in_direction():
     # Derived from the structure's own action_type, NOT from _DEBIT_OPTION_MEMBERS -- reading
     # the classification back would make any mis-assignment self-consistent and invisible.
     long_premium = {"buy_call", "buy_put", "open_bear_put_spread", "open_bull_call_spread",
-                    "open_call_butterfly", "open_straddle", "open_strangle"}
+                    "open_call_butterfly", "open_straddle", "open_strangle",
+                    # GRID 2, 2026-09-01. A 1x2 BACKSPREAD is net LONG an option: two long
+                    # legs against one short, opened to OWN convexity, with the short there
+                    # to finance it. Its net can price to a credit on the day's skew and
+                    # that does not change the thesis -- what the gate must express is "buy
+                    # vol only when it is cheap", the debit direction. Added here, in the
+                    # INDEPENDENT re-derivation, rather than by reading the launcher's own
+                    # partition back: that is the whole point of this list.
+                    "open_call_backspread", "open_put_backspread"}
     for kind, op in ops.items():
         at = mod._OPTION_STRATS[kind]["action_type"]
         assert op == ("<" if at in long_premium else ">"), (

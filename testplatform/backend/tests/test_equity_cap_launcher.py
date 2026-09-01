@@ -206,8 +206,17 @@ def test_no_strategy_the_launcher_builds_exposes_an_equity_cap_gene():
     cap must be absent from THAT space too, for every strategy variant the CLI can build."""
     from app.services.strategy_param_space import collect_param_space
 
-    for kind in sorted(L._STRATEGY_BUILDERS):
+    # PHASE-GATED keys are registered builders that REFUSE to build (grid 2's O_PMCC/O_CAL --
+    # two-expiry structures the codebase cannot yet submit; ``_PHASE_GATED_OPTION_STRATEGIES``
+    # says why). They are in ``_STRATEGY_BUILDERS`` on purpose, so ``--strategy O_PMCC`` is a
+    # KNOWN key that explains itself rather than argparse's "invalid choice" -- and they have
+    # no gene space at all to check. Skipping them is not a hole: a phase-gated key cannot
+    # expose an equity_cap gene because it cannot expose ANY gene, and
+    # ``test_option_grid_foundations.test_a_phase_gated_key_is_a_KNOWN_key_that_refuses``
+    # pins that the refusal is what happens instead.
+    for kind in sorted(set(L._STRATEGY_BUILDERS) - set(L._PHASE_GATED_OPTION_STRATEGIES)):
         strategy = L._build_strategy(kind, f"gene-space-{kind}", "FMPRating")
         space = collect_param_space(strategy)
         assert not any("equity_cap" in k for k in space), \
             f"{kind}: {[k for k in space if 'equity_cap' in k]}"
+    assert L._PHASE_GATED_OPTION_STRATEGIES, "the skip above must be exercising something"
