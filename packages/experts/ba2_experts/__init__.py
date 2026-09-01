@@ -12,6 +12,7 @@ from .FMPSenateTraderWeight import FMPSenateTraderWeight
 from .FMPSenateTraderCopy import FMPSenateTraderCopy
 from .FMPInsiderClusterBuy import FMPInsiderClusterBuy
 from .FMPEarningsDrift import FMPEarningsDrift
+from .FMPEarningsEvent import FMPEarningsEvent
 from .PennyMomentumTrader import PennyMomentumTrader
 from .FactorRanker import FactorRanker
 from .DeterministicScorer import DeterministicScorer
@@ -20,7 +21,8 @@ from .DeterministicScorer import DeterministicScorer
 # its book rails / breaker / lifecycle logic live on in ba2_common.core.option_book and
 # ba2_common.core.option_lifecycle, which serve every option position via the option RM.
 experts = [FinnHubRating, FMPRating, FMPSenateTraderWeight, FMPSenateTraderCopy,
-           FMPInsiderClusterBuy, FMPEarningsDrift, PennyMomentumTrader, FactorRanker,
+           FMPInsiderClusterBuy, FMPEarningsDrift, FMPEarningsEvent, PennyMomentumTrader,
+           FactorRanker,
            DeterministicScorer]
 
 

@@ -1,0 +1,617 @@
+"""FMPEarningsEvent — the cache-fed core (options-grid2 Task 7, design §9).
+
+The fixtures mirror the SHAPES measured against the real FMP disk cache on
+2026-08-31 / verified again 2026-09-01:
+
+  * ``past_earnings_quarterly__<SYM>.json`` is a LIST of rows
+    {date, symbol, eps, epsEstimated, time, revenue, revenueEstimated,
+     updatedFromDate, fiscalDateEnding} — 11-12 events per symbol over three
+    years, eps+epsEstimated populated on >=90% of names in ALL cap bands, and a
+    ``time`` slot distribution of bmo 4,935 / amc 2,505 / '--' 663 / missing 288
+    over 8,391 rows sampled from 120 files. The SBET-class outlier (1 of 12 rows
+    with usable data) is reproduced verbatim below.
+  * ``earnings_estimates_quarterly__<SYM>.json`` carries ``numberAnalystsEstimatedEps``
+    (plural "Analysts" — the provider used to read a singular spelling that appears
+    in no payload, so the count was silently 0 everywhere).
+
+Everything runs through the REAL ``FMPCompanyDetailsProvider`` with only
+``fmp_history_disk_cached`` patched, so the provider's own end_date filtering,
+row mapping and (new) announcement-slot passthrough are exercised rather than
+re-implemented by a fake.
+"""
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
+
+import pandas as pd
+import pytest
+
+from ba2_common.core.backtest_context import BacktestContext
+from ba2_common.core.types import OrderRecommendation
+from ba2_experts.FMPEarningsEvent import (
+    FMPEarningsEvent, composite_confidence, compute_features, earnings_day_move_pct,
+    normalize_feature,
+)
+from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import (
+    FMPCompanyDetailsProvider,
+)
+
+AS_OF = datetime(2025, 6, 10, tzinfo=timezone.utc)          # a Tuesday
+UPCOMING_DAY = "2025-06-16"                                  # a Monday, 6 days out
+
+BASE_SETTINGS = {
+    "earnings_days_look": 10,
+    "min_hist_events": 4,
+    "min_analysts": 3,
+    "allow_unconfirmed_dates": False,
+    "w_hist_move": 1.0,
+    "w_surprise_vol": 1.0,
+    "w_vol_cheapness": 1.0,
+}
+
+#: Past quarterly print dates, newest first — all Mondays, ~3 months apart, so no
+#: event's reacting session can ever be another event's reference session.
+PAST_DAYS = ["2025-03-17", "2024-12-16", "2024-09-16", "2024-06-17",
+             "2024-03-18", "2023-12-18", "2023-09-18", "2023-06-19",
+             "2023-03-20", "2022-12-19", "2022-09-19", "2022-06-20"]
+
+
+# ---------------------------------------------------------------- fixtures ---
+def _row(day, *, eps=1.20, est=1.00, slot="amc", symbol="TSTX"):
+    """One raw ``past_earnings_quarterly`` row in the measured cache shape."""
+    return {"date": day, "symbol": symbol, "eps": eps, "epsEstimated": est,
+            "time": slot, "revenue": 5_000_000_000, "revenueEstimated": 4_900_000_000,
+            "updatedFromDate": "2026-08-07", "fiscalDateEnding": day}
+
+
+def _prow(day, *, eps=1.20, est=1.00, slot="amc"):
+    """One row in the PROVIDER's mapped shape (what ``get_past_earnings`` emits) —
+    used where a pure helper is called directly, without the provider in the loop."""
+    return {"fiscal_date_ending": day, "report_date": day,
+            "reported_eps": eps, "estimated_eps": est, "time": slot}
+
+
+def _weekdays(start: str, end: str):
+    d = datetime.strptime(start, "%Y-%m-%d")
+    last = datetime.strptime(end, "%Y-%m-%d")
+    out = []
+    while d <= last:
+        if d.weekday() < 5:
+            out.append(d.strftime("%Y-%m-%d"))
+        d += timedelta(days=1)
+    return out
+
+
+def _next_weekday(day: str) -> str:
+    d = datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
+def _bars_df(jumps=None, start="2022-01-03", end="2025-06-10"):
+    """A flat 100.0 daily close series with single-day closes overridden.
+
+    Because only the REACTING session of an event is moved, and events sit a
+    quarter apart, each injected jump is read by exactly one event."""
+    jumps = jumps or {}
+    days = _weekdays(start, end)
+    closes = [float(jumps.get(d, 100.0)) for d in days]
+    return pd.DataFrame({"Date": pd.to_datetime(days, utc=True), "Close": closes})
+
+
+def _estimates_payload(n_analysts=8):
+    """One ``earnings_estimates_quarterly`` row (FMP serves these ANNUAL)."""
+    return [{"symbol": "TSTX", "date": "2025-12-31", "estimatedEpsAvg": 5.0,
+             "estimatedEpsHigh": 5.4, "estimatedEpsLow": 4.6,
+             "numberAnalystEstimatedRevenue": 7,
+             "numberAnalystsEstimatedEps": n_analysts}]
+
+
+class _Bundle:
+    """ProviderBundle over the real details provider + a canned OHLCV frame."""
+
+    def __init__(self, df):
+        self._df = df
+        self.ohlcv_calls = []
+        p = FMPCompanyDetailsProvider.__new__(FMPCompanyDetailsProvider)
+        p.api_key = "fake-key"
+        self._details = p
+
+    def fundamentals_details(self):
+        return self._details
+
+    def ohlcv(self):
+        outer = self
+
+        class _O:
+            def get_ohlcv_data(self, symbol, end_date=None, lookback_days=400, interval="1d"):
+                outer.ohlcv_calls.append((symbol, end_date, lookback_days))
+                return outer._df
+        return _O()
+
+    def price_at_date(self, symbol, as_of):
+        return 100.0
+
+
+def _run(earnings_rows, *, settings=None, df=None, estimates=None, as_of=AS_OF):
+    """Drive the real _gather + _process with the provider's disk layer patched."""
+    settings = {**BASE_SETTINGS, **(settings or {})}
+    bundle = _Bundle(df if df is not None else _bars_df())
+
+    def _fake_cache(namespace, symbol, fetch_fn, *a, **kw):
+        if namespace.startswith("past_earnings"):
+            return earnings_rows
+        if namespace.startswith("earnings_estimates"):
+            return estimates if estimates is not None else _estimates_payload()
+        raise AssertionError(f"unexpected namespace {namespace!r}")
+
+    e = FMPEarningsEvent.__new__(FMPEarningsEvent)
+    e.id = 1
+    with patch("ba2_providers.fundamentals.details.FMPCompanyDetailsProvider."
+               "fmp_history_disk_cached", side_effect=_fake_cache):
+        ctx = BacktestContext(providers=bundle, settings=settings, as_of=as_of,
+                              extra={"symbol": "TSTX"})
+        rec = e.analyze_as_of(as_of, ctx)
+    return rec, bundle
+
+
+def _healthy_rows(*, upcoming_slot="amc", n_past=8, jump_pct=4.0):
+    """An upcoming event plus ``n_past`` clean past prints, and matching bars.
+
+    Each past print is 'amc', so its reacting session is the NEXT weekday; that is
+    the only bar moved. Surprises alternate so surprise_vol is non-degenerate.
+    """
+    rows = [_row(UPCOMING_DAY, eps=None, est=1.30, slot=upcoming_slot)]
+    jumps = {}
+    for i, day in enumerate(PAST_DAYS[:n_past]):
+        est = 1.00
+        eps = 1.00 + (0.10 if i % 2 == 0 else 0.30)      # +10% / +30% surprises
+        rows.append(_row(day, eps=eps, est=est, slot="amc"))
+        jumps[_next_weekday(day)] = 100.0 * (1.0 + jump_pct / 100.0)
+    return rows, _bars_df(jumps)
+
+
+# ------------------------------------------------------------- happy path ---
+def test_ranks_a_qualifying_upcoming_event():
+    rows, df = _healthy_rows()
+    rec, _ = _run(rows, df=df)
+    assert not rec.skip, rec.skip_reason
+    assert rec.signal == OrderRecommendation.BUY
+    assert 1.0 <= rec.confidence <= 100.0
+    payload = rec.raw_outputs["FMPEarningsEvent"]
+    assert payload["event_date"] == UPCOMING_DAY
+    assert payload["days_to_earnings"] == 6            # 2025-06-10 -> 2025-06-16
+    assert payload["event_time_confirmed"] is True
+    assert payload["usable_events"] == 8
+    assert payload["hist_move"] == pytest.approx(4.0)
+    # surprises alternate 10% / 30% -> sample stdev of four 10s and four 30s
+    assert payload["surprise_vol"] == pytest.approx(10.69, abs=0.05)
+
+
+def test_payload_key_path_is_the_one_task9_reads():
+    """Live stamps ExpertRecommendation.data={'FMPEarningsEvent': ...}; the backtest
+    engine copies raw_outputs wholesale into .data. Both must expose the SAME path,
+    or Task 9's days_to_earnings condition works in one and silently never fires in
+    the other."""
+    rows, df = _healthy_rows()
+    rec, _ = _run(rows, df=df)
+    backtest_data = dict(rec.raw_outputs)              # daily_engine._persist does this
+    assert backtest_data["FMPEarningsEvent"]["days_to_earnings"] == 6
+
+
+def test_no_event_inside_the_look_window_is_refused():
+    rows, df = _healthy_rows()
+    rows[0] = _row("2025-07-21", eps=None, est=1.30)   # 41 days out
+    rec, _ = _run(rows, df=df)
+    assert rec.skip and "no earnings event within 10 days" in rec.skip_reason
+
+
+def test_the_look_window_is_inclusive_of_the_event_day():
+    """A print TODAY is 0 days away, not 'already past' — the same inclusive bound
+    DaysToEarningsCondition uses."""
+    rows, df = _healthy_rows()
+    rows[0] = _row("2025-06-10", eps=None, est=1.30)
+    rec, _ = _run(rows, df=df)
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["days_to_earnings"] == 0
+
+
+# ------------------------------------------------ the bmo/amc day convention ---
+def test_amc_move_is_the_next_session():
+    """'amc' prints after the close of D, so the reaction is Close(D+1)/Close(D)."""
+    bars = [("2024-06-17", 100.0), ("2024-06-18", 107.0), ("2024-06-19", 100.0)]
+    assert earnings_day_move_pct(bars, "2024-06-17", "amc") == pytest.approx(7.0)
+
+
+def test_bmo_move_is_the_event_day_itself():
+    """'bmo' prints before the open of D, so the reaction is Close(D)/Close(D-1)."""
+    bars = [("2024-06-14", 100.0), ("2024-06-17", 107.0), ("2024-06-18", 100.0)]
+    assert earnings_day_move_pct(bars, "2024-06-17", "bmo") == pytest.approx(7.0)
+
+
+def test_the_two_slots_are_not_interchangeable():
+    """The SAME price series read with the wrong slot yields a different number —
+    which is exactly why the slot must never be defaulted."""
+    bars = [("2024-06-14", 100.0), ("2024-06-17", 100.0),
+            ("2024-06-18", 107.0), ("2024-06-19", 100.0)]
+    assert earnings_day_move_pct(bars, "2024-06-17", "amc") == pytest.approx(7.0)
+    assert earnings_day_move_pct(bars, "2024-06-17", "bmo") == pytest.approx(0.0)
+
+
+def test_the_move_is_absolute():
+    bars = [("2024-06-17", 100.0), ("2024-06-18", 92.0)]
+    assert earnings_day_move_pct(bars, "2024-06-17", "amc") == pytest.approx(8.0)
+
+
+def test_unknown_slot_yields_no_move():
+    """'--' and missing are FMP's unknown slot: no guessed default, no move."""
+    bars = [("2024-06-14", 100.0), ("2024-06-17", 107.0), ("2024-06-18", 112.0)]
+    assert earnings_day_move_pct(bars, "2024-06-17", "--") is None
+    assert earnings_day_move_pct(bars, "2024-06-17", None) is None
+
+
+def test_missing_bar_on_either_side_yields_no_move():
+    assert earnings_day_move_pct([("2024-06-17", 100.0)], "2024-06-17", "amc") is None
+    assert earnings_day_move_pct([("2024-06-17", 100.0)], "2024-06-17", "bmo") is None
+
+
+def test_unknown_slot_events_do_not_count_toward_min_hist_events():
+    """A symbol whose prints are all unslotted is refused, not scored on guesses."""
+    rows, df = _healthy_rows(n_past=8)
+    rows = [rows[0]] + [{**r, "time": "--"} for r in rows[1:]]
+    rec, _ = _run(rows, df=df)
+    assert rec.skip and "0 usable past events" in rec.skip_reason
+
+
+# ------------------------------------------------------ min_hist_events floor ---
+def test_sbet_class_no_coverage_is_refused():
+    """MEASURED outlier: SBET carried usable data on 1 of its 12 rows. One usable
+    event is not a distribution — the symbol must leave the ranking."""
+    rows = [_row(UPCOMING_DAY, eps=None, est=1.30, slot="amc")]
+    jumps = {}
+    for i, day in enumerate(PAST_DAYS):
+        if i == 0:
+            rows.append(_row(day, eps=1.10, est=1.00, slot="amc"))
+            jumps[_next_weekday(day)] = 104.0
+        else:
+            rows.append(_row(day, eps=None, est=None, slot="--"))
+    rec, _ = _run(rows, df=_bars_df(jumps))
+    assert rec.skip and "1 usable past events < min_hist_events=4" in rec.skip_reason
+
+
+def test_min_hist_events_is_a_hard_floor_not_a_padded_rank():
+    """MUTATION (a): dropping/loosening the min_hist_events comparison would let a
+    3-event symbol into the ranking with a composite built from three prints. It
+    must SKIP, and the skip must not be reachable by any weight setting."""
+    rows, df = _healthy_rows(n_past=3)
+    rec, _ = _run(rows, df=df)
+    assert rec.skip and "3 usable past events < min_hist_events=4" in rec.skip_reason
+    assert rec.confidence == 0.0
+    # ... and exactly 4 usable events is admitted, so the floor is `<`, not `<=`.
+    rows4, df4 = _healthy_rows(n_past=4)
+    rec4, _ = _run(rows4, df=df4)
+    assert not rec4.skip and rec4.raw_outputs["FMPEarningsEvent"]["usable_events"] == 4
+
+
+# ---------------------------------------------------- unconfirmed-date trap ---
+def test_unconfirmed_upcoming_date_is_refused_by_default():
+    """MUTATION (b): admitting an unslotted upcoming row when allow_unconfirmed_dates
+    is False buys volatility against a date FMP has not pinned, which slips."""
+    rows, df = _healthy_rows(upcoming_slot="--")
+    rec, _ = _run(rows, df=df)
+    assert rec.skip
+    assert "unconfirmed" in rec.skip_reason and "2025-06-16" in rec.skip_reason
+
+
+def test_missing_slot_on_the_upcoming_row_is_also_unconfirmed():
+    rows, df = _healthy_rows()
+    rows[0] = {**rows[0], "time": None}
+    rec, _ = _run(rows, df=df)
+    assert rec.skip and "unconfirmed" in rec.skip_reason
+
+
+def test_unconfirmed_date_is_admitted_when_the_setting_allows_it():
+    rows, df = _healthy_rows(upcoming_slot="--")
+    rec, _ = _run(rows, df=df, settings={"allow_unconfirmed_dates": True})
+    assert not rec.skip, rec.skip_reason
+    assert rec.raw_outputs["FMPEarningsEvent"]["event_time_confirmed"] is False
+
+
+# ------------------------------------------------------ point-in-time / leak ---
+def test_the_upcoming_event_never_contributes_to_the_features():
+    """MUTATION (c): the cache file is a present-day snapshot, so the FUTURE row
+    already carries its eventual actual EPS. Splitting past/future on the as-of is
+    what keeps it out of surprise_vol; without the split this monstrous surprise
+    would dominate the feature."""
+    rows, df = _healthy_rows()
+    clean = _run(rows, df=df)[0].raw_outputs["FMPEarningsEvent"]
+
+    leaky = [{**rows[0], "eps": 25.0, "epsEstimated": 1.0}] + rows[1:]
+    got = _run(leaky, df=df)[0].raw_outputs["FMPEarningsEvent"]
+
+    assert got["surprise_vol"] == pytest.approx(clean["surprise_vol"])
+    assert got["hist_move"] == pytest.approx(clean["hist_move"])
+    assert got["usable_events"] == clean["usable_events"]
+
+
+def test_a_bmo_print_on_the_as_of_day_cannot_leak_into_the_features():
+    """The GENUINELY leakable case, and the reason the split is on the DATE rather
+    than on "could we price it": a 'bmo' event dated ON the as-of reacts during the
+    as-of session, so BOTH bars it needs already exist. Only the strict
+    ``date < as_of`` split keeps its (already-known, in a present-day cache file)
+    EPS and its move out of the history. Without the split hist_move and
+    surprise_vol both move violently."""
+    rows, df = _healthy_rows(n_past=8)
+    clean = _run(rows, df=df)[0].raw_outputs["FMPEarningsEvent"]
+
+    leaky = list(rows)
+    leaky[0] = _row("2025-06-10", eps=25.0, est=1.00, slot="bmo")   # today, pre-open
+    jumps = {d: c for d, c in zip(df["Date"].dt.strftime("%Y-%m-%d"), df["Close"])
+             if c != 100.0}
+    jumps["2025-06-10"] = 130.0                                     # a 30% reaction
+    got = _run(leaky, df=_bars_df(jumps))[0].raw_outputs["FMPEarningsEvent"]
+
+    assert got["days_to_earnings"] == 0                # it IS the upcoming event
+    assert got["usable_events"] == clean["usable_events"] == 8
+    assert got["hist_move"] == pytest.approx(clean["hist_move"])
+    assert got["surprise_vol"] == pytest.approx(clean["surprise_vol"])
+
+
+def test_an_event_dated_on_the_as_of_is_future_not_history():
+    """The boundary: 'past' is STRICTLY BEFORE the as-of. A print happening today
+    has not been priced yet, so it cannot be one of the historical observations."""
+    rows, df = _healthy_rows(n_past=8)
+    rows[0] = _row("2025-06-10", eps=9.0, est=1.0, slot="amc")   # today
+    rec, _ = _run(rows, df=df)
+    assert rec.raw_outputs["FMPEarningsEvent"]["usable_events"] == 8
+
+
+def test_price_history_is_never_read_past_the_as_of():
+    """The OHLCV window ends at the decision date, never at the calendar horizon."""
+    rows, df = _healthy_rows()
+    _, bundle = _run(rows, df=df)
+    assert bundle.ohlcv_calls, "no OHLCV read happened"
+    for _sym, end_date, _lb in bundle.ohlcv_calls:
+        assert end_date == AS_OF
+
+
+# ------------------------------------------------------- min_analysts gating ---
+def test_min_analysts_below_threshold_is_refused():
+    rows, df = _healthy_rows()
+    rec, _ = _run(rows, df=df, estimates=_estimates_payload(n_analysts=2))
+    assert rec.skip and "only 2 analysts < min_analysts=3" in rec.skip_reason
+
+
+def test_absent_analyst_count_fails_closed():
+    """An unread count is not evidence of coverage. With the gate armed the symbol
+    is refused and the reason is logged, so a coverage hole can never look like a
+    qualifying name."""
+    rows, df = _healthy_rows()
+    rec, _ = _run(rows, df=df, estimates=[])
+    assert rec.skip and "analyst count unavailable" in rec.skip_reason
+    # A published-but-zero count is FMP's "no count", handled the same way.
+    rec0, _ = _run(rows, df=df, estimates=_estimates_payload(n_analysts=0))
+    assert rec0.skip and "analyst count unavailable" in rec0.skip_reason
+
+
+def test_min_analysts_zero_disables_the_gate_and_its_fetch():
+    """0 means 'no gate' — and then the estimates payload is never even read."""
+    rows, df = _healthy_rows()
+    seen = []
+
+    def _fake_cache(namespace, symbol, fetch_fn, *a, **kw):
+        seen.append(namespace)
+        if namespace.startswith("past_earnings"):
+            return rows
+        raise AssertionError(f"estimates must not be fetched: {namespace!r}")
+
+    bundle = _Bundle(df)
+    e = FMPEarningsEvent.__new__(FMPEarningsEvent)
+    e.id = 1
+    with patch("ba2_providers.fundamentals.details.FMPCompanyDetailsProvider."
+               "fmp_history_disk_cached", side_effect=_fake_cache):
+        rec = e.analyze_as_of(AS_OF, BacktestContext(
+            providers=bundle, settings={**BASE_SETTINGS, "min_analysts": 0},
+            as_of=AS_OF, extra={"symbol": "TSTX"}))
+    assert not rec.skip, rec.skip_reason
+    assert not any(n.startswith("earnings_estimates") for n in seen)
+
+
+def test_the_analyst_count_reads_fmps_actual_plural_key():
+    """The provider used to read 'numberAnalystEstimatedEps' (singular), which
+    appears in NO cached payload — the count was 0 for every symbol, which under a
+    fail-closed gate would refuse the whole universe."""
+    rows, df = _healthy_rows()
+    rec, _ = _run(rows, df=df, estimates=_estimates_payload(n_analysts=3))
+    assert not rec.skip, rec.skip_reason
+
+
+# ------------------------------------------------- normalization / weighting ---
+def test_normalization_is_bounded_monotone_and_scale_anchored():
+    assert normalize_feature("hist_move", 0.0) == 0.0
+    assert normalize_feature("hist_move", 5.0) == pytest.approx(0.5)      # k = 5%
+    assert normalize_feature("surprise_vol", 25.0) == pytest.approx(0.5)  # k = 25%
+    assert normalize_feature("vol_cheapness", 1.0) == pytest.approx(0.5)  # k = 1.0
+    prev = -1.0
+    for x in (0.0, 1.0, 5.0, 20.0, 200.0, 1e6):
+        n = normalize_feature("hist_move", x)
+        assert 0.0 <= n < 1.0 and n > prev
+        prev = n
+
+
+def test_confidence_is_scale_free_in_the_weights():
+    """Scaling every weight by a constant cannot change the score: the GA searches
+    weight RATIOS, which is the only thing that can reorder symbols."""
+    feats = {"hist_move": 6.0, "surprise_vol": 18.0}
+    base = composite_confidence(feats, {"hist_move": 1.0, "surprise_vol": 2.0,
+                                        "vol_cheapness": 1.0})
+    scaled = composite_confidence(feats, {"hist_move": 10.0, "surprise_vol": 20.0,
+                                          "vol_cheapness": 10.0})
+    assert base == pytest.approx(scaled)
+
+
+def test_confidence_stays_inside_the_platform_1_to_100_scale():
+    for hm, sv in ((0.0, 0.0), (0.1, 0.1), (5.0, 25.0), (1e6, 1e6)):
+        c = composite_confidence({"hist_move": hm, "surprise_vol": sv},
+                                 {"hist_move": 1.0, "surprise_vol": 1.0,
+                                  "vol_cheapness": 1.0})
+        assert 1.0 <= c <= 100.0
+
+
+def test_w_hist_move_moves_the_rank():
+    """DEAD-GENE GUARD: two symbols whose feature profiles cross must swap order
+    when w_hist_move alone is changed. A weight that cannot do this is a gene the
+    GA burns budget on for nothing."""
+    a = {"hist_move": 12.0, "surprise_vol": 5.0}     # big mover, steady results
+    b = {"hist_move": 2.0, "surprise_vol": 60.0}     # quiet mover, wild results
+    low = {"hist_move": 0.1, "surprise_vol": 1.0, "vol_cheapness": 1.0}
+    high = {"hist_move": 10.0, "surprise_vol": 1.0, "vol_cheapness": 1.0}
+    assert composite_confidence(a, low) < composite_confidence(b, low)
+    assert composite_confidence(a, high) > composite_confidence(b, high)
+
+
+def test_w_surprise_vol_moves_the_rank():
+    a = {"hist_move": 12.0, "surprise_vol": 5.0}
+    b = {"hist_move": 2.0, "surprise_vol": 60.0}
+    low = {"hist_move": 1.0, "surprise_vol": 0.1, "vol_cheapness": 1.0}
+    high = {"hist_move": 1.0, "surprise_vol": 10.0, "vol_cheapness": 1.0}
+    assert composite_confidence(a, low) > composite_confidence(b, low)
+    assert composite_confidence(a, high) < composite_confidence(b, high)
+
+
+def test_w_vol_cheapness_moves_the_rank_once_task8_supplies_the_feature():
+    """The weight is declared TODAY and its wiring is live — only the FEATURE is
+    Task 8's. Feeding a vol_cheapness value straight into the composite proves the
+    seam is real, so Task 8 adds a feature and nothing else."""
+    a = {"hist_move": 12.0, "vol_cheapness": 0.2}
+    b = {"hist_move": 2.0, "vol_cheapness": 5.0}
+    low = {"hist_move": 1.0, "surprise_vol": 1.0, "vol_cheapness": 0.1}
+    high = {"hist_move": 1.0, "surprise_vol": 1.0, "vol_cheapness": 10.0}
+    assert composite_confidence(a, low) > composite_confidence(b, low)
+    assert composite_confidence(a, high) < composite_confidence(b, high)
+
+
+def test_vol_cheapness_is_absent_and_inert_in_this_task():
+    """Task 7 emits no implied leg, so the weight must be provably INERT rather than
+    quietly demoting every symbol (which a 0.0-valued feature would do)."""
+    rows, df = _healthy_rows()
+    base = _run(rows, df=df)[0]
+    assert base.raw_outputs["FMPEarningsEvent"]["vol_cheapness"] is None
+    for w in (0.0, 1.0, 50.0):
+        rec, _ = _run(rows, df=df, settings={"w_vol_cheapness": w})
+        assert rec.confidence == base.confidence
+
+
+def test_an_absent_feature_never_demotes():
+    """Renormalization, not a zero: a symbol with only hist_move must score exactly
+    what its hist_move alone deserves, not half of it."""
+    weights = {"hist_move": 1.0, "surprise_vol": 1.0, "vol_cheapness": 1.0}
+    only_move = composite_confidence({"hist_move": 5.0}, weights)
+    assert only_move == pytest.approx(1.0 + 99.0 * 0.5)
+    both_at_the_same_normalized_level = composite_confidence(
+        {"hist_move": 5.0, "surprise_vol": 25.0}, weights)
+    assert only_move == pytest.approx(both_at_the_same_normalized_level)
+
+
+def test_surprise_vol_is_absent_not_zero_when_there_is_no_dispersion_sample():
+    """One surprise has no standard deviation. Emitting 0.0 would assert 'this name
+    never surprises' — the strongest possible claim — from a single observation."""
+    jumps = {}
+    rows = []
+    for i, day in enumerate(PAST_DAYS[:4]):
+        eps = 1.10 if i == 0 else None      # only one row has a computable surprise
+        est = 1.00 if i == 0 else None
+        rows.append(_prow(day, eps=eps, est=est, slot="amc"))
+        jumps[_next_weekday(day)] = 103.0
+    df = _bars_df(jumps)
+    bars = list(zip(df["Date"].dt.strftime("%Y-%m-%d"), df["Close"].astype(float)))
+    out = compute_features(rows, bars)
+    assert out["usable_events"] == 4
+    assert "surprise_vol" not in out["features"]
+    assert out["features"]["hist_move"] == pytest.approx(3.0)
+
+
+def test_all_zero_weights_refuse_rather_than_invent_a_score():
+    rows, df = _healthy_rows()
+    rec, _ = _run(rows, df=df, settings={"w_hist_move": 0.0, "w_surprise_vol": 0.0,
+                                         "w_vol_cheapness": 0.0})
+    assert rec.skip and "no weighted feature available" in rec.skip_reason
+
+
+def test_negative_weights_are_clamped_not_inverted():
+    """The settings are importances. A negative one would flip a feature's meaning
+    behind the operator's back."""
+    feats = {"hist_move": 12.0, "surprise_vol": 5.0}
+    clamped = composite_confidence(feats, {"hist_move": -3.0, "surprise_vol": 1.0,
+                                           "vol_cheapness": 1.0})
+    only_sv = composite_confidence({"surprise_vol": 5.0},
+                                   {"surprise_vol": 1.0, "vol_cheapness": 1.0})
+    assert clamped == pytest.approx(only_sv)
+
+
+# ----------------------------------------------------------- withheld genes ---
+def test_the_withheld_features_are_not_settings():
+    """design §9 withheld w_dispersion / w_revision on MEASURED coverage (~3
+    in-window estimate rows per symbol, a forward-biased endpoint, 1-analyst
+    degeneracy). They are unlocked only by a point-in-time replay proving the
+    estimate rows predate the events they would score — until then they must not
+    exist as genes for the GA to find."""
+    keys = set(FMPEarningsEvent.get_settings_definitions())
+    assert "w_dispersion" not in keys
+    assert "w_revision" not in keys
+    assert keys == {"earnings_days_look", "min_hist_events", "min_analysts",
+                    "allow_unconfirmed_dates", "w_hist_move", "w_surprise_vol",
+                    "w_vol_cheapness"}
+
+
+def test_the_withholding_is_documented_with_its_unlock_condition():
+    """A silently-dropped feature is indistinguishable from one nobody thought of."""
+    import sys
+    # ``import ba2_experts.FMPEarningsEvent as mod`` would resolve to the CLASS the
+    # package __init__ binds under that name, not the module.
+    doc = sys.modules["ba2_experts.FMPEarningsEvent"].__doc__
+    assert "w_dispersion" in doc and "w_revision" in doc
+    assert "WHAT UNLOCKS THEM" in doc
+
+
+# ------------------------------------------------------ provider passthrough ---
+def test_provider_passes_the_announcement_slot_through():
+    """The expert cannot place an earnings-day move without the slot, and the
+    provider used to drop it. Also pins that a future-dated row is returned when the
+    caller asks to a horizon (which is how the upcoming print is found at all)."""
+    p = FMPCompanyDetailsProvider.__new__(FMPCompanyDetailsProvider)
+    p.api_key = "fake-key"
+    raw = [_row("2025-06-16", eps=None, est=1.30, slot="--"),
+           _row("2025-03-17", eps=1.10, est=1.00, slot="bmo")]
+    with patch("ba2_providers.fundamentals.details.FMPCompanyDetailsProvider."
+               "fmp_history_disk_cached", return_value=raw):
+        out = p.get_past_earnings("TSTX", frequency="quarterly",
+                                  end_date=datetime(2025, 6, 20), lookback_periods=8,
+                                  format_type="dict")
+    by_day = {r["report_date"]: r for r in out["earnings"]}
+    assert by_day["2025-06-16"]["time"] == "--"
+    assert by_day["2025-03-17"]["time"] == "bmo"
+
+
+def test_provider_horizon_filter_still_excludes_rows_past_the_end_date():
+    p = FMPCompanyDetailsProvider.__new__(FMPCompanyDetailsProvider)
+    p.api_key = "fake-key"
+    raw = [_row("2025-09-15"), _row("2025-06-16"), _row("2025-03-17")]
+    with patch("ba2_providers.fundamentals.details.FMPCompanyDetailsProvider."
+               "fmp_history_disk_cached", return_value=raw):
+        out = p.get_past_earnings("TSTX", frequency="quarterly",
+                                  end_date=datetime(2025, 6, 20), lookback_periods=8,
+                                  format_type="dict")
+    assert [r["report_date"] for r in out["earnings"]] == ["2025-06-16", "2025-03-17"]
+
+
+# ------------------------------------------------------------------ registry ---
+def test_registered_in_the_experts_registry():
+    from ba2_experts import get_expert_class
+    assert get_expert_class("FMPEarningsEvent") is FMPEarningsEvent
+
+
+def test_every_setting_declares_a_default_and_a_description():
+    for key, spec in FMPEarningsEvent.get_settings_definitions().items():
+        assert "default" in spec, key
+        assert spec["description"], key

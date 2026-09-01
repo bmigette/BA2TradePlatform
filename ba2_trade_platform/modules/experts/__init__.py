@@ -37,8 +37,8 @@ def _build_experts_list():
     class names are not bound at module scope (see module docstring)."""
     from ba2_experts import (
         FinnHubRating, FMPRating, FMPSenateTraderWeight, FMPSenateTraderCopy,
-        FMPInsiderClusterBuy, FMPEarningsDrift, PennyMomentumTrader, FactorRanker,
-        DeterministicScorer,
+        FMPInsiderClusterBuy, FMPEarningsDrift, FMPEarningsEvent, PennyMomentumTrader,
+        FactorRanker, DeterministicScorer,
     )
     return [
         TradingAgents,
@@ -48,6 +48,7 @@ def _build_experts_list():
         FMPSenateTraderCopy,
         FMPInsiderClusterBuy,
         FMPEarningsDrift,
+        FMPEarningsEvent,
         PennyMomentumTrader,
         FactorRanker,
         DeterministicScorer,

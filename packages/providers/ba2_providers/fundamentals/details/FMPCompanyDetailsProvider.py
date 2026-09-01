@@ -678,7 +678,16 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                     "fiscal_date_ending": earning_date.strftime("%Y-%m-%d"),
                     "report_date": earning_date_str,
                     "reported_eps": float(reported_eps) if reported_eps else 0,
-                    "estimated_eps": float(estimated_eps) if estimated_eps else 0
+                    "estimated_eps": float(estimated_eps) if estimated_eps else 0,
+                    # ADDITIVE (2026-09-01, FMPEarningsEvent): FMP's announcement slot.
+                    # Measured across 120 cached past_earnings_quarterly files (8,391 rows):
+                    # 'bmo' 4,935 / 'amc' 2,505 / '--' 663 / missing 288. It decides WHICH
+                    # session reacts to a print ('bmo' -> the event day itself, 'amc' -> the
+                    # next session), so an earnings-day move cannot be computed without it,
+                    # and '--'/None is FMP's "not confirmed yet" slot for a scheduled row.
+                    # Passed through raw (never defaulted) so a consumer can tell an unknown
+                    # slot apart from a real one. Every other consumer just sees one more key.
+                    "time": earning.get("time"),
                 }
                 
                 # Calculate surprise
@@ -867,7 +876,18 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                     "estimated_eps_avg": float(estimate.get("estimatedEpsAvg", 0)),
                     "estimated_eps_high": float(estimate.get("estimatedEpsHigh", 0)),
                     "estimated_eps_low": float(estimate.get("estimatedEpsLow", 0)),
-                    "number_of_analysts": int(estimate.get("numberAnalystEstimatedEps", 0))
+                    # FMP spells the EPS analyst count "numberAnalystsEstimatedEps" (plural
+                    # "Analysts") -- only the REVENUE one is singular
+                    # ("numberAnalystEstimatedRevenue"). This read used the singular spelling,
+                    # which appears in NO cached payload, so number_of_analysts was silently 0
+                    # for every symbol (verified against the 4,728 cached
+                    # earnings_estimates_quarterly__*.json files, all of which carry the plural
+                    # key). Both spellings are accepted so the pre-existing fixtures that use
+                    # the singular one keep resolving; real payloads now resolve too.
+                    "number_of_analysts": int(
+                        estimate.get("numberAnalystsEstimatedEps")
+                        or estimate.get("numberAnalystEstimatedEps")
+                        or 0),
                 }
                 
                 filtered_estimates.append((estimate_date, estimate_entry))
