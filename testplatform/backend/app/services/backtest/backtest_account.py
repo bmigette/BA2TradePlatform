@@ -55,7 +55,7 @@ from __future__ import annotations
 import bisect
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
@@ -71,6 +71,7 @@ from ba2_common.core.types import (
     OptionRight,
 )
 from ba2_common.core.option_types import OptionPosition
+from ba2_common.core.option_bs import bs_price
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
 from ba2_common.core.trade_store import orders_where, transactions_where
 
@@ -117,12 +118,21 @@ class _OptionLot:
     ``multiplier`` (typically 100) and ``avg_price`` (premium per share) let the per-bar
     marking value the lot at premium-close x qty x multiplier and let the fall-back use
     the entry premium when no bar exists for the marking day.
+
+    ``last_iv``/``last_iv_date`` (Task 3, the BS mark fallback): the contract's iv from
+    the MOST RECENT bar that actually had one, and that bar's date. Updated ONLY from a
+    REAL premium bar (``_option_positions_mtm``'s bar-exists branch) — never from a BS
+    estimate, so this can never compound (BS pricing off a BS-implied "iv" that was never
+    observed). Consulted by ``_bs_fallback_premium`` when the CURRENT bar is missing, and
+    only within ``_BS_IV_STALENESS_DAYS`` of ``last_iv_date`` — see that constant.
     """
 
     contract_symbol: str
     qty: float = 0.0
     avg_price: float = 0.0
     multiplier: float = 100.0
+    last_iv: Optional[float] = None
+    last_iv_date: Optional[date] = None
 
 
 @dataclass(slots=True)
@@ -154,6 +164,19 @@ class _FillProbe:
 # blow-up). A fill premium violating a no-arbitrage bound by MORE than this tolerance is
 # rejected as untradable (see BacktestAccount._arb_fill_reject_reason).
 _ARB_FILL_TOLERANCE = 0.05
+
+# Task 3 (BS mark fallback): the mid-life mark chain is bar close -> BS(bar iv) ->
+# intrinsic/entry. BS needs an iv; on the bar the cache is missing one, the contract's
+# OWN most-recently-observed iv is used, but only within this many CALENDAR days of the
+# bar that carried it -- past that, the vol regime the iv described may no longer hold
+# (an earnings gap, a vol crush, a multi-week illiquid stretch) and BS on a stale iv would
+# manufacture false precision that intrinsic/entry (a cruder but honest floor) does not
+# claim. 5 calendar days is a MODELLING JUDGMENT, not a measured number (documented per
+# the numbers-discipline rule): it bridges the ordinary weekend-plus-a-sparse-day gap the
+# 50-65% LEAPS-range bar density (design doc S1) implies is routine, without reaching back
+# far enough to survive a real vol-regime change. Whoever tightens/loosens this should
+# re-measure the cache's actual missing-bar run-length distribution first.
+_BS_IV_STALENESS_DAYS = 5
 
 # Maximum share of a premium bar's traded volume an option order may absorb and still
 # fill on that bar — the standard backtest participation assumption. Without it an
@@ -553,15 +576,24 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 bounds = self._lot_no_arb_bounds(lot.contract_symbol)
                 if bounds is not None:
                     px = min(max(float(px), bounds[0]), bounds[1])
+                # Task 3: a REAL bar is the one place ``last_iv`` is ever updated — a BS
+                # estimate must never be allowed to feed a later BS estimate. Zero extra
+                # BS work happens here (this IS the happy path; see the perf pin in
+                # test_bs_mark_fallback.py).
+                self._update_lot_last_iv(lot, bar)
             elif is_defined_risk:
-                # (2a) NO premium bar for a defined-risk leg on this bar -> mark at INTRINSIC (not
+                # (2a) NO premium bar for a defined-risk leg on this bar. Task 3 inserts a
+                # BS(last-known-iv) stage AHEAD of the intrinsic floor: mark at INTRINSIC (not
                 # the stale entry premium / 0) so an open combo whose sparse cache lacks a bar this
                 # tick is not understated (the offsetting leftover-long value is preserved).
-                px = self._leg_intrinsic(lot.contract_symbol, gb)
+                px = self._bs_fallback_premium(lot)
+                if px is None:
+                    px = self._leg_intrinsic(lot.contract_symbol, gb)
                 if px is None:
                     px = lot.avg_price
             else:
-                # (2c) NO premium bar for a NON-defined-risk lot: the intrinsic fallback
+                # (2c) NO premium bar for a NON-defined-risk lot. Task 3 inserts a
+                # BS(last-known-iv) stage AHEAD of the intrinsic-floor fallback that
                 # extends to ALL option lots (review 2026-08-30 F2) as a FLOOR on the
                 # entry-premium mark — for a SHORT the liability is max(intrinsic, entry)
                 # (a deep-ITM naked short stops printing bars precisely when it matters;
@@ -575,10 +607,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 # applies). When SPOT itself is unresolvable this tick, the
                 # entry-premium mark is KEPT — the fix is for the no-OPTION-bar case,
                 # not the no-equity-bar case.
-                px = lot.avg_price
-                bounds = self._lot_no_arb_bounds(lot.contract_symbol)
-                if bounds is not None:
-                    px = bounds[0] if px is None else min(max(float(px), bounds[0]), bounds[1])
+                px = self._bs_fallback_premium(lot)
+                if px is None:
+                    px = lot.avg_price
+                    bounds = self._lot_no_arb_bounds(lot.contract_symbol)
+                    if bounds is not None:
+                        px = bounds[0] if px is None else min(max(float(px), bounds[0]), bounds[1])
             if px is None:
                 continue
             contribution = lot.qty * px * lot.multiplier
@@ -1063,6 +1097,88 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return None
         return self._no_arb_premium_bounds(strike, right == OptionRight.CALL, spot)
 
+    # ==================================================================
+    # Task 3 — Black-Scholes mark fallback (bar close -> BS(bar iv) -> intrinsic/entry)
+    # ==================================================================
+    # BS PROVABLY NEVER TOUCHES A RISK NUMBER: ``_bs_fallback_premium``/``_bs_mark_rate``
+    # are called ONLY from ``_option_positions_mtm`` (a display/equity mark) and
+    # ``_liquidate_option_lot`` (a forced-close cash settlement at the current mark) —
+    # never from ``maintenance_margin_requirement``, ``_lot_maintenance_premium`` (the
+    # Reg-T PAIR premium term — deliberately left on the bar/entry/intrinsic discipline it
+    # already had), ``short_pair_margin_per_contract``, or ``option_reserve_required`` (the
+    # latter two live in a different module, ``OptionsAccountInterface.py``, and price
+    # strictly off strike/spot/net_credit supplied at ORDER-SUBMIT time — they have no
+    # bar/mark input for BS to reach through in the first place). Pinned structurally by
+    # ``test_bs_mark_fallback.py``'s callers/import test.
+    @staticmethod
+    def _bs_mark_rate() -> float:
+        """The SAME flat risk-free rate the options store used to invert each bar's own
+        iv (see ``options_store.default_options_risk_free_rate``). BS pricing a contract
+        off its own last-known iv should use the identical rate that iv was extracted
+        with — otherwise the round trip (bar close -> invert to iv -> BS back to a price)
+        would not reproduce the bar it started from even when nothing about the mark is
+        stale, purely from a rate mismatch."""
+        from .options_store import default_options_risk_free_rate
+        return default_options_risk_free_rate()
+
+    def _update_lot_last_iv(self, lot: "_OptionLot", bar: Optional[Dict[str, Any]]) -> None:
+        """Record ``bar``'s iv as the lot's LAST KNOWN iv (see ``_OptionLot``), for
+        ``_bs_fallback_premium`` to consult on a later bar whose premium is missing.
+
+        Only a REAL bar with a populated iv updates it — a missing bar, or a bar whose own
+        greeks failed to invert (``iv`` is None: e.g. a junk/negative close), leaves the
+        prior last-known value AND date untouched, so staleness is always measured from
+        the last bar that genuinely carried one, never from a bar that merely existed."""
+        if bar is None:
+            return
+        iv = bar.get("iv")
+        if iv is None:
+            return
+        lot.last_iv = float(iv)
+        lot.last_iv_date = self._as_of_date()
+
+    def _bs_fallback_premium(self, lot: "_OptionLot") -> Optional[float]:
+        """Black-Scholes MARK-FALLBACK premium for ``lot`` on a bar with NO premium bar —
+        the middle stage of the Task 3 mark chain (bar close -> BS(bar iv) ->
+        intrinsic/entry).
+
+        Requires: the lot's strike/right/expiry/underlying resolvable from its order, and
+        the underlying's spot resolvable (the SAME inputs ``_lot_no_arb_bounds`` needs —
+        reused via ``_lot_strike_spot_right``, so a contract BS can't price is exactly one
+        a no-arb bound also can't establish); the lot's OWN ``last_iv`` populated and
+        within ``_BS_IV_STALENESS_DAYS`` of today (never another contract's iv, never a
+        BS-estimated one — see ``_OptionLot``/``_update_lot_last_iv``); and a resolvable
+        ``dte_days > 0`` (the ``option_bs`` DTE=0 convention — a contract expiring TODAY
+        falls straight through to intrinsic, which already IS its correct price, so BS
+        would add nothing).
+
+        The result is clamped into the SAME no-arb bounds every other mark-chain stage
+        uses (``_clamp_premium_to_no_arb``) before being returned — BS is a mark ESTIMATE,
+        not a licence to skip the guard that protects every other stage (mutation (b)).
+
+        Returns None on ANY missing/unresolvable/stale input — callers then fall through
+        to their existing intrinsic/entry stage, unchanged from before this task. Never
+        raises: a degenerate input here must degrade the mark chain, not the backtest.
+        """
+        strike, spot, right = self._lot_strike_spot_right(lot.contract_symbol)
+        if strike is None or spot is None or right is None:
+            return None
+        if lot.last_iv is None or lot.last_iv_date is None:
+            return None
+        if (self._as_of_date() - lot.last_iv_date).days > _BS_IV_STALENESS_DAYS:
+            return None
+        o = self._lot_order(lot.contract_symbol)
+        if o is None or o.expiry is None:
+            return None
+        dte_days = (o.expiry - self._as_of_date()).days
+        price = bs_price(
+            float(spot), float(strike), dte_days, float(lot.last_iv), right,
+            r=self._bs_mark_rate(),
+        )
+        if price is None:
+            return None
+        return self._clamp_premium_to_no_arb(price, strike, right == OptionRight.CALL, spot)
+
     def _covered_short_call_contracts(self) -> set:
         """Contract symbols of held SHORT CALL lots fully covered by LONG underlying shares.
 
@@ -1482,14 +1598,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if bounds is not None:
                 premium = min(max(premium, bounds[0]), bounds[1])
         else:
-            # No premium bar on the liquidation bar. The entry premium books the buyback at
+            # No premium bar on the liquidation bar. Task 3: try BS off the contract's own
+            # LAST KNOWN iv first (already clamped into the same no-arb bounds by
+            # ``_bs_fallback_premium``) — a genuine mark estimate, used as-is, not floored
+            # at entry the way the cruder intrinsic/entry fallback below is. Only when BS
+            # is unavailable (no bar ever seen, stale iv, unresolvable strike/spot/expiry)
+            # does this fall to the pre-Task-3 rule: the entry premium books the buyback at
             # break-even — understating the loss at exactly the moment a breach implies the
             # premium moved against the short. Use INTRINSIC, floored at the entry premium
             # (a forced buyback is never booked BELOW entry mid-blow-up); the entry premium
             # remains the last resort when strike/spot/right are unresolvable.
-            premium = lot.avg_price
-            if bounds is not None and premium is not None:
-                premium = max(bounds[0], premium)
+            premium = self._bs_fallback_premium(lot)
+            if premium is None:
+                premium = lot.avg_price
+                if bounds is not None and premium is not None:
+                    premium = max(bounds[0], premium)
         if premium is None:
             return False
         txn = self._option_transaction_for_contract(lot.contract_symbol)
@@ -4624,6 +4747,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # the F6 memos refresh. Adds to an EXISTING lot change nothing the memos read.
             self._option_memo_gen += 1
         lot.multiplier = multiplier
+        # Task 3: seed/refresh last_iv at FILL time too, not only from a later equity-mark
+        # bar lookup — a position that opens and then immediately hits a missing-bar day
+        # (before any snapshot has run at the entry bar) must not lose the entry bar's iv
+        # to a same-day ordering accident.
+        if self._options is not None:
+            self._update_lot_last_iv(
+                lot, self._options.get_bar(contract_symbol, self._as_of_date()))
         old_qty = lot.qty
         new_qty = old_qty + signed_qty
         if old_qty == 0 or (old_qty > 0) == (signed_qty > 0):
