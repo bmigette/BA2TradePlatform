@@ -807,8 +807,8 @@ onward, the SHA each task's own "LANDED AS" note above cites:
 | 14a item 3 — results-comparability note | `d1b269c3` |
 | 14a item 4 — design/plan doc updates | `a04148f5` |
 | 14a item 5 — ruleset editor (help text + coverage test) | `88eaf945` |
-| 14a item 6 — this STATE note + EXPERTS.md | (this commit) |
-| 14a item 7 — final verification | (next commit) |
+| 14a item 6 — this STATE note + EXPERTS.md | `7e73e85a` |
+| 14a item 7 — final verification | (this commit) |
 
 Also verified ALREADY LANDED, needing no new work this task: the `O_CAL`
 phase-gated stub (refuses loudly with the design reference, like the naked
@@ -821,18 +821,28 @@ as part of Task 10's `746d59fd` launcher build, exercised by
 classification and the rule-level `enabled: False` removal convention (both
 documented at their own call sites — see item 4 above).
 
-### Baselines (measured Task 14a item 1, merge day — item 7 re-measures and
-this table is the one item 7 updates in place)
+### Baselines — FINAL (Task 14a item 7, re-measured end-to-end 2026-09-02,
+after every item 1-6 commit on this branch)
 
 | Suite | Result |
 |---|---|
-| backend `pytest tests/` | 4443 passed / 158 skipped / 8 failed (5 known `curve_uneven` + 3 real-low-memory `test_worker_server.py` flakes, box measured 2.4% free RAM — see item 1's commit) |
-| `packages/common` (run from its own dir) | 2933 passed / 1 known (`test_portfolio_allocation_wizard.py` float-dust) |
+| backend `pytest tests/` (from `testplatform/backend`) | 4446 passed / 158 skipped / 5 failed (all 5 the known `curve_uneven` float-dust frozen-baseline cases — no memory-flake failures this run, unlike item 1's measurement under concurrent grid load) |
+| `packages/common` (run from its own dir) | 2937 passed / 1 known (`test_portfolio_allocation_wizard.py` float-dust; +4 vs item 1's count from this task's own `test_rules_documentation_coverage.py`) |
 | `packages/experts` | 885 passed / 0 failed |
 | `packages/providers` | 447 passed / 0 failed |
 | `tests/backtest/test_equity_golden_run.py` | 3 passed (fingerprint unmoved) |
-| Root `tests/` (~9 min) | not yet re-run this task — item 7 |
-| `option_car`/`convex` frozen-baseline suites | not yet re-run this task — item 7 |
+| `tests/test_strategy_fitness_equity_frozen.py` | 809 passed / 5 failed (known `curve_uneven` cases, same as the full backend run) |
+| `tests/test_strategy_fitness_option_car.py` | 58 passed / 0 failed |
+| `tests/test_strategy_fitness_convex_frozen.py` | 167 passed / 0 failed |
+| Root `tests/` (from the worktree root, foreground, ~5m15s) | 4483 passed / 51 failed — the exact known-bad set (`test_portfolio_allocation_page.py`, `test_option_intent_migration.py`, `test_tastytrade_account.py`, `test_broker_sdk_pins.py`), nothing new |
+
+**No new failures anywhere. Every failing test is on the ground rules' own
+known-bad list or a previously-recorded frozen-baseline float-dust case.**
+The item-1 backend run's 3 extra `test_worker_server.py` failures (real,
+momentary low system memory under concurrent grid load — 1.53GB/63.71GB
+free at the time, matching the tests' own captured "1.4% memory free"
+message) did not reproduce on this final run; they were a real environment
+condition, not a code defect, exactly as recorded in item 1's commit.
 
 ### Open items
 
