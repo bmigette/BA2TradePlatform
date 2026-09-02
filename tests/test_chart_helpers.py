@@ -14,6 +14,7 @@ from ba2_trade_platform.ui.utils.chart_helpers import (
     LEGEND_SCROLL_THRESHOLD,
     axis_format,
     grid_options,
+    growth_pct_of_invested,
     legend_options,
     pct_of_invested,
 )
@@ -166,3 +167,43 @@ def test_an_unparseable_stored_colour_uses_the_palette_rather_than_grey():
 
 def test_no_stored_colours_at_all_is_the_plain_palette():
     assert label_series_colors(['A', 'B'], PALETTE, None) == ['#111111', '#222222']
+
+
+# ---------------------------------------------------------------------------
+# GROWTH is 0-based. The raw ratio is not.
+# ---------------------------------------------------------------------------
+
+def test_break_even_is_zero_percent_growth():
+    """Reported: "the growth starts at 100% not 0, makes no sense". A portfolio worth
+    exactly what was paid for it has grown by NOTHING, and reporting that as 100% makes
+    the reader subtract a hundred from every number on the axis before it says
+    anything."""
+    assert growth_pct_of_invested([100.0], [100.0]) == [0.0]
+
+
+def test_a_gain_reads_as_the_gain():
+    assert growth_pct_of_invested([166.86], [100.0]) == [66.86]
+
+
+def test_a_loss_reads_negative():
+    assert growth_pct_of_invested([77.84], [100.0]) == [-22.16]
+
+
+def test_the_invested_series_against_itself_is_the_zero_BASELINE():
+    """Which is why the value lines can be read straight off the axis."""
+    invested = [100.0, 250.0, 400.0]
+
+    assert growth_pct_of_invested(invested, invested) == [0.0, 0.0, 0.0]
+
+
+def test_growth_keeps_every_gap_the_raw_ratio_has():
+    """A shift must not turn an unmeasurable point into -100%."""
+    assert growth_pct_of_invested([100.0, 120.0], [0.0, 100.0]) == [None, 20.0]
+    assert growth_pct_of_invested([100.0], [-8.0]) == [None]
+
+
+def test_a_dividend_series_is_NOT_shifted():
+    """Cash paid out is a yield ON the capital, not a change in it. Shifting a 24.9%
+    payout down by a hundred would render it as a 75% loss."""
+    assert pct_of_invested([24.92], [100.0]) == [24.92]
+    assert growth_pct_of_invested([24.92], [100.0]) == [-75.08]   # what NOT to use

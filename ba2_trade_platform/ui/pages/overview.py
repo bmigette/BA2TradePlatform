@@ -17,7 +17,8 @@ from types import SimpleNamespace
 
 from ..utils.chart_helpers import (
     axis_format, fullscreen_button, fullscreen_content_button, grid_options,
-    label_series_colors, legend_options, mode_toggle, pct_of_invested,
+    growth_pct_of_invested, label_series_colors, legend_options, mode_toggle,
+    pct_of_invested,
 )
 from ..utils.perf_logger import PerfLogger
 from ..utils.protective_stop import resolve_protective_legs
@@ -6159,10 +6160,17 @@ class AccountGrowthTab:
                     if pct:
                         # Converted BEFORE the band is computed, so "above/below the
                         # invested line" keeps meaning the same thing in both modes.
+                        #
+                        # THREE SERIES, TWO CONVERSIONS. The VALUE lines become GROWTH
+                        # (0% = break-even), which is what "growth" has to mean; the
+                        # Invested line is therefore flat at 0 and is the baseline. The
+                        # DIVIDEND line keeps the raw ratio, because cash paid out is a
+                        # yield ON the capital rather than a change in it — shifting it
+                        # down by a hundred would render a real payout as a 75% loss.
                         denom = list(inv_data)
-                        total_data = pct_of_invested(total_data, denom)
+                        total_data = growth_pct_of_invested(total_data, denom)
                         div_data = pct_of_invested(div_data, denom)
-                        inv_data = pct_of_invested(denom, denom)
+                        inv_data = growth_pct_of_invested(denom, denom)
 
                     # Gain/loss band between Total and Invested (single label only).
                     # Two stacked bands: green where Total >= Invested, red where Invested > Total.
@@ -6481,6 +6489,14 @@ class AccountGrowthTab:
                 pct = pos_mode.value == '%'
 
                 def _conv(values, sym):
+                    """A VALUE series: growth over invested, so 0% is break-even."""
+                    if not pct:
+                        return [round(v, 2) for v in values]
+                    return growth_pct_of_invested(values, sym_cum_invested.get(sym) or [])
+
+                def _conv_yield(values, sym):
+                    """A DIVIDEND series: a yield ON the invested capital, not a change
+                    in it, so it keeps the raw ratio and is never shifted to 0-base."""
                     if not pct:
                         return [round(v, 2) for v in values]
                     return pct_of_invested(values, sym_cum_invested.get(sym) or [])
@@ -6510,7 +6526,7 @@ class AccountGrowthTab:
                             series.append({
                                 'name': div_name,
                                 'type': 'line',
-                                'data': _conv(sym_cum_divs[sym], sym),
+                                'data': _conv_yield(sym_cum_divs[sym], sym),
                                 'smooth': True,
                                 'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
                                 'itemStyle': {'color': color},

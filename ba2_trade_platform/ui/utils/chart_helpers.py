@@ -57,6 +57,29 @@ def pct_of_invested(values: Sequence[Optional[float]],
     return out
 
 
+def growth_pct_of_invested(values: Sequence[Optional[float]],
+                           invested: Sequence[Optional[float]]) -> List[Optional[float]]:
+    """``values`` as GROWTH over the capital put in: ``v / invested - 1``, as a percent.
+
+    Zero is break-even. This is what a line labelled "growth" has to mean — a portfolio
+    worth exactly what was paid for it has grown by nothing, and reporting that as 100%
+    (the raw ratio) makes the reader subtract a hundred from every number on the axis
+    before it says anything.
+
+    Use this for a VALUE series. ``pct_of_invested`` — the raw ratio — is still what a
+    DIVIDEND series wants: cash paid out is a yield ON the capital, not a change in it,
+    so 24.9% means "dividends worth a quarter of what was invested" and shifting it down
+    by a hundred would make a real payout read as a 75% loss.
+
+    Both are percentages OF the same denominator, so the two remain commensurable on one
+    axis: a value up 66% beside a 25% yield reads as the two components of total return,
+    which is exactly how these charts separate them (dividends are deliberately not added
+    into the value line, to avoid double-counting reinvestment).
+    """
+    return [None if pct is None else round(pct - 100.0, 2)
+            for pct in pct_of_invested(values, invested)]
+
+
 def axis_format(is_pct: bool) -> str:
     """The y-axis ``formatter`` for the current mode."""
     return AXIS_FORMAT_PCT if is_pct else AXIS_FORMAT_MONEY
