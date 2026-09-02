@@ -15,10 +15,14 @@ option EXPIRATIONS back to 2012-06-01, comfortably covering a 2020 backfill.
 
 DATA SHAPE. Unlike the old local-terminal REST endpoint (one CSV call returned a whole chain's
 OHLC across ALL expirations for a window), the cloud library requires ONE (underlying, single
-expiration) call per request — but that call CAN span the full date window in one shot
-(confirmed: a 2-week AAPL window in one ``option_history_greeks_eod`` call). So the natural
-unit of work is the SAME as TastyTrade's: one (underlying, expiry) partition, fetched with (up
-to) two calls instead of TastyTrade's one:
+expiration) call per request. That call CAN span a multi-week date window in one shot
+(confirmed: a 2-week AAPL window in one ``option_history_greeks_eod`` call) but NOT an
+arbitrary one: the server enforces a hard 365-DAY CAP per request (measured live 2026-09-02:
+"Too many days between start and end date; max 365 days allowed", grpc StatusCode.
+INVALID_ARGUMENT) — a multi-year backfill window is chunked into <=365-day sub-requests by
+``_chunk_window`` and looped over per (underlying, expiry), rather than sent as one call. So
+the natural unit of work is the SAME as TastyTrade's: one (underlying, expiry) partition,
+fetched with (up to) two calls PER WINDOW CHUNK instead of TastyTrade's one call total:
 
   * ``option_history_greeks_eod`` — OHLC + bid/ask/size + the full greeks block, INCLUDING
     ``implied_vol`` (a superset of the plain ``option_history_eod`` endpoint, so that one is
@@ -37,7 +41,7 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from ba2_common.core.interfaces.OptionsDataProviderInterface import (
@@ -52,6 +56,29 @@ logger = logging.getLogger(__name__)
 # without overclaiming depth for names that listed later. Env-overridable for a probe that
 # wants to push it.
 _DEFAULT_HISTORY_YEARS = float(os.getenv("THETADATA_HISTORY_YEARS", "8"))
+
+#: The server's hard per-request cap: "Too many days between start and end date; max 365
+#: days allowed" (grpc StatusCode.INVALID_ARGUMENT, measured live 2026-09-02). A window wider
+#: than this must be split into consecutive sub-requests -- see _chunk_window.
+_MAX_WINDOW_DAYS = 365
+
+
+def _chunk_window(start: date, end: date,
+                  max_days: int = _MAX_WINDOW_DAYS) -> List[Tuple[date, date]]:
+    """Split ``[start, end]`` (inclusive) into consecutive, non-overlapping sub-windows each
+    spanning at most ``max_days``. A window already within the cap returns a single chunk
+    identical to the input -- no behaviour change for the common (narrow-window) case.
+
+    Non-overlapping by construction, so a caller merging bars across chunks never has to
+    worry about a bar_date appearing in two of them.
+    """
+    out: List[Tuple[date, date]] = []
+    cur = start
+    while cur <= end:
+        nxt = min(end, cur + timedelta(days=max_days))
+        out.append((cur, nxt))
+        cur = nxt + timedelta(days=1)
+    return out
 
 
 def _parse_date(value: Any) -> Optional[date]:
@@ -208,43 +235,50 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
             by_underlying_expiry.setdefault((c.underlying.upper(), c.expiry), set()).add(
                 c.occ_symbol)
 
+        windows = _chunk_window(start, end)
         for (underlying, expiry), wanted in by_underlying_expiry.items():
-            bars_df = client.option_history_greeks_eod(
-                symbol=underlying, expiration=expiry, strike="*", right="both",
-                start_date=start, end_date=end)
-            if bars_df is None or len(bars_df) == 0:
-                continue  # nothing for this expiry in the window -- normal, not an error
-            oi_df = client.option_history_open_interest(
-                symbol=underlying, expiration=expiry, strike="*", right="both",
-                start_date=start, end_date=end)
-            oi_map = _index_open_interest(oi_df)
+            # One (underlying, expiry) partition, but the window may be wider than the
+            # server's 365-day-per-request cap -- see _chunk_window. Chunks are
+            # non-overlapping, so no bar_date can appear in two of them: concatenating the
+            # per-chunk results (by just yielding as each chunk is processed) is safe without
+            # any cross-chunk de-duplication.
+            for w_start, w_end in windows:
+                bars_df = client.option_history_greeks_eod(
+                    symbol=underlying, expiration=expiry, strike="*", right="both",
+                    start_date=w_start, end_date=w_end)
+                if bars_df is None or len(bars_df) == 0:
+                    continue  # nothing for this expiry in this chunk -- normal, not an error
+                oi_df = client.option_history_open_interest(
+                    symbol=underlying, expiration=expiry, strike="*", right="both",
+                    start_date=w_start, end_date=w_end)
+                oi_map = _index_open_interest(oi_df)
 
-            for row in bars_df.itertuples(index=False):
-                r = row._asdict()
-                strike = _num(r.get("strike"))
-                bar_date = _parse_date(r.get("timestamp") or r.get("created"))
-                right = r.get("right")
-                if strike is None or bar_date is None:
-                    continue
-                occ = _occ_symbol(underlying, expiry, right, strike)
-                if occ not in wanted:
-                    continue
-                close = _num(r.get("close"))
-                if close is None:
-                    continue  # a row with no close is not a usable bar
-                yield OptionEodBar(
-                    occ_symbol=occ, bar_date=bar_date,
-                    open=_num(r.get("open")) if _num(r.get("open")) is not None else close,
-                    high=_num(r.get("high")) if _num(r.get("high")) is not None else close,
-                    low=_num(r.get("low")) if _num(r.get("low")) is not None else close,
-                    close=close,
-                    volume=(int(_num(r.get("volume"))) if _num(r.get("volume")) is not None
-                           else None),
-                    bid=_num(r.get("bid")) or None,   # 0 -> None: "no quote"
-                    ask=_num(r.get("ask")) or None,
-                    open_interest=oi_map.get((strike, _right_word(right), bar_date)),
-                    iv=_num(r.get("implied_vol")),
-                )
+                for row in bars_df.itertuples(index=False):
+                    r = row._asdict()
+                    strike = _num(r.get("strike"))
+                    bar_date = _parse_date(r.get("timestamp") or r.get("created"))
+                    right = r.get("right")
+                    if strike is None or bar_date is None:
+                        continue
+                    occ = _occ_symbol(underlying, expiry, right, strike)
+                    if occ not in wanted:
+                        continue
+                    close = _num(r.get("close"))
+                    if close is None:
+                        continue  # a row with no close is not a usable bar
+                    yield OptionEodBar(
+                        occ_symbol=occ, bar_date=bar_date,
+                        open=_num(r.get("open")) if _num(r.get("open")) is not None else close,
+                        high=_num(r.get("high")) if _num(r.get("high")) is not None else close,
+                        low=_num(r.get("low")) if _num(r.get("low")) is not None else close,
+                        close=close,
+                        volume=(int(_num(r.get("volume"))) if _num(r.get("volume")) is not None
+                               else None),
+                        bid=_num(r.get("bid")) or None,   # 0 -> None: "no quote"
+                        ask=_num(r.get("ask")) or None,
+                        open_interest=oi_map.get((strike, _right_word(right), bar_date)),
+                        iv=_num(r.get("implied_vol")),
+                    )
 
     def fetch_bars_detailed(self, contracts: Iterable[OptionContractMeta], *,
                             start: date, end: date) -> CandleBatch:
