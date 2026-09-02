@@ -90,9 +90,15 @@ def test_every_offered_strategy_states_its_chain_depth():
 
 
 def test_the_chain_depth_thresholds_are_the_designs():
-    """Design section 5: LEAPS keys need DTE >= 365, the backspreads >= 180, O_ERN >= 7."""
+    """Design section 5: LEAPS keys need DTE >= 365, the backspreads >= 180, O_ERN >= 7.
+
+    O_PMCC joins the 365 group at ``718f7cf4`` (Task 6 un-gated the key): its LONG leg IS a
+    LEAPS, so it needs the same January-cycle chain depth O_LEAP does -- the 30-45-DTE
+    overlay is listed on every name and is never the binding constraint.
+    """
     d = _driver()
-    assert d._MIN_DTE == {"O_LEAP": 365, "O_ERN": 7, "O_CBS": 180, "O_PBS": 180}
+    assert d._MIN_DTE == {"O_LEAP": 365, "O_PMCC": 365, "O_ERN": 7,
+                          "O_CBS": 180, "O_PBS": 180}
 
 
 def test_an_unknown_strategy_fails_LOUDLY_rather_than_running_unfiltered():
@@ -102,12 +108,14 @@ def test_an_unknown_strategy_fails_LOUDLY_rather_than_running_unfiltered():
 
 
 def test_the_preflight_runs_once_per_DISTINCT_threshold():
-    """Three probes for four keys: the probe walks the whole parquet tree, so running it per
-    STRATEGY would pay for the same scan twice."""
+    """Three probes for FIVE keys: the probe walks the whole parquet tree, so running it per
+    STRATEGY would pay for the same scan twice. Still three DISTINCT thresholds after
+    ``718f7cf4`` added O_PMCC -- it shares O_LEAP's 365, which is exactly the saving this
+    test exists to state."""
     d = _driver()
     groups = d._thresholds(d._DEFAULT_STRATEGIES)
     assert set(groups) == {365, 180, 7}
-    assert sorted(groups[365]) == ["O_LEAP"]
+    assert sorted(groups[365]) == ["O_LEAP", "O_PMCC"]
     assert sorted(groups[180]) == ["O_CBS", "O_PBS"]
     assert groups[7] == ["O_ERN"]
 
@@ -133,11 +141,19 @@ def test_the_population_override_is_read_from_the_environment(monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_the_job_list_is_exactly_this():
     """THE GOLDEN. Strategy-major order (a partial run finishes whole structures), one job per
-    (strategy x expert), and the earnings expert on O_ERN AND NOWHERE ELSE."""
+    (strategy x expert), and the earnings expert on O_ERN AND NOWHERE ELSE.
+
+    REFROZEN at ``718f7cf4`` ("O_PMCC un-gated -- the key, its genes, and the roll rules the
+    ruleset carries"), which added O_PMCC to the driver's _DEFAULT_STRATEGIES in second
+    position. 5 jobs = the 4 frozen here before + O_PMCC. The row's PLACE is not a free
+    choice: _jobs yields in _DEFAULT_STRATEGIES order (strategy-major), so O_PMCC's job is
+    the SECOND row, and it runs under the general expert because it is not the event key.
+    """
     d = _driver()
     jobs = list(d._jobs(d._DEFAULT_STRATEGIES, ["FMPRating"], "FMPEarningsEvent"))
     assert jobs == [
         ("opt2-FMPRating-O_LEAP", "FMPRating", "O_LEAP"),
+        ("opt2-FMPRating-O_PMCC", "FMPRating", "O_PMCC"),
         ("opt2-FMPEarningsEvent-O_ERN", "FMPEarningsEvent", "O_ERN"),
         ("opt2-FMPRating-O_CBS", "FMPRating", "O_CBS"),
         ("opt2-FMPRating-O_PBS", "FMPRating", "O_PBS"),

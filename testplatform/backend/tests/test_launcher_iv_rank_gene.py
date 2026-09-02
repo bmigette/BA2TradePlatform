@@ -142,7 +142,14 @@ def test_the_two_halves_are_both_non_empty_and_disjoint_in_direction():
                     # vol only when it is cheap", the debit direction. Added here, in the
                     # INDEPENDENT re-derivation, rather than by reading the launcher's own
                     # partition back: that is the whole point of this list.
-                    "open_call_backspread", "open_put_backspread"}
+                    "open_call_backspread", "open_put_backspread",
+                    # GRID 2, 718f7cf4. A PMCC is a net-DEBIT diagonal: the LEAPS long
+                    # dominates the 30-45-DTE short it is financed by, so the position is
+                    # long premium on net and wants the BUYER's direction -- own vol only
+                    # when it is cheap. Same independent re-derivation as the backspreads
+                    # above: reasoned from the structure, not read back from
+                    # _DEBIT_OPTION_MEMBERS.
+                    "open_pmcc"}
     for kind, op in ops.items():
         at = mod._OPTION_STRATS[kind]["action_type"]
         assert op == ("<" if at in long_premium else ">"), (

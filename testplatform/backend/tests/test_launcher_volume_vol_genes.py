@@ -172,7 +172,12 @@ def test_the_two_halves_use_opposite_iv_rv_directions():
                     # variance-risk-premium gate too -- pay implied only when it is cheap
                     # against realised. Same reasoning, and same independent re-derivation,
                     # as the identical list in test_launcher_iv_rank_gene.
-                    "open_call_backspread", "open_put_backspread"}
+                    "open_call_backspread", "open_put_backspread",
+                    # GRID 2, 718f7cf4: the PMCC is a net-DEBIT diagonal -- the LEAPS long
+                    # dominates the short it is financed by -- so it wants the buyer's
+                    # direction on the variance-risk-premium gate too: pay implied only
+                    # when it is cheap against realised.
+                    "open_pmcc"}
     ops = {}
     for kind in _SINGLES:
         op = _leaf(mod._option_entry_rule(kind), f"{kind.lower()}-iv_rv")["op"]
