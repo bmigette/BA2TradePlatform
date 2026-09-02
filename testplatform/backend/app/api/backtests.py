@@ -13,6 +13,9 @@ from sqlalchemy.orm import Session, defer
 
 from app.models import get_db, Backtest, Strategy, TrainedModel, Dataset
 from app.services.sync_client import push_backtest
+from ba2_common.core.deploy_parity import (
+    BacktestRunFacts, backtest_only_settings, forced_expert_settings,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1239,6 +1242,20 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                 "run_schedule_override": _pick("runScheduleOverride", "run_schedule_override"),
             }
             interval = _pick("executionInterval", "execution_interval")
+        # THE ONE TABLE (ba2_common.core.deploy_parity), read here and in
+        # daily_backtest_handler._build_experts. Every setting the backtest FORCES onto a
+        # trial's expert is merged LAST -- exactly as the handler applies its gates last -- so
+        # a deployed genome cannot end up with a permission the scored run did not have. The
+        # highest-severity one is allow_automated_trade_modification: it defaults False live and
+        # gates every exit, so without this a deployed sleeve evaluates its exits and never
+        # submits them (2026-09-02 review, V3).
+        facts = BacktestRunFacts(
+            enable_short=bool(execution.get("enable_short")),
+            hold_assigned_stock=bool((acct if bt_block is not None else {}).get(
+                "hold_assigned_stock")),
+            entry_action=(bt_block.get("entry_action") if bt_block is not None else None),
+        )
+        expert_params = {**expert_params, **forced_expert_settings(facts)}
         return {
             "backtest_id": backtest.id,
             "name": backtest.name,
@@ -1247,6 +1264,10 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
             "settings": {
                 "expert_params": expert_params,
             },
+            # Behaviours the backtest DERIVED that have no live analogue (review V4/V5).
+            # Carried, never applied: a deploy that differs from its backtest must say so
+            # rather than differ silently. Each row's reason is in the table.
+            "backtest_only": backtest_only_settings(facts),
             # Execution config (seed/fill_model/warmup/commission/slippage/enable_short/
             # run_schedule) + universe + interval so a saved run can be reproduced
             # faithfully from the exports alone (the reproducibility goal).

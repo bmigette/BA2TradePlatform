@@ -26,6 +26,7 @@ import pathlib
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ba2_common.core.deploy_parity import BacktestRunFacts, forced_expert_settings
 from ba2_common.core.types import is_option_action
 
 from app.models.backtest import Backtest
@@ -954,6 +955,22 @@ def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float
     return out
 
 
+def _run_facts(config: Dict[str, Any]) -> BacktestRunFacts:
+    """The run-level facts the forced-settings table is a function of, read off a TRIAL config.
+
+    The export side reads the same three facts off the persisted
+    ``optimization_config['backtest']`` block, where two of them are spelled differently
+    (``hold_assigned_stock`` lives under ``account_settings`` on both, ``enable_short`` is
+    top-level on both). Naming them here is what makes the two reads provably the same read.
+    """
+    account_settings = config.get("account_settings") or {}
+    return BacktestRunFacts(
+        enable_short=bool(config.get("enable_short")),
+        hold_assigned_stock=bool(account_settings.get("hold_assigned_stock")),
+        entry_action=config.get("entry_action"),
+    )
+
+
 def _build_experts(
     config: Dict[str, Any], resolver: Any, account_id: int
 ) -> List[Tuple[Any, int, Dict[str, Any], int]]:
@@ -1023,7 +1040,24 @@ def _build_experts(
         # field's comment in _build_config) and always co-occurs with a real buy_tree/
         # entry_action there, so gate on their absence to keep that path's `[]` meaning
         # unchanged.
-        if entry_rules == [] and not buy_tree and not entry_action:
+        if entry_rules == [] and not buy_tree:
+            # ``and not entry_action`` USED TO BE PART OF THIS GUARD, and it was the sharper
+            # half of the same bug (2026-09-02 review, V4). On an OPTION run ``entry_action`` is
+            # always truthy -- it is carried run-level for every option key -- so a genome that
+            # pruned every member of its entry group fell through to the branch below and got
+            # RE-ARMED with ``entry_action`` on a bare permissive gate: the run traded a
+            # strategy the genome had explicitly switched off, corrupting both its fitness and
+            # the persisted top-N re-run. The empty list is the genome's decision on this path
+            # whether or not an option template exists, so honour it -- and say so, loudly,
+            # because "this individual has no entry path" is a real result that should never
+            # again be indistinguishable from a re-armed default.
+            if entry_action:
+                logger.error(
+                    f"_seed_enter({nm!r}): entry_rules is EXPLICITLY EMPTY (every rule pruned) "
+                    f"while a run-level entry_action is present. Seeding a ruleset with ZERO "
+                    f"entry rules -- the run-level option entry_action is NOT used to re-arm "
+                    f"this individual. It will take no entries by construction."
+                )
             return seed_entry_ruleset_from_rules(entry_rules, name=nm)
         if buy_tree or entry_action or entry_rules:
             return seed_ruleset_from_tree(buy_tree, name=nm, enable_short=enable_short,
@@ -1147,12 +1181,11 @@ def _build_experts(
             gate_settings: Dict[str, Any] = {}
             for k, v in decision_settings.items():
                 gate_settings[k] = (v, _setting_type(v))
-            gate_settings["allow_automated_trade_opening"] = (True, "bool")
-            gate_settings["enable_buy"] = (True, "bool")
-            # Live gates open-positions management (Adjust TP/SL/Close) on this flag.
-            gate_settings["allow_automated_trade_modification"] = (True, "bool")
-            # SHORT entries (the SELL enter rule) are gated by the RM on enable_sell.
-            gate_settings["enable_sell"] = (bool(config.get("enable_short")), "bool")
+            # THE ONE TABLE (ba2_common.core.deploy_parity). Written here and READ BY THE
+            # EXPORT PAYLOAD, so a gate forced onto a trial's expert cannot be added here
+            # without the deploy carrying it to the live ExpertInstance -- the review's V3.
+            for k, v in forced_expert_settings(_run_facts(config)).items():
+                gate_settings[k] = (v, _setting_type(v))
             expert.save_settings(gate_settings)
 
         resolver.register_expert(expert_id, expert)

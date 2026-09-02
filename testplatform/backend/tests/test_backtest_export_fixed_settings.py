@@ -14,12 +14,20 @@ from app.models.backtest import Backtest
 from app.models.database import Base, SessionLocal, engine
 from app.models.strategy import Strategy
 from app.models.strategy_optimization import StrategyOptimization
+from ba2_common.core.deploy_parity import BacktestRunFacts, forced_expert_settings
 
 
 @pytest.fixture(scope="module", autouse=True)
 def _host_db():
     Base.metadata.create_all(bind=engine)
     yield
+
+
+#: The gates every export now carries (ba2_common.core.deploy_parity, review V3). Not the
+#: subject of THIS file -- it is about the fixed-settings floor -- so each expectation below is
+#: written as "the floor, PLUS the gates", rather than restating four booleans four times.
+_GATES = forced_expert_settings(
+    BacktestRunFacts(enable_short=False, hold_assigned_stock=False, entry_action=None))
 
 
 def _backtest(**overrides):
@@ -43,7 +51,7 @@ def test_fallback_path_recovers_fixed_settings_when_no_optimization_link():
     })
     payload = _derive_export_payload(bt, "expert_settings", db=None)
     assert payload["settings"]["expert_params"] == {
-        "sizing_mode": "risk_atr", "profit_ratio": 1.2,
+        "sizing_mode": "risk_atr", "profit_ratio": 1.2, **_GATES,
     }
 
 
@@ -52,7 +60,7 @@ def test_fallback_path_with_no_fixed_settings_is_unaffected():
     before this fix (no regression for runs that never had fixed settings)."""
     bt = _backtest(strategy_params={"model:profit_ratio": 1.2})
     payload = _derive_export_payload(bt, "expert_settings", db=None)
-    assert payload["settings"]["expert_params"] == {"profit_ratio": 1.2}
+    assert payload["settings"]["expert_params"] == {"profit_ratio": 1.2, **_GATES}
 
 
 def test_happy_path_layers_persisted_fixed_settings_under_live_optimization_settings(monkeypatch):

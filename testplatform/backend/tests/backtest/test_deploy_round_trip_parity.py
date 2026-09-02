@@ -187,6 +187,27 @@ def _live_side(db, bt, label):
     return live_export, settings["settings"]["expert_params"]
 
 
+def _settings_payload(db, bt):
+    """The WHOLE ``expert_settings`` export payload -- expert_params, universe, backtest_only."""
+    from app.api.backtests import _derive_export_payload
+
+    return _derive_export_payload(bt, "expert_settings", db)
+
+
+def _imported_settings(payload_settings):
+    """What ``tools/import_deploy_payload.py`` writes to the live instance, its own way.
+
+    The tool's ``main()`` cannot run in-process (it repoints the process-global DB at the LIVE
+    trade DB -- see the module docstring), so this is the same two-step assembly it performs:
+    ``expert_params`` overlaid with the universe block's implied settings. The source-level
+    guard below proves the tool still assembles it this way.
+    """
+    from ba2_common.core.deploy_parity import live_settings_from_universe
+
+    return {**payload_settings["settings"]["expert_params"],
+            **live_settings_from_universe(payload_settings.get("universe"))}
+
+
 # ==================================================================================================
 # THE ROUND TRIP
 # ==================================================================================================
@@ -215,11 +236,18 @@ def test_the_deployed_ruleset_is_the_ruleset_the_backtest_ran(db, key, expert, r
 @pytest.mark.parametrize("key,expert,rule_id", CASES,
                          ids=[f"{k}|{e}" for k, e, _ in CASES])
 def test_the_deployed_expert_settings_are_the_settings_the_backtest_ran(db, key, expert, rule_id):
+    from ba2_common.core.deploy_parity import forced_expert_settings
+
     strat, genome, decoded, trial = _backtest_side(key, expert)
     bt = _persisted_row(db, key, expert, strat, genome, decoded)
     _live_export, live_settings = _live_side(db, bt, f"deploy-{key}")
 
-    assert live_settings == trial["experts"][0]["settings"], (
+    # The trial's own settings block PLUS the gates the handler forces on top of it -- which is
+    # what the expert instance ends up holding. Before the 2026-09-02 review's V3 fix this
+    # assertion compared against the trial block alone, and passed while the four gates reached
+    # the engine and not the deploy.
+    assert live_settings == {**trial["experts"][0]["settings"],
+                             **forced_expert_settings(_facts_for(trial))}, (
         f"{key}: the deploy payload's expert settings differ from the trial's")
     # Non-vacuous: every optimized model:* gene is in there at its optimized value.
     for gene, value in genome.items():
@@ -263,6 +291,181 @@ def test_the_seeded_backtest_ruleset_matches_the_deploy_payload_action_for_actio
         assert deployed == seeded[ruleset["subtype"]], (
             f"{key}/{ruleset['subtype']}: the seeded backtest EventActions and the deployed "
             f"ruleset's rules are not action-for-action identical")
+
+
+# ==================================================================================================
+# THE STRUCTURAL PIN -- every row of the forced-settings table, carried and applied
+# ==================================================================================================
+#
+# The 2026-09-02 review found five parity gaps (V1-V5) that this file's original three tests could
+# not see, because they only asked "does every gene reach the artefact?" and never "does the trial
+# config carry behaviour the artefact does not?". The repair is ONE table,
+# ``ba2_common.core.deploy_parity.BACKTEST_FORCED_SETTINGS``, that both the handler and the
+# exporter read. These tests iterate THE TABLE rather than a second copy of it, so:
+#
+#   * dropping a row makes ``test_every_forced_setting_reaches_the_deployed_instance`` fail (the
+#     engine still forces it -- it is the same table -- but the payload stops carrying it);
+#   * restoring the importer's universe-block drop makes
+#     ``test_the_import_tool_still_consumes_the_universe_block`` fail.
+#
+# Both mutations were executed before this was committed.
+
+
+def _facts_for(trial):
+    """The run facts, read off a TRIAL config the way the handler reads them."""
+    from app.services.backtest.daily_backtest_handler import _run_facts
+
+    return _run_facts(trial)
+
+
+def _engine_side_settings(key, expert_name, trial):
+    """What the BACKTEST ENGINE gave the expert, read back off the seeded row.
+
+    Not a re-derivation: ``daily_backtest_handler._build_experts`` is called for real, against a
+    temp backtest trading DB, and the persisted ``ExpertSetting`` rows are read back. That is
+    the definition of "what the backtest engine received".
+    """
+    from app.services.backtest.backtest_db import (
+        backtest_trading_db, seed_account_definition,
+    )
+    from app.services.backtest.daily_backtest_handler import _build_experts
+    from app.services.backtest.seam_wiring import wire_backtest_seams
+
+    class _Resolver:
+        def __init__(self):
+            self.experts = {}
+
+        def register_expert(self, eid, e):
+            self.experts[eid] = e
+
+    wire_backtest_seams()
+    with backtest_trading_db(f"deploy-gates-{key}"):
+        seed_account_definition(1, trial["account_settings"])
+        built = _build_experts(trial, _Resolver(), 1)
+        return dict(built[0][0].settings)
+
+
+@pytest.mark.parametrize("key,expert,rule_id", CASES,
+                         ids=[f"{k}|{e}" for k, e, _ in CASES])
+def test_every_forced_setting_reaches_the_deployed_instance(db, key, expert, rule_id):
+    """FOR EACH ROW OF THE TABLE: the payload carries it, and the value the import would write
+    equals the value the backtest engine actually held.
+
+    The row that made this worth building is ``allow_automated_trade_modification``: it defaults
+    False on ``MarketExpertInterface`` and ``TradeManager`` gates EVERY exit on it, so a deploy
+    that did not carry it produced an instance that evaluated its exits and never submitted
+    them -- live, with money.
+    """
+    from ba2_common.core.deploy_parity import BACKTEST_FORCED_SETTINGS
+
+    strat, genome, decoded, trial = _backtest_side(key, expert)
+    bt = _persisted_row(db, key, expert, strat, genome, decoded)
+    payload = _settings_payload(db, bt)
+    imported = _imported_settings(payload)
+    engine = _engine_side_settings(key, expert, trial)
+
+    carried = [r for r in BACKTEST_FORCED_SETTINGS if r.live_setting is not None]
+    # THE MEMBERSHIP, stated. Without it the loop below iterates the very table it is checking,
+    # so DELETING a row would make this test pass vacuously -- and a deleted row is precisely
+    # the defect: the handler stops forcing nothing (it reads the same table) but every OLD
+    # deployed instance keeps a gate the new export no longer carries.
+    assert {r.live_setting for r in carried} == {
+        "allow_automated_trade_opening", "enable_buy",
+        "allow_automated_trade_modification", "enable_sell",
+    }, ("the forced-settings table changed. ADDING a row is the point of the table -- say so "
+        "here. REMOVING one means a setting the backtest engine forces no longer reaches the "
+        "deployed instance, which is review finding V3 verbatim.")
+    for row in carried:
+        assert row.live_setting in payload["settings"]["expert_params"], (
+            f"{key}: the deploy payload does not carry {row.live_setting!r}. {row.why}")
+        assert row.live_setting in engine, (
+            f"{key}: the ENGINE did not receive {row.live_setting!r}; the handler and the "
+            f"exporter have stopped reading the same table")
+        assert imported[row.live_setting] == engine[row.live_setting], (
+            f"{key}: the deployed instance would get {row.live_setting}="
+            f"{imported[row.live_setting]!r} but the backtest engine ran with "
+            f"{engine[row.live_setting]!r}. {row.why}")
+
+
+@pytest.mark.parametrize("key,expert,rule_id", CASES,
+                         ids=[f"{k}|{e}" for k, e, _ in CASES])
+def test_a_behaviour_with_no_live_analogue_is_RECORDED_rather_than_silently_dropped(
+        db, key, expert, rule_id):
+    """The other half of the table. ``hold_assigned_stock`` (V5) and ``entry_action`` (V4) have
+    no live analogue -- closing either needs a change to a live broker or engine class, which is
+    an operator decision, not a deploy-tooling one. They are ALLOWLISTED here, each against the
+    reason recorded on its own row, so accepting the gap stays a deliberate act."""
+    from ba2_common.core.deploy_parity import BACKTEST_FORCED_SETTINGS
+
+    strat, genome, decoded, trial = _backtest_side(key, expert)
+    bt = _persisted_row(db, key, expert, strat, genome, decoded)
+    payload = _settings_payload(db, bt)
+
+    uncarried = [r for r in BACKTEST_FORCED_SETTINGS if r.live_setting is None]
+    assert {r.key for r in uncarried} == {"hold_assigned_stock", "entry_action"}, (
+        "a behaviour gained or lost a live analogue -- re-read deploy_parity's table and say "
+        "here which, and why")
+    for row in uncarried:
+        assert row.why_no_live_analogue, (
+            f"{row.key} claims no live analogue without saying what closing it would take")
+        assert row.key in payload["backtest_only"], (
+            f"{key}: {row.key!r} is neither applied nor recorded -- a deploy that differs from "
+            f"its backtest must SAY so")
+
+
+@pytest.mark.parametrize("key,expert,rule_id", CASES,
+                         ids=[f"{k}|{e}" for k, e, _ in CASES])
+def test_the_universe_block_reaches_the_deployed_settings(db, key, expert, rule_id):
+    """V1 + V2: the six ``screener:*`` genes and the underlying-price cap the option grids screen
+    on live in ``universe.screener_settings``, which the exporter has always built and the import
+    tool used to DROP. A static-universe payload maps to nothing (its symbols are a candidate
+    list, not a setting), so the mapping is asserted directly as well."""
+    from ba2_common.core.deploy_parity import (
+        SCREENER_UNIVERSE_SETTING, live_settings_from_universe,
+    )
+
+    strat, genome, decoded, trial = _backtest_side(key, expert)
+    bt = _persisted_row(db, key, expert, strat, genome, decoded)
+    payload = _settings_payload(db, bt)
+
+    assert "universe" in payload, "the exporter stopped building the block the import consumes"
+    assert live_settings_from_universe({"mode": "static", "symbols": ["AAPL"]}) == {}
+    screener = {"mode": "screener", "screener_store": "s",
+                "screener_settings": {"screener_price_max": 100.0, "screener_max_stocks": 12}}
+    mapped = live_settings_from_universe(screener)
+    assert mapped == {"screener_price_max": 100.0, "screener_max_stocks": 12,
+                      SCREENER_UNIVERSE_SETTING: "screener"}
+    # ... and the assembly the tool performs really does include it.
+    assert _imported_settings({**payload, "universe": screener}).items() >= mapped.items()
+
+
+def test_the_import_tool_still_consumes_the_universe_block():
+    """The drift guard on ``_imported_settings``. Source-level for the same reason the guard
+    below is: the tool reconfigures the process-global DB at import time, so it cannot be
+    imported here. If the tool stops calling this, the test above is pinning a path nobody
+    deploys through -- which is exactly the state the review found."""
+    imp = open(os.path.join(_TOOLS, "import_deploy_payload.py"), encoding="utf-8").read()
+    assert "live_settings_from_universe" in imp, (
+        "the import tool dropped the universe block again (review V1/V2)")
+    assert 'live_settings_from_universe(entry["settings"].get("universe"))' in imp, (
+        "the import tool no longer feeds the payload's universe block to the mapping")
+    assert "backtest_only" in imp, (
+        "the import tool must at least REPORT the behaviours it cannot apply")
+
+
+def test_the_handler_and_the_exporter_read_THE_SAME_TABLE():
+    """The property the whole repair rests on: one table, two readers. A source-level pin,
+    because the failure mode is someone adding a fifth gate to the handler by hand."""
+    handler = open(os.path.join(
+        _TESTPLATFORM, "backend", "app", "services", "backtest",
+        "daily_backtest_handler.py"), encoding="utf-8").read()
+    exporter = open(os.path.join(
+        _TESTPLATFORM, "backend", "app", "api", "backtests.py"), encoding="utf-8").read()
+    for src, who in ((handler, "the handler"), (exporter, "the exporter")):
+        assert "forced_expert_settings" in src, (
+            f"{who} no longer reads deploy_parity's table")
+    assert 'gate_settings["allow_automated_trade_opening"]' not in handler, (
+        "the handler is hand-writing a gate again instead of reading the table")
 
 
 # ==================================================================================================
