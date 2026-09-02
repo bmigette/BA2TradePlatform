@@ -10,40 +10,56 @@ compute IV/greeks ourselves instead of buying them from a vendor.
 Pure (no I/O, no DB). European-style Black-Scholes; equity options are American, so this is
 an approximation (mainly affects deep-ITM puts near ex-dividend) — acceptable for backtest
 strike selection / IV-rank gating, not for pricing early-exercise value.
+
+ONE BLACK-SCHOLES, NOT THREE (2026-09-02, plan Task 14b item 8). This module used to carry
+its OWN closed form — a private ``_d1_d2`` plus hand-written normal CDF/PDF — alongside
+``ba2_common.core.finance_calc.derivatives.black_scholes`` (the pinned shared pricer) and
+``ba2_common.core.option_bs.bs_price`` (the mark-fallback wrapper over it). Three copies of
+one formula, kept in step only by a 1e-6 parity test that would have tolerated a real
+divergence in the sixth decimal of every cached greek. ``bs_price`` and ``greeks`` below now
+DELEGATE to the shared function; what stays here is what is genuinely this module's own: the
+degenerate-input gate, the bisection inverter, and the one-shot convenience wrapper.
+
+WHAT THAT CHANGED, stated because it is a real (tiny) numeric move and not a pure refactor:
+``black_scholes`` ROUNDS its outputs to 6 decimals, and the old local form did not. Prices and
+greeks computed here therefore land on the same 6-decimal grid the platform's other greeks
+already use — which is the point (the cache viewer and the mark fallback were showing numbers
+from a different arithmetic), but it means a value can move by up to 5e-7. The Greek
+CONVENTIONS were already identical on both sides (theta per calendar day = annual/365, vega
+per 1 vol point = raw/100), so nothing needed translating.
 """
 from __future__ import annotations
 
-import math
 from typing import Optional
 
+from ba2_common.core.finance_calc.derivatives import black_scholes
 from ba2_common.core.types import OptionRight
 
-_SQRT_2PI = math.sqrt(2.0 * math.pi)
 
+def _shared(S: float, K: float, T: float, r: float, sigma: float,
+            option_type: OptionRight, q: float) -> Optional[dict]:
+    """The ONE shared BSM evaluation, behind this module's degenerate-input gate.
 
-def _norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-def _norm_pdf(x: float) -> float:
-    return math.exp(-0.5 * x * x) / _SQRT_2PI
-
-
-def _d1_d2(S: float, K: float, T: float, r: float, sigma: float, q: float) -> tuple:
-    v = sigma * math.sqrt(T)
-    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / v
-    return d1, d1 - v
+    The gate is this module's own responsibility and cannot move into ``black_scholes``: the
+    shared function is a pure formula and RAISES on degenerate inputs (``log(S/K)`` for
+    S <= 0, a zero denominator for ``sigma <= 0`` or ``T <= 0``), while every caller here is
+    a per-bar cache builder that must return "no computed greek for this row" and carry on.
+    """
+    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+        return None
+    try:
+        return black_scholes(S, K, T, r, sigma,
+                             option_type="call" if option_type == OptionRight.CALL else "put",
+                             dividend_yield=q)
+    except (ValueError, ZeroDivisionError, OverflowError, ArithmeticError):
+        return None
 
 
 def bs_price(S: float, K: float, T: float, r: float, sigma: float,
              option_type: OptionRight, q: float = 0.0) -> Optional[float]:
     """Black-Scholes theoretical price. None if inputs are degenerate (T<=0, sigma<=0)."""
-    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
-        return None
-    d1, d2 = _d1_d2(S, K, T, r, sigma, q)
-    if option_type == OptionRight.CALL:
-        return S * math.exp(-q * T) * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
-    return K * math.exp(-r * T) * _norm_cdf(-d2) - S * math.exp(-q * T) * _norm_cdf(-d1)
+    out = _shared(S, K, T, r, sigma, option_type, q)
+    return None if out is None else float(out["price"])
 
 
 # Bisection bracket for sigma: 0.01% to 500% annualized — wide enough for any liquid equity
@@ -90,30 +106,14 @@ def greeks(S: float, K: float, T: float, r: float, sigma: float,
     PER-DAY (annual theta / 365, the conventionally quoted figure); vega is PER 1-VOL-POINT
     (i.e. per 1% absolute change in IV, the conventionally quoted figure) — both divided down
     from the raw per-unit Black-Scholes derivatives so callers get broker-familiar numbers."""
-    if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+    out = _shared(S, K, T, r, sigma, option_type, q)
+    if out is None:
         return None
-    d1, d2 = _d1_d2(S, K, T, r, sigma, q)
-    pdf_d1 = _norm_pdf(d1)
-    disc_q = math.exp(-q * T)
-    disc_r = math.exp(-r * T)
-    sqrt_T = math.sqrt(T)
-
-    gamma = disc_q * pdf_d1 / (S * sigma * sqrt_T)
-    vega_annual = S * disc_q * pdf_d1 * sqrt_T
-    vega = vega_annual / 100.0  # per 1 vol POINT (1%), not per 1.0 (100%)
-
-    if option_type == OptionRight.CALL:
-        delta = disc_q * _norm_cdf(d1)
-        theta_annual = (-(S * disc_q * pdf_d1 * sigma) / (2 * sqrt_T)
-                        - r * K * disc_r * _norm_cdf(d2)
-                        + q * S * disc_q * _norm_cdf(d1))
-    else:
-        delta = disc_q * (_norm_cdf(d1) - 1.0)
-        theta_annual = (-(S * disc_q * pdf_d1 * sigma) / (2 * sqrt_T)
-                        + r * K * disc_r * _norm_cdf(-d2)
-                        - q * S * disc_q * _norm_cdf(-d1))
-
-    return {"delta": delta, "gamma": gamma, "theta": theta_annual / 365.0, "vega": vega}
+    # The shared pricer already publishes both under this module's conventions:
+    # ``theta_per_day`` is annual/365 and ``vega_per_point`` is raw/100. Renaming rather than
+    # recomputing is the whole point -- a second division here would be a second convention.
+    return {"delta": out["delta"], "gamma": out["gamma"],
+            "theta": out["theta_per_day"], "vega": out["vega_per_point"]}
 
 
 def compute_iv_and_greeks(price: Optional[float], S: Optional[float], K: float, T: float,

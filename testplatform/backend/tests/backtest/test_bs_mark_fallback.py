@@ -490,12 +490,19 @@ def test_equity_only_trial_never_calls_bs(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Cross-implementation parity (coordinator instruction 2026-09-01): the pinned shared
-# ``finance_calc.black_scholes`` and the backtest's OWN read-time inverter
-# (``option_greeks.bs_price``) must never silently drift apart — both price and both
-# invert the same iv, and a drift between them would corrupt marks in one direction
-# while leaving the other (e.g. the greeks the cache viewer/UI shows) unchanged.
+# ONE IMPLEMENTATION (plan Task 14b item 8, 2026-09-02). This section began as a PARITY
+# check at 1e-6 between three copies of one formula: the pinned shared
+# ``finance_calc.black_scholes``, the mark-fallback wrapper ``option_bs.bs_price``, and
+# ``option_greeks``'s OWN closed form (a private ``_d1_d2`` plus hand-written normal
+# CDF/PDF). A 1e-6 tolerance is exactly wide enough to tolerate a real divergence in the
+# sixth decimal of every cached greek, which is where a drift would first appear -- so the
+# copy is gone: ``option_greeks.bs_price``/``greeks`` now delegate to the shared function,
+# and these tests assert EQUALITY to 1e-9 rather than approximate agreement.
+#
+# The tolerance is 1e-9 rather than exact identity only so the pin does not depend on the
+# float repr of a rounded value; in practice all three now return the SAME object's number.
 # ---------------------------------------------------------------------------
+_BS_EXACT = 1e-9
 
 @pytest.mark.parametrize(
     "spot,strike,years,rate,iv,right",
@@ -516,7 +523,7 @@ def test_finance_calc_and_option_greeks_bs_agree(spot, strike, years, rate, iv, 
     shared = black_scholes(spot, strike, years, rate, iv, option_type=right)["price"]
     legacy = legacy_bs_price(spot, strike, years, rate, iv,
                               _OR.CALL if right == "call" else _OR.PUT)
-    assert legacy == pytest.approx(shared, abs=1e-6, rel=1e-6)
+    assert legacy == pytest.approx(shared, abs=_BS_EXACT, rel=0)
 
 
 def test_option_bs_wrapper_agrees_with_option_greeks_bs_price():
@@ -527,4 +534,52 @@ def test_option_bs_wrapper_agrees_with_option_greeks_bs_price():
     dte_days = 30
     price = bs_price(452.0, 500.0, dte_days, 0.30, OptionRight.CALL, r=0.045)
     legacy = legacy_bs_price(452.0, 500.0, dte_days / 365.0, 0.045, 0.30, OptionRight.CALL)
-    assert price == pytest.approx(legacy, abs=1e-6, rel=1e-6)
+    assert price == pytest.approx(legacy, abs=_BS_EXACT, rel=0)
+
+
+@pytest.mark.parametrize(
+    "spot,strike,years,rate,iv,right",
+    [
+        (100.0, 100.0, 1.0, 0.05, 0.20, "call"),
+        (100.0, 100.0, 1.0, 0.05, 0.20, "put"),
+        (452.0, 500.0, 8 / 365.0, 0.045, 0.30, "call"),
+        (30.0, 80.0, 200 / 365.0, 0.045, 0.55, "put"),
+        (250.0, 150.0, 0.5, 0.0, 0.90, "call"),
+        (10.0, 10.0, 1 / 365.0, 0.045, 0.15, "put"),
+    ],
+)
+def test_the_greeks_are_the_shared_ones_too(spot, strike, years, rate, iv, right):
+    """Not just the price. ``option_greeks.greeks`` used to recompute delta/gamma/theta/vega
+    from its own d1/d2, in its own conventions; a divergence there would have moved every
+    cached greek while the price parity test above stayed green."""
+    from ba2_common.core.finance_calc.derivatives import black_scholes
+    from app.services.backtest.option_greeks import greeks as legacy_greeks
+    from ba2_common.core.types import OptionRight as _OR
+
+    shared = black_scholes(spot, strike, years, rate, iv, option_type=right)
+    got = legacy_greeks(spot, strike, years, rate, iv,
+                        _OR.CALL if right == "call" else _OR.PUT)
+    assert got["delta"] == pytest.approx(shared["delta"], abs=_BS_EXACT, rel=0)
+    assert got["gamma"] == pytest.approx(shared["gamma"], abs=_BS_EXACT, rel=0)
+    # The conventions the module documents: theta PER CALENDAR DAY, vega PER 1 VOL POINT --
+    # which is what the shared pricer already publishes under those two names.
+    assert got["theta"] == pytest.approx(shared["theta_per_day"], abs=_BS_EXACT, rel=0)
+    assert got["vega"] == pytest.approx(shared["vega_per_point"], abs=_BS_EXACT, rel=0)
+
+
+def test_option_greeks_carries_no_second_black_scholes():
+    """THE STRUCTURAL HALF. A numeric parity test can only catch a divergence that has already
+    happened; this catches the copy being REINTRODUCED. Nothing in the module may spell the
+    closed form (d1/d2, a normal CDF/PDF) or import ``math`` for it -- the formula lives in
+    ``finance_calc.derivatives.black_scholes`` and nowhere else."""
+    import inspect
+
+    from app.services.backtest import option_greeks as og
+
+    src = inspect.getsource(og)
+    body = src.split('"""', 2)[-1]  # skip the module docstring, which DESCRIBES the removal
+    for banned in ("_d1_d2", "_norm_cdf", "_norm_pdf", "math.erf", "math.sqrt", "math.exp"):
+        assert banned not in body, (
+            f"option_greeks re-grew its own Black-Scholes ({banned!r}); the ONE implementation "
+            f"is finance_calc.derivatives.black_scholes")
+    assert "from ba2_common.core.finance_calc.derivatives import black_scholes" in src
