@@ -6766,16 +6766,19 @@ class AccountGrowthTab:
             #: on every symbol change. `fullscreen_button` says so politely when it is
             #: still None.
             latest_options = {'value': None}
+            # TITLE ROW carries only the panel controls (fullscreen), and the selector
+            # sits BELOW IT ON THE LEFT — the layout every other panel on this page uses.
+            # Putting the selector in the justify-between row pushed it to the right edge,
+            # which made this the one panel whose control was somewhere else.
             with ui.row().classes('w-full items-center justify-between'):
                 ui.label('Per-Position Growth').classes('text-md font-bold mb-2')
-                with ui.row().classes('items-center gap-2'):
-                    symbol_select = ui.select(
-                        options=symbol_options,
-                        value=symbol_options[0] if symbol_options else None,
-                        label='Select Symbol'
-                    ).classes('w-64')
-                    fullscreen_button(lambda: latest_options['value'],
-                                      title='Per-Position Growth')
+                fullscreen_button(lambda: latest_options['value'],
+                                  title='Per-Position Growth')
+            symbol_select = ui.select(
+                options=symbol_options,
+                value=symbol_options[0] if symbol_options else None,
+                label='Select Symbol'
+            ).classes('w-64 mb-2')
             chart_container = ui.column().classes('w-full')
 
             async def _load_position_chart(container, account_inst, symbol):
