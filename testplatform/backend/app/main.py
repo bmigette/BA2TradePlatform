@@ -141,7 +141,7 @@ app.add_middleware(APILoggingMiddleware)
 
 
 @app.get("/")
-async def root():
+def root():
     """Root endpoint - API information"""
     return {
         "name": "Deep Learning Financial Forecasting Platform API",
@@ -153,7 +153,7 @@ async def root():
 
 
 @app.get("/health")
-async def health_check():
+def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",

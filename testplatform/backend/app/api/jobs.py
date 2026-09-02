@@ -456,7 +456,7 @@ def sync_job_from_task(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def create_job(job_create: JobCreate):
+def create_job(job_create: JobCreate):
     """
     Create a new optimization job.
 
@@ -596,7 +596,7 @@ async def create_job(job_create: JobCreate):
 
 
 @router.get("", response_model=JobListResponse)
-async def list_jobs():
+def list_jobs():
     """
     List all optimization jobs.
 
@@ -693,7 +693,7 @@ def _profile_to_response(profile: OptimizationProfileModel) -> ProfileResponse:
 
 
 @router.post("/profiles", response_model=ProfileResponse, status_code=status.HTTP_201_CREATED)
-async def create_profile(profile: OptimizationProfileCreate, db: Session = Depends(get_db)):
+def create_profile(profile: OptimizationProfileCreate, db: Session = Depends(get_db)):
     """
     Create a new optimization profile.
 
@@ -738,7 +738,7 @@ async def create_profile(profile: OptimizationProfileCreate, db: Session = Depen
 
 
 @router.get("/profiles")
-async def list_profiles(db: Session = Depends(get_db)):
+def list_profiles(db: Session = Depends(get_db)):
     """
     List all optimization profiles.
 
@@ -754,7 +754,7 @@ async def list_profiles(db: Session = Depends(get_db)):
 
 
 @router.get("/profiles/{profile_id}", response_model=ProfileResponse)
-async def get_profile(profile_id: int, db: Session = Depends(get_db)):
+def get_profile(profile_id: int, db: Session = Depends(get_db)):
     """
     Get a specific optimization profile.
 
@@ -775,7 +775,7 @@ async def get_profile(profile_id: int, db: Session = Depends(get_db)):
 
 
 @router.delete("/profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_profile(profile_id: int, db: Session = Depends(get_db)):
+def delete_profile(profile_id: int, db: Session = Depends(get_db)):
     """
     Delete an optimization profile.
 
@@ -795,7 +795,7 @@ async def delete_profile(profile_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/profiles/{profile_id}/apply")
-async def apply_profile_to_job(profile_id: int, dataset_id: int, db: Session = Depends(get_db)):
+def apply_profile_to_job(profile_id: int, dataset_id: int, db: Session = Depends(get_db)):
     """
     Create a new job using settings from a profile.
 
@@ -825,11 +825,11 @@ async def apply_profile_to_job(profile_id: int, dataset_id: int, db: Session = D
     )
 
     # Reuse create_job logic
-    return await create_job(job_create)
+    return create_job(job_create)
 
 
 @router.put("/profiles/{profile_id}", response_model=ProfileResponse)
-async def update_profile(profile_id: int, profile: OptimizationProfileCreate, db: Session = Depends(get_db)):
+def update_profile(profile_id: int, profile: OptimizationProfileCreate, db: Session = Depends(get_db)):
     """
     Update an existing optimization profile.
 
@@ -865,7 +865,7 @@ async def update_profile(profile_id: int, profile: OptimizationProfileCreate, db
 
 
 @router.get("/profiles/{profile_id}/export")
-async def export_profile(profile_id: int, db: Session = Depends(get_db)):
+def export_profile(profile_id: int, db: Session = Depends(get_db)):
     """
     Export optimization profile to JSON format.
 
@@ -901,7 +901,7 @@ async def export_profile(profile_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/profiles/import", response_model=ProfileResponse)
-async def import_profile(profile_data: Dict[str, Any], db: Session = Depends(get_db)):
+def import_profile(profile_data: Dict[str, Any], db: Session = Depends(get_db)):
     """
     Import optimization profile from JSON format.
 
@@ -935,7 +935,7 @@ async def import_profile(profile_data: Dict[str, Any], db: Session = Depends(get
         )
 
         # Create as new profile
-        return await create_profile(profile, db)
+        return create_profile(profile, db)
 
     except HTTPException:
         raise
@@ -952,7 +952,7 @@ async def import_profile(profile_data: Dict[str, Any], db: Session = Depends(get
 # ============================================================================
 
 @router.get("/{job_id}", response_model=JobResponse)
-async def get_job(job_id: str):
+def get_job(job_id: str):
     """
     Get a specific job by ID.
 
@@ -980,7 +980,7 @@ async def get_job(job_id: str):
 
 
 @router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_job(job_id: str):
+def delete_job(job_id: str):
     """
     Delete a job by ID.
 
@@ -1022,7 +1022,7 @@ async def delete_job(job_id: str):
 
 
 @router.get("/{job_id}/progress", response_model=JobProgressResponse)
-async def get_job_progress(job_id: str):
+def get_job_progress(job_id: str):
     """
     Get detailed progress information for a job including metrics and logs.
 
@@ -1077,7 +1077,7 @@ async def get_job_progress(job_id: str):
 
 
 @router.post("/{job_id}/pause")
-async def pause_job(job_id: str):
+def pause_job(job_id: str):
     """
     Pause a running job.
 
@@ -1118,7 +1118,7 @@ async def pause_job(job_id: str):
 
 
 @router.post("/{job_id}/resume")
-async def resume_job(job_id: str):
+def resume_job(job_id: str):
     """
     Resume a paused or stopped (crashed) job.
 
@@ -1160,7 +1160,7 @@ async def resume_job(job_id: str):
 
 
 @router.post("/{job_id}/cancel")
-async def cancel_job(job_id: str):
+def cancel_job(job_id: str):
     """
     Cancel a running or paused job.
 
@@ -1252,7 +1252,7 @@ async def generate_sse_events(job_id: str):
 
 
 @router.get("/{job_id}/sse")
-async def get_job_progress_sse(job_id: str):
+def get_job_progress_sse(job_id: str):
     """
     Get live job progress via Server-Sent Events (SSE).
 
@@ -1283,7 +1283,7 @@ async def get_job_progress_sse(job_id: str):
 
 
 @router.get("/{job_id}/logs")
-async def get_job_logs(job_id: str, limit: int = 100):
+def get_job_logs(job_id: str, limit: int = 100):
     """
     Get training logs for a job.
 
@@ -1312,7 +1312,7 @@ async def get_job_logs(job_id: str, limit: int = 100):
 
 
 @router.get("/{job_id}/individuals")
-async def get_job_individuals(job_id: str, generation: Optional[int] = None, model_type: Optional[str] = None):
+def get_job_individuals(job_id: str, generation: Optional[int] = None, model_type: Optional[str] = None):
     """
     Get all individuals evaluated during optimization for visualization.
 
@@ -1400,7 +1400,7 @@ async def get_job_individuals(job_id: str, generation: Optional[int] = None, mod
 
 
 @router.get("/{job_id}/generations")
-async def get_job_generations(job_id: str):
+def get_job_generations(job_id: str):
     """
     Get generation-by-generation summary of optimization progress.
 
@@ -1414,7 +1414,7 @@ async def get_job_generations(job_id: str):
         List of generation summaries
     """
     # Get all individuals
-    individuals_response = await get_job_individuals(job_id)
+    individuals_response = get_job_individuals(job_id)
     all_individuals = individuals_response["individuals"]
 
     # Group by generation
@@ -1475,7 +1475,7 @@ class SaveToInventoryRequest(BaseModel):
 
 
 @router.get("/{job_id}/elite-models")
-async def get_job_elite_models(job_id: str):
+def get_job_elite_models(job_id: str):
     """
     Get elite models saved for a completed job.
 
@@ -1494,7 +1494,7 @@ async def get_job_elite_models(job_id: str):
 
 
 @router.post("/{job_id}/elite-models/{rank}/save-to-inventory")
-async def save_elite_to_inventory(
+def save_elite_to_inventory(
     job_id: str,
     rank: int,
     request: SaveToInventoryRequest,
@@ -1641,7 +1641,7 @@ class RetrainJobCreate(BaseModel):
 
 
 @router.post("/retrain", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def create_retrain_job(retrain_request: RetrainJobCreate):
+def create_retrain_job(retrain_request: RetrainJobCreate):
     """
     Create a retrain job for an existing model.
 
@@ -1797,7 +1797,7 @@ class RetrainSaveRequest(BaseModel):
 
 
 @router.post("/{job_id}/retrain-save")
-async def save_retrain_results(job_id: str, request: RetrainSaveRequest):
+def save_retrain_results(job_id: str, request: RetrainSaveRequest):
     """
     Save retrain job results - either update the original model or save as new.
 
@@ -1955,7 +1955,7 @@ async def save_retrain_results(job_id: str, request: RetrainSaveRequest):
 # ============================================================================
 
 @router.get("/jobs/{job_id}/datasets")
-async def get_job_datasets(job_id: str):
+def get_job_datasets(job_id: str):
     """
     Get information about cached datasets for a training job.
 
@@ -1975,7 +1975,7 @@ async def get_job_datasets(job_id: str):
 
 
 @router.get("/jobs/{job_id}/datasets/{filename}")
-async def download_job_dataset(job_id: str, filename: str):
+def download_job_dataset(job_id: str, filename: str):
     """
     Download a specific dataset file for a training job.
 

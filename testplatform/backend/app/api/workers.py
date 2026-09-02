@@ -144,7 +144,7 @@ def ensure_local_worker(db: Session):
 
 
 @router.get("", response_model=List[WorkerResponse])
-async def list_workers(db: Session = Depends(get_db)):
+def list_workers(db: Session = Depends(get_db)):
     """List all configured workers."""
     # Ensure local worker exists
     ensure_local_worker(db)
@@ -165,7 +165,7 @@ async def list_workers(db: Session = Depends(get_db)):
 
 
 @router.post("", response_model=WorkerResponse, status_code=201)
-async def create_worker(worker: WorkerCreate, db: Session = Depends(get_db)):
+def create_worker(worker: WorkerCreate, db: Session = Depends(get_db)):
     """Add a new remote worker configuration."""
     if worker.workerType == "local":
         raise HTTPException(status_code=400, detail="Cannot create additional local workers")
@@ -191,7 +191,7 @@ async def create_worker(worker: WorkerCreate, db: Session = Depends(get_db)):
 
 
 @router.get("/{worker_id}", response_model=WorkerResponse)
-async def get_worker(worker_id: int, db: Session = Depends(get_db)):
+def get_worker(worker_id: int, db: Session = Depends(get_db)):
     """Get worker details."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
@@ -200,7 +200,7 @@ async def get_worker(worker_id: int, db: Session = Depends(get_db)):
 
 
 @router.put("/{worker_id}", response_model=WorkerResponse)
-async def update_worker(worker_id: int, updates: WorkerUpdate, db: Session = Depends(get_db)):
+def update_worker(worker_id: int, updates: WorkerUpdate, db: Session = Depends(get_db)):
     """Update worker configuration."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
@@ -230,7 +230,7 @@ async def update_worker(worker_id: int, updates: WorkerUpdate, db: Session = Dep
 
 
 @router.delete("/{worker_id}")
-async def delete_worker(worker_id: int, db: Session = Depends(get_db)):
+def delete_worker(worker_id: int, db: Session = Depends(get_db)):
     """Delete a worker configuration."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
@@ -247,7 +247,7 @@ async def delete_worker(worker_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{worker_id}/status")
-async def get_worker_status(worker_id: int, db: Session = Depends(get_db)):
+def get_worker_status(worker_id: int, db: Session = Depends(get_db)):
     """Get worker status and metrics."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
@@ -306,7 +306,7 @@ async def get_worker_status(worker_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{worker_id}/enable")
-async def enable_worker(worker_id: int, db: Session = Depends(get_db)):
+def enable_worker(worker_id: int, db: Session = Depends(get_db)):
     """Enable a worker."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
@@ -320,7 +320,7 @@ async def enable_worker(worker_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{worker_id}/disable")
-async def disable_worker(worker_id: int, db: Session = Depends(get_db)):
+def disable_worker(worker_id: int, db: Session = Depends(get_db)):
     """Disable a worker."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
@@ -334,7 +334,7 @@ async def disable_worker(worker_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{worker_id}/health-check")
-async def health_check_worker(worker_id: int, db: Session = Depends(get_db)):
+def health_check_worker(worker_id: int, db: Session = Depends(get_db)):
     """Run health check on a worker."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
@@ -376,7 +376,7 @@ async def health_check_worker(worker_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/export", response_model=WorkerExport)
-async def export_workers(db: Session = Depends(get_db)):
+def export_workers(db: Session = Depends(get_db)):
     """Export all worker configurations."""
     workers = db.query(Worker).filter(Worker.is_local == False).all()
 
@@ -398,7 +398,7 @@ async def export_workers(db: Session = Depends(get_db)):
 
 
 @router.post("/import")
-async def import_workers(data: WorkerExport, db: Session = Depends(get_db)):
+def import_workers(data: WorkerExport, db: Session = Depends(get_db)):
     """Import worker configurations."""
     imported = 0
 
@@ -428,7 +428,7 @@ async def import_workers(data: WorkerExport, db: Session = Depends(get_db)):
 
 
 @router.post("/{worker_id}/sync-cache")
-async def sync_worker_cache(worker_id: int, db: Session = Depends(get_db)):
+def sync_worker_cache(worker_id: int, db: Session = Depends(get_db)):
     """Push the master's cache (diff, as one tar stream) to a remote worker."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:
@@ -444,7 +444,7 @@ async def sync_worker_cache(worker_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{worker_id}/update")
-async def update_worker_code(worker_id: int, db: Session = Depends(get_db)):
+def update_worker_code(worker_id: int, db: Session = Depends(get_db)):
     """Bring a remote worker's code up to the master's version (git pull + reinstall + restart)."""
     worker = db.query(Worker).filter(Worker.id == worker_id).first()
     if not worker:

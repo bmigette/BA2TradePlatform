@@ -12,8 +12,6 @@ import textwrap
 from dataclasses import dataclass
 from typing import Iterable
 
-import pytest
-
 # Polled by the frontend every 2-5 s; the routes that took the backend down.
 HOT_PATHS = {
     ("GET", "/api/dashboard/stats"),
@@ -148,10 +146,8 @@ def test_hot_path_routes_are_plain_def():
             f"{key} is async def but does only blocking work; make it `def`"
 
 
-# Task 6 of docs/plans/2026-09-02-testplatform-backend-event-loop-stall.md converts the rest of
-# the routes and REMOVES this xfail marker. strict=True so the marker cannot outlive the sweep.
-@pytest.mark.xfail(strict=True, reason="remaining pure-blocking async routes are converted in Task 6")
 def test_no_async_route_does_only_blocking_work():
-    """Every remaining `async def` route must genuinely await. Fix = delete `async` on the
-    listed endpoints."""
+    """Enforced across the whole app: an `async def` route must genuinely await, otherwise it does
+    its blocking work on the event loop. Fix = delete `async` on the listed endpoints (and drop the
+    now-pointless `await` at any in-process call site)."""
     assert _pure_blocking_async_routes() == []

@@ -64,7 +64,7 @@ class QueueStatsResponse(BaseModel):
 
 
 @router.post("", response_model=dict)
-async def create_task(request: TaskCreateRequest):
+def create_task(request: TaskCreateRequest):
     """
     Create and queue a new task.
 
@@ -99,7 +99,7 @@ async def create_task(request: TaskCreateRequest):
 
 
 @router.get("/{task_id}")
-async def get_task(task_id: str):
+def get_task(task_id: str):
     """
     Get task details by ID.
 
@@ -119,7 +119,7 @@ async def get_task(task_id: str):
 
 
 @router.get("/{task_id}/progress")
-async def get_task_progress(task_id: str):
+def get_task_progress(task_id: str):
     """
     Get task progress.
 
@@ -139,7 +139,7 @@ async def get_task_progress(task_id: str):
 
 
 @router.post("/{task_id}/cancel")
-async def cancel_task(task_id: str):
+def cancel_task(task_id: str):
     """
     Cancel a pending or running task.
 
@@ -166,7 +166,7 @@ async def cancel_task(task_id: str):
 
 
 @router.post("/{task_id}/pause")
-async def pause_task(task_id: str):
+def pause_task(task_id: str):
     """
     Pause a running task.
 
@@ -196,7 +196,7 @@ async def pause_task(task_id: str):
 
 
 @router.post("/{task_id}/resume")
-async def resume_task(task_id: str):
+def resume_task(task_id: str):
     """
     Resume a paused task.
 
@@ -225,7 +225,7 @@ async def resume_task(task_id: str):
 
 
 @router.get("/{task_id}/checkpoints")
-async def list_task_checkpoints(task_id: str):
+def list_task_checkpoints(task_id: str):
     """
     List all checkpoints for a task.
 
@@ -248,7 +248,7 @@ async def list_task_checkpoints(task_id: str):
 
 
 @router.get("/{task_id}/checkpoints/latest")
-async def get_latest_checkpoint(task_id: str):
+def get_latest_checkpoint(task_id: str):
     """
     Get the latest checkpoint for a task.
 
@@ -273,7 +273,7 @@ async def get_latest_checkpoint(task_id: str):
 
 
 @router.delete("/{task_id}/checkpoints/{epoch}")
-async def delete_checkpoint(task_id: str, epoch: int):
+def delete_checkpoint(task_id: str, epoch: int):
     """
     Delete a specific checkpoint.
 
@@ -303,7 +303,7 @@ async def delete_checkpoint(task_id: str, epoch: int):
 
 
 @router.post("/{task_id}/checkpoints/cleanup")
-async def cleanup_checkpoints(
+def cleanup_checkpoints(
     task_id: str,
     keep_latest: bool = Query(True, description="Keep the latest checkpoint"),
     keep_best: bool = Query(True, description="Keep the best checkpoint")
@@ -362,7 +362,7 @@ def list_tasks(
 
 
 @router.get("/stats/summary", response_model=QueueStatsResponse)
-async def get_queue_stats():
+def get_queue_stats():
     """
     Get task queue statistics.
 
@@ -375,7 +375,7 @@ async def get_queue_stats():
 
 
 @router.post("/cleanup")
-async def cleanup_old_tasks(days: int = Query(30, ge=1, le=365)):
+def cleanup_old_tasks(days: int = Query(30, ge=1, le=365)):
     """
     Remove old completed/failed tasks.
 
@@ -396,7 +396,7 @@ async def cleanup_old_tasks(days: int = Query(30, ge=1, le=365)):
 
 # Health check endpoint for the queue
 @router.get("/health/status")
-async def queue_health():
+def queue_health():
     """
     Check task queue health.
 

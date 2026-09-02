@@ -48,7 +48,7 @@ router = APIRouter()
 
 
 @router.get("/system-info")
-async def get_system_info():
+def get_system_info():
     """
     Get system information for ML training.
 
@@ -59,7 +59,7 @@ async def get_system_info():
 
 
 @router.get("/models")
-async def get_available_models():
+def get_available_models():
     """
     Get list of available ML model architectures for regression/forecasting.
 
@@ -74,7 +74,7 @@ async def get_available_models():
 
 
 @router.get("/classification-models")
-async def get_classification_models():
+def get_classification_models():
     """
     Get list of available ML model architectures for classification.
 
@@ -110,7 +110,7 @@ async def get_classification_models():
 
 
 @router.get("/models/{model_type}")
-async def get_model_details(model_type: str):
+def get_model_details(model_type: str):
     """
     Get details for a specific model type.
 
@@ -135,7 +135,7 @@ async def get_model_details(model_type: str):
 
 
 @router.post("/datasets/{dataset_id}/calculate-targets")
-async def calculate_prediction_targets(
+def calculate_prediction_targets(
     dataset_id: int,
     targets: List[Dict[str, Any]] = None,
     db: Session = Depends(get_db)
@@ -220,7 +220,7 @@ async def calculate_prediction_targets(
 
 
 @router.post("/datasets/{dataset_id}/preview-targets")
-async def preview_prediction_targets(
+def preview_prediction_targets(
     dataset_id: int,
     targets: List[Dict[str, Any]] = None,
     db: Session = Depends(get_db)
@@ -329,7 +329,7 @@ async def preview_prediction_targets(
 
 
 @router.post("/datasets/{dataset_id}/generate-training-data")
-async def generate_training_data(
+def generate_training_data(
     dataset_id: int,
     request: GenerateTrainingDataRequest = None,
     db: Session = Depends(get_db)
@@ -460,7 +460,7 @@ async def generate_training_data(
 
 
 @router.post("/datasets/{dataset_id}/split")
-async def split_dataset(
+def split_dataset(
     dataset_id: int,
     train_ratio: float = 0.8,
     shuffle: bool = False,
@@ -544,7 +544,7 @@ async def split_dataset(
 
 
 @router.get("/gpu-status")
-async def get_gpu_status():
+def get_gpu_status():
     """
     Get GPU utilization status.
 
@@ -569,7 +569,7 @@ async def get_gpu_status():
 
 
 @router.get("/genetic/status")
-async def get_genetic_optimizer_status():
+def get_genetic_optimizer_status():
     """
     Get genetic optimization library status.
 
@@ -584,7 +584,7 @@ async def get_genetic_optimizer_status():
 
 
 @router.post("/genetic/optimize")
-async def run_genetic_optimization(
+def run_genetic_optimization(
     population_size: int = 10,
     n_generations: int = 5,
     crossover_prob: float = 0.7,
@@ -650,7 +650,7 @@ async def run_genetic_optimization(
 
 
 @router.post("/train/{model_type}")
-async def train_model_demo(
+def train_model_demo(
     model_type: str,
     epochs: int = 10,
     batch_size: int = 32
@@ -700,7 +700,7 @@ async def train_model_demo(
 
 
 @router.get("/training/saved-models")
-async def list_saved_models():
+def list_saved_models():
     """
     List all saved trained models.
 
@@ -743,7 +743,7 @@ async def list_saved_models():
 
 
 @router.get("/genetic/libraries")
-async def list_genetic_libraries():
+def list_genetic_libraries():
     """
     List available genetic optimization libraries.
 
@@ -760,7 +760,7 @@ async def list_genetic_libraries():
 
 
 @router.post("/genetic/optimize-with-library")
-async def run_genetic_optimization_with_library(
+def run_genetic_optimization_with_library(
     library: str = "deap",
     population_size: int = 10,
     n_generations: int = 5,
@@ -844,7 +844,7 @@ async def run_genetic_optimization_with_library(
 # =============== Normalization Config Endpoints ===============
 
 @router.get("/normalization/{model_id}")
-async def get_model_normalization(
+def get_model_normalization(
     model_id: str,
     db: Session = Depends(get_db)
 ):
@@ -879,7 +879,7 @@ async def get_model_normalization(
 
 
 @router.get("/normalization/{model_id}/export")
-async def export_normalization(
+def export_normalization(
     model_id: str,
     db: Session = Depends(get_db)
 ):
@@ -935,7 +935,7 @@ predictions_df = prep_service.inverse_transform(model_output)
 
 
 @router.get("/normalization/by-dataset/{dataset_id}")
-async def get_dataset_normalization_configs(
+def get_dataset_normalization_configs(
     dataset_id: int,
     db: Session = Depends(get_db)
 ):
@@ -969,7 +969,7 @@ async def get_dataset_normalization_configs(
 
 
 @router.post("/normalization/save")
-async def save_normalization_config(
+def save_normalization_config(
     model_id: str,
     dataset_id: Optional[int] = None,
     method: str = "minmax_buffered",
@@ -1040,7 +1040,7 @@ async def save_normalization_config(
 
 
 @router.get("/class-imbalance/config")
-async def get_class_imbalance_config():
+def get_class_imbalance_config():
     """
     Get available class imbalance handling configurations.
 
@@ -1051,7 +1051,7 @@ async def get_class_imbalance_config():
 
 
 @router.post("/class-imbalance/recommend")
-async def get_recommended_imbalance_config(
+def get_recommended_imbalance_config(
     positive_count: int,
     negative_count: int
 ):
