@@ -23,6 +23,33 @@ kept as a separate key so results never blend.
 
 ## 2. Strategy key `O_CONVEX`
 
+> **LANDED AS (operator decision, 2026-09-02, superseding the plan's own
+> Task 13 text — "the tail-hedge put arm = a `kind` toggle gene (call|put|
+> both) — cheap per design"): `O_CONVEX` is a GROUP key over TWO
+> member arms, `O_CONVEXC` (bullish signal → `buy_call`) and `O_CONVEXP`
+> (bearish signal → `buy_put`), built with the exact same
+> `_build_strategy_option_group` mechanism `O_LEAP` uses — one toggleable
+> entry TradeRule per arm sharing ONE exit ruleset, not a categorical
+> `kind: call|put|both` gene. Reusing the group builder means the put arm
+> gets the group's STANDARD per-rule `enabled` gene for free instead of a new
+> toggle being invented, and there is no simultaneous call+put "both" arm on
+> offer: `has_no_position` is per-INSTRUMENT (not per-structure), so once
+> either arm opens a ticket on an underlying both rules are blocked from a
+> second one until it closes — the same 1-ticket-per-underlying guard every
+> other option key has, ruling "both" out by construction rather than
+> omission.
+>
+> **Also landed, beyond this section's original gene list (review finding,
+> 2026-09-02):** a PER-KEY override of the shared `opt_time` (elapsed-time,
+> `days_opened > N`) exit. The platform-shared band (28 default, 10-45) was
+> set for the 25-45-DTE structures the first grid searched and is authored ON
+> by default everywhere else — for `O_CONVEX`'s ~300-DTE median entry that
+> band would close a lottery ticket 28 days into a thesis built to run most
+> of a year. Fixed with a wider band (90-360 step 30, 10 levels) AND authored
+> OFF by default (the same `opt_sl_ml` removal idiom below, not a flag), so
+> an unsearched genome never closes the ticket early; the GA can still
+> discover a time stop is worth it and switch the rule on.
+
 Genes:
 - target delta **0.10–0.35 step 0.05** (the cheapness/convexity dial)
 - entry DTE **180–540** (medium-long: enough runway for a thesis to play out;
@@ -36,7 +63,13 @@ Genes:
   let them run)
 - `opt_sl_ml` stop **searchable with default OFF** — stopping a lottery ticket
   at a % of its premium amputates the convexity the strategy exists to buy.
-  The GA may still discover a stop helps; it must not be imposed.
+  The GA may still discover a stop helps; it must not be imposed. **LANDED
+  AS**: "default OFF" means the rule is REMOVED from the emitted ruleset for
+  an unsearched/default genome (`_OPTION_SL_ML_AUTHORED_OFF`), not stamped
+  with a `enabled: False` flag — the rule keeps its `toggle_optimize` gene so
+  the GA can still switch it on, but a rule-level `enabled: False` is never
+  emitted onto any ruleset (plan Task 14a item 4(e); the same removal, not a
+  flag, discipline the `opt_time` override above and O_ERN/O_CBS/O_PBS use).
 
 Max loss per ticket = premium (MEASURED); the rails charge it to the
 deployment cap. Nothing here is naked; the operator's no-naked rule is
@@ -56,7 +89,16 @@ routing like `_OPTION_CAR_STRATEGIES`):
 1. **Wipeout sentinel first** (same literal ordering discipline as F9a): any
    dd ≥ 100 → sentinel, before anything else.
 2. **Rank on end-of-window total return** (net of costs), NOT year-by-year
-   consistency. One number: did the winners beat the graveyard.
+   consistency. One number: did the winners beat the graveyard. **LANDED AS
+   NOTE**: this return term is a `total_return`-family value, and 683c7379
+   (2026-09, plan Task 14a item 3) fixed `stressed_results` so a run with
+   `--stress-spread-bps` set now actually applies the stress to
+   `total_return`/`calmar_ratio` instead of silently discarding it — before
+   that fix a stressed `option_convex` run was scoring on the UNSTRESSED
+   return term despite the flag. A convex run scored WITH `--stress-spread-
+   bps` before 683c7379 and one scored WITH it after are different baselines
+   for that reason (see the results-comparability note); an unstressed run
+   is unaffected either side of that commit.
 3. **Drawdown enters only past a threshold**: no penalty below 50% peak-to-
    trough (bleed is the cost of the book); linear penalty 50→90%; sentinel at
    100. The threshold is a config constant, commented, not a gene.
@@ -80,7 +122,11 @@ grid with a different threshold parameter. Preflight prints kept/dropped.
 - `tools/run_convex_matrix.py` (or a `--fitness option_convex` mode of the
   LEAPS script if the code falls out that way — operator does not care about
   the script boundary, only that results and fitness never mix).
-- Jobs: `O_CONVEX` × stage-1's experts, singles. 2–3 jobs. Pop 40 / gen 6.
+- Jobs: `O_CONVEX` × stage-1's experts, singles. **LANDED AS 2 jobs**:
+  `tools/run_convex_matrix.py`'s `_DEFAULT_EXPERTS` is `["FMPRating",
+  "DeterministicScorer"]` — the two stage-1 experts that clear the "measured,
+  not just registered" bar (the same reasoning `_DEFAULT_EXPERTS` uses for
+  the screener-style grid-2 keys). Pop 40 / gen 6.
 - Window 2023-01 → 2025-12, 2026 held out.
 
 ## 6. Build items beyond the LEAPS grid's

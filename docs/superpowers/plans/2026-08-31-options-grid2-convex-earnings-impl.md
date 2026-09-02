@@ -335,6 +335,13 @@ convention explicitly).
 
 ### Task 10 (sonnet): Grid-2 launcher wiring + matrix script
 
+> **LANDED AS** `746d59fd` (the five phase-1 option keys, gene tables, matrix
+> driver) + `9dd116e8` (fix: lower trade floor scoped to the long-dated
+> family only) + `8b705c58` (later operator amendment, 2026-09-02: O_LEAPC/
+> O_LEAPP merged into the ONE signal-driven group key `O_LEAP` — see the
+> leaps design's own "LANDED AS" note in §2). No other deviation from the
+> brief below.
+
 > **FRESH-EYES AMENDMENTS (controller review 2026-09-01, after Task 9):**
 > 1. **Fixed method, delta-domain params -- the dead-gene trap.** The launcher's
 >    existing strike-method machinery makes the METHOD a categorical gene sharing
@@ -381,6 +388,11 @@ trade floor applied to O_ERN (must NOT be).
 
 ### Task 11 (sonnet): expert genes for FMPEarningsEvent
 
+> **LANDED AS** `4e8791ab` (weights + `min_analysts` + `allow_unconfirmed_dates`
+> gene table, threaded through `_build_daily_trial_config`'s expert
+> settings). The `min_analysts` 0-5/default-1 amendment (below) landed with
+> it — see the leaps design's own "LANDED AS" note under §9.
+
 > **AMENDMENT (2026-09-01):** `min_analysts` gene range is **0-5 with 0 = gate
 > OFF** (measured: default 3 refuses 66% of the universe at a 2023 as-of, 47%
 > at 2025 -- decaying strictness that tilts the traded universe across the
@@ -394,6 +406,12 @@ settings (THE WHITELIST TRAP — prove the value reaches the expert with a
 recorded-chain test per gene); mutation: whitelist drop.
 
 ### Task 12 (opus): `option_convex` fitness
+
+> **LANDED AS** `79087da8` (the fitness itself — ranks on uncapped
+> cumulative P&L / starting capital, `capped_drawdown_curve` for the
+> drawdown term, per the equity-cap-masking amendment below) + `8708786a`
+> (fix: telemetry counted per TICKET, not per structure; a dead exception
+> swallow removed). No other deviation.
 
 > **AMENDMENT (2026-09-01) -- the equity-cap masking lesson, second
 > application.** Option grids run with `equity_cap`; capped equity reports ZERO
@@ -419,6 +437,14 @@ AND; sentinel ordering swapped (wipeout after return) — each kills a named
 frozen/property test.
 
 ### Task 13 (sonnet): `O_CONVEX` key + convex matrix
+
+> **LANDED AS** `967db2aa` (the `O_CONVEX` key + `tools/run_convex_matrix.py`)
+> + `64981161` (review fix: `opt_sl_ml`'s `enabled=False` was inert at
+> runtime — the removal-not-flag fix; convex-matrix hardening). **Deviation
+> from the brief below**: no `kind` toggle gene — `O_CONVEX` is a GROUP key
+> over two member arms (`O_CONVEXC`/`O_CONVEXP`), the same
+> `_build_strategy_option_group` mechanism `O_LEAP` uses, per operator
+> decision 2026-09-02 (see the convex design's own "LANDED AS" note in §2).
 **Files:** launcher `O_CONVEX` def (design §2 genes: delta 0.10–0.35, DTE
 180–540, per-ticket premium sizing 0.5–2.0%, tp multiple 3–10x|expiry via
 Task 4's condition, sl_ml default OFF, 1 ticket/underlying),
@@ -429,6 +455,13 @@ threshold, jobs O_CONVEX × experts). The tail-hedge put arm = a
 cross-score); sl_ml default genuinely off in the emitted ruleset.
 
 ### Task 14 (sonnet): docs + STATE + phase-2 stub
+
+> **LANDED AS two halves.** Task 14b (code-side: `O_CAL` stub,
+> `EXPERTS.md`, misc review fast-follows) is DONE — 10 commits
+> `4f3cb7a6..4568a71f`. Task 14a (this docs/closeout half — the merge, the
+> perf timing, the results-comparability note, and the completion STATE
+> note below) is this section's own work; see the STATE note's per-item SHA
+> table for its commits.
 
 > **AMENDMENTS (2026-09-01):** (a) PRE-LAUNCH PERF: time ONE real-cache option
 > trial (parquet store, a grid-2 key, a real universe symbol) against one real
@@ -632,6 +665,64 @@ across runs.
    engine finally running, not a regression. Any older recorded
    `perf_sample_bt` number is describing a different (and, per the harness's
    own purpose, broken) program.
+
+#### Task 14a item 4 — design/plan doc updates: remaining pieces
+
+**The aliased-import limitation of `getsource`-based pins (codebase-wide).**
+Several suites (`test_strike_method_registry.py`,
+`test_bs_mark_fallback.py`'s `test_risk_function_source_never_names_bs`, and
+others) pin a call-graph invariant by reading a function/class's OWN source
+text with `inspect.getsource` and asserting a literal name string is present
+or absent in it (e.g. `assert "bs_price" not in src` on every reserve/margin
+function, proving BS never reaches a risk number). This is a real, working
+guard for the direct-call shape it was written against — but `getsource`
+returns the SOURCE AS LITERALLY WRITTEN, not a resolved call graph: a
+function that reaches the guarded target through an ALIASED IMPORT (`from
+ba2_common.core.option_bs import bs_price as _compute_bs`, then calling
+`_compute_bs(...)`) would leave the literal string `"bs_price"` entirely
+absent from the guarded function's own source, and the pin would report
+"clean" while the call still happens. None of today's call sites use this
+form (verified for the BS/risk-function pin specifically as part of Task 3's
+own review), so the guards are correct as they stand — this is a recorded
+LIMITATION of the technique for the next agent adding a call site or a new
+`getsource`-based pin, not a defect found in this branch's code.
+
+**Task 2's 3 doc nits.** The plan's own amendment text (Task 14's
+amendments block, item (c)) references "Task 2's 3 doc nits" as something to
+carry forward, but no separate review artifact persisted in the repo (no
+review-notes doc, no follow-up commit message enumerating them) — the trail
+was searched (`docs/superpowers/`, the commit `2583e520` message in full,
+and `tools/probe_option_chain_depth.py`'s own docstring) and none names three
+specific items. Recorded here as NOT INDEPENDENTLY LOCATABLE rather than
+invented or silently dropped; `tools/probe_option_chain_depth.py`'s
+docstring and tests were re-read for clarity in the course of this task and
+no defect or omission was found in them.
+
+**`days_after_event` (forced) vs `days_opened` (discretionary), recorded as
+DELIBERATE.** Already landed in code, verified present, no doc change
+needed: `packages/common/ba2_common/core/TradeActionEvaluator.py`'s
+`_FORCED_EXIT_EVENT_TYPES` carries a block comment on its
+`N_DAYS_AFTER_EVENT` entry beginning "THIS IS CLASSIFIED OPPOSITE TO
+`days_opened`, DELIBERATELY, AND THE DIFFERENCE IS NOT 'both count days'" —
+`days_opened` is a STALENESS exit (nothing changed, the thesis hasn't paid,
+so it stays discretionary), while `days_after_event` is the terminal date of
+a binary event trade (the thesis is over once the print has passed and the
+searched window has elapsed, so it pays up like `days_to_expiry`). This is
+exactly the classification item 4 asks to have recorded — it already is, in
+the classifier's own docstring, the most authoritative place for it.
+
+**Rule-level `enabled: False` convention (never emitted; shared guard).**
+Also already landed and verified present:
+`packages/common/ba2_common/core/rules_convert.py`'s
+`live_actions_from_trade_rule` docstring states the choke point plainly —
+`rule.get("enabled") is False` converts to `None` (no action) UNCONDITIONALLY,
+before anything else runs, on BOTH the backtest seeder path
+(`default_rulesets.seed_ruleset_from_rules`) and the live export path
+(`strategy_to_live_export`/`trade_rules_to_live_export`) — and the emit-time
+half (`strategy_param_space._decode_rule_list` REMOVING an authored-off rule
+rather than flagging it) is documented beside it. This is the "shared guard"
+plan item 4's operator decision (e) refers to; already documented at its own
+call site, no doc addition needed here.
 
 ---
 
