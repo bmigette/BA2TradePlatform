@@ -1,16 +1,28 @@
-"""Split a symbols universe into N chunks and run tools/warm_options_history.py as N SEPARATE
-PROCESSES (not threads) against each -- each gets its own Python interpreter, its own
-TastySession/httpx client (or ThetaClient), its own asyncio event loop. Sharing one session
-object across threads would risk the class of thread-safety issue async httpx clients are not
-generally built for; separate processes sidestep that entirely -- true parallelism either way,
-sidestepping the GIL same as threads would, without that risk.
+"""Run tools/warm_options_history.py with real concurrency, split by --provider's needs:
+
+  * tastytrade: N SEPARATE PROCESSES, one symbols chunk each -- each process gets its own
+    Python interpreter, its own TastySession/httpx client, its own asyncio event loop.
+    Sharing one session object across threads would risk the class of thread-safety issue
+    async httpx clients are not generally built for; separate processes sidestep that
+    entirely -- true parallelism, sidestepping the GIL the same way threads would, without
+    that risk.
+  * thetadata: ONE process, the FULL symbols universe, warm_options_history.py's own
+    --concurrency N (THREADS sharing one provider instance within that one process). Found
+    live 2026-09-02: ThetaData authenticates ONE session per api_key, and N separate
+    PROCESSES each independently authenticating invalidate each other's session
+    (``StatusCode.UNAUTHENTICATED: "Invalid session ID. This can occur if more than one
+    terminal is running."``) -- nearly every unit failed outright. See thetadata.py's module
+    docstring for the fix (``existing_authorized_client``, one authenticated session shared
+    by every thread's own client) -- that sharing only works within one process.
 
 --provider {tastytrade,thetadata} (default tastytrade) picks BOTH the vendor and which venv
-runs the workers: tastytrade needs the `tastytrade` SDK (this repo's .venv), thetadata needs
+runs the worker(s): tastytrade needs the `tastytrade` SDK (this repo's .venv), thetadata needs
 the `thetadata` cloud library (deliberately only installed in the TEST venv, ba2-venvs/test --
-see testplatform/backend/requirements.txt; the live trade app has no use for it).
+see testplatform/backend/requirements.txt; the live trade app has no use for it). --workers
+means "processes" for tastytrade and "threads within the one process" for thetadata -- same
+flag, same intent ("how much concurrency"), different mechanism per provider's constraints.
 
-All processes for ONE provider write into that provider's OWN parquet store
+Every process writes into ITS OWN provider's parquet store
 (CACHE_FOLDER/{TastyTradeOptionsProvider,ThetaDataOptionsProvider}) -- safe because different
 symbols/expiries land in different files, and each unit's manifest is written via temp+rename
 per the store's own resumability contract. Running one provider never touches the other's tree.
@@ -103,6 +115,47 @@ def unregister_reboot_task() -> None:
         print(f"{STARTUP_BAT} did not exist (nothing to remove).")
 
 
+def _run_thetadata_single_process(args, py_exe: str, log_dir: str, concurrency: int) -> None:
+    """--provider thetadata: ONE process, the FULL symbols universe, warm_options_history.py's
+    own --concurrency (threads sharing one authenticated session within that process) -- see
+    the module docstring for why separate processes (the tastytrade path below) do not work
+    for this vendor."""
+    symbols_file = args.symbols_file or UNIVERSE
+    log_file = rf"{log_dir}\warmup.log"
+    stderr_file = rf"{log_dir}\warmup.stderr.log"
+    argv = [py_exe, SCRIPT, "--provider", "thetadata", "--db", PROD_DB,
+           "--log-file", log_file, "--concurrency", str(concurrency)]
+    if args.symbols_override:
+        argv += ["--symbols", args.symbols_override]
+    else:
+        argv += ["--symbols-file", symbols_file]
+    if args.api_key:
+        argv += ["--api-key", args.api_key]
+    if args.start:
+        argv += ["--start", args.start]
+    if args.end:
+        argv += ["--end", args.end]
+    if args.dry_run:
+        argv.append("--dry-run")
+    if args.limit:
+        argv += ["--limit", str(args.limit)]
+
+    print("provider   : thetadata")
+    print(f"  {'symbols=' + args.symbols_override if args.symbols_override else symbols_file} "
+         f"-> 1 process, --concurrency {concurrency} thread(s) -> {log_file} "
+         f"(stderr: {stderr_file})")
+    f_out = open(stderr_file, "a", encoding="utf-8", errors="replace")
+    p = subprocess.Popen(argv, stdout=f_out, stderr=subprocess.STDOUT, cwd=REPO)
+    print(f"\n1 process launched (PID {p.pid}, {concurrency} internal thread(s)).")
+    print("Waiting to finish (Ctrl-C is safe -- resumes on its own manifest state)...")
+    try:
+        rc = p.wait()
+        f_out.close()
+        print(f"  process pid {p.pid} exited rc={rc} ({log_file})")
+    except KeyboardInterrupt:
+        print("\nInterrupted -- process left running in background; re-run this script to resume.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--provider", choices=("tastytrade", "thetadata"), default="tastytrade",
@@ -156,6 +209,17 @@ def main():
         register_reboot_task(args.workers, args.batch_size, extra_for_reboot)
         return
 
+    py_exe = PY_BY_PROVIDER[args.provider]
+    # Namespaced by provider so a tastytrade run and a thetadata run can never clobber each
+    # other's chunk/log files if their windows happen to overlap.
+    log_dir = rf"{LOG_DIR}\{args.provider}"
+    os.makedirs(log_dir, exist_ok=True)
+    n = max(1, args.workers)
+
+    if args.provider == "thetadata":
+        _run_thetadata_single_process(args, py_exe, log_dir, n)
+        return
+
     if args.symbols_override:
         symbols = [s.strip().upper() for s in args.symbols_override.split(",") if s.strip()]
     else:
@@ -163,18 +227,11 @@ def main():
         with open(universe_file, encoding="utf-8") as f:
             symbols = [ln.strip() for ln in f if ln.strip() and not ln.startswith("#")]
 
-    n = max(1, args.workers)
     chunk_size = math.ceil(len(symbols) / n)
     chunks = [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
     print(f"provider   : {args.provider}")
     print(f"{len(symbols)} symbols -> {len(chunks)} process(es), ~{chunk_size} symbols each, "
          f"batch-size={args.batch_size}")
-
-    py_exe = PY_BY_PROVIDER[args.provider]
-    # Namespaced by provider so a tastytrade run and a thetadata run can never clobber each
-    # other's chunk/log files if their windows happen to overlap.
-    log_dir = rf"{LOG_DIR}\{args.provider}"
-    os.makedirs(log_dir, exist_ok=True)
     procs = []
     for i, chunk in enumerate(chunks):
         chunk_file = rf"{REPO}\tools\_wu_chunk_{args.provider}_{i}.txt"
@@ -189,12 +246,11 @@ def main():
         # worker within a day. Never point subprocess stdout at an unrotated file again.
         log_file = rf"{log_dir}\worker_{i}.log"
         stderr_file = rf"{log_dir}\worker_{i}.stderr.log"
+        # tastytrade only past this point -- thetadata returned via
+        # _run_thetadata_single_process above.
         argv = [py_exe, SCRIPT, "--symbols-file", chunk_file, "--provider", args.provider,
-               "--db", PROD_DB, "--log-file", log_file]
-        if args.provider == "tastytrade":
-            argv += ["--account-id", "2", "--batch-size", str(args.batch_size)]
-        elif args.api_key:
-            argv += ["--api-key", args.api_key]
+               "--db", PROD_DB, "--log-file", log_file,
+               "--account-id", "2", "--batch-size", str(args.batch_size)]
         if args.start:
             argv += ["--start", args.start]
         if args.end:

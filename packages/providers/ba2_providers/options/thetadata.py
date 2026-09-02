@@ -40,12 +40,27 @@ Both calls are per-(underlying, single expiry), so ``fetch_eod_bars``/``fetch_ba
 group the requested contracts by (underlying, expiry) exactly like the caller (TastyTrade
 today) already assumes — see ``tools/warm_options_history.py``'s ``WorkUnit``.
 
+CONCURRENCY. Unlike TastyTrade (separate OS PROCESSES, each with its own dxfeed session --
+see ``tools/run_option_warmup_parallel.py``), ThetaData's account authenticates ONE session
+per api_key: launching 8 separate processes each calling ``ThetaClient(api_key=...)``
+independently was measured live 2026-09-02 to invalidate each other's sessions --
+``StatusCode.UNAUTHENTICATED: "Invalid session ID. This can occur if more than one terminal
+is running."`` -- failing almost every unit outright. The library's fix is
+``existing_authorized_client``: a second ``ThetaClient`` built from an already-authenticated
+one SHARES that session rather than opening a new, competing one (confirmed live: 4 threads
+sharing one authenticated client via this parameter, zero errors). Sharing a Python object
+only works within one process, so ThetaData concurrency here is THREADS, not processes --
+``_get_client`` authenticates ONE session on first use (lock-guarded) and hands every thread
+its own ``existing_authorized_client``-linked client (thread-local, never shared directly:
+a gRPC client object is not documented as thread-safe, one per thread is the safe default).
+
 Docs: https://docs.thetadata.us/Python-Library/Getting-Started.html
 """
 from __future__ import annotations
 
 import logging
 import os
+import threading
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
@@ -181,7 +196,14 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
         self.history_years = float(history_years if history_years is not None
                                    else _DEFAULT_HISTORY_YEARS)
         self._dataframe_type = dataframe_type
-        self._client = None  # lazy: constructing ThetaClient opens a connection
+        self._client = None  # lazy: the ONE authenticated session (or a test-injected fake)
+        # True only once THIS instance has authenticated _client itself (see _get_client) --
+        # a test/other caller that injects its own fake straight into _client leaves this
+        # False, which is what tells _get_client to hand that fake back verbatim instead of
+        # trying to wrap it in a real ThetaClient(existing_authorized_client=...).
+        self._owns_session = False
+        self._session_lock = threading.Lock()
+        self._thread_local = threading.local()
         # Resolved alongside _client, in _get_client -- the real thetadata.errors.
         # NoDataFoundError once a live client exists. _NeverRaised until then, deliberately:
         # nothing ever raises it, so a caller that reaches the per-chunk except clause before
@@ -191,17 +213,38 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
 
     # -- interface ------------------------------------------------------
     def _get_client(self):
+        """The calling thread's client. Every thread shares the SAME authenticated session
+        (see the module docstring's CONCURRENCY section) but gets its OWN client object -- a
+        gRPC client is not documented thread-safe, so one per thread is the conservative
+        choice even though the session underneath is shared."""
         if self._client is None:
-            if not self.api_key:
-                raise RuntimeError(
-                    "ThetaDataOptionsProvider has no api_key (pass one, or set "
-                    "THETADATA_API_KEY) -- it was only asked for its history_floor() until "
-                    "now, which needs no key.")
+            with self._session_lock:
+                if self._client is None:  # re-check: lost the race to another thread
+                    if not self.api_key:
+                        raise RuntimeError(
+                            "ThetaDataOptionsProvider has no api_key (pass one, or set "
+                            "THETADATA_API_KEY) -- it was only asked for its history_floor() "
+                            "until now, which needs no key.")
+                    from thetadata import ThetaClient
+                    from thetadata.errors import NoDataFoundError
+                    self._client = ThetaClient(api_key=self.api_key,
+                                               dataframe_type=self._dataframe_type)
+                    self._no_data_exc = NoDataFoundError
+                    self._owns_session = True
+
+        if not self._owns_session:
+            # A fake/other client was injected directly (tests) -- hand it back verbatim;
+            # wrapping it in a real ThetaClient(existing_authorized_client=...) would both
+            # need the real thetadata package and defeat the injection entirely.
+            return self._client
+
+        thread_client = getattr(self._thread_local, "client", None)
+        if thread_client is None:
             from thetadata import ThetaClient
-            from thetadata.errors import NoDataFoundError
-            self._client = ThetaClient(api_key=self.api_key, dataframe_type=self._dataframe_type)
-            self._no_data_exc = NoDataFoundError
-        return self._client
+            thread_client = ThetaClient(existing_authorized_client=self._client,
+                                        dataframe_type=self._dataframe_type)
+            self._thread_local.client = thread_client
+        return thread_client
 
     def history_floor(self) -> date:
         today = date.today()
