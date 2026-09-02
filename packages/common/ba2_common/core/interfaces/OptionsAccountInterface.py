@@ -13,7 +13,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
-from ba2_common.core.option_expiry import is_multi_expiry_strategy
+from ba2_common.core.option_expiry import PMCC_STRATEGY, is_multi_expiry_strategy
+from ba2_common.core.option_lifecycle import PMCC_ROLL_STRATEGY
 from ba2_common.core.option_types import OptionContract, OptionQuote, OptionLeg, OptionPosition
 from ba2_common.core.types import OptionRight
 
@@ -305,9 +306,23 @@ class OptionsAccountInterface(ABC):
         # the close paths rebuild legs from stored order rows (reading
         # `getattr(o, "expiry", None)`), and refusing there would strand an open
         # position that can no longer be flattened — much worse than an incomplete intent.
+        # THE DECLARATION IS THE TRANSACTION'S, NOT ONLY THE ARGUMENT'S (plan Task 6). An
+        # ENTRY declares itself: ``open_pmcc`` passes ``option_strategy="pmcc"``. Everything
+        # that happens to that structure afterwards does NOT -- the flatten path submits under
+        # ``"close"`` (the one tag every close path in the codebase uses) and a roll under
+        # ``"pmcc_roll"``, and both carry two expiries because the position does. Keying only
+        # on the argument would admit the PMCC and then refuse to close it: a structure that
+        # can be opened and never flattened, which is worse than one that cannot be opened.
+        #
+        # Fail-closed twice over, and unchanged for everyone else: an order with NO
+        # ``transaction_id`` behaves exactly as before (an entry is the only thing that has no
+        # transaction yet), and a transaction whose OWN ``option_strategy`` is not declared
+        # still refuses. There is one declaration -- ``MULTI_EXPIRY_OPTION_STRATEGIES`` -- and
+        # this reads it off the row where ``_record_option_intent_on_transaction`` stamped it.
         expiries = sorted({leg.expiry for leg in legs if leg.expiry is not None})
-        multi_expiry_allowed = (len(expiries) == 2
-                                and is_multi_expiry_strategy(option_strategy))
+        declared = (is_multi_expiry_strategy(option_strategy)
+                    or self._transaction_declares_multi_expiry(transaction_id))
+        multi_expiry_allowed = (len(expiries) == 2 and declared)
         if len(expiries) > 1 and not multi_expiry_allowed:
             raise ValueError(
                 f"An option structure must be on a single expiry, but these {len(legs)} legs "
@@ -725,7 +740,37 @@ class OptionsAccountInterface(ABC):
     #: (``TradeActions`` and ``OptionPortfolioManager._close_structure``) submit offsetting
     #: legs tagged "close" on the SAME transaction, so letting one through would relabel
     #: every flattened structure in the book and make the strategy family unrecoverable.
-    NON_INTENT_STRATEGIES = ("close",)
+    #:
+    #: ``pmcc_roll`` joins for the same reason and a sharper one: a roll submits a buy-back
+    #: and a fresh overlay on the SAME transaction, and it happens over and over for the life
+    #: of the position. If it could define intent, a transaction whose stamp was somehow
+    #: missing would be relabelled "pmcc_roll" -- and the expiry readers dispatch on that tag,
+    #: so the structure would stop being a declared two-expiry one and its DTE would go
+    #: unevaluable mid-life.
+    NON_INTENT_STRATEGIES = ("close", PMCC_ROLL_STRATEGY)
+
+    def _transaction_declares_multi_expiry(self, transaction_id) -> bool:
+        """Has the transaction this order belongs to been DECLARED multi-expiry?
+
+        The second half of the submit guard's declaration test (see the comment at its call
+        site). ``False`` for ``None`` -- an entry has no transaction yet, so an entry declares
+        itself through its ``option_strategy`` argument or not at all -- and ``False`` for a
+        transaction that carries no recognised tag, which keeps the default a refusal.
+
+        Deliberately NOT exception-guarded. A read that fails here raises BEFORE any row is
+        written, which is exactly where this guard wants to fail; swallowing it would turn an
+        unreadable transaction into "not declared", i.e. into a different, quieter refusal
+        that reports the wrong cause.
+        """
+        if transaction_id is None:
+            return False
+        from ba2_common.core.models import Transaction
+        from ba2_common.core.trade_store import get_or_none
+
+        txn = get_or_none(Transaction, transaction_id)
+        if txn is None:
+            return False
+        return is_multi_expiry_strategy(getattr(txn, "option_strategy", None))
 
     def _record_option_intent_on_transaction(self, parent) -> None:
         """Stamp ``asset_class`` / ``option_strategy`` / ``expiry`` on the parent's Transaction.
@@ -1248,6 +1293,14 @@ class OptionsAccountInterface(ABC):
         "long_call", "long_put", "bull_call_spread", "bear_put_spread",
         "straddle", "strangle", "covered_call", "protective_put",
         "call_butterfly",
+        # The PMCC (plan Task 6). A NET DEBIT structure whose short call is covered by a long
+        # call at a LOWER strike that OUTLIVES it, which is how a broker margins a diagonal:
+        # as covered, with no collateral beyond the debit already paid. Putting it in
+        # RESERVING_STRATEGIES instead would charge the credit budget for money that has
+        # already left the account. The RISK number is a different question and is measured
+        # separately -- the payoff evaluator's intrinsic floor, stamped at submit and
+        # restamped at each roll.
+        PMCC_STRATEGY,
     })
 
     #: Strategies ``option_reserve_required`` prices with a branch of its own. Kept in

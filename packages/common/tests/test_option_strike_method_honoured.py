@@ -25,7 +25,7 @@ import ba2_common.core.TradeActions as TA
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ba2_common.core.option_types import OptionContract
 from ba2_common.core.types import (
-    ExpertActionType, OptionRight, get_option_action_values,
+    ExpertActionType, OptionRight, get_option_entry_action_values,
     get_strike_method_action_values, honours_strike_method,
 )
 
@@ -114,8 +114,11 @@ class _Acct(OptionsAccountInterface):
         return 1_000_000.0
 
 
-ENTRY_ACTION_VALUES = sorted(set(get_option_action_values())
-                             - {ExpertActionType.CLOSE_OPTION.value})
+# The actions that OPEN a structure from a chain. ``roll_pmcc_short`` is excluded with
+# ``close_option`` by the shared classifier (``types.get_option_entry_action_values``): it
+# re-selects its overlay from the box the ENTRY stamped on the order row, never from
+# ``self.strike_method``, so there is no method for it to honour or ignore.
+ENTRY_ACTION_VALUES = sorted(get_option_entry_action_values())
 
 _REC = SimpleNamespace(id=1, instance_id=None, data=None, price_at_date=None,
                        expected_profit_percent=None, recommended_action=None)

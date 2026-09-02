@@ -480,6 +480,26 @@ class ExpertEventType(str, Enum):
     # never a stop -- see TradeActionEvaluator._LOSS_SIDE_STOP_OPERATORS, which
     # deliberately omits it.
     N_PROFIT_MULTIPLE_OF_PREMIUM = "profit_multiple_of_premium"
+    # THE THREE TWO-EXPIRY READERS (plan Task 6). A diagonal's legs answer different
+    # questions, so "the DTE" and "the delta" stop being quantities until somebody says WHICH
+    # LEG -- and these three say so in their names, which is the whole discipline
+    # ``option_expiry`` exists to enforce.
+    #
+    # Calendar days of life left on the SHORT leg -- the roll WINDOW
+    # (``option_expiry.EXPIRY_RULE_ROLL_WINDOW``). Its sibling ``days_to_expiry`` reads the
+    # LONG leg, because that one asks the structure-exit question. Unevaluable (never fires,
+    # in EITHER direction) on a structure with no held short leg.
+    N_SHORT_LEG_DAYS_TO_EXPIRY = "short_leg_days_to_expiry"
+    # How much of the short overlay's own collected credit has decayed, as a percent: 0 the
+    # day it was sold, 100 when it can be bought back for nothing, NEGATIVE when it has gone
+    # against us. The buyback trigger of design 2026-08-31 leaps-grid §4. Unevaluable when the
+    # overlay cannot be priced or was sold for nothing -- an undefined percentage, never 100.
+    N_CREDIT_DECAYED_PCT = "credit_decayed_pct"
+    # The |delta| of the LONG leg -- the LEAPS. Design §4's third structure exit ("PMCC: LEAPS
+    # delta < ~0.50, searched on/off"): a stock replacement that has stopped tracking the
+    # underlying is no longer the position that was opened. Unevaluable when no quote carries
+    # a delta, which is every account whose data source publishes none.
+    N_LONG_LEG_DELTA = "long_leg_delta"
 
 
 class ExpertActionType(str, Enum):
@@ -521,6 +541,11 @@ class ExpertActionType(str, Enum):
     # ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``, which declares the ``"pmcc"``
     # strategy tag the submit guard and both DTE readers consult.
     OPEN_PMCC = "open_pmcc"
+    # ROLL THE OVERLAY, KEEP THE LONG. Buys back the PMCC's expiring short call and sells the
+    # next one, as ONE order on the same transaction. Not an entry (it opens no structure) and
+    # not a close (the position survives it) -- the wheel-pattern maintenance step design
+    # 2026-08-31 leaps-grid §4 calls the roll loop.
+    ROLL_PMCC_SHORT = "roll_pmcc_short"
     CLOSE_OPTION = "close_option"
 
 class MarketAnalysisStatus(str, Enum):
@@ -620,7 +645,10 @@ def get_numeric_event_values():
         ExpertEventType.N_DAYS_AFTER_EVENT.value,
         ExpertEventType.N_DAYS_TO_EXPIRY.value,
         ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value,
-        ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value
+        ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value,
+        ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY.value,
+        ExpertEventType.N_CREDIT_DECAYED_PCT.value,
+        ExpertEventType.N_LONG_LEG_DELTA.value,
     ]
 
 
@@ -663,8 +691,35 @@ def get_option_action_values():
         ExpertActionType.OPEN_CALL_BACKSPREAD.value,
         ExpertActionType.OPEN_PUT_BACKSPREAD.value,
         ExpertActionType.OPEN_PMCC.value,
+        ExpertActionType.ROLL_PMCC_SHORT.value,
         ExpertActionType.CLOSE_OPTION.value,
     ]
+
+
+def get_option_entry_action_values():
+    """Option action types that OPEN a structure by SELECTING contracts from a chain.
+
+    The option actions minus the two that act on a position that already exists:
+
+    * ``close_option`` resolves its contracts from the held position and takes no selection
+      parameters at all;
+    * ``roll_pmcc_short`` re-selects ONE leg, but from the box the ENTRY recorded on its own
+      order row rather than from parameters of its own -- so a producer that offers it strike
+      or DTE fields is offering knobs nothing reads, and a harness that runs it from a bare
+      set of entry kwargs is asking it to build a structure it is not there to build.
+
+    Every "for each option ENTRY action" audit derives from here, so a future action that
+    manages rather than opens is excluded once, in one place, instead of being subtracted by
+    hand in each of them.
+    """
+    return [v for v in get_option_action_values()
+            if v not in (ExpertActionType.CLOSE_OPTION.value,
+                         ExpertActionType.ROLL_PMCC_SHORT.value)]
+
+
+def is_option_entry_action(action_value):
+    """Check whether an option action type OPENS a structure by selecting from a chain."""
+    return action_value in get_option_entry_action_values()
 
 
 def is_numeric_event(event_value):

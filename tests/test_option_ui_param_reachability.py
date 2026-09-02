@@ -438,8 +438,12 @@ def test_strike_method_is_offered_for_exactly_the_actions_that_read_it(
     entries = [a.value for a in ExpertActionType
                if settings_module.is_option_action(a.value)
                and a is not ExpertActionType.CLOSE_OPTION]
-    # 20 since 2026-09-02 (plan Task 6): ``open_pmcc`` joined the 19 entry actions.
-    assert len(entries) == 20, entries
+    # 21 since 2026-09-02 (plan Task 6): 19 + ``open_pmcc`` + ``roll_pmcc_short``. The roll is
+    # not an ENTRY action (it selects from the box the entry stamped, not from parameters of
+    # its own) but the editor still lists it, because a live PMCC needs a rule that rolls its
+    # overlay -- and it must NOT be offered a strike method, which is what the loop below
+    # asserts by deriving the expectation from ``honours_strike_method``.
+    assert len(entries) == 21, entries
 
     for action_type in entries:
         with nicegui_client:

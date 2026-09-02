@@ -468,6 +468,12 @@ def build_structure(txn) -> Optional[OptionStructure]:
 
     net: Dict[str, float] = {}
     meta: Dict[str, Any] = {}
+    #: The price of the FIRST executed fill on each contract -- the one that OPENED it. Not
+    #: ``meta``'s (which keeps the last row seen, so after a buy-back it would be the CLOSING
+    #: price), and not the structure's net premium, which after a roll is a year-old LEAPS
+    #: debit mixed with several overlays' credits. The overlay's buyback trigger divides by
+    #: this number, so it has to be the credit that overlay actually collected.
+    entry_price: Dict[str, float] = {}
     total_cash = 0.0
     cash_known = True
     for order in orders:
@@ -479,6 +485,8 @@ def build_structure(txn) -> Optional[OptionStructure]:
         if order.open_price is None:
             cash_known = False
             continue
+        if contract not in entry_price:
+            entry_price[contract] = abs(float(order.open_price))
         total_cash += -sign * float(order.open_price) * qty
 
     legs = tuple(
@@ -489,6 +497,7 @@ def build_structure(txn) -> Optional[OptionStructure]:
             option_type=getattr(meta[contract], "option_type", None),
             expiry=getattr(meta[contract], "expiry", None),
             underlying=getattr(meta[contract], "underlying_symbol", None),
+            entry_premium=entry_price.get(contract),
         )
         for contract in sorted(net)
     )

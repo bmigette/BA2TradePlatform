@@ -646,7 +646,14 @@ class ParquetOptionsProvider:
         close = _f(u.close[i])
         # Same zero-spread proxy get_chain uses: entry actions price off chain rows while
         # close actions price off quotes, and the two must agree (options_provider bug B4).
-        return OptionQuote(symbol=occ_symbol, bid=close, ask=close, last=close)
+        #
+        # GREEKS TOO (plan Task 6), from the SAME per-row inversion ``get_chain`` uses -- the
+        # sqlite reader's twin change, and it must be a twin or a rule that reads a held
+        # contract's delta answers differently on the two backends. Memoised per row by
+        # ``greeks_tuple``, so a quote costs no extra inversion once the chain has priced it.
+        delta, iv = u.delta_iv_of_row(i, ci, self.spot_source)
+        return OptionQuote(symbol=occ_symbol, bid=close, ask=close, last=close,
+                           delta=delta, implied_volatility=iv)
 
     def get_bar(self, occ_symbol: str, as_of: date) -> Optional[dict]:
         u = self._u(_underlying_of(occ_symbol))

@@ -371,6 +371,52 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Roll/close the structure when days_to_expiry <= 21"
         },
+        ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY.value: {
+            "name": "Short Leg Days to Expiry (the roll window)",
+            "description": (
+                "Calendar days of life remaining on the structure's SHORT leg. The sibling of "
+                "days_to_expiry, and it asks the OTHER question: days_to_expiry reads the LONG "
+                "leg ('is there still life to roll into?', the roll FLOOR), while this reads the "
+                "SHORT leg ('is the overlay due to be rolled?', the roll WINDOW). On a "
+                "single-expiry structure both read the same date and this is simply days to "
+                "expiry; on a two-expiry structure such as a poor man's covered call they "
+                "deliberately differ. Use it to drive a roll_pmcc_short action a few days before "
+                "the overlay expires. Unevaluable — and so never firing, in either direction — "
+                "when the structure has no held short leg or its legs cannot be read."
+            ),
+            "type": "numeric",
+            "example": "Roll the overlay when short_leg_days_to_expiry <= 3"
+        },
+        ExpertEventType.N_CREDIT_DECAYED_PCT.value: {
+            "name": "Credit Decayed % (the buyback trigger)",
+            "description": (
+                "How much of the SHORT overlay's own collected credit has decayed away, as a "
+                "percentage: 0 the day it was sold, 100 when it can be bought back for nothing, "
+                "and NEGATIVE when it has moved against the position and now costs more than it "
+                "brought in. The second roll trigger beside the expiry window — buy the overlay "
+                "back early once most of its premium is gone, rather than holding it for the "
+                "last few cents. The basis is that leg's OWN entry premium, not the structure's "
+                "net, so it measures the overlay in front of you rather than drifting with the "
+                "position's history. Unevaluable when the overlay cannot be priced or was sold "
+                "for nothing (an undefined percentage, never 100%)."
+            ),
+            "type": "numeric",
+            "example": "Roll the overlay early when credit_decayed_pct >= 70"
+        },
+        ExpertEventType.N_LONG_LEG_DELTA.value: {
+            "name": "Long Leg Delta (the structure's cover)",
+            "description": (
+                "The ABSOLUTE delta of the structure's LONG leg — for a poor man's covered call, "
+                "the LEAPS. A stock replacement is one because its delta is near 1; once the "
+                "underlying has fallen far enough that the long tracks it at half a share, the "
+                "position that is open is no longer the position that was opened. Use it as a "
+                "structure exit ('close both legs when long_leg_delta < 0.50'). Unevaluable — "
+                "and so never firing — when no quote for that contract carries a delta, which "
+                "is the case for any data source that publishes no greeks."
+            ),
+            "type": "numeric",
+            "example": "Close the structure when long_leg_delta < 0.50"
+        },
         ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value: {
             "name": "Loss as % of Max Loss (defined-risk stop)",
             "description": (
@@ -727,6 +773,17 @@ def get_action_type_documentation() -> dict:
             ],
             "parameters": "strike_method/strike_param (a [long, short] delta pair: the LEAPS target and the overlay target), dte_min/dte_max (the LEAPS expiry window, 365+), short_dte_min/short_dte_max (the overlay's own window, typically 30-45), sizing (% of equity per structure). The overlay is re-selected from the SAME box at each roll - the spec is recorded on the entry order.",
             "example": "When bullish and flat, open_pmcc (LEAPS ~0.80 delta at 380-470 DTE, overlay ~0.20 delta at 30-45 DTE). Roll the overlay with roll_pmcc_short as it nears expiry; close BOTH legs when the LEAPS reaches its own DTE floor."
+        },
+        ExpertActionType.ROLL_PMCC_SHORT.value: {
+            "name": "Roll PMCC Short Overlay",
+            "description": "Buy back the poor man's covered call's expiring short call and sell the next one, as ONE order on the same position - the long LEAPS is never touched. The new overlay is selected from the SAME box the entry used (its delta target and DTE window are recorded on the entry order), so the position keeps one thesis for its whole life. The structure's max loss is restamped as each roll's credit comes in. Refuses rather than guessing on anything it cannot read: a position that was not opened as a PMCC, a roll already in flight, or a new overlay that would not sit above the LEAPS strike.",
+            "use_cases": [
+                "Roll the overlay a few days before it expires (short_leg_days_to_expiry <= N)",
+                "Roll early once most of the credit has decayed (credit_decayed_pct >= N)",
+                "Keep a rolling covered-call income stream running against a LEAPS"
+            ],
+            "parameters": "None. Everything the roll needs - the overlay's strike method, delta target, DTE window and liquidity gates - is read back off the entry order, so the rolled overlay always matches the one the entry chose.",
+            "example": "When short_leg_days_to_expiry <= 3, roll_pmcc_short (continue processing, so the structure's own exit rules still run on the same bar)"
         },
         ExpertActionType.CLOSE_OPTION.value: {
             "name": "Close Option",

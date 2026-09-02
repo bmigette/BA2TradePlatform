@@ -46,6 +46,13 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     # MUST be listed here or the leaf is silently dropped by triggers_from_condition_tree
     # ("an unknown field is skipped") and the engine never sees the gate at all.
     "days_to_expiry": ExpertEventType.N_DAYS_TO_EXPIRY,
+    # THE THREE PER-LEG READERS (plan Task 6). Same "list it here or the leaf is silently
+    # dropped" rule as days_to_expiry above -- and on these it is sharper still, because two
+    # of them drive a ROLL rather than a close: a dropped leaf leaves a PMCC's overlay to
+    # expire unrolled while every log claims the rule is configured.
+    "short_leg_days_to_expiry": ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY,
+    "credit_decayed_pct": ExpertEventType.N_CREDIT_DECAYED_PCT,
+    "long_leg_delta": ExpertEventType.N_LONG_LEG_DELTA,
     "percent_to_current_target": ExpertEventType.N_PERCENT_TO_CURRENT_TARGET,
     "new_target_percent": ExpertEventType.N_NEW_TARGET_PERCENT,
     # --- registered-but-unmapped numeric conditions -----------------------------------

@@ -3485,6 +3485,253 @@ class DaysToExpiryCondition(CompareCondition):
         return f"{days} DTE"
 
 
+class _TwoExpiryLegCondition(CompareCondition):
+    """Shared base for the three conditions that read ONE NAMED LEG of a structure.
+
+    A diagonal's legs answer different questions, so "the DTE" and "the delta" are not
+    quantities until a reader says which leg it means — the discipline ``option_expiry``
+    exists to enforce, extended from expiries to every per-leg measurement.
+
+    All three build the structure through ``OptionRiskManagement.build_structure``, the SAME
+    function the live exit pass uses, so the rule-level reader and ``option_lifecycle.decide``
+    are looking at one book built one way. Each then calls a pure function in
+    ``option_lifecycle`` for the measurement itself: the selection and the arithmetic have one
+    implementation, and only the wording of the "unknown because…" message belongs to the
+    reader (the ``option_expiry`` rule again — a result, not a message).
+
+    UNKNOWN NEVER FIRES, the ``DaysToExpiryCondition`` discipline verbatim: an unmeasurable
+    input leaves ``calculated_value`` at ``None``, ``evaluate()`` returns False for EVERY
+    operator, and the audit row renders the REASON instead of a plausible number. On these
+    three that matters more than usual, because two of them drive a ROLL: a reader that
+    answered "0 DTE" for a structure it could not see would roll every overlay on sight.
+    """
+
+    #: Rendered instead of a number when the measurement could not be made.
+    unknown_reason: Optional[str] = None
+
+    def _structure(self):
+        """(the structure as a value, "") or (None, why it is unmeasurable)."""
+        from ba2_common.core.OptionRiskManagement import build_structure
+        from ba2_common.core.models import Transaction
+        from ba2_common.core.trade_store import get_or_none
+
+        order = self.existing_order
+        if order is None:
+            return None, "no open position on this evaluation — there is no structure to read"
+        txn_id = getattr(order, "transaction_id", None)
+        if txn_id is None:
+            return None, (f"the open {self.instrument_name} order carries no transaction — "
+                          f"its legs cannot be assembled")
+        txn = get_or_none(Transaction, txn_id)
+        if txn is None:
+            return None, (f"transaction {txn_id} is not readable — {self.instrument_name}'s "
+                          f"legs cannot be assembled")
+        structure = build_structure(txn)
+        if structure is None:
+            return None, (f"transaction {txn_id} has no executed option leg on record — "
+                          f"there is no structure to read")
+        return structure, ""
+
+    def _quote_for(self, contract_symbol: str):
+        """The account's quote for ONE contract, or ``None``. Never raises into ``evaluate``."""
+        try:
+            return self.account.get_option_quote(contract_symbol)
+        except Exception as e:  # noqa: BLE001 — a quote hiccup is unmeasurable, not a crash
+            absorb_if_benign(e)
+            logger.debug(f"get_option_quote failed for {contract_symbol}: {e}")
+            return None
+
+    def _unevaluable(self, field: str, reason: str) -> bool:
+        self.calculated_value = None
+        self.unknown_reason = reason
+        logger.warning(f"{field} for {self.instrument_name} is unevaluable: {reason}")
+        return False
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            reason = getattr(self, "unknown_reason", None)
+            return f"unknown ({reason})" if reason else None
+        return self._render(self.calculated_value)
+
+    def _render(self, value) -> str:
+        return f"{value:.2f}"
+
+
+class ShortLegDaysToExpiryCondition(_TwoExpiryLegCondition):
+    """Calendar days of life left on the SHORT leg — THE ROLL WINDOW.
+
+    ``option_expiry.EXPIRY_RULE_ROLL_WINDOW``, reached through
+    ``option_lifecycle.roll_window_dte`` — the same function ``decide`` calls, so the grid's
+    roll rule and the live pass agree about when an overlay is due by construction rather than
+    by review.
+
+    Its sibling ``days_to_expiry`` reads the LONG leg and answers the OTHER question (the roll
+    FLOOR: is there still life to roll into). The two disagree on purpose, and naming them is
+    the point — with two expiries "the DTE" is not a quantity until somebody says which leg.
+
+    On a SINGLE-expiry structure both read the same date, so this is simply "days to expiry"
+    there; the rule table in ``option_expiry`` only bites when the legs actually differ.
+
+    Sign is ``DaysToExpiryCondition``'s: positive while alive, ``0`` on the expiry date,
+    NEGATIVE past it — a real and alarming state for a structure still holding a short.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            self.calculated_value = None
+            self.unknown_reason = None
+            from ba2_common.core.option_lifecycle import roll_window_dte
+
+            as_of = DaysToExpiryCondition._as_of_to_date(
+                getattr(self.expert_recommendation, "created_at", None)) \
+                if getattr(self.expert_recommendation, "created_at", None) is not None else None
+            if as_of is None:
+                return self._unevaluable(
+                    "short_leg_days_to_expiry",
+                    "no evaluation date on the recommendation — 'days remaining' has no "
+                    "reference point")
+            structure, blind = self._structure()
+            if structure is None:
+                return self._unevaluable("short_leg_days_to_expiry", blind)
+            days, blind = roll_window_dte(structure, as_of)
+            if days is None:
+                return self._unevaluable("short_leg_days_to_expiry", blind)
+            self.calculated_value = days
+            return self.operator_func(days, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating short_leg_days_to_expiry for "
+                         f"{self.instrument_name}: {e}", exc_info=True)
+            self.calculated_value = None
+            self.unknown_reason = f"error computing the overlay's remaining life: {e}"
+            return False
+
+    def _render(self, value) -> str:
+        days = int(value)
+        return f"{days} DTE on the short leg" if days >= 0 else \
+            f"{days} DTE on the short leg (expired {abs(days)}d ago)"
+
+    def get_description(self) -> str:
+        return (f"Check if days until the SHORT leg of {self.instrument_name}'s structure "
+                f"expires is {self.operator_str} {self.value}")
+
+
+class CreditDecayedPctCondition(_TwoExpiryLegCondition):
+    """How much of the SHORT overlay's own credit has decayed, as a percent.
+
+    Design 2026-08-31 leaps-grid §4's buyback trigger: "roll loop at short expiry/buyback
+    trigger (% of credit decayed)". ``0`` the day the overlay was sold, ``100`` when it can be
+    bought back for nothing, NEGATIVE when it has gone against the position and costs more
+    than it brought in. The arithmetic is ``option_lifecycle.credit_decay_pct`` — shared with
+    ``decide``, one definition.
+
+    THE BASIS IS THE LEG'S OWN ENTRY PREMIUM, not the structure's net. After one roll the
+    structure's net premium is a year-old LEAPS debit mixed with several overlays' credits,
+    and dividing by that would make the trigger drift with the position's history instead of
+    measuring the overlay in front of it.
+
+    Unevaluable — and so never firing, in either direction — when the overlay cannot be
+    priced, when there is no held short leg, or when it was sold for nothing (an undefined
+    percentage, never 100 %). "We could not price the overlay" and "the overlay is worthless"
+    are the two facts this codebase spends its effort keeping apart, and here they differ by a
+    roll nobody asked for.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            self.calculated_value = None
+            self.unknown_reason = None
+            from ba2_common.core.option_lifecycle import held_short_leg, pmcc_credit_decay
+
+            structure, blind = self._structure()
+            if structure is None:
+                return self._unevaluable("credit_decayed_pct", blind)
+            short = held_short_leg(structure)
+            if short is None:
+                return self._unevaluable(
+                    "credit_decayed_pct",
+                    "no held short leg — there is no overlay whose credit could have decayed")
+            # ONE quote, for the one contract the answer depends on. Building the whole
+            # chain map here would price the LEAPS on every bar for nothing.
+            quote = self._quote_for(short.contract_symbol)
+            decayed, blind = pmcc_credit_decay(
+                structure, {short.contract_symbol: quote} if quote is not None else {})
+            if decayed is None:
+                return self._unevaluable("credit_decayed_pct", blind)
+            self.calculated_value = decayed
+            return self.operator_func(decayed, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating credit_decayed_pct for {self.instrument_name}: "
+                         f"{e}", exc_info=True)
+            self.calculated_value = None
+            self.unknown_reason = f"error pricing the overlay against its own credit: {e}"
+            return False
+
+    def _render(self, value) -> str:
+        return f"{value:.2f}% of the overlay's credit decayed"
+
+    def get_description(self) -> str:
+        return (f"Check if the decayed fraction of the short overlay's credit on "
+                f"{self.instrument_name} is {self.operator_str} {self.value}%")
+
+
+class LongLegDeltaCondition(_TwoExpiryLegCondition):
+    """The ABSOLUTE delta of the LONG leg — the LEAPS.
+
+    Design 2026-08-31 leaps-grid §4's third structure exit: "or (PMCC) LEAPS delta < ~0.50
+    (searched on/off)". A stock replacement is a stock replacement because its delta is near
+    1; once the underlying has fallen far enough that the long tracks it at half a share, the
+    position that is open is not the position that was opened, and the remaining premium is
+    worth more sold than held.
+
+    ABSOLUTE delta, so the same threshold reads the same way on a put-side long if one ever
+    exists — the convention ``option_selector`` already ranks on.
+
+    Unevaluable when no quote carries a delta. That is not hypothetical: an account whose data
+    source publishes no greeks answers ``None`` for every contract, and this condition then
+    never fires in either direction rather than reading a missing greek as a collapsed one.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            self.calculated_value = None
+            self.unknown_reason = None
+            from ba2_common.core.option_lifecycle import held_long_leg
+
+            structure, blind = self._structure()
+            if structure is None:
+                return self._unevaluable("long_leg_delta", blind)
+            long_leg = held_long_leg(structure)
+            if long_leg is None:
+                return self._unevaluable(
+                    "long_leg_delta",
+                    "no held long leg — this structure has no cover whose delta to read")
+            quote = self._quote_for(long_leg.contract_symbol)
+            delta = getattr(quote, "delta", None) if quote is not None else None
+            if delta is None:
+                return self._unevaluable(
+                    "long_leg_delta",
+                    f"no delta for the long leg {long_leg.contract_symbol} — how closely it "
+                    f"still tracks {self.instrument_name} cannot be measured")
+            self.calculated_value = abs(float(delta))
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating long_leg_delta for {self.instrument_name}: {e}",
+                         exc_info=True)
+            self.calculated_value = None
+            self.unknown_reason = f"error reading the long leg's delta: {e}"
+            return False
+
+    def _render(self, value) -> str:
+        return f"{value:.4f} |delta| on the long leg"
+
+    def get_description(self) -> str:
+        return (f"Check if the LONG leg's absolute delta on {self.instrument_name} is "
+                f"{self.operator_str} {self.value}")
+
+
 class HasOptionPositionCondition(FlagCondition):
     """Check if this expert has an open option position for the underlying."""
 
@@ -3711,6 +3958,9 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_REC_DAYS_TO_EARNINGS: RecommendationDaysToEarningsCondition,
     ExpertEventType.N_DAYS_AFTER_EVENT: DaysAfterEventCondition,
     ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
+    ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY: ShortLegDaysToExpiryCondition,
+    ExpertEventType.N_CREDIT_DECAYED_PCT: CreditDecayedPctCondition,
+    ExpertEventType.N_LONG_LEG_DELTA: LongLegDeltaCondition,
     ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
     ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
     ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,

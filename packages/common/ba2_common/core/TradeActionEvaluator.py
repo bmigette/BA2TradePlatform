@@ -12,6 +12,7 @@ from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import Ruleset, EventAction, TradingOrder, TradeActionResult, ExpertRecommendation
 from ba2_common.core.types import (
     OrderRecommendation, ExpertEventType, ExpertActionType, get_option_action_values,
+    get_option_entry_action_values,
 )
 from ba2_common.core.db import get_db, get_instance, InstanceNotFound
 from ba2_common.logger import logger
@@ -26,7 +27,14 @@ from ba2_common.core.failure_modes import absorb_if_benign
 # dropped actions). ``_OPTION_ENTRY_ACTION_TYPES`` excludes CLOSE_OPTION (which resolves
 # its contract from the held position and takes no selection params).
 _ALL_OPTION_ACTION_TYPES = frozenset(ExpertActionType(v) for v in get_option_action_values())
-_OPTION_ENTRY_ACTION_TYPES = _ALL_OPTION_ACTION_TYPES - {ExpertActionType.CLOSE_OPTION}
+#: The option actions that OPEN a structure from a chain, and so are the ones a rule's
+#: selection params are forwarded to. Derived from ``types.get_option_entry_action_values``
+#: rather than by subtracting ``CLOSE_OPTION`` here, so the one classification serves this
+#: forwarding rule and every "for each entry builder" audit alike. ``roll_pmcc_short`` is
+#: excluded with ``close_option``: it re-selects its overlay from the spec the ENTRY stamped
+#: on the order row, so a param forwarded to it would be a knob nothing reads.
+_OPTION_ENTRY_ACTION_TYPES = frozenset(
+    ExpertActionType(v) for v in get_option_entry_action_values())
 
 # Selection-param keys forwarded from an option action config to the _OptionEntryAction
 # ctor. ``wing_width_pct`` is required by the 4-/3-leg structures (iron condor, jade
@@ -1217,6 +1225,7 @@ class TradeActionEvaluator:
                 'OpenCallBackspreadAction': ExpertActionType.OPEN_CALL_BACKSPREAD,
                 'OpenPutBackspreadAction': ExpertActionType.OPEN_PUT_BACKSPREAD,
                 'OpenPMCCAction': ExpertActionType.OPEN_PMCC,
+                'RollPMCCShortAction': ExpertActionType.ROLL_PMCC_SHORT,
                 'CloseOptionAction': ExpertActionType.CLOSE_OPTION,
             }
             
@@ -1262,6 +1271,10 @@ class TradeActionEvaluator:
                 ExpertActionType.OPEN_PMCC: 1,
                 ExpertActionType.CLOSE: 2,
                 ExpertActionType.CLOSE_OPTION: 2,
+                # The overlay roll runs WITH the closes, not with the entries: it acts on a
+                # position that is already open. Ahead of them in the list only by the rules'
+                # own order, which is where first-match priority is decided.
+                ExpertActionType.ROLL_PMCC_SHORT: 2,
                 ExpertActionType.ADJUST_TAKE_PROFIT: 3,
                 ExpertActionType.ADJUST_STOP_LOSS: 3,
             }

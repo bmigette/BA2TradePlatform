@@ -308,7 +308,17 @@ class HistoricalOptionsProvider:
         chain_row = (_chain_history(self.db_path, bar["underlying"]).row_for(
             occ_symbol, as_of.isoformat()) if bar.get("underlying") else None)
         bid, ask, last = _pit_quotes(chain_row, bar)
-        return OptionQuote(symbol=occ_symbol, bid=bid, ask=ask, last=last)
+        # GREEKS COME FROM THE SAME BAR (plan Task 6). ``OptionQuote`` has declared ``delta``
+        # and ``implied_volatility`` since it was written and this path left both None, so a
+        # rule-level reader of a HELD contract's delta had no point-in-time source at all --
+        # the chain path (``_to_contract``) has carried them from this very row for as long as
+        # the greeks columns have existed. It is the bar's OWN values, never the chain row's
+        # start-date snapshot, for the reason ``_to_contract`` states: the snapshot goes stale
+        # as the simulated clock advances. Absent stays None: a missing greek is unknown, and
+        # ``LongLegDeltaCondition`` declines to evaluate on it rather than reading it as zero.
+        return OptionQuote(symbol=occ_symbol, bid=bid, ask=ask, last=last,
+                           delta=bar.get("delta"),
+                           implied_volatility=bar.get("iv"))
 
     def get_bar(self, occ_symbol: str, as_of: date) -> Optional[dict]:
         return _bar_history(self.db_path, occ_symbol).by_date.get(as_of.isoformat())
