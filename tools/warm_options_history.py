@@ -247,8 +247,13 @@ def load_credentials(db_path: Optional[str] = None,
             "No TastyTrade credentials. Set TT_CLIENT_SECRET and TT_REFRESH_TOKEN "
             "(and TT_SANDBOX=1 for the certification environment), or pass --db "
             "<platform sqlite> to read them read-only from an account's settings.")
-    # mode=ro is belt; immutable=1 is braces — neither this process nor sqlite may write.
-    con = sqlite3.connect(f"file:{os.path.expanduser(db_path)}?mode=ro&immutable=1", uri=True)
+    # mode=ro alone: this process cannot write regardless. NOT immutable=1 -- that tells
+    # SQLite the file will NEVER change and lets it skip re-checking the WAL, so a row still
+    # sitting in an actively-written prod DB's WAL (not yet checkpointed into the main file --
+    # true of ANY live prod instance) silently reads as absent. Confirmed live 2026-09-02: a
+    # freshly-saved AppSetting('thetadata_api_key') was invisible under immutable=1 and
+    # present under mode=ro alone, on the SAME file, at the SAME instant.
+    con = sqlite3.connect(f"file:{os.path.expanduser(db_path)}?mode=ro", uri=True)
     try:
         acct = account_id
         if acct is None:
@@ -308,7 +313,8 @@ def load_thetadata_api_key(db_path: Optional[str] = None,
         raise SystemExit(
             "No ThetaData API key. Pass --api-key, set THETADATA_API_KEY, or pass --db "
             "<platform sqlite> to read AppSetting('thetadata_api_key') read-only.")
-    con = sqlite3.connect(f"file:{os.path.expanduser(db_path)}?mode=ro&immutable=1", uri=True)
+    # mode=ro alone -- NOT immutable=1, see load_credentials's comment on the same pattern.
+    con = sqlite3.connect(f"file:{os.path.expanduser(db_path)}?mode=ro", uri=True)
     try:
         row = con.execute(
             "SELECT value_str FROM appsetting WHERE key = 'thetadata_api_key'").fetchone()

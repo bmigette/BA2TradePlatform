@@ -763,6 +763,33 @@ def test_load_thetadata_api_key_reads_the_appsetting_via_db(tmp_path, monkeypatc
     assert warm.load_thetadata_api_key(db_path=db_path, api_key_arg=None) == "db-key"
 
 
+def test_load_thetadata_api_key_sees_a_row_still_in_an_open_WAL_writers_journal(
+        tmp_path, monkeypatch):
+    """Regression, found live 2026-09-02: the read connection used to add ``immutable=1`` to
+    ``mode=ro`` ("mode=ro is belt; immutable=1 is braces"). immutable=1 tells SQLite the file
+    will NEVER change, which lets it skip re-checking the WAL -- so a row committed by a still-
+    OPEN WAL-mode writer (exactly what a LIVE prod app's own long-running DB connection is)
+    read as silently ABSENT, even though ``SELECT`` against the same file with a normal
+    connection found it immediately. A real prod DB is checkpointed lazily, so this bit for
+    real the first time a key was saved and read back within the same session."""
+    monkeypatch.delenv("THETADATA_API_KEY", raising=False)
+    import sqlite3
+    db_path = str(tmp_path / "platform.sqlite")
+
+    writer = sqlite3.connect(db_path)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("CREATE TABLE appsetting (key TEXT, value_str TEXT)")
+    writer.execute("INSERT INTO appsetting (key, value_str) VALUES ('thetadata_api_key', ?)",
+                   ("wal-only-key",))
+    writer.commit()
+    try:
+        # The writer connection stays OPEN and uncheckpointed -- the row lives only in the
+        # -wal sidecar, not yet folded into the main db file. This is the live-prod shape.
+        assert warm.load_thetadata_api_key(db_path=db_path, api_key_arg=None) == "wal-only-key"
+    finally:
+        writer.close()
+
+
 def test_load_thetadata_api_key_raises_a_named_error_with_nothing_available(monkeypatch):
     monkeypatch.delenv("THETADATA_API_KEY", raising=False)
     with pytest.raises(SystemExit, match="No ThetaData API key"):
