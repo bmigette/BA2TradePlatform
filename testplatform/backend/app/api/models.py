@@ -132,7 +132,8 @@ def get_all_models(db: Session) -> List[dict]:
         models.append(db_model_to_dict(m))
 
     # Also include in-memory models (for backward compatibility)
-    for model_id, model_data in models_store.items():
+    # snapshot: routes run in the thread pool now, and the task-queue threads mutate this dict
+    for model_id, model_data in list(models_store.items()):
         # Skip if already in database
         if not any(m['id'] == model_id for m in models):
             models.append(model_data.copy())
@@ -338,8 +339,7 @@ def delete_model(model_id: str, db: Session = Depends(get_db)):
         return {"message": f"Model {model_id} deleted"}
 
     # Fall back to in-memory
-    if model_id in models_store:
-        del models_store[model_id]
+    if models_store.pop(model_id, None) is not None:
         logger.info(f"Deleted model {model_id} from memory")
         return {"message": f"Model {model_id} deleted"}
 

@@ -851,7 +851,8 @@ def scan_orphan_models():
 
         # Get all model file paths from the inventory
         inventory_paths = set()
-        for model in models_store.values():
+        # snapshot: routes run in the thread pool now, and the task-queue threads mutate this dict
+        for model in list(models_store.values()):
             if model.get('filePath'):
                 inventory_paths.add(Path(model['filePath']).resolve())
 
@@ -931,7 +932,7 @@ def cleanup_orphan_models(dry_run: bool = Query(True, description="If True, only
 
         # Get all model file paths from the inventory
         inventory_paths = set()
-        for model in models_store.values():
+        for model in list(models_store.values()):
             if model.get('filePath'):
                 inventory_paths.add(Path(model['filePath']).resolve())
 

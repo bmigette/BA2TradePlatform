@@ -370,17 +370,24 @@ def sync_job_from_task(job_id: str) -> Optional[Dict[str, Any]]:
     task_queue = get_task_queue()
     task_status = task_queue.get_task_status(job_id)
 
+    # Re-fetch instead of re-indexing `jobs_store[job_id]` below: this runs in the thread pool
+    # now, so a concurrent DELETE can drop the job between the membership check above and the
+    # writes that follow, and the indexing would raise KeyError.
+    job = jobs_store.get(job_id)
+    if job is None:
+        return None
+
     if task_status:
         # Update local job store from task queue
-        jobs_store[job_id]["status"] = task_status.get("status", "queued")
-        jobs_store[job_id]["progress"] = task_status.get("progress", 0)
+        job["status"] = task_status.get("status", "queued")
+        job["progress"] = task_status.get("progress", 0)
 
         if task_status.get("started_at"):
-            jobs_store[job_id]["startedAt"] = task_status["started_at"]
+            job["startedAt"] = task_status["started_at"]
         if task_status.get("completed_at"):
-            jobs_store[job_id]["completedAt"] = task_status["completed_at"]
+            job["completedAt"] = task_status["completed_at"]
         if task_status.get("error_message"):
-            jobs_store[job_id]["error"] = task_status["error_message"]
+            job["error"] = task_status["error_message"]
         if task_status.get("progress_message"):
             # Parse progress message for current generation info
             msg = task_status["progress_message"]
@@ -389,7 +396,7 @@ def sync_job_from_task(job_id: str) -> Optional[Dict[str, Any]]:
                     # Extract generation from message like "LSTM: Gen 5/50, Fitness: 0.85"
                     gen_part = msg.split("Gen ")[1].split(",")[0]
                     current, total = gen_part.split("/")
-                    jobs_store[job_id]["currentGeneration"] = int(current)
+                    job["currentGeneration"] = int(current)
                 except (IndexError, ValueError):
                     pass
 
@@ -399,36 +406,36 @@ def sync_job_from_task(job_id: str) -> Optional[Dict[str, Any]]:
 
             # Check result status for failures
             if result.get("status") == "failed":
-                jobs_store[job_id]["error"] = result.get("error", "Training failed")
+                job["error"] = result.get("error", "Training failed")
 
             # Extract best model info if available
             if result.get("best_model"):
                 best = result["best_model"]
-                jobs_store[job_id]["bestFitness"] = best.get("best_fitness")
+                job["bestFitness"] = best.get("best_fitness")
                 if best.get("metrics"):
-                    jobs_store[job_id]["currentAccuracy"] = best["metrics"].get("fitness")
+                    job["currentAccuracy"] = best["metrics"].get("fitness")
 
             # Store models trained count
             if "models_trained" in result:
-                jobs_store[job_id]["modelsTrained"] = result["models_trained"]
+                job["modelsTrained"] = result["models_trained"]
             if "total_models" in result:
-                jobs_store[job_id]["totalModels"] = result["total_models"]
+                job["totalModels"] = result["total_models"]
 
             # Store dataset statistics
             if "train_rows" in result:
-                jobs_store[job_id]["trainRows"] = result["train_rows"]
+                job["trainRows"] = result["train_rows"]
             if "test_rows" in result:
-                jobs_store[job_id]["testRows"] = result["test_rows"]
+                job["testRows"] = result["test_rows"]
             if "target_column" in result:
-                jobs_store[job_id]["targetColumn"] = result["target_column"]
+                job["targetColumn"] = result["target_column"]
             if "train_positives" in result:
-                jobs_store[job_id]["trainPositives"] = result["train_positives"]
+                job["trainPositives"] = result["train_positives"]
             if "test_positives" in result:
-                jobs_store[job_id]["testPositives"] = result["test_positives"]
+                job["testPositives"] = result["test_positives"]
             if "train_positives_pct" in result:
-                jobs_store[job_id]["trainPositivesPct"] = result["train_positives_pct"]
+                job["trainPositivesPct"] = result["train_positives_pct"]
             if "test_positives_pct" in result:
-                jobs_store[job_id]["testPositivesPct"] = result["test_positives_pct"]
+                job["testPositivesPct"] = result["test_positives_pct"]
 
     # Read training state from checkpoint_data (written by subprocess workers)
     try:
@@ -446,7 +453,7 @@ def sync_job_from_task(job_id: str) -> Optional[Dict[str, Any]]:
                             "trainPositives", "testPositives", "trainPositivesPct", "testPositivesPct",
                             "epochHistory"):
                     if key in cp:
-                        jobs_store[job_id][key] = cp[key]
+                        job[key] = cp[key]
         finally:
             db.close()
     except Exception:
@@ -613,7 +620,8 @@ def list_jobs():
         for job_id in list(jobs_store.keys()):
             sync_job_from_task(job_id)
 
-        jobs = [JobResponse(**job) for job in jobs_store.values()]
+        # snapshot: routes run in the thread pool now, and the task-queue threads mutate this dict
+        jobs = [JobResponse(**job) for job in list(jobs_store.values())]
         # Sort by createdAt descending
         jobs.sort(key=lambda x: x.createdAt, reverse=True)
 
@@ -1018,8 +1026,7 @@ def delete_job(job_id: str):
     # pool now, so two concurrent DELETEs can both pass the 404 check above and the second `del`
     # would raise KeyError -> 500 instead of the 204 the caller already earned.
     jobs_store.pop(job_id, None)
-    if job_id in job_progress_data:
-        del job_progress_data[job_id]
+    job_progress_data.pop(job_id, None)
     logger.info(f"Deleted job {job_id}")
 
 

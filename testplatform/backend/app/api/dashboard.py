@@ -124,7 +124,8 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
         "total": 0
     }
 
-    for job in jobs_store.values():
+    # snapshot: routes run in the thread pool now, and the task-queue threads mutate this dict
+    for job in list(jobs_store.values()):
         status = job.get("status", "unknown")
         if status in job_stats:
             job_stats[status] += 1
@@ -151,7 +152,7 @@ def get_dashboard_stats(db: Session = Depends(get_db)):
     activities: List[ActivityItem] = []
 
     # Add job activities
-    for job_id, job in jobs_store.items():
+    for job_id, job in list(jobs_store.items()):
         status = job.get("status", "unknown")
 
         # Job created activity

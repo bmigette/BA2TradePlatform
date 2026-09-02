@@ -164,8 +164,7 @@ def delete_api_key(provider_name: str):
             detail=f"Unknown provider: {provider_name}"
         )
 
-    if provider_name in api_keys_store:
-        del api_keys_store[provider_name]
+    api_keys_store.pop(provider_name, None)
 
     env_key = f"{provider_name.upper()}_API_KEY"
     if env_key in os.environ:
@@ -588,7 +587,8 @@ def get_gpu_memory_status():
 
         # Get active job count
         from app.api.jobs import jobs_store
-        active_jobs = sum(1 for j in jobs_store.values() if j.get("status") == "running")
+        # snapshot: routes run in the thread pool now, and the task-queue threads mutate this dict
+        active_jobs = sum(1 for j in list(jobs_store.values()) if j.get("status") == "running")
 
         return GpuMemoryStatus(
             available=True,
