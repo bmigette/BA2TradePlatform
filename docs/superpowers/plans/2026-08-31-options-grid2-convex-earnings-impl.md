@@ -724,6 +724,58 @@ rather than flagging it) is documented beside it. This is the "shared guard"
 plan item 4's operator decision (e) refers to; already documented at its own
 call site, no doc addition needed here.
 
+#### Task 14a item 5 — ruleset editor
+
+**Help text.** `packages/common/ba2_common/core/rules_documentation.py`'s
+`get_action_type_documentation()` was missing entries for NINE
+`ExpertActionType` members, not only the two backspreads the plan named:
+`STOP_PROCESSING`, `OPEN_SHORT_STRADDLE`, `OPEN_SHORT_STRANGLE`,
+`OPEN_IRON_CONDOR`, `OPEN_JADE_LIZARD`, `OPEN_CALL_BUTTERFLY`,
+`OPEN_PUT_RATIO_SPREAD`, `OPEN_CALL_BACKSPREAD`, `OPEN_PUT_BACKSPREAD`. All
+nine were backfilled (not only the two named) so the new coverage test
+below is an unconditional ratchet rather than a partial guard carrying
+pre-existing debt. The two backspreads carry the risk note the plan asked
+for: max loss is bounded and the worst case pins at the **LONG** strike
+(verified against the actual builder docstrings,
+`TradeActions.py`'s `OpenCallBackspreadAction`/`OpenPutBackspreadAction` —
+NOT the short strike, which a first draft of this entry got wrong and this
+task caught before committing), and both are marked ARC-floor exempt
+(`option_economics.ARC_FLOOR_EXEMPT_STRATEGIES` names `call_backspread`/
+`put_backspread`).
+
+**Test**: `packages/common/tests/test_rules_documentation_coverage.py` — every
+`ExpertActionType` member has an entry (and the reverse: no stale entry
+names a non-existent member); every entry has the expected shape (name/
+description/use_cases/parameters/example, non-empty); the two backspreads'
+entries are pinned to name the LONG strike and the ARC exemption
+specifically.
+
+**UI check — READ-ONLY** (per the brief's fallback: launching the worktree
+app was not attempted, in favour of a faster, equally conclusive structural
+check). `ba2_trade_platform/ui/pages/settings.py`'s ruleset editor is
+ENUM-DRIVEN at both places that matter, verified by reading the source
+directly:
+- The per-row action-type dropdown builds its options as
+  `{a.value: get_action_type_display_label(a.value) for a in
+  ExpertActionType}` — a full enum iteration, not a hand-maintained list —
+  so `OPEN_CALL_BACKSPREAD`/`OPEN_PUT_BACKSPREAD` were ALREADY selectable
+  before this task; only their HELP TEXT was missing, which is exactly this
+  item's scope.
+- The row's foldable "Info" panel and the ruleset dialog's full
+  "⚡ Available Action Types" reference section both call
+  `get_action_type_documentation()` and render `doc['name']`/
+  `doc['description']`/`doc['example']`/`doc['use_cases']` directly off
+  whatever the dict returns — so the two new entries render with no
+  settings.py code change needed.
+
+**Parked item, noted (not addressed by this task): the `classic_options`
+risk-manager rails have no UI path.** Already recorded in
+`docs/superpowers/specs/2026-08-27-option-risk-manager-design.md`: "the
+settings dialog renders none of the sleeve rails, so no UI path configures a
+live `classic_options` sleeve" — restated here because it is directly
+adjacent to the ruleset-editor work this item touched, not because it is
+new. Out of scope for Task 14a.
+
 ---
 
 ## Review cadence

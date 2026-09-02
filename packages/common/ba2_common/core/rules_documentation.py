@@ -489,6 +489,17 @@ def get_action_type_documentation() -> dict:
             "parameters": "Requires target_percent (e.g., 5.0 for 5% of virtual equity). Keeps minimum 1 share if target > 0%. Automatically calculates quantity to sell.",
             "example": "When instrument_account_share > 15%, decrease_instrument_share to 10% (rebalance)"
         },
+        ExpertActionType.STOP_PROCESSING.value: {
+            "name": "Stop Processing",
+            "description": "A guard rule: when its conditions match, evaluation of the REST of the ruleset halts immediately (no later rule in the list is evaluated this cycle). Used to short-circuit a ruleset rather than to place or modify an order.",
+            "use_cases": [
+                "Freeze all further rule evaluation while a data-quality condition holds (e.g. a stale quote)",
+                "Enforce a one-shot precedence: once an earlier rule's guard fires, later rules must not also fire this cycle",
+                "Emergency circuit-breaker gated on an account- or market-level condition"
+            ],
+            "parameters": "No additional parameters - the action itself carries no order fields. Only its rule's own conditions matter.",
+            "example": "When account_drawdown_percent >= 20%, stop_processing (halts the rest of this ruleset for the cycle)"
+        },
 
         # Option Actions
         ExpertActionType.BUY_CALL.value: {
@@ -611,6 +622,94 @@ def get_action_type_documentation() -> dict:
             ],
             "parameters": "strike_param = OTM distance percent for BOTH legs (default 5%), dte_min, dte_max, net-debit sizing (pct_equity / (call.ask + put.ask)), min_open_interest, max_spread_pct.",
             "example": "When iv_rank <= 30 and days_to_earnings <= 5, open_strangle (5% OTM call + put, 20-45 DTE, 10% equity by net debit)."
+        },
+        ExpertActionType.OPEN_SHORT_STRADDLE.value: {
+            "name": "Open Short Straddle",
+            "description": "Sell an at-the-money call AND an at-the-money put at the SAME strike (nearest spot) and SAME expiry. Short-volatility credit structure that profits when the underlying stays near the strike; the net credit (call.bid + put.bid) is the maximum gain and both legs are UNCOVERED (a naked short call has unbounded upside risk, a naked short put's downside is bounded only by the strike going to zero). Reg-T margin is reserved against BOTH legs. Excluded from the options grid-2 search (2026-08-31, unbounded-risk decision) but the builder, reserve math, and settlement remain fully supported for direct/manual use.",
+            "use_cases": [
+                "Sell rich, symmetric premium when iv_rank is very high and a large move either way is not expected",
+                "Income strategy on a range-bound name with no directional view",
+                "Manual/expert-directed use only -- not part of the searched grid space"
+            ],
+            "parameters": "dte_min, dte_max, net-credit sizing against Reg-T margin, min_open_interest, max_spread_pct. The strike is chosen ATM automatically (same strike for both legs).",
+            "example": "When iv_rank >= 80 and range_bound, open_short_straddle (ATM call + put, 25-45 DTE). UNBOUNDED risk on the call leg -- size and margin accordingly."
+        },
+        ExpertActionType.OPEN_SHORT_STRANGLE.value: {
+            "name": "Open Short Strangle",
+            "description": "Sell an out-of-the-money call (above spot) AND an out-of-the-money put (below spot) at DIFFERENT strikes, both OTM by a configurable percent or delta. Short-volatility credit structure, the strangle mirror of the short straddle: lower credit than an ATM straddle but a wider profitable range. Both legs are UNCOVERED (the same unbounded-upside call risk as the short straddle). Reg-T margin is reserved against BOTH legs. Excluded from the options grid-2 search (2026-08-31, unbounded-risk decision) but the builder, reserve math, and settlement remain fully supported for direct/manual use.",
+            "use_cases": [
+                "Sell premium with a wider break-even than a short straddle when iv_rank is high",
+                "Income strategy on a range-bound name with a defined OTM buffer on both sides",
+                "Manual/expert-directed use only -- not part of the searched grid space"
+            ],
+            "parameters": "strike_method/strike_param (or delta target) for each leg's OTM distance, dte_min, dte_max, net-credit sizing against Reg-T margin, min_open_interest, max_spread_pct.",
+            "example": "When iv_rank >= 80 and range_bound, open_short_strangle (~0.20 delta call + put, 25-45 DTE). UNBOUNDED risk on the call leg -- size and margin accordingly."
+        },
+        ExpertActionType.OPEN_IRON_CONDOR.value: {
+            "name": "Open Iron Condor",
+            "description": "Open a defined-risk, four-leg credit structure: sell an OTM put spread AND sell an OTM call spread (same expiry), i.e. a bear call spread stacked with a bull put spread. Profits when the underlying stays between the two short strikes at expiry. Net credit = (call spread credit) + (put spread credit); maximum loss is the WIDER of the two wing widths minus the total credit, reserved against buying power. Every leg is covered by construction (defined risk on both sides).",
+            "use_cases": [
+                "Collect premium on a range-bound name with strictly defined risk on both the upside and downside",
+                "Sell rich premium (high iv_rank) without the unbounded risk of a short strangle",
+                "Widen or narrow the profitable range independently of the wing width (defined-risk) gene"
+            ],
+            "parameters": "strike_param (OTM distance for the short strikes on both sides), wing_width_pct (distance to the long/protective strikes), dte_min, dte_max, max-loss sizing (pct_equity / (wing width - total credit)), min_open_interest, max_spread_pct.",
+            "example": "When iv_rank >= 60 and range_bound, open_iron_condor (shorts ~12% OTM, 5% wings, 25-45 DTE). Max loss (wing width - credit) is reserved; every leg is defined-risk."
+        },
+        ExpertActionType.OPEN_JADE_LIZARD.value: {
+            "name": "Open Jade Lizard",
+            "description": "Open a three-leg credit structure: a short put (cash-secured, full-notional reserve) plus a call credit spread (short call + long call wing). Constructed so the total credit collected exceeds the call spread's width -- the structure then has NO UPSIDE RISK at all (a rally past the short call is a wash or a small gain, never a loss from that side), leaving downside risk on the naked short put alone, exactly like a cash-secured put. Full-notional (strike*100) reserve applies because of the uncovered put leg.",
+            "use_cases": [
+                "Collect richer premium than a bare cash-secured put by adding a (risk-free on that side) call spread on top",
+                "Neutral-to-bullish income when iv_rank is high and a big rally is not the concern",
+                "Express the same downside thesis as a cash-secured put with extra yield from the call side"
+            ],
+            "parameters": "strike_param (short strike distances for both the put and the call spread), wing_width_pct (call spread width), dte_min, dte_max, sizing against the strike*100 cash reserve, min_open_interest, max_spread_pct.",
+            "example": "When neutral-to-bullish and iv_rank >= 60, open_jade_lizard (short put ~10% OTM, short call ~10% OTM + 5% wing, 25-45 DTE). Full-notional reserve on the put leg; no upside risk if sized so total credit > call-spread width."
+        },
+        ExpertActionType.OPEN_CALL_BUTTERFLY.value: {
+            "name": "Open Call Butterfly",
+            "description": "Open a defined-risk, three-strike debit structure: buy 1 lower-strike call, sell 2 middle-strike calls (the body), buy 1 higher-strike call, all same expiry, equal wing widths. Profits most if the underlying pins exactly at the body strike at expiry; maximum loss is the net debit paid, maximum gain is (wing width - net debit). The 2x short body is COVERED by the two long wings (never charged naked).",
+            "use_cases": [
+                "Bet on the underlying pinning near a specific level (e.g. a round number, a prior high) by expiry",
+                "Cheap, defined-risk way to express a narrow-range thesis for a small debit",
+                "Profit from time decay concentrated around the body strike when direction is a tight-range call"
+            ],
+            "parameters": "strike_param (the body strike's OTM distance from spot; 0.0 = ATM body), wing_width_pct (distance from the body to each wing), dte_min, dte_max, net-debit sizing, min_open_interest, max_spread_pct.",
+            "example": "When pinning_thesis and iv_rank <= 40, open_call_butterfly (ATM body, 10% wings, 30-45 DTE). Max loss = net debit; max gain = wing width - debit."
+        },
+        ExpertActionType.OPEN_PUT_RATIO_SPREAD.value: {
+            "name": "Open Put Ratio Spread",
+            "description": "Open a 1x2 put FRONTSPREAD (the mirror of the call/put backspreads below): BUY 1 higher-strike put, SELL 2 lower-strike puts, same expiry -- net SHORT options, typically entered for a net credit or small debit. Profits most if the underlying settles near the short strikes; below the short strikes the extra uncovered short put makes the structure's downside effectively UNBOUNDED (until the underlying hits zero). Full-notional reserve applies because of the extra uncovered short leg.",
+            "use_cases": [
+                "Collect a credit on a mildly bearish-to-neutral thesis while accepting tail risk far below the short strikes",
+                "Cheapen a bearish put purchase by selling an extra put further out to finance it",
+                "Manual/expert-directed use where the far-downside tail is explicitly accepted and sized for"
+            ],
+            "parameters": "strike_param (long/short strike distances, decoded as the [long, short] pair), wing_width_pct, dte_min, dte_max, sizing against the full-notional reserve, min_open_interest, max_spread_pct.",
+            "example": "When mildly bearish and iv_rank >= 50, open_put_ratio_spread (long ~5% OTM / short ~10% OTM, 25-45 DTE). Full-notional reserve on the extra short put; downside below the short strikes is effectively unbounded."
+        },
+        ExpertActionType.OPEN_CALL_BACKSPREAD.value: {
+            "name": "Open Call Backspread",
+            "description": "Open a 1x2 call ratio BACKSPREAD (the mirror of the put ratio FRONTspread above, and net LONG rather than net short): SELL 1 nearer-strike call, BUY 2 further-OTM calls of the same expiry. Convexity financed by the short leg -- the short call is COVERED by the two long calls by construction (never charged naked, unlike the put ratio spread above), so the structure's maximum loss is BOUNDED and the worst case pins at the LONG strike (the two longs' payoff exactly offsets the short there; above the break-even past that pin the two longs outrun the one short and profit is unbounded). Net credit-or-debit both admissible depending on the delta spread priced. Sized off MEASURED max loss at that pin (not premium collected) -- the known premium-vs-max-loss sizing gap other credit-adjacent structures have is closed for this builder.",
+            "use_cases": [
+                "Express a bullish, convexity-seeking thesis financed partly or fully by the short leg (cheaper than an outright 2x long-call position)",
+                "Position for a large upside move while bounding the worst case at the long strike",
+                "The bullish half of the convex-harvest grid's O_CBS key (design 2026-08-31)"
+            ],
+            "parameters": "strike_method/strike_param as a [long, short] delta pair (short leg nearer the money, e.g. 0.35-0.50 delta; long legs further OTM, e.g. 0.15-0.30 delta), dte_min, dte_max, max-loss sizing (pct_equity / measured worst-case-at-the-short-strike), min_open_interest, max_spread_pct. ARC-FLOOR EXEMPT: the min-annualized-return-on-collateral gate other credit structures consult does not apply here (near-zero-or-debit net by design; a floor would delete the structure).",
+            "example": "When bullish and convexity-seeking, open_call_backspread (short ~0.40 delta, 2x long ~0.20 delta, 60-180 DTE). Max loss (bounded, at the LONG strike) is reserved and measured directly, not approximated from premium."
+        },
+        ExpertActionType.OPEN_PUT_BACKSPREAD.value: {
+            "name": "Open Put Backspread",
+            "description": "Open a 1x2 put ratio BACKSPREAD, the bearish/crash-hedge twin of the call backspread above: SELL 1 nearer-strike put, BUY 2 further-OTM (lower-strike) puts of the same expiry. No call leg at all, so the payoff is flat above the short strike. Convexity financed by the short leg -- the short put is COVERED by the two long puts by construction (never charged naked), so maximum loss is BOUNDED and the worst case pins at the LONG strike; below it the two longs outrun the one short all the way to an underlying of zero (a crash pays convexly). Net credit-or-debit both admissible. Sized off MEASURED max loss at that pin (not premium collected), same discipline as the call backspread.",
+            "use_cases": [
+                "Express a bearish, convexity-seeking thesis financed partly or fully by the short leg",
+                "Crash hedge: a position that pays convexly on a large downside move while bounding the cost at the long strike",
+                "The bearish/crash-hedge half of the convex-harvest grid's O_PBS key (design 2026-08-31)"
+            ],
+            "parameters": "strike_method/strike_param as a [long, short] delta pair (short leg nearer the money; long legs further OTM/lower strike), dte_min, dte_max, max-loss sizing (pct_equity / measured worst-case-at-the-short-strike), min_open_interest, max_spread_pct. ARC-FLOOR EXEMPT: the min-annualized-return-on-collateral gate other credit structures consult does not apply here (near-zero-or-debit net by design; a floor would delete the structure).",
+            "example": "When bearish and hedging tail risk, open_put_backspread (short ~0.40 delta, 2x long ~0.20 delta, 60-180 DTE). Max loss (bounded, at the LONG strike) is reserved and measured directly; a crash below it pays convexly."
         },
         ExpertActionType.CLOSE_OPTION.value: {
             "name": "Close Option",
