@@ -1166,7 +1166,14 @@ def _apply_options_store(args, backtest_block: dict) -> None:
 # names and disqualifies only a genuinely thin config -- which is exactly what it is for. A
 # lower floor there would not have been "nearly inert", it would have been an unasked-for
 # weakening of the only breadth check the fitness applies to them.
-_OPTION_LOW_TRADE_FLOOR_STRATEGIES = {"O_LEAPC", "O_LEAPP"}
+#
+# THE KEY HERE IS THE LAUNCHED ONE, and after the 2026-09-02 merge that is the GROUP key
+# "O_LEAP", not its two members: ``_apply_option_trade_floor`` is called with the strategy
+# ``kind`` the CLI was given, and O_LEAPC/O_LEAPP are no longer launchable on their own (they
+# are the group's bullish and bearish arms). Listing the members here instead would leave the
+# real job -- ``--strategy O_LEAP`` -- on the default 12/yr floor, i.e. exactly the "LEAPS do
+# not work" artefact the arithmetic above exists to prevent.
+_OPTION_LOW_TRADE_FLOOR_STRATEGIES = {"O_LEAP"}
 _OPTION_LOW_TRADE_FLOOR = {"car_hard_min_trades_per_year": 3.0,
                            "car_min_trades_per_year": 8.0}
 
@@ -2447,10 +2454,20 @@ _OPTION_STRATS = {
     # ``option_strike_param`` under the delta method. ``_apply_option_strike_method_gene``
     # refuses to emit a method gene for a fixed-method row -- twice over, and deliberately.
     #
-    # PHASE 1 IS {O_LEAPC, O_LEAPP, O_ERN, O_CBS, O_PBS}. ``O_PMCC`` and ``O_CAL`` are
-    # PHASE-GATED (they need the per-leg-expiry Transaction work, plan Task 6-PRE) and have no
-    # row here at all -- see ``_PHASE_GATED_OPTION_STRATEGIES`` for the loud refusal.
-    "O_LEAPC": {  # LEAPS long call -- stock replacement (debit, delta-selected)
+    # PHASE 1 LAUNCHES {O_LEAP, O_ERN, O_CBS, O_PBS}. ``O_PMCC`` and ``O_CAL`` are PHASE-GATED
+    # (they need the per-leg-expiry Transaction work, plan Task 6-PRE) and have no row here at
+    # all -- see ``_PHASE_GATED_OPTION_STRATEGIES`` for the loud refusal.
+    #
+    # O_LEAPC / O_LEAPP ARE THE TWO ARMS OF ONE KEY, not two keys (operator decision
+    # 2026-09-02). They keep their own rows here -- a row IS a gene table, and each arm needs
+    # its own action -- but the launchable key is the GROUP "O_LEAP"
+    # (``_OPTION_GROUPS_ALL["O_LEAP"]``, ``_build_strategy_option_group``): a bullish arm
+    # (buy_call) and a bearish arm (buy_put) as two toggleable entry rules over ONE shared exit
+    # ruleset, exactly the shape O_CONVEX uses below. The per-arm ``enabled`` gene comes free
+    # with the group builder (``_option_entry_rule``'s ``toggleable=True``), so the GA can drop
+    # either direction; ``has_no_position`` is expert-level per INSTRUMENT, so the two arms can
+    # never both open on the same underlying anyway.
+    "O_LEAPC": {  # LEAPS long CALL arm of O_LEAP -- stock replacement (debit, delta-selected)
         # Delta 0.70-0.90 step 0.05 (5 levels): deep enough that the position tracks the
         # underlying nearly one-for-one, which is the whole "stock replacement" claim.
         "action_type": "buy_call", "option_strike_method": "delta",
@@ -2467,7 +2484,7 @@ _OPTION_STRATS = {
         "option_dte_optimize": True, "option_dte_min_range": 410,
         "option_dte_max_range": 500, "option_dte_step": 15,
         "option_sizing": 5.0},
-    "O_LEAPP": {  # LEAPS long put -- the bearish twin; same builder, same genes, kind=put.
+    "O_LEAPP": {  # LEAPS long PUT arm of O_LEAP -- the bearish twin; same genes, kind=put.
         # Enters on the BEARISH signal (see _OPTION_ENTRY_GATE), like O_LP. The delta band is
         # the same 0.70-0.90: ``option_selector`` compares ABSOLUTE delta for puts.
         "action_type": "buy_put", "option_strike_method": "delta",
@@ -2614,7 +2631,14 @@ _OPTION_STRATS = {
 #: round one, so every job's result is attributable to one structure (design §7). O_CONVEX is
 #: DELIBERATELY ABSENT: it is the separate convex-harvest grid (design §8) with its own
 #: fitness/universe/matrix script -- see _CONVEX_OPTION_STRATEGIES.
-_GRID2_OPTION_STRATEGIES = {"O_LEAPC", "O_LEAPP", "O_ERN", "O_CBS", "O_PBS"}
+_GRID2_OPTION_STRATEGIES = {"O_LEAP", "O_ERN", "O_CBS", "O_PBS"}
+
+#: O_LEAP's two members (operator decision 2026-09-02, superseding the two separate keys
+#: O_LEAPC/O_LEAPP). Same shape as _CONVEX_MEMBER_KEYS: not launchable on their own (no
+#: ``_STRATEGY_BUILDERS`` row), but they keep their OWN rows in ``_OPTION_STRATS`` and in every
+#: set keyed off ``set(_OPTION_STRATS)`` -- the debit partition and the fixed-delta-method pin
+#: -- because that is where the member-level bookkeeping actually lives.
+_LEAP_MEMBER_KEYS = {"O_LEAPC", "O_LEAPP"}
 
 #: The convex-harvest grid's own LAUNCHABLE key set (plan Task 13), mirroring
 #: _GRID2_OPTION_STRATEGIES' role for tools/run_convex_matrix.py -- kept SEPARATE from the set
@@ -2635,8 +2659,8 @@ _CONVEX_MEMBER_KEYS = {"O_CONVEXC", "O_CONVEXP"}
 #: purpose: its two builders hard-code ``percent_otm`` (see its row). O_CONVEX's two MEMBERS
 #: (the separate convex-harvest grid, plan Task 13) are included -- they fix the method for the
 #: identical reason grid 2's keys do; the group key "O_CONVEX" itself has no row to fix.
-_FIXED_DELTA_METHOD_STRATEGIES = ({"O_LEAPC", "O_LEAPP", "O_CBS", "O_PBS"}
-                                  | _CONVEX_MEMBER_KEYS)
+_FIXED_DELTA_METHOD_STRATEGIES = ({"O_CBS", "O_PBS"}
+                                  | _LEAP_MEMBER_KEYS | _CONVEX_MEMBER_KEYS)
 
 #: Grid-2 keys the design gates behind LATER machinery, with the reason. ``O_PMCC`` and
 #: ``O_CAL`` are two-EXPIRY structures, and the codebase refuses those at three independent,
@@ -2807,6 +2831,13 @@ _OPTION_GROUPS_ALL = {
     # excluded from _GRID2_OPTION_STRATEGIES/_OPTION_CAR_STRATEGIES accordingly (see
     # _CONVEX_OPTION_STRATEGIES / _CONVEX_MEMBER_KEYS above).
     "O_CONVEX": ["O_CONVEXC", "O_CONVEXP"],
+    # GRID 2's long-dated arm (operator decision 2026-09-02): ONE signal-driven key instead of
+    # the two separate keys O_LEAPC/O_LEAPP. Identical construction to O_CONVEX directly above
+    # -- a bullish arm (buy_call) and a bearish arm (buy_put) as two toggleable entry
+    # TradeRules over one shared exit ruleset -- so the GA gets the per-arm ``enabled`` gene for
+    # free and can drop either direction in a one-sided regime, and the grid runs one LEAPS job
+    # instead of two half-jobs that could never hold both directions at once anyway.
+    "O_LEAP": ["O_LEAPC", "O_LEAPP"],
 }
 _OPTION_GROUPS = {
     key: [m for m in members if m not in _FULL_NOTIONAL_OPTION_KINDS
@@ -3748,7 +3779,7 @@ def _screener_gate_opt_block(args, strategy_key: str) -> "dict | None":
 #                          is keyed off ``set(_OPTION_STRATS)``) must be listed -- the same
 #                          dual listing OS1/OS4 already use alongside their own members.
 _DEBIT_OPTION_KINDS = {"O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS", "O_STRD", "O_STRG",
-                       "O_LEAPC", "O_LEAPP", "O_ERN", "O_CBS", "O_PBS",
+                       "O_LEAP", "O_LEAPC", "O_LEAPP", "O_ERN", "O_CBS", "O_PBS",
                        "O_CONVEX", "O_CONVEXC", "O_CONVEXP",
                        "OS1", "OS4"}
 
@@ -3773,8 +3804,10 @@ if _DEBIT_OPTION_MEMBERS | _CREDIT_OPTION_MEMBERS != set(_OPTION_STRATS):
 #
 #   kind:     (default, min, max, step)                        levels
 _OPTION_DTE_EXIT_BANDS = {
-    "O_LEAPC": (150, 90, 240, 30),   # 6: design §2 "roll/exit DTE floor 90-240"
-    "O_LEAPP": (150, 90, 240, 30),   # 6
+    # Keyed on the GROUP key: ``_option_exit_rules`` is called with the launched kind, and
+    # after the 2026-09-02 merge that is "O_LEAP" (the two arms share one exit ruleset, which
+    # is the whole point of the group shape -- see _OPTION_GROUPS_ALL).
+    "O_LEAP":  (150, 90, 240, 30),   # 6: design §2 "roll/exit DTE floor 90-240"
     "O_CBS":   (30, 20, 45, 5),      # 6: design §2 "exit DTE floor 20-45"
     "O_PBS":   (30, 20, 45, 5),      # 6
     # O_ERN keeps the DEFAULT band: its expiry is 7-30 DTE, which is exactly the range the
@@ -4657,7 +4690,10 @@ _STRATEGY_BUILDERS = {
     "O_CSP": _build_strategy_option, "O_STRD": _build_strategy_option,
     "O_STRG": _build_strategy_option,
     # GRID 2 phase 1 (design 2026-08-31 §2) — singles, no umbrella group key.
-    "O_LEAPC": _build_strategy_option, "O_LEAPP": _build_strategy_option,
+    # O_LEAP is a GROUP key (call arm + put arm; see _OPTION_GROUPS_ALL["O_LEAP"]). O_LEAPC/
+    # O_LEAPP have no row of their own -- they are members only, never independently
+    # launchable, exactly like O_CONVEXC/O_CONVEXP.
+    "O_LEAP": _build_strategy_option_group,
     "O_ERN": _build_strategy_option,
     "O_CBS": _build_strategy_option, "O_PBS": _build_strategy_option,
     # CONVEX-HARVEST GRID (design 2026-08-31-convex-harvest-grid-design.md, plan Task 13) —

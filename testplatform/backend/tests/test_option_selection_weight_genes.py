@@ -80,16 +80,19 @@ def _group_halves():
 GROUP_HALVES = _group_halves()
 
 
-def test_the_group_halves_are_the_five_expected_ones():
+def test_the_group_halves_are_the_six_expected_ones():
     """Pins the DERIVATION against the table it replaced, so deriving it did not quietly
     change what is covered. Update this only when a group is genuinely added or removed.
 
     O_CONVEX (plan Task 13, added 2026-09-02) is a genuine addition: the convex-harvest
-    grid's call/put group, both members debit. It sorts LAST (``sorted()`` on the group-key
-    string: '_' > 'S' in ASCII, so "O_CONVEX" > "OS4")."""
+    grid's call/put group, both members debit. O_LEAP (the grid-2 LEAPS merge, same day) is
+    the second: its two arms are a bought call and a bought put, both DEBIT, which is exactly
+    why they can share one ``optsel:debit`` weight set. Both sort AFTER the OS* keys
+    (``sorted()`` on the group-key string decides at position 1: '_' (0x5F) > 'S' (0x53)), and
+    between themselves "O_CONVEX" < "O_LEAP" ('C' < 'L')."""
     assert GROUP_HALVES == [("OS1", "debit"), ("OS2", "credit"),
                             ("OS3", "credit"), ("OS4", "debit"),
-                            ("O_CONVEX", "debit")]
+                            ("O_CONVEX", "debit"), ("O_LEAP", "debit")]
 
 
 def _optsel(space):

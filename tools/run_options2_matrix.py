@@ -5,11 +5,14 @@ Design: docs/superpowers/specs/2026-08-31-leaps-grid-design.md (Sections 2, 5, 7
 Plan:   docs/superpowers/plans/2026-08-31-options-grid2-convex-earnings-impl.md (Task 10).
 
 Runs `ba2-test optimize --strategy <O_?>` SEQUENTIALLY (one job at a time) over grid 2's
-PHASE-1 strategy keys. SINGLES ONLY -- one job per (strategy x expert), no umbrella group key
-in round one, so every result is attributable to ONE structure (design Section 7):
+PHASE-1 strategy keys -- one job per (strategy x expert), so every result is attributable to
+ONE structure (design Section 7):
 
-    O_LEAPC   LEAPS long call   -- stock replacement, delta 0.70-0.90, entry DTE 365-550
-    O_LEAPP   LEAPS long put    -- the bearish twin
+    O_LEAP    LEAPS long -- ONE signal-driven key: a bullish buy_call arm (O_LEAPC) and a
+              bearish buy_put arm (O_LEAPP), delta 0.70-0.90, entry DTE 365-550, sharing one
+              exit ruleset. Operator decision 2026-09-02, superseding the two separate keys:
+              the two arms are the same structure pointed either way, and the group shape gives
+              the GA a per-arm on/off gene so it can drop a direction in a one-sided regime.
     O_ERN     earnings long vol -- straddle | strangle before the print (event-driven)
     O_CBS     call backspread   -- 1x2, convexity financed by the short
     O_PBS     put backspread    -- the crash-hedge arm
@@ -30,11 +33,11 @@ tree actually reaches it over the run window. Without it a LEAPS job over the fu
 universe spends most of its compute on names that never listed a 1-year expiry, and reports
 the resulting nothing as a result. Per-strategy thresholds:
 
-    O_LEAPC / O_LEAPP   DTE >= 365     (January-cycle LEAPS)
+    O_LEAP              DTE >= 365     (January-cycle LEAPS; both arms)
     O_CBS   / O_PBS     DTE >= 180
     O_ERN               DTE >= 7       (nearly the whole universe)
 
-The probe runs ONCE PER DISTINCT THRESHOLD (three, not five) and each job is launched with the
+The probe runs ONCE PER DISTINCT THRESHOLD (three, not four) and each job is launched with the
 KEPT list for its own threshold. A threshold that keeps NOTHING fails the whole run rather
 than launching a job with an empty universe.
 
@@ -48,7 +51,7 @@ is forced below -- the sqlite/Alpaca store's history floor is 2024-01-18 and can
 
 Usage (test venv; FMP_API_KEY/DB_FILE in env):
     ba2-venvs/test/Scripts/python.exe tools/run_options2_matrix.py \
-        [--strategies O_LEAPC,O_LEAPP,O_ERN,O_CBS,O_PBS] \
+        [--strategies O_LEAP,O_ERN,O_CBS,O_PBS] \
         [--experts FMPRating] [--earnings-expert FMPEarningsEvent] \
         [--start 2023-01-01] [--end 2025-12-31] \
         [--population 40] [--generations 6] [--dry-run]
@@ -71,16 +74,17 @@ from matrix_flags import cap_passthrough  # noqa: E402
 _UNIVERSE_FILE = os.path.join(_TOOLS_DIR, "options_universe_top100.txt")
 _PROBE = os.path.join(_TOOLS_DIR, "probe_option_chain_depth.py")
 
-# PHASE 1 (design Section 7). Order matters only for how a partial run reads: the two arms
-# with the most data support first, the event arm next, the two thinnest last.
-_DEFAULT_STRATEGIES = ["O_LEAPC", "O_LEAPP", "O_ERN", "O_CBS", "O_PBS"]
+# PHASE 1 (design Section 7). Order matters only for how a partial run reads: the key with the
+# most data support first, the event arm next, the two thinnest last.
+_DEFAULT_STRATEGIES = ["O_LEAP", "O_ERN", "O_CBS", "O_PBS"]
 
 # The CHAIN-DEPTH each key needs, in DTE (design Section 5). Keyed by strategy so a new key
 # cannot be added to the list above without stating what it needs -- an unlisted key is a hard
 # error below rather than a job with an unfiltered universe.
 _MIN_DTE = {
-    "O_LEAPC": 365,
-    "O_LEAPP": 365,
+    # Keyed by the LAUNCHABLE key: O_LEAPC/O_LEAPP are the two arms of O_LEAP and are not
+    # launchable on their own, so a threshold for them would never be read.
+    "O_LEAP": 365,
     "O_ERN": 7,
     "O_CBS": 180,
     "O_PBS": 180,
@@ -239,7 +243,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--strategies", default=",".join(_DEFAULT_STRATEGIES),
-                    help="Comma list of grid-2 phase-1 keys (O_LEAPC,O_LEAPP,O_ERN,O_CBS,"
+                    help="Comma list of grid-2 phase-1 keys (O_LEAP,O_ERN,O_CBS,"
                          "O_PBS). O_PMCC/O_CAL are phase-gated and refuse at the launcher.")
     ap.add_argument("--experts", default=",".join(_DEFAULT_EXPERTS),
                     help="Comma list of experts for the SCREENER-driven keys (default "

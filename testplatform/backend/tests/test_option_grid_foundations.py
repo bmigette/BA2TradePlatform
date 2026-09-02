@@ -912,11 +912,36 @@ def test_the_mode_the_grid_can_select_is_the_one_the_gate_engages_on():
 # structures, and a shared budget assertion over both would either be loose enough to be
 # useless for one of them or would fail the moment either grid legitimately grows.
 
-GRID2 = ["O_LEAPC", "O_LEAPP", "O_ERN", "O_CBS", "O_PBS"]
+# LAUNCHABLE grid-2 keys -- what ``--strategy`` accepts and what the matrix runs. O_LEAP is
+# a GROUP key over the two LEAPS arms (operator decision 2026-09-02, superseding the separate
+# O_LEAPC/O_LEAPP keys); O_LEAPC/O_LEAPP survive only as its members.
+GRID2 = ["O_LEAP", "O_ERN", "O_CBS", "O_PBS"]
+
+# The grid-2 STRUCTURES -- one per _OPTION_STRATS row, which is the granularity every per-row
+# assertion below (strike method, delta band, selection half) is really about. A member's genes
+# live in its GROUP's space, so ``_member_space`` routes through the launchable key.
+GRID2_MEMBERS = ["O_LEAPC", "O_LEAPP", "O_ERN", "O_CBS", "O_PBS"]
+
+#: member -> the key you actually launch to search it.
+_LAUNCH_KEY = {"O_LEAPC": "O_LEAP", "O_LEAPP": "O_LEAP"}
+
+
+def _member_space(m, member, expert="FMPRating"):
+    """The gene space a REAL run emits for this structure: its group's space when it is a
+    group member, its own when it is launchable on its own."""
+    return _space(m, _LAUNCH_KEY.get(member, member), expert)
+
+
+def _member_genes(m, member, expert="FMPRating"):
+    """The subset of that space belonging to THIS member -- its own rule-prefixed genes plus
+    the genes it shares (the ``shared-`` gates, ``optsel:``, and the common exit rules)."""
+    prefix = f"entry:{member.lower()}-entry:"
+    return {g: v for g, v in _member_space(m, member, expert).items()
+            if g.startswith(prefix) or not g.startswith("entry:")}
 
 
 # ---- amendment 1: the method is FIXED, and every searched strike band is a DELTA ------------
-@pytest.mark.parametrize("key", GRID2)
+@pytest.mark.parametrize("key", GRID2_MEMBERS)
 def test_no_grid2_key_searches_the_strike_METHOD(key):
     """THE DEAD-GENE TRAP THIS AMENDMENT EXISTS FOR.
 
@@ -927,7 +952,7 @@ def test_no_grid2_key_searches_the_strike_METHOD(key):
     (at the money on a key whose entire point is deep ITM), and a genome that picked ``delta``
     against a percent domain would refuse outright. Emitting the gene at all is the defect.
     """
-    genes = _space(_launcher(), key)
+    genes = _member_genes(_launcher(), key)
     offenders = [g for g in genes if g.endswith(":option_strike_method")]
     assert not offenders, f"{key} emits a strike-METHOD gene: {offenders}"
 
@@ -941,7 +966,7 @@ def test_every_fixed_method_keys_strike_band_is_a_delta_in_the_unit_interval(key
     delta-method row, whatever it is named.
     """
     m = _launcher()
-    genes = _space(m, key)
+    genes = _member_genes(m, key)
     bands = {g: v for g, v in genes.items() if ":option_strike_delta" in g}
     assert bands, f"{key} searches no strike delta at all"
     for name, spec in bands.items():
@@ -981,7 +1006,7 @@ def test_the_fixed_method_guard_survives_a_row_that_also_searches_the_percent_pa
     method gene.
     """
     m = _launcher()
-    cfg = dict(m._OPTION_STRATS["O_LEAPC"])
+    cfg = dict(m._OPTION_STRATS["O_LEAPC"])   # a member row; the guard is per ROW
     cfg["option_strike_param_optimize"] = True
     out = m._apply_option_strike_method_gene(cfg)
     assert "option_strike_method_optimize" not in out
@@ -1007,7 +1032,7 @@ def _decoded_entry_action(m, key, genome, expert="FMPRating"):
     from app.services.strategy_optimization_handler import _build_daily_trial_config
     from app.services.strategy_param_space import collect_param_space, decode_params
 
-    strat = m._build_strategy(key, f"g2-{key}", expert)
+    strat = m._build_strategy(_LAUNCH_KEY.get(key, key), f"g2-{key}", expert)
     space = collect_param_space(strat)
     missing = [g for g in genome if g not in space]
     assert not missing, (
@@ -1024,7 +1049,10 @@ def _decoded_entry_action(m, key, genome, expert="FMPRating"):
         "options_store": "parquet",
     }
     trial = _build_daily_trial_config(backtest_cfg, decoded, None)
-    return trial["entry_rules"][0]["actions"][0]
+    # A GROUP key emits one entry rule per member, so pick THIS member's rule by id rather
+    # than taking rule 0 (which would silently audit the call arm for every put-arm genome).
+    rule = next(r for r in trial["entry_rules"] if r["id"] == f"{key.lower()}-entry")
+    return rule["actions"][0]
 
 
 def test_the_leaps_delta_gene_moves_the_strike_target():
@@ -1144,9 +1172,13 @@ def test_only_the_event_key_carries_the_timing_gates():
     """The gates are O_ERN's, not the grid's: on any other key the stamp is absent, the leaf
     could never fire, and the strategy would trade nothing while carrying two live genes."""
     m = _launcher()
+    # Entry gates are per STRUCTURE (_option_entry_rule takes a member), exit rules per
+    # LAUNCHED key (_option_exit_rules takes the launchable kind) -- the group split.
+    for member in [k for k in GRID2_MEMBERS if k != "O_ERN"]:
+        fields = [c["field"]
+                  for c in m._option_entry_rule(member)["conditions"]["conditions"]]
+        assert "rec_days_to_earnings" not in fields, f"{member} carries an event entry gate"
     for key in [k for k in GRID2 if k != "O_ERN"]:
-        fields = [c["field"] for c in m._option_entry_rule(key)["conditions"]["conditions"]]
-        assert "rec_days_to_earnings" not in fields, f"{key} carries an event entry gate"
         assert not any(r["id"] == "opt_event" for r in m._option_exit_rules(key)), (
             f"{key} carries the event exit rule")
 
@@ -1197,7 +1229,7 @@ def test_the_expiry_constraint_is_checked_at_IMPORT_not_left_implicit():
 
 
 # ---- amendment 5: the debit/credit partition stays TOTAL ------------------------------------
-@pytest.mark.parametrize("key", GRID2)
+@pytest.mark.parametrize("key", GRID2_MEMBERS)
 def test_every_grid2_key_joined_the_DEBIT_half_by_its_iv_rank_thesis(key):
     """All five are long premium, so all five want "buy vol only when it is cheap". A key
     landing on the credit side would get the OPPOSITE gate, and the GA never searches an
@@ -1215,11 +1247,11 @@ def test_the_partition_is_still_total_over_every_member():
     assert not (m._DEBIT_OPTION_MEMBERS & m._CREDIT_OPTION_MEMBERS)
 
 
-@pytest.mark.parametrize("key", GRID2)
+@pytest.mark.parametrize("key", GRID2_MEMBERS)
 def test_every_grid2_key_gets_the_debit_halfs_selection_weights(key):
     """The partition's other consumer: the shared ``optsel:<half>:<w>`` genes. A member with
     no half raises rather than defaulting, so this also pins that the new keys resolve."""
-    genes = _space(_launcher(), key)
+    genes = _member_space(_launcher(), key)
     for w in ("w_premium", "w_iv", "w_rvol"):
         assert f"optsel:debit:{w}" in genes, f"{key} is missing optsel:debit:{w}"
         assert f"optsel:credit:{w}" not in genes
@@ -1244,15 +1276,32 @@ def test_the_grid2_genome_sizes_are_exactly_what_the_tables_add_up_to():
                                                                             SHARED  = 25
 
     Per key on top of that:
-      O_LEAPC / O_LEAPP  option_strike_delta                                = 1  -> 26
       O_ERN              option_strike_param, option_structure,
                          cond o_ern-days_to_earnings, cond days_after       = 4  -> 29
                          (the event exit has NO enabled gene -- not toggleable)
       O_CBS / O_PBS      option_strike_delta, option_strike_delta_long,
                          opt_tp_mult:{enabled, cond tp_mult}                = 4  -> 29
+
+    O_LEAP IS A GROUP, so the shared block above is not its arithmetic (2026-09-02 merge).
+    Re-derived from scratch:
+
+      per ARM (x2)       entry:<arm>-entry:enabled (the group's per-member toggle),
+                         <arm>-signal:enabled, <arm>-iv_rank:{value,enabled},
+                         <arm>-iv_rv:{value,enabled}, <arm>-exp_profit:{value,enabled},
+                         action option_strike_delta, option_dte, option_entry_cross,
+                         option_sizing                                     = 12  -> 24
+      shared gates       shared-gate_confidence:{value,enabled},
+                         shared-rel_volume:{value,enabled}                 =  4
+      exits (ONE set)    opt_tp/opt_time/opt_dte/opt_sl_ml x {enabled,value} = 8
+      selection weights  optsel:debit:{w_premium,w_iv,w_rvol}              =  3
+                                                                    O_LEAP = 39
+
+    39 is 13 fewer than the 52 the two separate 26-gene keys used to cost across two jobs,
+    and one job instead of two -- the arithmetic reason the merge is a search WIN and not
+    merely a tidier CLI.
     """
     m = _launcher()
-    expected = {"O_LEAPC": 26, "O_LEAPP": 26, "O_ERN": 29, "O_CBS": 29, "O_PBS": 29}
+    expected = {"O_LEAP": 39, "O_ERN": 29, "O_CBS": 29, "O_PBS": 29}
     for key, n in expected.items():
         got = len(_space(m, key))
         assert got == n, f"{key} genome is {got} genes, the table adds up to {n}"
@@ -1269,12 +1318,17 @@ def test_grid1_genomes_did_not_move():
 
 
 # ---- the lower TRADE FLOOR: long-dated keys only, never O_ERN --------------------------------
-@pytest.mark.parametrize("key", ["O_LEAPC", "O_LEAPP"])
+@pytest.mark.parametrize("key", ["O_LEAP"])
 def test_the_long_dated_keys_get_the_lower_trade_floor(key):
-    """THE LONG-DATED FAMILY IS EXACTLY O_LEAPC/O_LEAPP here (design section 2's third
-    member, O_PMCC, is phase-gated and has no row yet). Plan Task 10's wording is "a CONFIG
-    naming the long-dated keys only"; the backspreads are the separate convexity-financed
-    family at 60-180 DTE and are pinned in the untouched set below."""
+    """THE LONG-DATED FAMILY IS EXACTLY O_LEAP here -- the ONE key carrying both LEAPS arms
+    after the 2026-09-02 merge (design section 2's third member, O_PMCC, is phase-gated and
+    has no row yet). Plan Task 10's wording is "a CONFIG naming the long-dated keys only"; the
+    backspreads are the separate convexity-financed family at 60-180 DTE and are pinned in the
+    untouched set below.
+
+    THE KEY MUST BE THE LAUNCHED ONE. ``_apply_option_trade_floor`` is called with the CLI's
+    strategy kind, so naming the members here instead would leave the only job that exists
+    (--strategy O_LEAP) on the platform's 12/yr floor."""
     m = _launcher()
     block = {}
     m._apply_option_trade_floor(key, block)
@@ -1285,7 +1339,10 @@ def test_the_long_dated_keys_get_the_lower_trade_floor(key):
 def test_the_exempt_set_is_exactly_the_long_dated_family():
     """The set itself, so a key cannot be added to it without this test saying so."""
     m = _launcher()
-    assert m._OPTION_LOW_TRADE_FLOOR_STRATEGIES == {"O_LEAPC", "O_LEAPP"}
+    assert m._OPTION_LOW_TRADE_FLOOR_STRATEGIES == {"O_LEAP"}
+    # and the members, which are NOT launchable, are deliberately absent: a set entry for
+    # them would be read by nothing.
+    assert not (m._OPTION_LOW_TRADE_FLOOR_STRATEGIES & {"O_LEAPC", "O_LEAPP"})
 
 
 def test_the_event_key_NEVER_gets_the_lower_trade_floor():
@@ -1341,7 +1398,7 @@ def test_the_trade_floor_survives_the_trial_config_WHITELIST():
         "experts": [{"class": "FMPRating", "settings": {}}], "initial_capital": 20_000.0,
         "account_settings": {}, "warmup_days": 0, "seed": 1, "options_store": "parquet",
     }
-    m._apply_option_trade_floor("O_LEAPC", backtest_cfg)
+    m._apply_option_trade_floor("O_LEAP", backtest_cfg)
     trial = _build_daily_trial_config(backtest_cfg, {}, None)
     assert trial["car_hard_min_trades_per_year"] == 3.0
     assert trial["car_min_trades_per_year"] == 8.0
@@ -1355,7 +1412,7 @@ def test_an_explicit_run_level_floor_beats_the_expert_scan():
 
     m = _launcher()
     cfg = {"experts": [{"class": "DeterministicScorer", "settings": {}}]}
-    m._apply_option_trade_floor("O_LEAPC", cfg)
+    m._apply_option_trade_floor("O_LEAP", cfg)
     out = _car_trade_thresholds_for_experts(cfg)
     assert out["car_hard_min_trades_per_year"] == 3.0
     assert out["car_min_trades_per_year"] == 8.0
@@ -1494,7 +1551,7 @@ def test_the_ga_can_still_turn_sl_ml_on_with_the_decoded_threshold(key):
     assert leaf["value"] == 65
 
 
-@pytest.mark.parametrize("key", ["O_LEAPC", "O_LEAPP"])
+@pytest.mark.parametrize("key", ["O_LEAP"])
 def test_the_long_dated_keys_keep_opt_sl_ml_ON(key):
     """The negative: design section 2 lists ``opt_sl_ml`` as a plain gene for the LEAPS arms,
     not a default-off one -- a 400-day debit position is not a binary event bet."""
@@ -1557,10 +1614,28 @@ def test_every_grid2_key_is_scored_and_railed_as_a_PURE_option_kind(key):
         m._assert_option_window_excludes_holdout([key], "2026-06-30")
 
 
-@pytest.mark.parametrize("key", GRID2)
-def test_no_grid2_key_joined_a_SEARCHED_group(key):
-    """Design section 7: singles only in round one, so every result is attributable to ONE
-    structure."""
+@pytest.mark.parametrize("key", GRID2_MEMBERS)
+def test_no_grid2_key_joined_a_GRID1_family(key):
+    """Design section 7's real constraint: a grid-2 structure must never be searched inside a
+    GRID-1 family (OS1-OS4), because then its result would not be attributable to grid 2 at
+    all -- it would be one arm of a job scored under grid 1's fitness and universe.
+
+    O_LEAPC/O_LEAPP ARE group members as of 2026-09-02, and that is not a violation of the
+    above: their group ``O_LEAP`` IS a grid-2 key (both arms, one exit ruleset, grid-2's
+    fitness and universe threshold), the same shape O_CONVEX uses for the convex grid."""
     m = _launcher()
-    for members in m._OPTION_GROUPS_ALL.values():
-        assert key not in members
+    for group, members in m._OPTION_GROUPS_ALL.items():
+        if group in ("OS1", "OS2", "OS3", "OS4"):
+            assert key not in members, f"{key} joined grid-1 family {group}"
+
+
+@pytest.mark.parametrize("key", GRID2_MEMBERS)
+def test_every_grid2_structure_is_reachable_from_exactly_one_launchable_key(key):
+    """The merge must not have orphaned a structure or made one reachable twice."""
+    m = _launcher()
+    launchable = [k for k in m._STRATEGY_BUILDERS if k in m._GRID2_OPTION_STRATEGIES]
+    reach = [k for k in launchable
+             if k == key or key in m._OPTION_GROUPS.get(k, [])]
+    assert reach == [_LAUNCH_KEY.get(key, key)], (
+        f"{key} is reachable from {reach}, expected exactly "
+        f"[{_LAUNCH_KEY.get(key, key)!r}]")

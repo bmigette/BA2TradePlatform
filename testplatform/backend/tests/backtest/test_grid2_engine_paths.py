@@ -444,10 +444,14 @@ def _leap_rules(m, *, dte_floor):
     action = entry[0]["actions"][0]
     action["option_strike_param"] = 0.80
     action["option_dte_min"], action["option_dte_max"] = 300, 420
+    # ENTRY rule per ARM (O_LEAPC), EXIT rules per LAUNCHED KEY (O_LEAP): that split is the
+    # group shape itself -- two toggleable entry rules over one shared exit ruleset -- and
+    # asking _option_exit_rules for the member would silently hand back the platform DEFAULT
+    # 0..21 DTE band instead of the design's 90-240.
     exits = trade_rules_from_legacy(
-        exit_conditions=m._option_exit_rules("O_LEAPC"))["exit_rules"]
+        exit_conditions=m._option_exit_rules("O_LEAP"))["exit_rules"]
     exits = [r for r in exits if r.get("id") == "opt_dte"]
-    assert exits, "O_LEAPC must emit the opt_dte exit rule"
+    assert exits, "O_LEAP must emit the opt_dte exit rule"
     for leaf in exits[0]["conditions"]["conditions"]:
         if leaf.get("field") == "days_to_expiry":
             leaf["value"] = dte_floor
@@ -559,7 +563,9 @@ def test_o_leapc_dte_floor_exit_fires_inside_the_grid_window():
         ctx.__exit__(None, None, None)
 
 
-@pytest.mark.parametrize("kind,expected", [("O_LEAPC", (90, 240)), ("O_LEAPP", (90, 240)),
+# Keyed on the LAUNCHABLE key: _option_exit_rules is called with the launched kind, and the
+# two LEAPS arms share ONE exit ruleset under the group key O_LEAP (merge, 2026-09-02).
+@pytest.mark.parametrize("kind,expected", [("O_LEAP", (90, 240)),
                                            ("O_CBS", (20, 45)), ("O_PBS", (20, 45))])
 def test_the_dte_floor_band_is_the_designs(kind, expected):
     """The band the exit above depends on, read off the emitted rule rather than the table."""

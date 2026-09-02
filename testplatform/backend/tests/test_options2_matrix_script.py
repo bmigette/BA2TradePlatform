@@ -92,8 +92,7 @@ def test_every_offered_strategy_states_its_chain_depth():
 def test_the_chain_depth_thresholds_are_the_designs():
     """Design section 5: LEAPS keys need DTE >= 365, the backspreads >= 180, O_ERN >= 7."""
     d = _driver()
-    assert d._MIN_DTE == {"O_LEAPC": 365, "O_LEAPP": 365, "O_ERN": 7,
-                          "O_CBS": 180, "O_PBS": 180}
+    assert d._MIN_DTE == {"O_LEAP": 365, "O_ERN": 7, "O_CBS": 180, "O_PBS": 180}
 
 
 def test_an_unknown_strategy_fails_LOUDLY_rather_than_running_unfiltered():
@@ -103,12 +102,12 @@ def test_an_unknown_strategy_fails_LOUDLY_rather_than_running_unfiltered():
 
 
 def test_the_preflight_runs_once_per_DISTINCT_threshold():
-    """Three probes for five keys: the probe walks the whole parquet tree, so running it per
+    """Three probes for four keys: the probe walks the whole parquet tree, so running it per
     STRATEGY would pay for the same scan twice."""
     d = _driver()
     groups = d._thresholds(d._DEFAULT_STRATEGIES)
     assert set(groups) == {365, 180, 7}
-    assert sorted(groups[365]) == ["O_LEAPC", "O_LEAPP"]
+    assert sorted(groups[365]) == ["O_LEAP"]
     assert sorted(groups[180]) == ["O_CBS", "O_PBS"]
     assert groups[7] == ["O_ERN"]
 
@@ -138,8 +137,7 @@ def test_the_job_list_is_exactly_this():
     d = _driver()
     jobs = list(d._jobs(d._DEFAULT_STRATEGIES, ["FMPRating"], "FMPEarningsEvent"))
     assert jobs == [
-        ("opt2-FMPRating-O_LEAPC", "FMPRating", "O_LEAPC"),
-        ("opt2-FMPRating-O_LEAPP", "FMPRating", "O_LEAPP"),
+        ("opt2-FMPRating-O_LEAP", "FMPRating", "O_LEAP"),
         ("opt2-FMPEarningsEvent-O_ERN", "FMPEarningsEvent", "O_ERN"),
         ("opt2-FMPRating-O_CBS", "FMPRating", "O_CBS"),
         ("opt2-FMPRating-O_PBS", "FMPRating", "O_PBS"),
