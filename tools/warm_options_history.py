@@ -37,9 +37,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sqlite3
 import sys
+import threading
 import time as _time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -162,7 +164,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "parameters; the three offered scopes (read/trade/openid) cannot "
                         "grant it, so 'rest' needs a different credential type.")
     p.add_argument("--rate-limit", type=float, default=1.0,
-                   help="Seconds to pause between units (default 1.0). Be polite.")
+                   help="Seconds to pause between units (default 1.0). Be polite. Applies "
+                        "PER THREAD under --concurrency, not globally.")
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="Run this many THREADS (default 1, i.e. sequential -- unchanged "
+                        "behavior) sharing one provider instance, each processing its own "
+                        "slice of the unit list. Threads, not separate processes: some "
+                        "providers (ThetaData) authenticate ONE session per api_key and "
+                        "invalidate each other's session if run from separate processes -- "
+                        "see thetadata.py's module docstring. --provider tastytrade should "
+                        "keep using tools/run_option_warmup_parallel.py's --workers "
+                        "(separate processes) instead; this is for providers whose session "
+                        "must be shared in-process.")
     p.add_argument("--max-retries", type=int, default=4,
                    help="Attempts per unit before giving up on it (default 4). A unit that "
                         "never completes leaves NO manifest, so the next run redoes it.")
@@ -615,6 +628,74 @@ def run_units(plan: Plan, provider, store: OptionHistoryParquetStore,
     return stats
 
 
+def run_units_concurrent(plan: Plan, provider, store: OptionHistoryParquetStore,
+                         start: date, end: date, ns: argparse.Namespace, *,
+                         clock: Callable[[], datetime], sleep: Callable[[float], None],
+                         log: Callable[[str], None], concurrency: int) -> RunStats:
+    """``run_units`` across ``concurrency`` THREADS sharing one ``provider`` instance, each
+    given a contiguous slice of ``plan.units``.
+
+    THREADS, not separate processes: a provider whose live session must be shared across
+    concurrent workers (ThetaData -- see its module docstring's CONCURRENCY section) cannot
+    be split across OS processes, since a Python object cannot cross that boundary the way
+    TastyTrade's ``tools/run_option_warmup_parallel.py --workers`` (separate processes, each
+    with its own dxfeed session) does. ``run_units`` itself is left completely untouched
+    (still the single, sequential, heavily-tested implementation) -- this just calls it
+    ``concurrency`` times concurrently, each on its own unit slice.
+
+    ``plan.units`` is the only ``Plan`` field ``run_units`` reads, so a lightweight per-thread
+    sub-``Plan`` carrying just that slice is sufficient. Threads are DAEMON so a Ctrl-C during
+    ``.join()`` (SIGINT only ever interrupts the main thread) lets the process exit promptly,
+    same as the sequential path -- the in-flight unit simply has no manifest and is redone on
+    the next run, exactly like an interrupted sequential run already behaves.
+
+    ``concurrency <= 1`` (the default) or a single-unit plan calls ``run_units`` directly, no
+    thread pool at all -- byte-identical to the pre-concurrency behaviour.
+    """
+    if concurrency <= 1 or len(plan.units) <= 1:
+        return run_units(plan, provider, store, start, end, ns,
+                         clock=clock, sleep=sleep, log=log)
+
+    n = min(concurrency, len(plan.units))
+    chunk_size = math.ceil(len(plan.units) / n)
+    slices = [plan.units[i:i + chunk_size] for i in range(0, len(plan.units), chunk_size)]
+
+    results: List[Optional[RunStats]] = [None] * len(slices)
+    errors: List[Optional[BaseException]] = [None] * len(slices)
+
+    def _run_slice(idx: int, units: List[WorkUnit]) -> None:
+        sub_plan = Plan(units=units)
+        thread_log = lambda msg, i=idx: log(f"[t{i}] {msg}")  # noqa: E731 -- tiny, scoped
+        try:
+            results[idx] = run_units(sub_plan, provider, store, start, end, ns,
+                                     clock=clock, sleep=sleep, log=thread_log)
+        except BaseException as e:  # noqa: BLE001 -- re-raised on the main thread below
+            errors[idx] = e
+
+    threads = [threading.Thread(target=_run_slice, args=(i, s),
+                                name=f"warmup-slice-{i}", daemon=True)
+              for i, s in enumerate(slices)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for e in errors:
+        if e is not None:
+            raise e
+
+    merged = RunStats()
+    for r in results:
+        if r is None:
+            continue
+        merged.units_written += r.units_written
+        merged.units_empty += r.units_empty
+        merged.units_failed += r.units_failed
+        merged.rows += r.rows
+        merged.empty_contracts += r.empty_contracts
+    return merged
+
+
 # --------------------------------------------------------------------------- #
 # reporting
 # --------------------------------------------------------------------------- #
@@ -730,8 +811,9 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
     log(f"window     : {start.isoformat()} .. {end.isoformat()}")
     log(f"units      : {plan.units_pending} to fetch "
         f"({plan.units_done} complete, {plan.units_empty} known empty already on disk)")
-    stats = run_units(plan, provider, store, start, end, ns,
-                      clock=clock, sleep=sleep, log=log)
+    stats = run_units_concurrent(plan, provider, store, start, end, ns,
+                                 clock=clock, sleep=sleep, log=log,
+                                 concurrency=ns.concurrency)
     log(f"done: {stats.units_written} partitions written, {stats.units_empty} empty, "
         f"{stats.units_failed} failed, {stats.rows} rows, "
         f"{stats.empty_contracts} empty contracts recorded, "

@@ -11,6 +11,7 @@ frozen to a fixed instant, never ``today``.
 """
 import importlib
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Set
@@ -823,6 +824,71 @@ def test_a_grpc_invalid_argument_error_is_NOT_transient():
             return ("<_MultiThreadedRendezvous of RPC that terminated with:\n\tstatus = "
                    "StatusCode.INVALID_ARGUMENT\n\tdetails = \"bad request\">")
     assert not warm._is_transient(_FakeRpcError())
+
+
+# --------------------------------------------------------------------------- #
+# --concurrency (THREADS sharing one provider, found live 2026-09-02: ThetaData's session
+# model breaks under --workers' separate-PROCESS model, see thetadata.py's module docstring)
+# --------------------------------------------------------------------------- #
+def test_concurrency_default_of_one_delegates_straight_to_run_units(provider, store):
+    """The overwhelmingly common case (--provider tastytrade, unaffected by any of this)
+    must be BYTE IDENTICAL to calling run_units directly -- no thread pool, no reordering."""
+    rc, lines = _run(provider, store, extra=["--concurrency", "1"])
+    assert rc == 0
+    assert provider.fetched == EXPIRIES, "sequential order must be preserved, unchanged"
+    for e in EXPIRIES:
+        assert store.partition_state("AAPL", e, START, END) is PartitionState.COMPLETE
+
+
+def test_concurrency_above_one_still_completes_every_unit(provider, store):
+    """3 units split across --concurrency 3 (one thread each): every unit must still land,
+    nothing lost or double-counted, regardless of thread scheduling order."""
+    rc, lines = _run(provider, store, extra=["--concurrency", "3", "--rate-limit", "0"])
+    assert rc == 0
+    assert sorted(provider.fetched) == sorted(EXPIRIES)
+    for e in EXPIRIES:
+        assert store.partition_state("AAPL", e, START, END) is PartitionState.COMPLETE
+    done_line = next(l for l in lines if l.startswith("done:"))
+    assert "3 partitions written" in done_line
+
+
+def test_concurrency_actually_uses_multiple_threads_not_just_extra_bookkeeping(provider, store):
+    """Proves real concurrency happened, not just that the merged totals came out right by
+    coincidence of a hidden sequential fallback."""
+    seen_threads = set()
+    orig_fetch = provider.fetch_bars_detailed
+
+    def _tracking_fetch(*a, **kw):
+        seen_threads.add(threading.current_thread().name)
+        return orig_fetch(*a, **kw)
+
+    provider.fetch_bars_detailed = _tracking_fetch
+    rc, _lines = _run(provider, store, extra=["--concurrency", "3", "--rate-limit", "0"])
+    assert rc == 0
+    assert len(seen_threads) == 3, f"expected 3 distinct worker threads, saw {seen_threads}"
+    assert threading.current_thread().name not in seen_threads, \
+        "the fetches must run on the WORKER threads, not the calling thread"
+
+
+def test_concurrency_merges_stats_from_every_thread(provider, store):
+    """RunStats (rows/empty/failed/written) must be SUMMED across threads, not just the last
+    thread's or the first thread's numbers."""
+    rc, lines = _run(provider, store, extra=["--concurrency", "3", "--rate-limit", "0"])
+    assert rc == 0
+    done_line = next(l for l in lines if l.startswith("done:"))
+    # 3 partitions (one real bar each) -> 3 rows total, matching the non-concurrent baseline.
+    assert "3 rows" in done_line
+
+
+def test_a_slice_exception_propagates_to_the_caller(provider, store):
+    """A genuinely unexpected exception in one thread's slice must not be silently lost --
+    it must surface on the main thread, the same as an unhandled exception would sequentially."""
+    # A plain ValueError is caught and classified as permanent INSIDE run_units (the unit just
+    # fails, run_units keeps going) -- it never escapes run_units to prove propagation with.
+    # KeyboardInterrupt is the one exception run_units deliberately re-raises immediately.
+    provider.raise_exc[EXPIRIES[1]] = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        _run(provider, store, extra=["--concurrency", "3", "--rate-limit", "0"])
 
 
 def test_the_vendor_debug_cap_survives_the_sdks_own_lazy_import(provider, store):

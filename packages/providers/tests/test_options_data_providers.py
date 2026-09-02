@@ -9,6 +9,9 @@ merge (ThetaData does not fold OI into the bars call the way TastyTrade's dxfeed
 contract ``fetch_bars_detailed`` must honour for ``tools/warm_options_history.py``'s
 retry loop.
 """
+import sys
+import threading
+import types
 from datetime import date, timedelta
 
 import pandas as pd
@@ -90,6 +93,115 @@ def test_thetadata_raises_a_named_error_when_asked_to_talk_to_the_network_with_n
     finally:
         if old is not None:
             os.environ["THETADATA_API_KEY"] = old
+
+
+# --------------------------------------------------------------------------- #
+# ThetaData: shared-session threading (found live 2026-09-02: 8 separate PROCESSES each
+# calling ThetaClient(api_key=...) independently invalidated each other's sessions --
+# "Invalid session ID. This can occur if more than one terminal is running." The library's
+# fix is existing_authorized_client: a second client sharing an already-authenticated one's
+# session rather than opening a competing one -- confirmed live (4 threads, zero errors).
+# These tests exercise _get_client's orchestration of that against a FAKE thetadata module
+# (installed into sys.modules) so no real package or network is needed.
+# --------------------------------------------------------------------------- #
+def _install_fake_thetadata_module(monkeypatch, theta_client_cls):
+    fake_errors = types.ModuleType("thetadata.errors")
+
+    class _FakeNoDataFoundError(Exception):
+        pass
+
+    fake_errors.NoDataFoundError = _FakeNoDataFoundError
+    fake_thetadata = types.ModuleType("thetadata")
+    fake_thetadata.ThetaClient = theta_client_cls
+    fake_thetadata.errors = fake_errors
+    monkeypatch.setitem(sys.modules, "thetadata", fake_thetadata)
+    monkeypatch.setitem(sys.modules, "thetadata.errors", fake_errors)
+    return _FakeNoDataFoundError
+
+
+def test_get_client_authenticates_the_session_once_and_reuses_it_on_later_calls(monkeypatch):
+    constructed = []
+
+    class _FakeThetaClient:
+        def __init__(self, api_key=None, existing_authorized_client=None, dataframe_type="pandas"):
+            self.api_key = api_key
+            self.existing_authorized_client = existing_authorized_client
+            constructed.append(self)
+
+    _install_fake_thetadata_module(monkeypatch, _FakeThetaClient)
+
+    p = ThetaDataOptionsProvider(api_key="k")
+    c1 = p._get_client()
+    c2 = p._get_client()  # same thread, called again
+
+    assert len(constructed) == 2  # 1 authenticated session + 1 thread-local client wrapping it
+    main_session, wrapper = constructed
+    assert main_session.api_key == "k" and main_session.existing_authorized_client is None
+    assert wrapper.existing_authorized_client is main_session
+    assert c1 is c2 is wrapper, "the SAME thread must reuse its own client, not rebuild it"
+
+
+def test_get_client_gives_each_thread_its_own_client_sharing_one_session(monkeypatch):
+    constructed = []
+
+    class _FakeThetaClient:
+        def __init__(self, api_key=None, existing_authorized_client=None, dataframe_type="pandas"):
+            self.existing_authorized_client = existing_authorized_client
+            constructed.append(self)
+
+    _install_fake_thetadata_module(monkeypatch, _FakeThetaClient)
+
+    p = ThetaDataOptionsProvider(api_key="k")
+    seen = {}
+
+    def worker(name):
+        seen[name] = p._get_client()
+
+    threads = [threading.Thread(target=worker, args=(f"t{i}",)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(seen) == 4
+    assert len({id(c) for c in seen.values()}) == 4, "each thread must get its OWN client object"
+    sessions = {c.existing_authorized_client for c in seen.values()}
+    assert len(sessions) == 1, "every thread's client must share the SAME underlying session"
+
+
+def test_get_client_authenticates_only_once_under_a_concurrent_first_call_race(monkeypatch):
+    """The exact live failure this redesign fixes: several threads all calling _get_client()
+    for the FIRST time simultaneously must not each race to open their own competing
+    session."""
+    session_count = {"n": 0}
+
+    class _FakeThetaClient:
+        def __init__(self, api_key=None, existing_authorized_client=None, dataframe_type="pandas"):
+            if existing_authorized_client is None:
+                session_count["n"] += 1
+            self.existing_authorized_client = existing_authorized_client
+
+    _install_fake_thetadata_module(monkeypatch, _FakeThetaClient)
+
+    p = ThetaDataOptionsProvider(api_key="k")
+    threads = [threading.Thread(target=p._get_client) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert session_count["n"] == 1, \
+        "exactly one authenticated session must be created, however many threads race for it"
+
+
+def test_a_directly_injected_client_is_returned_verbatim_never_wrapped(monkeypatch):
+    """The existing test-injection path (_wired: p._client = fake) must keep working exactly
+    as before -- wrapping the fake in a real ThetaClient(existing_authorized_client=...)
+    would need the real package and silently defeat every other test's mocking."""
+    sentinel = object()
+    p = ThetaDataOptionsProvider(api_key="k")
+    p._client = sentinel
+    assert p._get_client() is sentinel
 
 
 # --------------------------------------------------------------------------- #
