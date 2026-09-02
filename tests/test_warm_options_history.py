@@ -702,6 +702,102 @@ def test_the_vendor_debug_logger_is_capped_regardless_of_log_file(provider, stor
     assert logging.getLogger("tastytrade").level == logging.WARNING
 
 
+# --------------------------------------------------------------------------- #
+# --provider — ThetaData alongside TastyTrade (2026-09-02)
+# --------------------------------------------------------------------------- #
+def test_the_store_root_defaults_to_a_separate_tree_per_provider(monkeypatch, tmp_path):
+    """--provider thetadata must never write into the existing TastyTrade tree (or vice
+    versa) unless --out is given explicitly -- the whole point of running it alongside the
+    existing cache instead of replacing it."""
+    import ba2_common.config as cfg
+    monkeypatch.setattr(cfg, "CACHE_FOLDER", str(tmp_path))
+
+    def _root_for(provider_flag):
+        lines: List[str] = []
+        fake = FakeProvider()
+        argv = ["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+               "--rate-limit", "0", "--discovery", "rest"]
+        if provider_flag:
+            argv += ["--provider", provider_flag]
+        warm.main(argv, provider=fake, store=None, clock=FakeClock(),
+                 sleep=lambda s: None, log=lines.append)
+        return next(l for l in lines if l.startswith("store root")).split(":", 1)[1].strip()
+
+    root_tt = _root_for(None)  # default
+    root_td = _root_for("thetadata")
+
+    assert os.path.basename(root_tt) == "TastyTradeOptionsProvider"
+    assert os.path.basename(root_td) == "ThetaDataOptionsProvider"
+    assert root_tt != root_td
+    assert os.path.dirname(root_tt) == os.path.dirname(root_td) == str(tmp_path)
+
+
+def test_load_thetadata_api_key_prefers_the_explicit_arg_over_everything():
+    os_environ_backup = os.environ.get("THETADATA_API_KEY")
+    os.environ["THETADATA_API_KEY"] = "env-key"
+    try:
+        assert warm.load_thetadata_api_key(db_path=None, api_key_arg="arg-key") == "arg-key"
+    finally:
+        if os_environ_backup is None:
+            os.environ.pop("THETADATA_API_KEY", None)
+        else:
+            os.environ["THETADATA_API_KEY"] = os_environ_backup
+
+
+def test_load_thetadata_api_key_falls_back_to_the_env_var(monkeypatch):
+    monkeypatch.setenv("THETADATA_API_KEY", "env-key")
+    assert warm.load_thetadata_api_key(db_path=None, api_key_arg=None) == "env-key"
+
+
+def test_load_thetadata_api_key_reads_the_appsetting_via_db(tmp_path, monkeypatch):
+    monkeypatch.delenv("THETADATA_API_KEY", raising=False)
+    import sqlite3
+    db_path = str(tmp_path / "platform.sqlite")
+    con = sqlite3.connect(db_path)
+    con.execute("CREATE TABLE appsetting (key TEXT, value_str TEXT)")
+    con.execute("INSERT INTO appsetting (key, value_str) VALUES ('thetadata_api_key', ?)",
+               ("db-key",))
+    con.commit()
+    con.close()
+
+    assert warm.load_thetadata_api_key(db_path=db_path, api_key_arg=None) == "db-key"
+
+
+def test_load_thetadata_api_key_raises_a_named_error_with_nothing_available(monkeypatch):
+    monkeypatch.delenv("THETADATA_API_KEY", raising=False)
+    with pytest.raises(SystemExit, match="No ThetaData API key"):
+        warm.load_thetadata_api_key(db_path=None, api_key_arg=None)
+
+
+def test_build_provider_dispatches_to_thetadata_on_the_flag(monkeypatch):
+    monkeypatch.setenv("THETADATA_API_KEY", "some-key")
+    from ba2_providers.options.thetadata import ThetaDataOptionsProvider
+    ns = warm.parse_args(["--symbols", "AAPL", "--provider", "thetadata"])
+    p = warm.build_provider(ns)
+    assert isinstance(p, ThetaDataOptionsProvider)
+    assert p.api_key == "some-key"
+
+
+def test_a_grpc_unavailable_error_is_recognised_as_transient():
+    """ThetaData's cloud client raises grpc.RpcError; its repr() carries the status name
+    directly. Without this, a rate-limited/temporarily-down ThetaData call would be treated
+    as permanent and fail the unit on the first attempt."""
+    class _FakeRpcError(Exception):
+        def __repr__(self):
+            return ("<_MultiThreadedRendezvous of RPC that terminated with:\n\tstatus = "
+                   "StatusCode.UNAVAILABLE\n\tdetails = \"upstream connect error\">")
+    assert warm._is_transient(_FakeRpcError())
+
+
+def test_a_grpc_invalid_argument_error_is_NOT_transient():
+    """A malformed request (e.g. bad symbol) fails identically on every retry."""
+    class _FakeRpcError(Exception):
+        def __repr__(self):
+            return ("<_MultiThreadedRendezvous of RPC that terminated with:\n\tstatus = "
+                   "StatusCode.INVALID_ARGUMENT\n\tdetails = \"bad request\">")
+    assert not warm._is_transient(_FakeRpcError())
+
+
 def test_the_vendor_debug_cap_survives_the_sdks_own_lazy_import(provider, store):
     """Regression for the 2026-08-26 fix-that-didn't-fix-it: a live relaunch with the FIRST
     version of this cap kept emitting DEBUG spam, because tastytrade/__init__.py's

@@ -24,7 +24,7 @@ from .ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from .AccountInterface import AccountInterface
 from .OptionsAccountInterface import OptionsAccountInterface
 from .OptionsDataProviderInterface import (
-    OptionsDataProviderInterface, OptionContractMeta, OptionEodBar,
+    OptionsDataProviderInterface, OptionContractMeta, OptionEodBar, CandleBatch,
 )
 from .MarketExpertInterface import MarketExpertInterface, BacktestInterface
 from .ExpertDataExportInterface import (
@@ -67,6 +67,7 @@ __all__ = [
     "OptionsDataProviderInterface",
     "OptionContractMeta",
     "OptionEodBar",
+    "CandleBatch",
     "MarketExpertInterface",
     "BacktestInterface",
     "ExpertDataExportInterface",

@@ -41,13 +41,12 @@ import math
 import os
 import re
 import ssl
-from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set
 
 from ba2_common.core.interfaces.OptionsDataProviderInterface import (
-    OptionContractMeta, OptionEodBar, OptionsDataProviderInterface,
+    CandleBatch, OptionContractMeta, OptionEodBar, OptionsDataProviderInterface,
 )
 from ba2_common.logger import logger
 
@@ -80,24 +79,6 @@ class StreamInterrupted(RuntimeError):
     def __init__(self, message: str, candles: Sequence[Any] = ()):
         super().__init__(message)
         self.candles = list(candles)
-
-
-@dataclass
-class CandleBatch:
-    """The outcome of one ``fetch_bars_detailed`` call.
-
-    ``empty`` and ``unresolved`` are what make resume trustworthy, and they must never be
-    merged: ``empty`` is a durable fact to record, ``unresolved`` is work still owed.
-    """
-    bars: List[OptionEodBar] = field(default_factory=list)
-    empty: Set[str] = field(default_factory=set)
-    unresolved: Set[str] = field(default_factory=set)
-    interrupted: bool = False
-
-    @property
-    def ok(self) -> bool:
-        """True when every requested contract was accounted for."""
-        return not self.unresolved
 
 
 # --------------------------------------------------------------------------- #
