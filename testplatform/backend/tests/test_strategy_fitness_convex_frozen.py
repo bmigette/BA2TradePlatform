@@ -217,13 +217,22 @@ CORPUS = {
     "structures_not_legs_fail": _base(avg_trades_per_year=100.0, trades=_LEGGED,
                                       total_trades=88),
 
-    # --- 5. wrappers this metric deliberately does NOT apply ----------------------------------
-    # Concentration/hit-rate/adjusted-return machinery all penalise the convex shape itself.
+    # --- 5. wrappers this metric does NOT apply (and the one it now does) ---------------------
+    # Concentration/hit-rate/adjusted-return machinery all penalise the convex shape itself, so
+    # those three stay omitted by decision. The SPREAD STRESS is applied as of 2026-09-02 --
+    # see the renamed case below.
     "adjusted_ignored_basis_cap": _base(profit_cap_pct=2_000.0, adjusted_total_return=55.0),
     "adjusted_ignored_share_cap": _base(profit_share_cap_pct=25.0, adjusted_total_return=55.0),
     "win_rate_factor_ignored": _base(fitness_win_rate_factor=True, win_rate=20.0),
     "robust_fitness_ignored": _base(robust_fitness=True, initial_capital=20_000.0),
-    "stress_spread_ignored": _base(stress_spread_bps=40.0, initial_capital=20_000.0),
+    # RENAMED 2026-09-02 (plan Task 14b item 6): the spread stress IS applied to this metric
+    # now -- ``stressed_results`` restates total_return, so ``min(base, stressed)`` is no
+    # longer inert. The LITERAL is unchanged because on THIS book the stress does not bind:
+    # _base hand-sets total_return 120.0 while its 90 trades at +120% pnl_pct compound to a
+    # stressed 147.6, and min(120.0, 147.6) = 120.0. The case that proves the wiring BITES is
+    # test_the_spread_stress_lowers_the_convex_return_term below, on a book whose total_return
+    # is derived from its own trades instead of hand-set.
+    "stress_spread_not_binding": _base(stress_spread_bps=40.0, initial_capital=20_000.0),
 
     # --- compute_fitness entry guards ---------------------------------------------------------
     "zero_trades": _base(total_trades=0),
@@ -282,7 +291,7 @@ _EXPECTED = {
     "adjusted_ignored_share_cap": "120.0",
     "win_rate_factor_ignored": "120.0",
     "robust_fitness_ignored": "120.0",
-    "stress_spread_ignored": "120.0",
+    "stress_spread_not_binding": "120.0",
 
     "zero_trades": "-1000000000.0",
     "account_wiped": "-2000000000.0",
@@ -650,3 +659,83 @@ def test_the_constants_are_the_documented_config_block():
     assert _CONVEX_MIN_TICKETS_PER_YEAR == 30.0
     assert _CONVEX_MIN_UNDERLYINGS == 20
     assert math.isclose(_convex_dd_factor(-70.0), 0.5)
+
+
+# ==================================================================================================
+# THE SPREAD STRESS, now that it is honest (plan Task 14b item 6, 2026-09-02)
+# ==================================================================================================
+# ``option_convex`` ranks on ``total_return``. Until this commit ``stressed_results`` restated
+# ``annualized_return`` and ``max_drawdown`` but NOT ``total_return``, so wiring the stress into
+# this metric would have produced a stress that looked applied and moved only the drawdown term
+# -- which is why the wrapper was omitted and why ``tools/run_convex_matrix.py`` REFUSED a
+# non-zero --stress-spread-bps rather than let it be silently inert. The restatement closes that,
+# the wrapper is wired, and the refusal is gone; these tests are what stands in its place.
+def _consistent_book(pnl_pct, initial=20_000.0):
+    """A results dict whose ``total_return`` and ``max_drawdown`` are DERIVED from its own
+    trades, so the unstressed and stressed passes measure the same book.
+
+    The corpus above hand-sets ``total_return`` (that is what makes it a freeze), and a hand-set
+    figure can sit either side of the stressed one -- which is exactly why the corpus case cannot
+    prove the wiring bites."""
+    from app.services.backtest.monte_carlo import _path_metrics, equity_path_from_trade_pcts
+
+    # entry_price/size/multiplier are REQUIRED for the stress to bite: apply_spread_cost
+    # charges bps on the NOTIONAL DEPLOYED (premium x contracts x 100 for an option) and
+    # deducts zero for a row that carries none. $10 premium x 2 contracts x 100 = $2,000 of
+    # notional per ticket, i.e. 10% of the $20k sleeve -- a real convex ticket size.
+    trades = [{"symbol": f"U{i:02d}", "underlying_symbol": f"U{i:02d}",
+               "pnl": p / 100.0 * initial, "pnl_pct": p,
+               "entry_price": 10.0, "size": 2.0, "multiplier": 100.0,
+               "exit_time": f"{2023 + i // 30}-{1 + (i % 12):02d}-15"}
+              for i, p in enumerate(pnl_pct)]
+    path = equity_path_from_trade_pcts(pnl_pct, initial)   # takes the PCT list, not dicts
+    m = _path_metrics(path, initial, 3.0)
+    return {
+        "total_trades": len(trades),
+        "avg_trades_per_year": len(trades) / 3.0,
+        "total_return": (float(m["final_equity"]) - initial) / initial * 100.0,
+        "max_drawdown": m["max_drawdown"],
+        "trades": trades,
+        "equity_curve": [{"date": "2023-01-02", "equity": initial},
+                         {"date": "2025-12-31", "equity": float(m["final_equity"])}],
+        "initial_capital": initial,
+        "win_rate": 100.0 * sum(1 for p in pnl_pct if p > 0) / len(pnl_pct),
+    }
+
+
+#: 90 tickets over 24+ underlyings (clears both breadth floors), mostly small losers with a few
+#: large winners -- the convex shape. Small per-ticket sizes so a 40bps round trip is a real but
+#: not overwhelming cost.
+_CONVEX_PNL_PCT = [(-1.0 if i % 5 else 9.0) for i in range(90)]
+
+
+def test_the_spread_stress_lowers_the_convex_return_term():
+    """THE WIRING, END TO END: the same book scored with and without --stress-spread-bps."""
+    plain = _consistent_book(_CONVEX_PNL_PCT)
+    stressed = dict(plain, stress_spread_bps=40.0)
+    base = compute_fitness(CONVEX, dict(plain), 0.0)
+    with_stress = compute_fitness(CONVEX, stressed, 0.0)
+    assert base > 0, "the fixture must clear the floors, or this proves nothing"
+    assert with_stress < base, (
+        f"--stress-spread-bps did not lower option_convex: {with_stress} vs {base}")
+
+
+def test_the_stress_is_what_moved_it_not_the_drawdown_term_alone():
+    """The specific defect the omission existed to avoid: a stress that moves ONLY the drawdown
+    factor while the return term it ranks on stays at its unstressed value."""
+    from app.services.strategy_fitness import stressed_results
+
+    plain = _consistent_book(_CONVEX_PNL_PCT)
+    st = stressed_results(dict(plain), 40.0)
+    assert st is not None
+    assert st["total_return"] < plain["total_return"], (
+        "stressed_results left total_return at its copied, unstressed value -- the metric's "
+        "whole ranking quantity")
+
+
+def test_no_stress_configured_leaves_the_convex_score_bit_identical():
+    """The other half: wiring the wrapper must not move a job that asked for no stress."""
+    plain = _consistent_book(_CONVEX_PNL_PCT)
+    a = compute_fitness(CONVEX, dict(plain), 0.0)
+    b = compute_fitness(CONVEX, dict(plain, stress_spread_bps=0.0), 0.0)
+    assert repr(a) == repr(b)

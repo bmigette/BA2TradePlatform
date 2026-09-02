@@ -16,6 +16,35 @@ CPython, so this is a BIT comparison, not an approximate one.
 If you are changing an equity metric ON PURPOSE, regenerate these literals in the same
 commit and say so in the message. Do not "fix" a failure by loosening the comparison.
 
+*** NOT COMPARABLE ACROSS THIS COMMIT (2026-09-02, plan Task 14b item 6) ***
+EIGHT literals were deliberately re-frozen, and a fitness produced before this commit cannot
+be compared with one produced after it FOR THE THREE STRESSED CASES BELOW. Everything else in
+this file is bit-identical, and that is asserted by the remaining ~800 unchanged literals.
+
+WHAT CHANGED. ``stressed_results`` restated only ``annualized_return`` and ``max_drawdown``.
+For ``total_return``/``return`` and ``calmar_ratio`` the stressed pass therefore re-read the
+COPIED, UNSTRESSED value off ``dict(results)``, so ``min(base, stressed)`` was inert: the
+--stress-spread-bps flag looked applied and changed nothing on exactly the metrics that rank
+on total return. It now restates both from the same stressed path.
+
+THE MOVED KEYS, with the arithmetic beside each entry below:
+  stress_on|return, stress_on|total_return                      119.7 -> 5.625799999999988
+  stress_on_thin|return, stress_on_thin|total_return            119.7 -> 5.625799999999988
+  stress_mid_concentration|return, ...|total_return             1.3895... -> 0.2123...
+  stress_mid_concentration|calmar, ...|calmar_ratio             0.01741... -> 0.06703...
+
+WHY IT WAS SAFE TO RE-FREEZE NOW. The lift condition recorded beside the CAR/OCAR unification
+("fold the two together when no grid is running") is about runs USING the affected metrics.
+``_consistent_annual_return`` and ``_option_consistent_annual_return`` read
+``annualized_return``/``adjusted_annualized_return``, ``max_drawdown``, ``equity_curve`` and
+the trade rate -- verified by reading the function bodies, not assumed -- and NEITHER reads
+``total_return`` or ``calmar_ratio``, so a CAR grid mid-flight is provably unaffected by this
+change. ``robustness_metrics``'s spread screen likewise reads only ``annualized_return``.
+The operator confirmed no grid is running with --fitness total_return/return/calmar_ratio.
+NOTE for the next person: ``tools/run_screener_capband_matrix.py`` DEFAULTS to
+``--fitness calmar_ratio``, so a run of that driver started before this commit is on the old
+scale -- do not compare its results across it.
+
 COVERAGE IS THE WHOLE VALUE HERE. A case the corpus does not contain is a change this file
 cannot see -- the first version of it missed the profit-cap switch (no case had an adjusted
 figure present with no cap active), and a mutation of that branch passed. When you add a
@@ -677,8 +706,15 @@ GOLDEN = {
     'robust_on|win_rate': '0.0',
     'stress_mid_concentration|CAR': '0.11538690082780359',
     'stress_mid_concentration|Goal': '0.11538690082780359',
-    'stress_mid_concentration|calmar': '0.017412396888828355',
-    'stress_mid_concentration|calmar_ratio': '0.017412396888828355',
+    # RE-FROZEN 2026-09-02 (see the header). The stressed pass now restates calmar from
+    # the stressed path's own components -- car 5.774429649249924 / max(|dd 0.0|, 1.0) =
+    # 5.774429649249924 -- instead of re-reading the copied 1.5. It goes UP here, and that
+    # is the corpus, not the metric: _base() hand-sets calmar_ratio 1.5, a number the _C3
+    # curve does not produce, so the stressed (computed) figure is the larger of the two
+    # and min() keeps the inner robustness-adjusted value. Ratio checks: 5.774429649249924
+    # / 1.5 = 3.8496, and 0.06703110723957173 / 0.017412396888828355 = 3.8496.
+    'stress_mid_concentration|calmar': '0.06703110723957173',
+    'stress_mid_concentration|calmar_ratio': '0.06703110723957173',
     'stress_mid_concentration|car': '0.11538690082780359',
     'stress_mid_concentration|consistent_annual_return': '0.11538690082780359',
     'stress_mid_concentration|drawdown': '20.0',
@@ -686,13 +722,16 @@ GOLDEN = {
     'stress_mid_concentration|max_dd': '20.0',
     'stress_mid_concentration|max_drawdown': '20.0',
     'stress_mid_concentration|profit_factor': '0.020894876266594028',
-    'stress_mid_concentration|return': '1.389509271728503',
+    # RE-FROZEN 2026-09-02: stressed total_return (18.29285463353683) x the same robustness
+    # factors the unstressed 119.7 was multiplied by; 0.21234829673919076 / 1.389509271728503
+    # = 0.15281 = 18.29285463353683 / 119.7.
+    'stress_mid_concentration|return': '0.21234829673919076',
     'stress_mid_concentration|sharpe': '0.016251570429573134',
     'stress_mid_concentration|sharpe_ratio': '0.016251570429573134',
     'stress_mid_concentration|sortino': '0.0243773556443597',
     'stress_mid_concentration|sortino_ratio': '0.0243773556443597',
     'stress_mid_concentration|sqn': '0.02785983502212537',
-    'stress_mid_concentration|total_return': '1.389509271728503',
+    'stress_mid_concentration|total_return': '0.21234829673919076',
     'stress_mid_concentration|win_rate': '0.7081041401456865',
     'stress_on_thin|CAR': '-100000000.0',
     'stress_on_thin|Goal': '-100000000.0',
@@ -705,13 +744,15 @@ GOLDEN = {
     'stress_on_thin|max_dd': '20.0',
     'stress_on_thin|max_drawdown': '20.0',
     'stress_on_thin|profit_factor': '1.8',
-    'stress_on_thin|return': '119.7',
+    # RE-FROZEN 2026-09-02: (final_equity - 100000) / 100000 * 100 on the +40bps path =
+    # 5.625799999999988, and min(119.7, 5.6258) = 5.6258. Was the INERT copy of 119.7.
+    'stress_on_thin|return': '5.625799999999988',
     'stress_on_thin|sharpe': '1.4',
     'stress_on_thin|sharpe_ratio': '1.4',
     'stress_on_thin|sortino': '2.1',
     'stress_on_thin|sortino_ratio': '2.1',
     'stress_on_thin|sqn': '2.4',
-    'stress_on_thin|total_return': '119.7',
+    'stress_on_thin|total_return': '5.625799999999988',
     'stress_on_thin|win_rate': '61.0',
     'stress_on|CAR': '0.9229173980911942',
     'stress_on|Goal': '0.9229173980911942',
@@ -724,13 +765,16 @@ GOLDEN = {
     'stress_on|max_dd': '20.0',
     'stress_on|max_drawdown': '20.0',
     'stress_on|profit_factor': '1.8',
-    'stress_on|return': '119.7',
+    # RE-FROZEN 2026-09-02: same arithmetic as stress_on_thin above (identical trades and
+    # initial capital; the two cases differ only in avg_trades_per_year, which no
+    # return-based metric reads).
+    'stress_on|return': '5.625799999999988',
     'stress_on|sharpe': '1.4',
     'stress_on|sharpe_ratio': '1.4',
     'stress_on|sortino': '2.1',
     'stress_on|sortino_ratio': '2.1',
     'stress_on|sqn': '2.4',
-    'stress_on|total_return': '119.7',
+    'stress_on|total_return': '5.625799999999988',
     'stress_on|win_rate': '61.0',
     'thin_11_9|CAR': '-100000000.0',
     'thin_11_9|Goal': '-100000000.0',

@@ -458,28 +458,22 @@ def compute_fitness(fitness_metric: str, results: dict,
     if metric in _CONVEX_ALIASES:
         # CONVEX-HARVEST-ONLY. Reached only by an explicit ``option_convex``, which is what
         # keeps every running equity and option_car grid out of this code path entirely (no
-        # branch, no cost). NONE of the shared wrappers below is applied, and each omission is
-        # a decision, not an oversight -- see _option_convex's docstring:
+        # branch, no cost). Two of the three shared wrappers are STILL omitted, and each
+        # omission is a decision, not an oversight -- see _option_convex's docstring:
         #   * _apply_win_rate_factor would SCORE the hit rate this metric only records;
         #   * robust_fitness's concentration screen would score top-5 share, the exact skew the
-        #     design keeps as telemetry (standing decision, 2026-08-06);
-        #   * _min_with_stressed cannot be applied honestly, because ``stressed_results``
-        #     restates ``annualized_return`` and ``max_drawdown`` but NOT ``total_return``,
-        #     which is what this metric ranks on. Wiring it would produce a stress that looks
-        #     applied and moves only the drawdown term.
-        #     THE SAME GAP IS ALREADY LIVE for the plain ``total_return``/``return`` metrics and
-        #     for ``calmar_ratio``: their stressed pass re-reads the COPIED unstressed value, so
-        #     the min() is inert. MEASURED 2026-09-02, not assumed -- adding
-        #     ``out["total_return"] = (metrics["final_equity"] - initial) / initial * 100`` to
-        #     stressed_results moves SIX equity frozen literals (stress_on|return,
-        #     stress_on|total_return, stress_on_thin|{return,total_return},
-        #     stress_mid_concentration|{return,total_return}), which currently freeze the inert
-        #     119.7. TASK 14 CARRY: fix stressed_results and re-freeze those six with a
-        #     not-comparable note, under the same "when no grid is running" condition the
-        #     CAR/OCAR unification waits on. Task 13's matrix script refuses a non-zero
-        #     --stress-spread-bps on an option_convex job so the stress is never silently inert
-        #     here in the meantime.
-        _fit = _option_convex(results)
+        #     design keeps as telemetry (standing decision, 2026-08-06).
+        # THE THIRD IS NOW APPLIED (2026-09-02, plan Task 14b item 6). It was omitted because
+        # ``stressed_results`` restated ``annualized_return`` and ``max_drawdown`` but NOT
+        # ``total_return``, which is what this metric ranks on -- so wiring it would have
+        # produced a stress that looked applied and moved only the drawdown term. That gap is
+        # closed (``stressed_results`` restates total_return and calmar_ratio from the same
+        # stressed path; the six equity literals it moves are re-frozen with the arithmetic in
+        # tests/test_strategy_fitness_equity_frozen.py's header), so the stress is now honest
+        # here and ``tools/run_convex_matrix.py``'s interim refusal of a non-zero
+        # --stress-spread-bps is removed in the same commit.
+        _fit = _min_with_stressed(_option_convex(results), fitness_metric, results,
+                                  stress_spread_bps)
         if isinstance(results, dict):
             # Same two keys _maybe_robust records on its non-robust path, so downstream
             # readers (reports, top-N re-scores) find what they expect.
@@ -915,6 +909,39 @@ def stressed_results(results: dict, stress_spread_bps: float) -> Optional[dict]:
     if "adjusted_annualized_return" in out:
         out["adjusted_annualized_return"] = car
     out["max_drawdown"] = metrics.get("max_drawdown")
+
+    # TOTAL RETURN AND CALMAR, restated from the SAME stressed path (2026-09-02, plan Task 14b
+    # item 6). Until now this function restated only the annualised return and the drawdown, so
+    # a stressed pass for ``total_return``/``return``/``calmar_ratio`` re-read the COPIED,
+    # UNSTRESSED value off ``dict(results)`` and ``min(base, stressed)`` was inert -- the flag
+    # looked applied and changed nothing. Measured, not assumed: it moves six equity frozen
+    # literals (see that file's header), all of them stress cases that were freezing the inert
+    # 119.7.
+    #
+    # THE ARITHMETIC IS THE UNSTRESSED ONE, not ``_path_metrics``'s convenience calmar.
+    # ``results.py`` divides by ``max(|dd|, _MIN_DRAWDOWN_FLOOR_PCT)`` -- a floor that stops a
+    # never-dipping curve producing an absurd ratio -- while ``_path_metrics`` divides by the
+    # raw |dd|. Taking its ``calmar`` verbatim would compare a floored number against an
+    # unfloored one inside ``min()``, which is not a stress, it is a units mismatch. The floor
+    # constant is IMPORTED rather than copied so the two can never drift.
+    from app.services.backtest.results import _MIN_DRAWDOWN_FLOOR_PCT
+
+    final_equity = float(metrics["final_equity"])
+    dd = metrics["max_drawdown"]
+    out["total_return"] = (final_equity - initial) / initial * 100.0
+    # No ``if dd else 0.0`` here, and that is the faithful half: ``results.py`` guards on
+    # ``dd_values`` -- whether a drawdown SERIES exists at all -- not on the drawdown being
+    # non-zero, and we have just computed a path, so the series exists. A never-dipping stressed
+    # path is calmar = car / the 1% floor, exactly as the unstressed pass would score it;
+    # returning 0.0 there would be ``_path_metrics``'s convenience convention, not this metric's.
+    out["calmar_ratio"] = car / max(abs(float(dd)), _MIN_DRAWDOWN_FLOOR_PCT)
+    # Same adjusted-key reasoning as ``adjusted_annualized_return`` above: the return-based
+    # metrics prefer the adjusted figure whenever a profit cap is active, so leaving these at
+    # their unstressed values would silently ignore the stress on every capped run.
+    if "adjusted_total_return" in out:
+        out["adjusted_total_return"] = out["total_return"]
+    if "adjusted_calmar_ratio" in out:
+        out["adjusted_calmar_ratio"] = out["calmar_ratio"]
 
     # Synthesize a dated curve at trade exits so the CONSISTENCY term is measured on the
     # stressed path too. Sparser than the real per-bar curve, but _calendar_year_returns only

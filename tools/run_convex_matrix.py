@@ -225,10 +225,14 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
         cmd += ["--mutation-prob", str(args.mutation_prob)]
     # "Pass 0 to disable": a 0 must be FORWARDED, or the launcher re-applies its own default.
     cmd += cap_passthrough(args)
-    # STRESS-SPREAD-BPS IS DELIBERATELY NOT FORWARDED. main() refuses a non-zero value before
-    # this function is ever reached (see _refuse_nonzero_stress below) -- a zero value needs
-    # no flag at all (the launcher's own --stress-spread-bps default is 0.0), so there is
-    # nothing here to pass on the only value this driver ever allows through.
+    # STRESS-SPREAD-BPS is forwarded when non-zero (2026-09-02, plan Task 14b item 6). It was
+    # REFUSED here until ``stressed_results`` restated ``total_return``: option_convex ranks on
+    # end-of-window total return, so a stress that moved only annualized_return/max_drawdown
+    # would have been silently inert on the very quantity being ranked. It restates both now
+    # and ``compute_fitness``'s _CONVEX_ALIASES branch applies ``_min_with_stressed``, so the
+    # flag does what it says. A zero still passes nothing: the launcher's own default is 0.0.
+    if args.stress_spread_bps:
+        cmd += ["--stress-spread-bps", str(args.stress_spread_bps)]
     if args.screener_gate_store:
         cmd += ["--screener-gate-store", args.screener_gate_store,
                 "--max-stock-price", str(args.max_stock_price)]
@@ -237,27 +241,16 @@ def build_cmd(args, launcher, name, expert, strategy, universe) -> list:
     return cmd
 
 
-def _refuse_nonzero_stress(stress_spread_bps: float) -> None:
-    """Design §6 item 4 / strategy_fitness.py's own TASK 14 CARRY note: ``option_convex``
-    ranks on RAW ``total_return`` (design §3's "end-of-window total return"), and
-    ``stressed_results`` restates ``annualized_return``/``max_drawdown`` but NOT
-    ``total_return`` -- so ``_min_with_stressed`` is SKIPPED ENTIRELY for ``option_convex``
-    (see strategy_fitness.compute_fitness's ``_CONVEX_ALIASES`` branch). A non-zero
-    --stress-spread-bps on a convex job would therefore be accepted, forwarded, and silently
-    INERT: the run would look stress-tested and would not be. Refusing here is cheaper than
-    debugging a "looks-applied" stress six months from now, and correct until Task 14 fixes
-    ``stressed_results`` to restate ``total_return`` (that TASK 14 CARRY note is the same one
-    strategy_fitness.py's compute_fitness names).
-    """
-    if stress_spread_bps:
-        raise SystemExit(
-            f"run_convex_matrix: --stress-spread-bps {stress_spread_bps} is REFUSED for "
-            f"option_convex jobs. option_convex ranks on RAW total_return, and "
-            f"stressed_results does not yet restate total_return under stress (only "
-            f"annualized_return/max_drawdown) -- see strategy_fitness.py's TASK 14 CARRY note "
-            f"on the _CONVEX_ALIASES branch. Passing a non-zero stress here would be silently "
-            f"INERT for the return term while looking applied. Drop the flag (or pass 0) "
-            f"until Task 14 restates total_return in stressed_results.")
+# _refuse_nonzero_stress WAS HERE, and its removal is the point of this note (2026-09-02,
+# plan Task 14b item 6). It refused a non-zero --stress-spread-bps because option_convex ranks
+# on end-of-window total return and ``stressed_results`` restated only annualized_return and
+# max_drawdown, which made the stress silently INERT for the term being ranked -- "the run
+# would look stress-tested and would not be". stressed_results now restates total_return (and
+# calmar_ratio) from the same stressed path, compute_fitness's _CONVEX_ALIASES branch applies
+# _min_with_stressed, and the flag is forwarded in build_cmd above. The replacement for the
+# refusal is a TEST that the stress actually lowers the metric's return term:
+# testplatform/backend/tests/test_strategy_fitness_convex_frozen.py::
+# test_the_spread_stress_lowers_the_convex_return_term.
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -323,10 +316,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Cap each BET's share of the run's net profit. Pass 0 to disable. "
                          "Same non-scoring note as --profit-cap-pct above.")
     ap.add_argument("--stress-spread-bps", type=float, default=0.0,
-                    help="REFUSED if non-zero (design Section 6 item 4): option_convex ranks "
-                         "on raw total_return, which stressed_results does not yet restate "
-                         "under stress, so a non-zero value would be silently inert. Task 14 "
-                         "carry; see strategy_fitness.py's TASK 14 CARRY note.")
+                    help="Rank every genome on the WORSE of its option_convex score at the "
+                         "modelled spread and at this many bps wider. Live since 2026-09-02: "
+                         "stressed_results now restates total_return, the term option_convex "
+                         "ranks on, so the stress is no longer inert here. Default 0 (off) -- "
+                         "scores either side of a non-zero value are NOT comparable."),
     ap.add_argument("--screener-gate-store", default=None,
                     help="Attach this parquet metric store as a GATE-ONLY per-bar entry gate.")
     ap.add_argument("--max-stock-price", type=float, default=100.0,
@@ -341,7 +335,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    _refuse_nonzero_stress(args.stress_spread_bps)
 
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]

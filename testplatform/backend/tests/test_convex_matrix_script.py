@@ -7,9 +7,13 @@ threshold, and its job list / argv are pinned as goldens. The two Task-13-specif
   * the fitness is ALWAYS ``option_convex`` (never option_car), and the launcher's own mutual
     refusal (``_refuse_convex_fitness_mismatch``) is the second line of defence if this driver
     is ever hand-edited to pass something else;
-  * a non-zero ``--stress-spread-bps`` is REFUSED (design §6 item 4 / strategy_fitness.py's
-    TASK 14 CARRY note): the stress overlay is inert for option_convex's return term until
-    Task 14 restates ``total_return`` in ``stressed_results``.
+  * ``--stress-spread-bps`` is FORWARDED when non-zero. It was REFUSED (design §6 item 4)
+    while ``stressed_results`` restated only annualized_return/max_drawdown, which left the
+    stress inert for the end-of-window total return option_convex ranks on -- "the run would
+    look stress-tested and would not be". Plan Task 14b item 6 restated total_return and wired
+    ``_min_with_stressed`` into the _CONVEX_ALIASES branch, so the refusal is gone and the
+    replacement is a test that the stress actually MOVES the metric (that one lives beside the
+    metric, in test_strategy_fitness_convex_frozen.py).
 
 Run from the backend dir:
     ./venv/bin/python -m pytest tests/test_convex_matrix_script.py -q
@@ -215,31 +219,45 @@ def test_the_window_stops_short_of_the_reserved_holdout():
 
 
 # --------------------------------------------------------------------------- #
-# The --stress-spread-bps refusal (design §6 item 4)
+# --stress-spread-bps: refused until 2026-09-02, forwarded since
 # --------------------------------------------------------------------------- #
 def test_stress_spread_bps_defaults_to_zero():
+    """OFF by default, and that is a comparability rule, not shyness: scores either side of a
+    non-zero stress are not comparable."""
     d = _driver()
     args = _args(d)
     assert args.stress_spread_bps == 0.0
 
 
-def test_zero_stress_spread_bps_is_accepted():
+def test_the_refusal_is_gone():
+    """Plan Task 14b item 6: stressed_results restates total_return, so the stress is no longer
+    inert for option_convex and the interim refusal has no reason to exist."""
     d = _driver()
-    d._refuse_nonzero_stress(0.0)  # must not raise
+    assert not hasattr(d, "_refuse_nonzero_stress")
 
 
-def test_nonzero_stress_spread_bps_is_REFUSED():
+def test_a_zero_stress_forwards_no_flag_at_all():
+    """The launcher's own default is 0.0, so passing it would be noise -- and a flag present in
+    the argv of every job is how a 'stress was on' misreading starts."""
     d = _driver()
-    with pytest.raises(SystemExit, match="stress-spread-bps"):
-        d._refuse_nonzero_stress(15.0)
+    cmd = d.build_cmd(_args(d), "ba2-test", "job", "FMPRating", "O_CONVEX", ["AAPL"])
+    assert "--stress-spread-bps" not in cmd
 
 
-def test_main_refuses_before_touching_the_universe_file_or_preflight(tmp_path, monkeypatch):
-    """The refusal must fire in main() itself, before any file I/O or subprocess spend --
-    driven through the real CLI parse, not just the helper function directly."""
+def test_a_nonzero_stress_reaches_the_launcher_argv():
+    """The whole point of lifting the refusal: the flag must actually be forwarded, or the
+    driver would accept it and drop it -- a quieter version of the same lie."""
     d = _driver()
-    with pytest.raises(SystemExit, match="stress-spread-bps"):
-        d.main(["--stress-spread-bps", "5", "--dry-run"])
+    args = _args(d, stress_spread_bps=40.0)
+    cmd = d.build_cmd(args, "ba2-test", "job", "FMPRating", "O_CONVEX", ["AAPL"])
+    assert "--stress-spread-bps" in cmd
+    assert cmd[cmd.index("--stress-spread-bps") + 1] == "40.0"
+
+
+def test_main_accepts_a_nonzero_stress(capsys):
+    """Through the real CLI parse: a non-zero value no longer exits."""
+    d = _driver()
+    assert d.main(["--stress-spread-bps", "5", "--dry-run"]) == 0
 
 
 def test_the_dry_run_universe_count_is_LABELLED_unfiltered(capsys):
@@ -289,9 +307,10 @@ def test_completed_names_reraises_an_unexpected_exception_type(monkeypatch):
         d._completed_names()
 
 
-def test_the_refusal_message_names_the_inert_reason():
-    """The message must name WHY -- total_return not restated under stress -- not just say
-    'refused', so an operator knows this is a Task-14 gap, not a permanent rule."""
+def test_the_help_text_no_longer_advertises_a_refusal():
+    """An operator reading --help must not be told the flag is refused when it is honoured."""
     d = _driver()
-    with pytest.raises(SystemExit, match="total_return"):
-        d._refuse_nonzero_stress(25.0)
+    action = next(a for a in d.build_parser()._actions
+                  if a.dest == "stress_spread_bps")
+    assert "REFUSED" not in (action.help or "")
+    assert "total_return" in (action.help or "")
