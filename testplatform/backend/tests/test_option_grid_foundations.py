@@ -1350,7 +1350,11 @@ def test_the_long_dated_keys_get_the_lower_trade_floor(key):
 def test_the_exempt_set_is_exactly_the_long_dated_family():
     """The set itself, so a key cannot be added to it without this test saying so."""
     m = _launcher()
-    assert m._OPTION_LOW_TRADE_FLOOR_STRATEGIES == {"O_LEAP"}
+    # O_PMCC joined on 2026-09-02 (plan Task 6): its long leg is a LEAPS on the same January
+    # cycles, so it has the same ~2.5 non-overlapping holding periods in a 3-year window that
+    # the exemption exists for. Its rolling overlay does NOT change that -- a roll is not a
+    # new position, and the trade floor counts positions.
+    assert m._OPTION_LOW_TRADE_FLOOR_STRATEGIES == {"O_LEAP", "O_PMCC"}
     # and the members, which are NOT launchable, are deliberately absent: a set entry for
     # them would be read by nothing.
     assert not (m._OPTION_LOW_TRADE_FLOOR_STRATEGIES & {"O_LEAPC", "O_LEAPP"})
@@ -1463,7 +1467,12 @@ def test_the_earnings_expert_warmup_reaches_a_run():
 
 
 # ---- phase-gated keys refuse LOUDLY ----------------------------------------------------------
-@pytest.mark.parametrize("bad", ["O_PMCC", "O_CAL"])
+# O_PMCC LEFT this list on 2026-09-02 (plan Task 6) -- the two-expiry lifecycle it was gated
+# behind landed, and it is now audited as an ordinary launchable single everywhere else in this
+# file. O_CAL remains, gated by design section 2 behind PMCC proving that machinery in a real
+# run; a single-element parametrize is kept so re-opening the gate for a phase-3 key is one
+# entry rather than a rewrite.
+@pytest.mark.parametrize("bad", ["O_CAL"])
 def test_a_phase_gated_key_refuses_with_the_plan_reference(bad):
     """The naked-exclusion discipline, applied to a different reason: never silently run,
     never silently skip, and say where the decision is written down."""
@@ -1476,7 +1485,7 @@ def test_a_phase_gated_key_refuses_with_the_plan_reference(bad):
     assert "2026-08-31-leaps-grid-design.md" in msg
 
 
-@pytest.mark.parametrize("bad", ["O_PMCC", "O_CAL"])
+@pytest.mark.parametrize("bad", ["O_CAL"])
 def test_a_phase_gated_key_is_a_KNOWN_key_that_refuses(bad):
     """Registered in ``_STRATEGY_BUILDERS`` so argparse accepts it and the operator reads the
     REASON -- rather than "invalid choice", which says nothing about why."""
@@ -1486,7 +1495,7 @@ def test_a_phase_gated_key_is_a_KNOWN_key_that_refuses(bad):
         m._STRATEGY_BUILDERS[bad](bad)
 
 
-@pytest.mark.parametrize("bad", ["O_PMCC", "O_CAL"])
+@pytest.mark.parametrize("bad", ["O_CAL"])
 def test_the_phase_gated_keys_have_no_gene_table(bad):
     """A row would be searchable by any path that reads the table directly."""
     m = _launcher()
@@ -1650,3 +1659,198 @@ def test_every_grid2_structure_is_reachable_from_exactly_one_launchable_key(key)
     assert reach == [_LAUNCH_KEY.get(key, key)], (
         f"{key} is reachable from {reach}, expected exactly "
         f"[{_LAUNCH_KEY.get(key, key)!r}]")
+
+
+# ==============================================================================================
+# O_PMCC — the two-expiry key (plan Task 6, design 2026-08-31 §2-§4)
+# ==============================================================================================
+def test_o_pmcc_is_launchable_and_no_longer_phase_gated():
+    """The gate came down because all three refusals it named now answer for a DECLARED
+    two-expiry structure — not because the gate was inconvenient."""
+    m = _launcher()
+    assert "O_PMCC" not in m._PHASE_GATED_OPTION_STRATEGIES
+    assert "O_PMCC" in m._STRATEGY_BUILDERS
+    assert "O_PMCC" in m._OPTION_STRATS
+    assert "O_PMCC" in m._GRID2_OPTION_STRATEGIES
+    assert m._STRATEGY_BUILDERS["O_PMCC"] is m._build_strategy_option
+
+
+def test_o_cal_is_STILL_gated_and_says_why():
+    """Phase 2, and the one-line change is recorded rather than implied."""
+    m = _launcher()
+    assert set(m._PHASE_GATED_OPTION_STRATEGIES) == {"O_CAL"}
+    with pytest.raises(SystemExit):
+        m._refuse_phase_gated_strategy("optimize", ["O_CAL"])
+
+
+def test_o_pmcc_enters_by_opening_a_pmcc():
+    m = _launcher()
+    strat = m._build_strategy("O_PMCC", "g-pmcc", "FMPRating")
+    action = strat.entry_rules[0]["actions"][0]
+    assert action["action_type"] == "open_pmcc"
+    assert action["option_strike_method"] == "delta"
+    # The per-leg pair ``_spread_params`` destructures as (long, short): the LEAPS target
+    # first, the overlay second.
+    assert action["option_strike_param"] == [0.80, 0.20]
+    assert (action["option_short_dte_min"], action["option_short_dte_max"]) == (30, 45)
+
+
+def test_the_two_delta_bands_are_the_designs_and_are_SEARCHED_independently():
+    """Design §2: "LEAPS leg delta 0.75-0.85 ... short-call overlay delta 0.15-0.30". One
+    shared target could only pick the two strikes nearest ONE delta, which is a different
+    structure — and on this one it would be an inadmissible one (the short must sit above the
+    long)."""
+    m = _launcher()
+    space = _space(m, "O_PMCC")
+    short = next(v for k, v in space.items() if k.endswith(":option_strike_delta"))
+    long = next(v for k, v in space.items() if k.endswith(":option_strike_delta_long"))
+    assert (short["min"], short["max"]) == (0.15, 0.30)
+    assert (long["min"], long["max"]) == (0.75, 0.85)
+
+
+def test_the_overlay_window_is_FIXED_and_carries_no_gene():
+    """Design §2 states the overlay's DTE as one narrow band (30-45), not a range, and at
+    pop 40 / gen 6 the gene budget belongs to the two deltas and the roll trigger. It is still
+    a real action PARAM, so a live rule and a phase-2 calendar can both set it."""
+    m = _launcher()
+    space = _space(m, "O_PMCC")
+    assert not [g for g in space if "short_dte" in g], (
+        "the overlay window must not be searched; see the row's own comment")
+
+
+def test_the_leaps_entry_dte_gene_can_never_decode_below_365():
+    """Design §2's "DTE >= 365". ``_apply_option_dte`` decodes the gene as a window CENTRE and
+    subtracts a half-width fixed by the AUTHORED window, so the floor is re-derived here from
+    the table rather than restated."""
+    m = _launcher()
+    cfg = m._OPTION_STRATS["O_PMCC"]
+    hw = max(int((cfg["option_dte_max"] - cfg["option_dte_min"]) // 2), 7)
+    assert cfg["option_dte_min_range"] - hw >= 365
+
+
+@pytest.mark.parametrize("rule_id,field,op", [
+    ("pmcc_roll_dte", "short_leg_days_to_expiry", "<="),
+    ("pmcc_roll_buyback", "credit_decayed_pct", ">="),
+    ("pmcc_delta_floor", "long_leg_delta", "<"),
+])
+def test_the_overlay_rules_are_emitted_with_their_designed_fields(rule_id, field, op):
+    m = _launcher()
+    rule = next(r for r in m._option_exit_rules("O_PMCC") if r["id"] == rule_id)
+    leaf = rule["conditions"]["conditions"][0]
+    assert (leaf["field"], leaf["op"]) == (field, op)
+    assert leaf["optimize"] is True
+
+
+def test_the_roll_rules_are_TWO_rules_because_a_nested_OR_is_not_evaluated():
+    """``rule_builders.tree_leaves`` flattens a rule's whole tree into one ANDed trigger dict,
+    so "roll at the expiry window OR at the buyback trigger" cannot be one rule with an OR
+    node — it would demand BOTH. Two rules, first match wins, exactly as ``opt_dte`` is its own
+    rule rather than another leaf on ``opt_time``."""
+    m = _launcher()
+    rolls = [r for r in m._option_exit_rules("O_PMCC")
+             if r["action_type"] == "roll_pmcc_short"]
+    assert len(rolls) == 2
+    for rule in rolls:
+        leaves = rule["conditions"]["conditions"]
+        assert len(leaves) == 1, f"{rule['id']} must carry ONE leaf; two would be ANDed"
+        assert rule["conditions"]["type"] == "AND"
+
+
+def test_the_roll_rules_come_FIRST_and_let_the_closes_run_behind_them():
+    """Front placement is the O_WHEEL idiom: ``opt_tp``/``opt_time`` compare fields a PMCC also
+    carries, so either could match on the very bar the overlay is due and break the walk with a
+    close before the roll was reached. ``continue_processing`` is the other half — a bar that
+    rolls must still be able to stop out."""
+    m = _launcher()
+    rules = m._option_exit_rules("O_PMCC")
+    ids = [r["id"] for r in rules]
+    assert ids[:3] == ["pmcc_roll_dte", "pmcc_roll_buyback", "pmcc_delta_floor"]
+    assert ids.index("pmcc_roll_dte") < ids.index("opt_tp")
+    for rid in ("pmcc_roll_dte", "pmcc_roll_buyback"):
+        assert next(r for r in rules if r["id"] == rid)["continue_processing"] is True
+
+
+def test_the_expiry_roll_is_the_one_exit_rule_the_GA_may_not_switch_OFF():
+    """The call ``opt_event`` already makes for O_ERN: with the roll off a PMCC is not a PMCC,
+    it is a diagonal waiting to have its short assigned. The two REFINEMENTS keep their genes."""
+    m = _launcher()
+    rules = {r["id"]: r for r in m._option_exit_rules("O_PMCC")}
+    assert "toggle_optimize" not in rules["pmcc_roll_dte"]
+    assert rules["pmcc_roll_buyback"]["toggle_optimize"] is True
+    assert rules["pmcc_delta_floor"]["toggle_optimize"] is True
+
+
+def test_the_roll_ACTION_carries_no_selection_genes_of_its_own():
+    """ONE overlay thesis per genome. The rolled overlay is selected from the box the ENTRY
+    stamped on its order row; a second ``option_strike_delta`` here would let a search enter at
+    0.15 delta and roll to 0.30, and would double the overlay's gene budget at pop 40."""
+    m = _launcher()
+    for rule in m._option_exit_rules("O_PMCC"):
+        if rule["action_type"] != "roll_pmcc_short":
+            continue
+        assert not [k for k in rule if k.startswith("option_")], rule
+
+
+def test_the_three_overlay_genes_reach_the_emitted_ruleset():
+    """Threshold genes are keyed on the LEAF id (``cond:<leaf>:value``) and on/off genes on
+    the RULE id (``exit:<rule>:enabled``) — the shape every other option exit already takes."""
+    m = _launcher()
+    space = _space(m, "O_PMCC")
+    assert (space["cond:roll_dte:value"]["min"], space["cond:roll_dte:value"]["max"]) == (1, 7)
+    assert (space["cond:roll_buyback:value"]["min"],
+            space["cond:roll_buyback:value"]["max"]) == (50, 90)
+    assert (space["cond:delta_floor:value"]["min"],
+            space["cond:delta_floor:value"]["max"]) == (0.40, 0.60)
+    # ...and the two REFINEMENTS carry their on/off gene while the expiry roll does not.
+    assert "exit:pmcc_roll_buyback:enabled" in space
+    assert "exit:pmcc_delta_floor:enabled" in space
+    assert "exit:pmcc_roll_dte:enabled" not in space
+
+
+def test_the_pmcc_dte_exit_is_the_LEAPS_roll_floor():
+    """Design §2: the PMCC "shares the LEAPS roll-floor gene". ``DaysToExpiryCondition`` reads
+    the LONG leg for a declared multi-expiry structure, so this band measures the LEAPS and can
+    never fire on the 30-45-DTE overlay."""
+    m = _launcher()
+    leaf = next(r for r in m._option_exit_rules("O_PMCC")
+                if r["id"] == "opt_dte")["conditions"]["conditions"][0]
+    assert (leaf["value_min"], leaf["value_max"]) == (90, 240)
+
+
+def test_opt_sl_ml_is_authored_off_for_the_pmcc_too():
+    m = _launcher()
+    rule = next(r for r in m._option_exit_rules("O_PMCC") if r["id"] == "opt_sl_ml")
+    assert rule["enabled"] is False and rule["toggle_optimize"] is True
+    assert "exit:opt_sl_ml:enabled" in _space(m, "O_PMCC")
+
+
+def test_the_pmcc_joins_the_debit_half_and_the_fixed_delta_method_set():
+    m = _launcher()
+    assert "O_PMCC" in m._DEBIT_OPTION_KINDS, (
+        "a LEAPS bought at a net debit; the iv_rank gate must point at CHEAP vol")
+    assert "O_PMCC" in m._FIXED_DELTA_METHOD_STRATEGIES
+    assert not [g for g in _space(m, "O_PMCC") if g.endswith(":option_strike_method")]
+
+
+def test_the_pmcc_gets_the_lower_trade_floor():
+    m = _launcher()
+    block = {}
+    m._apply_option_trade_floor("O_PMCC", block)
+    assert block["car_hard_min_trades_per_year"] == 3.0
+    assert block["car_min_trades_per_year"] == 8.0
+
+
+def test_the_matrix_driver_lists_the_pmcc_with_the_LEAPS_chain_depth():
+    """The driver's own tables, so the key is actually launched and probed at LEAPS depth
+    rather than at the 7-DTE floor its overlay would satisfy on every name."""
+    import importlib.util as _ilu
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))
+    path = os.path.join(root, "tools", "run_options2_matrix.py")
+    spec = _ilu.spec_from_file_location("run_options2_matrix", path)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert "O_PMCC" in mod._DEFAULT_STRATEGIES
+    assert mod._MIN_DTE["O_PMCC"] == mod._MIN_DTE["O_LEAP"] == 365

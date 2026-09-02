@@ -13,13 +13,17 @@ ONE structure (design Section 7):
               exit ruleset. Operator decision 2026-09-02, superseding the two separate keys:
               the two arms are the same structure pointed either way, and the group shape gives
               the GA a per-arm on/off gene so it can drop a direction in a one-sided regime.
+    O_PMCC    poor man's covered call -- a LEAPS call carrying a rolling short-call
+              overlay sold above its strike. TWO EXPIRIES, one structure; the overlay is
+              bought back and re-sold as it nears its own expiry.
     O_ERN     earnings long vol -- straddle | strangle before the print (event-driven)
     O_CBS     call backspread   -- 1x2, convexity financed by the short
     O_PBS     put backspread    -- the crash-hedge arm
 
-`O_PMCC` and `O_CAL` are PHASE-GATED (two-expiry structures; they need the per-leg-expiry
-work, plan Tasks 6-PRE/6) and are NOT in the default list. Naming one refuses loudly at the
-launcher, so this driver does not need to police it -- but it also does not offer it.
+`O_CAL` (the ATM calendar) is still PHASE-GATED -- design Section 2 holds it behind PMCC
+proving the two-expiry lifecycle in a real run -- so it is not in the default list. Naming
+it refuses loudly at the launcher, so this driver does not need to police it. `O_PMCC`
+JOINED phase 1 on 2026-09-02 (plan Task 6) once that lifecycle landed.
 
 THIS IS A SEPARATE DRIVER FROM ``run_options_matrix.py``, NOT A FLAG ON IT. That one searches
 the grid-1 families (OS1-OS4 + the equity-entry overlays) and its defaults are that grid's;
@@ -33,11 +37,12 @@ tree actually reaches it over the run window. Without it a LEAPS job over the fu
 universe spends most of its compute on names that never listed a 1-year expiry, and reports
 the resulting nothing as a result. Per-strategy thresholds:
 
-    O_LEAP              DTE >= 365     (January-cycle LEAPS; both arms)
+    O_LEAP  / O_PMCC    DTE >= 365     (January-cycle LEAPS: both O_LEAP arms, and the
+                                       PMCC's long leg)
     O_CBS   / O_PBS     DTE >= 180
     O_ERN               DTE >= 7       (nearly the whole universe)
 
-The probe runs ONCE PER DISTINCT THRESHOLD (three, not four) and each job is launched with the
+The probe runs ONCE PER DISTINCT THRESHOLD (three, not five) and each job is launched with the
 KEPT list for its own threshold. A threshold that keeps NOTHING fails the whole run rather
 than launching a job with an empty universe.
 
@@ -51,7 +56,7 @@ is forced below -- the sqlite/Alpaca store's history floor is 2024-01-18 and can
 
 Usage (test venv; FMP_API_KEY/DB_FILE in env):
     ba2-venvs/test/Scripts/python.exe tools/run_options2_matrix.py \
-        [--strategies O_LEAP,O_ERN,O_CBS,O_PBS] \
+        [--strategies O_LEAP,O_PMCC,O_ERN,O_CBS,O_PBS] \
         [--experts FMPRating] [--earnings-expert FMPEarningsEvent] \
         [--start 2023-01-01] [--end 2025-12-31] \
         [--population 40] [--generations 6] [--dry-run]
@@ -76,7 +81,7 @@ _PROBE = os.path.join(_TOOLS_DIR, "probe_option_chain_depth.py")
 
 # PHASE 1 (design Section 7). Order matters only for how a partial run reads: the key with the
 # most data support first, the event arm next, the two thinnest last.
-_DEFAULT_STRATEGIES = ["O_LEAP", "O_ERN", "O_CBS", "O_PBS"]
+_DEFAULT_STRATEGIES = ["O_LEAP", "O_PMCC", "O_ERN", "O_CBS", "O_PBS"]
 
 # The CHAIN-DEPTH each key needs, in DTE (design Section 5). Keyed by strategy so a new key
 # cannot be added to the list above without stating what it needs -- an unlisted key is a hard
@@ -85,6 +90,10 @@ _MIN_DTE = {
     # Keyed by the LAUNCHABLE key: O_LEAPC/O_LEAPP are the two arms of O_LEAP and are not
     # launchable on their own, so a threshold for them would never be read.
     "O_LEAP": 365,
+    # The PMCC's LONG leg is a LEAPS, so it needs the same January-cycle depth O_LEAP
+    # does; its 30-45-DTE overlay is listed on every name and is never the binding
+    # constraint.
+    "O_PMCC": 365,
     "O_ERN": 7,
     "O_CBS": 180,
     "O_PBS": 180,
@@ -243,8 +252,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--strategies", default=",".join(_DEFAULT_STRATEGIES),
-                    help="Comma list of grid-2 phase-1 keys (O_LEAP,O_ERN,O_CBS,"
-                         "O_PBS). O_PMCC/O_CAL are phase-gated and refuse at the launcher.")
+                    help="Comma list of grid-2 phase-1 keys (O_LEAP,O_PMCC,O_ERN,"
+                         "O_CBS,O_PBS). O_CAL is still phase-gated and refuses at the "
+                         "launcher.")
     ap.add_argument("--experts", default=",".join(_DEFAULT_EXPERTS),
                     help="Comma list of experts for the SCREENER-driven keys (default "
                          "FMPRating). O_ERN ignores this and uses --earnings-expert.")

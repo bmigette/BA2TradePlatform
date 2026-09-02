@@ -57,6 +57,25 @@ LEAPS leg delta 0.75–0.85, DTE ≥365; short-call overlay delta 0.15–0.30, D
 30–45, rolled at expiry or buyback trigger (% of credit decayed — searched);
 shares the LEAPS roll-floor gene.
 
+> **LANDED AS (2026-09-02, plan Task 6): a launchable phase-1 key.** The two-expiry
+> lifecycle is a RULESET, not an engine hook — `open_pmcc` opens both legs as one
+> structure (two expiries, per-leg child rows), and the OPEN_POSITIONS ruleset carries
+> three rules ahead of the ordinary closes: `pmcc_roll_dte`
+> (`short_leg_days_to_expiry <= N`, 1–7, NOT toggleable — with the roll off a PMCC is a
+> diagonal waiting to be assigned) and `pmcc_roll_buyback` (`credit_decayed_pct >= N`,
+> 50–90, toggleable) both firing `roll_pmcc_short`, plus `pmcc_delta_floor`
+> (`long_leg_delta < N`, 0.40–0.60, toggleable) closing BOTH legs. Two rules rather than
+> one OR because a rule's leaves are ANDed. **The overlay's DTE window (30–45) is a fixed
+> action param, not a gene** — the design states it as one band, and at pop 40 the budget
+> belongs to the two deltas and the roll trigger. **The rolled overlay is re-selected from
+> the box the ENTRY stamped on its order row**, so the roll rule carries no selection genes
+> of its own: one overlay thesis per genome. Max loss = the net debit measured by the
+> shared payoff evaluator (§3's intrinsic floor, no new arithmetic), restamped downward by
+> each roll's credit; charged COVERED because `structure_metrics` pairs the short call with
+> the long of the same right. `O_CAL` remains phase-2 and is one line away: add
+> `"calendar_spread"` to `option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES` and a row to
+> `_OPTION_STRATS`.
+
 ### Event family
 **`O_ERN` — earnings long vol.** Buy a straddle (or strangle — structure
 toggle gene) before earnings, exit after the move/crush. A DIFFERENT alpha
@@ -159,8 +178,8 @@ no-contract trials.
 - Singles only, one job per (strategy × expert) — attribution stays clean, the
   S1–S7 shape. Phase 1: {O_LEAP, O_PMCC, O_ERN, O_CBS, O_PBS} × stage-1's
   experts → 12–18 jobs (O_LEAP LANDED AS the merged O_LEAPC/O_LEAPP group key,
-  §2 above; O_PMCC stays phase-gated behind Task 6-PRE/6, not yet launchable
-  on this branch). Phase 2 adds O_CAL.
+  §2 above; O_PMCC became launchable 2026-09-02, plan Task 6). Phase 2 adds
+  O_CAL.
 - **Fitness `option_car`** for every key in this grid. Window 2023-01 →
   2025-12, 2026 held out. Long-dated keys get the explicit commented lower
   trade floor; O_ERN does not need it.

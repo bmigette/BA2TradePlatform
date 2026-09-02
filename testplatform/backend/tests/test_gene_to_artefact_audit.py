@@ -622,18 +622,22 @@ def test_the_case_list_is_exactly_what_the_launcher_tables_produce():
         launchable option keys = _STRATEGY_BUILDERS & _OPTION_STRATEGY_KEYS - phase-gated
                                = 15 grid-1 singles (O_LC O_LP O_VERT O_BF O_BULLCS O_BEARCS
                                  O_BULLPS O_CSP O_IC O_JL O_RS O_SSTD O_SSTG O_STRD O_STRG)
-                               +  3 grid-2 singles (O_ERN O_CBS O_PBS)
+                               +  4 grid-2 singles (O_ERN O_CBS O_PBS O_PMCC)
                                +  6 group/composite keys (OS1 OS2 OS3 OS4 O_CONVEX O_LEAP)
                                +  3 equity-entry/overlay keys (O_CC O_PP O_STK)
                                +  1 wheel (O_WHEEL)
-                               = 28
-        cases = 28 x FMPRating + O_ERN|FMPEarningsEvent + O_LC|screener = 30
+                               = 29
+        cases = 29 x FMPRating + O_ERN|FMPEarningsEvent + O_LC|screener = 31
+
+    28 -> 29 on 2026-09-02 (plan Task 6): O_PMCC left _PHASE_GATED_OPTION_STRATEGIES once the
+    two-expiry lifecycle it was gated behind landed, so it is now a launchable single and every
+    gene in its table is audited like any other.
     """
     m = _M
     expected_keys = sorted((set(m._STRATEGY_BUILDERS) & set(m._OPTION_STRATEGY_KEYS))
                            - set(m._PHASE_GATED_OPTION_STRATEGIES))
     assert OPTION_KEYS == expected_keys
-    assert len(OPTION_KEYS) == 28, (
+    assert len(OPTION_KEYS) == 29, (
         f"the launchable option-key set moved to {len(OPTION_KEYS)}: {OPTION_KEYS}. If that was "
         f"deliberate, update the arithmetic in this docstring in the same commit.")
     assert len(AUDIT_CASES) == len(OPTION_KEYS) + 2

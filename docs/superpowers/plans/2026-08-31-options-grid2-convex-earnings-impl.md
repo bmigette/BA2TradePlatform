@@ -727,9 +727,9 @@ consulted at every site.
 | `option_strike_delta_long` (LEAPS) | 0.75–0.85 step 0.05 (3) | action `strike_param[0]` |
 | `option_dte` (LEAPS window centre) | 410–500 step 15 (7) → windows [365,455]..[455,545] | action `dte_min`/`dte_max` |
 | `option_sizing` | the shared option band | action `sizing` |
-| `cond:pmcc_roll_dte:value` | 1–7 step 1 (7) | leaf `short_leg_days_to_expiry` |
-| `cond:pmcc_buyback:value` (+ `:enabled`) | 50–90 step 10 (5) | leaf `credit_decayed_pct` |
-| `cond:pmcc_delta_floor:value` (+ `:enabled`) | 0.40–0.60 step 0.05 (5) | leaf `long_leg_delta` |
+| `cond:roll_dte:value` | 1–7 step 1 (7) | leaf `short_leg_days_to_expiry` |
+| `cond:roll_buyback:value` (+ `exit:pmcc_roll_buyback:enabled`) | 50–90 step 10 (5) | leaf `credit_decayed_pct` |
+| `cond:delta_floor:value` (+ `exit:pmcc_delta_floor:enabled`) | 0.40–0.60 step 0.05 (5) | leaf `long_leg_delta` |
 | `cond:dte:value` (`opt_dte`, the LEAPS roll floor) | 90–240 step 30 (6) | leaf `days_to_expiry` |
 | plus the shared entry gates, `opt_tp`, `opt_time`, `opt_sl_ml` | as every grid-2 key | |
 
@@ -1378,12 +1378,16 @@ condition, not a code defect, exactly as recorded in item 1's commit.
   this branch's merge commit (`5246bc49`, which landed `dev`'s then-current
   `"2026.09.0009"`) — re-check before the merger's own version bump so the
   bumped number is not stale relative to `dev` at merge time.
-- **Task 6-PRE / Task 6 (per-leg expiry migration, PMCC/O_PMCC two-expiry
-  lifecycle) are NOT on this branch.** The plan resequenced them to run
-  AFTER Task 14 (controller decision, 2026-09-01) — `O_PMCC` and `O_CAL`
-  stay phase-gated until they land. This is the largest remaining piece of
-  the original plan and is explicitly future work, not a gap in this
-  branch's own scope.
+- **Task 6-PRE and Task 6 HAVE NOW LANDED** (2026-09-02, on the
+  `options-grid2` worktree branch). Per-leg expiries persist through the leg
+  rows with no migration (6-PRE); the PMCC builder, the roll loop, the
+  leg-pair invariant and the `O_PMCC` launcher key are Task 6. **`O_PMCC` is
+  un-gated and launchable; `O_CAL` is still phase-gated**, by design §2's own
+  decision to hold the calendar behind PMCC proving this machinery in a real
+  run — and it is one line away (`"calendar_spread"` into
+  `option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES`, plus an `_OPTION_STRATS`
+  row). The launchable option-key count moved 28 -> 29 accordingly
+  (`test_gene_to_artefact_audit.py`).
 - **Parked operator items** (carried forward, not resolved by this task):
   - `OS2` (the neutral-credit screener group) resolves to `[O_IC]` alone —
     `O_CSP` (cash-secured put, also full-notional/neutral-ish) is excluded

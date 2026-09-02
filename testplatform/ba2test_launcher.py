@@ -1173,7 +1173,7 @@ def _apply_options_store(args, backtest_block: dict) -> None:
 # are the group's bullish and bearish arms). Listing the members here instead would leave the
 # real job -- ``--strategy O_LEAP`` -- on the default 12/yr floor, i.e. exactly the "LEAPS do
 # not work" artefact the arithmetic above exists to prevent.
-_OPTION_LOW_TRADE_FLOOR_STRATEGIES = {"O_LEAP"}
+_OPTION_LOW_TRADE_FLOOR_STRATEGIES = {"O_LEAP", "O_PMCC"}
 _OPTION_LOW_TRADE_FLOOR = {"car_hard_min_trades_per_year": 3.0,
                            "car_min_trades_per_year": 8.0}
 
@@ -2495,6 +2495,38 @@ _OPTION_STRATS = {
         "option_dte_optimize": True, "option_dte_min_range": 410,
         "option_dte_max_range": 500, "option_dte_step": 15,
         "option_sizing": 5.0},
+    "O_PMCC": {  # poor man's covered call -- LEAPS + a rolling short-call overlay (debit)
+        # TWO LEGS ON TWO EXPIRIES, and the ONLY key in any grid that is. The LEAPS is the
+        # long half of the per-leg delta pair ``_apply_option_strike`` writes as
+        # ``[long, short]``, and the overlay is the short half -- the same shape O_CBS/O_PBS
+        # use, on a structure where the two legs also differ in EXPIRY.
+        "action_type": "open_pmcc", "option_strike_method": "delta",
+        "option_strike_param": [0.80, 0.20],
+        # SHORT overlay delta 0.15-0.30 step 0.05 (4 levels) -- design §2 verbatim. Far
+        # enough OTM that the LEAPS keeps most of an up-move, near enough to be worth
+        # selling.
+        "option_strike_delta": 0.20,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.15,
+        "option_strike_delta_max": 0.30, "option_strike_delta_step": 0.05,
+        # LEAPS delta 0.75-0.85 step 0.05 (3 levels) -- design §2. Deep enough that the long
+        # tracks the underlying nearly one-for-one, which is the stock-replacement claim.
+        "option_strike_delta_long": 0.80,
+        "option_strike_delta_long_optimize": True, "option_strike_delta_long_min": 0.75,
+        "option_strike_delta_long_max": 0.85, "option_strike_delta_long_step": 0.05,
+        # LEAPS ENTRY DTE >= 365, decoded exactly as O_LEAPC's: authored 380..470 fixes the
+        # half-width at 45, and centres 410..500 step 15 (7 levels) decode to [365,455] ..
+        # [455,545]. 90 days wide because §1 measured LEAPS living on the JANUARY cycles --
+        # a narrow window is usually empty.
+        "option_dte_min": 380, "option_dte_max": 470,
+        "option_dte_optimize": True, "option_dte_min_range": 410,
+        "option_dte_max_range": 500, "option_dte_step": 15,
+        # THE OVERLAY'S OWN WINDOW: design §2's "DTE 30-45", FIXED and deliberately not a
+        # gene. The design states it as one narrow band rather than a range, and at pop 40 /
+        # gen 6 the gene budget belongs to the two deltas and the roll trigger. It is still a
+        # real action param (``short_dte_min``/``short_dte_max``), so a live rule and a phase-2
+        # calendar can both set it -- it is unsearched here, not hard-coded there.
+        "option_short_dte_min": 30, "option_short_dte_max": 45,
+        "option_sizing": 5.0},
     "O_ERN": {  # earnings long vol -- straddle | strangle before the print (debit)
         # STRUCTURE IS A GENE (``option_structure``), not two entry rules: the choice is
         # between two BUILDERS, and two rules would duplicate the whole gate set for an
@@ -2640,7 +2672,7 @@ _OPTION_STRATS = {
 #: round one, so every job's result is attributable to one structure (design §7). O_CONVEX is
 #: DELIBERATELY ABSENT: it is the separate convex-harvest grid (design §8) with its own
 #: fitness/universe/matrix script -- see _CONVEX_OPTION_STRATEGIES.
-_GRID2_OPTION_STRATEGIES = {"O_LEAP", "O_ERN", "O_CBS", "O_PBS"}
+_GRID2_OPTION_STRATEGIES = {"O_LEAP", "O_PMCC", "O_ERN", "O_CBS", "O_PBS"}
 
 #: O_LEAP's two members (operator decision 2026-09-02, superseding the two separate keys
 #: O_LEAPC/O_LEAPP). Same shape as _CONVEX_MEMBER_KEYS: not launchable on their own (no
@@ -2672,7 +2704,7 @@ _CONVEX_MEMBER_KEYS = {"O_CONVEXC", "O_CONVEXP"}
 #: the row states design §2's band in the unit the design states it in. Its straddle arm still
 #: ignores the parameter -- ATM is not a parameterised strike -- which is a conditional domain,
 #: the same shape the percent band had.
-_FIXED_DELTA_METHOD_STRATEGIES = ({"O_CBS", "O_PBS", "O_ERN"}
+_FIXED_DELTA_METHOD_STRATEGIES = ({"O_CBS", "O_PBS", "O_ERN", "O_PMCC"}
                                   | _LEAP_MEMBER_KEYS | _CONVEX_MEMBER_KEYS)
 
 #: Grid-2 keys the design gates behind LATER machinery, with the reason. ``O_PMCC`` and
@@ -2682,9 +2714,15 @@ _FIXED_DELTA_METHOD_STRATEGIES = ({"O_CBS", "O_PBS", "O_ERN"}
 #: before the per-leg-expiry work lands would not produce a thin result -- it would produce no
 #: result at all, or a mis-stamped one. Refused LOUDLY at command entry, the same discipline
 #: ``_UNDEFINED_RISK_MEMBERS`` gets: never silently skipped, never silently run.
+#: ``O_PMCC`` LEFT THIS TABLE ON 2026-09-02 (plan Task 6). All three refusals it was gated
+#: behind now answer for a declared two-expiry structure: the submit guard admits exactly two
+#: expiries for a strategy in ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES`` (and, for the
+#: close and the roll, resolves that declaration from the TRANSACTION), and the two DTE readers
+#: name the leg they read -- ``option_lifecycle`` the SHORT (roll window), ``DaysToExpiryCondition``
+#: the LONG (roll floor). ``O_CAL`` stays: design §2 gates it behind PMCC proving this same
+#: machinery in a real run, and it is one line away -- add "calendar_spread" to
+#: MULTI_EXPIRY_OPTION_STRATEGIES and a row to _OPTION_STRATS.
 _PHASE_GATED_OPTION_STRATEGIES = {
-    "O_PMCC": ("two-expiry diagonal (LEAPS + short-call overlay); needs the per-leg expiry "
-               "work, plan Task 6-PRE, then Task 6"),
     "O_CAL": ("ATM calendar; design 2026-08-31 §2 gates it behind PMCC proving the same "
               "two-expiry lifecycle in this matrix (plan Task 14)"),
 }
@@ -3792,7 +3830,7 @@ def _screener_gate_opt_block(args, strategy_key: str) -> "dict | None":
 #                          is keyed off ``set(_OPTION_STRATS)``) must be listed -- the same
 #                          dual listing OS1/OS4 already use alongside their own members.
 _DEBIT_OPTION_KINDS = {"O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS", "O_STRD", "O_STRG",
-                       "O_LEAP", "O_LEAPC", "O_LEAPP", "O_ERN", "O_CBS", "O_PBS",
+                       "O_LEAP", "O_LEAPC", "O_LEAPP", "O_PMCC", "O_ERN", "O_CBS", "O_PBS",
                        "O_CONVEX", "O_CONVEXC", "O_CONVEXP",
                        "OS1", "OS4"}
 
@@ -3821,6 +3859,10 @@ _OPTION_DTE_EXIT_BANDS = {
     # after the 2026-09-02 merge that is "O_LEAP" (the two arms share one exit ruleset, which
     # is the whole point of the group shape -- see _OPTION_GROUPS_ALL).
     "O_LEAP":  (150, 90, 240, 30),   # 6: design §2 "roll/exit DTE floor 90-240"
+    # The PMCC "shares the LEAPS roll-floor gene" (design §2), and here the exit is the LONG
+    # leg's remaining life by construction: ``DaysToExpiryCondition`` reads the long leg for a
+    # declared multi-expiry structure, so this band never fires on the 30-45-DTE overlay.
+    "O_PMCC":  (150, 90, 240, 30),   # 6
     "O_CBS":   (30, 20, 45, 5),      # 6: design §2 "exit DTE floor 20-45"
     "O_PBS":   (30, 20, 45, 5),      # 6
     # O_ERN keeps the DEFAULT band: its expiry is 7-30 DTE, which is exactly the range the
@@ -3882,7 +3924,12 @@ _OPTION_TIME_EXIT_AUTHORED_OFF = {"O_CONVEX"}
 # a lottery ticket at a % of its premium amputates the convexity the strategy exists to buy.
 # The GA may still discover a stop helps; it must not be imposed." Same mechanism, same
 # reasoning as O_ERN/O_CBS/O_PBS above.
-_OPTION_SL_ML_AUTHORED_OFF = {"O_ERN", "O_CBS", "O_PBS", "O_CONVEX"}
+# O_PMCC (plan Task 6): the same reasoning one structure further on. Its max loss is the
+# LEAPS debit less every credit collected, RESTAMPED downward at each roll, so a fixed % of it
+# is a stop whose dollar level moves under the position -- and stopping a stock replacement at
+# 50% of a floor that the overlay is steadily paying down amputates exactly the position the
+# strategy exists to hold. Searchable, authored OFF.
+_OPTION_SL_ML_AUTHORED_OFF = {"O_ERN", "O_CBS", "O_PBS", "O_CONVEX", "O_PMCC"}
 
 # The exit that terminates an EVENT thesis: N days after the stamped earnings date. Design §2
 # searches 0-2. NOT toggleable, unlike every other exit here, and that is the point -- O_ERN's
@@ -3893,6 +3940,70 @@ _OPTION_SL_ML_AUTHORED_OFF = {"O_ERN", "O_CBS", "O_PBS", "O_CONVEX"}
 _OPTION_EVENT_EXIT_BANDS = {
     "O_ERN": (1, 0, 2, 1),   # 3 levels
 }
+
+# --- GRID 2: THE TWO-EXPIRY OVERLAY RULES (design 2026-08-31 §4, plan Task 6) ---------------
+#
+# The keys whose OPEN_POSITIONS ruleset carries a roll loop. A set rather than a bare `== `
+# check because ``O_CAL`` joins it in phase 2 with the identical machinery -- the calendar's
+# short leg is rolled the same way, for the same reason, by the same action.
+_OVERLAY_ROLL_KINDS = {"O_PMCC"}
+
+# THE ROLL WINDOW, on the SHORT leg. Days before the overlay's own expiry at which it is bought
+# back and re-sold. Design §2 says "rolled at expiry"; 1-7 rather than a band reaching 0 is a
+# FILL-MODEL fact, not a preference: under next_bar_open an order placed on the expiry day
+# fills the day AFTER the contract has already settled, so a 0 arm would not roll, it would be
+# assigned. Default 3, step 1 (7 levels).
+_OVERLAY_ROLL_DTE_BAND = {"value": 3, "value_min": 1, "value_max": 7, "value_step": 1}
+
+# THE BUYBACK TRIGGER: roll early once N % of the overlay's own credit has decayed (design §4,
+# "% of credit decayed -- searched"). 50-90 step 10 (5 levels): below 50 the roll pays the
+# spread twice for premium it has not yet earned, and at 100 it never fires (an option rarely
+# reaches exactly zero bid before expiry, and the DTE rule has it by then anyway).
+_OVERLAY_BUYBACK_BAND = {"value": 70, "value_min": 50, "value_max": 90, "value_step": 10}
+
+# THE DELTA FLOOR (design §4: "or (PMCC) LEAPS delta < ~0.50 (searched on/off)"). A stock
+# replacement whose long has stopped tracking the underlying is no longer the position that was
+# opened. 0.40-0.60 step 0.05 (5 levels) brackets the design's ~0.50 on both sides.
+_OVERLAY_DELTA_FLOOR_BAND = {"value": 0.50, "value_min": 0.40, "value_max": 0.60,
+                             "value_step": 0.05}
+
+
+def _overlay_rules(kind: str):
+    """The roll loop + the delta floor, for the keys that manage a two-expiry structure.
+
+    THREE RULES, NOT ONE, and the split is forced rather than stylistic. Leaves inside one rule
+    are ANDed (``rule_builders.tree_leaves`` flattens a tree into one trigger dict and
+    ``TradeActionEvaluator`` requires all of them), so "roll at the expiry window OR at the
+    buyback trigger" cannot be a nested OR -- it is two rules, exactly as ``opt_dte`` is its own
+    rule rather than another leaf on ``opt_time``.
+
+    THE TWO ROLL RULES CARRY ``continue_processing``: a bar that rolls the overlay must still
+    reach the closing rules behind it, or a position could not be rolled and stopped out on the
+    same day. The wheel's covered-call overlay is spliced the same way and for the same reason.
+
+    ``pmcc_roll_dte`` is the one rule here WITHOUT a ``toggle_optimize`` gene, and that is the
+    point (the same call ``opt_event`` makes for O_ERN): with the roll switched off a PMCC is
+    not a PMCC, it is a diagonal waiting to have its short assigned. The BUYBACK trigger and the
+    DELTA FLOOR are both genuinely optional refinements and keep their on/off genes.
+    """
+    if kind not in _OVERLAY_ROLL_KINDS:
+        return []
+    return [
+        {"id": "pmcc_roll_dte", "action_type": "roll_pmcc_short",
+         "continue_processing": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "roll_dte", "field": "short_leg_days_to_expiry", "op": "<=",
+              "optimize": True, **_OVERLAY_ROLL_DTE_BAND}]}},
+        {"id": "pmcc_roll_buyback", "action_type": "roll_pmcc_short",
+         "toggle_optimize": True, "continue_processing": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "roll_buyback", "field": "credit_decayed_pct", "op": ">=",
+              "optimize": True, **_OVERLAY_BUYBACK_BAND}]}},
+        {"id": "pmcc_delta_floor", "action_type": "close_option", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "delta_floor", "field": "long_leg_delta", "op": "<",
+              "optimize": True, **_OVERLAY_DELTA_FLOOR_BAND}]}},
+    ]
 
 
 def _option_exit_rules(kind: str):
@@ -3957,7 +4068,12 @@ def _option_exit_rules(kind: str):
     # 25-45-DTE band's 28-day default.
     if kind in _OPTION_TIME_EXIT_AUTHORED_OFF:
         opt_time["enabled"] = False
-    rules = [
+    # THE OVERLAY RULES GO FIRST (design §4, plan Task 6). Front placement is the O_WHEEL
+    # idiom and it is load-bearing here for the same reason: ``opt_tp`` and ``opt_time``
+    # compare fields a PMCC also carries, so either could match on the very bar the overlay is
+    # due and break the walk with a close_option before the roll was ever reached. The roll
+    # rules carry ``continue_processing``, so the closes behind them still run on the same bar.
+    rules = _overlay_rules(kind) + [
         {"id": "opt_tp", "action_type": "close_option", "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [
              {"id": "tp", "field": "profit_loss_percent", "op": ">",
@@ -4723,10 +4839,12 @@ _STRATEGY_BUILDERS = {
     # launchable (mirrors OS1-OS4's members, which ARE independently launchable because they
     # pre-existed as grid-1 singles; O_CONVEXC/O_CONVEXP have no such standalone history).
     "O_CONVEX": _build_strategy_option_group,
-    # GRID 2 phase 2 — registered so the key is KNOWN to argparse and the operator gets the
-    # phase-gate reason instead of "invalid choice"; the builder refuses (see
-    # _PHASE_GATED_OPTION_STRATEGIES).
-    "O_PMCC": _build_strategy_phase_gated, "O_CAL": _build_strategy_phase_gated,
+    # O_PMCC joined phase 1 on 2026-09-02 (plan Task 6): the two-expiry lifecycle it was gated
+    # behind now exists, so it builds like any other single. O_CAL stays phase 2 — registered so
+    # the key is KNOWN to argparse and the operator gets the phase-gate reason instead of
+    # argparse's "invalid choice"; its builder refuses (see _PHASE_GATED_OPTION_STRATEGIES).
+    "O_PMCC": _build_strategy_option,
+    "O_CAL": _build_strategy_phase_gated,
     "O_CC": _build_strategy_covered_call, "O_STK": _build_strategy_stock,
     "O_PP": _build_strategy_protective_put,
     # O_CSP's option entry + O_CC's covered-call overlay, gated on has_assigned_shares.
