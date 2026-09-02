@@ -448,6 +448,138 @@ reference, like the naked exclusion); update EXPERTS.md for FMPEarningsEvent;
 write the plan's completion STATE note; verify ALL suites one last time and
 tabulate the final baselines for the merger (who owes the version bump).
 
+#### Task 14a item 2 — PRE-LAUNCH PERF, measured 2026-09-02
+
+**Method.** One real-cache option trial (parquet store, key `O_LEAPC`, real
+universe symbol AXP, window 2024-01-02..2024-03-15 — AXP's real 2025-01-17
+January-cycle LEAPS expiry sits ~381 DTE at the window start, inside
+`O_LEAPC`'s authored 380-470 entry band) timed against one real equity trial
+of comparable bars (same symbol/window/expert-shaped gene table, key `S1`).
+Both driven through the low-level `DailyBacktestEngine` harness
+`testplatform/backend/tests/backtest/test_grid2_engine_paths.py` already uses
+(NOT an optimization job), foreground, `logging.disable(logging.WARNING)`.
+Script kept out-of-tree (scratchpad, not committed):
+`run_one_trial_perf2.py`.
+
+**Result — COLD (first trial touching this symbol in a fresh process, i.e.
+a worker's first trial on a new symbol):**
+
+| leg | wall-clock | bars | orders |
+|---|---|---|---|
+| EQUITY (S1) | 0.143-0.179 s | 52 | 3 (1 filled round-trip) |
+| OPTION (O_LEAPC, real parquet) | 0.972-1.905 s | 52 | 5 (none filled — see below) |
+| **ratio** | **5.3x-11.5x across 6 repeated runs** | | |
+
+**Result — WARM (second+ trial on the SAME symbol in the SAME process, the
+steady state of a real GA generation once a worker has touched a symbol
+once):** OPTION 0.169 s vs EQUITY's own 0.143-0.179 s — **ratio ~1.0x-1.2x,
+comparable.**
+
+**VERDICT: criterion 2 FAILS on the cold path, PASSES on the warm path.**
+The plan's acceptance criterion ("option trial runtime stays comparable to
+equity trial runtime") was written without this cold/warm distinction and is
+not met as a blanket claim — a worker's first trial against any new symbol
+pays a real, un-amortized tax; every trial after it on that symbol (the rest
+of a GA generation, and every later generation) does not. **Not fixed here**
+(profiling only, per the controller's decision) — flagged as the input an
+optimization task needs, not a task this branch completes.
+
+**Profile (cProfile, cold trial, sorted by cumulative time, top of a 25-row
+table; full 25 rows in `docs/superpowers/plans/`-adjacent scratch, restated
+here):**
+
+```
+ncalls  tottime  cumtime  file:function
+     1    0.003    1.905  daily_engine.py:463(run)
+    52    0.001    1.878  daily_engine.py:839(_run_expert_bar)
+    52    0.001    1.861  daily_engine.py:907(_stage_recommendation_candidate)
+    48    0.002    1.804  TradeActionEvaluator.py:366(execute)
+    48    0.000    1.796  TradeActions.py:3050(execute)
+    48    0.000    1.758  TradeActions.py:3089(_resolve)
+    48    0.000    1.676  TradeActions.py:2229(_chain)
+    48    0.000    1.675  backtest_account.py:3394(get_option_chain)
+    48    0.021    1.675  parquet_options_provider.py:613(get_chain)
+    58    0.000    1.566  parquet_options_provider.py:706(_u)
+    58    0.000    1.565  parquet_options_provider.py:541(_underlying)
+     1    0.015    1.562  parquet_options_provider.py:522(_raw_underlying)
+     1    0.015    1.548  parquet_options_provider.py:498(_load_raw_underlying)
+     1    0.016    0.984  parquet_store.py:404(read_underlying)
+     1    0.000    0.950  pandas concat.py:157(concat)
+   184    0.007    0.848  pandas parquet.py:500(read_parquet)
+     1    0.024    0.548  parquet_options_provider.py:237(__init__)  [ParquetOptionsProvider]
+   184    0.055    0.409  pyarrow pandas_compat.py:794(table_to_dataframe)
+```
+
+**Hot spot, named:** `_load_raw_underlying` reads **184 separate parquet
+partition files** (one per expiry AXP has ever listed, 2023-01-03..2026-08-27
+— every January/monthly cycle across the FULL 3.5-year store, not scoped to
+the run's 2.5-month window) and concatenates them into one `_RawUnderlying`
+via pandas `read_parquet` x184 -> `pd.concat`. This is a **per-symbol,
+per-process ONE-TIME load**, not a per-bar or per-candidate cost — it is
+cached afterward by `parquet_options_provider._WORKER_RAW_CACHE` (an LRU
+keyed on `(root, underlying)`, "read at most once per worker" per its own
+docstring), which is exactly why the warm-trial number collapses to ~equity
+parity. The BS-fallback / per-candidate delta filtering that runs on EVERY
+bar (`get_chain` x48, `execute`/`_resolve`/`_chain` chain) is cheap by
+comparison (tottime, not cumtime, on those frames is near-zero) — **the
+entire cold-path cost is the eager whole-history load, not per-bar work**.
+Optimization-task input: scope `read_underlying` to (or lazily extend to)
+the run's actual `[start-warmup, end]` window instead of reading every
+partition the store has ever accumulated for that symbol.
+
+**Real-world impact depends on how many DISTINCT symbols cycle through one
+worker process per job** (paid once per symbol per worker, not once per
+trial) — not measured here (out of scope for a profiling-only task); a
+future optimization task should measure it before sizing any fix.
+
+**Settling the 0-orders question (existing evidence, not new debugging).**
+`app/services/strategy_optimization_handler.py:_trial_worker` — the GA's
+own per-individual entry point every local/remote trial goes through — calls
+`run_daily_backtest(config, ...)` directly (line ~267), the SAME entry point
+`tools/run_genome_once.py` uses and the one this task first tried.
+`tests/backtest/test_equity_golden_run.py` (the results-identity pin) does
+**NOT** use that path: it drives `DailyBacktestEngine` directly (the
+low-level harness, matching this task's `test_grid2_engine_paths.py`-shaped
+approach) via the LEGACY `seed_ruleset_from_tree(buy_tree=..., ...)` path,
+not the unified TradeRule-list (`entry_rules`) shape `S1`/`O_LEAPC` use. So
+the golden run's proof that trades happen does not directly cover the
+TradeRule-list-through-`run_daily_backtest` combination this task's first
+attempt used. **OPEN QUESTION for the final reviewer:** a first attempt at
+this task drove `run_daily_backtest` directly with real FMPRating +
+TradeRule-shaped `S1`/`O_LEAPC` `entry_rules` on AXP/this window and got ZERO
+orders on BOTH sides — even after independently confirming
+`run_daily_backtest`'s own `_build_experts` forces
+`allow_automated_trade_opening=True` and builds a real ATR
+`indicator_provider` automatically (ruling out this task's first two
+low-level-harness bugs, below, as the cause there). Real grid jobs
+(matrix3/goal2020) demonstrably DO place trades through this exact
+mechanism at scale, so **signal absence (FMPRating never cleared `S1`'s
+tier gate for AXP in this narrow 2.5-month window) is the more likely
+explanation** than a framework defect — but this was not independently
+isolated further (out of scope: "do not debug"), and is recorded here as
+unresolved rather than asserted.
+
+**Three standalone-harness lessons** (next to the getsource/aliased-import
+note below — same spirit: pitfalls the next agent building a bare
+`DailyBacktestEngine` harness will hit and should not have to re-discover):
+1. A bare `indicator_provider=object()` makes classic-RM ATR sizing raise
+   `AttributeError` on every candidate, silently swallowed by the engine
+   ("candidate risk manager failed ... 'object' object has no attribute
+   'get_indicator'") — zero orders, no exception surfaced. Same defect
+   `tools/perf_sample_bt.py`'s docstring already documents and fixes with a
+   `_StubIndicatorProvider`; any new standalone harness needs the same stub.
+2. `allow_automated_trade_opening` (interface default `False`) must be
+   forced `True` via `expert.save_settings(...)` in any hand-built harness —
+   `run_daily_backtest`'s own `_build_experts` does this automatically for a
+   real trial, but a low-level harness (like
+   `test_grid2_engine_paths.py`'s `_harness`, or `tests/backtest/
+   test_equity_golden_run.py`) must do it explicitly.
+3. A pure-option entry needs `config["entry_action"]` set (in addition to
+   `entry_rules`) on the `DailyBacktestEngine` config or the engine submits
+   with `submit_to_broker=False`, and every option order lands as
+   `"(manual review, not submitted)"` — a `TradeActionResult`, never a real
+   `TradingOrder` — instead of being priced/sized/filled.
+
 ---
 
 ## Review cadence
