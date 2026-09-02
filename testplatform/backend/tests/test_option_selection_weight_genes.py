@@ -80,11 +80,16 @@ def _group_halves():
 GROUP_HALVES = _group_halves()
 
 
-def test_the_group_halves_are_the_four_expected_ones():
+def test_the_group_halves_are_the_five_expected_ones():
     """Pins the DERIVATION against the table it replaced, so deriving it did not quietly
-    change what is covered. Update this only when a group is genuinely added or removed."""
+    change what is covered. Update this only when a group is genuinely added or removed.
+
+    O_CONVEX (plan Task 13, added 2026-09-02) is a genuine addition: the convex-harvest
+    grid's call/put group, both members debit. It sorts LAST (``sorted()`` on the group-key
+    string: '_' > 'S' in ASCII, so "O_CONVEX" > "OS4")."""
     assert GROUP_HALVES == [("OS1", "debit"), ("OS2", "credit"),
-                            ("OS3", "credit"), ("OS4", "debit")]
+                            ("OS3", "credit"), ("OS4", "debit"),
+                            ("O_CONVEX", "debit")]
 
 
 def _optsel(space):

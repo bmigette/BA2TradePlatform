@@ -138,6 +138,20 @@ def test_expiry_after_window_end_does_not_disqualify_a_bar_inside_the_window(too
 # --------------------------------------------------------------------------------------- #
 # probe_symbols / main(): summary, out-file, sampling reproducibility
 # --------------------------------------------------------------------------------------- #
+def test_min_dte_is_a_genuine_runtime_parameter_not_hardcoded_at_365(tool, tree):
+    """Plan Task 13 / design (convex-harvest) Section 4 item 4: the convex-harvest grid needs
+    DTE >= 270 (broader than grid 2's LEAPS threshold of 365) from the SAME probe tool. This
+    proves --min-dte is a real CLI parameter the tool reads at call time, not a value fixed
+    anywhere in the module -- 270 sits strictly between SHALLOW's deepest bar (60d) and DEEP's
+    (400d), so DEEP is kept and SHALLOW is dropped at 270 exactly as it is at 365."""
+    results = tool.probe_symbols(tree, ["DEEP", "SHALLOW", "EMPTY"], 270,
+                                 WINDOW_START, WINDOW_END)
+    by_symbol = {r.symbol: r for r in results}
+    assert by_symbol["DEEP"].kept is True
+    assert by_symbol["SHALLOW"].kept is False
+    assert by_symbol["EMPTY"].kept is False
+
+
 def test_probe_symbols_covers_the_whole_input_list(tool, tree):
     results = tool.probe_symbols(tree, ["DEEP", "SHALLOW", "EMPTY"], 365,
                                   WINDOW_START, WINDOW_END)

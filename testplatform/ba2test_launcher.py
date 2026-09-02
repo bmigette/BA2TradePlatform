@@ -2544,15 +2544,99 @@ _OPTION_STRATS = {
         "option_dte_optimize": True, "option_dte_min_range": 90,
         "option_dte_max_range": 150, "option_dte_step": 10,
         "option_sizing": 5.0},
+
+    # ==========================================================================================
+    # CONVEX-HARVEST GRID (design 2026-08-31, docs/superpowers/specs/
+    # 2026-08-31-convex-harvest-grid-design.md §2) -- plan Task 13. A SEPARATE grid from GRID 2
+    # above: its own fitness (``option_convex``, ``_CONVEX_FITNESS`` below), its own universe
+    # threshold (DTE >= 270 vs 365/180/7), its own matrix script
+    # (``tools/run_convex_matrix.py``). Sharing this table with grid 2 is fine -- the ROW is
+    # just a gene table -- but every DERIVED set below is checked member-by-member so O_CONVEX
+    # never inherits a grid-2-only behaviour (the trade floor) or drifts into grid 2's fitness
+    # default (the ``_OPTION_CAR_STRATEGIES`` exclusion right below this table).
+    #
+    # TWO MEMBER ROWS, ONE GROUP KEY -- operator decision, 2026-09-02, superseding the earlier
+    # ``kind`` toggle gene. O_CONVEX is a GROUPED strategy (``_build_strategy_option_group``,
+    # the exact OS1-OS4 mechanism): "O_CONVEXC" (bullish signal -> buy_call) and "O_CONVEXP"
+    # (bearish signal -> buy_put) are each their own toggleable entry TradeRule sharing ONE
+    # exit ruleset -- the SAME construction O_LEAPC/O_LEAPP already use as two SEPARATE keys,
+    # merged here into one launchable key via the group machinery instead of a new
+    # ``option_structure`` categorical gene. Reusing the group builder means the put arm gets
+    # the group's STANDARD per-rule ``enabled`` gene for free (``entry:o_convexp-entry:enabled``
+    # -- see ``_option_entry_rule``'s ``toggleable=True``), which is exactly the "existing
+    # standard gene, do not invent a new toggle" instruction: the GA can switch either arm off
+    # independently (e.g. drop the put arm in a bull window) with no new machinery. There is no
+    # "both" (simultaneous call+put) arm and none is offered: ``has_no_position`` is EXPERT-
+    # level per INSTRUMENT (not per-structure), so once either arm opens a ticket on an
+    # underlying, BOTH rules are blocked from opening a second one on it until the first
+    # closes -- the same 1-ticket-per-underlying guard as every other option key, and it rules
+    # out a simultaneous call+put by construction, not by omission.
+    "O_CONVEXC": {  # convex-harvest CALL arm -- cheap far-OTM long-dated calls
+        # DELTA 0.10-0.35 STEP 0.05 (design §2: "the cheapness/convexity dial") -- 6 levels.
+        # FIXED to the delta method like every fixed-delta key above (amendment 1's dead-gene
+        # trap: a percent-OTM domain read as a delta target selects the deepest-ITM contract on
+        # the chain). Default 0.20 sits mid-band, genuinely cheap.
+        "action_type": "buy_call", "option_strike_method": "delta",
+        "option_strike_param": 0.20, "option_strike_delta": 0.20,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.10,
+        "option_strike_delta_max": 0.35, "option_strike_delta_step": 0.05,
+        # ENTRY DTE 180-540 (design §2: "medium-long: enough runway for a thesis to play out;
+        # not restricted to January cycles"). Authored 300..420 fixes hw = (420-300)//2 = 60,
+        # so the searched centres 240..480 step 40 (7 levels) decode to [180,300] .. [420,540]
+        # -- every window landing INSIDE the design band at both ends (pinned by
+        # test_no_o_convex_genome_can_decode_outside_the_180_540_band).
+        "option_dte_min": 300, "option_dte_max": 420,
+        "option_dte_optimize": True, "option_dte_min_range": 240,
+        "option_dte_max_range": 480, "option_dte_step": 40,
+        # PER-TICKET PREMIUM SIZING 0.5-2.0% of sleeve (design §2). ``option_sizing`` (% of
+        # equity committed per structure) IS the existing "percent of sleeve" mechanism -- and
+        # combined with the FIXED 1-ticket-per-underlying rule (``has_no_position``,
+        # unconditional on every option entry rule -- see _option_entry_rule), a structure's
+        # sizing % already reads as its per-ticket cap: "many small tickets, no single ticket
+        # dominates ex-ante" is exactly what a low option_sizing ceiling enforces. Authored 1.0
+        # is a NEW row in _OPTION_SIZING_BANDS (band 0.5-2.0 step 0.25, 7 levels) -- no existing
+        # authored value covers a sub-5% debit band.
+        "option_sizing": 1.0},
+    "O_CONVEXP": {  # convex-harvest PUT arm -- the tail-hedge twin; same genes, kind=put.
+        # Enters on the BEARISH signal (see _OPTION_ENTRY_GATE override below), like O_LP /
+        # O_LEAPP. Same delta/DTE/sizing bands as O_CONVEXC -- one thesis, two directions.
+        "action_type": "buy_put", "option_strike_method": "delta",
+        "option_strike_param": 0.20, "option_strike_delta": 0.20,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.10,
+        "option_strike_delta_max": 0.35, "option_strike_delta_step": 0.05,
+        "option_dte_min": 300, "option_dte_max": 420,
+        "option_dte_optimize": True, "option_dte_min_range": 240,
+        "option_dte_max_range": 480, "option_dte_step": 40,
+        "option_sizing": 1.0},
 }
 
 #: The grid-2 keys (design 2026-08-31), phase 1. SINGLES ONLY -- no umbrella group key in
-#: round one, so every job's result is attributable to one structure (design §7).
+#: round one, so every job's result is attributable to one structure (design §7). O_CONVEX is
+#: DELIBERATELY ABSENT: it is the separate convex-harvest grid (design §8) with its own
+#: fitness/universe/matrix script -- see _CONVEX_OPTION_STRATEGIES.
 _GRID2_OPTION_STRATEGIES = {"O_LEAPC", "O_LEAPP", "O_ERN", "O_CBS", "O_PBS"}
 
+#: The convex-harvest grid's own LAUNCHABLE key set (plan Task 13), mirroring
+#: _GRID2_OPTION_STRATEGIES' role for tools/run_convex_matrix.py -- kept SEPARATE from the set
+#: above rather than folded in, exactly because the two grids must never be run or scored
+#: together (design §8). "O_CONVEX" is the GROUP key (``_build_strategy_option_group``);
+#: "O_CONVEXC"/"O_CONVEXP" are its two members and are NOT independently launchable (no
+#: ``_STRATEGY_BUILDERS`` row of their own) -- see _CONVEX_MEMBER_KEYS for the member-level
+#: bookkeeping (debit partition, CAR-fitness exclusion) those two still need.
+_CONVEX_OPTION_STRATEGIES = {"O_CONVEX"}
+
+#: O_CONVEX's two members. Not launchable directly; still need their OWN entries wherever a
+#: set is keyed off ``set(_OPTION_STRATS)`` (the debit/credit partition, the CAR-fitness
+#: exclusion, the fixed-delta-method pin) because that is where ``_OPTION_STRATS`` actually
+#: puts them -- the group key "O_CONVEX" itself has no row there at all (O_WHEEL's same shape).
+_CONVEX_MEMBER_KEYS = {"O_CONVEXC", "O_CONVEXP"}
+
 #: Grid-2 keys whose strike selection is FIXED to ``delta`` (amendment 1). O_ERN is absent on
-#: purpose: its two builders hard-code ``percent_otm`` (see its row).
-_FIXED_DELTA_METHOD_STRATEGIES = {"O_LEAPC", "O_LEAPP", "O_CBS", "O_PBS"}
+#: purpose: its two builders hard-code ``percent_otm`` (see its row). O_CONVEX's two MEMBERS
+#: (the separate convex-harvest grid, plan Task 13) are included -- they fix the method for the
+#: identical reason grid 2's keys do; the group key "O_CONVEX" itself has no row to fix.
+_FIXED_DELTA_METHOD_STRATEGIES = ({"O_LEAPC", "O_LEAPP", "O_CBS", "O_PBS"}
+                                  | _CONVEX_MEMBER_KEYS)
 
 #: Grid-2 keys the design gates behind LATER machinery, with the reason. ``O_PMCC`` and
 #: ``O_CAL`` are two-EXPIRY structures, and the codebase refuses those at three independent,
@@ -2617,6 +2701,10 @@ _OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
 # gate entirely and let the straddle fire on either signal, which is what a vol bet wants.
 _OPTION_ENTRY_GATE["O_LEAPP"] = "bearish"
 _OPTION_ENTRY_GATE["O_PBS"] = "bearish"
+# CONVEX-HARVEST GRID (plan Task 13): O_CONVEXP is the put/tail-hedge arm of the O_CONVEX
+# group, so it gates on the expert's SELL signal exactly as O_LP/O_LEAPP do. O_CONVEXC keeps
+# the "bullish" default like every call arm above.
+_OPTION_ENTRY_GATE["O_CONVEXP"] = "bearish"
 
 # FULL-NOTIONAL structures: those whose per-contract buying-power reserve scales with the
 # STRIKE (cash-secured / un-netted naked notional) rather than with a defined-risk spread
@@ -2712,6 +2800,13 @@ _OPTION_GROUPS_ALL = {
     # short premium and nothing else.
     "OS3": ["O_JL", "O_RS", "O_BEARCS", "O_BULLPS"],        # skewed CREDIT (asymmetric short premium)
     "OS4": ["O_STRD", "O_STRG"],                            # volatility DEBIT (non-directional)
+    # CONVEX-HARVEST GRID (plan Task 13, operator decision 2026-09-02): O_CONVEXC (bullish ->
+    # buy_call) + O_CONVEXP (bearish -> buy_put), the SAME two-member-group shape as every row
+    # above, reused rather than a new ``option_structure`` categorical gene. A SEPARATE group
+    # from OS1-OS4 -- it belongs to the convex-harvest grid (design §8), not grid 1, and is
+    # excluded from _GRID2_OPTION_STRATEGIES/_OPTION_CAR_STRATEGIES accordingly (see
+    # _CONVEX_OPTION_STRATEGIES / _CONVEX_MEMBER_KEYS above).
+    "O_CONVEX": ["O_CONVEXC", "O_CONVEXP"],
 }
 _OPTION_GROUPS = {
     key: [m for m in members if m not in _FULL_NOTIONAL_OPTION_KINDS
@@ -2947,7 +3042,17 @@ def _assert_option_window_excludes_holdout(strat_kinds, end) -> None:
 # comparable to S2 and to every prior O_STK run (see _rm_opt_for's docstring for the same
 # carve-out reasoning on a different knob) -- widening the fitness in the name of the option
 # arms would corrupt the control the option arms are measured against.
-_OPTION_CAR_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
+# O_CONVEX (AND ITS TWO MEMBERS) ARE EXCLUDED HERE, EXPLICITLY (plan Task 13). "O_CONVEX" is a
+# member of ``_PURE_OPTION_STRATEGIES`` via ``set(_OPTION_GROUPS)``, and "O_CONVEXC"/
+# "O_CONVEXP" are members via ``set(_OPTION_STRATS)`` (they have rows there); without this
+# subtraction any of the three would join ``_OPTION_CAR_STRATEGIES`` by construction and
+# ``_resolve_fitness`` would silently default an unflagged ``--strategy O_CONVEX`` run to
+# ``option_consistent_annual_return`` -- the one default the design (§3) says the convex-
+# harvest grid must never get. The convex grid has NO implicit default at all (see
+# ``_CONVEX_FITNESS`` below): every O_CONVEX job must name ``--fitness option_convex``
+# explicitly, and ``_refuse_convex_fitness_mismatch`` enforces it.
+_OPTION_CAR_STRATEGIES = ((_PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"})
+                          - _CONVEX_OPTION_STRATEGIES - _CONVEX_MEMBER_KEYS)
 
 # The CONVEX-HARVEST fitness (docs/superpowers/specs/2026-08-31-convex-harvest-grid-design.md
 # §3, registered in strategy_fitness.py). Ranks a book of cheap far-OTM long-dated tickets on
@@ -2955,15 +3060,46 @@ _OPTION_CAR_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
 # GA to gut the convexity to fake smoothness. It is SELECTABLE TODAY -- an explicit
 # ``--fitness option_convex`` wins over the resolution below, which is how the convex matrix
 # will ask for it.
-#
-# TASK 13 SEAM (not implemented here, deliberately): the ``O_CONVEX`` strategy key does not
-# exist yet, so there is nothing to route and nothing to refuse. When it lands, the MUTUAL
-# REFUSAL goes here -- an O_CONVEX job must REFUSE ``option_consistent_annual_return`` and any
-# ``_OPTION_CAR_STRATEGIES`` job must REFUSE ``option_convex`` -- so the two grids can never
-# silently cross-score. Comparing numbers across two fitness metrics is the exact trap the
-# 2026-08-04 CAR-scale change taught us never to allow, and design §8 is why the convex work
-# is a separate grid rather than a matrix row.
 _CONVEX_FITNESS = "option_convex"
+
+
+def _refuse_convex_fitness_mismatch(command: str, strat_kind: str, fitness: str) -> None:
+    """Task 13 seam: O_CONVEX and every other strategy score under MUTUALLY EXCLUSIVE fitness
+    metrics, and the split must never be silent -- the exact trap the 2026-08-04 CAR-scale
+    change taught us never to allow (comparing numbers across two fitness metrics), and design
+    §8's whole reason the convex work is a separate grid rather than a matrix row.
+
+    Called AFTER ``_resolve_fitness`` (so an implicit default is checked exactly like an
+    explicit ``--fitness``), on the EFFECTIVE fitness -- an O_CONVEX job that took no
+    ``--fitness`` at all still has to land on ``option_convex`` to pass, and ``_resolve_fitness``
+    never defaults a kind to it (see ``_CONVEX_FITNESS``'s comment), so a bare
+    ``--strategy O_CONVEX`` refuses here rather than silently scoring under the equity/CAR
+    default.
+
+    Two directions, one function, one message shape per direction (Task 13 text: "REFUSED at
+    launch with a message naming the mismatch"):
+      * O_CONVEX + anything but ``option_convex`` -- refused.
+      * ``option_convex`` + anything but O_CONVEX -- refused (covers every equity AND every
+        other option kind; the design ties the metric to exactly one structure).
+    """
+    is_convex_kind = strat_kind in _CONVEX_OPTION_STRATEGIES
+    is_convex_fitness = fitness == _CONVEX_FITNESS
+    if is_convex_kind and not is_convex_fitness:
+        sys.exit(
+            f"ba2-test {command}: --strategy {strat_kind} (the convex-harvest grid) must run "
+            f"under --fitness {_CONVEX_FITNESS}, got {fitness!r}. The option_car family "
+            f"rewards smooth equity and would teach the GA to gut the convexity O_CONVEX "
+            f"exists to buy (design 2026-08-31-convex-harvest-grid-design.md §3/§8). Pass "
+            f"--fitness {_CONVEX_FITNESS} explicitly -- it is never a default.")
+    if is_convex_fitness and not is_convex_kind:
+        sys.exit(
+            f"ba2-test {command}: --fitness {_CONVEX_FITNESS} is O_CONVEX-only, got "
+            f"--strategy {strat_kind!r}. {_CONVEX_FITNESS} ranks uncapped end-of-window "
+            f"return behind a breadth floor tuned for a lottery-ticket book -- scoring any "
+            f"other structure with it would silently cross the option_car grid and the "
+            f"convex-harvest grid (design §8), the exact trap the 2026-08-04 CAR-scale "
+            f"change taught us never to allow. Use --strategy O_CONVEX, or drop "
+            f"--fitness {_CONVEX_FITNESS}.")
 
 
 def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: str) -> str:
@@ -2989,7 +3125,7 @@ def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: st
 
     ``option_convex`` (``_CONVEX_FITNESS``) is NOT a default for any kind: the convex-harvest
     grid names it explicitly, and the ``cli_fitness`` short-circuit above is what carries it.
-    See ``_CONVEX_FITNESS`` for the Task-13 mutual-refusal seam.
+    See ``_refuse_convex_fitness_mismatch`` for the Task-13 mutual-refusal seam.
     """
     if cli_fitness:
         return cli_fitness
@@ -3147,6 +3283,12 @@ _OPTION_SIZING_BANDS = {
     # budget is equity * MIN(this, max_virtual_equity_per_instrument_percent) — so this row and
     # _OPTION_RM_OVERRIDE have to move together or neither moves anything.
     20.0: (5.0, 50.0, 5.0),
+    # CONVEX-HARVEST (plan Task 13, design 2026-08-31-convex-harvest-grid-design.md §2):
+    # "per-ticket premium sizing 0.5-2.0% of sleeve -- many small tickets, no single ticket may
+    # dominate ex-ante". A NEW row: no existing authored value's band reaches below 1.0% (the
+    # 5.0 row's floor), and the design's own ceiling (2.0%) sits BELOW that row's floor entirely
+    # -- sharing it would either refuse the whole band or silently widen it past the design.
+    1.0: (0.5, 2.0, 0.25),
 }
 _missing_sizings = sorted({cfg["option_sizing"] for cfg in _OPTION_STRATS.values()
                            if cfg.get("option_sizing") is not None}
@@ -3597,8 +3739,17 @@ def _screener_gate_opt_block(args, strategy_key: str) -> "dict | None":
 #                          NOT move it: the sign of one day's fill is not the thesis. Debit.
 # The partition is asserted TOTAL below, so a future key that lands in neither set fails at
 # import rather than inheriting the credit thesis by omission.
+#   * O_CONVEX / O_CONVEXC / O_CONVEXP -- bought far-OTM calls/puts. Cheap long premium by
+#                          construction; the design's own thesis is "own convexity", which only
+#                          a debit thesis can express. Debit. Both the GROUP key ("O_CONVEX",
+#                          needed by ``_option_exit_rules``'s ``debit = kind in
+#                          _DEBIT_OPTION_KINDS`` check, called with the group name) and its two
+#                          MEMBERS (needed by the debit/credit partition assertion below, which
+#                          is keyed off ``set(_OPTION_STRATS)``) must be listed -- the same
+#                          dual listing OS1/OS4 already use alongside their own members.
 _DEBIT_OPTION_KINDS = {"O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS", "O_STRD", "O_STRG",
                        "O_LEAPC", "O_LEAPP", "O_ERN", "O_CBS", "O_PBS",
+                       "O_CONVEX", "O_CONVEXC", "O_CONVEXP",
                        "OS1", "OS4"}
 
 # The same split at MEMBER granularity (the group keys removed). Entry gates are authored per
@@ -3628,6 +3779,14 @@ _OPTION_DTE_EXIT_BANDS = {
     "O_PBS":   (30, 20, 45, 5),      # 6
     # O_ERN keeps the DEFAULT band: its expiry is 7-30 DTE, which is exactly the range the
     # 0..21 band was authored for, and its real exit is the event exit below.
+    # CONVEX-HARVEST (plan Task 13): the convex-harvest design §2 states no explicit roll/exit
+    # DTE floor, but O_CONVEX's own entry DTE (180-540, decoded windows as low as [180,300])
+    # has the SAME shape as O_LEAPC's problem above -- the platform default (0..21) sits well
+    # inside the terminal decay/gamma zone a 180-540-day position should exit BEFORE, not the
+    # zone it should live in. 30-120 step 15 (7 levels) stays comfortably below every decoded
+    # entry window's floor (>=180), so the exit is always reachable without ever firing at
+    # entry (pinned by test_the_dte_exit_ceiling_never_reaches_the_entry_floor).
+    "O_CONVEX": (60, 30, 120, 15),   # 7
 }
 
 # TAKE PROFIT AS A MULTIPLE OF THE PREMIUM PAID (``profit_multiple_of_premium``, plan Task 4).
@@ -3642,6 +3801,11 @@ _OPTION_DTE_EXIT_BANDS = {
 _OPTION_TP_MULTIPLE_BANDS = {
     "O_CBS": (3, 2, 6, 1),   # 5
     "O_PBS": (3, 2, 6, 1),   # 5
+    # CONVEX-HARVEST (plan Task 13, design §2): "take-profit multiple 3x-10x premium, plus
+    # hold-to-expiry". The hold-to-expiry arm is this SAME ``toggle_optimize`` gene switched
+    # off -- identical mechanism to the backspreads' "| to expiry" above, not a new one: with
+    # the rule off, the position rides opt_dte/opt_time/expiry itself instead of a TP multiple.
+    "O_CONVEX": (5, 3, 10, 1),   # 8
 }
 
 # ``opt_sl_ml`` AUTHORED OFF (still searched). Design §2 for O_ERN: "opt_sl_ml searchable,
@@ -3649,7 +3813,12 @@ _OPTION_TP_MULTIPLE_BANDS = {
 # for the backspreads. The rule keeps its ``toggle_optimize`` gene, so the GA still explores
 # both; what changes is the ruleset the launcher EMITS, which is what an unsearched run, a
 # seeded live deploy and the persisted top-N ruleset all read.
-_OPTION_SL_ML_AUTHORED_OFF = {"O_ERN", "O_CBS", "O_PBS"}
+#
+# O_CONVEX (plan Task 13, design §2): "opt_sl_ml stop searchable with default OFF -- stopping
+# a lottery ticket at a % of its premium amputates the convexity the strategy exists to buy.
+# The GA may still discover a stop helps; it must not be imposed." Same mechanism, same
+# reasoning as O_ERN/O_CBS/O_PBS above.
+_OPTION_SL_ML_AUTHORED_OFF = {"O_ERN", "O_CBS", "O_PBS", "O_CONVEX"}
 
 # The exit that terminates an EVENT thesis: N days after the stamped earnings date. Design §2
 # searches 0-2. NOT toggleable, unlike every other exit here, and that is the point -- O_ERN's
@@ -4466,6 +4635,13 @@ _STRATEGY_BUILDERS = {
     "O_LEAPC": _build_strategy_option, "O_LEAPP": _build_strategy_option,
     "O_ERN": _build_strategy_option,
     "O_CBS": _build_strategy_option, "O_PBS": _build_strategy_option,
+    # CONVEX-HARVEST GRID (design 2026-08-31-convex-harvest-grid-design.md, plan Task 13) —
+    # separate grid, GROUP builder (call arm + put arm, two toggleable entry rules; see
+    # _OPTION_GROUPS_ALL["O_CONVEX"] and the row comments in _OPTION_STRATS). O_CONVEXC/
+    # O_CONVEXP are NOT registered here -- they are group members only, never independently
+    # launchable (mirrors OS1-OS4's members, which ARE independently launchable because they
+    # pre-existed as grid-1 singles; O_CONVEXC/O_CONVEXP have no such standalone history).
+    "O_CONVEX": _build_strategy_option_group,
     # GRID 2 phase 2 — registered so the key is KNOWN to argparse and the operator gets the
     # phase-gate reason instead of "invalid choice"; the builder refuses (see
     # _PHASE_GATED_OPTION_STRATEGIES).
@@ -4582,6 +4758,7 @@ def _cmd_optimize(args) -> int:
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
                                "consistent_annual_return" if spec.get("options") else "sharpe_ratio")
+    _refuse_convex_fitness_mismatch("optimize", args.strategy, fitness)
     _assert_option_window_excludes_holdout([args.strategy], args.end)
     universe = [s.strip().upper() for s in args.universe.split(",") if s.strip()]
     if not universe:
@@ -4942,6 +5119,7 @@ def _cmd_optimize_batch(args) -> int:
         # default.
         fitness = _resolve_fitness(args.fitness, strat_kind,
                                    "consistent_annual_return" if spec.get("options") else "calmar_ratio")
+        _refuse_convex_fitness_mismatch("optimize-batch", strat_kind, fitness)
         name = f"{prefix}-{expert}-{strat_kind}-{fitness}"
         db = SessionLocal()
         try:

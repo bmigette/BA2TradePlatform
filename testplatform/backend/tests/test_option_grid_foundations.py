@@ -1306,7 +1306,8 @@ def test_the_event_key_NEVER_gets_the_lower_trade_floor():
     assert "O_ERN" not in m._OPTION_LOW_TRADE_FLOOR_STRATEGIES
 
 
-@pytest.mark.parametrize("key", ["S2", "O_LC", "O_IC", "OS1", "O_CBS", "O_PBS", None])
+@pytest.mark.parametrize("key", ["S2", "O_LC", "O_IC", "OS1", "O_CBS", "O_PBS", "O_CONVEX",
+                                 None])
 def test_no_other_strategy_is_touched_by_the_trade_floor(key):
     """Every existing job's fitness must be bit-identical: an absent key leaves the
     expert/platform resolution exactly as it was.
@@ -1314,7 +1315,12 @@ def test_no_other_strategy_is_touched_by_the_trade_floor(key):
     O_CBS/O_PBS ARE IN THIS LIST, not the exempt one (corrected 2026-09-02). They are the
     convexity-financed family, not the long-dated one: a 60-180 DTE entry exited at a 20-45
     DTE floor lives 15-160 days, i.e. 2.3-24 structures per underlying per year, so the
-    platform's 12/yr floor is reachable and disqualifies only a genuinely thin config."""
+    platform's 12/yr floor is reachable and disqualifies only a genuinely thin config.
+
+    O_CONVEX IS IN THIS LIST TOO (plan Task 13): the breadth floor for the convex-harvest
+    grid lives in ``option_convex``'s OWN fitness (design §3 item 4: >=30 tickets/yr AND
+    >=20 distinct underlyings), not in this launcher-side long-dated exemption -- O_CONVEX
+    must keep the platform trade floor."""
     m = _launcher()
     block = {}
     m._apply_option_trade_floor(key, block)

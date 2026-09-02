@@ -78,7 +78,16 @@ def test_the_band_brackets_the_authored_size_and_actually_varies(kind):
     assert levels >= 5, f"{kind}: only {levels} sizing levels"
 
 
-@pytest.mark.parametrize("kind", _SINGLES)
+#: The convex-harvest grid's two members (plan Task 13) are the ONE deliberate exception to
+#: the >=1.0% floor below: design 2026-08-31-convex-harvest-grid-design.md §2 states the
+#: per-ticket floor as 0.5% OF SLEEVE, not 1% -- "many small tickets, no single ticket may
+#: dominate ex-ante" is a NARROWER bet than any grid-1/grid-2 structure's "a real 1-contract
+#: bet" reasoning ever assumed. Excluded from the shared-floor test below and re-pinned at its
+#: OWN floor immediately after it.
+_CONVEX_MEMBERS = {"O_CONVEXC", "O_CONVEXP"}
+
+
+@pytest.mark.parametrize("kind", [k for k in _SINGLES if k not in _CONVEX_MEMBERS])
 def test_the_band_never_reaches_zero_or_the_whole_account(kind):
     """A 0% size is a structure that cannot open (a zero-trade genome dressed as a real one);
     an unbounded one bets the account on a single structure.
@@ -92,6 +101,17 @@ def test_the_band_never_reaches_zero_or_the_whole_account(kind):
     spec = collect_param_space(_build(kind))[f"entry:{kind.lower()}-entry:a0:option_sizing"]
     assert spec["min"] >= 1.0, f"{kind}: sizing can go to {spec['min']}%"
     assert spec["max"] <= 50.0, f"{kind}: sizing can reach {spec['max']}% of equity"
+
+
+@pytest.mark.parametrize("kind", sorted(_CONVEX_MEMBERS))
+def test_the_convex_members_band_never_reaches_zero_or_past_the_designs_2_percent_ceiling(kind):
+    """The convex-harvest grid's OWN floor/ceiling (design §2: 0.5-2.0% of sleeve) -- narrower
+    than every other structure's band on purpose, not a relaxation of the zero-size guard
+    above: 0.5% still cannot open a zero-trade genome, and 2.0% is far inside the shared 50%
+    leverage ceiling."""
+    spec = collect_param_space(_build(kind))[f"entry:{kind.lower()}-entry:a0:option_sizing"]
+    assert spec["min"] == 0.5, f"{kind}: expected the design's 0.5% floor, got {spec['min']}%"
+    assert spec["max"] == 2.0, f"{kind}: expected the design's 2.0% ceiling, got {spec['max']}%"
 
 
 def test_the_bands_differ_by_structure_class():
