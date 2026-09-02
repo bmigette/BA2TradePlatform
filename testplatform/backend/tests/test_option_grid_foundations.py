@@ -1854,3 +1854,28 @@ def test_the_matrix_driver_lists_the_pmcc_with_the_LEAPS_chain_depth():
 
     assert "O_PMCC" in mod._DEFAULT_STRATEGIES
     assert mod._MIN_DTE["O_PMCC"] == mod._MIN_DTE["O_LEAP"] == 365
+
+
+def test_no_option_row_declares_a_gene_its_own_builder_cannot_read():
+    """THE INERT-KNOB GUARD, found by a mutation that SURVIVED the gene-to-artefact audit.
+
+    That audit asks "does this gene reach its mapped DESTINATION?", and ``option_wing_width``
+    has a perfectly good destination (``wing_width_pct``) — for the four structures that read
+    it. Declaring the gene on a row whose builder ignores the field therefore passes the audit
+    while the GA spends population on a knob that changes nothing: exactly the silently-inert
+    gene the ``w_profit``/``w_rr`` note in ``_OptionEntryAction.__init__`` refuses, one layer
+    up. The classifiers already say who reads what; this makes the tables obey them.
+    """
+    from ba2_common.core.types import uses_arc_floor, uses_short_dte_window, uses_wing_width
+
+    m = _launcher()
+    checks = (("option_wing_width_optimize", uses_wing_width, "wing_width_pct"),
+              ("option_min_arc_optimize", uses_arc_floor, "min_arc"),
+              ("option_short_dte_min", uses_short_dte_window, "short_dte_min/max"))
+    offenders = []
+    for key, cfg in m._OPTION_STRATS.items():
+        action = str(cfg.get("action_type") or "")
+        for flag, reads, field in checks:
+            if cfg.get(flag) is not None and not reads(action):
+                offenders.append(f"{key} declares {flag} but {action} never reads {field}")
+    assert not offenders, offenders

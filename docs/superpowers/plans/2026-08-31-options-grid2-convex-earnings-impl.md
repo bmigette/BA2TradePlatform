@@ -759,6 +759,37 @@ that table's docstring warns about.
 `long_leg_delta` has no other point-in-time source, `OptionQuote` already
 declares the fields, and no existing consumer reads them.
 
+> **LANDED AS (2026-09-02).** M1 design `52d92630`; M2 builder `7d718727`; M3 roll loop +
+> invariant + the three per-leg conditions `54a3ee56`; M5 launcher/matrix `718f7cf4`; M4
+> engine e2e `7cd17374`; M6 verification (this commit). **M5 was committed BEFORE M4**, and
+> deliberately: the e2e runs the launcher's OWN emitted rules (`_option_entry_rule("O_PMCC")`
+> / `_option_exit_rules("O_PMCC")`), so an e2e written before the key existed could only have
+> tested hand-built rules — i.e. not the artefact a real job runs.
+>
+> **Mutations executed, all six killed** (scratch harness; file-copy restores, `git status
+> --short` clean after each):
+>
+> | # | mutation | killed by |
+> |---|---|---|
+> | a | the roll writes the new short BEFORE buying the old one back | `test_the_roll_ticket_closes_BEFORE_it_opens` |
+> | b | the structure close releases the LONG (the cover) first | `test_a_close_that_releases_the_LONG_first_is_refused` |
+> | c | `restamped_max_loss` ignores the roll's credit | `test_the_restamp_lowers_the_floor_by_the_credit_banked` |
+> | d | admission allows a short strike at/below the LEAPS strike | `test_a_short_strike_at_or_below_the_leaps_strike_is_REFUSED` |
+> | e | a launcher-only gene on O_PMCC (`option_wing_width`) | `test_no_option_row_declares_a_gene_its_own_builder_cannot_read` |
+> | f | the roll trigger's field is not in `rule_builders.FIELD_EVENT` | `test_gene_to_artefact_audit.py -k O_PMCC` |
+>
+> **(e) SURVIVED on the first attempt, and that is a finding rather than a footnote.** The
+> gene-to-artefact audit asks "does this gene reach its MAPPED DESTINATION?", and
+> `option_wing_width` has a perfectly good one — for the four structures that read it. A row
+> declaring it on a builder that ignores the field therefore passed, while the GA would spend
+> population on a knob that changes nothing. The audit is not wrong; it answers a different
+> question. `test_no_option_row_declares_a_gene_its_own_builder_cannot_read` was added to
+> answer this one, deriving from the classifiers that already say who reads what
+> (`uses_wing_width` / `uses_arc_floor` / `uses_short_dte_window`), and it kills the mutation.
+> (f) was added alongside it because the FIELD_EVENT registration is the sharper version of
+> the same hazard: an unregistered field is SILENTLY DROPPED by the shared converter, so the
+> roll rule would reach the engine as nothing while every log claimed it was configured.
+
 **12. Count pins this moves** (each updated with the arithmetic shown, never
 adjusted-until-green): `test_gene_to_artefact_audit.py`'s `len(OPTION_KEYS)`,
 `test_option_strike_method_honoured.py`'s two counts,
