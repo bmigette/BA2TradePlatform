@@ -22,7 +22,14 @@ arbitrary one: the server enforces a hard 365-DAY CAP per request (measured live
 INVALID_ARGUMENT) — a multi-year backfill window is chunked into <=365-day sub-requests by
 ``_chunk_window`` and looped over per (underlying, expiry), rather than sent as one call. So
 the natural unit of work is the SAME as TastyTrade's: one (underlying, expiry) partition,
-fetched with (up to) two calls PER WINDOW CHUNK instead of TastyTrade's one call total:
+fetched with (up to) two calls PER WINDOW CHUNK instead of TastyTrade's one call total.
+
+That window is narrowed to end at the EXPIRY, not the run's global end, before chunking: an
+option never trades past its own expiration, so a 2020-01-17 expiry queried all the way to a
+2026-09 run end wasted 6 of 7 chunk-pairs getting NoDataFoundError for years the contract
+could never have traded in (measured live: ~9.5 min for that ONE unit). Only the END is
+narrowed, never the START -- a LEAPS contract can legitimately have started trading long
+before the run's start date, so narrowing that side risks losing real data.
 
   * ``option_history_greeks_eod`` — OHLC + bid/ask/size + the full greeks block, INCLUDING
     ``implied_vol`` (a superset of the plain ``option_history_eod`` endpoint, so that one is
@@ -296,13 +303,26 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
             by_underlying_expiry.setdefault((c.underlying.upper(), c.expiry), set()).add(
                 c.occ_symbol)
 
-        windows = _chunk_window(start, end)
         for (underlying, expiry), wanted in by_underlying_expiry.items():
+            # An option NEVER trades past its own expiration, so querying any further than
+            # that wastes real requests on chunks guaranteed to answer "nothing here" --
+            # measured live 2026-09-02: a 2020-01-17 expiry queried all the way to a
+            # 2026-09-02 run end spent 7 chunk-pairs of calls (~9.5 min) getting NoDataFound
+            # on 6 of them for months the contract could never have traded in. Capping the
+            # window's END at the expiry (never touching the START -- a contract, especially
+            # a LEAPS, can legitimately have started trading long before the run's start
+            # date, so narrowing that side risks losing real data) fixes that for every
+            # expiry earlier than the run's end, which in a multi-year backfill is most of
+            # them.
+            group_end = min(end, expiry)
+            if group_end < start:
+                continue  # this expiry is entirely before the window -- nothing to fetch
             # One (underlying, expiry) partition, but the window may be wider than the
             # server's 365-day-per-request cap -- see _chunk_window. Chunks are
             # non-overlapping, so no bar_date can appear in two of them: concatenating the
             # per-chunk results (by just yielding as each chunk is processed) is safe without
             # any cross-chunk de-duplication.
+            windows = _chunk_window(start, group_end)
             for w_start, w_end in windows:
                 try:
                     bars_df = client.option_history_greeks_eod(

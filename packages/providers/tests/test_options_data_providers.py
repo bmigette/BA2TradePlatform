@@ -360,6 +360,56 @@ def test_one_greeks_call_and_one_open_interest_call_per_underlying_expiry():
     assert greeks_kwargs["symbol"] == "AAPL" and greeks_kwargs["expiration"] == _EXPIRY
 
 
+def test_the_query_window_is_capped_at_the_contracts_own_expiry_not_the_runs_global_end():
+    """An option never trades past its own expiration -- querying years past it (e.g. a
+    2025-01-17 expiry all the way to a 2030 run end) wastes real requests on chunks
+    guaranteed to answer 'nothing here'. Confirmed to matter live: a 2020-01-17 expiry
+    queried to a 2026-09 run end spent 6 of 7 chunk-pairs on NoDataFoundError, ~9.5 minutes
+    for that ONE unit."""
+    calls_seen = []
+
+    class _TrackingClient(_FakeClient):
+        def option_history_greeks_eod(self, **kw):
+            calls_seen.append((kw["start_date"], kw["end_date"]))
+            return _greeks_df([])
+
+    client = _TrackingClient()
+    p = _wired(client)
+    list(p.fetch_eod_bars(_CONTRACTS, start=date(2024, 1, 1), end=date(2030, 1, 1)))
+
+    assert calls_seen, "at least one call must have been made"
+    for _, c_end in calls_seen:
+        assert c_end <= _EXPIRY, \
+            f"queried past the contract's own expiry ({_EXPIRY}): end_date={c_end}"
+
+
+def test_the_query_window_start_is_never_narrowed_only_the_end():
+    """A LEAPS contract can legitimately have started trading long before the run's start
+    date -- only the END may be capped at the expiry; narrowing the START risks losing real
+    data the contract genuinely has."""
+    calls_seen = []
+
+    class _TrackingClient(_FakeClient):
+        def option_history_greeks_eod(self, **kw):
+            calls_seen.append(kw["start_date"])
+            return _greeks_df([])
+
+    client = _TrackingClient()
+    p = _wired(client)
+    list(p.fetch_eod_bars(_CONTRACTS, start=date(2010, 1, 1), end=date(2030, 1, 1)))
+
+    assert calls_seen[0] == date(2010, 1, 1), "the run's start date must survive untouched"
+
+
+def test_an_expiry_entirely_before_the_window_is_skipped_without_a_call():
+    client = _FakeClient()
+    p = _wired(client)
+    # The window starts AFTER the contract's own expiry -- nothing to fetch, no call at all.
+    bars = list(p.fetch_eod_bars(_CONTRACTS, start=date(2025, 6, 1), end=date(2025, 12, 1)))
+    assert bars == []
+    assert client.calls == []
+
+
 def test_open_interest_is_skipped_when_greeks_eod_has_no_rows():
     """An expiry genuinely absent from the window (e.g. listed after `end`) must not spend a
     second call finding out its open interest is empty too."""
