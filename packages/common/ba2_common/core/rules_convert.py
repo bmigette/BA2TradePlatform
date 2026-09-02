@@ -452,7 +452,23 @@ def _action_cfg_to_live(action: dict, key: str) -> Optional[Dict[str, dict]]:
 def live_actions_from_trade_rule(rule: dict) -> Optional[Dict[str, dict]]:
     """A TradeRule's ordered ``actions`` list -> ONE live EventAction ``actions`` dict
     (keys ``a0``..``aN``), or None when nothing converts. Shared by the export path AND the
-    backtest seeder so both build byte-identical action configs."""
+    backtest seeder so both build byte-identical action configs.
+
+    ``rule.get("enabled") is False`` -> None, UNCONDITIONALLY, before anything else runs. This
+    is the ONE choke point every rule reaches on both the backtest seeder path
+    (``default_rulesets.seed_ruleset_from_rules``) and the live export path
+    (``strategy_to_live_export`` / ``trade_rules_to_live_export``) -- so it is the single place
+    a rule-level ``enabled: False`` marker (the launcher's ``_OPTION_SL_ML_AUTHORED_OFF``
+    convention: O_ERN/O_CBS/O_PBS/O_CONVEX's ``opt_sl_ml``) can be made to actually mean
+    "inactive" for BOTH runtimes instead of being carried through as an inert flag nothing else
+    reads. FAIL-CLOSED on purpose: this also protects a HAND-WRITTEN ruleset (imported from a
+    live export, or built directly against this module) that sets ``enabled: False`` on a rule
+    without ever passing through the GA's own decode-time removal
+    (``strategy_param_space._decode_rule_list``, the emit-time half of this same fix) -- an
+    unsearched run built straight from ``_option_exit_rules()`` never calls ``decode_params`` at
+    all, so THIS guard, not that one, is what makes "authored off" true for it."""
+    if rule.get("enabled") is False:
+        return None
     actions: Dict[str, dict] = {}
     for ai, action in enumerate(a for a in (rule.get("actions") or []) if isinstance(a, dict)):
         converted = _action_cfg_to_live(action, key=f"a{ai}")

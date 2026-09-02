@@ -619,7 +619,20 @@ def _decode_rule_list(rules, ns: str,
                       optsel_by_half: Optional[Dict[str, Dict[str, Any]]] = None):
     """Deep-copy ONE TradeRule list applying decoded genes: drop toggle-disabled rules,
     substitute per-action values / option params, drop toggle-disabled (non-open) actions,
-    apply the shared per-half selection-weight genes, and substitute condition values."""
+    apply the shared per-half selection-weight genes, and substitute condition values.
+
+    AUTHORED-OFF RULES (``rule["enabled"] is False`` -- the launcher's
+    ``_OPTION_SL_ML_AUTHORED_OFF`` convention) get the OPPOSITE default from every other
+    toggleable rule: normal rules are KEPT unless the GA's gene explicitly decodes to 0;
+    an authored-off rule is DROPPED unless the gene explicitly decodes to 1. Reviewer finding
+    (2026-09-02): the old code kept the AUTHORED ``enabled: False`` key verbatim on a rule the
+    GA left untouched (no gene in the genome at all -- the default/unsearched-run case), and
+    NOTHING downstream ever consulted that key for a backtest run, so "authored off" was
+    genuinely inert for exactly the case it exists to cover. This is the emit-time half of the
+    fix (removal, matching ``_option_entry_rule``'s own "REMOVED, not flagged enabled: False"
+    idiom for --gates-off); ``rules_convert.live_actions_from_trade_rule`` is the shared
+    fail-closed half that also covers a Strategy built WITHOUT ever calling ``decode_params``
+    (an unsearched run seeded straight from ``_option_exit_rules()``)."""
     out = []
     for rule in copy.deepcopy(rules or []):
         if not isinstance(rule, dict):
@@ -627,7 +640,12 @@ def _decode_rule_list(rules, ns: str,
             continue
         rid = rule.get("id")
         genes = rule_genes.get(rid or "", {})
-        if genes.get("enabled") == 0:
+        gene_enabled = genes.get("enabled")
+        if rule.get("enabled") is False:
+            if gene_enabled != 1:
+                continue  # authored OFF, and the GA did not explicitly turn it on
+            del rule["enabled"]  # GA turned it ON -- emit it, with no stale enabled key
+        elif gene_enabled == 0:
             continue  # whole rule dropped by the GA
         actions = []
         for idx, action in enumerate(a for a in (rule.get("actions") or [])

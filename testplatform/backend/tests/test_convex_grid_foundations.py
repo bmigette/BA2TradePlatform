@@ -315,24 +315,74 @@ def test_o_convex_is_in_the_sl_ml_authored_off_set():
 
 
 def test_the_default_genome_carries_no_active_sl_ml_exit():
-    """THE PIN: the emitted ruleset from a DEFAULT genome (no genes touched at all) carries
-    opt_sl_ml with enabled=False -- design §2's "default OFF", checked on the actual emitted
-    rule (mirrors test_opt_sl_ml_is_authored_OFF_but_still_searched's two-assertion shape for
-    O_ERN/O_CBS/O_PBS)."""
+    """THE PIN, ON THE EFFECT NOT THE KEY (reviewer fix, 2026-09-02: the old version asserted
+    ``sl_ml.get("enabled") is False`` on the emitted rule -- a stale flag nothing downstream
+    ever read, not an inactive rule; see strategy_param_space._decode_rule_list's docstring and
+    rules_convert.live_actions_from_trade_rule's docstring for the two-sided fix). The emitted
+    ruleset from a DEFAULT genome (no genes touched at all) must carry NO opt_sl_ml rule AT
+    ALL -- design §2's "default OFF", checked on the actual emitted ruleset (mirrors
+    test_the_default_genome_emits_no_sl_ml_rule_at_all's shape for O_ERN/O_CBS/O_PBS in
+    test_option_grid_foundations.py)."""
     m = _launcher()
     rule = next(r for r in m._option_exit_rules("O_CONVEX") if r["id"] == "opt_sl_ml")
     assert rule["enabled"] is False
     assert rule["toggle_optimize"] is True
     assert "exit:opt_sl_ml:enabled" in _space(m)
     trial = _decoded(m, {})
-    sl_ml = next(r for r in trial["exit_rules"] if r["id"] == "opt_sl_ml")
-    assert sl_ml.get("enabled") is False
+    assert not any(r["id"] == "opt_sl_ml" for r in trial["exit_rules"]), (
+        "a default (unsearched) genome must carry NO opt_sl_ml rule, not one merely flagged "
+        "enabled=False")
 
 
 def test_sl_ml_can_still_be_dropped_by_the_GA_the_other_half_of_searchable():
     m = _launcher()
     trial = _decoded(m, {"exit:opt_sl_ml:enabled": 0})
     assert not any(r["id"] == "opt_sl_ml" for r in trial["exit_rules"])
+
+
+def test_the_ga_can_still_turn_sl_ml_on_with_the_decoded_threshold():
+    """The other half of "searchable": gene=1 emits an ACTIVE rule (no ``enabled`` key at all)
+    carrying the GA's OWN decoded threshold, not the authored default."""
+    m = _launcher()
+    trial = _decoded(m, {"exit:opt_sl_ml:enabled": 1, "cond:sl_ml:value": 70})
+    rule = next(r for r in trial["exit_rules"] if r["id"] == "opt_sl_ml")
+    assert "enabled" not in rule, "an emitted, GA-enabled rule must carry no stale flag"
+    leaf = rule["conditions"]["conditions"][0]
+    assert leaf["field"] == "loss_pct_of_max_loss"
+    assert leaf["value"] == 70
+
+
+# ---- the elapsed-time exit (opt_time): wider band, authored OFF ------------------------------
+# Review finding (2026-09-02): the shared 28-day default (10-45 band) contradicts a ~300-DTE
+# convex thesis. O_CONVEX gets its OWN band (90-360 step 30) and is authored off by the same
+# removal idiom as opt_sl_ml.
+def test_o_convex_has_its_own_wider_elapsed_time_band():
+    m = _launcher()
+    assert m._OPTION_TIME_EXIT_OVERRIDE["O_CONVEX"] == {
+        "value": 180, "value_min": 90, "value_max": 360, "value_step": 30}
+    assert "O_CONVEX" in m._OPTION_TIME_EXIT_AUTHORED_OFF
+
+
+def test_the_default_genome_emits_no_opt_time_rule_at_all():
+    m = _launcher()
+    rule = next(r for r in m._option_exit_rules("O_CONVEX") if r["id"] == "opt_time")
+    assert rule["enabled"] is False
+    assert rule["toggle_optimize"] is True
+    assert "exit:opt_time:enabled" in _space(m)
+    trial = _decoded(m, {})
+    assert not any(r["id"] == "opt_time" for r in trial["exit_rules"]), (
+        "a default (unsearched) genome must carry NO opt_time rule, not one merely flagged "
+        "enabled=False")
+
+
+def test_the_ga_can_turn_opt_time_on_with_the_decoded_days():
+    m = _launcher()
+    trial = _decoded(m, {"exit:opt_time:enabled": 1, "cond:td:value": 270})
+    rule = next(r for r in trial["exit_rules"] if r["id"] == "opt_time")
+    assert "enabled" not in rule, "an emitted, GA-enabled rule must carry no stale flag"
+    leaf = rule["conditions"]["conditions"][0]
+    assert leaf["field"] == "days_opened"
+    assert leaf["value"] == 270
 
 
 # ---- max 1 concurrent ticket per underlying, FIXED (has_no_position) ------------------------

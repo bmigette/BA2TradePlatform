@@ -1440,6 +1440,60 @@ def test_opt_sl_ml_is_authored_OFF_but_still_searched(key):
     assert "exit:opt_sl_ml:enabled" in _space(m, key)
 
 
+def _decoded_trial(m, key, genome, expert="FMPRating"):
+    """The trial config a real run actually receives for ``key`` -- through
+    ``_build_daily_trial_config``, the same whitelist-trap guard the rest of this file's
+    recorded-chain tests use."""
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+    from app.services.strategy_param_space import decode_params
+
+    strat = m._build_strategy(key, f"g-slml-{key}", expert)
+    decoded = decode_params(strat, genome)
+    backtest_cfg = {
+        "backtest_id": f"slml-{key}", "start_date": "2024-02-01", "end_date": "2024-06-01",
+        "enabled_instruments": ["AAPL"],
+        "experts": [{"class": expert, "settings": {}}],
+        "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
+        "entry_action": getattr(strat, "entry_action", None), "options_store": "parquet",
+    }
+    return _build_daily_trial_config(backtest_cfg, decoded, None)
+
+
+# THE EFFECT, NOT THE AUTHORED KEY (reviewer finding, 2026-09-02). ``rule["enabled"] is False``
+# on the AUTHORED dict (test above) is necessary but NOT sufficient -- before the fix, that
+# stale key survived onto a DEFAULT (unsearched) genome's EMITTED ruleset untouched, and
+# nothing in either runtime (strategy_param_space._decode_rule_list's old drop-only-on-0 logic,
+# default_rulesets.seed_ruleset_from_rules, or rules_convert.live_actions_from_trade_rule)
+# actually skipped a rule for carrying it -- so a default-genome trial, an unsearched run and a
+# seeded live deploy all carried an ACTIVE close_option max-loss stop the design forbids. The
+# fix is two-sided: _decode_rule_list now REMOVES an authored-off rule unless its gene decodes
+# to 1 (emit time), and rules_convert.live_actions_from_trade_rule skips any rule carrying
+# ``enabled: False`` regardless of how it got there (the shared fail-closed guard covering an
+# unsearched run that never calls decode_params at all). These two tests prove the EFFECT on
+# the emitted ruleset, not the authored marker.
+@pytest.mark.parametrize("key", ["O_ERN", "O_CBS", "O_PBS"])
+def test_the_default_genome_emits_no_sl_ml_rule_at_all(key):
+    m = _launcher()
+    trial = _decoded_trial(m, key, {})
+    assert not any(r["id"] == "opt_sl_ml" for r in trial["exit_rules"]), (
+        f"{key}: a default (unsearched) genome must carry NO opt_sl_ml rule, not one merely "
+        f"flagged enabled=False")
+
+
+@pytest.mark.parametrize("key", ["O_ERN", "O_CBS", "O_PBS"])
+def test_the_ga_can_still_turn_sl_ml_on_with_the_decoded_threshold(key):
+    """The other half of "searchable": gene=1 emits an ACTIVE rule (no enabled key at all --
+    "no emitted ruleset ever carries a rule-level enabled flag") carrying the GA's OWN decoded
+    threshold, not the authored default."""
+    m = _launcher()
+    trial = _decoded_trial(m, key, {"exit:opt_sl_ml:enabled": 1, "cond:sl_ml:value": 65})
+    rule = next(r for r in trial["exit_rules"] if r["id"] == "opt_sl_ml")
+    assert "enabled" not in rule, f"{key}: an emitted, GA-enabled rule must carry no stale flag"
+    leaf = rule["conditions"]["conditions"][0]
+    assert leaf["field"] == "loss_pct_of_max_loss"
+    assert leaf["value"] == 65
+
+
 @pytest.mark.parametrize("key", ["O_LEAPC", "O_LEAPP"])
 def test_the_long_dated_keys_keep_opt_sl_ml_ON(key):
     """The negative: design section 2 lists ``opt_sl_ml`` as a plain gene for the LEAPS arms,

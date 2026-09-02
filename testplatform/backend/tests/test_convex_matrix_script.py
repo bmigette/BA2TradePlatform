@@ -122,19 +122,28 @@ def test_the_fitness_default_is_option_convex_and_nothing_else():
 # --------------------------------------------------------------------------- #
 # The job list -- GOLDEN
 # --------------------------------------------------------------------------- #
+def test_the_default_experts_are_two_measured_stage_1_experts():
+    """Design §5: "O_CONVEX x stage-1's experts, singles. 2-3 jobs." FMPRating AND
+    DeterministicScorer both have measured large-cap results (DeterministicScorer's in the
+    matrix3 grid) -- review addition, 2026-09-02."""
+    d = _driver()
+    assert d._DEFAULT_EXPERTS == ["FMPRating", "DeterministicScorer"]
+
+
 def test_the_job_list_is_exactly_this():
+    """THE GOLDEN, using the REAL default experts -- 2 jobs, inside design §5's 2-3 range."""
     d = _driver()
-    jobs = list(d._jobs(d._DEFAULT_STRATEGIES, ["FMPRating"]))
-    assert jobs == [("convex-FMPRating-O_CONVEX", "FMPRating", "O_CONVEX")]
-
-
-def test_a_second_expert_adds_a_second_job():
-    d = _driver()
-    jobs = list(d._jobs(["O_CONVEX"], ["FMPRating", "DeterministicScorer"]))
+    jobs = list(d._jobs(d._DEFAULT_STRATEGIES, d._DEFAULT_EXPERTS))
     assert jobs == [
         ("convex-FMPRating-O_CONVEX", "FMPRating", "O_CONVEX"),
         ("convex-DeterministicScorer-O_CONVEX", "DeterministicScorer", "O_CONVEX"),
     ]
+
+
+def test_a_single_expert_override_still_yields_one_job():
+    d = _driver()
+    jobs = list(d._jobs(["O_CONVEX"], ["FMPRating"]))
+    assert jobs == [("convex-FMPRating-O_CONVEX", "FMPRating", "O_CONVEX")]
 
 
 def test_the_name_suffix_reaches_every_job():
@@ -231,6 +240,53 @@ def test_main_refuses_before_touching_the_universe_file_or_preflight(tmp_path, m
     d = _driver()
     with pytest.raises(SystemExit, match="stress-spread-bps"):
         d.main(["--stress-spread-bps", "5", "--dry-run"])
+
+
+def test_the_dry_run_universe_count_is_LABELLED_unfiltered(capsys):
+    """Review finding (2026-09-02): --dry-run short-circuits ``_preflight`` to the RAW
+    universe -- the real probe subprocess never runs -- so an unlabelled symbol count reads
+    as "this many passed the DTE>=270 probe", which is false for every --dry-run line."""
+    d = _driver()
+    rc = d.main(["--dry-run"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "(unfiltered, dry-run)" in out
+
+
+# --------------------------------------------------------------------------- #
+# _completed_names -- named DB exceptions, never a bare swallow
+# --------------------------------------------------------------------------- #
+def test_completed_names_warns_and_returns_empty_on_a_missing_table(tmp_path, monkeypatch,
+                                                                    caplog):
+    """A fresh db (no strategy_optimizations table yet) is a real, expected first-run shape --
+    but review finding (2026-09-02): the old bare ``except Exception`` swallowed it (and a
+    LOCKED db, the dangerous case) with zero trace. Must log at WARNING, not stay silent."""
+    import logging
+    import sqlite3
+
+    empty_db = tmp_path / "empty.db"
+    sqlite3.connect(str(empty_db)).close()  # a real sqlite file with NO tables
+    monkeypatch.setenv("DB_FILE", str(empty_db))
+    d = _driver()
+    with caplog.at_level(logging.WARNING):
+        names = d._completed_names()
+    assert names == set()
+    assert any("could not read completed job names" in r.message for r in caplog.records)
+
+
+def test_completed_names_reraises_an_unexpected_exception_type(monkeypatch):
+    """Only the named sqlite exceptions are swallowed-with-a-warning; anything else (a
+    programming error) must NOT be hidden."""
+    import sqlite3
+
+    d = _driver()
+
+    def _boom(*_a, **_k):
+        raise TypeError("not a sqlite problem")
+
+    monkeypatch.setattr(sqlite3, "connect", _boom)
+    with pytest.raises(TypeError):
+        d._completed_names()
 
 
 def test_the_refusal_message_names_the_inert_reason():

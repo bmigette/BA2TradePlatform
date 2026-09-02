@@ -3808,6 +3808,24 @@ _OPTION_TP_MULTIPLE_BANDS = {
     "O_CONVEX": (5, 3, 10, 1),   # 8
 }
 
+# ``opt_time`` (the ELAPSED-time exit, ``days_opened > N``) PER-KEY OVERRIDE (review finding,
+# 2026-09-02). The shared debit/credit ``td`` band below (28 default, 10-45) was set for the
+# 25-45-DTE structures the first grid searched, and it is authored ON BY DEFAULT everywhere --
+# a real close trigger, not a loose gene. O_CONVEX's median entry is a ~300-DTE ticket
+# (option_dte centre 240-480), so the SHARED band would close a lottery ticket 28 days into a
+# thesis built to run for the better part of a year -- the same "wrong band for this tenor"
+# defect ``_OPTION_DTE_EXIT_BANDS`` already exists to fix for the REMAINING-life exit, just on
+# the ELAPSED-time exit instead. Fixed the SAME way: a wider band (90-360 step 30, 10 levels)
+# AND authored OFF by default (the ``opt_sl_ml``/``_OPTION_SL_ML_AUTHORED_OFF`` removal idiom,
+# not a flag -- see ``strategy_param_space._decode_rule_list``'s and
+# ``rules_convert.live_actions_from_trade_rule``'s docstrings for why removal, not a flag) so a
+# default/unsearched genome never closes the ticket at 28 days; the GA can still discover a
+# time stop is worth it and turn the rule on.
+_OPTION_TIME_EXIT_OVERRIDE = {
+    "O_CONVEX": {"value": 180, "value_min": 90, "value_max": 360, "value_step": 30},
+}
+_OPTION_TIME_EXIT_AUTHORED_OFF = {"O_CONVEX"}
+
 # ``opt_sl_ml`` AUTHORED OFF (still searched). Design §2 for O_ERN: "opt_sl_ml searchable,
 # default OFF -- the thesis is binary; a stop mid-event amputates it", and the same sentence
 # for the backspreads. The rule keeps its ``toggle_optimize`` gene, so the GA still explores
@@ -3874,17 +3892,24 @@ def _option_exit_rules(kind: str):
     dte_default, dte_lo, dte_hi, dte_step = _OPTION_DTE_EXIT_BANDS.get(kind, (21, 0, 21, 3))
     tp = ({"value": 100, "value_min": 25, "value_max": 200, "value_step": 25} if debit
           else {"value": 50, "value_min": 25, "value_max": 75, "value_step": 5})
-    td = ({"value": 28, "value_min": 10, "value_max": 45, "value_step": 5} if debit
-          else {"value": 21, "value_min": 10, "value_max": 35, "value_step": 5})
+    td = _OPTION_TIME_EXIT_OVERRIDE.get(kind) or (
+        {"value": 28, "value_min": 10, "value_max": 45, "value_step": 5} if debit
+        else {"value": 21, "value_min": 10, "value_max": 35, "value_step": 5})
+    opt_time = {"id": "opt_time", "action_type": "close_option", "toggle_optimize": True,
+                "conditions": {"type": "AND", "conditions": [
+                    {"id": "td", "field": "days_opened", "op": ">",
+                     "optimize": True, **td}]}}
+    # See _OPTION_TIME_EXIT_OVERRIDE's comment: O_CONVEX authors this OFF (removal idiom, not
+    # a flag) so a default/unsearched genome never closes a ~300-DTE ticket at the shared
+    # 25-45-DTE band's 28-day default.
+    if kind in _OPTION_TIME_EXIT_AUTHORED_OFF:
+        opt_time["enabled"] = False
     rules = [
         {"id": "opt_tp", "action_type": "close_option", "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [
              {"id": "tp", "field": "profit_loss_percent", "op": ">",
               "optimize": True, **tp}]}},
-        {"id": "opt_time", "action_type": "close_option", "toggle_optimize": True,
-         "conditions": {"type": "AND", "conditions": [
-             {"id": "td", "field": "days_opened", "op": ">",
-              "optimize": True, **td}]}},
+        opt_time,
         # Its OWN rule, not another leaf on opt_time: leaves inside one rule are ANDed, so
         # folding it in would demand "held N days AND M days left" and would cost the DTE
         # exit its own on/off gene.

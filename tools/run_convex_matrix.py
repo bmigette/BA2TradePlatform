@@ -37,7 +37,7 @@ expert signals.
 
 Usage (test venv; FMP_API_KEY/DB_FILE in env):
     ba2-venvs/test/Scripts/python.exe tools/run_convex_matrix.py \
-        [--experts FMPRating] \
+        [--experts FMPRating,DeterministicScorer] \
         [--start 2023-01-01] [--end 2025-12-31] \
         [--population 40] [--generations 6] [--dry-run]
 
@@ -76,14 +76,15 @@ _MIN_DTE = {
     "O_CONVEX": 270,
 }
 
-# STAGE-1'S EXPERTS (design Section 5). FMPRating is the grid-1/grid-2 default and the only
-# expert with a measured large-cap signal on this options universe -- the same precedent
-# run_options2_matrix.py's own ``_DEFAULT_EXPERTS`` set for the screener-style grid-2 keys.
-# The design's own job count ("2-3 jobs") assumes more than one stage-1 expert is available;
-# today only one is measured, so the default here is ONE job, exactly like grid 2's screener
-# arms. ``--experts`` is a real override, so a second measured expert costs a flag, not a
-# code edit, once one exists.
-_DEFAULT_EXPERTS = ["FMPRating"]
+# STAGE-1'S EXPERTS (design Section 5: "O_CONVEX x stage-1's experts, singles. 2-3 jobs.").
+# FMPRating is the grid-1/grid-2 default and the only expert with a measured large-cap signal
+# on this options universe -- the same precedent run_options2_matrix.py's own
+# ``_DEFAULT_EXPERTS`` set for the screener-style grid-2 keys. DeterministicScorer joins it
+# (review addition, 2026-09-02): it has MEASURED large-cap results in the matrix3 grid, so it
+# clears the same "measured, not just registered" bar FMPRating does, and TWO experts x ONE
+# strategy key lands the driver's default at 2 jobs -- inside the design's own 2-3 range.
+# ``--experts`` is a real override either way.
+_DEFAULT_EXPERTS = ["FMPRating", "DeterministicScorer"]
 
 # Options need ~2x the equity balance headroom -- $20k, the same figure grid 1 and grid 2 run
 # at, so results across all three grids are read against the same account size.
@@ -112,14 +113,36 @@ def _db_path() -> str:
 
 
 def _completed_names() -> set:
+    """Names already ``completed`` in ``strategy_optimizations`` -- read fresh on every call
+    (called once per loop iteration in ``main``) so the driver is resumable if killed and
+    re-run mid-matrix.
+
+    Catches ONLY the sqlite exceptions a missing/locked/pre-migration db can genuinely raise
+    (``OperationalError`` -- locked db, no such table on a fresh db, disk I/O; ``DatabaseError``
+    -- their common base, corrupt file) and LOGS them at WARNING rather than swallowing them
+    silently (review finding, 2026-09-02: a bare ``except Exception: return set()`` makes a
+    LOCKED db -- a real, occasionally-hit condition when another process holds the sqlite file
+    -- silently read as "nothing completed", so ``main`` re-launches a job that already
+    finished, burning a full GA search for a duplicate result nothing ever reports as wrong).
+    Anything else (a programming error, an unexpected exception type) is NOT this function's
+    business to hide and re-raises.
+    """
+    import logging
     import sqlite3
+
     try:
         c = sqlite3.connect(_db_path())
-        rows = c.execute(
-            "SELECT name FROM strategy_optimizations WHERE status='completed'").fetchall()
-        c.close()
+        try:
+            rows = c.execute(
+                "SELECT name FROM strategy_optimizations WHERE status='completed'").fetchall()
+        finally:
+            c.close()
         return {r[0] for r in rows}
-    except Exception:  # noqa: BLE001
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+        logging.getLogger(__name__).warning(
+            "run_convex_matrix: could not read completed job names from %s (%s: %s) -- "
+            "treating as NONE completed. If this is a LOCKED db (another process holding it), "
+            "a job that already finished may be RE-RUN.", _db_path(), type(e).__name__, e)
         return set()
 
 
@@ -246,8 +269,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="Comma list of convex-grid keys (default O_CONVEX -- the only key "
                          "today).")
     ap.add_argument("--experts", default=",".join(_DEFAULT_EXPERTS),
-                    help="Comma list of stage-1 experts (default FMPRating -- the only expert "
-                         "with a measured large-cap signal on this options universe).")
+                    help="Comma list of stage-1 experts (default FMPRating,DeterministicScorer "
+                         "-- both have measured large-cap results on this options universe).")
     ap.add_argument("--start", default="2023-01-01",
                     help="Backtest start (design Section 5 window; needs the parquet store).")
     ap.add_argument("--end", default="2025-12-31",
@@ -347,10 +370,15 @@ def main(argv=None) -> int:
                                  args.probe_out_dir, dry_run=args.dry_run)
 
     if args.dry_run:
+        # UNFILTERED, LABELLED (review finding, 2026-09-02): --dry-run makes _preflight
+        # (and --skip-preflight) short-circuit to the RAW universe -- neither the real probe
+        # subprocess nor a file read ever runs -- so the symbol count below is the input
+        # list's size, not a DTE>=270-filtered one. Printing it unlabelled reads as "this many
+        # symbols passed the chain-depth probe", which is false for every --dry-run job line.
         for nm, exp, s in jobs:
             uni = kept_by_dte[_MIN_DTE[s]]
             print(f"  {'DONE' if nm in done else 'TODO'}  {nm}  ({exp} {s}, "
-                  f"DTE>={_MIN_DTE[s]}, {len(uni)} symbols)")
+                  f"DTE>={_MIN_DTE[s]}, {len(uni)} symbols (unfiltered, dry-run))")
         return 0
 
     for i, (name, expert, strat) in enumerate(jobs, 1):
