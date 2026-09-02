@@ -110,3 +110,89 @@ pushed from the fix branches; no version bump taken (deliberate — see deploy p
 * Stage-2 substrate (F3): per operator, built AFTER stage-1 research digestion.
 * Tasks 7-10 of the selection plan: still on hold pending operator review of the findings
   doc; Task 9 unblocked by the F13 purges, Task 10 shaped by the F15 w_rr decision.
+
+---
+
+## FOLLOW-UP TASK LIST for the operator (recorded 2026-09-03, from the options-grid2 final review §1b/§2b)
+
+Recorded, NOT implemented. Each item is a judgement call the operator owns; the branch's
+FIX-NEEDED items were landed separately (the 5 stale tests, deploy-payload parity, the
+`_entry_order` ordering pin). Ranked cheapest-first within each group.
+
+### A. LIVE BEHAVIOUR — read this one first
+
+**A1. `LIFECYCLE_ROLL_SHORT` is computed and then silently discarded. LIVE MONEY.**
+`option_lifecycle.decide()` computes the PMCC overlay roll (`option_lifecycle.py:1113-1119`,
+`pmcc_roll_due:868-892`) and hands back `LIFECYCLE_ROLL_SHORT`. That reason is **not in
+`LIFECYCLE_CLOSING_REASONS`**, and `option_lifecycle_service.py:397-418` handles only
+`UNKNOWN` / `COVER_LOST` / `should_close` — so the live pass reaches a roll decision and drops
+it on the floor. Today the roll happens anyway, via the RULE (`pmcc_roll_dte` ->
+`ShortLegDaysToExpiryCondition` -> `RollPMCCShortAction`), which is why nothing is visibly
+broken. But a live PMCC sleeve is currently protected by exactly one of the two mechanisms
+that appear to exist, and nothing in the code says which.
+
+The review's recommendation is to **DELETE the dead branch** and let the rule own the roll in
+both runtimes — that is `RollPMCCShortAction`'s own "IT IS A RULE, NOT AN ENGINE HOOK"
+argument, and it is the only option that leaves one mechanism rather than one and a half. The
+alternative (wiring the reason through the service) creates a second roller the backtest does
+not have, i.e. a NEW parity gap. **This is a live-behaviour decision on real money. It is not
+a tooling change, and it was deliberately left for the operator to judge.**
+
+### B. The tested-delta gap — the only live rule with NO backtest counterpart
+
+**B1. Add a `ShortLegDeltaCondition`.** Tested-delta management (`option_lifecycle.py:536-568`,
+`:1099-1105`) is the one live exit no ruleset can express: the only delta condition in the
+registry is `LongLegDeltaCondition` (`TradeConditions.py:3679`), and **no short-leg delta field
+exists**. So the GA cannot search it, and no grid result is evidence about it. The shape
+already exists — `_TwoExpiryLegCondition` plus `option_lifecycle._tested`'s short-leg selection
+— and the precedent to copy is exactly `credit_decayed_pct` -> `CreditDecayedPctCondition`
+(`TradeConditions.py:3619`), which the review confirmed is genuinely ONE implementation reached
+by both runtimes. Biggest parity win per unit of work on the whole list.
+
+### C. The remaining `decide()`-only behaviours (review §2b table)
+
+Live = the shared rules path **plus** `decide()`; backtest = the shared rules path only. Live
+is a strict superset for exits, so **a grid result systematically understates how aggressively
+a live sleeve exits.** Pinned in `EXPERTS.md:164`: do not read a backtest as evidence about
+profit-capture / roll-DTE / tested-delta behaviour.
+
+| # | Behaviour | Status | Cheapest close |
+|---|---|---|---|
+| C1 | **Circuit-breaker FLATTEN** | PARTIAL — the breaker TRANSITION is shared (`daily_engine.py:1544-1564` -> `update_sleeve_breaker:1161`) and the entry decline is shared, but the backtest never CLOSES the book: it rides a drawdown live liquidates | mirror `option_lifecycle_service.py:415-418` at the `update_sleeve_breaker` call site (`daily_engine.py:1550`). Without it `EXPERTS.md:161`'s "one implementation, two callers" is true of the latch but not of its consequence |
+| C2 | **Covered-call cover-lost close** | NO — `grep cover_lost` over `testplatform/` = 0 hits | a condition, or accept that O_CC backtests never model it |
+| C3 | **Profit capture** (`profit_capture_pct`) | PARTIAL — same arithmetic, **two implementations** (`option_lifecycle._pnl_pct:495-533` vs `TradeConditions._get_spread_pnl_via_transaction`), fed by different quote sources (chain map vs per-leg `get_option_quote`) | unify the two P&L implementations |
+| C4 | **Strangle-specific capture** (`strangle_capture_pct`) | PARTIAL — no distinct backtest knob; every credit kind shares one `opt_tp` band | a per-kind band, if the distinction is real |
+| C5 | **Credit-multiple stops** (`dr_stop_*`/`ur_stop_*`) | DIFFERENT — live partitions by declared strategy tag and carries a deliberate quirk (with `ur_stop` off, a naked structure has NO stop even when `dr_stop` is on); the backtest partitions differently, can have both live, and uses different denominators | decide which partition is correct, then make it one |
+| C6 | **DTE roll/close** | PARTIAL — identical on single-expiry; on a declared multi-expiry structure live reads the SHORT leg and `DaysToExpiryCondition` the LONG. Deliberate, documented both sides | none needed; know it when reading a PMCC/diagonal result |
+| C7 | **Unknown/unmeasurable alarm** | PARTIAL — live has `LifecyclePassResult.unknown`; the backtest has per-condition `_unevaluable` only, so an unevaluable condition is a `False`, indistinguishable from "threshold not met". **A trial cannot report how many bars it was blind** | an aggregate blind counter on the trial |
+| C8 | **Close mechanics** | DIFFERENT BY DESIGN — live MARKET (`_close:770-824`), backtest LIMIT plus a backtest-only spread concession (`CloseOptionAction:5301-5347`); residual optimism recorded at `:5264-5269` | accepted |
+| C9 | **Expiry / assignment settlement** | DIFFERENT — live is OCC plus the broker; the backtest never exercises ITM longs, always assigns short ITM, and models no early American assignment | known limitation |
+| C10 | **Reverse direction** — what the BACKTEST does that live does not | margin-call liquidation; `hold_assigned_stock`; the exit-quote concession; **per-bar cadence** (the backtest walks OPEN_POSITIONS every bar, live runs on the JobManager schedule); and **rule ordering** — `_insert_option_overlay(anchor="front")` plus `continue_processing` make first-match order load-bearing in the backtest, while live's `decide()` has a fixed precedence ladder, so on a bar where profit-capture and roll-DTE both hold the two runtimes record different REASONS | — |
+
+Also standing: **no shipped grid spec sets `risk_manager_mode: classic_options`**
+(`ba2test_launcher.py:1073-1083`, pinned by
+`test_no_shipped_expert_spec_selects_a_risk_manager_mode`), so in current grid jobs the entry
+rails and the sleeve breaker are inert too. That changes how to read every "both runtimes"
+claim in `EXPERTS.md:158-163`.
+
+### D. Pre-existing: the seam-wiring resolver captures a stale `get_provider`
+
+`_wire_provider_resolver` (`seam_wiring.py:182-199`) does `from ba2_providers import
+get_provider` and its `_resolve` closure **binds that function object**. `wire_backtest_seams`
+is idempotent (`if _resolver is None`, `:152-156`), so if the FIRST wire in a process happens
+while `e2e_support.hermetic_providers` has `ba2_providers.get_provider` patched to a fixture,
+the closure captures the FIXTURE permanently and is never rebuilt. `hermetic_providers`
+restores the module attribute correctly — the closure is what is stale.
+
+Reproduces in two files:
+`pytest tests/backtest/test_daily_engine_e2e.py tests/backtest/test_seam_wiring.py` ->
+`assert <FixtureOHLCVProvider> is <FMPOHLCVProvider>`. Not caused by the options-grid2 branch
+(`git log 56c3f8c2..HEAD --` on `seam_wiring.py`, `test_seam_wiring.py`, `e2e_support.py`,
+`hermetic_providers.py` and `test_daily_engine_e2e.py` is empty).
+
+**Fix is one line, in production:** resolve through the module attribute at call time —
+`import ba2_providers` then `return ba2_providers.get_provider(category, name, **kwargs)` —
+instead of the bound name. Benign in production (each GA worker wires once, against the real
+provider), but it makes the whole backend suite ORDER-DEPENDENT, which is how the 5 stale
+`O_PMCC` tests stayed invisible for a day. **Left unfixed here as a production change outside
+the FIX-NEEDED mandate**; its 2 failures are expected in a full backend run.
