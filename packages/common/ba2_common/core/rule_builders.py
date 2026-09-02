@@ -285,7 +285,22 @@ def action_from_rule(rule: dict, key: str = "act") -> Optional[Dict[str, dict]]:
     open_strangle/close_option, ...) emit an action config carrying the option selection
     params (strike_method/strike_param/dte_min/dte_max/sizing/liquidity) in the EXACT shape
     the ``TradeActionEvaluator`` reads — so the BACKTEST builds the option ``TradeAction``
-    identically to live."""
+    identically to live.
+
+    ``rule.get("enabled") is False`` -> None, UNCONDITIONALLY, before anything else runs —
+    including before the option branch, which returns early and would otherwise let an
+    authored-off option rule (``opt_sl_ml`` is exactly that) straight through. This is the
+    LEGACY-shape half of the 2026-09-02 fail-closed guard: ``live_actions_from_trade_rule``
+    covers the ordered-``actions`` pair (``default_rulesets.seed_ruleset_from_rules`` +
+    ``rules_convert.trade_rules_to_live_export``), and THIS covers the one-action-per-rule
+    pair that never reaches it — ``rules_convert.strategy_to_live_export``'s exit loop (live)
+    and ``default_rulesets.seed_open_positions_ruleset`` (backtest). Both shapes, both
+    runtimes, same rule: an ``enabled: False`` rule produces no action at all rather than an
+    inert flag nothing downstream reads. ``is False`` and not falsiness, so an absent key and
+    an explicit ``True`` both convert normally (pinned in
+    packages/common/tests/test_live_actions_enabled_flag.py)."""
+    if rule.get("enabled") is False:
+        return None
     raw = rule.get("action_type") or rule.get("action")
     if is_option_action(str(raw)):
         return {key: _option_action_config(str(raw), rule)}

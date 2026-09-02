@@ -12,9 +12,19 @@ guard is the fail-closed half of the fix: it applies to ANY rule dict handed to 
 not it ever passed through the GA's decode-time removal
 (``strategy_param_space._decode_rule_list``), which is what makes it safe for a HAND-WRITTEN
 ruleset too.
+
+THE LEGACY SHAPE (added 2026-09-02, plan Task 14b item 1): two call sites never reach
+``live_actions_from_trade_rule`` at all -- ``strategy_to_live_export``'s exit loop and
+``default_rulesets.seed_open_positions_ruleset`` both convert a rule through
+``rule_builders.action_from_rule`` (the ONE-action-per-rule legacy shape ``decode_params``
+still emits) and so bypassed the guard entirely. The guard therefore lives in BOTH shared
+converters; ``action_from_rule`` is the choke point for the legacy pair exactly as
+``live_actions_from_trade_rule`` is for the ordered-actions pair.
 """
+from ba2_common.core.rule_builders import action_from_rule
 from ba2_common.core.rules_convert import (
     live_actions_from_trade_rule,
+    strategy_to_live_export,
     trade_rules_to_live_export,
 )
 
@@ -71,4 +81,69 @@ def test_a_ruleset_of_only_disabled_rules_produces_no_open_positions_ruleset():
     ruleset is emitted at all (mirrors the "rules whose actions all fail to convert are
     dropped" contract ``trade_rules_to_live_export`` already documents)."""
     out = trade_rules_to_live_export(entry_rules=[], exit_rules=[_CLOSE_RULE_ENABLED_FALSE])
+    assert not [rs for rs in out["rulesets"] if rs["subtype"] == "open_positions"]
+
+
+# ==================================================================================================
+# THE LEGACY (one-action-per-rule) SHAPE -- ``rule_builders.action_from_rule``
+# ==================================================================================================
+# ``decode_params`` still emits exit rules in the flat legacy shape
+# ``{id, conditions, action_type, action_value, enabled}``, and TWO shared converters read that
+# shape directly instead of going through ``live_actions_from_trade_rule``:
+#   * ``rules_convert.strategy_to_live_export``'s exit loop (the LIVE export half), and
+#   * ``default_rulesets.seed_open_positions_ruleset`` (the BACKTEST seeder half, pinned in
+#     testplatform/backend/tests/backtest/test_sl_ml_authored_off_parity.py -- it needs a DB).
+# Both call ``action_from_rule``, so that is where the guard belongs for this pair.
+
+_LEGACY_DISABLED_EXIT = {
+    "id": "opt_sl_ml", "name": "opt_sl_ml", "enabled": False, "toggle_optimize": True,
+    "conditions": {"type": "AND", "conditions": [
+        {"id": "sl_ml", "field": "loss_pct_of_max_loss", "op": ">", "value": 50}]},
+    "action_type": "close_option",
+}
+
+_LEGACY_LIVE_EXIT = {
+    "id": "opt_tp", "name": "opt_tp",
+    "conditions": {"type": "AND", "conditions": [
+        {"id": "tp", "field": "profit_loss_percent", "op": ">", "value": 100}]},
+    "action_type": "close_option",
+}
+
+
+def test_action_from_rule_returns_none_for_a_rule_flagged_enabled_false():
+    assert action_from_rule(_LEGACY_DISABLED_EXIT) is None
+
+
+def test_action_from_rule_still_converts_a_rule_with_no_enabled_key():
+    assert action_from_rule(_LEGACY_LIVE_EXIT)["act"]["action_type"] == "close_option"
+
+
+def test_action_from_rule_still_converts_a_rule_explicitly_enabled_true():
+    """``is False``, not falsiness: an explicit True must convert."""
+    rule = {**_LEGACY_DISABLED_EXIT, "enabled": True}
+    assert action_from_rule(rule)["act"]["action_type"] == "close_option"
+
+
+def test_action_from_rule_guards_an_option_action_too():
+    """The option branch returns BEFORE the EXIT_ACTION lookup, so the guard has to sit above
+    both or an option rule (which is exactly what ``opt_sl_ml`` is) slips through."""
+    rule = {"action_type": "buy_call", "enabled": False,
+            "option_strike_method": "delta", "option_strike_param": 0.8}
+    assert action_from_rule(rule) is None
+
+
+def test_strategy_to_live_export_drops_a_disabled_legacy_exit_rule():
+    """The legacy LIVE export path end-to-end: no open_positions rule for the disabled one."""
+    out = strategy_to_live_export(
+        buy_tree=None, sell_tree=None,
+        exit_rules=[_LEGACY_DISABLED_EXIT, _LEGACY_LIVE_EXIT])
+    op = next(rs for rs in out["rulesets"] if rs["subtype"] == "open_positions")
+    names = {r["name"] for r in op["rules"]}
+    assert "opt_tp" in names
+    assert "opt_sl_ml" not in names
+
+
+def test_strategy_to_live_export_emits_no_open_positions_ruleset_when_all_are_disabled():
+    out = strategy_to_live_export(buy_tree=None, sell_tree=None,
+                                  exit_rules=[_LEGACY_DISABLED_EXIT])
     assert not [rs for rs in out["rulesets"] if rs["subtype"] == "open_positions"]

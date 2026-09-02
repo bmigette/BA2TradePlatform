@@ -82,3 +82,53 @@ def test_both_runtimes_agree_the_disabled_rule_produces_no_action_at_all(_tradin
 
     out = trade_rules_to_live_export(entry_rules=[], exit_rules=[_DISABLED_CLOSE_RULE])
     assert not [rs for rs in out["rulesets"] if rs["subtype"] == "open_positions"]
+
+
+# ==================================================================================================
+# THE LEGACY (one-action-per-rule) SHAPE -- plan Task 14b item 1
+# ==================================================================================================
+# ``seed_open_positions_ruleset`` is the OTHER backtest seeder, and it converts through
+# ``rule_builders.action_from_rule``, NOT ``live_actions_from_trade_rule`` -- so it bypassed the
+# 64981161 guard entirely. Its live twin is ``rules_convert.strategy_to_live_export``'s exit loop
+# (pinned without a DB in packages/common/tests/test_live_actions_enabled_flag.py). Same parity
+# contract, same fail-closed rule, second shape.
+
+_LEGACY_DISABLED_EXIT = {
+    "id": "opt_sl_ml", "name": "opt_sl_ml", "enabled": False, "toggle_optimize": True,
+    "conditions": {"type": "AND", "conditions": [
+        {"id": "sl_ml", "field": "loss_pct_of_max_loss", "op": ">", "value": 50}]},
+    "action_type": "close_option",
+}
+
+_LEGACY_LIVE_EXIT = {
+    "id": "opt_tp", "name": "opt_tp",
+    "conditions": {"type": "AND", "conditions": [
+        {"id": "tp", "field": "profit_loss_percent", "op": ">", "value": 100}]},
+    "action_type": "close_option",
+}
+
+
+def test_the_legacy_seeder_produces_no_action_for_the_disabled_rule(_trading_db):
+    rid = dr.seed_open_positions_ruleset(
+        [_LEGACY_DISABLED_EXIT, _LEGACY_LIVE_EXIT], name="sl-ml-legacy")
+    # ``seed_open_positions_ruleset`` names its event actions ``<name>-rule-<idx>``, so identify
+    # the surviving one by its trigger field rather than by rule id.
+    with Session(cdb.get_engine()) as s:
+        rs = s.get(Ruleset, rid)
+        fields = [t["event_type"]
+                  for ea in rs.event_actions for t in (ea.triggers or {}).values()]
+    assert "profit_loss_percent" in fields
+    assert "loss_pct_of_max_loss" not in fields
+
+
+def test_both_legacy_runtimes_agree_the_disabled_rule_produces_nothing(_trading_db):
+    """THE LEGACY PARITY ASSERTION: only the disabled rule -> the backtest seeder links zero
+    event actions AND ``strategy_to_live_export`` emits no open_positions ruleset."""
+    from ba2_common.core.rules_convert import strategy_to_live_export
+
+    rid = dr.seed_open_positions_ruleset([_LEGACY_DISABLED_EXIT], name="sl-ml-legacy-empty")
+    assert _seeded_event_action_names(rid) == []
+
+    out = strategy_to_live_export(buy_tree=None, sell_tree=None,
+                                  exit_rules=[_LEGACY_DISABLED_EXIT])
+    assert not [rs for rs in out["rulesets"] if rs["subtype"] == "open_positions"]
