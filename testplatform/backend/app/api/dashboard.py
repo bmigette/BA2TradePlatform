@@ -102,8 +102,11 @@ class DashboardResponse(BaseModel):
     workers: List[WorkerStat] = []
 
 
+# Plain `def` ON PURPOSE: this handler does blocking SQLAlchemy + sync httpx (remote worker
+# /health probes) work. As `async def` it ran on the event loop and a single slow query froze
+# every route for minutes (2026-09-02). tests/test_routes_do_not_block_event_loop.py pins this.
 @router.get("/stats", response_model=DashboardResponse)
-async def get_dashboard_stats(db: Session = Depends(get_db)):
+def get_dashboard_stats(db: Session = Depends(get_db)):
     """
     Get aggregated dashboard statistics.
 

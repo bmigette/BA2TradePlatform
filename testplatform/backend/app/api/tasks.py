@@ -336,7 +336,7 @@ async def cleanup_checkpoints(
 
 
 @router.get("")
-async def list_tasks(
+def list_tasks(
     status: Optional[str] = Query(None, description="Filter by status"),
     task_type: Optional[str] = Query(None, description="Filter by task type"),
     limit: int = Query(100, ge=1, le=1000, description="Maximum tasks to return")

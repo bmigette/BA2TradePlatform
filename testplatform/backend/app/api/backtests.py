@@ -172,7 +172,7 @@ class BacktestListResponse(BaseModel):
 
 
 @router.get("")
-async def list_backtests(
+def list_backtests(
     expert: Optional[str] = None,
     optimization_id: Optional[int] = None,
     saved: Optional[bool] = None,
