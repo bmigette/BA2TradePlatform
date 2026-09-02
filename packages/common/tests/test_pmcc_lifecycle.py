@@ -36,6 +36,7 @@ from ba2_common.core.TradeActions import (
     PMCC_ADMISSION_REFUSAL, _measured_max_loss_per_contract, create_action,
 )
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from ba2_common.core.models import Transaction, TradingOrder
 from ba2_common.core.option_expiry import (
     MULTI_EXPIRY_OPTION_STRATEGIES, PMCC_STRATEGY, is_multi_expiry_strategy,
@@ -119,6 +120,17 @@ class PMCCAccount(OptionsAccountInterface):
     the only knobs the admission cases need.
     """
 
+    #: THE SHARED FILL SEAM, BORROWED rather than reimplemented -- the technique
+    #: ``test_option_breaker_parity`` already uses. ``refresh_transactions`` is the one place
+    #: both runtimes roll an observed fill into the transaction (the backtest account
+    #: overrides it only to re-stamp simulated dates and delegates the lifecycle to
+    #: ``super()``; no live account overrides it at all). ``ExtendableSettingsInterface`` is
+    #: deliberately NOT inherited -- it wants a DB-backed settings row, and what is under test
+    #: is the method, not its host.
+    refresh_transactions = ReadOnlyAccountInterface.refresh_transactions
+    _restamp_declared_multi_expiry_max_loss = (
+        ReadOnlyAccountInterface.__dict__["_restamp_declared_multi_expiry_max_loss"])
+
     def __init__(self, balance=1_000_000.0, overlay_rows=None, overlay_expiry=None,
                  deltas=True, roll_rows=None):
         self.id = 1
@@ -135,6 +147,13 @@ class PMCCAccount(OptionsAccountInterface):
         #: ``{contract_symbol: OptionQuote}`` overrides. Everything else is priced off the
         #: chain tables, so only the contract whose price has MOVED needs a row here.
         self.quotes = {}
+        #: ``{contract_symbol: price}`` -- what a leg FILLS at, when that differs from what it
+        #: was quoted at. A real fill rarely equals the limit, and the stamp must follow the
+        #: fill; a fixture where the two are identical cannot tell the two apart.
+        self.fills = {}
+        #: When set, the NEXT multi-leg submit is terminalised UNFILLED under this status --
+        #: a broker rejection, or a day-limit that expired against a market that never came.
+        self.refuse_next_fill = None
 
     # -- clock / prices ------------------------------------------------------
     def _as_of_date(self):
@@ -197,6 +216,8 @@ class PMCCAccount(OptionsAccountInterface):
         """What one leg fills at: BUY pays the ask, SELL takes the bid. The double's stand-in
         for a broker, so the per-leg ``open_price`` rows the lifecycle reads are real prices
         rather than the structure's net smeared across the legs."""
+        if contract_symbol in self.fills:
+            return self.fills[contract_symbol]
         quote = self.quotes.get(contract_symbol) or self._every_contract().get(contract_symbol)
         if quote is None:
             return None
@@ -212,6 +233,16 @@ class PMCCAccount(OptionsAccountInterface):
     def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
         from ba2_common.core.db import update_instance
         self.submitted.append((trading_order, list(legs), list(leg_orders or [])))
+        if self.refuse_next_fill is not None:
+            # TERMINAL AND UNFILLED: the ticket reached the broker and died there. No
+            # ``open_price``, no ``filled_qty`` -- nothing about the position changed.
+            status, self.refuse_next_fill = self.refuse_next_fill, None
+            trading_order.status = status
+            update_instance(trading_order)
+            for child in (leg_orders or []):
+                child.status = status
+                update_instance(child)
+            return trading_order
         trading_order.status = OrderStatus.FILLED
         trading_order.broker_order_id = f"double-{trading_order.id}"
         trading_order.open_price = trading_order.limit_price
@@ -923,24 +954,6 @@ def test_the_roll_prices_at_both_crossing_touches():
     assert res["data"]["limit_price"] == pytest.approx(ROLL_NET)
 
 
-def test_the_roll_RESTAMPS_the_max_loss_on_the_entry_order():
-    """Design §3: the intrinsic floor is the LEAPS debit less EVERY credit collected since.
-    ``loss_pct_of_max_loss`` divides by this row; leaving it at 1700 would make the stop
-    progressively too loose as credits came in."""
-    from ba2_common.core.db import get_instance
-
-    acct, parent = _open()
-    assert get_instance(TradingOrder, parent.id).data["max_loss_per_contract"] == \
-        pytest.approx(MAX_LOSS)
-    _arrive_at_roll_day(acct)
-    res = _roll(acct, parent)
-
-    assert res["success"], res["message"]
-    assert res["data"]["max_loss_per_contract"] == pytest.approx(ROLLED_MAX_LOSS)
-    assert get_instance(TradingOrder, parent.id).data["max_loss_per_contract"] == \
-        pytest.approx(ROLLED_MAX_LOSS)
-
-
 def test_the_roll_leaves_the_overlay_SPEC_and_the_transaction_intent_untouched():
     """A roll is maintenance, not a redefinition: the position is still a pmcc, and the next
     roll reads the same box this one did."""
@@ -1329,3 +1342,281 @@ def test_the_roll_action_is_registered_and_documented():
     assert isinstance(action, RollPMCCShortAction)
     doc = get_action_type_documentation()[ROLL]
     assert doc["name"] and doc["description"] and doc["use_cases"]
+
+
+# ======================================================================================
+# 13. THE STAMP FOLLOWS THE FILL, NOT THE TICKET (2026-09-02 review)
+# ======================================================================================
+#
+# The roll used to rewrite ``max_loss_per_contract`` from its QUOTED limit the moment
+# ``submit_option_order`` returned. A ticket that never fills then moved the risk denominator
+# by a credit nobody collected -- and an unfilled DEBIT roll RAISED the floor, LOOSENING
+# ``opt_sl_ml`` on a position that had paid nothing. Every later roll compounded from that
+# wrong base.
+#
+# The stamp is now DERIVED from the executed fills by
+# ``ReadOnlyAccountInterface.refresh_transactions``, which is the ONE place both runtimes
+# observe a fill: the backtest account overrides it only to re-stamp simulated dates and
+# delegates the lifecycle to ``super()``, and no live account overrides it at all -- their
+# broker-specific work is ``refresh_orders``, which lands the fills this loop then rolls in.
+from ba2_common.core.OptionRiskManagement import max_loss_from_fills  # noqa: E402
+
+
+def _observe_fills(acct):
+    """The shared fill seam. Named, because that IS the thing under test."""
+    return acct.refresh_transactions()
+
+
+def _entry_stamp(parent):
+    from ba2_common.core.db import get_instance
+    return (get_instance(TradingOrder, parent.id).data or {}).get("max_loss_per_contract")
+
+
+def test_a_FILLED_roll_restamps_from_the_FILL_and_not_from_the_limit():
+    """The fixture makes the two differ, and the arithmetic is by hand.
+
+    Entry fills: buy the LEAPS at its 20.00 ask, sell the overlay at its 3.00 bid -> 17.00
+    paid -> $1,700. The roll is QUOTED at 0.50 - 2.50 = -2.00 (a 2.00 credit) but FILLS at
+    0.60 to buy back and 2.40 to re-sell -> 1.80 collected, not 2.00.
+
+        from the FILLS:  (20.00 + 0.60 - 3.00 - 2.40) x 100 = 1,520
+        from the LIMIT:  1,700 - 2.00 x 100                 = 1,500
+
+    $20 apart on one roll, and compounding on every one after it.
+    """
+    acct, parent = _open()
+    _observe_fills(acct)
+    assert _entry_stamp(parent) == pytest.approx(MAX_LOSS)
+
+    _arrive_at_roll_day(acct)
+    acct.fills = {OLD_SHORT: 0.60, NEW_SHORT: 2.40}
+    res = _roll(acct, parent)
+    assert res["success"], res["message"]
+    assert res["data"]["limit_price"] == pytest.approx(ROLL_NET), "quoted at -2.00"
+
+    # THE WINDOW, closed. Submitting the ticket must not touch the row at all -- the exit
+    # rules behind the roll evaluate on this SAME bar (the roll carries
+    # ``continue_processing``), so a stamp written here would be read by ``opt_sl_ml`` before
+    # any fill was observed.
+    assert _entry_stamp(parent) == pytest.approx(MAX_LOSS), (
+        "the submit moved the risk denominator before anything had filled")
+
+    _observe_fills(acct)
+    assert _entry_stamp(parent) == pytest.approx(1520.0)
+    assert _entry_stamp(parent) != pytest.approx(1500.0), (
+        "the stamp came from the ticket's limit, not from what the ticket actually did")
+
+
+def test_the_action_reports_its_projection_as_a_PROJECTION():
+    """The audit row still says what the roll expected to bank -- under a name that cannot be
+    mistaken for the persisted denominator."""
+    acct, parent = _open()
+    _arrive_at_roll_day(acct)
+    acct.fills = {OLD_SHORT: 0.60, NEW_SHORT: 2.40}
+    res = _roll(acct, parent)
+
+    assert "max_loss_per_contract" not in res["data"]
+    assert res["data"]["projected_max_loss_per_contract"] == pytest.approx(1500.0)
+
+
+@pytest.mark.parametrize("status", [OrderStatus.REJECTED, OrderStatus.EXPIRED,
+                                    OrderStatus.CANCELED])
+def test_an_UNFILLED_roll_leaves_the_stamp_and_the_position_exactly_as_they_were(status):
+    """THE DEFECT, pinned. A rejected or day-expired ticket changed nothing about the
+    position, so it must change nothing about the number the stop divides by."""
+    acct, parent = _open()
+    _observe_fills(acct)
+    before_stamp = _entry_stamp(parent)
+    before_held = _held(parent.transaction_id)
+
+    _arrive_at_roll_day(acct)
+    acct.refuse_next_fill = status
+    res = _roll(acct, parent)
+    assert res["success"], res["message"]      # the ticket WAS sent; it died at the broker
+    assert _entry_stamp(parent) == pytest.approx(before_stamp), (
+        "the submit moved the stamp before the broker had even answered")
+    _observe_fills(acct)
+
+    assert _entry_stamp(parent) == pytest.approx(before_stamp) == pytest.approx(MAX_LOSS)
+    assert _held(parent.transaction_id) == before_held
+    assert set(before_held) == {LONG_LEAPS, OLD_SHORT}, "the structure is untouched"
+
+
+@pytest.mark.parametrize("status", [OrderStatus.REJECTED, OrderStatus.EXPIRED,
+                                    OrderStatus.CANCELED])
+def test_an_UNFILLED_roll_does_not_block_the_next_roll_FOREVER(status):
+    """``_roll_in_flight`` refuses while a ticket is still WORKING -- which is right, and
+    would be a trap if a dead ticket counted as working: the overlay would then expire
+    unrolled and be assigned, because the rule that was supposed to roll it refused on every
+    remaining bar. A terminal status is not a working order."""
+    acct, parent = _open()
+    _arrive_at_roll_day(acct)
+    acct.refuse_next_fill = status
+    assert _roll(acct, parent)["success"]
+    _observe_fills(acct)
+
+    res = _roll(acct, parent)
+    assert res["success"], (
+        f"a {status} ticket blocked the retry: {res['message']}")
+    _observe_fills(acct)
+    held = _held(parent.transaction_id)
+    assert OLD_SHORT not in held and held[NEW_SHORT] == pytest.approx(-5.0)
+
+
+def test_a_WORKING_ticket_still_blocks_a_second_overlay():
+    """The other half, so the fix above cannot become "never refuse": a ticket that is
+    neither executed NOR terminal is still in flight, and rolling again would write a SECOND
+    overlay behind the first."""
+    from ba2_common.core.db import update_instance
+    from ba2_common.core.trade_store import orders_where
+
+    acct, parent = _open()
+    _arrive_at_roll_day(acct)
+    assert _roll(acct, parent)["success"]
+    for o in orders_where(transaction_id=parent.transaction_id):
+        if o.option_strategy == PMCC_ROLL_STRATEGY or o.contract_symbol == NEW_SHORT:
+            o.status = OrderStatus.ACCEPTED
+            update_instance(o)
+
+    res = _roll(acct, parent)
+    assert not res["success"] and "still working" in res["message"]
+
+
+def test_the_derived_floor_is_IDEMPOTENT():
+    """Re-deriving cannot drift, which is the property an incremental restamp did not have:
+    observing the same fills ten more times gives the same number."""
+    acct, parent = _open()
+    _arrive_at_roll_day(acct)
+    acct.fills = {OLD_SHORT: 0.60, NEW_SHORT: 2.40}
+    assert _roll(acct, parent)["success"]
+
+    _observe_fills(acct)
+    once = _entry_stamp(parent)
+    for _ in range(10):
+        _observe_fills(acct)
+    assert _entry_stamp(parent) == pytest.approx(once)
+
+
+def test_the_derived_floor_agrees_with_the_per_roll_arithmetic():
+    """The two statements of design section 3 must agree: "the cash this position has net
+    paid" (what is persisted) and "the previous floor plus this roll's net" (the per-roll
+    form ``restamped_max_loss`` states). They are the same claim, so a fixture where the fills
+    ARE the quotes must produce the same number both ways."""
+    acct, parent = _open()
+    _observe_fills(acct)
+    before = _entry_stamp(parent)
+
+    _arrive_at_roll_day(acct)
+    res = _roll(acct, parent)
+    assert res["success"], res["message"]
+    _observe_fills(acct)
+
+    incremental = restamped_max_loss(before, res["data"]["limit_price"])
+    assert _entry_stamp(parent) == pytest.approx(incremental)
+
+
+def test_the_stamp_is_derived_by_the_SHARED_function_the_live_pass_would_use():
+    """PARITY, the packages/common half: the LIVE-shaped caller -- a plain
+    ``OptionsAccountInterface`` with no backtest override anywhere in its MRO -- writes
+    exactly what ``OptionRiskManagement.max_loss_from_fills`` returns for the same rows.
+
+    The BACKTEST half is pinned in ``testplatform/backend/tests/backtest/
+    test_per_leg_expiry_parity.py``: ``BacktestAccount.refresh_transactions`` delegates the
+    lifecycle to this same inherited method, so the two runtimes cannot compute the stamp two
+    ways.
+    """
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+    from ba2_common.core.trade_store import orders_where
+
+    assert type(PMCCAccount()).refresh_transactions is \
+        ReadOnlyAccountInterface.refresh_transactions, (
+        "this double must exercise the SHARED refresh, or it proves nothing about parity")
+
+    acct, parent = _open()
+    _arrive_at_roll_day(acct)
+    acct.fills = {OLD_SHORT: 0.60, NEW_SHORT: 2.40}
+    assert _roll(acct, parent)["success"]
+    _observe_fills(acct)
+
+    orders = orders_where(transaction_id=parent.transaction_id)
+    direct = max_loss_from_fills(orders, parent.filled_qty or parent.quantity, 100)
+    assert _entry_stamp(parent) == pytest.approx(direct) == pytest.approx(1520.0)
+
+
+def test_an_unpriced_executed_leg_leaves_the_stamp_ALONE():
+    """Unmeasurable is not zero, and here it is not "recompute without it" either: a stale
+    conservative denominator beats a guessed one, because the stop divides by it."""
+    from ba2_common.core.db import update_instance
+    from ba2_common.core.trade_store import orders_where
+
+    acct, parent = _open()
+    _observe_fills(acct)
+    assert _entry_stamp(parent) == pytest.approx(MAX_LOSS)
+
+    for o in orders_where(transaction_id=parent.transaction_id):
+        if o.contract_symbol == OLD_SHORT:
+            o.open_price = None
+            update_instance(o)
+    _observe_fills(acct)
+    assert _entry_stamp(parent) == pytest.approx(MAX_LOSS)
+
+
+def test_a_SINGLE_expiry_structure_is_never_restamped():
+    """The relaxation is opt-in at every site, this one included: only a strategy DECLARED in
+    MULTI_EXPIRY_OPTION_STRATEGIES has a floor that moves after entry. Everything else keeps
+    the stamp its submit wrote, byte for byte."""
+    from ba2_common.core.db import get_instance, update_instance
+
+    acct, parent = _open()
+    txn = get_instance(Transaction, parent.transaction_id)
+    txn.option_strategy = "bull_call_spread"
+    update_instance(txn)
+    stored = get_instance(TradingOrder, parent.id)
+    stored.data = {**(stored.data or {}), "max_loss_per_contract": 1.0}
+    update_instance(stored)
+
+    _observe_fills(acct)
+    assert _entry_stamp(parent) == pytest.approx(1.0), (
+        "an undeclared structure's stamp was rewritten from its fills")
+
+
+def test_an_equity_transaction_never_reaches_the_option_restamp(monkeypatch):
+    """CRITERION 1, structurally: an equity trial does ZERO option work here.
+
+    The guard at the call site is one attribute read and one ``is None`` test, so for a plain
+    equity transaction the derivation is never entered and neither is its import -- call-count
+    zero, not "cheap enough".
+    """
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import TradingOrder as _TO
+    from ba2_common.core.types import AssetClass, OrderType
+
+    calls = []
+    monkeypatch.setattr(PMCCAccount, "_restamp_declared_multi_expiry_max_loss",
+                        staticmethod(lambda *a, **k: calls.append(a)))
+    acct = PMCCAccount()
+    txn_id = add_instance(Transaction(symbol="XYZ", quantity=10, side=OrderDirection.BUY,
+                                      multiplier=1, expert_id=None))
+    add_instance(_TO(account_id=1, symbol="XYZ", quantity=10, side=OrderDirection.BUY,
+                     order_type=OrderType.BUY_LIMIT, status=OrderStatus.FILLED,
+                     filled_qty=10, open_price=100.0, asset_class=AssetClass.EQUITY,
+                     transaction_id=txn_id))
+
+    acct.refresh_transactions()
+    assert calls == [], "an equity transaction reached the option restamp"
+
+
+def test_the_pmcc_transaction_DOES_reach_it(monkeypatch):
+    """The other half, so the guard above cannot become "never restamp anything"."""
+    calls = []
+    real = PMCCAccount.__dict__["_restamp_declared_multi_expiry_max_loss"]
+
+    def spy(transaction, orders):
+        calls.append(transaction.id)
+        return real(transaction, orders)
+
+    monkeypatch.setattr(PMCCAccount, "_restamp_declared_multi_expiry_max_loss",
+                        staticmethod(spy))
+    acct, parent = _open()
+    acct.refresh_transactions()
+    assert parent.transaction_id in calls

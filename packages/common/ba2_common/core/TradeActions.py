@@ -4945,8 +4945,13 @@ class RollPMCCShortAction(_OptionEntryAction):
         from ba2_common.core.trade_store import orders_where
         rows = [o for o in orders_where(transaction_id=transaction_id)
                 if getattr(o, "parent_order_id", None) is None
-                and getattr(o, "asset_class", None) == AssetClass.OPTION]
-        return rows[0] if rows else None
+                and getattr(o, "asset_class", None) == AssetClass.OPTION
+                and not getattr(o, "contract_symbol", None)]
+        # THE OLDEST, by id. After one roll the transaction has TWO parentless option orders
+        # and ``orders_where`` promises no ordering, so taking whichever came back first would
+        # hand a later roll the ROLL's parent -- which carries no overlay spec, so the roll
+        # would refuse for a reason that is not true.
+        return min(rows, key=lambda o: (o.id is None, o.id or 0)) if rows else None
 
     def _roll_in_flight(self, transaction_id) -> Optional[str]:
         """The contract symbol of an option order on this transaction that is neither executed
@@ -5126,7 +5131,14 @@ class RollPMCCShortAction(_OptionEntryAction):
         if submitted is None:
             return self._refuse(f"the broker refused the roll order "
                                 f"({short.contract_symbol} -> {picked.symbol})")
-        restamped = self._restamp_max_loss(entry, quoted)
+        # NO RESTAMP HERE (2026-09-02 review). The stamp follows the FILL, not the ticket:
+        # ``ReadOnlyAccountInterface.refresh_transactions`` re-derives it from the executed
+        # rows through ``OptionRiskManagement.max_loss_from_fills``, which is the one place
+        # both runtimes observe a fill. Writing it from ``quoted`` here moved the risk
+        # denominator by a credit that a rejected or day-expired ticket never collected --
+        # and an unfilled DEBIT roll RAISED the floor, loosening ``opt_sl_ml`` on a position
+        # that had paid nothing. The projected value is reported for the audit row under a
+        # name that says it is a projection.
         return self._result(
             True, f"Rolled the pmcc overlay on {self.instrument_name}: "
                   f"{short.contract_symbol} -> {picked.symbol}",
@@ -5134,7 +5146,8 @@ class RollPMCCShortAction(_OptionEntryAction):
              "closed_contract": short.contract_symbol,
              "opened_contract": picked.symbol,
              "limit_price": quoted,
-             "max_loss_per_contract": restamped})
+             "projected_max_loss_per_contract": restamped_max_loss(
+                 (getattr(entry, "data", None) or {}).get("max_loss_per_contract"), quoted)})
 
     def _safe_quote(self, contract_symbol: str):
         try:
@@ -5144,28 +5157,6 @@ class RollPMCCShortAction(_OptionEntryAction):
             logger.debug(f"get_option_quote failed for {contract_symbol}: {e}")
             return None
 
-    def _restamp_max_loss(self, entry, roll_net) -> Optional[float]:
-        """Rewrite the entry order's ``max_loss_per_contract`` for the credit just banked.
-
-        Design §3: the intrinsic floor is the LEAPS debit less EVERY credit collected since,
-        so each roll is one more term. ``None`` -- leave the stamp alone -- whenever either
-        input is unreadable: a stale conservative denominator is a far better failure than a
-        guessed one, because ``loss_pct_of_max_loss`` divides by it.
-        """
-        if entry is None:
-            return None
-        data = dict(getattr(entry, "data", None) or {})
-        updated = restamped_max_loss(data.get("max_loss_per_contract"), roll_net)
-        if updated is None:
-            logger.warning(
-                f"{self._action_type_value()} for {self.instrument_name}: the max-loss stamp "
-                f"({data.get('max_loss_per_contract')!r}) or the roll net ({roll_net!r}) is "
-                f"unreadable, so the stamp is left UNCHANGED rather than guessed at")
-            return None
-        data["max_loss_per_contract"] = updated
-        entry.data = data
-        update_instance(entry)
-        return updated
 
 
 def build_closing_legs(children, parent_quantity: int, quote_fn, held_qty=None) -> "tuple[List[OptionLeg], Optional[float]]":

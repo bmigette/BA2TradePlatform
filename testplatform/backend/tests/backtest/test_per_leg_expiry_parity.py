@@ -396,3 +396,51 @@ def test_the_shared_accessor_gives_those_same_two_answers_directly(written_pmcc)
     assert (roll.expiry, exit_.expiry) == (SHORT_EXPIRY, LONG_EXPIRY)
     assert roll.rule_applied == EXPIRY_RULE_ROLL_WINDOW
     assert exit_.rule_applied == EXPIRY_RULE_STRUCTURE_EXIT
+
+
+# ---------------------------------------------------------------------------
+# THE FILL SEAM (plan Task 6, 2026-09-02 review): one function, two runtimes
+# ---------------------------------------------------------------------------
+def test_the_transaction_refresh_is_ONE_implementation_both_runtimes_reach():
+    """A two-expiry structure's max loss MOVES after entry -- the long's debit less every
+    credit its rolling overlay banks -- so it has to be re-derived when a fill is observed.
+    That is only safe if "when a fill is observed" is ONE place.
+
+    It is. ``ReadOnlyAccountInterface.refresh_transactions`` is the single implementation:
+    the backtest account overrides it ONLY to re-stamp wall-clock dates onto the simulated
+    clock and delegates the lifecycle to ``super()``, and no live account overrides it at all
+    -- their broker-specific work is ``refresh_orders``, which lands the fills this loop then
+    rolls into the transaction. So the synchronous backtest fill and the asynchronous live one
+    reach the same derivation.
+    """
+    import inspect
+
+    from app.services.backtest.backtest_account import BacktestAccount
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+
+    # The DERIVATION itself is defined once and nowhere overridden -- so both runtimes run the
+    # same function object, not two that happen to agree.
+    assert (BacktestAccount._restamp_declared_multi_expiry_max_loss
+            is ReadOnlyAccountInterface._restamp_declared_multi_expiry_max_loss)
+
+    # And the backtest's own override of the surrounding loop DELEGATES rather than reimplements.
+    src = inspect.getsource(BacktestAccount.refresh_transactions)
+    assert "super().refresh_transactions()" in src, (
+        "BacktestAccount stopped delegating the transaction lifecycle; the two runtimes would "
+        "then observe fills through two different implementations")
+
+
+def test_the_live_account_does_not_override_the_transaction_refresh():
+    """The identity half, for the runtime this repo cannot execute."""
+    import importlib
+
+    for module, cls in (("ba2_trade_platform.modules.accounts.AlpacaAccount", "AlpacaAccount"),
+                        ("ba2_trade_platform.modules.accounts.TastyTradeAccount",
+                         "TastyTradeAccount")):
+        try:
+            account_cls = getattr(importlib.import_module(module), cls)
+        except Exception:  # noqa: BLE001 -- a broker SDK this env lacks is not a finding
+            continue
+        assert "refresh_transactions" not in vars(account_cls), (
+            f"{cls} overrides refresh_transactions: the live fill would reach a different "
+            f"implementation from the backtest's")

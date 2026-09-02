@@ -522,6 +522,66 @@ def build_structure(txn) -> Optional[OptionStructure]:
     )
 
 
+def max_loss_from_fills(orders: Sequence[Any], structures: Optional[float],
+                        multiplier: int = 100) -> Optional[float]:
+    """The intrinsic floor of a two-expiry structure, per contract, FROM ITS EXECUTED FILLS.
+
+    ``orders`` are the transaction's order rows (parents included — they are skipped: only
+    rows carrying a ``contract_symbol`` are legs, and a multi-leg parent's ``open_price`` is
+    the net, which would double-count). BUY is positive, so the sum is what the position has
+    NET PAID: the long's debit less every credit the overlay has banked. Divided by the
+    structure count and scaled by the multiplier, that is design §3's "max loss = LEAPS debit
+    − net credits" — and it is a MEASUREMENT of what happened, not a running correction
+    applied to a guess.
+
+    ``None`` — leave the existing stamp ALONE — for every input that is not fully readable: no
+    executed leg, an unreadable structure count, or an executed leg with no fill price. A
+    stale conservative denominator is a far better failure than a guessed one, because
+    ``loss_pct_of_max_loss`` divides by it.
+
+    WHY THIS AND NOT A RESTAMP AT SUBMIT (2026-09-02 review). The roll used to rewrite the
+    stamp from its QUOTED limit immediately after ``submit_option_order`` returned. A ticket
+    that never fills — rejected, or day-expired against a limit the market never met — then
+    moved the number by a credit that was never collected, an unfilled DEBIT roll RAISED the
+    floor and so LOOSENED ``opt_sl_ml``, and every later roll compounded from that wrong base.
+    Reading the fills is idempotent: an unfilled ticket has no fill and contributes nothing,
+    and recomputing on every refresh cannot drift.
+    """
+    from ba2_common.core.types import OrderStatus
+
+    if structures is None:
+        return None
+    try:
+        count = abs(float(structures))
+    except (TypeError, ValueError):
+        return None
+    if count <= _EPS:
+        return None
+
+    executed = OrderStatus.get_executed_statuses()
+    total = 0.0
+    seen = False
+    for order in orders:
+        if not getattr(order, "contract_symbol", None):
+            continue                       # a multi-leg parent: its price is the NET
+        if getattr(order, "status", None) not in executed:
+            continue                       # an unfilled ticket contributes nothing
+        price = getattr(order, "open_price", None)
+        if price is None:
+            return None                    # executed and unpriced: unmeasurable, never zero
+        qty = float(getattr(order, "filled_qty", None) or getattr(order, "quantity", None) or 0.0)
+        if qty <= 0:
+            continue
+        sign = 1.0 if order.side == OrderDirection.BUY else -1.0
+        total += sign * float(price) * qty
+        seen = True
+    if not seen:
+        return None
+    from ba2_common.core.option_lifecycle import intrinsic_floor_per_contract
+
+    return intrinsic_floor_per_contract(total / count, multiplier)
+
+
 def entry_net_premium(txn) -> Optional[float]:
     """The structure's entry net premium per share, signed: ``+`` debit, ``-`` credit.
 

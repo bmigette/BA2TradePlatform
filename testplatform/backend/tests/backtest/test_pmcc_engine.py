@@ -455,28 +455,50 @@ def test_the_roll_ticket_closes_the_old_overlay_BEFORE_it_opens_the_new(run_resu
     assert [l.position_intent for l in legs] == ["buy_to_close", "sell_to_open"]
 
 
-def test_the_max_loss_stamp_is_RESTAMPED_by_the_roll(run_result):
-    """Design section 3: the intrinsic floor is the LEAPS debit less EVERY credit collected
-    since. The roll banks the difference between the buy-back and the re-sale, and the entry
-    order's stamp -- ``loss_pct_of_max_loss``'s denominator -- moves with it."""
+def test_the_max_loss_stamp_is_RESTAMPED_by_the_ROLLS_OWN_FILLS(run_result):
+    """Design section 3: the intrinsic floor is the long's debit less EVERY credit collected
+    since -- and "collected" means FILLED, not quoted.
+
+    The stamp is sampled PER BAR (the roll rewrites the row, and the structure exit later
+    drives the floor to zero, so neither the entry-time nor the end-of-run value survives to
+    be read back). The number after the roll must equal the number before it plus the roll's
+    OWN EXECUTED cash, derived here from the child rows' fill prices -- never from the parent
+    ticket's limit, which a rejected or day-expired roll would have moved for nothing.
+    """
     account, seen = run_result
     orders = _orders(781)
     entry = next(o for o in orders
                  if o.parent_order_id is None and o.option_strategy == "pmcc")
     roll = next(o for o in orders if o.option_strategy == "pmcc_roll")
+    structures = float(entry.filled_qty or entry.quantity)
 
-    stamped = (entry.data or {})["max_loss_per_contract"]
-    at_entry = seen[0]["max_loss"]                       # the stamp the submit seam wrote
-    expected = max(0.0, at_entry + float(roll.limit_price) * 100.0)
-    assert stamped == pytest.approx(expected), (
-        f"the stamp is {stamped} but it was {at_entry} at entry and the roll netted "
-        f"{roll.limit_price} per share; the denominator did not follow the credit")
-    assert float(roll.limit_price) < 0, (
-        "this fixture's overlay decays, so the roll must bank a CREDIT (a negative net under "
-        "the house MLEG convention) — otherwise the restamp is being pinned in the direction "
-        "the design is not about")
-    assert stamped < at_entry, "the accrued credit did not lower the intrinsic floor"
+    before = next(r["max_loss"] for r in seen if set(r["legs"]) == {LEAPS, OVERLAY1})
+    after = next(r["max_loss"] for r in seen if set(r["legs"]) == {LEAPS, OVERLAY2})
 
+    from ba2_common.core.types import OrderDirection
+    banked = 0.0
+    for leg in (o for o in orders if o.parent_order_id == roll.id):
+        assert leg.open_price is not None, "an executed roll leg with no fill price"
+        sign = 1.0 if leg.side == OrderDirection.BUY else -1.0
+        banked += sign * float(leg.open_price) * float(leg.filled_qty or leg.quantity)
+
+    assert after == pytest.approx(before + banked / structures * 100.0), (
+        f"the stamp moved {before} -> {after}, but the roll's own fills banked "
+        f"{banked / structures:.4f} per structure")
+    assert after < before, "the accrued credit did not lower the intrinsic floor"
+    assert banked < 0, (
+        "this fixture's overlay decays, so the roll must bank a CREDIT -- otherwise the "
+        "restamp is being pinned in the direction the design is not about")
+
+
+def test_the_stamp_is_DERIVED_from_the_fills_on_every_bar(run_result):
+    """Idempotence, observed rather than argued: the row is re-derived on every refresh, so
+    every bar of a settled state carries the SAME number -- an incremental restamp would drift
+    the moment a refresh ran twice."""
+    account, seen = run_result
+    for legs in ({LEAPS, OVERLAY1}, {LEAPS, OVERLAY2}):
+        stamps = {r["max_loss"] for r in seen if set(r["legs"]) == legs}
+        assert len(stamps) == 1, f"the stamp drifted across bars of one state: {stamps}"
 
 def test_the_structure_exit_reads_the_LONG_leg_and_closes_BOTH_legs(run_result):
     """``days_to_expiry`` reads the LONG leg for a declared two-expiry structure. Reading the

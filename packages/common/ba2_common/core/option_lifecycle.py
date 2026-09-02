@@ -697,9 +697,50 @@ def pmcc_credit_decay(structure: OptionStructure,
     return pct, ""
 
 
+def intrinsic_floor_per_contract(signed_cash_per_structure: Optional[float],
+                                 multiplier: int = 100) -> Optional[float]:
+    """Design §3's intrinsic floor, from the cash a structure has actually PAID. ``None`` =
+    unmeasurable.
+
+    ``signed_cash_per_structure`` is the net premium outlay per structure with BUY positive:
+    the LEAPS debit, less every credit the overlay has banked since. So this IS "max loss =
+    LEAPS debit − net credits", stated as one number rather than as a base plus a running
+    correction — and that difference is the whole point.
+
+    WHY NOT INCREMENTAL. The obvious implementation restamps at each roll by adding that
+    roll's net to the previous stamp, and it is wrong twice over: a ticket that never fills
+    still moves the number (an unfilled DEBIT roll raises the floor and LOOSENS ``opt_sl_ml``
+    on a position that never paid anything), and every later roll then compounds from that
+    wrong base. Deriving from the EXECUTED fills instead is idempotent — recomputing it a
+    hundred times gives the same answer, an unfilled ticket contributes nothing because it has
+    no fill, and there is no base to drift.
+
+    CLAMPED AT ZERO, and that is a statement rather than a guard: once the accrued credits have
+    paid for the long outright there is no defined loss left, and ``loss_pct_of_max_loss``
+    self-disarms on a non-positive stamp (its ``per_contract <= 0 -> None`` branch). A
+    structure that cannot lose has no loss-as-a-percentage-of-its-loss, and reporting one would
+    be inventing a denominator.
+    """
+    if signed_cash_per_structure is None:
+        return None
+    try:
+        cash, mult = float(signed_cash_per_structure), float(multiplier)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(cash) and math.isfinite(mult)) or mult <= 0:
+        return None
+    return max(0.0, cash * mult)
+
+
 def restamped_max_loss(previous_max_loss: Optional[float], roll_net: Optional[float],
                        multiplier: int = 100) -> Optional[float]:
     """The structure's max loss after a roll, per contract. ``None`` = do not restamp.
+
+    NO LONGER THE PERSISTED PATH (2026-09-02 review). The stamp is DERIVED from executed fills
+    by :func:`intrinsic_floor_per_contract` — see its docstring for why an incremental restamp
+    written at submit time is the wrong shape. This is kept because it states the per-roll
+    ARITHMETIC the derived floor must agree with, and the two are pinned against each other by
+    ``test_the_derived_floor_agrees_with_the_per_roll_arithmetic``.
 
     ``max_loss_new = max_loss_old + roll_net x multiplier``, with ``roll_net`` SIGNED the way
     every option limit in this codebase is: positive = a net debit paid, negative = a net
