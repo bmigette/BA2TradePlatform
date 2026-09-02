@@ -1620,3 +1620,129 @@ def test_the_pmcc_transaction_DOES_reach_it(monkeypatch):
     acct, parent = _open()
     acct.refresh_transactions()
     assert parent.transaction_id in calls
+
+
+# ======================================================================================
+# 14. WHICH PARENTLESS ROW IS "THE ENTRY" — the oldest, by id (74be78a1)
+# ======================================================================================
+#
+# After ONE roll the transaction owns TWO parentless option orders: the ``pmcc`` entry, which
+# carries ORDER_PMCC_OVERLAY_KEY (and the max-loss stamp), and the ``pmcc_roll`` ticket, which
+# carries neither. ``RollPMCCShortAction._entry_order`` has to pick the first of those, and
+# ``trade_store.orders_where`` PROMISES NO ORDERING -- it happens to return rowid order today,
+# which is why the pre-fix ``rows[0]`` passed every existing test while being wrong.
+#
+# So these two tests break that accident deliberately: ``orders_where`` is wrapped to hand its
+# rows back REVERSED, which is a return order it is entirely entitled to produce. Under the
+# oldest-by-id rule nothing changes. Under ``rows[0]`` the action is handed the ROLL's parent,
+# reads no overlay spec off it, and refuses the SECOND roll for a reason that is not true --
+# leaving the LEAPS uncovered from that bar on.
+
+#: One more overlay cycle than the base fixture offers, so a SECOND roll has somewhere to go.
+ROLL_DAY_2 = ROLL_DAY + timedelta(days=35)          # TODAY + 70
+ROLL2_EXPIRY = ROLL_DAY_2 + timedelta(days=35)      # TODAY + 105, inside [30, 45] from there
+ROLL2_ROWS = {
+    114.0: (4.00, 4.20, 0.30),
+    118.0: (2.30, 2.50, 0.20),      # <- the SECOND replacement overlay, sold at the BID
+    128.0: (0.30, 0.40, 0.10),
+}
+SECOND_SHORT = f"XYZ{ROLL2_EXPIRY:%y%m%d}C{int(118.0 * 1000):08d}"
+
+
+class TwoCycleAccount(PMCCAccount):
+    """``PMCCAccount`` with a third expiry tier. The base fixture stops after one roll cycle,
+    and one roll is exactly the case where ``rows[0]`` is still right."""
+
+    def _rows_for(self, expiry_min, expiry_max):
+        if expiry_min <= ROLL2_EXPIRY <= expiry_max:
+            return ROLL2_ROWS, ROLL2_EXPIRY
+        return super()._rows_for(expiry_min, expiry_max)
+
+    def _every_contract(self):
+        out = super()._every_contract()
+        for c in self._contracts("XYZ", ROLL2_ROWS, ROLL2_EXPIRY):
+            out[c.symbol] = c
+        return out
+
+
+def _parentless_option_rows(transaction_id):
+    from ba2_common.core.trade_store import orders_where
+    from ba2_common.core.types import AssetClass
+    return [o for o in orders_where(transaction_id=transaction_id)
+            if o.parent_order_id is None and o.asset_class == AssetClass.OPTION
+            and not o.contract_symbol]
+
+
+def _reverse_orders_where(monkeypatch):
+    """Make ``orders_where`` return its rows newest-first. A legitimate return order -- the
+    function documents none -- and the one that tells the two selection rules apart."""
+    from ba2_common.core import trade_store
+    real = trade_store.orders_where
+    monkeypatch.setattr(trade_store, "orders_where",
+                        lambda *a, **k: list(reversed(real(*a, **k))))
+
+
+def _roll_once(acct, parent, day, buyback_ask):
+    acct.today = day
+    held = [c for c in _held(parent.transaction_id) if c != LONG_LEAPS]
+    assert len(held) == 1, f"expected exactly one live overlay, got {held}"
+    acct.quotes[held[0]] = OptionQuote(symbol=held[0], bid=buyback_ask - 0.10,
+                                       ask=buyback_ask, last=buyback_ask, delta=0.05)
+    res = _roll(acct, parent)
+    _observe_fills(acct)
+    return res
+
+
+def test_the_entry_order_is_the_OLDEST_parentless_row_not_whichever_came_back_first(monkeypatch):
+    """THE RULE, named. Two parentless option rows exist and only the older one carries the
+    spec, so 'the parentless one' is ambiguous and 'the first one returned' is an accident of
+    the store."""
+    from ba2_common.core.TradeActions import RollPMCCShortAction
+
+    acct, parent = _open(TwoCycleAccount())
+    _observe_fills(acct)
+    assert _roll_once(acct, parent, ROLL_DAY, OLD_OVERLAY_BUYBACK)["success"]
+
+    rows = _parentless_option_rows(parent.transaction_id)
+    assert len(rows) == 2, (
+        f"the ambiguity this rule resolves is not present in the fixture: {rows}")
+    by_id = sorted(rows, key=lambda o: o.id)
+    assert ORDER_PMCC_OVERLAY_KEY in (by_id[0].data or {}), "the entry carries the spec"
+    assert ORDER_PMCC_OVERLAY_KEY not in (by_id[1].data or {}), (
+        "the ROLL's parent must NOT carry a spec, or picking the wrong row is harmless and "
+        "this test proves nothing")
+
+    action = create_action(ExpertActionType.ROLL_PMCC_SHORT, "XYZ", acct, SimpleNamespace(),
+                           parent, SimpleNamespace(id=1, instance_id=None, data=None,
+                                                   price_at_date=None,
+                                                   expected_profit_percent=None,
+                                                   recommended_action=None))
+    assert isinstance(action, RollPMCCShortAction)
+    assert action._entry_order(parent.transaction_id).id == by_id[0].id
+
+    _reverse_orders_where(monkeypatch)
+    assert action._entry_order(parent.transaction_id).id == by_id[0].id, (
+        "the entry order was chosen by the store's return order, not by id")
+
+
+def test_a_SECOND_roll_still_rolls_when_the_rows_come_back_newest_first(monkeypatch):
+    """THE CONSEQUENCE. Same two rolls, one under each return order: the overlay that ends up
+    on the book must be the same contract either way."""
+    def two_rolls():
+        acct, parent = _open(TwoCycleAccount())
+        _observe_fills(acct)
+        assert _roll_once(acct, parent, ROLL_DAY, OLD_OVERLAY_BUYBACK)["success"]
+        second = _roll_once(acct, parent, ROLL_DAY_2, 0.40)
+        return acct, parent, second
+
+    _, parent_a, ordered = two_rolls()
+    assert ordered["success"], ordered["message"]
+    held_a = _held(parent_a.transaction_id)
+
+    _reverse_orders_where(monkeypatch)
+    _, parent_b, reversed_ = two_rolls()
+    assert reversed_["success"], (
+        f"the second roll refused because the rows came back in a different order: "
+        f"{reversed_['message']}")
+    assert set(held_a) == set(_held(parent_b.transaction_id)) == {LONG_LEAPS, SECOND_SHORT}
+    assert NEW_SHORT not in _held(parent_b.transaction_id)
