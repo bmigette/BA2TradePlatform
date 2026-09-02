@@ -31,6 +31,11 @@ fetched with (up to) two calls PER WINDOW CHUNK instead of TastyTrade's one call
     TastyTrade's dxfeed candles do; it is one snapshot per (contract, day), joined back onto
     the bars by (strike, right, date).
 
+Both calls RAISE ``thetadata.errors.NoDataFoundError`` (rather than returning an empty
+dataframe) when a request's window/expiry genuinely has nothing — a normal outcome (a
+low-volume underlying with no listed chain on a given Friday), not an error; caught per-chunk
+and treated the same as an empty response (see ``ThetaDataOptionsProvider._no_data_exc``).
+
 Both calls are per-(underlying, single expiry), so ``fetch_eod_bars``/``fetch_bars_detailed``
 group the requested contracts by (underlying, expiry) exactly like the caller (TastyTrade
 today) already assumes — see ``tools/warm_options_history.py``'s ``WorkUnit``.
@@ -155,6 +160,11 @@ def _index_open_interest(df: Any) -> Dict[Tuple[float, str, date], int]:
     return out
 
 
+class _NeverRaised(Exception):
+    """Placeholder for ThetaDataOptionsProvider._no_data_exc before a live client has resolved
+    the real thetadata.errors.NoDataFoundError. Nothing ever raises this on purpose."""
+
+
 class ThetaDataOptionsProvider(OptionsDataProviderInterface):
     """Historical options via ThetaData's cloud API (official ``thetadata`` Python library)."""
 
@@ -172,6 +182,12 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
                                    else _DEFAULT_HISTORY_YEARS)
         self._dataframe_type = dataframe_type
         self._client = None  # lazy: constructing ThetaClient opens a connection
+        # Resolved alongside _client, in _get_client -- the real thetadata.errors.
+        # NoDataFoundError once a live client exists. _NeverRaised until then, deliberately:
+        # nothing ever raises it, so a caller that reaches the per-chunk except clause before
+        # _get_client() has run (should not happen, but must not silently swallow real
+        # exceptions if it somehow does) catches nothing rather than everything.
+        self._no_data_exc: type = _NeverRaised
 
     # -- interface ------------------------------------------------------
     def _get_client(self):
@@ -182,7 +198,9 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
                     "THETADATA_API_KEY) -- it was only asked for its history_floor() until "
                     "now, which needs no key.")
             from thetadata import ThetaClient
+            from thetadata.errors import NoDataFoundError
             self._client = ThetaClient(api_key=self.api_key, dataframe_type=self._dataframe_type)
+            self._no_data_exc = NoDataFoundError
         return self._client
 
     def history_floor(self) -> date:
@@ -243,14 +261,26 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
             # per-chunk results (by just yielding as each chunk is processed) is safe without
             # any cross-chunk de-duplication.
             for w_start, w_end in windows:
-                bars_df = client.option_history_greeks_eod(
-                    symbol=underlying, expiration=expiry, strike="*", right="both",
-                    start_date=w_start, end_date=w_end)
+                try:
+                    bars_df = client.option_history_greeks_eod(
+                        symbol=underlying, expiration=expiry, strike="*", right="both",
+                        start_date=w_start, end_date=w_end)
+                except self._no_data_exc:
+                    # The library RAISES rather than returning an empty dataframe when a
+                    # request's window/expiry genuinely has nothing -- e.g. a low-volume
+                    # underlying with no listed chain on a given Friday. Confirmed live
+                    # 2026-09-02 (NoDataFoundError), the same "normal, not an error" case the
+                    # len()==0 branch below already handles for the rare case it DOES return
+                    # an empty frame instead.
+                    continue
                 if bars_df is None or len(bars_df) == 0:
                     continue  # nothing for this expiry in this chunk -- normal, not an error
-                oi_df = client.option_history_open_interest(
-                    symbol=underlying, expiration=expiry, strike="*", right="both",
-                    start_date=w_start, end_date=w_end)
+                try:
+                    oi_df = client.option_history_open_interest(
+                        symbol=underlying, expiration=expiry, strike="*", right="both",
+                        start_date=w_start, end_date=w_end)
+                except self._no_data_exc:
+                    oi_df = None  # no OI for this chunk; bars alone are still worth keeping
                 oi_map = _index_open_interest(oi_df)
 
                 for row in bars_df.itertuples(index=False):

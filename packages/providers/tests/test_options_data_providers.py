@@ -137,9 +137,15 @@ class _FakeClient:
         return self._strikes[expiration]
 
 
+class _FakeNoDataError(Exception):
+    """Stand-in for thetadata.errors.NoDataFoundError -- _wired bypasses _get_client (the only
+    place that resolves the real class), so a test exercising that path raises/expects THIS."""
+
+
 def _wired(client: _FakeClient) -> ThetaDataOptionsProvider:
     p = ThetaDataOptionsProvider(api_key="test-key")
     p._client = client  # bypass the lazy `from thetadata import ThetaClient`
+    p._no_data_exc = _FakeNoDataError  # ditto for thetadata.errors.NoDataFoundError
     return p
 
 
@@ -250,6 +256,69 @@ def test_open_interest_is_skipped_when_greeks_eod_has_no_rows():
     bars = list(p.fetch_eod_bars(_CONTRACTS, start=date(2024, 10, 1), end=date(2024, 10, 1)))
     assert bars == []
     assert [c[0] for c in client.calls] == ["greeks_eod"]
+
+
+# --------------------------------------------------------------------------- #
+# ThetaData: NoDataFoundError -- the library RAISES for "genuinely nothing here"
+# instead of returning an empty dataframe (found live 2026-09-02, the SAME backfill
+# relaunch that found the 365-day cap: BJ's low-volume weeklies raised on every request).
+# --------------------------------------------------------------------------- #
+def test_greeks_eod_raising_no_data_is_treated_as_an_empty_chunk_not_an_error():
+    class _RaisingClient(_FakeClient):
+        def option_history_greeks_eod(self, **kw):
+            self.calls.append(("greeks_eod", kw))
+            raise _FakeNoDataError("No data found")
+
+    client = _RaisingClient()
+    p = _wired(client)
+    bars = list(p.fetch_eod_bars(_CONTRACTS, start=date(2024, 10, 1), end=date(2024, 10, 1)))
+
+    assert bars == []
+    # open_interest must NOT be called either -- same short-circuit as an empty dataframe.
+    assert [c[0] for c in client.calls] == ["greeks_eod"]
+
+
+def test_open_interest_raising_no_data_still_keeps_the_bars():
+    """The bars are the point; missing OI for one chunk must not throw the whole chunk away."""
+    class _RaisingOiClient(_FakeClient):
+        def option_history_open_interest(self, **kw):
+            self.calls.append(("open_interest", kw))
+            raise _FakeNoDataError("No data found")
+
+    client = _RaisingOiClient(greeks=_greeks_df([
+        dict(symbol="AAPL", expiration="2025-01-17", strike=200.0, right="CALL",
+            timestamp="2024-10-01", open=10.0, high=11.0, low=9.5, close=10.5,
+            volume=1234, bid=10.4, ask=10.6, implied_vol=0.28),
+    ]))
+    p = _wired(client)
+    bars = list(p.fetch_eod_bars(_CONTRACTS, start=date(2024, 10, 1), end=date(2024, 10, 1)))
+
+    assert len(bars) == 1
+    assert bars[0].close == 10.5
+    assert bars[0].open_interest is None, "no OI data -> None, not a fabricated 0"
+
+
+def test_a_nodata_chunk_does_not_abort_the_other_chunks_of_a_wide_window():
+    """The exact shape that broke the real backfill: most Fridays for a thin name raise
+    NoDataFoundError, but the one that DOES have data, in a LATER chunk, must still land."""
+    calls_seen = []
+
+    class _MixedClient(_FakeClient):
+        def option_history_greeks_eod(self, **kw):
+            calls_seen.append(kw["start_date"])
+            if kw["start_date"].year == 2020:
+                raise _FakeNoDataError("No data found")
+            return _greeks_df([dict(
+                symbol="AAPL", expiration="2025-01-17", strike=200.0, right="CALL",
+                timestamp="2021-06-01", open=1, high=1, low=1, close=33.0,
+                volume=1, bid=None, ask=None, implied_vol=None)])
+
+    client = _MixedClient()
+    p = _wired(client)
+    bars = list(p.fetch_eod_bars(_CONTRACTS, start=date(2020, 1, 1), end=date(2021, 12, 31)))
+
+    assert len(calls_seen) == 2, "both chunks must still be requested"
+    assert [b.close for b in bars] == [33.0]
 
 
 # --------------------------------------------------------------------------- #
