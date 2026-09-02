@@ -9,7 +9,7 @@ merge (ThetaData does not fold OI into the bars call the way TastyTrade's dxfeed
 contract ``fetch_bars_detailed`` must honour for ``tools/warm_options_history.py``'s
 retry loop.
 """
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 import pytest
@@ -18,7 +18,7 @@ from ba2_common.core.interfaces import (
     CandleBatch, OptionContractMeta, OptionEodBar, OptionsDataProviderInterface,
 )
 from ba2_providers import OPTIONS_PROVIDERS, get_provider
-from ba2_providers.options.thetadata import ThetaDataOptionsProvider, _occ_symbol
+from ba2_providers.options.thetadata import ThetaDataOptionsProvider, _chunk_window, _occ_symbol
 from types import SimpleNamespace
 
 
@@ -250,6 +250,72 @@ def test_open_interest_is_skipped_when_greeks_eod_has_no_rows():
     bars = list(p.fetch_eod_bars(_CONTRACTS, start=date(2024, 10, 1), end=date(2024, 10, 1)))
     assert bars == []
     assert [c[0] for c in client.calls] == ["greeks_eod"]
+
+
+# --------------------------------------------------------------------------- #
+# ThetaData: 365-day-per-request cap (found live 2026-09-02, launching the
+# 2020-2026 backfill: "Too many days between start and end date; max 365 days allowed")
+# --------------------------------------------------------------------------- #
+def test_chunk_window_leaves_a_narrow_window_untouched():
+    assert _chunk_window(date(2024, 10, 1), date(2024, 10, 14)) == \
+        [(date(2024, 10, 1), date(2024, 10, 14))]
+
+
+def test_chunk_window_splits_at_exactly_365_days():
+    start = date(2020, 1, 1)
+    chunks = _chunk_window(start, date(2020, 1, 1) + timedelta(days=365))
+    assert len(chunks) == 1, "exactly 365 days apart must still fit in ONE request"
+
+
+def test_chunk_window_splits_a_multi_year_span_into_contiguous_non_overlapping_pieces():
+    start, end = date(2020, 1, 1), date(2026, 9, 2)
+    chunks = _chunk_window(start, end)
+
+    assert chunks[0][0] == start
+    assert chunks[-1][1] == end
+    for c_start, c_end in chunks:
+        assert (c_end - c_start).days <= 365
+    # contiguous: each chunk starts the day after the previous one ends
+    for (_, prev_end), (next_start, _) in zip(chunks, chunks[1:]):
+        assert next_start == prev_end + timedelta(days=1)
+
+
+def test_fetch_eod_bars_chunks_a_wide_window_into_separate_requests_and_merges_the_bars():
+    """The bug that broke the real 2020-2026 launch: every request carried the FULL window
+    and ThetaData rejected every single one. Two chunks here, with DIFFERENT bars in each,
+    proves both actually get fetched and yielded -- not just that two calls happen."""
+    calls_seen = []
+
+    class _ChunkedFakeClient(_FakeClient):
+        def option_history_greeks_eod(self, **kw):
+            calls_seen.append(("greeks_eod", kw["start_date"], kw["end_date"]))
+            # A distinct bar per chunk, dated inside that chunk's own window.
+            if kw["start_date"].year == 2020:
+                return _greeks_df([dict(
+                    symbol="AAPL", expiration="2025-01-17", strike=200.0, right="CALL",
+                    timestamp="2020-06-01", open=1, high=1, low=1, close=11.0,
+                    volume=1, bid=None, ask=None, implied_vol=None)])
+            return _greeks_df([dict(
+                symbol="AAPL", expiration="2025-01-17", strike=200.0, right="CALL",
+                timestamp="2021-06-01", open=1, high=1, low=1, close=22.0,
+                volume=1, bid=None, ask=None, implied_vol=None)])
+
+        def option_history_open_interest(self, **kw):
+            calls_seen.append(("open_interest", kw["start_date"], kw["end_date"]))
+            return _oi_df([])
+
+    client = _ChunkedFakeClient()
+    p = _wired(client)
+    # > 365 days -> must chunk (2020-01-01 .. 2021-12-31 is ~730 days).
+    bars = list(p.fetch_eod_bars(_CONTRACTS, start=date(2020, 1, 1), end=date(2021, 12, 31)))
+
+    greeks_calls = [c for c in calls_seen if c[0] == "greeks_eod"]
+    assert len(greeks_calls) == 2, "a >365-day window must be split into 2 requests"
+    for _, c_start, c_end in greeks_calls:
+        assert (c_end - c_start).days <= 365
+
+    closes = sorted(b.close for b in bars)
+    assert closes == [11.0, 22.0], "bars from BOTH chunks must be yielded, not just the first"
 
 
 def test_fetch_bars_detailed_reports_missing_contracts_as_empty_never_unresolved():
