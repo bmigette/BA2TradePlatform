@@ -580,6 +580,59 @@ note below — same spirit: pitfalls the next agent building a bare
    `"(manual review, not submitted)"` — a `TradeActionResult`, never a real
    `TradingOrder` — instead of being priced/sized/filled.
 
+#### Task 14a item 3 — results-comparability note
+
+Recorded the way the 2026-08-04 CAR-scale change is recorded
+(`docs/RUNBOOK-goal2020-grid.md` §7, "Three things make this grid's numbers
+a new baseline, not a continuation"): each point below marks a NEW baseline
+that must never be compared with numbers from before it, within a run or
+across runs.
+
+1. **Task-3 Black-Scholes mark fallback is a new option-results baseline
+   (2026-09 grid-2 vs the 2026.08.0058 stage-1 deploy).** Before Task 3,
+   an option position with no bar on a given day carried at
+   `max(intrinsic, entry)` — a floor, not a market-implied mark. After Task
+   3, the same barless day marks at `BS(bar iv)` first, falling through to
+   the floor only when spot/iv/dte are unavailable. Since roughly a third to
+   half of the trading days at LEAPS range have no bar for the held contract
+   (design §1: 50-65% density; this task's own item-2 measurement corroborates
+   sparsity at real symbols), this changes the DAILY equity curve — and
+   therefore drawdown, Sharpe, and every fitness computed off it — for every
+   option position that spans a barless day. **Stage-1 option numbers (any
+   backtest/optimization run BEFORE this branch merges, tagged with
+   `app_version` <= `2026.08.0058`) and grid-2 numbers (run AFTER this
+   branch merges) are DIFFERENT BASELINES.** Never rank, average, or diff
+   an option result across that line; re-run the comparison side you need
+   on the new baseline instead.
+2. **683c7379 restates `total_return`/`calmar_ratio` inside
+   `stressed_results` — every fitness run with `--stress-spread-bps` set is
+   a new baseline for those two metrics** (the stress was computed but
+   silently discarded before this fix; a stressed run's `total_return`/
+   `calmar_ratio` now differ from a pre-fix run of the identical genome on
+   the identical data). Scope, checked directly against the tools this
+   plan's grids use: `tools/run_screener_capband_matrix.py`'s goal2020/
+   matrix3 invocations pass `--fitness consistent_annual_return` explicitly
+   (`docs/RUNBOOK-goal2020-grid.md`'s own recorded command line) — NOT
+   `total_return`/`calmar_ratio` — so **matrix3 and goal2020 are
+   unaffected** by this change. A **bare** `run_screener_capband_matrix.py`
+   invocation (no `--fitness` flag) DEFAULTS to `calmar_ratio`
+   (`ap.add_argument("--fitness", default="calmar_ratio")`) and IS affected
+   if it also carries `--stress-spread-bps` — a distinct trap from the
+   metric-name one: the flag alone does not tell you which baseline a run's
+   `total_return`/`calmar_ratio` belong to; check whether `--stress-spread-bps`
+   was set and whether the run predates or postdates 683c7379.
+3. **`perf_sample_bt.py`'s numbers before/after 4169ae47 are NOT
+   COMPARABLE**, per that commit's own docstring: the harness's indicator
+   provider was a bare `object()` for its whole prior life, so every
+   BUY evaluated was NEVER SIZED OR SUBMITTED (`orders/run=0`) — the
+   wall-clock measured rule evaluation with no order flow behind it, not
+   the fill-engine/order-simulator cost the docstring claims to measure.
+   Measured on the default 20x250 sample, best of 3: BEFORE 0.416s / 0
+   orders, AFTER 4.796s / 649 orders — an 11x difference that is the fill
+   engine finally running, not a regression. Any older recorded
+   `perf_sample_bt` number is describing a different (and, per the harness's
+   own purpose, broken) program.
+
 ---
 
 ## Review cadence
