@@ -1,8 +1,10 @@
 """``types.get_strike_method_action_values`` must equal what the builders actually do.
 
-Only ELEVEN of the nineteen ``_OptionEntryAction`` subclasses pass ``method=self.strike_method``
-to the selector; the other eight hard-code ``method="percent_otm"`` and leave
-``self.strike_method`` a dead attribute (OPT-S2). Anything that OFFERS a strike-method choice
+Only TWELVE of the nineteen ``_OptionEntryAction`` subclasses pass ``self.strike_method``
+to the selector; the other seven hard-code ``method="percent_otm"`` and leave
+``self.strike_method`` a dead attribute (OPT-S2) -- except the long STRADDLE, which is off the
+list for a different reason: its strike is not a parameter (both legs are the ATM strike by
+definition), so a method there could never move a strike. Anything that OFFERS a strike-method choice
 -- the rule editor, or the GA's strike-method gene -- must offer it for exactly those eleven, or
 it hands out a knob that silently does nothing (a 0.30 "delta" becomes a strike 0.30 PERCENT
 OTM, i.e. at the money).
@@ -72,6 +74,18 @@ def _source_honours(cls) -> bool:
         except (OSError, TypeError):
             continue
         if "method=self.strike_method" in src:
+            return True
+        # THE NORMALIZING IDIOM (2026-09-02, OpenStrangleAction). A builder whose method may
+        # legitimately be unset has to normalize before it selects -- a ``None`` method reaches
+        # ``option_selector.target_strike`` as an UNRECOGNISED one and returns no strike at
+        # all, i.e. the structure silently refuses -- so it reads ``self.strike_method`` into a
+        # local and passes THAT. Both halves are required here (the read AND the pass), which
+        # is why this is not a loosening: a class that merely mentions ``self.strike_method``
+        # still derives False. Without this the guard reports a builder that demonstrably
+        # follows the setting as ignoring it -- the same false negative the MRO walk above
+        # fixed for the backspreads, and the sibling runtime test disagrees again.
+        if (re.search(r"method\s*=\s*str\(\s*self\.strike_method\b", src)
+                and "method=method" in src):
             return True
     return False
 

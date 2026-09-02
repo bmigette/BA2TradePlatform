@@ -747,11 +747,13 @@ def uses_arc_floor(action_value):
 def get_strike_method_action_values():
     """Option action types whose builder actually READS ``strike_method``.
 
-    These ELEVEN of the nineteen ``_OptionEntryAction`` subclasses pass
-    ``method=self.strike_method`` into the selector. The other eight -- straddle, strangle,
-    short straddle, short strangle, iron condor, jade lizard, call butterfly, put ratio
-    spread -- hard-code ``method="percent_otm"`` at every selection site, so
-    ``strike_method`` is set on the shared base and then never read: a dead attribute.
+    These TWELVE of the nineteen ``_OptionEntryAction`` subclasses pass
+    ``method=self.strike_method`` into the selector. The other seven -- straddle, short
+    straddle, short strangle, iron condor, jade lizard, call butterfly, put ratio spread --
+    hard-code ``method="percent_otm"`` at every selection site, so ``strike_method`` is set on
+    the shared base and then never read: a dead attribute. (The long STRANGLE left that list on
+    2026-09-02; the long STRADDLE is on it for a different reason from the rest -- its strike
+    is not a parameter at all, see ``OpenStraddleAction``.)
 
     THIS IS A LIVE TRAP, not a curiosity (OPT-S2). The rule editor rendered the Strike
     Method select for every non-close option action, DEFAULTED IT TO ``delta``,
@@ -797,6 +799,16 @@ def get_strike_method_action_values():
         # 2-element ``strike_param`` read by ``_spread_params`` as ``(long, short)``.
         ExpertActionType.OPEN_CALL_BACKSPREAD.value,
         ExpertActionType.OPEN_PUT_BACKSPREAD.value,
+        # The long STRANGLE (2026-09-02). Both legs go through ``select_single`` with
+        # ``method=self.strike_method`` and ONE shared target, which is what makes a delta
+        # target a symmetric strangle: the selector ranks on ABSOLUTE delta, so a single
+        # |delta| picks a call above spot and a put below it. This is design 2026-08-31
+        # section 2's "strangle width delta 0.25-0.45" becoming expressible -- until now
+        # O_ERN's width had to be searched in percent because the builder read nothing else.
+        # Its sibling ``open_straddle`` is deliberately still absent: a straddle's strike is
+        # not a parameter (both legs sit on the ATM strike by definition), so a method there
+        # could never move a strike. See ``OpenStraddleAction``'s docstring.
+        ExpertActionType.OPEN_STRANGLE.value,
     ]
 
 

@@ -1,7 +1,7 @@
 """OPT-S2 — ``get_strike_method_action_values()`` must match what the BUILDERS read.
 
-Eleven of the nineteen entry builders pass ``method=self.strike_method`` into the selector.
-The other eight hard-code ``method="percent_otm"`` at every selection site, so
+Twelve of the nineteen entry builders pass ``self.strike_method`` into the selector.
+The other seven hard-code ``method="percent_otm"`` at every selection site, so
 ``self.strike_method`` is set on the shared base and never read.
 
 That list is what the rule editor uses to decide whether to offer a Strike Method at all,
@@ -183,5 +183,7 @@ def test_the_strike_method_list_matches_what_the_builder_reads(action_type, spy)
 def test_the_list_is_a_strict_subset_of_the_entry_actions():
     """A name on the list that is not an entry action would silently offer nothing."""
     assert set(get_strike_method_action_values()) <= set(ENTRY_ACTION_VALUES)
-    assert len(get_strike_method_action_values()) == 11
-    assert len(set(ENTRY_ACTION_VALUES) - set(get_strike_method_action_values())) == 8
+    # 12 since 2026-09-02: the long STRANGLE learned the method (design 2026-08-31 section 2's
+    # "strangle width delta 0.25-0.45"). 19 entry actions - 12 = 7 still hard-coded.
+    assert len(get_strike_method_action_values()) == 12
+    assert len(set(ENTRY_ACTION_VALUES) - set(get_strike_method_action_values())) == 7

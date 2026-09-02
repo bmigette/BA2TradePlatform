@@ -62,8 +62,21 @@ _FIXED_METHOD = sorted(k for k in _SINGLES if _authored_method(k) != "percent_ot
 _DELTA_CAPABLE = sorted(k for k in _SINGLES
                         if honours_strike_method(mod._OPTION_STRATS[k]["action_type"])
                         and k not in _FIXED_METHOD)
+def _reachable_action_types(kind):
+    """Every action type a genome for this row can actually SUBMIT.
+
+    Usually one -- the authored ``action_type``. A row with an ``option_structure`` gene (only
+    O_ERN today) reaches its choices too, and that is the whole point of the gene: the decoded
+    ``action_type`` IS the choice. Deriving "delta blind" off the authored type alone said
+    O_ERN ignores strike_method because its DEFAULT arm is the straddle, while its strangle arm
+    honours it (2026-09-02) and its delta gene is live on every strangle genome."""
+    row = mod._OPTION_STRATS[kind]
+    return [row["action_type"], *row.get("option_structure_choices", [])]
+
+
 _DELTA_BLIND = sorted(k for k in _SINGLES
-                      if not honours_strike_method(mod._OPTION_STRATS[k]["action_type"]))
+                      if not any(honours_strike_method(a)
+                                 for a in _reachable_action_types(k)))
 
 
 def _build(kind):

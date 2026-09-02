@@ -957,7 +957,7 @@ def test_no_grid2_key_searches_the_strike_METHOD(key):
     assert not offenders, f"{key} emits a strike-METHOD gene: {offenders}"
 
 
-@pytest.mark.parametrize("key", ["O_LEAPC", "O_LEAPP", "O_CBS", "O_PBS"])
+@pytest.mark.parametrize("key", ["O_LEAPC", "O_LEAPP", "O_CBS", "O_PBS", "O_ERN"])
 def test_every_fixed_method_keys_strike_band_is_a_delta_in_the_unit_interval(key):
     """The other half of amendment 1: the bands the fixed-delta keys DO search are deltas.
 
@@ -975,26 +975,37 @@ def test_every_fixed_method_keys_strike_band_is_a_delta_in_the_unit_interval(key
     assert m._OPTION_STRATS[key]["option_strike_method"] == "delta"
 
 
-def test_o_ern_is_the_documented_exception_and_says_why():
-    """O_ERN's two builders CANNOT read a strike method, so its width gene is a percent.
+def test_o_ern_searches_the_designs_delta_band_now_that_the_strangle_reads_it():
+    """THE EXCEPTION IS GONE (plan Task 14b item 5, 2026-09-02).
 
-    Design section 2 asks for "strangle width delta 0.25-0.45". ``open_straddle`` and
-    ``open_strangle`` are two of the eight builders that hard-code ``percent_otm`` at every
-    selection site, so a delta band handed to them would be READ AS A PERCENT -- 0.25% OTM,
-    effectively at the money, on both legs. That is the OPT-S2 trap, and the honest response
-    is to search the unit the builder reads. Pinned here, against the registry rather than
-    against a comment, so the day either builder learns the method this test fails and the
-    row can be converted.
+    This used to be ``test_o_ern_is_the_documented_exception_and_says_why``: design section 2
+    asks for "strangle width delta 0.25-0.45", and both of O_ERN's builders hard-coded
+    ``percent_otm``, so the row searched the unit the builder read (percent) and the test
+    pinned the exception against the registry "so the day either builder learns the method
+    this test fails and the row can be converted". ``OpenStrangleAction`` learned it; the row
+    is converted; the exception is replaced by the ordinary rule -- O_ERN is now in
+    ``test_every_fixed_method_keys_strike_band_is_a_delta_in_the_unit_interval``'s
+    parametrization like every other fixed-delta key.
+
+    The STRADDLE arm is still off the registry, and that stays correct rather than pending: a
+    straddle's strike is not a parameter (both legs sit on the ATM strike by definition), so
+    a method there could never move a strike. The delta gene is therefore inert on that arm
+    and live on every strangle genome -- a conditional domain, exactly as the percent band
+    was.
     """
     from ba2_common.core.types import honours_strike_method
 
     m = _launcher()
-    for choice in m._OPTION_STRATS["O_ERN"]["option_structure_choices"]:
-        assert not honours_strike_method(choice), (
-            f"{choice} now honours strike_method -- O_ERN's width gene can and should "
-            f"become the design's delta band (0.25-0.45); see its _OPTION_STRATS row")
-    assert m._OPTION_STRATS["O_ERN"]["option_strike_method"] == "percent_otm"
-    assert "O_ERN" not in m._FIXED_DELTA_METHOD_STRATEGIES
+    row = m._OPTION_STRATS["O_ERN"]
+    assert honours_strike_method("open_strangle")
+    assert not honours_strike_method("open_straddle")
+    assert row["option_strike_method"] == "delta"
+    assert (row["option_strike_delta_min"], row["option_strike_delta_max"],
+            row["option_strike_delta_step"]) == (0.25, 0.45, 0.05)
+    assert "option_strike_param_optimize" not in row, (
+        "the percent band must be GONE, not left beside the delta one -- two width genes "
+        "would fight over the same option_strike_param")
+    assert "O_ERN" in m._FIXED_DELTA_METHOD_STRATEGIES
 
 
 def test_the_fixed_method_guard_survives_a_row_that_also_searches_the_percent_param():

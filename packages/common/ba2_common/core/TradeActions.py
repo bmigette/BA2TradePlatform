@@ -3682,6 +3682,16 @@ class OpenStraddleAction(_OptionEntryAction):
     direction (e.g. ahead of earnings). Both legs are bought to open at the strike
     nearest spot, which MUST be identical for the call and the put. net debit =
     call.ask + put.ask (positive); sized by the combined per-contract debit.
+
+    IGNORES ``strike_method``, DELIBERATELY -- it is not one of the eight OPT-S2 builders left
+    unfixed, it is a structure whose strike is not a parameter at all. A straddle IS the ATM
+    pair: "the strike nearest spot" is the same contract whether you name it 0% OTM or ~0.50
+    delta, and both legs are pinned to that one strike by definition. So the builder keeps
+    ``method="percent_otm", strike_param=0`` (the ATM idiom the selector already has) and
+    ``open_straddle`` stays OUT of ``types.get_strike_method_action_values()``: listing it
+    would promise the rule editor and the GA a knob that can never move a strike, which is the
+    OPT-S2 trap from the other side. Its SIBLING ``OpenStrangleAction`` DOES honour the method
+    (2026-09-02) -- that is where the width lives.
     """
 
     def _action_type_value(self) -> str:
@@ -3748,12 +3758,26 @@ class OpenStrangleAction(_OptionEntryAction):
     """Open a long strangle: BUY an OTM call AND an OTM put at DIFFERENT strikes.
 
     Cheaper long-volatility variant of the straddle: the call is bought above spot
-    and the put below spot (both OTM by ``strike_param`` percent, default 5%). Both
-    legs are bought to open. net debit = call.ask + put.ask (positive); sized by the
-    combined per-contract debit. Needs a larger move than a straddle to pay off.
+    and the put below spot (both OTM by ``strike_param``). Both legs are bought to
+    open. net debit = call.ask + put.ask (positive); sized by the combined
+    per-contract debit. Needs a larger move than a straddle to pay off.
+
+    HONOURS ``strike_method`` (2026-09-02). Both legs are selected with the SAME method and
+    the SAME target, which is what makes a delta target a SYMMETRIC strangle: the selector
+    compares ABSOLUTE delta (``option_selector._pick_by``), so one target picks a call above
+    spot and a put below it at matching |delta|. Before this the builder hard-coded
+    ``percent_otm`` at both sites (OPT-S2), which made design 2026-08-31 section 2's
+    "strangle width delta 0.25-0.45" inexpressible -- a 0.25 handed to a percent selector
+    targets 0.25% OTM, effectively at the money, i.e. a straddle wearing a strangle's name.
+    ``percent_otm`` remains the default and the meaning of an unset method, so every existing
+    O_STRG genome and every hand-written live rule decodes to the same strikes as before.
     """
 
     DEFAULT_OTM_PCT = 5.0   # OTM distance (percent) when strike_param is not configured
+    # ... and the delta method's own default, because 5.0 read as a DELTA target is not "5%
+    # OTM", it is "the contract whose |delta| is nearest 5" -- i.e. the deepest OTM strike on
+    # the chain, every time. One default per method, never one shared number.
+    DEFAULT_DELTA = 0.30
 
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_STRANGLE.value
@@ -3765,16 +3789,18 @@ class OpenStrangleAction(_OptionEntryAction):
             return self._result(False, f"Empty option chain for {self.instrument_name}")
         liq = self._liq(call_chain, put_chain)
         spot = self._spot()
-        otm_pct = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
+        method = str(self.strike_method or "percent_otm")
+        default_param = self.DEFAULT_DELTA if method == "delta" else self.DEFAULT_OTM_PCT
+        width = self.strike_param if self.strike_param is not None else default_param
         call_c = select_single(
-            call_chain, method="percent_otm", strike_param=otm_pct, spot=spot,
+            call_chain, method=method, strike_param=width, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
             policy=self.selection_policy, **liq)
         if call_c is None:
             return self._result(False, f"No liquid OTM call for strangle on {self.instrument_name}")
         put_c = select_single(
-            put_chain, method="percent_otm", strike_param=otm_pct, spot=spot,
+            put_chain, method=method, strike_param=width, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
             policy=self.selection_policy, **liq)

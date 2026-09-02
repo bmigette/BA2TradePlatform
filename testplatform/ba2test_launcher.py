@@ -2502,23 +2502,32 @@ _OPTION_STRATS = {
         "action_type": "open_straddle",
         "option_structure_optimize": True,
         "option_structure_choices": ["open_straddle", "open_strangle"],
-        # THE ONE PLACE GRID-2 CANNOT SAY "DELTA", AND IT IS THE BUILDERS' LIMIT, NOT A CHOICE.
-        # ``open_straddle`` and ``open_strangle`` are two of the EIGHT builders that hard-code
-        # ``method="percent_otm"`` at every selection site (``types.get_strike_method_action_
-        # values`` is the registry, drift-guarded from the builders' own source by
-        # packages/common/tests/test_strike_method_registry.py). Design §2's "strangle width
-        # delta 0.25-0.45" is therefore not expressible today: offering a delta band to a
-        # builder that reads it as a PERCENT would target 0.25% OTM -- effectively at the
-        # money -- on both legs, which is the OPT-S2 trap said out loud. So the strangle's
-        # width is searched in the unit its builder actually reads, and it reuses O_STRG's
-        # already-authored percent band (2-12% step 2) verbatim rather than inventing one.
-        # RECORDED FOR THE OPERATOR: converting this to delta is a change to
-        # ``OpenStrangleAction``, not to this table. Inert on the straddle arm by construction
-        # (``OpenStraddleAction`` always selects ATM and ignores strike_param) -- a
-        # conditional domain, not a dead gene: it moves the strikes on every strangle genome.
-        "option_strike_method": "percent_otm", "option_strike_param": 5.0,
-        "option_strike_param_optimize": True, "option_strike_param_min": 2.0,
-        "option_strike_param_max": 12.0, "option_strike_param_step": 2.0,
+        # DELTA 0.25-0.45 STEP 0.05 (5 levels) -- design §2's own band, expressible since
+        # 2026-09-02 (plan Task 14b item 5). Until then ``open_strangle`` hard-coded
+        # ``method="percent_otm"`` at both selection sites, so this row had to search the
+        # width in percent (O_STRG's 2-12% band) and RECORDED that converting it was a change
+        # to ``OpenStrangleAction``, not to this table. That change landed: the strangle now
+        # passes ``self.strike_method`` on BOTH legs and joined
+        # ``types.get_strike_method_action_values()`` (drift-guarded from the builders' own
+        # source by packages/common/tests/test_strike_method_registry.py and, by RUNNING them,
+        # by test_option_strike_method_honoured.py). One target on both legs is what makes it
+        # SYMMETRIC: the selector ranks on ABSOLUTE delta, so 0.35 picks a call above spot and
+        # a put below it at matching |delta|.
+        #
+        # STILL A CONDITIONAL DOMAIN, and for a reason that has not changed: ``open_straddle``
+        # is ATM by DEFINITION -- both legs on the strike nearest spot -- so it reads no strike
+        # parameter under any method, and this gene is inert on the straddle arm and live on
+        # every strangle genome. That is a conditional domain, not a dead gene, and it is why
+        # the straddle deliberately stays OFF the strike-method registry (see
+        # ``OpenStraddleAction``'s docstring).
+        #
+        # NO METHOD GENE (amendment 1): a fixed-method row does not search the method --
+        # ``_apply_option_strike_method_gene`` refuses twice over, on the non-honouring action
+        # type AND on the authored non-percent method.
+        "option_strike_method": "delta", "option_strike_param": 0.35,
+        "option_strike_delta": 0.35,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.25,
+        "option_strike_delta_max": 0.45, "option_strike_delta_step": 0.05,
         # EXPIRY MUST LAND AFTER THE PRINT. Authored 14..28 fixes hw = 7, and the searched
         # centres 14..23 step 3 (4 levels) decode to [7,21] [10,24] [13,27] [16,30] -- inside
         # design §2's 7-30 band, and every one of them has dte_min >= 7 > the entry gene's
@@ -2655,11 +2664,15 @@ _CONVEX_OPTION_STRATEGIES = {"O_CONVEX"}
 #: puts them -- the group key "O_CONVEX" itself has no row there at all (O_WHEEL's same shape).
 _CONVEX_MEMBER_KEYS = {"O_CONVEXC", "O_CONVEXP"}
 
-#: Grid-2 keys whose strike selection is FIXED to ``delta`` (amendment 1). O_ERN is absent on
-#: purpose: its two builders hard-code ``percent_otm`` (see its row). O_CONVEX's two MEMBERS
-#: (the separate convex-harvest grid, plan Task 13) are included -- they fix the method for the
-#: identical reason grid 2's keys do; the group key "O_CONVEX" itself has no row to fix.
-_FIXED_DELTA_METHOD_STRATEGIES = ({"O_CBS", "O_PBS"}
+#: Grid-2 keys whose strike selection is FIXED to ``delta`` (amendment 1). O_CONVEX's two
+#: MEMBERS (the separate convex-harvest grid, plan Task 13) are included -- they fix the method
+#: for the identical reason grid 2's keys do; the group keys "O_CONVEX"/"O_LEAP" themselves
+#: have no row to fix. O_ERN JOINED ON 2026-09-02 (plan Task 14b item 5): it was the documented
+#: exception only because ``open_strangle`` could not read a strike method; now that it can,
+#: the row states design §2's band in the unit the design states it in. Its straddle arm still
+#: ignores the parameter -- ATM is not a parameterised strike -- which is a conditional domain,
+#: the same shape the percent band had.
+_FIXED_DELTA_METHOD_STRATEGIES = ({"O_CBS", "O_PBS", "O_ERN"}
                                   | _LEAP_MEMBER_KEYS | _CONVEX_MEMBER_KEYS)
 
 #: Grid-2 keys the design gates behind LATER machinery, with the reason. ``O_PMCC`` and
