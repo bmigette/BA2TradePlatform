@@ -30,16 +30,17 @@ Features (design §9 "Genes — emission decided BY the measurements")
                      an absent feature never demotes, ``composite_confidence``
                      renormalizes over the present ones).
 
-HOW SEVERE IS THE DEFAULT ``min_analysts=3``? Measured 2026-09-01 over a random 600
+HOW SEVERE WAS THE OLD DEFAULT ``min_analysts=3``? Measured 2026-09-01 over a random 600
 of the 4,728 cached ``earnings_estimates_quarterly`` payloads, replaying this
 expert's own gate (nearest estimate row on/after the as-of, plural analyst key,
 0 read as "no count"): it REFUSES 66% of symbols at a 2023-06-10 as-of and 47% at
 2025-06-10. Coverage thins going back because the endpoint is forward-biased. So the
-default is deliberately strict, not accidentally so — it discards roughly half the
-universe at recent dates and two thirds at older ones. Task 10 should pick the gene
-range with those two numbers in front of it: a range that never reaches low values
-would leave most of the mid/small bands unreachable, which is exactly where design
-§9 says O_ERN runs FIRST.
+OLD default was deliberately strict, not accidentally so — it discarded roughly half
+the universe at recent dates and two thirds at older ones. LANDED (Task 11): the class
+DEFAULT is now 1 (a data-quality floor, not a selection filter), and the grid searches
+``min_analysts`` 0-5 with 0 = gate OFF — a range that never reached the low end would
+have left most of the mid/small bands unreachable, which is exactly where design §9
+says O_ERN runs FIRST.
 
 WITHHELD, deliberately not implemented (design §9, recorded not silently dropped)
 --------------------------------------------------------------------------------
@@ -580,7 +581,7 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
             },
             "min_analysts": {
                 # DEFAULT LOWERED 3 -> 1 (Task 11, 2026-09-02). Measured 2026-09-01 (see the
-                # module docstring, "HOW SEVERE IS THE DEFAULT min_analysts=3?"): replaying this
+                # module docstring, "HOW SEVERE WAS THE OLD DEFAULT min_analysts=3?"): replaying this
                 # expert's own gate over a random 600 of 4,728 cached earnings_estimates_quarterly
                 # payloads, the OLD default=3 refused 66% of the universe at a 2023-06-10 as-of and
                 # 47% at 2025-06-10 -- decaying strictness that tilts the traded universe across the

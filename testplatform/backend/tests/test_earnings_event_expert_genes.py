@@ -98,7 +98,13 @@ def test_gene_reaches_the_effective_expert_setting(setting, value):
     effective setting to the genome's value, not silently fall back to the class default."""
     overrides = _trial_settings_for(setting, value)
     decision_settings = _expert_decision_settings(FMPEarningsEvent, overrides)
-    assert decision_settings[setting] == value
+    effective = decision_settings[setting]
+    if isinstance(value, bool):
+        # IDENTITY/TYPE, not ==: Python's 1 == True / 0 == False would let a str/int leak
+        # (e.g. "True", or 1 surviving in place of True) pass silently.
+        assert effective is value, f"{setting}: expected {value!r} (bool), got {effective!r}"
+    else:
+        assert effective == value
 
 
 def test_min_analysts_default_is_now_one_not_three():
