@@ -356,7 +356,7 @@ membership is opt-in, `None`/unknown/`""` is not a member, and an undeclared
 two-expiry submit still raises the unchanged `ValueError`.
 
 `"calendar_spread"` is deliberately NOT a member — `O_CAL` is phase-2 in
-`_PHASE_GATED_OPTION_STRATEGIES` (`ba2test_launcher.py:2678-2690`), and the
+`_PHASE_GATED_OPTION_STRATEGIES` (`ba2test_launcher.py:2685`), and the
 existing guard test submits two expiries tagged `calendar_spread` and requires a
 refusal. Adding `"calendar_spread"` is the one-line change phase 2 makes.
 `"pmcc"` has no builder yet (that is Task 6): this task opens the door, Task 6
