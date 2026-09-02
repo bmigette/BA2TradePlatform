@@ -252,6 +252,127 @@ a LIVE money record, consumed by both runtimes.** Requirements (each pinned):
    single-expiry rows; those rows read identically after upgrade.
 Model: opus. Two-stage review, with the migration reviewed by a second agent.
 
+#### DESIGN, 2026-09-02 (written BEFORE any code, per the controller)
+
+**1. Where per-leg expiries live: they ALREADY live in the leg rows. NO column,
+NO migration.**
+
+The brief allowed for either answer and asked for evidence. The evidence says the
+storage exists and has since revision `08de6c7b6eed`:
+
+- `TradingOrder.expiry: date | None` — `packages/common/ba2_common/core/models.py:503`,
+  in the per-leg option block (`contract_symbol`/`option_type`/`strike`/`expiry`/
+  `position_intent`). Added to the physical table by
+  `alembic/versions/08de6c7b6eed_add_option_fields_to_tradingorder.py:30`
+  (`op.add_column("tradingorder", sa.Column("expiry", sa.Date(), nullable=True))`).
+- A multi-leg structure persists **one `TradingOrder` child row per leg**, linked
+  by `parent_order_id` (`models.py:470-481`), and
+  `OptionsAccountInterface.submit_option_order` already writes each leg's own date:
+  `expiry=leg.expiry` at `OptionsAccountInterface.py:391`. There is no leg JSON
+  blob and no `OptionLeg` table — the child row IS the leg.
+- Both in-memory leg value objects already carry it too: `OptionLeg.expiry`
+  (`option_types.py:72`) and `LifecycleLeg.expiry` (`option_lifecycle.py:196`).
+- Both DTE readers already consult per-leg dates today — `_dte` over
+  `structure.held_legs` (`option_lifecycle.py:510`) and
+  `DaysToExpiryCondition._held_leg_expiries` (`TradeConditions.py:3299-3338`).
+
+So `Transaction.expiry` was never the *storage*; it is a denormalised
+**structure-level summary** of a set that is already recorded per leg. The task is
+therefore not "add per-leg storage" but "stop treating disagreement among the legs
+as necessarily corrupt". `Transaction.expiry` keeps its exact single-value meaning:
+it is filled only when the structure genuinely has ONE expiry, and for a declared
+multi-expiry structure it stays NULL — the honest value — with the leg rows as the
+record. Every existing builder is byte-identical (`len(expiries) <= 1` on every one
+of the 16 supported structures, so every expression below evaluates as it does today).
+
+**Migration id: NONE.** Alembic head stays `b7f3d21c98ae`
+(`b7f3d21c98ae_add_risk_manager_run_table.py`). Requirement 5 becomes the
+"no migration needed" proof it allows for: a test asserting the head is unchanged
+and single, that the `transaction` table gains no column (`compare_metadata` drift
+check, the `test_option_intent_migration.py` pattern), and that existing
+single-expiry rows in a fixture DB read identically through the new accessor.
+
+**2. The accessor** — new shared module
+`packages/common/ba2_common/core/option_expiry.py` (source of truth; nothing in the
+in-tree shim):
+
+```python
+MULTI_EXPIRY_OPTION_STRATEGIES: frozenset[str]        # the declaration (see 4)
+def is_multi_expiry_strategy(strategy: str | None) -> bool
+
+EXPIRY_RULE_ROLL_WINDOW  = "roll_window"      # -> the SHORT leg
+EXPIRY_RULE_STRUCTURE_EXIT = "structure_exit" # -> the LONG leg
+
+@dataclass(frozen=True)
+class ExpiryLeg:            # one HELD leg, reduced to what an expiry question needs
+    expiry: date | None
+    net_qty: float          # signed, BUY +, SELL -; short is net_qty < 0
+
+@dataclass(frozen=True)
+class ExpiryResolution:
+    expiry: date | None         # the answer, or None
+    conflict: tuple[date, ...]  # the distinct candidates when unresolved, else ()
+    missing: bool               # no candidate at all
+    rule_applied: str | None    # which named rule picked it; None = single-expiry
+
+def resolve_structure_expiry(legs, *, strategy, rule,
+                             declared_expiry=None) -> ExpiryResolution
+```
+
+It returns a RESULT, not a message. Each reader renders its own wording, so both
+readers' existing "unknown because…" strings — which their suites assert on
+verbatim — stay byte-identical. What is shared is the part that is actually risky:
+the *selection*. `declared_expiry` is the structure-level candidate
+(`Transaction.expiry` / the parent order's `expiry`).
+
+Resolution order: candidates = held legs' known expiries ∪ `declared_expiry`.
+Zero → `missing`. Exactly one → that date, `rule_applied=None` (**a per-leg question
+on a single-expiry structure returns the single expiry — no behaviour change**).
+More than one → if the strategy is NOT declared multi-expiry, `conflict` (today's
+refusal, unchanged); if it IS, apply the named rule and pick the nearest leg on the
+requested side, `conflict` if that side has no leg (fail-closed: never fall back to
+the other side).
+
+**3. The named DTE rules.** Ambiguity is what the guard existed to prevent, so each
+reader now states its side in code and in its docstring:
+
+| reader | question it answers | rule | leg |
+|---|---|---|---|
+| `option_lifecycle._dte` | the roll window (`roll_dte`, "time to roll the overlay") | `EXPIRY_RULE_ROLL_WINDOW` | **SHORT** |
+| `DaysToExpiryCondition` (the `opt_dte` exit) | the roll floor / structure exit ("is there still life to roll into") | `EXPIRY_RULE_STRUCTURE_EXIT` | **LONG** |
+| the `opt_time` exit | elapsed days since open | — | **none** |
+
+This matches design §4 exactly: "Roll loop: at short expiry"; "Structure exit:
+long-leg DTE floor". `opt_time` is listed because requirement 3 names it: it reads
+`days_opened` (`ba2test_launcher.py:3944-3947`), never an expiry, so it reads NO
+leg — stated so nobody looks for a leg rule there. `opt_dte` reaches
+`DaysToExpiryCondition` via `field: "days_to_expiry"` → `rule_builders.py:48` →
+`TradeConditions.py:3656`.
+
+**4. The multi-expiry declaration.** A module constant in shared code,
+`MULTI_EXPIRY_OPTION_STRATEGIES = frozenset({"pmcc"})`, consulted by the guard AND
+by both readers, so one list governs all three sites. Fail-closed by construction:
+membership is opt-in, `None`/unknown/`""` is not a member, and an undeclared
+two-expiry submit still raises the unchanged `ValueError`.
+
+`"calendar_spread"` is deliberately NOT a member — `O_CAL` is phase-2 in
+`_PHASE_GATED_OPTION_STRATEGIES` (`ba2test_launcher.py:2678-2690`), and the
+existing guard test submits two expiries tagged `calendar_spread` and requires a
+refusal. Adding `"calendar_spread"` is the one-line change phase 2 makes.
+`"pmcc"` has no builder yet (that is Task 6): this task opens the door, Task 6
+walks through it, and `O_PMCC` stays phase-gated meanwhile.
+
+**5. Both runtimes, one code path.** This is structural, not a convention:
+`BacktestAccount(AccountInterface, OptionsAccountInterface)` overrides
+`submit_option_order` only to drop its order cache and calls
+`super().submit_option_order(*args, **kwargs)`
+(`backtest_account.py:2085-2093`); `AlpacaAccount` does not override it at all and
+implements only the `_submit_option_order_impl` broker hook. So the guard, the leg
+persistence and both DTE readers are literally the same functions in both runtimes.
+The parity test pins that a structure submitted through the backtest account and
+one submitted through a live-shaped account double yield identical per-leg rows and
+identical accessor answers.
+
 ### Task 6 (opus): two-expiry lifecycle builder (PMCC first)
 
 > **RESEQUENCED 2026-09-01 (controller decision after a designed STOP).** The
