@@ -466,8 +466,19 @@ def compute_fitness(fitness_metric: str, results: dict,
         #   * _min_with_stressed cannot be applied honestly, because ``stressed_results``
         #     restates ``annualized_return`` and ``max_drawdown`` but NOT ``total_return``,
         #     which is what this metric ranks on. Wiring it would produce a stress that looks
-        #     applied and moves only the drawdown term. Fix stressed_results (and re-freeze the
-        #     equity baseline, which pins its current output) when no grid is running.
+        #     applied and moves only the drawdown term.
+        #     THE SAME GAP IS ALREADY LIVE for the plain ``total_return``/``return`` metrics and
+        #     for ``calmar_ratio``: their stressed pass re-reads the COPIED unstressed value, so
+        #     the min() is inert. MEASURED 2026-09-02, not assumed -- adding
+        #     ``out["total_return"] = (metrics["final_equity"] - initial) / initial * 100`` to
+        #     stressed_results moves SIX equity frozen literals (stress_on|return,
+        #     stress_on|total_return, stress_on_thin|{return,total_return},
+        #     stress_mid_concentration|{return,total_return}), which currently freeze the inert
+        #     119.7. TASK 14 CARRY: fix stressed_results and re-freeze those six with a
+        #     not-comparable note, under the same "when no grid is running" condition the
+        #     CAR/OCAR unification waits on. Task 13's matrix script refuses a non-zero
+        #     --stress-spread-bps on an option_convex job so the stress is never silently inert
+        #     here in the meantime.
         _fit = _option_convex(results)
         if isinstance(results, dict):
             # Same two keys _maybe_robust records on its non-robust path, so downstream
@@ -607,6 +618,46 @@ def _structure_count(trades) -> Optional[int]:
             slots.add(txn)
         n += 1
     return n
+
+
+def _structure_pnls(trades) -> list:
+    """Net P&L per independent BET, in first-appearance order -- the same partition
+    ``_structure_count`` counts, but carrying each structure's SUMMED P&L rather than a tally.
+
+    Option legs (marked by ``contract_symbol``) sharing a ``transaction_id`` are ONE bet and
+    their P&Ls are added; everything else -- equity, and any option leg with no transaction id
+    -- is its own. A missing ``transaction_id`` is UNKNOWN structure identity, not a shared
+    one, exactly as in ``_structure_count``: merging on ``None`` would fabricate one giant bet
+    out of unrelated legs.
+
+    WHY THIS EXISTS SEPARATELY FROM THE ROW LIST. Any per-BET statistic computed on the raw
+    rows is wrong for multi-leg structures, and wrong in a direction that hides risk: a
+    vertical that netted $5,000 as +3,000 / +2,000 shows a largest bet of 3,000, so a
+    concentration reading built on rows UNDERSTATES how much of the book one bet was. The
+    round-trip recorder emits one row per leg (``get_round_trip_trades`` keys on
+    ``(transaction_id, contract_symbol)``), so this is the whole population on an option grid,
+    not an edge case.
+
+    ``len(_structure_pnls(t)) == _structure_count(t)`` for every non-None trade list, and
+    ``test_strategy_fitness_convex_frozen`` pins that so the two partitions cannot drift.
+    Non-dict rows are counted as their own zero-P&L bet, which is what keeps that identity true
+    (``_structure_count`` counts them individually too).
+    """
+    pnls: list = []
+    slots: dict = {}          # transaction_id -> index into pnls
+    for t in trades:
+        if not isinstance(t, dict):
+            pnls.append(0.0)
+            continue
+        pnl = float(t.get("pnl") or 0.0)
+        txn = t.get("transaction_id")
+        if t.get("contract_symbol") and txn is not None:
+            if txn in slots:
+                pnls[slots[txn]] += pnl
+                continue
+            slots[txn] = len(pnls)
+        pnls.append(pnl)
+    return pnls
 
 
 def _trades_per_year(results: dict) -> Optional[float]:
@@ -1206,13 +1257,22 @@ def _convex_telemetry(trades, tickets_per_year: float, underlyings: int) -> dict
     decision, 2026-08-06 -- skew is a legitimate profile and stays a deploy-time check, not a
     GA signal). Recording them here is what makes that checkable after the fact.
 
+    EVERY FIGURE IS PER TICKET (STRUCTURE), NOT PER LEG -- the same unit ``tickets_per_year``
+    is measured in (``_trades_per_year`` -> ``_structure_count``). Mixing the two units inside
+    one telemetry block is the defect this signature exists to avoid: on a leg count a
+    four-leg structure is four tickets, so a book of 22 verticals would report a 12% hit rate
+    where it earned 24%, and a multi-leg winner's P&L is split across its legs so the
+    concentration shares come out SMALLER than the book actually was -- understating exactly
+    the risk this telemetry is recorded to expose. ``_structure_pnls`` does the grouping.
+
     Computed directly rather than through ``robustness_metrics`` on purpose: that function also
-    runs a 1000-path Monte Carlo (cost this metric has no use for) and returns every share as
-    None whenever the book is net negative, which is a screening decision rather than a
-    reporting one. The share convention is nonetheless kept identical -- a share of a negative
-    or zero net is not a share, so those stay None.
+    runs a 1000-path Monte Carlo (cost this metric has no use for), and it reads the raw ROWS,
+    so its own top1/top5 carry the per-leg split described above (a pre-existing gap in the
+    robustness screen, out of scope here -- it is not consulted by this metric). The
+    net-negative convention is nonetheless kept identical: a share of a negative or zero net is
+    not a share, so those stay None.
     """
-    pnl = [float(t.get("pnl") or 0.0) for t in trades if isinstance(t, dict)]
+    pnl = _structure_pnls(trades)
     n = len(pnl)
     out = {"hit_rate_pct": None, "top1_pct": None, "top5_pct": None,
            "tickets_per_year": float(tickets_per_year), "distinct_underlyings": int(underlyings),
@@ -1273,6 +1333,23 @@ def _option_convex(results: dict) -> float:
     ``test_a_capped_run_ranks_on_uncapped_pnl_not_on_the_capped_equity_series`` pins it with a
     binding cap: +400% of the cap must outrank +40%, and it does not if the deployed series is
     ranked on (both read as zero).
+
+    AND IT IS THE COMPOUNDED FIGURE, NOT ``sum(pnl) / cap``. Be precise about what
+    ``total_return`` is under a cap: ``scoring_curve`` COMPOUNDS the periods
+    (``level *= 1 + pnl_i / cap``), so the number is the PRODUCT of the periodic returns, not
+    their sum. On a cap of 100, two periods of +50 read 1.5 x 1.5 = 2.25, i.e. +125%, where the
+    simple cumulative reading is +100%; a single period of +110 reads +110% either way. So the
+    two orderings genuinely differ -- the compounded reading ranks the two-period +50/+50 book
+    ABOVE the one-shot +110, and the simple reading ranks it below.
+
+    We keep the PLATFORM convention (the compounded one) for two reasons. First, there is
+    exactly one ``total_return`` in this codebase and it means one thing: re-deriving a private
+    "simple" variant here would put two numbers with the same name in the same results dict,
+    which is the failure mode the three-series trap above already demonstrates. Second, where
+    the two disagree the compounded reading favours the convex thesis rather than fighting it
+    -- it pays a book that CONVERTED a win into more size for the next draw, which is what
+    "the winners must pay for the graveyard" means over a multi-year window. Neither reading
+    truncates any P&L, which is the property the equity-cap amendment actually requires.
 
     NO ADJUSTED-RETURN SWITCH UNDER PROFIT CAPS, deliberately, and unlike every other
     return-based metric here. ``--profit-cap-pct`` is default-ON in the launcher and clips a
@@ -1343,11 +1420,13 @@ def _option_convex(results: dict) -> float:
         return LOW_TRADE_SENTINEL
 
     # --- 5. TELEMETRY: recorded, NEVER scored -------------------------------------------------
-    telemetry = _convex_telemetry(trades, tpy, underlyings)
-    try:
-        results["convex_telemetry"] = telemetry
-    except Exception:  # noqa: BLE001 -- results may be a non-dict in odd callers
-        pass
+    # Written unguarded, deliberately. The ``try/except Exception: pass`` this used to carry was
+    # an unnamed broad swallow (BA2_ERROR_MODE=enforce) AND dead: ``compute_fitness`` only
+    # reaches this function through a branch that has already indexed ``results`` half a dozen
+    # times, and its own recording of ``fitness_raw`` is isinstance-guarded, so a non-dict
+    # caller raises long before here. A caller that somehow gets this far with an unwritable
+    # results object should hear about it rather than lose its telemetry silently.
+    results["convex_telemetry"] = _convex_telemetry(trades, tpy, underlyings)
 
     if ret <= 0:
         return ret  # unfactored: a penalty factor on a negative would flip its sign

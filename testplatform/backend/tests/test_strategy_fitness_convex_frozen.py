@@ -51,6 +51,8 @@ from app.services.strategy_fitness import (
     _CONVEX_MIN_UNDERLYINGS,
     _CONVEX_WIPED_OUT_DD_PCT,
     _convex_dd_factor,
+    _structure_count,
+    _structure_pnls,
     compute_fitness,
 )
 
@@ -98,6 +100,39 @@ _TRADES_19 = _rows(n_underlyings=19)    # one under it
 _TRADES_25 = _rows(n_underlyings=25)
 _TRADES_3 = _rows(n_underlyings=3)
 _LEGGED = _rows(n=88, n_underlyings=22, legs_per_structure=4)   # 22 four-leg tickets
+
+
+def _two_leg_rows():
+    """30 TWO-LEG tickets, one per underlying, built so per-ticket and per-LEG telemetry differ
+    in every figure. See ``test_telemetry_counts_tickets_not_legs`` for the arithmetic.
+
+      ticket  0      legs +3,000 / +2,000   -> net +5,000   (a winner SPLIT across its legs)
+      tickets 1-4    legs   +300 /   -100   -> net   +200   (a winner with a LOSING leg)
+      tickets 5-29   legs   -100 /   -100   -> net   -200   (the graveyard)
+    """
+    rows = []
+    for s in range(30):
+        if s == 0:
+            legs = (3_000.0, 2_000.0)
+        elif s < 5:
+            legs = (300.0, -100.0)
+        else:
+            legs = (-100.0, -100.0)
+        u = f"V{s + 1:02d}"
+        for k, pnl in enumerate(legs):
+            rows.append({
+                "symbol": u,
+                "underlying_symbol": u,
+                "pnl": pnl,
+                "pnl_pct": pnl / 100.0,
+                "exit_time": f"2024-{1 + s % 12:02d}-15",
+                "contract_symbol": f"{u}250117{'C' if k == 0 else 'P'}00100000",
+                "transaction_id": 1_000 + s,
+            })
+    return rows
+
+
+_TWO_LEG = _two_leg_rows()   # 60 rows / 30 tickets / 30 underlyings
 
 _CURVE = [{"date": "2023-01-03", "equity": 20_000.0},
           {"date": "2023-12-29", "equity": 22_000.0},
@@ -437,14 +472,89 @@ def test_a_missing_trade_list_raises_rather_than_silently_disqualifying():
 # TELEMETRY: recorded, never scored
 # ---------------------------------------------------------------------------------------------
 def test_telemetry_is_recorded_on_the_results_payload():
+    """ARITHMETIC, by hand, on ``_TRADES`` (90 single-leg tickets, so tickets == rows here):
+
+      winners   12,000 + 4,000 + 2,500 + 1,500 + 900 + 600 + 400 + 300 + 200 = 22,400 (9 of 90)
+      graveyard 81 x -100                                                    = -8,100
+      net                                                                    = 14,300
+      hit rate  9 / 90                                                       = 10%
+      top-1     12,000 / 14,300                                              = 83.916...%
+      top-5     (12,000 + 4,000 + 2,500 + 1,500 + 900) / 14,300 = 20,900 / 14,300 = 146.153...%
+    """
     r = _base()
     compute_fitness(CONVEX, r)
     t = r["convex_telemetry"]
-    assert t["hit_rate_pct"] == pytest.approx(10.0)          # 9 winners in 90 tickets
-    assert t["top1_pct"] == pytest.approx(83.91608391608392)
-    assert t["top5_pct"] == pytest.approx(146.15384615384616)
+    assert t["hit_rate_pct"] == pytest.approx(100.0 * 9 / 90)
+    assert t["top1_pct"] == pytest.approx(100.0 * 12_000 / 14_300)
+    assert t["top5_pct"] == pytest.approx(100.0 * 20_900 / 14_300)
     assert t["tickets_per_year"] == pytest.approx(30.0)
     assert t["distinct_underlyings"] == 24
+    assert t["tickets_scored"] == 90
+
+
+def test_telemetry_counts_tickets_not_legs():
+    """THE UNIT IS THE TICKET (STRUCTURE), the same unit ``tickets_per_year`` is measured in.
+
+    ``_TWO_LEG`` is 30 two-leg tickets = 60 rows, net +800. Counted correctly and counted per
+    LEG the two readings disagree on every figure:
+
+                        per TICKET (correct)              per LEG (wrong)
+      tickets_scored    30                                60
+      winners           5  (ticket 0 + tickets 1-4)       6  (+3,000, +2,000, 4 x +300)
+      hit rate          5 / 30      = 16.666...%          6 / 60      = 10%
+      largest bet       +5,000 (ticket 0, legs summed)    +3,000 (its bigger leg alone)
+      top-1             5,000 / 800 = 625%                3,000 / 800 = 375%
+      top-5             5,800 / 800 = 725%                5,900 / 800 = 737.5%
+
+    Top-1 is where the defect bites and in which direction: splitting a winner across its legs
+    UNDERSTATES how much of the book one bet was -- 375% instead of 625% -- so a concentration
+    reading built on rows makes a dangerously skewed result look tamer than it is.
+    """
+    # leg rate 60/yr over 30 tickets = 30 tickets/yr, exactly at the breadth floor
+    r = _base(avg_trades_per_year=60.0, trades=_TWO_LEG, total_trades=60)
+    assert compute_fitness(CONVEX, r) == pytest.approx(120.0)   # clears both floors
+    t = r["convex_telemetry"]
+    assert t["tickets_scored"] == 30
+    assert t["tickets_per_year"] == pytest.approx(30.0)
+    assert t["distinct_underlyings"] == 30
+    assert t["hit_rate_pct"] == pytest.approx(100.0 * 5 / 30)
+    assert t["top1_pct"] == pytest.approx(625.0)
+    assert t["top5_pct"] == pytest.approx(725.0)
+    # ...and explicitly NOT the per-leg answers, so a regression to row counting is named.
+    assert t["hit_rate_pct"] != pytest.approx(10.0)
+    assert t["top1_pct"] != pytest.approx(375.0)
+    assert t["top5_pct"] != pytest.approx(737.5)
+
+
+def test_the_telemetry_unit_matches_the_breadth_floor_unit():
+    """``tickets_scored`` x (years spanned) must be the same population ``tickets_per_year``
+    rates. Both come from the structure partition; a telemetry block that counted legs while
+    the floor counted structures would report two different books under one heading."""
+    r = _base(avg_trades_per_year=120.0, trades=_LEGGED, total_trades=88)
+    compute_fitness(CONVEX, r)
+    t = r["convex_telemetry"]
+    assert t["tickets_scored"] == 22            # 88 rows / 4 legs each
+    assert t["tickets_per_year"] == pytest.approx(30.0)   # 120 leg-rate x 22/88
+
+
+@pytest.mark.parametrize("trades", [_TRADES, _TRADES_20, _LEGGED, _TWO_LEG, [],
+                                    [{"pnl": 1.0}, "not-a-dict", {"pnl": 2.0}]],
+                         ids=["single_leg", "at_floor", "four_leg", "two_leg", "empty", "junk"])
+def test_structure_pnls_partitions_exactly_as_structure_count(trades):
+    """Drift guard: the P&L grouping and the ticket TALLY must not diverge -- they are the same
+    partition, and the ticket rate is derived from the tally while the shares are derived from
+    the grouping."""
+    assert len(_structure_pnls(trades)) == _structure_count(trades)
+
+
+def test_structure_pnls_sums_the_legs_of_one_ticket():
+    assert sorted(_structure_pnls(_TWO_LEG), reverse=True)[:5] \
+        == [5_000.0, 200.0, 200.0, 200.0, 200.0]
+    assert sum(_structure_pnls(_TWO_LEG)) == pytest.approx(800.0)
+    # an option leg with NO transaction id is UNKNOWN identity, never a shared one
+    orphans = [{"pnl": 5.0, "contract_symbol": "X", "transaction_id": None},
+               {"pnl": 7.0, "contract_symbol": "X", "transaction_id": None}]
+    assert _structure_pnls(orphans) == [5.0, 7.0]
 
 
 def test_telemetry_never_moves_the_score():
