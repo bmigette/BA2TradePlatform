@@ -147,6 +147,22 @@ def test_live_enter_path_submits_rm_sized_funded_orders():
         assert submitted == {"AAPL": 400.0, "MSFT": 400.0, "GOOGL": 200.0}, submitted
         assert all(qty and qty > 0 for (_s, qty, _sl) in account.submitted)
         assert created, "process_expert_recommendations_after_analysis should return created orders"
+
+        # 2026-09-02: this run must also be VISIBLE in the Risk Manager Runs UI. Before this
+        # fix, size_candidate_orders (this exact live path) never called into
+        # risk_manager_run.record_run at all -- only the DB-pending-order path
+        # (review_and_prioritize_pending_orders) did, and dev's real orders never go through
+        # that path, leaving the table permanently empty despite the manager genuinely
+        # sizing real orders every day.
+        from ba2_common.core.db import get_all_instances
+        from ba2_common.core.models import RiskManagerRun
+        runs = [r for r in get_all_instances(RiskManagerRun) if r.expert_instance_id == inst.id]
+        assert len(runs) == 1, "the live enter path must persist exactly one RiskManagerRun"
+        run = runs[0]
+        assert run.mode == "classic"
+        assert run.symbols_received == 3
+        assert run.symbols_funded == 3
+        assert {d["symbol"] for d in run.decisions} == {"AAPL", "MSFT", "GOOGL"}
     finally:
         if prev_resolver is not None:
             set_instance_resolver(prev_resolver)
