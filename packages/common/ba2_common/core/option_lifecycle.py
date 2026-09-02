@@ -99,7 +99,9 @@ from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple, Unio
 
 from ba2_common.core.option_expiry import (
     EXPIRY_RULE_ROLL_WINDOW,
+    PMCC_STRATEGY,
     ExpiryLeg,
+    is_multi_expiry_strategy,
     resolve_structure_expiry,
 )
 from ba2_common.core.option_types import OptionContract
@@ -167,6 +169,29 @@ CoverValue = Union[int, float, str, None]
 #: call, or a ``{transaction_id: CoverValue}`` mapping (what a pass over a BOOK has to
 #: supply).
 CoverInput = Optional[Union[int, float, str, Mapping[int, CoverValue]]]
+
+#: WHERE THE PMCC'S OVERLAY SPEC LIVES: a dict on the ENTRY order's ``data``, written by
+#: ``OpenPMCCAction`` through ``_submit_option_order(extra_entry_facts=...)`` and read back by
+#: ``RollPMCCShortAction`` when it selects the NEXT overlay.
+#:
+#: The order row is the only thing that travels with the position, and the roll happens weeks
+#: after the entry with a DIFFERENT recommendation in hand -- the same reason
+#: ``earnings_stamp.ORDER_EVENT_DATE_KEY`` exists. Carrying it here rather than giving the roll
+#: action its own selection genes is what keeps ONE overlay thesis per genome: a second
+#: ``option_strike_delta`` on the roll rule would let a search enter at 0.15 delta and roll to
+#: 0.30, and would double the overlay's gene budget at a population of 40.
+#:
+#: ABSENCE IS A REFUSAL, never a default. A position without this key was not opened by
+#: ``open_pmcc``, and guessing which contract its overlay should be is exactly the fabricated
+#: input this module exists to refuse.
+ORDER_PMCC_OVERLAY_KEY = "pmcc_overlay"
+
+#: The keys ``ORDER_PMCC_OVERLAY_KEY``'s dict carries -- the whole selection box the entry
+#: picked its overlay from, so the roll re-selects under identical gates. Named here, once,
+#: because the writer (``OpenPMCCAction``) and the reader (``RollPMCCShortAction``) are in a
+#: different module from each other's tests.
+PMCC_OVERLAY_SPEC_KEYS = ("strike_method", "strike_param", "dte_min", "dte_max",
+                          "min_open_interest", "max_spread_pct", "min_volume")
 
 #: Strategies whose loss stop is the *undefined-risk* multiple (``ur_stop_*``).
 #: Everything else uses ``dr_stop_*``. Promoted verbatim from ``_should_close``:

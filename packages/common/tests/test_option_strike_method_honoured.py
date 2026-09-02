@@ -1,6 +1,6 @@
 """OPT-S2 — ``get_strike_method_action_values()`` must match what the BUILDERS read.
 
-Twelve of the nineteen entry builders pass ``self.strike_method`` into the selector.
+Thirteen of the twenty entry builders pass ``self.strike_method`` into the selector.
 The other seven hard-code ``method="percent_otm"`` at every selection site, so
 ``self.strike_method`` is set on the shared base and never read.
 
@@ -150,7 +150,15 @@ def _methods_used(action_type, configured, spy):
         ExpertActionType(action_type), "AAPL", acct, SimpleNamespace(), None, _REC,
         strike_method=configured, strike_param=5.0, dte_min=10, dte_max=40,
         sizing=2.0, min_open_interest=10, max_spread_pct=90.0, min_volume=25,
-        wing_width_pct=10.0)
+        wing_width_pct=10.0,
+        # The PMCC's SECOND expiry window, passed unconditionally exactly as
+        # ``wing_width_pct`` is: every other builder swallows it. It has to be strictly
+        # nearer than ``dte_min`` or the builder refuses at the WINDOW, before any
+        # selection, and this file measures selector calls. The fixture chain publishes one
+        # expiry (2024-06-21, 20 DTE), so the overlay leg finds no contract inside [1,9] —
+        # which is fine and is the point: BOTH of the PMCC's ``select_single`` calls are
+        # still made with the configured method, and that is the quantity under test.
+        short_dte_min=1, short_dte_max=9)
     act.submit_to_broker = True
     act.execute()
     return [m for _, m in spy]
@@ -183,7 +191,12 @@ def test_the_strike_method_list_matches_what_the_builder_reads(action_type, spy)
 def test_the_list_is_a_strict_subset_of_the_entry_actions():
     """A name on the list that is not an entry action would silently offer nothing."""
     assert set(get_strike_method_action_values()) <= set(ENTRY_ACTION_VALUES)
-    # 12 since 2026-09-02: the long STRANGLE learned the method (design 2026-08-31 section 2's
-    # "strangle width delta 0.25-0.45"). 19 entry actions - 12 = 7 still hard-coded.
-    assert len(get_strike_method_action_values()) == 12
+    # 12 on 2026-09-02 morning: the long STRANGLE learned the method (design 2026-08-31
+    # section 2's "strangle width delta 0.25-0.45"). 13 the same day, +1 for ``open_pmcc``
+    # (plan Task 6): both its legs are delta picks made with ``method=self.strike_method``,
+    # one per expiry window. Entry actions went 19 -> 20 with it, so the hard-coded
+    # remainder is unchanged at 20 - 13 = 7 (straddle, short straddle, short strangle, iron
+    # condor, jade lizard, call butterfly, put ratio spread).
+    assert len(get_strike_method_action_values()) == 13
+    assert len(ENTRY_ACTION_VALUES) == 20
     assert len(set(ENTRY_ACTION_VALUES) - set(get_strike_method_action_values())) == 7

@@ -717,6 +717,17 @@ def get_action_type_documentation() -> dict:
             "parameters": "strike_method/strike_param as a [long, short] delta pair (short leg nearer the money; long legs further OTM/lower strike), dte_min, dte_max, max-loss sizing (pct_equity / measured worst-case-at-the-long-strike), min_open_interest, max_spread_pct. ARC-FLOOR EXEMPT: the min-annualized-return-on-collateral gate other credit structures consult does not apply here (near-zero-or-debit net by design; a floor would delete the structure).",
             "example": "When bearish and hedging tail risk, open_put_backspread (short ~0.40 delta, 2x long ~0.20 delta, 60-180 DTE). Max loss (bounded, at the LONG strike) is reserved and measured directly; a crash below it pays convexly."
         },
+        ExpertActionType.OPEN_PMCC.value: {
+            "name": "Open Poor Man's Covered Call",
+            "description": "Buy a deep-ITM LEAPS call (365+ DTE, ~0.80 delta) and sell a nearer-dated call above its strike against it. A stock replacement that collects premium: the LEAPS stands in for 100 shares at a fraction of the cost, and the short overlay is rolled at each expiry. THE ONLY structure whose legs sit on two different expiries. Admission requires the short strike ABOVE the long strike and the short expiry BEFORE the long's; max loss is the net debit paid, less every credit collected as the overlay is rolled.",
+            "use_cases": [
+                "Own a long-dated bullish position for a fraction of the share cost",
+                "Finance a LEAPS call's time decay with a rolling short-call overlay",
+                "Run a covered-call income strategy without the capital to hold 100 shares"
+            ],
+            "parameters": "strike_method/strike_param (a [long, short] delta pair: the LEAPS target and the overlay target), dte_min/dte_max (the LEAPS expiry window, 365+), short_dte_min/short_dte_max (the overlay's own window, typically 30-45), sizing (% of equity per structure). The overlay is re-selected from the SAME box at each roll - the spec is recorded on the entry order.",
+            "example": "When bullish and flat, open_pmcc (LEAPS ~0.80 delta at 380-470 DTE, overlay ~0.20 delta at 30-45 DTE). Roll the overlay with roll_pmcc_short as it nears expiry; close BOTH legs when the LEAPS reaches its own DTE floor."
+        },
         ExpertActionType.CLOSE_OPTION.value: {
             "name": "Close Option",
             "description": "Close a held option position (long call, spread, or short covered call). Used for take-profit, stop-loss, time-stop, or thesis-flip exits.",

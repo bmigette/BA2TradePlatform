@@ -2792,8 +2792,18 @@ class _OptionEntryAction(TradeAction):
     def _submit_option_order(self, legs: List[OptionLeg], quantity: int,
                              limit_price: float, option_strategy: str,
                              option_reserve: Optional[float] = None,
-                             stock_cover_price: Optional[float] = None) -> Dict[str, Any]:
+                             stock_cover_price: Optional[float] = None,
+                             extra_entry_facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Submit (or defer) the assembled option order, honoring submit_to_broker.
+
+        ``extra_entry_facts`` is a builder-specific fact set that must ride the ORDER ROW,
+        not merely the ``TradeActionResult``. It is merged into ``data`` AND into the
+        persisted ``entry_facts`` unconditionally, which is the point: the whitelist below is
+        a documented trap (a key written into ``data`` and missing from the tuple reaches
+        every log and every UI row and never reaches the order, so a later exit reads
+        nothing), and an explicit argument is how a builder closes it instead of tripping
+        over it. ``OpenPMCCAction`` uses it for the overlay spec its roll action re-selects
+        from; callers that pass nothing are byte-identical to before.
 
         When `option_reserve` is provided (short-premium strategies: CSP / credit
         spread), it is persisted on the parent order's `data["option_reserve"]` so
@@ -2837,6 +2847,8 @@ class _OptionEntryAction(TradeAction):
         limit_price = quoted
         if option_reserve is not None:
             data["option_reserve"] = option_reserve
+        if extra_entry_facts:
+            data.update(extra_entry_facts)
         # Design 2026-08-29 S8.2: persist the structure's measured max loss beside
         # option_reserve so the loss_pct_of_max_loss exit can read it BACK -- no leg
         # reconstruction, no OCC parsing at evaluation time. Stamped ONLY when MEASURED
@@ -2975,6 +2987,11 @@ class _OptionEntryAction(TradeAction):
         entry_facts = {k: data[k] for k in ("option_reserve", "max_loss_per_contract",
                                             ORDER_EVENT_DATE_KEY)
                        if k in data}
+        # The caller-STATED facts, which is what makes them immune to the whitelist trap
+        # above: the builder that needs a fact on the row names it at the call site instead
+        # of hoping somebody remembered to extend a tuple three hundred lines away.
+        if extra_entry_facts:
+            entry_facts.update(extra_entry_facts)
         if self.entry_cross is not None and float(self.entry_cross) != ENTRY_CROSS_NEUTRAL:
             entry_facts["entry_cross"] = float(self.entry_cross)
         if entry_facts and order_id is not None:
@@ -4588,6 +4605,265 @@ class OpenPutBackspreadAction(_BackspreadAction):
         return f"Open put backspread on {self.instrument_name}"
 
 
+# DELIBERATELY DOWN HERE, not in the module header. ``tests/test_no_zero_coercion.py`` pins an
+# allowlist entry to the EXACT line ``TradeActions.py:1548``, so an import added at the top of
+# this file moves a line-numbered assertion in an unrelated suite. Both names are plain
+# constants used from this point on, and neither module imports this one (``option_lifecycle``
+# is the pure module and its import-leak gate forbids reaching back here), so there is no cycle.
+from ba2_common.core.option_expiry import PMCC_STRATEGY
+from ba2_common.core.option_lifecycle import ORDER_PMCC_OVERLAY_KEY
+
+#: Greppable marker on the PMCC admission refusal, so a structure the chain could not offer
+#: is told apart in a log from a thin chain or an exhausted budget -- the same discipline as
+#: ``BACKSPREAD_SHAPE_REFUSAL`` and ``option_economics.ARC_FLOOR_REFUSAL``.
+PMCC_ADMISSION_REFUSAL = "not an admissible poor man's covered call"
+
+
+class OpenPMCCAction(_OptionEntryAction):
+    """``O_PMCC`` -- the poor man's covered call: a LEAPS call covered by a short call.
+
+    TWO LEGS, TWO EXPIRIES, ONE STRUCTURE (design 2026-08-31 leaps-grid §3-§4). The long is a
+    deep-ITM LEAPS call (DTE >= 365, delta 0.75-0.85) standing in for 100 shares; the short is
+    a nearer-dated call (DTE 30-45, delta 0.15-0.30) at a HIGHER strike, sold against it. It
+    is the first structure in this platform whose legs disagree about when they expire, which
+    is why it is the sole declared member of
+    ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``: the submit guard admits exactly two
+    expiries for it, each leg's date is recorded on its own child row, and
+    ``Transaction.expiry`` stays NULL because no single date is true of the whole position
+    (plan Task 6-PRE).
+
+    ADMISSION IS A REFUSAL, NOT A FILTER, and it has two clauses:
+
+    * ``short.strike > long.strike``. A short at or below the LEAPS strike is a bear call
+      spread wearing a diagonal's name: its worst case is no longer the debit paid, because
+      the short can be assigned into a long that is itself further out of the money.
+    * ``short.expiry < long.expiry``. It is the whole structure -- the long outliving the
+      short is what makes the intrinsic floor below a real bound, and a "diagonal" whose
+      short outlives its long is a naked call with a decoration.
+
+    Both are stated as verdicts (a failed ``TradeActionResult``) rather than as selector
+    filters, so a chain that cannot offer the structure today is RECORDED as such instead of
+    silently producing a different structure.
+
+    RISK: THE INTRINSIC FLOOR, AND IT IS ALREADY WHAT THE SHARED STAMP MEASURES.
+    ``_measured_max_loss_per_contract`` builds the payoff legs and asks
+    ``option_payoff.max_loss``; for BUY call K1 / SELL call K2 > K1 at net debit ``d`` the
+    upside slope is zero (so not UNBOUNDED), the critical points are ``{0, K1, K2}`` and the
+    worst is ``-d x 100`` at an underlying of zero. That is exactly design §3's "max loss =
+    LEAPS debit - net credits" -- MEASURED, per contract, from the same evaluator every other
+    structure uses, and never a formula written out here.
+
+    THE EVALUATOR PRICES BOTH LEGS AT ONE EXPIRY. That is not an oversight: at the SHORT's
+    expiry the long is worth AT LEAST its intrinsic, so treating it as worth exactly its
+    intrinsic is the conservative bound the design chose ("errs against the strategy"). The
+    number is the risk basis, the deployment-cap charge and ``opt_sl_ml``'s denominator, and
+    it is RESTAMPED downward as each roll banks another credit (``RollPMCCShortAction``).
+
+    COVERED, NEVER NAKED -- AND NO ``stock_cover_price``. ``structure_metrics`` pairs the
+    short call with a long of the SAME right from the order's own legs, so a PMCC reports
+    ``is_defined_risk=True`` and its max loss is charged to the deployment cap rather than to
+    the naked sub-cap (``option_book._is_undefined_risk``). This is what "extends the
+    covered-call stock-leg fix, cover kind = long option" means: the same seam and the same
+    covered-vs-naked question, answered FROM THE LEGS. The ``stock_cover_price`` argument
+    exists for cover the legs cannot see, and passing it here would ADD the whole stock value
+    to the measured loss (``1700 + 100 x C`` on a 17.00 debit) -- a worse number for a
+    structure that holds no stock.
+
+    NO RESERVE. A diagonal whose long outlives its short is margined as covered, so ``"pmcc"``
+    is deliberately absent from ``OptionsAccountInterface.RESERVING_STRATEGIES`` and this
+    builder posts no collateral: the debit already paid IS the risk.
+
+    PER ENTRY, NOT PER BAR. Two chain fetches, two ``select_single`` calls and one payoff
+    evaluation, all inside one entry action's ``execute()``. Nothing here is reachable from
+    the per-bar loop and an equity trial never constructs it.
+    """
+
+    OPTION_TYPE = OptionRight.CALL
+    OPTION_STRATEGY = PMCC_STRATEGY
+
+    def __init__(self, *args, short_dte_min: Optional[int] = None,
+                 short_dte_max: Optional[int] = None, **kwargs):
+        """``short_dte_min``/``short_dte_max`` are the OVERLAY's own expiry window.
+
+        A second window, not a second gene: ``dte_min``/``dte_max`` carry the LEAPS window
+        (searched, 365-550) and design §2 states the overlay's as a fixed 30-45 band. They are
+        real action params -- forwarded by ``rule_builders._OPTION_ACTION_PARAM_KEYS`` and
+        ``TradeActionEvaluator._OPTION_ENTRY_PARAM_KEYS`` like every other selection knob --
+        rather than class constants, so the same builder serves the calendar in phase 2.
+        """
+        super().__init__(*args, **kwargs)
+        self.short_dte_min = short_dte_min
+        self.short_dte_max = short_dte_max
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_PMCC.value
+
+    def _overlay_window(self, today: date) -> Tuple[date, date]:
+        """The overlay's ``[expiry_min, expiry_max]`` fetch window, or a LOUD config error.
+
+        The twin of ``_expiry_window`` for the SECOND window, and it refuses the same two
+        unusable configurations for the same reason: an unset ceiling asks the provider for
+        an inverted window and then reports the empty answer as a thin chain, and an inverted
+        window can never contain an expiry. It additionally refuses a window that is not
+        strictly NEARER than the LEAPS window, because that is the structure itself -- see the
+        class docstring's second admission clause. Caught by ``execute()``'s
+        ``OptionSelectionConfigError`` branch, which names the knob instead of saying "no
+        liquid contract".
+        """
+        if self.short_dte_min is None or self.short_dte_max is None:
+            raise OptionDteWindowError(
+                f"PMCC overlay DTE window for {self.instrument_name} is unusable: "
+                f"short_dte_min={self.short_dte_min}, short_dte_max={self.short_dte_max}. "
+                f"Both are required -- the overlay is selected from its OWN expiry window, "
+                f"not from the LEAPS window.")
+        lo, hi = int(self.short_dte_min), int(self.short_dte_max)
+        if lo > hi:
+            raise OptionDteWindowError(
+                f"PMCC overlay DTE window for {self.instrument_name} is inverted: "
+                f"short_dte_min={lo} > short_dte_max={hi}; no expiry can fall in it.")
+        if self.dte_min is not None and hi >= int(self.dte_min):
+            raise OptionDteWindowError(
+                f"PMCC overlay DTE window [{lo},{hi}] for {self.instrument_name} is not "
+                f"strictly nearer than the LEAPS window [{self.dte_min},{self.dte_max}]: the "
+                f"overlay could be selected at or beyond the long's own expiry, which is a "
+                f"naked call, not a diagonal.")
+        return today + timedelta(days=lo), today + timedelta(days=hi)
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        today = self._today()
+        # Both windows are validated BEFORE either fetch, so a misconfigured overlay window
+        # is never reported as an empty LEAPS chain.
+        leaps_min, leaps_max = self._expiry_window(today)
+        overlay_min, overlay_max = self._overlay_window(today)
+        leaps_chain = self.account.get_option_chain(
+            self.instrument_name, leaps_min, leaps_max, self.OPTION_TYPE)
+        if not leaps_chain:
+            return self._result(
+                False, f"Empty LEAPS option chain for {self.instrument_name} in the "
+                       f"[{self.dte_min},{self.dte_max}] DTE window")
+        overlay_chain = self.account.get_option_chain(
+            self.instrument_name, overlay_min, overlay_max, self.OPTION_TYPE)
+        if not overlay_chain:
+            return self._result(
+                False, f"Empty overlay option chain for {self.instrument_name} in the "
+                       f"[{self.short_dte_min},{self.short_dte_max}] DTE window")
+        # EACH CHAIN CHECKED ON ITS OWN (the 2026-08-23 rule): they are two separate fetches,
+        # so a source that answers one and not the other must not have one vouch for both.
+        liq = self._liq(leaps_chain, overlay_chain)
+        spot = self._spot()
+        long_param, short_param = self._spread_params()
+        leaps = select_single(
+            leaps_chain, method=self.strike_method, strike_param=long_param, spot=spot,
+            option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=today, target_price=self._consensus_target(),
+            policy=self.selection_policy, **liq)
+        if leaps is None:
+            return self._result(False, self._pick_refusal_message(
+                leaps_chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid LEAPS call for pmcc on {self.instrument_name}"))
+        overlay = select_single(
+            overlay_chain, method=self.strike_method, strike_param=short_param, spot=spot,
+            option_type=self.OPTION_TYPE, dte_min=self.short_dte_min,
+            dte_max=self.short_dte_max, today=today, target_price=self._consensus_target(),
+            policy=self.selection_policy, **liq)
+        if overlay is None:
+            return self._result(False, self._pick_refusal_message(
+                overlay_chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=(f"No liquid short-call overlay for pmcc on "
+                                 f"{self.instrument_name}")))
+        refusal = self._admission_refusal(leaps, overlay)
+        if refusal is not None:
+            return refusal
+        if leaps.ask is None or leaps.ask <= 0:
+            return self._result(False, f"No ask price for LEAPS leg {leaps.symbol}")
+        if overlay.bid is None or overlay.bid <= 0:
+            return self._result(False, f"No bid price for overlay leg {overlay.symbol}")
+        # Buy the long at the ASK, sell the overlay at the BID -- the touch every other
+        # builder quotes at. Positive = net DEBIT, the house MLEG convention.
+        net_debit = round(leaps.ask - overlay.bid, 4)
+        if net_debit <= 0:
+            return self._result(
+                False, f"Non-positive net debit ({net_debit}) for pmcc on "
+                       f"{self.instrument_name}: the overlay pays for the LEAPS outright, "
+                       f"which is not this structure")
+        legs = [
+            OptionLeg(contract_symbol=leaps.symbol, side=OrderDirection.BUY,
+                      position_intent="buy_to_open", option_type=self.OPTION_TYPE,
+                      strike=leaps.strike, expiry=leaps.expiry, underlying=leaps.underlying),
+            OptionLeg(contract_symbol=overlay.symbol, side=OrderDirection.SELL,
+                      position_intent="sell_to_open", option_type=self.OPTION_TYPE,
+                      strike=overlay.strike, expiry=overlay.expiry,
+                      underlying=overlay.underlying),
+        ]
+        # THE RISK NUMBER, from the payoff evaluator over these same legs and this same net --
+        # the same MEASUREMENT the submit stamp will make, not a second formula. A structure
+        # the evaluator cannot measure is REFUSED rather than submitted with the stamp
+        # missing, because that stamp is the intrinsic floor the whole design rests on.
+        max_loss_per_contract = _measured_max_loss_per_contract(legs, net_debit)
+        if max_loss_per_contract is None or max_loss_per_contract <= 0:
+            return self._result(
+                False, f"Max loss for pmcc on {self.instrument_name} is not MEASURED "
+                       f"(unbounded, or a quote the payoff evaluator reads as risk-free) -- "
+                       f"refusing rather than sizing against an unknown")
+        quantity = self._size_by_cost(net_debit * 100.0, self.sizing)
+        if quantity < 1:
+            return self._result(
+                False, f"Insufficient budget to size pmcc for {self.instrument_name} "
+                       f"(net_debit={net_debit})")
+        return self._submit_option_order(
+            legs, quantity, net_debit, self.OPTION_STRATEGY,
+            extra_entry_facts={ORDER_PMCC_OVERLAY_KEY: self._overlay_spec()})
+
+    def _admission_refusal(self, leaps, overlay) -> Optional[Dict[str, Any]]:
+        """The two admission clauses, as a recorded verdict. ``None`` to proceed."""
+        why = None
+        if leaps.strike is None or overlay.strike is None:
+            why = (f"a leg with no strike ({leaps.symbol} @ {leaps.strike}, "
+                   f"{overlay.symbol} @ {overlay.strike})")
+        elif overlay.strike <= leaps.strike:
+            why = (f"short strike {overlay.strike:g} <= LEAPS strike {leaps.strike:g} -- "
+                   f"that is a bear call spread, and its worst case is not the debit paid")
+        elif leaps.expiry is None or overlay.expiry is None:
+            why = (f"a leg with no expiry ({leaps.symbol} @ {leaps.expiry}, "
+                   f"{overlay.symbol} @ {overlay.expiry})")
+        elif overlay.expiry >= leaps.expiry:
+            why = (f"short expiry {overlay.expiry} >= LEAPS expiry {leaps.expiry} -- the "
+                   f"long must outlive the short or the intrinsic floor is not a bound")
+        if why is None:
+            return None
+        logger.warning(f"{self._action_type_value()} for {self.instrument_name}: "
+                       f"{PMCC_ADMISSION_REFUSAL} ({why})")
+        return self._result(
+            False,
+            f"{PMCC_ADMISSION_REFUSAL} on {self.instrument_name}: {why}. Refusing the entry.",
+            {"option_strategy": self.OPTION_STRATEGY,
+             "long_strike": leaps.strike, "short_strike": overlay.strike,
+             "long_expiry": leaps.expiry.isoformat() if leaps.expiry else None,
+             "short_expiry": overlay.expiry.isoformat() if overlay.expiry else None})
+
+    def _overlay_spec(self) -> Dict[str, Any]:
+        """The selection box THIS entry picked its overlay from, for the roll to re-use.
+
+        Every key of ``option_lifecycle.PMCC_OVERLAY_SPEC_KEYS``, always -- including the
+        ``None``s, because "this gate was not configured" is a fact the roll must reproduce
+        exactly and an absent key would be indistinguishable from a spec written by an older
+        build. See ``ORDER_PMCC_OVERLAY_KEY`` for why the spec rides the row at all.
+        """
+        _, short_param = self._spread_params()
+        return {
+            "strike_method": self.strike_method,
+            "strike_param": short_param,
+            "dte_min": self.short_dte_min,
+            "dte_max": self.short_dte_max,
+            "min_open_interest": self.min_open_interest,
+            "max_spread_pct": self.max_spread_pct,
+            "min_volume": self.min_volume,
+        }
+
+    def get_description(self) -> str:
+        return f"Open poor man's covered call on {self.instrument_name}"
+
+
 def build_closing_legs(children, parent_quantity: int, quote_fn, held_qty=None) -> "tuple[List[OptionLeg], Optional[float]]":
     """Build reversed legs (and a net limit price) that close a spread's child legs.
 
@@ -5057,6 +5333,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.OPEN_PUT_RATIO_SPREAD: OpenPutRatioSpreadAction,
         ExpertActionType.OPEN_CALL_BACKSPREAD: OpenCallBackspreadAction,
         ExpertActionType.OPEN_PUT_BACKSPREAD: OpenPutBackspreadAction,
+        ExpertActionType.OPEN_PMCC: OpenPMCCAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     

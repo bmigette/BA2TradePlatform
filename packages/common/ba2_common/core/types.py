@@ -515,6 +515,12 @@ class ExpertActionType(str, Enum):
     # net short; these are net LONG options and are covered by construction.
     OPEN_CALL_BACKSPREAD = "open_call_backspread"
     OPEN_PUT_BACKSPREAD = "open_put_backspread"
+    # THE POOR MAN'S COVERED CALL (design 2026-08-31 leaps-grid §3-§4): a LEAPS call
+    # (DTE >= 365) covered by a nearer-dated short call at a HIGHER strike. The first
+    # structure in this platform whose legs sit on TWO expiries -- see
+    # ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``, which declares the ``"pmcc"``
+    # strategy tag the submit guard and both DTE readers consult.
+    OPEN_PMCC = "open_pmcc"
     CLOSE_OPTION = "close_option"
 
 class MarketAnalysisStatus(str, Enum):
@@ -656,6 +662,7 @@ def get_option_action_values():
         ExpertActionType.OPEN_PUT_RATIO_SPREAD.value,
         ExpertActionType.OPEN_CALL_BACKSPREAD.value,
         ExpertActionType.OPEN_PUT_BACKSPREAD.value,
+        ExpertActionType.OPEN_PMCC.value,
         ExpertActionType.CLOSE_OPTION.value,
     ]
 
@@ -700,6 +707,30 @@ def get_wing_width_action_values():
 def uses_wing_width(action_value):
     """Check whether an option action type reads ``wing_width_pct``."""
     return action_value in get_wing_width_action_values()
+
+
+def get_short_dte_window_action_values():
+    """Option action types that select a leg from a SECOND, nearer expiry window.
+
+    Exactly one today: ``open_pmcc``. Its LEAPS leg is picked from ``dte_min``/``dte_max``
+    (365+) and its short overlay from ``short_dte_min``/``short_dte_max`` (30-45) — two
+    windows, because two expiries is what a diagonal IS. Every other structure puts all its
+    legs on one expiry and would read the second window as a decoy.
+
+    Kept beside the action enum for the same reason as ``get_wing_width_action_values``: a
+    producer (the rule editor, the GA's action table) must render exactly the fields its
+    consumer reads. Offering it everywhere is the OPT-S2 trap in a new place; offering it
+    nowhere is what left ``wing_width_pct`` unreachable from a live rule for a year, so that
+    a live 4-leg structure ran on a class constant with nothing on screen saying so.
+    """
+    return [
+        ExpertActionType.OPEN_PMCC.value,
+    ]
+
+
+def uses_short_dte_window(action_value):
+    """Check whether an option action type reads ``short_dte_min``/``short_dte_max``."""
+    return action_value in get_short_dte_window_action_values()
 
 
 def get_arc_floor_action_values():
@@ -747,7 +778,7 @@ def uses_arc_floor(action_value):
 def get_strike_method_action_values():
     """Option action types whose builder actually READS ``strike_method``.
 
-    These TWELVE of the nineteen ``_OptionEntryAction`` subclasses pass
+    These THIRTEEN of the twenty ``_OptionEntryAction`` subclasses pass
     ``method=self.strike_method`` into the selector. The other seven -- straddle, short
     straddle, short strangle, iron condor, jade lizard, call butterfly, put ratio spread --
     hard-code ``method="percent_otm"`` at every selection site, so ``strike_method`` is set on
@@ -772,7 +803,7 @@ def get_strike_method_action_values():
     Kept next to the action enum rather than in the UI for the same reason as
     ``get_wing_width_action_values``: a producer must render exactly the fields its consumer
     reads. Two independent drift guards, written against different consumers and arriving by
-    different routes, agree on this same set of eleven --
+    different routes, agree on this same set of thirteen --
     ``packages/common/tests/test_option_strike_method_honoured.py`` runs each builder and
     watches which method the selector was actually handed, and
     ``packages/common/tests/test_strike_method_registry.py`` derives the set from the action
@@ -809,6 +840,14 @@ def get_strike_method_action_values():
         # not a parameter (both legs sit on the ATM strike by definition), so a method there
         # could never move a strike. See ``OpenStraddleAction``'s docstring.
         ExpertActionType.OPEN_STRANGLE.value,
+        # The PMCC (2026-09-02, plan Task 6). BOTH legs are ``select_single`` picks made with
+        # ``method=self.strike_method``, one per expiry window, and design 2026-08-31 §2
+        # states both targets in DELTA (LEAPS 0.75-0.85, overlay 0.15-0.30) -- a per-leg pair
+        # read by ``_spread_params`` as ``(long, short)``, the same shape the verticals and
+        # the backspreads already use. ``roll_pmcc_short`` is deliberately NOT here: it
+        # re-selects the overlay from the SPEC THE ENTRY STAMPED on its order row, never from
+        # ``self.strike_method``, so offering it a method knob would be a decoy.
+        ExpertActionType.OPEN_PMCC.value,
     ]
 
 

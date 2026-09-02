@@ -14,7 +14,7 @@ from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ba2_common.core.option_selection_policy import WIRED_WEIGHT_BANDS
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_arc_floor, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, uses_short_dte_window, uses_arc_floor, honours_strike_method, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
 from ...core.cleanup import (
     preview_cleanup, execute_cleanup, get_cleanup_statistics,
     preview_trade_action_result_retention, execute_trade_action_result_retention,
@@ -4965,6 +4965,8 @@ class TradeSettingsTab:
                 min_oi_input = None
                 max_spread_input = None
                 wing_width_input = None
+                short_dte_min_input = None
+                short_dte_max_input = None
                 min_arc_input = None
                 w_premium_input = None
                 w_iv_input = None
@@ -4975,6 +4977,7 @@ class TradeSettingsTab:
                     nonlocal strike_method_select, strike_param_input, dte_min_input
                     nonlocal dte_max_input, sizing_input, min_oi_input, max_spread_input
                     nonlocal wing_width_input, min_arc_input
+                    nonlocal short_dte_min_input, short_dte_max_input
                     nonlocal w_premium_input, w_iv_input, w_rvol_input
 
                     action_value_container.clear()
@@ -4992,6 +4995,7 @@ class TradeSettingsTab:
                     strike_method_select = strike_param_input = None
                     dte_min_input = dte_max_input = sizing_input = None
                     min_oi_input = max_spread_input = wing_width_input = None
+                    short_dte_min_input = short_dte_max_input = None
                     min_arc_input = None
                     w_premium_input = w_iv_input = w_rvol_input = None
 
@@ -5112,6 +5116,28 @@ class TradeSettingsTab:
                                         step=0.5,
                                         format='%.1f'
                                     ).classes('w-28').props('dense')
+                                # The SECOND expiry window, for the one structure whose legs
+                                # sit on two of them: the PMCC picks its LEAPS from DTE
+                                # min/max above (365+) and its short overlay from these
+                                # (30-45). Offered only there, for the same reason Wing Width
+                                # is offered only on the wing structures -- a second window on
+                                # a single-expiry builder is a control that changes nothing.
+                                # Without a field here a live PMCC could not be written at
+                                # all: the builder REFUSES an unset overlay window rather
+                                # than falling back to the LEAPS one.
+                                if uses_short_dte_window(selected_type):
+                                    short_dte_min_input = ui.number(
+                                        label='Overlay DTE min',
+                                        value=action_config.get('short_dte_min', 30) if action_config else 30,
+                                        min=0,
+                                        format='%d'
+                                    ).classes('w-28').props('dense')
+                                    short_dte_max_input = ui.number(
+                                        label='Overlay DTE max',
+                                        value=action_config.get('short_dte_max', 45) if action_config else 45,
+                                        min=0,
+                                        format='%d'
+                                    ).classes('w-28').props('dense')
                                 # Min ARC: the premium-richness floor, as a PERCENT per year
                                 # on the collateral the structure ties up. Offered only for
                                 # the CREDIT structures, which are the only ones that post
@@ -5228,6 +5254,8 @@ class TradeSettingsTab:
                     'min_oi_input': lambda: min_oi_input,
                     'max_spread_input': lambda: max_spread_input,
                     'wing_width_input': lambda: wing_width_input,
+                    'short_dte_min_input': lambda: short_dte_min_input,
+                    'short_dte_max_input': lambda: short_dte_max_input,
                     'min_arc_input': lambda: min_arc_input,
                     'w_premium_input': lambda: w_premium_input,
                     'w_iv_input': lambda: w_iv_input,
@@ -5318,6 +5346,8 @@ class TradeSettingsTab:
                         moi = action_refs['min_oi_input']()
                         msp = action_refs['max_spread_input']()
                         wwp = action_refs['wing_width_input']()
+                        sdmin = action_refs['short_dte_min_input']()
+                        sdmax = action_refs['short_dte_max_input']()
                         maf = action_refs['min_arc_input']()
                         weight_widgets = (
                             ('w_premium', action_refs['w_premium_input']()),
@@ -5357,6 +5387,15 @@ class TradeSettingsTab:
                             action_config['max_spread_pct'] = float(msp.value)
                         if wwp and wwp.value is not None:
                             action_config['wing_width_pct'] = float(wwp.value)
+                        # Keyed on the ACTION as well as on the widget, for the reason
+                        # spelled out at strike_method above: these two are CONDITIONAL
+                        # widgets, and a conditional widget's closure is exactly what
+                        # outlived its row and wrote a wing width onto a long call.
+                        if uses_short_dte_window(action_type):
+                            if sdmin and sdmin.value is not None:
+                                action_config['short_dte_min'] = int(sdmin.value)
+                            if sdmax and sdmax.value is not None:
+                                action_config['short_dte_max'] = int(sdmax.value)
                         # Percent on screen, FRACTION on the wire: option_economics works in
                         # fractions (0.15 == 15 %/yr) and so does the gene. Only persisted
                         # when the user actually entered one -- a blank field must leave the

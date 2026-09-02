@@ -230,6 +230,12 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("strike_param", ("option_strike_param",)),
     ("dte_min", ("option_dte_min",)),
     ("dte_max", ("option_dte_max",)),
+    # THE SECOND EXPIRY WINDOW, read only by ``OpenPMCCAction`` (plan Task 6): the OVERLAY's
+    # own DTE band, distinct from the LEAPS band above. Absent for every single-expiry
+    # structure, which is what keeps them byte-identical -- only keys present in a config are
+    # forwarded.
+    ("short_dte_min", ("option_short_dte_min",)),
+    ("short_dte_max", ("option_short_dte_max",)),
     ("sizing", ("option_sizing",)),
     ("min_open_interest", ("option_min_oi", "option_min_open_interest")),
     ("max_spread_pct", ("option_max_spread_pct", "option_max_spread")),

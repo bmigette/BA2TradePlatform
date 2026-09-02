@@ -34,6 +34,10 @@ _OPTION_ENTRY_ACTION_TYPES = _ALL_OPTION_ACTION_TYPES - {ExpertActionType.CLOSE_
 # action's own defaults apply otherwise.
 _OPTION_ENTRY_PARAM_KEYS = (
     'strike_method', 'strike_param', 'dte_min', 'dte_max',
+    # The PMCC's SECOND expiry window (plan Task 6): the short overlay is selected from its
+    # own 30-45 DTE band while dte_min/dte_max carry the LEAPS' 365+ one. Only keys present
+    # in an action's config are forwarded, so every single-expiry builder is unaffected.
+    'short_dte_min', 'short_dte_max',
     'sizing', 'min_open_interest', 'max_spread_pct', 'min_volume', 'wing_width_pct',
     # PREMIUM-RICHNESS floor (a FRACTION, 0.15 == 15 %/yr), read by the CREDIT builders via
     # _refuse_if_arc_below_floor. Absent means no floor -- the pre-OPT-C1 behaviour where any
@@ -1212,6 +1216,7 @@ class TradeActionEvaluator:
                 'OpenPutRatioSpreadAction': ExpertActionType.OPEN_PUT_RATIO_SPREAD,
                 'OpenCallBackspreadAction': ExpertActionType.OPEN_CALL_BACKSPREAD,
                 'OpenPutBackspreadAction': ExpertActionType.OPEN_PUT_BACKSPREAD,
+                'OpenPMCCAction': ExpertActionType.OPEN_PMCC,
                 'CloseOptionAction': ExpertActionType.CLOSE_OPTION,
             }
             
@@ -1254,6 +1259,7 @@ class TradeActionEvaluator:
                 ExpertActionType.OPEN_BULL_PUT_SPREAD: 1,
                 ExpertActionType.OPEN_STRADDLE: 1,
                 ExpertActionType.OPEN_STRANGLE: 1,
+                ExpertActionType.OPEN_PMCC: 1,
                 ExpertActionType.CLOSE: 2,
                 ExpertActionType.CLOSE_OPTION: 2,
                 ExpertActionType.ADJUST_TAKE_PROFIT: 3,

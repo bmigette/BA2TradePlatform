@@ -83,7 +83,13 @@ _EPS = 1e-9
 #: ``"pmcc"`` has no builder yet — that is plan Task 6. This constant opens the door; Task 6
 #: walks through it. ``O_PMCC`` stays phase-gated meanwhile, so nothing in the grid can
 #: reach the relaxed path until the lifecycle that manages it exists.
-MULTI_EXPIRY_OPTION_STRATEGIES: frozenset = frozenset({"pmcc"})
+#: The poor-man's-covered-call tag, as ONE string rather than a literal repeated at each of
+#: the sites that now read it (the submit guard, both DTE readers, the builder, the roll
+#: action, the launcher's strategy row). ``OpenPMCCAction`` submits under it and
+#: ``resolve_structure_expiry`` reads the legs by side because of it.
+PMCC_STRATEGY = "pmcc"
+
+MULTI_EXPIRY_OPTION_STRATEGIES: frozenset = frozenset({PMCC_STRATEGY})
 
 
 #: The roll-window question -> the SHORT leg. "When must the overlay be rolled?"
