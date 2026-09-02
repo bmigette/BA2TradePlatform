@@ -2,7 +2,7 @@
 Backtest model for storing backtest results
 """
 
-from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, ForeignKey, Float, Boolean
+from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, ForeignKey, Float, Boolean, Index
 from sqlalchemy.sql import func
 from .database import Base
 
@@ -172,6 +172,35 @@ class Backtest(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Covering index for every SUMMARY read of this table (dashboard activity, GET /api/backtests).
+    #
+    # WHY. The four JSON blobs above (results/trades/equity_curve/drawdown_curve; ~10 MB per
+    # recent row in the live DB) are stored physically BEFORE created_at — and before every
+    # column any later migration appended (expert_name, labels, ga_fitness, ...). SQLite reads a
+    # row's overflow chain sequentially, so touching ANY post-blob column costs ~10 MB per row
+    # visited: `ORDER BY created_at` over ~1k rows measured 18 s warm / ~2 min cold and froze the
+    # API. With every summary column in one index, SQLite serves those queries from the index
+    # alone ("USING COVERING INDEX") and never opens a row.
+    #
+    # RULES. (1) created_at stays FIRST (newest-first ORDER BY walks the index in order).
+    # (2) Never add a blob/curve column here. (3) If you add a column that a list/summary query
+    # will SELECT, add it here AND to db_migrate/031 (tests pin the two lists together), or that
+    # query silently falls back to the 10-MB-per-row scan. Mirrored by
+    # db_migrate/031_add_covering_summary_indexes.py for existing DBs.
+    __table_args__ = (
+        Index(
+            "ix_backtests_summary",
+            "created_at", "id", "name", "engine_type", "status", "expert_name",
+            "optimization_id", "labels", "model_id", "prediction_dataset_id",
+            "execution_dataset_id", "strategy_id", "start_date", "end_date", "initial_capital",
+            "fitness_metric", "description", "is_saved", "error_message", "started_at",
+            "completed_at", "total_return", "adjusted_total_return", "ga_fitness",
+            "sharpe_ratio", "max_drawdown", "win_rate", "profit_factor", "total_trades",
+            "winning_trades", "losing_trades", "avg_trade_duration", "final_equity",
+            "best_trade", "worst_trade",
+        ),
+    )
 
     def __repr__(self):
         return f"<Backtest(id={self.id}, name='{self.name}', return={self.total_return})>"

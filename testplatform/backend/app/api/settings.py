@@ -74,7 +74,7 @@ def mask_key(key: str) -> str:
 
 
 @router.post("/api-keys", response_model=ApiKeyResponse)
-async def set_api_key(request: ApiKeyRequest):
+def set_api_key(request: ApiKeyRequest):
     """
     Set an API key for a data provider.
 
@@ -111,7 +111,7 @@ async def set_api_key(request: ApiKeyRequest):
 
 
 @router.get("/api-keys", response_model=List[ApiKeyResponse])
-async def list_api_keys():
+def list_api_keys():
     """
     List all configured API keys (masked).
 
@@ -148,7 +148,7 @@ async def list_api_keys():
 
 
 @router.delete("/api-keys/{provider_name}")
-async def delete_api_key(provider_name: str):
+def delete_api_key(provider_name: str):
     """
     Delete an API key for a provider.
 
@@ -164,8 +164,7 @@ async def delete_api_key(provider_name: str):
             detail=f"Unknown provider: {provider_name}"
         )
 
-    if provider_name in api_keys_store:
-        del api_keys_store[provider_name]
+    api_keys_store.pop(provider_name, None)
 
     env_key = f"{provider_name.upper()}_API_KEY"
     if env_key in os.environ:
@@ -177,7 +176,7 @@ async def delete_api_key(provider_name: str):
 
 
 @router.post("/providers/test", response_model=ProviderTestResponse)
-async def test_provider_connection(request: ProviderTestRequest):
+def test_provider_connection(request: ProviderTestRequest):
     """
     Test connection to a data provider.
 
@@ -236,7 +235,7 @@ async def test_provider_connection(request: ProviderTestRequest):
 
 
 @router.get("/gpu-info", response_model=GpuInfoResponse)
-async def get_gpu_info():
+def get_gpu_info():
     """
     Get GPU/CUDA availability information.
 
@@ -287,7 +286,7 @@ async def get_gpu_info():
 
 
 @router.get("/system-info")
-async def get_system_info():
+def get_system_info():
     """
     Get comprehensive system information.
 
@@ -357,7 +356,7 @@ async def get_app_settings():
 
 
 @router.put("")
-async def update_app_settings(settings: AppSettingsUpdate):
+def update_app_settings(settings: AppSettingsUpdate):
     """
     Update application settings.
 
@@ -477,7 +476,7 @@ async def set_gpu_acceleration(enabled: bool = True):
 
 
 @router.get("/job-limits")
-async def get_job_limits():
+def get_job_limits():
     """
     Get job concurrency limits.
 
@@ -491,7 +490,7 @@ async def get_job_limits():
 
 
 @router.put("/job-limits")
-async def set_job_limits(max_concurrent_jobs: int = 2):
+def set_job_limits(max_concurrent_jobs: int = 2):
     """
     Set job concurrency limits.
 
@@ -553,7 +552,7 @@ gpu_memory_settings = {
 
 
 @router.get("/gpu-memory", response_model=GpuMemoryStatus)
-async def get_gpu_memory_status():
+def get_gpu_memory_status():
     """
     Get detailed GPU memory status.
 
@@ -588,7 +587,8 @@ async def get_gpu_memory_status():
 
         # Get active job count
         from app.api.jobs import jobs_store
-        active_jobs = sum(1 for j in jobs_store.values() if j.get("status") == "running")
+        # snapshot: routes run in the thread pool now, and the task-queue threads mutate this dict
+        active_jobs = sum(1 for j in list(jobs_store.values()) if j.get("status") == "running")
 
         return GpuMemoryStatus(
             available=True,
@@ -611,7 +611,7 @@ async def get_gpu_memory_status():
 
 
 @router.post("/gpu-memory/clear-cache")
-async def clear_gpu_cache():
+def clear_gpu_cache():
     """
     Clear GPU cache to free memory.
 
@@ -667,7 +667,7 @@ async def clear_gpu_cache():
 
 
 @router.get("/gpu-memory/settings")
-async def get_gpu_memory_settings():
+def get_gpu_memory_settings():
     """
     Get GPU memory management settings.
 
@@ -686,7 +686,7 @@ async def get_gpu_memory_settings():
 
 
 @router.put("/gpu-memory/settings")
-async def update_gpu_memory_settings(
+def update_gpu_memory_settings(
     memory_threshold_percent: Optional[float] = None,
     min_free_memory_gb: Optional[float] = None,
     auto_clear_cache: Optional[bool] = None,
@@ -817,7 +817,7 @@ def _trade_db_path() -> str:
 
 
 @router.post("/import-keys-from-trade", response_model=ImportKeysResponse)
-async def import_keys_from_trade():
+def import_keys_from_trade():
     """Import credential AppSetting rows from the live trade platform's DB into the
     test platform's keys DB (the ba2_common-configured DB).
 
@@ -936,7 +936,7 @@ def _mask_secret(value: Optional[str]) -> Optional[str]:
 
 
 @router.get("/credential-keys", response_model=CredentialKeysResponse)
-async def list_credential_keys():
+def list_credential_keys():
     """List credential AppSetting keys with MASKED values.
 
     Reads the ba2_common-configured DB (the same rows get_app_setting() reads). A key
@@ -976,7 +976,7 @@ async def list_credential_keys():
 
 
 @router.put("/credential-keys", response_model=CredentialKeysUpdateResponse)
-async def update_credential_keys(payload: CredentialKeysUpdate):
+def update_credential_keys(payload: CredentialKeysUpdate):
     """Upsert credential key/value pairs into the ba2_common AppSetting table.
 
     Writes the SAME rows get_app_setting() reads. Empty values are skipped (use the

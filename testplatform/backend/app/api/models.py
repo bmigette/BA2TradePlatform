@@ -132,7 +132,8 @@ def get_all_models(db: Session) -> List[dict]:
         models.append(db_model_to_dict(m))
 
     # Also include in-memory models (for backward compatibility)
-    for model_id, model_data in models_store.items():
+    # snapshot: routes run in the thread pool now, and the task-queue threads mutate this dict
+    for model_id, model_data in list(models_store.items()):
         # Skip if already in database
         if not any(m['id'] == model_id for m in models):
             models.append(model_data.copy())
@@ -231,7 +232,7 @@ def save_model_to_db(model_data: dict, db: Session) -> TrainedModel:
 
 
 @router.get("", response_model=ModelListResponse)
-async def list_models(
+def list_models(
     dataset_id: Optional[int] = None,
     model_type: Optional[str] = None,
     sort_by: Optional[str] = "createdAt",
@@ -306,7 +307,7 @@ async def list_models(
 
 
 @router.get("/{model_id}", response_model=ModelResponse)
-async def get_model(model_id: str, db: Session = Depends(get_db)):
+def get_model(model_id: str, db: Session = Depends(get_db)):
     """Get model details by ID."""
     model = get_model_by_id(model_id, db)
     if not model:
@@ -327,7 +328,7 @@ async def get_model(model_id: str, db: Session = Depends(get_db)):
 
 
 @router.delete("/{model_id}")
-async def delete_model(model_id: str, db: Session = Depends(get_db)):
+def delete_model(model_id: str, db: Session = Depends(get_db)):
     """Delete a model."""
     # Try database first
     db_model = db.query(TrainedModel).filter(TrainedModel.model_id == model_id).first()
@@ -338,8 +339,7 @@ async def delete_model(model_id: str, db: Session = Depends(get_db)):
         return {"message": f"Model {model_id} deleted"}
 
     # Fall back to in-memory
-    if model_id in models_store:
-        del models_store[model_id]
+    if models_store.pop(model_id, None) is not None:
         logger.info(f"Deleted model {model_id} from memory")
         return {"message": f"Model {model_id} deleted"}
 
@@ -353,7 +353,7 @@ class FoundationModelRegister(BaseModel):
 
 
 @router.get("/foundation/available")
-async def list_foundation_models():
+def list_foundation_models():
     """List available foundation models that can be registered."""
     from app.services.chronos_service import list_available_models, is_model_downloaded
     models = list_available_models()
@@ -363,7 +363,7 @@ async def list_foundation_models():
 
 
 @router.post("/foundation")
-async def register_foundation_model(
+def register_foundation_model(
     request: FoundationModelRegister,
     db: Session = Depends(get_db)
 ):
@@ -417,7 +417,7 @@ async def register_foundation_model(
 
 
 @router.get("/{model_id}/prediction-fields")
-async def get_prediction_fields(
+def get_prediction_fields(
     model_id: str,
     db: Session = Depends(get_db)
 ):
@@ -479,7 +479,7 @@ async def get_prediction_fields(
 
 
 @router.post("/{model_id}/export")
-async def export_model(model_id: str, format: str = "pytorch", db: Session = Depends(get_db)):
+def export_model(model_id: str, format: str = "pytorch", db: Session = Depends(get_db)):
     """Export a model in the specified format."""
     model = get_model_by_id(model_id, db)
     if not model:
@@ -521,19 +521,19 @@ async def export_model(model_id: str, format: str = "pytorch", db: Session = Dep
 
 
 @router.post("/{model_id}/export/pytorch")
-async def export_model_pytorch(model_id: str, db: Session = Depends(get_db)):
+def export_model_pytorch(model_id: str, db: Session = Depends(get_db)):
     """Export model to PyTorch checkpoint format (.pt)."""
-    return await export_model(model_id, format="pytorch", db=db)
+    return export_model(model_id, format="pytorch", db=db)
 
 
 @router.post("/{model_id}/export/onnx")
-async def export_model_onnx(model_id: str, db: Session = Depends(get_db)):
+def export_model_onnx(model_id: str, db: Session = Depends(get_db)):
     """Export model to ONNX format for cross-platform deployment."""
-    return await export_model(model_id, format="onnx", db=db)
+    return export_model(model_id, format="onnx", db=db)
 
 
 @router.post("/{model_id}/clone")
-async def clone_model(model_id: str, db: Session = Depends(get_db)):
+def clone_model(model_id: str, db: Session = Depends(get_db)):
     """Clone a model with a new ID."""
     original = get_model_by_id(model_id, db)
     if not original:
@@ -566,7 +566,7 @@ class RunPredictionsRequest(BaseModel):
 
 
 @router.post("/{model_id}/run-predictions")
-async def run_model_predictions(
+def run_model_predictions(
     model_id: str,
     request: RunPredictionsRequest = None,
     db: Session = Depends(get_db)
@@ -1064,7 +1064,7 @@ async def run_model_predictions(
 
 
 @router.get("/{model_id}/predictions")
-async def get_model_predictions(model_id: str, limit: int = 100, db: Session = Depends(get_db)):
+def get_model_predictions(model_id: str, limit: int = 100, db: Session = Depends(get_db)):
     """Get prediction visualization data for a model."""
     model = get_model_by_id(model_id, db)
     if not model:
@@ -1079,7 +1079,7 @@ async def get_model_predictions(model_id: str, limit: int = 100, db: Session = D
 
 
 @router.get("/{model_id}/confusion-matrix")
-async def get_confusion_matrix(model_id: str, db: Session = Depends(get_db)):
+def get_confusion_matrix(model_id: str, db: Session = Depends(get_db)):
     """Get confusion matrix data for a classification model."""
     model = get_model_by_id(model_id, db)
     if not model:
