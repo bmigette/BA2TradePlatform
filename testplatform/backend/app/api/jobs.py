@@ -1014,8 +1014,10 @@ def delete_job(job_id: str):
     finally:
         db.close()
 
-    # Delete from in-memory stores
-    del jobs_store[job_id]
+    # Delete from in-memory stores. `pop(..., None)`, not `del`: this route runs in the thread
+    # pool now, so two concurrent DELETEs can both pass the 404 check above and the second `del`
+    # would raise KeyError -> 500 instead of the 204 the caller already earned.
+    jobs_store.pop(job_id, None)
     if job_id in job_progress_data:
         del job_progress_data[job_id]
     logger.info(f"Deleted job {job_id}")

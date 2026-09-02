@@ -19,6 +19,14 @@ HOT_PATHS = {
     ("GET", "/api/backtests"),
 }
 
+# Routes that must stay ON the event loop: they do no I/O at all, and a liveness probe that
+# queues behind a saturated thread pool would report a healthy backend as dead.
+LOOP_NATIVE_ROUTES = {("GET", "/"), ("GET", "/health")}
+
+# Anything a loop-native route calls that could touch the network, the disk, or the DB. The
+# allowlist above may only ever hold routes that do none of it.
+_IO_CALL_NAMES = {"execute", "query", "commit", "get", "post", "sleep", "open", "run"}
+
 
 @dataclass(frozen=True)
 class _ResolvedRoute:
@@ -94,6 +102,8 @@ def _pure_blocking_async_routes():
     for r in _api_routes():
         if inspect.iscoroutinefunction(r.endpoint) and not _awaits_something(r.endpoint):
             for m in sorted(r.methods):
+                if (m, r.path) in LOOP_NATIVE_ROUTES:
+                    continue  # deliberately on the loop - see test_loop_native_routes_*
                 bad.append(f"{m} {r.path} -> {r.endpoint.__module__}.{r.endpoint.__name__}")
     return bad
 
@@ -146,8 +156,35 @@ def test_hot_path_routes_are_plain_def():
             f"{key} is async def but does only blocking work; make it `def`"
 
 
+def test_loop_native_routes_are_async_and_do_no_io():
+    """The one exemption to the rule, kept honest. `/health` and `/` are liveness probes
+    (ba2cli.py polls `GET /health`); as plain `def` they would share the same 40-token anyio pool
+    as every blocking route this plan moved there, so a saturated pool would make a healthy
+    backend look dead. They may stay on the loop only for as long as they do no I/O whatsoever —
+    no DB session, no call that could reach the network or the disk."""
+    by_key = {(m, r.path): r for r in _api_routes() for m in r.methods}
+    for key in LOOP_NATIVE_ROUTES:
+        assert key in by_key, f"route {key} not found — did its path change?"
+        fn = by_key[key].endpoint
+        assert inspect.iscoroutinefunction(fn), \
+            f"{key} must stay `async def`: a liveness probe cannot queue behind the thread pool"
+
+        assert "get_db" not in str(inspect.signature(fn)), \
+            f"{key} takes a DB session; it can no longer be loop-native"
+
+        func = ast.parse(textwrap.dedent(inspect.getsource(inspect.unwrap(fn)))).body[0]
+        called = {
+            getattr(n.func, "attr", None) or getattr(n.func, "id", None)
+            for n in _own_body_nodes(func.body)
+            if isinstance(n, ast.Call)
+        }
+        assert not (called & _IO_CALL_NAMES), \
+            f"{key} calls {sorted(called & _IO_CALL_NAMES)}; that is I/O on the event loop"
+
+
 def test_no_async_route_does_only_blocking_work():
     """Enforced across the whole app: an `async def` route must genuinely await, otherwise it does
     its blocking work on the event loop. Fix = delete `async` on the listed endpoints (and drop the
-    now-pointless `await` at any in-process call site)."""
+    now-pointless `await` at any in-process call site). The only exemption is LOOP_NATIVE_ROUTES,
+    which test_loop_native_routes_are_async_and_do_no_io holds to a stricter standard."""
     assert _pure_blocking_async_routes() == []
