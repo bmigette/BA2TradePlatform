@@ -7,14 +7,60 @@ commits), plus this review's own commits. Worktree
 
 ---
 
-## VERDICT: **FIX-NEEDED** (nothing structural; 5 stale tests block a clean merge)
+## VERDICT: **MERGE-READY** (re-verified independently, 2026-09-03)
 
-> **POST-FIX, 2026-09-03: the FIX-NEEDED items are implemented — now CLEAN-GREEN for the
-> merge.** F1+F2 (`f73d14bd`), F5 (`d1a604ef`), F4/V1-V5 (`dcc91137`), and the §2b/F3 follow-ups
-> recorded (`6b28e185`). Backend **4532 passed / 158 skipped / 7 failed** (was 4518/158/12): the
-> 5 stale tests are gone and the 7 left are the 2 pre-existing seam-wiring (F3) plus the 5
-> pre-existing `curve_uneven` baseline. Both goldens unmoved. **Section 9 below records what was
-> done; nothing above it was rewritten.**
+> **ORIGINAL VERDICT (2026-09-02): FIX-NEEDED** — nothing structural; 5 stale tests blocked a
+> clean merge. Everything below this box is the original review, unrewritten.
+>
+> **RE-VERIFICATION (2026-09-03), by the reviewer, on the 5 fix commits.** Every claim checked
+> by execution, not by reading the commit messages:
+>
+> * **Backend `pytest tests/`: 4532 passed / 158 skipped / 7 failed** (was 4518/158/12). The 5
+>   `O_PMCC` staleness failures are gone; the 7 remaining are EXACTLY the 2 pre-existing
+>   `test_seam_wiring.py` (F3, still open) + the 5 pre-existing `curve_uneven` frozen-baseline
+>   cases. No new failure anywhere.
+> * `packages/common` **3133 passed / 1** (the known float-dust). Goldens **3 + 5 = 8, both
+>   fingerprints unmoved**. `test_deploy_round_trip_parity.py` **16**,
+>   `test_options2_matrix_script.py` **17**, `test_pmcc_lifecycle.py` **106**, the two launcher
+>   gene files **284**.
+> * **Mutations executed by the reviewer** (restored by file copy, tree clean after each):
+>   dropping the `allow_automated_trade_modification` row from `BACKTEST_FORCED_SETTINGS` →
+>   `test_every_forced_setting_reaches_the_deployed_instance` FAILS ×2 (the explicit membership
+>   assertion at `test_deploy_round_trip_parity.py:372-377` is what makes a deletion
+>   non-vacuous); restoring the importer's universe-block drop
+>   (`import_deploy_payload.py:129`) → `test_the_import_tool_still_consumes_the_universe_block`
+>   FAILS.
+> * **The refreeze of the two labelled goldens is justified by `718f7cf4` alone.** Diffed: the
+>   only expectations that moved are `_MIN_DTE` gaining `"O_PMCC": 365`, `groups[365]` gaining
+>   one member (still three distinct thresholds), the job list gaining one row in second
+>   position (the order `_jobs` yields), and `"open_pmcc"` joining the `long_premium` set in
+>   both independent re-derivations. No other frozen value changed — this is a refreeze, not
+>   adjust-until-green.
+>
+> **Table totality (§2a V3):** the handler has exactly **two** `save_settings` sites — the only
+> two in the whole backtest package. The non-bypass one is 100% table-driven
+> (`forced_expert_settings(_run_facts(config))`, `daily_backtest_handler.py:1187`), and all
+> three trees — handler, export API (`backtests.py:1258`/`:1270`) and
+> `tools/import_deploy_payload.py` — read the same table, pinned by
+> `test_the_handler_and_the_exporter_read_THE_SAME_TABLE`. **One write is not a table row:**
+> the BYPASS path's `enabled_instruments` (`daily_backtest_handler.py:1163-1168`). It is
+> explicitly justified — in `live_settings_from_universe`'s docstring, which argues a static
+> universe maps to no setting and that overwriting a live instance's universe is a separate,
+> bigger decision — but the justification lives in prose rather than as a row, and no test pins
+> that the bypass path writes nothing else. **One judgement call:** `equity_cap` is left out as
+> market-simulation, alongside commission/slippage/spread/fill_model; unlike those it is a
+> capital constraint rather than an exchange parameter, so it is the one omission worth a
+> second look. `risk_manager_mode` is not forced at all — `assert_backtestable_risk_mode`
+> refuses `smart` instead.
+>
+> **Remaining, none blocking:** F3 (the stale `get_provider` closure — still the reason the
+> backend suite is order-dependent), F0 (the 52nd root-suite known-bad), the §2b live-only
+> lifecycle gaps (recorded in `6b28e185`, not implemented), and V5/V4 which are `backtest_only`
+> rows by design — carried so a deploy is explicitly different rather than silently different,
+> and closable only by a live broker/engine change. The merger checklist in §8 still applies in
+> full, above all the ONE `TEST_APP_VERSION` bump at a matrix3 job boundary.
+>
+> **Section 9 records what the fix commits did; nothing above it was rewritten.**
 
 The branch's *code* stands up. The two things the operator was most worried about both came
 back clean:
