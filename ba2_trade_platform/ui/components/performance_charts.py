@@ -139,7 +139,9 @@ class TimeSeriesChart:
     
     def __init__(self, title: str, series_data: Dict[str, List[Tuple[datetime, float]]],
                  xlabel: str = "Date", ylabel: str = "", height: int = 400,
-                 date_format: str = "auto"):
+                 date_format: str = "auto",
+                 bar_series: Optional[Dict[str, List[Tuple[datetime, float]]]] = None,
+                 bar_ylabel: str = ""):
         """
         Args:
             title: Chart title
@@ -148,6 +150,11 @@ class TimeSeriesChart:
             ylabel: Y-axis label
             height: Chart height in pixels
             date_format: Date format - "auto", "monthly", "daily", or custom strftime format
+            bar_series: Optional {series_name: [(datetime, value), ...]} drawn as
+                translucent bars BEHIND the lines, on their own right-hand axis. Used for
+                a magnitude that shares the x-axis but not the unit -- drawdown %, which
+                cannot share a dollar axis without one of the two being meaningless.
+            bar_ylabel: Label for that right-hand axis.
         """
         self.title = title
         self.series_data = series_data
@@ -155,6 +162,8 @@ class TimeSeriesChart:
         self.ylabel = ylabel
         self.height = height
         self.date_format = date_format
+        self.bar_series = bar_series or {}
+        self.bar_ylabel = bar_ylabel
     
     # Modern color palette for dark theme
     COLORS = [
@@ -170,7 +179,28 @@ class TimeSeriesChart:
             return
         
         fig = go.Figure()
-        
+
+        # BARS FIRST. Plotly paints traces in the order they are added, so adding these
+        # before the lines is what puts them behind. Their colour is looked up by the
+        # SERIES NAME, not by their own enumeration index, so an expert's bar is the same
+        # hue as its line even when only some experts have bars.
+        line_names = list(self.series_data.keys())
+        for bar_name, points in self.bar_series.items():
+            if not points:
+                continue
+            try:
+                color = self.COLORS[line_names.index(bar_name) % len(self.COLORS)]
+            except ValueError:
+                color = self.COLORS[len(line_names) % len(self.COLORS)]
+            fig.add_trace(go.Bar(
+                x=[d[0] for d in points],
+                y=[d[1] for d in points],
+                name=f'{bar_name} DD',
+                yaxis='y2',
+                marker=dict(color=color, opacity=0.22),
+                hovertemplate=f'{bar_name} drawdown<br>%{{x}}<br>%{{y:.1f}}%<extra></extra>',
+            ))
+
         for idx, (series_name, data_points) in enumerate(self.series_data.items()):
             if not data_points:
                 continue
@@ -209,6 +239,22 @@ class TimeSeriesChart:
                 gridcolor='rgba(160,174,192,0.2)',
                 zerolinecolor='rgba(160,174,192,0.3)'
             ),
+            # A SECOND axis, not a shared one: drawdown is a percentage and the lines are
+            # dollars. Sharing would either squash the lines flat or scale the bars into
+            # nonsense, depending on which unit happened to be larger.
+            #
+            # ``showgrid=False`` so the two axes do not draw two sets of gridlines over
+            # each other, and the bars are grouped so several experts sit side by side in
+            # a month instead of hiding one another.
+            yaxis2=dict(
+                title=dict(text=self.bar_ylabel, font=dict(color='#a0aec0')),
+                tickfont=dict(color='#a0aec0', size=10),
+                overlaying='y',
+                side='right',
+                showgrid=False,
+                rangemode='tozero',
+            ) if self.bar_series else None,
+            barmode='group',
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
@@ -436,6 +482,49 @@ def calculate_max_drawdown(equity_curve: List[float]) -> float:
     drawdown = (equity_array - running_max) / running_max * 100
     
     return abs(np.min(drawdown))
+
+
+def max_drawdown_from_pnl(pnls: List[float]) -> Tuple[float, Optional[float]]:
+    """``(worst peak-to-trough fall in dollars, that fall as a % of the peak)``.
+
+    Takes a sequence of per-trade P&Ls IN CLOSE ORDER and walks the cumulative curve
+    itself, rather than handing that curve to ``calculate_max_drawdown``. The existing
+    function divides by the running maximum, which is exactly 0 at the start of any
+    cumulative P&L series and stays 0 or negative for an expert that is down on its
+    first trades -- so the first drawdown it meets is a divide-by-zero and every later
+    one is measured against a negative base.
+
+    THE PERCENTAGE IS ``None`` WHEN THERE IS NO POSITIVE PEAK TO MEASURE AGAINST. An
+    expert whose cumulative P&L has never been above zero has a real dollar drawdown and
+    no meaningful percentage one: "down 100% of a peak of -$40" is not a fact. The
+    dollar figure is always available, which is why both are returned.
+
+    A drawdown of 0.0 with a positive peak means the curve only ever rose -- a genuine
+    measurement, and distinct from the ``None`` above.
+    """
+    if not pnls:
+        return 0.0, None
+    cumulative = 0.0
+    peak = 0.0
+    worst_fall = 0.0
+    worst_pct: Optional[float] = None
+    for pnl in pnls:
+        cumulative += float(pnl)
+        if cumulative > peak:
+            peak = cumulative
+        fall = peak - cumulative
+        if fall > worst_fall:
+            worst_fall = fall
+        # Measured at each point against the peak IN FORCE THEN, not against the final
+        # peak: a 30% fall early on does not become a 5% one because the curve tripled
+        # afterwards.
+        if peak > 0 and fall > 0:
+            pct = fall / peak * 100.0
+            if worst_pct is None or pct > worst_pct:
+                worst_pct = pct
+    if worst_pct is None and peak > 0:
+        worst_pct = 0.0
+    return round(worst_fall, 2), (None if worst_pct is None else round(worst_pct, 2))
 
 
 def calculate_profit_factor(winning_trades: List[float], losing_trades: List[float]) -> Optional[float]:

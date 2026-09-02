@@ -385,8 +385,17 @@ class TradeRiskManagement:
         Returns the funded candidate ``TradingOrder`` objects (each with ``.quantity`` set),
         already ordered by the RM's profit prioritization. Returns [] when automated trade opening
         is disabled or nothing is fundable.
+
+        Records a ``RiskManagerRun`` (mode=classic) for every symbol RECEIVED, same as the DB
+        path — this IS the live enter path, so it is the one that must carry the "why did
+        nothing trade today?" record, not just the DB path nothing on dev actually calls (see
+        ``_record_candidate_run``).
         """
         from ba2_common.core.instance_resolver import get_instance_resolver
+
+        # Monotonic, so the recorded duration cannot jump if the wall clock is adjusted
+        # mid-run. Taken before ANY work, matching review_and_prioritize_pending_orders.
+        run_started_at = time.monotonic()
 
         if not candidates:
             return []
@@ -420,20 +429,37 @@ class TradeRiskManagement:
         filtered = self._filter_orders_by_permissions(orders, enable_buy, enable_sell)
         filtered_ids = {id(o) for o in filtered}
         pairs = [(o, rec) for (o, rec) in candidates if id(o) in filtered_ids]
-        for o, _rec in candidates:
-            if id(o) not in filtered_ids:
-                self.logger.debug(f"candidate {o.symbol} {o.side} dropped by buy/sell permission filter")
+        dropped_by_permission = [o for (o, _rec) in candidates if id(o) not in filtered_ids]
+        for o in dropped_by_permission:
+            self.logger.debug(f"candidate {o.symbol} {o.side} dropped by buy/sell permission filter")
         if not pairs:
             return []
 
-        orders_to_update, orders_to_delete, _prices, _bal, _cap = self._size_prioritized_orders(
-            expert, expert_instance, expert_instance_id, pairs, ratio)
+        orders_to_update, orders_to_delete, symbol_prices, available_balance, max_per_instrument = (
+            self._size_prioritized_orders(expert, expert_instance, expert_instance_id, pairs, ratio))
         for o in (orders_to_delete or []):
             self.logger.debug(f"candidate {o.symbol} {o.side} not funded by RM (qty=0) — dropped "
                               f"(temp-list flow: never persisted)")
         funded = [o for o in orders_to_update if o.quantity and o.quantity > 0]
         self.logger.info(f"Candidate sizing for expert {expert_instance_id}: {len(funded)} funded "
                          f"of {len(pairs)} candidate(s)")
+
+        self._record_candidate_run(
+            expert_instance_id=expert_instance_id,
+            account_id=expert_instance.account_id,
+            started_at=run_started_at,
+            candidates=candidates,
+            dropped_by_permission=dropped_by_permission,
+            orders_to_update=orders_to_update,
+            orders_to_delete=orders_to_delete,
+            symbol_prices=symbol_prices,
+            context={
+                "available_balance": available_balance,
+                "max_per_instrument": max_per_instrument,
+                "enable_buy": enable_buy,
+                "enable_sell": enable_sell,
+            },
+        )
         return funded
 
     def _get_pending_orders_for_review(self, expert_instance_id: int) -> List[TradingOrder]:
@@ -622,6 +648,100 @@ class TradeRiskManagement:
         except Exception as e:  # noqa: BLE001 -- observability must not fail the sizing pass
             self.logger.warning(
                 f"Failed to record classic risk-manager run for expert "
+                f"{expert_instance_id}: {e}")
+
+    def _record_candidate_run(self, *, expert_instance_id, account_id, started_at,
+                              candidates, dropped_by_permission,
+                              orders_to_update, orders_to_delete, symbol_prices,
+                              context) -> None:
+        """The in-memory-candidate twin of ``_record_classic_run``.
+
+        ``size_candidate_orders`` (the LIVE enter path) never persists a qty=0 order — that
+        is the whole point of it, see its docstring — so there is no order ``.id`` to key
+        decisions by. Candidates are correlated by python IDENTITY (``id(order)``) instead,
+        the same technique the permission filter a few lines up in ``size_candidate_orders``
+        already uses; object identity survives ``_size_prioritized_orders`` because it mutates
+        the SAME order objects in place rather than returning new ones.
+
+        No ``OUTCOME_NO_RECOMMENDATION`` case here, unlike the DB path: every candidate this
+        method receives already carries its ``ExpertRecommendation`` by construction (a
+        ``(order, rec)`` pair) — the DB path's pending orders can lose that link, candidates
+        never had one to lose.
+
+        Found 2026-09-02: this recording was wired ONLY into ``review_and_prioritize_pending_
+        orders`` (the DB-pending-order path), which dev's live orders do not actually go
+        through (they arrive already-sized via this method), leaving ``risk_manager_run``
+        permanently empty despite the classic manager genuinely running every day.
+        """
+        try:
+            from ba2_common.core.trade_store import inmem_trades_active
+            if inmem_trades_active():
+                return
+
+            from ba2_common.core.risk_manager_run import (
+                MODE_CLASSIC, OUTCOME_FUNDED, OUTCOME_PERMISSION, OUTCOME_UNFUNDED,
+                decision, record_run)
+
+            permission_ids = {id(o) for o in (dropped_by_permission or [])}
+            funded_by_id = {id(o): o for o in (orders_to_update or [])}
+            unfunded_ids = {id(o) for o in (orders_to_delete or [])}
+            prices = symbol_prices or {}
+            cap = context.get("max_per_instrument")
+
+            decisions = []
+            for order, _rec in (candidates or []):
+                symbol = order.symbol
+                side = getattr(order.side, "value", order.side)
+                oid = id(order)
+                if oid in permission_ids:
+                    decisions.append(decision(
+                        symbol, OUTCOME_PERMISSION,
+                        f"{side} entries are disabled for this expert", side=side))
+                elif oid in funded_by_id:
+                    funded = funded_by_id[oid]
+                    raw_qty = funded.quantity
+                    if raw_qty is None:
+                        # UNMEASURABLE, not zero -- see the identical branch in
+                        # _record_classic_run for why.
+                        decisions.append(decision(
+                            symbol, OUTCOME_FUNDED,
+                            "funded, but the order carries no quantity — the size is "
+                            "UNMEASURABLE (not zero); repair the order's quantity",
+                            side=side))
+                        continue
+                    qty = float(raw_qty)
+                    price = prices.get(symbol)
+                    cost = None if price is None else round(qty * float(price), 2)
+                    decisions.append(decision(
+                        symbol, OUTCOME_FUNDED,
+                        (f"funded at {qty:g}" if cost is None
+                         else f"funded at {qty:g} (~{cost:,.2f})"),
+                        quantity=qty, side=side, price=price, cost=cost))
+                elif oid in unfunded_ids:
+                    price = prices.get(symbol)
+                    if price is None:
+                        why = ("sized to zero; no price was available, so the binding "
+                               "limit cannot be identified")
+                    elif cap is not None and float(price) > float(cap):
+                        why = (f"one share at {float(price):,.2f} exceeds the "
+                               f"{float(cap):,.2f} per-instrument cap")
+                    else:
+                        why = ("sized to zero; the remaining budget did not cover one "
+                               f"share at {float(price):,.2f}")
+                    decisions.append(decision(symbol, OUTCOME_UNFUNDED, why,
+                                              side=side, price=price))
+                else:
+                    decisions.append(decision(
+                        symbol, OUTCOME_UNFUNDED,
+                        "not funded by the sizing pass and not queued for deletion",
+                        side=side))
+
+            record_run(expert_instance_id=expert_instance_id, account_id=account_id,
+                       mode=MODE_CLASSIC, decisions=decisions, context=context,
+                       started_at=started_at)
+        except Exception as e:  # noqa: BLE001 -- observability must not fail the sizing pass
+            self.logger.warning(
+                f"Failed to record candidate risk-manager run for expert "
                 f"{expert_instance_id}: {e}")
 
     def _get_orders_with_recommendations(self, orders: List[TradingOrder]) -> List[Tuple[TradingOrder, ExpertRecommendation]]:

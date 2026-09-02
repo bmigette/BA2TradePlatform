@@ -11,6 +11,7 @@ frozen to a fixed instant, never ``today``.
 """
 import importlib
 import os
+import threading
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Set
@@ -700,6 +701,194 @@ def test_the_vendor_debug_logger_is_capped_regardless_of_log_file(provider, stor
     rc, _lines = _run(provider, store)
     assert rc == 0
     assert logging.getLogger("tastytrade").level == logging.WARNING
+
+
+# --------------------------------------------------------------------------- #
+# --provider — ThetaData alongside TastyTrade (2026-09-02)
+# --------------------------------------------------------------------------- #
+def test_the_store_root_defaults_to_a_separate_tree_per_provider(monkeypatch, tmp_path):
+    """--provider thetadata must never write into the existing TastyTrade tree (or vice
+    versa) unless --out is given explicitly -- the whole point of running it alongside the
+    existing cache instead of replacing it."""
+    import ba2_common.config as cfg
+    monkeypatch.setattr(cfg, "CACHE_FOLDER", str(tmp_path))
+
+    def _root_for(provider_flag):
+        lines: List[str] = []
+        fake = FakeProvider()
+        argv = ["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+               "--rate-limit", "0", "--discovery", "rest"]
+        if provider_flag:
+            argv += ["--provider", provider_flag]
+        warm.main(argv, provider=fake, store=None, clock=FakeClock(),
+                 sleep=lambda s: None, log=lines.append)
+        return next(l for l in lines if l.startswith("store root")).split(":", 1)[1].strip()
+
+    root_tt = _root_for(None)  # default
+    root_td = _root_for("thetadata")
+
+    assert os.path.basename(root_tt) == "TastyTradeOptionsProvider"
+    assert os.path.basename(root_td) == "ThetaDataOptionsProvider"
+    assert root_tt != root_td
+    assert os.path.dirname(root_tt) == os.path.dirname(root_td) == str(tmp_path)
+
+
+def test_load_thetadata_api_key_prefers_the_explicit_arg_over_everything():
+    os_environ_backup = os.environ.get("THETADATA_API_KEY")
+    os.environ["THETADATA_API_KEY"] = "env-key"
+    try:
+        assert warm.load_thetadata_api_key(db_path=None, api_key_arg="arg-key") == "arg-key"
+    finally:
+        if os_environ_backup is None:
+            os.environ.pop("THETADATA_API_KEY", None)
+        else:
+            os.environ["THETADATA_API_KEY"] = os_environ_backup
+
+
+def test_load_thetadata_api_key_falls_back_to_the_env_var(monkeypatch):
+    monkeypatch.setenv("THETADATA_API_KEY", "env-key")
+    assert warm.load_thetadata_api_key(db_path=None, api_key_arg=None) == "env-key"
+
+
+def test_load_thetadata_api_key_reads_the_appsetting_via_db(tmp_path, monkeypatch):
+    monkeypatch.delenv("THETADATA_API_KEY", raising=False)
+    import sqlite3
+    db_path = str(tmp_path / "platform.sqlite")
+    con = sqlite3.connect(db_path)
+    con.execute("CREATE TABLE appsetting (key TEXT, value_str TEXT)")
+    con.execute("INSERT INTO appsetting (key, value_str) VALUES ('thetadata_api_key', ?)",
+               ("db-key",))
+    con.commit()
+    con.close()
+
+    assert warm.load_thetadata_api_key(db_path=db_path, api_key_arg=None) == "db-key"
+
+
+def test_load_thetadata_api_key_sees_a_row_still_in_an_open_WAL_writers_journal(
+        tmp_path, monkeypatch):
+    """Regression, found live 2026-09-02: the read connection used to add ``immutable=1`` to
+    ``mode=ro`` ("mode=ro is belt; immutable=1 is braces"). immutable=1 tells SQLite the file
+    will NEVER change, which lets it skip re-checking the WAL -- so a row committed by a still-
+    OPEN WAL-mode writer (exactly what a LIVE prod app's own long-running DB connection is)
+    read as silently ABSENT, even though ``SELECT`` against the same file with a normal
+    connection found it immediately. A real prod DB is checkpointed lazily, so this bit for
+    real the first time a key was saved and read back within the same session."""
+    monkeypatch.delenv("THETADATA_API_KEY", raising=False)
+    import sqlite3
+    db_path = str(tmp_path / "platform.sqlite")
+
+    writer = sqlite3.connect(db_path)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("CREATE TABLE appsetting (key TEXT, value_str TEXT)")
+    writer.execute("INSERT INTO appsetting (key, value_str) VALUES ('thetadata_api_key', ?)",
+                   ("wal-only-key",))
+    writer.commit()
+    try:
+        # The writer connection stays OPEN and uncheckpointed -- the row lives only in the
+        # -wal sidecar, not yet folded into the main db file. This is the live-prod shape.
+        assert warm.load_thetadata_api_key(db_path=db_path, api_key_arg=None) == "wal-only-key"
+    finally:
+        writer.close()
+
+
+def test_load_thetadata_api_key_raises_a_named_error_with_nothing_available(monkeypatch):
+    monkeypatch.delenv("THETADATA_API_KEY", raising=False)
+    with pytest.raises(SystemExit, match="No ThetaData API key"):
+        warm.load_thetadata_api_key(db_path=None, api_key_arg=None)
+
+
+def test_build_provider_dispatches_to_thetadata_on_the_flag(monkeypatch):
+    monkeypatch.setenv("THETADATA_API_KEY", "some-key")
+    from ba2_providers.options.thetadata import ThetaDataOptionsProvider
+    ns = warm.parse_args(["--symbols", "AAPL", "--provider", "thetadata"])
+    p = warm.build_provider(ns)
+    assert isinstance(p, ThetaDataOptionsProvider)
+    assert p.api_key == "some-key"
+
+
+def test_a_grpc_unavailable_error_is_recognised_as_transient():
+    """ThetaData's cloud client raises grpc.RpcError; its repr() carries the status name
+    directly. Without this, a rate-limited/temporarily-down ThetaData call would be treated
+    as permanent and fail the unit on the first attempt."""
+    class _FakeRpcError(Exception):
+        def __repr__(self):
+            return ("<_MultiThreadedRendezvous of RPC that terminated with:\n\tstatus = "
+                   "StatusCode.UNAVAILABLE\n\tdetails = \"upstream connect error\">")
+    assert warm._is_transient(_FakeRpcError())
+
+
+def test_a_grpc_invalid_argument_error_is_NOT_transient():
+    """A malformed request (e.g. bad symbol) fails identically on every retry."""
+    class _FakeRpcError(Exception):
+        def __repr__(self):
+            return ("<_MultiThreadedRendezvous of RPC that terminated with:\n\tstatus = "
+                   "StatusCode.INVALID_ARGUMENT\n\tdetails = \"bad request\">")
+    assert not warm._is_transient(_FakeRpcError())
+
+
+# --------------------------------------------------------------------------- #
+# --concurrency (THREADS sharing one provider, found live 2026-09-02: ThetaData's session
+# model breaks under --workers' separate-PROCESS model, see thetadata.py's module docstring)
+# --------------------------------------------------------------------------- #
+def test_concurrency_default_of_one_delegates_straight_to_run_units(provider, store):
+    """The overwhelmingly common case (--provider tastytrade, unaffected by any of this)
+    must be BYTE IDENTICAL to calling run_units directly -- no thread pool, no reordering."""
+    rc, lines = _run(provider, store, extra=["--concurrency", "1"])
+    assert rc == 0
+    assert provider.fetched == EXPIRIES, "sequential order must be preserved, unchanged"
+    for e in EXPIRIES:
+        assert store.partition_state("AAPL", e, START, END) is PartitionState.COMPLETE
+
+
+def test_concurrency_above_one_still_completes_every_unit(provider, store):
+    """3 units split across --concurrency 3 (one thread each): every unit must still land,
+    nothing lost or double-counted, regardless of thread scheduling order."""
+    rc, lines = _run(provider, store, extra=["--concurrency", "3", "--rate-limit", "0"])
+    assert rc == 0
+    assert sorted(provider.fetched) == sorted(EXPIRIES)
+    for e in EXPIRIES:
+        assert store.partition_state("AAPL", e, START, END) is PartitionState.COMPLETE
+    done_line = next(l for l in lines if l.startswith("done:"))
+    assert "3 partitions written" in done_line
+
+
+def test_concurrency_actually_uses_multiple_threads_not_just_extra_bookkeeping(provider, store):
+    """Proves real concurrency happened, not just that the merged totals came out right by
+    coincidence of a hidden sequential fallback."""
+    seen_threads = set()
+    orig_fetch = provider.fetch_bars_detailed
+
+    def _tracking_fetch(*a, **kw):
+        seen_threads.add(threading.current_thread().name)
+        return orig_fetch(*a, **kw)
+
+    provider.fetch_bars_detailed = _tracking_fetch
+    rc, _lines = _run(provider, store, extra=["--concurrency", "3", "--rate-limit", "0"])
+    assert rc == 0
+    assert len(seen_threads) == 3, f"expected 3 distinct worker threads, saw {seen_threads}"
+    assert threading.current_thread().name not in seen_threads, \
+        "the fetches must run on the WORKER threads, not the calling thread"
+
+
+def test_concurrency_merges_stats_from_every_thread(provider, store):
+    """RunStats (rows/empty/failed/written) must be SUMMED across threads, not just the last
+    thread's or the first thread's numbers."""
+    rc, lines = _run(provider, store, extra=["--concurrency", "3", "--rate-limit", "0"])
+    assert rc == 0
+    done_line = next(l for l in lines if l.startswith("done:"))
+    # 3 partitions (one real bar each) -> 3 rows total, matching the non-concurrent baseline.
+    assert "3 rows" in done_line
+
+
+def test_a_slice_exception_propagates_to_the_caller(provider, store):
+    """A genuinely unexpected exception in one thread's slice must not be silently lost --
+    it must surface on the main thread, the same as an unhandled exception would sequentially."""
+    # A plain ValueError is caught and classified as permanent INSIDE run_units (the unit just
+    # fails, run_units keeps going) -- it never escapes run_units to prove propagation with.
+    # KeyboardInterrupt is the one exception run_units deliberately re-raises immediately.
+    provider.raise_exc[EXPIRIES[1]] = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        _run(provider, store, extra=["--concurrency", "3", "--rate-limit", "0"])
 
 
 def test_the_vendor_debug_cap_survives_the_sdks_own_lazy_import(provider, store):

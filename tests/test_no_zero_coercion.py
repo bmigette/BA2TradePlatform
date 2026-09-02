@@ -361,16 +361,20 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:3852":
+    "ba2_trade_platform/ui/pages/settings.py:3747":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
-        "measurement of anything",
-    "ba2_trade_platform/ui/pages/settings.py:3900":
+        "measurement of anything (was :3852 pre-merge on this branch, :3851 pre-merge on dev "
+        "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
+        "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747)",
+    "ba2_trade_platform/ui/pages/settings.py:3795":
         "same settings-import default; the comment above the line records why the fallback was "
-        "deliberately restored",
-    "ba2_trade_platform/ui/components/performance_charts.py:412":
+        "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
+        "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
+        "continuation line 3795, one past the outer .get(...)'s opening line 3794)",
+    "ba2_trade_platform/ui/components/performance_charts.py:458":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
-        "right answer for an unmeasured trade",
-    "ba2_trade_platform/ui/components/performance_charts.py:413":
+        "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl was added above it)",
+    "ba2_trade_platform/ui/components/performance_charts.py:459":
         "loss half of the same win-rate count; 0 is excluded from both tallies rather than "
         "scored as either",
     "testplatform/backend/app/services/data_build_handler.py:157":
@@ -430,7 +434,9 @@ BASELINE: dict = {
     "ba2_trade_platform/modules/accounts/IBKRAccount.py": 2,
     "ba2_trade_platform/modules/accounts/TastyTradeAccount.py": 5,
     "ba2_trade_platform/ui/pages/marketanalysishistory.py": 1,
-    "ba2_trade_platform/ui/pages/overview.py": 17,
+    # 17 -> 16: the invested-series accumulator now SKIPS a trade with no qty or
+    # price instead of reading either as 0, which would book a free trade.
+    "ba2_trade_platform/ui/pages/overview.py": 16,
     "ba2_trade_platform/ui/pages/settings.py": 2,
     "ba2_trade_platform/ui/pages/tools.py": 1,
     "ba2_trade_platform/ui/utils/portfolio_allocation_view.py": 3,
@@ -470,7 +476,7 @@ BASELINE: dict = {
     "testplatform/backend/app/services/backtest_handler.py": 1,
     "testplatform/backend/app/services/strategy_optimization_handler.py": 1,
 }
-BASELINE_TOTAL = 172
+BASELINE_TOTAL = 171
 
 
 # =========================================================================== #

@@ -818,6 +818,37 @@ div[class*="disconnect"] * {
     color: #000000 !important;
 }
 
+/* THE SELECTOR THAT ACTUALLY MATCHES A WARNING TOAST.
+ *
+ * The two rules above have always been inert. ``ui.notify(..., type='warning')`` does
+ * NOT produce ``q-notification--warning``: Quasar's Notify emits the BEM modifier for
+ * the POSITION/shape (``q-notification--standard``) and carries the colour as utility
+ * classes -- ``bg-warning text-white``. So the amber background came from Quasar while
+ * the black text this file asked for was never applied, and the blanket
+ * ``.q-notification { color: #ffffff }`` above supplied white instead: white on amber,
+ * which is the unreadable toast that was reported.
+ *
+ * Matching on ``.bg-warning`` fixes every one of the 109 warning call sites at once,
+ * which is why this is here and not a ``text_color=`` argument threaded through them.
+ * ``.q-notification.bg-warning`` outranks the blanket rule on specificity, and the
+ * descendant rule is needed because Quasar's own ``text-white`` sits on the root and
+ * is inherited by the message and the icon.
+ *
+ * The negative/error pair below has the same dead selector, but its intent (white on
+ * red) is what Quasar already does, so nothing looks wrong and it is left alone.
+ */
+.q-notification.bg-warning,
+.q-notification.bg-orange {
+    background: rgba(255, 152, 0, 0.98) !important;
+    border-color: rgba(255, 152, 0, 1) !important;
+    color: #1a1f2e !important;
+}
+
+.q-notification.bg-warning *,
+.q-notification.bg-orange * {
+    color: #1a1f2e !important;
+}
+
 .q-notification--negative,
 .q-banner--negative,
 .q-notification--error,

@@ -70,6 +70,19 @@ _REMOTE_MEM_FLOOR_PCT = float(_os.getenv('BT_REMOTE_MEM_FLOOR_PCT', '10'))
 # _down_worker_recheck_loop.
 _DOWN_WORKER_RECHECK_S = float(_os.getenv('BT_DOWN_WORKER_RECHECK_S', '45'))
 
+# Extra attempts at /health during pre-flight before giving up on it (1 -> two attempts total).
+# A single flaky read (remote227 still finishing the previous job's sweep, a network blip) used
+# to be taken at face value and silently pinned the ENTIRE job to 1 slot for its whole multi-hour
+# lifetime -- opt 420 (2026-09-01): no memory/capacity log line at all, straight to "0 local + 1
+# remote slot(s)". Nothing later in the run ever re-polls to correct it.
+_HEALTH_PREFLIGHT_RETRIES = int(_os.getenv('BT_HEALTH_PREFLIGHT_RETRIES', '1'))
+# An intentionally oversized /pool/resize probe used ONLY when /health is unavailable after
+# retrying. The worker clamps any request to its own daemon --workers ceiling
+# (worker_server._CAPACITY_MAX) and always answers with its real current capacity -- including on
+# a refusal (trials in flight) -- so this discovers the worker's true configured size without
+# ever guessing. Far above any real deployment's slot count.
+_CAPACITY_DISCOVERY_PROBE = 10_000
+
 
 def _log_memory_diagnostics(log, context: str) -> None:
     """Best-effort process/system memory snapshot, logged when a local trial dies unexpectedly
@@ -323,8 +336,8 @@ class DistributedEvaluator:
                 return False
             worker_client.push_cache(w, log=self.log)
             worker_client.push_secrets(w, secrets, log=self.log)
-            try:
-                _health = worker_client.health(w)
+            _health = self._health_with_retry(w)
+            if _health is not None:
                 w["capacity"] = max(1, int(_health.get("capacity") or 1))
                 # The daemon's ceiling, NOT the pool's current size -- a worker we shrank
                 # for a narrow job must still be growable back for a wide one. Older
@@ -343,13 +356,51 @@ class DistributedEvaluator:
                             f"worker tree rss {_mem.get('rss_mb')} MB")
                     self.log(_msg + ("  <- LOW: trials will stall, not crash"
                                      if (_mem.get("used_pct") or 0) >= 90 else ""))
-            except Exception:  # noqa: BLE001 — fall back to 1 slot if /health didn't report
-                w["capacity"] = max(1, int(w.get("capacity") or 1))
+            else:
+                # /health never answered. Discover the worker's REAL configured ceiling via a
+                # resize probe rather than guessing 1 slot -- see _discover_capacity_via_resize.
+                w["capacity"] = self._discover_capacity_via_resize(w)
+                w["capacity_max"] = w["capacity"]
             self._size_remote_pool(w)
             return True
         except Exception as e:  # noqa: BLE001 — a bad worker must never abort the run
             self.log(f"worker {w.get('name')} pre-flight failed: {e}; excluding")
             return False
+
+    def _health_with_retry(self, w: dict) -> Optional[dict]:
+        """``worker_client.health(w)``, retried ``_HEALTH_PREFLIGHT_RETRIES`` times before giving
+        up. Every failure is LOGGED (never swallowed silently) -- a flaky poll used to be
+        indistinguishable from a genuinely tiny worker, and both looked identical in the grid log:
+        no trace at all. Returns None only after every attempt has failed."""
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, _HEALTH_PREFLIGHT_RETRIES + 2):
+            try:
+                return worker_client.health(w)
+            except Exception as e:  # noqa: BLE001 — a flaky poll must never abort pre-flight
+                last_exc = e
+                self.log(f"worker {w.get('name')}: /health check failed (attempt {attempt}/"
+                         f"{_HEALTH_PREFLIGHT_RETRIES + 1}): {e!r}")
+        self.log(f"worker {w.get('name')}: /health unavailable after "
+                 f"{_HEALTH_PREFLIGHT_RETRIES + 1} attempt(s) ({last_exc!r}); falling back to "
+                 f"its configured max pool size")
+        return None
+
+    def _discover_capacity_via_resize(self, w: dict) -> int:
+        """Last-resort capacity discovery when /health is unusable: request an intentionally
+        oversized pool. The worker always clamps the request to its own daemon --workers ceiling
+        and reports its real current capacity back -- even when it refuses the resize outright
+        (trials in flight) -- so this recovers the true number instead of guessing. Only when this
+        ALSO fails do we fall back to the bare 1-slot floor, and that is logged loudly too."""
+        try:
+            out = worker_client.resize_pool(w, _CAPACITY_DISCOVERY_PROBE)
+            cap = max(1, int(out.get("capacity") or 1))
+            self.log(f"worker {w.get('name')}: discovered {cap}-slot configured pool size via "
+                     f"resize probe (health was unavailable)")
+            return cap
+        except Exception as e:  # noqa: BLE001 — genuinely nothing left to try
+            self.log(f"worker {w.get('name')}: could not discover its configured pool size "
+                     f"either ({e!r}); falling back to a 1-slot pool")
+            return 1
 
     def _size_remote_pool(self, w: dict) -> None:
         """Size *w*'s trial pool to the slots THIS job will actually engage.

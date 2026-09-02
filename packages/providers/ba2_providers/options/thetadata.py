@@ -1,106 +1,251 @@
-"""ThetaData v3 historical-options provider.
+"""ThetaData cloud historical-options provider (official ``thetadata`` Python library).
 
-Chosen because it is the cheapest way to get PRE-2024 option history: Alpaca's floor is a
-hard 2024-01-18 at every tier (measured), while ThetaData's tiers go 4y / 8y / 12y back
-($40 / $80 / $160 per month as of 2026-07). That extra depth — not price — is the reason
-this exists; Alpaca's own $99 OPRA upgrade buys quality but no additional history.
+TRANSPORT (rewritten 2026-09-02). The previous implementation of this module talked to a
+LOCALLY-RUNNING "Theta Terminal" desktop process over unauthenticated REST on
+``127.0.0.1:25503`` — that was ThetaData's only offering when this file was first written.
+ThetaData has since shipped an official cloud Python library (``pip install thetadata``) that
+connects directly to their servers with a bearer API key (``ThetaClient(api_key=...)``), no
+terminal required. That is the transport a "td1_prod_..." key is for, and it is what this
+module now uses exclusively.
 
-TRANSPORT: ThetaData is NOT a cloud API with a bearer key. A local "Theta Terminal"
-process authenticates the subscription and serves REST on 127.0.0.1:25503; requests carry
-no credentials. So the failure mode to expect during setup is a CONNECTION error (terminal
-not running), not a 401 — hence the explicit, actionable error below.
+WHY THIS PROVIDER EXISTS AT ALL, alongside TastyTrade's (``tastytrade.py``, the platform's
+other historical-options source): TastyTrade/dxfeed's IV coverage floors around October 2022
+(measured) — real, but recent. A live probe against ThetaData with a real key found AAPL
+option EXPIRATIONS back to 2012-06-01, comfortably covering a 2020 backfill.
 
-BULK SHAPE: one ``/v3/option/history/eod`` call with ``expiration=*&strike=*&right=both``
-returns an entire chain's EOD across the whole date range, so a build is one request per
-underlying rather than Alpaca's thousands of per-contract batches. Both discovery and bars
-are served from that single response (cached per (underlying, window)) instead of issuing
-separate listing calls.
+DATA SHAPE. Unlike the old local-terminal REST endpoint (one CSV call returned a whole chain's
+OHLC across ALL expirations for a window), the cloud library requires ONE (underlying, single
+expiration) call per request. That call CAN span a multi-week date window in one shot
+(confirmed: a 2-week AAPL window in one ``option_history_greeks_eod`` call) but NOT an
+arbitrary one: the server enforces a hard 365-DAY CAP per request (measured live 2026-09-02:
+"Too many days between start and end date; max 365 days allowed", grpc StatusCode.
+INVALID_ARGUMENT) — a multi-year backfill window is chunked into <=365-day sub-requests by
+``_chunk_window`` and looped over per (underlying, expiry), rather than sent as one call. So
+the natural unit of work is the SAME as TastyTrade's: one (underlying, expiry) partition,
+fetched with (up to) two calls PER WINDOW CHUNK instead of TastyTrade's one call total:
 
-Docs: https://docs.thetadata.us/operations/option_history_eod.html
+  * ``option_history_greeks_eod`` — OHLC + bid/ask/size + the full greeks block, INCLUDING
+    ``implied_vol`` (a superset of the plain ``option_history_eod`` endpoint, so that one is
+    never called separately here).
+  * ``option_history_open_interest`` — ThetaData does not fold OI into the bars call the way
+    TastyTrade's dxfeed candles do; it is one snapshot per (contract, day), joined back onto
+    the bars by (strike, right, date).
+
+Both calls RAISE ``thetadata.errors.NoDataFoundError`` (rather than returning an empty
+dataframe) when a request's window/expiry genuinely has nothing — a normal outcome (a
+low-volume underlying with no listed chain on a given Friday), not an error; caught per-chunk
+and treated the same as an empty response (see ``ThetaDataOptionsProvider._no_data_exc``).
+
+Both calls are per-(underlying, single expiry), so ``fetch_eod_bars``/``fetch_bars_detailed``
+group the requested contracts by (underlying, expiry) exactly like the caller (TastyTrade
+today) already assumes — see ``tools/warm_options_history.py``'s ``WorkUnit``.
+
+CONCURRENCY. Unlike TastyTrade (separate OS PROCESSES, each with its own dxfeed session --
+see ``tools/run_option_warmup_parallel.py``), ThetaData's account authenticates ONE session
+per api_key: launching 8 separate processes each calling ``ThetaClient(api_key=...)``
+independently was measured live 2026-09-02 to invalidate each other's sessions --
+``StatusCode.UNAUTHENTICATED: "Invalid session ID. This can occur if more than one terminal
+is running."`` -- failing almost every unit outright. The library's fix is
+``existing_authorized_client``: a second ``ThetaClient`` built from an already-authenticated
+one SHARES that session rather than opening a new, competing one (confirmed live: 4 threads
+sharing one authenticated client via this parameter, zero errors). Sharing a Python object
+only works within one process, so ThetaData concurrency here is THREADS, not processes --
+``_get_client`` authenticates ONE session on first use (lock-guarded) and hands every thread
+its own ``existing_authorized_client``-linked client (thread-local, never shared directly:
+a gRPC client object is not documented as thread-safe, one per thread is the safe default).
+
+Docs: https://docs.thetadata.us/Python-Library/Getting-Started.html
 """
 from __future__ import annotations
 
-import csv
-import io
 import logging
 import os
-from datetime import date, datetime
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+import threading
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from ba2_common.core.interfaces.OptionsDataProviderInterface import (
-    OptionContractMeta, OptionEodBar, OptionsDataProviderInterface,
+    CandleBatch, OptionContractMeta, OptionEodBar, OptionsDataProviderInterface,
 )
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_BASE_URL = os.getenv("THETADATA_BASE_URL", "http://127.0.0.1:25503")
-# Per-tier history depth (Options Value 4y / Standard 8y / Pro 12y). Not auto-detected —
-# the terminal does not advertise the plan — so it is configurable and defaults to the
-# cheapest paid tier, which is the conservative choice: too-shallow only rejects windows
-# the caller could have had, whereas too-deep would silently build a cache full of gaps.
-_DEFAULT_HISTORY_YEARS = float(os.getenv("THETADATA_HISTORY_YEARS", "4"))
+# Depth to accept without rejecting the window up front (see history_floor). NOT a claim that
+# every underlying has data this far back — it is a live-verified floor for at least one name
+# (AAPL, back to 2012), kept conservative here so a 2020 backfill is comfortably inside it
+# without overclaiming depth for names that listed later. Env-overridable for a probe that
+# wants to push it.
+_DEFAULT_HISTORY_YEARS = float(os.getenv("THETADATA_HISTORY_YEARS", "8"))
+
+#: The server's hard per-request cap: "Too many days between start and end date; max 365
+#: days allowed" (grpc StatusCode.INVALID_ARGUMENT, measured live 2026-09-02). A window wider
+#: than this must be split into consecutive sub-requests -- see _chunk_window.
+_MAX_WINDOW_DAYS = 365
 
 
-def _occ_symbol(underlying: str, expiry: date, right: str, strike: float) -> str:
-    """Build the OCC symbol the cache keys on: ROOT + YYMMDD + C/P + strike*1000 (8 digits).
+def _chunk_window(start: date, end: date,
+                  max_days: int = _MAX_WINDOW_DAYS) -> List[Tuple[date, date]]:
+    """Split ``[start, end]`` (inclusive) into consecutive, non-overlapping sub-windows each
+    spanning at most ``max_days``. A window already within the cap returns a single chunk
+    identical to the input -- no behaviour change for the common (narrow-window) case.
 
-    ThetaData returns the contract as separate symbol/expiration/strike/right columns, so
-    the canonical OCC id has to be reconstructed to match what the rest of the platform
-    (and the Alpaca-built caches) use.
+    Non-overlapping by construction, so a caller merging bars across chunks never has to
+    worry about a bar_date appearing in two of them.
     """
-    cp = "C" if str(right).lower().startswith("c") else "P"
-    return f"{underlying.upper()}{expiry:%y%m%d}{cp}{int(round(float(strike) * 1000)):08d}"
+    out: List[Tuple[date, date]] = []
+    cur = start
+    while cur <= end:
+        nxt = min(end, cur + timedelta(days=max_days))
+        out.append((cur, nxt))
+        cur = nxt + timedelta(days=1)
+    return out
 
 
-def _parse_date(value: str) -> Optional[date]:
-    """ThetaData accepts/returns YYYYMMDD or YYYY-MM-DD depending on field and version."""
-    s = str(value).strip()
-    if not s:
+def _parse_date(value: Any) -> Optional[date]:
+    """Accepts a ``date``/``datetime``/pandas ``Timestamp`` (tz-aware or not) or a
+    ``YYYY-MM-DD``/``YYYYMMDD`` string — the library returns dates as plain strings in some
+    columns (``expiration`` from ``option_list_expirations``) and as pandas datetime64 in
+    others (``timestamp`` from ``option_history_open_interest``), so every shape must be
+    handled rather than assumed."""
+    if value is None:
         return None
-    for fmt in ("%Y%m%d", "%Y-%m-%d"):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    # pandas.Timestamp / numpy.datetime64 duck-type a `.date()` or `.to_pydatetime()`.
+    to_date = getattr(value, "date", None)
+    if callable(to_date):
         try:
-            return datetime.strptime(s, fmt).date()
+            return to_date()
+        except TypeError:
+            pass
+    s = str(value).strip()
+    if not s or s.lower() == "nat":
+        return None
+    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(s[:10] if fmt == "%Y-%m-%d" else s, fmt).date()
         except ValueError:
             continue
     return None
 
 
-def _f(row: dict, key: str) -> Optional[float]:
-    v = row.get(key)
-    if v is None or str(v).strip() == "":
+def _num(value: Any) -> Optional[float]:
+    """NaN-safe float extraction from a pandas cell. pandas represents a missing numeric as
+    ``float('nan')``, not ``None`` — a bare ``value is None`` check would let NaN through as a
+    real number (and ``float('nan')`` is truthy, so it would not even get caught downstream)."""
+    if value is None:
         return None
     try:
-        f = float(v)
+        f = float(value)
     except (TypeError, ValueError):
         return None
-    # ThetaData uses 0 for "no quote" on bid/ask; a real option never trades at 0.00 bid AND
-    # ask, and passing 0 through would look like a free contract to the arb guard.
-    return f
+    return None if f != f else f  # NaN != NaN
 
 
-def _i(row: dict, key: str) -> Optional[int]:
-    f = _f(row, key)
-    return int(f) if f is not None else None
+def _right_word(right: Any) -> str:
+    """'CALL'/'call'/'C' -> 'call'; anything else -> 'put'. ThetaData's dataframes spell it
+    out ('CALL'/'PUT'); normalise once so every call site agrees."""
+    return "call" if str(right).strip().lower().startswith("c") else "put"
+
+
+def _occ_symbol(underlying: str, expiry: date, right: Any, strike: float) -> str:
+    """ROOT + YYMMDD + C/P + strike*1000 (8 digits) — the OCC id the rest of the platform (and
+    the TastyTrade-built caches) key on. Matches ``tastytrade.py``'s ``occ_symbol``."""
+    cp = "C" if _right_word(right) == "call" else "P"
+    return f"{underlying.upper()}{expiry:%y%m%d}{cp}{int(round(float(strike) * 1000)):08d}"
+
+
+def _index_open_interest(df: Any) -> Dict[Tuple[float, str, date], int]:
+    """(strike, 'call'|'put', bar_date) -> open_interest, from an
+    ``option_history_open_interest`` dataframe. One row per (contract, day) — no aggregation
+    needed, just a lookup index for the bars merge."""
+    out: Dict[Tuple[float, str, date], int] = {}
+    if df is None or len(df) == 0:
+        return out
+    for row in df.itertuples(index=False):
+        r = row._asdict()
+        strike = _num(r.get("strike"))
+        bar_date = _parse_date(r.get("timestamp") or r.get("date"))
+        oi = _num(r.get("open_interest"))
+        if strike is None or bar_date is None or oi is None:
+            continue
+        out[(strike, _right_word(r.get("right")), bar_date)] = int(oi)
+    return out
+
+
+class _NeverRaised(Exception):
+    """Placeholder for ThetaDataOptionsProvider._no_data_exc before a live client has resolved
+    the real thetadata.errors.NoDataFoundError. Nothing ever raises this on purpose."""
 
 
 class ThetaDataOptionsProvider(OptionsDataProviderInterface):
-    """Historical options via a locally-running Theta Terminal (v3 REST)."""
+    """Historical options via ThetaData's cloud API (official ``thetadata`` Python library)."""
 
     name = "thetadata"
 
-    def __init__(self, base_url: Optional[str] = None,
-                 history_years: Optional[float] = None,
-                 timeout: int = 120):
-        self.base_url = (base_url or _DEFAULT_BASE_URL).rstrip("/")
+    def __init__(self, api_key: Optional[str] = None, history_years: Optional[float] = None,
+                 dataframe_type: str = "pandas"):
+        # NO required credentials at construction (matches Alpaca/TastyTrade here): the
+        # registry (OPTIONS_PROVIDERS / options_history_floor) constructs every provider with
+        # no args just to ask its history_floor(), and must not need a live key to do that.
+        # api_key is resolved lazily, in _get_client, only once a method that actually talks
+        # to the network is called.
+        self.api_key = api_key or os.getenv("THETADATA_API_KEY")
         self.history_years = float(history_years if history_years is not None
                                    else _DEFAULT_HISTORY_YEARS)
-        self.timeout = timeout
-        # (underlying, start, end) -> parsed rows. A build calls discover_contracts then
-        # fetch_eod_bars over the SAME window, and the bulk endpoint already returned both;
-        # caching avoids paying for that (large) response twice.
-        self._bulk_cache: Dict[Tuple[str, str, str], List[dict]] = {}
+        self._dataframe_type = dataframe_type
+        self._client = None  # lazy: the ONE authenticated session (or a test-injected fake)
+        # True only once THIS instance has authenticated _client itself (see _get_client) --
+        # a test/other caller that injects its own fake straight into _client leaves this
+        # False, which is what tells _get_client to hand that fake back verbatim instead of
+        # trying to wrap it in a real ThetaClient(existing_authorized_client=...).
+        self._owns_session = False
+        self._session_lock = threading.Lock()
+        self._thread_local = threading.local()
+        # Resolved alongside _client, in _get_client -- the real thetadata.errors.
+        # NoDataFoundError once a live client exists. _NeverRaised until then, deliberately:
+        # nothing ever raises it, so a caller that reaches the per-chunk except clause before
+        # _get_client() has run (should not happen, but must not silently swallow real
+        # exceptions if it somehow does) catches nothing rather than everything.
+        self._no_data_exc: type = _NeverRaised
 
     # -- interface ------------------------------------------------------
+    def _get_client(self):
+        """The calling thread's client. Every thread shares the SAME authenticated session
+        (see the module docstring's CONCURRENCY section) but gets its OWN client object -- a
+        gRPC client is not documented thread-safe, so one per thread is the conservative
+        choice even though the session underneath is shared."""
+        if self._client is None:
+            with self._session_lock:
+                if self._client is None:  # re-check: lost the race to another thread
+                    if not self.api_key:
+                        raise RuntimeError(
+                            "ThetaDataOptionsProvider has no api_key (pass one, or set "
+                            "THETADATA_API_KEY) -- it was only asked for its history_floor() "
+                            "until now, which needs no key.")
+                    from thetadata import ThetaClient
+                    from thetadata.errors import NoDataFoundError
+                    self._client = ThetaClient(api_key=self.api_key,
+                                               dataframe_type=self._dataframe_type)
+                    self._no_data_exc = NoDataFoundError
+                    self._owns_session = True
+
+        if not self._owns_session:
+            # A fake/other client was injected directly (tests) -- hand it back verbatim;
+            # wrapping it in a real ThetaClient(existing_authorized_client=...) would both
+            # need the real thetadata package and defeat the injection entirely.
+            return self._client
+
+        thread_client = getattr(self._thread_local, "client", None)
+        if thread_client is None:
+            from thetadata import ThetaClient
+            thread_client = ThetaClient(existing_authorized_client=self._client,
+                                        dataframe_type=self._dataframe_type)
+            self._thread_local.client = thread_client
+        return thread_client
+
     def history_floor(self) -> date:
         today = date.today()
         return today.replace(year=today.year - int(self.history_years))
@@ -109,122 +254,116 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
                            strike_min: Optional[float] = None,
                            strike_max: Optional[float] = None,
                            max_contracts: Optional[int] = None) -> List[OptionContractMeta]:
-        # Derived from the bulk EOD response rather than the separate list-expirations /
-        # list-strikes endpoints: those would report contracts that exist but have no EOD
-        # rows in the window, which would then be written to the chain table as permanently
-        # empty. Deriving from actual data keeps the chain and bars consistent by
-        # construction.
-        rows = self._bulk_eod(underlying, expiry_gte, expiry_lte)
-        seen: Dict[str, OptionContractMeta] = {}
-        for r in rows:
-            exp = _parse_date(r.get("expiration", ""))
-            strike = _f(r, "strike")
-            if exp is None or strike is None:
+        """Only reached by ``--discovery rest``; the default (and what a real backfill uses)
+        is ``--discovery synthetic``, which builds contracts from the local price cache and
+        never calls this. Kept correct rather than optimised: one ``option_list_strikes`` call
+        per expiry in the window."""
+        client = self._get_client()
+        exps = client.option_list_expirations(underlying.upper())
+        out: List[OptionContractMeta] = []
+        for row in exps.itertuples(index=False):
+            exp = _parse_date(getattr(row, "expiration", None))
+            if exp is None or exp < expiry_gte or exp > expiry_lte:
                 continue
-            if exp < expiry_gte or exp > expiry_lte:
-                continue
-            if strike_min is not None and strike < strike_min:
-                continue
-            if strike_max is not None and strike > strike_max:
-                continue
-            right = str(r.get("right", "")).lower()
-            otype = "call" if right.startswith("c") else "put"
-            occ = _occ_symbol(underlying, exp, right, strike)
-            if occ not in seen:
-                seen[occ] = OptionContractMeta(occ_symbol=occ, underlying=underlying.upper(),
-                                               option_type=otype, strike=strike, expiry=exp)
-        out = list(seen.values())
+            strikes = client.option_list_strikes(underlying.upper(), exp)
+            for srow in strikes.itertuples(index=False):
+                strike = _num(getattr(srow, "strike", None))
+                if strike is None:
+                    continue
+                if strike_min is not None and strike < strike_min:
+                    continue
+                if strike_max is not None and strike > strike_max:
+                    continue
+                for right in ("call", "put"):
+                    occ = _occ_symbol(underlying, exp, right, strike)
+                    out.append(OptionContractMeta(occ_symbol=occ, underlying=underlying.upper(),
+                                                   option_type=right, strike=strike, expiry=exp))
         if max_contracts is not None and len(out) > max_contracts:
             # Keep strikes nearest the band centre — near-the-money is what gets selected.
             if strike_min is not None and strike_max is not None:
                 centre = (strike_min + strike_max) / 2.0
             else:
-                strikes = sorted(c.strike for c in out)
-                centre = strikes[len(strikes) // 2]
+                strikes_sorted = sorted(c.strike for c in out)
+                centre = strikes_sorted[len(strikes_sorted) // 2]
             out = sorted(out, key=lambda c: abs(c.strike - centre))[:max_contracts]
         return out
 
     def fetch_eod_bars(self, contracts: Iterable[OptionContractMeta], *,
                        start: date, end: date) -> Iterator[OptionEodBar]:
+        client = self._get_client()
+        by_underlying_expiry: Dict[Tuple[str, date], set] = {}
+        for c in contracts:
+            by_underlying_expiry.setdefault((c.underlying.upper(), c.expiry), set()).add(
+                c.occ_symbol)
+
+        windows = _chunk_window(start, end)
+        for (underlying, expiry), wanted in by_underlying_expiry.items():
+            # One (underlying, expiry) partition, but the window may be wider than the
+            # server's 365-day-per-request cap -- see _chunk_window. Chunks are
+            # non-overlapping, so no bar_date can appear in two of them: concatenating the
+            # per-chunk results (by just yielding as each chunk is processed) is safe without
+            # any cross-chunk de-duplication.
+            for w_start, w_end in windows:
+                try:
+                    bars_df = client.option_history_greeks_eod(
+                        symbol=underlying, expiration=expiry, strike="*", right="both",
+                        start_date=w_start, end_date=w_end)
+                except self._no_data_exc:
+                    # The library RAISES rather than returning an empty dataframe when a
+                    # request's window/expiry genuinely has nothing -- e.g. a low-volume
+                    # underlying with no listed chain on a given Friday. Confirmed live
+                    # 2026-09-02 (NoDataFoundError), the same "normal, not an error" case the
+                    # len()==0 branch below already handles for the rare case it DOES return
+                    # an empty frame instead.
+                    continue
+                if bars_df is None or len(bars_df) == 0:
+                    continue  # nothing for this expiry in this chunk -- normal, not an error
+                try:
+                    oi_df = client.option_history_open_interest(
+                        symbol=underlying, expiration=expiry, strike="*", right="both",
+                        start_date=w_start, end_date=w_end)
+                except self._no_data_exc:
+                    oi_df = None  # no OI for this chunk; bars alone are still worth keeping
+                oi_map = _index_open_interest(oi_df)
+
+                for row in bars_df.itertuples(index=False):
+                    r = row._asdict()
+                    strike = _num(r.get("strike"))
+                    bar_date = _parse_date(r.get("timestamp") or r.get("created"))
+                    right = r.get("right")
+                    if strike is None or bar_date is None:
+                        continue
+                    occ = _occ_symbol(underlying, expiry, right, strike)
+                    if occ not in wanted:
+                        continue
+                    close = _num(r.get("close"))
+                    if close is None:
+                        continue  # a row with no close is not a usable bar
+                    yield OptionEodBar(
+                        occ_symbol=occ, bar_date=bar_date,
+                        open=_num(r.get("open")) if _num(r.get("open")) is not None else close,
+                        high=_num(r.get("high")) if _num(r.get("high")) is not None else close,
+                        low=_num(r.get("low")) if _num(r.get("low")) is not None else close,
+                        close=close,
+                        volume=(int(_num(r.get("volume"))) if _num(r.get("volume")) is not None
+                               else None),
+                        bid=_num(r.get("bid")) or None,   # 0 -> None: "no quote"
+                        ask=_num(r.get("ask")) or None,
+                        open_interest=oi_map.get((strike, _right_word(right), bar_date)),
+                        iv=_num(r.get("implied_vol")),
+                    )
+
+    def fetch_bars_detailed(self, contracts: Iterable[OptionContractMeta], *,
+                            start: date, end: date) -> CandleBatch:
+        """Matches TastyTrade's ``fetch_bars_detailed`` contract (see ``CandleBatch``) so
+        ``tools/warm_options_history.py``'s retry/requeue loop works unchanged for either
+        provider. ThetaData's API is plain request/response (no streaming "still pending"
+        state), so ``unresolved`` is always empty here: a contract either came back with bars
+        or it did not, on this one attempt — there is nothing partial to re-subscribe to."""
+        contracts = list(contracts)
         wanted = {c.occ_symbol for c in contracts}
         if not wanted:
-            return
-        by_underlying: Dict[str, List[OptionContractMeta]] = {}
-        for c in contracts:
-            by_underlying.setdefault(c.underlying.upper(), []).append(c)
-
-        for underlying, group in by_underlying.items():
-            exp_lo = min(c.expiry for c in group)
-            exp_hi = max(c.expiry for c in group)
-            for r in self._bulk_eod(underlying, exp_lo, exp_hi, start=start, end=end):
-                exp = _parse_date(r.get("expiration", ""))
-                strike = _f(r, "strike")
-                bar_date = _parse_date(r.get("created", "") or r.get("date", ""))
-                if exp is None or strike is None or bar_date is None:
-                    continue
-                if bar_date < start or bar_date > end:
-                    continue
-                occ = _occ_symbol(underlying, exp, str(r.get("right", "")), strike)
-                if occ not in wanted:
-                    continue
-                close = _f(r, "close")
-                if close is None:
-                    continue  # a row with no close is not a usable bar
-                yield OptionEodBar(
-                    occ_symbol=occ, bar_date=bar_date,
-                    open=_f(r, "open") if _f(r, "open") is not None else close,
-                    high=_f(r, "high") if _f(r, "high") is not None else close,
-                    low=_f(r, "low") if _f(r, "low") is not None else close,
-                    close=close,
-                    volume=_i(r, "volume"),
-                    bid=_f(r, "bid") or None,   # 0 -> None: "no quote", not a free option
-                    ask=_f(r, "ask") or None,
-                    open_interest=_i(r, "open_interest"),
-                )
-
-    # -- transport ------------------------------------------------------
-    def _bulk_eod(self, underlying: str, expiry_gte: date, expiry_lte: date,
-                  start: Optional[date] = None, end: Optional[date] = None) -> List[dict]:
-        """One bulk EOD request covering the whole chain + window, memoized per window."""
-        s = (start or expiry_gte).strftime("%Y%m%d")
-        e = (end or expiry_lte).strftime("%Y%m%d")
-        key = (underlying.upper(), s, e)
-        cached = self._bulk_cache.get(key)
-        if cached is not None:
-            return cached
-        rows = self._get_csv("/v3/option/history/eod", {
-            "symbol": underlying.upper(),
-            "expiration": "*",     # whole chain in one call
-            "strike": "*",
-            "right": "both",
-            "start_date": s,
-            "end_date": e,
-            "format": "csv",
-        })
-        self._bulk_cache[key] = rows
-        return rows
-
-    def _get_csv(self, path: str, params: dict) -> List[dict]:
-        import requests
-
-        url = f"{self.base_url}{path}"
-        try:
-            resp = requests.get(url, params=params, timeout=self.timeout)
-        except requests.exceptions.ConnectionError as e:
-            # The expected setup failure — be explicit rather than surfacing a bare socket
-            # error, because "no credentials in the request" makes this easy to misdiagnose
-            # as an auth problem.
-            raise RuntimeError(
-                f"Cannot reach the Theta Terminal at {self.base_url}. ThetaData v3 serves "
-                f"REST from a LOCAL terminal process (there is no cloud API key): start the "
-                f"Theta Terminal and sign in with the subscribed account, then retry. "
-                f"Override the address with THETADATA_BASE_URL. ({e})"
-            ) from e
-        if resp.status_code == 472:
-            # ThetaData's documented "no data for this request" — an empty window is normal.
-            return []
-        resp.raise_for_status()
-        text = resp.text.strip()
-        if not text:
-            return []
-        return list(csv.DictReader(io.StringIO(text)))
+            return CandleBatch()
+        bars = list(self.fetch_eod_bars(contracts, start=start, end=end))
+        seen = {b.occ_symbol for b in bars}
+        return CandleBatch(bars=bars, empty=wanted - seen, unresolved=set())

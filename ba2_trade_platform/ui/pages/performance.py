@@ -13,7 +13,8 @@ from ba2_trade_platform.core.utils import calculate_transaction_pnl
 from ba2_trade_platform.ui.components.performance_charts import (
     MetricCard, PerformanceBarChart, TimeSeriesChart, PieChartComponent,
     PerformanceTable, MultiMetricDashboard,
-    calculate_sharpe_ratio, calculate_win_loss_ratio, calculate_max_drawdown, calculate_profit_factor
+    calculate_sharpe_ratio, calculate_win_loss_ratio, calculate_max_drawdown, calculate_profit_factor,
+    max_drawdown_from_pnl
 )
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
@@ -164,8 +165,20 @@ class PerformanceTab:
                     if position_value != 0:
                         returns.append(pnl / position_value)
             
+            # Drawdown walks the cumulative curve, so the order is load-bearing: the same
+            # trades in a different sequence give a different worst fall. `pnls` above is
+            # in whatever order the query returned, so this is sorted explicitly by close
+            # date. A transaction with no close date is still open and has no place on a
+            # REALISED equity curve.
+            ordered = sorted((t for t in txns if t.close_date), key=lambda t: t.close_date)
+            ordered_pnls = [pnl for pnl in (calculate_transaction_pnl(t) for t in ordered)
+                            if pnl is not None]
+            max_dd, max_dd_pct = max_drawdown_from_pnl(ordered_pnls)
+
             expert_metrics[expert_name] = {
                 'total_transactions': len(txns),
+                'max_drawdown': max_dd,
+                'max_drawdown_pct': max_dd_pct,
                 'avg_duration_days': np.mean(durations) if durations else 0,
                 'total_pnl': sum(pnls) if pnls else 0,
                 'avg_pnl': np.mean(pnls) if pnls else 0,
@@ -351,19 +364,42 @@ class PerformanceTab:
         # Profit series
         profit_series = {}
         transaction_series = {}
-        
+        drawdown_series = {}
+
         for expert_name in expert_names:
             profit_points = []
             txn_points = []
-            
+            dd_points = []
+            # Drawdown is a property of the CUMULATIVE curve, so it is walked month by
+            # month here rather than derived from each month's P&L in isolation: a month
+            # that made money can still leave the expert further below its peak.
+            cumulative = 0.0
+            peak = 0.0
+
             for month in months:
                 month_date = datetime.strptime(month, '%Y-%m')
                 expert_data = monthly_data[month].get(expert_name, {'pnl': 0, 'count': 0})
                 profit_points.append((month_date, expert_data['pnl']))
                 txn_points.append((month_date, expert_data['count']))
-            
+
+                cumulative += expert_data['pnl']
+                if cumulative > peak:
+                    peak = cumulative
+                # No positive peak yet means there is nothing to be down FROM: an expert
+                # whose cumulative P&L has never been above zero has no percentage
+                # drawdown, and 0% there would read as "never lost", which is the
+                # opposite of the truth. Plotly omits a None bar entirely.
+                dd_points.append(
+                    (month_date, round((peak - cumulative) / peak * 100.0, 2))
+                    if peak > 0 else (month_date, None))
+
             profit_series[expert_name] = profit_points
             transaction_series[expert_name] = txn_points
+            # Only carried when the expert was actually in drawdown at some point --
+            # otherwise the chart grows a right-hand axis and a legend entry for a row
+            # of zero-height bars.
+            if any(v for _d, v in dd_points):
+                drawdown_series[expert_name] = dd_points
         
         with ui.grid(columns=2).classes('w-full gap-4'):
             # Monthly profit chart
@@ -372,7 +408,9 @@ class PerformanceTab:
                 series_data=profit_series,
                 ylabel="P&L ($)",
                 height=400,
-                date_format="monthly"
+                date_format="monthly",
+                bar_series=drawdown_series,
+                bar_ylabel="Drawdown (%)",
             )
             chart1.render()
             
@@ -397,7 +435,7 @@ class PerformanceTab:
         columns = [
             'Expert Instance', 'Transactions', 'Avg Duration (days)', 'Total P&L', 
             'Avg P&L', 'Win Rate', 'Profit Factor', 'Largest Win', 
-            'Largest Loss', 'Sharpe Ratio'
+            'Largest Loss', 'Max DD', 'Sharpe Ratio'
         ]
         
         rows = []
@@ -412,6 +450,13 @@ class PerformanceTab:
                 'Profit Factor': f"{metrics['profit_factor']:.2f}" if metrics['profit_factor'] is not None else 'N/A',
                 'Largest Win': f"${metrics['largest_win']:,.2f}" if metrics['largest_win'] is not None else 'N/A',
                 'Largest Loss': f"${metrics['largest_loss']:,.2f}" if metrics['largest_loss'] is not None else 'N/A',
+                # Dollars AND percent, because the percent is unavailable for an expert
+                # whose cumulative P&L never rose above zero -- there is no positive peak
+                # to measure the fall against, and the dollar figure is the only honest
+                # answer there.
+                'Max DD': (f"${metrics['max_drawdown']:,.2f}"
+                           + (f" ({metrics['max_drawdown_pct']:.1f}%)"
+                              if metrics['max_drawdown_pct'] is not None else "")),
                 'Sharpe Ratio': f"{metrics['sharpe_ratio']:.2f}" if metrics['sharpe_ratio'] is not None else 'N/A'
             })
         

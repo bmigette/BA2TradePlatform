@@ -614,11 +614,20 @@ def _read_symbol_list(path: str) -> List[str]:
         return [ln.strip().upper() for ln in f if ln.strip() and not ln.startswith("#")]
 
 
+#: Vendor name -> its store's cache folder, matching warm_options_history.py's own
+#: --provider -> default --out mapping (both providers write the SAME COLUMNS shape via the
+#: SAME OptionHistoryParquetStore, just to separate trees, so one check function covers both).
+_OPTIONS_PROVIDER_DIRS = {"tastytrade": "TastyTradeOptionsProvider",
+                          "thetadata": "ThetaDataOptionsProvider"}
+
+
 def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15,
                          shallow_expiries_threshold: int = 3,
-                         gap_start: Optional[str] = None, gap_end: Optional[str] = None) -> dict:
-    """Coverage + non-triviality of the TastyTrade options parquet store
-    (``tools/warm_options_history.py``'s target, ``CACHE_FOLDER/TastyTradeOptionsProvider``).
+                         gap_start: Optional[str] = None, gap_end: Optional[str] = None,
+                         provider: str = "tastytrade") -> dict:
+    """Coverage + non-triviality of an options parquet store built by
+    ``tools/warm_options_history.py --provider {tastytrade,thetadata}``
+    (``CACHE_FOLDER/{TastyTradeOptionsProvider,ThetaDataOptionsProvider}``).
 
     Four things, none of which the other checks in this file touch (options data is entirely
     outside push_cache's OHLCV/metric_store sync and outside the fmp_history warm-cache checks):
@@ -675,7 +684,12 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
     from ba2_providers.options.tastytrade import expiry_calendar
     from datetime import date
 
-    store = OptionHistoryParquetStore()
+    if provider not in _OPTIONS_PROVIDER_DIRS:
+        raise ValueError(f"unknown options provider {provider!r}; "
+                         f"expected one of {sorted(_OPTIONS_PROVIDER_DIRS)}")
+    import ba2_common.config as _cfg
+    store = OptionHistoryParquetStore(
+        root=os.path.join(_cfg.CACHE_FOLDER, _OPTIONS_PROVIDER_DIRS[provider]))
     universe_path = universe_path or _default_options_universe_path()
     universe = set(_read_symbol_list(universe_path))
     present_dirs = set(store.underlyings())
@@ -751,10 +765,12 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
 
 def print_options_cache_report(universe_path: Optional[str], iv_sample: int,
                                 gap_start: Optional[str] = None,
-                                gap_end: Optional[str] = None) -> bool:
+                                gap_end: Optional[str] = None,
+                                provider: str = "tastytrade") -> bool:
     """Runs check_options_cache and prints a report. Returns True if nothing looks broken."""
-    print("\n=== options cache (TastyTradeOptionsProvider) ===")
-    res = check_options_cache(universe_path, iv_sample, gap_start=gap_start, gap_end=gap_end)
+    print(f"\n=== options cache ({_OPTIONS_PROVIDER_DIRS[provider]}) ===")
+    res = check_options_cache(universe_path, iv_sample, gap_start=gap_start, gap_end=gap_end,
+                              provider=provider)
     ok = True
 
     print(f"  store root: {res['store_root']}  ({res['disk_bytes'] / (1 << 30):.2f} GB on disk)")
@@ -1069,10 +1085,17 @@ def main() -> int:
     ap.add_argument("--validity-symbols", type=int, default=25, help="How many OHLCV symbols to sample for the per-month coverage check (default 25).")
     ap.add_argument("--nan-threshold", type=float, default=0.5, help="Flag a metric_store column if its NaN rate for a month exceeds this fraction (default 0.5 = 50%%).")
     ap.add_argument("--check-options", action="store_true",
-                    help="Also check the TastyTrade options parquet store (universe coverage, "
-                         "per-symbol partition depth, IV/open_interest/volume non-null rate, "
-                         "per-symbol expiry gaps). Off by default -- separate from the "
-                         "equity-grid checks above and can be slow on a large store.")
+                    help="Also check the options parquet store(s) -- see --options-provider "
+                         "(universe coverage, per-symbol partition depth, "
+                         "IV/open_interest/volume non-null rate, per-symbol expiry gaps). Off "
+                         "by default -- separate from the equity-grid checks above and can be "
+                         "slow on a large store.")
+    ap.add_argument("--options-provider", choices=("tastytrade", "thetadata", "both"),
+                    default="tastytrade",
+                    help="Which options parquet store(s) to check (default tastytrade, "
+                         "matching warm_options_history.py's own default). 'both' checks the "
+                         "TastyTrade and ThetaData trees separately, one report each -- they "
+                         "are always distinct folders, never merged.")
     ap.add_argument("--options-universe", default=None,
                     help="Symbol list to check options coverage against (default: "
                          "tools/options_universe_large_cap.txt).")
@@ -1108,9 +1131,13 @@ def main() -> int:
                 overall_ok = False
 
     if args.check_options:
-        if not print_options_cache_report(args.options_universe, args.options_iv_sample,
-                                          args.options_gap_start, args.options_gap_end):
-            overall_ok = False
+        providers = (list(_OPTIONS_PROVIDER_DIRS) if args.options_provider == "both"
+                    else [args.options_provider])
+        for prov in providers:
+            if not print_options_cache_report(args.options_universe, args.options_iv_sample,
+                                              args.options_gap_start, args.options_gap_end,
+                                              provider=prov):
+                overall_ok = False
 
     if args.skip_workers:
         print()

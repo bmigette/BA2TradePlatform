@@ -41,9 +41,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
 import sqlite3
 import sys
+import threading
 import time as _time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -125,13 +127,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         description="Resumably warm the historical options parquet cache from dxfeed.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Interrupt with Ctrl-C at any time; re-run the same command to resume.")
+    p.add_argument("--provider", choices=("tastytrade", "thetadata"), default="tastytrade",
+                   help="Vendor to fetch from (default tastytrade). 'tastytrade' reads "
+                        "dxfeed (IV coverage floors ~2022-10); 'thetadata' reads ThetaData's "
+                        "cloud API (verified live back to 2012 for AAPL) -- needs a "
+                        "THETADATA_API_KEY or --api-key / --db app-setting. The two write to "
+                        "SEPARATE store roots by default (see --out), so running one never "
+                        "touches the other's cache.")
+    p.add_argument("--api-key", help="ThetaData API key. Falls back to THETADATA_API_KEY, "
+                                     "then AppSetting('thetadata_api_key') via --db. Unused "
+                                     "for --provider tastytrade.")
     p.add_argument("--symbols", help="Comma-separated underlyings, e.g. AAPL,MSFT.")
     p.add_argument("--symbols-file",
                    help="File with one underlying per line ('#' comments allowed), "
                         "e.g. tools/options_universe_top100.txt.")
     p.add_argument("--start", default=DEFAULT_START, help=f"Window start (default {DEFAULT_START}).")
     p.add_argument("--end", help="Window end (default: today).")
-    p.add_argument("--out", help="Store root (default: CACHE_FOLDER/TastyTradeOptionsProvider).")
+    p.add_argument("--out", help="Store root (default: CACHE_FOLDER/TastyTradeOptionsProvider "
+                                 "or CACHE_FOLDER/ThetaDataOptionsProvider, matching --provider "
+                                 "-- always a SEPARATE tree per provider unless overridden).")
     p.add_argument("--dry-run", action="store_true",
                    help="Print exactly what would be fetched and write NOTHING. Contract "
                         "discovery still runs so the counts are real (free under the default "
@@ -154,7 +168,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "parameters; the three offered scopes (read/trade/openid) cannot "
                         "grant it, so 'rest' needs a different credential type.")
     p.add_argument("--rate-limit", type=float, default=1.0,
-                   help="Seconds to pause between units (default 1.0). Be polite.")
+                   help="Seconds to pause between units (default 1.0). Be polite. Applies "
+                        "PER THREAD under --concurrency, not globally.")
+    p.add_argument("--concurrency", type=int, default=1,
+                   help="Run this many THREADS (default 1, i.e. sequential -- unchanged "
+                        "behavior) sharing one provider instance, each processing its own "
+                        "slice of the unit list. Threads, not separate processes: some "
+                        "providers (ThetaData) authenticate ONE session per api_key and "
+                        "invalidate each other's session if run from separate processes -- "
+                        "see thetadata.py's module docstring. --provider tastytrade should "
+                        "keep using tools/run_option_warmup_parallel.py's --workers "
+                        "(separate processes) instead; this is for providers whose session "
+                        "must be shared in-process.")
     p.add_argument("--max-retries", type=int, default=4,
                    help="Attempts per unit before giving up on it (default 4). A unit that "
                         "never completes leaves NO manifest, so the next run redoes it.")
@@ -167,9 +192,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--strict-snapshot", action="store_true",
                    help="Require an explicit end-of-snapshot per contract; treat silence as "
                         "unknown rather than as empty. Slower and safer.")
-    p.add_argument("--db", help="Read-only sqlite path to load TastyTrade credentials from "
-                                "when the environment does not supply them.")
-    p.add_argument("--account-id", type=int, help="Account row id inside --db.")
+    p.add_argument("--db", help="Read-only sqlite path to load credentials from when the "
+                                "environment does not supply them: TastyTrade's account "
+                                "client_secret/refresh_token (--provider tastytrade), or "
+                                "AppSetting('thetadata_api_key') (--provider thetadata).")
+    p.add_argument("--account-id", type=int, help="Account row id inside --db "
+                                                   "(--provider tastytrade only).")
     p.add_argument("--log-file",
                    help="Write progress/retry/error lines to this path via a bounded "
                         "RotatingFileHandler instead of stdout. Use this (not shell "
@@ -236,8 +264,13 @@ def load_credentials(db_path: Optional[str] = None,
             "No TastyTrade credentials. Set TT_CLIENT_SECRET and TT_REFRESH_TOKEN "
             "(and TT_SANDBOX=1 for the certification environment), or pass --db "
             "<platform sqlite> to read them read-only from an account's settings.")
-    # mode=ro is belt; immutable=1 is braces — neither this process nor sqlite may write.
-    con = sqlite3.connect(f"file:{os.path.expanduser(db_path)}?mode=ro&immutable=1", uri=True)
+    # mode=ro alone: this process cannot write regardless. NOT immutable=1 -- that tells
+    # SQLite the file will NEVER change and lets it skip re-checking the WAL, so a row still
+    # sitting in an actively-written prod DB's WAL (not yet checkpointed into the main file --
+    # true of ANY live prod instance) silently reads as absent. Confirmed live 2026-09-02: a
+    # freshly-saved AppSetting('thetadata_api_key') was invisible under immutable=1 and
+    # present under mode=ro alone, on the SAME file, at the SAME instant.
+    con = sqlite3.connect(f"file:{os.path.expanduser(db_path)}?mode=ro", uri=True)
     try:
         acct = account_id
         if acct is None:
@@ -283,8 +316,42 @@ def _sandbox_from(settings: Dict[str, object]) -> bool:
     return bool(raw)
 
 
+def load_thetadata_api_key(db_path: Optional[str] = None,
+                           api_key_arg: Optional[str] = None) -> str:
+    """ThetaData API key: --api-key, else THETADATA_API_KEY, else READ-ONLY from a platform
+    sqlite's ``AppSetting('thetadata_api_key')``. Nothing is written and the key is never
+    logged -- mirrors ``load_credentials``'s read-only-connection discipline."""
+    if api_key_arg:
+        return api_key_arg
+    env = os.environ.get("THETADATA_API_KEY")
+    if env:
+        return env
+    if not db_path:
+        raise SystemExit(
+            "No ThetaData API key. Pass --api-key, set THETADATA_API_KEY, or pass --db "
+            "<platform sqlite> to read AppSetting('thetadata_api_key') read-only.")
+    # mode=ro alone -- NOT immutable=1, see load_credentials's comment on the same pattern.
+    con = sqlite3.connect(f"file:{os.path.expanduser(db_path)}?mode=ro", uri=True)
+    try:
+        row = con.execute(
+            "SELECT value_str FROM appsetting WHERE key = 'thetadata_api_key'").fetchone()
+    finally:
+        con.close()
+    if not row or not row[0]:
+        raise SystemExit(
+            f"No thetadata_api_key AppSetting found in {db_path}. Pass --api-key, set "
+            f"THETADATA_API_KEY, or save the key via the Settings UI / app settings.")
+    return row[0]
+
+
 def build_provider(ns: argparse.Namespace):  # pragma: no cover - network
-    """A real provider with a lazily-created TastyTrade session."""
+    """A real provider — TastyTrade (lazily-created session) or ThetaData (a resolved
+    api_key), per --provider."""
+    if ns.provider == "thetadata":
+        from ba2_providers.options.thetadata import ThetaDataOptionsProvider
+        api_key = load_thetadata_api_key(ns.db, ns.api_key)
+        return ThetaDataOptionsProvider(api_key=api_key)
+
     from ba2_providers.options.tastytrade import TastyTradeOptionsProvider
 
     def session_factory():
@@ -476,7 +543,13 @@ def _is_transient(e: Exception) -> bool:
     return any(m in s for m in (
         "RemoteDisconnected", "Connection aborted", "ConnectionError", "ConnectionResetError",
         "timed out", "Timeout", "Max retries", "TooManyRequests", "429",
-        "502", "503", "504", "Temporarily", "rate limit", "Rate limit"))
+        "502", "503", "504", "Temporarily", "rate limit", "Rate limit",
+        # ThetaData's cloud client raises grpc.RpcError, whose repr() carries the gRPC status
+        # name directly (e.g. "status = StatusCode.UNAVAILABLE") -- observed live 2026-09-02.
+        # UNAUTHENTICATED/INVALID_ARGUMENT/PERMISSION_DENIED are deliberately NOT here: those
+        # are a bad key/request, identical on every retry.
+        "StatusCode.UNAVAILABLE", "StatusCode.RESOURCE_EXHAUSTED",
+        "StatusCode.DEADLINE_EXCEEDED", "StatusCode.ABORTED"))
 
 
 def run_units(plan: Plan, provider, store: OptionHistoryParquetStore,
@@ -559,6 +632,74 @@ def run_units(plan: Plan, provider, store: OptionHistoryParquetStore,
     return stats
 
 
+def run_units_concurrent(plan: Plan, provider, store: OptionHistoryParquetStore,
+                         start: date, end: date, ns: argparse.Namespace, *,
+                         clock: Callable[[], datetime], sleep: Callable[[float], None],
+                         log: Callable[[str], None], concurrency: int) -> RunStats:
+    """``run_units`` across ``concurrency`` THREADS sharing one ``provider`` instance, each
+    given a contiguous slice of ``plan.units``.
+
+    THREADS, not separate processes: a provider whose live session must be shared across
+    concurrent workers (ThetaData -- see its module docstring's CONCURRENCY section) cannot
+    be split across OS processes, since a Python object cannot cross that boundary the way
+    TastyTrade's ``tools/run_option_warmup_parallel.py --workers`` (separate processes, each
+    with its own dxfeed session) does. ``run_units`` itself is left completely untouched
+    (still the single, sequential, heavily-tested implementation) -- this just calls it
+    ``concurrency`` times concurrently, each on its own unit slice.
+
+    ``plan.units`` is the only ``Plan`` field ``run_units`` reads, so a lightweight per-thread
+    sub-``Plan`` carrying just that slice is sufficient. Threads are DAEMON so a Ctrl-C during
+    ``.join()`` (SIGINT only ever interrupts the main thread) lets the process exit promptly,
+    same as the sequential path -- the in-flight unit simply has no manifest and is redone on
+    the next run, exactly like an interrupted sequential run already behaves.
+
+    ``concurrency <= 1`` (the default) or a single-unit plan calls ``run_units`` directly, no
+    thread pool at all -- byte-identical to the pre-concurrency behaviour.
+    """
+    if concurrency <= 1 or len(plan.units) <= 1:
+        return run_units(plan, provider, store, start, end, ns,
+                         clock=clock, sleep=sleep, log=log)
+
+    n = min(concurrency, len(plan.units))
+    chunk_size = math.ceil(len(plan.units) / n)
+    slices = [plan.units[i:i + chunk_size] for i in range(0, len(plan.units), chunk_size)]
+
+    results: List[Optional[RunStats]] = [None] * len(slices)
+    errors: List[Optional[BaseException]] = [None] * len(slices)
+
+    def _run_slice(idx: int, units: List[WorkUnit]) -> None:
+        sub_plan = Plan(units=units)
+        thread_log = lambda msg, i=idx: log(f"[t{i}] {msg}")  # noqa: E731 -- tiny, scoped
+        try:
+            results[idx] = run_units(sub_plan, provider, store, start, end, ns,
+                                     clock=clock, sleep=sleep, log=thread_log)
+        except BaseException as e:  # noqa: BLE001 -- re-raised on the main thread below
+            errors[idx] = e
+
+    threads = [threading.Thread(target=_run_slice, args=(i, s),
+                                name=f"warmup-slice-{i}", daemon=True)
+              for i, s in enumerate(slices)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for e in errors:
+        if e is not None:
+            raise e
+
+    merged = RunStats()
+    for r in results:
+        if r is None:
+            continue
+        merged.units_written += r.units_written
+        merged.units_empty += r.units_empty
+        merged.units_failed += r.units_failed
+        merged.rows += r.rows
+        merged.empty_contracts += r.empty_contracts
+    return merged
+
+
 # --------------------------------------------------------------------------- #
 # reporting
 # --------------------------------------------------------------------------- #
@@ -639,7 +780,16 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
         raise SystemExit(f"--end {end} is before --start {start}.")
 
     if store is None:
-        store = OptionHistoryParquetStore(root=ns.out)
+        # Each provider writes to its OWN tree by default -- "ThetaDataOptionsProvider" is a
+        # SEPARATE folder from "TastyTradeOptionsProvider", never the same one, so running
+        # --provider thetadata can never overwrite/erase the existing TastyTrade cache.
+        out_root = ns.out
+        if not out_root:
+            import ba2_common.config as _cfg
+            provider_dir = ("ThetaDataOptionsProvider" if ns.provider == "thetadata"
+                            else "TastyTradeOptionsProvider")
+            out_root = os.path.join(_cfg.CACHE_FOLDER, provider_dir)
+        store = OptionHistoryParquetStore(root=out_root)
     if provider is None:
         provider = build_provider(ns)  # pragma: no cover - network
 
@@ -665,8 +815,9 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
     log(f"window     : {start.isoformat()} .. {end.isoformat()}")
     log(f"units      : {plan.units_pending} to fetch "
         f"({plan.units_done} complete, {plan.units_empty} known empty already on disk)")
-    stats = run_units(plan, provider, store, start, end, ns,
-                      clock=clock, sleep=sleep, log=log)
+    stats = run_units_concurrent(plan, provider, store, start, end, ns,
+                                 clock=clock, sleep=sleep, log=log,
+                                 concurrency=ns.concurrency)
     log(f"done: {stats.units_written} partitions written, {stats.units_empty} empty, "
         f"{stats.units_failed} failed, {stats.rows} rows, "
         f"{stats.empty_contracts} empty contracts recorded, "

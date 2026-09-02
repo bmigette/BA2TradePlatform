@@ -71,6 +71,9 @@ tenacity>=8.2.0
 finnhub-python>=2.4.0
 trafilatura>=1.6.0
 waybackpy>=3.0.6
+thetadata>=1.0.10  # tools/warm_options_history.py --provider thetadata (offline options-cache
+                    # warmup only; NOT needed by the live trade app, hence test venv not root
+                    # requirements.txt)
 
 # Validation
 pydantic>=2.10.0
