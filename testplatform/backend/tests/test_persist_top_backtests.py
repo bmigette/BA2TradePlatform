@@ -421,7 +421,7 @@ def test_persist_trial_worker_retries_once_then_succeeds(monkeypatch):
     assert len(attempts) == 2
 
 
-def test_persist_trial_worker_returns_failure_after_four_local_failures(monkeypatch):
+def test_persist_trial_worker_returns_failure_after_six_local_failures(monkeypatch):
     attempts = []
 
     def always_fails(cfg):
@@ -435,13 +435,15 @@ def test_persist_trial_worker_returns_failure_after_four_local_failures(monkeypa
 
     assert out["ok"] is False
     assert "disk I/O error" in out["error"]
-    assert len(attempts) == 4, "must try exactly 4 times before giving up (existing contract: ok=False, never raises)"
+    assert len(attempts) == 6, "must try exactly 6 times before giving up (existing contract: ok=False, never raises)"
 
 
 def test_persist_trial_worker_retry_backoff_doubles_each_attempt(monkeypatch):
     """opt 379/380 (2026-08-28) re-hit the SAME disk I/O error on the single 5s retry the prior
-    fix gave it -- sustained contention, not a one-off blip. This locks in the doubling schedule
-    (5s, 10s, 20s) that replaced the flat single retry."""
+    fix gave it -- sustained contention, not a one-off blip. opt 424 (2026-09-02, two concurrent
+    grids sharing the box) then re-hit it a THIRD time on the 4-attempt/35s-total schedule that
+    fix landed with, so the budget was widened again: 6 attempts, doubling out to 5s..160s
+    (155s total) gives sustained contention from a second concurrent grid real room to clear."""
     attempts = []
     sleeps = []
 
@@ -457,5 +459,5 @@ def test_persist_trial_worker_retry_backoff_doubles_each_attempt(monkeypatch):
     out = _soh._persist_trial_worker({"name": "TOP1"})
 
     assert out["ok"] is False
-    assert len(attempts) == 4
-    assert sleeps == [5.0, 10.0, 20.0]
+    assert len(attempts) == 6
+    assert sleeps == [5.0, 10.0, 20.0, 40.0, 80.0]
