@@ -124,3 +124,30 @@ def test_the_fitness_help_names_the_metric_resolve_fitness_actually_picks(comman
     assert mod._resolve_fitness(None, "O_LC", stock_default) == _OPTION_METRIC
     assert stock_default in block, (
         f"`{command} --help` does not name its stock default {stock_default!r}: {block}")
+
+
+# --------------------------------------------------------------------------------------------
+# option_convex (Task 12): selectable by NAME, never a default
+# --------------------------------------------------------------------------------------------
+def test_an_explicit_convex_fitness_survives_the_resolution_for_every_kind():
+    """The convex-harvest grid names its metric explicitly; the CLI short-circuit must carry it
+    through untouched whatever strategy kind the job runs (design §5: fitness `option_convex`)."""
+    for kind in sorted(mod._OPTION_STRATEGY_KEYS) + ["S1", "S2"]:
+        assert mod._resolve_fitness(mod._CONVEX_FITNESS, kind, "sharpe_ratio") \
+            == mod._CONVEX_FITNESS
+
+
+def test_the_convex_metric_is_never_a_default():
+    """Task 13 adds the O_CONVEX key and the mutual refusal. Until then nothing may DEFAULT to
+    the convex metric -- an option_car job that silently drifted onto it would be scored on a
+    metric its results are not comparable with."""
+    for kind in sorted(mod._OPTION_STRATEGY_KEYS) + ["S1", "S2", "S7"]:
+        for default in ("sharpe_ratio", "calmar_ratio", "consistent_annual_return"):
+            assert mod._resolve_fitness(None, kind, default) != mod._CONVEX_FITNESS
+
+
+def test_the_convex_metric_the_launcher_names_is_the_one_the_registry_accepts():
+    """String-level drift guard: the launcher's constant must BE a registered fitness name."""
+    from app.services import strategy_fitness as sf
+
+    assert mod._CONVEX_FITNESS in sf.catalog_accepted_metrics()

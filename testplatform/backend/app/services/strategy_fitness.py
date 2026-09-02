@@ -142,6 +142,48 @@ _OCAR_DD_FLOOR = 5.0
 _OCAR_WIPED_OUT_DD_PCT = 100.0
 _OCAR_ALIASES = ("option_consistent_annual_return", "option_car", "ocar")
 
+# --- option_convex metric constants (CONFIG, not genes) ----------------------------------------
+# The CONVEX-HARVEST fitness (docs/superpowers/specs/2026-08-31-convex-harvest-grid-design.md
+# §3). A book of cheap far-OTM medium/long-dated calls across many names: most tickets expire
+# worthless (expected, not failure) and the few large winners must pay for the graveyard.
+#
+# WHY THE CAR FAMILY CANNOT JUDGE IT. ``consistent_annual_return`` and its option twin rank on
+# a year-by-year consistency factor times a drawdown guard. Convex harvesting bleeds premium
+# steadily and wins lumpily, so a genuinely profitable convex book scores like a bad strategy
+# under either -- and the GA would "learn" to gut the convexity (tight stops, near-dated, low
+# delta) to fake smoothness. The metric has to match the payoff shape, so it is a SEPARATE
+# metric rather than a flag: a metric an existing grid never NAMES is a code path it cannot
+# reach, and the equity path stays frozen bit-for-bit
+# (tests/test_strategy_fitness_equity_frozen.py). Scores from this metric are NOT comparable
+# with any CAR-family score.
+#
+# THE THRESHOLDS BELOW ARE CONFIG, NOT SEARCHABLE. Exposing them to the GA would let a genome
+# buy its way past the floors it exists to be held to.
+_CONVEX_DD_FREE_PCT = 50.0    # % peak-to-trough drawdown penalised not at all -- the premium
+#                               bleed IS the cost of the book, so charging for it would price
+#                               the strategy's own mechanism as a defect.
+_CONVEX_DD_DEAD_PCT = 90.0    # % at which the penalty factor reaches 0.0. Linear between the
+#                               two: factor = 1 - (dd - FREE) / (DEAD - FREE).
+# Between DEAD and the wipeout the factor stays 0.0: a winning book that gave back nine tenths
+# of its peak keeps NOTHING of its return, but it is still a scored run (0.0), ranked above
+# every disqualification. That band is deliberately explicit rather than folded into the
+# sentinel -- a 92% drawdown is a survivable catastrophe, a 100% one is a dead account.
+_CONVEX_WIPED_OUT_DD_PCT = 100.0  # >= this is terminal: WIPED_OUT_SENTINEL, checked FIRST.
+#
+# BREADTH replaces the CAR trade floor (design §3.4). A convex result built on five tickets is
+# a coin flip, not a strategy; rare-win strategies need many independent draws. BOTH conditions
+# must hold -- ticket COUNT alone can be met by pyramiding a handful of names, and underlying
+# count alone can be met by one ticket each. The conjunction is the floor.
+_CONVEX_MIN_TICKETS_PER_YEAR = 30.0   # STRUCTURES per year (see _trades_per_year), not legs
+_CONVEX_MIN_UNDERLYINGS = 20          # distinct underlyings traded over the whole window
+_CONVEX_ALIASES = ("option_convex",)
+# One name on purpose. ``option_car``'s aliases exist because the CAR family predates the
+# fitness catalog; a new metric with three spellings is three strings a routing rail has to
+# know about. TASK 13 SEAM: the O_CONVEX strategy key and the mutual refusal (an O_CONVEX job
+# must refuse ``option_car`` and an option_car job must refuse O_CONVEX -- never silently
+# cross-score) land in the LAUNCHER's ``_resolve_fitness`` / ``_OPTION_CAR_STRATEGIES``
+# routing, not here: this module scores what it is handed and does not know strategy kinds.
+
 # fitness_metric (lower-cased) -> results-dict key. max_drawdown is handled
 # specially (negated) and is therefore NOT in this map.
 _FITNESS_KEYS = {
@@ -237,6 +279,7 @@ _CATALOG_META = {
 _MAX_DRAWDOWN_KEY = "max_drawdown"
 _CAR_KEY = _CAR_ALIASES[0]  # "consistent_annual_return"
 _OCAR_KEY = _OCAR_ALIASES[0]  # "option_consistent_annual_return"
+_CONVEX_KEY = _CONVEX_ALIASES[0]  # "option_convex"
 
 _SPECIAL_META = {
     _MAX_DRAWDOWN_KEY: {
@@ -266,6 +309,21 @@ _SPECIAL_META = {
         "supports_trade_scale": False,
         "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
+    },
+    _CONVEX_KEY: {
+        "label": "Convex Harvest (Option)",
+        "description": "For a CONVEX option book (many cheap far-OTM long-dated tickets): "
+                       "end-of-window total return, penalised only past a 50% drawdown, "
+                       "behind a breadth floor of >=30 tickets/yr AND >=20 underlyings. "
+                       "Hit rate and top-1/top-5 concentration are RECORDED, never scored. "
+                       "Scores are NOT comparable with any CAR-family metric.",
+        # The breadth floor replaces the trade scale (compute_fitness returns before that
+        # block). The win-rate factor would SCORE the hit rate, which this metric records and
+        # must never rank on -- a convex book's low hit rate is the design, not a defect. The
+        # adjusted-under-caps switch clips exactly the mega-winners the thesis is about.
+        "supports_trade_scale": False,
+        "supports_win_rate_factor": False,
+        "uses_adjusted_under_caps": False,
     },
 }
 
@@ -304,8 +362,9 @@ def _build_metrics_catalog() -> list:
         _MAX_DRAWDOWN_KEY: ["drawdown", "max_dd"],
         _CAR_KEY: sorted(a for a in _CAR_ALIASES if a != _CAR_KEY),
         _OCAR_KEY: sorted(a for a in _OCAR_ALIASES if a != _OCAR_KEY),
+        _CONVEX_KEY: sorted(a for a in _CONVEX_ALIASES if a != _CONVEX_KEY),
     }
-    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY):
+    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY, _OCAR_KEY, _CONVEX_KEY):
         meta = _SPECIAL_META.get(special)
         if meta is None:
             raise KeyError(f"strategy_fitness METRICS_CATALOG drift: no metadata for {special!r}.")
@@ -335,7 +394,7 @@ def assert_catalog_complete() -> None:
     """
     accepted = catalog_accepted_metrics()  # raises if any canonical/special lacks metadata
     expected = (set(_FITNESS_KEYS) | {_MAX_DRAWDOWN_KEY} | set(_CAR_ALIASES)
-                | set(_OCAR_ALIASES))
+                | set(_OCAR_ALIASES) | set(_CONVEX_ALIASES))
     missing = expected - accepted
     if missing:
         raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
@@ -396,11 +455,32 @@ def compute_fitness(fitness_metric: str, results: dict,
             _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
             fitness_metric, results, stress_spread_bps, robust)
 
+    if metric in _CONVEX_ALIASES:
+        # CONVEX-HARVEST-ONLY. Reached only by an explicit ``option_convex``, which is what
+        # keeps every running equity and option_car grid out of this code path entirely (no
+        # branch, no cost). NONE of the shared wrappers below is applied, and each omission is
+        # a decision, not an oversight -- see _option_convex's docstring:
+        #   * _apply_win_rate_factor would SCORE the hit rate this metric only records;
+        #   * robust_fitness's concentration screen would score top-5 share, the exact skew the
+        #     design keeps as telemetry (standing decision, 2026-08-06);
+        #   * _min_with_stressed cannot be applied honestly, because ``stressed_results``
+        #     restates ``annualized_return`` and ``max_drawdown`` but NOT ``total_return``,
+        #     which is what this metric ranks on. Wiring it would produce a stress that looks
+        #     applied and moves only the drawdown term. Fix stressed_results (and re-freeze the
+        #     equity baseline, which pins its current output) when no grid is running.
+        _fit = _option_convex(results)
+        if isinstance(results, dict):
+            # Same two keys _maybe_robust records on its non-robust path, so downstream
+            # readers (reports, top-N re-scores) find what they expect.
+            results["fitness_raw"] = _fit
+            results["fitness_robust"] = None
+        return _fit
+
     key = _FITNESS_KEYS.get(metric)
     if key is None:
         raise ValueError(
             f"Unknown fitness_metric: {fitness_metric!r}. "
-            f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'} | set(_CAR_ALIASES) | set(_OCAR_ALIASES))}"
+            f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'} | set(_CAR_ALIASES) | set(_OCAR_ALIASES) | set(_CONVEX_ALIASES))}"
         )
     # Profit-cap-aware: when EITHER cap was applied (per-trade basis cap ``profit_cap_pct`` or
     # portfolio-share cap ``profit_share_cap_pct``), the GA must rank on the ADJUSTED return-based
@@ -1074,6 +1154,204 @@ def _option_consistent_annual_return(results: dict) -> float:
         )
     consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
     return base * dd_penalty * consistency * trade_gate
+
+
+# ---------------------------------------------------------------------------
+# option_convex: the CONVEX-HARVEST metric
+# ---------------------------------------------------------------------------
+def _convex_dd_factor(dd: float) -> float:
+    """The drawdown factor: 1.0 below the FREE threshold, linear to 0.0 at the DEAD one.
+
+    Reads the MAGNITUDE (``max_drawdown`` is recorded negative by ``results._drawdown_curve``
+    and by ``equity_cap.capped_drawdown_curve``, but a positive spelling must score the same
+    rather than inverting the shape).
+
+    Exactly 1.0 at and below 50%, 0.5 at 70%, 0.0 at and above 90%. Non-increasing everywhere
+    and strictly decreasing between the two thresholds. Deliberately NOT the CAR family's
+    ``REFERENCE / dd`` shape: that prices EVERY drawdown, and a convex book's steady premium
+    bleed would be charged for as if it were a defect rather than the mechanism.
+    """
+    d = abs(float(dd))
+    if d <= _CONVEX_DD_FREE_PCT:
+        return 1.0
+    if d >= _CONVEX_DD_DEAD_PCT:
+        return 0.0
+    return 1.0 - (d - _CONVEX_DD_FREE_PCT) / (_CONVEX_DD_DEAD_PCT - _CONVEX_DD_FREE_PCT)
+
+
+def _distinct_underlyings(trades) -> int:
+    """How many distinct UNDERLYINGS a trade list touched.
+
+    ``underlying_symbol`` is set on option legs (``results._trade_row``) and ``symbol`` on
+    equity rows, so the union of the two is the name the bet was on either way. A set is
+    insensitive to a structure's leg count, so no structures-vs-legs correction is needed here
+    (unlike the ticket RATE, which needs ``_trades_per_year``).
+    """
+    names = set()
+    for t in trades:
+        if not isinstance(t, dict):
+            continue
+        name = t.get("underlying_symbol") or t.get("symbol")
+        if name:
+            names.add(str(name))
+    return len(names)
+
+
+def _convex_telemetry(trades, tickets_per_year: float, underlyings: int) -> dict:
+    """Diagnostics RECORDED alongside the score and never folded into it.
+
+    Hit rate and top-1/top-5 share of net P&L are the two numbers a reader will want first on a
+    convex result, and both are things this metric must not rank on: a low hit rate is the
+    design (design §1), and the concentration deploy-check will light up BY DESIGN (standing
+    decision, 2026-08-06 -- skew is a legitimate profile and stays a deploy-time check, not a
+    GA signal). Recording them here is what makes that checkable after the fact.
+
+    Computed directly rather than through ``robustness_metrics`` on purpose: that function also
+    runs a 1000-path Monte Carlo (cost this metric has no use for) and returns every share as
+    None whenever the book is net negative, which is a screening decision rather than a
+    reporting one. The share convention is nonetheless kept identical -- a share of a negative
+    or zero net is not a share, so those stay None.
+    """
+    pnl = [float(t.get("pnl") or 0.0) for t in trades if isinstance(t, dict)]
+    n = len(pnl)
+    out = {"hit_rate_pct": None, "top1_pct": None, "top5_pct": None,
+           "tickets_per_year": float(tickets_per_year), "distinct_underlyings": int(underlyings),
+           "tickets_scored": n}
+    if n == 0:
+        return out
+    out["hit_rate_pct"] = 100.0 * sum(1 for p in pnl if p > 0) / n
+    net = sum(pnl)
+    if net <= 0:
+        return out
+    srt = sorted(pnl, reverse=True)
+    out["top1_pct"] = 100.0 * srt[0] / net
+    out["top5_pct"] = 100.0 * sum(srt[:5]) / net
+    return out
+
+
+def _option_convex(results: dict) -> float:
+    """CONVEX-HARVEST goal metric: ``total_return x drawdown_factor``, behind a breadth floor.
+
+    THE ORDER OF THIS FUNCTION BODY IS THE CONTRACT (F9(a) discipline, the same literal-ordering
+    rule ``_option_consistent_annual_return`` carries). Steps run in exactly this sequence and
+    ``tests/test_strategy_fitness_convex_frozen.py`` pins each boundary:
+
+      1. WIPEOUT SENTINEL, literally first. A measured drawdown >= 100% is terminal and must
+         rank WORST of every disqualification this metric can produce
+         (WIPED_OUT_SENTINEL < ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0). Checked after
+         ANY other early return, a wiped genome escapes through it: an unreadable return would
+         hand it ZERO_TRADE_SENTINEL (-1e9) and a thin book LOW_TRADE_SENTINEL (-1e8), both
+         numerically ABOVE -2e9 -- "a 3-ticket blow-up outranks never trading".
+      2. RETURN TERM -- the end-of-window total return, net of costs. ONE number: did the
+         winners beat the graveyard. Not year-by-year consistency, which a convex book cannot
+         have and should not be asked for.
+      3. DRAWDOWN PENALTY -- ``_convex_dd_factor``: free below 50%, linear 50 -> 90, dead above.
+      4. BREADTH FLOOR -- >= 30 tickets/yr AND >= 20 distinct underlyings, else
+         LOW_TRADE_SENTINEL. The CAR family's 12/yr floor is the wrong shape here: a convex
+         book's evidence comes from the NUMBER OF INDEPENDENT DRAWS, so both the rate and the
+         spread across names have to clear, and either alone can be gamed (pyramid a handful
+         of names for the rate; one ticket each for the spread).
+      5. TELEMETRY -- recorded on ``results``, never scored.
+
+    WHERE THE RETURN COMES FROM, AND WHY IT IS NOT THE CAPPED SERIES. Option grids run under
+    ``equity_cap``. Three different series exist and conflating them is the whole trap
+    (``services/backtest/equity_cap.py``):
+
+      * DEPLOYED equity, ``min(cap, real_equity)`` -- what the SIZER sees. It reports ZERO P&L
+        for every period spent above the cap, so a 5x convex winner reads as nothing. It never
+        reaches a results dict, and this metric must never reconstruct it.
+      * the SCORING curve, ``scoring_curve`` -- the REAL recorded equity restated with every
+        period's P&L divided by the FIXED cap and compounded. No P&L is dropped. Under a cap
+        ``build_results`` puts this in ``results["equity_curve"]`` and sets ``initial`` to the
+        cap, so ``results["total_return"]`` IS the run's uncapped cumulative P&L expressed
+        against the starting capital -- which is what this reads.
+      * the CAPPED DRAWDOWN curve, ``capped_drawdown_curve`` -- peak-to-trough on cumulative
+        P&L divided by the cap. Under a cap ``build_results`` derives
+        ``results["max_drawdown"]`` from exactly this, which is what this reads. Peak-to-trough
+        on the deployed series would report a flat, risk-free run.
+
+    ``test_a_capped_run_ranks_on_uncapped_pnl_not_on_the_capped_equity_series`` pins it with a
+    binding cap: +400% of the cap must outrank +40%, and it does not if the deployed series is
+    ranked on (both read as zero).
+
+    NO ADJUSTED-RETURN SWITCH UNDER PROFIT CAPS, deliberately, and unlike every other
+    return-based metric here. ``--profit-cap-pct`` is default-ON in the launcher and clips a
+    bet's gain at a multiple of its cost basis -- i.e. it clips precisely the mega-winners a
+    convex book exists to catch. Ranking the adjusted figure would re-introduce, one layer up,
+    the same masking the equity-cap amendment removes. The raw figure is the honest one for
+    THIS thesis; the concentration it implies is reported in the telemetry instead.
+
+    NO WIN-RATE FACTOR AND NO ROBUSTNESS ADJUSTMENT either -- see the branch in
+    ``compute_fitness`` for the reasoning on each.
+
+    A NEGATIVE return is returned UNFACTORED: multiplying it by a <1 drawdown factor would
+    IMPROVE a losing book, flipping the penalty's sign (the same guard the CAR family carries).
+    """
+    # --- 1. WIPEOUT SENTINEL -- LITERALLY FIRST, ahead of every other read -------------------
+    # Same guards and same reasoning as _option_consistent_annual_return: an unmeasurable
+    # drawdown is NOT a zero drawdown, and defaulting it would hand the genome the largest
+    # factor this metric can produce. A measured 0.0 is a real value and is scored.
+    dd_raw = results.get("max_drawdown")
+    if dd_raw is None:
+        raise ValueError(
+            "option_convex requires results['max_drawdown'] and it is absent or None. An "
+            "unmeasurable drawdown is not a zero drawdown: defaulting it would hand this "
+            "genome the largest multiplier the metric can produce."
+        )
+    try:
+        dd = abs(float(dd_raw))
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"option_convex: max_drawdown is not numeric: {dd_raw!r}") from e
+    if not math.isfinite(dd):
+        raise ValueError(
+            f"option_convex: max_drawdown is not finite ({dd_raw!r}). The run produced nonsense "
+            f"and is rejected rather than scored as risk-free."
+        )
+    if dd >= _CONVEX_WIPED_OUT_DD_PCT:
+        return WIPED_OUT_SENTINEL
+
+    # --- 2. RETURN TERM: end-of-window total return, net of costs, on UNCAPPED P&L -----------
+    ret = results.get("total_return")
+    if ret is None or (isinstance(ret, float) and (math.isnan(ret) or math.isinf(ret))):
+        return ZERO_TRADE_SENTINEL
+    ret = float(ret)
+
+    # --- 3. DRAWDOWN PENALTY ------------------------------------------------------------------
+    dd_factor = _convex_dd_factor(dd)
+
+    # --- 4. BREADTH FLOOR: tickets/yr AND distinct underlyings, both --------------------------
+    # LOUD on an absent trade list. Breadth is unmeasurable without it, and silently
+    # disqualifying every genome would read as "the strategy never traded". The signature is
+    # re-scoring a stored Backtest: ``backtests.results`` keeps the trade list in its OWN
+    # column, so a caller that passes the blob straight back in has no ``trades`` key. An
+    # EMPTY list is a real (if degenerate) measurement and is scored, not raised on.
+    if "trades" not in results:
+        raise ValueError(
+            "option_convex requires results['trades'] to measure the breadth floor (>= "
+            f"{_CONVEX_MIN_UNDERLYINGS} distinct underlyings), and the key is absent. If you "
+            "are re-scoring a stored Backtest, note that `results` excludes the trade list -- "
+            "restore it from the trades column first, or every genome is disqualified."
+        )
+    trades = results["trades"] or []
+    tpy = _trades_per_year(results)
+    if tpy is None:
+        return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
+    tpy = float(tpy)
+    underlyings = _distinct_underlyings(trades)
+    # AND, not OR: both floors must clear. See the constants block.
+    if tpy < _CONVEX_MIN_TICKETS_PER_YEAR or underlyings < _CONVEX_MIN_UNDERLYINGS:
+        return LOW_TRADE_SENTINEL
+
+    # --- 5. TELEMETRY: recorded, NEVER scored -------------------------------------------------
+    telemetry = _convex_telemetry(trades, tpy, underlyings)
+    try:
+        results["convex_telemetry"] = telemetry
+    except Exception:  # noqa: BLE001 -- results may be a non-dict in odd callers
+        pass
+
+    if ret <= 0:
+        return ret  # unfactored: a penalty factor on a negative would flip its sign
+    return ret * dd_factor
 
 
 def _consistency_factor(year_returns: list) -> float:

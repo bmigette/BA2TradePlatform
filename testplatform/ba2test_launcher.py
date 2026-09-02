@@ -2949,6 +2949,22 @@ def _assert_option_window_excludes_holdout(strat_kinds, end) -> None:
 # arms would corrupt the control the option arms are measured against.
 _OPTION_CAR_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
 
+# The CONVEX-HARVEST fitness (docs/superpowers/specs/2026-08-31-convex-harvest-grid-design.md
+# §3, registered in strategy_fitness.py). Ranks a book of cheap far-OTM long-dated tickets on
+# its end-of-window total return behind a breadth floor, because the CAR family would teach the
+# GA to gut the convexity to fake smoothness. It is SELECTABLE TODAY -- an explicit
+# ``--fitness option_convex`` wins over the resolution below, which is how the convex matrix
+# will ask for it.
+#
+# TASK 13 SEAM (not implemented here, deliberately): the ``O_CONVEX`` strategy key does not
+# exist yet, so there is nothing to route and nothing to refuse. When it lands, the MUTUAL
+# REFUSAL goes here -- an O_CONVEX job must REFUSE ``option_consistent_annual_return`` and any
+# ``_OPTION_CAR_STRATEGIES`` job must REFUSE ``option_convex`` -- so the two grids can never
+# silently cross-score. Comparing numbers across two fitness metrics is the exact trap the
+# 2026-08-04 CAR-scale change taught us never to allow, and design §8 is why the convex work
+# is a separate grid rather than a matrix row.
+_CONVEX_FITNESS = "option_convex"
+
 
 def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: str) -> str:
     """Effective fitness metric for an optimize job. An explicit --fitness always wins.
@@ -2970,6 +2986,10 @@ def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: st
     ``option_consistent_annual_return`` (aliases ``option_car`` / ``ocar``) is registered in
     ``strategy_fitness.py`` on the ``option-fitness`` branch; this returns its NAME, and
     ``compute_fitness`` resolves it once that branch is merged.
+
+    ``option_convex`` (``_CONVEX_FITNESS``) is NOT a default for any kind: the convex-harvest
+    grid names it explicitly, and the ``cli_fitness`` short-circuit above is what carries it.
+    See ``_CONVEX_FITNESS`` for the Task-13 mutual-refusal seam.
     """
     if cli_fitness:
         return cli_fitness
@@ -5671,7 +5691,11 @@ def main(argv: "list | None" = None) -> int:
                          "EVERY year: (adjusted) annualized return, hard >=30 trades/yr gate, "
                          "soft drawdown penalty beyond 20%%, x worst-year/mean-year consistency "
                          "(--fitness-trade-scale is a no-op for it); the option default is that "
-                         "shape applied to an option book.")
+                         "shape applied to an option book. 'option_convex' is the "
+                         "CONVEX-HARVEST metric (end-of-window total return, drawdown free "
+                         "below 50%%, breadth floor >=30 tickets/yr AND >=20 underlyings, hit "
+                         "rate/concentration recorded not scored) -- never a default, name it "
+                         "explicitly, and never compare its scores with a CAR-family score.")
     op.add_argument("--generations", type=int, default=6)
     op.add_argument("--population", type=int, default=10)
     op.add_argument("--parallel", type=int, default=4, help="Parallel trials (ThreadPoolExecutor).")
