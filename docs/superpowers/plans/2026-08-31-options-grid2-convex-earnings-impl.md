@@ -501,21 +501,33 @@ a worker's first trial on a new symbol):**
 |---|---|---|---|
 | EQUITY (S1) | 0.143-0.179 s | 52 | 3 (1 filled round-trip) |
 | OPTION (O_LEAPC, real parquet) | 0.972-1.905 s | 52 | 5 (none filled — see below) |
-| **ratio** | **5.3x-11.5x across 6 repeated runs** | | |
+| **ratio** | **5.3x-8.1x across 6 repeated runs** | | |
 
-**Result — WARM (second+ trial on the SAME symbol in the SAME process, the
-steady state of a real GA generation once a worker has touched a symbol
-once):** OPTION 0.169 s vs EQUITY's own 0.143-0.179 s — **ratio ~1.0x-1.2x,
-comparable.**
+The six logged cold ratios: 5.31, 5.58, 6.32, 6.54, 6.80, 8.13 (a prior draft
+of this note said "5.3x-11.5x" — the 11.5x was wrong, produced by
+cross-pairing the cProfile-instrumented run's OPTION time against an
+unpaired, different run's EQUITY minimum instead of that same run's own
+EQUITY leg). Reviewer's independent reproduction (2026-09-02): 6.37x.
 
-**VERDICT: criterion 2 FAILS on the cold path, PASSES on the warm path.**
-The plan's acceptance criterion ("option trial runtime stays comparable to
-equity trial runtime") was written without this cold/warm distinction and is
-not met as a blanket claim — a worker's first trial against any new symbol
-pays a real, un-amortized tax; every trial after it on that symbol (the rest
-of a GA generation, and every later generation) does not. **Not fixed here**
-(profiling only, per the controller's decision) — flagged as the input an
-optimization task needs, not a task this branch completes.
+**Result — WARM (second+ trial on the SAME symbol in the SAME process),
+STATED PRECISELY:** OPTION 0.169 s vs EQUITY's own 0.143-0.179 s. This
+number is real but **does NOT establish "a full trial is comparable warm"**:
+every timing run in this measurement — cold and warm alike — ended with
+`open_option_positions=0` (see the profile below; no order ever filled), so
+NONE of these numbers include the cost of PER-BAR POSITION MARKING on a held
+option (the BS-fallback/greeks work item 2's design references as the other
+half of a real trial's cost). The 0.169s warm number is the amortized
+CANDIDATE-SELECTION cost only, not a full held-position trial. See the
+STATE note's Open-items entry below for the amortized-cost table and the
+open question this leaves for launch readiness.
+
+**VERDICT: criterion 2 FAILS on the cold path; the warm path's
+candidate-selection cost is comparable, but no measurement here covers a
+full, position-holding trial.** The plan's acceptance criterion ("option
+trial runtime stays comparable to equity trial runtime") was written without
+this cold/warm distinction and is not met as a blanket claim. **Not fixed
+here** (profiling only, per the controller's decision) — flagged as the
+input an optimization task needs, not a task this branch completes.
 
 **Profile (cProfile, cold trial, sorted by cumulative time, top of a 25-row
 table; full 25 rows in `docs/superpowers/plans/`-adjacent scratch, restated
@@ -621,8 +633,9 @@ a new baseline, not a continuation"): each point below marks a NEW baseline
 that must never be compared with numbers from before it, within a run or
 across runs.
 
-1. **Task-3 Black-Scholes mark fallback is a new option-results baseline
-   (2026-09 grid-2 vs the 2026.08.0058 stage-1 deploy).** Before Task 3,
+1. **Task-3 Black-Scholes mark fallback (`cc337f9e`) is a new option-results
+   baseline (2026-09 grid-2 vs the 2026.08.0058 stage-1 deploy).** Before
+   Task 3,
    an option position with no bar on a given day carried at
    `max(intrinsic, entry)` — a floor, not a market-implied mark. After Task
    3, the same barless day marks at `BS(bar iv)` first, falling through to
@@ -711,16 +724,23 @@ searched window has elapsed, so it pays up like `days_to_expiry`). This is
 exactly the classification item 4 asks to have recorded — it already is, in
 the classifier's own docstring, the most authoritative place for it.
 
-**Rule-level `enabled: False` convention (never emitted; shared guard).**
-Also already landed and verified present:
+**Rule-level `enabled: False` convention (never survives into an EMITTED
+ruleset; shared guard).** CORRECTED (2026-09-02 review): the launcher DOES
+stamp `enabled: False` onto its own AUTHORED rule TEMPLATE
+(`ba2test_launcher.py` ~:3952/:4027, e.g. `_OPTION_SL_ML_AUTHORED_OFF`) —
+"never emitted" overstated that. What is true, and verified present:
+`strategy_param_space._decode_rule_list` (~:616-635) REMOVES an
+authored-off rule at DECODE time (a default/unsearched genome drops it
+outright; the GA's own gene can still turn it back on), and
 `packages/common/ba2_common/core/rules_convert.py`'s
-`live_actions_from_trade_rule` docstring states the choke point plainly —
-`rule.get("enabled") is False` converts to `None` (no action) UNCONDITIONALLY,
-before anything else runs, on BOTH the backtest seeder path
-(`default_rulesets.seed_ruleset_from_rules`) and the live export path
-(`strategy_to_live_export`/`trade_rules_to_live_export`) — and the emit-time
-half (`strategy_param_space._decode_rule_list` REMOVING an authored-off rule
-rather than flagging it) is documented beside it. This is the "shared guard"
+`live_actions_from_trade_rule` docstring states the shared fail-closed
+choke point plainly — `rule.get("enabled") is False` converts to `None` (no
+action) UNCONDITIONALLY, before anything else runs, on BOTH the backtest
+seeder path (`default_rulesets.seed_ruleset_from_rules`) and the live
+export path (`strategy_to_live_export`/`trade_rules_to_live_export`). So the
+accurate claim is: a rule authored `enabled: False` never SURVIVES into an
+emitted ruleset (the one actually seeded/exported), even though the flag
+itself is real on the pre-decode template. This is the "shared guard"
 plan item 4's operator decision (e) refers to; already documented at its own
 call site, no doc addition needed here.
 
@@ -797,11 +817,11 @@ onward, the SHA each task's own "LANDED AS" note above cites:
 
 | Task | Landed as (primary SHAs) |
 |---|---|
-| 10 — launcher wiring + matrix script | `746d59fd`, `9dd116e8`, `8b705c58` |
+| 10 — launcher wiring + matrix script | `746d59fd`, `9dd116e8` |
 | 11 — FMPEarningsEvent gene table | `4e8791ab` |
 | 12 — `option_convex` fitness | `79087da8`, `8708786a` |
 | 13 — `O_CONVEX` key + convex matrix | `967db2aa`, `64981161` |
-| 14b (code-side) | 10 commits `4f3cb7a6..4568a71f` |
+| 14b (code-side) | 10 commits: `4f3cb7a6` + the 9 commits in `4f3cb7a6..4568a71f` (includes `8b705c58`, the O_LEAPC/O_LEAPP -> O_LEAP merge cited by Task 10's own "LANDED AS" note above — kept out of Task 10's row here so the two rows stay disjoint) |
 | 14a item 1 — merge origin/dev | `5246bc49` |
 | 14a item 2 — PRE-LAUNCH PERF | `db6924b6` |
 | 14a item 3 — results-comparability note | `d1b269c3` |
@@ -813,11 +833,15 @@ onward, the SHA each task's own "LANDED AS" note above cites:
 Also verified ALREADY LANDED, needing no new work this task: the `O_CAL`
 phase-gated stub (refuses loudly with the design reference, like the naked
 exclusion — `_PHASE_GATED_OPTION_STRATEGIES` in `ba2test_launcher.py`, wired
-as part of Task 10's `746d59fd` launcher build, exercised by
+as part of Task 10's `746d59fd` launcher build). CORRECTED (2026-09-02
+review): verified by its OWN tests,
 `test_a_phase_gated_key_refuses_with_the_plan_reference` /
 `test_a_phase_gated_key_is_a_KNOWN_key_that_refuses` in
-`test_option_grid_foundations.py` and re-verified structurally by Task 14b's
-`abe3686e`/`4568a71f`); the `days_after_event`/`days_opened` DELIBERATE
+`test_option_grid_foundations.py` — NOT "re-verified structurally by
+`abe3686e`/`4568a71f`" as an earlier draft of this note claimed; those two
+Task 14b commits only EXCLUDE the already-gated keys from their own
+(different) structural audits, they do not independently verify the O_CAL
+stub itself. The `days_after_event`/`days_opened` DELIBERATE
 classification and the rule-level `enabled: False` removal convention (both
 documented at their own call sites — see item 4 above).
 
@@ -846,6 +870,35 @@ condition, not a code defect, exactly as recorded in item 1's commit.
 
 ### Open items
 
+- **Item 2's perf verdict (criterion 2 FAILS cold) is a launch-readiness
+  input, not resolved here — read item 2 above in full before deploying
+  anything off this branch.** Amortised-cost table (reviewer analysis,
+  2026-09-02, from item 2's own cold/warm numbers):
+
+  | scenario | recycle interval | amortised cold tax | as % of a ~159s option trial |
+  |---|---|---|---|
+  | cold cost per symbol | — | ~0.80 s (0.973 − 0.169 measured) | — |
+  | local pool | every 8 individuals | 78.4 s / 8 = ~9.8 s per trial | ~6% |
+  | distributed path | once per GENERATION | ~1.3 s per trial | ~0.8% |
+
+  So the cold tax is real but single-digit-percent once amortised across a
+  real population/generation, and is NOT by itself a launch blocker at
+  either recycle cadence. **The warm "~1.0x-1.2x" claim in item 2 does NOT
+  establish that a FULL trial is comparable**: `open_option_positions=0` in
+  EVERY timing run (cold and warm) means no run ever held a position long
+  enough to price per-bar marking — the 0.169s warm number is the
+  candidate-selection cost alone, not a full trial's cost. **Operator's open
+  question, now under test by a short GA probe** (per-reviewer instruction,
+  2026-09-02): whether the parquet options store, once loaded, holds RAW
+  frames that get RE-FILTERED per bar (real pandas cost repeated every
+  candidate evaluation) versus a PRE-PROCESSED, directly-usable structure —
+  the same shape the equity path already has via its OHLCV preload +
+  worker-level memo. **Launch readiness on performance waits for that
+  probe's answer**, not on this task's own measurement alone.
+- **`origin/dev` has advanced to `TEST_APP_VERSION = "2026.09.0010"`** since
+  this branch's merge commit (`5246bc49`, which landed `dev`'s then-current
+  `"2026.09.0009"`) — re-check before the merger's own version bump so the
+  bumped number is not stale relative to `dev` at merge time.
 - **Task 6-PRE / Task 6 (per-leg expiry migration, PMCC/O_PMCC two-expiry
   lifecycle) are NOT on this branch.** The plan resequenced them to run
   AFTER Task 14 (controller decision, 2026-09-01) — `O_PMCC` and `O_CAL`

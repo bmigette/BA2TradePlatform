@@ -69,6 +69,19 @@ def test_the_two_backspreads_document_the_arc_floor_exemption_and_the_long_strik
             f"(it pins at the LONG strike -- see TradeActions.py's builder docstrings)")
         assert "at the short strike)" not in blob, (
             f"{action_type.value}: max-loss risk note names the wrong strike (short, not long)")
+        # PARAMETERS specifically, and the HYPHENATED "worst-case-at-the-..." form: the
+        # 2026-09-02 review caught a real regression the checks above did not -- the
+        # parameters field said "measured worst-case-at-the-SHORT-strike" (hyphens, not the
+        # spaced "at the short strike)" form the earlier assertion looked for) while the
+        # description/example correctly said LONG strike. Same contradiction, different
+        # spelling; both forms are pinned now so it cannot come back either way.
+        params_lower = entry["parameters"].lower()
+        assert "worst-case-at-the-long-strike" in params_lower, (
+            f"{action_type.value}: parameters field must name the LONG strike "
+            f"(hyphenated 'worst-case-at-the-long-strike' form)")
+        assert "worst-case-at-the-short-strike" not in params_lower, (
+            f"{action_type.value}: parameters field names the wrong strike (short, not long) "
+            f"in the hyphenated 'worst-case-at-the-...-strike' form")
         assert "ARC" in entry["parameters"] and "EXEMPT" in entry["parameters"].upper(), (
             f"{action_type.value}: missing the ARC-floor exemption note")
 

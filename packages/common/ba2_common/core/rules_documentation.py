@@ -697,7 +697,7 @@ def get_action_type_documentation() -> dict:
                 "Position for a large upside move while bounding the worst case at the long strike",
                 "The bullish half of the convex-harvest grid's O_CBS key (design 2026-08-31)"
             ],
-            "parameters": "strike_method/strike_param as a [long, short] delta pair (short leg nearer the money, e.g. 0.35-0.50 delta; long legs further OTM, e.g. 0.15-0.30 delta), dte_min, dte_max, max-loss sizing (pct_equity / measured worst-case-at-the-short-strike), min_open_interest, max_spread_pct. ARC-FLOOR EXEMPT: the min-annualized-return-on-collateral gate other credit structures consult does not apply here (near-zero-or-debit net by design; a floor would delete the structure).",
+            "parameters": "strike_method/strike_param as a [long, short] delta pair (short leg nearer the money, e.g. 0.35-0.50 delta; long legs further OTM, e.g. 0.15-0.30 delta), dte_min, dte_max, max-loss sizing (pct_equity / measured worst-case-at-the-long-strike), min_open_interest, max_spread_pct. ARC-FLOOR EXEMPT: the min-annualized-return-on-collateral gate other credit structures consult does not apply here (near-zero-or-debit net by design; a floor would delete the structure).",
             "example": "When bullish and convexity-seeking, open_call_backspread (short ~0.40 delta, 2x long ~0.20 delta, 60-180 DTE). Max loss (bounded, at the LONG strike) is reserved and measured directly, not approximated from premium."
         },
         ExpertActionType.OPEN_PUT_BACKSPREAD.value: {
@@ -708,7 +708,7 @@ def get_action_type_documentation() -> dict:
                 "Crash hedge: a position that pays convexly on a large downside move while bounding the cost at the long strike",
                 "The bearish/crash-hedge half of the convex-harvest grid's O_PBS key (design 2026-08-31)"
             ],
-            "parameters": "strike_method/strike_param as a [long, short] delta pair (short leg nearer the money; long legs further OTM/lower strike), dte_min, dte_max, max-loss sizing (pct_equity / measured worst-case-at-the-short-strike), min_open_interest, max_spread_pct. ARC-FLOOR EXEMPT: the min-annualized-return-on-collateral gate other credit structures consult does not apply here (near-zero-or-debit net by design; a floor would delete the structure).",
+            "parameters": "strike_method/strike_param as a [long, short] delta pair (short leg nearer the money; long legs further OTM/lower strike), dte_min, dte_max, max-loss sizing (pct_equity / measured worst-case-at-the-long-strike), min_open_interest, max_spread_pct. ARC-FLOOR EXEMPT: the min-annualized-return-on-collateral gate other credit structures consult does not apply here (near-zero-or-debit net by design; a floor would delete the structure).",
             "example": "When bearish and hedging tail risk, open_put_backspread (short ~0.40 delta, 2x long ~0.20 delta, 60-180 DTE). Max loss (bounded, at the LONG strike) is reserved and measured directly; a crash below it pays convexly."
         },
         ExpertActionType.CLOSE_OPTION.value: {

@@ -190,9 +190,11 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
   look-ahead (`earnings_days_look`, a plain setting, not a gene) and stamps
   `days_to_earnings` + feature values onto the recommendation; `O_ERN`'s
   searched entry gene (`rec_days_to_earnings <= X`, 1–5) reads that stamp.
-- **Warmup**: `BACKTEST_WARMUP_BARS = 620` (pinned equal to the launcher's
-  `_EXPERT_WARMUP_BARS`/`_SUPPORTED_EXPERTS` table entry by a dedicated test —
-  a mismatch there would silently starve the expert of history it needs).
+- **Warmup**: `BACKTEST_WARMUP_BARS = 620` (pinned equal to the
+  `_EXPERT_WARMUP_BARS`/`_SUPPORTED_EXPERTS` table entry in
+  `testplatform/backend/app/services/backtest/daily_backtest_handler.py`
+  (:232/:271) — NOT the launcher — by a dedicated test; a mismatch there
+  would silently starve the expert of history it needs).
 - **Stamp contract** (`ba2_common.core.earnings_stamp`): recommendations
   carry `raw_outputs[EARNINGS_STAMP_NAMESPACE]` (namespace
   `"FMPEarningsEvent"`) with `DAYS_TO_EARNINGS_KEY` (`"days_to_earnings"`)
