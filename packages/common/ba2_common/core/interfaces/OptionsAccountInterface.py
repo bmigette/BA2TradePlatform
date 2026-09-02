@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
+from ba2_common.core.option_expiry import is_multi_expiry_strategy
 from ba2_common.core.option_types import OptionContract, OptionQuote, OptionLeg, OptionPosition
 from ba2_common.core.types import OptionRight
 
@@ -249,9 +250,11 @@ class OptionsAccountInterface(ABC):
         2-4 legs   -> a parent option order (option_strategy set, no contract_symbol)
                       + leg children linked via parent_order_id.
 
-        Raises ValueError if the legs span more than one expiry, or if a ``covered_call``
-        is not covered by free shares (see the two guards below). Both refuse BEFORE any
-        row is written, so a refusal leaves nothing half-recorded.
+        Raises ValueError if the legs span more than one expiry — unless ``option_strategy``
+        is DECLARED in ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``, which permits
+        exactly two — or if a ``covered_call`` is not covered by free shares (see the two
+        guards below). Both refuse BEFORE any row is written, so a refusal leaves nothing
+        half-recorded.
 
         THE COVER RAISE IS A BACKSTOP, not the channel a caller should rely on. A short
         cover is an operational outcome with a remedy, not a malformed call: a caller
@@ -281,15 +284,31 @@ class OptionsAccountInterface(ABC):
         # call butterfly, put ratio spread — put every leg on one expiry. A calendar or a
         # diagonal does not make that field incomplete, it makes it WRONG: a money record
         # asserting a date half the position does not honour, with nothing anywhere to
-        # contradict it. Adding such a structure must therefore start by teaching the
-        # Transaction to carry per-leg expiries — this refusal is the reminder.
+        # contradict it.
+        #
+        # THE RELAXATION (plan Task 6-PRE) IS OPT-IN AND NARROW. A strategy DECLARED in
+        # `MULTI_EXPIRY_OPTION_STRATEGIES` may span exactly two expiries; the per-leg record
+        # is the child rows written below, each carrying its own `expiry`, and the
+        # structure-level value stays NULL for it rather than asserting a date half the
+        # position does not honour (see the parent's `expiry=` below). Everything else still
+        # refuses, and because membership is opt-in, a missing or unrecognised strategy tag
+        # is "not declared" — the default is still refusal.
+        #
+        # THREE expiries refuse even when declared. The lifecycle this unlocks is a
+        # TWO-expiry one (long cover + short overlay), and the named read rules in
+        # `option_expiry` pick the binding leg per SIDE — with three distinct entry expiries
+        # there is no stated basis for which pair the structure is. (The readers do handle
+        # more than two, because a roll in flight can transiently net that way; what is
+        # refused here is submitting one.)
         #
         # A leg whose expiry is None is UNKNOWN, not a second expiry, and is not counted:
         # the close paths rebuild legs from stored order rows (reading
         # `getattr(o, "expiry", None)`), and refusing there would strand an open
         # position that can no longer be flattened — much worse than an incomplete intent.
         expiries = sorted({leg.expiry for leg in legs if leg.expiry is not None})
-        if len(expiries) > 1:
+        multi_expiry_allowed = (len(expiries) == 2
+                                and is_multi_expiry_strategy(option_strategy))
+        if len(expiries) > 1 and not multi_expiry_allowed:
             raise ValueError(
                 f"An option structure must be on a single expiry, but these {len(legs)} legs "
                 f"span {len(expiries)}: {', '.join(d.isoformat() for d in expiries)}. "
@@ -341,16 +360,27 @@ class OptionsAccountInterface(ABC):
             contract_symbol=(first.contract_symbol if not is_multi else None),
             option_type=(first.option_type if not is_multi else None),
             strike=(first.strike if not is_multi else None),
-            # EXPIRY IS THE EXCEPTION, and it is a fact about the WHOLE structure.
-            # The single-expiry guard above has already refused anything spanning two dates,
-            # so `expiries` holds at most one element: the structure's expiry, or nothing when
-            # no leg records one (the flatten path, where legs are rebuilt from stored rows and
-            # may carry expiry=None — UNKNOWN stays NULL here rather than becoming an invented
-            # date). The parent IS the row the broker fills, and it was NULL here for every
-            # multi-leg, which is why `OptionPortfolioManager._should_close`'s roll-at-DTE
-            # branch — `expiry is not None and (expiry - as_of.date()).days <= roll_dte` — had
-            # never once fired for a spread or a strangle.
-            expiry=(expiries[0] if expiries else None),
+            # EXPIRY IS THE EXCEPTION, and it is a fact about the WHOLE structure — when
+            # there IS one. `expiries` holds the distinct dates the legs recorded, and only
+            # a single one is a fact about the whole position:
+            #   1 -> the structure's expiry;
+            #   0 -> no leg records one (the flatten path, where legs are rebuilt from
+            #        stored rows and may carry expiry=None) — UNKNOWN stays NULL rather than
+            #        becoming an invented date;
+            #   2 -> a DECLARED multi-expiry structure (the guard above refuses every other
+            #        way to get here). NULL is the only honest value: picking either date
+            #        would make the row the broker fills assert an expiry that half the
+            #        position does not honour, which is precisely the failure the guard's
+            #        comment describes. The per-leg truth is on the child rows below, and
+            #        `option_expiry.resolve_structure_expiry` is how it is read back.
+            # This expression is byte-identical to the previous `expiries[0] if expiries`
+            # for every structure that reached here before, because the guard made
+            # len(expiries) <= 1 unconditionally.
+            # The parent was NULL here for every multi-leg, which is why
+            # `OptionPortfolioManager._should_close`'s roll-at-DTE branch —
+            # `expiry is not None and (expiry - as_of.date()).days <= roll_dte` — had never
+            # once fired for a spread or a strangle.
+            expiry=(expiries[0] if len(expiries) == 1 else None),
             expert_recommendation_id=expert_recommendation_id,
             transaction_id=transaction_id,
         )
