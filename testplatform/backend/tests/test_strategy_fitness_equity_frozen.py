@@ -709,9 +709,12 @@ GOLDEN = {
     # RE-FROZEN 2026-09-02 (see the header). The stressed pass now restates calmar from
     # the stressed path's own components -- car 5.774429649249924 / max(|dd 0.0|, 1.0) =
     # 5.774429649249924 -- instead of re-reading the copied 1.5. It goes UP here, and that
-    # is the corpus, not the metric: _base() hand-sets calmar_ratio 1.5, a number the _C3
-    # curve does not produce, so the stressed (computed) figure is the larger of the two
-    # and min() keeps the inner robustness-adjusted value. Ratio checks: 5.774429649249924
+    # is the corpus, not the metric: _base()'s calmar_ratio 1.5 is self-consistent with the
+    # corpus's OWN scalars (annualized_return 30.0 / max(|max_drawdown 20.0|, 1.0) = 1.5) but
+    # inconsistent with the _C3 curve and the _TR_MID trade list this case also carries, which
+    # is what the stressed pass recomputes from. So the stressed (computed) figure is the
+    # larger of the two and min() keeps the inner robustness-adjusted value. Ratio checks:
+    # 5.774429649249924
     # / 1.5 = 3.8496, and 0.06703110723957173 / 0.017412396888828355 = 3.8496.
     'stress_mid_concentration|calmar': '0.06703110723957173',
     'stress_mid_concentration|calmar_ratio': '0.06703110723957173',
