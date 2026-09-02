@@ -1249,15 +1249,31 @@ _EXPERT_OPT = {
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },
-    # GRID 2's event expert (design 2026-08-31 §9). REGISTERED HERE WITH NO GENES YET, on
-    # purpose: without a spec ``_cmd_optimize`` exits before it builds anything, so an
-    # ``--expert FMPEarningsEvent`` job would be dead on arrival and the O_ERN arm of the
-    # matrix could not be smoke-run at all. Its gene table (the three weights + min_analysts +
-    # allow_unconfirmed_dates, with min_analysts' measured 0-5 range) is plan Task 11's; until
-    # it lands the expert runs on its own class defaults, which is a valid -- if unsearched --
-    # baseline job rather than an error.
+    # GRID 2's event expert (design 2026-08-31 §9, plan Task 11). The three ranking weights are
+    # RATIOS (composite_confidence is a weighted MEAN over the PRESENT features, invariant to a
+    # common rescale -- see the class docstring's "Normalization" section), so the same
+    # 0.0-2.0/step 0.25 band FactorRanker's factor_weight_* genes use applies unchanged: what the
+    # GA searches is relative importance, not an absolute unit.
     "FMPEarningsEvent": {
-        "expert_params": {},
+        "expert_params": {
+            "w_hist_move": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
+            "w_surprise_vol": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
+            "w_vol_cheapness": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
+            # AMENDMENT 2026-09-01: 0-5, 0 = gate OFF (the expert's own get_settings_definitions
+            # documents this; _process's ``if min_analysts > 0`` implements it). Measured (module
+            # docstring): the OLD default=3 refused 66% of the universe at a 2023-06-10 as-of and
+            # 47% at 2025-06-10 -- a range that never reached the low end would leave most of the
+            # mid/small bands unreachable, exactly where design §9 says O_ERN runs FIRST. The
+            # class DEFAULT is now 1 (Task 11); this gene is what searches the selection question.
+            "min_analysts": {"optimize": True, "min": 0, "max": 5, "step": 1, "type": "int"},
+            # Boolean gene: encoded as a 2-choice categorical (index 0/1 -> False/True), the
+            # standard pattern _collect_expert already handles for any "choice"-typed expert
+            # param -- no new gene TYPE needed. See the class docstring: an unconfirmed
+            # ('--'/missing) FMP announcement slot means the date itself is unpinned, so this
+            # toggles whether the GA is allowed to trade a date that might still slip.
+            "allow_unconfirmed_dates": {"optimize": True, "type": "choice",
+                                        "choices": [False, True]},
+        },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },
     "FMPInsiderClusterBuy": {

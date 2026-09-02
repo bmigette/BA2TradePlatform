@@ -579,7 +579,15 @@ class FMPEarningsEvent(AnalysisStatusRenderMixin, MarketExpertInterface):
                                "padded rank. Names with no earnings coverage fail here naturally.",
             },
             "min_analysts": {
-                "type": "int", "required": True, "default": 3,
+                # DEFAULT LOWERED 3 -> 1 (Task 11, 2026-09-02). Measured 2026-09-01 (see the
+                # module docstring, "HOW SEVERE IS THE DEFAULT min_analysts=3?"): replaying this
+                # expert's own gate over a random 600 of 4,728 cached earnings_estimates_quarterly
+                # payloads, the OLD default=3 refused 66% of the universe at a 2023-06-10 as-of and
+                # 47% at 2025-06-10 -- decaying strictness that tilts the traded universe across the
+                # window. 1 is a DATA-QUALITY floor (some estimate exists at all), not a selection
+                # filter; the grid's own min_analysts gene (0-5, 0 = gate off) is what searches the
+                # selection question.
+                "type": "int", "required": True, "default": 1,
                 "description": "Minimum analysts behind the forward EPS estimate. 0 disables the "
                                "gate. With the gate on, a symbol whose analyst count cannot be "
                                "read is REFUSED (fail-closed), because an unread count is not "
