@@ -9,6 +9,13 @@ commits), plus this review's own commits. Worktree
 
 ## VERDICT: **FIX-NEEDED** (nothing structural; 5 stale tests block a clean merge)
 
+> **POST-FIX, 2026-09-03: the FIX-NEEDED items are implemented — now CLEAN-GREEN for the
+> merge.** F1+F2 (`f73d14bd`), F5 (`d1a604ef`), F4/V1-V5 (`dcc91137`), and the §2b/F3 follow-ups
+> recorded (`6b28e185`). Backend **4532 passed / 158 skipped / 7 failed** (was 4518/158/12): the
+> 5 stale tests are gone and the 7 left are the 2 pre-existing seam-wiring (F3) plus the 5
+> pre-existing `curve_uneven` baseline. Both goldens unmoved. **Section 9 below records what was
+> done; nothing above it was rewritten.**
+
 The branch's *code* stands up. The two things the operator was most worried about both came
 back clean:
 
@@ -507,3 +514,134 @@ artefact does not?" — which is why the whole V1-V5 class was invisible. Its
 * **`run_screener_capband_matrix.py` default fitness** is `calmar_ratio`, not
   `consistent_annual_return`. Check any NEW bare invocation before comparing its numbers with
   the recorded matrix3/goal2020 jobs, which pass `--fitness` explicitly.
+
+---
+
+# 9. POST-FIX (2026-09-03) — the FIX-NEEDED items, implemented
+
+Appended, not edited: everything above is the reviewer's findings as written, and stands. This
+section records what was done about them. Same worktree, same `PYTHONPATH` pinning, one suite at
+a time. Free RAM 22-27 GB throughout.
+
+| Commit | Item | What |
+|---|---|---|
+| `f73d14bd` | §7 F1 + F2 | the 5 stale `O_PMCC` expectations — a JUSTIFIED refreeze, naming `718f7cf4` |
+| `d1a604ef` | §7 F5 | `RollPMCCShortAction._entry_order` — the oldest-by-id rule, named |
+| `dcc91137` | §7 F4 / §2a V1-V5 | ONE forced-settings table read by the handler AND the exporter; the importer stops dropping the universe block; the empty-group re-arm closed |
+| `6b28e185` | §2b + §7 F3 | the lifecycle and seam-wiring follow-ups, recorded in the STATE note |
+
+## 9a. What each item became
+
+**F1 + F2 (`f73d14bd`).** Test-only, exactly the edits §7 specified. `_MIN_DTE` gains
+`"O_PMCC": 365`; `sorted(groups[365])` becomes `["O_LEAP", "O_PMCC"]` (still THREE distinct
+thresholds for five keys — the sharing IS the saving that test states); the labelled GOLDEN job
+list becomes 5 rows = the 4 frozen before + `O_PMCC` in SECOND position, because `_jobs` yields
+in `_DEFAULT_STRATEGIES` order and `O_PMCC` is not the event key. `"open_pmcc"` joins the
+`long_premium` set in BOTH independent re-derivations, reasoned from the structure (a net-DEBIT
+diagonal whose LEAPS long dominates the short financing it) rather than read back from
+`_DEBIT_OPTION_MEMBERS` — which is the whole point of those lists. Both goldens carry a comment
+naming `718f7cf4` as the commit that legitimately moved them.
+
+**F5 (`d1a604ef`).** Two tests in `packages/common/tests/test_pmcc_lifecycle.py` that wrap
+`trade_store.orders_where` to return its rows REVERSED — a return order it is entirely entitled
+to produce, since it promises none. One states the ambiguity (two parentless option rows after
+one roll, only the older carrying `ORDER_PMCC_OVERLAY_KEY`) and pins the selection under both
+orders; the other pins the consequence, that a SECOND roll leaves the same contract on the book
+either way. The base fixture stops after one roll cycle — and one roll is exactly the case where
+`rows[0]` is still right — so a local `TwoCycleAccount` adds a third expiry tier.
+
+**F4 / V1-V5 (`dcc91137`).** The repair is ONE table,
+`packages/common/ba2_common/core/deploy_parity.py`, in `ba2_common` because three trees read it:
+the testplatform handler, the testplatform export API, and `tools/import_deploy_payload.py`
+(which runs against the LIVE checkout and has only the packages on its path).
+
+| row | live setting | value | disposition |
+|---|---|---|---|
+| `allow_automated_trade_opening` | same name | `True` | carried + applied |
+| `enable_buy` | same name | `True` | carried + applied |
+| `allow_automated_trade_modification` | same name | `True` | carried + applied — **V3, the severe one** |
+| `enable_sell` | same name | `bool(enable_short)` | carried + applied |
+| `hold_assigned_stock` | **none** | the run's flag | carried under `backtest_only`, RECORDED not applied (V5) |
+| `entry_action` | **none** | the template | carried under `backtest_only`, RECORDED not applied (V4) |
+
+Each `live_setting is None` row carries a `why_no_live_analogue` string the round-trip test
+quotes, so accepting the gap stays a deliberate act rather than an omission.
+`hold_assigned_stock` cannot be closed without changing
+`AlpacaAccount.reconcile_option_assignments` — a live BROKER class, out of mandate and an
+operator decision. `entry_action` has no live key at all (`TradeManager` stages EVERY
+enter-market recommendation as an RM candidate), so carrying it as an APPLIED setting would be a
+lie.
+
+V1 + V2 were the same root §7 F4 diagnosed: `live_settings_from_universe` maps
+`universe.screener_settings` onto the identically-named live settings plus
+`instrument_selection_method="screener"`, and the importer now consumes the block it used to
+drop. A static universe maps to nothing, deliberately — its symbols are a candidate list, not a
+setting, and overwriting a live instance's `enabled_instruments` from a backtest is a much bigger
+decision than carrying the screener config.
+
+V4's sharper half is fixed in production: `_seed_enter`'s guard read
+`entry_rules == [] and not buy_tree and not entry_action`, and `entry_action` is always truthy on
+an option run, so a genome that pruned every entry rule was re-armed with the run's option action
+on a bare permissive gate. The empty list is the genome's decision; it now wins, and the run says
+so at ERROR level.
+
+`test_deploy_round_trip_parity.py` went 8 -> 16 passed. Its new pin calls
+`daily_backtest_handler._build_experts` FOR REAL against a temp backtest trading DB and reads the
+persisted `ExpertSetting` rows back, so "what the backtest engine received" is OBSERVED, not
+re-derived. It also asserts the table's MEMBERSHIP explicitly — without that, a test iterating
+the table it is checking would pass vacuously when a row is deleted, which is the very defect.
+
+**No live-account or broker class was touched.**
+
+## 9b. Mutations executed for the post-fix work
+
+| # | Mutation | Named test it killed | Result |
+|---|---|---|---|
+| 1 | `RollPMCCShortAction._entry_order` -> `rows[0] if rows else None` | both new ordering tests | **KILLED both**; all 104 pre-existing tests in that file still PASSED — §2c's "the pre-fix `rows[0]` would have passed it too" reproduced exactly |
+| 2 | drop the `allow_automated_trade_modification` row from the table | `test_every_forced_setting_reaches_the_deployed_instance` | **KILLED**, both parametrized cases |
+| 3 | restore the importer's universe-block drop | `test_the_import_tool_still_consumes_the_universe_block` | **KILLED** |
+| 4 | restore `and not entry_action` in `_seed_enter`'s guard | `test_config_entry_rules_explicitly_empty_is_NOT_re_armed_by_a_run_level_entry_action` | **KILLED** |
+
+Every restore was by **file copy**, with `git status --short` verified clean afterwards.
+
+## 9c. Suites — post-fix (the §5 table, re-run)
+
+| Suite | Post-fix | §5 |
+|---|---|---|
+| backend `pytest tests/` (from `testplatform/backend`) | **4532 passed / 158 skipped / 7 failed**, 7m50s | 4518 / 158 / 12 |
+| `packages/common` (from its own dir) | **3133 passed / 1 failed** (the known `test_portfolio_allocation_wizard` float-dust) | 3131 / 1 |
+| `tests/backtest/test_equity_golden_run.py` + `test_option_golden_run.py` | **8 passed** — BOTH fingerprints unmoved | 3 + 5 |
+| `tests/backtest/test_deploy_round_trip_parity.py` | **16 passed** | 8 |
+| `packages/common/tests/test_pmcc_lifecycle.py` | **106 passed** | 104 |
+| `tests/test_options2_matrix_script.py` | **17 passed** | 14 passed / 3 failed |
+| `tests/test_launcher_iv_rank_gene.py` + `test_launcher_volume_vol_genes.py` | **284 passed** | 282 passed / 2 failed |
+
+**The 7 remaining backend failures, itemised.** The 5 stale `O_PMCC` failures are GONE. Left:
+
+* **2 × `tests/backtest/test_seam_wiring.py`** — §7 F3, **pre-existing**, unchanged. The
+  production one-line fix (resolve `get_provider` through the module attribute at call time) was
+  deliberately NOT taken: production change, outside the FIX-NEEDED mandate. Now recorded as
+  follow-up **D** in the STATE note. Expect these two in any full backend run.
+* **5 × `tests/test_strategy_fitness_equity_frozen.py::…[curve_uneven|*]`** — the STATE note's
+  own pre-existing baseline, listed in §5 as "809 passed / 5 failed (the known `curve_uneven`
+  cases) — at baseline". They surface in the full run because it includes that file.
+
+§7 F0 (`test_account_interface.py::…OWN_working_close…`) is a ROOT-suite failure, untouched by
+this work; it still wants either a fixture fix or a place on the known-bad list.
+
+## 9d. What was NOT done, and why
+
+* **§2b / §1b lifecycle follow-ups** — recorded, not implemented, by mandate. They are now a
+  ranked operator task list in
+  `docs/superpowers/plans/2026-08-30-option-program-review-STATE.md`. Read **A1** first: live
+  computes `LIFECYCLE_ROLL_SHORT` and silently discards it. That is a live-money behaviour
+  decision, not a tooling change.
+* **§7 F3** — the seam-wiring fix: production, out of mandate, recorded as follow-up **D**.
+* **§7 F0** — the root-suite `accountdefinition` fixture failure: pre-existing, out of scope.
+* **§7 F6** — `test_gene_to_artefact_audit.py` still audits one direction only. The *other*
+  direction is now pinned for the DEPLOY path specifically, by the forced-settings table and its
+  round-trip test — which is the path that made V1-V5 invisible. Broadening the audit test itself
+  remains open.
+* **No `version.py` bump.** Merger checklist item 2 still owns it — and note `dcc91137` touches
+  `packages/`, so it is `testplatform/version.py` that bumps, at a matrix3 job boundary and never
+  mid-run.
