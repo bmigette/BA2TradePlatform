@@ -784,3 +784,101 @@ at least one mutation re-run and independent re-derivation of any number the
 task wrote into comments. After Task 14: one consolidated final review of the
 branch. The controller dispatches reviews with the same worktree/method-trap
 preamble as implementation briefs.
+
+---
+
+## STATE — completion note (Task 14a item 6, 2026-09-02)
+
+### What landed (SHAs, Tasks 1-14a)
+
+Tasks 1-9 landed before this docs/closeout pass (`56c3f8c2..746d59fd` range,
+see `git log --oneline 56c3f8c2..HEAD` for the full trail). From Task 10
+onward, the SHA each task's own "LANDED AS" note above cites:
+
+| Task | Landed as (primary SHAs) |
+|---|---|
+| 10 — launcher wiring + matrix script | `746d59fd`, `9dd116e8`, `8b705c58` |
+| 11 — FMPEarningsEvent gene table | `4e8791ab` |
+| 12 — `option_convex` fitness | `79087da8`, `8708786a` |
+| 13 — `O_CONVEX` key + convex matrix | `967db2aa`, `64981161` |
+| 14b (code-side) | 10 commits `4f3cb7a6..4568a71f` |
+| 14a item 1 — merge origin/dev | `5246bc49` |
+| 14a item 2 — PRE-LAUNCH PERF | `db6924b6` |
+| 14a item 3 — results-comparability note | `d1b269c3` |
+| 14a item 4 — design/plan doc updates | `a04148f5` |
+| 14a item 5 — ruleset editor (help text + coverage test) | `88eaf945` |
+| 14a item 6 — this STATE note + EXPERTS.md | (this commit) |
+| 14a item 7 — final verification | (next commit) |
+
+Also verified ALREADY LANDED, needing no new work this task: the `O_CAL`
+phase-gated stub (refuses loudly with the design reference, like the naked
+exclusion — `_PHASE_GATED_OPTION_STRATEGIES` in `ba2test_launcher.py`, wired
+as part of Task 10's `746d59fd` launcher build, exercised by
+`test_a_phase_gated_key_refuses_with_the_plan_reference` /
+`test_a_phase_gated_key_is_a_KNOWN_key_that_refuses` in
+`test_option_grid_foundations.py` and re-verified structurally by Task 14b's
+`abe3686e`/`4568a71f`); the `days_after_event`/`days_opened` DELIBERATE
+classification and the rule-level `enabled: False` removal convention (both
+documented at their own call sites — see item 4 above).
+
+### Baselines (measured Task 14a item 1, merge day — item 7 re-measures and
+this table is the one item 7 updates in place)
+
+| Suite | Result |
+|---|---|
+| backend `pytest tests/` | 4443 passed / 158 skipped / 8 failed (5 known `curve_uneven` + 3 real-low-memory `test_worker_server.py` flakes, box measured 2.4% free RAM — see item 1's commit) |
+| `packages/common` (run from its own dir) | 2933 passed / 1 known (`test_portfolio_allocation_wizard.py` float-dust) |
+| `packages/experts` | 885 passed / 0 failed |
+| `packages/providers` | 447 passed / 0 failed |
+| `tests/backtest/test_equity_golden_run.py` | 3 passed (fingerprint unmoved) |
+| Root `tests/` (~9 min) | not yet re-run this task — item 7 |
+| `option_car`/`convex` frozen-baseline suites | not yet re-run this task — item 7 |
+
+### Open items
+
+- **Task 6-PRE / Task 6 (per-leg expiry migration, PMCC/O_PMCC two-expiry
+  lifecycle) are NOT on this branch.** The plan resequenced them to run
+  AFTER Task 14 (controller decision, 2026-09-01) — `O_PMCC` and `O_CAL`
+  stay phase-gated until they land. This is the largest remaining piece of
+  the original plan and is explicitly future work, not a gap in this
+  branch's own scope.
+- **Parked operator items** (carried forward, not resolved by this task):
+  - `OS2` (the neutral-credit screener group) resolves to `[O_IC]` alone —
+    `O_CSP` (cash-secured put, also full-notional/neutral-ish) is excluded
+    from the group by the same naked-vol/full-notional filter that dropped
+    `O_SSTG`/`O_SSTD`. Whether `O_CSP` should ever join `OS2`, or stay a
+    standalone key, is an open design question (`ba2test_launcher.py`
+    ~line 3705's own comment carries the detail) — not decided here.
+  - `classic_options` risk-manager rails have no UI path (settings dialog
+    renders none of the sleeve rails) — see item 5 above.
+  - The `option-selection-modes` branch's work (through `56c3f8c2`, the
+    base this branch was cut from) has been MERGED into `dev` but is not
+    yet DEPLOYED to any live `ExpertInstance` — a live deploy of that stack
+    remains a separate, pending operator action, unrelated to this branch's
+    own merge/deploy status.
+- **The 0-orders open question from item 2** (TradeRule-shaped rulesets
+  through `run_daily_backtest` with real FMPRating on AXP) is unresolved —
+  see item 2's note above for the evidence gathered and why "signal
+  absence" is the more likely explanation.
+
+### Who owes the `TEST_APP_VERSION` bump
+
+**The merger**, per `CLAUDE.md`'s versioning table (`packages/` changes bump
+`testplatform/version.py`'s `TEST_APP_VERSION`, not
+`ba2_trade_platform/version.py`) — this branch touches only
+`packages/`/`testplatform/`. **ONE bump, at a matrix3 job boundary, never
+mid-run** (per the standing distributed-worker convention: workers compare
+`TEST_APP_VERSION` alone to decide whether to self-update, so a mid-run bump
+would fragment a running grid's workers onto different code). This branch's
+own merge commit (`5246bc49`) took `dev`'s already-bumped
+`TEST_APP_VERSION = "2026.09.0009"` verbatim and did not bump it further —
+consistent with the ground rules ("No push, no `version.py` edits — the
+merger owes the bump").
+
+**`run_screener_capband_matrix.py` default-fitness note** (carried from
+item 3): a bare invocation of that script (no `--fitness` flag) defaults to
+`calmar_ratio`, not `consistent_annual_return` — the merger/operator should
+check any NEW invocation (as opposed to the already-recorded matrix3/
+goal2020 commands, which pass `--fitness consistent_annual_return`
+explicitly) for whether it relies on the default before comparing its
+numbers with either running grid's baseline.

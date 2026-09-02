@@ -166,6 +166,68 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 
 📖 **Historical spec:** [docs/superpowers/specs/2026-07-24-premium-seller-expert-design.md](docs/superpowers/specs/2026-07-24-premium-seller-expert-design.md)
 
+### 9. FMPEarningsEvent
+**Ranks upcoming earnings events for the options grid's `O_ERN` (earnings long-vol) key**
+
+- **Type**: Event-driven ranker (not a screener/rating expert — it emits one
+  recommendation per symbol carrying an event inside its look window, not a
+  standing directional view)
+- **Methodology**: A per-symbol composite score from three features computed
+  off the FMP disk cache (`past_earnings_quarterly`, and — for
+  `w_vol_cheapness` — an ATM straddle read from an options-capable account),
+  mapped to confidence 1–100. Below `min_hist_events` a symbol gets NO
+  recommendation (never a padded rank).
+- **Data Sources**: FMP `past_earnings_quarterly` (dates + eps/epsEstimated,
+  used for both the event date and the historical-move/surprise features);
+  `earnings_estimates_quarterly` (analyst count, for the `min_analysts` gate
+  only — dispersion/revision features are deliberately withheld, see below);
+  an options-capable account (backtest parquet reader / live broker chain)
+  for the implied-move leg of `w_vol_cheapness`, duck-typed and fail-to-absent.
+- **Instrument Selection**: Static/Dynamic (screener-style, like FMPRating —
+  cannot recommend its own instruments)
+- **Timing split (design rule)**: the EXPERT owns the ranking; the STRATEGY
+  (`O_ERN`) owns the timing. The expert surfaces every event inside a fixed
+  look-ahead (`earnings_days_look`, a plain setting, not a gene) and stamps
+  `days_to_earnings` + feature values onto the recommendation; `O_ERN`'s
+  searched entry gene (`rec_days_to_earnings <= X`, 1–5) reads that stamp.
+- **Warmup**: `BACKTEST_WARMUP_BARS = 620` (pinned equal to the launcher's
+  `_EXPERT_WARMUP_BARS`/`_SUPPORTED_EXPERTS` table entry by a dedicated test —
+  a mismatch there would silently starve the expert of history it needs).
+- **Stamp contract** (`ba2_common.core.earnings_stamp`): recommendations
+  carry `raw_outputs[EARNINGS_STAMP_NAMESPACE]` (namespace
+  `"FMPEarningsEvent"`) with `DAYS_TO_EARNINGS_KEY` (`"days_to_earnings"`)
+  and `EVENT_DATE_KEY` (`"event_date"`, ISO string). The `O_ERN` entry order
+  carries the event date FORWARD onto its own row under
+  `ORDER_EVENT_DATE_KEY` (`"earnings_event_date"`) at submit time, so the
+  exit's `days_after_event >= Y` condition reads the date off the ORDER
+  (which does not change after entry), never off whatever recommendation
+  happens to be in hand at exit time (a later, unrelated event by then).
+  `stamped_event_date()` is the one reader both the entry-stamp and the
+  order-carry-forward code paths share.
+- **Key Features**:
+  - Composite rank from `w_hist_move` (avg absolute earnings-day move over
+    past events), `w_surprise_vol` (std of past EPS surprises), and
+    `w_vol_cheapness` (historical move ÷ option-implied move — the only
+    feature comparing what you PAY to what you GET; absent when no
+    options-capable account is available, never demotes)
+  - `min_analysts` (0–5, 0 = gate off; expert default 1 as a data-quality
+    floor, not a selection filter — see the setting's own comment for the
+    2026-09-01 measurement that moved the default down from 3)
+  - `allow_unconfirmed_dates` (off by default — an unconfirmed print date
+    slips, and buying volatility ahead of a date that moves buys nothing)
+  - `w_dispersion`/`w_revision` DO NOT EXIST: design §9 withheld them on
+    measured coverage (~3 in-window `earnings_estimates_quarterly` rows per
+    symbol, a forward-biased endpoint, and 1-analyst degeneracy in mid/small
+    caps) — unlocked only by a point-in-time replay proving the estimate
+    rows predate the events they would score.
+
+**Key Settings** (7 total): `earnings_days_look` (default 10, plain setting
+not a gene), `min_hist_events` (default 4), `min_analysts` (default 1, gene
+0–5), `allow_unconfirmed_dates` (default False, gene), `w_hist_move` /
+`w_surprise_vol` / `w_vol_cheapness` (default 1.0 each, genes).
+
+📖 **Design:** [docs/superpowers/specs/2026-08-31-leaps-grid-design.md](docs/superpowers/specs/2026-08-31-leaps-grid-design.md) §9
+
 ## Expert Properties Comparison
 
 | Expert | Can Recommend Instruments | Self-executing¹ | Typical Use Case |
