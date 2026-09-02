@@ -819,14 +819,19 @@ def _fitness_suffix(fit_raw: Any, fit_ranked: Any, robustness: Any) -> str:
 
 
 # Backoff schedule for _persist_trial_worker's retries: base delay, doubled each attempt (5s,
-# 10s, 20s between ATTEMPTS=4 tries). A single 5s retry (the original fix) was NOT enough: opt
-# 379 and opt 380 both re-hit the identical sqlite3.OperationalError('disk I/O error') on that
-# one retry too, on 2026-08-28, under SUSTAINED (not momentary) disk contention from concurrent
-# grid jobs + manual recovery re-runs sharing the same box -- a fixed short wait doesn't give
-# that kind of contention time to clear. Exponential backoff over more attempts trades a longer
-# worst case for actually riding it out.
+# 10s, 20s, 40s, 80s between ATTEMPTS=6 tries -- 155s total). A single 5s retry (the original
+# fix) was NOT enough: opt 379 and opt 380 both re-hit the identical
+# sqlite3.OperationalError('disk I/O error') on that one retry too, on 2026-08-28, under
+# SUSTAINED (not momentary) disk contention from concurrent grid jobs + manual recovery re-runs
+# sharing the same box -- a fixed short wait doesn't give that kind of contention time to clear.
+# The 4-attempt/35s-total budget that fix landed with was in turn NOT enough either: opt 424
+# (2026-09-02) re-hit the SAME error a third time, with two full concurrent GA grids (goal2020 +
+# matrix3) sharing the box's disk rather than one -- the contention window is wider now than
+# when the doubling schedule was sized. Widened again rather than retried indefinitely: this is
+# the slow post-GA persist phase, not the fitness-critical path, so a few extra minutes of
+# patience per rank is cheap against permanently losing a top-N result.
 _LOCAL_RETRY_BACKOFF_S = 5.0
-_LOCAL_RETRY_ATTEMPTS = 4
+_LOCAL_RETRY_ATTEMPTS = 6
 
 
 def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, Any]:
@@ -840,13 +845,15 @@ def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, 
     returns ``{ok: False, error}`` so one bad re-run never poisons the pool or aborts the others.
 
     Retries up to ``_LOCAL_RETRY_ATTEMPTS - 1`` times, with exponential backoff, before giving up:
-    goal2020 opt 361/362/364/372/377/379/380 all lost a top-N rank to a transient failure (a leaked
-    worker slot, a mid-restart 503, or here, a bare ``sqlite3.OperationalError('disk I/O error')``
-    writing the trial's own ``persist_trading_db`` file under concurrent disk load) — none of them
-    a real defect in the genome. A flat single retry (5s) turned out not to be enough for the disk
-    I/O case specifically when the contention is sustained rather than a one-off blip (opt 379/380
-    re-hit it on the retry too); the doubling schedule gives sustained contention more room to
-    clear. Mirrors ``_remote_then_local``'s retry-before-giving-up shape one layer in.
+    goal2020 opt 361/362/364/372/377/379/380/424 all lost a top-N rank to a transient failure (a
+    leaked worker slot, a mid-restart 503, or here, a bare ``sqlite3.OperationalError('disk I/O
+    error')`` writing the trial's own ``persist_trading_db`` file under concurrent disk load) —
+    none of them a real defect in the genome. A flat single retry (5s) turned out not to be enough
+    for the disk I/O case specifically when the contention is sustained rather than a one-off blip
+    (opt 379/380 re-hit it on the retry too); the doubling schedule gives sustained contention
+    more room to clear, and opt 424 (2026-09-02, two concurrent GA grids on the same box) widened
+    the budget further still — see ``_LOCAL_RETRY_ATTEMPTS``. Mirrors ``_remote_then_local``'s
+    retry-before-giving-up shape one layer in.
 
     ``ctl`` is the worker's per-job cancellation block. It is accepted here because
     ``worker_server._submit_job`` appends one to EVERY pooled call — without this parameter
