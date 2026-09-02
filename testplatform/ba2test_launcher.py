@@ -3909,7 +3909,14 @@ def _option_exit_rules(kind: str):
     56-87% win rate but only 3.8-18% TR — small wins eaten by uncapped losers).
 
     ``opt_dte`` (``days_to_expiry <= N``) is the roll-at-DTE exit, and it is NOT split by
-    payoff profile — one band for debit and credit alike:
+    payoff profile — one band for debit and credit alike.
+
+    WHICH LEG IT READS: for a strategy declared multi-expiry in
+    ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES`` (``pmcc``), ``days_to_expiry`` reads the
+    LONG leg — the structure-exit / roll-floor question, so a PMCC is not closed merely
+    because its short overlay is expiring on schedule. (``option_lifecycle._dte`` asks the
+    other question, the roll WINDOW, and reads the SHORT leg.) Single-expiry structures are
+    unaffected, and mixed expiries on an UNDECLARED strategy stay unevaluable.
 
     * ``days_opened`` cannot express it. The entry DTE window is itself a gene
       (``option_dte``, decoded to a >= 14-day-wide window), so "28 days after opening"

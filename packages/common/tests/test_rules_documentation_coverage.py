@@ -16,7 +16,10 @@ before this task -- not merely the two backspreads the plan named. Left undocume
 have made this test fail on landing; documenting all nine keeps the ratchet unconditional
 (every member, no baseline) rather than a partial guard with pre-existing debt baked in.
 """
-from ba2_common.core.rules_documentation import get_action_type_documentation
+from ba2_common.core.rules_documentation import (
+    get_action_type_documentation,
+    get_event_type_documentation,
+)
 from ba2_common.core.types import ExpertActionType
 
 
@@ -87,3 +90,30 @@ def test_the_two_backspreads_document_the_arc_floor_exemption_and_the_long_strik
 
     from ba2_common.core.option_economics import ARC_FLOOR_EXEMPT_STRATEGIES
     assert {"call_backspread", "put_backspread"} <= ARC_FLOOR_EXEMPT_STRATEGIES
+
+
+def test_days_to_expiry_documents_WHICH_LEG_it_reads():
+    """Task 6-PRE requirement 3: ``opt_dte`` must STATE which leg it reads.
+
+    With a declared multi-expiry structure (PMCC) the legs sit on two dates, so "days of
+    life remaining" is not a quantity until the entry says which leg it means. This
+    condition answers the structure-exit / roll-floor question and therefore reads the LONG
+    leg; ``option_lifecycle._dte`` asks the roll WINDOW and reads the SHORT leg. Help text
+    that leaves that unsaid is precisely the ambiguity the single-expiry guard existed to
+    prevent, so it is pinned here rather than left to a docstring.
+    """
+    from ba2_common.core.types import ExpertEventType
+
+    entry = get_event_type_documentation()[ExpertEventType.N_DAYS_TO_EXPIRY.value]
+    description = entry["description"]
+
+    assert "LONG leg" in description, (
+        "days_to_expiry help text must name the LONG leg for declared multi-expiry "
+        "structures -- see option_expiry.EXPIRY_RULE_STRUCTURE_EXIT")
+    assert "SHORT leg" not in description, (
+        "days_to_expiry reads the LONG leg; naming the SHORT leg here would contradict "
+        "TradeConditions.DaysToExpiryCondition._resolve_expiry")
+    assert "pmcc" in description.lower(), \
+        "name the declared strategy the leg rule applies to"
+    assert "unevaluable" in description, \
+        "mixed expiries on an UNDECLARED strategy must still be documented as unevaluable"

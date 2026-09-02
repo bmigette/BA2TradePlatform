@@ -260,21 +260,36 @@ NO migration.**
 The brief allowed for either answer and asked for evidence. The evidence says the
 storage exists and has since revision `08de6c7b6eed`:
 
-- `TradingOrder.expiry: date | None` — `packages/common/ba2_common/core/models.py:503`,
+- `TradingOrder.expiry: date | None` — `packages/common/ba2_common/core/models.py:508`,
   in the per-leg option block (`contract_symbol`/`option_type`/`strike`/`expiry`/
   `position_intent`). Added to the physical table by
   `alembic/versions/08de6c7b6eed_add_option_fields_to_tradingorder.py:30`
   (`op.add_column("tradingorder", sa.Column("expiry", sa.Date(), nullable=True))`).
 - A multi-leg structure persists **one `TradingOrder` child row per leg**, linked
-  by `parent_order_id` (`models.py:470-481`), and
+  by `parent_order_id` (`models.py:481`), and
   `OptionsAccountInterface.submit_option_order` already writes each leg's own date:
-  `expiry=leg.expiry` at `OptionsAccountInterface.py:391`. There is no leg JSON
+  `expiry=leg.expiry` at `OptionsAccountInterface.py:421`. There is no leg JSON
   blob and no `OptionLeg` table — the child row IS the leg.
 - Both in-memory leg value objects already carry it too: `OptionLeg.expiry`
-  (`option_types.py:72`) and `LifecycleLeg.expiry` (`option_lifecycle.py:196`).
-- Both DTE readers already consult per-leg dates today — `_dte` over
-  `structure.held_legs` (`option_lifecycle.py:510`) and
-  `DaysToExpiryCondition._held_leg_expiries` (`TradeConditions.py:3299-3338`).
+  (`option_types.py:72`) and `LifecycleLeg.expiry` (`option_lifecycle.py:201`).
+- Both DTE readers already consult per-leg dates today — `_dte`
+  (`option_lifecycle.py:528`) and `DaysToExpiryCondition._held_legs`
+  (`TradeConditions.py:3314`, feeding `_resolve_expiry` at `:3365`).
+
+> Line references in this section were re-verified after the implementation
+> commits, so they point at the post-task file (the numbers moved as the readers
+> grew their rule docstrings). Accessor suite size, re-measured at the same time
+> with `--collect-only`: **44** in `test_option_expiry_accessor.py`, and the split
+> is **38 + 6** — the 38 that landed with req 1, plus the 6 `declared_expiries`
+> cases req 3 added when the parameter went plural (3 new test functions, each
+> parametrized over both named rules; `-k structure_level` collects exactly 6).
+> The req-1 commit message's "38" was correct when written and is left as the
+> historical record rather than rewritten.
+>
+> (The review note that prompted this refresh gave the split as "35 + 9". That
+> arithmetic does not reproduce: `git show 8875abb9:` on the test file has 22
+> `def test_` functions collecting 38 cases, and the plural-parameter additions
+> collect 6. Recorded rather than copied, per the plan's numbers-discipline rule.)
 
 So `Transaction.expiry` was never the *storage*; it is a denormalised
 **structure-level summary** of a set that is already recorded per leg. The task is
@@ -316,16 +331,20 @@ class ExpiryResolution:
     rule_applied: str | None    # which named rule picked it; None = single-expiry
 
 def resolve_structure_expiry(legs, *, strategy, rule,
-                             declared_expiry=None) -> ExpiryResolution
+                             declared_expiries: Iterable[date | None] = ()
+                             ) -> ExpiryResolution
 ```
 
 It returns a RESULT, not a message. Each reader renders its own wording, so both
 readers' existing "unknown because…" strings — which their suites assert on
 verbatim — stay byte-identical. What is shared is the part that is actually risky:
-the *selection*. `declared_expiry` is the structure-level candidate
-(`Transaction.expiry` / the parent order's `expiry`).
+the *selection*. `declared_expiries` holds the structure-level candidates, and it
+is PLURAL because `DaysToExpiryCondition` reads two independent sources —
+`Transaction.expiry` and the parent order's `expiry` — which can contradict each
+other with no legs involved at all; collapsing them to one scalar would lose that
+contradiction. `None` entries are ignored.
 
-Resolution order: candidates = held legs' known expiries ∪ `declared_expiry`.
+Resolution order: candidates = held legs' known expiries ∪ `declared_expiries`.
 Zero → `missing`. Exactly one → that date, `rule_applied=None` (**a per-leg question
 on a single-expiry structure returns the single expiry — no behaviour change**).
 More than one → if the strategy is NOT declared multi-expiry, `conflict` (today's
@@ -344,7 +363,7 @@ reader now states its side in code and in its docstring:
 
 This matches design §4 exactly: "Roll loop: at short expiry"; "Structure exit:
 long-leg DTE floor". `opt_time` is listed because requirement 3 names it: it reads
-`days_opened` (`ba2test_launcher.py:3944-3947`), never an expiry, so it reads NO
+`days_opened` (`ba2test_launcher.py:3951-3954`), never an expiry, so it reads NO
 leg — stated so nobody looks for a leg rule there. `opt_dte` reaches
 `DaysToExpiryCondition` via `field: "days_to_expiry"` → `rule_builders.py:48` →
 `TradeConditions.py:3656`.

@@ -360,7 +360,13 @@ def get_event_type_documentation() -> dict:
                 "days_to_expiry <= 0). The value is 0 on the expiry date itself and NEGATIVE for a "
                 "structure still open past expiry. If the expiry cannot be determined — no expiry "
                 "recorded anywhere, or the legs disagree — the condition is unevaluable and does "
-                "NOT fire in either direction (it is never treated as 0 days left)."
+                "NOT fire in either direction (it is never treated as 0 days left). WHICH LEG IT "
+                "READS: for a strategy declared multi-expiry (pmcc), where the legs legitimately "
+                "sit on two dates, this condition reads the LONG leg — it is the structure-exit / "
+                "roll-floor question, 'is there still life to roll into?', so a PMCC is not closed "
+                "just because its short overlay is expiring on schedule. Single-expiry structures "
+                "are unaffected (one date is the answer, no leg rule applies), and legs that "
+                "disagree on an UNDECLARED strategy remain unevaluable."
             ),
             "type": "numeric",
             "example": "Roll/close the structure when days_to_expiry <= 21"
