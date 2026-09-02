@@ -214,3 +214,91 @@ def test_an_unavailable_backtest_seam_does_not_guess_live(monkeypatch):
                         decisions=[decision("AAPL", OUTCOME_FUNDED, "sized", quantity=1)])
 
     assert run_id is None
+
+
+# ---------------------------------------------------------------------------------------
+# _record_candidate_run -- the in-memory-candidate twin of _record_classic_run
+#
+# size_candidate_orders (the LIVE enter path -- see TradeManager.process_expert_
+# recommendations_after_analysis) never persists qty=0 orders, so _record_classic_run's
+# wiring into review_and_prioritize_pending_orders (the DB-pending-order path dev does not
+# actually use) left the Risk Manager Runs table permanently empty on dev: 0 rows in
+# risk_manager_run despite real, correctly-sized orders being placed daily. Found 2026-09-02.
+# ---------------------------------------------------------------------------------------
+
+class _CandidateOrder:
+    """A transient TradingOrder stand-in -- no .id, correlated by python identity, exactly
+    like size_candidate_orders' own permission filter already does."""
+    def __init__(self, symbol, side="BUY", quantity=None):
+        self.symbol = symbol
+        self.side = side
+        self.quantity = quantity
+
+
+def test_candidate_backtest_builds_no_decisions_at_all(monkeypatch):
+    """Same guard, same reason as the DB path: the guard must be asked BEFORE any decision
+    is built, not just before the write."""
+    from ba2_common.core.TradeRiskManagement import TradeRiskManagement
+
+    monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: True)
+
+    built = []
+
+    def _spy(*a, **kw):
+        built.append(a)
+        raise AssertionError("a decision was built during a backtest")
+
+    monkeypatch.setattr("ba2_common.core.risk_manager_run.decision", _spy)
+
+    rm = TradeRiskManagement.__new__(TradeRiskManagement)
+    rm.logger = __import__("logging").getLogger("test")
+
+    order = _CandidateOrder("AAPL", quantity=10)
+    rm._record_candidate_run(
+        expert_instance_id=1, account_id=1, started_at=None,
+        candidates=[(order, object())], dropped_by_permission=[],
+        orders_to_update=[], orders_to_delete=[], symbol_prices={}, context={})
+
+    assert built == []
+
+
+def test_a_live_candidate_run_is_persisted_distinguishing_funded_permission_and_unfunded(
+        monkeypatch, expert_instance_id):
+    """The three outcomes the candidate path can actually produce (funded / permission-
+    refused / sized-to-zero) each land as their own decision, keyed by object identity since
+    candidate orders have no persisted .id -- and every candidate is accounted for."""
+    from ba2_common.core.TradeRiskManagement import TradeRiskManagement
+    from ba2_common.core.risk_manager_run import (
+        OUTCOME_FUNDED, OUTCOME_PERMISSION, OUTCOME_UNFUNDED, MODE_CLASSIC)
+
+    monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: False)
+
+    funded_order = _CandidateOrder("AAPL", quantity=12)
+    permission_order = _CandidateOrder("MSFT", side="SELL")
+    unfunded_order = _CandidateOrder("TSLA", quantity=0)
+
+    rm = TradeRiskManagement.__new__(TradeRiskManagement)
+    rm.logger = __import__("logging").getLogger("test")
+    rm._record_candidate_run(
+        expert_instance_id=expert_instance_id, account_id=None, started_at=None,
+        candidates=[(funded_order, object()), (permission_order, object()),
+                    (unfunded_order, object())],
+        dropped_by_permission=[permission_order],
+        orders_to_update=[funded_order], orders_to_delete=[unfunded_order],
+        symbol_prices={"AAPL": 100.0},
+        context={"available_balance": 5000.0, "max_per_instrument": 2000.0})
+
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.models import RiskManagerRun
+    saved = [r for r in get_all_instances(RiskManagerRun)
+            if r.expert_instance_id == expert_instance_id]
+    assert len(saved) == 1
+    run = saved[0]
+    assert run.mode == MODE_CLASSIC
+    assert run.symbols_received == 3
+    assert run.symbols_funded == 1
+    by_symbol = {d["symbol"]: d for d in run.decisions}
+    assert by_symbol["AAPL"]["outcome"] == OUTCOME_FUNDED
+    assert by_symbol["AAPL"]["quantity"] == 12.0
+    assert by_symbol["MSFT"]["outcome"] == OUTCOME_PERMISSION
+    assert by_symbol["TSLA"]["outcome"] == OUTCOME_UNFUNDED
