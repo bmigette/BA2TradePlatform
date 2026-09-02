@@ -2,7 +2,7 @@
 StrategyOptimization model for storing optimization runs
 """
 
-from sqlalchemy import Column, Integer, String, DateTime, JSON, Float, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, JSON, Float, ForeignKey, Index
 from sqlalchemy.sql import func
 from .database import Base
 
@@ -42,6 +42,15 @@ class StrategyOptimization(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     started_at = Column(DateTime(timezone=True), nullable=True)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    # Covering index for the dashboard's "recent optimizations" activity + status counts. Same
+    # trap as backtests: all_results (0.5 MB avg, 3.3 MB max) is stored BEFORE created_at, so an
+    # ORDER BY created_at scan reads every row's blob. See Backtest.__table_args__ for the rules;
+    # mirrored by db_migrate/031.
+    __table_args__ = (
+        Index("ix_strategy_optimizations_activity",
+              "created_at", "id", "name", "status", "started_at", "completed_at"),
+    )
 
     def __repr__(self):
         return f"<StrategyOptimization(id={self.id}, status='{self.status}')>"
