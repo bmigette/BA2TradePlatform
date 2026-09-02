@@ -452,6 +452,321 @@ covered-call stock-leg fix (same seam, cover kind = long option). This is the
 largest task; STOP-and-report rather than invent if the lifecycle service's
 shape fights the design.
 
+#### DESIGN, 2026-09-02 (written BEFORE any code, per the controller)
+
+Measurements below were re-read on this branch at `571cd35c`; every line
+reference is from that tree.
+
+**0. The shape question the brief told me to STOP on, answered: the lifecycle
+service does NOT fight the design, because the ROLL IS A RULESET RULE, not an
+engine hook.**
+
+`option_lifecycle.decide` has exactly one production caller —
+`ba2_trade_platform/core/option_lifecycle_service.run_option_lifecycle_pass`,
+the LIVE pass on the `JobManager` schedule. The BACKTEST engine never calls it
+(`daily_engine.py:750` calls only `update_sleeve_breaker`), and the grid's
+option exits are ruleset rules evaluated through `TradeActionEvaluator` by BOTH
+runtimes (`daily_engine._manage_open_positions` at `:1230-1242`; the live
+`TradeManager` through the same evaluator). So there are two ways to make the
+roll happen and only one of them keeps every standing principle:
+
+* an engine hook — a new per-bar step in `daily_engine` — would put the roll's
+  knobs somewhere that is neither a ruleset param nor an expert setting, would
+  need a second implementation for live, and would add per-bar work an equity
+  trial has to be scoped out of by hand;
+* **a rule** — `{condition on the SHORT leg} -> action roll_pmcc_short` in the
+  OPEN_POSITIONS ruleset — puts the knobs in ruleset params (the audit test's
+  own definition of a legal gene destination), runs identically in both
+  runtimes because both walk the same ruleset through the same evaluator, and
+  costs an equity trial exactly nothing because an equity ruleset has no such
+  rule.
+
+The precedent is `O_WHEEL`: `_build_strategy_wheel` already puts an option
+ENTRY action (`sell_covered_call`) into the OPEN_POSITIONS ruleset, spliced at
+the FRONT with `continue_processing: True` (`ba2test_launcher._insert_option_overlay`,
+`anchor="front"`). The PMCC roll is the same shape.
+
+`decide()` still gets the roll — see §6 — so the live pass does not close a
+PMCC the moment its overlay approaches expiry. Both paths call the SAME pure
+functions in `option_lifecycle`; that is the parity, and it is tested.
+
+**1. The builder: `OpenPMCCAction`, action value `open_pmcc`, strategy tag
+`"pmcc"` (already the sole member of `MULTI_EXPIRY_OPTION_STRATEGIES`).**
+
+ONE `submit_option_order` call, two legs, two expiries, one parent + two per-leg
+child rows (Task 6-PRE's storage, `OptionsAccountInterface.py:404-427`):
+
+| leg | side | intent | selection |
+|---|---|---|---|
+| LEAPS call | BUY | `buy_to_open` | `select_single`, method `delta`, target = `_spread_params()[0]` (the LONG param), DTE window = `dte_min/dte_max` (365+) |
+| overlay call | SELL | `sell_to_open` | `select_single`, method `delta`, target = `_spread_params()[1]` (the SHORT param), DTE window = `short_dte_min/short_dte_max` (fixed 30-45) |
+
+Two chain fetches because the two DTE windows do not overlap; each is validated
+by `_liq` on its own (the 2026-08-23 per-chain rule). `_build_and_submit`, not
+`_resolve`, for the same reason the backspreads use it: the builder needs to
+own its submit call (it stamps overlay facts, §4).
+
+**ADMISSION: `short.strike > leaps.strike`, refused otherwise** — a
+`self._result(False, ...)` verdict, not a raise (the operational-refusal
+channel: the structure on offer is not a PMCC today). A short at or below the
+long strike is a bear call spread wearing a diagonal's name, and its worst case
+is not the LEAPS debit.
+
+**Sizing** is premium sizing on the net debit: `cost_per_contract =
+net_debit * 100`, `net_debit = leaps.ask - overlay.bid`. A non-positive net
+(the overlay pays for the LEAPS outright) is refused: it is not the structure.
+
+**No `option_reserve`.** A diagonal whose long expires AFTER the short is
+margined as covered; `RESERVING_STRATEGIES` deliberately does not gain `"pmcc"`.
+
+**2. Max loss = LEAPS debit − net credit, and the EXISTING stamp already
+computes it.** `_measured_max_loss_per_contract(legs, net_debit)` builds
+`PayoffLeg`s carrying the net on one carrier leg (`_entry_payoff_legs`,
+`TradeActions.py:1885-1934`) and asks `option_payoff.max_loss`. For BUY call
+K1 / SELL call K2>K1 at net debit `d` the upside slope is 0 (not UNBOUNDED),
+the critical points are `{0, K1, K2}`, and the worst is `-d*100` at spot 0 —
+i.e. **MEASURED, `d*100` per contract**, which is exactly design §3's intrinsic
+floor ("at the short's expiry the long is worth >= intrinsic; max loss = LEAPS
+debit − net credits"). Worked by hand in the test: LEAPS 20.00 ask, overlay
+3.00 bid -> net 17.00 -> stamp 1700.00.
+
+The payoff evaluator reads both legs as expiring together. That is not a bug
+here, it is the conservative reading the design asked for, and it is stated in
+the builder's docstring.
+
+**CHARGED COVERED, NEVER NAKED, and no `stock_cover_price` is passed.**
+`structure_metrics` pairs the short call with a long of the SAME right, so a
+PMCC reports `is_defined_risk=True` and `committed = width * 100` with
+`naked_committed` untouched (`option_book._is_undefined_risk`,
+`option_book.py:486-514`). The cover here is an OPTION, inside the order's own
+legs — which is why the covered-call seam's `stock_cover_price` argument is
+NOT reused: that argument exists for cover the order's legs cannot see, and
+passing it on a debit call spread would ADD the full stock value to the
+measured loss (`1700 + 100*C`). **This is what "extends the covered-call
+stock-leg fix, cover kind = long option" means in practice: the same seam
+(`_measured_max_loss_per_contract` -> `admit_option_entry`), the same
+covered-vs-naked question, answered from the legs instead of from an argument.**
+
+**3. The roll, as two rules and one action.**
+
+Nested OR groups are NOT evaluated: `rule_builders.tree_leaves` flattens every
+leaf of a rule into one ANDed trigger dict (`rule_builders.py:168-217`,
+`TradeActionEvaluator._evaluate_conditions:906`), and `rules_convert._or_branches`
+exists precisely to split a top-level OR into N rules. "Roll at short expiry OR
+at the buyback trigger" is therefore TWO rules, which is also the launcher's own
+stated idiom ("Its OWN rule, not another leaf on opt_time").
+
+```
+pmcc_roll_dte      short_leg_days_to_expiry <= N   ->  roll_pmcc_short   (not toggleable)
+pmcc_roll_buyback  credit_decayed_pct       >= P   ->  roll_pmcc_short   (toggleable)
+```
+
+Both are spliced at the FRONT of `_option_exit_rules("O_PMCC")` with
+`continue_processing: True`, so a bar that rolls still reaches the close rules
+behind it. `pmcc_roll_dte` is NOT toggleable for the same reason `opt_event` is
+not on `O_ERN`: with the roll off, a PMCC is not a PMCC, it is a diagonal
+waiting to be assigned.
+
+**What the roll order IS: one multi-leg order on the SAME transaction**, tagged
+`option_strategy="pmcc_roll"`, legs in this order:
+
+1. `buy_to_close` the currently-held short (its own expiry),
+2. `sell_to_open` the newly selected short (the next expiry).
+
+One order, so the two legs cannot half-happen at the account level; the ORDER
+of the legs is the fail-closed statement and is checked by a pure function
+before submit (§7). `"pmcc_roll"` joins
+`OptionsAccountInterface.NON_INTENT_STRATEGIES` so a roll can never re-stamp
+the transaction's intent.
+
+**Structure identity survives the roll** because nothing about it moves: same
+`Transaction`, same entry parent `TradingOrder` (which is what
+`existing_order` resolves to on every later bar —
+`daily_engine._oldest_entry_order` -> `_entry_order_for_transaction`), same
+`transaction_id` on every roll row. The rolled short is a NEW child order under
+the ROLL parent, not under the entry parent — which is exactly why the close
+path has to change (§5).
+
+**The new short's selection parameters are NOT new genes.** They are read back
+off the entry order's persisted `data` (§4). One gene, one thesis: a separate
+`option_strike_delta` on the roll action would let the GA enter at a 0.15 delta
+and roll to a 0.30, and would double the overlay's gene budget at pop 40.
+
+**4. Entry facts: the overlay spec rides the entry order row.** Same idiom as
+`earnings_event_date` and `entry_cross` — the row is the only thing that travels
+with the position. `_submit_option_order` grows ONE argument,
+`extra_entry_facts: Optional[Dict]`, merged into `data` AND into the persisted
+`entry_facts` unconditionally: the whitelist trap documented at
+`TradeActions.py:2970-2974` is real, and an explicit argument is how a
+builder-specific fact closes it instead of tripping over it.
+
+Stamped under `option_lifecycle.ORDER_PMCC_OVERLAY_KEY = "pmcc_overlay"`:
+`strike_method`, `strike_param` (the SHORT target), `dte_min`, `dte_max`,
+`min_open_interest`, `max_spread_pct`, `min_volume`. The roll action REFUSES
+when the key is absent — that position was not opened by `open_pmcc`, and
+guessing the overlay spec is exactly the fabricated-input this codebase refuses.
+`entry_cross` is read from its own already-persisted key, so the roll's buyback
+concedes the same fraction the entry did (the F7 rule for a DISCRETIONARY close;
+a scheduled roll is not a risk exit).
+
+**The restamp.** After a roll the accrued credit changes the intrinsic floor:
+
+```
+max_loss_new = max_loss_old + roll_net * 100        # roll_net signed: +debit / -credit
+```
+
+A roll that nets a credit `c` lowers the stamp by `c*100`; a roll that costs
+more to buy back than the new sale brings in RAISES it. Clamped at `0.0`, and
+`0.0` means the accrued credits have paid for the LEAPS — `loss_pct_of_max_loss`
+then self-disarms (`per_contract <= 0 -> None`), which is the right answer: a
+structure with no defined loss left has no loss percentage. Written by
+merge-not-replace onto the ENTRY parent order's `data` (the row
+`LossPctOfMaxLossCondition._defined_risk_dollars` reads, `TradeConditions.py:1882-1884`).
+
+**5. The exit paths, and how each closes BOTH legs.**
+
+| exit | rule / field | leg it reads | action |
+|---|---|---|---|
+| long DTE floor | `opt_dte` / `days_to_expiry` | LONG (6-PRE `EXPIRY_RULE_STRUCTURE_EXIT`) | `close_option` |
+| max-loss stop | `opt_sl_ml` / `loss_pct_of_max_loss` | — (the restamped denominator) | `close_option` |
+| delta floor | `pmcc_delta_floor` / `long_leg_delta` | LONG | `close_option` |
+| take profit | `opt_tp` / `profit_loss_percent` | structure | `close_option` |
+| elapsed time | `opt_time` / `days_opened` | — | `close_option` |
+| manual / breaker | `CloseOptionAction`, `LIFECYCLE_BREAKER` | — | `close_option` |
+
+Every one of them is the SAME action, `CloseOptionAction._close_multi_leg`,
+which submits ONE multi-leg order flattening the structure. Atomicity is
+therefore a property of the order, not of a sequence — but it only holds if
+that order actually names the CURRENTLY-held legs, and today it does not:
+`_close_multi_leg` enumerates `children` of the ENTRY parent
+(`TradeActions.py:4901-4913`). After a roll the live short is a child of the
+ROLL parent, so the existing code would close the LEAPS and leave the rolled
+short NAKED. **That is the invariant's real failure mode and the change that
+fixes it:** the closing set is the transaction's HELD contracts (the `held_qty`
+netting already computed at `:4929-4956`), with the entry children first (so
+every existing structure's leg list is byte-identical) and any held contract
+they do not cover appended from its own order row.
+
+**6. `decide()` — the live pass gets the roll too.** For a structure whose
+strategy is declared in `MULTI_EXPIRY_OPTION_STRATEGIES`, the `roll_dte` branch
+yields the NEW, NON-closing reason `LIFECYCLE_ROLL_SHORT` instead of
+`LIFECYCLE_ROLL_DTE`. `_dte` already reads the SHORT leg there (6-PRE), so
+without this change the live pass would CLOSE a PMCC every time its overlay
+came within `roll_dte` — a LEAPS with a year left, thrown away on schedule.
+The buyback trigger is read from an OPTIONAL setting
+(`pmcc_buyback_pct`, present/absent by the `SETTING_BREAKER_TRIPPED` idiom), so
+`option_lifecycle_service.REQUIRED_SETTINGS` and every live expert's settings
+are untouched. `LIFECYCLE_ROLL_SHORT` is deliberately NOT in
+`LIFECYCLE_CLOSING_REASONS`.
+
+**7. THE INVARIANT, as three pure functions in `option_lifecycle` that both
+runtimes call.**
+
+```python
+def uncovered_short_calls(legs) -> Tuple[str, ...]
+    # net-short call contracts with no net-long call cover, after netting
+def close_legs_are_fail_closed(legs) -> Optional[str]
+    # every buy_to_close of a short must precede any sell_to_close of a long
+def roll_legs_are_fail_closed(legs) -> Optional[str]
+    # the buy_to_close of the old short must precede the sell_to_open of the new
+```
+
+Fail-closed means: the long is released only after the short's buyback is on
+the same ticket ahead of it, and a roll whose new short cannot be selected
+leaves the long ALONE (covered by nothing — allowed; a naked short is not).
+The two ordering functions return a REASON string, and both the roll action and
+the PMCC close path refuse on a non-`None` answer. The ordering rule is applied
+ONLY to a declared multi-expiry structure: for a single-expiry combo every leg
+settles at one expiry and the order inside the ticket carries no risk meaning,
+so applying it there would move existing structures' leg lists for nothing.
+
+**8. Marks (Task 3 hierarchy), per leg.** Nothing new is needed and nothing is
+added: `_option_positions_mtm` already marks EVERY lot through
+`bar close (no-arb clamped) -> BS(last_iv <= 5 days) -> intrinsic-floored entry
+premium` (`backtest_account.py:513-647`). `"pmcc"` is deliberately NOT added to
+`DEFINED_RISK_LONG_STRATEGIES`/`DEFINED_RISK_SHORT_STRATEGIES`, and that single
+omission carries two consequences the design needs:
+
+* the two legs are marked INDEPENDENTLY (the non-defined-risk branch), so
+  structure value = long mark − short mark with no group clamp to a "width"
+  that a two-expiry structure does not have;
+* `defined_risk_combo_strategy` returns None, so `_apply_option_expiry` settles
+  the overlay PER LEG at ITS OWN expiry and the LEAPS keeps living. A
+  unit-settled combo would close the LEAPS on the overlay's expiry day — the
+  exact opposite of the design.
+
+Structure P&L for the exit conditions is already correct through
+`_get_spread_pnl_via_transaction`: it nets EVERY executed option row on the
+transaction (so each roll's realised credit folds into `cash_collected`) and
+marks the still-held legs long-at-bid / short-at-ask.
+
+STATED LIMITATION, not fixed here: `get_option_quote` is exact-date-or-None
+(`options_provider.get_quote`), so on a bar with no option bar the equity curve
+is BS-marked while every exit CONDITION declines to evaluate. That asymmetry is
+pre-existing (Task 3 scoped itself to the mark path) and applies to `O_LEAP`
+identically; it is recorded here because a PMCC at LEAPS-range sparsity meets it
+on ~half its bars.
+
+**9. Two-expiry submits that are not entries: the guard learns to ask the
+TRANSACTION.** The close of a PMCC carries two expiries under
+`option_strategy="close"`, and the roll carries two under `"pmcc_roll"` —
+neither is a member of `MULTI_EXPIRY_OPTION_STRATEGIES`, so today's guard
+(`OptionsAccountInterface.py:308-318`) would refuse both and a PMCC could be
+opened and never closed. The declaration is therefore resolved as: the
+`option_strategy` argument, OR — when a `transaction_id` is supplied — the
+TRANSACTION's own recorded `option_strategy`. Fail-closed and unchanged
+everywhere else: no `transaction_id` behaves exactly as today, and a
+transaction whose own strategy is undeclared still refuses. One declaration,
+consulted at every site.
+
+**10. Genes (design §2), and where each lands.**
+
+| gene | range / step | destination |
+|---|---|---|
+| `option_strike_delta` (overlay) | 0.15–0.30 step 0.05 (4) | action `strike_param[1]` |
+| `option_strike_delta_long` (LEAPS) | 0.75–0.85 step 0.05 (3) | action `strike_param[0]` |
+| `option_dte` (LEAPS window centre) | 410–500 step 15 (7) → windows [365,455]..[455,545] | action `dte_min`/`dte_max` |
+| `option_sizing` | the shared option band | action `sizing` |
+| `cond:pmcc_roll_dte:value` | 1–7 step 1 (7) | leaf `short_leg_days_to_expiry` |
+| `cond:pmcc_buyback:value` (+ `:enabled`) | 50–90 step 10 (5) | leaf `credit_decayed_pct` |
+| `cond:pmcc_delta_floor:value` (+ `:enabled`) | 0.40–0.60 step 0.05 (5) | leaf `long_leg_delta` |
+| `cond:dte:value` (`opt_dte`, the LEAPS roll floor) | 90–240 step 30 (6) | leaf `days_to_expiry` |
+| plus the shared entry gates, `opt_tp`, `opt_time`, `opt_sl_ml` | as every grid-2 key | |
+
+**FIXED, deliberately not genes:** the strike METHOD (`delta`, like every
+grid-2 key — `_FIXED_DELTA_METHOD_STRATEGIES`), and the OVERLAY DTE WINDOW
+(30–45, design §2's own numbers). The overlay window is one narrow band the
+design states as a constant rather than a range, and at pop 40 / gen 6 the gene
+budget belongs to the two deltas and the roll trigger. `opt_sl_ml` is AUTHORED
+OFF by the removal idiom (`_OPTION_SL_ML_AUTHORED_OFF`) and still searched.
+
+**11. Registry surface (each one a place a new action/field is silently
+dropped if missed).** Actions `open_pmcc`, `roll_pmcc_short`:
+`ExpertActionType`, `get_option_action_values`, `get_strike_method_action_values`,
+`create_action`'s map, `TradeActionEvaluator._get_action_type_from_action` +
+`priority_map`, `rules_documentation.get_action_type_documentation`. Fields
+`short_leg_days_to_expiry`, `credit_decayed_pct`, `long_leg_delta`:
+`ExpertEventType`, `get_numeric_event_values`, `TradeConditions.CONDITION_MAP`,
+`rule_builders.FIELD_EVENT`, `rules_documentation.get_event_type_documentation`,
+`rules_export_import._FIELD_ABBR` (checked for abbreviation collisions).
+`long_leg_delta` joins `_FORCED_EXIT_EVENT_TYPES` (a broken-thesis structure
+exit pays up, like the DTE floor); `short_leg_days_to_expiry` does NOT — no
+emitted rule closes on it, and classifying a field nothing reads is the decoy
+that table's docstring warns about.
+
+`HistoricalOptionsProvider.get_quote` (and its parquet twin) start populating
+`OptionQuote.delta`/`implied_volatility` from the bar row they already read —
+`long_leg_delta` has no other point-in-time source, `OptionQuote` already
+declares the fields, and no existing consumer reads them.
+
+**12. Count pins this moves** (each updated with the arithmetic shown, never
+adjusted-until-green): `test_gene_to_artefact_audit.py`'s `len(OPTION_KEYS)`,
+`test_option_strike_method_honoured.py`'s two counts,
+`test_option_ui_param_reachability.py`'s option-action count, and
+`test_option_grid_foundations.py`'s grid-2 genome-size table. No new import is
+added ABOVE `TradeActions.py:1548` (`tests/test_no_zero_coercion.py` pins that
+exact line) — the new code uses the file's existing function-local import idiom.
+
 ## Phase C — the expert
 
 ### Task 7 (opus): `FMPEarningsEvent` core (features from the disk cache)
