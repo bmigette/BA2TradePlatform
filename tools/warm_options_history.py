@@ -121,13 +121,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         description="Resumably warm the historical options parquet cache from dxfeed.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Interrupt with Ctrl-C at any time; re-run the same command to resume.")
+    p.add_argument("--provider", choices=("tastytrade", "thetadata"), default="tastytrade",
+                   help="Vendor to fetch from (default tastytrade). 'tastytrade' reads "
+                        "dxfeed (IV coverage floors ~2022-10); 'thetadata' reads ThetaData's "
+                        "cloud API (verified live back to 2012 for AAPL) -- needs a "
+                        "THETADATA_API_KEY or --api-key / --db app-setting. The two write to "
+                        "SEPARATE store roots by default (see --out), so running one never "
+                        "touches the other's cache.")
+    p.add_argument("--api-key", help="ThetaData API key. Falls back to THETADATA_API_KEY, "
+                                     "then AppSetting('thetadata_api_key') via --db. Unused "
+                                     "for --provider tastytrade.")
     p.add_argument("--symbols", help="Comma-separated underlyings, e.g. AAPL,MSFT.")
     p.add_argument("--symbols-file",
                    help="File with one underlying per line ('#' comments allowed), "
                         "e.g. tools/options_universe_top100.txt.")
     p.add_argument("--start", default=DEFAULT_START, help=f"Window start (default {DEFAULT_START}).")
     p.add_argument("--end", help="Window end (default: today).")
-    p.add_argument("--out", help="Store root (default: CACHE_FOLDER/TastyTradeOptionsProvider).")
+    p.add_argument("--out", help="Store root (default: CACHE_FOLDER/TastyTradeOptionsProvider "
+                                 "or CACHE_FOLDER/ThetaDataOptionsProvider, matching --provider "
+                                 "-- always a SEPARATE tree per provider unless overridden).")
     p.add_argument("--dry-run", action="store_true",
                    help="Print exactly what would be fetched and write NOTHING. Contract "
                         "discovery still runs so the counts are real (free under the default "
@@ -163,9 +175,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--strict-snapshot", action="store_true",
                    help="Require an explicit end-of-snapshot per contract; treat silence as "
                         "unknown rather than as empty. Slower and safer.")
-    p.add_argument("--db", help="Read-only sqlite path to load TastyTrade credentials from "
-                                "when the environment does not supply them.")
-    p.add_argument("--account-id", type=int, help="Account row id inside --db.")
+    p.add_argument("--db", help="Read-only sqlite path to load credentials from when the "
+                                "environment does not supply them: TastyTrade's account "
+                                "client_secret/refresh_token (--provider tastytrade), or "
+                                "AppSetting('thetadata_api_key') (--provider thetadata).")
+    p.add_argument("--account-id", type=int, help="Account row id inside --db "
+                                                   "(--provider tastytrade only).")
     p.add_argument("--log-file",
                    help="Write progress/retry/error lines to this path via a bounded "
                         "RotatingFileHandler instead of stdout. Use this (not shell "
@@ -279,8 +294,41 @@ def _sandbox_from(settings: Dict[str, object]) -> bool:
     return bool(raw)
 
 
+def load_thetadata_api_key(db_path: Optional[str] = None,
+                           api_key_arg: Optional[str] = None) -> str:
+    """ThetaData API key: --api-key, else THETADATA_API_KEY, else READ-ONLY from a platform
+    sqlite's ``AppSetting('thetadata_api_key')``. Nothing is written and the key is never
+    logged -- mirrors ``load_credentials``'s read-only-connection discipline."""
+    if api_key_arg:
+        return api_key_arg
+    env = os.environ.get("THETADATA_API_KEY")
+    if env:
+        return env
+    if not db_path:
+        raise SystemExit(
+            "No ThetaData API key. Pass --api-key, set THETADATA_API_KEY, or pass --db "
+            "<platform sqlite> to read AppSetting('thetadata_api_key') read-only.")
+    con = sqlite3.connect(f"file:{os.path.expanduser(db_path)}?mode=ro&immutable=1", uri=True)
+    try:
+        row = con.execute(
+            "SELECT value_str FROM appsetting WHERE key = 'thetadata_api_key'").fetchone()
+    finally:
+        con.close()
+    if not row or not row[0]:
+        raise SystemExit(
+            f"No thetadata_api_key AppSetting found in {db_path}. Pass --api-key, set "
+            f"THETADATA_API_KEY, or save the key via the Settings UI / app settings.")
+    return row[0]
+
+
 def build_provider(ns: argparse.Namespace):  # pragma: no cover - network
-    """A real provider with a lazily-created TastyTrade session."""
+    """A real provider — TastyTrade (lazily-created session) or ThetaData (a resolved
+    api_key), per --provider."""
+    if ns.provider == "thetadata":
+        from ba2_providers.options.thetadata import ThetaDataOptionsProvider
+        api_key = load_thetadata_api_key(ns.db, ns.api_key)
+        return ThetaDataOptionsProvider(api_key=api_key)
+
     from ba2_providers.options.tastytrade import TastyTradeOptionsProvider
 
     def session_factory():
@@ -472,7 +520,13 @@ def _is_transient(e: Exception) -> bool:
     return any(m in s for m in (
         "RemoteDisconnected", "Connection aborted", "ConnectionError", "ConnectionResetError",
         "timed out", "Timeout", "Max retries", "TooManyRequests", "429",
-        "502", "503", "504", "Temporarily", "rate limit", "Rate limit"))
+        "502", "503", "504", "Temporarily", "rate limit", "Rate limit",
+        # ThetaData's cloud client raises grpc.RpcError, whose repr() carries the gRPC status
+        # name directly (e.g. "status = StatusCode.UNAVAILABLE") -- observed live 2026-09-02.
+        # UNAUTHENTICATED/INVALID_ARGUMENT/PERMISSION_DENIED are deliberately NOT here: those
+        # are a bad key/request, identical on every retry.
+        "StatusCode.UNAVAILABLE", "StatusCode.RESOURCE_EXHAUSTED",
+        "StatusCode.DEADLINE_EXCEEDED", "StatusCode.ABORTED"))
 
 
 def run_units(plan: Plan, provider, store: OptionHistoryParquetStore,
@@ -635,7 +689,16 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
         raise SystemExit(f"--end {end} is before --start {start}.")
 
     if store is None:
-        store = OptionHistoryParquetStore(root=ns.out)
+        # Each provider writes to its OWN tree by default -- "ThetaDataOptionsProvider" is a
+        # SEPARATE folder from "TastyTradeOptionsProvider", never the same one, so running
+        # --provider thetadata can never overwrite/erase the existing TastyTrade cache.
+        out_root = ns.out
+        if not out_root:
+            import ba2_common.config as _cfg
+            provider_dir = ("ThetaDataOptionsProvider" if ns.provider == "thetadata"
+                            else "TastyTradeOptionsProvider")
+            out_root = os.path.join(_cfg.CACHE_FOLDER, provider_dir)
+        store = OptionHistoryParquetStore(root=out_root)
     if provider is None:
         provider = build_provider(ns)  # pragma: no cover - network
 

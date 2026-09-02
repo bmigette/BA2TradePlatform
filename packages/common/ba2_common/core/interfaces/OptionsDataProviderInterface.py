@@ -18,9 +18,9 @@ Two shapes of vendor API are supported by the same two methods:
     range; ``fetch_eod_bars`` filters that down to the requested contract set.
 """
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
-from typing import Iterable, Iterator, List, Optional
+from typing import Iterable, Iterator, List, Optional, Set
 
 
 @dataclass(frozen=True)
@@ -63,6 +63,30 @@ class OptionEodBar:
     #: Vendor-supplied implied volatility as a DECIMAL (0.2841 == 28.41%), or None.
     #: Appended LAST so every existing positional construction is unaffected.
     iv: Optional[float] = None
+
+
+@dataclass
+class CandleBatch:
+    """The outcome of one ``fetch_bars_detailed`` call — the per-contract-resolution-tracking
+    sibling of ``fetch_eod_bars``, used by ``tools/warm_options_history.py``'s retry/requeue
+    loop so a partial answer never re-fetches contracts it already has.
+
+    Moved here from the tastytrade provider (2026-09-02, ThetaData integration): this is
+    vendor-neutral by construction — a provider whose API is a plain request/response (no
+    streaming "still pending" state, e.g. ThetaData) simply always returns ``unresolved``
+    empty, while a streaming vendor (TastyTrade/DXLink) can leave contracts unresolved for a
+    retry to pick up. ``empty`` and ``unresolved`` must never be merged: ``empty`` is a
+    durable fact to record, ``unresolved`` is work still owed.
+    """
+    bars: List["OptionEodBar"] = field(default_factory=list)
+    empty: Set[str] = field(default_factory=set)
+    unresolved: Set[str] = field(default_factory=set)
+    interrupted: bool = False
+
+    @property
+    def ok(self) -> bool:
+        """True when every requested contract was accounted for."""
+        return not self.unresolved
 
 
 class OptionsDataProviderInterface(ABC):
