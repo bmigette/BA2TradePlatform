@@ -362,16 +362,40 @@ refusal. Adding `"calendar_spread"` is the one-line change phase 2 makes.
 `"pmcc"` has no builder yet (that is Task 6): this task opens the door, Task 6
 walks through it, and `O_PMCC` stays phase-gated meanwhile.
 
-**5. Both runtimes, one code path.** This is structural, not a convention:
-`BacktestAccount(AccountInterface, OptionsAccountInterface)` overrides
-`submit_option_order` only to drop its order cache and calls
-`super().submit_option_order(*args, **kwargs)`
-(`backtest_account.py:2085-2093`); `AlpacaAccount` does not override it at all and
-implements only the `_submit_option_order_impl` broker hook. So the guard, the leg
-persistence and both DTE readers are literally the same functions in both runtimes.
-The parity test pins that a structure submitted through the backtest account and
-one submitted through a live-shaped account double yield identical per-leg rows and
-identical accessor answers.
+**5. Both runtimes, one code path.** This is structural, not a convention. Verified
+2026-09-02 with `grep -rn "def submit_option_order" --include=*.py . | grep -v
+/tests/` — exactly TWO production definitions:
+
+- `OptionsAccountInterface.submit_option_order` (`OptionsAccountInterface.py:237`)
+  — the guard, the parent row, the per-leg child rows, the intent stamp;
+- `BacktestAccount.submit_option_order` (`backtest_account.py:2085-2093`), a thin
+  passthrough: `result = super().submit_option_order(*args, **kwargs)` followed by
+  `self.invalidate_order_cache()`, so the fill engine's next read sees the new
+  rows. It contains no expiry logic of its own.
+
+`AlpacaAccount` does not override it at all. Both runtimes supply only the broker
+hook `_submit_option_order_impl` (`backtest_account.py:3617`,
+`AlpacaAccount.py:6122`). On the READ side,
+`OptionRiskManagement.build_structure` was promoted precisely so "the live exit
+pass and the shared entry gate build one book from one definition", and both DTE
+readers reach `option_expiry.resolve_structure_expiry`.
+
+The parity test therefore pins the live path by IDENTITY (`AlpacaAccount
+.submit_option_order is OptionsAccountInterface.submit_option_order`) and the
+backtest path BEHAVIOURALLY: `BacktestAccount`'s override is borrowed as a
+function onto an account double (the technique `test_option_breaker_parity.py`
+already uses) and must produce byte-identical per-leg rows and identical
+accessor answers to the plain interface path, for both a declared PMCC and an
+undeclared refusal.
+
+> METHOD NOTE (2026-09-02, during implementation). A first "verification" of this
+> paragraph ran the same grep piped through `head -10` and saw only
+> `packages/common` test doubles — `testplatform` sorts after `packages`, so the
+> one real override was cut off. That briefly produced a confident, wrong
+> correction claiming no override existed. Recorded because the plan's
+> numbers-discipline rule applies to design claims too: a truncated grep is not a
+> measurement, and the fix (drop `head`, exclude `/tests/`) is what the line
+> numbers above now rest on.
 
 ### Task 6 (opus): two-expiry lifecycle builder (PMCC first)
 
