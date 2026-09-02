@@ -103,6 +103,35 @@ def test_upgrade_is_a_noop_on_a_fresh_db_that_already_has_them(tmp_path):
     conn.close()
 
 
+def test_upgrade_skips_an_index_whose_columns_are_not_all_present_yet(tmp_path):
+    """A DB whose backtests table predates the summary columns must be skipped, not half-built.
+
+    scripts/migrate_db.py runs migrations in order, so this should not happen — but a partially
+    migrated DB must not raise (that would block every later migration) and must not leave a
+    truncated index behind. The strategy_optimizations index is unaffected and still gets built,
+    so upgrade() must still report True.
+    """
+    path = _fresh_schema_db(tmp_path)
+    conn = sqlite3.connect(path)
+    cur = conn.cursor()
+    cur.execute("DROP INDEX ix_backtests_summary")
+    cur.execute("DROP INDEX ix_strategy_optimizations_activity")
+    # Replace backtests with a pre-021-style table missing almost every summary column.
+    cur.execute("DROP TABLE backtests")
+    cur.execute("CREATE TABLE backtests (id INTEGER PRIMARY KEY, name VARCHAR(255) NOT NULL, "
+                "created_at DATETIME)")
+    conn.commit()
+
+    m = _load_migration()
+    assert m.upgrade(cur, conn) is True  # strategy_optimizations index still built
+    cur.execute("PRAGMA index_list(backtests)")
+    assert "ix_backtests_summary" not in [row[1] for row in cur.fetchall()]
+    by_name = {name: cols for _t, name, cols in m._INDEXES}
+    assert _index_columns(cur, "ix_strategy_optimizations_activity") == \
+        by_name["ix_strategy_optimizations_activity"]
+    conn.close()
+
+
 def test_upgrade_skips_when_the_table_is_missing(tmp_path):
     conn = sqlite3.connect(tmp_path / "empty.sqlite")
     cur = conn.cursor()
