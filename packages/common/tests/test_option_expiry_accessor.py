@@ -97,7 +97,7 @@ def test_a_single_expiry_structure_answers_the_same_under_either_rule(rule):
 @pytest.mark.parametrize("rule", BOTH_RULES)
 def test_the_declared_structure_expiry_alone_answers(rule):
     """Historical rows carry the date on the transaction/parent only."""
-    res = resolve_structure_expiry([], strategy="long_call", rule=rule, declared_expiry=NEAR)
+    res = resolve_structure_expiry([], strategy="long_call", rule=rule, declared_expiries=(NEAR,))
     assert res.expiry == NEAR and res.rule_applied is None
 
 
@@ -154,8 +154,32 @@ def test_a_declared_structure_disagreeing_with_its_own_declared_expiry_is_a_conf
     """Legs agree on NEAR, the row says FAR. Two dates, and the legs cannot adjudicate a
     structure-level value — unresolved, not silently leg-first."""
     res = resolve_structure_expiry([_long(NEAR), _short(NEAR)], strategy="bull_call_spread",
-                                   rule=rule, declared_expiry=FAR)
+                                   rule=rule, declared_expiries=(FAR,))
     assert res.expiry is None and res.conflict == (NEAR, FAR)
+
+
+@pytest.mark.parametrize("rule", BOTH_RULES)
+def test_two_structure_level_sources_that_disagree_are_a_conflict(rule):
+    """``DaysToExpiryCondition`` reads TWO structure-level values — ``Transaction.expiry``
+    and the parent order's — and they can contradict each other with no legs involved at
+    all. Hence the plural parameter: collapsing them to one would lose that contradiction."""
+    res = resolve_structure_expiry([], strategy="bull_call_spread", rule=rule,
+                                   declared_expiries=(NEAR, FAR))
+    assert res.expiry is None and res.conflict == (NEAR, FAR)
+
+
+@pytest.mark.parametrize("rule", BOTH_RULES)
+def test_two_structure_level_sources_that_AGREE_are_not_a_conflict(rule):
+    res = resolve_structure_expiry([], strategy="bull_call_spread", rule=rule,
+                                   declared_expiries=(NEAR, NEAR))
+    assert res.expiry == NEAR and res.conflict == ()
+
+
+@pytest.mark.parametrize("rule", BOTH_RULES)
+def test_a_None_structure_level_source_is_ignored(rule):
+    res = resolve_structure_expiry([], strategy="bull_call_spread", rule=rule,
+                                   declared_expiries=(None, NEAR))
+    assert res.expiry == NEAR
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +261,7 @@ def test_a_declared_structure_ignores_its_stale_declared_expiry_when_the_legs_sp
     cannot become the answer."""
     stale = date(2026, 7, 17)
     res = resolve_structure_expiry([_long(FAR), _short(NEAR)], strategy="pmcc",
-                                   rule=EXPIRY_RULE_ROLL_WINDOW, declared_expiry=stale)
+                                   rule=EXPIRY_RULE_ROLL_WINDOW, declared_expiries=(stale,))
     assert res.expiry == NEAR
 
 

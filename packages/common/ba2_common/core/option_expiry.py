@@ -113,7 +113,7 @@ class ExpiryLeg:
     """One leg, reduced to the only two facts an expiry question needs.
 
     ``net_qty`` is SIGNED in contracts, BUY positive — the same convention
-    ``option_lifecycle.LifecycleLeg`` and ``DaysToExpiryCondition._held_leg_expiries`` net
+    ``option_lifecycle.LifecycleLeg`` and ``DaysToExpiryCondition._held_legs`` net
     with. A leg is HELD when ``abs(net_qty) > _EPS`` and SHORT when ``net_qty < -_EPS``, so
     a leg bought back to close nets to zero and stops contributing its (now stale) date.
 
@@ -162,7 +162,8 @@ class ExpiryResolution:
 
 def resolve_structure_expiry(legs: Iterable[ExpiryLeg], *, strategy: Optional[str],
                              rule: str,
-                             declared_expiry: Optional[date] = None) -> ExpiryResolution:
+                             declared_expiries: Iterable[Optional[date]] = ()
+                             ) -> ExpiryResolution:
     """Resolve one structure's expiry for ONE named question.
 
     :param legs: the structure's legs (any iterable of :class:`ExpiryLeg`); unheld legs and
@@ -171,9 +172,11 @@ def resolve_structure_expiry(legs: Iterable[ExpiryLeg], *, strategy: Optional[st
         :data:`MULTI_EXPIRY_OPTION_STRATEGIES`.
     :param rule: :data:`EXPIRY_RULE_ROLL_WINDOW` or :data:`EXPIRY_RULE_STRUCTURE_EXIT`. An
         unrecognised value raises — a typo must not silently become a fall-through branch.
-    :param declared_expiry: the structure-level value (``Transaction.expiry``, or the parent
-        ``TradingOrder``'s). Historical rows carry it and no leg dates at all, which is what
-        keeps them measurable.
+    :param declared_expiries: the STRUCTURE-LEVEL values, of which there may be more than
+        one source: ``DaysToExpiryCondition`` reads both ``Transaction.expiry`` and the
+        parent ``TradingOrder.expiry``, and two sources that disagree is itself a
+        contradiction the caller must not lose. ``None`` entries are ignored. Historical
+        rows carry these and no leg dates at all, which is what keeps them measurable.
 
     A leg with no expiry is UNKNOWN, not a second expiry: it adds no information and never
     vetoes the legs that do. That is load-bearing for the close paths, which rebuild legs
@@ -189,8 +192,7 @@ def resolve_structure_expiry(legs: Iterable[ExpiryLeg], *, strategy: Optional[st
     held = [leg for leg in legs if leg.is_held and leg.expiry is not None]
 
     candidates = {leg.expiry for leg in held}
-    if declared_expiry is not None:
-        candidates.add(declared_expiry)
+    candidates |= {d for d in declared_expiries if d is not None}
 
     if not candidates:
         return ExpiryResolution(missing=True)
@@ -207,8 +209,8 @@ def resolve_structure_expiry(legs: Iterable[ExpiryLeg], *, strategy: Optional[st
         # closes) — both would be inventing one.
         return ExpiryResolution(conflict=listed)
 
-    # DECLARED multi-expiry: the legs ARE the record, so the named rule reads them. A
-    # structure-level ``declared_expiry`` is deliberately not consulted from here — a real
+    # DECLARED multi-expiry: the legs ARE the record, so the named rule reads them. The
+    # structure-level ``declared_expiries`` are deliberately not consulted from here — a real
     # two-expiry structure records NULL there (``submit_option_order`` writes the parent's
     # expiry only when the legs share one), so any value present is stale and must not be
     # able to become the answer.

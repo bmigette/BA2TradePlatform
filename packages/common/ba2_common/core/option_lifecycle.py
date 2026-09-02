@@ -97,6 +97,11 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
+from ba2_common.core.option_expiry import (
+    EXPIRY_RULE_ROLL_WINDOW,
+    ExpiryLeg,
+    resolve_structure_expiry,
+)
 from ba2_common.core.option_types import OptionContract
 from ba2_common.core.types import OptionRight
 
@@ -501,23 +506,39 @@ def _tested(structure: OptionStructure,
 def _dte(structure: OptionStructure, as_of: date) -> Tuple[Optional[int], str]:
     """(days to expiry, "") or (None, why it is unmeasurable).
 
-    The parent row's ``expiry`` is preferred, and the held legs answer when it is
-    absent — which it was for every multi-leg, making the roll branch unreachable.
-    ``submit_option_order`` refuses multi-expiry structures, so legs that disagree are
-    a contradiction: unknown, not ``max()`` and not ``min()``. A leg that simply has no
-    expiry adds no information and does not veto the legs that do.
+    THE QUESTION THIS ANSWERS IS THE ROLL WINDOW. Its only consumer is the ``roll_dte``
+    branch of :func:`_decide_one` — "how long until this structure must be rolled or
+    closed?" — so on a two-expiry structure it reads the **SHORT** leg
+    (:data:`option_expiry.EXPIRY_RULE_ROLL_WINDOW`). A PMCC rolls when its overlay expires;
+    reading the LEAPS here would put the roll a year out and the roll branch would never
+    fire, which is the same dead-branch failure this function was written to end.
+
+    Its sibling reader, ``TradeConditions.DaysToExpiryCondition``, answers the OTHER
+    question — the roll floor / structure exit — and therefore reads the LONG leg. The two
+    disagree on purpose; see ``option_expiry`` for the rule table.
+
+    The structure-level ``expiry`` and the held legs are all candidates. When they yield a
+    single date, that date is the answer and the leg rule is not exercised at all — which is
+    why every single-expiry structure behaves exactly as before. Legs that disagree are a
+    contradiction for any strategy NOT declared in
+    ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``: unknown, not ``max()`` and not
+    ``min()``. A leg that simply has no expiry adds no information and does not veto the
+    legs that do.
     """
-    candidates = {l.expiry for l in structure.held_legs if l.expiry is not None}
-    if structure.expiry is not None:
-        candidates.add(structure.expiry)
-    if not candidates:
+    resolution = resolve_structure_expiry(
+        [ExpiryLeg(expiry=l.expiry, net_qty=l.net_qty) for l in structure.legs],
+        strategy=structure.strategy,
+        rule=EXPIRY_RULE_ROLL_WINDOW,
+        declared_expiries=(structure.expiry,),
+    )
+    if resolution.missing:
         return None, ("no expiry on the structure or any of its held legs — the roll "
                       "window cannot be evaluated")
-    if len(candidates) > 1:
-        listed = ", ".join(str(e) for e in sorted(candidates))
+    if resolution.expiry is None:
+        listed = ", ".join(str(e) for e in resolution.conflict)
         return None, (f"conflicting expiries on one structure ({listed}) — its DTE is "
                       f"undefined")
-    return (candidates.pop() - as_of).days, ""
+    return (resolution.expiry - as_of).days, ""
 
 
 # ---------------------------------------------------------------------------

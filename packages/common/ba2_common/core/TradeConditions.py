@@ -3261,9 +3261,24 @@ class DaysToExpiryCondition(CompareCondition):
     Empty candidate set -> unevaluable. More than one distinct date -> unevaluable: a
     structure whose own rows disagree about when it expires has no DTE, and picking
     ``min()`` (closes early) or ``max()`` (never closes) would be inventing one.
-    Multi-expiry structures are refused at submit time, but pre-existing rows are not.
     A leg with no expiry at all simply adds no information and never vetoes the legs
     that have one.
+
+    The one exception, and it is DECLARED
+    -------------------------------------
+    Multi-expiry structures were refused at submit time, so disagreement could only ever be
+    corruption. A strategy listed in ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES`` (PMCC
+    today; calendars in phase 2) may now legitimately span two expiries, and for those the
+    disagreement is resolved by a NAMED rule rather than refused.
+
+    **This condition reads the LONG leg.** It backs the ``opt_dte`` exit, which asks whether
+    the structure still has life — the roll FLOOR. ``option_lifecycle._dte`` asks the other
+    question, the roll WINDOW, and reads the SHORT leg. Naming them is the whole point: with
+    two expiries "the DTE" is not a quantity until somebody says which leg they mean.
+
+    Nothing changes for a single-expiry structure: one candidate is one answer, and the leg
+    rule is never exercised. Pre-existing rows that disagree stay unevaluable, because their
+    strategy is not declared.
 
     The "today" is the recommendation's ``created_at`` — the simulated as-of bar in a
     backtest, wall-clock in live — never ``date.today()``, so the value is deterministic
@@ -3296,18 +3311,24 @@ class DaysToExpiryCondition(CompareCondition):
             return as_of.astimezone(timezone.utc).date()
         return as_of
 
-    def _held_leg_expiries(self, transaction_id):
-        """Distinct expiries of the still-HELD legs of ``transaction_id``.
+    def _held_legs(self, transaction_id):
+        """The still-HELD legs of ``transaction_id``, as ``option_expiry.ExpiryLeg``.
 
         Netted per contract symbol over the EXECUTED option orders exactly as
         ``_get_spread_pnl_via_transaction`` does — a contract whose signed quantity nets
         to zero is closed and contributes nothing.
+
+        THE SIGNED NET QUANTITY IS CARRIED OUT, not just the dates. It is what tells a
+        SHORT leg from a LONG one, and on a two-expiry structure the side IS the answer
+        (see ``option_expiry``): this reader takes the LONG leg. Returning a bare set of
+        dates, as this method used to, threw that away.
         """
+        from ba2_common.core.option_expiry import ExpiryLeg
         from ba2_common.core.trade_store import orders_where
         from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus
 
         if transaction_id is None:
-            return set()
+            return []
 
         executed = OrderStatus.get_executed_statuses()
         net: Dict[str, float] = {}
@@ -3331,43 +3352,79 @@ class DaysToExpiryCondition(CompareCondition):
                 expiry_by_contract.setdefault(o.contract_symbol, set()).add(
                     self._as_date(o.expiry))
 
-        out = set()
+        out = []
         for contract, qty in net.items():
             if abs(qty) > 1e-9:
-                out |= expiry_by_contract.get(contract, set())
+                # One ExpiryLeg per date the contract carries. Normally exactly one; two is
+                # the corrupt-data case the comment above describes, and emitting both keeps
+                # it a loud contradiction instead of a silent first-row-wins.
+                for expiry in sorted(expiry_by_contract.get(contract, set())):
+                    out.append(ExpiryLeg(expiry=expiry, net_qty=qty))
         return out
 
     def _resolve_expiry(self):
-        """(expiry, "") or (None, why it is unmeasurable). Never guesses."""
+        """(expiry, "") or (None, why it is unmeasurable). Never guesses.
+
+        THE QUESTION THIS ANSWERS IS THE STRUCTURE EXIT — the roll FLOOR. ``opt_dte``
+        closes a position when its life runs out, so on a two-expiry structure this reads
+        the **LONG** leg (``option_expiry.EXPIRY_RULE_STRUCTURE_EXIT``): "is there still
+        life to roll into?". Reading the short leg here would flatten a PMCC every time its
+        overlay approached its own expiry, throwing away a LEAPS with a year left because a
+        30-day call was expiring exactly on schedule.
+
+        Its sibling reader, ``option_lifecycle._dte``, answers the roll WINDOW and therefore
+        reads the SHORT leg. The two disagree on purpose; ``option_expiry`` carries the rule
+        table and both are pinned in ``test_option_per_leg_dte_rules.py``.
+
+        The strategy tag comes from the ``Transaction`` — the INTENT record — because that
+        is where ``submit_option_order`` stamps it and where it survives the individual
+        orders. Only a strategy DECLARED in ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``
+        gets the leg rule; for everything else disagreeing sources remain a contradiction,
+        exactly as before.
+        """
+        from ba2_common.core.option_expiry import (
+            EXPIRY_RULE_STRUCTURE_EXIT, resolve_structure_expiry)
+
         order = self.existing_order
         if order is None:
             return None, ("no open position on this evaluation — there is no option "
                           "life to measure")
 
-        candidates = set()
+        # The STRUCTURE-LEVEL candidates, plural: the transaction's declared intent and the
+        # parent order's stamp are two independent sources that can contradict each other
+        # with no legs involved at all, and that contradiction must not be collapsed.
+        declared = []
+        strategy = None
         txn_id = getattr(order, "transaction_id", None)
         if txn_id is not None:
             from ba2_common.core.models import Transaction
             from ba2_common.core.trade_store import get_or_none
             txn = get_or_none(Transaction, txn_id)
-            if txn is not None and txn.expiry is not None:
-                candidates.add(self._as_date(txn.expiry))
+            if txn is not None:
+                strategy = txn.option_strategy
+                if txn.expiry is not None:
+                    declared.append(self._as_date(txn.expiry))
 
         order_expiry = getattr(order, "expiry", None)
         if order_expiry is not None:
-            candidates.add(self._as_date(order_expiry))
+            declared.append(self._as_date(order_expiry))
 
-        candidates |= self._held_leg_expiries(txn_id)
+        resolution = resolve_structure_expiry(
+            self._held_legs(txn_id),
+            strategy=strategy,
+            rule=EXPIRY_RULE_STRUCTURE_EXIT,
+            declared_expiries=declared,
+        )
 
-        if not candidates:
+        if resolution.missing:
             return None, (f"no expiry on the transaction, the order or any held leg of "
                           f"{self.instrument_name} — the remaining option life cannot be "
                           f"determined")
-        if len(candidates) > 1:
-            listed = ", ".join(str(e) for e in sorted(candidates))
+        if resolution.expiry is None:
+            listed = ", ".join(str(e) for e in resolution.conflict)
             return None, (f"conflicting expiries on one {self.instrument_name} structure "
                           f"({listed}) — its remaining life is undefined")
-        return candidates.pop(), ""
+        return resolution.expiry, ""
 
     def evaluate(self) -> bool:
         try:
