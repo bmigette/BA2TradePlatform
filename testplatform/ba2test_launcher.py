@@ -1157,11 +1157,16 @@ def _apply_options_store(args, backtest_block: dict) -> None:
 # to the key that can actually satisfy it -- and would let a 3-trades-a-year O_ERN genome, the
 # clearest possible sign the entry gates are mis-tuned, score as a normal config.
 #
-# The backspreads are in because the plan names them in (Task 10). Their arithmetic binds far
-# less: 60-180 DTE entries exited at a 20-45 DTE floor live 15-160 days, i.e. 2.3-24
-# structures/underlying/year, so the default floor would rarely have bitten them -- the lower
-# floor is nearly inert there and is recorded as such rather than dressed up as a finding.
-_OPTION_LOW_TRADE_FLOOR_STRATEGIES = {"O_LEAPC", "O_LEAPP", "O_CBS", "O_PBS"}
+# THE BACKSPREADS ARE OUT (corrected 2026-09-02, review of 746d59fd). They were briefly in,
+# on a misreading of the plan: Task 10 says "a CONFIG naming the long-dated keys only", and
+# design §2's long-dated family is O_LEAPC / O_LEAPP / O_PMCC. O_CBS/O_PBS are the separate
+# CONVEXITY-FINANCED family at 60-180 DTE, and their own arithmetic says they never needed the
+# exemption: a 60-180 DTE entry exited at a 20-45 DTE floor lives 15-160 days, i.e. 2.3-24
+# structures per underlying per year, so the default 12/yr floor is reachable on a handful of
+# names and disqualifies only a genuinely thin config -- which is exactly what it is for. A
+# lower floor there would not have been "nearly inert", it would have been an unasked-for
+# weakening of the only breadth check the fitness applies to them.
+_OPTION_LOW_TRADE_FLOOR_STRATEGIES = {"O_LEAPC", "O_LEAPP"}
 _OPTION_LOW_TRADE_FLOOR = {"car_hard_min_trades_per_year": 3.0,
                            "car_min_trades_per_year": 8.0}
 

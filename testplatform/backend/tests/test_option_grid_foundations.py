@@ -1269,13 +1269,23 @@ def test_grid1_genomes_did_not_move():
 
 
 # ---- the lower TRADE FLOOR: long-dated keys only, never O_ERN --------------------------------
-@pytest.mark.parametrize("key", ["O_LEAPC", "O_LEAPP", "O_CBS", "O_PBS"])
+@pytest.mark.parametrize("key", ["O_LEAPC", "O_LEAPP"])
 def test_the_long_dated_keys_get_the_lower_trade_floor(key):
+    """THE LONG-DATED FAMILY IS EXACTLY O_LEAPC/O_LEAPP here (design section 2's third
+    member, O_PMCC, is phase-gated and has no row yet). Plan Task 10's wording is "a CONFIG
+    naming the long-dated keys only"; the backspreads are the separate convexity-financed
+    family at 60-180 DTE and are pinned in the untouched set below."""
     m = _launcher()
     block = {}
     m._apply_option_trade_floor(key, block)
     assert block["car_hard_min_trades_per_year"] == 3.0
     assert block["car_min_trades_per_year"] == 8.0
+
+
+def test_the_exempt_set_is_exactly_the_long_dated_family():
+    """The set itself, so a key cannot be added to it without this test saying so."""
+    m = _launcher()
+    assert m._OPTION_LOW_TRADE_FLOOR_STRATEGIES == {"O_LEAPC", "O_LEAPP"}
 
 
 def test_the_event_key_NEVER_gets_the_lower_trade_floor():
@@ -1296,10 +1306,15 @@ def test_the_event_key_NEVER_gets_the_lower_trade_floor():
     assert "O_ERN" not in m._OPTION_LOW_TRADE_FLOOR_STRATEGIES
 
 
-@pytest.mark.parametrize("key", ["S2", "O_LC", "O_IC", "OS1", None])
+@pytest.mark.parametrize("key", ["S2", "O_LC", "O_IC", "OS1", "O_CBS", "O_PBS", None])
 def test_no_other_strategy_is_touched_by_the_trade_floor(key):
     """Every existing job's fitness must be bit-identical: an absent key leaves the
-    expert/platform resolution exactly as it was."""
+    expert/platform resolution exactly as it was.
+
+    O_CBS/O_PBS ARE IN THIS LIST, not the exempt one (corrected 2026-09-02). They are the
+    convexity-financed family, not the long-dated one: a 60-180 DTE entry exited at a 20-45
+    DTE floor lives 15-160 days, i.e. 2.3-24 structures per underlying per year, so the
+    platform's 12/yr floor is reachable and disqualifies only a genuinely thin config."""
     m = _launcher()
     block = {}
     m._apply_option_trade_floor(key, block)
