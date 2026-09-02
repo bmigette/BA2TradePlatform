@@ -1,0 +1,509 @@
+# options-grid2 — consolidated final review (2026-09-02/03)
+
+Branch `options-grid2`, reviewed at `74be78a1` (branch range `56c3f8c2..74be78a1`, ~178
+commits), plus this review's own commits. Worktree
+`C:\Users\basti\Documents\dev\BA2-options-grid2`. Plan:
+`docs/superpowers/plans/2026-08-31-options-grid2-convex-earnings-impl.md`.
+
+---
+
+## VERDICT: **FIX-NEEDED** (nothing structural; 5 stale tests block a clean merge)
+
+The branch's *code* stands up. The two things the operator was most worried about both came
+back clean:
+
+* **The open question is answered, and the answer is "the code is fine."** A TradeRule-shaped
+  ruleset driven through `run_daily_backtest` — the GA's own `_trial_worker` entry point —
+  **does** produce fills. The earlier 0-orders harness result was signal absence, not a
+  handler defect. Now pinned by a test (§3).
+* **Task 6's roll machinery is reached by BOTH runtimes**, verified hop by hop, and the
+  `_entry_order` oldest-by-id fix is correct (§2c).
+
+What blocks the merge is narrower and entirely mechanical: **Task 6 (`O_PMCC`, `718f7cf4`)
+landed AFTER the branch's own final verification pass and broke 5 backend tests that were
+never re-run.** All 5 are stale test-side expectations, not production defects. They are
+listed with their exact fixes in §7 (F1, F2). They were left for the operator rather than
+patched here because two of them are explicitly-labelled goldens, and the ground rules forbid
+adjust-until-green.
+
+Beyond that, the review found one **pre-existing** parity gap class that is a genuine
+launch-readiness input (§2a, V3/V5/V2 in particular) and one pre-existing test-isolation
+defect (§7 F3). Neither is caused by this branch.
+
+---
+
+## 1. What this review changed
+
+| Commit | What |
+|---|---|
+| (merge) | `origin/dev` merged — clean, no conflicts. dev's side touched only `thetadata.py`, its provider test, and `testplatform/version.py`; this branch touched none of them since the merge base. `version.py` taken from dev verbatim (`TEST_APP_VERSION = "2026.09.0010"`). |
+| `67141bbe` | NEW TEST: a TradeRule ruleset through `run_daily_backtest`, asserting fills (§3). |
+| `9a126d13` | NEW TEST + golden: an option results-identity fingerprint for `O_LEAP` (§4). |
+
+**CWD fix (mandate item 4) was already landed** — `test_option_grid_foundations.py:28-29`
+already resolves `_LAUNCHER_PATH` off `__file__` (comment cites `dcd12237`). Verified passing
+from both directories: 215 passed from `testplatform/backend`, 215 passed from the worktree
+root. No commit needed.
+
+No production code was changed by this review. Every mutation was restored by file copy and
+`git status --short` was verified clean after each.
+
+---
+
+## 2. Parity audit
+
+### 2a. Launcher-only behaviour (the operator's top concern)
+
+The rule: a GA gene must land ONLY in an emitted ruleset parameter or an expert setting.
+GA-level knobs (fitness, population, trade/breadth floors, schedule, universe, dates, warmup,
+seed, caching) and market-simulation parameters (commission, slippage, spread, fill model —
+the account simulating the exchange) are legitimately launcher-side.
+
+**Everything the GA *searches* is clean.** All ~30 gene families — `model:*` (expert params +
+the classic-RM sizing block + the regime overlay), `cond:<id>:value`/`:enabled`,
+`entry|exit:<rid>:enabled`, `exit:<rid>:a<i>:action_value`, and the whole option-selection set
+(`option_strike_param`, `option_strike_method`, `option_strike_delta[_long]`,
+`option_structure`, `option_dte`, `option_wing_width`, `option_sizing`, `option_min_arc`,
+`option_entry_cross`, `optsel:<half>:w_*`) — land in a ruleset action parameter or an expert
+setting. `test_gene_to_artefact_audit.py` pins that direction across 31 case combinations with
+per-gene sentinels, and the trial-config **whitelist drops nothing**: all five `decode_params`
+outputs are consumed by `_build_daily_trial_config`. **No inert GA dimension was found.** The
+rule-level `enabled: False` convention is fail-closed on both seeding paths — an authored-off
+rule is *removed*, never emitted carrying a stale flag.
+
+**What is NOT clean is the other direction** — behaviour the trial config carries that the
+artefact does not. The audit test never asks that question, which is why none of this was
+caught. Five findings, all **pre-existing** (none introduced by this branch's tasks), verified
+against the code by a second pass:
+
+| # | Finding | Where | Severity for a live deploy |
+|---|---|---|---|
+| **V3** | The handler **forces four trading permissions** onto every trial's expert, after the decoded overrides: `allow_automated_trade_opening=True`, `enable_buy=True`, `allow_automated_trade_modification=True`, `enable_sell=bool(enable_short)`. The interface defaults `allow_automated_trade_opening` and `allow_automated_trade_modification` to **False**. `TradeManager.py:2611` gates every open-positions action on `allow_automated_trade_modification` (`evaluator.execute(submit_to_broker=...)`). The launcher puts no permission key into expert settings, and `import_deploy_payload.py:120-122` sets only `allow_automated_trade_opening`, only for freshly created instances. | `daily_backtest_handler.py:1147-1156`; defaults `MarketExpertInterface.py:77-96`; gate `ba2_trade_platform/core/TradeManager.py:2611` | **HIGHEST.** A deployed genome evaluates its exits and creates them *pending, never submitted*. Every deploy runs live with no automated exits until someone ticks the box by hand. |
+| **V5** | `hold_assigned_stock` is a per-strategy-key **launcher** decision. Only `O_WHEEL` gets `True`; for every other option key the backtest sells stock delivered by assignment (clamped to the unpledged excess, remainder re-queued). Live never does this — `AlpacaAccount.reconcile_option_assignments` opens the equity long and stops. | `ba2test_launcher.py:4440-4463`, written at `:5018`/`:5347`; consumed at `backtest_account.py:3823` (`daily_backtest_handler.py:497` is only the API passthrough) | **HIGH.** Backtested P&L for `O_CSP`/`O_JL`/`O_RS` and the wheel family assumes a de-risking action live will not perform. The handler's own comment says flipping it "changes WHICH STRATEGY the run represents". |
+| **V2** | A hard-coded **$100 underlying-price cap** (`_MAX_STOCK_PRICE_DEFAULT = 100.0`), plus per-row caps ($300 for `O_SSTG`/`O_SSTD`, $100 for `O_IC`/`O_BF`/`O_LP`), enforced in the screener gate at `metric_store.py:1102`/`:1230`. It *is* exported (`backtests.py:1184-1195`, inside `universe.screener_settings`) and a live setting exists (`MarketExpertInterface.py:567`, `screener_price_max`) — but `tools/import_deploy_payload.py:119` writes only `settings.settings.expert_params` and **silently drops the `universe` block**. | `ba2test_launcher.py:3240`, `:3785-3798`, `:5143-5145`, `:6262`; rows `:2304`, `:2313`, `:2336`, `:2363`, `:2421` | **MEDIUM-HIGH.** The genome was selected on cheap names only; live it structures the same trades on $200-$400 underlyings where the per-contract reserve exceeds the sleeve. |
+| **V4** | `entry_action` is a testplatform-only config key carrying an **undecoded template**; `daily_engine.py:411-417` derives a run-global `_entry_is_option` from it and `:1011-1015` submits option entries directly instead of staging an RM candidate. Live has no such key and stages *every* enter-market recommendation as an RM candidate (`TradeManager.py:1906-1934`). A second, sharper bug rides the same line: if the GA prunes **every** member rule of a group, `daily_backtest_handler.py:1026`'s guard (`entry_rules == [] and not buy_tree and not entry_action`) fails *because `entry_action` is truthy*, so `:1028-1030` re-arms the run with `members[0]`'s option action on a bare permissive gate — the exact silent re-arm that comment was written to prevent. | `ba2test_launcher.py:4169`, `:4569`; `strategy_optimization_handler.py:1851`, `:2032`; `daily_engine.py:411-417`, `:1011-1015`; `daily_backtest_handler.py:1026-1030` | **MEDIUM.** The RM-funding asymmetry is real. The empty-group re-arm corrupts both the GA fitness and the persisted top-N for that genome. (The `members[0]` concern *per se* is inert — the derived value is a boolean and every member is an option action.) |
+| **V1** | The six `screener:*` genes reach a **per-bar entry universe filter** that lives only in the trial config (`screener_runtime`). | `ba2test_launcher.py:5137` + `:5185-5187` → `strategy_param_space.py:728` → `strategy_optimization_handler.py:1917-1936`, `:2048` → `daily_engine.py:601-606`, `:705` | **LOW for the option grids** — no options driver passes `--screener` (only `run_screener_capband_matrix.py:394` does), so this bites the equity cap-band grid. The live settings already exist under the exact same six names (`MarketExpertInterface.py:519-601`); as with V2 the break is in `import_deploy_payload.py`. |
+
+**Common root for V1, V2 and half of V3:** `tools/import_deploy_payload.py` consumes only
+`settings.settings.expert_params` and discards the `universe`, `execution` and
+`execution_interval` blocks that `_derive_export_payload` (`backtests.py:1216-1255`) already
+builds. One block in the importer closes most of it.
+
+**Sub-claim explicitly REFUTED** (it would have been the worst finding, so it is recorded):
+`enable_short` is indeed never set by either launcher command, but that flag is what *seeds*
+the symmetric SELL entry rule (`daily_backtest_handler.py:1029` → `default_rulesets.py:283-284`).
+With it off, no SELL-side candidate is ever created, so `_filter_orders_by_permissions` never
+fires. The equity legs of `O_CC`/`O_PP`/`O_STK` are BUY orders and pass on `enable_buy=True`;
+`O_WHEEL`'s entry is `O_CSP`'s short put, a pure-option entry. **No grid key is silently
+crippled.**
+
+**Secondary:** `test_gene_to_artefact_audit.py`'s `test_the_allowlist_is_exactly_this`
+(`:662-668`) asserts the only exemption is `schedule:`, while `_check_gene`'s `screener`
+branch (`:417-430`) accepts `trial["screener_runtime"]["settings"]` as a valid destination — a
+second exemption that is *documented* (comment at `:96-99`) but **un-asserted**, so that test
+cannot catch it. Also `strategy_optimization_handler.py:1990`
+`.get("execution_interval", "1d")` — no shipped caller omits it, but a hand-written config
+silently gets a daily fill clock instead of 5 min (latent trap, low severity). And
+`strategy_param_space.py:544-551` swallows a malformed authored DTE window into `hw = 7` —
+unreachable with shipped data (every authored window is int/int).
+
+### 2b. The live-only option lifecycle pass — STANDING FINDING, not a blocker
+
+`option_lifecycle_service.py` → `option_lifecycle.decide()` runs **live only**, by design.
+Documented at `EXPERTS.md:164`:
+
+> - **The exit/servicing pass is still LIVE ONLY**, by design: profit capture, tested-delta,
+> roll-DTE and the stops run in `option_lifecycle_service`, while a backtest expresses the
+> same exits as the strategy's own `close_option` rules, which the GA searches. Do not read a
+> backtest as evidence about profit-capture/roll-DTE/tested-delta behaviour.
+
+The one-line summary: **live = the shared rules path *plus* `decide()`; backtest = the shared
+rules path only.** Live is a strict superset for exits, so a grid result systematically
+*understates* how aggressively a live sleeve exits.
+
+| Live behaviour | Live code | Backtest equivalent | Reproduced? |
+|---|---|---|---|
+| Circuit-breaker FLATTEN of the book | `option_lifecycle.py:1058-1062`; `option_lifecycle_service.py:358-368`, closed `:415-418` | transition IS shared (`daily_engine.py:1544-1564` → `OptionRiskManagement.update_sleeve_breaker:1161`); entry decline shared (`option_book.py:582-585`) — **the flatten is not** | **PARTIAL** — backtest trips and refuses new entries but never closes the book; it rides the drawdown live liquidates |
+| Covered-call cover-lost close | `option_lifecycle.py:938-989`, `:1064-1069`; cover measured `option_lifecycle_service.py:522-710` | NONE (`grep cover_lost` over `testplatform/` = 0 hits) | **NO** |
+| Profit capture (`profit_capture_pct`) | `option_lifecycle.py:1071-1079`; P&L `_pnl_pct:495-533` | `opt_tp` rule `ba2test_launcher.py:4077-4080` → `ProfitLossPercentCondition` `TradeConditions.py:1814` | **PARTIAL** — same arithmetic, **two implementations** (`_pnl_pct` says "mirrors"), different quote sources (chain map vs per-leg `get_option_quote`) |
+| Strangle-specific capture (`strangle_capture_pct`) | `option_lifecycle.py:1072-1073` | NONE as a distinct knob — all credit kinds share one `opt_tp` band | **PARTIAL** |
+| Credit-multiple stop (`dr_stop_*`/`ur_stop_*`) | `option_lifecycle.py:1081-1097` | `opt_sl` `:4117-4121`; `opt_sl_ml` `:4140-4144` → `LossPctOfMaxLossCondition` | **DIFFERENT** — live partitions by declared strategy tag (and carries a deliberate quirk: with `ur_stop` off, a naked structure has NO stop even when `dr_stop` is on); the backtest partitions differently and can have both live, with different denominators |
+| **Tested-delta management** | `option_lifecycle.py:536-568`, `:1099-1105` | **NONE** — the only delta condition is `LongLegDeltaCondition` (`TradeConditions.py:3679`); no short-leg delta field exists in the registry | **NO — the hardest gap.** No ruleset can express it and the GA cannot search it |
+| DTE roll/close, single-expiry | `option_lifecycle.py:1120-1122`, `roll_window_dte:571-606` (SHORT leg) | `opt_dte` `:4085-4089` → `DaysToExpiryCondition:3216` (**LONG** leg) | **PARTIAL** — identical on single-expiry; on a declared multi-expiry structure the two readers *deliberately* disagree (documented both sides) |
+| PMCC overlay roll | `option_lifecycle.py:1113-1119`, `pmcc_roll_due:868-892` | `pmcc_roll_dte` `:3992-3996` → `ShortLegDaysToExpiryCondition:3560` → `RollPMCCShortAction:4875` | **YES via the rule** — and the live `decide()` branch is a **dead end**: `LIFECYCLE_ROLL_SHORT` is not in `LIFECYCLE_CLOSING_REASONS` and `option_lifecycle_service.py:397-418` handles only `UNKNOWN`/`COVER_LOST`/`should_close`, so live computes "roll" and silently discards it |
+| PMCC buyback (`pmcc_buyback_pct`) | `option_lifecycle.py:218-228`, `credit_decay_pct:647-676` | `pmcc_roll_buyback` `:3997-4001` → `CreditDecayedPctCondition:3619` | **YES** — genuinely one implementation |
+| Unknown / unmeasurable alarm | `option_lifecycle.py:1124-1130`; `LifecyclePassResult.unknown:196` | per-condition only (`_TwoExpiryLegCondition._unevaluable:3544-3548`) | **PARTIAL** — backtest has no aggregate; an unevaluable condition is a `False`, indistinguishable from "threshold not met". A trial cannot report how many bars it was blind |
+| Close execution mechanics | `option_lifecycle_service._close:770-824` — **MARKET** order | `CloseOptionAction:5236-5409` — **LIMIT** + backtest-only spread concession `:5301-5347` | **DIFFERENT by design**; residual optimism recorded at `:5264-5269` |
+| Wheel steps | NONE in the live pass (assignment reconciled in `AlpacaAccount.py:6489-6593`) | `_build_strategy_wheel` `:4703-4770`, conditions `TradeConditions.py:3768`/`:3836` | **N/A** — rules-only in both; runs live through the same evaluator |
+| Expiry / assignment settlement | NONE in the live pass — OCC + broker | `daily_engine._apply_option_expiry:1455-1542` | **DIFFERENT** — backtest never exercises ITM longs, always assigns short ITM, models no early American assignment |
+
+**Reverse direction — what the backtest does that live does not:** margin-call liquidation
+(`daily_engine.py:1430-1433`, `:756-757`); `hold_assigned_stock` (V5 above); the exit-quote
+concession; **per-bar cadence** (backtest walks OPEN_POSITIONS every bar, live on the
+JobManager schedule); and **rule ordering effects** — `_insert_option_overlay(anchor="front")`
+plus `continue_processing` make first-match order load-bearing in the backtest, while live's
+`decide()` has its own fixed precedence ladder, so on a bar where profit-capture and roll-DTE
+both hold the two runtimes record different reasons.
+
+**Recommended follow-up, cheapest first:**
+1. **Add a `short_leg_delta` condition.** The only live rule with *no* expressible backtest
+   counterpart. The shape already exists (`_TwoExpiryLegCondition` + `option_lifecycle._tested`'s
+   short-leg selection); follows the `credit_decayed_pct` precedent exactly. Biggest win per
+   unit of work.
+2. **Decide what `LIFECYCLE_ROLL_SHORT` is for.** Today live computes it and drops it. Prefer
+   *deleting* the branch and letting the rule own the roll in both runtimes — that matches
+   `RollPMCCShortAction`'s own "IT IS A RULE, NOT AN ENGINE HOOK" argument.
+3. **Give the breaker trip an exit in the backtest** at the `update_sleeve_breaker` call site
+   (`daily_engine.py:1550`), mirroring `option_lifecycle_service.py:415-418`. Without it,
+   `EXPERTS.md:161`'s "one implementation, two callers" is true of the latch but not of its
+   consequence.
+4. **Unify the two P&L implementations** (`option_lifecycle._pnl_pct` and
+   `TradeConditions._get_spread_pnl_via_transaction`).
+5. Longer term: drive a shared `decide()` per bar from `daily_engine`, as the breaker
+   transition already is.
+
+Also worth recording: **no shipped grid spec sets `risk_manager_mode: classic_options`**
+(`ba2test_launcher.py:1073-1083`, pinned by
+`test_no_shipped_expert_spec_selects_a_risk_manager_mode`), so in current grid jobs the entry
+rails and the breaker are inert too. That changes how to read every "both runtimes" claim in
+`EXPERTS.md:158-163`.
+
+### 2c. Task 6's roll — reached by BOTH runtimes (re-confirmed)
+
+All five items live in `packages/common/ba2_common/` and are reached through the same two
+shared spines: the ruleset walk (`TradeActionEvaluator` → `create_action` → `action.execute()`)
+and the fill observation (`ReadOnlyAccountInterface.refresh_transactions`).
+
+| # | Item | Live entry | Backtest entry | Verdict |
+|---|---|---|---|---|
+| 1 | `RollPMCCShortAction` (`TradeActions.py:4875`) | `WorkerQueue.py:1578` → `TradeManager.py:2358` → evaluator `:2531`/`:2554` → `:2611` → `TradeActionEvaluator.py:378` → `action.execute()` | `daily_engine.py:463` → `_manage_open_positions` `:712` (def `:1154`) → evaluator `:1230`/`:1233` → `:1242` → same `TradeActionEvaluator.execute` | **BOTH** |
+| 2 | `CloseOptionAction` (`TradeActions.py:5236`) | identical chain; `forced_exit` set at `TradeActionEvaluator.py:1161` | identical chain | **BOTH** |
+| 3 | Submit guard (`OptionsAccountInterface.submit_option_order:238`; multi-expiry invariant `:322-333`, cover `:343`) | Alpaca/Tasty **do not override** `submit_option_order` — only the broker hook `_submit_option_order_impl` (`AlpacaAccount.py:6122`) | `BacktestAccount.submit_option_order` (`backtest_account.py:2085`) is a 3-line `super()` passthrough; hook at `:3617` | **BOTH** |
+| 4 | Fill-derived max-loss: `_restamp_declared_multi_expiry_max_loss:925` called from `refresh_transactions` at `ReadOnlyAccountInterface.py:1057` → `OptionRiskManagement.max_loss_from_fills:525` → `option_lifecycle.intrinsic_floor_per_contract:700` | `JobManager.py:724` → `TradeManager.py:222` → `account.refresh_transactions()` at `TradeManager.py:276`; no live account overrides it | **the ENGINE calls it**: `daily_engine.py:1375` (after `refresh_orders()`) and `:1451` (post-settlement) → `BacktestAccount.refresh_transactions` (`backtest_account.py:2950`), whose **first statement** is `super().refresh_transactions()` (`:2968`) | **BOTH** |
+| 5 | `_entry_order` oldest-by-id (`TradeActions.py:4942-4954`) | via #1 | via #1; sibling `ReadOnlyAccountInterface.py:952-954` via #4 | **BOTH, correct** |
+
+**`74be78a1` verified.** It removes `RollPMCCShortAction._restamp_max_loss` entirely, replaces
+the submit-time write with a comment (`TradeActions.py:5134-5141`), and renames the result key
+to `projected_max_loss_per_contract` (`:5149`) so **nothing is persisted at submit**. The
+persisted value is written only in `_restamp_declared_multi_expiry_max_loss`, from
+`entry.filled_qty or entry.quantity` and executed leg rows; `max_loss_from_fills` returns
+`None` (leave the stamp alone) for an unreadable structure count, no executed leg, or an
+executed leg with `open_price is None`. Unfilled tickets contribute nothing and the derivation
+is idempotent. Equity does structurally zero work — one attribute read and one `is None` test
+at `ReadOnlyAccountInterface.py:1055-1057`, pinned by
+`test_an_equity_transaction_never_reaches_the_option_restamp`.
+
+**`_entry_order` — correct.** Both copies use the identical key:
+
+```python
+return min(rows, key=lambda o: (o.id is None, o.id or 0)) if rows else None
+```
+
+A genuine `min` by id; the tuple key sorts `id is None` last rather than aliasing it to 0; the
+added `not contract_symbol` filter stops a single-leg option order being read as a multi-leg
+parent. Both copies agreeing matters because that row carries both `ORDER_PMCC_OVERLAY_KEY`
+and `max_loss_per_contract` (the `loss_pct_of_max_loss` denominator).
+
+**One gap worth a follow-up test:** the `ReadOnlyAccountInterface` copy *is* pinned (via
+`_entry_stamp(parent)` re-fetching the original parent by id after a roll —
+`test_pmcc_lifecycle.py:1370`, `:1375`, `:1485`, `:1518`). **`RollPMCCShortAction._entry_order`
+has no test naming the ordering.** The nearest coverage
+(`test_an_UNFILLED_roll_does_not_block_the_next_roll_FOREVER`, `:1447`) does exercise it with
+two parentless rows, but `trade_store.orders_where` returns insertion/rowid order, so the
+pre-fix `rows[0]` would have passed it too. A test that reverses or shuffles the returned rows
+before selection would close it. (Listed as F5 below.)
+
+---
+
+## 3. The open question — RESOLVED, in favour of the code
+
+**Question:** a standalone harness produced 0 orders driving a TradeRule-shaped ruleset
+through `run_daily_backtest` (the GA's `_trial_worker` entry point), while the golden run uses
+a lower-level path. Handler defect, or signal absence?
+
+**Answer: signal absence. The handler is fine.** Three runs over the same hermetic fixture,
+same expert (`FMPEarningsDrift`), same window, differing only in ruleset shape:
+
+| Run | Ruleset shape | `total_trades` |
+|---|---|---|
+| A (control) | no `entry_rules` — the legacy default seeding path | **1** |
+| B | TradeRule rows from the shared converter `trade_rules_from_legacy` | **1** |
+| C | the launcher's own `S1` rules via `_build_strategy` → `decode_params` | **4** |
+
+Committed as `testplatform/backend/tests/backtest/test_traderule_ruleset_through_run_daily_backtest.py`
+(`67141bbe`). No existing test covered this arrangement: `test_grid2_engine_paths.py` drives
+TradeRule rulesets but constructs `DailyBacktestEngine` by hand; `test_daily_engine_e2e.py`
+goes through the handler but on the legacy path; `test_deploy_round_trip_parity.py` compares
+decoded artefacts without running anything.
+
+**The fills alone pin nothing — a mutation proved it.** Forcing `_is_trade_rules` to return
+`False` left all three trade counts **unchanged**, because `_seed_enter`'s legacy arm also
+accepts `entry_rules` (as `seed_ruleset_from_tree(entry_actions=...)`) and still fills. The
+test therefore also spies on which of the four enter-seeding functions ran and with what
+argument. Re-run under the same mutation: **tests B and C now FAIL**; restored by file copy,
+tree clean, 3 passed.
+
+---
+
+## 4. The new option results baseline
+
+No golden-style fingerprint existed for any option key. Added:
+`testplatform/backend/tests/backtest/test_option_golden_run.py` +
+`tests/backtest/golden/option_leap_golden_run.json` (`9a126d13`).
+
+It runs the `O_LEAP` chain — the **launcher's own** emitted entry/exit rules via `_leap_rules`,
+over a fixture chain at the ~50% LEAPS bar density — through the real
+`DailyBacktestEngine.run()`, and pins every round-trip at full float precision *including* the
+option-only columns (`contract_symbol`, `underlying_symbol`, `multiplier`) that the equity
+fingerprint deliberately drops, **plus the whole 149-point equity curve**.
+
+```
+sha256        a28a414be4d1e0c9e5cd9b5ce9b393ce987c9004cb1bd39eb3d28382839e73e5
+n_trades      1   (entry 2024-01-02 @ 21.25, exit 2024-04-29 @ 24.7115, pnl 692.30, 84 bars,
+                   contract GOLDX250222C00080000)
+final_equity  100692.3
+curve         149 points, 53 distinct held-option equity values over the 84 held bars
+```
+
+**THIS IS A NEW BASELINE, NOT A PROOF OF IDENTITY WITH PRE-BRANCH BEHAVIOUR.** The equity
+golden can claim identity because its harness was replayed against a pre-options reference
+tree and compared. Nothing comparable is claimed here — the branch's own results-comparability
+note already records a **baseline split on the Black-Scholes mark fallback**, so an option run
+on this branch is *not* expected to reproduce a pre-branch number. This pin says only: from
+here on, these numbers do not move without someone saying so.
+
+Two fixture defects were found and fixed while building it, each now guarded by its own test:
+
+* A period-14 premium wave against the ~42-bar hold put the exit on the wave's own zero phase,
+  so entry and exit filled at the identical premium and **every P&L field was `'0.0'`** — a
+  fingerprint that hashes stably while pinning nothing. Period is now 13.
+  `test_the_golden_carries_a_NON_ZERO_round_trip` guards it.
+* A flat underlying left the BS fallback returning one constant.
+  `test_the_curve_actually_MOVES_while_the_option_is_held` guards it.
+
+**Mutation-verified.** `option_bs.bs_price(...) * 1.000001` — a 1-part-per-million perturbation
+— leaves the trade rows untouched and is caught **only** by the pinned curve. That is the
+evidence that the BS fallback is genuinely reached and genuinely pinned. Restored by file
+copy; 15 passed across the two goldens + `test_grid2_engine_paths.py` afterwards.
+
+---
+
+## 5. Suites
+
+All run one at a time, on the merged tree, with the worktree-pinning `PYTHONPATH` verified
+(`ba2_common`, `ba2_providers`, `ba2_experts` and `ba2test_launcher` all resolve inside
+`BA2-options-grid2`). Free RAM 26-27 GB throughout.
+
+| Suite | Result | vs the STATE note's baseline |
+|---|---|---|
+| backend `pytest tests/` (from `testplatform/backend`) | **4518 passed / 158 skipped / 12 failed**, 8m05s | was 4446/158/5 — **7 NEW failures**, all pre-existing on the branch (see below) |
+| `packages/common` (from its own dir) | **3131 passed / 1 failed** (the known `test_portfolio_allocation_wizard` float-dust) | at baseline |
+| `packages/experts` | **885 passed / 0 failed** | at baseline |
+| `packages/providers` | **450 passed / 0 failed** | 447 + 3 from dev's thetadata test |
+| root `tests/` (from the worktree root) | **4494 passed / 52 failed**, 6m05s | the known-bad set (`test_portfolio_allocation_page` 31, `test_option_intent_migration` 16, `test_tastytrade_account` 2, `test_broker_sdk_pins` 2 = 51) **+ 1** |
+| `tests/backtest/test_equity_golden_run.py` | **3 passed** — fingerprint unmoved | at baseline |
+| `tests/backtest/test_option_golden_run.py` (NEW) | **5 passed** | new |
+| `tests/test_strategy_fitness_equity_frozen.py` | **809 passed / 5 failed** (the known `curve_uneven` cases) | at baseline |
+| `tests/test_strategy_fitness_option_car.py` | **58 passed / 0 failed** | at baseline |
+| `tests/test_strategy_fitness_convex_frozen.py` | **167 passed / 0 failed** | at baseline |
+| `test_option_grid_foundations.py` from `testplatform/backend` / from the worktree root | **215 passed / 215 passed** | CWD fix confirmed both ways |
+
+### The 7 new backend failures — all pre-existing, none caused by this review
+
+**5 of them are Task 6 staleness** (`test_options2_matrix_script.py` ×3,
+`test_launcher_iv_rank_gene.py` ×1, `test_launcher_volume_vol_genes.py` ×1). They fail in
+isolation, without any of this review's files, and the cause is diagnosed statically: `O_PMCC`
+was added to `_DEFAULT_STRATEGIES`/`_MIN_DTE`/`_OPTION_STRATS` and four dependent tests were
+not updated. **F1/F2 in §7.** The STATE note's "no new failures" verification predates Task 6.
+
+**2 of them are an order-dependent seam-wiring capture** (`test_seam_wiring.py` ×2). Controlled
+comparison over `tests/backtest/`: **with** this review's two new files 2 failed / 1032 passed;
+**without** them 2 failed / 1024 passed — the identical two. **F3 in §7.**
+
+### The 1 extra root-suite failure
+
+`tests/test_accounts/test_account_interface.py::TestTheExitGuardNetsSalesAlreadyInFlight::test_a_transactions_OWN_working_close_is_not_counted_against_itself`
+— `sqlite3.OperationalError: no such table: accountdefinition`, a test-DB setup failure in
+`tests/conftest.py:62`'s `reset_test_db`. **Reproduces in isolation** (1 failed / 110 passed),
+so it is not a load flake. Neither the test file, `conftest.py`, nor `ba2_common/core/db.py`
+was touched by this branch (`git log 56c3f8c2..HEAD --` on those paths is empty) — it arrived
+with the `option-selection-modes` work already on `dev`. **Recommend adding it to the known-bad
+list (making it 52) or fixing the fixture.**
+
+---
+
+## 6. Mutation spot-checks of earlier tasks' pins
+
+Three earlier tasks' guards, re-verified by executing one mutation each. Every restore was by
+**file copy**, and `git status --short` was clean after each (only this untracked report file).
+
+| Task | Guard | Mutation applied | Named test | Result |
+|---|---|---|---|---|
+| 10 | fixed-delta strike-method set | dropped `"O_PMCC"` from `_FIXED_DELTA_METHOD_STRATEGIES` (`ba2test_launcher.py:2707`) | `test_the_pmcc_joins_the_debit_half_and_the_fixed_delta_method_set` (`test_option_grid_foundations.py:1827`) | **KILLED** — AssertionError at `:1831` |
+| 12 | cap-binding return term | clamped the return term at the cap in `_option_convex` (`strategy_fitness.py:1417`), simulating a rank on the capped (deployed) equity series — the exact masking the pin exists to prevent | `test_a_capped_run_ranks_on_uncapped_pnl_not_on_the_capped_equity_series` (`test_strategy_fitness_convex_frozen.py:386`) | **KILLED** — AssertionError at `:397` (`big > 100.0`) |
+| 13 | rule-level `enabled` guard | made an authored-off rule SURVIVE instead of being removed (`strategy_param_space.py:644-647` → `pass`) | `test_the_default_genome_carries_no_active_sl_ml_exit` (`test_convex_grid_foundations.py:316`) | **KILLED** |
+
+After all three restores: `test_option_grid_foundations.py` +
+`test_strategy_fitness_convex_frozen.py` + `test_convex_grid_foundations.py` = **430 passed**.
+
+A **fourth** mutation, on this review's own new test, is recorded in §3: forcing
+`_is_trade_rules` to `False` initially **SURVIVED**, which is what forced that test to be
+strengthened with a seeder spy; it then killed tests B and C.
+
+A **fifth**, on the new option golden (§4): `option_bs.bs_price(...) * 1.000001` — caught only
+by the pinned equity curve, which is why the curve is in the fingerprint.
+
+---
+
+## 7. FIX-NEEDED list for the operator
+
+Nothing here was changed by this review — every item needs either a production-code change or a
+deliberate golden edit, both outside this review's mandate.
+
+### BLOCKING the merge (5 failing backend tests, all test-side staleness)
+
+**Root cause, shared by F1 and F2:** Task 6 (`O_PMCC`) landed as `718f7cf4` **after** the
+branch's own final-verification pass (STATE note item 7) recorded "4446 passed / 5 failed, no
+new failures". Adding `O_PMCC` to `_OPTION_STRATS` and to the matrix driver's
+`_DEFAULT_STRATEGIES` invalidated four dependent tests, and the suites were never re-run. The
+launcher's behaviour is **correct** in every case — `test_option_grid_foundations.py:1827`
+(`test_the_pmcc_joins_the_debit_half_and_the_fixed_delta_method_set`) passes, confirming the
+production classification. Only the tests are stale.
+
+**F1 — `tests/test_options2_matrix_script.py`, 3 tests.** `_DEFAULT_STRATEGIES` is now
+`["O_LEAP", "O_PMCC", "O_ERN", "O_CBS", "O_PBS"]` (`tools/run_options2_matrix.py:84`) and
+`_MIN_DTE` now carries `"O_PMCC": 365` (`:89-100`, with the rationale: the PMCC's LONG leg is a
+LEAPS, so it needs the same January-cycle depth).
+
+* `test_the_chain_depth_thresholds_are_the_designs` (`:92-95`) — add `"O_PMCC": 365` to the
+  expected dict.
+* `test_the_preflight_runs_once_per_DISTINCT_threshold` (`:104-112`) — `sorted(groups[365])`
+  becomes `["O_LEAP", "O_PMCC"]`. The docstring's "Three probes for four keys" becomes "for
+  five keys" (still three distinct thresholds — the point of the test is unchanged).
+* `test_the_job_list_is_exactly_this` (`:134-144`) — **this one is labelled "THE GOLDEN"**;
+  insert `("opt2-FMPRating-O_PMCC", "FMPRating", "O_PMCC")` as the SECOND row, matching the
+  strategy-major order of `_DEFAULT_STRATEGIES`. Confirm the ordering intent before editing.
+
+**F2 — `tests/test_launcher_iv_rank_gene.py` + `tests/test_launcher_volume_vol_genes.py`, 2
+tests.** Both hold an INDEPENDENT re-derivation of the debit/credit partition (deliberately not
+read back from `_DEBIT_OPTION_MEMBERS`, so a mis-assignment cannot be self-consistent).
+`O_PMCC`'s `action_type` is `"open_pmcc"` (`ba2test_launcher.py:2503`) and is absent from both
+lists, so each test derives `">"` while the launcher correctly emits `"<"`.
+
+* `test_the_two_halves_are_both_non_empty_and_disjoint_in_direction`
+  (`test_launcher_iv_rank_gene.py:126`, list at `:136-145`)
+* `test_the_two_halves_use_opposite_iv_rv_directions`
+  (`test_launcher_volume_vol_genes.py:165`, list at `:168-175`)
+
+Add `"open_pmcc"` to the `long_premium` set in BOTH, with the reasoning stated in the
+re-derivation's own idiom: **a PMCC is a net-DEBIT diagonal — the LEAPS long dominates the
+30-45-DTE short, so it wants the buyer's direction on both the IV-rank and the IV/RV gate.**
+(Both files already carry exactly this note for the backspreads; follow that pattern.)
+
+### NON-BLOCKING (pre-existing; none caused by this branch)
+
+**F0 — one extra root-suite failure**, `test_account_interface.py::...::test_a_transactions_OWN_working_close_is_not_counted_against_itself`
+(`sqlite3.OperationalError: no such table: accountdefinition`, from `tests/conftest.py:62`
+`reset_test_db`). Reproduces in isolation; arrived with the `option-selection-modes` work
+already on `dev`. Either fix the fixture or record it as the 52nd known-bad.
+
+**F3 — the seam-wiring resolver captures a stale `get_provider` (test-isolation).** Two
+`tests/backtest/test_seam_wiring.py` tests fail in a full `tests/backtest/` run and pass when
+the file is run alone. **Reproduces in two files:**
+`pytest tests/backtest/test_daily_engine_e2e.py tests/backtest/test_seam_wiring.py` →
+`assert <FixtureOHLCVProvider> is <FMPOHLCVProvider>`.
+
+**Not caused by this review's new tests** — controlled comparison: `tests/backtest/` with my
+two files = 2 failed / 1032 passed; without them = 2 failed / 1024 passed, the identical two.
+And none of `seam_wiring.py`, `test_seam_wiring.py`, `e2e_support.py`, `hermetic_providers.py`
+or `test_daily_engine_e2e.py` was touched by this branch (`git log 56c3f8c2..HEAD --` on those
+paths is empty).
+
+**Mechanism, exactly:** `_wire_provider_resolver` (`seam_wiring.py:182-199`) does
+`from ba2_providers import get_provider` and its `_resolve` closure **binds that function
+object**. `wire_backtest_seams` is idempotent (`if _resolver is None`, `:152-156`), so if the
+FIRST wire happens while `e2e_support.hermetic_providers` has `ba2_providers.get_provider`
+patched to the fixture, the closure captures the FIXTURE permanently and is never rebuilt for
+the rest of the process. `hermetic_providers` restores the module attribute correctly — the
+closure is what is stale.
+
+**Fix (one line, production):** resolve through the module attribute at call time —
+`import ba2_providers` and `return ba2_providers.get_provider(category, name, **kwargs)` —
+instead of the bound name. Benign in production (each GA worker wires once against the real
+provider), but it makes the whole backend suite order-dependent, which is how the 5 stale tests
+above stayed invisible for a day.
+
+**F4 — the parity violations of §2a.** V3 (forced trading permissions, no artefact) is the one
+to fix before any live deploy off this branch; V5, V2, V4, V1 follow. The common repair for
+V1/V2/half of V3 is one block in `tools/import_deploy_payload.py:119-122`, carrying
+`universe.screener_settings` + `instrument_selection_method` + the permission gates into
+`expert_params` — the export side (`backtests.py:1184-1255`) already builds them and the live
+settings already exist under the same names.
+
+**F5 — `RollPMCCShortAction._entry_order` has no test naming its ordering** (§2c). The fix is
+correct; it is simply unwitnessed on the action side, because `trade_store.orders_where`
+returns insertion/rowid order and the pre-fix `rows[0]` would have passed the nearest existing
+test. A test that reverses or shuffles the returned rows before selection closes it.
+
+**F6 — `test_gene_to_artefact_audit.py` audits one direction only** (§2a secondary). It asks
+"does every gene reach the artefact?" and never "does the trial config carry behaviour the
+artefact does not?" — which is why the whole V1-V5 class was invisible. Its
+`test_the_allowlist_is_exactly_this` also cannot catch the `screener` exemption its own
+`_check_gene` grants.
+
+---
+
+## 8. MERGER CHECKLIST
+
+1. **Land F1 + F2 first.** 5 stale tests, test-only edits, exact changes in §7. The branch is
+   not clean-green until they are done.
+2. **ONE `TEST_APP_VERSION` bump, at a matrix3 job boundary — NEVER mid-run.** Workers compare
+   `TEST_APP_VERSION` alone to decide whether to self-update
+   (`worker_client.py:ensure_synced`), so a mid-run bump fragments a running grid onto
+   different code and silently breaks trial reproducibility. This branch touches only
+   `packages/` and `testplatform/`, so it is `testplatform/version.py` that bumps, **not**
+   `ba2_trade_platform/version.py`.
+3. **`origin/dev` merge state: DONE and clean.** Merged during this review; dev's side touched
+   only `packages/providers/ba2_providers/options/thetadata.py` (expiry-capped query window),
+   its provider test, and `version.py`. No overlap with this branch since the merge base, no
+   conflicts. `version.py` taken from dev verbatim at `TEST_APP_VERSION = "2026.09.0010"` — the
+   merger's own bump goes on top of that number, so re-check dev has not moved again first.
+4. **Option grids must be RETARGETED to start 2020-01-01 on ThetaData before any launch**, with
+   provider parity pins and the option-cache optimisation in place. Memory note from the
+   measured cold/warm work: cold load is **~3.6 s / 22 MB per symbol** on the 2024+ store and
+   roughly **3x that at 2020**. Mitigations to have in hand before launching: raise
+   `BT_MAX_TASKS_PER_CHILD` for option jobs (`strategy_optimization_handler.py:406`, default
+   **8**) so the cold tax amortises over more individuals, and/or move to **one parquet per
+   symbol**. The STATE note's amortised table stands: ~9.8 s/trial (~6%) on the local pool at
+   the default recycle interval, ~1.3 s/trial (~0.8%) on the distributed path — real, but not
+   a launch blocker by itself. The genuinely open perf question is the STATE note's own: does
+   the parquet store hold RAW frames that get RE-FILTERED per bar, versus a pre-processed
+   structure like the equity path's OHLCV preload + worker memo. Launch readiness on
+   performance waits on that probe.
+5. **`BT_BAR_CACHE_TRIALS=0` is the default** (`price_source.py:171`) and means *flush the whole
+   bar cache every individual*. That costs equity grids hours of repeated preloads. Evaluate
+   raising it for the next launch — it is one env var.
+6. **Do not read a backtest as evidence about profit-capture / roll-DTE / tested-delta**
+   (`EXPERTS.md:164`, §2b). If any option key is deployed live off this branch, the live
+   lifecycle pass will exit more aggressively than the grid that selected it.
+7. **Before any live deploy: fix V3** (§2a/F4). Otherwise the deployed instance evaluates its
+   exits and never submits them.
+
+### Parked operator items (carried forward, unresolved)
+
+* **`OS2` = `[O_IC]` alone.** `O_CSP` (cash-secured put, also full-notional/neutral-ish) is
+  excluded by the same naked-vol/full-notional filter that dropped `O_SSTG`/`O_SSTD`. Whether
+  it should ever join `OS2` or stay standalone is an open design question —
+  `ba2test_launcher.py` ~line 3705 carries the detail.
+* **`classic_options` risk-manager rails have no UI path** — the settings dialog renders none
+  of the sleeve rails. Compounding this: **no shipped grid spec sets
+  `risk_manager_mode: classic_options`** at all, so in current grid jobs the entry rails and
+  the sleeve breaker are inert.
+* **The `option-selection-modes` stack (through `56c3f8c2`, this branch's base) is MERGED into
+  `dev` but not DEPLOYED to any live `ExpertInstance`.** A separate, pending operator action,
+  unrelated to this branch's merge status.
+* **The live-only lifecycle pass** (§2b) — standing follow-up, five ranked steps, cheapest
+  first being a `short_leg_delta` condition.
+* **`run_screener_capband_matrix.py` default fitness** is `calmar_ratio`, not
+  `consistent_annual_return`. Check any NEW bare invocation before comparing its numbers with
+  the recorded matrix3/goal2020 jobs, which pass `--fitness` explicitly.

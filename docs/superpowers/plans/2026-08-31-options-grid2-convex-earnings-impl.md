@@ -1459,3 +1459,50 @@ check any NEW invocation (as opposed to the already-recorded matrix3/
 goal2020 commands, which pass `--fitness consistent_annual_return`
 explicitly) for whether it relies on the default before comparing its
 numbers with either running grid's baseline.
+
+---
+
+## STATE — SUPERSEDED by the consolidated final review (2026-09-02/03)
+
+**Read `docs/superpowers/plans/2026-09-02-options-grid2-final-review.md` instead of the
+baseline table above.** Everything in this file up to here stands EXCEPT the item-7
+verification numbers, which are stale in a way that matters.
+
+**Why they are stale.** Item 7's "no new failures anywhere" was measured BEFORE Task 6 /
+6-PRE landed (this note's own Open-items section says Task 6 landed on 2026-09-02, after).
+`718f7cf4` added `O_PMCC` to `_OPTION_STRATS` and to the matrix driver's
+`_DEFAULT_STRATEGIES`/`_MIN_DTE`, which invalidated **five** backend tests that were never
+re-run. The suites were never re-measured after that commit, so the branch closed reporting
+a green it no longer had.
+
+**Branch verdict: FIX-NEEDED** — 5 stale TEST-side expectations block a clean merge. The
+launcher's behaviour is correct in every one of them
+(`test_the_pmcc_joins_the_debit_half_and_the_fixed_delta_method_set` passes, confirming the
+production classification); only the tests need updating. Exact edits are in §7 (F1, F2) of
+the review.
+
+**Resolved by the review:**
+
+- **The 0-orders open question is CLOSED, in favour of the code.** A TradeRule-shaped ruleset
+  DOES fill through `run_daily_backtest` — control 1 trade, converted TradeRules 1 trade, the
+  launcher's own decoded `S1` rules 4 trades, same fixture and expert throughout. Signal
+  absence, not a handler defect. Pinned by
+  `testplatform/backend/tests/backtest/test_traderule_ruleset_through_run_daily_backtest.py`
+  (`67141bbe`) — with a seeder spy, because a mutation proved the fill counts alone pin
+  nothing (`_seed_enter`'s legacy arm also accepts `entry_rules` and still fills).
+- **`origin/dev` is merged** (clean; `TEST_APP_VERSION = "2026.09.0010"` taken from dev). The
+  merger still owes ONE bump on top, at a matrix3 job boundary.
+- **An option results baseline now exists** — `test_option_golden_run.py` +
+  `golden/option_leap_golden_run.json` (`9a126d13`), sha256
+  `a28a414be4d1e0c9e5cd9b5ce9b393ce987c9004cb1bd39eb3d28382839e73e5`. A NEW baseline, NOT an
+  identity claim against pre-branch behaviour — the results-comparability note's BS-fallback
+  baseline split still applies.
+- **Task 6's roll machinery is reached by BOTH runtimes**, verified hop by hop, and
+  `74be78a1`'s fill-derived max-loss and the `_entry_order` oldest-by-id fix are correct.
+
+**New standing findings** (all pre-existing, none introduced by this branch's tasks): the
+launcher/handler carries five classes of behaviour that reach no artefact (forced trading
+permissions, `hold_assigned_stock`, the $100 underlying cap, `entry_action`, the screener
+genes) — see §2a; the live-only lifecycle pass gap is tabulated behaviour by behaviour in
+§2b; and a seam-wiring closure captures a stale `get_provider`, which is what made the whole
+backend suite order-dependent and let the five stale tests hide (§7 F3).
