@@ -6,6 +6,7 @@ only if it actually awaits.
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import textwrap
 from dataclasses import dataclass
@@ -62,10 +63,32 @@ def _api_routes():
     return list(_flatten_routes(app.routes))
 
 
+_NESTED_SCOPE = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _own_body_nodes(nodes) -> Iterable[ast.AST]:
+    """Yield `nodes` and everything under them, WITHOUT descending into nested scopes.
+
+    Like `ast.walk`, but it prunes nested `def`/`async def`/`lambda`. An `await` inside a nested
+    coroutine that the route never awaits is not work the route does on the event loop, so
+    counting it would let a genuinely blocking route pass as "awaits something".
+    """
+    for node in nodes:
+        if isinstance(node, _NESTED_SCOPE):
+            continue
+        yield node
+        yield from _own_body_nodes(ast.iter_child_nodes(node))
+
+
 def _awaits_something(fn) -> bool:
     src = textwrap.dedent(inspect.getsource(inspect.unwrap(fn)))
-    tree = ast.parse(src)
-    return any(isinstance(n, (ast.Await, ast.AsyncWith, ast.AsyncFor)) for n in ast.walk(tree))
+    func = ast.parse(src).body[0]
+    assert isinstance(func, (ast.FunctionDef, ast.AsyncFunctionDef)), f"{fn!r} is not a function"
+    # `func.body` only: not its decorators, not its argument defaults, not nested definitions.
+    return any(
+        isinstance(n, (ast.Await, ast.AsyncWith, ast.AsyncFor))
+        for n in _own_body_nodes(func.body)
+    )
 
 
 def _pure_blocking_async_routes():
@@ -75,6 +98,27 @@ def _pure_blocking_async_routes():
             for m in sorted(r.methods):
                 bad.append(f"{m} {r.path} -> {r.endpoint.__module__}.{r.endpoint.__name__}")
     return bad
+
+
+async def _awaits_only_inside_a_nested_def():
+    """An `async def` whose sole `await` sits in a nested coroutine it never awaits: every
+    statement it actually runs is blocking, so the oracle must NOT call this one awaiting."""
+    async def _inner():
+        await asyncio.sleep(0)
+
+    return _inner
+
+
+async def _awaits_for_real():
+    await asyncio.sleep(0)
+    return None
+
+
+def test_awaits_something_ignores_nested_scopes():
+    """The oracle judges the route body alone — an `await` parked in a nested `def`/`lambda`
+    never runs on the loop unless the route awaits it, and the route here does not."""
+    assert _awaits_something(_awaits_for_real) is True
+    assert _awaits_something(_awaits_only_inside_a_nested_def) is False
 
 
 def test_route_discovery_sees_the_included_routers():
