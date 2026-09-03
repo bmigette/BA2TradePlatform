@@ -783,3 +783,63 @@ one.
 B1 (short-leg delta), C1 (breaker flatten), C3/C4/C5, C7-C10 and D are untouched and still
 ranked in the STATE note. `EXPERTS.md:164`'s warning narrows but does not disappear: roll-DTE is
 now genuinely shared, and profit-capture / tested-delta / the credit stops remain live-only.
+
+### 10g. M7 (2026-09-03) — O_WHEEL's inherited exits after assignment
+
+Closing the covered call's DTE case (§10b) exposed the other half of the same defect on the
+same key. `O_WHEEL` is ONE ruleset over a position that changes identity halfway through, and
+the five exits it inherits from `O_CSP` were all authored for the short PUT. Once the put is
+ASSIGNED the evaluator anchors them on the STOCK.
+
+| rule | PUT phase | STOCK phase, before M7 | disposition |
+|---|---|---|---|
+| `cc_dte` / `cc_guard` / `cc_sell` | not held / false | the written call and the assigned shares, repository-resolved | already named — unchanged |
+| `opt_tp` | the put's % of credit | **re-anchors onto the assigned stock's P&L** and fires a close that resolves nothing | (i) inert by construction |
+| `opt_time` | the put's days held | **re-anchors onto the stock transaction's `open_date`** | (i) |
+| `opt_sl` | the put's % of credit (loss side) | same re-anchor as `opt_tp` | (i) |
+| `opt_dte` | the put's remaining life | unevaluable — no option legs on the stock txn | (i), was inert only by accident |
+| `opt_sl_ml` | the put's loss vs max loss | unevaluable — assignment order has no `max_loss_per_contract` | (i), same |
+
+**Measured, not argued: 52 bars per rule** in one engine run with the guard removed.
+
+**(ii) and (iii) were rejected** — re-pointing them at the covered call would reuse a short
+put's calibration for a different subject (and the call already has `cc_dte`); removing them
+would strip the wheel's put management and diverge its gene space from `O_CSP`'s, breaking the
+seeding story `_build_strategy_wheel` rests on.
+
+**`wheel_stock_guard`** — a `stop_processing` rule on `has_assigned_shares`, spliced AFTER
+`cc_sell` and BEFORE the inherited closes. The codebase's NOT idiom, the same shape as
+`cc_guard`, reading the condition `cc_sell` already uses. **No `toggle_optimize`**, so the GA
+cannot switch the protection off and **M7 adds no gene** — the audit and comparability entry 4
+are unchanged by it. `cc_dte` stays ahead of both guards, so the written call's own exit keeps
+working in both stock sub-phases.
+
+**Emission: `O_WHEEL` only**, proved by dumping every key's emitted entry+exit tree before and
+after — 36 keys built, exactly one changed.
+
+**The pin is about EVALUATION, not outcomes.**
+`tests/backtest/test_wheel_engine_cycle.py` drives the full cycle through
+`DailyBacktestEngine.run()` (CSP sold → assigned → call written → call bought back by `cc_dte`
+with days of life left, at a non-zero price) and wraps `_evaluate_conditions` to record which
+rule was asked on which bar. Per rule: asked on every put-phase bar, and on **zero** bars after
+assignment. The boundary is strictly-after on purpose — the manage pass runs BEFORE settlement,
+so on the assignment bar the put is still legitimately the anchor.
+
+**Mutations executed** (restored by file copy, tree clean after each):
+
+| Mutation | Result |
+|---|---|
+| Remove `wheel_stock_guard` (the first-match-slot protection) | 8 reachability pins FAIL; in the real engine run all five per-rule pins FAIL at **52 bars each** |
+| Splice the guard behind `opt_tp` instead of `cc_sell` (re-anchor ONE rule) | exactly that rule's pin fails — which is what makes the pins per-rule |
+
+**Suites, post-merge with `origin/dev` (`973fe3a8`, `TEST_APP_VERSION 2026.09.0014`, taken
+verbatim, no bump):** backend `pytest tests/` **4594 passed / 158 skipped / 5 failed** — and
+the known-bad set SHRANK: dev's CI fix (repo root on `sys.path` in `tests/backtest/conftest.py`)
+resolved the two `test_seam_wiring` F3 failures, leaving only the 5 `curve_uneven`
+frozen-baseline cases. `packages/common` **3168 passed / 1** (the known float-dust flake).
+Goldens **18, both fingerprints unmoved**. `tests/backtest` **1061 passed / 1 skipped**.
+
+The new fixture runs under `hermetic_providers()`: `wire_backtest_seams` is idempotent, so
+whichever test wires first owns the provider seam for the process, and after certain earlier
+tests the entry raised "FMP API key not configured". That is the suite's own order dependence,
+handled the way the other engine e2e tests in that directory handle it.

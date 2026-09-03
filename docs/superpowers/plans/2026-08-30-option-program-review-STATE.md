@@ -171,12 +171,24 @@ shipped instead of the recommended deletion:
   comparability entry 4) and **every live instance of them needs re-export/re-import**
   (final-review merger-checklist item 8).
 
-**MERGER NOTE — the version bump.** `packages/` changed AFTER `origin/dev`'s
-`TEST_APP_VERSION = "2026.09.0013"` bump (`bfb19508`), so the follow-up merge takes it to
-**0014**. The operator does that bump at merge time, at a matrix3 job boundary and never
+**MERGER NOTE — the version bump.** `origin/dev` has since bumped to
+`TEST_APP_VERSION = "2026.09.0014"` itself (`973fe3a8`, the CI parity fix), and that number is
+merged into the branch verbatim. `packages/` changed again after it (M6/M7), so the follow-up
+merge takes it to **0015**. The operator does that bump at merge time, at a matrix3 job boundary and never
 mid-run: distributed workers compare `TEST_APP_VERSION` alone to decide whether to
 self-update, and shared `packages/` code that reaches them without a bump leaves workers
 running different `ba2_common` from the master. No bump was taken on the branch.
+
+**C2 is now fully closed (M7, 2026-09-03).** Closing the covered-call DTE case exposed a
+second half of the same defect on the same key: `O_WHEEL` inherits five exits from `O_CSP`,
+all authored for the short PUT, and once the put is ASSIGNED the evaluator anchors them on the
+STOCK. `opt_tp`/`opt_sl` then read the assigned lot's P&L and `opt_time` its `open_date` —
+confident numbers compared against a short put's credit band — and fire a `close_option` that
+resolves nothing while consuming the bar's first-match slot. `opt_dte`/`opt_sl_ml` were inert
+there only by accident. MEASURED: 52 bars per rule in one engine run. `wheel_stock_guard` (a
+`stop_processing` rule on `has_assigned_shares`, after `cc_sell` and before the inherited
+closes, with no on/off gene) makes all five inert BY CONSTRUCTION. No gene added; `O_WHEEL`
+only; `O_WHEEL` was already a new baseline under comparability entry 4.
 
 Still open on this list: B1 (short-leg delta), C1 (breaker flatten), C3/C4/C5, C7-C10, and D.
 
