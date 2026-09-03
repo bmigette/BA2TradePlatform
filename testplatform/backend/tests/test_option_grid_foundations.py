@@ -264,11 +264,24 @@ def test_wheel_is_scored_and_railed_as_a_PURE_option_kind():
 def test_wheel_reuses_O_CSPs_entry_gene_keys_verbatim():
     """Not cosmetic: it is what lets a stage-1 O_CSP winner seed an O_WHEEL job. encode_params
     drops keys the target space does not know, so a renamed entry rule would silently discard
-    every entry gene of the seed."""
+    every entry gene of the seed.
+
+    A SUBSET, not equality, since 2026-09-03. ``cond:`` genes carry no entry/exit namespace,
+    so this set has always included exit-condition genes too — and the wheel now has one
+    O_CSP does not: ``cond:ccdte:value``, the written call's own DTE floor (``cc_dte``),
+    which only a key that writes a covered call can have. That direction is harmless for
+    seeding: the seed simply leaves the extra gene at its default. The direction that would
+    break seeding is a key O_CSP has and the wheel does not, and that is what is asserted.
+    The extra keys are named explicitly so an UNEXPECTED one still fails.
+    """
     m = _launcher()
     csp = {g for g in _space(m, "O_CSP") if g.startswith("entry:") or g.startswith("cond:")}
     wheel = {g for g in _space(m, "O_WHEEL") if g.startswith("entry:") or g.startswith("cond:")}
-    assert csp == wheel, f"entry gene keys diverged: {sorted(csp ^ wheel)}"
+    assert not (csp - wheel), (
+        f"O_CSP gene keys the wheel does not know, so a seed would silently drop them: "
+        f"{sorted(csp - wheel)}")
+    assert sorted(wheel - csp) == ["cond:ccdte:value"], (
+        f"the wheel gained gene keys O_CSP has no counterpart for: {sorted(wheel - csp)}")
 
 
 # ==============================================================================================

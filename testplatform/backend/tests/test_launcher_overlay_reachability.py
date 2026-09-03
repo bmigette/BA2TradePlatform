@@ -202,3 +202,64 @@ def test_the_anti_stacking_guard_still_precedes_the_overlay(kind):
         f"{kind}: the guard {guard.get('id')!r} must precede the overlay "
         f"{overlay.get('id')!r}; got order {ids}"
     )
+
+
+# ---------------------------------------------------------------------------
+# THE WRITTEN CALL'S OWN EXIT (2026-09-03)
+#
+# ``option_lifecycle.decide`` no longer closes a single-expiry structure at its expiry --
+# the ``opt_dte`` RULE owns that exit, in both runtimes. So on the two keys that write a
+# call over a stock cover, that rule must exist AND be reachable while the call is open, or
+# the call is unmanaged everywhere instead of just in the backtest.
+# ---------------------------------------------------------------------------
+def _rule_by_id(rules, rid):
+    return next((r for r in rules if r.get("id") == rid), None)
+
+
+@pytest.mark.parametrize("kind", ["O_CC", "O_WHEEL"])
+def test_the_key_that_writes_a_call_emits_a_dte_close_for_it(kind):
+    """It is emitted at all, it closes an OPTION, and it is searched."""
+    strat = mod._build_strategy(kind, kind, "FMPRating")
+    rules = list(strat.exit_rules or [])
+    dte = _rule_by_id(rules, "cc_dte")
+    assert dte is not None, (
+        f"{kind} writes a covered call and emits no cc_dte rule; since the live pass "
+        f"stopped closing at the roll window, nothing closes that call in either runtime")
+    assert "close_option" in _action_types(dte), (
+        f"{kind}: cc_dte must close the OPTION, not the shares: {_action_types(dte)}")
+    fields = {leaf.get("field") for leaf in _leaves(dte.get("conditions") or {})}
+    assert fields == {"covered_call_days_to_expiry"}, (
+        f"{kind}: cc_dte gates on {fields}. It must NOT be days_to_expiry, which reads the "
+        f"evaluated transaction — the STOCK on an overlay key — and is inert here")
+    target = {a.get("close_target") for a in (dte.get("actions") or [])}
+    assert target == {"covered_call"}, (
+        f"{kind}: cc_dte's close names no covered-call target ({target}), so it would try "
+        f"to resolve the option off the stock position and close nothing")
+    assert dte.get("toggle_optimize") is True, (
+        f"{kind}: cc_dte carries no on/off gene, so the GA cannot decide whether the "
+        f"written call should be closed at a DTE floor at all")
+
+
+@pytest.mark.parametrize("kind", ["O_CC", "O_WHEEL"])
+def test_the_dte_close_is_REACHABLE_while_a_covered_call_is_open(kind):
+    """The whole point, and the thing that was broken on O_WHEEL.
+
+    ``cc_guard`` halts the ruleset (``stop_processing``) on every bar a covered call is
+    open. A DTE close BEHIND it is emitted, carries its genes, and can never fire on the
+    very position it exists for. Modelled through the same first-match walk the rest of
+    this file uses rather than by index, so a reorder that keeps the shadow still fails.
+    """
+    strat = mod._build_strategy(kind, kind, "FMPRating")
+    rules = list(strat.exit_rules or [])
+    dte = _rule_by_id(rules, "cc_dte")
+    guard = next(r for r in rules if "stop_processing" in _action_types(r))
+
+    # The bar: a covered call is open (so the guard's flag is true) AND it is at its DTE
+    # floor. Nothing else about the equity has moved.
+    def matched(rule):
+        return rule is dte or rule is guard or _always_matches(rule)
+
+    reached = _walk_until_break(rules, matched=matched)
+    assert "cc_dte" in reached, (
+        f"{kind}: on a bar where the written call is at its DTE floor the walk stopped "
+        f"before cc_dte (reached {reached}) — the call has no exit in either runtime")

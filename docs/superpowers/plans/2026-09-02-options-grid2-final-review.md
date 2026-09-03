@@ -541,6 +541,18 @@ artefact does not?" — which is why the whole V1-V5 class was invisible. Its
    lifecycle pass will exit more aggressively than the grid that selected it.
 7. **Before any live deploy: fix V3** (§2a/F4). Otherwise the deployed instance evaluates its
    exits and never submits them.
+8. **Every LIVE `O_CC` / `O_WHEEL` instance must be RE-EXPORTED and RE-IMPORTED** (added
+   2026-09-03, §10). Those two keys gained a rule — `cc_dte`, which buys the written call back
+   at a DTE floor — and `option_lifecycle.decide` simultaneously STOPPED closing a
+   single-expiry structure at its expiry. A live instance whose stored ruleset predates this
+   therefore has neither mechanism: the pass no longer closes its call and its ruleset has no
+   rule that does, so the call runs to expiry or assignment unmanaged. This is a live-money
+   step, not housekeeping. Run `tools/export_deploy_payload.py` for the backtest that
+   currently backs each instance and `tools/import_deploy_payload.py` to push the regenerated
+   ruleset onto it, then `POST /api/reload` to drop the instance and settings caches. Any
+   PMCC-shaped instance also needs a `roll_pmcc_short` rule present — from 2026-09-03 the pass
+   RAISES `UnownedRollError` when a two-expiry structure is due to roll and the ruleset has no
+   rule to roll it (that is the intended loud refusal, not a regression).
 
 ### Parked operator items (carried forward, unresolved)
 

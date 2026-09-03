@@ -1189,6 +1189,31 @@ across runs.
    `perf_sample_bt` number is describing a different (and, per the harness's
    own purpose, broken) program.
 
+4. **`O_CC` and `O_WHEEL` gained an exit on 2026-09-03 (`cc_dte`), so every
+   result from those two keys is a NEW BASELINE.** Until this date the covered
+   call those keys write had NO exit in the backtest at all: `O_CC`'s exit list
+   is entirely equity rules, and `O_WHEEL`'s `opt_dte` sat behind the
+   `stop_processing` guard that halts the ruleset for the whole time a call is
+   open. The written call therefore always rode to expiry or assignment, while
+   the LIVE lifecycle pass closed it at its roll window — one strategy, two
+   behaviours. Both keys now emit `cc_dte`
+   (`covered_call_days_to_expiry <= N` → `close_option(close_target=
+   'covered_call')`, band 0-14 step 2, default 7, authored ON with its own
+   on/off gene) at the FRONT of their exit list, and the live pass no longer
+   closes it. Consequences, both real:
+   * the EXIT distribution moves — calls that expired worthless or were
+     assigned are now bought back with days of life left, which changes the
+     premium captured, the share turnover and every metric computed off the
+     equity curve;
+   * the GENE SPACE grows by two keys (`cond:ccdte:value`,
+     `exit:cc_dte:enabled`), so an old `O_CC`/`O_WHEEL` genome is a point in a
+     smaller space. `encode_params` seeds it fine (the new genes take their
+     defaults), but a seeded run is NOT a continuation of the old one.
+   **Never rank, average or diff an `O_CC` or `O_WHEEL` result across this
+   line.** Every other key is untouched: `cc_dte` is emitted only by
+   `_COVERED_CALL_OVERLAY_KINDS`, and both option goldens plus the equity
+   golden are unmoved (verified by execution, not by inspection).
+
 #### Task 14a item 4 — design/plan doc updates: remaining pieces
 
 **The aliased-import limitation of `getsource`-based pins (codebase-wide).**

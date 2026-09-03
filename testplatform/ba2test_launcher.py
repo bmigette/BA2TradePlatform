@@ -4596,6 +4596,87 @@ def _with_round_lot_entry(s, lot: int = 100):
     return s
 
 
+# --- THE WRITTEN CALL'S OWN EXIT (2026-09-03) -----------------------------------------------
+#
+# The keys whose ENTRY is the stock and whose call is an OVERLAY on it. They need their own DTE
+# close and they cannot use ``opt_dte`` for it: both runtimes evaluate an OPEN_POSITIONS ruleset
+# once per SYMBOL against the OLDEST entry order, which here is the STOCK, while
+# ``SellCoveredCallAction`` writes the call on its own transaction -- so ``days_to_expiry``,
+# which reads the evaluated transaction, is not merely wrong on these keys, it is INERT. It
+# never fires in either direction while carrying a searched gene. MEASURED end to end in
+# ``tests/backtest/test_covered_call_engine.py``.
+#
+# ``covered_call_days_to_expiry`` resolves the written call through the trade repository
+# (expert + underlying), the way ``has_covered_call`` already does, and the close names the
+# same target. See ``TradeConditions.CoveredCallDaysToExpiryCondition``.
+#
+# THE STANDING RULE: an option exit condition anchored on the evaluated transaction is inert
+# for a stock-anchored overlay key; overlay keys must use repository-resolved conditions.
+_COVERED_CALL_OVERLAY_KINDS = {"O_CC", "O_WHEEL"}
+
+# Days before the written call's own expiry at which it is bought back. 0-14 step 2 (8 levels),
+# default 7. It must REACH 0 -- "let it expire / be assigned" is the wheel's own thesis and the
+# GA must be able to choose it -- and 14 is the natural cap against the 25-45-DTE window
+# ``_option_overlay_action`` authors: a higher floor would buy the call back before it had
+# earned the theta it was written for.
+_COVERED_CALL_DTE_BAND = {"value": 7, "value_min": 0, "value_max": 14, "value_step": 2}
+
+
+def _covered_call_exit_rule(kind: str):
+    """Buy the WRITTEN CALL back a few days before it expires, leaving the shares held.
+
+    AUTHORED ON, with its own on/off gene. On, because until 2026-09-03 the live lifecycle
+    pass closed this call at its roll window and the backtest did not -- one strategy, two
+    behaviours -- and the fix is that the RULE owns it in both runtimes; a default-off rule
+    would simply move the asymmetry into the default genome. The gene is there because
+    "never buy it back, let it be assigned" is a legitimate covered-call thesis (it is the
+    wheel's), not because the exit is optional decoration.
+
+    NOT ``continue_processing``: buying the call back IS the bar's action, and the guard
+    behind it exists to stop a new one being written on the same bar as the close.
+    """
+    if kind not in _COVERED_CALL_OVERLAY_KINDS:
+        return []
+    return [
+        {"id": "cc_dte", "action_type": "close_option", "close_target": "covered_call",
+         "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "ccdte", "field": "covered_call_days_to_expiry", "op": "<=",
+              "optimize": True, **_COVERED_CALL_DTE_BAND}]}},
+    ]
+
+
+def _prepend_covered_call_exit(kind: str, exit_rules):
+    """Put the written call's DTE close at the FRONT of an overlay key's exit list.
+
+    In front of ``cc_guard`` specifically, and that placement is the whole rule rather than a
+    preference: the guard is a ``stop_processing`` rule on ``has_covered_call``, so it halts
+    the ruleset for the ENTIRE time a call is open -- which is exactly when this close needs
+    to fire. Behind the guard the rule would be emitted, carry its genes, and be unreachable
+    on every bar it could ever apply to.
+
+    In front of the equity closes too, on both key shapes: a bar on which the shares are
+    being sold must buy the call back rather than leave it naked, and a first-match walk that
+    reached ``exit_bearish`` first would break before it got here. (``_insert_option_overlay``
+    makes the opposite call for the WRITING rule, for the mirror-image reason.)
+
+    Converted to the TradeRule shape when the list is already in it: ``_build_strategy_S2``
+    runs its rows through ``trade_rules_from_legacy``, and a legacy row spliced in afterwards
+    keeps a top-level ``action_type`` with an EMPTY ``actions`` list -- which the shared
+    exporter, reading ``actions``, turns into a rule with no action at all. The gene would
+    then be searched and reach nothing. (Caught by ``test_gene_to_artefact_audit``.)
+    """
+    from ba2_common.core.rule_models import trade_rules_from_legacy
+
+    rules = _covered_call_exit_rule(kind)
+    if not rules:
+        return exit_rules
+    existing = list(exit_rules or [])
+    if existing and "actions" in existing[0]:
+        rules = trade_rules_from_legacy(exit_conditions=rules)["exit_rules"]
+    return rules + existing
+
+
 def _insert_option_overlay(exit_rules, guard, overlay, *, anchor: str = "adjust"):
     """Splice an option OVERLAY pair (guard + overlay) into an exit list so it is REACHABLE.
 
@@ -4696,6 +4777,7 @@ def _build_strategy_covered_call(kind: str):
          # Writing the call must NOT consume the bar's single first-match slot: the exit
          # rules behind it (the break-even lock, the floor stop) still have to run.
          "continue_processing": True})
+    s.exit_rules = _prepend_covered_call_exit(kind, s.exit_rules)
     return s
 
 
@@ -4767,6 +4849,7 @@ def _build_strategy_wheel(kind: str):
          # See O_CC's cc_sell: writing the call must not consume the bar's first-match slot.
          "continue_processing": True},
         anchor="front")
+    s.exit_rules = _prepend_covered_call_exit(kind, s.exit_rules)
     return s
 
 
