@@ -195,16 +195,21 @@ def test_the_notices_and_the_totals_live_on_the_OTHER_tab(nicegui_client):
 
 def test_the_three_buttons_are_reachable_from_BOTH_tabs(nicegui_client):
     """They are the point of the dialog. Drawn as siblings of the panels, so no
-    tab can hide them -- and drawn ONCE, so there is no second Submit to press."""
+    tab can hide them -- and drawn ONCE, so there is no second Submit to press.
+
+    The SELECTION buttons ('Select all', 'Deselect all' and the per-label pairs)
+    are deliberately not in this list: they act on the order table and live inside
+    the orders panel with it. What the assertion protects is that the three
+    buttons which END the dialog are outside every panel and appear once each.
+    """
     from nicegui import ui
 
-    root = _draw(nicegui_client)
-    buttons = [el for el in root.descendants() if isinstance(el, ui.button)]
-    captions = [el.text for el in buttons]
+    buttons = [el for el in _draw(nicegui_client).descendants()
+               if isinstance(el, ui.button)]
+    outside = [el for el in buttons
+               if not [a for a in _ancestors(el) if isinstance(a, ui.tab_panel)]]
 
-    assert captions == ['Refresh', 'Cancel', 'Submit']
-    for button in buttons:
-        assert not [el for el in _ancestors(button) if isinstance(el, ui.tab_panel)]
+    assert [el.text for el in outside] == ['Refresh', 'Cancel', 'Submit']
 
 
 def test_the_notices_tab_says_how_many_there_are_without_being_opened(

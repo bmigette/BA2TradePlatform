@@ -271,6 +271,22 @@ MARKER_NOTICE_COUNT = 'dry-run-notice-count'
 MARKER_ROWS_VIEWPORT = 'dry-run-rows-viewport'
 #: The order table's sticky header row.
 MARKER_TABLE_HEAD = 'dry-run-table-head'
+#: The order table's sticky FOOTER row: the column totals over the TICKED rows.
+#: Rebuilt on every tick, so it can never describe a selection other than the one
+#: the boxes show.
+MARKER_TABLE_FOOT = 'dry-run-table-foot'
+#: The selection toolbar above the table: 'Select all' / 'Deselect all', then one
+#: ``all`` / ``none`` pair per label in the plan. Buttons, not links: they change
+#: what Submit will SEND.
+MARKER_SELECT_ALL = 'dry-run-select-all'
+MARKER_DESELECT_ALL = 'dry-run-deselect-all'
+MARKER_LABEL_SELECT = 'dry-run-label-select'
+SELECT_ALL_LABEL = 'Select all'
+DESELECT_ALL_LABEL = 'Deselect all'
+#: The caption of the footer's first cell: how many of the sendable rows are ticked.
+FOOTER_CAPTION_FMT = 'Total ({ticked}/{sendable} ticked)'
+FOOTER_TOOLTIP = ('Column totals over the TICKED rows only - exactly what Submit '
+                  'will send. Un-ticked rows are excluded here and are never ordered.')
 #: The free-text Reasons cell, on the order table and on the 'Not traded' table.
 #: By marker: every word in it also appears in a notice above, so a text search
 #: cannot tell which of the two drew it.
@@ -429,6 +445,21 @@ NOTICE_BADGE_CLASSES = 'ml-2'
 #: colour and tooltips, which is why these rows stay hand-rolled.
 GRID_HEAD_CLASSES = 'pf-grid-head w-full min-w-max text-xs py-1 px-1'
 GRID_ROW_CLASSES = 'pf-grid-row w-full min-w-max text-sm items-center py-1 px-1'
+#: The footer: the header's opaque bar so rows scrolling under it stay hidden, but
+#: pinned to the BOTTOM of the viewport (``pf-grid-head`` pins to the top, so the
+#: inline style below overrides it). ``normal-case`` because the header's
+#: uppercase transform would shout every money figure.
+GRID_FOOT_CLASSES = ('pf-grid-head w-full min-w-max text-sm normal-case items-center '
+                     'py-1 px-1')
+GRID_FOOT_STYLE = 'top: auto; bottom: 0; border-top: 1px solid rgba(255,255,255,0.12);'
+
+#: The NOTICES tab was set in ``text-xs`` throughout and the user could not read it
+#: ("Text is too small here"). The notices are one size up and the totals two: the
+#: totals are the numbers Submit commits to and they were the smallest thing on the
+#: tab.
+NOTICE_TEXT_CLASSES = 'text-sm'
+TOTALS_TEXT_CLASSES = 'text-base'
+TOTALS_NOTE_CLASSES = 'text-sm'
 
 #: The order table's columns, ONCE. Header text, width, and whether the column is
 #: numeric -- ``(name, header, width, numeric)``. The header row and the cell row
@@ -675,6 +706,8 @@ class AllocationWizard:
         self._rows_container = None
         self._no_order_container = None
         self._totals_container = None
+        self._selection_container = None
+        self._footer_container = None
         self._submit_button = None
         self._submit_tooltip = None
         #: One-shot latch. See ``_submit``: NiceGUI runs a sync click handler
@@ -729,13 +762,18 @@ class AllocationWizard:
                         if not self.base.supports_fractional:
                             _label(NO_FRACTIONAL_SUPPORT_NOTE,
                                    'text-xs text-gray-400')
+                    # ABOVE the scrolling viewport, so the buttons that decide
+                    # what Submit sends never scroll out of reach.
+                    self._selection_container = ui.row() \
+                        .classes('w-full items-center gap-1 shrink-0 flex-wrap')
                     self._rows_container = ui.column().classes(DIALOG_ROWS_CLASSES) \
                         .mark(MARKER_ROWS_VIEWPORT)
                     self._no_order_container = ui.column().classes('w-full shrink-0')
                 with ui.tab_panel(TAB_NOTICES).classes(TAB_PANEL_CLASSES):
                     with ui.column().classes(DIALOG_NOTICES_CLASSES):
                         self._render_base_figures()
-                        _label(MARKET_ORDER_TIMING_NOTE, 'text-xs text-orange-400')
+                        _label(MARKET_ORDER_TIMING_NOTE,
+                               f'{NOTICE_TEXT_CLASSES} text-orange-400')
                         self._notices_container = ui.column().classes('w-full')
                         self._totals_container = ui.column().classes('w-full')
             self._render_notices()
@@ -891,12 +929,15 @@ class AllocationWizard:
                 for text in notices:
                     with ui.row().classes('w-full items-start gap-2 no-wrap'):
                         _paint(ui.icon('warning'), 'text-orange-400 text-sm shrink-0')
-                        _label(text, 'text-xs text-orange-400').mark(MARKER_PLAN_NOTICE)
+                        _label(text, f'{NOTICE_TEXT_CLASSES} text-orange-400') \
+                            .mark(MARKER_PLAN_NOTICE)
                 for text, severity in warnings:
                     # ``color=`` on purpose: 'info' is classed ``text-gray-400``,
                     # which the stylesheet DOES paint -- in #b0bec5, not the page's
                     # own ``NEUTRAL_TEXT_COLOR``. The severity's declared hex wins.
-                    _label(text, PLAN_WARNING_CLASSES[severity],
+                    # The view's classes carry ``text-xs``; the size is restated
+                    # here (last class wins) so this tab reads at ONE size.
+                    _label(text, f'{PLAN_WARNING_CLASSES[severity]} {NOTICE_TEXT_CLASSES}',
                            color=PLAN_WARNING_COLORS[severity]) \
                         .mark(MARKER_PLAN_WARNING)
 
@@ -999,7 +1040,145 @@ class AllocationWizard:
         # here went stale the moment the user pressed Refresh -- the previous
         # solve's complaint sitting above the new solve's table.
         for warning in self.base.warnings:
-            _label(warning, 'text-xs text-orange-400')
+            _label(warning, f'{NOTICE_TEXT_CLASSES} text-orange-400')
+
+    # -- selection ----------------------------------------------------------
+    def _sendable_rows(self) -> List[Dict]:
+        """The dry-run rows that CAN be ticked: neither suppressed nor skipped."""
+        return [r for r in dry_run_rows(self.plan)
+                if not r['suppressed'] and not r['skipped']]
+
+    def _symbol_labels(self) -> Dict[str, List[str]]:
+        """symbol -> the labels the plan says it came from, in plan order."""
+        return {row.symbol: list(row.labels) for row in self.plan.rows}
+
+    def _labels_in_table(self) -> List[str]:
+        """Every label carried by a sendable row, first-seen order, no repeats."""
+        by_symbol = self._symbol_labels()
+        seen: List[str] = []
+        for row in self._sendable_rows():
+            for label in by_symbol.get(row['symbol'], []):
+                if label not in seen:
+                    seen.append(label)
+        return seen
+
+    def _set_selection(self, symbols, checked: bool):
+        """Tick or un-tick ``symbols`` in one go, then redraw the boxes and totals.
+
+        Only SENDABLE symbols can enter the selection -- a suppressed row has no
+        order, and ticking it here would put a refused order into what Submit
+        sends, the exact thing ``_render_row`` disables its box to prevent.
+        """
+        sendable = {r['symbol'] for r in self._sendable_rows()}
+        wanted = {s for s in symbols if s in sendable}
+        if checked:
+            self.selected |= wanted
+        else:
+            self.selected -= wanted
+        self._render_rows()
+        self._render_totals()
+
+    def _select_all(self, checked: bool):
+        self._set_selection([r['symbol'] for r in self._sendable_rows()], checked)
+
+    def _select_label(self, label: str, checked: bool):
+        """Every sendable row carrying ``label`` -- INCLUDING one that also carries
+        another label. 'None for ARK26' means no ARK26 order goes out, whatever
+        else the symbol belongs to."""
+        by_symbol = self._symbol_labels()
+        self._set_selection([r['symbol'] for r in self._sendable_rows()
+                             if label in by_symbol.get(r['symbol'], [])], checked)
+
+    def _render_selection_toolbar(self):
+        """'Select all' / 'Deselect all', then an ``all`` / ``none`` pair per label.
+
+        Drawn only when there is something to tick. The per-label pairs answer the
+        question the table cannot: "send the NASDAQ30 rebalance but hold the ARK26
+        one back", without un-ticking twenty rows by hand.
+        """
+        if self._selection_container is None:
+            return
+        self._selection_container.clear()
+        if not self._sendable_rows():
+            return
+        labels = self._labels_in_table()
+        with self._selection_container:
+            ui.button(SELECT_ALL_LABEL, on_click=lambda: self._select_all(True)) \
+                .props('dense outline size=sm').mark(MARKER_SELECT_ALL)
+            ui.button(DESELECT_ALL_LABEL, on_click=lambda: self._select_all(False)) \
+                .props('dense outline size=sm').mark(MARKER_DESELECT_ALL)
+            for label in labels:
+                with ui.row().classes('items-center gap-0 ml-2 no-wrap'):
+                    _label(f'{label}:', 'text-xs text-gray-400 mr-1')
+                    ui.button('all', on_click=lambda _e, lbl=label: self._select_label(lbl, True)) \
+                        .props('dense flat size=sm').mark(MARKER_LABEL_SELECT) \
+                        .tooltip(f'Tick every {label} order')
+                    ui.button('none', on_click=lambda _e, lbl=label: self._select_label(lbl, False)) \
+                        .props('dense flat size=sm').mark(MARKER_LABEL_SELECT) \
+                        .tooltip(f'Un-tick every {label} order')
+
+    def _render_table_footer(self):
+        """The column totals over the TICKED rows, pinned to the table's foot.
+
+        Summed from ``dry_run_rows`` -- the numbers the cells above were drawn
+        from -- so the footer can never disagree with the column it closes. Money
+        columns only; a quantity total across different symbols means nothing.
+        ``Est. value`` is split into the buy and the sell total because the two
+        move in opposite directions and one net figure would hide a large sell
+        behind a large buy. ``None`` values (an unpriced holding) are EXCLUDED,
+        not counted as zero.
+        """
+        if self._footer_container is None:
+            return
+        self._footer_container.clear()
+        rows = [r for r in self._sendable_rows() if r['symbol'] in self.selected]
+        sendable = len(self._sendable_rows())
+        cost = sum(r['current_cost_basis'] for r in rows)
+        values = [r['current_value'] for r in rows if r['current_value'] is not None]
+        buys = sum(r['estimated_value'] for r in rows if r['side'] == 'BUY')
+        sells = sum(r['estimated_value'] for r in rows if r['side'] == 'SELL')
+        target = sum(r['target_notional'] for r in rows)
+        projected = [r['projected_notional'] for r in rows
+                     if r['projected_notional'] is not None]
+        weight = sum(r['weight_pct'] for r in rows)
+        projected_weight = sum(r['projected_weight_pct'] for r in rows)
+        bp_effect = sum(r['bp_effect'] for r in rows)
+        bp_pct = sum(r['bp_usage_pct'] for r in rows)
+        with self._footer_container:
+            with ui.row().classes(GRID_FOOT_CLASSES).style(GRID_FOOT_STYLE) \
+                    .mark(MARKER_TABLE_FOOT):
+                ui.label('').classes(_col('tick'))
+                with ui.label(FOOTER_CAPTION_FMT.format(ticked=len(rows),
+                                                        sendable=sendable)) \
+                        .classes(_col('symbol', 'font-medium')):
+                    ui.tooltip(FOOTER_TOOLTIP)
+                ui.label('').classes(_col('held'))
+                ui.label(f"{cost:,.2f}").classes(_col('cost'))
+                ui.label(f"{sum(values):,.2f}"
+                         + ('' if len(values) == len(rows) else ' *')) \
+                    .classes(_col('value'))
+                ui.label('').classes(_col('side'))
+                ui.label('').classes(_col('qty'))
+                ui.label('').classes(_col('order'))
+                ui.label('').classes(_col('sizing'))
+                ui.label('').classes(_col('outcome'))
+                with ui.column().classes(_col('estimated_value', 'gap-0 leading-tight')):
+                    _label(f"B {buys:,.2f}", 'text-green-500 text-xs')
+                    _label(f"S {sells:,.2f}", 'text-red-500 text-xs')
+                ui.label(f"{target:,.2f}").classes(_col('target'))
+                ui.label(f"{sum(projected):,.2f}"
+                         + ('' if len(projected) == len(rows) else ' *')) \
+                    .classes(_col('projected'))
+                _label(f"{weight:.2f}% → {projected_weight:.2f}%",
+                       _col('weight', 'text-xs text-gray-400'))
+                _label(f"{bp_effect:+,.2f}" if abs(bp_effect) >= 0.005 else '0.00',
+                       _col('bp_effect', 'text-green-500 font-medium'
+                            if bp_effect > 0 else ''))
+                ui.label('').classes(_col('bp_ratio'))
+                ui.label(f"{bp_pct:.1f}%").classes(_col('bp_pct'))
+                _label('* an unpriced row is left out of this total'
+                       if len(values) != len(rows) or len(projected) != len(rows)
+                       else '', _col('reasons', 'text-xs text-gray-400'))
 
     def _render_rows(self):
         """The dry-run table, left to right: what you HOLD, what will be DONE,
@@ -1028,6 +1207,8 @@ class AllocationWizard:
         right-aligned money column cannot line up under a left-aligned heading.
         """
         self._rows_container.clear()
+        self._footer_container = None
+        self._render_selection_toolbar()
         rows = dry_run_rows(self.plan)
         with self._rows_container:
             if not rows:
@@ -1043,6 +1224,10 @@ class AllocationWizard:
                         .classes(_col(name))
             for row in rows:
                 self._render_row(row)
+            # The footer lives INSIDE the viewport so it can stick to its bottom
+            # edge; its own container so a tick redraws the totals and nothing else.
+            self._footer_container = ui.column().classes('w-full min-w-max gap-0')
+        self._render_table_footer()
 
     def _render_row(self, row: Dict):
         """One line of the dry-run table.
@@ -1226,7 +1411,7 @@ class AllocationWizard:
             bp_line += BP_BUDGET_BREAKDOWN_FMT.format(
                 available=selected_plan.available_buying_power, released=released)
         with self._totals_container:
-            with ui.row().classes('w-full gap-6 mt-2 text-sm'):
+            with ui.row().classes(f'w-full gap-6 mt-2 {TOTALS_TEXT_CLASSES}'):
                 ui.label(f"Sell value: {selected_plan.total_sell_value:,.2f}")
                 ui.label(f"Buy value: {buy_value:,.2f}")
                 ui.label(bp_line).mark(MARKER_BP_BUDGET)
@@ -1241,13 +1426,13 @@ class AllocationWizard:
             if totals is not None and selected_plan.reserved_pct > LABEL_TOTAL_TOLERANCE_PCT:
                 cash_after = totals['estimated_cash_after']
                 reserved = selected_plan.reserved_notional
-                with ui.row().classes('w-full text-sm'):
+                with ui.row().classes(f'w-full {TOTALS_TEXT_CLASSES}'):
                     _label(CASH_VS_RESERVE_FMT.format(
                         cash=cash_after, reserved=reserved,
                         delta=cash_after - reserved),
                         'text-orange-400' if cash_after < reserved else '') \
                         .mark(MARKER_CASH_VS_RESERVE)
-            with ui.row().classes('w-full gap-6 text-sm'):
+            with ui.row().classes(f'w-full gap-6 {TOTALS_TEXT_CLASSES}'):
                 _label(f"Held cost: {held_cost:,.2f}", 'text-gray-400')
                 _label(f"Held value: {sum(priced):,.2f}"
                        + ('' if len(priced) == len(shown)
@@ -1260,9 +1445,9 @@ class AllocationWizard:
             if buy_value > MONEY_EPSILON:
                 _label(BP_IS_A_CHARGE_NOTE_FMT.format(
                     buy_value=buy_value, required=required,
-                    ratio=required / buy_value), 'text-xs text-gray-400') \
+                    ratio=required / buy_value), f'{TOTALS_NOTE_CLASSES} text-gray-400') \
                     .mark(MARKER_BP_NOTE)
-            with ui.row().classes('w-full gap-6 text-sm'):
+            with ui.row().classes(f'w-full gap-6 {TOTALS_TEXT_CLASSES}'):
                 # SIGNED: a bump's over-allocation nets against a rounding shortfall,
                 # which is what "how far off target will I be" actually means.
                 _label(f"Off target after rounding: {summary['residual_notional']:,.2f} "
@@ -1285,13 +1470,14 @@ class AllocationWizard:
                 # this line announce an over-allocation of 0.00.
             # Against the BUDGET, the same denominator the line above divides.
             if required > budget:
-                _label(BP_OVER_BUDGET_NOTE, 'text-xs text-orange-400')
+                _label(BP_OVER_BUDGET_NOTE, f'{TOTALS_NOTE_CLASSES} text-orange-400')
 
     def _toggle(self, symbol: str, checked: bool):
         if checked:
             self.selected.add(symbol)
         else:
             self.selected.discard(symbol)
+        self._render_table_footer()
         self._render_totals()
 
     def _refresh(self, allow_fractional: bool):

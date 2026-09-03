@@ -607,6 +607,42 @@ def resolve_symbol_weights(symbols, *, saved, values, unmeasurable):
     return out
 
 
+#: Half a cent: the share boxes step by 0.01, so anything under this is a stored
+#: zero rather than a share somebody typed.
+ZERO_SHARE_EPSILON_PCT = 0.005
+
+#: The orange count beside a label's tag icon: how many of its symbols will get
+#: NOTHING. Its tooltip, because a bare number on an icon is a riddle -- and the
+#: sentence names the two ways out, since neither is discoverable from the badge.
+ZERO_SHARE_BADGE_TOOLTIP_FMT = (
+    '{count} of {total} symbol(s) in {label} have a 0% or unset share of this '
+    'label, so they receive no money and produce no order. Give each one a share, '
+    'or remove it from the label.')
+
+
+def count_zero_share_symbols(symbols, weights) -> int:
+    """How many of ``symbols`` have no share of their label. Pure.
+
+    A share of 0 and a share that is not set are counted TOGETHER on purpose: both
+    end in the same place -- the symbol is in the label, is listed on the page, and
+    the plan buys none of it -- and the user's question ("which of these are at
+    zero?") does not distinguish them. ``weights`` is the live ``{symbol: pct}``
+    map, which carries only the symbols that HAVE a share, so a missing key is an
+    unset share and not a lookup failure.
+
+    Deliberately not a percentage or a money figure: it is a count of rows to go
+    and look at, and turning it into a share of the label would make it a second
+    reading of the very column it is pointing at.
+    """
+    weights = weights or {}
+    total = 0
+    for symbol in (symbols or []):
+        share = weights.get(symbol)
+        if share is None or abs(float(share)) < ZERO_SHARE_EPSILON_PCT:
+            total += 1
+    return total
+
+
 @dataclass
 class SymbolRow:
     """One symbol's line in the default view.

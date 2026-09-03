@@ -153,7 +153,8 @@ from ..utils.portfolio_allocation_view import (
     ALLOCATION_BAR_LEGEND, allocation_bar, band_color, RESERVE_SELL_WARNING,
     SHARE_DEFAULT_NOTE, symbol_total_bar, SYMBOL_TOTAL_BAR_CAPTION,
     LABEL_TOTAL_BAR_CAPTION, LABEL_TOTAL_BAR_LEGEND, LABEL_TOTAL_CLASSES,
-    LABEL_TOTAL_COLORS, LABEL_TOTAL_TOOLTIP, class_color_style,
+    LABEL_TOTAL_COLORS, LABEL_TOTAL_TOOLTIP, ZERO_SHARE_BADGE_TOOLTIP_FMT,
+    class_color_style, count_zero_share_symbols,
     label_total_readout,
     load_current_symbol_shares, load_last_symbol_shares, managed_total_value,
     important_color_style,
@@ -714,6 +715,9 @@ MARKER_LABEL_PNL = 'pf-label-pnl'
 #: several on the row and its whole content is an inline colour -- and because the
 #: user's complaint was precisely that it disagreed with the bar beside it.
 MARKER_LABEL_ICON = 'pf-label-icon'
+#: The orange count beside that icon: symbols in the label whose share is 0% or
+#: unset. Marked because its text is a bare integer that repeats all over the row.
+MARKER_LABEL_ZERO_BADGE = 'pf-label-zero-badge'
 #: One preset colour chip. Bare divs whose entire content is a background colour.
 MARKER_COLOR_SWATCH = 'pf-color-swatch'
 #: The "no colour" chip, which is NOT a colour and therefore not one of the above.
@@ -923,6 +927,98 @@ def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
     # The label's own share-of-100 bar, from the SAME map the cells were written
     # from -- so the picture and the column cannot disagree about the total.
     _apply_symbol_bar(live, label)
+    # ...and the count of symbols left at zero, which IS moved by a symbol edit
+    # even though nothing else on the label header is. Its own writer, so this
+    # path and ``_apply_bars`` cannot drift apart.
+    _apply_zero_badge(live, label)
+
+
+#: What a second press is told while the first is still solving. An 'info', not a
+#: warning: the user did nothing wrong, the answer is simply not back yet.
+REVIEW_BUSY_NOTICE = 'Still solving the plan against the broker — one moment'
+
+
+class ClickLatch:
+    """ONE in-flight run of a button's handler, and the button that shows it.
+
+    The dry-run solve is a broker round trip -- positions, bulk quotes, per-symbol
+    margin, a precheck order per buy -- and NiceGUI dispatches every click as its
+    own task (``nicegui/events.py``: ``handle_event`` schedules the coroutine and
+    returns at once). So a slow solve left the button live and a second press
+    started a SECOND flow: two dry runs stacked, each with its own Submit, and the
+    one underneath solved against positions the one on top was about to change.
+    Reported from live use -- "clicking review here is not instant. So I click
+    twice then screens opens twice".
+
+    TWO defences, because either alone leaves a hole. The button is DISABLED and
+    shows Quasar's spinner, which is also the honest answer to "is anything
+    happening?"; and the flag refuses a call that arrives anyway -- a queued
+    click, a keyboard activation, a stale client. The flag is what makes the
+    refusal true rather than merely unlikely.
+
+    Released in a ``finally``: a latch a failure does not release is a button that
+    never works again. Deliberately NOT one-shot, unlike the dry run's own submit
+    latch -- that one guards orders already sent, this one guards a solve that
+    ordered nothing, and the user must be able to press it again.
+    """
+
+    def __init__(self, busy_notice: str, button=None):
+        self.busy_notice = busy_notice
+        self.button = button
+        self.busy = False
+
+    async def run(self, factory) -> bool:
+        """Await ``factory()`` unless a run is already in flight. Returns whether
+        this call ran -- so a caller can tell "done" from "refused"."""
+        if self.busy:
+            logger.debug(f"ClickLatch: refused a re-entrant press ({self.busy_notice})")
+            ui.notify(self.busy_notice, type='info')
+            return False
+        self.busy = True
+        if self.button is not None:
+            self.button.set_enabled(False)
+            self.button.props('loading')
+        try:
+            await factory()
+        finally:
+            self.busy = False
+            if self.button is not None:
+                self.button.props(remove='loading')
+                self.button.set_enabled(True)
+        return True
+
+
+def _apply_zero_badge(live: Dict[str, Any], label: str) -> None:
+    """Restate one label's zero-share badge: how many of its symbols get NOTHING.
+
+    ONE writer, called from two places on purpose. ``_apply_bars`` covers every
+    change that moves the label rows (a target, the reserve, a reload); a SYMBOL
+    share edit deliberately does not go through there -- the label bars must not
+    move for it -- and the badge is the one thing on the row that such an edit
+    does change. Typing 0 into the last funded symbol has to raise the badge
+    without a reload, or the row goes on looking healthy while the plan sells the
+    position out.
+
+    Read from ``live['weights']``, the SAME map the Share-of-label column is
+    written from, so the badge and the column cannot disagree about which rows sit
+    at zero. Hidden rather than zeroed when every symbol has a share: an orange 0
+    beside a healthy label is the noise that makes a real badge easy to miss.
+    """
+    widgets = live['bars'].get(label)
+    if not widgets:
+        return
+    badge = widgets.get('zero_badge')
+    if badge is None:
+        return
+    view = live['view_by_label'].get(label)
+    members = [row.symbol for row in view.rows] if view is not None else []
+    zeroes = count_zero_share_symbols(members, live['weights'].get(label))
+    badge.set_text(str(zeroes))
+    badge.set_visibility(zeroes > 0)
+    tooltip = widgets.get('zero_tooltip')
+    if tooltip is not None:
+        tooltip.set_text(ZERO_SHARE_BADGE_TOOLTIP_FMT.format(
+            count=zeroes, total=len(members), label=label))
 
 
 def _apply_bars(live: Dict[str, Any]) -> None:
@@ -956,6 +1052,7 @@ def _apply_bars(live: Dict[str, Any]) -> None:
             # twice, and invisible to every Python test because the element
             # carried the right value the whole time.
             icon.style(replace=important_color_style(bar.color))
+        _apply_zero_badge(live, bar.label)
         widgets['value'].set_text(f'${bar.current_value:,.2f}')
         # Every string below is the PURE layer's, not this module's: the
         # denominator rule, the "(real N%)" parenthetical and the over/under
@@ -2503,6 +2600,18 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                         lambda hexed, stored, lbl=view.label: _recolour_label(
                         live, lbl, stored))
             widgets['icon'] = icon
+            # HOW MANY SYMBOLS IN THIS LABEL GET NOTHING -- a 0% share or none set
+            # at all. Beside the tag icon because that is where the eye lands on a
+            # collapsed row, and the whole point is to see it WITHOUT opening the
+            # label. Drawn empty and filled in by ``_apply_bars`` from the live
+            # weights, so it follows a share the user types rather than describing
+            # the page as it loaded; ``_apply_bars`` also hides it when every
+            # symbol has a share, because a badge reading 0 is noise.
+            zero_badge = ui.badge('').props('color=orange') \
+                .classes('shrink-0').mark(MARKER_LABEL_ZERO_BADGE)
+            with zero_badge:
+                widgets['zero_tooltip'] = ui.tooltip('')
+            widgets['zero_badge'] = zero_badge
             ui.label(view.label).classes('w-48 truncate font-medium')
             widgets['value'] = ui.label('').classes('w-28 text-right')
             # THE bar component, shared with the per-label symbol-share total and
@@ -3033,10 +3142,18 @@ async def content() -> None:
             ui.notify(f'Valuation mode: {chosen}', type='info')
             await _refresh()
 
+        review_latch = ClickLatch(REVIEW_BUSY_NOTICE)
+
+        async def _review() -> None:
+            """The Review button: ONE dry run per press, however many times it is
+            pressed. See ``ClickLatch``."""
+            await review_latch.run(
+                lambda: _open_allocation_flow(account_id, mode_state['value'],
+                                              _refresh))
+
         with toolbar:
-            ui.button(REVIEW_BUTTON_LABEL, icon='fact_check',
-                      on_click=lambda: _open_allocation_flow(
-                          account_id, mode_state['value'], _refresh)) \
+            review_latch.button = ui.button(
+                REVIEW_BUTTON_LABEL, icon='fact_check', on_click=_review) \
                 .props('color=primary') \
                 .tooltip('Solve the plan against the broker and show it for review. '
                          'Nothing is ordered until you press Submit in the dry run.')

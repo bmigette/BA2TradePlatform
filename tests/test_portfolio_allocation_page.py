@@ -2680,22 +2680,46 @@ def _press(button):
     ``app.handle_exception``, which swallows them, so a handler that blew up would
     look identical to one that did nothing.
 
-    Both are intercepted here for the duration of the click: the queued coroutine is
+    Both are intercepted here for the duration of the click: the queued work is
     run, and an exception is re-raised instead of being logged into the void.
+
+    THE INTERCEPT IS ``create_or_defer``, not ``on_startup``. On nicegui 3.12
+    ``handle_event`` hands the coroutine to ``background_tasks.create_or_defer``,
+    which -- with no loop running -- queues ``lambda: create(awaitable)`` on
+    ``on_startup``. Catching it there yields a FUNCTION rather than an awaitable,
+    and calling that function walks straight into ``create``'s own
+    ``assert core.loop is not None``. Both failures presented as the click doing
+    nothing, so thirty-one tests on this file were passing their setup and failing
+    at their first assertion about a page that had never moved.
+
+    Taking ``create_or_defer`` gets the awaitable itself, before any of that.
+    ``on_startup`` stays patched as well, so a version that defers some other way
+    still cannot silently drop the coroutine on the floor.
     """
-    from nicegui import app, core
+    import inspect
+
+    from nicegui import app, background_tasks, core
 
     queued, failures = [], []
+    original_defer = background_tasks.create_or_defer
     original_startup, original_handler = app.on_startup, core.app.handle_exception
+    background_tasks.create_or_defer = lambda awaitable, **_kw: queued.append(awaitable)
     app.on_startup = queued.append
     core.app.handle_exception = failures.append
     try:
         _fire(button)
     finally:
+        background_tasks.create_or_defer = original_defer
         app.on_startup = original_startup
         core.app.handle_exception = original_handler
-    for coro in queued:
-        asyncio.run(_await(coro))
+
+    async def _run(item):
+        result = item if inspect.isawaitable(item) else item()
+        if inspect.isawaitable(result):
+            await result
+
+    for item in queued:
+        asyncio.run(_run(item))
     if failures:
         raise failures[0]
 
@@ -7639,3 +7663,252 @@ def test_a_blank_stored_name_is_treated_as_no_name():
     panel.display_names = {'AAPL': '   '}
 
     assert panel._titled(['AAPL']) == 'AAPL'
+
+
+# ---------------------------------------------------------------------------
+# THE ZERO-SHARE BADGE (2026-09-03)
+#
+# "near the label logo, put a orange badge with amount of symbols that is 0 or
+# null share. No badge if all are >0%"
+#
+# A symbol sitting in a label at 0% is invisible on a collapsed row: the label's
+# own bar, target and delta are all healthy, and the only place the zero shows is
+# a column inside the fold. The badge is what makes it countable without opening
+# anything.
+# ---------------------------------------------------------------------------
+
+
+def _zero_badge(root, index=0):
+    return _marked(root, page.MARKER_LABEL_ZERO_BADGE)[index]
+
+
+def test_the_label_row_badges_how_many_symbols_have_no_share(nicegui_client,
+                                                             account_id):
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT', 'TSLA'),
+                            weights={'AAPL': 100.0, 'MSFT': 0.0, 'TSLA': 0.0}))
+    badge = _zero_badge(root)
+
+    assert badge.text == '2'
+    assert badge.visible
+    assert 'orange' in badge._props.get('color', '')
+
+
+def test_a_label_whose_symbols_all_have_a_share_carries_NO_badge(nicegui_client,
+                                                                  account_id):
+    """"No badge if all are >0%" -- an orange 0 beside a healthy label is the
+    noise that makes a real one easy to miss."""
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT'),
+                            weights={'AAPL': 60.0, 'MSFT': 40.0}))
+
+    assert not _zero_badge(root).visible
+
+
+def test_the_badge_counts_an_UNSET_share_alongside_an_explicit_zero(nicegui_client,
+                                                                    account_id):
+    """Both end in the same place: the symbol is in the label and the plan buys
+    none of it."""
+    views = _views([ManagedLabel('ARK26', 40.0)],
+                   {'ARK26': ['AAPL', 'MSFT', 'TSLA']},
+                   # MSFT typed to zero; TSLA has no stored share at all, and the
+                   # label cannot be valued, so its share resolves to unknown.
+                   weights={'ARK26': {'AAPL': 100.0, 'MSFT': 0.0}})
+    for row in views[0].rows:
+        if row.symbol == 'TSLA':
+            row.weight_pct = None
+    root = _draw(nicegui_client, account_id, views)
+
+    assert _zero_badge(root).text == '2'
+
+
+def test_the_badge_tooltip_names_the_label_and_the_way_out(nicegui_client,
+                                                            account_id):
+    """A bare number on an icon is a riddle."""
+    from nicegui import ui
+
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT'),
+                            weights={'AAPL': 100.0, 'MSFT': 0.0}))
+    tooltips = [el._text for el in _zero_badge(root).descendants()
+                if isinstance(el, ui.tooltip)]
+
+    assert len(tooltips) == 1
+    assert 'ARK26' in tooltips[0]
+    assert 'no order' in tooltips[0] and 'remove' in tooltips[0]
+
+
+def test_the_badge_follows_a_share_typed_on_the_page(nicegui_client, account_id):
+    """It is written in ``_apply_bars`` from the SAME live weights the Share-of-label
+    column is written from, so the two cannot disagree about which rows are at
+    zero. Typing a share into the last empty symbol must clear the badge without a
+    reload."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT'),
+                            weights={'AAPL': 100.0, 'MSFT': 0.0}))
+    assert _zero_badge(root).text == '1'
+
+    with nicegui_client:
+        _emit(_tables(root)[0], 'weightChange', ['MSFT', 25.0])
+
+    assert not _zero_badge(root).visible
+
+
+def test_zeroing_a_share_on_the_page_raises_the_badge(nicegui_client, account_id):
+    """The direction that matters: the user has just told the plan to sell a
+    position out, and the row it happened on is now one fold away."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT'),
+                            weights={'AAPL': 60.0, 'MSFT': 40.0}))
+    assert not _zero_badge(root).visible
+
+    with nicegui_client:
+        _emit(_tables(root)[0], 'weightChange', ['MSFT', 0.0])
+
+    badge = _zero_badge(root)
+    assert badge.visible and badge.text == '1'
+
+
+# ---------------------------------------------------------------------------
+# REVIEW AND SUBMIT: ONE DIALOG PER PRESS (2026-09-03)
+#
+# "clicking review here is not instant. So I click twice then screens opens
+# twice". The solve is a broker round trip and NiceGUI schedules every click as
+# its own task, so the second one opened a SECOND dry run over the first -- two
+# plans, two Submit buttons, and the one underneath solved against pre-trade
+# positions.
+# ---------------------------------------------------------------------------
+
+
+def _ui():
+    from nicegui import ui
+    return ui
+
+
+def _review_button(root):
+    return next(el for el in root.descendants()
+                if isinstance(el, _ui().button)
+                and el._props.get('label') == page.REVIEW_BUTTON_LABEL)
+
+
+def _review_handler(button):
+    """The button's own click handler, so a test can re-enter it the way a second
+    click does -- which ``_press`` cannot, because it runs each click to
+    completion before firing the next."""
+    return next(listener.handler for listener in button._event_listeners.values()
+                if listener.type.split('.')[0] == 'click')
+
+
+def _drawn_page(monkeypatch, nicegui_client, account_id):
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    monkeypatch.setattr(page, 'get_selected_account_id', lambda: account_id)
+    _run_in_client(nicegui_client, page.content)
+    return nicegui_client.layout
+
+
+def test_a_second_review_click_during_the_solve_opens_no_second_dry_run(
+        monkeypatch, nicegui_client):
+    """The user's report: "clicking review here is not instant. So I click twice
+    then screens opens twice". The solve is a broker round trip and NiceGUI gives
+    every click its own task, so the second press used to stack a second dry run --
+    with its own Submit, over positions the first one was about to change."""
+    _capture_notifications(monkeypatch)
+    latch = page.ClickLatch(page.REVIEW_BUSY_NOTICE)
+    runs, refused = [], []
+
+    async def _slow_flow():
+        runs.append(True)
+        # THE SECOND CLICK, arriving while this solve is still running.
+        refused.append(await latch.run(_slow_flow))
+
+    with nicegui_client:
+        assert asyncio.run(latch.run(_slow_flow)) is True
+
+    assert runs == [True]
+    assert refused == [False]
+    # ...and the latch is open again, because the solve ordered nothing and the
+    # user must be able to press Review a second time.
+    assert latch.busy is False
+
+
+def test_the_review_latch_tells_the_user_why_the_second_press_did_nothing(
+        monkeypatch, nicegui_client):
+    """A press that silently does nothing reads as a broken button."""
+    sent = _capture_notifications(monkeypatch)
+    latch = page.ClickLatch(page.REVIEW_BUSY_NOTICE)
+
+    async def _flow():
+        await latch.run(_flow)
+
+    with nicegui_client:
+        asyncio.run(latch.run(_flow))
+
+    assert (page.REVIEW_BUSY_NOTICE, 'info') in sent
+
+
+def test_the_review_latch_disables_its_button_while_it_works(monkeypatch,
+                                                              nicegui_client):
+    """The honest answer to "is anything happening?" -- and the half of the
+    defence the user can see."""
+    _capture_notifications(monkeypatch)
+    with nicegui_client:
+        button = _ui().button('Review and Submit')
+        latch = page.ClickLatch(page.REVIEW_BUSY_NOTICE, button=button)
+        seen = {}
+
+        async def _flow():
+            seen['enabled'] = button.enabled
+            seen['loading'] = button._props.get('loading')
+
+        asyncio.run(latch.run(_flow))
+
+    assert seen == {'enabled': False, 'loading': True}
+    assert button.enabled and 'loading' not in button._props
+
+
+def test_the_review_latch_reopens_after_a_solve_that_raises(monkeypatch,
+                                                             nicegui_client):
+    """A latch a failure does not release is a button that never works again."""
+    _capture_notifications(monkeypatch)
+    with nicegui_client:
+        button = _ui().button('Review and Submit')
+        latch = page.ClickLatch(page.REVIEW_BUSY_NOTICE, button=button)
+
+        async def _boom():
+            raise RuntimeError('broker connection reset')
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(latch.run(_boom))
+
+    assert latch.busy is False
+    assert button.enabled and 'loading' not in button._props
+
+
+def test_the_page_wires_the_review_button_through_the_latch(monkeypatch,
+                                                             nicegui_client,
+                                                             account_id):
+    """The wiring, not the mechanism: the button must actually be the latch's."""
+    source = _page_source_text()
+    assert 'ClickLatch(REVIEW_BUSY_NOTICE)' in source
+    assert 'review_latch.button = ui.button(' in source
+    assert 'await review_latch.run(' in source
+
+
+def _page_source_text():
+    from pathlib import Path
+    return Path(page.__file__).read_text(encoding='utf-8')
+
+
+def _ui():
+    from nicegui import ui
+    return ui
