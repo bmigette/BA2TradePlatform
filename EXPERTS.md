@@ -152,22 +152,83 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 
 📖 **Full guide:** [docs/FACTORRANKER_EXPERT.md](docs/FACTORRANKER_EXPERT.md)
 
-### 8. PremiumSeller (backtest-only)
-**Systematic option premium seller — defined-risk put credit spreads on large caps**
+### 8. PremiumSeller — REMOVED 2026-08-31
+**Deleted** (operator decision; option-model plan Task 12, `docs/superpowers/plans/2026-08-24-option-model-and-lifecycle.md`). The systematic short-premium expert's capabilities were promoted into shared code — book rails and circuit breaker in `ba2_common.core.option_book`, exit lifecycle (profit capture, tested-delta, roll-DTE, stops) in `ba2_common.core.option_lifecycle` — so they are no longer one expert's private machinery. The launcher refuses `ba2-test optimize --expert PremiumSeller` loudly; historical backtest/optimization rows naming it remain readable.
 
-- **Type**: Systematic options income expert (self-executing bypass expert, no classic RM)
-- **Methodology**: Sells put credit spreads (optionally naked puts / short strangles under stricter sub-rails) on a static large-cap universe; harvests the volatility risk premium
-- **Data Sources**: OPRA options history (offline cache), FMP daily prices, FMP earnings calendar, FMP grades/ratings
-- **Instrument Selection**: Expert-driven via its own `static_universe` setting (comma-separated underlyings, **required**)
+**What is actually wired, as of 2026-09-01.** Set `risk_manager_mode: classic_options` on any expert and its option **entries** are gated by the sleeve rails and the breaker latch, in live and in the backtest alike — one implementation at the `TradeActions` submit choke point (design §4).
+
+- **Entry gating: both runtimes.** `max_deployment_pct`, `undefined_risk_max_pct`, `max_notional_leverage`, `max_concurrent_structures`, one-per-underlying, assignment capacity, and a refusal while the breaker latch is `halted`. The four rails have **no defaults** — an expert that declares none refuses its option entries and names the missing setting.
+- **Breaker TRANSITIONS: both runtimes, one function** (since 2026-09-01). `OptionRiskManagement.update_sleeve_breaker` ratchets the sleeve's peak equity, trips the stand-down and re-arms it on recovery. Live calls it from `option_lifecycle_service` (the exit pass, on the `JobManager` schedule); the backtest calls it once per bar from `daily_engine`, behind the same `classic_options` check the entry gate dispatches on — so an equity trial reaches it zero times. Before that the transition was live-only and `RAIL_BREAKER_HALTED` was unreachable in a backtest, which made a `classic_options` backtest systematically more permissive than live.
+- **One definition of the sleeve's SIZING equity: `account.get_account_snapshot().equity`** — cash plus positions marked to market, in both runtimes. It is the denominator of `max_deployment_pct` / `max_notional_leverage`. It replaced `account.get_balance()`, which meant account EQUITY on Alpaca and spendable CASH on the backtest account, so those rails had been measuring different quantities in the two runtimes. **Option grid results produced before 2026-09-01 measured the backtest rails against CASH and are not comparable** to results after it.
+- **The BREAKER measures the account's TRUE equity, which is not the same number under a backtest equity cap.** The capped figure the sizer reads is `min(cap, cash + marks)`, and that clamp is one-sided — it compresses peaks and never troughs, so a 50k-capped account falling 100k -> 64k reports a 0.0% drawdown and never stands down, while the identical path live halts at -20%. The breaker therefore reads `account.true_equity()`: the same snapshot field for every real broker (live behaviour unchanged, there being no cap), the uncapped `cash + marks` on the backtest account. It is still one shared breaker function over one latch store — the difference is the account's own answer, not forked logic. Sizing rails are deliberately NOT moved onto it: a sizer must respect the cap.
+- **The exit/servicing pass is still LIVE ONLY**, by design: profit capture, tested-delta, roll-DTE and the stops run in `option_lifecycle_service`, while a backtest expresses the same exits as the strategy's own `close_option` rules, which the GA searches. Do not read a backtest as evidence about profit-capture/roll-DTE/tested-delta behaviour.
+- **The lifecycle thresholds are declared on `MarketExpertInterface`, with NO defaults.** `circuit_breaker_pct`, `profit_capture_pct`, `roll_dte`, `tested_delta_enabled`, `dr_stop_enabled`, `ur_stop_enabled` and the four conditional ones (`strangle_capture_pct`, `tested_delta`, `dr_stop_credit_mult`, `ur_stop_credit_mult`) left the tree with PremiumSeller's settings block and were re-declared on 2026-09-01, so any expert can be switched over and configured. A risk threshold nobody stated is not a threshold: `circuit_breaker_pct` is a REQUIRED **rail** (an undeclared one refuses every option entry by name, like the other four), and a sleeve missing any of the five required lifecycle thresholds has its live exit pass abort loudly rather than run on a substituted number.
+
+📖 **Historical spec:** [docs/superpowers/specs/2026-07-24-premium-seller-expert-design.md](docs/superpowers/specs/2026-07-24-premium-seller-expert-design.md)
+
+### 9. FMPEarningsEvent
+**Ranks upcoming earnings events for the options grid's `O_ERN` (earnings long-vol) key**
+
+- **Type**: Event-driven ranker (not a screener/rating expert — it emits one
+  recommendation per symbol carrying an event inside its look window, not a
+  standing directional view)
+- **Methodology**: A per-symbol composite score from three features computed
+  off the FMP disk cache (`past_earnings_quarterly`, and — for
+  `w_vol_cheapness` — an ATM straddle read from an options-capable account),
+  mapped to confidence 1–100. Below `min_hist_events` a symbol gets NO
+  recommendation (never a padded rank).
+- **Data Sources**: FMP `past_earnings_quarterly` (dates + eps/epsEstimated,
+  used for both the event date and the historical-move/surprise features);
+  `earnings_estimates_quarterly` (analyst count, for the `min_analysts` gate
+  only — dispersion/revision features are deliberately withheld, see below);
+  an options-capable account (backtest parquet reader / live broker chain)
+  for the implied-move leg of `w_vol_cheapness`, duck-typed and fail-to-absent.
+- **Instrument Selection**: Static/Dynamic (screener-style, like FMPRating —
+  cannot recommend its own instruments)
+- **Timing split (design rule)**: the EXPERT owns the ranking; the STRATEGY
+  (`O_ERN`) owns the timing. The expert surfaces every event inside a fixed
+  look-ahead (`earnings_days_look`, a plain setting, not a gene) and stamps
+  `days_to_earnings` + feature values onto the recommendation; `O_ERN`'s
+  searched entry gene (`rec_days_to_earnings <= X`, 1–5) reads that stamp.
+- **Warmup**: `BACKTEST_WARMUP_BARS = 620` (pinned equal to the
+  `_EXPERT_WARMUP_BARS`/`_SUPPORTED_EXPERTS` table entry in
+  `testplatform/backend/app/services/backtest/daily_backtest_handler.py`
+  (:232/:271) — NOT the launcher — by a dedicated test; a mismatch there
+  would silently starve the expert of history it needs).
+- **Stamp contract** (`ba2_common.core.earnings_stamp`): recommendations
+  carry `raw_outputs[EARNINGS_STAMP_NAMESPACE]` (namespace
+  `"FMPEarningsEvent"`) with `DAYS_TO_EARNINGS_KEY` (`"days_to_earnings"`)
+  and `EVENT_DATE_KEY` (`"event_date"`, ISO string). The `O_ERN` entry order
+  carries the event date FORWARD onto its own row under
+  `ORDER_EVENT_DATE_KEY` (`"earnings_event_date"`) at submit time, so the
+  exit's `days_after_event >= Y` condition reads the date off the ORDER
+  (which does not change after entry), never off whatever recommendation
+  happens to be in hand at exit time (a later, unrelated event by then).
+  `stamped_event_date()` is the one reader both the entry-stamp and the
+  order-carry-forward code paths share.
 - **Key Features**:
-  - Entry signals — IVR gate, IV-HV spread, SMA trend filter, earnings exclusion, FMP-rating floor — all GA-tunable expert settings
-  - Exit signals — profit capture, tested-delta, roll-DTE, credit-multiple stops, circuit breaker — all GA-tunable expert settings
-  - Lifecycle owned by `OptionPortfolioManager` (entries on entry bars, exit management on manage bars) — **no `ExpertRecommendation`, no classic RM**
-  - Backtest-only in v1 (`run_analysis` raises `NotImplementedError`); GA-optimizable via the launcher grid (`ba2-test optimize --expert PremiumSeller`, fitness defaults to `consistent_annual_return`)
+  - Composite rank from `w_hist_move` (avg absolute earnings-day move over
+    past events), `w_surprise_vol` (std of past EPS surprises), and
+    `w_vol_cheapness` (historical move ÷ option-implied move — the only
+    feature comparing what you PAY to what you GET; absent when no
+    options-capable account is available, never demotes)
+  - `min_analysts` (0–5, 0 = gate off; expert default 1 as a data-quality
+    floor, not a selection filter — see the setting's own comment for the
+    2026-09-01 measurement that moved the default down from 3)
+  - `allow_unconfirmed_dates` (off by default — an unconfirmed print date
+    slips, and buying volatility ahead of a date that moves buys nothing)
+  - `w_dispersion`/`w_revision` DO NOT EXIST: design §9 withheld them on
+    measured coverage (~3 in-window `earnings_estimates_quarterly` rows per
+    symbol, a forward-biased endpoint, and 1-analyst degeneracy in mid/small
+    caps) — unlocked only by a point-in-time replay proving the estimate
+    rows predate the events they would score.
 
-**Key Settings**: `static_universe`, `iv_rank_min`, `iv_hv_min_pp`, `trend_sma`, `target_delta`, `target_dte`, `spread_width`, `min_credit_ratio`, `risk_per_structure_pct`, `profit_capture_pct`, `roll_dte`, `max_deployment_pct`, `circuit_breaker_pct` (+ naked-structure rails `enable_short_put` / `enable_short_strangle`).
+**Key Settings** (7 total): `earnings_days_look` (default 10, plain setting
+not a gene), `min_hist_events` (default 4), `min_analysts` (default 1, gene
+0–5), `allow_unconfirmed_dates` (default False, gene), `w_hist_move` /
+`w_surprise_vol` / `w_vol_cheapness` (default 1.0 each, genes).
 
-📖 **Spec:** [docs/superpowers/specs/2026-07-24-premium-seller-expert-design.md](docs/superpowers/specs/2026-07-24-premium-seller-expert-design.md)
+📖 **Design:** [docs/superpowers/specs/2026-08-31-leaps-grid-design.md](docs/superpowers/specs/2026-08-31-leaps-grid-design.md) §9
 
 ## Expert Properties Comparison
 
@@ -180,7 +241,6 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 | FMPSenateTraderCopy | **Yes** | No | Simple government trade copying |
 | PennyMomentumTrader | **Yes** | **Yes** | Live intraday penny-stock momentum |
 | FactorRanker | **Yes** | **Yes** | Systematic multi-factor equity ranking |
-| PremiumSeller | **Yes** (own setting) | **Yes** | Systematic option premium selling (backtest-only) |
 
 ¹ *Self-executing* experts place and manage their own orders via a dedicated manager (no `ExpertRecommendation`, no SmartRiskManager); order/expert attribution flows through `Transaction.expert_id`.
 

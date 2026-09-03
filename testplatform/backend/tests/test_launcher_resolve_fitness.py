@@ -34,10 +34,30 @@ _EQUITY_KINDS = sorted(mod._OPTION_STRATEGY_KEYS - mod._PURE_OPTION_STRATEGIES)
 #: carve-out reasoning on a different knob) and is the only equity kind left on the stock default.
 _OPTION_CAR_JOINS = ["O_CC", "O_PP"]
 
+#: The convex-harvest grid (plan Task 13) is the ONE exception to "every pure-option kind
+#: defaults to option_consistent_annual_return": ``option_convex`` is NEVER a default for any
+#: kind (design §3), so O_CONVEX and its two group members are explicitly EXCLUDED from
+#: ``_OPTION_CAR_STRATEGIES`` (ba2test_launcher.py's own comment there) and fall through to the
+#: caller's stock default here instead -- checked below, and by
+#: test_convex_grid_foundations.py's ``test_o_convex_is_excluded_from_the_car_default_set``.
+#: What actually stops that from mattering at launch time is
+#: ``_refuse_convex_fitness_mismatch`` (test_convex_grid_foundations.py's
+#: ``test_o_convex_refuses_the_bare_platform_default_too``), not this function.
+_CONVEX_KINDS = {"O_CONVEX", "O_CONVEXC", "O_CONVEXP"}
 
-@pytest.mark.parametrize("kind", sorted(mod._PURE_OPTION_STRATEGIES))
+
+@pytest.mark.parametrize("kind", sorted(mod._PURE_OPTION_STRATEGIES - _CONVEX_KINDS))
 def test_pure_option_kinds_default_to_the_option_metric(kind):
     assert mod._resolve_fitness(None, kind, "sharpe_ratio") == _OPTION_METRIC
+
+
+@pytest.mark.parametrize("kind", sorted(_CONVEX_KINDS))
+def test_the_convex_grid_is_the_one_pure_option_exception(kind):
+    """See _CONVEX_KINDS above: option_convex is never a _resolve_fitness default, for any
+    kind -- O_CONVEX falls through to the caller's stock default here, and IS in
+    _PURE_OPTION_STRATEGIES (the exclusion is from _OPTION_CAR_STRATEGIES only)."""
+    assert kind in mod._PURE_OPTION_STRATEGIES
+    assert mod._resolve_fitness(None, kind, "sharpe_ratio") == "sharpe_ratio"
 
 
 @pytest.mark.parametrize("kind", ["O_STK", "S1", "S2", "S7"])
@@ -76,9 +96,14 @@ def test_an_explicit_cli_fitness_always_wins(kind):
 
 def test_the_option_grid_never_reaches_the_equity_metric_by_default():
     """The whole point of the split: no default path from a pure-option kind to the metric the
-    running equity backtests are scored on."""
+    running equity backtests are scored on.
+
+    O_CONVEX (and its members) are EXCLUDED from this iteration -- they are the one deliberate
+    exception (see _CONVEX_KINDS above): _resolve_fitness alone DOES return the equity default
+    for them, and the launch-time refusal (_refuse_convex_fitness_mismatch), not this
+    function, is what stops that from ever reaching a real job."""
     picked = {mod._resolve_fitness(None, k, "sharpe_ratio")
-              for k in mod._PURE_OPTION_STRATEGIES}
+              for k in mod._PURE_OPTION_STRATEGIES - _CONVEX_KINDS}
     assert picked == {_OPTION_METRIC}
     assert "consistent_annual_return" not in picked
 
@@ -124,3 +149,30 @@ def test_the_fitness_help_names_the_metric_resolve_fitness_actually_picks(comman
     assert mod._resolve_fitness(None, "O_LC", stock_default) == _OPTION_METRIC
     assert stock_default in block, (
         f"`{command} --help` does not name its stock default {stock_default!r}: {block}")
+
+
+# --------------------------------------------------------------------------------------------
+# option_convex (Task 12): selectable by NAME, never a default
+# --------------------------------------------------------------------------------------------
+def test_an_explicit_convex_fitness_survives_the_resolution_for_every_kind():
+    """The convex-harvest grid names its metric explicitly; the CLI short-circuit must carry it
+    through untouched whatever strategy kind the job runs (design §5: fitness `option_convex`)."""
+    for kind in sorted(mod._OPTION_STRATEGY_KEYS) + ["S1", "S2"]:
+        assert mod._resolve_fitness(mod._CONVEX_FITNESS, kind, "sharpe_ratio") \
+            == mod._CONVEX_FITNESS
+
+
+def test_the_convex_metric_is_never_a_default():
+    """Task 13 adds the O_CONVEX key and the mutual refusal. Until then nothing may DEFAULT to
+    the convex metric -- an option_car job that silently drifted onto it would be scored on a
+    metric its results are not comparable with."""
+    for kind in sorted(mod._OPTION_STRATEGY_KEYS) + ["S1", "S2", "S7"]:
+        for default in ("sharpe_ratio", "calmar_ratio", "consistent_annual_return"):
+            assert mod._resolve_fitness(None, kind, default) != mod._CONVEX_FITNESS
+
+
+def test_the_convex_metric_the_launcher_names_is_the_one_the_registry_accepts():
+    """String-level drift guard: the launcher's constant must BE a registered fitness name."""
+    from app.services import strategy_fitness as sf
+
+    assert mod._CONVEX_FITNESS in sf.catalog_accepted_metrics()

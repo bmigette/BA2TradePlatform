@@ -3,9 +3,13 @@
 
 WHAT IT DOES. For each underlying it enumerates the option contracts expiring in the window,
 groups them by expiry, and downloads each expiry's daily candles — including
-``imp_volatility`` and ``open_interest``, the two fields that are NULL across all 6,757,055
-rows of the incumbent cache and that therefore make ``method="delta"`` select nothing and
-``min_open_interest`` reject entire chains.
+``imp_volatility`` and ``open_interest``. ``open_interest`` is the field the incumbent cache
+genuinely lacks (NULL across all 1,440,782 of its chain rows, with no bar column to recover
+it), which is what makes ``min_open_interest`` reject entire chains there. Its
+``imp_volatility`` is thin rather than absent (46% of chain rows, 88.2% of bar rows), so a
+vendor IV is an improvement, not a rescue — re-measured 2026-08-31, correcting an earlier
+note here that claimed both were NULL across "all 6,757,055 rows" and that ``method="delta"``
+therefore selected nothing. See ``ba2_common.core.option_selector._publishes_spread``.
 
 Each (underlying, expiry) is one UNIT OF WORK and one parquet partition. Interrupting the run
 — Ctrl-C, a dropped socket, a sleeping laptop — loses at most the unit in flight, never

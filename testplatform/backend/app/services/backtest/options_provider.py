@@ -241,11 +241,14 @@ def _to_contract(r: dict, greeks_row: Optional[dict] = None) -> OptionContract:
         last=last, implied_volatility=g.get("iv"), delta=g.get("delta"),
         gamma=g.get("gamma"), theta=g.get("theta"), vega=g.get("vega"),
         open_interest=r.get("open_interest"),
-        # VOLUME comes from the BAR, not the chain row (2026-07-25). option_chain.volume is
-        # NULL for every row a fetch_options build writes (verified: 0 of 958,024 populated) —
+        # VOLUME comes from the BAR, not the chain row. option_chain.volume is NULL for every
+        # row a fetch_options build writes (re-measured 2026-08-31: 0 of 1,440,782 populated) —
         # Alpaca exposes no as-of volume for a past date, so the chain snapshot never gets one.
-        # option_bar.volume IS populated for every bar (13,729,262 of 13,729,262), because a
-        # bar only exists for a contract that actually traded that day. Reading the chain
+        # option_bar.volume IS populated for every bar (19,484,995 of 19,484,995), because a
+        # bar only exists for a contract that actually traded that day. THIS IS WHY "volume is
+        # NULL in the cache" is a claim about the CHAIN TABLE ONLY: what the selector sees is
+        # the bar's volume, so a volume-ranked weight is live here even though the chain
+        # column is empty. Reading the chain
         # column left OptionContract.volume permanently None, so any selector-side liquidity
         # gate keyed on volume silently passed EVERYTHING while the fill engine's
         # participation cap (_OPTION_FILL_MAX_VOLUME_PARTICIPATION) — which reads the bar
@@ -305,7 +308,17 @@ class HistoricalOptionsProvider:
         chain_row = (_chain_history(self.db_path, bar["underlying"]).row_for(
             occ_symbol, as_of.isoformat()) if bar.get("underlying") else None)
         bid, ask, last = _pit_quotes(chain_row, bar)
-        return OptionQuote(symbol=occ_symbol, bid=bid, ask=ask, last=last)
+        # GREEKS COME FROM THE SAME BAR (plan Task 6). ``OptionQuote`` has declared ``delta``
+        # and ``implied_volatility`` since it was written and this path left both None, so a
+        # rule-level reader of a HELD contract's delta had no point-in-time source at all --
+        # the chain path (``_to_contract``) has carried them from this very row for as long as
+        # the greeks columns have existed. It is the bar's OWN values, never the chain row's
+        # start-date snapshot, for the reason ``_to_contract`` states: the snapshot goes stale
+        # as the simulated clock advances. Absent stays None: a missing greek is unknown, and
+        # ``LongLegDeltaCondition`` declines to evaluate on it rather than reading it as zero.
+        return OptionQuote(symbol=occ_symbol, bid=bid, ask=ask, last=last,
+                           delta=bar.get("delta"),
+                           implied_volatility=bar.get("iv"))
 
     def get_bar(self, occ_symbol: str, as_of: date) -> Optional[dict]:
         return _bar_history(self.db_path, occ_symbol).by_date.get(as_of.isoformat())
@@ -423,10 +436,17 @@ class HistoricalOptionsProvider:
             #
             # Why not stamp the row with its inversion date and refuse it when that date is
             # after `as_of`? That needs a new option_chain column, and no existing cache has
-            # one (the shared 10.9 GB file predates even the iv/delta columns), so every row
-            # would read "provenance unknown" and be refused anyway -- the same behaviour as
-            # this, plus a migration and a second thing to keep correct. The provenance is
-            # not recoverable retrospectively; absent is the honest reading.
+            # one, so every row would read "provenance unknown" and be refused anyway -- the
+            # same behaviour as this, plus a migration and a second thing to keep correct.
+            # The provenance is not recoverable retrospectively; absent is the honest reading.
+            #
+            # THE MISSING COLUMN IS THE INVERSION DATE, NOT THE GREEKS. This note used to say
+            # "the shared 10.9 GB file predates even the iv/delta columns", which is wrong on
+            # both counts: the file is 4.12 GB, and `option_chain` and `option_bar` both
+            # DECLARE and POPULATE iv/delta (46.0% and 88.2% of rows respectively -- see
+            # `option_selector._publishes_spread`, the one re-verified record). The greeks
+            # being present is exactly why the clamp above has anything to clamp; what no
+            # schema records is WHEN each one was inverted.
             #
             # Fails CLOSED, which the stack already copes with: this returns None when no
             # in-window call has a usable clamped iv+delta, and IVRankCondition treats an

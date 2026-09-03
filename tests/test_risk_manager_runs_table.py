@@ -196,3 +196,75 @@ def test_a_sizing_manager_shows_no_iteration_count(expert_id):
     row = next(r for r in _rows(expert_id) if r['run_type'] == 'classic')
 
     assert row['iteration_count'] == '-'
+
+
+# ---------------------------------------------------------------------------------------
+# The producer meets the table (review 2026-08-30 dev-merge, FIX 2)
+# ---------------------------------------------------------------------------------------
+"""The Options filter had a reader and a model but NO producer.
+
+``RiskManagerRun.mode`` and the UI's ``mode == 'options'`` filter shipped from dev; the
+option risk manager shipped from the options branch writing a ``SmartRiskManagerJob`` with
+``model_used="classic_options"`` — a column no filter looks at. The two halves never met:
+the Options filter returned nothing, and every option run surfaced mislabelled under
+**Smart**. These tests drive the REAL producer into the REAL fetch, so the handshake
+cannot come apart again silently.
+"""
+
+
+def _option_run(expert_id, *, admitted=("AAPL",), refused=("MSFT",)):
+    """Produce a run through the real writer, from the real journal.
+
+    The journal is the producer's input, and the journal-entry -> decision-row mapping is
+    pinned in ``packages/common/tests/test_option_risk_manager_wiring.py``. What is pinned
+    HERE is the other end: that what ``flush_option_rm_run`` writes is what the table's
+    Options filter reads.
+    """
+    import ba2_common.core.OptionRiskManagement as rm
+
+    rm.reset_journal()
+    for symbol in admitted:
+        rm._journal_entry(expert_id, rm.OptionEntryVerdict(
+            True, "", "ok", "within every sleeve rail"),
+            symbol, "cash_secured_put", 1)
+    for symbol in refused:
+        rm._journal_entry(expert_id, rm.OptionEntryVerdict(
+            False, "OPTION RAIL REFUSAL", "max_deployment",
+            "cash_secured_put on %s: max_deployment — 42.0%% of a 40.0%% cap" % symbol),
+            symbol, "cash_secured_put", 1)
+    return rm.flush_option_rm_run(expert_id, None)
+
+
+def test_an_option_run_appears_under_the_options_filter(expert_id):
+    """The whole handshake: the option risk manager's own run, fetched by the filter that
+    existed for it. Before FIX 2 this returned an empty list."""
+    run_id = _option_run(expert_id)
+    assert run_id is not None
+
+    rows = _rows(expert_id, 'options')
+
+    assert [r['id'] for r in rows] == [run_id]
+    assert rows[0]['run_type'] == 'options'
+    assert rows[0]['type_label'] == 'Options'
+    # One admitted of two weighed — the sizing manager's count, not an action count.
+    assert rows[0]['actions_taken_count'] == '1 / 2'
+
+
+def test_the_smart_filter_no_longer_shows_the_option_run(expert_id):
+    """It used to be the ONLY place it showed, labelled as a Smart job. An option run is
+    not an LLM job and must not sit in that list."""
+    _option_run(expert_id)
+
+    assert _rows(expert_id, 'smart') == []
+    # And it is not double-reported: the union shows it exactly once, as an options run.
+    assert [r['run_type'] for r in _rows(expert_id)] == ['options']
+
+
+def test_a_backtest_writes_no_run_row_at_all(expert_id, monkeypatch):
+    """The pin holds through the rewrite: a grid evaluates tens of thousands of entries
+    and has no runs table to read them."""
+    monkeypatch.setattr("ba2_common.core.trade_store.inmem_trades_active", lambda: True)
+
+    assert _option_run(expert_id) is None
+    assert _rows(expert_id) == []
+

@@ -143,6 +143,20 @@ class FakeAccount(MockAccount):
             raise self.balance_error
         return self._balance
 
+    def get_account_info(self):
+        """The read the sleeve's equity actually comes down since 2026-09-01.
+
+        ``sleeve_equity`` reads ``get_account_snapshot().equity`` — one definition for both
+        runtimes — and ``MockAccount`` does not override the snapshot, so the tolerant
+        ``ReadOnlyAccountInterface`` probe lands HERE. ``balance_error`` therefore has to
+        fail this call to model "the balance endpoint is down"; failing ``get_balance``
+        alone would leave the breaker reading a perfectly healthy equity and the test
+        asserting nothing.
+        """
+        if self.balance_error is not None:
+            raise self.balance_error
+        return super().get_account_info()
+
     # -- market data -------------------------------------------------------
     def get_option_chain(self, underlying, expiry_min, expiry_max, option_type=None,
                          strike_min=None, strike_max=None):
@@ -184,6 +198,20 @@ def _capture_errors(monkeypatch):
     module = sys.modules[svc.__name__]
     messages: List[str] = []
     monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+def _capture_rm_errors(monkeypatch):
+    """Collect ``logger.error`` text emitted by the SHARED option risk manager.
+
+    The sleeve's equity read moved there (one reader, both runtimes), so the error a failed
+    balance endpoint produces is now logged by ``ba2_common``, not by this service. Same
+    reasoning as ``_capture_errors`` for why this is not caplog.
+    """
+    import ba2_common.core.OptionRiskManagement as _rm
+
+    messages: List[str] = []
+    monkeypatch.setattr(_rm.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
     return messages
 
 
@@ -870,11 +898,15 @@ def test_an_unreadable_balance_leaves_the_breaker_blind_and_trips_nothing(wired)
     assert account.submitted == []
 
 
-def test_a_balance_call_that_raises_leaves_the_breaker_blind_too(monkeypatch, wired):
-    """An exception reading the balance is unknown equity, not zero equity.
+def test_an_equity_read_that_raises_leaves_the_breaker_blind_too(monkeypatch, wired):
+    """An exception reading the equity is unknown equity, not zero equity.
 
     Substituting 0.0 against a ratcheted peak is a measured 100% drawdown, and the breaker
     would flatten the entire sleeve on a broker hiccup.
+
+    (Named for the BALANCE call until 2026-09-01, when the sleeve's equity became
+    ``get_account_snapshot().equity`` — one definition for live and backtest. The fact under
+    test is unchanged; the endpoint that fails is the one the breaker now reads.)
     """
     account, expert, expert_row = wired
     open_credit_spread(account, expert_row)
@@ -882,7 +914,7 @@ def test_a_balance_call_that_raises_leaves_the_breaker_blind_too(monkeypatch, wi
     account._balance = 100_000.0
     run(expert_row)                                  # peak = 100k
     account.balance_error = RuntimeError("balance endpoint 503")
-    errors = _capture_errors(monkeypatch)
+    errors = _capture_rm_errors(monkeypatch)
 
     result = run(expert_row)
 

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
+from ba2_common.core.option_expiry import PMCC_STRATEGY, is_multi_expiry_strategy
+from ba2_common.core.option_lifecycle import PMCC_ROLL_STRATEGY
 from ba2_common.core.option_types import OptionContract, OptionQuote, OptionLeg, OptionPosition
 from ba2_common.core.types import OptionRight
 
@@ -48,7 +50,8 @@ COVER_REFUSAL = "UNCOVERED SHORT CALL"
 #: this account holds". The cover guard REFUSES on exactly that promise and no other:
 #:
 #: * a ``short_strangle``/``short_put`` is DELIBERATELY undefined-risk and is gated by
-#:   PremiumSeller's ``undefined_risk_max_pct`` rail, not by share inventory;
+#:   the ``undefined_risk_max_pct`` book rail (``ba2_common.core.option_book``), not by
+#:   share inventory;
 #: * a ``bear_call_spread`` answers for its short call with a LONG CALL rather than with
 #:   shares, so it is never refused HERE — but it is not outside the cover ledger either:
 #:   ``shares_pledged_to_short_calls`` counts its short leg as pledging shares like any
@@ -57,7 +60,7 @@ COVER_REFUSAL = "UNCOVERED SHORT CALL"
 #:   short call really can have 100 shares called away), and a real constraint: two such
 #:   sleeves on one ticker will not both write;
 #: * every close path submits under ``"close"`` (``option_lifecycle_service``,
-#:   ``PremiumSeller.portfolio``, ``close_option_position``), so flattening is never
+#:   ``close_option_position``), so flattening is never
 #:   gated on a cover reading — a refusal there would strand an open position.
 COVERED_CALL_STRATEGY = "covered_call"
 
@@ -248,9 +251,11 @@ class OptionsAccountInterface(ABC):
         2-4 legs   -> a parent option order (option_strategy set, no contract_symbol)
                       + leg children linked via parent_order_id.
 
-        Raises ValueError if the legs span more than one expiry, or if a ``covered_call``
-        is not covered by free shares (see the two guards below). Both refuse BEFORE any
-        row is written, so a refusal leaves nothing half-recorded.
+        Raises ValueError if the legs span more than one expiry — unless ``option_strategy``
+        is DECLARED in ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``, which permits
+        exactly two — or if a ``covered_call`` is not covered by free shares (see the two
+        guards below). Both refuse BEFORE any row is written, so a refusal leaves nothing
+        half-recorded.
 
         THE COVER RAISE IS A BACKSTOP, not the channel a caller should rely on. A short
         cover is an operational outcome with a remedy, not a malformed call: a caller
@@ -280,15 +285,45 @@ class OptionsAccountInterface(ABC):
         # call butterfly, put ratio spread — put every leg on one expiry. A calendar or a
         # diagonal does not make that field incomplete, it makes it WRONG: a money record
         # asserting a date half the position does not honour, with nothing anywhere to
-        # contradict it. Adding such a structure must therefore start by teaching the
-        # Transaction to carry per-leg expiries — this refusal is the reminder.
+        # contradict it.
+        #
+        # THE RELAXATION (plan Task 6-PRE) IS OPT-IN AND NARROW. A strategy DECLARED in
+        # `MULTI_EXPIRY_OPTION_STRATEGIES` may span exactly two expiries; the per-leg record
+        # is the child rows written below, each carrying its own `expiry`, and the
+        # structure-level value stays NULL for it rather than asserting a date half the
+        # position does not honour (see the parent's `expiry=` below). Everything else still
+        # refuses, and because membership is opt-in, a missing or unrecognised strategy tag
+        # is "not declared" — the default is still refusal.
+        #
+        # THREE expiries refuse even when declared. The lifecycle this unlocks is a
+        # TWO-expiry one (long cover + short overlay), and the named read rules in
+        # `option_expiry` pick the binding leg per SIDE — with three distinct entry expiries
+        # there is no stated basis for which pair the structure is. (The readers do handle
+        # more than two, because a roll in flight can transiently net that way; what is
+        # refused here is submitting one.)
         #
         # A leg whose expiry is None is UNKNOWN, not a second expiry, and is not counted:
-        # the close paths rebuild legs from stored order rows (PremiumSeller/portfolio.py
-        # reads `getattr(o, "expiry", None)`), and refusing there would strand an open
+        # the close paths rebuild legs from stored order rows (reading
+        # `getattr(o, "expiry", None)`), and refusing there would strand an open
         # position that can no longer be flattened — much worse than an incomplete intent.
+        # THE DECLARATION IS THE TRANSACTION'S, NOT ONLY THE ARGUMENT'S (plan Task 6). An
+        # ENTRY declares itself: ``open_pmcc`` passes ``option_strategy="pmcc"``. Everything
+        # that happens to that structure afterwards does NOT -- the flatten path submits under
+        # ``"close"`` (the one tag every close path in the codebase uses) and a roll under
+        # ``"pmcc_roll"``, and both carry two expiries because the position does. Keying only
+        # on the argument would admit the PMCC and then refuse to close it: a structure that
+        # can be opened and never flattened, which is worse than one that cannot be opened.
+        #
+        # Fail-closed twice over, and unchanged for everyone else: an order with NO
+        # ``transaction_id`` behaves exactly as before (an entry is the only thing that has no
+        # transaction yet), and a transaction whose OWN ``option_strategy`` is not declared
+        # still refuses. There is one declaration -- ``MULTI_EXPIRY_OPTION_STRATEGIES`` -- and
+        # this reads it off the row where ``_record_option_intent_on_transaction`` stamped it.
         expiries = sorted({leg.expiry for leg in legs if leg.expiry is not None})
-        if len(expiries) > 1:
+        declared = (is_multi_expiry_strategy(option_strategy)
+                    or self._transaction_declares_multi_expiry(transaction_id))
+        multi_expiry_allowed = (len(expiries) == 2 and declared)
+        if len(expiries) > 1 and not multi_expiry_allowed:
             raise ValueError(
                 f"An option structure must be on a single expiry, but these {len(legs)} legs "
                 f"span {len(expiries)}: {', '.join(d.isoformat() for d in expiries)}. "
@@ -340,16 +375,27 @@ class OptionsAccountInterface(ABC):
             contract_symbol=(first.contract_symbol if not is_multi else None),
             option_type=(first.option_type if not is_multi else None),
             strike=(first.strike if not is_multi else None),
-            # EXPIRY IS THE EXCEPTION, and it is a fact about the WHOLE structure.
-            # The single-expiry guard above has already refused anything spanning two dates,
-            # so `expiries` holds at most one element: the structure's expiry, or nothing when
-            # no leg records one (the flatten path, where legs are rebuilt from stored rows and
-            # may carry expiry=None — UNKNOWN stays NULL here rather than becoming an invented
-            # date). The parent IS the row the broker fills, and it was NULL here for every
-            # multi-leg, which is why `OptionPortfolioManager._should_close`'s roll-at-DTE
-            # branch — `expiry is not None and (expiry - as_of.date()).days <= roll_dte` — had
-            # never once fired for a spread or a strangle.
-            expiry=(expiries[0] if expiries else None),
+            # EXPIRY IS THE EXCEPTION, and it is a fact about the WHOLE structure — when
+            # there IS one. `expiries` holds the distinct dates the legs recorded, and only
+            # a single one is a fact about the whole position:
+            #   1 -> the structure's expiry;
+            #   0 -> no leg records one (the flatten path, where legs are rebuilt from
+            #        stored rows and may carry expiry=None) — UNKNOWN stays NULL rather than
+            #        becoming an invented date;
+            #   2 -> a DECLARED multi-expiry structure (the guard above refuses every other
+            #        way to get here). NULL is the only honest value: picking either date
+            #        would make the row the broker fills assert an expiry that half the
+            #        position does not honour, which is precisely the failure the guard's
+            #        comment describes. The per-leg truth is on the child rows below, and
+            #        `option_expiry.resolve_structure_expiry` is how it is read back.
+            # This expression is byte-identical to the previous `expiries[0] if expiries`
+            # for every structure that reached here before, because the guard made
+            # len(expiries) <= 1 unconditionally.
+            # The parent was NULL here for every multi-leg, which is why
+            # `OptionPortfolioManager._should_close`'s roll-at-DTE branch —
+            # `expiry is not None and (expiry - as_of.date()).days <= roll_dte` — had never
+            # once fired for a spread or a strangle.
+            expiry=(expiries[0] if len(expiries) == 1 else None),
             expert_recommendation_id=expert_recommendation_id,
             transaction_id=transaction_id,
         )
@@ -479,9 +525,9 @@ class OptionsAccountInterface(ABC):
         and turns the same sentence into a failed ``TradeActionResult``, so nothing is
         raised on the path where a refusal is an ordinary outcome.
 
-        This raise stays because not every caller has such a channel.
-        ``PremiumSeller.rebalance``, ``OptionPortfolioManager`` and any future direct
-        caller reach ``submit_option_order`` with nowhere to put a verdict, and for them
+        This raise stays because not every caller has such a channel. Any direct
+        caller (historically ``PremiumSeller.rebalance``, deleted 2026-08-31; any
+        future one) reaches ``submit_option_order`` with nowhere to put a verdict, and for them
         the alternative to an exception is a silent naked write. It is a backstop and
         not the primary channel: reaching it means a caller did not ask first.
 
@@ -505,8 +551,8 @@ class OptionsAccountInterface(ABC):
         WHY THIS LIVES AT THE SEAM AND NOT IN THE ACTION. ``SellCoveredCallAction``
         checks cover too, and it stays — but it was the ONLY caller that did.
         ``submit_option_order`` validated a non-empty leg list, a 4-leg ceiling and a
-        single expiry, so ``PremiumSeller.rebalance``, ``OptionPortfolioManager`` and any
-        future caller could write a naked short call under the ``covered_call`` tag with
+        single expiry, so a direct caller (``PremiumSeller.rebalance``, until its
+        2026-08-31 deletion) could write a naked short call under the ``covered_call`` tag with
         nothing in the repo to notice. A promise enforced at one of five call sites is a
         convention, not an invariant.
 
@@ -694,7 +740,37 @@ class OptionsAccountInterface(ABC):
     #: (``TradeActions`` and ``OptionPortfolioManager._close_structure``) submit offsetting
     #: legs tagged "close" on the SAME transaction, so letting one through would relabel
     #: every flattened structure in the book and make the strategy family unrecoverable.
-    NON_INTENT_STRATEGIES = ("close",)
+    #:
+    #: ``pmcc_roll`` joins for the same reason and a sharper one: a roll submits a buy-back
+    #: and a fresh overlay on the SAME transaction, and it happens over and over for the life
+    #: of the position. If it could define intent, a transaction whose stamp was somehow
+    #: missing would be relabelled "pmcc_roll" -- and the expiry readers dispatch on that tag,
+    #: so the structure would stop being a declared two-expiry one and its DTE would go
+    #: unevaluable mid-life.
+    NON_INTENT_STRATEGIES = ("close", PMCC_ROLL_STRATEGY)
+
+    def _transaction_declares_multi_expiry(self, transaction_id) -> bool:
+        """Has the transaction this order belongs to been DECLARED multi-expiry?
+
+        The second half of the submit guard's declaration test (see the comment at its call
+        site). ``False`` for ``None`` -- an entry has no transaction yet, so an entry declares
+        itself through its ``option_strategy`` argument or not at all -- and ``False`` for a
+        transaction that carries no recognised tag, which keeps the default a refusal.
+
+        Deliberately NOT exception-guarded. A read that fails here raises BEFORE any row is
+        written, which is exactly where this guard wants to fail; swallowing it would turn an
+        unreadable transaction into "not declared", i.e. into a different, quieter refusal
+        that reports the wrong cause.
+        """
+        if transaction_id is None:
+            return False
+        from ba2_common.core.models import Transaction
+        from ba2_common.core.trade_store import get_or_none
+
+        txn = get_or_none(Transaction, transaction_id)
+        if txn is None:
+            return False
+        return is_multi_expiry_strategy(getattr(txn, "option_strategy", None))
 
     def _record_option_intent_on_transaction(self, parent) -> None:
         """Stamp ``asset_class`` / ``option_strategy`` / ``expiry`` on the parent's Transaction.
@@ -893,8 +969,8 @@ class OptionsAccountInterface(ABC):
     def plausible_atm_iv(cls, iv) -> Optional[float]:
         """``float(iv)`` when it can be a real annualised ATM IV, else None.
 
-        THE single definition, shared by the live recorder, the live rank, the backtest
-        rank and PremiumSeller's gate, so "what counts as a possible IV" cannot fork the
+        THE single definition, shared by the live recorder, the live rank and the backtest
+        rank, so "what counts as a possible IV" cannot fork the
         way the two IV-rank implementations did. Returning None (not a clamped value, not
         0.0) is the whole point: every caller already treats None as "unknown" and fails
         closed, and clamping would manufacture exactly the fabricated sample the recorder
@@ -1206,7 +1282,7 @@ class OptionsAccountInterface(ABC):
     #: bought for a net DEBIT and its maximum loss is that debit, already paid at entry —
     #: the design spec classes it as a debit structure and every other debit structure is
     #: on this list. It was mis-listed as reserving while ``OpenCallButterflyAction``,
-    #: alone among the 17 entry builders, submitted it with no ``option_reserve=``. One
+    #: alone among the 19 entry builders, submitted it with no ``option_reserve=``. One
     #: open fly therefore made ``reserved_option_buying_power_detail`` UNMEASURABLE, so
     #: ``available_option_buying_power()`` returned ``None`` and
     #: ``check_option_buying_power(>0)`` returned False for all EIGHT credit structures,
@@ -1217,6 +1293,14 @@ class OptionsAccountInterface(ABC):
         "long_call", "long_put", "bull_call_spread", "bear_put_spread",
         "straddle", "strangle", "covered_call", "protective_put",
         "call_butterfly",
+        # The PMCC (plan Task 6). A NET DEBIT structure whose short call is covered by a long
+        # call at a LOWER strike that OUTLIVES it, which is how a broker margins a diagonal:
+        # as covered, with no collateral beyond the debit already paid. Putting it in
+        # RESERVING_STRATEGIES instead would charge the credit budget for money that has
+        # already left the account. The RISK number is a different question and is measured
+        # separately -- the payoff evaluator's intrinsic floor, stamped at submit and
+        # restamped at each roll.
+        PMCC_STRATEGY,
     })
 
     #: Strategies ``option_reserve_required`` prices with a branch of its own. Kept in
@@ -1231,6 +1315,12 @@ class OptionsAccountInterface(ABC):
         "bear_call_spread", "bull_put_spread", "credit_spread",
         "short_straddle", "short_strangle", "naked_put",
         "put_ratio_spread",
+        # The 1x2 BACKSPREADS (2026-09-01), priced by the DEFINED-RISK branch below with
+        # the credit verticals -- NOT by the ``put_ratio_spread`` full-notional branch two
+        # names up, which exists because a FRONTspread is net SHORT an option. A backspread
+        # is net LONG one: its single short is covered by two longs, so nothing about it is
+        # naked and its whole risk is the (width - net_credit) pin between the strikes.
+        "call_backspread", "put_backspread",
         "jade_lizard",
         "iron_condor", "debit_spread",
     })
@@ -1312,12 +1402,22 @@ class OptionsAccountInterface(ABC):
             # shares is set aside): reserve the full assignment cost.
             _require(strike=strike)
             return strike * 100.0 * quantity
-        if strategy in ("bear_call_spread", "bull_put_spread", "credit_spread"):
+        if strategy in ("bear_call_spread", "bull_put_spread", "credit_spread",
+                        "call_backspread", "put_backspread"):
             # Defined-risk credit VERTICALS: the broker margins them at their textbook max
             # loss (the two-leg case Alpaca's MLEG engine does recognise — unlike the
             # jade_lizard / put_ratio_spread shapes below). Identical arithmetic on either
             # right: the call spread's risk is (higher - lower) above the short call, the
             # put spread's is (higher - lower) below the short put.
+            #
+            # THE TWO 1x2 BACKSPREADS SHARE THIS BRANCH, and the arithmetic is theirs
+            # unchanged rather than by analogy: sell 1 at K_s, buy 2 at K_l, and at expiry
+            # the payoff bottoms out at K_l -- the short fully ITM by the width, the longs
+            # worthless -- for exactly (width - net_credit) x 100 of loss, which is what
+            # this line computes. A net DEBIT arrives as a NEGATIVE net_credit and is
+            # therefore ADDED, which is right: the debit is money already spent that the
+            # worst case does not give back. Verified against the payoff evaluator (not
+            # just against itself) in ``test_backspread_builders``.
             _require(spread_width=spread_width, net_credit=net_credit)
             max_loss = (spread_width - net_credit)
             return max(0.0, max_loss) * 100.0 * quantity

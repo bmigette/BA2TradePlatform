@@ -1502,14 +1502,19 @@ class WorkerQueue:
                             logger.debug(f"[RISK_MGR_TRIGGER] ===== END (risk_manager_mode not configured) =====")
                             return
                         
-                        if risk_manager_mode == "classic":
-                            logger.debug(f"[RISK_MGR_TRIGGER] Using CLASSIC risk manager mode")
+                        # classic_options is CLASSIC + the option sleeve rails (design
+                        # 2026-08-27 SS11): the same rule engine decides WHETHER, and the
+                        # shared OptionRiskManagement gate inside the option actions decides
+                        # whether the sleeve can carry it. It therefore needs the same enter
+                        # ruleset classic does, and is dispatched down the same branch.
+                        if risk_manager_mode in ("classic", "classic_options"):
+                            logger.debug(f"[RISK_MGR_TRIGGER] Using {risk_manager_mode.upper()} risk manager mode")
                             
                             # Get ruleset ID from ExpertInstance database record
                             enter_market_ruleset_id = expert_instance_record.enter_market_ruleset_id
                             # Check if ruleset ID is actually set (not None, not empty string)
                             if not enter_market_ruleset_id or (isinstance(enter_market_ruleset_id, str) and not enter_market_ruleset_id.strip()):
-                                error_msg = f"Classic risk manager mode enabled but no enter_market_ruleset_id configured for expert {expert_instance_id}"
+                                error_msg = f"{risk_manager_mode} risk manager mode enabled but no enter_market_ruleset_id configured for expert {expert_instance_id}"
                                 logger.error(f"[RISK_MGR_TRIGGER] {error_msg}")
                                 logger.error(f"Settings keys: {list(settings.keys()) if settings else 'None'}")
                                 logger.error(f"enter_market_ruleset_id value: {repr(enter_market_ruleset_id)}")
@@ -1556,8 +1561,14 @@ class WorkerQueue:
                             # Use classic TradeManager for automated processing
                             logger.info(f"[RISK_MGR_TRIGGER] Expert {expert_instance_id} using CLASSIC risk manager mode, triggering TradeManager")
                             
+                            import time as _time
+
                             from .TradeManager import get_trade_manager
                             trade_manager = get_trade_manager()
+                            # MONOTONIC, matching risk_manager_run.record_run and the
+                            # classic manager: the run's duration must not jump when the
+                            # system clock is adjusted mid-pass.
+                            rm_started_at = _time.monotonic()
                             
                             if use_case == AnalysisUseCase.ENTER_MARKET:
                                 logger.debug(f"[RISK_MGR_TRIGGER] Processing ENTER_MARKET recommendations")
@@ -1574,7 +1585,30 @@ class WorkerQueue:
                                 logger.info(f"[RISK_MGR_TRIGGER] Automated processing created {len(created_orders)} orders for expert {expert_instance_id}")
                             else:
                                 logger.debug(f"[RISK_MGR_TRIGGER] No orders created by automated processing for expert {expert_instance_id}")
-                            logger.debug(f"[RISK_MGR_TRIGGER] ===== END (classic mode completed) =====")
+                            # THE OPTION RUN RECORD. Everything the option risk manager
+                            # decided this pass -- every admission and every refused rail --
+                            # is written as ONE ``RiskManagerRun`` row with mode="options",
+                            # which is the record the runs view's Options filter queries
+                            # (review 2026-08-30 FIX 2: it used to write a
+                            # SmartRiskManagerJob, which that filter cannot see, so option
+                            # runs surfaced mislabelled under Smart). Until classic_options
+                            # existed nothing could produce one. A failure to record must
+                            # never unwind trades that have already been placed, which is
+                            # why it is caught here rather than left to the caller's guard.
+                            if risk_manager_mode == "classic_options":
+                                try:
+                                    from ba2_common.core.OptionRiskManagement import flush_option_rm_run
+                                    run_id = flush_option_rm_run(
+                                        expert_instance_id, expert_instance_record.account_id,
+                                        started_at=rm_started_at)
+                                    if run_id is not None:
+                                        logger.info(f"[RISK_MGR_TRIGGER] Recorded option risk "
+                                                    f"manager run {run_id} for expert {expert_instance_id}")
+                                except Exception as e:
+                                    logger.error(f"[RISK_MGR_TRIGGER] Failed to record the option "
+                                                 f"risk manager run for expert {expert_instance_id}: {e}",
+                                                 exc_info=True)
+                            logger.debug(f"[RISK_MGR_TRIGGER] ===== END ({risk_manager_mode} mode completed) =====")
                     finally:
                         # Always remove from processing set, even if an error occurred
                         logger.debug(f"[RISK_MGR_TRIGGER] Removing from processing set for {lock_key}")

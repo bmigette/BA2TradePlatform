@@ -48,7 +48,20 @@ def test_every_structure_can_search_its_dte_window(kind):
 
 @pytest.mark.parametrize("kind", sorted(set(ALL_OPTION_KINDS) - ATM_BY_CONSTRUCTION))
 def test_every_non_atm_structure_can_search_its_strike(kind):
-    assert _suffixes(kind, ":option_strike_param"), f"{kind} strike_param is frozen"
+    """A structure that picks a strike must be able to SEARCH it -- in whatever unit it picks.
+
+    Widened from ``:option_strike_param`` alone (2026-09-01, grid 2). That suffix is the
+    percent-OTM gene; a row that fixes its method to ``delta`` searches
+    ``:option_strike_delta`` (+ ``:option_strike_delta_long`` for a per-leg pair) instead, and
+    ``strategy_param_space._apply_option_strike`` is what writes the decoded value onto the
+    action's ``option_strike_param``. Demanding the percent gene by name would fail a key
+    whose strike is fully searched, just in the other unit -- i.e. it would be checking the
+    NAME rather than the reachability this file is about.
+    """
+    reachable = (_suffixes(kind, ":option_strike_param")
+                 | _suffixes(kind, ":option_strike_delta")
+                 | _suffixes(kind, ":option_strike_delta_long"))
+    assert reachable, f"{kind} has no searchable strike gene in ANY unit"
 
 
 @pytest.mark.parametrize("kind", sorted(WING_STRUCTURES))

@@ -97,13 +97,31 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-from ba2_common.core.option_types import OptionContract
-from ba2_common.core.types import OptionRight
+from ba2_common.core.option_expiry import (
+    EXPIRY_RULE_ROLL_WINDOW,
+    PMCC_STRATEGY,
+    ExpiryLeg,
+    is_multi_expiry_strategy,
+    resolve_structure_expiry,
+)
+from ba2_common.core.option_types import OptionContract, OptionLeg
+from ba2_common.core.types import OptionRight, OrderDirection
 
 LIFECYCLE_HOLD = "hold"
 LIFECYCLE_PROFIT_CAPTURE = "profit_capture"
 LIFECYCLE_CREDIT_STOP = "credit_stop"
 LIFECYCLE_ROLL_DTE = "roll_dte"
+#: ROLL THE OVERLAY, DO NOT CLOSE THE STRUCTURE. The two-expiry answer to the roll window,
+#: and deliberately NOT a member of ``LIFECYCLE_CLOSING_REASONS``.
+#:
+#: ``_dte`` reads the SHORT leg for the roll window (the Task 6-PRE rule), which is right for
+#: both kinds of structure and means the OPPOSITE thing for each. On a single-expiry structure
+#: the short IS the structure, so its expiry approaching is the end of the position:
+#: ``LIFECYCLE_ROLL_DTE``, a close. On a declared two-expiry structure the short is an OVERLAY
+#: over a long that has a year left, so its expiry approaching is a scheduled maintenance
+#: event: buy the overlay back, sell the next one, keep the long. Returning the CLOSING reason
+#: there would throw a LEAPS away every month, on schedule, and call it a roll.
+LIFECYCLE_ROLL_SHORT = "roll_short"
 LIFECYCLE_TESTED = "tested"
 LIFECYCLE_BREAKER = "circuit_breaker"
 #: A ``covered_call`` whose shares are no longer there: the short call is NAKED. Only a
@@ -163,6 +181,29 @@ CoverValue = Union[int, float, str, None]
 #: supply).
 CoverInput = Optional[Union[int, float, str, Mapping[int, CoverValue]]]
 
+#: WHERE THE PMCC'S OVERLAY SPEC LIVES: a dict on the ENTRY order's ``data``, written by
+#: ``OpenPMCCAction`` through ``_submit_option_order(extra_entry_facts=...)`` and read back by
+#: ``RollPMCCShortAction`` when it selects the NEXT overlay.
+#:
+#: The order row is the only thing that travels with the position, and the roll happens weeks
+#: after the entry with a DIFFERENT recommendation in hand -- the same reason
+#: ``earnings_stamp.ORDER_EVENT_DATE_KEY`` exists. Carrying it here rather than giving the roll
+#: action its own selection genes is what keeps ONE overlay thesis per genome: a second
+#: ``option_strike_delta`` on the roll rule would let a search enter at 0.15 delta and roll to
+#: 0.30, and would double the overlay's gene budget at a population of 40.
+#:
+#: ABSENCE IS A REFUSAL, never a default. A position without this key was not opened by
+#: ``open_pmcc``, and guessing which contract its overlay should be is exactly the fabricated
+#: input this module exists to refuse.
+ORDER_PMCC_OVERLAY_KEY = "pmcc_overlay"
+
+#: The keys ``ORDER_PMCC_OVERLAY_KEY``'s dict carries -- the whole selection box the entry
+#: picked its overlay from, so the roll re-selects under identical gates. Named here, once,
+#: because the writer (``OpenPMCCAction``) and the reader (``RollPMCCShortAction``) are in a
+#: different module from each other's tests.
+PMCC_OVERLAY_SPEC_KEYS = ("strike_method", "strike_param", "dte_min", "dte_max",
+                          "min_open_interest", "max_spread_pct", "min_volume")
+
 #: Strategies whose loss stop is the *undefined-risk* multiple (``ur_stop_*``).
 #: Everything else uses ``dr_stop_*``. Promoted verbatim from ``_should_close``:
 #: the selection is by declared strategy, NOT by the measured risk of the legs.
@@ -172,6 +213,26 @@ UNDEFINED_RISK_STRATEGIES = ("short_put", "short_strangle")
 #: drawdown breaker has tripped, every structure is flattened with LIFECYCLE_BREAKER.
 #: Absent means "not tripped"; the book layer computes and supplies it.
 SETTING_BREAKER_TRIPPED = "circuit_breaker_tripped"
+
+#: The overlay BUYBACK TRIGGER, as a percentage of the short leg's collected credit that has
+#: decayed away (design §4: "roll loop at short expiry/buyback trigger"). OPTIONAL, by the
+#: ``SETTING_BREAKER_TRIPPED`` idiom: present means the trigger is configured, ABSENT means
+#: this caller does not use it -- not "0%", which would roll every overlay on sight.
+#:
+#: It is optional rather than required because the two callers ask for it differently. The
+#: BACKTEST/grid path never reaches ``decide`` at all: its trigger is a ruleset leaf
+#: (``credit_decayed_pct``), which is where the GA's gene has to land. The LIVE pass reaches
+#: ``decide`` with an expert's settings, and requiring a key there would add a row to
+#: ``option_lifecycle_service.REQUIRED_SETTINGS`` and so to every existing sleeve's settings
+#: -- a migration for a knob no live expert uses yet.
+SETTING_PMCC_BUYBACK_PCT = "pmcc_buyback_pct"
+
+#: The strategy tag a ROLL order carries. Not a member of
+#: ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``: the roll's two legs are admitted by the
+#: guard because the TRANSACTION they belong to is declared, not because the roll invented its
+#: own declaration. It IS a member of ``OptionsAccountInterface.NON_INTENT_STRATEGIES``, so a
+#: roll can never restate what the position is.
+PMCC_ROLL_STRATEGY = "pmcc_roll"
 
 _EPS = 1e-9
 
@@ -195,6 +256,15 @@ class LifecycleLeg:
     option_type: Optional[OptionRight] = None
     expiry: Optional[date] = None
     underlying: Optional[str] = None
+    #: What this leg's OWN premium was, per share, at the fill that opened it -- positive for
+    #: both sides (the magnitude; the direction is in ``net_qty``). ``None`` is UNKNOWN, never
+    #: 0.0: the buyback trigger divides by it, and a zero basis is an undefined percentage
+    #: rather than a total decay.
+    #:
+    #: The structure-level ``entry_net_premium`` cannot answer this. The buyback trigger asks
+    #: how much of THIS overlay's credit has decayed, and after a roll the structure's net is a
+    #: mix of a year-old LEAPS debit and several overlays' credits. Only the leg knows.
+    entry_premium: Optional[float] = None
 
     @property
     def is_held(self) -> bool:
@@ -498,26 +568,328 @@ def _tested(structure: OptionStructure,
     return False, "", ""
 
 
-def _dte(structure: OptionStructure, as_of: date) -> Tuple[Optional[int], str]:
+def roll_window_dte(structure: OptionStructure, as_of: date) -> Tuple[Optional[int], str]:
     """(days to expiry, "") or (None, why it is unmeasurable).
 
-    The parent row's ``expiry`` is preferred, and the held legs answer when it is
-    absent — which it was for every multi-leg, making the roll branch unreachable.
-    ``submit_option_order`` refuses multi-expiry structures, so legs that disagree are
-    a contradiction: unknown, not ``max()`` and not ``min()``. A leg that simply has no
-    expiry adds no information and does not veto the legs that do.
+    THE QUESTION THIS ANSWERS IS THE ROLL WINDOW. Its only consumer is the ``roll_dte``
+    branch of :func:`_decide_one` — "how long until this structure must be rolled or
+    closed?" — so on a two-expiry structure it reads the **SHORT** leg
+    (:data:`option_expiry.EXPIRY_RULE_ROLL_WINDOW`). A PMCC rolls when its overlay expires;
+    reading the LEAPS here would put the roll a year out and the roll branch would never
+    fire, which is the same dead-branch failure this function was written to end.
+
+    Its sibling reader, ``TradeConditions.DaysToExpiryCondition``, answers the OTHER
+    question — the roll floor / structure exit — and therefore reads the LONG leg. The two
+    disagree on purpose; see ``option_expiry`` for the rule table.
+
+    The structure-level ``expiry`` and the held legs are all candidates. When they yield a
+    single date, that date is the answer and the leg rule is not exercised at all — which is
+    why every single-expiry structure behaves exactly as before. Legs that disagree are a
+    contradiction for any strategy NOT declared in
+    ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``: unknown, not ``max()`` and not
+    ``min()``. A leg that simply has no expiry adds no information and does not veto the
+    legs that do.
     """
-    candidates = {l.expiry for l in structure.held_legs if l.expiry is not None}
-    if structure.expiry is not None:
-        candidates.add(structure.expiry)
-    if not candidates:
+    resolution = resolve_structure_expiry(
+        [ExpiryLeg(expiry=l.expiry, net_qty=l.net_qty) for l in structure.legs],
+        strategy=structure.strategy,
+        rule=EXPIRY_RULE_ROLL_WINDOW,
+        declared_expiries=(structure.expiry,),
+    )
+    if resolution.missing:
         return None, ("no expiry on the structure or any of its held legs — the roll "
                       "window cannot be evaluated")
-    if len(candidates) > 1:
-        listed = ", ".join(str(e) for e in sorted(candidates))
+    if resolution.expiry is None:
+        listed = ", ".join(str(e) for e in resolution.conflict)
         return None, (f"conflicting expiries on one structure ({listed}) — its DTE is "
                       f"undefined")
-    return (candidates.pop() - as_of).days, ""
+    return (resolution.expiry - as_of).days, ""
+
+
+#: The name this function has always carried inside ``_decide_one``. Kept so the module's own
+#: suite and the per-leg-rule suite keep addressing it as they do; ``roll_window_dte`` is the
+#: same function under the name a CALLER outside this module should use, and the rule-level
+#: reader ``TradeConditions.ShortLegDaysToExpiryCondition`` calls it by that name so the roll
+#: window has exactly one implementation for both runtimes.
+_dte = roll_window_dte
+
+
+# ---------------------------------------------------------------------------
+# the two-expiry (PMCC / calendar) overlay: roll, restamp, and the invariant
+# ---------------------------------------------------------------------------
+def held_short_leg(structure: OptionStructure) -> Optional[LifecycleLeg]:
+    """The overlay: the NEAREST-expiry held SHORT leg, or ``None`` when there is none.
+
+    Nearest, because a roll in flight can transiently leave two shorts on the books and it is
+    the soonest that forces the next decision -- the same tie-break
+    ``option_expiry.resolve_structure_expiry`` makes for the roll window, kept identical on
+    purpose. A short with no recorded expiry sorts last rather than winning by accident.
+    """
+    shorts = [leg for leg in structure.held_legs if leg.is_short]
+    if not shorts:
+        return None
+    return min(shorts, key=lambda l: (l.expiry is None, l.expiry or date.max))
+
+
+def held_long_leg(structure: OptionStructure) -> Optional[LifecycleLeg]:
+    """The cover: the FARTHEST-expiry held LONG leg, or ``None`` when there is none.
+
+    Farthest, and that is the mirror of :func:`held_short_leg`'s nearest for the same reason:
+    the question this leg answers is "how much structure is left", and the long that decides
+    it is the one that outlives the others. On a PMCC there is exactly one.
+    """
+    longs = [leg for leg in structure.held_legs if not leg.is_short]
+    if not longs:
+        return None
+    return max(longs, key=lambda l: (l.expiry is not None, l.expiry or date.min))
+
+
+def credit_decay_pct(entry_credit: Optional[float],
+                     current_ask: Optional[float]) -> Optional[float]:
+    """How much of a sold option's credit has DECAYED, as a percent. ``None`` = unmeasurable.
+
+    ``(entry_credit - current_ask) / entry_credit x 100``: ``0`` the moment it was sold,
+    ``100`` when it can be bought back for nothing, and NEGATIVE when the short has gone
+    against us and costs more than it brought in. Ask, not bid or mid, because buying the
+    overlay back is what the number is deciding.
+
+    THE single definition, shared by the two callers so they cannot fork: the live pass
+    (``decide`` -> :func:`pmcc_credit_decay`) and the rule-level
+    ``TradeConditions.CreditDecayedPctCondition`` that backs the grid's ``credit_decayed_pct``
+    gene.
+
+    ``None`` for every input that is not a usable number, and specifically for an entry credit
+    of ``0`` -- an option sold for nothing has no credit to decay, so the percentage is
+    undefined rather than 100. Refusing here is what stops "we could not price the overlay"
+    from reading as "the overlay is worthless, roll it".
+    """
+    if entry_credit is None or current_ask is None:
+        return None
+    try:
+        credit, ask = float(entry_credit), float(current_ask)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(credit) and math.isfinite(ask)):
+        return None
+    if credit <= _EPS or ask < 0:
+        return None
+    return round((credit - ask) / credit * 100.0, 4)
+
+
+def pmcc_credit_decay(structure: OptionStructure,
+                      chain_by_symbol: Mapping[str, OptionContract]
+                      ) -> Tuple[Optional[float], str]:
+    """(% of the overlay's credit that has decayed, "") or (None, why it is unmeasurable)."""
+    short = held_short_leg(structure)
+    if short is None:
+        return None, ("no held short leg — there is no overlay whose credit could have "
+                      "decayed")
+    row = chain_by_symbol.get(short.contract_symbol)
+    if row is None:
+        return None, (f"no chain row for the overlay {short.contract_symbol} — what it costs "
+                      f"to buy back is unknown")
+    ask = row.ask if row.ask is not None else row.last
+    pct = credit_decay_pct(short.entry_premium, ask)
+    if pct is None:
+        return None, (f"the overlay {short.contract_symbol} cannot be priced against its own "
+                      f"entry credit ({short.entry_premium!r} sold, {ask!r} to buy back) — "
+                      f"the decayed fraction is undefined")
+    return pct, ""
+
+
+def intrinsic_floor_per_contract(signed_cash_per_structure: Optional[float],
+                                 multiplier: int = 100) -> Optional[float]:
+    """Design §3's intrinsic floor, from the cash a structure has actually PAID. ``None`` =
+    unmeasurable.
+
+    ``signed_cash_per_structure`` is the net premium outlay per structure with BUY positive:
+    the LEAPS debit, less every credit the overlay has banked since. So this IS "max loss =
+    LEAPS debit − net credits", stated as one number rather than as a base plus a running
+    correction — and that difference is the whole point.
+
+    WHY NOT INCREMENTAL. The obvious implementation restamps at each roll by adding that
+    roll's net to the previous stamp, and it is wrong twice over: a ticket that never fills
+    still moves the number (an unfilled DEBIT roll raises the floor and LOOSENS ``opt_sl_ml``
+    on a position that never paid anything), and every later roll then compounds from that
+    wrong base. Deriving from the EXECUTED fills instead is idempotent — recomputing it a
+    hundred times gives the same answer, an unfilled ticket contributes nothing because it has
+    no fill, and there is no base to drift.
+
+    CLAMPED AT ZERO, and that is a statement rather than a guard: once the accrued credits have
+    paid for the long outright there is no defined loss left, and ``loss_pct_of_max_loss``
+    self-disarms on a non-positive stamp (its ``per_contract <= 0 -> None`` branch). A
+    structure that cannot lose has no loss-as-a-percentage-of-its-loss, and reporting one would
+    be inventing a denominator.
+    """
+    if signed_cash_per_structure is None:
+        return None
+    try:
+        cash, mult = float(signed_cash_per_structure), float(multiplier)
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(cash) and math.isfinite(mult)) or mult <= 0:
+        return None
+    return max(0.0, cash * mult)
+
+
+def restamped_max_loss(previous_max_loss: Optional[float], roll_net: Optional[float],
+                       multiplier: int = 100) -> Optional[float]:
+    """The structure's max loss after a roll, per contract. ``None`` = do not restamp.
+
+    NO LONGER THE PERSISTED PATH (2026-09-02 review). The stamp is DERIVED from executed fills
+    by :func:`intrinsic_floor_per_contract` — see its docstring for why an incremental restamp
+    written at submit time is the wrong shape. This is kept because it states the per-roll
+    ARITHMETIC the derived floor must agree with, and the two are pinned against each other by
+    ``test_the_derived_floor_agrees_with_the_per_roll_arithmetic``.
+
+    ``max_loss_new = max_loss_old + roll_net x multiplier``, with ``roll_net`` SIGNED the way
+    every option limit in this codebase is: positive = a net debit paid, negative = a net
+    credit received. So a roll that banks a 1.20 credit lowers the floor by $120, and a roll
+    that costs more to buy back than the new overlay brings in RAISES it. One expression,
+    both directions, because "the credit accrued" and "the buyback cost more than the
+    re-sale" are the same arithmetic with opposite signs.
+
+    This IS design §3's "restamped as credits accrue": the intrinsic floor is the LEAPS debit
+    less every credit collected since, and each roll is one more term.
+
+    CLAMPED AT ZERO, and that is a statement rather than a guard. Once the accrued credits
+    have paid for the LEAPS outright there is no defined loss left, and
+    ``loss_pct_of_max_loss`` self-disarms on a non-positive stamp (its
+    ``per_contract <= 0 -> None`` branch). A structure that cannot lose has no
+    loss-as-a-percentage-of-its-loss, and reporting one would be inventing a denominator.
+
+    ``None`` in either argument returns ``None``: an unmeasurable roll must leave the existing
+    stamp ALONE. Overwriting it with a guess is worse than leaving a slightly stale
+    conservative number, because the stamp is a risk denominator.
+    """
+    if previous_max_loss is None or roll_net is None:
+        return None
+    try:
+        previous, net, mult = (float(previous_max_loss), float(roll_net), float(multiplier))
+    except (TypeError, ValueError):
+        return None
+    if not (math.isfinite(previous) and math.isfinite(net) and math.isfinite(mult)):
+        return None
+    return max(0.0, previous + net * mult)
+
+
+def uncovered_short_calls(legs: Iterable[LifecycleLeg]) -> Tuple[str, ...]:
+    """THE INVARIANT, as a measurement: the short CALL contracts nothing is covering.
+
+    A net-short call is covered by a net-long call of the same underlying; short contracts
+    beyond the long count are naked, and a naked call is the one option position in this
+    platform whose loss is genuinely unbounded (``option_payoff.max_loss`` returns UNBOUNDED
+    for exactly this shape). Every mutating path on a two-expiry structure -- the roll, the
+    structure close -- asks this about the leg set it would LEAVE BEHIND and refuses on a
+    non-empty answer.
+
+    CALLS ONLY, deliberately. A short PUT is bounded below (strike minus credit, at an
+    underlying of zero), so it is a risk this codebase measures rather than an invariant it
+    forbids; folding it in here would make the guard refuse every cash-secured put ever
+    written. Short STOCK is likewise out of scope: this module sees option legs.
+
+    Contracts come back sorted, so a refusal message is the same on every run.
+    """
+    shorts, longs = [], 0.0
+    for leg in legs:
+        if leg.option_type != OptionRight.CALL or not leg.is_held:
+            continue
+        if leg.is_short:
+            shorts.append(leg)
+        else:
+            longs += leg.net_qty
+    if not shorts:
+        return ()
+    short_qty = sum(abs(l.net_qty) for l in shorts)
+    if longs + _EPS >= short_qty:
+        return ()
+    return tuple(sorted(l.contract_symbol for l in shorts))
+
+
+def _intents(legs: Sequence[OptionLeg]) -> List[str]:
+    return [(leg.position_intent or "").strip().lower() for leg in legs]
+
+
+def close_legs_are_fail_closed(legs: Sequence[OptionLeg]) -> Optional[str]:
+    """``None`` when this closing ticket releases the cover LAST, else why it does not.
+
+    FAIL-CLOSED MEANS ONE THING HERE: the long is let go only after the short it covers is
+    bought back. Both legs ride one multi-leg order, so neither can happen without the other
+    at the account level -- but the ORDER of the legs is the statement of intent, it is what a
+    broker works and what a sequential fallback would follow, and a rule nobody wrote down is
+    a rule the next edit deletes.
+
+    Applied ONLY to a declared two-expiry structure (the caller decides). On a single-expiry
+    combo every leg settles on one day and the order inside the ticket carries no risk
+    meaning, so imposing it there would reshuffle existing structures' leg lists for nothing.
+    """
+    intents = _intents(legs)
+    last_buy_to_close = max((i for i, it in enumerate(intents) if it == "buy_to_close"),
+                            default=None)
+    first_sell_to_close = min((i for i, it in enumerate(intents) if it == "sell_to_close"),
+                              default=None)
+    if last_buy_to_close is None or first_sell_to_close is None:
+        return None                     # nothing to order: no short, or no long
+    if first_sell_to_close < last_buy_to_close:
+        return ("closing legs are not fail-closed: the long is sold to close at position "
+                f"{first_sell_to_close} BEFORE the short is bought back at position "
+                f"{last_buy_to_close}. The long IS the cover — releasing it first leaves a "
+                f"naked short call, which is the one position this structure may never hold.")
+    return None
+
+
+def roll_legs_are_fail_closed(legs: Sequence[OptionLeg]) -> Optional[str]:
+    """``None`` when this roll ticket closes the old overlay BEFORE opening the new one.
+
+    Exactly two legs, in exactly that order. The new short is written only behind the
+    buy-back of the old one, so the ticket can never describe a moment at which the structure
+    owes two overlays against one long.
+
+    A roll that cannot be built this way is not submitted at all -- and that is the safe
+    failure, because a PMCC whose overlay expired unrolled is a long call with no cover,
+    which loses money slowly. A PMCC with two overlays is a naked call, which does not.
+    """
+    if len(legs) != 2:
+        return (f"a roll ticket is exactly two legs (buy back the old overlay, sell the "
+                f"next); got {len(legs)}")
+    intents = _intents(legs)
+    if intents[0] != "buy_to_close":
+        return (f"the roll's FIRST leg must buy back the expiring overlay, but it is "
+                f"{intents[0]!r}")
+    if intents[1] != "sell_to_open":
+        return (f"the roll's SECOND leg must sell the next overlay, but it is "
+                f"{intents[1]!r}")
+    if legs[0].side != OrderDirection.BUY or legs[1].side != OrderDirection.SELL:
+        return ("the roll's leg SIDES contradict their intents: buying back is a BUY and "
+                f"selling the next overlay is a SELL, got {legs[0].side} / {legs[1].side}")
+    return None
+
+
+def pmcc_roll_due(structure: OptionStructure,
+                  chain_by_symbol: Mapping[str, OptionContract],
+                  as_of: date, *, roll_dte: int,
+                  buyback_pct: Optional[float] = None) -> Tuple[bool, str, str]:
+    """(roll the overlay, why, why it is unmeasurable) for ONE two-expiry structure.
+
+    Design §4's two triggers, in the order they are stated: the overlay's own expiry window,
+    then the buyback trigger. ``buyback_pct`` of ``None`` means the second trigger is not
+    configured -- NOT 0 %, which would roll every overlay the moment it was written.
+
+    Only the roll WINDOW can make this unmeasurable in a way worth reporting: a structure
+    whose overlay cannot be priced still rolls on schedule, so an unpriceable buyback merely
+    leaves that trigger unasked. The same "a definite action outranks an unmeasurable input"
+    rule the module applies everywhere else.
+    """
+    dte, dte_blind = roll_window_dte(structure, as_of)
+    if dte is not None and dte <= roll_dte:
+        return True, f"overlay at {dte} DTE <= roll_dte {roll_dte}", ""
+    decay_blind = ""
+    if buyback_pct is not None:
+        decayed, decay_blind = pmcc_credit_decay(structure, chain_by_symbol)
+        if decayed is not None and decayed >= float(buyback_pct):
+            return True, (f"overlay credit {decayed:.2f}% decayed >= buyback trigger "
+                          f"{float(buyback_pct):g}%"), ""
+    return False, "", "; ".join(b for b in (dte_blind, decay_blind) if b)
 
 
 # ---------------------------------------------------------------------------
@@ -732,10 +1104,20 @@ def _decide_one(structure: OptionStructure,
         if tested:
             return LifecycleDecision(txn, LIFECYCLE_TESTED, tested_detail, pnl_pct)
 
-    # 6. the time stop / roll.
+    # 6. the time stop / roll. ONE question -- "is the short leg's expiry upon us?" -- with
+    #    two answers, because on a DECLARED two-expiry structure the short is an overlay over
+    #    a long that outlives it. There the answer is ROLL THE OVERLAY (not a closing reason);
+    #    everywhere else it is the pre-existing close. See LIFECYCLE_ROLL_SHORT.
     roll_dte = int(_require(settings, "roll_dte"))
-    dte, dte_blind = _dte(structure, as_of)
-    if dte is not None and dte <= roll_dte:
+    dte, dte_blind = roll_window_dte(structure, as_of)
+    if is_multi_expiry_strategy(structure.strategy):
+        buyback = (settings[SETTING_PMCC_BUYBACK_PCT]
+                   if SETTING_PMCC_BUYBACK_PCT in settings else None)
+        due, roll_detail, dte_blind = pmcc_roll_due(
+            structure, chain_by_symbol, as_of, roll_dte=roll_dte, buyback_pct=buyback)
+        if due:
+            return LifecycleDecision(txn, LIFECYCLE_ROLL_SHORT, roll_detail, pnl_pct)
+    elif dte is not None and dte <= roll_dte:
         return LifecycleDecision(txn, LIFECYCLE_ROLL_DTE,
                                  f"{dte} DTE <= roll_dte {roll_dte}", pnl_pct)
 

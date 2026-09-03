@@ -490,3 +490,63 @@ def test_config_entry_rules_explicitly_empty_seeds_zero_rules_not_default(monkey
         )
     finally:
         ctx.__exit__(None, None, None)
+
+
+def test_config_entry_rules_explicitly_empty_is_NOT_re_armed_by_a_run_level_entry_action(
+        monkeypatch, caplog):
+    """THE SHARPER HALF of the same defect (2026-09-02 final review, V4).
+
+    The guard above used to read ``entry_rules == [] and not buy_tree and not entry_action``.
+    On an OPTION run ``entry_action`` is ALWAYS truthy -- it is carried run-level for every
+    option key -- so a genome that pruned every member of its entry group failed that guard,
+    fell through to ``seed_ruleset_from_tree(buy_tree=None, entry_action=...)`` and got RE-ARMED
+    with the run's option action on a bare permissive gate. The exact silent re-arm the comment
+    above was written to prevent, reintroduced by the option path.
+
+    The empty list is the genome's decision either way, so it wins -- and the run says so at
+    ERROR level, because "this individual has no entry path" must never again be
+    indistinguishable from a re-armed default.
+    """
+    import logging
+
+    from app.services.backtest import daily_backtest_handler as H
+    from app.services.backtest.seam_wiring import wire_backtest_seams
+    from ba2_common.core.db import get_db
+    from ba2_common.core.models import RulesetEventActionLink
+    from sqlmodel import select
+
+    monkeypatch.setitem(
+        H._SUPPORTED_EXPERTS, "_ConfigWiredStubExpert",
+        "tests.backtest.test_entry_bracket_engine",
+    )
+
+    account_id = 303
+    account, ctx, ps = _acct([(D1, 100, 101, 99, 100)], account_id=account_id)
+    try:
+        ps.set_clock(D1)
+        resolver = wire_backtest_seams()
+
+        config = {
+            "experts": ["_ConfigWiredStubExpert"],
+            "enabled_instruments": ["AAPL"],
+            "entry_rules": [],           # every member of the entry group pruned
+            # ... and the run-level option entry the option keys always carry.
+            "entry_action": {"action_type": "buy_call", "action_value": {"dte_min": 30}},
+        }
+        with caplog.at_level(logging.ERROR):
+            built = H._build_experts(config, resolver, account_id)
+        _expert, _expert_id, _decision_settings, ruleset_id = built[0]
+
+        with get_db() as session:
+            links = session.exec(
+                select(RulesetEventActionLink).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id
+                )
+            ).all()
+        assert links == [], (
+            "a run-level entry_action re-armed a genome that had pruned every entry rule -- "
+            "the trial traded a strategy its genome switched off")
+        assert any("entry_rules is EXPLICITLY EMPTY" in r.message for r in caplog.records), (
+            "the run took no entries by construction and said nothing about it")
+    finally:
+        ctx.__exit__(None, None, None)

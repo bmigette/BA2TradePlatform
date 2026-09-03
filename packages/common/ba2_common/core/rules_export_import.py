@@ -35,7 +35,19 @@ _FIELD_ABBR: Dict[str, str] = {
     "relative_volume": "relVol",
     "iv_to_realized_vol": "ivOverRv",
     "days_to_earnings": "toEarn",
+    "rec_days_to_earnings": "recToEarn",
+    "days_after_event": "afterEvent",
     "days_to_expiry": "toExp",
+    # Curated, not left to the camelCase fallback: "short_leg_days_to_expiry" truncates to
+    # "shortLegDays" and "credit_decayed_pct" to "creditDecaye", neither of which reads as
+    # anything, and the first is one word away from colliding with any future
+    # short_leg_days_* field. Uniqueness across every event is pinned by
+    # tests/test_condition_registry_coverage.py.
+    "short_leg_days_to_expiry": "shortToExp",
+    "credit_decayed_pct": "credDecay",
+    "long_leg_delta": "longDelta",
+    "loss_pct_of_max_loss": "lossOfMax",
+    "profit_multiple_of_premium": "tpMult",
     "percent_below_recent_high": "belowHigh",
     "percent_above_recent_low": "aboveLow",
     "instrument_account_share": "acctShare",

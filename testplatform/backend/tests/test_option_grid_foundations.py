@@ -13,13 +13,24 @@ DERIVES from expected_profit_percent when absent -- the model's own field descri
 so the two are the same signal and one gate replaces four.
 """
 import importlib.util
+import os
 import sys
 
 import pytest
 
 
+# tests/ -> backend/ -> testplatform/, then the launcher beside backend/. Resolved off
+# __file__ rather than a CWD-relative string because CI runs with working-directory
+# testplatform/backend and a bare "testplatform/ba2test_launcher.py" resolves differently
+# there than from the repo root -- the exact failure that broke the parity workflow on
+# 2026-08-28 (dcd12237). Every other launcher-loading test in this directory already
+# resolves off __file__ (e.g. test_bull_put_spread_grid.py); this file was the one holdout.
+_LAUNCHER_PATH = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))), "ba2test_launcher.py")
+
+
 def _launcher():
-    spec = importlib.util.spec_from_file_location("lch", "testplatform/ba2test_launcher.py")
+    spec = importlib.util.spec_from_file_location("lch", _LAUNCHER_PATH)
     m = importlib.util.module_from_spec(spec)
     sys.modules["lch"] = m
     try:
@@ -61,17 +72,29 @@ def test_the_expected_profit_gate_is_searchable_and_toggleable(key):
 
 
 def test_the_swap_shrinks_every_structure_genome():
-    """The point is not only correctness: 8 genes out, 2 in, on every structure."""
+    """The point is not only correctness: 8 genes out, 2 in, on every structure.
+
+    The cap moved 26 -> 28 when ``opt_sl_ml`` landed (Task 9): every MEASURED-max-loss
+    structure deliberately gained exactly two genes (``exit:opt_sl_ml:enabled`` +
+    ``cond:sl_ml:value``). It moved 28 -> 31 when the three SelectionPolicy weight genes
+    landed (Task 10): every pure-option member gains EXACTLY its half's shared
+    ``optsel:<half>:{w_premium,w_iv,w_rvol}`` -- 3 genes, hand-derived, never more, because
+    the sharing tier collapses them per half rather than per member. The budget still
+    bites -- an accidental fourth gene anywhere fails it."""
     m = _launcher()
     for key in PURE:
-        assert len(_space(m, key)) <= 26, (
-            f"{key} genome is {len(_space(m, key))}; the price-gate swap should put every "
-            f"structure at or under 26 genes")
+        assert len(_space(m, key)) <= 31, (
+            f"{key} genome is {len(_space(m, key))}; the price-gate swap plus the two "
+            f"opt_sl_ml genes plus the three shared selection-weight genes should put "
+            f"every structure at or under 31 genes")
 
 
 def test_the_group_genome_shrinks_too():
+    """95 -> 98 with Task 10's weight genes: a GROUP also gains exactly 3 (every launcher
+    group is single-half, so the shared tier adds one set, not one per member -- OS1
+    measured 81 before, 84 after)."""
     m = _launcher()
-    assert len(_space(m, "OS1")) <= 95, "OS1 should fall from 120 to ~90 after the swap"
+    assert len(_space(m, "OS1")) <= 98, "OS1 should sit at ~84: 81 + the 3 shared weights"
 
 
 def test_no_value_offset_from_survives_in_an_option_entry_rule():
@@ -392,7 +415,7 @@ def test_the_gates_off_flag_exists_on_the_optimize_command():
     import subprocess
 
     env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
-    out = subprocess.run([sys.executable, "testplatform/ba2test_launcher.py", "optimize", "--help"],
+    out = subprocess.run([sys.executable, _LAUNCHER_PATH, "optimize", "--help"],
                          capture_output=True, text=True, env=env, timeout=300)
     assert "--gates-off" in out.stdout, out.stdout[-2000:] + out.stderr[-2000:]
 
@@ -541,3 +564,1318 @@ def test_the_hold_set_is_explicit_about_which_kinds_manage_stock():
     assert m._hold_assigned_stock("O_CSP") is False
     assert m._hold_assigned_stock(None) is False, \
         "bypass experts ignore --strategy; their account settings must not inherit it"
+
+
+# ==============================================================================================
+# Task 9 -- opt_sl_ml: a stop at a % of the structure's MEASURED max loss (design 2026-08-29 S6)
+# ==============================================================================================
+#
+# THE EMISSION PREDICATE IS "MEASURED max_loss", NOT "defined-risk spread" AND NOT "no naked
+# short" (the corrected S6 rule, 2026-08-30): a cash-secured put is bounded below -- strike
+# minus credit, at an underlying of zero -- so it IS measured and DOES carry the rule; only a
+# net-uncovered short CALL (short strangle / straddle) is genuinely unbounded. Emission is a
+# strategy-level APPLICABILITY gate, not the safety mechanism: even where emitted, the
+# condition self-disarms on any position whose parent order lacks the persisted
+# max_loss_per_contract stamp (test_max_loss_persisted_at_submit.py pins that submit-side
+# guarantee), so a composite like the wheel may carry the rule and it simply never fires on
+# the unstamped covered-call legs. [2026-08-31 made the CC stamp; review finding M3,
+# 2026-09-01, reversed that -- the stamp is measured from the order's OWN legs, so a covered
+# call stamps nothing and the self-disarm is again what keeps the rule inert on it. The
+# verified cover still reaches the option RM's admission, a different question.]
+
+SL_ML_RULE_ID = "opt_sl_ml"
+SL_ML_COND_ID = "sl_ml"
+
+
+def _exit_rule(m, kind, rule_id):
+    for r in m._option_exit_rules(kind):
+        if r["id"] == rule_id:
+            return r
+    raise AssertionError(f"{kind}: exit rule {rule_id!r} not found "
+                         f"(have {[r['id'] for r in m._option_exit_rules(kind)]})")
+
+
+def test_opt_sl_ml_is_never_emitted_for_a_member_whose_max_loss_is_unbounded():
+    """Asserted over ALL members, not spot-checked (plan Task 9's 'test that matters most')."""
+    m = _launcher()
+    for kind in m._OPTION_STRATS:
+        ids = {r["id"] for r in m._option_exit_rules(kind)}
+        if kind in m._UNDEFINED_RISK_MEMBERS:
+            assert SL_ML_RULE_ID not in ids, f"{kind} has no max loss to take a fraction of"
+        else:
+            assert SL_ML_RULE_ID in ids, f"{kind} has a MEASURED max loss and no {SL_ML_RULE_ID}"
+
+
+def test_the_unbounded_set_is_exactly_the_uncovered_short_call_structures():
+    """The corrected S6 rule, pinned as data: a short strangle and a short straddle each carry
+    a short call no other leg of the order covers; NOTHING else in the taxonomy does. In
+    particular O_CSP (short put: bounded at strike minus credit), O_JL (its short call is
+    covered by the long wing) and O_RS (all puts) are MEASURED -- listing any of them here is
+    the stale pre-correction table row this branch explicitly retired."""
+    m = _launcher()
+    assert m._UNDEFINED_RISK_MEMBERS == {"O_SSTG", "O_SSTD"}
+
+
+# ==============================================================================================
+# The grid stops SEARCHING unbounded structures (operator decision 2026-08-31,
+# AskUserQuestion: "Only truly unbounded"). O_SSTG/O_SSTD leave the searched set; everything
+# else stays (CSP/wheel stay -- the rails size them as uncovered risk). The structures remain
+# fully SUPPORTED in code: builders, reserve math and settlement are untouched, and an
+# EXPLICIT single request refuses loudly instead of silently running or silently skipping.
+# ==============================================================================================
+def test_no_searched_group_contains_an_unbounded_structure():
+    """The searched set, member by member. Hand-derived from _OPTION_GROUPS_ALL:
+    OS1 [O_LC,O_LP,O_VERT,O_BF,O_BULLCS] loses nothing; OS2 [O_SSTG,O_SSTD,O_IC,O_CSP]
+    loses O_SSTG/O_SSTD (risk, 2026-08-31) AND O_CSP (affordability,
+    _FULL_NOTIONAL_OPTION_KINDS -- a standing, separate decision) leaving [O_IC];
+    OS3 [O_JL,O_RS,O_BEARCS,O_BULLPS] loses O_JL/O_RS (affordability) leaving
+    [O_BEARCS,O_BULLPS]; OS4 [O_STRD,O_STRG] loses nothing."""
+    m = _launcher()
+    for group, members in m._OPTION_GROUPS.items():
+        assert not set(members) & m._UNDEFINED_RISK_MEMBERS, (group, members)
+    assert m._OPTION_GROUPS["OS2"] == ["O_IC"]
+    assert m._OPTION_GROUPS["OS3"] == ["O_BEARCS", "O_BULLPS"]
+    # The TAXONOMY keeps them: the exclusion shrinks what is searched, never what exists.
+    assert set(m._OPTION_GROUPS_ALL["OS2"]) >= {"O_SSTG", "O_SSTD"}
+
+
+def test_the_search_exclusion_is_driven_by_the_one_unbounded_definition():
+    """No second hand-written list: the searched groups are exactly _OPTION_GROUPS_ALL
+    minus the two named sets. A mutant that forks its own idea of 'unbounded' (or of
+    'unaffordable') diverges from this recomputation and dies."""
+    m = _launcher()
+    assert m._OPTION_GROUPS == {
+        key: [mem for mem in members
+              if mem not in m._FULL_NOTIONAL_OPTION_KINDS
+              and mem not in m._UNDEFINED_RISK_MEMBERS]
+        for key, members in m._OPTION_GROUPS_ALL.items()
+    }
+
+
+@pytest.mark.parametrize("bad", ["O_SSTG", "O_SSTD"])
+def test_an_explicit_unbounded_single_refuses_loudly(bad):
+    """`ba2-test optimize --strategy O_SSTG` dies citing the decision -- BEFORE any DB
+    row is created. Never silently runs, never silently skips."""
+    from types import SimpleNamespace as NS
+
+    m = _launcher()
+    with pytest.raises(SystemExit) as e:
+        m._cmd_optimize(NS(expert="FMPRating", strategy=bad))
+    msg = str(e.value)
+    assert bad in msg and "2026-08-31" in msg and "Only truly unbounded" in msg
+
+
+def test_the_batch_command_refuses_the_same_keys_with_the_same_message():
+    m = _launcher()
+    with pytest.raises(SystemExit) as e:
+        m._refuse_unbounded_strategy_request("optimize-batch", ["S2", "O_SSTD"])
+    assert "O_SSTD" in str(e.value) and "2026-08-31" in str(e.value)
+    # A request with no unbounded key passes through untouched.
+    assert m._refuse_unbounded_strategy_request("optimize-batch", ["S2", "O_IC"]) is None
+
+
+def test_the_builders_stay_fully_supported():
+    """Only the SEARCH shrank. The rows, builders and genome derivation for the excluded
+    structures are untouched -- an explicit non-grid consumer (or a future re-admission)
+    finds them exactly as they were."""
+    m = _launcher()
+    for kind in ("O_SSTG", "O_SSTD"):
+        assert kind in m._OPTION_STRATS
+        assert kind in m._STRATEGY_BUILDERS
+        s = m._build_strategy(kind, f"g-{kind}", "FMPRating")
+        assert s.entry_rules, kind
+
+
+def test_a_cash_secured_put_carries_the_max_loss_stop():
+    """THE CORRECTED-RULE CASE. A naked short put is not 'undefined risk': its loss is bounded
+    at (strike - credit) x 100, the submit path stamps that measurement
+    (test_a_naked_short_put_submit_STAMPS_its_measured_max_loss_corrected_s6), and so the
+    stop's denominator exists. Emit-for-CSP is the assertion the stale design table would
+    have failed."""
+    m = _launcher()
+    assert SL_ML_RULE_ID in {r["id"] for r in m._option_exit_rules("O_CSP")}
+
+
+def test_the_rule_body_matches_design_s6_exactly():
+    """Field, op, default, band and both toggles -- the shape design S6 spells out verbatim.
+    op is '>' on a POSITIVE loss percentage (the condition negates the P&L), value_step 5
+    against opt_sl's 25: max-loss fractions are scale-free so the finer grid is affordable."""
+    m = _launcher()
+    rule = _exit_rule(m, "O_VERT", SL_ML_RULE_ID)
+    assert rule["action_type"] == "close_option"
+    assert rule["toggle_optimize"] is True
+    leaves = rule["conditions"]["conditions"]
+    assert [c["field"] for c in leaves] == ["loss_pct_of_max_loss"]
+    leaf = leaves[0]
+    assert leaf["id"] == SL_ML_COND_ID
+    assert leaf["op"] == ">"
+    assert leaf["value"] == 50
+    assert leaf["optimize"] is True
+    assert (leaf["value_min"], leaf["value_max"], leaf["value_step"]) == (25, 75, 5)
+
+
+def test_the_rule_is_identical_across_every_carrying_member():
+    """One shape, no per-member drift: the threshold is scale-free BECAUSE the denominator is
+    each structure's own max loss, so nothing about the band may vary by structure.
+
+    ``enabled`` IS EXCLUDED FROM THE COMPARISON, and only ``enabled`` (2026-09-01, grid 2).
+    It is not part of the rule's SHAPE -- it is the authored DEFAULT of the on/off gene every
+    carrying member still emits, and design 2026-08-31 section 2 sets it OFF for the
+    binary-thesis keys ("opt_sl_ml searchable, default OFF -- the thesis is binary; a stop
+    mid-event amputates it") on O_ERN / O_CBS / O_PBS. Excluding the whole rule for those
+    three would have been the easy fix and the wrong one: the invariant this test exists for
+    is that the FIELD, OP, DEFAULT THRESHOLD, BAND and ``toggle_optimize`` never vary by
+    structure, and all five are still compared on every member.
+    ``test_opt_sl_ml_is_authored_OFF_but_still_searched`` pins the excluded key's values on
+    the three keys that set it, so the exclusion cannot hide a change to it.
+    """
+    m = _launcher()
+
+    def _shape(rule):
+        return {k: v for k, v in rule.items() if k != "enabled"}
+
+    reference = _shape(_exit_rule(m, "O_VERT", SL_ML_RULE_ID))
+    for kind in m._OPTION_STRATS:
+        if kind not in m._UNDEFINED_RISK_MEMBERS:
+            assert _shape(_exit_rule(m, kind, SL_ML_RULE_ID)) == reference, kind
+
+
+def test_a_group_with_any_measured_member_carries_the_rule_once():
+    """Groups share ONE exit list, and every SEARCHED group now consists of measured
+    members only (the unbounded O_SSTG/O_SSTD left the searched set 2026-08-31 -- when
+    OS2 still mixed them with O_IC, the rule was emitted and self-disarmed on the
+    unstamped orders via Task 8's absence guarantee). The any-member-measured predicate
+    is retained and pinned by the hypothetical-group test below."""
+    m = _launcher()
+    for group in m._OPTION_GROUPS:
+        ids = [r["id"] for r in m._option_exit_rules(group)]
+        assert ids.count(SL_ML_RULE_ID) == 1, (group, ids)
+
+
+def test_a_hypothetical_all_unbounded_group_would_not_carry_it(monkeypatch):
+    """The group predicate is 'any member measured', so a family of nothing but naked short
+    calls emits no rule -- pinned against the cheap regression of emitting unconditionally
+    for every group key."""
+    m = _launcher()
+    monkeypatch.setitem(m._OPTION_GROUPS, "OS_TEST_UNBOUNDED", ["O_SSTG", "O_SSTD"])
+    ids = {r["id"] for r in m._option_exit_rules("OS_TEST_UNBOUNDED")}
+    assert SL_ML_RULE_ID not in ids
+
+
+def test_the_wheel_inherits_the_rule_from_o_csp():
+    """The mixed-strategy case from the plan: the wheel's CSP entry stamps a measured max
+    loss, its covered-call overlay does not -- the rule rides along and Task 8's absence
+    gate keeps it inert on the unstamped legs. (2026-08-31 briefly made the CC stamp;
+    review finding M3, 2026-09-01, put it back, so this is again the original reading.)"""
+    m = _launcher()
+    s = m._build_strategy("O_WHEEL", "g-wheel", "FMPRating")
+    assert SL_ML_RULE_ID in [r.get("id") for r in s.exit_rules]
+
+
+def test_both_stops_coexist_on_a_credit_carrier():
+    """Design S6: two independently toggleable rules, not a basis gene on opt_sl -- the GA
+    selects the basis by toggling which rule is live. A measured CREDIT structure therefore
+    carries BOTH stops."""
+    m = _launcher()
+    ids = [r["id"] for r in m._option_exit_rules("O_IC")]
+    assert "opt_sl" in ids and SL_ML_RULE_ID in ids
+
+
+# ---------------------------------------------------------------------------
+# genome -> ruleset: the genes exist where (and only where) the rule does, and they MOVE it
+# ---------------------------------------------------------------------------
+
+def test_the_genes_are_emitted_for_measured_strategies_only():
+    m = _launcher()
+    for kind in ["O_VERT", "O_CSP", "O_IC"]:
+        space = _space(m, kind)
+        assert space[f"exit:{SL_ML_RULE_ID}:enabled"] == {
+            "type": "int", "min": 0, "max": 1, "step": 1}, kind
+        assert space[f"cond:{SL_ML_COND_ID}:value"] == {
+            "type": "float", "min": 25.0, "max": 75.0, "step": 5.0}, kind
+    for kind in ["O_SSTG", "O_SSTD"]:
+        space = _space(m, kind)
+        assert f"exit:{SL_ML_RULE_ID}:enabled" not in space, kind
+        assert f"cond:{SL_ML_COND_ID}:value" not in space, kind
+
+
+def test_the_threshold_gene_decodes_onto_the_condition():
+    """Kills the hardcoded-threshold mutant: a decoded 30 must land on the leaf, not be
+    shadowed by the literal 50."""
+    from app.services.strategy_param_space import decode_params
+
+    m = _launcher()
+    s = m._build_strategy_option("O_VERT")
+    decoded = decode_params(s, {f"cond:{SL_ML_COND_ID}:value": 30})
+    rule = next(r for r in decoded["exit_rules"] if r["id"] == SL_ML_RULE_ID)
+    leaf = next(c for c in rule["conditions"]["conditions"] if c["id"] == SL_ML_COND_ID)
+    assert leaf["value"] == 30
+    assert leaf["field"] == "loss_pct_of_max_loss"
+    assert leaf["op"] == ">"
+
+
+def test_toggling_the_rule_off_drops_it_and_spares_the_siblings():
+    from app.services.strategy_param_space import decode_params
+
+    m = _launcher()
+    s = m._build_strategy_option("O_IC")
+    assert SL_ML_RULE_ID in [r["id"] for r in s.exit_rules]
+    decoded = decode_params(s, {f"exit:{SL_ML_RULE_ID}:enabled": 0})
+    ids = [r["id"] for r in decoded["exit_rules"]]
+    assert SL_ML_RULE_ID not in ids
+    assert "opt_sl" in ids and "opt_tp" in ids
+
+
+def test_the_sl_ml_leaf_becomes_a_real_engine_trigger():
+    """A field missing from rule_builders' FIELD_EVENT map is silently DROPPED by
+    triggers_from_condition_tree and the GA tunes a gene the engine cannot see -- the exact
+    dead-gene failure the OS1 price gates shipped. Prove the leaf survives seeding."""
+    from ba2_common.core.rule_builders import triggers_from_condition_tree
+
+    m = _launcher()
+    rule = _exit_rule(m, "O_VERT", SL_ML_RULE_ID)
+    triggers = triggers_from_condition_tree(rule["conditions"])
+    assert [t["event_type"] for t in triggers.values()] == ["loss_pct_of_max_loss"]
+    assert list(triggers.values())[0]["operator"] == ">"
+
+
+# =============================================================================
+# THE RISK-MANAGER MODE REACHES A TRIAL (review finding M5, 2026-09-01)
+#
+# classic_options was selectable by a live expert and by a hand-written config,
+# and by NO GRID JOB: nothing in the launcher ever wrote risk_manager_mode onto
+# an expert's run settings, so the option risk manager could not be searched at
+# all. _expert_run_settings is the one plumbing point; absent stays the default.
+# =============================================================================
+def test_no_shipped_expert_spec_selects_a_risk_manager_mode():
+    """THE GOLDEN NO-OP. Every expert the grid ships must produce the settings dict it
+    always did -- no risk_manager_mode key at all, so every existing job is byte-identical.
+    A spec that wants the option rails has to say so, deliberately, one expert at a time."""
+    m = _launcher()
+    for name, spec in m._EXPERT_OPT.items():
+        assert "risk_manager_mode" not in spec, name
+        settings = m._expert_run_settings(spec, ["AAPL", "MSFT"])
+        assert "risk_manager_mode" not in settings, name
+
+
+def test_a_spec_that_names_classic_options_reaches_the_TRIAL_config():
+    """THE RECORDED CHAIN, end to end: spec -> _expert_run_settings -> the run's experts
+    block -> _build_daily_trial_config -> the per-trial expert settings the engine feeds to
+    the expert. The middle step is a WHITELIST that rebuilds the trial config key by key, so
+    "the launcher wrote it" is not evidence that a trial ever sees it.
+
+    MUTATION KILL: drop the two-line plumbing in _expert_run_settings and the key is gone
+    from the trial config."""
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+
+    m = _launcher()
+    spec = {**m._EXPERT_OPT["FMPRating"], "risk_manager_mode": "classic_options"}
+    settings = m._expert_run_settings(spec, ["AAPL"])
+    assert settings["risk_manager_mode"] == "classic_options"
+
+    backtest_cfg = {
+        "backtest_id": "m5-chain",
+        "start_date": "2024-01-02",
+        "end_date": "2024-03-01",
+        "enabled_instruments": ["AAPL"],
+        "experts": [{"class": "FMPRating", "settings": settings}],
+        "initial_capital": 100_000.0,
+        "account_settings": {},
+        "warmup_days": 0,
+        "seed": 1,
+    }
+    trial = _build_daily_trial_config(backtest_cfg, {}, None)
+    assert trial["experts"][0]["settings"]["risk_manager_mode"] == "classic_options"
+
+
+def test_the_mode_the_grid_can_select_is_the_one_the_gate_engages_on():
+    """One spelling, checked against the gate rather than against a second copy of the
+    string: the H2 dispatch engages on EXACTLY this value and treats anything else as
+    legacy, so a typo'd spec would search a mode that does nothing."""
+    from ba2_common.core.OptionRiskManagement import (
+        RISK_MANAGER_MODE_CLASSIC_OPTIONS, option_risk_manager_enabled,
+    )
+
+    m = _launcher()
+    spec = {**m._EXPERT_OPT["FMPRating"],
+            "risk_manager_mode": RISK_MANAGER_MODE_CLASSIC_OPTIONS}
+    settings = m._expert_run_settings(spec, ["AAPL"])
+    assert option_risk_manager_enabled(settings) is True
+
+
+# ==============================================================================================
+# GRID 2 (plan 2026-08-31 Task 10, design 2026-08-31 sections 2/5/7)
+# ==============================================================================================
+#
+# The gene tables above are grid 1's. Grid 2's keys are pinned SEPARATELY rather than folded
+# into ``PURE``, and deliberately: the two grids answer different questions with different
+# structures, and a shared budget assertion over both would either be loose enough to be
+# useless for one of them or would fail the moment either grid legitimately grows.
+
+# LAUNCHABLE grid-2 keys -- what ``--strategy`` accepts and what the matrix runs. O_LEAP is
+# a GROUP key over the two LEAPS arms (operator decision 2026-09-02, superseding the separate
+# O_LEAPC/O_LEAPP keys); O_LEAPC/O_LEAPP survive only as its members.
+GRID2 = ["O_LEAP", "O_ERN", "O_CBS", "O_PBS"]
+
+# The grid-2 STRUCTURES -- one per _OPTION_STRATS row, which is the granularity every per-row
+# assertion below (strike method, delta band, selection half) is really about. A member's genes
+# live in its GROUP's space, so ``_member_space`` routes through the launchable key.
+GRID2_MEMBERS = ["O_LEAPC", "O_LEAPP", "O_ERN", "O_CBS", "O_PBS"]
+
+#: member -> the key you actually launch to search it.
+_LAUNCH_KEY = {"O_LEAPC": "O_LEAP", "O_LEAPP": "O_LEAP"}
+
+
+def _member_space(m, member, expert="FMPRating"):
+    """The gene space a REAL run emits for this structure: its group's space when it is a
+    group member, its own when it is launchable on its own."""
+    return _space(m, _LAUNCH_KEY.get(member, member), expert)
+
+
+def _member_genes(m, member, expert="FMPRating"):
+    """The subset of that space belonging to THIS member -- its own rule-prefixed genes plus
+    the genes it shares (the ``shared-`` gates, ``optsel:``, and the common exit rules)."""
+    prefix = f"entry:{member.lower()}-entry:"
+    return {g: v for g, v in _member_space(m, member, expert).items()
+            if g.startswith(prefix) or not g.startswith("entry:")}
+
+
+# ---- amendment 1: the method is FIXED, and every searched strike band is a DELTA ------------
+@pytest.mark.parametrize("key", GRID2_MEMBERS)
+def test_no_grid2_key_searches_the_strike_METHOD(key):
+    """THE DEAD-GENE TRAP THIS AMENDMENT EXISTS FOR.
+
+    ``option_strike_method`` is a CATEGORICAL gene sharing ONE ``option_strike_param`` domain
+    with the percent-OTM alternative. Every grid-2 thesis is stated in delta -- a 0.80-delta
+    stock replacement, a 0.40/0.20 backspread -- so there is no single domain that is correct
+    under both methods: a genome that picked ``percent_otm`` would read 0.80 as 0.8% OTM
+    (at the money on a key whose entire point is deep ITM), and a genome that picked ``delta``
+    against a percent domain would refuse outright. Emitting the gene at all is the defect.
+    """
+    genes = _member_genes(_launcher(), key)
+    offenders = [g for g in genes if g.endswith(":option_strike_method")]
+    assert not offenders, f"{key} emits a strike-METHOD gene: {offenders}"
+
+
+@pytest.mark.parametrize("key", ["O_LEAPC", "O_LEAPP", "O_CBS", "O_PBS", "O_ERN"])
+def test_every_fixed_method_keys_strike_band_is_a_delta_in_the_unit_interval(key):
+    """The other half of amendment 1: the bands the fixed-delta keys DO search are deltas.
+
+    A delta lives in (0,1) by definition, and a percent-OTM band (0-8, 2-12, ...) does not --
+    so this single arithmetic check catches a percent band that has been given to a
+    delta-method row, whatever it is named.
+    """
+    m = _launcher()
+    genes = _member_genes(m, key)
+    bands = {g: v for g, v in genes.items() if ":option_strike_delta" in g}
+    assert bands, f"{key} searches no strike delta at all"
+    for name, spec in bands.items():
+        assert 0.0 < spec["min"] < spec["max"] < 1.0, (
+            f"{key}'s {name} band {spec['min']}..{spec['max']} is not a delta in (0,1)")
+    assert m._OPTION_STRATS[key]["option_strike_method"] == "delta"
+
+
+def test_o_ern_searches_the_designs_delta_band_now_that_the_strangle_reads_it():
+    """THE EXCEPTION IS GONE (plan Task 14b item 5, 2026-09-02).
+
+    This used to be ``test_o_ern_is_the_documented_exception_and_says_why``: design section 2
+    asks for "strangle width delta 0.25-0.45", and both of O_ERN's builders hard-coded
+    ``percent_otm``, so the row searched the unit the builder read (percent) and the test
+    pinned the exception against the registry "so the day either builder learns the method
+    this test fails and the row can be converted". ``OpenStrangleAction`` learned it; the row
+    is converted; the exception is replaced by the ordinary rule -- O_ERN is now in
+    ``test_every_fixed_method_keys_strike_band_is_a_delta_in_the_unit_interval``'s
+    parametrization like every other fixed-delta key.
+
+    The STRADDLE arm is still off the registry, and that stays correct rather than pending: a
+    straddle's strike is not a parameter (both legs sit on the ATM strike by definition), so
+    a method there could never move a strike. The delta gene is therefore inert on that arm
+    and live on every strangle genome -- a conditional domain, exactly as the percent band
+    was.
+    """
+    from ba2_common.core.types import honours_strike_method
+
+    m = _launcher()
+    row = m._OPTION_STRATS["O_ERN"]
+    assert honours_strike_method("open_strangle")
+    assert not honours_strike_method("open_straddle")
+    assert row["option_strike_method"] == "delta"
+    assert (row["option_strike_delta_min"], row["option_strike_delta_max"],
+            row["option_strike_delta_step"]) == (0.25, 0.45, 0.05)
+    assert "option_strike_param_optimize" not in row, (
+        "the percent band must be GONE, not left beside the delta one -- two width genes "
+        "would fight over the same option_strike_param")
+    assert "O_ERN" in m._FIXED_DELTA_METHOD_STRATEGIES
+
+
+def test_the_fixed_method_guard_survives_a_row_that_also_searches_the_percent_param():
+    """The guard is on what the row DECLARES, not on how it happens to be written.
+
+    Today's grid-2 rows also decline ``option_strike_param_optimize``, which the older guard
+    already catches -- so without this the amendment would be enforced by an accident of
+    authoring, and adding a percent gene to a grid-2 row later would silently re-arm the
+    method gene.
+    """
+    m = _launcher()
+    cfg = dict(m._OPTION_STRATS["O_LEAPC"])   # a member row; the guard is per ROW
+    cfg["option_strike_param_optimize"] = True
+    out = m._apply_option_strike_method_gene(cfg)
+    assert "option_strike_method_optimize" not in out
+    assert "option_strike_method_choices" not in out
+
+
+# ---- dead-gene guards: one per gene FAMILY, genome -> decode -> a DIFFERENT structure ------
+def _decoded_entry_action(m, key, genome, expert="FMPRating"):
+    """The option ENTRY action as a trial actually receives it: through the REAL
+    ``_build_daily_trial_config``, not through ``decode_params`` alone.
+
+    That is the whole point of the guard. ``_build_daily_trial_config`` rebuilds the trial
+    config KEY BY KEY (it says so itself), so a gene can decode perfectly and still never
+    reach the engine -- the whitelist trap. Reading the action back off the trial config's
+    ``entry_rules`` proves the value survived the whole journey.
+
+    THE EMISSION IS CHECKED TOO, and it has to be: ``decode_params`` reads a FLAT dict and
+    never consults the param space, so a genome key can decode and land on the action while
+    ``collect_param_space`` emits no gene for it at all -- the GA would then never produce
+    that key and the whole chain below would be exercising a value only this test can set.
+    Emitted AND reaches the action is the guard; either half alone is not.
+    """
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+    from app.services.strategy_param_space import collect_param_space, decode_params
+
+    strat = m._build_strategy(_LAUNCH_KEY.get(key, key), f"g2-{key}", expert)
+    space = collect_param_space(strat)
+    missing = [g for g in genome if g not in space]
+    assert not missing, (
+        f"{key} does not EMIT {missing} as gene(s), so the GA can never set them; the "
+        f"decode below would be testing a value nothing in a real run can produce")
+    decoded = decode_params(strat, genome)
+    backtest_cfg = {
+        "backtest_id": f"grid2-{key}",
+        "start_date": "2024-02-01", "end_date": "2024-06-01",
+        "enabled_instruments": ["AAPL"],
+        "experts": [{"class": expert, "settings": {}}],
+        "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
+        "entry_action": getattr(strat, "entry_action", None),
+        "options_store": "parquet",
+    }
+    trial = _build_daily_trial_config(backtest_cfg, decoded, None)
+    # A GROUP key emits one entry rule per member, so pick THIS member's rule by id rather
+    # than taking rule 0 (which would silently audit the call arm for every put-arm genome).
+    rule = next(r for r in trial["entry_rules"] if r["id"] == f"{key.lower()}-entry")
+    return rule["actions"][0]
+
+
+def test_the_leaps_delta_gene_moves_the_strike_target():
+    """Gene family: ``option_strike_delta`` (single-leg). Two levels of the SAME gene must
+    reach the action as two different selection targets."""
+    m = _launcher()
+    lo = _decoded_entry_action(m, "O_LEAPC",
+                               {"entry:o_leapc-entry:a0:option_strike_delta": 0.70})
+    hi = _decoded_entry_action(m, "O_LEAPC",
+                               {"entry:o_leapc-entry:a0:option_strike_delta": 0.90})
+    assert lo["option_strike_method"] == hi["option_strike_method"] == "delta"
+    assert lo["option_strike_param"] == 0.70
+    assert hi["option_strike_param"] == 0.90
+
+
+def test_the_backspread_leg_genes_move_the_two_legs_INDEPENDENTLY():
+    """Gene family: the per-leg delta PAIR.
+
+    The failure this catches is not "the gene is dropped" but "the two genes collapse onto
+    one target" -- which would leave the selector picking the two nearest strikes to a single
+    delta, a materially different structure from the 0.40/0.20 backspread design section 2
+    searches, with both genes still moving something.
+    """
+    m = _launcher()
+    for key, prefix in (("O_CBS", "o_cbs"), ("O_PBS", "o_pbs")):
+        a = _decoded_entry_action(m, key, {
+            f"entry:{prefix}-entry:a0:option_strike_delta": 0.35,
+            f"entry:{prefix}-entry:a0:option_strike_delta_long": 0.15})
+        b = _decoded_entry_action(m, key, {
+            f"entry:{prefix}-entry:a0:option_strike_delta": 0.50,
+            f"entry:{prefix}-entry:a0:option_strike_delta_long": 0.30})
+        # [long, short] -- the order ``TradeActions._spread_params`` destructures.
+        assert a["option_strike_param"] == [0.15, 0.35], a["option_strike_param"]
+        assert b["option_strike_param"] == [0.30, 0.50], b["option_strike_param"]
+        # And moving ONE gene moves ONE leg.
+        mixed = _decoded_entry_action(m, key, {
+            f"entry:{prefix}-entry:a0:option_strike_delta": 0.35,
+            f"entry:{prefix}-entry:a0:option_strike_delta_long": 0.30})
+        assert mixed["option_strike_param"] == [0.30, 0.35]
+
+
+def test_the_structure_gene_submits_a_DIFFERENT_builder():
+    """Gene family: ``option_structure``. Not a parameter -- the action TYPE itself, i.e.
+    which builder the engine constructs."""
+    m = _launcher()
+    a = _decoded_entry_action(m, "O_ERN",
+                              {"entry:o_ern-entry:a0:option_structure": "open_straddle"})
+    b = _decoded_entry_action(m, "O_ERN",
+                              {"entry:o_ern-entry:a0:option_structure": "open_strangle"})
+    assert a["action_type"] == "open_straddle"
+    assert b["action_type"] == "open_strangle"
+    assert a["action_type"] != b["action_type"]
+
+
+def test_the_grid2_dte_gene_moves_the_selection_window():
+    """Gene family: ``option_dte``. Decoded as a window CENTRE, so the pin is on the WINDOW
+    the action ends up carrying -- the two numbers the selector filters the chain by."""
+    m = _launcher()
+    lo = _decoded_entry_action(m, "O_LEAPC", {"entry:o_leapc-entry:a0:option_dte": 410})
+    hi = _decoded_entry_action(m, "O_LEAPC", {"entry:o_leapc-entry:a0:option_dte": 500})
+    assert (lo["option_dte_min"], lo["option_dte_max"]) == (365, 455)
+    assert (hi["option_dte_min"], hi["option_dte_max"]) == (455, 545)
+
+
+@pytest.mark.parametrize("key,prefix", [("O_LEAPC", "o_leapc"), ("O_ERN", "o_ern"),
+                                        ("O_CBS", "o_cbs")])
+def test_the_sizing_gene_reaches_the_action(key, prefix):
+    """Gene family: ``option_sizing`` -- the one gene that gates the fitness arithmetic
+    (contracts x max_loss IS sizing% of equity by construction)."""
+    m = _launcher()
+    a = _decoded_entry_action(m, key, {f"entry:{prefix}-entry:a0:option_sizing": 1.0})
+    b = _decoded_entry_action(m, key, {f"entry:{prefix}-entry:a0:option_sizing": 10.0})
+    assert a["option_sizing"] == 1.0 and b["option_sizing"] == 10.0
+
+
+def test_the_event_timing_genes_reach_the_seeded_rules():
+    """Gene family: the two O_ERN timing thresholds, which live on CONDITIONS rather than on
+    the action -- a different half of the decode, and the half the whitelist could drop
+    wholesale (``entry_rules``/``exit_rules``)."""
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+    from app.services.strategy_param_space import decode_params
+
+    m = _launcher()
+    strat = m._build_strategy("O_ERN", "g2-ern", "FMPRating")
+    decoded = decode_params(strat, {"cond:o_ern-days_to_earnings:value": 5,
+                                    "cond:days_after:value": 2})
+    trial = _build_daily_trial_config(
+        {"backtest_id": "ern", "start_date": "2024-02-01", "end_date": "2024-06-01",
+         "enabled_instruments": ["AAPL"],
+         "experts": [{"class": "FMPRating", "settings": {}}], "initial_capital": 20_000.0,
+         "account_settings": {}, "warmup_days": 0, "seed": 1,
+         "entry_action": getattr(strat, "entry_action", None), "options_store": "parquet"},
+        decoded, None)
+
+    entry_leaf = next(c for c in trial["entry_rules"][0]["conditions"]["conditions"]
+                      if c["field"] == "rec_days_to_earnings")
+    assert entry_leaf["value"] == 5 and entry_leaf["op"] == "<="
+    exit_rule = next(r for r in trial["exit_rules"] if r["id"] == "opt_event")
+    exit_leaf = exit_rule["conditions"]["conditions"][0]
+    assert exit_leaf["field"] == "days_after_event"
+    assert exit_leaf["value"] == 2 and exit_leaf["op"] == ">="
+
+
+def test_the_entry_field_is_the_STAMPED_one_not_the_calendar_fetching_one():
+    """Amendment 3. ``days_to_earnings`` is the legacy condition that goes and FETCHES a
+    calendar; ``rec_days_to_earnings`` reads the number the recommendation was stamped with.
+    Using the former would re-fetch per symbol per bar AND could disagree with the ranking
+    the expert computed at that same bar."""
+    m = _launcher()
+    leaves = m._option_entry_rule("O_ERN")["conditions"]["conditions"]
+    fields = [c["field"] for c in leaves]
+    assert "rec_days_to_earnings" in fields
+    assert "days_to_earnings" not in fields
+
+
+def test_only_the_event_key_carries_the_timing_gates():
+    """The gates are O_ERN's, not the grid's: on any other key the stamp is absent, the leaf
+    could never fire, and the strategy would trade nothing while carrying two live genes."""
+    m = _launcher()
+    # Entry gates are per STRUCTURE (_option_entry_rule takes a member), exit rules per
+    # LAUNCHED key (_option_exit_rules takes the launchable kind) -- the group split.
+    for member in [k for k in GRID2_MEMBERS if k != "O_ERN"]:
+        fields = [c["field"]
+                  for c in m._option_entry_rule(member)["conditions"]["conditions"]]
+        assert "rec_days_to_earnings" not in fields, f"{member} carries an event entry gate"
+    for key in [k for k in GRID2 if k != "O_ERN"]:
+        assert not any(r["id"] == "opt_event" for r in m._option_exit_rules(key)), (
+            f"{key} carries the event exit rule")
+
+
+# ---- amendment 2: the expiry must land AFTER the print -------------------------------------
+def test_no_o_ern_genome_can_decode_to_an_expiry_before_the_print():
+    """Exhaustive over the DTE gene's OWN lattice, not a sampled genome.
+
+    The band has 4 levels; walking all of them and re-deriving the decoded window is a
+    stronger statement than any single decode, and it is the statement the constraint needs:
+    NO genome, not "not this one".
+    """
+    from app.services.strategy_param_space import _apply_option_dte
+
+    m = _launcher()
+    cfg = m._OPTION_STRATS["O_ERN"]
+    ceiling = m._EVENT_ENTRY_DAYS["value_max"]
+    lo, hi, step = (cfg["option_dte_min_range"], cfg["option_dte_max_range"],
+                    cfg["option_dte_step"])
+    centres = list(range(lo, hi + 1, step))
+    assert len(centres) == 4, f"expected 4 searched DTE levels, got {centres}"
+    for centre in centres:
+        action = dict(cfg)
+        _apply_option_dte(action, centre)
+        assert action["option_dte_min"] > ceiling, (
+            f"DTE centre {centre} decodes to dte_min={action['option_dte_min']}, which is "
+            f"not strictly past the {ceiling}-day entry ceiling: the straddle could expire "
+            f"BEFORE the print it is a bet on")
+        assert 7 <= action["option_dte_min"] and action["option_dte_max"] <= 30, (
+            f"DTE centre {centre} decodes to {action['option_dte_min']}.."
+            f"{action['option_dte_max']}, outside design section 2's 7-30 band")
+
+
+def test_the_expiry_constraint_is_checked_at_IMPORT_not_left_implicit():
+    """The guard itself, driven by a violating table. Import-time, because at decode time a
+    violating genome is one refused individual in a population of 40 -- and 39 scored ones
+    that quietly searched a nonsense region."""
+    m = _launcher()
+    bad = dict(m._OPTION_STRATS["O_ERN"])
+    bad["option_dte_min_range"] = 11   # 11 - 7 = 4, inside the 5-day entry ceiling
+    original = m._OPTION_STRATS["O_ERN"]
+    m._OPTION_STRATS["O_ERN"] = bad
+    try:
+        with pytest.raises(RuntimeError, match="entry ceiling"):
+            m._assert_option_expiry_clears_event_window("O_ERN")
+    finally:
+        m._OPTION_STRATS["O_ERN"] = original
+
+
+# ---- amendment 5: the debit/credit partition stays TOTAL ------------------------------------
+@pytest.mark.parametrize("key", GRID2_MEMBERS)
+def test_every_grid2_key_joined_the_DEBIT_half_by_its_iv_rank_thesis(key):
+    """All five are long premium, so all five want "buy vol only when it is cheap". A key
+    landing on the credit side would get the OPPOSITE gate, and the GA never searches an
+    operator, so nothing downstream could recover from it."""
+    m = _launcher()
+    assert key in m._DEBIT_OPTION_MEMBERS
+    assert key not in m._CREDIT_OPTION_MEMBERS
+
+
+def test_the_partition_is_still_total_over_every_member():
+    """The assertion the launcher makes at import, restated as a test so the SET is checked
+    and not merely the fact that import succeeded."""
+    m = _launcher()
+    assert m._DEBIT_OPTION_MEMBERS | m._CREDIT_OPTION_MEMBERS == set(m._OPTION_STRATS)
+    assert not (m._DEBIT_OPTION_MEMBERS & m._CREDIT_OPTION_MEMBERS)
+
+
+@pytest.mark.parametrize("key", GRID2_MEMBERS)
+def test_every_grid2_key_gets_the_debit_halfs_selection_weights(key):
+    """The partition's other consumer: the shared ``optsel:<half>:<w>`` genes. A member with
+    no half raises rather than defaulting, so this also pins that the new keys resolve."""
+    genes = _member_space(_launcher(), key)
+    for w in ("w_premium", "w_iv", "w_rvol"):
+        assert f"optsel:debit:{w}" in genes, f"{key} is missing optsel:debit:{w}"
+        assert f"optsel:credit:{w}" not in genes
+
+
+# ---- gene BUDGET, hand-derived ---------------------------------------------------------------
+def test_the_grid2_genome_sizes_are_exactly_what_the_tables_add_up_to():
+    """HAND-DERIVED, per key, so an accidental extra gene is caught by arithmetic rather than
+    by a ceiling nobody re-checks.
+
+    Shared by EVERY grid-2 single (they all build through ``_option_entry_rule`` +
+    ``_option_exit_rules``):
+
+      entry conditions   signal:enabled, shared-gate_confidence:{value,enabled},
+                         <k>-iv_rank:{value,enabled}, shared-rel_volume:{value,enabled},
+                         <k>-iv_rv:{value,enabled}, <k>-exp_profit:{value,enabled}   = 11
+                         (``-flat`` is a correctness guard, no gene)
+      entry action       option_dte, option_entry_cross, option_sizing               =  3
+      exits              opt_tp:{enabled,cond tp}, opt_time:{enabled,cond td},
+                         opt_dte:{enabled,cond dte}, opt_sl_ml:{enabled,cond sl_ml}  =  8
+      selection weights  optsel:debit:{w_premium,w_iv,w_rvol}                        =  3
+                                                                            SHARED  = 25
+
+    Per key on top of that:
+      O_ERN              option_strike_param, option_structure,
+                         cond o_ern-days_to_earnings, cond days_after       = 4  -> 29
+                         (the event exit has NO enabled gene -- not toggleable)
+      O_CBS / O_PBS      option_strike_delta, option_strike_delta_long,
+                         opt_tp_mult:{enabled, cond tp_mult}                = 4  -> 29
+
+    O_LEAP IS A GROUP, so the shared block above is not its arithmetic (2026-09-02 merge).
+    Re-derived from scratch:
+
+      per ARM (x2)       entry:<arm>-entry:enabled (the group's per-member toggle),
+                         <arm>-signal:enabled, <arm>-iv_rank:{value,enabled},
+                         <arm>-iv_rv:{value,enabled}, <arm>-exp_profit:{value,enabled},
+                         action option_strike_delta, option_dte, option_entry_cross,
+                         option_sizing                                     = 12  -> 24
+      shared gates       shared-gate_confidence:{value,enabled},
+                         shared-rel_volume:{value,enabled}                 =  4
+      exits (ONE set)    opt_tp/opt_time/opt_dte/opt_sl_ml x {enabled,value} = 8
+      selection weights  optsel:debit:{w_premium,w_iv,w_rvol}              =  3
+                                                                    O_LEAP = 39
+
+    39 is 13 fewer than the 52 the two separate 26-gene keys used to cost across two jobs,
+    and one job instead of two -- the arithmetic reason the merge is a search WIN and not
+    merely a tidier CLI.
+    """
+    m = _launcher()
+    expected = {"O_LEAP": 39, "O_ERN": 29, "O_CBS": 29, "O_PBS": 29}
+    for key, n in expected.items():
+        got = len(_space(m, key))
+        assert got == n, f"{key} genome is {got} genes, the table adds up to {n}"
+
+
+def test_grid1_genomes_did_not_move():
+    """The budget pin above is worthless if grid 2 grew grid 1 on the way past. 31 is the
+    ceiling ``test_the_swap_shrinks_every_structure_genome`` already derives; this restates
+    it AFTER the grid-2 tables exist so a shared-table edit that widened an existing key
+    cannot hide behind the new keys' own pins."""
+    m = _launcher()
+    for key in PURE:
+        assert len(_space(m, key)) <= 31, f"{key} grew past the grid-1 budget"
+
+
+# ---- the lower TRADE FLOOR: long-dated keys only, never O_ERN --------------------------------
+@pytest.mark.parametrize("key", ["O_LEAP"])
+def test_the_long_dated_keys_get_the_lower_trade_floor(key):
+    """THE LONG-DATED FAMILY IS EXACTLY O_LEAP here -- the ONE key carrying both LEAPS arms
+    after the 2026-09-02 merge (design section 2's third member, O_PMCC, is phase-gated and
+    has no row yet). Plan Task 10's wording is "a CONFIG naming the long-dated keys only"; the
+    backspreads are the separate convexity-financed family at 60-180 DTE and are pinned in the
+    untouched set below.
+
+    THE KEY MUST BE THE LAUNCHED ONE. ``_apply_option_trade_floor`` is called with the CLI's
+    strategy kind, so naming the members here instead would leave the only job that exists
+    (--strategy O_LEAP) on the platform's 12/yr floor."""
+    m = _launcher()
+    block = {}
+    m._apply_option_trade_floor(key, block)
+    assert block["car_hard_min_trades_per_year"] == 3.0
+    assert block["car_min_trades_per_year"] == 8.0
+
+
+def test_the_exempt_set_is_exactly_the_long_dated_family():
+    """The set itself, so a key cannot be added to it without this test saying so."""
+    m = _launcher()
+    # O_PMCC joined on 2026-09-02 (plan Task 6): its long leg is a LEAPS on the same January
+    # cycles, so it has the same ~2.5 non-overlapping holding periods in a 3-year window that
+    # the exemption exists for. Its rolling overlay does NOT change that -- a roll is not a
+    # new position, and the trade floor counts positions.
+    assert m._OPTION_LOW_TRADE_FLOOR_STRATEGIES == {"O_LEAP", "O_PMCC"}
+    # and the members, which are NOT launchable, are deliberately absent: a set entry for
+    # them would be read by nothing.
+    assert not (m._OPTION_LOW_TRADE_FLOOR_STRATEGIES & {"O_LEAPC", "O_LEAPP"})
+
+
+def test_the_event_key_NEVER_gets_the_lower_trade_floor():
+    """THE NEGATIVE PIN (plan Task 10, amendment 7, and design section 6's own sentence:
+    "O_ERN keeps the normal floor -- earnings events are frequent").
+
+    Earnings are quarterly PER NAME and design section 8 calls O_ERN "the one key whose
+    result deserves statistical weight" precisely because it gets hundreds of independent
+    events in-window. A lower floor there removes the only breadth check the fitness applies
+    to the one key that can actually satisfy it -- and lets a three-trades-a-year O_ERN
+    genome, which is the clearest possible sign the entry gates are mis-tuned, score as a
+    normal config.
+    """
+    m = _launcher()
+    block = {}
+    m._apply_option_trade_floor("O_ERN", block)
+    assert block == {}, f"O_ERN must keep the platform trade floor, got {block}"
+    assert "O_ERN" not in m._OPTION_LOW_TRADE_FLOOR_STRATEGIES
+
+
+@pytest.mark.parametrize("key", ["S2", "O_LC", "O_IC", "OS1", "O_CBS", "O_PBS", "O_CONVEX",
+                                 None])
+def test_no_other_strategy_is_touched_by_the_trade_floor(key):
+    """Every existing job's fitness must be bit-identical: an absent key leaves the
+    expert/platform resolution exactly as it was.
+
+    O_CBS/O_PBS ARE IN THIS LIST, not the exempt one (corrected 2026-09-02). They are the
+    convexity-financed family, not the long-dated one: a 60-180 DTE entry exited at a 20-45
+    DTE floor lives 15-160 days, i.e. 2.3-24 structures per underlying per year, so the
+    platform's 12/yr floor is reachable and disqualifies only a genuinely thin config.
+
+    O_CONVEX IS IN THIS LIST TOO (plan Task 13): the breadth floor for the convex-harvest
+    grid lives in ``option_convex``'s OWN fitness (design §3 item 4: >=30 tickets/yr AND
+    >=20 distinct underlyings), not in this launcher-side long-dated exemption -- O_CONVEX
+    must keep the platform trade floor."""
+    m = _launcher()
+    block = {}
+    m._apply_option_trade_floor(key, block)
+    assert block == {}
+
+
+def test_the_trade_floor_survives_the_trial_config_WHITELIST():
+    """THE WHITELIST TRAP. ``_build_daily_trial_config`` rebuilds the trial config key by key,
+    so a floor that is parsed, stored and echoed by the launcher is still SILENTLY DEAD if it
+    is not listed there -- every long-dated genome disqualified by a floor the run had
+    explicitly lowered, with nothing in any log to say so."""
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+
+    m = _launcher()
+    backtest_cfg = {
+        "backtest_id": "floor", "start_date": "2024-02-01", "end_date": "2024-06-01",
+        "enabled_instruments": ["AAPL"],
+        "experts": [{"class": "FMPRating", "settings": {}}], "initial_capital": 20_000.0,
+        "account_settings": {}, "warmup_days": 0, "seed": 1, "options_store": "parquet",
+    }
+    m._apply_option_trade_floor("O_LEAP", backtest_cfg)
+    trial = _build_daily_trial_config(backtest_cfg, {}, None)
+    assert trial["car_hard_min_trades_per_year"] == 3.0
+    assert trial["car_min_trades_per_year"] == 8.0
+
+
+def test_an_explicit_run_level_floor_beats_the_expert_scan():
+    """And the resolver honours it. ``_car_trade_thresholds_for_experts`` takes the TIGHTEST
+    across experts, which would silently discard exactly the lowering this feature performs;
+    a run-level value is a decision and wins."""
+    from app.services.backtest.daily_backtest_handler import _car_trade_thresholds_for_experts
+
+    m = _launcher()
+    cfg = {"experts": [{"class": "DeterministicScorer", "settings": {}}]}
+    m._apply_option_trade_floor("O_LEAP", cfg)
+    out = _car_trade_thresholds_for_experts(cfg)
+    assert out["car_hard_min_trades_per_year"] == 3.0
+    assert out["car_min_trades_per_year"] == 8.0
+    # ... and with nothing stated, the expert scan is untouched.
+    assert "car_hard_min_trades_per_year" not in _car_trade_thresholds_for_experts(
+        {"experts": [{"class": "FMPRating", "settings": {}}]})
+
+
+# ---- amendment 4: the earnings expert is REGISTERED, and the warmup numbers agree -----------
+def test_the_earnings_expert_is_a_supported_backtest_expert():
+    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS
+    assert _SUPPORTED_EXPERTS["FMPEarningsEvent"] == "ba2_experts.FMPEarningsEvent"
+
+
+def test_the_earnings_expert_warmup_table_matches_the_class():
+    """EQUALITY, not "both are set". ``derive_warmup_days`` prefers the CLASS attribute and
+    falls back to the table when the import fails -- so a disagreement is a silently
+    different warmup on exactly the runs where something is already wrong."""
+    from ba2_experts.FMPEarningsEvent import FMPEarningsEvent
+    from app.services.backtest.daily_backtest_handler import _EXPERT_WARMUP_BARS
+    assert _EXPERT_WARMUP_BARS["FMPEarningsEvent"] == FMPEarningsEvent.BACKTEST_WARMUP_BARS
+    assert FMPEarningsEvent.BACKTEST_WARMUP_BARS == 620
+
+
+def test_the_earnings_expert_can_actually_be_optimized():
+    """Registration is not enough: ``_cmd_optimize`` exits before building anything when the
+    expert has no ``_EXPERT_OPT`` spec, so an O_ERN job would be dead on arrival."""
+    m = _launcher()
+    assert "FMPEarningsEvent" in m._EXPERT_OPT
+    settings = m._expert_run_settings(m._EXPERT_OPT["FMPEarningsEvent"], ["AAPL"])
+    assert settings  # a real settings dict, not an empty one
+
+
+def test_the_earnings_expert_warmup_reaches_a_run():
+    from app.services.backtest.daily_backtest_handler import derive_warmup_days
+    assert derive_warmup_days(["FMPEarningsEvent"]) >= 620
+
+
+# ---- phase-gated keys refuse LOUDLY ----------------------------------------------------------
+# O_PMCC LEFT this list on 2026-09-02 (plan Task 6) -- the two-expiry lifecycle it was gated
+# behind landed, and it is now audited as an ordinary launchable single everywhere else in this
+# file. O_CAL remains, gated by design section 2 behind PMCC proving that machinery in a real
+# run; a single-element parametrize is kept so re-opening the gate for a phase-3 key is one
+# entry rather than a rewrite.
+@pytest.mark.parametrize("bad", ["O_CAL"])
+def test_a_phase_gated_key_refuses_with_the_plan_reference(bad):
+    """The naked-exclusion discipline, applied to a different reason: never silently run,
+    never silently skip, and say where the decision is written down."""
+    m = _launcher()
+    with pytest.raises(SystemExit) as e:
+        m._refuse_phase_gated_strategy("optimize", [bad])
+    msg = str(e.value)
+    assert bad in msg and "PHASE-GATED" in msg
+    assert "2026-08-31-options-grid2-convex-earnings-impl.md" in msg
+    assert "2026-08-31-leaps-grid-design.md" in msg
+
+
+@pytest.mark.parametrize("bad", ["O_CAL"])
+def test_a_phase_gated_key_is_a_KNOWN_key_that_refuses(bad):
+    """Registered in ``_STRATEGY_BUILDERS`` so argparse accepts it and the operator reads the
+    REASON -- rather than "invalid choice", which says nothing about why."""
+    m = _launcher()
+    assert bad in m._STRATEGY_BUILDERS
+    with pytest.raises(SystemExit):
+        m._STRATEGY_BUILDERS[bad](bad)
+
+
+@pytest.mark.parametrize("bad", ["O_CAL"])
+def test_the_phase_gated_keys_have_no_gene_table(bad):
+    """A row would be searchable by any path that reads the table directly."""
+    m = _launcher()
+    assert bad not in m._OPTION_STRATS
+    assert bad not in m._GRID2_OPTION_STRATEGIES
+
+
+# ---- the emitted exit ruleset ------------------------------------------------------------------
+@pytest.mark.parametrize("key", ["O_ERN", "O_CBS", "O_PBS"])
+def test_opt_sl_ml_is_authored_OFF_but_still_searched(key):
+    """Design section 2, twice: "opt_sl_ml searchable, default OFF -- the thesis is binary; a
+    stop mid-event amputates it". Both halves matter -- authored off is what the emitted
+    ruleset, a seeded deploy and the persisted top-N read; still searched is what lets the
+    GA disagree."""
+    m = _launcher()
+    rule = next(r for r in m._option_exit_rules(key) if r["id"] == "opt_sl_ml")
+    assert rule["enabled"] is False
+    assert rule["toggle_optimize"] is True
+    assert "exit:opt_sl_ml:enabled" in _space(m, key)
+
+
+def _decoded_trial(m, key, genome, expert="FMPRating"):
+    """The trial config a real run actually receives for ``key`` -- through
+    ``_build_daily_trial_config``, the same whitelist-trap guard the rest of this file's
+    recorded-chain tests use."""
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+    from app.services.strategy_param_space import decode_params
+
+    strat = m._build_strategy(key, f"g-slml-{key}", expert)
+    decoded = decode_params(strat, genome)
+    backtest_cfg = {
+        "backtest_id": f"slml-{key}", "start_date": "2024-02-01", "end_date": "2024-06-01",
+        "enabled_instruments": ["AAPL"],
+        "experts": [{"class": expert, "settings": {}}],
+        "initial_capital": 20_000.0, "account_settings": {}, "warmup_days": 0, "seed": 1,
+        "entry_action": getattr(strat, "entry_action", None), "options_store": "parquet",
+    }
+    return _build_daily_trial_config(backtest_cfg, decoded, None)
+
+
+# THE EFFECT, NOT THE AUTHORED KEY (reviewer finding, 2026-09-02). ``rule["enabled"] is False``
+# on the AUTHORED dict (test above) is necessary but NOT sufficient -- before the fix, that
+# stale key survived onto a DEFAULT (unsearched) genome's EMITTED ruleset untouched, and
+# nothing in either runtime (strategy_param_space._decode_rule_list's old drop-only-on-0 logic,
+# default_rulesets.seed_ruleset_from_rules, or rules_convert.live_actions_from_trade_rule)
+# actually skipped a rule for carrying it -- so a default-genome trial, an unsearched run and a
+# seeded live deploy all carried an ACTIVE close_option max-loss stop the design forbids. The
+# fix is two-sided: _decode_rule_list now REMOVES an authored-off rule unless its gene decodes
+# to 1 (emit time), and rules_convert.live_actions_from_trade_rule skips any rule carrying
+# ``enabled: False`` regardless of how it got there (the shared fail-closed guard covering an
+# unsearched run that never calls decode_params at all). These two tests prove the EFFECT on
+# the emitted ruleset, not the authored marker.
+@pytest.mark.parametrize("key", ["O_ERN", "O_CBS", "O_PBS"])
+def test_the_default_genome_emits_no_sl_ml_rule_at_all(key):
+    m = _launcher()
+    trial = _decoded_trial(m, key, {})
+    assert not any(r["id"] == "opt_sl_ml" for r in trial["exit_rules"]), (
+        f"{key}: a default (unsearched) genome must carry NO opt_sl_ml rule, not one merely "
+        f"flagged enabled=False")
+
+
+@pytest.mark.parametrize("key", ["O_ERN", "O_CBS", "O_PBS"])
+def test_the_ga_can_still_turn_sl_ml_on_with_the_decoded_threshold(key):
+    """The other half of "searchable": gene=1 emits an ACTIVE rule (no enabled key at all --
+    "no emitted ruleset ever carries a rule-level enabled flag") carrying the GA's OWN decoded
+    threshold, not the authored default."""
+    m = _launcher()
+    trial = _decoded_trial(m, key, {"exit:opt_sl_ml:enabled": 1, "cond:sl_ml:value": 65})
+    rule = next(r for r in trial["exit_rules"] if r["id"] == "opt_sl_ml")
+    assert "enabled" not in rule, f"{key}: an emitted, GA-enabled rule must carry no stale flag"
+    leaf = rule["conditions"]["conditions"][0]
+    assert leaf["field"] == "loss_pct_of_max_loss"
+    assert leaf["value"] == 65
+
+
+@pytest.mark.parametrize("key", ["O_LEAP"])
+def test_the_long_dated_keys_keep_opt_sl_ml_ON(key):
+    """The negative: design section 2 lists ``opt_sl_ml`` as a plain gene for the LEAPS arms,
+    not a default-off one -- a 400-day debit position is not a binary event bet."""
+    m = _launcher()
+    rule = next(r for r in m._option_exit_rules(key) if r["id"] == "opt_sl_ml")
+    assert "enabled" not in rule
+    assert key not in m._OPTION_SL_ML_AUTHORED_OFF
+
+
+@pytest.mark.parametrize("key", ["O_CBS", "O_PBS"])
+def test_the_backspreads_take_profit_on_a_MULTIPLE_of_the_premium(key):
+    """Design section 2: "take-profit multiple 2x-6x | to expiry". The "| to expiry" arm IS
+    the rule's own on/off gene, not a sentinel value -- pinned so a later reader does not
+    add a magic number for it."""
+    m = _launcher()
+    rule = next(r for r in m._option_exit_rules(key) if r["id"] == "opt_tp_mult")
+    leaf = rule["conditions"]["conditions"][0]
+    assert leaf["field"] == "profit_multiple_of_premium"
+    assert leaf["op"] == ">="
+    assert (leaf["value_min"], leaf["value_max"], leaf["value_step"]) == (2, 6, 1)
+    assert rule["toggle_optimize"] is True
+
+
+def test_no_grid1_key_grew_a_take_profit_multiple():
+    m = _launcher()
+    for key in PURE:
+        assert not any(r["id"] == "opt_tp_mult" for r in m._option_exit_rules(key))
+
+
+def test_grid1_keeps_the_original_dte_exit_band():
+    """The per-key DTE band table must not have moved anyone else: 0..21 step 3 is what every
+    grid-1 key had, and changing it would re-score every completed option job."""
+    m = _launcher()
+    for key in PURE + ["OS1", "OS2", "OS3", "OS4"]:
+        leaf = next(r for r in m._option_exit_rules(key)
+                    if r["id"] == "opt_dte")["conditions"]["conditions"][0]
+        assert (leaf["value"], leaf["value_min"], leaf["value_max"], leaf["value_step"]) \
+            == (21, 0, 21, 3), f"{key}'s opt_dte band moved"
+
+
+def test_the_event_exit_is_not_toggleable():
+    """Every other exit carries an on/off gene; this one does not, and that is the design's
+    own split -- with it off the strategy is not O_ERN with a gate disabled, it is an
+    unmanaged straddle waiting for opt_dte."""
+    m = _launcher()
+    rule = next(r for r in m._option_exit_rules("O_ERN") if r["id"] == "opt_event")
+    assert "toggle_optimize" not in rule
+    assert "exit:opt_event:enabled" not in _space(m, "O_ERN")
+
+
+# ---- fitness + holdout routing ---------------------------------------------------------------
+@pytest.mark.parametrize("key", GRID2)
+def test_every_grid2_key_is_scored_and_railed_as_a_PURE_option_kind(key):
+    """Two consumers of ``_PURE_OPTION_STRATEGIES``: the fitness default (option_car, design
+    section 7) and the walk-forward holdout rail (2026 must stay unspent)."""
+    m = _launcher()
+    assert key in m._PURE_OPTION_STRATEGIES
+    assert m._resolve_fitness(None, key, "sharpe_ratio") == "option_consistent_annual_return"
+    with pytest.raises(SystemExit):
+        m._assert_option_window_excludes_holdout([key], "2026-06-30")
+
+
+@pytest.mark.parametrize("key", GRID2_MEMBERS)
+def test_no_grid2_key_joined_a_GRID1_family(key):
+    """Design section 7's real constraint: a grid-2 structure must never be searched inside a
+    GRID-1 family (OS1-OS4), because then its result would not be attributable to grid 2 at
+    all -- it would be one arm of a job scored under grid 1's fitness and universe.
+
+    O_LEAPC/O_LEAPP ARE group members as of 2026-09-02, and that is not a violation of the
+    above: their group ``O_LEAP`` IS a grid-2 key (both arms, one exit ruleset, grid-2's
+    fitness and universe threshold), the same shape O_CONVEX uses for the convex grid."""
+    m = _launcher()
+    for group, members in m._OPTION_GROUPS_ALL.items():
+        if group in ("OS1", "OS2", "OS3", "OS4"):
+            assert key not in members, f"{key} joined grid-1 family {group}"
+
+
+@pytest.mark.parametrize("key", GRID2_MEMBERS)
+def test_every_grid2_structure_is_reachable_from_exactly_one_launchable_key(key):
+    """The merge must not have orphaned a structure or made one reachable twice."""
+    m = _launcher()
+    launchable = [k for k in m._STRATEGY_BUILDERS if k in m._GRID2_OPTION_STRATEGIES]
+    reach = [k for k in launchable
+             if k == key or key in m._OPTION_GROUPS.get(k, [])]
+    assert reach == [_LAUNCH_KEY.get(key, key)], (
+        f"{key} is reachable from {reach}, expected exactly "
+        f"[{_LAUNCH_KEY.get(key, key)!r}]")
+
+
+# ==============================================================================================
+# O_PMCC — the two-expiry key (plan Task 6, design 2026-08-31 §2-§4)
+# ==============================================================================================
+def test_o_pmcc_is_launchable_and_no_longer_phase_gated():
+    """The gate came down because all three refusals it named now answer for a DECLARED
+    two-expiry structure — not because the gate was inconvenient."""
+    m = _launcher()
+    assert "O_PMCC" not in m._PHASE_GATED_OPTION_STRATEGIES
+    assert "O_PMCC" in m._STRATEGY_BUILDERS
+    assert "O_PMCC" in m._OPTION_STRATS
+    assert "O_PMCC" in m._GRID2_OPTION_STRATEGIES
+    assert m._STRATEGY_BUILDERS["O_PMCC"] is m._build_strategy_option
+
+
+def test_o_cal_is_STILL_gated_and_says_why():
+    """Phase 2, and the one-line change is recorded rather than implied."""
+    m = _launcher()
+    assert set(m._PHASE_GATED_OPTION_STRATEGIES) == {"O_CAL"}
+    with pytest.raises(SystemExit):
+        m._refuse_phase_gated_strategy("optimize", ["O_CAL"])
+
+
+def test_o_pmcc_enters_by_opening_a_pmcc():
+    m = _launcher()
+    strat = m._build_strategy("O_PMCC", "g-pmcc", "FMPRating")
+    action = strat.entry_rules[0]["actions"][0]
+    assert action["action_type"] == "open_pmcc"
+    assert action["option_strike_method"] == "delta"
+    # The per-leg pair ``_spread_params`` destructures as (long, short): the LEAPS target
+    # first, the overlay second.
+    assert action["option_strike_param"] == [0.80, 0.20]
+    assert (action["option_short_dte_min"], action["option_short_dte_max"]) == (30, 45)
+
+
+def test_the_two_delta_bands_are_the_designs_and_are_SEARCHED_independently():
+    """Design §2: "LEAPS leg delta 0.75-0.85 ... short-call overlay delta 0.15-0.30". One
+    shared target could only pick the two strikes nearest ONE delta, which is a different
+    structure — and on this one it would be an inadmissible one (the short must sit above the
+    long)."""
+    m = _launcher()
+    space = _space(m, "O_PMCC")
+    short = next(v for k, v in space.items() if k.endswith(":option_strike_delta"))
+    long = next(v for k, v in space.items() if k.endswith(":option_strike_delta_long"))
+    assert (short["min"], short["max"]) == (0.15, 0.30)
+    assert (long["min"], long["max"]) == (0.75, 0.85)
+
+
+def test_the_overlay_window_is_FIXED_and_carries_no_gene():
+    """Design §2 states the overlay's DTE as one narrow band (30-45), not a range, and at
+    pop 40 / gen 6 the gene budget belongs to the two deltas and the roll trigger. It is still
+    a real action PARAM, so a live rule and a phase-2 calendar can both set it."""
+    m = _launcher()
+    space = _space(m, "O_PMCC")
+    assert not [g for g in space if "short_dte" in g], (
+        "the overlay window must not be searched; see the row's own comment")
+
+
+def test_the_leaps_entry_dte_gene_can_never_decode_below_365():
+    """Design §2's "DTE >= 365". ``_apply_option_dte`` decodes the gene as a window CENTRE and
+    subtracts a half-width fixed by the AUTHORED window, so the floor is re-derived here from
+    the table rather than restated."""
+    m = _launcher()
+    cfg = m._OPTION_STRATS["O_PMCC"]
+    hw = max(int((cfg["option_dte_max"] - cfg["option_dte_min"]) // 2), 7)
+    assert cfg["option_dte_min_range"] - hw >= 365
+
+
+@pytest.mark.parametrize("rule_id,field,op", [
+    ("pmcc_roll_dte", "short_leg_days_to_expiry", "<="),
+    ("pmcc_roll_buyback", "credit_decayed_pct", ">="),
+    ("pmcc_delta_floor", "long_leg_delta", "<"),
+])
+def test_the_overlay_rules_are_emitted_with_their_designed_fields(rule_id, field, op):
+    m = _launcher()
+    rule = next(r for r in m._option_exit_rules("O_PMCC") if r["id"] == rule_id)
+    leaf = rule["conditions"]["conditions"][0]
+    assert (leaf["field"], leaf["op"]) == (field, op)
+    assert leaf["optimize"] is True
+
+
+def test_the_roll_rules_are_TWO_rules_because_a_nested_OR_is_not_evaluated():
+    """``rule_builders.tree_leaves`` flattens a rule's whole tree into one ANDed trigger dict,
+    so "roll at the expiry window OR at the buyback trigger" cannot be one rule with an OR
+    node — it would demand BOTH. Two rules, first match wins, exactly as ``opt_dte`` is its own
+    rule rather than another leaf on ``opt_time``."""
+    m = _launcher()
+    rolls = [r for r in m._option_exit_rules("O_PMCC")
+             if r["action_type"] == "roll_pmcc_short"]
+    assert len(rolls) == 2
+    for rule in rolls:
+        leaves = rule["conditions"]["conditions"]
+        assert len(leaves) == 1, f"{rule['id']} must carry ONE leaf; two would be ANDed"
+        assert rule["conditions"]["type"] == "AND"
+
+
+def test_the_roll_rules_come_FIRST_and_let_the_closes_run_behind_them():
+    """Front placement is the O_WHEEL idiom: ``opt_tp``/``opt_time`` compare fields a PMCC also
+    carries, so either could match on the very bar the overlay is due and break the walk with a
+    close before the roll was reached. ``continue_processing`` is the other half — a bar that
+    rolls must still be able to stop out."""
+    m = _launcher()
+    rules = m._option_exit_rules("O_PMCC")
+    ids = [r["id"] for r in rules]
+    assert ids[:3] == ["pmcc_roll_dte", "pmcc_roll_buyback", "pmcc_delta_floor"]
+    assert ids.index("pmcc_roll_dte") < ids.index("opt_tp")
+    for rid in ("pmcc_roll_dte", "pmcc_roll_buyback"):
+        assert next(r for r in rules if r["id"] == rid)["continue_processing"] is True
+
+
+def test_the_expiry_roll_is_the_one_exit_rule_the_GA_may_not_switch_OFF():
+    """The call ``opt_event`` already makes for O_ERN: with the roll off a PMCC is not a PMCC,
+    it is a diagonal waiting to have its short assigned. The two REFINEMENTS keep their genes."""
+    m = _launcher()
+    rules = {r["id"]: r for r in m._option_exit_rules("O_PMCC")}
+    assert "toggle_optimize" not in rules["pmcc_roll_dte"]
+    assert rules["pmcc_roll_buyback"]["toggle_optimize"] is True
+    assert rules["pmcc_delta_floor"]["toggle_optimize"] is True
+
+
+def test_the_roll_ACTION_carries_no_selection_genes_of_its_own():
+    """ONE overlay thesis per genome. The rolled overlay is selected from the box the ENTRY
+    stamped on its order row; a second ``option_strike_delta`` here would let a search enter at
+    0.15 delta and roll to 0.30, and would double the overlay's gene budget at pop 40."""
+    m = _launcher()
+    for rule in m._option_exit_rules("O_PMCC"):
+        if rule["action_type"] != "roll_pmcc_short":
+            continue
+        assert not [k for k in rule if k.startswith("option_")], rule
+
+
+def test_the_three_overlay_genes_reach_the_emitted_ruleset():
+    """Threshold genes are keyed on the LEAF id (``cond:<leaf>:value``) and on/off genes on
+    the RULE id (``exit:<rule>:enabled``) — the shape every other option exit already takes."""
+    m = _launcher()
+    space = _space(m, "O_PMCC")
+    assert (space["cond:roll_dte:value"]["min"], space["cond:roll_dte:value"]["max"]) == (1, 7)
+    assert (space["cond:roll_buyback:value"]["min"],
+            space["cond:roll_buyback:value"]["max"]) == (50, 90)
+    assert (space["cond:delta_floor:value"]["min"],
+            space["cond:delta_floor:value"]["max"]) == (0.40, 0.60)
+    # ...and the two REFINEMENTS carry their on/off gene while the expiry roll does not.
+    assert "exit:pmcc_roll_buyback:enabled" in space
+    assert "exit:pmcc_delta_floor:enabled" in space
+    assert "exit:pmcc_roll_dte:enabled" not in space
+
+
+def test_the_pmcc_dte_exit_is_the_LEAPS_roll_floor():
+    """Design §2: the PMCC "shares the LEAPS roll-floor gene". ``DaysToExpiryCondition`` reads
+    the LONG leg for a declared multi-expiry structure, so this band measures the LEAPS and can
+    never fire on the 30-45-DTE overlay."""
+    m = _launcher()
+    leaf = next(r for r in m._option_exit_rules("O_PMCC")
+                if r["id"] == "opt_dte")["conditions"]["conditions"][0]
+    assert (leaf["value_min"], leaf["value_max"]) == (90, 240)
+
+
+def test_opt_sl_ml_is_authored_off_for_the_pmcc_too():
+    m = _launcher()
+    rule = next(r for r in m._option_exit_rules("O_PMCC") if r["id"] == "opt_sl_ml")
+    assert rule["enabled"] is False and rule["toggle_optimize"] is True
+    assert "exit:opt_sl_ml:enabled" in _space(m, "O_PMCC")
+
+
+def test_the_pmcc_joins_the_debit_half_and_the_fixed_delta_method_set():
+    m = _launcher()
+    assert "O_PMCC" in m._DEBIT_OPTION_KINDS, (
+        "a LEAPS bought at a net debit; the iv_rank gate must point at CHEAP vol")
+    assert "O_PMCC" in m._FIXED_DELTA_METHOD_STRATEGIES
+    assert not [g for g in _space(m, "O_PMCC") if g.endswith(":option_strike_method")]
+
+
+def test_the_pmcc_gets_the_lower_trade_floor():
+    m = _launcher()
+    block = {}
+    m._apply_option_trade_floor("O_PMCC", block)
+    assert block["car_hard_min_trades_per_year"] == 3.0
+    assert block["car_min_trades_per_year"] == 8.0
+
+
+def test_the_matrix_driver_lists_the_pmcc_with_the_LEAPS_chain_depth():
+    """The driver's own tables, so the key is actually launched and probed at LEAPS depth
+    rather than at the 7-DTE floor its overlay would satisfy on every name."""
+    import importlib.util as _ilu
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__)))))
+    path = os.path.join(root, "tools", "run_options2_matrix.py")
+    spec = _ilu.spec_from_file_location("run_options2_matrix", path)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    assert "O_PMCC" in mod._DEFAULT_STRATEGIES
+    assert mod._MIN_DTE["O_PMCC"] == mod._MIN_DTE["O_LEAP"] == 365
+
+
+def test_no_option_row_declares_a_gene_its_own_builder_cannot_read():
+    """THE INERT-KNOB GUARD, found by a mutation that SURVIVED the gene-to-artefact audit.
+
+    That audit asks "does this gene reach its mapped DESTINATION?", and ``option_wing_width``
+    has a perfectly good destination (``wing_width_pct``) — for the four structures that read
+    it. Declaring the gene on a row whose builder ignores the field therefore passes the audit
+    while the GA spends population on a knob that changes nothing: exactly the silently-inert
+    gene the ``w_profit``/``w_rr`` note in ``_OptionEntryAction.__init__`` refuses, one layer
+    up. The classifiers already say who reads what; this makes the tables obey them.
+    """
+    from ba2_common.core.types import uses_arc_floor, uses_short_dte_window, uses_wing_width
+
+    m = _launcher()
+    checks = (("option_wing_width_optimize", uses_wing_width, "wing_width_pct"),
+              ("option_min_arc_optimize", uses_arc_floor, "min_arc"),
+              ("option_short_dte_min", uses_short_dte_window, "short_dte_min/max"))
+    offenders = []
+    for key, cfg in m._OPTION_STRATS.items():
+        action = str(cfg.get("action_type") or "")
+        for flag, reads, field in checks:
+            if cfg.get(flag) is not None and not reads(action):
+                offenders.append(f"{key} declares {flag} but {action} never reads {field}")
+    assert not offenders, offenders

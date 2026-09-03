@@ -132,6 +132,9 @@ def test_each_exit_is_a_SEPARATE_single_leaf_rule(kind):
                 DTE_RULE_ID: ["days_to_expiry"]}
     if kind not in mod._DEBIT_OPTION_KINDS:
         expected["opt_sl"] = ["profit_loss_percent"]
+    if kind not in mod._UNDEFINED_RISK_MEMBERS:
+        # Task 9: every MEASURED-max-loss structure also carries the max-loss-scaled stop.
+        expected["opt_sl_ml"] = ["loss_pct_of_max_loss"]
 
     actual = {r["id"]: [c["field"] for c in r["conditions"]["conditions"]]
               for r in mod._option_exit_rules(kind)}

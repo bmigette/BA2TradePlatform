@@ -1,20 +1,23 @@
 """READ-ONLY reader behind the option-cache chain viewer.
 
 Purpose: when a backtest produces no trades the first question is always "was the data
-even there?", and until now the only way to answer it was to write SQL against a 10.9 GB
+even there?", and until now the only way to answer it was to write SQL against a 4.12 GB
 sqlite. This module answers it, laid out the way a broker shows a chain.
 
 THREE STORES, NOT ONE. They differ in what they can honestly say, so they are surfaced
 separately rather than blended:
 
-``alpaca-chain``   ``option_chain`` in the legacy sqlite. 6,757,055 rows, and exactly
-                   THREE distinct ``as_of`` snapshot dates for the whole file
-                   (2024-02-01, 2026-03-23, 2026-06-09) — not three per symbol; most
-                   symbols have fewer. ``iv``/``delta``/``gamma``/``theta``/``vega``/
-                   ``open_interest``/``volume`` are NULL in every one of those rows, and
-                   ``bid == ask == last`` in all 4,328,587 quoted rows (measured
-                   2026-08-25: ``SELECT COUNT(*) FROM option_chain WHERE ask > bid`` is
-                   0). That equality is a synthesised placeholder from the cache build,
+``alpaca-chain``   ``option_chain`` in the legacy sqlite. 1,440,782 rows over 101
+                   underlyings, and exactly ONE ``as_of`` snapshot date for the whole
+                   file (2024-02-01). ``open_interest`` and ``volume`` are NULL in every
+                   one of those rows; ``iv``/``delta``/``gamma``/``theta``/``vega`` are
+                   NOT — they are populated on 663,111 of them (46.0%), across 98 of the
+                   101 underlyings. ``bid == ask == last`` in all 1,083,571 quoted rows
+                   (``SELECT COUNT(*) FROM option_chain WHERE ask > bid`` is 0).
+                   Re-measured 2026-08-31, replacing a "6,757,055 rows / three snapshots
+                   / greeks NULL everywhere" description that matched nothing in the file;
+                   the full record is in
+                   ``ba2_common.core.option_selector._publishes_spread``. That equality is a synthesised placeholder from the cache build,
                    not a quote, so this store exposes a single ``close`` and NO bid/ask
                    keys at all. Rendering it as a spread would be a wrong-but-plausible
                    number.
@@ -73,7 +76,7 @@ GREEKS_MODEL = ("Black-Scholes-Merton — ba2_common.core.finance_calc.derivativ
 
 _CHAIN_NULL_REASON = (
     "NULL in the legacy Alpaca chain snapshot — the build never recorded this column "
-    "(0 of 6,757,055 rows populated). Absent, not zero.")
+    "(0 of 1,440,782 rows populated). Absent, not zero.")
 _BAR_NO_COLUMN_REASON = (
     "The legacy option_bar table carries OHLC and volume only; it has no column for this "
     "field. Absent, not zero.")
@@ -93,16 +96,16 @@ _SPOT_ABSENT_REASON = (
     "No underlying spot price: neither the option_chain/option_bar tables nor the parquet "
     "partitions store one. Supply a spot to compute greeks.")
 
-#: 2,428,468 of the 6,757,055 chain rows (36%) carry NULL bid/ask/last: the contract is in
+#: 357,211 of the 1,440,782 chain rows (24.8%) carry NULL bid/ask/last: the contract is in
 #: the snapshot but the build captured no price for it. "In the chain" and "priced" are not
 #: the same claim, and the difference is exactly what someone asking "was the data there?"
 #: needs to see.
 _NO_QUOTE_REASON = (
     "No price recorded. The contract is in the chain snapshot but the build captured no "
-    "quote for it — 2,428,468 of the 6,757,055 chain rows are like this. Absent, not zero.")
+    "quote for it — 357,211 of the 1,440,782 chain rows are like this. Absent, not zero.")
 
 _QUOTE_NOTE_LEGACY = (
-    "This store records bid == ask == close in every quoted row (0 of 4,328,587 have "
+    "This store records bid == ask == close in every quoted row (0 of 1,083,571 have "
     "ask > bid). That is a placeholder written by the cache build, not a market quote, so "
     "no bid/ask spread is shown — only the close it was copied from.")
 
@@ -144,7 +147,7 @@ def open_legacy_readonly(path: str):
 
     ``mode=ro`` makes any INSERT/CREATE/ALTER raise; ``immutable=1`` additionally stops
     sqlite touching the file at all (no -wal/-shm sidecars, no locking) — which matters
-    because this file is 10.9 GB of irreplaceable download.
+    because this file is 4.12 GB of irreplaceable download.
     """
     uri = "file:" + urllib.parse.quote(path) + "?mode=ro&immutable=1"
     cx = sqlite3.connect(uri, uri=True)
@@ -158,7 +161,7 @@ def open_legacy_readonly(path: str):
 def _legacy_db_path() -> str:
     # Imported at CALL time, never bound at import: tests rebind the attribute on
     # ba2_common.config, and an import-time capture would send every read at the real
-    # 10.9 GB file.
+    # 4.12 GB file.
     import ba2_common.config as cfg
     return cfg.OPTIONS_CACHE_DB
 
@@ -243,7 +246,7 @@ def stores() -> List[Dict[str, Any]]:
             "has_quote_spread": False,
             "quote_note": _QUOTE_NOTE_LEGACY,
             "description": (
-                "Point-in-time chain snapshots. Very few as-of dates (three in the whole "
+                "Point-in-time chain snapshots. Very few as-of dates (one in the whole "
                 "file); prices only, every greek and open-interest column NULL."),
         },
         {
@@ -334,7 +337,7 @@ def search_symbols(q: str, limit: int = 50) -> Dict[str, Any]:
 def available_dates(symbol: str) -> Dict[str, Any]:
     """Per store, the as-of dates that actually hold rows for ``symbol``.
 
-    A free calendar over a store with three snapshot dates would return nothing on almost
+    A free calendar over a store with a single snapshot date would return nothing on almost
     every click and read as broken, so the UI picks from this list.
     """
     sym = symbol.strip().upper()

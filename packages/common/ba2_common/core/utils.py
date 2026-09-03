@@ -840,13 +840,28 @@ def get_risk_manager_mode(settings: dict, default: str = "classic") -> str:
         default: Default value if setting is missing or invalid (default: "classic")
         
     Returns:
-        Risk manager mode: "smart" or "classic"
-        
+        Risk manager mode: "smart", "classic" or "classic_options"
+
     Example:
         >>> mode = get_risk_manager_mode(expert.settings)
         >>> # Returns "classic" if missing or invalid
         >>> # Returns "smart" if explicitly set to "smart"
+
+    ``classic_options`` (design 2026-08-27 §11) routes an expert's OPTION entries through
+    ``OptionRiskManagement`` -- the sleeve rails and the drawdown breaker -- and leaves every
+    other path exactly as ``classic``. Before it was admitted here nothing could select it,
+    so no option run could be produced at all.
+
+    NOTE ON THE FALLBACK. This accessor keeps its lenient contract: an unrecognised value
+    reads as ``classic`` for the DISPATCH decision, because the alternative is an unhandled
+    exception in the middle of a live trading cycle. The option path does not share that
+    leniency -- ``OptionRiskManagement.normalise_risk_manager_mode`` RAISES on an
+    unrecognised mode, so a typo cannot silently disable the option risk manager. The two
+    read one list (``VALID_RISK_MANAGER_MODES``) so they can never disagree about what is
+    admitted.
     """
+    from ba2_common.core.OptionRiskManagement import VALID_RISK_MANAGER_MODES
+
     if not settings or not isinstance(settings, dict):
         return default
     
@@ -854,7 +869,7 @@ def get_risk_manager_mode(settings: dict, default: str = "classic") -> str:
     risk_manager_mode = risk_manager_mode.strip().lower()
     
     # Validate the value
-    valid_modes = ["classic", "smart"]
+    valid_modes = list(VALID_RISK_MANAGER_MODES)
     if risk_manager_mode not in valid_modes:
         logger.debug(f"Invalid risk_manager_mode '{risk_manager_mode}', using default '{default}'")
         return default

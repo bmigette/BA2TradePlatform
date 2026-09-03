@@ -361,13 +361,16 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:3746":
+    "ba2_trade_platform/ui/pages/settings.py:3747":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
-        "measurement of anything (was :3851 before fetch_info/fetch_missing_info were "
-        "collapsed onto core.instrument_enrichment)",
-    "ba2_trade_platform/ui/pages/settings.py:3794":
+        "measurement of anything (was :3852 pre-merge on this branch, :3851 pre-merge on dev "
+        "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
+        "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747)",
+    "ba2_trade_platform/ui/pages/settings.py:3795":
         "same settings-import default; the comment above the line records why the fallback was "
-        "deliberately restored (was :3899, same shift)",
+        "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
+        "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
+        "continuation line 3795, one past the outer .get(...)'s opening line 3794)",
     "ba2_trade_platform/ui/components/performance_charts.py:458":
         "a transaction with no P&L counts as neither a win (>0) nor a loss (<0), which is the "
         "right answer for an unmeasured trade (was :412 before max_drawdown_from_pnl was added above it)",
@@ -380,14 +383,23 @@ ALLOWLIST: dict = {
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:1538":
+    "packages/common/ba2_common/core/TradeActions.py:1548":
         "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
         "SETTING, a configured cap rather than a measurement of anything "
         "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "
         "resolve split added the option_request import; :1533 before it added the "
         "option_payoff import; :1534 before the F3 entry-quote gene added the "
-        "option_entry_quote import; :1537 before the option selection-modes stack "
-        "added one more import above it)",
+        "option_entry_quote import; :1537 at the two option lineages' common base; "
+        ":1546 after three IMPORT-BLOCK additions above it (+9): the option_payoff "
+        "import expanding to a multi-line form (+5), the OptionRiskManagement import "
+        "(+3) and the option_selection_policy import (+1) — NOT the "
+        "_option_risk_manager helper, which sits ~1,100 lines BELOW this line and "
+        "cannot shift it (review 2026-08-30 dev-merge, FIX 4); :1547 after the F7 close "
+        "concession wrapped that option_entry_quote import onto a second line to pull "
+        "in ENTRY_CROSS_FULL (+1); :1548 after Task 9 added ONE import line "
+        "(``from ba2_common.core.earnings_stamp import ...``, line 37) for the earnings "
+        "event-date carry-forward -- 1547 + 1 = 1548, and it is the ONLY line this task "
+        "added above 1547: its other two edits sit at ~2888 and ~2976)",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",
@@ -414,7 +426,9 @@ BASELINE: dict = {
     "ba2_trade_platform/core/ModelBillingUsage.py": 12,
     "ba2_trade_platform/core/SmartRiskManagerGraph.py": 6,
     "ba2_trade_platform/core/SmartRiskManagerToolkit.py": 2,
-    "ba2_trade_platform/core/option_lifecycle_service.py": 3,
+    # option_lifecycle_service.py is GONE from this register: its 3 coercions moved with
+    # ``_build_structure`` into ba2_common.core.OptionRiskManagement (the shared sleeve
+    # reader, listed below at the same count), and the service now delegates.
     "ba2_trade_platform/core/portfolio_allocation_service.py": 3,
     "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 11,
     "ba2_trade_platform/modules/accounts/IBKRAccount.py": 2,
@@ -441,6 +455,11 @@ BASELINE: dict = {
     "packages/common/ba2_common/core/utils.py": 2,
     "packages/common/ba2_common/core/position_sizing.py": 2,
     "packages/experts/ba2_experts/DeterministicScorer/__init__.py": 3,
+    # The three PROMOTED sleeve-reader coercions, moved verbatim out of
+    # option_lifecycle_service (whose entry above drops to 0 by exactly this amount): a
+    # filled/ordered quantity, a transaction quantity and the contract multiplier, each
+    # read off a persisted row. Net repo change: zero.
+    "packages/common/ba2_common/core/OptionRiskManagement.py": 3,
     "packages/experts/ba2_experts/FMPRating.py": 1,
     "packages/experts/ba2_experts/FMPSenateTraderCopy.py": 1,
     "packages/experts/ba2_experts/FMPSenateTraderWeight.py": 3,
@@ -448,14 +467,16 @@ BASELINE: dict = {
     "packages/experts/ba2_experts/FactorRanker/portfolio.py": 1,
     "packages/experts/ba2_experts/PennyMomentumTrader/monitoring.py": 1,
     "packages/experts/ba2_experts/PennyMomentumTrader/screening.py": 1,
-    "packages/experts/ba2_experts/PremiumSeller/portfolio.py": 4,
+    # PremiumSeller/portfolio.py (2, in _tested / _close_structure) left the register
+    # 2026-08-31: the whole expert was deleted (plan Task 12), coercions and all. The
+    # total below drops by exactly those 2.
     "packages/providers/ba2_providers/fundamentals/overview/FMPCompanyOverviewProvider.py": 1,
     "packages/providers/ba2_providers/insider/FMPInsiderProvider.py": 4,
     "testplatform/backend/app/services/backtest/backtest_account.py": 26,
     "testplatform/backend/app/services/backtest_handler.py": 1,
     "testplatform/backend/app/services/strategy_optimization_handler.py": 1,
 }
-BASELINE_TOTAL = 175
+BASELINE_TOTAL = 171
 
 
 # =========================================================================== #

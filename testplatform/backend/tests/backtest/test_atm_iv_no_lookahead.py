@@ -21,10 +21,16 @@ version of that read which is not lookahead.
 
 WHY DROPPING THE FALLBACK RATHER THAN STAMPING THE ROW. The alternative was to record the
 date each row's IV was inverted from and refuse rows dated after ``as_of``. That needs a new
-column on ``option_chain``; no existing cache has one (the shared 10.9 GB file predates even
-the greek columns), so every row would read "provenance unknown" and be refused anyway --
-identical behaviour to this, plus a schema migration and a second thing to keep correct. The
-information is not recoverable retrospectively, so the honest read is that it is absent.
+column on ``option_chain``; no existing cache has one, so every row would read "provenance
+unknown" and be refused anyway -- identical behaviour to this, plus a schema migration and a
+second thing to keep correct. The information is not recoverable retrospectively, so the
+honest read is that it is absent.
+
+(THE MISSING COLUMN IS THE INVERSION DATE, NOT THE GREEKS. This used to read "the shared
+10.9 GB file predates even the greek columns" -- false on both counts: the file is 4.12 GB and
+both tables declare AND populate iv/delta, on 46.0% of chain rows and 88.2% of bar rows. See
+``ba2_common.core.option_selector._publishes_spread``, the one re-verified record. The greeks
+being present is precisely why the clamp under test has anything to clamp.)
 
 This matters more since 2026-08-26, when ``iv_rank`` became a live searched gene: the
 statistic being corrupted is the only cross-sectionally comparable option number the platform

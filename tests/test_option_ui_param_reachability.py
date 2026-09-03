@@ -277,10 +277,18 @@ def test_the_editor_persists_every_param_it_is_expected_to(editor):
     # account). A live account has real quotes and its builders already quote at the real
     # touch -- buy@ask / sell@bid IS a full concession -- so a live editor field could only
     # ever be a control that changes nothing. See core.option_entry_quote.
-    expected = consumed - {'min_volume', 'strike_method', 'entry_cross'}
+    #
+    # short_dte_min/short_dte_max are the third kind of omission, and it is the PER-ACTION
+    # one again: only ``open_pmcc`` selects a leg from a second, nearer expiry window
+    # (``uses_short_dte_window``), so on an iron condor the pair is a decoy in exactly the
+    # way Wing Width is a decoy on a long call. Their reachability ON the PMCC is asserted
+    # by its own test below, so this exclusion cannot hide the fields disappearing.
+    expected = consumed - {'min_volume', 'strike_method', 'entry_cross',
+                           'short_dte_min', 'short_dte_max'}
     assert expected <= persisted, f"live rules cannot set: {sorted(expected - persisted)}"
     assert 'min_volume' not in persisted
     assert 'strike_method' not in persisted
+    assert 'short_dte_min' not in persisted and 'short_dte_max' not in persisted
     assert persisted <= consumed, (
         f"the editor writes keys no option action reads: {sorted(persisted - consumed)}")
 
@@ -297,12 +305,40 @@ def test_the_editor_persists_every_param_for_a_structure_that_reads_the_strike_m
 
     persisted = set(saved) - {'action_type'}
     consumed = set(_OPTION_ENTRY_PARAM_KEYS)
-    # wing_width_pct is the per-action omission here, mirroring strike_method above;
-    # entry_cross is backtest-only (see the note in the sibling test).
-    expected = consumed - {'min_volume', 'wing_width_pct', 'entry_cross'}
+    # wing_width_pct and the PMCC's second expiry window are the per-action omissions here,
+    # mirroring strike_method above; entry_cross is backtest-only (see the sibling test).
+    expected = consumed - {'min_volume', 'wing_width_pct', 'entry_cross',
+                           'short_dte_min', 'short_dte_max'}
     assert expected <= persisted, f"live rules cannot set: {sorted(expected - persisted)}"
     assert 'strike_method' in persisted
     assert persisted <= consumed
+
+
+def test_the_editor_offers_the_pmcc_its_SECOND_expiry_window(editor):
+    """The half the two exclusions above rest on.
+
+    ``OpenPMCCAction`` REFUSES an unset overlay window rather than falling back to the LEAPS
+    one, so without these two fields no live rule could open a PMCC at all -- the same
+    reachability gap that left ``wing_width_pct`` unsettable for a year, except louder,
+    because this one refuses instead of silently using a class constant.
+    """
+    from ba2_common.core.types import ExpertActionType as _AT
+
+    editor.add_row(_AT.OPEN_PMCC.value)
+    assert editor.widget('short_dte_min_input') is not None
+    assert editor.widget('short_dte_max_input') is not None
+    saved = editor.save()
+    assert saved['short_dte_min'] == 30
+    assert saved['short_dte_max'] == 45
+
+
+def test_switching_off_the_pmcc_drops_its_stale_overlay_window(editor):
+    """The conditional-widget hazard the wing width already taught us: a closure that
+    outlives its row persists a value onto the action type the user switched TO."""
+    from ba2_common.core.types import ExpertActionType as _AT
+
+    saved = editor.add_row(_AT.OPEN_PMCC.value).choose(PLAIN_OPTION_ACTION).save()
+    assert 'short_dte_min' not in saved and 'short_dte_max' not in saved, saved
 
 
 def test_every_persisted_param_survives_the_trip_into_the_action(editor):
@@ -354,7 +390,7 @@ def test_the_deliberate_omission_is_documented_where_someone_would_add_it(settin
 # --------------------------------------------------------------------------- #
 # OPT-S2: strike_method — the editor must not OFFER what the builder ignores
 # --------------------------------------------------------------------------- #
-# Eight of the seventeen entry builders hard-code ``method="percent_otm"`` at every
+# Eight of the nineteen entry builders hard-code ``method="percent_otm"`` at every
 # selection site, so ``self.strike_method`` is a dead attribute on them. The editor
 # nevertheless rendered the Strike Method select for EVERY non-close option action,
 # DEFAULTED it to ``delta``, placeholdered Strike Param as ``0.30``, and persisted the
@@ -402,7 +438,12 @@ def test_strike_method_is_offered_for_exactly_the_actions_that_read_it(
     entries = [a.value for a in ExpertActionType
                if settings_module.is_option_action(a.value)
                and a is not ExpertActionType.CLOSE_OPTION]
-    assert len(entries) == 17, entries
+    # 21 since 2026-09-02 (plan Task 6): 19 + ``open_pmcc`` + ``roll_pmcc_short``. The roll is
+    # not an ENTRY action (it selects from the box the entry stamped, not from parameters of
+    # its own) but the editor still lists it, because a live PMCC needs a rule that rolls its
+    # overlay -- and it must NOT be offered a strike method, which is what the loop below
+    # asserts by deriving the expectation from ``honours_strike_method``.
+    assert len(entries) == 21, entries
 
     for action_type in entries:
         with nicegui_client:

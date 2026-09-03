@@ -35,6 +35,9 @@ from ba2_common.core import db as _ba2_db  # noqa: E402
 _ba2_db.configure_db(LIVE_DB)
 
 from ba2_common.core.db import add_instance, get_instance, update_instance  # noqa: E402
+from ba2_common.core.deploy_parity import (  # noqa: E402
+    SCREENER_UNIVERSE_SETTING, live_settings_from_universe,
+)
 from ba2_common.core.models import ExpertInstance  # noqa: E402
 from ba2_common.core.rules_convert import trade_rules_to_live_export  # noqa: E402
 from ba2_common.core.rules_export_import import RulesImporter  # noqa: E402
@@ -117,12 +120,31 @@ def main() -> int:
 
         expert = _expert_class(expert_name)(inst_id)
         expert_params = dict(entry["settings"]["settings"]["expert_params"])
+        # THE UNIVERSE BLOCK, which this tool used to DROP -- the common root of review
+        # findings V1 (the six screener:* genes) and V2 (the $100 underlying-price cap every
+        # option grid screened on). The exporter has always built it; consuming only
+        # ``settings.expert_params`` meant a genome selected on cheap names was deployed onto
+        # whatever universe the live instance happened to have. The live settings exist under
+        # the SAME names, so the whole repair is this mapping.
+        universe_params = live_settings_from_universe(entry["settings"].get("universe"))
+        if universe_params:
+            # The universe is part of WHAT WAS SCORED, so it wins over the run's base settings
+            # for the same reason the forced gates do.
+            expert_params = {**expert_params, **universe_params}
+            print(f"universe: {len(universe_params)} screener setting(s) carried into "
+                  f"expert_params ({SCREENER_UNIVERSE_SETTING}="
+                  f"{universe_params[SCREENER_UNIVERSE_SETTING]!r})")
         if created:
-            # Defaults to False; without it the instance analyses and never trades.
+            # Defaults to False; without it the instance analyses and never trades. The export
+            # now carries it explicitly (deploy_parity), so this is a floor for an OLD payload.
             expert_params.setdefault("allow_automated_trade_opening", True)
         expert.save_settings({k: (v, None) for k, v in expert_params.items()})
         print(f"expertsetting: saved {len(expert_params)} keys for instance {inst_id}"
               + ("  (incl. allow_automated_trade_opening)" if created else ""))
+        # Behaviours the backtest derived that live has no analogue for. NOT applied -- a
+        # deploy that differs from its backtest must SAY so (review V4/V5).
+        for k, v in (entry["settings"].get("backtest_only") or {}).items():
+            print(f"  BACKTEST-ONLY, not applied: {k}={v!r}")
 
     print("\n=== deploy complete ===")
     return 0

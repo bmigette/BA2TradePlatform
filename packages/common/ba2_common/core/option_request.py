@@ -54,6 +54,21 @@ SELECTION_CONFIG_REFUSAL = "a selection parameter can never select anything"
 # and telling them apart is the whole reason this constant exists.
 BUDGET_CEILING_REFUSAL = "the cheapest contract in the box exceeds the max-loss ceiling"
 
+# THE SLEEVE RAILS, not the per-structure budget. ``option_book.check_rails`` answers a
+# question no other refusal here asks: how much of the WHOLE sleeve is already deployed, how
+# levered it is, how much of it is naked, how many structures it holds, whether it could fund
+# delivery on the short puts it would then own, and whether the drawdown breaker has stood it
+# down. Every one of those is a statement about the book, so none of them can be a per-request
+# budget phrase -- the remedy is to close something or to raise a rail, never to widen a box.
+# ``RailVerdict.reason`` carries WHICH rail declined; this phrase is the family.
+OPTION_RAIL_REFUSAL = "the sleeve rails decline this structure"
+
+# The expert asked for the option risk manager and did not declare the rails it enforces. A
+# CONFIGURATION refusal, kept apart from OPTION_RAIL_REFUSAL on purpose: a rail that declined
+# is the system working, and a rail that does not exist is the operator's to fix. Collapsing
+# them would report a missing setting as a breached limit.
+OPTION_RAILS_UNCONFIGURED_REFUSAL = "the option risk manager has no configured sleeve rails"
+
 #: Every phrase above. ``StructureRefusal`` validates against this so a free-text reason cannot
 #: creep in — the phrases are only useful if they are exhaustive and stable.
 REFUSAL_PHRASES = (
@@ -71,6 +86,8 @@ REFUSAL_PHRASES = (
     NON_POSITIVE_NET_REFUSAL,
     SELECTION_CONFIG_REFUSAL,
     BUDGET_CEILING_REFUSAL,
+    OPTION_RAIL_REFUSAL,
+    OPTION_RAILS_UNCONFIGURED_REFUSAL,
 )
 
 

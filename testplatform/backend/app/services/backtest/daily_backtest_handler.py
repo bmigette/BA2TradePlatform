@@ -26,6 +26,7 @@ import pathlib
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ba2_common.core.deploy_parity import BacktestRunFacts, forced_expert_settings
 from ba2_common.core.types import is_option_action
 
 from app.models.backtest import Backtest
@@ -70,12 +71,15 @@ def backtest_options_provider(config: Optional[Dict[str, Any]] = None) -> str:
     ``BACKTEST_OPTIONS_STORE``, default ``sqlite``) is the ONLY input here — there is still no
     knob that moves the vendor independently of the store being read.
 
-    Corroborated on the shared sqlite cache (measured 2026-08-26,
-    ``~/Documents/ba2/common/cache/options/options_history.sqlite``): 0 bars dated before
-    2024-01-18, earliest bar 2024-02-01, and the only three chain snapshots in the whole file
-    are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it. The parquet tree
-    measured 2026-08-28 holds 686 underlyings / 9,587 partitions over 2023-01-03..2023-03-31,
-    i.e. exactly the window the sqlite cannot serve.
+    Corroborated on the shared sqlite cache
+    (``~/Documents/ba2/common/cache/options/options_history.sqlite``): 0 bars dated before
+    2024-01-18, earliest bar 2024-02-01, and a SINGLE chain snapshot in the whole file —
+    2024-02-01. (This docstring previously named three, 2024-02-01 / 2026-03-23 / 2026-06-09;
+    that count was wrong. The store's measured shape is recorded once, in
+    ``ba2_common.core.option_selector._publishes_spread`` — cite that, do not re-derive it.)
+    Either way there is no 2023 in it. The parquet tree measured 2026-08-28 holds 686
+    underlyings / 9,587 partitions over 2023-01-03..2023-03-31, i.e. exactly the window the
+    sqlite cannot serve.
     """
     from app.services.backtest.options_store import STORE_VENDOR, resolve_options_store
 
@@ -237,11 +241,9 @@ _SUPPORTED_EXPERTS = {
     # FactorPortfolioManager. ``_build_experts`` detects the marker and skips ruleset seeding /
     # RM-gate enabling for it; the engine routes its targets straight to the portfolio manager.
     "FactorRanker": "ba2_experts.FactorRanker",
-    # BYPASS expert (options): PremiumSeller declares ``bypasses_classic_rm`` AND
-    # ``manages_between_entries`` — it sells premium (CSP/CC) on its entry cadence via its
-    # own OptionPortfolioManager (``portfolio_manager_classpath``) and additionally runs a
-    # manage pass (exits only) on MANAGE bars. Engine seams route both passes.
-    "PremiumSeller": "ba2_experts.PremiumSeller",
+    # PremiumSeller (BYPASS options expert) was removed from this map 2026-08-31 with the
+    # expert's deletion (operator decision; option-model plan Task 12). A historical payload
+    # naming it is rejected fail-early like any other unknown expert, by design.
     # Classic (non-bypass) signal experts, also no-LLM + analyze_as_of-driven:
     #  * FinnHubRating — analyst recommendation-trend rating (needs the ``finnhub_api_key`` setting;
     #    no LLM). Recommendation trends are disk-cached (backtest-only) like the FMP histories.
@@ -256,6 +258,11 @@ _SUPPORTED_EXPERTS = {
     # (provider filing-date filter) + causal OHLCV slicing. Macro degrades to the
     # index-trend input when FRED is not wired into the backtest bundle.
     "DeterministicScorer": "ba2_experts.DeterministicScorer",
+    # Earnings-EVENT ranker (grid 2's O_ERN chain, design 2026-08-31 §9). Ranks upcoming
+    # earnings events from the FMP disk cache (past_earnings_quarterly x OHLCV) and stamps
+    # the event date + days-to-earnings onto its recommendations, which is what the strategy's
+    # rec_days_to_earnings / days_after_event timing gates read. No LLM, analyze_as_of-driven.
+    "FMPEarningsEvent": "ba2_experts.FMPEarningsEvent",
 }
 
 
@@ -264,7 +271,6 @@ _SUPPORTED_EXPERTS = {
 # momentum needs a full year. An expert may override via a ``BACKTEST_WARMUP_BARS`` class attr.
 _EXPERT_WARMUP_BARS = {
     "FactorRanker": 252,          # momentum_12_1 lookback (12 months)
-    "PremiumSeller": 300,         # SMA-200/HV floor; matches BACKTEST_WARMUP_BARS
     "FMPRating": 10,
     "FMPEarningsDrift": 10,
     "FMPInsiderClusterBuy": 10,
@@ -272,6 +278,14 @@ _EXPERT_WARMUP_BARS = {
     "FMPSenateTraderWeight": 10,  # recent congressional trades; ATR floor governs warmup
     "FMPSenateTraderCopy": 10,
     "DeterministicScorer": 260,   # 12-1 momentum (252) + SMA200 trend inputs
+    # 620 = the class's own BACKTEST_WARMUP_BARS. Its features are computed over PAST earnings
+    # events (min_hist_events of them), and events are quarterly: 4+ quarters of history plus
+    # the earnings-day move measured off OHLCV needs ~2.5 years of bars. The table and the
+    # class attribute must AGREE -- ``derive_warmup_days`` prefers the class and falls back to
+    # this table on an import failure, so a disagreement is a silently different warmup on the
+    # exact runs where the import is broken. Pinned equal by
+    # test_option_grid_foundations.test_the_earnings_expert_warmup_table_matches_the_class.
+    "FMPEarningsEvent": 620,
 }
 _WARMUP_FLOOR_DAYS = 60           # never warm up less than this (ATR + safety)
 _BARS_TO_CALDAYS = 1.45           # trading bars -> calendar days (≈252 bars/year -> ~365 days)
@@ -904,11 +918,25 @@ def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float
     several experts naming a value the TIGHTEST wins, so a mixed run can never be scored more
     leniently than its strictest member. Returns {} when nobody declares one -- the fitness reader
     then falls back to its module defaults, i.e. pre-existing behaviour exactly.
+
+    AN EXPLICIT RUN-LEVEL VALUE WINS OVER THE EXPERT SCAN, and it is the one place the
+    "tightest wins" rule is deliberately not applied. The cadence a config can reach is set by
+    the STRUCTURE's holding period, not by the expert: the same expert driving a 400-DTE LEAPS
+    call and a 35-DTE long call produces trade rates an order of magnitude apart, and no class
+    attribute on the expert can tell those two runs apart. So a run that states its objective
+    (``ba2test_launcher._apply_option_trade_floor``, grid 2's long-dated keys) has stated it
+    ON PURPOSE, and taking the max with an expert's number would silently discard exactly the
+    lowering it exists to perform. Absent (every existing run) -> the expert scan below,
+    unchanged.
     """
     import importlib
 
     out: Dict[str, float] = {}
     for key in ("car_hard_min_trades_per_year", "car_min_trades_per_year"):
+        explicit = config.get(key)
+        if explicit is not None:
+            out[key] = float(explicit)
+            continue
         best = None
         for spec in config.get("experts", []) or []:
             class_name = spec.get("class") if isinstance(spec, dict) else spec
@@ -925,6 +953,22 @@ def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float
         if best is not None:
             out[key] = best
     return out
+
+
+def _run_facts(config: Dict[str, Any]) -> BacktestRunFacts:
+    """The run-level facts the forced-settings table is a function of, read off a TRIAL config.
+
+    The export side reads the same three facts off the persisted
+    ``optimization_config['backtest']`` block, where two of them are spelled differently
+    (``hold_assigned_stock`` lives under ``account_settings`` on both, ``enable_short`` is
+    top-level on both). Naming them here is what makes the two reads provably the same read.
+    """
+    account_settings = config.get("account_settings") or {}
+    return BacktestRunFacts(
+        enable_short=bool(config.get("enable_short")),
+        hold_assigned_stock=bool(account_settings.get("hold_assigned_stock")),
+        entry_action=config.get("entry_action"),
+    )
 
 
 def _build_experts(
@@ -996,7 +1040,24 @@ def _build_experts(
         # field's comment in _build_config) and always co-occurs with a real buy_tree/
         # entry_action there, so gate on their absence to keep that path's `[]` meaning
         # unchanged.
-        if entry_rules == [] and not buy_tree and not entry_action:
+        if entry_rules == [] and not buy_tree:
+            # ``and not entry_action`` USED TO BE PART OF THIS GUARD, and it was the sharper
+            # half of the same bug (2026-09-02 review, V4). On an OPTION run ``entry_action`` is
+            # always truthy -- it is carried run-level for every option key -- so a genome that
+            # pruned every member of its entry group fell through to the branch below and got
+            # RE-ARMED with ``entry_action`` on a bare permissive gate: the run traded a
+            # strategy the genome had explicitly switched off, corrupting both its fitness and
+            # the persisted top-N re-run. The empty list is the genome's decision on this path
+            # whether or not an option template exists, so honour it -- and say so, loudly,
+            # because "this individual has no entry path" is a real result that should never
+            # again be indistinguishable from a re-armed default.
+            if entry_action:
+                logger.error(
+                    f"_seed_enter({nm!r}): entry_rules is EXPLICITLY EMPTY (every rule pruned) "
+                    f"while a run-level entry_action is present. Seeding a ruleset with ZERO "
+                    f"entry rules -- the run-level option entry_action is NOT used to re-arm "
+                    f"this individual. It will take no entries by construction."
+                )
             return seed_entry_ruleset_from_rules(entry_rules, name=nm)
         if buy_tree or entry_action or entry_rules:
             return seed_ruleset_from_tree(buy_tree, name=nm, enable_short=enable_short,
@@ -1120,12 +1181,11 @@ def _build_experts(
             gate_settings: Dict[str, Any] = {}
             for k, v in decision_settings.items():
                 gate_settings[k] = (v, _setting_type(v))
-            gate_settings["allow_automated_trade_opening"] = (True, "bool")
-            gate_settings["enable_buy"] = (True, "bool")
-            # Live gates open-positions management (Adjust TP/SL/Close) on this flag.
-            gate_settings["allow_automated_trade_modification"] = (True, "bool")
-            # SHORT entries (the SELL enter rule) are gated by the RM on enable_sell.
-            gate_settings["enable_sell"] = (bool(config.get("enable_short")), "bool")
+            # THE ONE TABLE (ba2_common.core.deploy_parity). Written here and READ BY THE
+            # EXPORT PAYLOAD, so a gate forced onto a trial's expert cannot be added here
+            # without the deploy carrying it to the live ExpertInstance -- the review's V3.
+            for k, v in forced_expert_settings(_run_facts(config)).items():
+                gate_settings[k] = (v, _setting_type(v))
             expert.save_settings(gate_settings)
 
         resolver.register_expert(expert_id, expert)

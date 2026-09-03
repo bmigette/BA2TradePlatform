@@ -4,7 +4,7 @@ The type was written on the assumption that no vendor serves IV, so the platform
 Black-Scholes off the contract's own close. dxfeed does serve it (``imp_volatility`` on every
 candle), and a vendor print beats an inversion: the inversion needs a risk-free rate, a
 dividend assumption and a clean close, and it cannot produce anything at all for the
-4,328,587 rows whose bid/ask were fabricated as ``bid = ask = close``.
+1,083,571 rows whose bid/ask were fabricated as ``bid = ask = close``.
 
 Adding the field is additive — it defaults to ``None`` and sits last, so every existing
 construction (Alpaca's and ThetaData's, positional or keyword) is unchanged.

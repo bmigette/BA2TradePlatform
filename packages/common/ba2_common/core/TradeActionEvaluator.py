@@ -12,6 +12,7 @@ from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import Ruleset, EventAction, TradingOrder, TradeActionResult, ExpertRecommendation
 from ba2_common.core.types import (
     OrderRecommendation, ExpertEventType, ExpertActionType, get_option_action_values,
+    get_option_entry_action_values,
 )
 from ba2_common.core.db import get_db, get_instance, InstanceNotFound
 from ba2_common.logger import logger
@@ -26,7 +27,14 @@ from ba2_common.core.failure_modes import absorb_if_benign
 # dropped actions). ``_OPTION_ENTRY_ACTION_TYPES`` excludes CLOSE_OPTION (which resolves
 # its contract from the held position and takes no selection params).
 _ALL_OPTION_ACTION_TYPES = frozenset(ExpertActionType(v) for v in get_option_action_values())
-_OPTION_ENTRY_ACTION_TYPES = _ALL_OPTION_ACTION_TYPES - {ExpertActionType.CLOSE_OPTION}
+#: The option actions that OPEN a structure from a chain, and so are the ones a rule's
+#: selection params are forwarded to. Derived from ``types.get_option_entry_action_values``
+#: rather than by subtracting ``CLOSE_OPTION`` here, so the one classification serves this
+#: forwarding rule and every "for each entry builder" audit alike. ``roll_pmcc_short`` is
+#: excluded with ``close_option``: it re-selects its overlay from the spec the ENTRY stamped
+#: on the order row, so a param forwarded to it would be a knob nothing reads.
+_OPTION_ENTRY_ACTION_TYPES = frozenset(
+    ExpertActionType(v) for v in get_option_entry_action_values())
 
 # Selection-param keys forwarded from an option action config to the _OptionEntryAction
 # ctor. ``wing_width_pct`` is required by the 4-/3-leg structures (iron condor, jade
@@ -34,6 +42,10 @@ _OPTION_ENTRY_ACTION_TYPES = _ALL_OPTION_ACTION_TYPES - {ExpertActionType.CLOSE_
 # action's own defaults apply otherwise.
 _OPTION_ENTRY_PARAM_KEYS = (
     'strike_method', 'strike_param', 'dte_min', 'dte_max',
+    # The PMCC's SECOND expiry window (plan Task 6): the short overlay is selected from its
+    # own 30-45 DTE band while dte_min/dte_max carry the LEAPS' 365+ one. Only keys present
+    # in an action's config are forwarded, so every single-expiry builder is unaffected.
+    'short_dte_min', 'short_dte_max',
     'sizing', 'min_open_interest', 'max_spread_pct', 'min_volume', 'wing_width_pct',
     # PREMIUM-RICHNESS floor (a FRACTION, 0.15 == 15 %/yr), read by the CREDIT builders via
     # _refuse_if_arc_below_floor. Absent means no floor -- the pre-OPT-C1 behaviour where any
@@ -44,6 +56,11 @@ _OPTION_ENTRY_PARAM_KEYS = (
     # gives up when it quotes. Absent or 0.0 leaves the builder's quote untouched, and a live
     # account -- which models no spread -- ignores it entirely. See core.option_entry_quote.
     'entry_cross',
+    # SELECTION-POLICY WEIGHTS (design 2026-08-29 §7): the GA-wired choosing inside the box.
+    # Absent or all-zero builds no policy and the selector keeps its legacy path byte for
+    # byte. w_profit/w_rr are deliberately not forwarded until a builder supplies the
+    # structure_fn they need -- see _OptionEntryAction.__init__.
+    'w_premium', 'w_iv', 'w_rvol',
 )
 
 
@@ -51,12 +68,73 @@ _OPTION_ENTRY_PARAM_KEYS = (
 #: discretionary one — see ``forced_option_exit``.
 _FORCED_EXIT_EVENT_TYPES = frozenset({
     ExpertEventType.N_DAYS_TO_EXPIRY.value,
+    # `days_after_event` -- the O_ERN post-print exit (design 2026-08-31 leaps-grid S9).
+    #
+    # THIS IS CLASSIFIED OPPOSITE TO `days_opened`, DELIBERATELY, AND THE DIFFERENCE IS NOT
+    # "both count days". `days_opened` is a STALENESS exit: nothing about the position
+    # changed, the thesis simply has not paid, and the close can wait for a decent quote --
+    # that is what makes it discretionary, and it stays discretionary (pinned by test).
+    # `days_after_event` is the terminal date of a BINARY EVENT trade. The position is long
+    # premium bought for one announcement; once that announcement has passed and the searched
+    # number of days has elapsed, the thesis is over and what remains is a decaying option
+    # nobody chose to own. There is no waiting for a better print -- theta and the post-event
+    # vol crush are both running against it every day it stays on -- so the exit pays up, the
+    # same reading `days_to_expiry` gets. Classifying it discretionary would let a trial book
+    # its event exits at the entry concession fraction instead of the modelled spread, which
+    # is the filter-flattering exit F7 exists to remove, on the ONE grid key whose result the
+    # design says deserves statistical weight (hundreds of independent events in-window).
+    ExpertEventType.N_DAYS_AFTER_EVENT.value,
 })
-#: P&L trigger event types whose LOSS side (operator < / <=) is a stop-loss.
-_PL_EVENT_TYPES = frozenset({
-    ExpertEventType.N_PROFIT_LOSS_PERCENT.value,
-    ExpertEventType.N_PROFIT_LOSS_AMOUNT.value,
-})
+#: LOSS-SIDE STOP TRIGGERS, keyed by the field's SIGN CONVENTION.
+#:
+#: A numeric trigger is a stop-loss when it fires as the position gets WORSE, and which
+#: operators mean "worse" depends entirely on which way the field is signed. The two
+#: conventions in the registry today point in OPPOSITE directions, so the classifier
+#: cannot key on a single operator set:
+#:
+#:   * SIGNED RESULT (``profit_loss_percent`` / ``profit_loss_amount`` /
+#:     ``profit_multiple_of_premium``): the position's own P&L, or an affine transform of
+#:     it — NEGATIVE (or, for the multiple, below 1.0) while losing. Worse == smaller, so
+#:     ``<`` / ``<=`` is the stop and ``>`` / ``>=`` is the take-profit.
+#:     ``profit_multiple_of_premium < 1.0`` reads "worth less than what was paid" — the
+#:     same de-facto stop as ``profit_loss_percent < 0``, just rescaled (``multiple = 1 +
+#:     percent / 100``), so it takes the identical operator set.
+#:   * LOSS MAGNITUDE (``loss_pct_of_max_loss``, design 2026-08-29 S8.2): unrealized loss
+#:     as a % of the structure's DEFINED max loss — POSITIVE while losing, +100 when the
+#:     whole defined risk is gone, negative while profitable. INVERTED vs the P&L fields:
+#:     worse == bigger, so ``>`` / ``>=`` is the stop and there is no take-profit reading.
+#:
+#: Review 2026-08-30 (dev-merge, FIX 1): the classifier previously enumerated only the
+#: signed-result convention, so the grid-wide ``opt_sl_ml`` stop (``loss_pct_of_max_loss``
+#: with ``>``) matched no test and was classified like a take-profit — a discretionary
+#: mid-quote close, exactly the filter-flattered exit F7 exists to remove. On the 9 debit
+#: kinds it is the ONLY stop (``opt_sl`` is credit-only), so 100 % of its firings were
+#: misclassified.
+#:
+#: Review 2026-09-01 (Task 4 follow-up): ``profit_multiple_of_premium`` was registered in
+#: ``CONDITION_MAP``/``FIELD_EVENT`` without a row here, so its loss-side reading
+#: (``< 1.0``) classified as discretionary — a real stop paying only the entry's
+#: concession fraction instead of crossing the full modelled spread, the same defect FIX 1
+#: fixed for ``loss_pct_of_max_loss``. It joins the SIGNED-RESULT bucket (its take-profit
+#: side, ``>=``, was already correctly discretionary and stays that way).
+#:
+#: A NEW loss-side field is registered by adding its convention HERE, not by adding a
+#: branch below. Keeping the mechanism a lookup was deliberate: ``loss_pct_of_max_loss``
+#: is the only INVERTED-sign field in ``ExpertEventType`` today (audited against
+#: ``get_number_event_values()``: every other numeric event that IS a stop follows the
+#: signed-result convention above; the rest are distances, counts of days, or unsigned
+#: market statistics that are not stops at all), but the S8.2 family it belongs to —
+#: "loss as a fraction of a measured risk budget" — is the shape a second inverted field
+#: would take.
+_LOSS_SIDE_STOP_OPERATORS = {
+    ExpertEventType.N_PROFIT_LOSS_PERCENT.value: frozenset({"<", "<="}),
+    ExpertEventType.N_PROFIT_LOSS_AMOUNT.value: frozenset({"<", "<="}),
+    ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value: frozenset({">", ">="}),
+    # multiple = 1 + profit_loss_percent / 100 -- same signed-result convention as the
+    # profit_loss_* pair above: below 1.0 (worth less than paid) is the stop, at/above the
+    # searched threshold is the take-profit. See the module docstring above.
+    ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value: frozenset({"<", "<="}),
+}
 
 
 def forced_option_exit(event_action) -> bool:
@@ -68,12 +146,33 @@ def forced_option_exit(event_action) -> bool:
     — never its name, which is free text:
 
       * a ``days_to_expiry`` trigger is the DTE/roll exit — forced;
-      * a ``profit_loss_percent`` / ``profit_loss_amount`` trigger with a ``<``/``<=``
-        operator is a loss-side stop — forced;
-      * everything else (TP ``>`` gates, time exits, sentiment/rating flags) is
+      * a ``days_after_event`` trigger is the O_ERN post-print exit — forced. See the
+        note on its entry in ``_FORCED_EXIT_EVENT_TYPES`` above for why this ONE time
+        exit is classified opposite to ``days_opened``;
+      * a numeric trigger whose operator points at the LOSS side of its own field is a
+        stop — forced. Which operators those are is per-field and looked up in
+        ``_LOSS_SIDE_STOP_OPERATORS``, because the two sign conventions disagree: a
+        ``profit_loss_*`` stop is ``<``/``<=`` (P&L is negative while losing) while a
+        ``loss_pct_of_max_loss`` stop is ``>``/``>=`` (a loss MAGNITUDE, positive while
+        losing);
+      * everything else (TP gates, the REMAINING time exits, sentiment/rating flags) is
         discretionary. The ``days_opened`` time exit is DELIBERATELY discretionary —
-        the F7 brief's forced list was SL / DTE / breaker / margin only (the breaker
-        is deferred to F5's shared-rails work) — recorded so it is not re-litigated.
+        the F7 brief's forced list was SL / DTE / breaker / margin only — recorded so
+        it is not re-litigated. "Time exits are discretionary" is therefore NOT the
+        rule and never was: ``days_after_event`` is the counter-example, and the two
+        are pinned side by side in
+        ``packages/common/tests/test_earnings_event_timing_gates.py``.
+
+    THE BREAKER AND THE MARGIN CALL ARE NOT MISSING FROM THAT LIST — they never reach
+    this function. F5's shared-rails work has since landed (``update_sleeve_breaker`` is
+    called per bar by ``daily_engine._update_option_breakers`` and by the live
+    ``run_option_lifecycle_pass``), and a breaker stand-down flattens the book through
+    ``option_lifecycle.decide``'s ``LIFECYCLE_BREAKER`` while a margin call goes through
+    the account's liquidation — neither is a RULE, so neither has ``triggers`` for this
+    classifier to read. There is no ``ExpertEventType`` for either, and adding one is not
+    what forced classification needs: those paths choose their own quoting. (Review
+    2026-08-30 dev-merge, FIX 6 — the earlier note said the breaker was "deferred to F5",
+    which has been true of nothing since 2026-09-01.)
 
     The flag is inert in live by construction: only an account that models a spread
     (``option_modelled_half_spread``) lets ``CloseOptionAction`` act on it.
@@ -84,7 +183,8 @@ def forced_option_exit(event_action) -> bool:
         event_type = trigger.get("event_type")
         if event_type in _FORCED_EXIT_EVENT_TYPES:
             return True
-        if event_type in _PL_EVENT_TYPES and trigger.get("operator") in ("<", "<="):
+        loss_side = _LOSS_SIDE_STOP_OPERATORS.get(event_type)
+        if loss_side is not None and trigger.get("operator") in loss_side:
             return True
     return False
 
@@ -1122,6 +1222,10 @@ class TradeActionEvaluator:
                 'OpenJadeLizardAction': ExpertActionType.OPEN_JADE_LIZARD,
                 'OpenCallButterflyAction': ExpertActionType.OPEN_CALL_BUTTERFLY,
                 'OpenPutRatioSpreadAction': ExpertActionType.OPEN_PUT_RATIO_SPREAD,
+                'OpenCallBackspreadAction': ExpertActionType.OPEN_CALL_BACKSPREAD,
+                'OpenPutBackspreadAction': ExpertActionType.OPEN_PUT_BACKSPREAD,
+                'OpenPMCCAction': ExpertActionType.OPEN_PMCC,
+                'RollPMCCShortAction': ExpertActionType.ROLL_PMCC_SHORT,
                 'CloseOptionAction': ExpertActionType.CLOSE_OPTION,
             }
             
@@ -1164,8 +1268,13 @@ class TradeActionEvaluator:
                 ExpertActionType.OPEN_BULL_PUT_SPREAD: 1,
                 ExpertActionType.OPEN_STRADDLE: 1,
                 ExpertActionType.OPEN_STRANGLE: 1,
+                ExpertActionType.OPEN_PMCC: 1,
                 ExpertActionType.CLOSE: 2,
                 ExpertActionType.CLOSE_OPTION: 2,
+                # The overlay roll runs WITH the closes, not with the entries: it acts on a
+                # position that is already open. Ahead of them in the list only by the rules'
+                # own order, which is where first-match priority is decided.
+                ExpertActionType.ROLL_PMCC_SHORT: 2,
                 ExpertActionType.ADJUST_TAKE_PROFIT: 3,
                 ExpertActionType.ADJUST_STOP_LOSS: 3,
             }

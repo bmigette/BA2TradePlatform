@@ -651,8 +651,11 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
 
     3. IV/OPEN_INTEREST/VOLUME NON-NULL RATE (sampled, from symbols that actually have data): the
        entire reason this store exists over the incumbent options_history.sqlite is that
-       ``imp_volatility``/``open_interest`` were NULL across all 6,757,055 of ITS rows (see
-       parquet_store.py's COLUMNS docstring and warm_options_history.py's module docstring). A
+       ``open_interest`` is NULL across all 1,440,782 of ITS chain rows, with no bar column to
+       recover it (``imp_volatility`` is thin there rather than absent -- 46% of chain rows,
+       88.2% of bar rows -- re-measured 2026-08-31; see
+       ba2_common.core.option_selector._publishes_spread, parquet_store.py's COLUMNS docstring
+       and warm_options_history.py's module docstring). A
        silently-regressed fetch that stopped populating these fields would pass every other check
        here (files exist, non-empty, right shape) while quietly reproducing the exact defect this
        pipeline was built to fix. ``open``/``high``/``low``/``close`` are NOT sampled here: they
@@ -846,8 +849,8 @@ def print_options_cache_report(universe_path: Optional[str], iv_sample: int,
 # local copy rather than an import so this tool stays runnable without the backtest package on
 # the path; if the engine's table changes, update here too).
 _WARMUP_BARS_BY_EXPERT = {
-    "FactorRanker": 252,          # momentum_12_1 (12 months) -- the deepest non-option lookback
-    "PremiumSeller": 300,         # SMA-200/HV floor (options expert; excluded from equity grids)
+    "FactorRanker": 252,          # momentum_12_1 (12 months) -- the deepest lookback
+    # PremiumSeller (300 bars) removed 2026-08-31 with the expert's deletion (plan Task 12).
     "FMPRating": 10,
     "FMPEarningsDrift": 10,
     "FMPInsiderClusterBuy": 10,
@@ -935,8 +938,8 @@ def check_warmup_coverage(store_dir: str, provider_dir: str, interval: str, star
 
 # Experts the warmup-dependency check sizes against: every non-option expert a goal2020-style
 # equity grid runs. FactorRanker's 252-bar momentum dominates, so this is the deepest requirement
-# any equity job will derive. PremiumSeller (options, 300 bars) is excluded -- the options cache
-# floors at 2024 anyway, so it can never run a 2020 window.
+# any equity job will derive. (PremiumSeller — options, 300 bars — was excluded here until its
+# deletion, 2026-08-31: the options cache floors at 2024, so it could never run a 2020 window.)
 _warmup_experts = ["FactorRanker", "FMPRating", "FMPEarningsDrift",
                    "FMPInsiderClusterBuy", "FMPSenateTraderWeight"]
 

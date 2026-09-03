@@ -141,6 +141,70 @@ class SelectionPolicy:
                 and self.w_profit == 0.0 and self.w_rr == 0.0)
 
 
+#: The admissible range of every weight the GA ACTUALLY EMITS, and therefore the only range a
+#: rule reaching the live path can honestly claim. ONE SOURCE OF TRUTH, deliberately: the
+#: launcher's ``_OPTION_SELECTION_WEIGHT_BANDS`` samples inside these bounds and the live rule
+#: editor refuses outside them, so every weight a human can type is a weight the search could
+#: have produced. A live-only value would be a rule NO backtest can reproduce -- the exact
+#: backtest/live divergence this whole seam exists to prevent.
+#:
+#: The signs are the design's, not an accident. ``w_premium`` and ``w_iv`` are SIGNED because
+#: sellers want rich premium/vol and buyers want cheap, and which is right is the question the
+#: search settles. ``w_rvol`` is UNSIGNED because nobody wants an illiquid contract: a negative
+#: value would ask the picker to prefer the thinnest contract on the chain, which is not a
+#: strategy, it is a fill failure waiting to happen.
+#:
+#: ``w_box_center`` is absent because it is PINNED at 1.0 and is not a gene; ``w_spread``,
+#: ``w_profit`` and ``w_rr`` are absent because nothing emits them yet -- see the launcher's
+#: table for the evidence withholding each one.
+WIRED_WEIGHT_BANDS: Dict[str, Tuple[float, float]] = {
+    "w_premium": (-2.0, 2.0),
+    "w_iv": (-2.0, 2.0),
+    "w_rvol": (0.0, 2.0),
+}
+
+
+class SelectionWeightOutOfBand(ValueError):
+    """A selection weight outside ``WIRED_WEIGHT_BANDS``.
+
+    Its own type, not a bare ValueError, so a caller can name it in an ``except`` rather than
+    swallowing every ValueError the construction path can raise (BA2_ERROR_MODE is enforce:
+    a broad handler propagates unless the site names the type).
+    """
+
+
+def validate_wired_weights(weights: Dict[str, float]) -> None:
+    """Refuse a weight outside its band -- which includes NaN and the infinities.
+
+    FAIL CLOSED, and refuse at CONFIG time rather than silently clamping. Clamping would let a
+    rule display -5.0 while the picker ranked on -2.0, which is the "knob that lies" defect the
+    surrounding module is built to avoid; and a NaN weight scores every candidate NaN, whose
+    comparisons are all False, so the pick would silently collapse to list order.
+
+    An unknown key is refused too: ``w_profit`` forwarded here would name a real
+    ``SelectionPolicy`` field that no builder can rank on, so it would look wired and do
+    nothing.
+    """
+    for name, value in weights.items():
+        band = WIRED_WEIGHT_BANDS.get(name)
+        if band is None:
+            raise SelectionWeightOutOfBand(
+                f"{name!r} is not a wired selection weight; the GA emits only "
+                f"{sorted(WIRED_WEIGHT_BANDS)}")
+        lo, hi = band
+        # NaN AND THE INFINITIES FALL OUT OF THIS COMPARISON, and deliberately so rather than
+        # through a separate isfinite check: every comparison against NaN is False, so the
+        # chain is False and the guard fires. A dedicated branch for them was written first
+        # and killed no test, because this one already refuses all three -- so it was dead
+        # code dressed as a second rail. It matters that they ARE refused: a NaN weight does
+        # not error the pick, it scores every candidate NaN and silently collapses the choice
+        # to list order, which looks exactly like a policy that is working.
+        if not (lo <= value <= hi):
+            raise SelectionWeightOutOfBand(
+                f"{name}={value} is outside the searched band [{lo}, {hi}], so no backtest "
+                f"could have produced it and none can reproduce this rule")
+
+
 @dataclass(frozen=True)
 class PolicyContext:
     """Everything about the request that is not the candidate list.
@@ -635,6 +699,30 @@ def inapplicable_features(candidates: Sequence[OptionContract], ctx: PolicyConte
     lacks an IV is a data outage, not a shape that has no IV, and conflating the two would let a
     silent feed failure quietly disable a gene mid-run.
 
+    SO THE F17 CLAIM THIS FUNCTION BACKS IS NARROWER THAN IT SOUNDS, and the limit belongs next
+    to the rule that causes it. "An inert gene and a live-but-unhelpful one stop looking
+    identical" is TRUE ONLY OF ``profit`` AND ``rr`` — the two weights the grid WITHHOLDS. It is
+    false, by construction, of the three the grid actually EMITS (``premium``, ``iv``,
+    ``rvol``) and of ``spread``: this function can never name them, so a run in which one of
+    them is constant across every candidate — inert in exactly the sense that matters to a GA —
+    reports nothing at all. Whoever reads a grid post-mortem for "was this gene dead?" gets an
+    answer for the withheld pair and silence for the emitted three.
+
+    WHY IT IS NOT SIMPLY WIDENED (considered and declined 2026-08-31). Detecting an inert
+    emitted column is trivial — after ``_normalise`` a degenerate column is already constant, so
+    it is an O(n) test on numbers ``score_all`` has computed anyway. The cost is the plumbing:
+    the matrix lives inside ``score_all`` and the report is raised in
+    ``option_selector._policy_pick``, so honest reuse means threading a precomputed matrix
+    through ``score_all``/``pick``/``pick_with_reason`` — the exact widening of ``pick`` that
+    the Tasks 1-5 no-op guarantees rest on NOT happening (see ``pick_with_reason``'s "A SEPARATE
+    ENTRY POINT RATHER THAN A WIDER RETURN ON ``pick``"). Recomputing the columns instead would
+    reintroduce the second-pass defect that the shared payoff exists to remove. And a
+    per-pick log would fire per structure, per bar, per symbol — a single-candidate box makes
+    EVERY column constant, so the common case is noise, not signal. The question "can this gene
+    move a pick on this data?" is a once-per-RUN question about the store, and it is answered
+    that way in the launcher's ``_OPTION_SELECTION_WEIGHT_BANDS``, which records a measurement
+    per weight per store. That is where to look, and where to add to.
+
     An empty candidate list reports both features inapplicable, which is vacuously true and
     costs nothing: ``pick`` has already returned None before any weight is consulted.
 
@@ -1103,8 +1191,15 @@ def _eligible_and_reason(
 
 
 def score_all(candidates: Sequence[OptionContract], ctx: PolicyContext,
-              policy: SelectionPolicy) -> List[float]:
-    """The weighted score of each candidate. Higher wins."""
+              policy: SelectionPolicy,
+              payoff: Optional[PayoffColumns] = None) -> List[float]:
+    """The weighted score of each candidate. Higher wins.
+
+    ``payoff`` accepts an already-computed ``payoff_columns`` result and is forwarded into
+    ``feature_matrix``'s memo. A caller that also runs ``inapplicable_features`` for the same
+    pick (the ``select_single`` seam's applicability report) passes ONE object to both, so the
+    report describes the very numbers the ranking used and the 5039us pass runs once, not
+    twice. None — every caller that wants no report — computes lazily as before."""
     weights = {"box_center": policy.w_box_center, "premium": policy.w_premium,
                "iv": policy.w_iv, "rvol": policy.w_rvol, "spread": policy.w_spread,
                "profit": policy.w_profit, "rr": policy.w_rr}
@@ -1138,13 +1233,14 @@ def score_all(candidates: Sequence[OptionContract], ctx: PolicyContext,
     # immediate; with a default it would be a feature that exists, normalises, and is then
     # silently never scored -- the dead gene this module keeps legislating against.
     active = [name for name in FEATURE_NAMES if weights[name]]
-    m = feature_matrix(candidates, ctx, only=active)
+    m = feature_matrix(candidates, ctx, only=active, payoff=payoff)
     return [sum(weights[name] * m[name][i] for name in active)
             for i in range(len(candidates))]
 
 
 def pick(candidates: Sequence[OptionContract], ctx: PolicyContext,
-         policy: SelectionPolicy) -> Optional[OptionContract]:
+         policy: SelectionPolicy,
+         payoff: Optional[PayoffColumns] = None) -> Optional[OptionContract]:
     """The single best contract in the box, or None when the box is empty.
 
     THE TIE-BREAK IS THE EXISTING ONE. Ties resolve to the LOWEST STRIKE and then the EARLIEST
@@ -1161,18 +1257,21 @@ def pick(candidates: Sequence[OptionContract], ctx: PolicyContext,
     RETURNS THE CONTRACT ONLY, unchanged. ``pick_with_reason`` is the same computation and also
     says why there was nothing to return.
     """
-    return pick_with_reason(candidates, ctx, policy)[0]
+    return pick_with_reason(candidates, ctx, policy, payoff=payoff)[0]
 
 
 def pick_with_reason(
         candidates: Sequence[OptionContract], ctx: PolicyContext,
-        policy: SelectionPolicy) -> Tuple[Optional[OptionContract], Optional[SelectionRefusal]]:
+        policy: SelectionPolicy, payoff: Optional[PayoffColumns] = None,
+) -> Tuple[Optional[OptionContract], Optional[SelectionRefusal]]:
     """``pick``, plus a ``SelectionRefusal`` whenever it chose nothing.
 
-    THE SEAM ``_resolve()`` WILL USE. ``pick`` has no production caller yet, so this is designed
-    for the one that is coming rather than retrofitted around one that exists; it returns a pair
-    instead of raising because a refusal is DATA the risk manager triages beside every other
-    candidate on the bar, not an exception that unwinds the bar.
+    THE SEAM ``_resolve()`` WILL USE for triage. ``pick`` now has a production caller --
+    ``option_selector.select_single`` / ``select_vertical_spread`` route every non-default
+    policy through it (``_policy_pick``), which is what makes the GA-wired weights govern real
+    entry picks -- but the REASON half still waits for the risk manager's triage; it returns a
+    pair instead of raising because a refusal is DATA the risk manager triages beside every
+    other candidate on the bar, not an exception that unwinds the bar.
 
     A SEPARATE ENTRY POINT RATHER THAN A WIDER RETURN ON ``pick``, because the no-op guarantees
     of Tasks 1-5 all rest on ``pick`` being the very function the recorded-chain tests pin. Its
@@ -1186,7 +1285,23 @@ def pick_with_reason(
     cands, refusal = _eligible_and_reason(candidates, ctx)
     if not cands:
         return None, refusal
-    scores = score_all(cands, ctx, policy)
+    # A LENGTH MISMATCH MEANS THE PAYOFF DESCRIBES A DIFFERENT SET, SO IT IS DROPPED.
+    # ``eligible`` above can narrow the list, and a payoff computed over the wider one would
+    # misalign every column with the candidates actually being scored.
+    #
+    # This is a BACKSTOP, not the normal path, and the earlier note here justified it with a
+    # claim about its own callers that was false: it said "the delta/box filters run before
+    # anything payoff-shaped exists", when ``option_selector._policy_pick`` -- the only
+    # production caller that passes a shared ``payoff`` -- computed that payoff BEFORE this
+    # narrowing ran. On a narrowing chain the shared pass was therefore discarded here and
+    # ``score_all`` recomputed it: 2 passes, not the 1 the sharing promises. ``_policy_pick``
+    # now narrows FIRST and builds the payoff on the eligible set, so the lengths match and
+    # this branch does not fire for it. The check stays for any future caller that has not
+    # been taught the ordering -- silently scoring misaligned columns is far worse than
+    # paying for a second pass.
+    if payoff is not None and len(cands) != len(candidates):
+        payoff = None
+    scores = score_all(cands, ctx, policy, payoff=payoff)
     best = min(range(len(cands)),
                key=lambda i: (-scores[i], cands[i].strike, cands[i].expiry))
     return cands[best], None

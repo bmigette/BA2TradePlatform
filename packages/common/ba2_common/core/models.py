@@ -212,9 +212,14 @@ class Transaction(SQLModel, table=True):
                                         description="The INTENT: bull_call_spread, iron_condor, "
                                                     "covered_call... None for equity.")
     expiry: date | None = Field(default=None, index=True,
-                                description="The structure's expiry. Valid as a single value ONLY "
-                                            "because every supported structure is single-expiry "
-                                            "(no calendars/diagonals). See Task 2.")
+                                description="The structure's expiry, as a SUMMARY: set only when "
+                                            "every leg shares one date, which is all 16 "
+                                            "single-expiry structures. NULL for a strategy in "
+                                            "option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES (pmcc) "
+                                            "— a diagonal has no single expiry, and the record "
+                                            "there is the per-leg TradingOrder child rows, read "
+                                            "via option_expiry.resolve_structure_expiry. NULL is "
+                                            "also 'not recorded'. See Task 2, Task 6-PRE.")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
     # JSON field for storing additional data (e.g., TradeConditionsData)

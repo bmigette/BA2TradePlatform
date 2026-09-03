@@ -2012,6 +2012,15 @@ def _build_daily_trial_config(
         # for the same reason as the line above -- this dict is a whitelist, so a knob absent from
         # it is inert while every log upstream still claims the run is robustness-ranked.
         "robust_fitness": backtest_cfg.get("robust_fitness"),
+        # RUN-LEVEL trade-frequency objective (grid 2's lower floor for the long-dated option
+        # keys, ba2test_launcher._apply_option_trade_floor). Same whitelist reason as the two
+        # lines above: omitted here, the floor would be parsed, stored, echoed by the launcher
+        # and then silently replaced per trial by the expert/platform default -- every
+        # long-dated genome disqualified by a floor the run had explicitly lowered, with
+        # nothing in any log to say so. None (every existing job) leaves
+        # ``_car_trade_thresholds_for_experts`` on its expert/default resolution exactly.
+        "car_hard_min_trades_per_year": backtest_cfg.get("car_hard_min_trades_per_year"),
+        "car_min_trades_per_year": backtest_cfg.get("car_min_trades_per_year"),
         # Optimizer-decoded TradeRule lists (unified rule model, migration 028): the engine
         # seeds the ENTER_MARKET / OPEN_POSITIONS rulesets 1:1 from these (one EventAction per
         # rule, all actions + continue_processing verbatim; disabled rules/actions already

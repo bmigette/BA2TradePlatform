@@ -31,17 +31,50 @@ The parquet cache (`TastyTradeOptionsProvider`, 857 underlyings, bars
 ## 2. Strategy keys and genes (each its own searched space)
 
 ### Long-dated family
-**`O_LEAPC` — stock-replacement long call.** Delta-selected (new strike method,
-§6.1). Genes: target delta 0.70–0.90 step 0.05; entry DTE 365–550; roll/exit
-DTE floor 90–240 (exit before the decay/gamma zone); `opt_sl_ml`; sizing.
+> **LANDED AS (operator decision, 2026-09-02, superseding the two-key text
+> below): `O_LEAPC`/`O_LEAPP` are NOT two launchable keys — they are the two
+> toggleable ARMS of ONE signal-driven group key `O_LEAP`** (a bullish
+> `buy_call` arm and a bearish `buy_put` arm, one shared entry-gate table per
+> arm via `_option_entry_rule(member, toggleable=True)`, one shared exit
+> ruleset). The expert's directional signal (bullish/bearish) picks which arm
+> can fire — there is no separate `kind` gene; `has_no_position` is
+> per-instrument, so both arms can never open on the same underlying at once.
+> The per-arm `enabled` gene comes free with the group builder, so the GA can
+> drop a direction outright in a one-sided regime. Each arm keeps its own row
+> (and so its own gene table) below — a row IS a gene table — but only
+> `O_LEAP` is a launchable strategy key.
 
-**`O_LEAPP` — bearish twin.** Same builder, `kind=put`, same genes. The grid's
+**`O_LEAPC` — stock-replacement long call arm.** Delta-selected (new strike
+method, §6.1). Genes: target delta 0.70–0.90 step 0.05; entry DTE 365–550;
+roll/exit DTE floor 90–240 (exit before the decay/gamma zone); `opt_sl_ml`;
+sizing.
+
+**`O_LEAPP` — bearish arm.** Same builder, `buy_put`, same genes. The grid's
 only bearish long-dated arm.
 
 **`O_PMCC` — poor man's covered call** (diagonal, wheel-pattern lifecycle, §3–4).
 LEAPS leg delta 0.75–0.85, DTE ≥365; short-call overlay delta 0.15–0.30, DTE
 30–45, rolled at expiry or buyback trigger (% of credit decayed — searched);
 shares the LEAPS roll-floor gene.
+
+> **LANDED AS (2026-09-02, plan Task 6): a launchable phase-1 key.** The two-expiry
+> lifecycle is a RULESET, not an engine hook — `open_pmcc` opens both legs as one
+> structure (two expiries, per-leg child rows), and the OPEN_POSITIONS ruleset carries
+> three rules ahead of the ordinary closes: `pmcc_roll_dte`
+> (`short_leg_days_to_expiry <= N`, 1–7, NOT toggleable — with the roll off a PMCC is a
+> diagonal waiting to be assigned) and `pmcc_roll_buyback` (`credit_decayed_pct >= N`,
+> 50–90, toggleable) both firing `roll_pmcc_short`, plus `pmcc_delta_floor`
+> (`long_leg_delta < N`, 0.40–0.60, toggleable) closing BOTH legs. Two rules rather than
+> one OR because a rule's leaves are ANDed. **The overlay's DTE window (30–45) is a fixed
+> action param, not a gene** — the design states it as one band, and at pop 40 the budget
+> belongs to the two deltas and the roll trigger. **The rolled overlay is re-selected from
+> the box the ENTRY stamped on its order row**, so the roll rule carries no selection genes
+> of its own: one overlay thesis per genome. Max loss = the net debit measured by the
+> shared payoff evaluator (§3's intrinsic floor, no new arithmetic), restamped downward by
+> each roll's credit; charged COVERED because `structure_metrics` pairs the short call with
+> the long of the same right. `O_CAL` remains phase-2 and is one line away: add
+> `"calendar_spread"` to `option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES` and a row to
+> `_OPTION_STRATS`.
 
 ### Event family
 **`O_ERN` — earnings long vol.** Buy a straddle (or strangle — structure
@@ -55,6 +88,19 @@ not already bid); sizing; `opt_sl_ml` searchable, default OFF (the thesis is
 binary; a stop mid-event amputates it). Uses the FMP earnings-dates provider
 (FMPEarningsDrift already consumes it). Daily-bar caveat: entries/exits pin to
 closes; the intraday earnings-day price is not modelled — stated, accepted.
+
+> **LANDED AS (2026-09-02, plan Task 14b item 5):** the delta 0.25–0.45 band
+> above was designed from the start but not expressible until this date —
+> `OpenStrangleAction` hard-coded `method="percent_otm"` at both leg-selection
+> sites until it learned the delta method (now passes `self.strike_method` on
+> BOTH legs; the selector ranks on ABSOLUTE delta, so one target on both legs
+> is symmetric — 0.35 picks a call above spot and a put below it at matching
+> `|delta|`). `option_strike_delta` is a STILL-CONDITIONAL domain, not a dead
+> gene: `open_straddle` is ATM by definition (both legs on the strike nearest
+> spot) and stays deliberately OFF the strike-method registry (see
+> `OpenStraddleAction`'s own docstring) — the gene is inert on the straddle
+> arm and live on every strangle genome, the same shape a conditional-domain
+> gene takes anywhere else in this design.
 
 ### Convexity-financed family
 **`O_CBS` / `O_PBS` — call / put ratio backspreads** (sell 1 nearer, buy 2
@@ -130,8 +176,10 @@ no-contract trials.
 ## 7. Matrix
 
 - Singles only, one job per (strategy × expert) — attribution stays clean, the
-  S1–S7 shape. Phase 1: {O_LEAPC, O_LEAPP, O_PMCC, O_ERN, O_CBS, O_PBS} ×
-  stage-1's experts → 12–18 jobs. Phase 2 adds O_CAL.
+  S1–S7 shape. Phase 1: {O_LEAP, O_PMCC, O_ERN, O_CBS, O_PBS} × stage-1's
+  experts → 12–18 jobs (O_LEAP LANDED AS the merged O_LEAPC/O_LEAPP group key,
+  §2 above; O_PMCC became launchable 2026-09-02, plan Task 6). Phase 2 adds
+  O_CAL.
 - **Fitness `option_car`** for every key in this grid. Window 2023-01 →
   2025-12, 2026 held out. Long-dated keys get the explicit commented lower
   trade floor; O_ERN does not need it.
@@ -190,8 +238,17 @@ EMIT:
 - `w_vol_cheapness` — historical move ÷ current implied move (straddle price
   from the options cache; bar iv 88% populated, measured). The only feature
   comparing what you PAY to what you GET — the prior favourite.
-- `min_analysts` (1–5, searchable gate) and `allow_unconfirmed_dates` (on/off —
+- `min_analysts` (searchable gate) and `allow_unconfirmed_dates` (on/off —
   estimated dates slip; a slipped date buys vol for nothing).
+
+> **AMENDMENT (2026-09-01), LANDED (plan Task 11):** `min_analysts`' range is
+> **0–5, with 0 = the gate OFF** — measured: the original 1–5 band's default
+> of 3 refuses 66% of the universe at a 2023 as-of and 47% at 2025, a
+> decaying strictness that tilts the traded universe across the window. The
+> expert's DEFAULT (not the gene's) is lowered to **1** — a data-quality
+> floor (at least one analyst covers the name), not a selection filter — and
+> this measurement is recorded beside the setting in
+> `packages/experts/ba2_experts/FMPEarningsEvent.py`.
 
 WITHHELD until verified point-in-time (recorded, not silently dropped):
 - `w_dispersion` — ~3 in-window estimate rows/symbol and 1-analyst degeneracy

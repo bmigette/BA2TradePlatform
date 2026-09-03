@@ -138,9 +138,14 @@ SCREENER_PROVIDERS: Dict[str, Type[ScreenerProviderInterface]] = {
 # measured 2024-01-18 history floor at every tier; "thetadata" exists to reach further
 # back (4-12y by tier) and needs a locally-running Theta Terminal rather than an API key.
 # "tastytrade" reads dxfeed, which serves daily candles for ALREADY-EXPIRED contracts and
-# is the only one of the three whose bars carry imp_volatility and open_interest -- the two
-# fields that are NULL across all 6,757,055 rows of the incumbent cache and that therefore
-# kill delta selection and min_open_interest in backtest.
+# is the only one of the three whose bars carry imp_volatility and open_interest.
+# PRECISELY WHAT THAT BUYS, re-measured 2026-08-31 (the full record is in
+# ``ba2_common.core.option_selector._publishes_spread``): of the incumbent cache's 1,440,782
+# option_chain rows, open_interest is NULL on ALL of them and no option_bar column recovers
+# it, so min_open_interest is genuinely un-answerable there. IV/delta are NOT: they are
+# populated on 46% of chain rows and 88.2% of the 19,484,995 option_bar rows. An earlier
+# version of this note said both fields were NULL across "all 6,757,055 rows" -- a row count
+# that matches no table in the file, and a claim that only ever held for open_interest.
 OPTIONS_PROVIDERS: Dict[str, Type[OptionsDataProviderInterface]] = {
     "alpaca": AlpacaOptionsProvider,
     "thetadata": ThetaDataOptionsProvider,

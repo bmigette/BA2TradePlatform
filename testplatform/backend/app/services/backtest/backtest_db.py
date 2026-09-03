@@ -140,14 +140,49 @@ def backtest_trading_db(run_id: int | str, in_memory: bool = True) -> Iterator[s
     # nothing needs persisting. File-backed runs stay on SQLite (rows must survive on disk).
     store_ctx = (trade_store.inmem_trades()
                  if (in_memory and _inmem_trades_enabled()) else nullcontext())
+    # The option risk manager keeps per-sleeve PROCESS state -- the drawdown breaker latch,
+    # the charges for structures submitted but not yet visible in the book, and the decision
+    # journal. It is keyed per thread while a backtest trade store is active, so CONCURRENT
+    # trials cannot see each other; SEQUENTIAL trials on one worker thread would still
+    # inherit the previous trial's latch, and a run whose sleeve starts halted because an
+    # earlier genome drew down is not reproducible. Cleared at BOTH ends of the run (the two
+    # calls below): on the way in so this trial starts clean, and on the way out so nothing
+    # leaks into live code paths on this thread.
+    #
+    # reset_thread_state, NOT reset_state: the latter is a bare .clear() on three
+    # process-wide dicts, so under --parallel > 1 the first trial to finish wiped every
+    # sibling's latch, charges and journal and left them trading against a sleeve the rails
+    # believed was empty. This clears only the keys THIS thread filed and never the live
+    # (None, expert) keys.
+    from ba2_common.core import OptionRiskManagement as option_rm
+    option_rm.reset_thread_state()
     try:
         with store_ctx:
             yield target
     finally:
-        # Drop THIS thread's override so the backtest DB never leaks into subsequent (live) code
-        # paths or other trials on this thread. (A file DB is left on disk for post-mortem; the
-        # in-memory DB is freed when its engine is disposed by clear_threadlocal_db.)
-        common_db.clear_threadlocal_db()
+        # Sequential trials on ONE worker thread share a sleeve key (both in-memory, same
+        # thread), so without this the next genome inherits this one is latch and its
+        # in-flight charges -- a trial that opens nothing because an EARLIER trial drew
+        # down is not reproducible. Clearing on the way OUT also stops the state leaking
+        # into live code paths on this thread.
+        #
+        # NESTED try/finally, so the DB override is dropped even if the sleeve reset raises.
+        # It did: ``reset_thread_state`` iterated the shared stores unsynchronised and a
+        # sibling trial's write made it raise ``RuntimeError: dictionary changed size during
+        # iteration`` -- and because it is the FIRST statement here, that raise skipped
+        # ``clear_threadlocal_db()`` and left this worker thread pointed at the finished
+        # run's database for every later piece of work, live paths included. The race itself
+        # is fixed at source (``OptionRiskManagement._STATE_LOCK``); this ordering is what
+        # stops ANY future failure in the reset from mis-routing a thread's database. The
+        # exception still propagates -- nothing here swallows it.
+        try:
+            option_rm.reset_thread_state()
+        finally:
+            # Drop THIS thread's override so the backtest DB never leaks into subsequent (live)
+            # code paths or other trials on this thread. (A file DB is left on disk for
+            # post-mortem; the in-memory DB is freed when its engine is disposed by
+            # clear_threadlocal_db.)
+            common_db.clear_threadlocal_db()
 
 
 def seed_account_definition(

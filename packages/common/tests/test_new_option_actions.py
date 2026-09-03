@@ -249,17 +249,37 @@ def test_evaluator_maps_new_option_action_classes(class_name, expected_type):
 
 
 def test_evaluator_option_type_lists_cover_all_option_actions():
-    """Every option ExpertActionType in the canonical get_option_action_values() must be
-    routed by the evaluator's execute() order-creating list (so the action submits)."""
-    from ba2_common.core.types import get_option_action_values
-    from ba2_common.core.TradeActionEvaluator import _OPTION_ENTRY_ACTION_TYPES
+    """Every option ExpertActionType must be ROUTED by the evaluator, and the ENTRY list must
+    be exactly the actions that select from a chain.
+
+    Two claims, and they used to be one because there was exactly one non-entry option action.
+    ``roll_pmcc_short`` (plan Task 6) is the second: it acts on a position that already exists
+    and re-selects its overlay from the spec the ENTRY stamped on the order row, so a
+    selection param forwarded to it would be a knob nothing reads. The entry set is therefore
+    derived from the shared classifier rather than by subtracting ``CLOSE_OPTION`` here — one
+    classification, so this test and every "for each entry builder" audit cannot disagree.
+
+    The ROUTING claim is the one that actually protects "the action submits": an option action
+    in neither branch reaches ``create_action`` with no kwargs at all, which for a builder that
+    needs a strike is a silent no-op.
+    """
+    from ba2_common.core.types import (
+        get_option_action_values, get_option_entry_action_values,
+    )
+    from ba2_common.core.TradeActionEvaluator import (
+        _ALL_OPTION_ACTION_TYPES, _OPTION_ENTRY_ACTION_TYPES,
+    )
 
     canonical = {ExpertActionType(v) for v in get_option_action_values()}
-    # CLOSE_OPTION is routed too but is not an "entry"; entry list = canonical - {CLOSE_OPTION}
-    expected_entries = canonical - {ExpertActionType.CLOSE_OPTION}
-    assert expected_entries.issubset(_OPTION_ENTRY_ACTION_TYPES), (
-        f"missing from evaluator entry list: {expected_entries - _OPTION_ENTRY_ACTION_TYPES}"
-    )
+    assert canonical == _ALL_OPTION_ACTION_TYPES, "an option action the evaluator cannot route"
+
+    expected_entries = {ExpertActionType(v) for v in get_option_entry_action_values()}
+    assert expected_entries == _OPTION_ENTRY_ACTION_TYPES, (
+        f"evaluator entry list disagrees with the classifier: "
+        f"{expected_entries ^ _OPTION_ENTRY_ACTION_TYPES}")
+    # The non-entry option actions, named so a future addition is a deliberate edit here.
+    assert canonical - expected_entries == {ExpertActionType.CLOSE_OPTION,
+                                            ExpertActionType.ROLL_PMCC_SHORT}
 
 
 def test_evaluator_forwards_wing_width_pct():

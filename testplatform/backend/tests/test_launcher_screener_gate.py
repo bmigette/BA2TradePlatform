@@ -60,15 +60,23 @@ def test_per_strategy_override_wins(monkeypatch):
 
 
 def test_group_merges_active_member_overrides(monkeypatch):
-    # _OPTION_GROUPS (post affordability filter) trims OS2 to [O_SSTG, O_SSTD, O_IC] --
-    # O_CSP is a full-notional kind and excluded from the DEFAULT grouped search (it only runs
-    # as an explicit single-strategy job). O_SSTG/O_SSTD now carry REAL $300 caps
-    # (F4, 2026-08-30), so overriding the FIRST member alone no longer proves the merge -- a
-    # later real value would still win. Override the LAST live member (O_IC, uncapped by
-    # default) to prove the merge order against real neighbors too.
-    assert L._OPTION_GROUPS["OS2"] == ["O_SSTG", "O_SSTD", "O_IC"]
+    # _OPTION_GROUPS applies BOTH filters, so OS2's active set is [O_IC] alone: O_CSP is a
+    # full-notional kind (explicit single-strategy jobs only) and O_SSTG/O_SSTD left the
+    # searched set on 2026-08-31 (unbounded risk). Dev's F4 reading of this test -- "override
+    # the LAST live member because O_SSTG/O_SSTD now carry real $300 caps that would win a
+    # later merge" -- is moot here: those rows are no longer merged at all (their caps stay on
+    # the rows as inert record, and the next test pins that they cannot leak in).
+    assert L._OPTION_GROUPS["OS2"] == ["O_IC"]
     monkeypatch.setitem(L._OPTION_STRATS["O_IC"], "screener_gate_base", {"price_max": 55.0})
     assert L._screener_gate_base_for_strategy("OS2")["price_max"] == 55.0
+
+
+def test_an_excluded_members_override_never_reaches_its_group(monkeypatch):
+    """The merge reads ACTIVE members only. O_SSTG left the searched set 2026-08-31
+    (unbounded risk -- _UNDEFINED_RISK_MEMBERS), so an override on its row must not leak
+    into OS2's gate settings."""
+    monkeypatch.setitem(L._OPTION_STRATS["O_SSTG"], "screener_gate_base", {"price_max": 55.0})
+    assert "price_max" not in L._screener_gate_base_for_strategy("OS2")
 
 
 def test_base_json_beats_cli_default_and_loses_to_strategy(tmp_path, monkeypatch):

@@ -206,6 +206,39 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             raw=dict(info) if isinstance(info, dict) else {},
         )
 
+    def true_equity(self) -> Optional[float]:
+        """This account's REAL equity: cash plus positions marked to market, UNCAPPED.
+
+        CONCRETE, and for every real broker it is exactly
+        ``get_account_snapshot().equity`` -- a broker publishes one equity and there is
+        nothing to un-cap. Overriding it is a simulator's job.
+
+        WHY THE SEAM EXISTS (review finding, 2026-09-01). ``BacktestAccount`` may be run
+        under a fixed-notional equity cap, and every money accessor it publishes is deliberately
+        clamped to ``deployed_equity() = min(cap, cash + mark-to-market)`` so that sizing,
+        buying power and margin all spend the capped dollars. That clamp is ONE-SIDED: it
+        compresses peaks and never troughs. A drawdown measured on it is therefore not a
+        drawdown at all -- a 50k-capped account that goes 100k -> 64k, a true -36%, reads
+        50k -> 50k and 0.0%, so a risk breaker built on the capped figure never fires in a
+        backtest and fires live. The backtest's equity-cap module states the same rule for the metrics
+        ("feeding the capped figure into scoring would report zero P&L for every period
+        spent above the cap") and ships ``capped_drawdown_curve`` for exactly that reason.
+
+        TWO QUESTIONS, TWO ANSWERS, and callers must not confuse them:
+
+          * *how many dollars may I deploy?* -> ``get_account_snapshot().equity``, the
+            capped seam. Sizing rails (``max_deployment_pct``, ``max_notional_leverage``)
+            keep reading it: a sizer must respect the cap.
+          * *how much have I actually lost from my peak?* -> this. The drawdown breaker
+            reads it, in both runtimes, through one shared function
+            (``OptionRiskManagement.update_sleeve_breaker``). The runtime difference lives
+            HERE, in the account's honest answer, not in forked breaker logic.
+
+        ``None`` means UNKNOWN and never zero, exactly as on ``AccountSnapshot``: a
+        fabricated 0.0 is a measured 100% drawdown.
+        """
+        return self.get_account_snapshot().equity
+
     def get_cash_transfers(
         self,
         start_date: Optional[date] = None,
@@ -888,6 +921,56 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         pass
 
+    @staticmethod
+    def _restamp_declared_multi_expiry_max_loss(transaction, orders) -> Optional[float]:
+        """Re-derive a DECLARED two-expiry structure's ``max_loss_per_contract`` from its
+        EXECUTED fills, and write it onto the entry order. Returns the value, or ``None``.
+
+        Called from ``refresh_transactions``' per-transaction loop (see the comment at the
+        call site for why that is the seam), and a no-op for everything else: the strategy
+        must be a member of ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``, which is opt-in,
+        so a single-expiry structure's stamp is written once at submit and never touched
+        again -- byte-identical to before this existed.
+
+        THE ROW IT WRITES is the ENTRY order: the oldest parentless option order of the
+        transaction, which is where ``_submit_option_order`` stamped the entry measurement and
+        where ``LossPctOfMaxLossCondition`` reads its denominator. "Oldest" is by id and is
+        load-bearing: after a roll the transaction has TWO parentless option orders, and the
+        roll's is not the row the stamps live on.
+
+        Unmeasurable leaves the existing stamp ALONE (see ``max_loss_from_fills``), and a
+        value equal to what is already there writes nothing -- so a per-bar refresh over a
+        settled position costs one comparison, not a row update.
+        """
+        from ba2_common.core.db import update_instance
+        from ba2_common.core.option_expiry import is_multi_expiry_strategy
+        from ba2_common.core.types import AssetClass
+
+        if not is_multi_expiry_strategy(getattr(transaction, "option_strategy", None)):
+            return None
+        parents = [o for o in orders
+                   if getattr(o, "asset_class", None) == AssetClass.OPTION
+                   and getattr(o, "parent_order_id", None) is None
+                   and not getattr(o, "contract_symbol", None)]
+        if not parents:
+            return None
+        entry = min(parents, key=lambda o: (o.id is None, o.id or 0))
+
+        from ba2_common.core.OptionRiskManagement import max_loss_from_fills
+
+        structures = entry.filled_qty or entry.quantity
+        derived = max_loss_from_fills(orders, structures,
+                                      int(getattr(entry, "multiplier", None) or 100))
+        if derived is None:
+            return None
+        data = dict(getattr(entry, "data", None) or {})
+        if data.get("max_loss_per_contract") == derived:
+            return derived
+        data["max_loss_per_contract"] = derived
+        entry.data = data
+        update_instance(entry)
+        return derived
+
     def refresh_transactions(self) -> bool:
         """
         Refresh/synchronize transaction states based on linked order and position states.
@@ -949,6 +1032,29 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
 
                     if not orders:
                         continue
+
+                    # THE INTRINSIC-FLOOR RESTAMP, for the ONE kind of structure whose risk
+                    # basis moves after entry: a declared two-expiry position (PMCC today,
+                    # calendars in phase 2), whose max loss is the long's debit less every
+                    # credit its rolling overlay has banked (design 2026-08-31 §3).
+                    #
+                    # THIS IS THE SEAM BECAUSE IT IS THE ONE PLACE BOTH RUNTIMES OBSERVE A
+                    # FILL. There is exactly one implementation of this method: the backtest
+                    # account overrides it only to re-stamp wall-clock dates onto the
+                    # simulated clock and delegates the lifecycle itself to ``super()``, and
+                    # no live account overrides it at all -- the broker-specific work is
+                    # ``refresh_orders``, which lands the fills this loop then rolls into the
+                    # transaction. So the derived stamp is written by one function for the
+                    # synchronous backtest fill and the asynchronous live one alike.
+                    #
+                    # EQUITY DOES ZERO WORK, structurally rather than by hope: an equity
+                    # transaction's ``option_strategy`` is None, so this is one attribute read
+                    # and one ``is None`` test -- the derivation is never called, and neither
+                    # is its import. Pinned by
+                    # ``test_an_equity_transaction_never_reaches_the_option_restamp``.
+                    strategy = getattr(transaction, "option_strategy", None)
+                    if strategy is not None:
+                        self._restamp_declared_multi_expiry_max_loss(transaction, orders)
 
                     # Separate orders into market entry orders and TP/SL orders
                     market_entry_orders = [o for o in orders if not o.depends_on_order]

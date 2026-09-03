@@ -21,6 +21,13 @@ from ba2_common.core.failure_modes import absorb_if_benign
 # than re-invented so the engine, the live service, the UI and the conditions all raise
 # and catch the same class. See its docstring for the 2026-07-03 incident.
 from ba2_common.core.portfolio_allocation import PositionFetchFailed
+# The earnings-event STAMP CONTRACT (design 2026-08-31 leaps-grid S9): the key paths the
+# ranking expert writes and the two O_ERN timing conditions below read back. Shared with
+# TradeActions, which stamps the event date onto the entry order at submit.
+from ba2_common.core.earnings_stamp import (
+    order_event_date,
+    stamped_days_to_earnings,
+)
 
 
 # --- Provider-injection seam -------------------------------------------------
@@ -1835,6 +1842,178 @@ class ProfitLossPercentCondition(CompareCondition):
             return None
         return f"{self.calculated_value:.2f}%"
 
+
+class LossPctOfMaxLossCondition(CompareCondition):
+    """Unrealized LOSS as a percentage of the position's persisted DEFINED maximum loss.
+
+    value = -pnl_amount / (max_loss_per_contract x contracts) x 100 -- POSITIVE while
+    losing, +100 when the whole defined risk is gone, NEGATIVE while profitable (so a
+    ``>`` stop can never fire on a winner). Scale-free by construction: the denominator
+    carries the same contract count the P&L already does, so 1 contract and 5 read the
+    same percentage -- the property a %-of-credit stop (``opt_sl``) does not have.
+
+    THE DENOMINATOR IS READ BACK, NEVER RECONSTRUCTED. ``TradeActions._submit_option_order``
+    persisted ``max_loss_per_contract`` onto the parent order's ``data`` beside
+    ``option_reserve`` (design 2026-08-29 S8.2), and ONLY when ``option_payoff.max_loss``
+    returned MEASURED. A structure with no measured max loss (a short call; a broken
+    quote) has NO key, which is "contracts that support it" enforced by the data: this
+    condition then refuses to evaluate rather than special-casing structure shapes here.
+
+    UNKNOWN NEVER FIRES -- the ``DaysToExpiryCondition`` discipline. An absent key, a
+    zero/negative/stringly-typed/NaN persisted value, an unknowable contract count, or a
+    P&L that cannot be resolved each leave ``calculated_value`` None and ``evaluate()``
+    False for EVERY operator. The two defaults specifically refused:
+
+    * absence read as some number -> a stop fires on a position whose risk was never
+      measured (the worst available failure: it closes positions on sight);
+    * unevaluable read as 0 % -> any ``<`` gate fires for every position we merely
+      failed to price, while looking configured.
+    """
+
+    def _defined_risk_dollars(self) -> Optional[float]:
+        """``max_loss_per_contract x contracts`` in dollars, or None -- no measurement.
+
+        The number-or-None reading reuses ``option_payoff._numeric``, the module rule for
+        "is this a usable quantity" (rejects bool, str, NaN, infinity) -- the persisted
+        value must never be *parsed* into firing, only read.
+        """
+        from ba2_common.core.option_payoff import _numeric
+
+        order = self.existing_order
+        data = getattr(order, "data", None)
+        per_contract = _numeric((data or {}).get("max_loss_per_contract"))
+        if per_contract is None or per_contract <= 0:
+            return None
+        contracts = _numeric(getattr(order, "filled_qty", None))
+        if contracts is None or contracts == 0:
+            contracts = _numeric(getattr(order, "quantity", None))
+        if contracts is None or contracts == 0:
+            return None
+        return per_contract * abs(contracts)
+
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                self.calculated_value = None
+                return False
+
+            # Denominator FIRST: it is a pure row read, while the P&L fetches option
+            # quotes -- and a structure that never persisted a max loss should cost
+            # nothing per bar.
+            denominator = self._defined_risk_dollars()
+            if denominator is None:
+                self.calculated_value = None
+                return False
+
+            pnl = _get_pnl_for_condition(self)
+            if pnl is None:
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = -pnl['amount'] / denominator * 100.0
+            return self.operator_func(self.calculated_value, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating loss_pct_of_max_loss condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if unrealized loss for {self.instrument_name} is "
+                f"{self.operator_str} {self.value}% of the structure's max loss")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.2f}% of max loss"
+
+
+class ProfitMultipleOfPremiumCondition(CompareCondition):
+    """Current structure value as a MULTIPLE of the entry premium paid (LONG/debit only).
+
+    value = current_structure_value / entry_premium. ``_get_pnl_for_condition`` (single-leg
+    via ``TransactionHelper.calculate_option_pnl``, multi-leg via
+    ``_get_spread_pnl_via_transaction``) already computes ``pnl_pct = pnl_amount /
+    (entry_premium x contracts x multiplier) x 100`` for both paths, and
+    ``current_structure_value = entry_premium + pnl_amount / (contracts x multiplier)``, so:
+
+        multiple = current_structure_value / entry_premium = 1 + pnl_pct / 100
+
+    SCALE-FREE by the same construction as ``LossPctOfMaxLossCondition``: the denominator
+    the P&L machinery divides by already carries the same contract count the numerator
+    does, so 1 contract and 5 contracts read the identical multiple.
+
+    A "multiple of premium PAID" is only a coherent number for a DEBIT entry (a long
+    option, or a net-debit spread) -- there is no such multiple for a credit RECEIVED. The
+    persisted ``open_price`` is always an absolute magnitude (see
+    ``_get_spread_pnl_via_transaction``'s docstring: "a stored absolute value prices
+    identically"); the SIGN lives entirely in ``transaction.side`` -- BUY == debit ==
+    positive premium, SELL == credit == negative. So this condition refuses to evaluate,
+    NEVER firing in EITHER operator direction, whenever the transaction is not a BUY.
+    That check is a pure row read, done BEFORE the P&L fetch (which hits live option
+    quotes) -- mirroring ``LossPctOfMaxLossCondition``'s "denominator first" ordering, so a
+    credit structure costs nothing extra per bar.
+
+    UNKNOWN NEVER FIRES -- the ``DaysToExpiryCondition``/``LossPctOfMaxLossCondition``
+    discipline. No ``existing_order``, no resolvable transaction, a credit (SELL) entry, or
+    a P&L ``_get_pnl_for_condition`` cannot resolve (missing quote, missing multiplier, an
+    already-flat structure) each leave ``calculated_value`` None and ``evaluate()`` False
+    for EVERY operator. The two defaults specifically refused:
+
+    * a credit structure reads as firing (denominator sign mishandled) -> a TP fires on a
+      position that never paid a premium to be "worth a multiple of";
+    * unevaluable read as 0 -> ``profit_multiple_of_premium < N`` fires on sight for any
+      position we merely failed to price.
+
+    This is a PROFIT-side gate (like ``profit_loss_percent``'s ``>`` reading), never a
+    stop -- see ``TradeActionEvaluator._LOSS_SIDE_STOP_OPERATORS``, which deliberately
+    omits it so a rule naming this field classifies DISCRETIONARY, not forced.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                self.calculated_value = None
+                return False
+
+            from ba2_common.core.types import OrderDirection
+
+            transaction = _get_transaction_for_order(self.existing_order)
+            if transaction is None:
+                self.calculated_value = None
+                return False
+
+            # Side FIRST -- a pure row read, cheaper than the option-quote fetch
+            # _get_pnl_for_condition does, and a credit entry never qualifies.
+            if transaction.side != OrderDirection.BUY:
+                self.calculated_value = None
+                return False
+
+            pnl = _get_pnl_for_condition(self)
+            if pnl is None:
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = 1.0 + pnl['percent'] / 100.0
+            return self.operator_func(self.calculated_value, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating profit_multiple_of_premium condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if current value for {self.instrument_name} is "
+                f"{self.operator_str} {self.value}x the entry premium paid")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.2f}x"
+
+
 # Confidence Condition Implementation
 class ConfidenceCondition(CompareCondition):
     """Compare expert confidence value."""
@@ -2713,6 +2892,12 @@ class DaysToEarningsCondition(CompareCondition):
     Unknown is never a value: with no usable evaluation date or no upcoming earnings from
     either source, ``calculated_value`` stays None and ``evaluate()`` returns False for every
     operator.
+
+    NOT the condition a CHAINED earnings strategy should use. When the entry runs behind an
+    expert that already ranked the event (``FMPEarningsEvent``), the gate belongs on
+    ``rec_days_to_earnings`` -- the distance THAT expert stamped on the recommendation --
+    so the timing and the rank cannot disagree (design 2026-08-31 leaps-grid S9). This one
+    stays the answer for UNCHAINED uses: any expert, no stamp required.
     """
 
     #: How far past the evaluation bar to read the earnings calendar. Comfortably more than
@@ -2855,6 +3040,179 @@ class DaysToEarningsCondition(CompareCondition):
         return f"{int(self.calculated_value)}d"
 
 
+class RecommendationDaysToEarningsCondition(CompareCondition):
+    """Days to earnings AS THE RANKING EXPERT STAMPED IT -- the chained-entry timing gate.
+
+    ``calculated_value = expert_recommendation.data["FMPEarningsEvent"]["days_to_earnings"]``,
+    read back, never recomputed. This is ``O_ERN``'s entry gene (``rec_days_to_earnings <= X``,
+    X searched 1-5 -- design 2026-08-31 leaps-grid S9).
+
+    WHY THIS EXISTS BESIDE ``DaysToEarningsCondition``
+    -------------------------------------------------
+    The design's TIMING SPLIT is: the EXPERT owns the ranking, the STRATEGY owns the timing,
+    and there is ONE timing knob. ``FMPEarningsEvent`` already resolved the event date to
+    score the symbol at that bar; it stamps the distance it measured. A strategy that gated
+    on a SECOND, independently fetched calendar read could disagree with the rank it is
+    acting on -- a different date (the calendar moves, a print is delayed, the annual-estimate
+    fallback fires), or the same date measured against a different clock. So the chained gate
+    reads the STAMP and nothing else.
+
+    ``DaysToEarningsCondition`` (``days_to_earnings``) is NOT changed and NOT deprecated: it
+    fetches the FMP calendar itself and is the answer for UNCHAINED uses -- any expert, no
+    stamp required (e.g. "do not open anything that would straddle an earnings print").
+    Making THAT condition stamp-first-with-a-calendar-fallback was considered and rejected:
+    a fallback is exactly the second timing source this split exists to remove, it cannot
+    satisfy "absent stamp never fires" (it would fire off the calendar instead), and it would
+    silently change the meaning of every ruleset already using the field.
+
+    WHY THE STAMPED INTEGER AND NOT ``stamped event_date - the evaluation bar``
+    -----------------------------------------------------------------------
+    The recommendation carries BOTH, so the distance could be recomputed here against
+    this bar instead of read. Rejected, and the difference is worth stating because it is
+    not zero:
+
+    * In a BACKTEST the two are identical by construction -- the recommendation is
+      produced on the SAME simulated bar the entry rule then evaluates -- so the choice
+      buys nothing there and costs a subtraction per symbol per bar.
+    * In LIVE they diverge exactly when an analysis is older than the evaluation (a
+      skipped or failed scheduled run, or a manage pass reusing an earlier
+      recommendation). The stamp then reads the distance AS OF THE ANALYSIS DAY, which is
+      LARGER than the true remaining distance -- and against this field's ``<=`` gate a
+      larger number REFUSES the entry. The stale reading is the conservative one: it
+      declines to open a pre-earnings straddle on a signal that has aged, rather than
+      opening it a day or two late off a rank nobody recomputed. Recomputing would take
+      that trade.
+    * And recomputing re-introduces a second clock into the one place the timing split
+      exists to keep single-sourced. The integer IS what the rank was computed against.
+
+    ``days_after_event`` makes the opposite choice (it recomputes from a stamped DATE)
+    for the opposite reason: an exit has no "the analysis is stale" reading -- the event
+    is in the past and the number must grow every day the position stays on.
+
+    ABSENT STAMP NEVER FIRES -- the ``DaysToExpiryCondition`` / ``LossPctOfMaxLoss``
+    discipline, and here it is load-bearing rather than defensive. Every recommendation from
+    every other expert has no ``FMPEarningsEvent`` payload, so if absence read as ``0`` the
+    gate ``rec_days_to_earnings <= 5`` would pass for the ENTIRE universe and the strategy
+    would buy a straddle on everything while looking timed. ``calculated_value`` therefore
+    stays ``None`` and ``evaluate()`` returns False for EVERY operator when the stamp is
+    missing, non-dict, or not a real number (bool/str/NaN are refused, not parsed).
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            days = stamped_days_to_earnings(self.expert_recommendation)
+            if days is None:
+                # DEBUG, not warning: on any non-event expert this is the normal case for
+                # every symbol on every bar, and a warning per symbol per bar is noise.
+                logger.debug(
+                    f"rec_days_to_earnings for {self.instrument_name} is unevaluable: the "
+                    f"recommendation carries no FMPEarningsEvent days_to_earnings stamp")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = days
+            return self.operator_func(days, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating rec_days_to_earnings condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the expert's stamped days-to-earnings for {self.instrument_name} "
+                f"is {self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{int(self.calculated_value)}d"
+
+
+class DaysAfterEventCondition(CompareCondition):
+    """Calendar days SINCE the stamped event -- the exit half of the O_ERN timing split.
+
+    ``calculated_value = (the evaluation bar) - (the event date the ENTRY order carries)``.
+    ``O_ERN``'s exit gene is ``days_after_event >= Y``, Y searched 0-2 (design 2026-08-31
+    leaps-grid S9): hold the straddle through the print, then take whatever the move and the
+    vol crush left, Y days later.
+
+    THE REFERENCE DATE COMES OFF THE ORDER, NOT THE RECOMMENDATION
+    --------------------------------------------------------------
+    By exit time the recommendation in hand is a DIFFERENT, later one -- possibly for the
+    NEXT quarter's print, possibly from another expert entirely. The date that matters is
+    the one the position was opened for, so ``TradeActions._submit_option_order`` carries it
+    forward onto the parent order's ``data["earnings_event_date"]`` at submit, beside
+    ``max_loss_per_contract`` and ``option_reserve``. Same seam, same read-back-never-
+    reconstruct rule (design 2026-08-29 S8.2). The alternative -- re-reading the entry
+    recommendation through ``TradingOrder.expert_recommendation_id`` -- was rejected: it is a
+    row fetch per open position per bar for a value that never changes after entry.
+
+    THE DATE CONVENTION, PINNED
+    ---------------------------
+    Two ``date`` objects subtracted -- no timezone arithmetic, no wall clock, no partial
+    days. "Today" is ``self._evaluation_date()``: the SIMULATED bar in a backtest, the wall
+    clock in live (``DaysToExpiryCondition``'s clock, for the same reason -- a backtest's
+    wall clock is years past the last bar). The event day itself reads ``0``; the next
+    calendar day reads ``1``. So on a Monday event, ``days_after_event >= 1`` first passes on
+    the Tuesday bar, and ``>= 0`` passes on the Monday bar itself. Negative before the event
+    -- a real state, since the entry is taken 1-5 days BEFORE the print -- and NOT clamped,
+    because clamping to 0 would make ``>= 0`` fire the moment the position opened.
+
+    UNKNOWN NEVER FIRES, in either direction. No order, no ``data`` dict, no
+    ``earnings_event_date``, an unparseable one, or an unreadable simulated clock each leave
+    ``calculated_value`` ``None`` and ``evaluate()`` False for EVERY operator. Absence is the
+    normal case for every position not opened off an earnings-event recommendation, and the
+    default specifically refused is "absent reads as today" (``0``), which would fire
+    ``>= 0`` on sight and flatten every option position in the book.
+
+    FORCED, NOT DISCRETIONARY, when it closes an option structure -- registered in
+    ``TradeActionEvaluator._FORCED_EXIT_EVENT_TYPES`` beside ``days_to_expiry``. See the
+    note there for why this time exit is classified opposite to ``days_opened``.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            if not self.existing_order:
+                self.calculated_value = None
+                return False
+
+            # Row read FIRST: a position with no event stamp -- every equity position and
+            # every option position from any other expert -- must cost nothing per bar.
+            event_day = order_event_date(self.existing_order)
+            if event_day is None:
+                self.calculated_value = None
+                return False
+
+            as_of = self._evaluation_date()
+            if as_of is None:
+                # A backtest account whose simulated clock is unreadable. Substituting
+                # date.today() here is the DaysToEarningsCondition bug, in a position exit.
+                logger.warning(
+                    f"days_after_event for {self.instrument_name} is unevaluable: no usable "
+                    f"evaluation date")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = (as_of - event_day).days
+            return self.operator_func(self.calculated_value, self.value)
+
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating days_after_event condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if calendar days since {self.instrument_name}'s stamped event is "
+                f"{self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{int(self.calculated_value)}d after event"
+
+
 class DaysToExpiryCondition(CompareCondition):
     """Calendar days of option life REMAINING: ``expiry - the evaluation date``.
 
@@ -2903,9 +3261,24 @@ class DaysToExpiryCondition(CompareCondition):
     Empty candidate set -> unevaluable. More than one distinct date -> unevaluable: a
     structure whose own rows disagree about when it expires has no DTE, and picking
     ``min()`` (closes early) or ``max()`` (never closes) would be inventing one.
-    Multi-expiry structures are refused at submit time, but pre-existing rows are not.
     A leg with no expiry at all simply adds no information and never vetoes the legs
     that have one.
+
+    The one exception, and it is DECLARED
+    -------------------------------------
+    Multi-expiry structures were refused at submit time, so disagreement could only ever be
+    corruption. A strategy listed in ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES`` (PMCC
+    today; calendars in phase 2) may now legitimately span two expiries, and for those the
+    disagreement is resolved by a NAMED rule rather than refused.
+
+    **This condition reads the LONG leg.** It backs the ``opt_dte`` exit, which asks whether
+    the structure still has life — the roll FLOOR. ``option_lifecycle._dte`` asks the other
+    question, the roll WINDOW, and reads the SHORT leg. Naming them is the whole point: with
+    two expiries "the DTE" is not a quantity until somebody says which leg they mean.
+
+    Nothing changes for a single-expiry structure: one candidate is one answer, and the leg
+    rule is never exercised. Pre-existing rows that disagree stay unevaluable, because their
+    strategy is not declared.
 
     The "today" is the recommendation's ``created_at`` — the simulated as-of bar in a
     backtest, wall-clock in live — never ``date.today()``, so the value is deterministic
@@ -2938,18 +3311,24 @@ class DaysToExpiryCondition(CompareCondition):
             return as_of.astimezone(timezone.utc).date()
         return as_of
 
-    def _held_leg_expiries(self, transaction_id):
-        """Distinct expiries of the still-HELD legs of ``transaction_id``.
+    def _held_legs(self, transaction_id):
+        """The still-HELD legs of ``transaction_id``, as ``option_expiry.ExpiryLeg``.
 
         Netted per contract symbol over the EXECUTED option orders exactly as
         ``_get_spread_pnl_via_transaction`` does — a contract whose signed quantity nets
         to zero is closed and contributes nothing.
+
+        THE SIGNED NET QUANTITY IS CARRIED OUT, not just the dates. It is what tells a
+        SHORT leg from a LONG one, and on a two-expiry structure the side IS the answer
+        (see ``option_expiry``): this reader takes the LONG leg. Returning a bare set of
+        dates, as this method used to, threw that away.
         """
+        from ba2_common.core.option_expiry import ExpiryLeg
         from ba2_common.core.trade_store import orders_where
         from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus
 
         if transaction_id is None:
-            return set()
+            return []
 
         executed = OrderStatus.get_executed_statuses()
         net: Dict[str, float] = {}
@@ -2973,43 +3352,79 @@ class DaysToExpiryCondition(CompareCondition):
                 expiry_by_contract.setdefault(o.contract_symbol, set()).add(
                     self._as_date(o.expiry))
 
-        out = set()
+        out = []
         for contract, qty in net.items():
             if abs(qty) > 1e-9:
-                out |= expiry_by_contract.get(contract, set())
+                # One ExpiryLeg per date the contract carries. Normally exactly one; two is
+                # the corrupt-data case the comment above describes, and emitting both keeps
+                # it a loud contradiction instead of a silent first-row-wins.
+                for expiry in sorted(expiry_by_contract.get(contract, set())):
+                    out.append(ExpiryLeg(expiry=expiry, net_qty=qty))
         return out
 
     def _resolve_expiry(self):
-        """(expiry, "") or (None, why it is unmeasurable). Never guesses."""
+        """(expiry, "") or (None, why it is unmeasurable). Never guesses.
+
+        THE QUESTION THIS ANSWERS IS THE STRUCTURE EXIT — the roll FLOOR. ``opt_dte``
+        closes a position when its life runs out, so on a two-expiry structure this reads
+        the **LONG** leg (``option_expiry.EXPIRY_RULE_STRUCTURE_EXIT``): "is there still
+        life to roll into?". Reading the short leg here would flatten a PMCC every time its
+        overlay approached its own expiry, throwing away a LEAPS with a year left because a
+        30-day call was expiring exactly on schedule.
+
+        Its sibling reader, ``option_lifecycle._dte``, answers the roll WINDOW and therefore
+        reads the SHORT leg. The two disagree on purpose; ``option_expiry`` carries the rule
+        table and both are pinned in ``test_option_per_leg_dte_rules.py``.
+
+        The strategy tag comes from the ``Transaction`` — the INTENT record — because that
+        is where ``submit_option_order`` stamps it and where it survives the individual
+        orders. Only a strategy DECLARED in ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``
+        gets the leg rule; for everything else disagreeing sources remain a contradiction,
+        exactly as before.
+        """
+        from ba2_common.core.option_expiry import (
+            EXPIRY_RULE_STRUCTURE_EXIT, resolve_structure_expiry)
+
         order = self.existing_order
         if order is None:
             return None, ("no open position on this evaluation — there is no option "
                           "life to measure")
 
-        candidates = set()
+        # The STRUCTURE-LEVEL candidates, plural: the transaction's declared intent and the
+        # parent order's stamp are two independent sources that can contradict each other
+        # with no legs involved at all, and that contradiction must not be collapsed.
+        declared = []
+        strategy = None
         txn_id = getattr(order, "transaction_id", None)
         if txn_id is not None:
             from ba2_common.core.models import Transaction
             from ba2_common.core.trade_store import get_or_none
             txn = get_or_none(Transaction, txn_id)
-            if txn is not None and txn.expiry is not None:
-                candidates.add(self._as_date(txn.expiry))
+            if txn is not None:
+                strategy = txn.option_strategy
+                if txn.expiry is not None:
+                    declared.append(self._as_date(txn.expiry))
 
         order_expiry = getattr(order, "expiry", None)
         if order_expiry is not None:
-            candidates.add(self._as_date(order_expiry))
+            declared.append(self._as_date(order_expiry))
 
-        candidates |= self._held_leg_expiries(txn_id)
+        resolution = resolve_structure_expiry(
+            self._held_legs(txn_id),
+            strategy=strategy,
+            rule=EXPIRY_RULE_STRUCTURE_EXIT,
+            declared_expiries=declared,
+        )
 
-        if not candidates:
+        if resolution.missing:
             return None, (f"no expiry on the transaction, the order or any held leg of "
                           f"{self.instrument_name} — the remaining option life cannot be "
                           f"determined")
-        if len(candidates) > 1:
-            listed = ", ".join(str(e) for e in sorted(candidates))
+        if resolution.expiry is None:
+            listed = ", ".join(str(e) for e in resolution.conflict)
             return None, (f"conflicting expiries on one {self.instrument_name} structure "
                           f"({listed}) — its remaining life is undefined")
-        return candidates.pop(), ""
+        return resolution.expiry, ""
 
     def evaluate(self) -> bool:
         try:
@@ -3068,6 +3483,253 @@ class DaysToExpiryCondition(CompareCondition):
         if days < 0:
             return f"{days} DTE (expired {abs(days)}d ago)"
         return f"{days} DTE"
+
+
+class _TwoExpiryLegCondition(CompareCondition):
+    """Shared base for the three conditions that read ONE NAMED LEG of a structure.
+
+    A diagonal's legs answer different questions, so "the DTE" and "the delta" are not
+    quantities until a reader says which leg it means — the discipline ``option_expiry``
+    exists to enforce, extended from expiries to every per-leg measurement.
+
+    All three build the structure through ``OptionRiskManagement.build_structure``, the SAME
+    function the live exit pass uses, so the rule-level reader and ``option_lifecycle.decide``
+    are looking at one book built one way. Each then calls a pure function in
+    ``option_lifecycle`` for the measurement itself: the selection and the arithmetic have one
+    implementation, and only the wording of the "unknown because…" message belongs to the
+    reader (the ``option_expiry`` rule again — a result, not a message).
+
+    UNKNOWN NEVER FIRES, the ``DaysToExpiryCondition`` discipline verbatim: an unmeasurable
+    input leaves ``calculated_value`` at ``None``, ``evaluate()`` returns False for EVERY
+    operator, and the audit row renders the REASON instead of a plausible number. On these
+    three that matters more than usual, because two of them drive a ROLL: a reader that
+    answered "0 DTE" for a structure it could not see would roll every overlay on sight.
+    """
+
+    #: Rendered instead of a number when the measurement could not be made.
+    unknown_reason: Optional[str] = None
+
+    def _structure(self):
+        """(the structure as a value, "") or (None, why it is unmeasurable)."""
+        from ba2_common.core.OptionRiskManagement import build_structure
+        from ba2_common.core.models import Transaction
+        from ba2_common.core.trade_store import get_or_none
+
+        order = self.existing_order
+        if order is None:
+            return None, "no open position on this evaluation — there is no structure to read"
+        txn_id = getattr(order, "transaction_id", None)
+        if txn_id is None:
+            return None, (f"the open {self.instrument_name} order carries no transaction — "
+                          f"its legs cannot be assembled")
+        txn = get_or_none(Transaction, txn_id)
+        if txn is None:
+            return None, (f"transaction {txn_id} is not readable — {self.instrument_name}'s "
+                          f"legs cannot be assembled")
+        structure = build_structure(txn)
+        if structure is None:
+            return None, (f"transaction {txn_id} has no executed option leg on record — "
+                          f"there is no structure to read")
+        return structure, ""
+
+    def _quote_for(self, contract_symbol: str):
+        """The account's quote for ONE contract, or ``None``. Never raises into ``evaluate``."""
+        try:
+            return self.account.get_option_quote(contract_symbol)
+        except Exception as e:  # noqa: BLE001 — a quote hiccup is unmeasurable, not a crash
+            absorb_if_benign(e)
+            logger.debug(f"get_option_quote failed for {contract_symbol}: {e}")
+            return None
+
+    def _unevaluable(self, field: str, reason: str) -> bool:
+        self.calculated_value = None
+        self.unknown_reason = reason
+        logger.warning(f"{field} for {self.instrument_name} is unevaluable: {reason}")
+        return False
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            reason = getattr(self, "unknown_reason", None)
+            return f"unknown ({reason})" if reason else None
+        return self._render(self.calculated_value)
+
+    def _render(self, value) -> str:
+        return f"{value:.2f}"
+
+
+class ShortLegDaysToExpiryCondition(_TwoExpiryLegCondition):
+    """Calendar days of life left on the SHORT leg — THE ROLL WINDOW.
+
+    ``option_expiry.EXPIRY_RULE_ROLL_WINDOW``, reached through
+    ``option_lifecycle.roll_window_dte`` — the same function ``decide`` calls, so the grid's
+    roll rule and the live pass agree about when an overlay is due by construction rather than
+    by review.
+
+    Its sibling ``days_to_expiry`` reads the LONG leg and answers the OTHER question (the roll
+    FLOOR: is there still life to roll into). The two disagree on purpose, and naming them is
+    the point — with two expiries "the DTE" is not a quantity until somebody says which leg.
+
+    On a SINGLE-expiry structure both read the same date, so this is simply "days to expiry"
+    there; the rule table in ``option_expiry`` only bites when the legs actually differ.
+
+    Sign is ``DaysToExpiryCondition``'s: positive while alive, ``0`` on the expiry date,
+    NEGATIVE past it — a real and alarming state for a structure still holding a short.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            self.calculated_value = None
+            self.unknown_reason = None
+            from ba2_common.core.option_lifecycle import roll_window_dte
+
+            as_of = DaysToExpiryCondition._as_of_to_date(
+                getattr(self.expert_recommendation, "created_at", None)) \
+                if getattr(self.expert_recommendation, "created_at", None) is not None else None
+            if as_of is None:
+                return self._unevaluable(
+                    "short_leg_days_to_expiry",
+                    "no evaluation date on the recommendation — 'days remaining' has no "
+                    "reference point")
+            structure, blind = self._structure()
+            if structure is None:
+                return self._unevaluable("short_leg_days_to_expiry", blind)
+            days, blind = roll_window_dte(structure, as_of)
+            if days is None:
+                return self._unevaluable("short_leg_days_to_expiry", blind)
+            self.calculated_value = days
+            return self.operator_func(days, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating short_leg_days_to_expiry for "
+                         f"{self.instrument_name}: {e}", exc_info=True)
+            self.calculated_value = None
+            self.unknown_reason = f"error computing the overlay's remaining life: {e}"
+            return False
+
+    def _render(self, value) -> str:
+        days = int(value)
+        return f"{days} DTE on the short leg" if days >= 0 else \
+            f"{days} DTE on the short leg (expired {abs(days)}d ago)"
+
+    def get_description(self) -> str:
+        return (f"Check if days until the SHORT leg of {self.instrument_name}'s structure "
+                f"expires is {self.operator_str} {self.value}")
+
+
+class CreditDecayedPctCondition(_TwoExpiryLegCondition):
+    """How much of the SHORT overlay's own credit has decayed, as a percent.
+
+    Design 2026-08-31 leaps-grid §4's buyback trigger: "roll loop at short expiry/buyback
+    trigger (% of credit decayed)". ``0`` the day the overlay was sold, ``100`` when it can be
+    bought back for nothing, NEGATIVE when it has gone against the position and costs more
+    than it brought in. The arithmetic is ``option_lifecycle.credit_decay_pct`` — shared with
+    ``decide``, one definition.
+
+    THE BASIS IS THE LEG'S OWN ENTRY PREMIUM, not the structure's net. After one roll the
+    structure's net premium is a year-old LEAPS debit mixed with several overlays' credits,
+    and dividing by that would make the trigger drift with the position's history instead of
+    measuring the overlay in front of it.
+
+    Unevaluable — and so never firing, in either direction — when the overlay cannot be
+    priced, when there is no held short leg, or when it was sold for nothing (an undefined
+    percentage, never 100 %). "We could not price the overlay" and "the overlay is worthless"
+    are the two facts this codebase spends its effort keeping apart, and here they differ by a
+    roll nobody asked for.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            self.calculated_value = None
+            self.unknown_reason = None
+            from ba2_common.core.option_lifecycle import held_short_leg, pmcc_credit_decay
+
+            structure, blind = self._structure()
+            if structure is None:
+                return self._unevaluable("credit_decayed_pct", blind)
+            short = held_short_leg(structure)
+            if short is None:
+                return self._unevaluable(
+                    "credit_decayed_pct",
+                    "no held short leg — there is no overlay whose credit could have decayed")
+            # ONE quote, for the one contract the answer depends on. Building the whole
+            # chain map here would price the LEAPS on every bar for nothing.
+            quote = self._quote_for(short.contract_symbol)
+            decayed, blind = pmcc_credit_decay(
+                structure, {short.contract_symbol: quote} if quote is not None else {})
+            if decayed is None:
+                return self._unevaluable("credit_decayed_pct", blind)
+            self.calculated_value = decayed
+            return self.operator_func(decayed, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating credit_decayed_pct for {self.instrument_name}: "
+                         f"{e}", exc_info=True)
+            self.calculated_value = None
+            self.unknown_reason = f"error pricing the overlay against its own credit: {e}"
+            return False
+
+    def _render(self, value) -> str:
+        return f"{value:.2f}% of the overlay's credit decayed"
+
+    def get_description(self) -> str:
+        return (f"Check if the decayed fraction of the short overlay's credit on "
+                f"{self.instrument_name} is {self.operator_str} {self.value}%")
+
+
+class LongLegDeltaCondition(_TwoExpiryLegCondition):
+    """The ABSOLUTE delta of the LONG leg — the LEAPS.
+
+    Design 2026-08-31 leaps-grid §4's third structure exit: "or (PMCC) LEAPS delta < ~0.50
+    (searched on/off)". A stock replacement is a stock replacement because its delta is near
+    1; once the underlying has fallen far enough that the long tracks it at half a share, the
+    position that is open is not the position that was opened, and the remaining premium is
+    worth more sold than held.
+
+    ABSOLUTE delta, so the same threshold reads the same way on a put-side long if one ever
+    exists — the convention ``option_selector`` already ranks on.
+
+    Unevaluable when no quote carries a delta. That is not hypothetical: an account whose data
+    source publishes no greeks answers ``None`` for every contract, and this condition then
+    never fires in either direction rather than reading a missing greek as a collapsed one.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            self.calculated_value = None
+            self.unknown_reason = None
+            from ba2_common.core.option_lifecycle import held_long_leg
+
+            structure, blind = self._structure()
+            if structure is None:
+                return self._unevaluable("long_leg_delta", blind)
+            long_leg = held_long_leg(structure)
+            if long_leg is None:
+                return self._unevaluable(
+                    "long_leg_delta",
+                    "no held long leg — this structure has no cover whose delta to read")
+            quote = self._quote_for(long_leg.contract_symbol)
+            delta = getattr(quote, "delta", None) if quote is not None else None
+            if delta is None:
+                return self._unevaluable(
+                    "long_leg_delta",
+                    f"no delta for the long leg {long_leg.contract_symbol} — how closely it "
+                    f"still tracks {self.instrument_name} cannot be measured")
+            self.calculated_value = abs(float(delta))
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating long_leg_delta for {self.instrument_name}: {e}",
+                         exc_info=True)
+            self.calculated_value = None
+            self.unknown_reason = f"error reading the long leg's delta: {e}"
+            return False
+
+    def _render(self, value) -> str:
+        return f"{value:.4f} |delta| on the long leg"
+
+    def get_description(self) -> str:
+        return (f"Check if the LONG leg's absolute delta on {self.instrument_name} is "
+                f"{self.operator_str} {self.value}")
 
 
 class HasOptionPositionCondition(FlagCondition):
@@ -3275,6 +3937,8 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_NEW_TARGET_PERCENT: NewTargetPercentCondition,
     ExpertEventType.N_PROFIT_LOSS_AMOUNT: ProfitLossAmountCondition,
     ExpertEventType.N_PROFIT_LOSS_PERCENT: ProfitLossPercentCondition,
+    ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS: LossPctOfMaxLossCondition,
+    ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM: ProfitMultipleOfPremiumCondition,
     ExpertEventType.N_DAYS_OPENED: DaysOpenedCondition,
     ExpertEventType.N_DAYS_SINCE_LAST_CLOSE: DaysSinceLastCloseCondition,
     ExpertEventType.N_DAYS_SINCE_LAST_PROFITABLE_CLOSE: DaysSinceLastProfitableCloseCondition,
@@ -3291,7 +3955,12 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_RELATIVE_VOLUME: RelativeVolumeCondition,
     ExpertEventType.N_IV_TO_REALIZED_VOL: IVToRealizedVolCondition,
     ExpertEventType.N_DAYS_TO_EARNINGS: DaysToEarningsCondition,
+    ExpertEventType.N_REC_DAYS_TO_EARNINGS: RecommendationDaysToEarningsCondition,
+    ExpertEventType.N_DAYS_AFTER_EVENT: DaysAfterEventCondition,
     ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
+    ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY: ShortLegDaysToExpiryCondition,
+    ExpertEventType.N_CREDIT_DECAYED_PCT: CreditDecayedPctCondition,
+    ExpertEventType.N_LONG_LEG_DELTA: LongLegDeltaCondition,
     ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
     ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
     ExpertEventType.F_HAS_PROTECTIVE_PUT: HasProtectivePutCondition,

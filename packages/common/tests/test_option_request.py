@@ -14,7 +14,8 @@ from ba2_common.core.option_request import (
     CONFIDENCE_UNMEASURABLE_REFUSAL,
     EMPTY_BOX_REFUSAL, EMPTY_CHAIN_REFUSAL, MAX_LOSS_UNMEASURABLE_REFUSAL,
     MISSING_QUOTE_REFUSAL, NEGATIVE_EXPECTANCY_REFUSAL, NON_POSITIVE_NET_REFUSAL,
-    NO_LIQUID_CONTRACT_REFUSAL, REFUSAL_PHRASES, SELECTION_CONFIG_REFUSAL,
+    NO_LIQUID_CONTRACT_REFUSAL, OPTION_RAILS_UNCONFIGURED_REFUSAL,
+    OPTION_RAIL_REFUSAL, REFUSAL_PHRASES, SELECTION_CONFIG_REFUSAL,
     TARGET_UNMEASURABLE_REFUSAL, UNDEFINED_RISK_REFUSAL,
     OptionStructureRequest, ResolvedStructure, ScoredStructure, StructureRefusal)
 
@@ -48,7 +49,10 @@ def test_all_refusal_phrases_are_registered_and_distinct():
                BUDGET_EXHAUSTED_REFUSAL, EMPTY_BOX_REFUSAL,
                EMPTY_CHAIN_REFUSAL, NO_LIQUID_CONTRACT_REFUSAL, MISSING_QUOTE_REFUSAL,
                NON_POSITIVE_NET_REFUSAL, SELECTION_CONFIG_REFUSAL,
-               BUDGET_CEILING_REFUSAL]
+               BUDGET_CEILING_REFUSAL,
+               # The two SLEEVE-level phrases (option risk manager wiring, design SS4):
+               # a rail that declined, and rails the expert never configured.
+               OPTION_RAIL_REFUSAL, OPTION_RAILS_UNCONFIGURED_REFUSAL]
     assert len(set(phrases)) == len(phrases)
     assert set(phrases) == set(REFUSAL_PHRASES)
 

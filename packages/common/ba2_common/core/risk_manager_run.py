@@ -53,13 +53,19 @@ OUTCOME_PERMISSION = "REFUSED_PERMISSION"
 OUTCOME_NO_RECOMMENDATION = "REFUSED_NO_RECOMMENDATION"
 #: Sized, and the money ran out -- the budget, or the per-instrument cap.
 OUTCOME_UNFUNDED = "REFUSED_UNFUNDED"
+#: An OPTION-sleeve rail declined the entry. Deliberately NOT ``REFUSED_UNFUNDED``: the
+#: sleeve rails include the drawdown BREAKER and the "this expert declares no rails"
+#: refusal, neither of which is a shortage of money, and reporting a stand-down as
+#: "the budget ran out" would send the reader to check a balance that was never the cause.
+#: The rail that spoke is named in the decision's ``reason``.
+OUTCOME_RAIL = "REFUSED_RAIL"
 #: The manager raised on this symbol. Distinct from a refusal: nothing DECIDED anything.
 OUTCOME_ERROR = "ERROR"
 
 #: Outcomes that mean "this symbol will not trade". Everything except FUNDED, spelled out
 #: rather than derived, so a new outcome has to state which side of the line it is on.
 REFUSED_OUTCOMES = (OUTCOME_PERMISSION, OUTCOME_NO_RECOMMENDATION,
-                    OUTCOME_UNFUNDED, OUTCOME_ERROR)
+                    OUTCOME_UNFUNDED, OUTCOME_RAIL, OUTCOME_ERROR)
 
 
 def decision(symbol: str, outcome: str, reason: str, *,

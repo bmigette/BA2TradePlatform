@@ -2,7 +2,7 @@
 
 ``call_butterfly`` — a DEBIT structure — sat in ``RESERVING_STRATEGIES`` while
 ``OpenCallButterflyAction`` submitted it with no ``option_reserve=``. It was the only one
-of the 17 entry builders to do so, and the consequence was account-wide:
+of the (then) 17 entry builders to do so, and the consequence was account-wide:
 ``reserved_option_buying_power_detail`` treats "listed as reserving, no reserve recorded"
 as UNMEASURABLE, so one open butterfly made ``available_option_buying_power()`` return
 ``None`` and ``check_option_buying_power(>0)`` return False for ALL EIGHT credit builders,
@@ -30,7 +30,9 @@ import pytest
 import ba2_common.core.TradeActions as TA
 from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ba2_common.core.option_types import OptionContract
-from ba2_common.core.types import ExpertActionType, OptionRight, get_option_action_values
+from ba2_common.core.types import (
+    ExpertActionType, OptionRight, get_option_entry_action_values,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -76,22 +78,34 @@ class _Acct(OptionsAccountInterface):
     def get_current_price(self, symbol=None):
         return self._spot
 
+    #: TWO expiries, and the near one exists for exactly one structure. Every single-expiry
+    #: builder asks for a window that contains only 2024-06-21 and therefore sees the SAME
+    #: list it always saw; the PMCC is the one action that fetches TWICE, once per leg, and
+    #: without a second date its overlay window comes back empty and the builder refuses
+    #: before selecting anything -- which would make this audit report "no selection
+    #: happened" for a builder that is working correctly.
+    NEAR_EXPIRY = date(2024, 6, 6)
+    FAR_EXPIRY = date(2024, 6, 21)
+
     def get_option_chain(self, underlying, expiry_min, expiry_max, option_type,
                          strike_min=None, strike_max=None):
         out = []
-        for s in range(70, 131, 5):
-            if option_type == OptionRight.CALL:
-                otm = max(float(s) - self._spot, 0.0)
-                intrinsic = max(self._spot - float(s), 0.0)
-            else:
-                otm = max(self._spot - float(s), 0.0)
-                intrinsic = max(float(s) - self._spot, 0.0)
-            bid = max(0.2, 5.0 - 0.08 * otm) + intrinsic
-            out.append(OptionContract(
-                symbol=f"{underlying}{s}{option_type.value[0].upper()}",
-                underlying=underlying, option_type=option_type, strike=float(s),
-                expiry=date(2024, 6, 21), bid=round(bid, 4), ask=round(bid + 0.2, 4),
-                last=round(bid, 4), open_interest=1000, volume=500))
+        for expiry in (self.NEAR_EXPIRY, self.FAR_EXPIRY):
+            if not (expiry_min <= expiry <= expiry_max):
+                continue
+            for s in range(70, 131, 5):
+                if option_type == OptionRight.CALL:
+                    otm = max(float(s) - self._spot, 0.0)
+                    intrinsic = max(self._spot - float(s), 0.0)
+                else:
+                    otm = max(self._spot - float(s), 0.0)
+                    intrinsic = max(float(s) - self._spot, 0.0)
+                bid = max(0.2, 5.0 - 0.08 * otm) + intrinsic
+                out.append(OptionContract(
+                    symbol=f"{underlying}{expiry:%y%m%d}{s}{option_type.value[0].upper()}",
+                    underlying=underlying, option_type=option_type, strike=float(s),
+                    expiry=expiry, bid=round(bid, 4), ask=round(bid + 0.2, 4),
+                    last=round(bid, 4), open_interest=1000, volume=500))
         return out
 
     def submit_option_order(self, *, legs, quantity, order_type, limit_price,
@@ -137,8 +151,19 @@ class _Acct(OptionsAccountInterface):
         return 1_000_000.0
 
 
-ENTRY_ACTION_VALUES = sorted(set(get_option_action_values())
-                             - {ExpertActionType.CLOSE_OPTION.value})
+# The actions that OPEN a structure from a chain. ``roll_pmcc_short`` is excluded with
+# ``close_option`` by the shared classifier: it manages a position that already exists and
+# re-selects its overlay from the spec the ENTRY stamped, so running it from a bare set of
+# entry kwargs asks it to build something it is not there to build.
+ENTRY_ACTION_VALUES = sorted(get_option_entry_action_values())
+
+#: The PMCC is the one structure that needs a SECOND expiry window and a PER-LEG strike pair
+#: (its short must sit ABOVE its long, which one shared target cannot express). Every other
+#: builder ignores both keys.
+_PER_ACTION_EXTRAS = {
+    ExpertActionType.OPEN_PMCC.value: dict(short_dte_min=1, short_dte_max=9,
+                                           strike_param=[5.0, 15.0]),
+}
 
 _REC = SimpleNamespace(id=1, instance_id=None, data=None, price_at_date=None,
                        expected_profit_percent=None, recommended_action=None)
@@ -157,11 +182,14 @@ def _run(action_type, monkeypatch):
 
     monkeypatch.setattr(TA._OptionEntryAction, "_held_equity_shares", lambda self: 200.0)
     acct = _Acct()
-    act = TA.create_action(
-        ExpertActionType(action_type), "AAPL", acct, SimpleNamespace(), None, _REC,
+    kwargs = dict(
         strike_method="percent_otm", strike_param=5.0, dte_min=10, dte_max=40,
         sizing=2.0, min_open_interest=10, max_spread_pct=90.0, min_volume=25,
         wing_width_pct=10.0)
+    kwargs.update(_PER_ACTION_EXTRAS.get(action_type, {}))
+    act = TA.create_action(
+        ExpertActionType(action_type), "AAPL", acct, SimpleNamespace(), None, _REC,
+        **kwargs)
     act.submit_to_broker = True
     result = act.execute()
     if not acct.orders:

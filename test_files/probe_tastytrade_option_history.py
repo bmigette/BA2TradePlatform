@@ -6,9 +6,11 @@ Decides whether ThetaData is needed at all. Three questions, in order of importa
      Live chains list only current contracts. If dxfeed refuses expired symbols you can
      build history going forward but cannot backtest the past two years.
   2. How far back does a LISTED contract go?
-  3. Are `imp_volatility` and `open_interest` actually populated? Those are NULL across
-     all 6,757,055 rows of the Alpaca-built cache and are why delta selection and
-     min_open_interest are dead in backtest.
+  3. Are `imp_volatility` and `open_interest` actually populated? `open_interest` is NULL
+     across all 1,440,782 chain rows of the Alpaca-built cache, which is why
+     min_open_interest is dead in backtest. (Its `imp_volatility`/`delta` are thin, not
+     absent -- 46% of chain rows, 88.2% of bar rows -- so delta selection is NOT dead there;
+     re-measured 2026-08-31.)
 
 Market data only. No orders: every order-mutating SDK method is tripwired.
 

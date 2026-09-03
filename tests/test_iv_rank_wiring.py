@@ -393,8 +393,8 @@ def test_a_poisoned_stored_sample_is_dropped_from_the_series(mock_account):
 
 
 def test_the_bound_is_one_shared_definition(mock_account):
-    """Live, backtest and PremiumSeller must not each invent their own idea of
-    'a possible implied volatility'."""
+    """Live and backtest must not each invent their own idea of 'a possible implied
+    volatility'. (PremiumSeller was the third consumer until its deletion, 2026-08-31.)"""
     assert OptionsAccountInterface.plausible_atm_iv(0.30) == 0.30
     assert OptionsAccountInterface.plausible_atm_iv(0.0) is None
     assert OptionsAccountInterface.plausible_atm_iv(None) is None

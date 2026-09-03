@@ -26,8 +26,11 @@ and nothing here may perturb it.
 
 WHAT THE PARQUET HAS THAT THE SQLITE DOES NOT
   * ``open_interest`` — POPULATED (26,853 of 27,974 GOOG rows). The sqlite's is NULL on every
-    one of its 6,757,055 chain rows, so ``option_selector``'s ``min_open_interest`` gate is
-    un-answerable there and becomes usable here.
+    one of its 1,440,782 chain rows (re-measured 2026-08-31; see
+    ``option_selector._publishes_spread`` for the full record), so ``option_selector``'s
+    ``min_open_interest`` gate is un-answerable there and becomes usable here. This is the
+    ONE field that is genuinely dead in the sqlite -- its ``iv``/``delta`` are populated on
+    46% of chain rows and 88% of BAR rows, so do not extend this bullet to them.
   * ``iv`` — the VENDOR's implied volatility, populated (26,840 of 27,974 GOOG rows). It is
     carried through on the bar dict as ``vendor_iv`` but is NOT what selection reads; see
     GREEKS below.
@@ -45,8 +48,14 @@ WHAT IT DOES NOT HAVE, AND WHY THAT IS NOT A REGRESSION
     of a vol unit — close in kind, not equal. ``vendor_iv`` is preserved on the bar dict so a
     later change can prefer it without re-reading 205 MB.
   * bid/ask are ABSENT (dxfeed serves no historical NBBO for dead contracts) and no worse
-    than sqlite, where ``bid == ask`` on all 6,757,055 rows: both stores are a ZERO-SPREAD
-    premium proxy and the tradeable spread is MODELLED downstream by ``option_spread_pct``.
+    than sqlite, where ``bid == ask`` on every quoted row (0 of 1,083,571 have ask > bid;
+    the other 357,211 of 1,440,782 chain rows carry no quote at all): both stores are a
+    ZERO-SPREAD premium proxy and the tradeable spread is MODELLED downstream by
+    ``option_spread_pct``. CONSEQUENCE FOR RANKING, since it reads backwards at a glance:
+    a constant 0.0 spread is not "no signal", it is the BEST possible score --
+    ``option_selection_policy._minimise`` maps a degenerate column to 0.0 and inverts it to
+    1.0 for every candidate. ``w_spread`` therefore fails OPEN uniformly here, which is why
+    the grid withholds it (see the launcher's ``_OPTION_SELECTION_WEIGHT_BANDS``).
     So bid = ask = last = the clamped bar's close, which is literally what
     ``fetch_options.contract_to_metadata_chain_row`` writes into the sqlite chain. Returning
     None instead would be "fail-loud" in name only: the option ENTRY action needs a non-None
@@ -455,7 +464,9 @@ class _Underlying:
         iv, delta, gamma, theta, vega = self.greeks_tuple(i, ci, spot_source)
         close = _f(self.close[i])
         # ZERO-SPREAD PREMIUM PROXY, identical in effect to the sqlite store (bid == ask on
-        # all 6,757,055 of its rows). The tradeable spread is modelled by option_spread_pct.
+        # every one of its quoted rows). The tradeable spread is modelled by
+        # option_spread_pct; note this makes spread_pct a constant 0.0, which RANKS BEST
+        # rather than not ranking -- see the module docstring's bid/ask bullet.
         vol = _i(self.volume[i])
         return OptionContract(
             symbol=raw.c_occ[ci], underlying=self.underlying,
@@ -635,7 +646,14 @@ class ParquetOptionsProvider:
         close = _f(u.close[i])
         # Same zero-spread proxy get_chain uses: entry actions price off chain rows while
         # close actions price off quotes, and the two must agree (options_provider bug B4).
-        return OptionQuote(symbol=occ_symbol, bid=close, ask=close, last=close)
+        #
+        # GREEKS TOO (plan Task 6), from the SAME per-row inversion ``get_chain`` uses -- the
+        # sqlite reader's twin change, and it must be a twin or a rule that reads a held
+        # contract's delta answers differently on the two backends. Memoised per row by
+        # ``greeks_tuple``, so a quote costs no extra inversion once the chain has priced it.
+        delta, iv = u.delta_iv_of_row(i, ci, self.spot_source)
+        return OptionQuote(symbol=occ_symbol, bid=close, ask=close, last=close,
+                           delta=delta, implied_volatility=iv)
 
     def get_bar(self, occ_symbol: str, as_of: date) -> Optional[dict]:
         u = self._u(_underlying_of(occ_symbol))

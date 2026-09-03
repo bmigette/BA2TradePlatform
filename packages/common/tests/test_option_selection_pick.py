@@ -178,7 +178,7 @@ def test_a_non_finite_delta_is_excluded_rather_than_winning():
 def test_missing_spread_scores_worst_not_best():
     """`_minimise`'s fail-closed direction had no test; flipping it left the suite green.
 
-    It bites real data: per option_selector._publishes_spread, 2,428,468 cached rows carry no
+    It bites real data: per option_selector._publishes_spread, 357,211 cached rows carry no
     quote at all, so spread_pct is None for them. Fail-open would make quoteless contracts the
     PREFERRED ones at any positive w_spread.
     """

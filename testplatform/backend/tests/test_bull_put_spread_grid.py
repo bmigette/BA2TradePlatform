@@ -204,11 +204,23 @@ def test_the_group_decode_can_select_it_alone():
     assert [r.get("id") for r in (decoded.get("entry_rules") or [])] == [RID]
 
 
-def test_the_action_type_is_not_a_duplicate_of_an_existing_key():
+def test_this_key_is_not_a_duplicate_of_an_existing_one():
     """A copy-pasted key that kept its donor's ``action_type`` looks like a new structure
-    and searches the old one."""
-    action_types = [v["action_type"] for v in mod._OPTION_STRATS.values()]
-    assert len(action_types) == len(set(action_types)), action_types
+    and searches the old one.
+
+    SCOPED TO ``KIND`` (2026-09-01, grid 2). This used to assert that every ``action_type``
+    in ``_OPTION_STRATS`` was unique -- a whole-table claim living in a file about ONE key.
+    Grid 2 deliberately reuses three builders at different tenors and deltas (``O_LEAPC`` is
+    ``buy_call`` like ``O_LC``; see ``test_option_strategy_builders``'s
+    ``test_no_two_keys_search_the_SAME_structure_the_same_way``, which is where the
+    table-wide invariant now lives, restated as "no two keys search the same space").
+    What belongs HERE is the claim this file is about: O_BULLPS introduced a genuinely new
+    structure, so nothing else may carry its action_type.
+    """
+    at = mod._OPTION_STRATS[KIND]["action_type"]
+    others = [k for k, v in mod._OPTION_STRATS.items()
+              if k != KIND and v["action_type"] == at]
+    assert not others, f"{KIND}'s action_type {at!r} is also used by {others}"
 
 
 def test_the_engine_routes_it_down_the_option_entry_path():

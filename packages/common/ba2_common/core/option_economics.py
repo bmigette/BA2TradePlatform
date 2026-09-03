@@ -63,6 +63,30 @@ RESERVE_TABLE_MULTIPLIER = 100.0
 ARC_FLOOR_REFUSAL = "return on collateral below the configured floor"
 
 
+#: RESERVING strategies whose BUILDER deliberately never consults the ARC floor. Membership
+#: here is not "the gate does not apply" -- ``applies_to`` below still answers True for these,
+#: because they do post collateral -- it is "no builder asks the question, on purpose", and it
+#: exists so the two drift guards that walk ``RESERVING_STRATEGIES`` looking for an ARC-gated
+#: builder (``packages/common/tests/test_option_arc_gate_enforced.py`` and
+#: ``testplatform/backend/tests/test_option_min_arc_gene.py``) name ONE exemption list instead
+#: of two that can disagree. Two different reasons, both spelled out:
+#:
+#:  * the three PRICING ALIASES have no action class at all -- ``option_reserve_required``
+#:    prices them for callers that name a structure generically, and nothing builds one;
+#:  * the two 1x2 BACKSPREADS (design 2026-08-31 SS2) are the convexity-financed family,
+#:    whose whole thesis is that the short leg finances the longs. Their net is near zero BY
+#:    DESIGN and may be a DEBIT, so a minimum annualised-return-on-collateral floor would
+#:    refuse exactly the structures the design is built to search -- and at a net debit the
+#:    ratio is not merely thin but undefined (``annualized_return_on_collateral`` returns
+#:    None, which a configured floor turns into a refusal). The premium-richness question is
+#:    the right one for a structure OPENED for its credit; a backspread is opened for its
+#:    convexity and its risk is gated by the measured max loss instead.
+ARC_FLOOR_EXEMPT_STRATEGIES = frozenset({
+    "credit_spread", "naked_put", "debit_spread",
+    "call_backspread", "put_backspread",
+})
+
+
 def applies_to(strategy: str) -> bool:
     """True when ``strategy`` posts collateral, i.e. when an ARC floor is meaningful.
 

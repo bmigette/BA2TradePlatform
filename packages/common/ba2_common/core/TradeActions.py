@@ -25,13 +25,23 @@ from ba2_common.core.option_entry_quote import (
     ENTRY_CROSS_FULL, ENTRY_CROSS_NEUTRAL, entry_limit_with_concession,
     quote_concession,
 )
-from ba2_common.core.option_payoff import PayoffLeg
+from ba2_common.core.option_payoff import (
+    MEASURED as _PAYOFF_MEASURED,
+    PayoffLeg,
+    max_loss as _payoff_max_loss,
+    _numeric as _payoff_numeric,
+)
+from ba2_common.core.OptionRiskManagement import (
+    admit_option_entry, option_risk_manager_enabled, record_submitted,
+)
+from ba2_common.core.earnings_stamp import ORDER_EVENT_DATE_KEY, stamped_event_date
 from ba2_common.core.option_request import ResolvedStructure
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
+from ba2_common.core.option_selection_policy import SelectionPolicy, validate_wired_weights
 from ba2_common.core.option_selector import (
     select_single, select_vertical_spread, select_wing, passes_liquidity,
     check_liquidity_data_available, OptionDteWindowError, OptionSelectionConfigError,
-    OptionLiquidityDataMissingToday)
+    OptionLiquidityDataMissingToday, describe_pick_failure)
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.db import InstanceNotFound
@@ -1872,6 +1882,190 @@ class DecreaseInstrumentShareAction(TradeAction):
         return f"Decrease {self.instrument_name} position to {self.target_percent}% of virtual equity"
 
 
+def _entry_payoff_legs(legs: List[OptionLeg], limit_price) -> Optional[List[PayoffLeg]]:
+    """``PayoffLeg``s equivalent to ONE contract of an entry order, or None when underivable.
+
+    Per-leg premiums are gone by the time the order is assembled -- builders price the
+    structure as ONE net limit -- but the payoff at expiry depends on the individual
+    premiums only through that net: every premium term in ``payoff_at`` is a
+    spot-independent cash flow. So the net is carried on ONE carrier leg (a BUY leg for a
+    net debit, a SELL leg for a net credit, divided by that leg's ratio) and every other
+    leg is priced at zero; the payoff CURVE -- and therefore ``max_loss`` -- is identical
+    to the true structure's.
+
+    Sign conventions are the submit path's own: a MULTI-leg limit is the signed net
+    (positive debit, negative credit -- the Alpaca MLEG convention every multi-leg
+    builder follows), while a SINGLE-leg limit is the positive premium with the
+    direction on the leg's side.
+
+    None -- no derivation, NEVER a guess -- when any leg is missing its right or strike,
+    the limit is not a finite number (or a negative single-leg premium, which the
+    convention cannot mean), or no leg points the way the net does. The caller stamps
+    nothing in that case; absence must never become a fabricated number downstream.
+    """
+    net = _payoff_numeric(limit_price)
+    if net is None or not legs:
+        return None
+    if len(legs) == 1:
+        if net < 0:
+            return None                     # single-leg limits are positive by convention
+        if legs[0].side == OrderDirection.SELL:
+            net = -net                      # a sold single leg is a credit
+    carrier = None
+    if net != 0.0:
+        want = OrderDirection.BUY if net > 0 else OrderDirection.SELL
+        for i, leg in enumerate(legs):
+            if leg.side == want:
+                carrier = i
+                break
+        if carrier is None:
+            return None                     # a net no leg's direction can express
+    out: List[PayoffLeg] = []
+    for i, leg in enumerate(legs):
+        strike = _payoff_numeric(leg.strike)
+        if leg.option_type not in (OptionRight.CALL, OptionRight.PUT) or strike is None:
+            return None                     # cannot price a leg with no right or strike
+        ratio = int(leg.ratio_qty or 1)
+        out.append(PayoffLeg(
+            kind="call" if leg.option_type == OptionRight.CALL else "put",
+            side=leg.side,
+            premium=(abs(net) / ratio) if i == carrier else 0.0,
+            strike=strike, ratio=ratio))
+    return out
+
+
+#: Greppable marker on every refusal ``_backspread_shape_refusal`` emits, so the ratio
+#: invariant can be told apart in a log from a thin chain or an exhausted budget. Same
+#: discipline as ``option_economics.ARC_FLOOR_REFUSAL`` and
+#: ``OptionsAccountInterface.ASSIGNMENT_CAPACITY_REFUSAL``.
+BACKSPREAD_SHAPE_REFUSAL = "not a covered 1x2 backspread"
+
+#: The 1x2 ratio, as two named numbers rather than two literals sprinkled through the two
+#: builders. ONE short against TWO longs is the whole structure: it is what makes the short
+#: covered, what makes the upside slope positive on the call version, and what puts the
+#: worst case at the LONG strike instead of at infinity. Changing either number without
+#: changing ``_backspread_shape_refusal`` is the mutation the shape guard exists to catch.
+BACKSPREAD_SHORT_RATIO = 1
+BACKSPREAD_LONG_RATIO = 2
+
+
+def _backspread_shape_refusal(legs: List[OptionLeg], *, option_type: OptionRight
+                              ) -> Optional[str]:
+    """Why ``legs`` is NOT a covered 1x2 backspread -- or ``None`` when it is.
+
+    THE INVERTED RATIO IS THE FAILURE THIS EXISTS FOR. Swap the two ratios and a call
+    backspread becomes 2 SHORT calls against 1 long: a net-uncovered short call, whose loss
+    at expiry grows without limit as the underlying rises. That structure must never reach
+    the broker, and "must never" has to be a check on the LEGS rather than a promise in a
+    docstring -- the legs are the only artefact the submit path actually sends.
+
+    Structural, and deliberately not a payoff question. ``option_payoff.max_loss`` also
+    refuses the flipped CALL shape (its ``upside_slope`` guard reports UNBOUNDED), but it
+    cannot refuse the flipped PUT shape: 2 short puts against 1 long put is bounded below --
+    UNBOUNDED is a fact about short calls, not about naked-ness -- so it would come back
+    MEASURED and submit as a structure whose short leg nobody covers. That shape already has
+    a builder of its own (``OpenPutRatioSpreadAction``, the FRONTspread), which reserves the
+    full short-strike notional for exactly that reason; arriving at it through this builder
+    would reserve the wing width instead. So the ratio is checked here, and the payoff gate
+    runs as well, and neither is redundant with the other.
+
+    Every clause is an admission requirement, not a preference:
+
+    * exactly two legs, same right, same expiry -- the payoff derivation and the reserve
+      both price a single-expiry two-strike structure;
+    * exactly one SELL leg at ratio 1 and one BUY leg at ratio 2 (``BACKSPREAD_*_RATIO``);
+    * the LONG leg further OTM than the short (calls: higher strike; puts: lower), which is
+      what puts the trough between the strikes and makes the structure long convexity.
+    """
+    if len(legs) != 2:
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: {len(legs)} legs (a 1x2 backspread has "
+                f"exactly 2)")
+    for leg in legs:
+        if leg.option_type != option_type:
+            return (f"{BACKSPREAD_SHAPE_REFUSAL}: leg {leg.contract_symbol} is "
+                    f"{leg.option_type}, not {option_type}")
+        if leg.strike is None or leg.expiry is None:
+            return (f"{BACKSPREAD_SHAPE_REFUSAL}: leg {leg.contract_symbol} carries no "
+                    f"strike/expiry, so the ratio cannot be verified")
+    if legs[0].expiry != legs[1].expiry:
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: legs expire on different dates "
+                f"({legs[0].expiry} vs {legs[1].expiry})")
+    shorts = [l for l in legs if l.side == OrderDirection.SELL]
+    longs = [l for l in legs if l.side == OrderDirection.BUY]
+    if len(shorts) != 1 or len(longs) != 1:
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: {len(shorts)} short and {len(longs)} long "
+                f"legs (a 1x2 backspread has one of each)")
+    short, long_ = shorts[0], longs[0]
+    n_short = int(short.ratio_qty or 1)
+    n_long = int(long_.ratio_qty or 1)
+    if n_long <= n_short:
+        # The inverted ratio, named for what it IS rather than for the arithmetic: on calls
+        # this is an uncovered short call and the loss is unbounded above; on puts it is an
+        # uncovered short put priced as if it were a spread.
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: {n_short} short x {n_long} long is a "
+                f"net-UNCOVERED short {option_type.value} -- the loss is UNBOUNDED above "
+                f"on calls and reserved at the wrong basis on puts; refusing to submit it")
+    if n_short != BACKSPREAD_SHORT_RATIO or n_long != BACKSPREAD_LONG_RATIO:
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: ratio is {n_short}x{n_long}, not "
+                f"{BACKSPREAD_SHORT_RATIO}x{BACKSPREAD_LONG_RATIO}")
+    further_out = (long_.strike > short.strike if option_type == OptionRight.CALL
+                   else long_.strike < short.strike)
+    if not further_out:
+        return (f"{BACKSPREAD_SHAPE_REFUSAL}: the long {option_type.value} strike "
+                f"{long_.strike} is not further OTM than the short's {short.strike}")
+    return None
+
+
+def _measured_max_loss_per_contract(legs: List[OptionLeg], limit_price,
+                                    stock_cover_price=None) -> Optional[float]:
+    """Dollars ONE contract of this order can lose -- ONLY when that is a measurement.
+
+    ``option_payoff.max_loss`` is tri-state and only ``MEASURED`` yields a number.
+    UNBOUNDED (a short call with no cover among the order's own legs or supplied
+    beside them) and UNMEASURABLE (an underivable leg set, a broken quote) both return
+    None here and the submit path stamps NOTHING: absence of
+    ``data["max_loss_per_contract"]`` is the "contracts that support it" gate for the
+    ``loss_pct_of_max_loss`` exit condition, enforced by data rather than by a runtime
+    special case at evaluation time.
+
+    THE CORRECTED S6 RULE (2026-08-30): the predicate is the MEASURED payoff, never
+    "is this structure a naked short". A naked short PUT is bounded below -- strike
+    minus credit, at an underlying of zero -- so it IS measured and IS stamped; only
+    short calls (and short stock) are genuinely unbounded.
+
+    THE STOCK COVER (2026-08-31, operator decision; SCOPED by review finding M3,
+    2026-09-01): a covered call's cover is held stock OUTSIDE the order's legs, so from
+    the legs alone its short call reads UNBOUNDED. A caller that has VERIFIED the
+    account actually holds (or simultaneously acquires) the covering shares may pass
+    ``stock_cover_price`` -- the per-share price of the one 100-share lot backing each
+    contract -- and the evaluator (which already supports stock legs; see ``PayoffLeg``)
+    then measures the true structure: (cover price - credit) x 100. An unmeasurable
+    cover price refuses to measure (None), never fabricates. The seam NEVER infers cover
+    from the strategy name -- a bare short call submitted under the ``covered_call`` tag
+    with no cover supplied still reads UNBOUNDED.
+
+    WHO ASKS WITH A COVER, AND WHO DOES NOT. Only the RISK MANAGER's denominator
+    (``_submit_option_order`` -> ``admit_option_entry``): the rails ask how much of the
+    sleeve the whole position commits, and the stock is part of that position. The ORDER
+    STAMP (``data["max_loss_per_contract"]``) asks the cover-free question and gets the
+    cover-free answer, because it is ``loss_pct_of_max_loss``'s denominator against a
+    numerator that is the OPTION legs' P&L alone -- see the comment at the stamp.
+    """
+    payoff_legs = _entry_payoff_legs(legs, limit_price)
+    if payoff_legs is None:
+        return None
+    if stock_cover_price is not None:
+        cover = _payoff_numeric(stock_cover_price)
+        if cover is None or cover <= 0:
+            return None                     # an unmeasurable cover cannot measure the structure
+        payoff_legs = payoff_legs + [PayoffLeg(kind="stock", side=OrderDirection.BUY,
+                                               premium=cover)]
+    result = _payoff_max_loss(payoff_legs)
+    if result.state != _PAYOFF_MEASURED:
+        return None
+    return result.amount
+
+
 # Factory function to create actions based on action type
 class _OptionEntryAction(TradeAction):
     """Shared base for option-entry actions (BuyCall / BullCallSpread / CoveredCall).
@@ -1914,6 +2108,9 @@ class _OptionEntryAction(TradeAction):
                  wing_width_pct: Optional[float] = None,
                  min_arc: Optional[float] = None,
                  entry_cross: Optional[float] = None,
+                 w_premium: Optional[float] = None,
+                 w_iv: Optional[float] = None,
+                 w_rvol: Optional[float] = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
@@ -1942,6 +2139,31 @@ class _OptionEntryAction(TradeAction):
         # pre-F3 quote exactly. Only a simulator that models a spread can answer it, so in
         # live it is inert by construction -- see core.option_entry_quote.
         self.entry_cross = entry_cross
+        # SELECTION-POLICY WEIGHTS (the GA-wired genes, design 2026-08-29 §7). Built HERE,
+        # EXPLICITLY, because this ctor ends in **kwargs: a weight forwarded under a name this
+        # block does not store would be swallowed silently, and the gene would look wired at
+        # every upstream layer while every pick ran the default policy. None/0.0 across the
+        # board yields policy None -- the selector's legacy 27us path, byte-identical picks.
+        # w_profit/w_rr are deliberately NOT accepted yet: no builder supplies the
+        # structure_fn they need, so accepting them would create exactly the silently-inert
+        # knob this comment warns about (see the launcher's weight-band table).
+        weights = {"w_premium": w_premium, "w_iv": w_iv, "w_rvol": w_rvol}
+        present = {k: float(v) for k, v in weights.items() if v is not None}
+        # THE HARD RAIL, and it is here rather than in the editor because the editor is not the
+        # only producer: a GA genome arrives through rule_builders, a deploy through
+        # rules_convert, and a hand-edited EventAction row through neither. Every one of them
+        # lands on this ctor, so this is the one place that can refuse a weight the search
+        # could never have emitted. The editor validates too, ahead of this, only so the user
+        # gets a message instead of a rule that saves and then builds no action.
+        validate_wired_weights(present)
+        # Stored as passed, so the three params are readable back off the action exactly like
+        # every other forwarded selection param. WITHOUT this the keys would reach the ctor and
+        # vanish into the signature, and an audit walking the action would report the rule as
+        # carrying no weights while the policy below quietly ranked on them.
+        self.w_premium = w_premium
+        self.w_iv = w_iv
+        self.w_rvol = w_rvol
+        self.selection_policy = SelectionPolicy(**present) if any(present.values()) else None
 
     # --- helpers ----------------------------------------------------------
     def _action_type_value(self) -> str:
@@ -2044,6 +2266,51 @@ class _OptionEntryAction(TradeAction):
             check_liquidity_data_available(chain, underlying=self.instrument_name,
                                            source=source, **gates)
         return gates
+
+    def _pick_refusal_message(self, chain: List[OptionContract], *, option_type: OptionRight,
+                              liq: Dict[str, Any], generic_message: str) -> str:
+        """The text for a ``select_single``/``select_vertical_spread`` refusal (``None`` pick).
+
+        ``generic_message`` is each call site's OWN, already-worded "No liquid <structure>"
+        string -- passed in, not reconstructed here -- so every existing method's refusal stays
+        BYTE-IDENTICAL: this only ever substitutes a more specific cause, never rephrases the
+        fallback. See ``option_selector.describe_pick_failure`` for the one cause it currently
+        names (the ``delta`` method's chain-wide missing-delta case) and why every other cause
+        still reads as ``generic_message``. One seam for all nine ``strike_method``-honouring
+        builders, instead of nine hand-written cause checks that could each drift from it.
+
+        NOT GATED ON ``self.selection_policy`` (corrected 2026-09-01, caught in review): this
+        is called from the SAME ``if contract/pair is None`` branch whether that ``None`` came
+        from the legacy ``_pick_by`` call or from an ACTIVE, non-default ``SelectionPolicy``
+        routed through ``_policy_pick`` -- ``select_single``'s internal branch on
+        ``policy.is_default`` is invisible from here, and ``describe_pick_failure`` answers the
+        same missing-delta question either way. See
+        ``test_option_delta_strike_method.test_buy_call_names_delta_under_an_active_selection_policy``."""
+        reason = describe_pick_failure(
+            chain, method=self.strike_method, option_type=option_type,
+            dte_min=self.dte_min, dte_max=self.dte_max, today=self._today(), **liq)
+        if reason:
+            return f"{reason} for {self.instrument_name}"
+        return generic_message
+
+    def _spread_params(self) -> Tuple[Any, Any]:
+        """Split strike_param into (long, short) params for the two legs.
+
+        PROMOTED to the base 2026-09-01 (it was four byte-identical copies on the four
+        vertical builders, and the backspread pair would have made six). Nothing else
+        changed -- the four inherit the same body they used to define -- so every structure
+        that selects TWO legs by method expresses a per-leg target the same way:
+        ``{"long": .., "short": ..}`` or a 2-element sequence, one value for both legs
+        otherwise (``select_vertical_spread`` excludes the first pick before making the
+        second, so a single value still yields two DIFFERENT strikes).
+        """
+        sp = self.strike_param
+        if isinstance(sp, dict):
+            return sp.get("long"), sp.get("short")
+        if isinstance(sp, (list, tuple)) and len(sp) == 2:
+            return sp[0], sp[1]
+        # Single value: use the same param for both legs (selector dedups by strike).
+        return sp, sp
 
     def _virtual_equity(self) -> Optional[float]:
         """balance * virtual_equity_pct/100 (defaults to balance when unknown)."""
@@ -2395,9 +2662,10 @@ class _OptionEntryAction(TradeAction):
         an ordinary condition — a feed outage, a second call on the same lot, shares not
         yet visible on the broker's side — logs a stack trace at ERROR.
 
-        The seam's raise STAYS as the backstop for direct callers
-        (``PremiumSeller.rebalance``, ``OptionPortfolioManager``), which have nowhere to
-        put a verdict; this is the ask-first path for the caller that does. The verdict's
+        The seam's raise STAYS as the backstop for direct ``submit_option_order``
+        callers, which have nowhere to put a verdict (historically
+        ``PremiumSeller.rebalance`` — deleted 2026-08-31 — and any future direct
+        caller); this is the ask-first path for the caller that does. The verdict's
         ``reason`` is the seam's own sentence verbatim, so both channels say one thing.
 
         Placed AFTER sizing, like ``_downsize_to_delivery_capacity`` is placed after the
@@ -2466,16 +2734,89 @@ class _OptionEntryAction(TradeAction):
                 f"(modelled concession {quote_concession(legs, halves, fraction):.4f}/share)")
         return quoted
 
+    def _option_risk_manager(self):
+        """(expert, expert_instance_id) when this expert runs the option risk manager.
+
+        ``(None, None)`` otherwise, and that is the overwhelmingly common answer: an action
+        with no recommendation, no instance, or an expert in ``classic``/``smart`` mode
+        never touches ``OptionRiskManagement`` at all. THAT is what makes design SS11's
+        "nothing existing changes until an expert is switched over" a property of the code
+        rather than a hope, and ``test_a_default_expert_never_reaches_the_option_risk_manager``
+        pins it.
+
+        The one place this cannot fail closed is a resolver that raises: the mode lives in
+        the expert's settings, so an expert we cannot resolve is an expert whose mode we do
+        not know, and refusing on that would refuse every legacy CLASSIC option entry too.
+        It is logged at ERROR naming the instance -- for a ``classic_options`` expert that
+        log line is the signal that its rails did not run.
+
+        The MODE READ obeys the same rule (review finding H2, 2026-09-01): a string that is
+        not an admitted mode answers "not engaged" and logs a WARNING once per instance,
+        instead of raising out of this method. It raised here until 2026-09-01, OUTSIDE the
+        guarded path, so a single expert whose ``risk_manager_mode`` held the literal
+        ``"None"`` aborted the remaining actions of the whole Phase-1 pass under
+        ``BA2_ERROR_MODE=enforce``. Fail-closed lives INSIDE the option path -- an expert
+        that really did select ``classic_options`` and cannot produce its rails still has
+        its entry refused by ``admit_option_entry``.
+        """
+        instance_id = (self.expert_recommendation.instance_id
+                       if self.expert_recommendation else None)
+        if not instance_id:
+            return None, None
+        from ba2_common.core.instance_resolver import (
+            InstanceResolverNotConfigured, get_instance_resolver,
+        )
+        try:
+            expert = get_instance_resolver().get_expert_instance(instance_id)
+        except InstanceResolverNotConfigured:
+            # No host has injected a resolver: a unit-test process, never a trading one.
+            # Both live startup and the backtest seam wiring inject one, so this branch
+            # cannot be reached by an expert that could have been configured at all.
+            return None, None
+        except Exception as e:  # noqa: BLE001 -- the resolver is INJECTED; it can fail in
+            # ways this module cannot enumerate. See the docstring: this is the one branch
+            # that cannot fail closed without refusing every classic-mode option entry.
+            absorb_if_benign(e, Exception)
+            logger.error(f"_option_risk_manager: could not resolve expert {instance_id} "
+                         f"({e}) -- if that expert runs risk_manager_mode='classic_options' "
+                         f"its sleeve rails did NOT run for {self.instrument_name}",
+                         exc_info=True)
+            return None, None
+        if expert is None:
+            return None, None
+        if not option_risk_manager_enabled(getattr(expert, "settings", None),
+                                           expert_instance_id=instance_id):
+            return None, None
+        return expert, instance_id
+
     def _submit_option_order(self, legs: List[OptionLeg], quantity: int,
                              limit_price: float, option_strategy: str,
-                             option_reserve: Optional[float] = None) -> Dict[str, Any]:
+                             option_reserve: Optional[float] = None,
+                             stock_cover_price: Optional[float] = None,
+                             extra_entry_facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Submit (or defer) the assembled option order, honoring submit_to_broker.
+
+        ``extra_entry_facts`` is a builder-specific fact set that must ride the ORDER ROW,
+        not merely the ``TradeActionResult``. It is merged into ``data`` AND into the
+        persisted ``entry_facts`` unconditionally, which is the point: the whitelist below is
+        a documented trap (a key written into ``data`` and missing from the tuple reaches
+        every log and every UI row and never reaches the order, so a later exit reads
+        nothing), and an explicit argument is how a builder closes it instead of tripping
+        over it. ``OpenPMCCAction`` uses it for the overlay spec its roll action re-selects
+        from; callers that pass nothing are byte-identical to before.
 
         When `option_reserve` is provided (short-premium strategies: CSP / credit
         spread), it is persisted on the parent order's `data["option_reserve"]` so
         `OptionsAccountInterface.reserved_option_buying_power()` can account for it.
 
-        THE ENTRY-QUOTE CONCESSION IS APPLIED HERE (F3), the one choke point all seventeen
+        `stock_cover_price` is the held-stock cover seam (2026-08-31, operator
+        decision): the covered-call builder passes the underlying's CURRENT SPOT here
+        after verifying the shares are actually held, so the max-loss measurement and
+        the option RM see the true covered structure instead of a naked short call.
+        See the comment at the stamp below for the ratified valuation choice. Callers
+        that supply no cover are byte-identical to before.
+
+        THE ENTRY-QUOTE CONCESSION IS APPLIED HERE (F3), the one choke point all nineteen
         builders reach, so no builder can be forgotten and none needs to know about it.
         ``entry_cross`` = the fraction of each leg's own modelled spread this entry gives up;
         at the default 0.0 (or on any account with no spread model, i.e. every live one) the
@@ -2506,12 +2847,110 @@ class _OptionEntryAction(TradeAction):
         limit_price = quoted
         if option_reserve is not None:
             data["option_reserve"] = option_reserve
+        if extra_entry_facts:
+            data.update(extra_entry_facts)
+        # Design 2026-08-29 S8.2: persist the structure's measured max loss beside
+        # option_reserve so the loss_pct_of_max_loss exit can read it BACK -- no leg
+        # reconstruction, no OCC parsing at evaluation time. Stamped ONLY when MEASURED
+        # (absence is the "contracts that support it" gate); computed from the
+        # concession-adjusted limit because that is the order actually submitted.
+        #
+        # THE STAMP IS MEASURED FROM THE ORDER'S OWN LEGS ONLY (review finding M3,
+        # 2026-09-01). A covered call therefore stamps NOTHING: its short call is unbounded
+        # among the legs the order actually carries, and `opt_sl_ml` self-disarms on it.
+        # That is the coherent answer, and the 2026-08-31 decision to stamp
+        # (spot - credit) x 100 here is reversed. The stamp is `loss_pct_of_max_loss`'s
+        # DENOMINATOR, and the condition's NUMERATOR is the option position's own P&L: on a
+        # covered call the two measure different books. The short call's loss is bounded
+        # only by the stock's gain, so a ratio of option-leg loss over a stock-inclusive
+        # max loss could only reach its threshold when the underlying moved FAVOURABLY for
+        # the position as a whole -- a stop that fires on good news and never on bad.
+        #
+        # MEASURED FROM THE CONCEDED LIMIT, WHICH IS NOT ALWAYS THE NUMBER A BUILDER SIZED
+        # AND RESERVED AGAINST (stated exactly, 2026-09-01 review finding D). A builder that
+        # measures its own max loss to size by it -- the two 1x2 backspreads do -- measures
+        # BEFORE the concession, because `_quote_with_concession` is applied here, after
+        # sizing, deliberately (see the note at the top of this method). So on a trial with
+        # `entry_cross > 0` the STAMP is the more conservative of the two: the concession
+        # moves the limit against the entry by at most the ratio-weighted sum of the legs'
+        # modelled half-spreads, which for a debit RAISES the measured max loss and for a
+        # credit lowers the credit and so raises it too. The gap is exactly the conceded
+        # amount x 100 per contract -- `quote_concession`'s ratio-weighted sum of modelled
+        # half-spreads, i.e. at most one half-spread per leg (2.5% of premium at the grid's
+        # --option-spread-pct 5.0). It is zero at the 0.0 default and on every live account
+        # (none models a spread), and it errs against the strategy in both directions. What
+        # it is NOT is "one measurement shared by sizing, reserve and stop": those three
+        # agree exactly only when the concession is inert.
+        max_loss_per_contract = _measured_max_loss_per_contract(legs, limit_price)
+        if max_loss_per_contract is not None:
+            data["max_loss_per_contract"] = max_loss_per_contract
+        # THE EVENT-CLOCK CARRY-FORWARD (design 2026-08-31 leaps-grid S9, the TIMING SPLIT).
+        # Same seam and same discipline as the max-loss stamp above: the EXIT needs the date
+        # of the event this ENTRY was taken for, and by exit time the recommendation in hand
+        # is a DIFFERENT, later one (next quarter's print, or another expert entirely). The
+        # order row is the only thing that travels with the position, so the date rides it and
+        # ``days_after_event`` reads it BACK -- no re-fetch of the earnings calendar, no second
+        # timing source that could disagree with the one the entry was timed on.
+        #
+        # STAMPED ONLY WHEN THE RECOMMENDATION CARRIES ONE. Absence of the key is the gate:
+        # every order not opened off an earnings-event recommendation has no key, and
+        # ``days_after_event`` is then UNEVALUABLE for that position rather than reading the
+        # event as "today" and flattening it on sight. ISO string, not a ``date``: ``data`` is
+        # a JSON column.
+        event_day = stamped_event_date(self.expert_recommendation)
+        if event_day is not None:
+            data[ORDER_EVENT_DATE_KEY] = event_day.isoformat()
+        # THE RM'S DENOMINATOR IS A DIFFERENT QUESTION and keeps the cover (2026-08-31,
+        # OPERATOR-RATIFIED VALUATION). The rails ask "how much of the sleeve does this
+        # structure commit", which IS the whole position -- stock included -- so a verified
+        # covered call is measurable there: (spot - credit) x 100 per contract, the cover
+        # priced at CURRENT SPOT at decision time and never at the shares' historical cost
+        # basis (folding unrealized stock P&L into a forward-looking risk number would make
+        # the same short call charge differently for reasons that have nothing to do with
+        # its risk). This is what keeps the covered call and the wheel's CC phase ADMISSIBLE
+        # to the rails, charged to the deployment cap as COVERED risk
+        # (candidate_from_entry), never to the naked/uncovered sub-cap.
+        rm_max_loss_per_contract = (
+            max_loss_per_contract if stock_cover_price is None
+            else _measured_max_loss_per_contract(legs, limit_price,
+                                                 stock_cover_price=stock_cover_price))
         if not self.submit_to_broker:
             logger.info(f"_OptionEntryAction: submit disabled for {self.instrument_name} "
                         f"{option_strategy} - recording informational result")
             return self._result(True,
                                  f"{option_strategy} for {self.instrument_name} (manual review, not submitted)",
                                  data)
+        # THE OPTION RISK MANAGER (design 2026-08-27 SS4, review finding F5). This is the one
+        # choke point all nineteen builders reach, and it is reached identically by the live
+        # pass (TradeManager -> TradeActionEvaluator) and by the backtest engine
+        # (daily_engine -> TradeActionEvaluator), so ONE call arms both runtimes -- which is
+        # the whole content of SS4's operator decision.
+        #
+        # BEHIND the submit_to_broker branch, deliberately (it was ahead of it until
+        # 2026-09-01). The gate is not a read: it JOURNALS its verdict and, on an admission,
+        # the caller CHARGES the sleeve for what is now in flight. Run on a preview, it wrote
+        # "admitted" into the run record for a structure that was never sent, and the run
+        # report then showed entries the operator's book never took. A preview is not an
+        # entry, so it does not consume the sleeve's headroom and does not appear in the
+        # entry journal.
+        #
+        # The max loss is HANDED to the RM, never re-derived there: no leg reconstruction, no
+        # OCC parsing. It equals the stamped value on every structure except a verified
+        # covered call, where the stamp is absent (see above) and the RM is given the
+        # cover-inclusive measurement instead.
+        rm_expert, rm_instance_id = self._option_risk_manager()
+        rm_candidate = None
+        if rm_expert is not None:
+            verdict = admit_option_entry(
+                expert=rm_expert, account=self.account, expert_instance_id=rm_instance_id,
+                underlying=self.instrument_name, option_strategy=option_strategy,
+                legs=legs, quantity=quantity,
+                max_loss_per_contract=rm_max_loss_per_contract,
+                stock_cover_price=stock_cover_price)
+            if not verdict.allowed:
+                data["option_rm_rail"] = verdict.reason
+                return self._result(False, verdict.message, data)
+            rm_candidate = verdict.candidate
         order = self.account.submit_option_order(
             legs=legs, quantity=quantity, order_type="limit", limit_price=limit_price,
             option_strategy=option_strategy, expert_recommendation_id=expert_rec_id)
@@ -2519,26 +2958,52 @@ class _OptionEntryAction(TradeAction):
             return self._result(False, f"Failed to submit {option_strategy} for {self.instrument_name}", data)
         order_id = getattr(order, "id", None)
         data["order_id"] = order_id
-        # Persist the short-premium reserve on the order so available BP reflects it —
-        # and the entry-quote concession fraction, so a later DISCRETIONARY close can
-        # concede the SAME fraction this entry did (review 2026-08-30 F7; see
-        # CloseOptionAction._close_cross_fraction). Persisted whenever the gene is set
-        # (not only when it moved this particular quote); absent for the 0.0 default,
-        # so a default run's order row is byte-identical.
-        row_extra: Dict[str, Any] = {}
-        if option_reserve is not None:
-            row_extra["option_reserve"] = option_reserve
+        if rm_candidate is not None:
+            # Charge the sleeve for what is now on the wire. Its transaction is WAITING with
+            # no executed leg, so book_totals cannot see it until it fills, and without this
+            # every later candidate in the same cycle would measure the book as if this
+            # structure did not exist -- the concentrated book F5 says the rails exist to
+            # stop. The charge is dropped again the moment the transaction becomes visible.
+            record_submitted(rm_instance_id, getattr(order, "transaction_id", None),
+                             rm_candidate)
+        # Persist the entry facts on the order row. FOUR of them, from three lineages:
+        #   - option_reserve       -- the short-premium reserve, so available BP reflects it;
+        #   - max_loss_per_contract -- the measured max loss, so the loss_pct_of_max_loss exit
+        #     can read its denominator back off the row (design 2026-08-29 S8.2);
+        #   - earnings_event_date  -- the stamped event this entry was timed on, so the
+        #     days_after_event exit can read it back (design 2026-08-31 leaps-grid S9);
+        #   - entry_cross          -- the entry-quote concession fraction, so a later
+        #     DISCRETIONARY close can concede the SAME fraction this entry did (review
+        #     2026-08-30 F7; see CloseOptionAction._close_cross_fraction).
+        # entry_cross is persisted whenever the gene is set (not only when it moved this
+        # particular quote) and is absent for the 0.0 default, so a default run's order row
+        # is byte-identical to before.
+        #
+        # THIS TUPLE IS A WHITELIST, AND THAT IS THE TRAP. A key written into ``data`` above
+        # but missing HERE reaches the TradeActionResult (so every log and every UI row shows
+        # it) and never reaches the ORDER, which is where the exit conditions read. The stamp
+        # would look configured and be inert -- the ``days_after_event`` gene would be a dead
+        # gene the GA tuned for a whole campaign. Named by constant, not spelled again.
+        entry_facts = {k: data[k] for k in ("option_reserve", "max_loss_per_contract",
+                                            ORDER_EVENT_DATE_KEY)
+                       if k in data}
+        # The caller-STATED facts, which is what makes them immune to the whitelist trap
+        # above: the builder that needs a fact on the row names it at the call site instead
+        # of hoping somebody remembered to extend a tuple three hundred lines away.
+        if extra_entry_facts:
+            entry_facts.update(extra_entry_facts)
         if self.entry_cross is not None and float(self.entry_cross) != ENTRY_CROSS_NEUTRAL:
-            row_extra["entry_cross"] = float(self.entry_cross)
-        if row_extra and order_id is not None:
+            entry_facts["entry_cross"] = float(self.entry_cross)
+        if entry_facts and order_id is not None:
             try:
                 stored = get_instance(TradingOrder, order_id)
                 if stored is not None:
-                    stored.data = {**(stored.data or {}), **row_extra}
+                    stored.data = {**(stored.data or {}), **entry_facts}
                     update_instance(stored)
             except Exception as e:
                 absorb_if_benign(e, InstanceNotFound)
-                logger.error(f"Failed to persist option_reserve on order {order_id}: {e}", exc_info=True)
+                logger.error(f"Failed to persist entry facts {sorted(entry_facts)} on "
+                             f"order {order_id}: {e}", exc_info=True)
         return self._result(True, f"Submitted {option_strategy} for {self.instrument_name}", data)
 
     def _build_and_submit(self) -> Dict[str, Any]:
@@ -2648,9 +3113,11 @@ class BuyCallAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, f"No liquid call contract for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid call contract for {self.instrument_name}"))
         if contract.ask is None or contract.ask <= 0:
             return self._result(False, f"No ask price for {contract.symbol}")
         limit_price = contract.ask                          # buy at ASK
@@ -2692,9 +3159,11 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if pair is None:
-            return self._result(False, f"No liquid bull call spread for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid bull call spread for {self.instrument_name}"))
         long_c, short_c = pair
         if long_c.ask is None or short_c.bid is None:
             return self._result(False, f"Missing quote for spread legs on {self.instrument_name}")
@@ -2722,16 +3191,6 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
                 f"(net_debit={net_debit})"),
             reserve_kwargs={})
 
-    def _spread_params(self) -> Tuple[Any, Any]:
-        """Split strike_param into (long, short) params for the two legs."""
-        sp = self.strike_param
-        if isinstance(sp, dict):
-            return sp.get("long"), sp.get("short")
-        if isinstance(sp, (list, tuple)) and len(sp) == 2:
-            return sp[0], sp[1]
-        # Single value: use the same param for both legs (selector dedups by strike).
-        return sp, sp
-
     def get_description(self) -> str:
         return f"Open bull call spread on {self.instrument_name}"
 
@@ -2754,9 +3213,11 @@ class BuyPutAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, f"No liquid put contract for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid put contract for {self.instrument_name}"))
         if contract.ask is None or contract.ask <= 0:
             return self._result(False, f"No ask price for {contract.symbol}")
         limit_price = contract.ask                          # buy at ASK
@@ -2798,9 +3259,11 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if pair is None:
-            return self._result(False, f"No liquid bear put spread for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid bear put spread for {self.instrument_name}"))
         # For a PUT debit spread the selector returns (long, short) with long.strike > short.strike.
         long_c, short_c = pair
         if long_c.ask is None or short_c.bid is None:
@@ -2828,16 +3291,6 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
                 f"Insufficient budget to size bear_put_spread for {self.instrument_name} "
                 f"(net_debit={net_debit})"),
             reserve_kwargs={})
-
-    def _spread_params(self) -> Tuple[Any, Any]:
-        """Split strike_param into (long, short) params for the two legs."""
-        sp = self.strike_param
-        if isinstance(sp, dict):
-            return sp.get("long"), sp.get("short")
-        if isinstance(sp, (list, tuple)) and len(sp) == 2:
-            return sp[0], sp[1]
-        # Single value: use the same param for both legs (selector dedups by strike).
-        return sp, sp
 
     def get_description(self) -> str:
         return f"Open bear put spread on {self.instrument_name}"
@@ -2878,9 +3331,11 @@ class SellCoveredCallAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, f"No liquid call contract for covered call on {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid call contract for covered call on {self.instrument_name}"))
         if contract.bid is None or contract.bid <= 0:
             return self._result(False, f"No bid price for {contract.symbol}")
         limit_price = contract.bid                          # sell at BID
@@ -2896,7 +3351,15 @@ class SellCoveredCallAction(_OptionEntryAction):
         refusal = self._refuse_if_cover_is_short([leg], quantity, "covered_call")
         if refusal is not None:
             return refusal
-        return self._submit_option_order([leg], quantity, limit_price, "covered_call")
+        # THE STOCK COVER (2026-08-31, operator decision): both holding checks have now
+        # passed -- this expert's own filled buys hold >= 100 shares/contract AND the
+        # account-wide cover verdict is ok -- so the cover leg may be supplied to the
+        # max-loss measurement and the option RM. Priced at CURRENT SPOT, not cost basis
+        # (the ratified forward-looking-denominator choice; see _submit_option_order).
+        # A path that has NOT verified the shares must never pass this argument: the
+        # seam does not infer cover from the "covered_call" name.
+        return self._submit_option_order([leg], quantity, limit_price, "covered_call",
+                                         stock_cover_price=spot)
 
     def get_description(self) -> str:
         return f"Sell covered call on {self.instrument_name}"
@@ -2935,15 +3398,24 @@ class BuyProtectivePutAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, f"No liquid put contract for protective put on {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid put contract for protective put on {self.instrument_name}"))
         if contract.ask is None or contract.ask <= 0:
             return self._result(False, f"No ask price for {contract.symbol}")
         limit_price = contract.ask                          # buy at ASK
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
                         position_intent="buy_to_open", option_type=self.OPTION_TYPE,
                         strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+        # NO stock cover leg here, deliberately (checked with the covered-call fix,
+        # 2026-08-31): the protective put also rides held stock, but a long put on its
+        # own is already loss-bounded -- its max loss IS the debit, which is both what
+        # the RM design charges a protective put against the budget (S8.1 lane 2) and
+        # the denominator the opt_sl_ml stop should manage on the put itself. Folding
+        # the stock in would inflate that denominator ~(spot - strike + debit)/debit-fold
+        # and effectively disarm the stop on the hedge.
         return self._submit_option_order([leg], quantity, limit_price, "protective_put")
 
     def get_description(self) -> str:
@@ -2974,9 +3446,11 @@ class SellCashSecuredPutAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, f"No liquid put contract for cash-secured put on {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid put contract for cash-secured put on {self.instrument_name}"))
         if contract.bid is None or contract.bid <= 0:
             return self._result(False, f"No bid price for {contract.symbol}")
         if contract.strike is None or contract.strike <= 0:
@@ -3034,16 +3508,6 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_BEAR_CALL_SPREAD.value
 
-    def _spread_params(self) -> Tuple[Any, Any]:
-        """Split strike_param into (long, short) params for the two legs."""
-        sp = self.strike_param
-        if isinstance(sp, dict):
-            return sp.get("long"), sp.get("short")
-        if isinstance(sp, (list, tuple)) and len(sp) == 2:
-            return sp[0], sp[1]
-        # Single value: use the same param for both legs (selector dedups by strike).
-        return sp, sp
-
     def _build_and_submit(self) -> Dict[str, Any]:
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
@@ -3055,9 +3519,11 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if pair is None:
-            return self._result(False, f"No liquid bear call spread for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid bear call spread for {self.instrument_name}"))
         # For a CALL spread the selector returns (lo, hi) ordered by strike.
         # Bear CALL CREDIT spread: SHORT = lo (lower strike), LONG = hi (higher strike).
         lo_c, hi_c = pair
@@ -3133,16 +3599,6 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_BULL_PUT_SPREAD.value
 
-    def _spread_params(self) -> Tuple[Any, Any]:
-        """Split strike_param into (long, short) params for the two legs."""
-        sp = self.strike_param
-        if isinstance(sp, dict):
-            return sp.get("long"), sp.get("short")
-        if isinstance(sp, (list, tuple)) and len(sp) == 2:
-            return sp[0], sp[1]
-        # Single value: use the same param for both legs (selector dedups by strike).
-        return sp, sp
-
     def _build_and_submit(self) -> Dict[str, Any]:
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
@@ -3154,9 +3610,11 @@ class OpenBullPutSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            **liq)
+            policy=self.selection_policy, **liq)
         if pair is None:
-            return self._result(False, f"No liquid bull put spread for {self.instrument_name}")
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid bull put spread for {self.instrument_name}"))
         # For a PUT chain the selector returns its DEBIT ordering: (higher, lower) =
         # (long, short) for a bear put spread. A bull put CREDIT spread is the mirror —
         # SHORT the higher strike, LONG the lower one.
@@ -3241,6 +3699,16 @@ class OpenStraddleAction(_OptionEntryAction):
     direction (e.g. ahead of earnings). Both legs are bought to open at the strike
     nearest spot, which MUST be identical for the call and the put. net debit =
     call.ask + put.ask (positive); sized by the combined per-contract debit.
+
+    IGNORES ``strike_method``, DELIBERATELY -- it is not one of the eight OPT-S2 builders left
+    unfixed, it is a structure whose strike is not a parameter at all. A straddle IS the ATM
+    pair: "the strike nearest spot" is the same contract whether you name it 0% OTM or ~0.50
+    delta, and both legs are pinned to that one strike by definition. So the builder keeps
+    ``method="percent_otm", strike_param=0`` (the ATM idiom the selector already has) and
+    ``open_straddle`` stays OUT of ``types.get_strike_method_action_values()``: listing it
+    would promise the rule editor and the GA a knob that can never move a strike, which is the
+    OPT-S2 trap from the other side. Its SIBLING ``OpenStrangleAction`` DOES honour the method
+    (2026-09-02) -- that is where the width lives.
     """
 
     def _action_type_value(self) -> str:
@@ -3258,7 +3726,7 @@ class OpenStraddleAction(_OptionEntryAction):
             call_chain, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            **liq)
+            policy=self.selection_policy, **liq)
         if call_c is None:
             return self._result(False, f"No liquid ATM call for straddle on {self.instrument_name}")
         # Force the put to the SAME strike + expiry as the chosen call leg.
@@ -3268,7 +3736,7 @@ class OpenStraddleAction(_OptionEntryAction):
             put_candidates, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            **liq)
+            policy=self.selection_policy, **liq)
         if put_c is None:
             return self._result(False,
                                 f"No liquid ATM put at strike {call_c.strike} for straddle "
@@ -3307,12 +3775,26 @@ class OpenStrangleAction(_OptionEntryAction):
     """Open a long strangle: BUY an OTM call AND an OTM put at DIFFERENT strikes.
 
     Cheaper long-volatility variant of the straddle: the call is bought above spot
-    and the put below spot (both OTM by ``strike_param`` percent, default 5%). Both
-    legs are bought to open. net debit = call.ask + put.ask (positive); sized by the
-    combined per-contract debit. Needs a larger move than a straddle to pay off.
+    and the put below spot (both OTM by ``strike_param``). Both legs are bought to
+    open. net debit = call.ask + put.ask (positive); sized by the combined
+    per-contract debit. Needs a larger move than a straddle to pay off.
+
+    HONOURS ``strike_method`` (2026-09-02). Both legs are selected with the SAME method and
+    the SAME target, which is what makes a delta target a SYMMETRIC strangle: the selector
+    compares ABSOLUTE delta (``option_selector._pick_by``), so one target picks a call above
+    spot and a put below it at matching |delta|. Before this the builder hard-coded
+    ``percent_otm`` at both sites (OPT-S2), which made design 2026-08-31 section 2's
+    "strangle width delta 0.25-0.45" inexpressible -- a 0.25 handed to a percent selector
+    targets 0.25% OTM, effectively at the money, i.e. a straddle wearing a strangle's name.
+    ``percent_otm`` remains the default and the meaning of an unset method, so every existing
+    O_STRG genome and every hand-written live rule decodes to the same strikes as before.
     """
 
     DEFAULT_OTM_PCT = 5.0   # OTM distance (percent) when strike_param is not configured
+    # ... and the delta method's own default, because 5.0 read as a DELTA target is not "5%
+    # OTM", it is "the contract whose |delta| is nearest 5" -- i.e. the deepest OTM strike on
+    # the chain, every time. One default per method, never one shared number.
+    DEFAULT_DELTA = 0.30
 
     def _action_type_value(self) -> str:
         return ExpertActionType.OPEN_STRANGLE.value
@@ -3324,19 +3806,21 @@ class OpenStrangleAction(_OptionEntryAction):
             return self._result(False, f"Empty option chain for {self.instrument_name}")
         liq = self._liq(call_chain, put_chain)
         spot = self._spot()
-        otm_pct = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
+        method = str(self.strike_method or "percent_otm")
+        default_param = self.DEFAULT_DELTA if method == "delta" else self.DEFAULT_OTM_PCT
+        width = self.strike_param if self.strike_param is not None else default_param
         call_c = select_single(
-            call_chain, method="percent_otm", strike_param=otm_pct, spot=spot,
+            call_chain, method=method, strike_param=width, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            **liq)
+            policy=self.selection_policy, **liq)
         if call_c is None:
             return self._result(False, f"No liquid OTM call for strangle on {self.instrument_name}")
         put_c = select_single(
-            put_chain, method="percent_otm", strike_param=otm_pct, spot=spot,
+            put_chain, method=method, strike_param=width, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            **liq)
+            policy=self.selection_policy, **liq)
         if put_c is None:
             return self._result(False, f"No liquid OTM put for strangle on {self.instrument_name}")
         if call_c.ask is None or put_c.ask is None:
@@ -3390,7 +3874,7 @@ class OpenShortStraddleAction(_OptionEntryAction):
         call_c = select_single(
             call_chain, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), **liq)
+            today=self._today(), policy=self.selection_policy, **liq)
         if call_c is None:
             return self._result(False, f"No liquid ATM call for short straddle on {self.instrument_name}")
         put_candidates = [c for c in put_chain
@@ -3398,7 +3882,7 @@ class OpenShortStraddleAction(_OptionEntryAction):
         put_c = select_single(
             put_candidates, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), **liq)
+            today=self._today(), policy=self.selection_policy, **liq)
         if put_c is None:
             return self._result(False, f"No liquid ATM put for short straddle on {self.instrument_name}")
         if call_c.bid is None or put_c.bid is None:
@@ -3479,11 +3963,11 @@ class OpenShortStrangleAction(_OptionEntryAction):
         call_c = select_single(
             call_chain, method="percent_otm", strike_param=otm, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), **liq)
+            today=self._today(), policy=self.selection_policy, **liq)
         put_c = select_single(
             put_chain, method="percent_otm", strike_param=otm, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), **liq)
+            today=self._today(), policy=self.selection_policy, **liq)
         if call_c is None or put_c is None:
             return self._result(False, f"No liquid OTM legs for short strangle on {self.instrument_name}")
         # Pin both legs to the same expiry (use the call's expiry).
@@ -3492,7 +3976,7 @@ class OpenShortStrangleAction(_OptionEntryAction):
                 [c for c in put_chain if c.expiry == call_c.expiry],
                 method="percent_otm", strike_param=otm, spot=spot,
                 option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                today=self._today(), **liq)
+                today=self._today(), policy=self.selection_policy, **liq)
             if put_c is None:
                 return self._result(False, f"No same-expiry OTM put for short strangle on {self.instrument_name}")
         if call_c.bid is None or put_c.bid is None:
@@ -3569,10 +4053,10 @@ class OpenIronCondorAction(_OptionEntryAction):
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), **liq)
+                           today=self._today(), policy=self.selection_policy, **liq)
         sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), **liq)
+                           today=self._today(), policy=self.selection_policy, **liq)
         if sc is None or sp is None:
             return self._result(False, f"No liquid short legs for iron condor on {self.instrument_name}")
         # Wings farther OTM, same expiry as the matching short leg.
@@ -3658,10 +4142,10 @@ class OpenJadeLizardAction(_OptionEntryAction):
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), **liq)
+                           today=self._today(), policy=self.selection_policy, **liq)
         sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), **liq)
+                           today=self._today(), policy=self.selection_policy, **liq)
         if sc is None or sp is None:
             return self._result(False, f"No liquid short legs for jade lizard on {self.instrument_name}")
         lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
@@ -3744,7 +4228,7 @@ class OpenCallButterflyAction(_OptionEntryAction):
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         body = select_single(chain, method="percent_otm", strike_param=body_otm, spot=spot,
                              option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                             today=self._today(), **liq)
+                             today=self._today(), policy=self.selection_policy, **liq)
         if body is None:
             return self._result(False, f"No liquid body call for butterfly on {self.instrument_name}")
         upper = select_wing(chain, center_strike=body.strike, width_pct=wing,
@@ -3824,9 +4308,14 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         long_p = select_single(chain, method="percent_otm", strike_param=otm, spot=spot,
                                option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                               today=self._today(), **liq)
+                               today=self._today(), policy=self.selection_policy, **liq)
         if long_p is None:
             return self._result(False, f"No liquid long put for ratio spread on {self.instrument_name}")
+        # NOT policy-governed, unlike the long leg above: a wing is a width-derived strike,
+        # not a box, so there is no band for the weights to rank inside. This is the site where
+        # that exclusion is least comfortable -- the short put is the 2x leg -- and
+        # ``option_selector.select_wing``'s docstring records both the reasoning and what it
+        # would take to change it.
         short_p = select_wing(chain, center_strike=long_p.strike, width_pct=wing,
                               option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
                               today=self._today(), expiry=long_p.expiry,
@@ -3888,6 +4377,788 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         return f"Open put ratio spread on {self.instrument_name}"
 
 
+class _BackspreadAction(_OptionEntryAction):
+    """Ratio BACKSPREAD, 1x2: SELL 1 nearer-delta leg, BUY 2 further-OTM legs.
+
+    One expiry, one right, a FIXED 1x2 ratio (``BACKSPREAD_SHORT_RATIO`` /
+    ``BACKSPREAD_LONG_RATIO``). The convexity-financed family of design 2026-08-31 SS2:
+    the short leg pays for most of the two longs, so the structure buys convexity with the
+    bleed of long premium largely removed. ``O_PBS`` is additionally a crash hedge -- below
+    the long strike the two puts outrun the one short.
+
+    THE MIRROR OF ``OpenPutRatioSpreadAction``, and the two must not be confused. That one
+    is a FRONTspread (BUY 1, SELL 2): net SHORT an option, reserved at the full short-strike
+    notional because Alpaca margins it as a naked short put. This one is net LONG an option,
+    covered by construction, and reserved at its defined max loss.
+
+    RISK, MEASURED, NEVER ASSUMED. The payoff is a V with its trough at the LONG strike --
+    at expiry there the short is fully ITM and the longs are worthless -- so the max loss is
+    ``(width - net_credit) x 100`` per contract, where a net DEBIT is a negative credit and
+    therefore ADDS. Both rights, one formula. Above the break-even the longs' 2x slope wins
+    and the profit is UNBOUNDED on the call version; that is the point of the structure and
+    it demotes nothing (``max_profit`` reporting UNBOUNDED is an inapplicable answer, and an
+    inapplicable answer never counts against a candidate).
+
+    The number is taken from ``_measured_max_loss_per_contract`` -- the payoff evaluator,
+    the same MEASURED source the submit stamp uses -- and never from a formula written out
+    here; ``option_reserve_required`` then re-derives it in closed form for the reserve, and
+    ``test_backspread_builders`` pins the two against hand-derived dollars. A structure the
+    evaluator cannot measure (UNBOUNDED, or a crossed quote it reads as an arbitrage) is
+    REFUSED rather than submitted with the stamp missing.
+
+    SIZING IS BY MAX LOSS, NOT BY PREMIUM -- and for this structure that is not a
+    refinement (see ``_size_by_cost`` at the call site).
+
+    NET CREDIT AND NET DEBIT ARE BOTH ADMISSIBLE. Which one a given pair of delta targets
+    produces is a fact about the skew on the day, not a property of the strategy, so there
+    is no sign refusal in either direction; the SIGN of the limit still has to be right,
+    and it follows the house MLEG convention (negative = credit).
+
+    PER ENTRY, NOT PER BAR. Everything here runs once, inside one entry action's
+    ``execute()``: one chain fetch, one ``select_vertical_spread`` call, one payoff
+    evaluation over 3 critical points. Nothing in this class is reachable from the per-bar
+    loop, and an equity trial never constructs it.
+    """
+
+    #: Set by the two concrete subclasses; both are used by name in
+    #: ``OptionsAccountInterface.RESERVING_STRATEGIES`` and priced by its defined-risk
+    #: branch.
+    OPTION_STRATEGY: str = ""
+
+    def _legs_from_pair(self, pair) -> "Tuple[OptionContract, OptionContract]":
+        """``(short_contract, long_contract)`` out of ``select_vertical_spread``'s pair.
+
+        The selector returns its pair ordered for a DEBIT vertical -- ``(lo, hi)`` for
+        calls, ``(hi, lo)`` for puts, i.e. (long, short) under THAT convention. A backspread
+        sells the nearer leg and buys the further one, which is the opposite assignment on
+        both rights, so the legs are re-derived from the STRIKES rather than from tuple
+        position (the same thing ``OpenBearCallSpreadAction`` does for the same reason).
+        """
+        lo, hi = sorted(pair, key=lambda c: c.strike)
+        if self.OPTION_TYPE == OptionRight.CALL:
+            return lo, hi          # calls: sell the LOWER strike, buy the HIGHER
+        return hi, lo              # puts: sell the HIGHER strike, buy the LOWER
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
+        spot = self._spot()
+        long_param, short_param = self._spread_params()
+        # ONE selector call for both legs, not two: ``select_vertical_spread`` is the idiom
+        # for "two strikes, one expiry, each picked by the configured method", it pins both
+        # legs to a single expiry by construction (a backspread whose legs expire on
+        # different days is a different structure), and it routes BOTH picks through the
+        # SelectionPolicy. ``select_wing`` -- the ratio FRONTspread's idiom -- would place
+        # the second leg a fixed % away from the first, which cannot express a delta target
+        # at all, and delta is what design SS2 searches on both legs of this structure.
+        pair = select_vertical_spread(
+            chain, method=self.strike_method, long_param=long_param,
+            short_param=short_param, spot=spot, option_type=self.OPTION_TYPE,
+            dte_min=self.dte_min, dte_max=self.dte_max, today=self._today(),
+            target_price=self._consensus_target(), policy=self.selection_policy, **liq)
+        if pair is None:
+            return self._result(False, self._pick_refusal_message(
+                chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=(f"No liquid {self.OPTION_STRATEGY} for "
+                                 f"{self.instrument_name}")))
+        short_c, long_c = self._legs_from_pair(pair)
+        if short_c.bid is None or long_c.ask is None:
+            return self._result(
+                False, f"Missing quote for {self.OPTION_STRATEGY} legs on "
+                       f"{self.instrument_name}")
+        width = round(abs(long_c.strike - short_c.strike), 4)
+        if width <= 0:
+            return self._result(
+                False, f"Non-positive strike width ({width}) for {self.OPTION_STRATEGY} "
+                       f"on {self.instrument_name}")
+        # SIGNED NET, the house MLEG convention: positive = net debit, negative = net
+        # credit. Sell the short leg at its BID, buy each long at its ASK -- the same touch
+        # every other builder quotes at. A backspread prices to either sign and BOTH are
+        # admitted; what must never happen is the sign being wrong, because
+        # ``_submit_option_order`` hands this straight to the broker as the MLEG limit.
+        net = round(BACKSPREAD_LONG_RATIO * long_c.ask
+                    - BACKSPREAD_SHORT_RATIO * short_c.bid, 4)
+        legs = [
+            OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
+                      ratio_qty=BACKSPREAD_SHORT_RATIO, position_intent="sell_to_open",
+                      option_type=self.OPTION_TYPE, strike=short_c.strike,
+                      expiry=short_c.expiry, underlying=short_c.underlying),
+            OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
+                      ratio_qty=BACKSPREAD_LONG_RATIO, position_intent="buy_to_open",
+                      option_type=self.OPTION_TYPE, strike=long_c.strike,
+                      expiry=long_c.expiry, underlying=long_c.underlying),
+        ]
+        # THE RATIO INVARIANT, checked on the legs that would actually be sent.
+        shape = _backspread_shape_refusal(legs, option_type=self.OPTION_TYPE)
+        if shape is not None:
+            logger.error(f"{self._action_type_value()} for {self.instrument_name}: "
+                         f"{shape}")
+            return self._result(False, f"{shape} on {self.instrument_name}")
+        # THE RISK NUMBER, from the payoff evaluator over these same legs and this same
+        # net. Not a formula written out here: sizing, the reserve and the stamp are one
+        # MEASUREMENT (the payoff evaluator) rather than three formulas that happen to
+        # agree -- but they are not always the same NUMBER. This one is measured from the
+        # UNCONCEDED net, because `_submit_option_order` applies `entry_cross` after
+        # sizing; with the gene set, the stamp it writes is measured from the conceded
+        # limit and is the larger, more conservative of the two, by at most one modelled
+        # half-spread per leg. Zero difference at the 0.0 default and on every live
+        # account. See the note beside the stamp.
+        max_loss_per_contract = _measured_max_loss_per_contract(legs, net)
+        if max_loss_per_contract is None or max_loss_per_contract <= 0:
+            return self._result(
+                False, f"Max loss for {self.OPTION_STRATEGY} on {self.instrument_name} is "
+                       f"not MEASURED (unbounded, or a quote the payoff evaluator reads "
+                       f"as risk-free) -- refusing rather than sizing against an unknown")
+        # SIZING BY MAX LOSS, AND HERE THAT IS LOAD-BEARING (the known premium-vs-max-loss
+        # gap, closed for these two builders). Every premium-sized builder divides the
+        # budget by what it PAYS; a backspread's net is near zero by design (the short
+        # finances the longs) and can be a credit, so premium sizing would divide by ~0 --
+        # unbounded contracts on a structure that genuinely risks (width - credit) x 100
+        # each -- or by a negative. The max loss is the only quantity that is both positive
+        # and meaningful for both signs, which is why ``_size_by_cost`` (dollars ONE
+        # contract consumes) is called with it directly rather than through
+        # ``_size``/``_size_by_reserve``.
+        quantity = self._size_by_cost(max_loss_per_contract, self.sizing)
+        if quantity < 1:
+            return self._result(
+                False, f"Insufficient budget to size {self.OPTION_STRATEGY} for "
+                       f"{self.instrument_name} (max_loss={max_loss_per_contract})")
+        # A net DEBIT is a NEGATIVE credit and the reserve branch subtracts it, so the
+        # collateral is (width + debit) x 100 -- more than the width, which is correct: the
+        # debit is money already spent that the worst case does not give back.
+        net_credit = round(-net, 4)
+        reserve = self.account.option_reserve_required(
+            self.OPTION_STRATEGY, quantity, spread_width=width, net_credit=net_credit)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(
+                False, f"Insufficient buying power to reserve {reserve} for "
+                       f"{self.OPTION_STRATEGY} on {self.instrument_name} (available="
+                       f"{self.account.available_option_buying_power()})")
+        quantity, refusal = self._assignment_capacity(short_c, quantity)
+        if refusal is not None:
+            return refusal
+        reserve = self.account.option_reserve_required(
+            self.OPTION_STRATEGY, quantity, spread_width=width, net_credit=net_credit)
+        return self._submit_option_order(legs, quantity, net, self.OPTION_STRATEGY,
+                                         option_reserve=reserve)
+
+    def _assignment_capacity(self, short_c, quantity):
+        """The short-put delivery gate, for the right that has one. ``(quantity, refusal)``.
+
+        Overridden by the PUT subclass. A CALL backspread's short leg is a CALL: assignment
+        delivers shares and pays cash IN, so it consumes no delivery capacity -- charging it
+        would refuse entries for an obligation that does not exist.
+        """
+        return quantity, None
+
+
+class OpenCallBackspreadAction(_BackspreadAction):
+    """``O_CBS`` -- call ratio backspread: SELL 1 nearer call, BUY 2 further-OTM calls.
+
+    Long convexity to the UPSIDE, financed by the short. The worst case is a pin at the
+    long strike; above the break-even the two longs outrun the one short and the profit is
+    unbounded. ``upside_slope`` is +1 contract of calls, so the LOSS is bounded -- which is
+    exactly what the inverted ratio would destroy.
+    """
+
+    OPTION_TYPE = OptionRight.CALL
+    OPTION_STRATEGY = "call_backspread"
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_CALL_BACKSPREAD.value
+
+    def get_description(self) -> str:
+        return f"Open call backspread on {self.instrument_name}"
+
+
+class OpenPutBackspreadAction(_BackspreadAction):
+    """``O_PBS`` -- put ratio backspread: SELL 1 nearer put, BUY 2 further-OTM puts.
+
+    The crash-hedge arm of the family (design 2026-08-31 SS2). No call leg at all, so
+    ``upside_slope`` is 0 and the payoff is flat above the short strike; the worst case is
+    the pin at the long strike, and below it the two longs outrun the one short all the way
+    to an underlying of zero.
+    """
+
+    OPTION_TYPE = OptionRight.PUT
+    OPTION_STRATEGY = "put_backspread"
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_PUT_BACKSPREAD.value
+
+    def _assignment_capacity(self, short_c, quantity):
+        """CHARGED, exactly like every other builder carrying a short put.
+
+        One short put per unit (``BACKSPREAD_SHORT_RATIO``), and the two long puts net
+        NOTHING off the delivery bill -- the same fact the bull put spread's wing is pinned
+        on: a long put is OUR right, exercisable on a LATER day, after the shares have
+        already been paid for at the short strike tonight. So the bill is
+        ``short strike x 100 x units`` and the gate downsizes to what the cash can deliver.
+        """
+        return self._downsize_to_delivery_capacity(
+            self.OPTION_STRATEGY, strike=short_c.strike, quantity=quantity,
+            contracts_per_unit=BACKSPREAD_SHORT_RATIO)
+
+    def get_description(self) -> str:
+        return f"Open put backspread on {self.instrument_name}"
+
+
+# DELIBERATELY DOWN HERE, not in the module header. ``tests/test_no_zero_coercion.py`` pins an
+# allowlist entry to the EXACT line ``TradeActions.py:1548``, so an import added at the top of
+# this file moves a line-numbered assertion in an unrelated suite. Both names are plain
+# constants used from this point on, and neither module imports this one (``option_lifecycle``
+# is the pure module and its import-leak gate forbids reaching back here), so there is no cycle.
+from ba2_common.core.option_expiry import PMCC_STRATEGY, is_multi_expiry_strategy
+from ba2_common.core.option_lifecycle import (
+    ORDER_PMCC_OVERLAY_KEY, PMCC_OVERLAY_SPEC_KEYS, PMCC_ROLL_STRATEGY,
+    close_legs_are_fail_closed, restamped_max_loss, roll_legs_are_fail_closed,
+)
+
+#: Greppable marker on the PMCC admission refusal, so a structure the chain could not offer
+#: is told apart in a log from a thin chain or an exhausted budget -- the same discipline as
+#: ``BACKSPREAD_SHAPE_REFUSAL`` and ``option_economics.ARC_FLOOR_REFUSAL``.
+PMCC_ADMISSION_REFUSAL = "not an admissible poor man's covered call"
+
+
+class OpenPMCCAction(_OptionEntryAction):
+    """``O_PMCC`` -- the poor man's covered call: a LEAPS call covered by a short call.
+
+    TWO LEGS, TWO EXPIRIES, ONE STRUCTURE (design 2026-08-31 leaps-grid §3-§4). The long is a
+    deep-ITM LEAPS call (DTE >= 365, delta 0.75-0.85) standing in for 100 shares; the short is
+    a nearer-dated call (DTE 30-45, delta 0.15-0.30) at a HIGHER strike, sold against it. It
+    is the first structure in this platform whose legs disagree about when they expire, which
+    is why it is the sole declared member of
+    ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES``: the submit guard admits exactly two
+    expiries for it, each leg's date is recorded on its own child row, and
+    ``Transaction.expiry`` stays NULL because no single date is true of the whole position
+    (plan Task 6-PRE).
+
+    ADMISSION IS A REFUSAL, NOT A FILTER, and it has two clauses:
+
+    * ``short.strike > long.strike``. A short at or below the LEAPS strike is a bear call
+      spread wearing a diagonal's name: its worst case is no longer the debit paid, because
+      the short can be assigned into a long that is itself further out of the money.
+    * ``short.expiry < long.expiry``. It is the whole structure -- the long outliving the
+      short is what makes the intrinsic floor below a real bound, and a "diagonal" whose
+      short outlives its long is a naked call with a decoration.
+
+    Both are stated as verdicts (a failed ``TradeActionResult``) rather than as selector
+    filters, so a chain that cannot offer the structure today is RECORDED as such instead of
+    silently producing a different structure.
+
+    RISK: THE INTRINSIC FLOOR, AND IT IS ALREADY WHAT THE SHARED STAMP MEASURES.
+    ``_measured_max_loss_per_contract`` builds the payoff legs and asks
+    ``option_payoff.max_loss``; for BUY call K1 / SELL call K2 > K1 at net debit ``d`` the
+    upside slope is zero (so not UNBOUNDED), the critical points are ``{0, K1, K2}`` and the
+    worst is ``-d x 100`` at an underlying of zero. That is exactly design §3's "max loss =
+    LEAPS debit - net credits" -- MEASURED, per contract, from the same evaluator every other
+    structure uses, and never a formula written out here.
+
+    THE EVALUATOR PRICES BOTH LEGS AT ONE EXPIRY. That is not an oversight: at the SHORT's
+    expiry the long is worth AT LEAST its intrinsic, so treating it as worth exactly its
+    intrinsic is the conservative bound the design chose ("errs against the strategy"). The
+    number is the risk basis, the deployment-cap charge and ``opt_sl_ml``'s denominator, and
+    it is RESTAMPED downward as each roll banks another credit (``RollPMCCShortAction``).
+
+    COVERED, NEVER NAKED -- AND NO ``stock_cover_price``. ``structure_metrics`` pairs the
+    short call with a long of the SAME right from the order's own legs, so a PMCC reports
+    ``is_defined_risk=True`` and its max loss is charged to the deployment cap rather than to
+    the naked sub-cap (``option_book._is_undefined_risk``). This is what "extends the
+    covered-call stock-leg fix, cover kind = long option" means: the same seam and the same
+    covered-vs-naked question, answered FROM THE LEGS. The ``stock_cover_price`` argument
+    exists for cover the legs cannot see, and passing it here would ADD the whole stock value
+    to the measured loss (``1700 + 100 x C`` on a 17.00 debit) -- a worse number for a
+    structure that holds no stock.
+
+    NO RESERVE. A diagonal whose long outlives its short is margined as covered, so ``"pmcc"``
+    is deliberately absent from ``OptionsAccountInterface.RESERVING_STRATEGIES`` and this
+    builder posts no collateral: the debit already paid IS the risk.
+
+    PER ENTRY, NOT PER BAR. Two chain fetches, two ``select_single`` calls and one payoff
+    evaluation, all inside one entry action's ``execute()``. Nothing here is reachable from
+    the per-bar loop and an equity trial never constructs it.
+    """
+
+    OPTION_TYPE = OptionRight.CALL
+    OPTION_STRATEGY = PMCC_STRATEGY
+
+    def __init__(self, *args, short_dte_min: Optional[int] = None,
+                 short_dte_max: Optional[int] = None, **kwargs):
+        """``short_dte_min``/``short_dte_max`` are the OVERLAY's own expiry window.
+
+        A second window, not a second gene: ``dte_min``/``dte_max`` carry the LEAPS window
+        (searched, 365-550) and design §2 states the overlay's as a fixed 30-45 band. They are
+        real action params -- forwarded by ``rule_builders._OPTION_ACTION_PARAM_KEYS`` and
+        ``TradeActionEvaluator._OPTION_ENTRY_PARAM_KEYS`` like every other selection knob --
+        rather than class constants, so the same builder serves the calendar in phase 2.
+        """
+        super().__init__(*args, **kwargs)
+        self.short_dte_min = short_dte_min
+        self.short_dte_max = short_dte_max
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_PMCC.value
+
+    def _overlay_window(self, today: date) -> Tuple[date, date]:
+        """The overlay's ``[expiry_min, expiry_max]`` fetch window, or a LOUD config error.
+
+        The twin of ``_expiry_window`` for the SECOND window, and it refuses the same two
+        unusable configurations for the same reason: an unset ceiling asks the provider for
+        an inverted window and then reports the empty answer as a thin chain, and an inverted
+        window can never contain an expiry. It additionally refuses a window that is not
+        strictly NEARER than the LEAPS window, because that is the structure itself -- see the
+        class docstring's second admission clause. Caught by ``execute()``'s
+        ``OptionSelectionConfigError`` branch, which names the knob instead of saying "no
+        liquid contract".
+        """
+        if self.short_dte_min is None or self.short_dte_max is None:
+            raise OptionDteWindowError(
+                f"PMCC overlay DTE window for {self.instrument_name} is unusable: "
+                f"short_dte_min={self.short_dte_min}, short_dte_max={self.short_dte_max}. "
+                f"Both are required -- the overlay is selected from its OWN expiry window, "
+                f"not from the LEAPS window.")
+        lo, hi = int(self.short_dte_min), int(self.short_dte_max)
+        if lo > hi:
+            raise OptionDteWindowError(
+                f"PMCC overlay DTE window for {self.instrument_name} is inverted: "
+                f"short_dte_min={lo} > short_dte_max={hi}; no expiry can fall in it.")
+        if self.dte_min is not None and hi >= int(self.dte_min):
+            raise OptionDteWindowError(
+                f"PMCC overlay DTE window [{lo},{hi}] for {self.instrument_name} is not "
+                f"strictly nearer than the LEAPS window [{self.dte_min},{self.dte_max}]: the "
+                f"overlay could be selected at or beyond the long's own expiry, which is a "
+                f"naked call, not a diagonal.")
+        return today + timedelta(days=lo), today + timedelta(days=hi)
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        today = self._today()
+        # Both windows are validated BEFORE either fetch, so a misconfigured overlay window
+        # is never reported as an empty LEAPS chain.
+        leaps_min, leaps_max = self._expiry_window(today)
+        overlay_min, overlay_max = self._overlay_window(today)
+        leaps_chain = self.account.get_option_chain(
+            self.instrument_name, leaps_min, leaps_max, self.OPTION_TYPE)
+        if not leaps_chain:
+            return self._result(
+                False, f"Empty LEAPS option chain for {self.instrument_name} in the "
+                       f"[{self.dte_min},{self.dte_max}] DTE window")
+        overlay_chain = self.account.get_option_chain(
+            self.instrument_name, overlay_min, overlay_max, self.OPTION_TYPE)
+        if not overlay_chain:
+            return self._result(
+                False, f"Empty overlay option chain for {self.instrument_name} in the "
+                       f"[{self.short_dte_min},{self.short_dte_max}] DTE window")
+        # EACH CHAIN CHECKED ON ITS OWN (the 2026-08-23 rule): they are two separate fetches,
+        # so a source that answers one and not the other must not have one vouch for both.
+        liq = self._liq(leaps_chain, overlay_chain)
+        spot = self._spot()
+        long_param, short_param = self._spread_params()
+        leaps = select_single(
+            leaps_chain, method=self.strike_method, strike_param=long_param, spot=spot,
+            option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=today, target_price=self._consensus_target(),
+            policy=self.selection_policy, **liq)
+        if leaps is None:
+            return self._result(False, self._pick_refusal_message(
+                leaps_chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=f"No liquid LEAPS call for pmcc on {self.instrument_name}"))
+        overlay = select_single(
+            overlay_chain, method=self.strike_method, strike_param=short_param, spot=spot,
+            option_type=self.OPTION_TYPE, dte_min=self.short_dte_min,
+            dte_max=self.short_dte_max, today=today, target_price=self._consensus_target(),
+            policy=self.selection_policy, **liq)
+        if overlay is None:
+            return self._result(False, self._pick_refusal_message(
+                overlay_chain, option_type=self.OPTION_TYPE, liq=liq,
+                generic_message=(f"No liquid short-call overlay for pmcc on "
+                                 f"{self.instrument_name}")))
+        refusal = self._admission_refusal(leaps, overlay)
+        if refusal is not None:
+            return refusal
+        if leaps.ask is None or leaps.ask <= 0:
+            return self._result(False, f"No ask price for LEAPS leg {leaps.symbol}")
+        if overlay.bid is None or overlay.bid <= 0:
+            return self._result(False, f"No bid price for overlay leg {overlay.symbol}")
+        # Buy the long at the ASK, sell the overlay at the BID -- the touch every other
+        # builder quotes at. Positive = net DEBIT, the house MLEG convention.
+        net_debit = round(leaps.ask - overlay.bid, 4)
+        if net_debit <= 0:
+            return self._result(
+                False, f"Non-positive net debit ({net_debit}) for pmcc on "
+                       f"{self.instrument_name}: the overlay pays for the LEAPS outright, "
+                       f"which is not this structure")
+        legs = [
+            OptionLeg(contract_symbol=leaps.symbol, side=OrderDirection.BUY,
+                      position_intent="buy_to_open", option_type=self.OPTION_TYPE,
+                      strike=leaps.strike, expiry=leaps.expiry, underlying=leaps.underlying),
+            OptionLeg(contract_symbol=overlay.symbol, side=OrderDirection.SELL,
+                      position_intent="sell_to_open", option_type=self.OPTION_TYPE,
+                      strike=overlay.strike, expiry=overlay.expiry,
+                      underlying=overlay.underlying),
+        ]
+        # THE RISK NUMBER, from the payoff evaluator over these same legs and this same net --
+        # the same MEASUREMENT the submit stamp will make, not a second formula. A structure
+        # the evaluator cannot measure is REFUSED rather than submitted with the stamp
+        # missing, because that stamp is the intrinsic floor the whole design rests on.
+        max_loss_per_contract = _measured_max_loss_per_contract(legs, net_debit)
+        if max_loss_per_contract is None or max_loss_per_contract <= 0:
+            return self._result(
+                False, f"Max loss for pmcc on {self.instrument_name} is not MEASURED "
+                       f"(unbounded, or a quote the payoff evaluator reads as risk-free) -- "
+                       f"refusing rather than sizing against an unknown")
+        quantity = self._size_by_cost(net_debit * 100.0, self.sizing)
+        if quantity < 1:
+            return self._result(
+                False, f"Insufficient budget to size pmcc for {self.instrument_name} "
+                       f"(net_debit={net_debit})")
+        return self._submit_option_order(
+            legs, quantity, net_debit, self.OPTION_STRATEGY,
+            extra_entry_facts={ORDER_PMCC_OVERLAY_KEY: self._overlay_spec()})
+
+    def _admission_refusal(self, leaps, overlay) -> Optional[Dict[str, Any]]:
+        """The two admission clauses, as a recorded verdict. ``None`` to proceed."""
+        why = None
+        if leaps.strike is None or overlay.strike is None:
+            why = (f"a leg with no strike ({leaps.symbol} @ {leaps.strike}, "
+                   f"{overlay.symbol} @ {overlay.strike})")
+        elif overlay.strike <= leaps.strike:
+            why = (f"short strike {overlay.strike:g} <= LEAPS strike {leaps.strike:g} -- "
+                   f"that is a bear call spread, and its worst case is not the debit paid")
+        elif leaps.expiry is None or overlay.expiry is None:
+            why = (f"a leg with no expiry ({leaps.symbol} @ {leaps.expiry}, "
+                   f"{overlay.symbol} @ {overlay.expiry})")
+        elif overlay.expiry >= leaps.expiry:
+            why = (f"short expiry {overlay.expiry} >= LEAPS expiry {leaps.expiry} -- the "
+                   f"long must outlive the short or the intrinsic floor is not a bound")
+        if why is None:
+            return None
+        logger.warning(f"{self._action_type_value()} for {self.instrument_name}: "
+                       f"{PMCC_ADMISSION_REFUSAL} ({why})")
+        return self._result(
+            False,
+            f"{PMCC_ADMISSION_REFUSAL} on {self.instrument_name}: {why}. Refusing the entry.",
+            {"option_strategy": self.OPTION_STRATEGY,
+             "long_strike": leaps.strike, "short_strike": overlay.strike,
+             "long_expiry": leaps.expiry.isoformat() if leaps.expiry else None,
+             "short_expiry": overlay.expiry.isoformat() if overlay.expiry else None})
+
+    def _overlay_spec(self) -> Dict[str, Any]:
+        """The selection box THIS entry picked its overlay from, for the roll to re-use.
+
+        Every key of ``option_lifecycle.PMCC_OVERLAY_SPEC_KEYS``, always -- including the
+        ``None``s, because "this gate was not configured" is a fact the roll must reproduce
+        exactly and an absent key would be indistinguishable from a spec written by an older
+        build. See ``ORDER_PMCC_OVERLAY_KEY`` for why the spec rides the row at all.
+        """
+        _, short_param = self._spread_params()
+        return {
+            "strike_method": self.strike_method,
+            "strike_param": short_param,
+            "dte_min": self.short_dte_min,
+            "dte_max": self.short_dte_max,
+            "min_open_interest": self.min_open_interest,
+            "max_spread_pct": self.max_spread_pct,
+            "min_volume": self.min_volume,
+        }
+
+    def get_description(self) -> str:
+        return f"Open poor man's covered call on {self.instrument_name}"
+
+
+#: Greppable marker on every ``roll_pmcc_short`` refusal, so a roll that did not happen is
+#: told apart in a log from a roll that was never due.
+PMCC_ROLL_REFUSAL = "pmcc overlay not rolled"
+
+
+class RollPMCCShortAction(_OptionEntryAction):
+    """``roll_pmcc_short`` -- buy back the expiring overlay, sell the next one, keep the LEAPS.
+
+    Design 2026-08-31 leaps-grid §4's roll loop, as ONE multi-leg order on the SAME
+    transaction: ``buy_to_close`` the held short, then ``sell_to_open`` the newly selected
+    one. Not an entry (it opens no structure) and not a close (the position survives it).
+
+    IT IS A RULE, NOT AN ENGINE HOOK, and that is the whole reason this class exists rather
+    than a per-bar branch in the backtest engine. Both runtimes walk the same OPEN_POSITIONS
+    ruleset through the same ``TradeActionEvaluator``, so one action serves live and backtest
+    with no second implementation to drift; the roll's TRIGGERS land in ruleset params, which
+    is where a searched knob is allowed to live; and an equity trial, whose ruleset carries no
+    such rule, does exactly nothing extra. ``O_WHEEL`` already puts an option entry action in
+    an exit ruleset for the same reasons.
+
+    THE NEW OVERLAY IS SELECTED FROM THE ENTRY'S OWN BOX, read back off the entry order's
+    ``data[ORDER_PMCC_OVERLAY_KEY]``. Not from this action's parameters, and the launcher
+    gives it none: a second delta gene on the roll rule would let a search enter at 0.15 delta
+    and roll to 0.30 -- two theses in one position -- and would double the overlay's gene
+    budget at a population of 40. A position with no such stamp was not opened by
+    ``open_pmcc``, and this REFUSES rather than guessing what its overlay should be.
+
+    FAIL-CLOSED, and the failure it is closed against is specific: the engine must never hold
+    the short without the long. Three guards, in order, each refusing rather than adjusting:
+
+    * a roll ALREADY IN FLIGHT (any non-terminal, unexecuted option order on the transaction)
+      -- otherwise the rule, which fires on every bar its trigger holds, would stack a second
+      overlay behind the first while the first was still working;
+    * the ticket's LEG ORDER (``roll_legs_are_fail_closed``) -- the buy-back is written first,
+      so the ticket can never describe a moment at which the position owes two overlays;
+    * the position the ticket would LEAVE BEHIND (``uncovered_short_calls``) -- measured, not
+      argued.
+
+    A roll that cannot be built at all is the SAFE failure and is deliberately allowed to
+    happen: the long is simply left uncovered for a while, which costs theta. The unsafe
+    failure is two shorts against one long, and no path here can produce it.
+
+    THE RESTAMP. Each roll's net changes the intrinsic floor -- design §3's "max loss = LEAPS
+    debit - net credits, restamped as credits accrue" -- so the entry order's
+    ``max_loss_per_contract`` is rewritten through ``option_lifecycle.restamped_max_loss``.
+    That row is ``loss_pct_of_max_loss``'s denominator; leaving it at the entry value would
+    make the stop progressively too loose as credits came in.
+
+    NO RISK-MANAGER ADMISSION. ``admit_option_entry`` prices a structure ABOUT TO BE ADDED to
+    the sleeve and charges the deployment cap for it. A roll adds no structure: the same
+    position continues, with a max loss that a credit roll LOWERS. Running the entry gate here
+    would charge the sleeve twice for one position and could refuse the maintenance of a
+    position the sleeve already holds -- which would leave the overlay to expire, i.e. refuse
+    a risk-REDUCING action on risk grounds.
+    """
+
+    OPTION_TYPE = OptionRight.CALL
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.ROLL_PMCC_SHORT.value
+
+    def get_description(self) -> str:
+        return f"Roll the poor man's covered call overlay on {self.instrument_name}"
+
+    # -- refusals ------------------------------------------------------------
+    def _refuse(self, why: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        logger.warning(f"{self._action_type_value()} for {self.instrument_name}: "
+                       f"{PMCC_ROLL_REFUSAL} — {why}")
+        return self._result(False, f"{PMCC_ROLL_REFUSAL} on {self.instrument_name}: {why}",
+                            data or {})
+
+    # -- the position --------------------------------------------------------
+    def _entry_order(self, transaction_id):
+        """The transaction's ENTRY order: the one with no parent. The row the overlay spec and
+        the max-loss stamp both live on, and the row a later roll must rewrite."""
+        from ba2_common.core.trade_store import orders_where
+        rows = [o for o in orders_where(transaction_id=transaction_id)
+                if getattr(o, "parent_order_id", None) is None
+                and getattr(o, "asset_class", None) == AssetClass.OPTION
+                and not getattr(o, "contract_symbol", None)]
+        # THE OLDEST, by id. After one roll the transaction has TWO parentless option orders
+        # and ``orders_where`` promises no ordering, so taking whichever came back first would
+        # hand a later roll the ROLL's parent -- which carries no overlay spec, so the roll
+        # would refuse for a reason that is not true.
+        return min(rows, key=lambda o: (o.id is None, o.id or 0)) if rows else None
+
+    def _roll_in_flight(self, transaction_id) -> Optional[str]:
+        """The contract symbol of an option order on this transaction that is neither executed
+        nor terminal, i.e. still working at the broker. ``None`` when the book is settled."""
+        from ba2_common.core.trade_store import orders_where
+        executed = OrderStatus.get_executed_statuses()
+        terminal = set(OrderStatus.get_terminal_statuses())
+        for o in orders_where(transaction_id=transaction_id):
+            if getattr(o, "asset_class", None) != AssetClass.OPTION:
+                continue
+            if o.status in executed or o.status in terminal:
+                continue
+            return o.contract_symbol or f"order {o.id}"
+        return None
+
+    def execute(self) -> "TradeActionResult":
+        try:
+            from ba2_common.core.OptionRiskManagement import build_structure
+            from ba2_common.core.models import Transaction
+            from ba2_common.core.option_lifecycle import (
+                held_long_leg, held_short_leg, uncovered_short_calls,
+            )
+            from ba2_common.core.trade_store import get_or_none
+
+            if not self._supports_options():
+                return self._refuse("this account does not support options")
+            order = self.existing_order
+            txn_id = getattr(order, "transaction_id", None) if order is not None else None
+            if txn_id is None:
+                return self._refuse("there is no open position on this evaluation")
+            txn = get_or_none(Transaction, txn_id)
+            if txn is None or not is_multi_expiry_strategy(getattr(txn, "option_strategy", None)):
+                return self._refuse(
+                    f"transaction {txn_id} is not a declared two-expiry structure "
+                    f"({getattr(txn, 'option_strategy', None)!r}) — only a structure whose "
+                    f"legs may legitimately span two expiries has an overlay to roll")
+            working = self._roll_in_flight(txn_id)
+            if working is not None:
+                return self._refuse(
+                    f"an option order on this position is still working ({working}). Rolling "
+                    f"again now would write a SECOND overlay behind the first")
+            entry = self._entry_order(txn_id)
+            spec = ((getattr(entry, "data", None) or {}).get(ORDER_PMCC_OVERLAY_KEY)
+                    if entry is not None else None)
+            if not isinstance(spec, dict):
+                return self._refuse(
+                    "the entry order carries no overlay spec — this position was not opened "
+                    "by open_pmcc, and which contract its next overlay should be is not "
+                    "something to guess at")
+            structure = build_structure(txn)
+            if structure is None:
+                return self._refuse(f"transaction {txn_id} has no executed option leg on "
+                                    f"record — its legs cannot be assembled")
+            short = held_short_leg(structure)
+            long_leg = held_long_leg(structure)
+            if short is None:
+                return self._refuse("this structure holds no short leg — there is no overlay "
+                                    "to roll")
+            if long_leg is None or long_leg.strike is None:
+                return self._refuse(
+                    "this structure holds no long leg with a readable strike — rolling an "
+                    "overlay onto nothing would write a naked call")
+            return self._roll(order, entry, txn, structure, short, long_leg, spec)
+        except OptionSelectionConfigError as e:
+            logger.error(f"{self._action_type_value()} for {self.instrument_name} is "
+                         f"misconfigured: {e}")
+            return self._result(False, str(e))
+        except Exception as e:
+            absorb_if_benign(e, InstanceNotFound)
+            logger.error(f"Error executing {self._action_type_value()} for "
+                         f"{self.instrument_name}: {e}", exc_info=True)
+            return self._result(False, f"Error executing option action: {str(e)}")
+
+    def _roll(self, order, entry, txn, structure, short, long_leg, spec) -> Dict[str, Any]:
+        from ba2_common.core.option_lifecycle import LifecycleLeg, uncovered_short_calls
+
+        today = self._today()
+        dte_min, dte_max = spec.get("dte_min"), spec.get("dte_max")
+        if dte_min is None or dte_max is None or int(dte_min) > int(dte_max):
+            raise OptionDteWindowError(
+                f"the recorded overlay DTE window for {self.instrument_name} is unusable "
+                f"({dte_min!r}..{dte_max!r}); no expiry can fall in it")
+        chain = self.account.get_option_chain(
+            self.instrument_name, today + timedelta(days=int(dte_min)),
+            today + timedelta(days=int(dte_max)), self.OPTION_TYPE)
+        if not chain:
+            return self._refuse(f"no option chain in the recorded overlay window "
+                                f"[{dte_min},{dte_max}] DTE")
+        # THE ENTRY'S OWN GATES, from the stamp: the next overlay is picked under the same
+        # liquidity conditions the first one was, or the position quietly changes character.
+        liq = {"min_open_interest": spec.get("min_open_interest"),
+               "max_spread_pct": spec.get("max_spread_pct"),
+               "min_volume": spec.get("min_volume")}
+        check_liquidity_data_available(chain, underlying=self.instrument_name,
+                                       source=type(self.account).__name__, **liq)
+        picked = select_single(
+            chain, method=spec.get("strike_method"), strike_param=spec.get("strike_param"),
+            spot=self._spot(), option_type=self.OPTION_TYPE, dte_min=int(dte_min),
+            dte_max=int(dte_max), today=today, target_price=None, policy=None, **liq)
+        if picked is None:
+            return self._refuse(
+                f"no liquid replacement overlay in the recorded window [{dte_min},{dte_max}] "
+                f"DTE. The long is left uncovered until one appears, which costs theta — "
+                f"writing a worse contract to avoid that is how a thesis drifts")
+        if picked.strike is None or picked.strike <= long_leg.strike:
+            return self._refuse(
+                f"the replacement overlay's strike ({picked.strike}) is not above the long "
+                f"leg's ({long_leg.strike}) — that is a vertical, not a covered call")
+        if picked.symbol == short.contract_symbol:
+            return self._refuse(f"the replacement overlay is the SAME contract as the one "
+                                f"being rolled ({picked.symbol}) — buying a contract back and "
+                                f"selling it again is a round trip that pays the spread twice "
+                                f"for nothing")
+        if short.expiry is not None and picked.expiry is not None \
+                and picked.expiry <= short.expiry:
+            return self._refuse(
+                f"the replacement overlay expires {picked.expiry}, no later than the one it "
+                f"replaces ({short.expiry}) — a roll moves the overlay FORWARD")
+        old_row = self._safe_quote(short.contract_symbol)
+        buyback = getattr(old_row, "ask", None) if old_row is not None else None
+        if buyback is None or picked.bid is None or picked.bid <= 0:
+            return self._refuse(
+                f"the roll cannot be priced (buy back {short.contract_symbol} at "
+                f"{buyback!r}, sell {picked.symbol} at {picked.bid!r})")
+        contracts = abs(float(short.net_qty))
+        # NOT ``structure.quantity or 0.0``: an unreadable structure count is UNKNOWN, and a
+        # zero here would size a roll of nothing rather than say so. Refuse, name it, stop.
+        structures = structure.quantity
+        if structures is None or abs(float(structures)) <= 0 or contracts <= 0:
+            return self._refuse(
+                f"the position's size is unreadable ({structures!r} structures, "
+                f"{contracts!r} short contracts), so the roll cannot be sized")
+        structures = abs(float(structures))
+        ratio = max(1, int(round(contracts / structures)))
+        legs = [
+            OptionLeg(contract_symbol=short.contract_symbol, side=OrderDirection.BUY,
+                      ratio_qty=ratio, position_intent="buy_to_close",
+                      option_type=self.OPTION_TYPE, strike=short.strike,
+                      expiry=short.expiry, underlying=structure.underlying),
+            OptionLeg(contract_symbol=picked.symbol, side=OrderDirection.SELL,
+                      ratio_qty=ratio, position_intent="sell_to_open",
+                      option_type=self.OPTION_TYPE, strike=picked.strike,
+                      expiry=picked.expiry, underlying=picked.underlying),
+        ]
+        unsafe = roll_legs_are_fail_closed(legs)
+        if unsafe is not None:
+            logger.error(f"{self._action_type_value()} for {self.instrument_name}: {unsafe}")
+            return self._refuse(unsafe)
+        # THE INVARIANT, measured on the position this ticket would leave behind: the old
+        # overlay nets to zero, the new one takes its place, the long is untouched.
+        after = [l for l in structure.held_legs if l.contract_symbol != short.contract_symbol]
+        after.append(LifecycleLeg(contract_symbol=picked.symbol, net_qty=-contracts,
+                                  option_type=self.OPTION_TYPE))
+        stranded = uncovered_short_calls(after)
+        if stranded:
+            return self._refuse(
+                f"the roll would leave short call(s) {', '.join(stranded)} with no long call "
+                f"cover", {"uncovered_short_contracts": list(stranded)})
+        # SIGNED NET, the house MLEG convention: positive = debit. Buy the old back at its
+        # ASK, sell the new at its BID -- both crossing touches, so the roll is never
+        # flattered by a mid.
+        net = round(ratio * (float(buyback) - float(picked.bid)), 4)
+        # The concession THIS position's entry conceded, read off the same row the overlay
+        # spec came from. A roll is scheduled maintenance, not a risk exit, so it pays what
+        # the entry paid rather than crossing the whole modelled spread (the F7 rule for a
+        # DISCRETIONARY close).
+        self.entry_cross = (getattr(entry, "data", None) or {}).get("entry_cross")
+        quoted = self._quote_with_concession(legs, net)
+        if not self.submit_to_broker:
+            return self._result(True, f"PMCC roll deferred for {self.instrument_name} "
+                                      f"(manual review, not submitted)",
+                                {"contract_symbols": [l.contract_symbol for l in legs],
+                                 "limit_price": quoted, "status": "PENDING"})
+        submitted = self.account.submit_option_order(
+            legs=legs, quantity=int(structures), order_type="limit", limit_price=quoted,
+            option_strategy=PMCC_ROLL_STRATEGY, transaction_id=txn.id)
+        if submitted is None:
+            return self._refuse(f"the broker refused the roll order "
+                                f"({short.contract_symbol} -> {picked.symbol})")
+        # NO RESTAMP HERE (2026-09-02 review). The stamp follows the FILL, not the ticket:
+        # ``ReadOnlyAccountInterface.refresh_transactions`` re-derives it from the executed
+        # rows through ``OptionRiskManagement.max_loss_from_fills``, which is the one place
+        # both runtimes observe a fill. Writing it from ``quoted`` here moved the risk
+        # denominator by a credit that a rejected or day-expired ticket never collected --
+        # and an unfilled DEBIT roll RAISED the floor, loosening ``opt_sl_ml`` on a position
+        # that had paid nothing. The projected value is reported for the audit row under a
+        # name that says it is a projection.
+        return self._result(
+            True, f"Rolled the pmcc overlay on {self.instrument_name}: "
+                  f"{short.contract_symbol} -> {picked.symbol}",
+            {"option_strategy": PMCC_ROLL_STRATEGY,
+             "closed_contract": short.contract_symbol,
+             "opened_contract": picked.symbol,
+             "limit_price": quoted,
+             "projected_max_loss_per_contract": restamped_max_loss(
+                 (getattr(entry, "data", None) or {}).get("max_loss_per_contract"), quoted)})
+
+    def _safe_quote(self, contract_symbol: str):
+        try:
+            return self.account.get_option_quote(contract_symbol)
+        except Exception as e:  # noqa: BLE001 — an unpriceable roll is a refusal, not a crash
+            absorb_if_benign(e, InstanceNotFound)
+            logger.debug(f"get_option_quote failed for {contract_symbol}: {e}")
+            return None
+
+
+
 def build_closing_legs(children, parent_quantity: int, quote_fn, held_qty=None) -> "tuple[List[OptionLeg], Optional[float]]":
     """Build reversed legs (and a net limit price) that close a spread's child legs.
 
@@ -3909,6 +5180,14 @@ def build_closing_legs(children, parent_quantity: int, quote_fn, held_qty=None) 
             (the B10 partial-close hazard); the close ratio is sized from the held qty,
             not the original leg qty. When None every child is closed at its original
             ratio (legacy behavior).
+
+    THE DIRECTION COMES FROM ``held_qty`` TOO when it is supplied, not only the size. Both
+    facts are questions about what is HELD NOW, and answering one from the netted position
+    while answering the other from the original row is how the two could disagree. They
+    cannot disagree on any structure that only ever opened and flattened — the sign of the
+    net always matches the opening side, which is why this is byte-identical for every
+    pre-existing caller — but they DO disagree on a rolled overlay, whose current short is a
+    contract the entry order never mentioned and whose ``children`` row is somebody else's.
     """
     legs: List[OptionLeg] = []
     net: float = 0.0
@@ -3919,10 +5198,12 @@ def build_closing_legs(children, parent_quantity: int, quote_fn, held_qty=None) 
             if abs(held) < 1e-9:
                 continue  # leg closed individually mid-life — nothing left to close
             qty_for_ratio = abs(held)
+            open_side = OrderDirection.BUY if held > 0 else OrderDirection.SELL
         else:
             qty_for_ratio = abs(float(child.quantity or 0.0))
-        close_side = OrderDirection.SELL if child.side == OrderDirection.BUY else OrderDirection.BUY
-        intent = "sell_to_close" if child.side == OrderDirection.BUY else "buy_to_close"
+            open_side = child.side
+        close_side = OrderDirection.SELL if open_side == OrderDirection.BUY else OrderDirection.BUY
+        intent = "sell_to_close" if open_side == OrderDirection.BUY else "buy_to_close"
         ratio = 1
         if qty_for_ratio and parent_quantity:
             ratio = max(1, int(round(qty_for_ratio / parent_quantity)))
@@ -3967,12 +5248,18 @@ class CloseOptionAction(TradeAction):
     simulator that models a spread implements — so live is byte-identical by
     construction:
 
-      * DISCRETIONARY closes (TP, time, sentiment, ...) concede the fraction the
-        position's ENTRY conceded (``data['entry_cross']`` on the entry/parent order —
-        the existing gene, no new one);
-      * FORCED closes (``forced_exit=True``: SL stop / DTE roll, classified from the
-        firing rule's triggers by ``TradeActionEvaluator.forced_option_exit``) cross the
-        modelled spread FULLY — a risk exit pays up.
+      * DISCRETIONARY closes (TP, the ``days_opened`` staleness exit, sentiment, ...)
+        concede the fraction the position's ENTRY conceded (``data['entry_cross']`` on
+        the entry/parent order — the existing gene, no new one);
+      * FORCED closes (``forced_exit=True``: SL stop / DTE roll / the O_ERN
+        ``days_after_event`` post-print exit, classified from the firing rule's triggers
+        by ``TradeActionEvaluator.forced_option_exit``) cross the modelled spread FULLY
+        — a risk exit pays up.
+
+    "Time exit" does not decide this, and the two time exits land on OPPOSITE sides:
+    ``days_opened`` is discretionary, ``days_after_event`` is forced. The reasoning lives
+    once, on ``_FORCED_EXIT_EVENT_TYPES``' ``days_after_event`` entry — read it there
+    rather than re-deriving it here.
 
     RESIDUAL OPTIMISM, RECORDED (operator-delegated design, 2026-08-30): live closes
     always pay the full real touch, while a backtest DISCRETIONARY close concedes only
@@ -4249,9 +5536,52 @@ class CloseOptionAction(TradeAction):
                 held_qty[o.contract_symbol] = held_qty.get(o.contract_symbol, 0.0) + (
                     q if o.side == OrderDirection.BUY else -q)
 
+        # The INTENT record. Which side a two-expiry structure must be flattened from is a
+        # property of what the position IS, and that is stamped on the transaction — not on
+        # this closing order, which submits under "close" like every other close path.
+        from ba2_common.core.models import Transaction
+        from ba2_common.core.trade_store import get_or_none
+        txn = (get_or_none(Transaction, order.transaction_id)
+               if order.transaction_id is not None else None)
+        # THE CLOSING SET IS THE TRANSACTION'S HELD CONTRACTS, not the entry parent's
+        # children (plan Task 6). For every single-expiry structure the two are the same set
+        # and this is a no-op; for a ROLLED PMCC they are not, because the live overlay is a
+        # child of the ROLL order and the entry parent has never heard of it. Closing only
+        # what the entry named would sell the LEAPS and leave that overlay standing — a naked
+        # short call, which is precisely the invariant this structure is not allowed to break.
+        children = self._closing_children(children, txn_orders, held_qty)
         legs, net_limit = build_closing_legs(
             children, parent_quantity=quantity, quote_fn=self._safe_option_quote,
             held_qty=held_qty)
+        # FAIL-CLOSED ORDERING, for a DECLARED two-expiry structure only. The cover here is
+        # an option leg, so the ticket must buy the short back before it releases the long;
+        # on a single-expiry combo every leg settles on one day and the order inside the
+        # ticket carries no risk meaning, so imposing it there would reshuffle existing
+        # structures' leg lists for nothing. The guard behind the sort is not decoration: it
+        # is what a future path that builds these legs some other way has to satisfy.
+        if is_multi_expiry_strategy(getattr(txn, "option_strategy", None)):
+            legs = sorted(
+                legs, key=lambda l: 0 if (l.position_intent or "") == "buy_to_close" else 1)
+            unsafe = close_legs_are_fail_closed(legs)
+            if unsafe is not None:
+                logger.error(f"close_option for {self.instrument_name}: {unsafe}")
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
+                    message=unsafe, data={"transaction_id": order.transaction_id})
+        # AND THE INVARIANT ITSELF, measured on the position this ticket would LEAVE BEHIND.
+        # It is the backstop for the enumeration above rather than a restatement of it: a
+        # closing set that misses a held short call is refused here whatever produced it, so
+        # the worst outcome of a future bug is a position that stays open, never one that
+        # goes naked.
+        stranded = self._uncovered_after(held_qty, legs, txn_orders, quantity)
+        if stranded:
+            message = (f"refusing to close {self.instrument_name}: the closing order would "
+                       f"leave short call(s) {', '.join(stranded)} with no long call cover. "
+                       f"A structure that cannot be flattened safely stays open.")
+            logger.error(f"close_option for {self.instrument_name}: {message}")
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
+                message=message, data={"uncovered_short_contracts": list(stranded)})
         # F7: the synthetic net is a MID net — concede the exit fraction per leg (the
         # +debit/-credit convention makes "give up" = net UP for every leg; see
         # entry_limit_with_concession). No-op on live accounts and when net_limit is
@@ -4292,6 +5622,66 @@ class CloseOptionAction(TradeAction):
             action_type=ExpertActionType.CLOSE_OPTION.value, success=True,
             message=f"Submitted multi-leg close for {self.instrument_name} ({contract_syms})",
             data={"contract_symbols": contract_syms, "limit_price": net_limit})
+
+    @staticmethod
+    def _closing_children(children, txn_orders, held_qty: Dict[str, float]) -> List[Any]:
+        """``children`` plus one representative row per HELD contract they do not cover.
+
+        The entry parent's children are kept FIRST and in their original order, so for every
+        structure whose held contracts are exactly its entry legs — which is every
+        single-expiry structure ever opened — this returns the same list it was given and
+        ``build_closing_legs`` produces a byte-identical order.
+
+        What it adds is the contract a ROLL created: the live overlay's opening row hangs off
+        the roll parent, not the entry parent, so ``children`` alone does not mention it. Any
+        row for that contract will do here because only per-contract-invariant fields are read
+        off it (strike, right, expiry, underlying) — the SIZE and the DIRECTION both come from
+        ``held_qty``, which is the only thing that knows what is still held.
+        """
+        seen = {c.contract_symbol for c in children}
+        extra: Dict[str, Any] = {}
+        for row in txn_orders:
+            symbol = row.contract_symbol
+            if symbol in seen or symbol in extra:
+                continue
+            if abs(held_qty.get(symbol, 0.0)) < 1e-9:
+                continue
+            extra[symbol] = row
+        return list(children) + [extra[s] for s in sorted(extra)]
+
+    @staticmethod
+    def _uncovered_after(held_qty: Dict[str, float], legs: List[OptionLeg],
+                         txn_orders, quantity: int) -> "tuple":
+        """Short call contracts left NAKED once ``legs`` are applied to ``held_qty``.
+
+        The invariant, measured rather than argued: apply the closing ticket to the netted
+        position and ask ``option_lifecycle.uncovered_short_calls`` about what is left. Empty
+        is the only acceptable answer, and it is the answer for a complete flatten by
+        construction — everything nets to zero, and a set with no held legs has no naked one.
+
+        The option RIGHT comes off the transaction's order rows, because ``held_qty`` is a
+        bare ``{symbol: qty}`` map. A contract whose right cannot be read is left out of the
+        check rather than guessed at: this is a refusal gate, and refusing a legitimate close
+        on an unreadable row would strand the position it is trying to protect.
+        """
+        from ba2_common.core.option_lifecycle import LifecycleLeg, uncovered_short_calls
+
+        remaining = dict(held_qty)
+        for leg in legs:
+            # CONTRACTS, not structures: ``held_qty`` counts contracts, while a closing leg
+            # carries a per-structure RATIO. Multiplying by the parent quantity is what makes
+            # a 5-lot PMCC net to zero instead of to -4 short calls.
+            delta = float(leg.ratio_qty or 1) * float(quantity)
+            if leg.side == OrderDirection.SELL:
+                delta = -delta
+            remaining[leg.contract_symbol] = remaining.get(leg.contract_symbol, 0.0) + delta
+        rights = {}
+        for row in txn_orders:
+            if row.contract_symbol not in rights and row.option_type is not None:
+                rights[row.contract_symbol] = row.option_type
+        return uncovered_short_calls(
+            LifecycleLeg(contract_symbol=symbol, net_qty=qty, option_type=rights[symbol])
+            for symbol, qty in sorted(remaining.items()) if symbol in rights)
 
     def _safe_option_quote(self, contract_symbol: str):
         try:
@@ -4349,6 +5739,10 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.OPEN_JADE_LIZARD: OpenJadeLizardAction,
         ExpertActionType.OPEN_CALL_BUTTERFLY: OpenCallButterflyAction,
         ExpertActionType.OPEN_PUT_RATIO_SPREAD: OpenPutRatioSpreadAction,
+        ExpertActionType.OPEN_CALL_BACKSPREAD: OpenCallBackspreadAction,
+        ExpertActionType.OPEN_PUT_BACKSPREAD: OpenPutBackspreadAction,
+        ExpertActionType.OPEN_PMCC: OpenPMCCAction,
+        ExpertActionType.ROLL_PMCC_SHORT: RollPMCCShortAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     

@@ -745,14 +745,69 @@ def test_the_short_straddle_is_charged_its_STRIKE_not_the_spot():
 # ==========================================================================
 # THE SCOPE OF THE GATE, scanned out of the source (mutations D12/D13/D14)
 # ==========================================================================
-def _gated_strategies():
-    """Every strategy name handed to ``_downsize_to_delivery_capacity``, by ``ast``."""
-    import ast
-    import inspect
-    from ba2_common.core import TradeActions
+def _scan_gate_calls(source: str):
+    """The strategy handed to every ``_downsize_to_delivery_capacity`` call in ``source``.
 
-    tree = ast.parse(inspect.getsource(TradeActions))
+    WHAT IT READS, EXACTLY -- and the promise is deliberately narrow, because the previous
+    version of this docstring promised more than the code delivered (2026-09-01 review
+    finding B, three silent evasions demonstrated). The gate's strategy is its FIRST
+    POSITIONAL argument at every call site, and that is the ONLY argument this scan looks
+    at; the keywords beside it (``strike``, ``quantity``, ``contracts_per_unit``) are not
+    its business. That argument must resolve, and it resolves in exactly two shapes:
+
+      * a string LITERAL (``self._downsize_to_delivery_capacity("iron_condor", ...)``), or
+      * ``self.<CONST>`` where ``<CONST> = "literal"`` sits in the enclosing class's own
+        body (``OPTION_STRATEGY``, which the 1x2 backspreads share with their reserve and
+        submit calls so the three cannot disagree).
+
+    ANY OTHER SHAPE RAISES -- a local variable, an f-string, a module constant, a call, a
+    starred argument, the strategy passed by KEYWORD, or no positional argument at all. A
+    call this test cannot read is a call it is not guarding, and the honest response is a
+    failure naming the site, not a quietly shorter set.
+
+    AN EMPTY RESOLVED STRING RAISES TOO, rather than joining the set. ``_BackspreadAction``
+    declares ``OPTION_STRATEGY: str = ""`` as the slot its two subclasses fill; if the
+    capacity call were ever moved UP into that base, ``self.OPTION_STRATEGY`` would resolve
+    there to ``""`` and be ADDED -- a name matching no strategy, so the set equality below
+    would fail complaining about an empty string instead of about the builder that stopped
+    being scannable. Refusing it here says which.
+
+    Takes SOURCE TEXT rather than the module so the refusals above can be exercised on
+    synthetic call sites (``test_the_scan_refuses_a_call_it_cannot_read``). Every real call
+    site is readable today, so without that the refusal branches would never run.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+
+    def enclosing_class(node):
+        while node is not None:
+            node = parents.get(node)
+            if isinstance(node, ast.ClassDef):
+                return node
+        return None
+
+    def string_constants(cls):
+        """``NAME = "literal"`` in this class body (not inside its methods)."""
+        out = {}
+        if cls is None:
+            return out
+        for stmt in cls.body:
+            targets = (stmt.targets if isinstance(stmt, ast.Assign)
+                       else [stmt.target] if isinstance(stmt, ast.AnnAssign) else [])
+            value = getattr(stmt, "value", None)
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                for t in targets:
+                    if isinstance(t, ast.Name):
+                        out[t.id] = value.value
+        return out
+
     found = set()
+    unresolved = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
@@ -760,11 +815,95 @@ def _gated_strategies():
         name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
         if name != "_downsize_to_delivery_capacity":
             continue
-        for arg in list(node.args) + [kw.value for kw in node.keywords]:
-            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
-                found.add(arg.value)
-    assert found, "the ast scan found no gated strategies — the scan itself is broken"
+        cls = enclosing_class(node)
+        where = f"line {node.lineno} in {getattr(cls, 'name', '<module>')}"
+        if not node.args:
+            unresolved.append(f"{where}: no positional strategy argument")
+            continue
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            resolved = arg.value
+        elif (isinstance(arg, ast.Attribute) and isinstance(arg.value, ast.Name)
+                and arg.value.id == "self"):
+            resolved = string_constants(cls).get(arg.attr)
+            if resolved is None:
+                unresolved.append(
+                    f"{where}: self.{arg.attr} is not a string constant of that class")
+                continue
+        else:
+            unresolved.append(
+                f"{where}: {type(arg).__name__} is not a readable strategy")
+            continue
+        if not resolved.strip():
+            unresolved.append(
+                f"{where}: the strategy resolves to an EMPTY string -- an unfilled "
+                f"OPTION_STRATEGY slot, not a gated structure")
+            continue
+        found.add(resolved)
+    assert not unresolved, (
+        f"the ast scan could not read the strategy handed to the capacity gate at "
+        f"{unresolved} -- an unreadable call is an unguarded one")
     return found
+
+
+def _gated_strategies():
+    """Every strategy name handed to ``_downsize_to_delivery_capacity`` in TradeActions."""
+    import inspect
+
+    from ba2_common.core import TradeActions
+
+    found = _scan_gate_calls(inspect.getsource(TradeActions))
+    assert found, "the ast scan found no gated strategies -- the scan itself is broken"
+    return found
+
+
+_UNREADABLE_CALL_SITES = [
+    # a local variable -- readable to a human, opaque to ast
+    '        strategy = "put_backspread"\n'
+    '        self._downsize_to_delivery_capacity(strategy, strike=1.0, quantity=1)',
+    # the strategy passed by KEYWORD, so args[0] does not exist
+    '        self._downsize_to_delivery_capacity(option_strategy="put_backspread",\n'
+    '                                            strike=1.0, quantity=1)',
+    # an f-string
+    '        self._downsize_to_delivery_capacity(f"put_{self.kind}", strike=1.0,\n'
+    '                                            quantity=1)',
+    # the LIVE trap: the base class slot, still empty
+    '        self._downsize_to_delivery_capacity(self.OPTION_STRATEGY, strike=1.0,\n'
+    '                                            quantity=1)',
+]
+
+
+@pytest.mark.parametrize("body", _UNREADABLE_CALL_SITES)
+def test_the_scan_refuses_a_call_it_cannot_read(body):
+    """The scan's own refusal, exercised rather than asserted about in a docstring."""
+    source = ('class Faked:\n'
+              '    OPTION_STRATEGY: str = ""\n'
+              '    def go(self):\n'
+              + body + '\n')
+    with pytest.raises(AssertionError, match="unreadable|EMPTY"):
+        _scan_gate_calls(source)
+
+
+def test_the_scan_still_reads_the_two_shapes_it_promises():
+    """The other direction, so the refusal above cannot be "refuse everything"."""
+    source = ('class Faked:\n'
+              '    OPTION_STRATEGY = "put_backspread"\n'
+              '    def go(self):\n'
+              '        self._downsize_to_delivery_capacity("iron_condor", strike=1.0,\n'
+              '                                            quantity=1)\n'
+              '        self._downsize_to_delivery_capacity(self.OPTION_STRATEGY,\n'
+              '                                            strike=1.0, quantity=1)\n')
+    assert _scan_gate_calls(source) == {"iron_condor", "put_backspread"}
+
+
+def test_the_empty_slot_the_scan_refuses_is_a_real_declaration():
+    """``_BackspreadAction.OPTION_STRATEGY = ""`` is what makes that refusal load-bearing
+    rather than hypothetical: move the capacity call up into the base and the scan reads an
+    empty string off it."""
+    from ba2_common.core import TradeActions as TA
+
+    assert TA._BackspreadAction.OPTION_STRATEGY == ""
+    assert TA.OpenPutBackspreadAction.OPTION_STRATEGY == "put_backspread"
 
 
 def test_only_the_builders_that_carry_a_SHORT_PUT_call_the_capacity_gate():
@@ -781,8 +920,16 @@ def test_only_the_builders_that_carry_a_SHORT_PUT_call_the_capacity_gate():
     jade_lizard         ``SELL`` naked put + ``SELL`` call + ``BUY`` call wing -> YES
     put_ratio_spread    ``BUY`` 1 put + ``SELL`` 2 puts (``ratio_qty=2``)    -> YES
     bull_put_spread     ``SELL`` higher put + ``BUY`` lower put wing         -> YES
+    put_backspread      ``SELL`` 1 higher put + ``BUY`` 2 lower puts         -> YES
     bear_call_spread    ``SELL`` lower call + ``BUY`` higher call            -> NO
+    call_backspread     ``SELL`` 1 lower call + ``BUY`` 2 higher calls       -> NO
     ==================  ============================================================
+
+    The 1x2 PUT BACKSPREAD (2026-09-01) is charged for the same reason the bull put spread
+    is, and its two long puts net NOTHING off the bill for the same reason that spread's one
+    wing does not: the long is OUR right, exercisable on a LATER day, after the shares have
+    already been paid for at the short strike tonight. Its CALL twin is not charged -- an
+    assigned short call delivers shares and takes cash IN.
 
     KNOWN AND REPORTED, deliberately out of this commit's scope: ``bear_put_spread``
     (``BUY`` the higher-strike put, ``SELL`` the lower one) also carries a short put and
@@ -793,6 +940,7 @@ def test_only_the_builders_that_carry_a_SHORT_PUT_call_the_capacity_gate():
     assert _gated_strategies() == {
         "cash_secured_put", "short_straddle", "short_strangle",
         "iron_condor", "jade_lizard", "put_ratio_spread", "bull_put_spread",
+        "put_backspread",
     }
 
 
@@ -812,6 +960,10 @@ def test_only_the_builders_that_carry_a_SHORT_PUT_call_the_capacity_gate():
     ("open_call_butterfly", dict(strike_method="percent_otm", strike_param=0.0,
                                  wing_width_pct=10.0, dte_min=10, dte_max=40,
                                  sizing=20.0)),
+    # The CALL backspread: its only short leg is a CALL, so a book at full delivery
+    # capacity must not stop it. (Its PUT twin IS charged -- see the table above.)
+    ("open_call_backspread", dict(strike_method="percent_otm", strike_param=[10.0, 5.0],
+                                  dte_min=10, dte_max=40, sizing=20.0)),
 ])
 def test_a_structure_with_no_short_put_opens_on_a_book_at_full_capacity(full_book,
                                                                         action, kw):

@@ -1,5 +1,11 @@
-"""GA wiring (spec §3.4): a bypass expert's gene space is its own model:* params
-ONLY — classic cond:/exit:/tp/sl genes are stripped by collect_param_space(bypass=True)."""
+"""GA wiring (spec §3.4): a BYPASS expert's gene space is its own model:* params
+ONLY — classic cond:/exit:/tp/sl genes are stripped by collect_param_space(bypass=True).
+
+Nothing here is PremiumSeller-specific and never was; the file was named
+``test_premium_seller_ga.py`` because that expert was the first bypass expert. It was
+deleted on 2026-08-31 and the name outlived it, pointing every reader at code that no
+longer exists. Renamed 2026-09-01 to what the file actually pins (FactorRanker is the
+bypass expert this now guards)."""
 import pytest
 
 

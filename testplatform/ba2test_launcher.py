@@ -1058,8 +1058,9 @@ def _daily_manage_schedule() -> dict:
 
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
-    the expert's own universe setting when the spec names one (PremiumSeller's static_universe —
-    it reads its universe from that setting, not from enabled_instruments).
+    the expert's own universe setting when the spec names one (``universe_setting`` — for an
+    expert that reads its universe from a setting, not from enabled_instruments; no current
+    spec names one since PremiumSeller's removal, 2026-08-31).
 
     ``overrides`` wins over fixed_settings. Used by ``--sizing-mode`` so the SAME expert spec can
     be run once per sizing mode without editing _EXPERT_OPT: sizing_mode is a 2-value categorical
@@ -1067,10 +1068,25 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     deliberately compared as two separate runs rather than made a gene — under notional the five
     ATR genes face no selection pressure and drift random, so a crossover that flips the mode
     would judge it with unselected parameters and bias the comparison toward whichever mode
-    happens to dominate the population."""
+    happens to dominate the population.
+
+    ``risk_manager_mode`` (review finding M5, 2026-09-01) is plumbed here and NOWHERE ELSE:
+    a spec that names one has it written onto the run's expert settings, from which
+    ``strategy_optimization_handler._build_daily_trial_config`` carries it into every trial
+    (that dict passes expert settings through wholesale, so nothing downstream drops it) and
+    ``daily_backtest_handler`` reads it. Until this existed the ``classic_options`` mode was
+    selectable by a live expert and by a hand-written config, but by no GRID JOB -- the
+    option risk manager could not be searched at all.
+
+    ABSENT IS THE DEFAULT and stays absent: a spec that does not name the key produces the
+    same settings dict it always did, byte for byte, so every existing job is unchanged.
+    ``test_no_shipped_expert_spec_selects_a_risk_manager_mode`` pins that.
+    """
     settings = dict(spec["fixed_settings"])
     if spec.get("universe_setting"):
         settings[spec["universe_setting"]] = ",".join(universe)
+    if spec.get("risk_manager_mode"):
+        settings["risk_manager_mode"] = spec["risk_manager_mode"]
     if overrides:
         settings.update(overrides)
     return settings
@@ -1113,10 +1129,75 @@ def _apply_options_store(args, backtest_block: dict) -> None:
         {"options_store": getattr(args, "options_store", None)})
 
 
+# --- the LOWER TRADE FLOOR for the long-dated grid-2 keys -----------------------------------
+#
+# ``option_consistent_annual_return`` disqualifies a config below a hard trades/year floor
+# (``strategy_fitness._CAR_HARD_MIN_TRADES_PER_YEAR`` = 12) and ramps credit up to
+# ``_CAR_MIN_TRADES_PER_YEAR`` = 30. Those two numbers are a SCREENER expert's cadence. A
+# structure that is OPENED at 365-550 DTE and exited at a 90-240 DTE floor lives 125-460
+# CALENDAR DAYS by construction (365-240 at the fastest, 550-90 at the slowest), so over the
+# grid's 1,095-day window ONE underlying supports between 1,095/460 = 2.4 and 1,095/125 = 8.8
+# sequential structures -- 0.8 to 2.9 per underlying per YEAR. Clearing a 12/yr floor
+# therefore needs between 4 and 15 underlyings occupied CONTINUOUSLY, and design §1 measured
+# that only 8 of 14 sampled January expiries carry any 1-year+ bars at all: the eligible slice
+# of the universe is a fraction of it. On the default floor the metric would disqualify the
+# long-dated arms for having the holding period the design chose for them, and the grid would
+# report that as "LEAPS do not work".
+#
+# THESE TWO NUMBERS ARE AUTHORED FROM THAT ARITHMETIC, NOT MEASURED -- there is no grid-2 run
+# to measure against yet, the same footing as the ARC bands above. 3/yr hard keeps a genuinely
+# 1-or-2-trade artifact disqualified (2.4 structures/underlying is the SLOWEST single-name
+# rate, so 3/yr still demands more than one name), and 8/yr full credit is about three
+# concurrent names at the slow end.
+#
+# O_ERN IS DELIBERATELY ABSENT, and that is the load-bearing half of this table. Earnings
+# events are quarterly per name and the design's own §8 calls O_ERN "the one key whose result
+# deserves statistical weight" precisely because it gets hundreds of independent events
+# in-window. Handing it a lower floor would remove the only breadth check the fitness applies
+# to the key that can actually satisfy it -- and would let a 3-trades-a-year O_ERN genome, the
+# clearest possible sign the entry gates are mis-tuned, score as a normal config.
+#
+# THE BACKSPREADS ARE OUT (corrected 2026-09-02, review of 746d59fd). They were briefly in,
+# on a misreading of the plan: Task 10 says "a CONFIG naming the long-dated keys only", and
+# design §2's long-dated family is O_LEAPC / O_LEAPP / O_PMCC. O_CBS/O_PBS are the separate
+# CONVEXITY-FINANCED family at 60-180 DTE, and their own arithmetic says they never needed the
+# exemption: a 60-180 DTE entry exited at a 20-45 DTE floor lives 15-160 days, i.e. 2.3-24
+# structures per underlying per year, so the default 12/yr floor is reachable on a handful of
+# names and disqualifies only a genuinely thin config -- which is exactly what it is for. A
+# lower floor there would not have been "nearly inert", it would have been an unasked-for
+# weakening of the only breadth check the fitness applies to them.
+#
+# THE KEY HERE IS THE LAUNCHED ONE, and after the 2026-09-02 merge that is the GROUP key
+# "O_LEAP", not its two members: ``_apply_option_trade_floor`` is called with the strategy
+# ``kind`` the CLI was given, and O_LEAPC/O_LEAPP are no longer launchable on their own (they
+# are the group's bullish and bearish arms). Listing the members here instead would leave the
+# real job -- ``--strategy O_LEAP`` -- on the default 12/yr floor, i.e. exactly the "LEAPS do
+# not work" artefact the arithmetic above exists to prevent.
+_OPTION_LOW_TRADE_FLOOR_STRATEGIES = {"O_LEAP", "O_PMCC"}
+_OPTION_LOW_TRADE_FLOOR = {"car_hard_min_trades_per_year": 3.0,
+                           "car_min_trades_per_year": 8.0}
+
+
+def _apply_option_trade_floor(strategy_key: "str | None", backtest_block: dict) -> None:
+    """Write the long-dated keys' trade-frequency objective onto the run's backtest block.
+
+    A no-op for every other strategy, which keeps every existing job's fitness bit-identical:
+    absent keys leave ``_car_trade_thresholds_for_experts`` on its expert/default resolution,
+    exactly as before.
+
+    A STRATEGY-level floor, not an expert-level one, because the holding period is a property
+    of the STRUCTURE: the same expert driving O_LEAPC and O_LC produces cadences an order of
+    magnitude apart, and a class attribute on the expert cannot tell them apart.
+    """
+    if strategy_key in _OPTION_LOW_TRADE_FLOOR_STRATEGIES:
+        backtest_block.update(_OPTION_LOW_TRADE_FLOOR)
+
+
 def _bypass_gene_space(spec: dict) -> dict:
     """GA gene space for a BYPASS expert: its expert_params plus the narrow _BYPASS_RM_OPT block
-    UNLESS the spec opts out (no_bypass_rm — PremiumSeller's manager owns its exits, so the
-    engine stop pass has no reader for risk_per_trade_pct and the gene would be dead weight)."""
+    UNLESS the spec opts out (no_bypass_rm — for a bypass expert whose manager owns its exits,
+    leaving risk_per_trade_pct with no reader; no current spec sets it since PremiumSeller's
+    removal, 2026-08-31)."""
     return {**spec["expert_params"], **({} if spec.get("no_bypass_rm") else _BYPASS_RM_OPT)}
 
 
@@ -1172,6 +1253,33 @@ _EXPERT_OPT = {
             # would silently override 'static' mode's own tuned value, which defeats the point.
             "max_expected_profit_percent": {"optimize": True, "min": 20.0, "max": 500.0,
                                             "step": 20.0, "type": "float"},
+        },
+        "fixed_settings": {"sizing_mode": "risk_atr"},
+    },
+    # GRID 2's event expert (design 2026-08-31 §9, plan Task 11). The three ranking weights are
+    # RATIOS (composite_confidence is a weighted MEAN over the PRESENT features, invariant to a
+    # common rescale -- see the class docstring's "Normalization" section), so the same
+    # 0.0-2.0/step 0.25 band FactorRanker's factor_weight_* genes use applies unchanged: what the
+    # GA searches is relative importance, not an absolute unit.
+    "FMPEarningsEvent": {
+        "expert_params": {
+            "w_hist_move": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
+            "w_surprise_vol": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
+            "w_vol_cheapness": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
+            # AMENDMENT 2026-09-01: 0-5, 0 = gate OFF (the expert's own get_settings_definitions
+            # documents this; _process's ``if min_analysts > 0`` implements it). Measured (module
+            # docstring): the OLD default=3 refused 66% of the universe at a 2023-06-10 as-of and
+            # 47% at 2025-06-10 -- a range that never reached the low end would leave most of the
+            # mid/small bands unreachable, exactly where design §9 says O_ERN runs FIRST. The
+            # class DEFAULT is now 1 (Task 11); this gene is what searches the selection question.
+            "min_analysts": {"optimize": True, "min": 0, "max": 5, "step": 1, "type": "int"},
+            # Boolean gene: encoded as a 2-choice categorical (index 0/1 -> False/True), the
+            # standard pattern _collect_expert already handles for any "choice"-typed expert
+            # param -- no new gene TYPE needed. See the class docstring: an unconfirmed
+            # ('--'/missing) FMP announcement slot means the date itself is unpinned, so this
+            # toggles whether the GA is allowed to trade a date that might still slip.
+            "allow_unconfirmed_dates": {"optimize": True, "type": "choice",
+                                        "choices": [False, True]},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },
@@ -1298,42 +1406,10 @@ _EXPERT_OPT = {
         "fixed_settings": {"universe_source": "static", "weighting": "equal"},
         "bypass": True,
     },
-    # PremiumSeller is a BYPASS *options* income expert (design: docs/superpowers/specs/
-    # 2026-07-24-premium-seller-expert-design.md): it sells defined-risk put credit spreads on
-    # large caps and manages its own exits on manage bars (OptionPortfolioManager.manage_open).
-    # options=True  -> the run gets the offline options-cache seam (options_cache_db forwarded
-    #                  per-trial by _build_daily_trial_config).
-    # universe_setting -> --universe is injected into its static_universe setting (it reads its
-    #                  universe from that setting, NOT from enabled_instruments).
-    # no_bypass_rm  -> _BYPASS_RM_OPT's risk_per_trade_pct has no reader for it: the gene prices
-    #                  FactorRanker's resting protective stop (protective_stop_price), and
-    #                  PremiumSeller's OptionPortfolioManager has no such stop (it owns its exits
-    #                  via manage_open), so the gene would be dead weight.
-    "PremiumSeller": {
-        "expert_params": {
-            "iv_rank_min": {"optimize": True, "min": 20.0, "max": 60.0, "step": 10.0, "type": "float"},
-            "iv_hv_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
-            "trend_filter_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
-            "target_delta": {"optimize": True, "min": 0.15, "max": 0.40, "step": 0.05, "type": "float"},
-            "target_dte": {"optimize": True, "min": 21, "max": 45, "step": 6, "type": "int"},
-            "spread_width": {"optimize": True, "min": 2.5, "max": 10.0, "step": 2.5, "type": "float"},
-            "min_credit_ratio": {"optimize": True, "min": 0.05, "max": 0.20, "step": 0.05, "type": "float"},
-            "profit_capture_pct": {"optimize": True, "min": 25.0, "max": 75.0, "step": 25.0, "type": "float"},
-            "roll_dte": {"optimize": True, "min": 14, "max": 28, "step": 7, "type": "int"},
-            "risk_per_structure_pct": {"optimize": True, "min": 1.0, "max": 5.0, "step": 1.0, "type": "float"},
-            "max_deployment_pct": {"optimize": True, "min": 20.0, "max": 60.0, "step": 10.0, "type": "float"},
-            "dr_stop_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
-            "dr_stop_credit_mult": {"optimize": True, "min": 1.5, "max": 3.0, "step": 0.5, "type": "float"},
-            "tested_delta_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
-        },
-        # Naked structures stay OFF in v1 (defined-risk only); the earnings filter stays pinned ON.
-        "fixed_settings": {"enable_short_put": False, "enable_short_strangle": False,
-                           "earnings_filter_enabled": True},
-        "bypass": True,
-        "options": True,
-        "universe_setting": "static_universe",
-        "no_bypass_rm": True,
-    },
+    # PremiumSeller's grid entry was REMOVED 2026-08-31 (operator decision; option-model plan
+    # Task 12): the expert is deleted, so `ba2-test optimize --expert PremiumSeller` now refuses
+    # loudly via the "not configured" exit below. Its promoted rails/lifecycle logic serve every
+    # option position through ba2_common.option_book / option_lifecycle and the option RM.
 }
 
 
@@ -2205,10 +2281,19 @@ _OPTION_STRATS = {
         "option_strike_param_max": 6.0, "option_strike_param_step": 2.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
         "option_dte_max_range": 60, "option_dte_step": 5},
-    "O_SSTG": {  # short strangle (credit) -- Reg-T naked-vol bracket, not notional: spot cap
-        # $300 (grid design §6 -- $50 restrictive / $300 permissive on the reserve table below
-        # _FULL_NOTIONAL_OPTION_KINDS; capped, not excluded, so stage 1 measures it honestly
-        # instead of confounding structure quality with affordability). F4, 2026-08-30.
+    "O_SSTG": {  # short strangle (credit) -- OUT OF THE SEARCHED SET since 2026-08-31
+        # (operator decision, AskUserQuestion: "Only truly unbounded"): its short call has no
+        # covering leg, so its worst case is UNBOUNDED (_UNDEFINED_RISK_MEMBERS) and the grid
+        # no longer searches it; an explicit --strategy/--strategies request refuses loudly.
+        # THIS RISK DECISION SUPERSEDES THE F4 AFFORDABILITY STANCE (F4, 2026-08-30, on dev:
+        # "capped, not excluded" -- a $300 Reg-T screener_gate_base cap so stage 1 could
+        # measure the structure without confounding quality with affordability). F4 answered
+        # "can the account afford it?"; 2026-08-31 answers "may the grid risk it?" -- and the
+        # answer is no even where it is affordable, so on a merge the exclusion wins. The row
+        # itself STAYS: builder, reserve math, settlement and tests remain fully supported --
+        # and so does F4's $300 cap below, now INERT (the grouped search never reads an
+        # excluded member's row), kept so re-admitting the structure restores a measured
+        # affordability bracket rather than an unbounded-price one.
         "action_type": "open_short_strangle", "option_strike_method": "percent_otm",
         "option_strike_param": 12.0, "option_dte_min": 25, "option_dte_max": 45,
         "option_sizing": 20.0,
@@ -2217,8 +2302,9 @@ _OPTION_STRATS = {
         "option_dte_optimize": True, "option_dte_min_range": 20,
         "option_dte_max_range": 50, "option_dte_step": 5,
         "screener_gate_base": {"price_max": 300.0}},
-    "O_SSTD": {  # short straddle (credit) -- same Reg-T bracket as O_SSTG, same $300 cap.
-        # F4, 2026-08-30.
+    "O_SSTD": {  # short straddle (credit) -- OUT OF THE SEARCHED SET since 2026-08-31,
+        # same unbounded short call and same supersession of F4's cap as O_SSTG above; its
+        # $300 cap likewise stays on the row as inert record.
         "action_type": "open_short_straddle", "option_strike_method": "percent_otm",
         "option_strike_param": 0.0, "option_dte_min": 25, "option_dte_max": 45,
         "option_sizing": 20.0,
@@ -2350,7 +2436,327 @@ _OPTION_STRATS = {
         "option_strike_param_max": 12.0, "option_strike_param_step": 2.0,
         "option_dte_optimize": True, "option_dte_min_range": 10,
         "option_dte_max_range": 55, "option_dte_step": 5},
+
+    # ==========================================================================================
+    # GRID 2 (design 2026-08-31, docs/superpowers/specs/2026-08-31-leaps-grid-design.md §2)
+    # ==========================================================================================
+    #
+    # THE METHOD IS FIXED TO ``delta`` ON EVERY KEY THAT HONOURS IT, AND IT IS NEVER SEARCHED.
+    # The launcher's strike-method machinery makes the METHOD a categorical gene that SHARES
+    # one ``option_strike_param`` domain with the percent-OTM alternative (see
+    # ``_apply_option_strike_method_gene``). Every grid-2 thesis is stated in DELTA -- a
+    # 0.80-delta stock replacement, a 0.40/0.20 backspread -- and a percent-OTM domain read as
+    # a delta target selects the deepest-ITM contract on the chain, so a shared domain here is
+    # not a search, it is a decode error waiting for a genome. These rows therefore declare
+    # ``option_strike_method: "delta"`` and NO ``option_strike_param_optimize``; the searched
+    # quantity is ``option_strike_delta`` (+ ``option_strike_delta_long`` for the per-leg
+    # pair), which ``strategy_param_space._apply_option_strike`` writes onto
+    # ``option_strike_param`` under the delta method. ``_apply_option_strike_method_gene``
+    # refuses to emit a method gene for a fixed-method row -- twice over, and deliberately.
+    #
+    # PHASE 1 LAUNCHES {O_LEAP, O_ERN, O_CBS, O_PBS}. ``O_PMCC`` and ``O_CAL`` are PHASE-GATED
+    # (they need the per-leg-expiry Transaction work, plan Task 6-PRE) and have no row here at
+    # all -- see ``_PHASE_GATED_OPTION_STRATEGIES`` for the loud refusal.
+    #
+    # O_LEAPC / O_LEAPP ARE THE TWO ARMS OF ONE KEY, not two keys (operator decision
+    # 2026-09-02). They keep their own rows here -- a row IS a gene table, and each arm needs
+    # its own action -- but the launchable key is the GROUP "O_LEAP"
+    # (``_OPTION_GROUPS_ALL["O_LEAP"]``, ``_build_strategy_option_group``): a bullish arm
+    # (buy_call) and a bearish arm (buy_put) as two toggleable entry rules over ONE shared exit
+    # ruleset, exactly the shape O_CONVEX uses below. The per-arm ``enabled`` gene comes free
+    # with the group builder (``_option_entry_rule``'s ``toggleable=True``), so the GA can drop
+    # either direction; ``has_no_position`` is expert-level per INSTRUMENT, so the two arms can
+    # never both open on the same underlying anyway.
+    "O_LEAPC": {  # LEAPS long CALL arm of O_LEAP -- stock replacement (debit, delta-selected)
+        # Delta 0.70-0.90 step 0.05 (5 levels): deep enough that the position tracks the
+        # underlying nearly one-for-one, which is the whole "stock replacement" claim.
+        "action_type": "buy_call", "option_strike_method": "delta",
+        "option_strike_param": 0.80, "option_strike_delta": 0.80,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.70,
+        "option_strike_delta_max": 0.90, "option_strike_delta_step": 0.05,
+        # ENTRY DTE 365-550 (design §2). ``_apply_option_dte`` decodes the gene as the window
+        # CENTRE and keeps a half-width taken from the AUTHORED window, so the authored
+        # 380..470 fixes hw = (470-380)//2 = 45 and the searched centres 410..500 step 15
+        # (7 levels) decode to [365,455] .. [455,545] -- every window inside the design band,
+        # and 90 days wide so a January-cycle LEAPS expiry can actually fall in it (§1: LEAPS
+        # live on the January cycles, so a narrow window is usually empty).
+        "option_dte_min": 380, "option_dte_max": 470,
+        "option_dte_optimize": True, "option_dte_min_range": 410,
+        "option_dte_max_range": 500, "option_dte_step": 15,
+        "option_sizing": 5.0},
+    "O_LEAPP": {  # LEAPS long PUT arm of O_LEAP -- the bearish twin; same genes, kind=put.
+        # Enters on the BEARISH signal (see _OPTION_ENTRY_GATE), like O_LP. The delta band is
+        # the same 0.70-0.90: ``option_selector`` compares ABSOLUTE delta for puts.
+        "action_type": "buy_put", "option_strike_method": "delta",
+        "option_strike_param": 0.80, "option_strike_delta": 0.80,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.70,
+        "option_strike_delta_max": 0.90, "option_strike_delta_step": 0.05,
+        "option_dte_min": 380, "option_dte_max": 470,
+        "option_dte_optimize": True, "option_dte_min_range": 410,
+        "option_dte_max_range": 500, "option_dte_step": 15,
+        "option_sizing": 5.0},
+    "O_PMCC": {  # poor man's covered call -- LEAPS + a rolling short-call overlay (debit)
+        # TWO LEGS ON TWO EXPIRIES, and the ONLY key in any grid that is. The LEAPS is the
+        # long half of the per-leg delta pair ``_apply_option_strike`` writes as
+        # ``[long, short]``, and the overlay is the short half -- the same shape O_CBS/O_PBS
+        # use, on a structure where the two legs also differ in EXPIRY.
+        "action_type": "open_pmcc", "option_strike_method": "delta",
+        "option_strike_param": [0.80, 0.20],
+        # SHORT overlay delta 0.15-0.30 step 0.05 (4 levels) -- design §2 verbatim. Far
+        # enough OTM that the LEAPS keeps most of an up-move, near enough to be worth
+        # selling.
+        "option_strike_delta": 0.20,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.15,
+        "option_strike_delta_max": 0.30, "option_strike_delta_step": 0.05,
+        # LEAPS delta 0.75-0.85 step 0.05 (3 levels) -- design §2. Deep enough that the long
+        # tracks the underlying nearly one-for-one, which is the stock-replacement claim.
+        "option_strike_delta_long": 0.80,
+        "option_strike_delta_long_optimize": True, "option_strike_delta_long_min": 0.75,
+        "option_strike_delta_long_max": 0.85, "option_strike_delta_long_step": 0.05,
+        # LEAPS ENTRY DTE >= 365, decoded exactly as O_LEAPC's: authored 380..470 fixes the
+        # half-width at 45, and centres 410..500 step 15 (7 levels) decode to [365,455] ..
+        # [455,545]. 90 days wide because §1 measured LEAPS living on the JANUARY cycles --
+        # a narrow window is usually empty.
+        "option_dte_min": 380, "option_dte_max": 470,
+        "option_dte_optimize": True, "option_dte_min_range": 410,
+        "option_dte_max_range": 500, "option_dte_step": 15,
+        # THE OVERLAY'S OWN WINDOW: design §2's "DTE 30-45", FIXED and deliberately not a
+        # gene. The design states it as one narrow band rather than a range, and at pop 40 /
+        # gen 6 the gene budget belongs to the two deltas and the roll trigger. It is still a
+        # real action param (``short_dte_min``/``short_dte_max``), so a live rule and a phase-2
+        # calendar can both set it -- it is unsearched here, not hard-coded there.
+        "option_short_dte_min": 30, "option_short_dte_max": 45,
+        "option_sizing": 5.0},
+    "O_ERN": {  # earnings long vol -- straddle | strangle before the print (debit)
+        # STRUCTURE IS A GENE (``option_structure``), not two entry rules: the choice is
+        # between two BUILDERS, and two rules would duplicate the whole gate set for an
+        # either/or that ``has_no_position`` already makes exclusive.
+        "action_type": "open_straddle",
+        "option_structure_optimize": True,
+        "option_structure_choices": ["open_straddle", "open_strangle"],
+        # DELTA 0.25-0.45 STEP 0.05 (5 levels) -- design §2's own band, expressible since
+        # 2026-09-02 (plan Task 14b item 5). Until then ``open_strangle`` hard-coded
+        # ``method="percent_otm"`` at both selection sites, so this row had to search the
+        # width in percent (O_STRG's 2-12% band) and RECORDED that converting it was a change
+        # to ``OpenStrangleAction``, not to this table. That change landed: the strangle now
+        # passes ``self.strike_method`` on BOTH legs and joined
+        # ``types.get_strike_method_action_values()`` (drift-guarded from the builders' own
+        # source by packages/common/tests/test_strike_method_registry.py and, by RUNNING them,
+        # by test_option_strike_method_honoured.py). One target on both legs is what makes it
+        # SYMMETRIC: the selector ranks on ABSOLUTE delta, so 0.35 picks a call above spot and
+        # a put below it at matching |delta|.
+        #
+        # STILL A CONDITIONAL DOMAIN, and for a reason that has not changed: ``open_straddle``
+        # is ATM by DEFINITION -- both legs on the strike nearest spot -- so it reads no strike
+        # parameter under any method, and this gene is inert on the straddle arm and live on
+        # every strangle genome. That is a conditional domain, not a dead gene, and it is why
+        # the straddle deliberately stays OFF the strike-method registry (see
+        # ``OpenStraddleAction``'s docstring).
+        #
+        # NO METHOD GENE (amendment 1): a fixed-method row does not search the method --
+        # ``_apply_option_strike_method_gene`` refuses twice over, on the non-honouring action
+        # type AND on the authored non-percent method.
+        "option_strike_method": "delta", "option_strike_param": 0.35,
+        "option_strike_delta": 0.35,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.25,
+        "option_strike_delta_max": 0.45, "option_strike_delta_step": 0.05,
+        # EXPIRY MUST LAND AFTER THE PRINT. Authored 14..28 fixes hw = 7, and the searched
+        # centres 14..23 step 3 (4 levels) decode to [7,21] [10,24] [13,27] [16,30] -- inside
+        # design §2's 7-30 band, and every one of them has dte_min >= 7 > the entry gene's
+        # ceiling of 5 days-before-earnings. ``_assert_option_expiry_clears_event_window``
+        # re-derives that from the table at import so the band and the constraint cannot
+        # drift apart silently.
+        "option_dte_min": 14, "option_dte_max": 28,
+        "option_dte_optimize": True, "option_dte_min_range": 14,
+        "option_dte_max_range": 23, "option_dte_step": 3,
+        "option_sizing": 5.0},
+    "O_CBS": {  # call ratio backspread 1x2 (convexity financed by the short)
+        # PER-LEG DELTA TARGETS: short 0.35-0.50, long 0.15-0.30 (design §2), decoded into the
+        # ``[long, short]`` pair ``TradeActions._spread_params`` destructures. One shared
+        # target could only pick the two NEAREST strikes to one delta, which is a different
+        # structure from the one the design searches.
+        "action_type": "open_call_backspread", "option_strike_method": "delta",
+        "option_strike_param": [0.20, 0.40],
+        "option_strike_delta": 0.40,          # the SHORT (nearer) leg
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.35,
+        "option_strike_delta_max": 0.50, "option_strike_delta_step": 0.05,
+        "option_strike_delta_long": 0.20,     # the 2x LONG (further) legs
+        "option_strike_delta_long_optimize": True, "option_strike_delta_long_min": 0.15,
+        "option_strike_delta_long_max": 0.30, "option_strike_delta_long_step": 0.05,
+        # DTE 60-180: authored 80..140 fixes hw = 30, centres 90..150 step 10 (7 levels)
+        # decode to [60,120] .. [120,180].
+        "option_dte_min": 80, "option_dte_max": 140,
+        "option_dte_optimize": True, "option_dte_min_range": 90,
+        "option_dte_max_range": 150, "option_dte_step": 10,
+        "option_sizing": 5.0},
+    "O_PBS": {  # put ratio backspread 1x2 -- the crash-hedge arm (design §2)
+        "action_type": "open_put_backspread", "option_strike_method": "delta",
+        "option_strike_param": [0.20, 0.40],
+        "option_strike_delta": 0.40,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.35,
+        "option_strike_delta_max": 0.50, "option_strike_delta_step": 0.05,
+        "option_strike_delta_long": 0.20,
+        "option_strike_delta_long_optimize": True, "option_strike_delta_long_min": 0.15,
+        "option_strike_delta_long_max": 0.30, "option_strike_delta_long_step": 0.05,
+        "option_dte_min": 80, "option_dte_max": 140,
+        "option_dte_optimize": True, "option_dte_min_range": 90,
+        "option_dte_max_range": 150, "option_dte_step": 10,
+        "option_sizing": 5.0},
+
+    # ==========================================================================================
+    # CONVEX-HARVEST GRID (design 2026-08-31, docs/superpowers/specs/
+    # 2026-08-31-convex-harvest-grid-design.md §2) -- plan Task 13. A SEPARATE grid from GRID 2
+    # above: its own fitness (``option_convex``, ``_CONVEX_FITNESS`` below), its own universe
+    # threshold (DTE >= 270 vs 365/180/7), its own matrix script
+    # (``tools/run_convex_matrix.py``). Sharing this table with grid 2 is fine -- the ROW is
+    # just a gene table -- but every DERIVED set below is checked member-by-member so O_CONVEX
+    # never inherits a grid-2-only behaviour (the trade floor) or drifts into grid 2's fitness
+    # default (the ``_OPTION_CAR_STRATEGIES`` exclusion right below this table).
+    #
+    # TWO MEMBER ROWS, ONE GROUP KEY -- operator decision, 2026-09-02, superseding the earlier
+    # ``kind`` toggle gene. O_CONVEX is a GROUPED strategy (``_build_strategy_option_group``,
+    # the exact OS1-OS4 mechanism): "O_CONVEXC" (bullish signal -> buy_call) and "O_CONVEXP"
+    # (bearish signal -> buy_put) are each their own toggleable entry TradeRule sharing ONE
+    # exit ruleset -- the SAME construction O_LEAPC/O_LEAPP already use as two SEPARATE keys,
+    # merged here into one launchable key via the group machinery instead of a new
+    # ``option_structure`` categorical gene. Reusing the group builder means the put arm gets
+    # the group's STANDARD per-rule ``enabled`` gene for free (``entry:o_convexp-entry:enabled``
+    # -- see ``_option_entry_rule``'s ``toggleable=True``), which is exactly the "existing
+    # standard gene, do not invent a new toggle" instruction: the GA can switch either arm off
+    # independently (e.g. drop the put arm in a bull window) with no new machinery. There is no
+    # "both" (simultaneous call+put) arm and none is offered: ``has_no_position`` is EXPERT-
+    # level per INSTRUMENT (not per-structure), so once either arm opens a ticket on an
+    # underlying, BOTH rules are blocked from opening a second one on it until the first
+    # closes -- the same 1-ticket-per-underlying guard as every other option key, and it rules
+    # out a simultaneous call+put by construction, not by omission.
+    "O_CONVEXC": {  # convex-harvest CALL arm -- cheap far-OTM long-dated calls
+        # DELTA 0.10-0.35 STEP 0.05 (design §2: "the cheapness/convexity dial") -- 6 levels.
+        # FIXED to the delta method like every fixed-delta key above (amendment 1's dead-gene
+        # trap: a percent-OTM domain read as a delta target selects the deepest-ITM contract on
+        # the chain). Default 0.20 sits mid-band, genuinely cheap.
+        "action_type": "buy_call", "option_strike_method": "delta",
+        "option_strike_param": 0.20, "option_strike_delta": 0.20,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.10,
+        "option_strike_delta_max": 0.35, "option_strike_delta_step": 0.05,
+        # ENTRY DTE 180-540 (design §2: "medium-long: enough runway for a thesis to play out;
+        # not restricted to January cycles"). Authored 300..420 fixes hw = (420-300)//2 = 60,
+        # so the searched centres 240..480 step 40 (7 levels) decode to [180,300] .. [420,540]
+        # -- every window landing INSIDE the design band at both ends (pinned by
+        # test_no_o_convex_genome_can_decode_outside_the_180_540_band).
+        "option_dte_min": 300, "option_dte_max": 420,
+        "option_dte_optimize": True, "option_dte_min_range": 240,
+        "option_dte_max_range": 480, "option_dte_step": 40,
+        # PER-TICKET PREMIUM SIZING 0.5-2.0% of sleeve (design §2). ``option_sizing`` (% of
+        # equity committed per structure) IS the existing "percent of sleeve" mechanism -- and
+        # combined with the FIXED 1-ticket-per-underlying rule (``has_no_position``,
+        # unconditional on every option entry rule -- see _option_entry_rule), a structure's
+        # sizing % already reads as its per-ticket cap: "many small tickets, no single ticket
+        # dominates ex-ante" is exactly what a low option_sizing ceiling enforces. Authored 1.0
+        # is a NEW row in _OPTION_SIZING_BANDS (band 0.5-2.0 step 0.25, 7 levels) -- no existing
+        # authored value covers a sub-5% debit band.
+        "option_sizing": 1.0},
+    "O_CONVEXP": {  # convex-harvest PUT arm -- the tail-hedge twin; same genes, kind=put.
+        # Enters on the BEARISH signal (see _OPTION_ENTRY_GATE override below), like O_LP /
+        # O_LEAPP. Same delta/DTE/sizing bands as O_CONVEXC -- one thesis, two directions.
+        "action_type": "buy_put", "option_strike_method": "delta",
+        "option_strike_param": 0.20, "option_strike_delta": 0.20,
+        "option_strike_delta_optimize": True, "option_strike_delta_min": 0.10,
+        "option_strike_delta_max": 0.35, "option_strike_delta_step": 0.05,
+        "option_dte_min": 300, "option_dte_max": 420,
+        "option_dte_optimize": True, "option_dte_min_range": 240,
+        "option_dte_max_range": 480, "option_dte_step": 40,
+        "option_sizing": 1.0},
 }
+
+#: The grid-2 keys (design 2026-08-31), phase 1. SINGLES ONLY -- no umbrella group key in
+#: round one, so every job's result is attributable to one structure (design §7). O_CONVEX is
+#: DELIBERATELY ABSENT: it is the separate convex-harvest grid (design §8) with its own
+#: fitness/universe/matrix script -- see _CONVEX_OPTION_STRATEGIES.
+_GRID2_OPTION_STRATEGIES = {"O_LEAP", "O_PMCC", "O_ERN", "O_CBS", "O_PBS"}
+
+#: O_LEAP's two members (operator decision 2026-09-02, superseding the two separate keys
+#: O_LEAPC/O_LEAPP). Same shape as _CONVEX_MEMBER_KEYS: not launchable on their own (no
+#: ``_STRATEGY_BUILDERS`` row), but they keep their OWN rows in ``_OPTION_STRATS`` and in every
+#: set keyed off ``set(_OPTION_STRATS)`` -- the debit partition and the fixed-delta-method pin
+#: -- because that is where the member-level bookkeeping actually lives.
+_LEAP_MEMBER_KEYS = {"O_LEAPC", "O_LEAPP"}
+
+#: The convex-harvest grid's own LAUNCHABLE key set (plan Task 13), mirroring
+#: _GRID2_OPTION_STRATEGIES' role for tools/run_convex_matrix.py -- kept SEPARATE from the set
+#: above rather than folded in, exactly because the two grids must never be run or scored
+#: together (design §8). "O_CONVEX" is the GROUP key (``_build_strategy_option_group``);
+#: "O_CONVEXC"/"O_CONVEXP" are its two members and are NOT independently launchable (no
+#: ``_STRATEGY_BUILDERS`` row of their own) -- see _CONVEX_MEMBER_KEYS for the member-level
+#: bookkeeping (debit partition, CAR-fitness exclusion) those two still need.
+_CONVEX_OPTION_STRATEGIES = {"O_CONVEX"}
+
+#: O_CONVEX's two members. Not launchable directly; still need their OWN entries wherever a
+#: set is keyed off ``set(_OPTION_STRATS)`` (the debit/credit partition, the CAR-fitness
+#: exclusion, the fixed-delta-method pin) because that is where ``_OPTION_STRATS`` actually
+#: puts them -- the group key "O_CONVEX" itself has no row there at all (O_WHEEL's same shape).
+_CONVEX_MEMBER_KEYS = {"O_CONVEXC", "O_CONVEXP"}
+
+#: Grid-2 keys whose strike selection is FIXED to ``delta`` (amendment 1). O_CONVEX's two
+#: MEMBERS (the separate convex-harvest grid, plan Task 13) are included -- they fix the method
+#: for the identical reason grid 2's keys do; the group keys "O_CONVEX"/"O_LEAP" themselves
+#: have no row to fix. O_ERN JOINED ON 2026-09-02 (plan Task 14b item 5): it was the documented
+#: exception only because ``open_strangle`` could not read a strike method; now that it can,
+#: the row states design §2's band in the unit the design states it in. Its straddle arm still
+#: ignores the parameter -- ATM is not a parameterised strike -- which is a conditional domain,
+#: the same shape the percent band had.
+_FIXED_DELTA_METHOD_STRATEGIES = ({"O_CBS", "O_PBS", "O_ERN", "O_PMCC"}
+                                  | _LEAP_MEMBER_KEYS | _CONVEX_MEMBER_KEYS)
+
+#: Grid-2 keys the design gates behind LATER machinery, with the reason. ``O_PMCC`` and
+#: ``O_CAL`` are two-EXPIRY structures, and the codebase refuses those at three independent,
+#: test-pinned sites (``submit_option_order``'s single-expiry guard, ``option_lifecycle._dte``,
+#: ``DaysToExpiryCondition``) because ``Transaction.expiry`` is a single value. Running them
+#: before the per-leg-expiry work lands would not produce a thin result -- it would produce no
+#: result at all, or a mis-stamped one. Refused LOUDLY at command entry, the same discipline
+#: ``_UNDEFINED_RISK_MEMBERS`` gets: never silently skipped, never silently run.
+#: ``O_PMCC`` LEFT THIS TABLE ON 2026-09-02 (plan Task 6). All three refusals it was gated
+#: behind now answer for a declared two-expiry structure: the submit guard admits exactly two
+#: expiries for a strategy in ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES`` (and, for the
+#: close and the roll, resolves that declaration from the TRANSACTION), and the two DTE readers
+#: name the leg they read -- ``option_lifecycle`` the SHORT (roll window), ``DaysToExpiryCondition``
+#: the LONG (roll floor). ``O_CAL`` stays: design §2 gates it behind PMCC proving this same
+#: machinery in a real run, and it is one line away -- add "calendar_spread" to
+#: MULTI_EXPIRY_OPTION_STRATEGIES and a row to _OPTION_STRATS.
+_PHASE_GATED_OPTION_STRATEGIES = {
+    "O_CAL": ("ATM calendar; design 2026-08-31 §2 gates it behind PMCC proving the same "
+              "two-expiry lifecycle in this matrix (plan Task 14)"),
+}
+
+
+def _refuse_phase_gated_strategy(command: str, strategy_keys) -> None:
+    """Loud refusal for an EXPLICIT request to run a PHASE-GATED grid-2 key.
+
+    Mirrors ``_refuse_unbounded_strategy_request`` exactly (one bad key exits the whole
+    command) for the same reason: a quietly thinner grid hides the decision.
+    """
+    bad = sorted(set(strategy_keys or ()) & set(_PHASE_GATED_OPTION_STRATEGIES))
+    if bad:
+        detail = "; ".join(f"{k}: {_PHASE_GATED_OPTION_STRATEGIES[k]}" for k in bad)
+        sys.exit(
+            f"ba2-test {command}: {', '.join(bad)} is PHASE-GATED and has no gene table yet "
+            f"({detail}). See docs/superpowers/plans/"
+            f"2026-08-31-options-grid2-convex-earnings-impl.md (Tasks 6-PRE / 6 / 14) and "
+            f"docs/superpowers/specs/2026-08-31-leaps-grid-design.md §3-§4. Admitting it to a "
+            f"run is a reviewed change to _PHASE_GATED_OPTION_STRATEGIES' consumers, not a "
+            f"flag.")
+
+
+def _build_strategy_phase_gated(kind: str):
+    """Strategy builder for a phase-gated key: it refuses, always.
+
+    Registered in ``_STRATEGY_BUILDERS`` so ``--strategy O_PMCC`` is a KNOWN key argparse
+    accepts and the operator gets the reason above rather than argparse's generic
+    "invalid choice" -- and so any future caller that reaches the builders directly, past the
+    command-entry refusal, still cannot build one.
+    """
+    _refuse_phase_gated_strategy("optimize", [kind])
+    raise RuntimeError(f"{kind} is phase-gated")  # unreachable: the line above exits
+
 
 # Directional entry gate per pure-option strategy: which signal flag the entry rule requires.
 # Every original O_* key fires on the expert's BULLISH signal (including O_VERT — a bearish
@@ -2362,6 +2768,18 @@ _OPTION_STRATS = {
 _OPTION_ENTRY_GATE = {k: "bullish" for k in _OPTION_STRATS}
 _OPTION_ENTRY_GATE["O_LP"] = "bearish"
 _OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
+# GRID 2: O_LEAPP is the grid's only bearish long-dated arm (design §2, "the bearish twin"),
+# so it gates on the expert's SELL signal exactly as O_LP does. O_LEAPC is bullish; O_CBS
+# (upside convexity) is bullish; O_PBS is the crash hedge and is the family's other bearish
+# structure. O_ERN is non-directional and keeps the "bullish" default like O_STRD/O_STRG --
+# that leaf is toggle_optimize=True in _option_entry_rule, so the GA can drop the direction
+# gate entirely and let the straddle fire on either signal, which is what a vol bet wants.
+_OPTION_ENTRY_GATE["O_LEAPP"] = "bearish"
+_OPTION_ENTRY_GATE["O_PBS"] = "bearish"
+# CONVEX-HARVEST GRID (plan Task 13): O_CONVEXP is the put/tail-hedge arm of the O_CONVEX
+# group, so it gates on the expert's SELL signal exactly as O_LP/O_LEAPP do. O_CONVEXC keeps
+# the "bullish" default like every call arm above.
+_OPTION_ENTRY_GATE["O_CONVEXP"] = "bearish"
 
 # FULL-NOTIONAL structures: those whose per-contract buying-power reserve scales with the
 # STRIKE (cash-secured / un-netted naked notional) rather than with a defined-risk spread
@@ -2387,6 +2805,59 @@ _OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
 # --initial-capital to ~$100k) to search them again.
 _FULL_NOTIONAL_OPTION_KINDS = {"O_CSP", "O_JL", "O_RS"}
 
+# Members whose worst case is UNBOUNDED -- ``option_payoff.max_loss`` has no number for them,
+# so the submit path stamps no ``max_loss_per_contract`` and ``loss_pct_of_max_loss`` has no
+# denominator: the ``opt_sl_ml`` exit rule is never emitted for a strategy built solely of
+# these (design 2026-08-29 S6).
+#
+# THE PREDICATE IS THE MEASURED PAYOFF, NOT "is this a naked short" (the corrected S6 rule,
+# 2026-08-30): only a net-uncovered short CALL is genuinely unbounded, because only the
+# upside is infinite. Concretely, per structure:
+#   * O_SSTG / O_SSTD -- a short call no other leg of the order covers: UNBOUNDED. In here.
+#   * O_CSP -- a naked short PUT is bounded below at (strike - credit) x 100, the underlying
+#     stopping at zero: MEASURED, stamped, carries the rule. (The pre-correction design table
+#     called this unbounded; packages/common/tests/test_max_loss_persisted_at_submit.py pins
+#     the corrected behaviour at the stamping seam.)
+#   * O_JL -- its short call is covered by the long wing, its short put bounded at zero:
+#     MEASURED (worst of the two sides).
+#   * O_RS -- all puts (1x2): bounded at an underlying of zero: MEASURED.
+#   * everything else is a debit or defined-risk structure: MEASURED trivially.
+#
+# TWO CONSUMERS, ONE DEFINITION -- deliberately, so "what counts as unbounded" can never
+# drift between them:
+#   1. the ``opt_sl_ml`` emission gate in ``_option_exit_rules`` (design 2026-08-29 S6).
+#      That half is the strategy-level APPLICABILITY gate only -- the safety mechanism is
+#      Task 8's absence rule (no stamp => the condition can never fire), which is also what
+#      keeps it inert on the wheel's covered-call legs: a CC's cover is held stock OUTSIDE
+#      the order, and the stamp is measured from the order's OWN legs, so a CC stamps
+#      nothing. (2026-08-31 briefly made it stamp (spot - credit) x 100; review finding M3,
+#      2026-09-01, reversed that -- an option-legs-only numerator over a stock-inclusive
+#      denominator is not a ratio of anything. The verified cover still reaches the option
+#      RM's admission, which asks what the WHOLE position commits.)
+#   2. the grouped-search filter over ``_OPTION_GROUPS_ALL`` below (operator decision
+#      2026-08-31, AskUserQuestion: "Only truly unbounded"): these members LEAVE the
+#      SEARCHED set entirely, the same way ``_FULL_NOTIONAL_OPTION_KINDS`` already filters
+#      it. An explicit single-strategy request (--strategy/--strategies O_SSTG or O_SSTD)
+#      refuses loudly in the optimize commands -- never silently runs, never silently
+#      skips. The structures stay fully SUPPORTED in code (builders, reserve math,
+#      settlement, tests untouched) -- only what the grid searches shrinks.
+_UNDEFINED_RISK_MEMBERS = {"O_SSTG", "O_SSTD"}
+
+
+def _refuse_unbounded_strategy_request(command: str, strategy_keys) -> None:
+    """Loud refusal for an EXPLICIT request to run an unbounded-risk single (consumer 2
+    above). Never silently runs, never silently skips: one bad key exits the whole
+    command so the operator sees the decision rather than a quietly thinner grid."""
+    bad = sorted(set(strategy_keys or ()) & _UNDEFINED_RISK_MEMBERS)
+    if bad:
+        sys.exit(
+            f"ba2-test {command}: {', '.join(bad)} left the SEARCHED set on 2026-08-31 "
+            f"(operator decision, AskUserQuestion: 'Only truly unbounded'): a net-uncovered "
+            f"short call has UNBOUNDED risk (_UNDEFINED_RISK_MEMBERS). The builders and "
+            f"reserve math remain fully supported in code; re-admitting the structures to a "
+            f"run is a reviewed change to _UNDEFINED_RISK_MEMBERS' consumers, not a flag.")
+
+
 # GROUPED option strategies: ONE optimize job searching a FAMILY of similar structures.
 # Each member becomes its own toggleable entry TradeRule (entry:<member>-entry:enabled gene)
 # carrying its own option action + option_* genes, so the GA can turn structures on/off and
@@ -2404,9 +2875,24 @@ _OPTION_GROUPS_ALL = {
     # short premium and nothing else.
     "OS3": ["O_JL", "O_RS", "O_BEARCS", "O_BULLPS"],        # skewed CREDIT (asymmetric short premium)
     "OS4": ["O_STRD", "O_STRG"],                            # volatility DEBIT (non-directional)
+    # CONVEX-HARVEST GRID (plan Task 13, operator decision 2026-09-02): O_CONVEXC (bullish ->
+    # buy_call) + O_CONVEXP (bearish -> buy_put), the SAME two-member-group shape as every row
+    # above, reused rather than a new ``option_structure`` categorical gene. A SEPARATE group
+    # from OS1-OS4 -- it belongs to the convex-harvest grid (design §8), not grid 1, and is
+    # excluded from _GRID2_OPTION_STRATEGIES/_OPTION_CAR_STRATEGIES accordingly (see
+    # _CONVEX_OPTION_STRATEGIES / _CONVEX_MEMBER_KEYS above).
+    "O_CONVEX": ["O_CONVEXC", "O_CONVEXP"],
+    # GRID 2's long-dated arm (operator decision 2026-09-02): ONE signal-driven key instead of
+    # the two separate keys O_LEAPC/O_LEAPP. Identical construction to O_CONVEX directly above
+    # -- a bullish arm (buy_call) and a bearish arm (buy_put) as two toggleable entry
+    # TradeRules over one shared exit ruleset -- so the GA gets the per-arm ``enabled`` gene for
+    # free and can drop either direction in a one-sided regime, and the grid runs one LEAPS job
+    # instead of two half-jobs that could never hold both directions at once anyway.
+    "O_LEAP": ["O_LEAPC", "O_LEAPP"],
 }
 _OPTION_GROUPS = {
-    key: [m for m in members if m not in _FULL_NOTIONAL_OPTION_KINDS]
+    key: [m for m in members if m not in _FULL_NOTIONAL_OPTION_KINDS
+          and m not in _UNDEFINED_RISK_MEMBERS]     # risk exclusion, 2026-08-31 -- see above
     for key, members in _OPTION_GROUPS_ALL.items()
 }
 # A group whose every member was filtered out would silently produce a job with no entries
@@ -2414,8 +2900,10 @@ _OPTION_GROUPS = {
 _empty_groups = [k for k, v in _OPTION_GROUPS.items() if not v]
 if _empty_groups:
     raise RuntimeError(
-        f"_OPTION_GROUPS {_empty_groups} have no affordable members left after excluding "
-        f"{sorted(_FULL_NOTIONAL_OPTION_KINDS)}; drop the group or relax the exclusion.")
+        f"_OPTION_GROUPS {_empty_groups} have no searchable members left after excluding "
+        f"{sorted(_FULL_NOTIONAL_OPTION_KINDS)} (affordability) and "
+        f"{sorted(_UNDEFINED_RISK_MEMBERS)} (unbounded risk, 2026-08-31); drop the group "
+        f"or relax an exclusion.")
 
 # Pure-option strategy keys (entry is the option action; no equity leg). O_CC/O_STK are equity.
 #
@@ -2472,32 +2960,39 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    A run still cannot span two vendors: one reader is built, and
 #    `backtest_options_provider()` answers for that one.
 #
-#    Do NOT instead lower the Alpaca number: measured on the shared 10.9 GB cache (2026-08-26)
-#    it holds 0 bars before 2024-01-18, its earliest bar is 2024-02-01, and its only three
-#    chain snapshots are 2024-02-01 / 2026-03-23 / 2026-06-09. There is no 2023 in it, and a
-#    floor that lies produces a backtest that trades on nothing and reports it as a result —
-#    strictly worse than this refusal.
+#    Do NOT instead lower the Alpaca number: the sqlite cache holds 0 bars before 2024-01-18,
+#    its earliest bar is 2024-02-01, and it carries a SINGLE chain snapshot (2024-02-01) — not
+#    the three this note used to name, and the file is 4.12 GB, not 10.9. Cite
+#    `option_selector._publishes_spread` for the store's measured shape; it is the one
+#    re-verified record and every other count in this file defers to it. What matters here is
+#    unchanged: there is no 2023 in it, and a floor that lies produces a backtest that trades
+#    on nothing and reports it as a result — strictly worse than this refusal.
 #
 #    (Noted in passing: even Alpaca's 2024-01-18 is ~2 weeks optimistic against that store,
-#    whose first chain snapshot is 2024-02-01. A vendor floor bounds what COULD have been
+#    whose only chain snapshot is 2024-02-01. A vendor floor bounds what COULD have been
 #    fetched, not what was.)
 #
-# 2. THE GREEKS ARE NOT IN THE CACHE YET.  ** WASTES THE RUN **
+# 2. THE GREEKS ARE IN BOTH STORES.  ** WITHDRAWN — this was a ** WASTES THE RUN ** banner
+#    standing on a measurement that was never true of the file it named. **
 #    `iv_rank` and `iv_to_realized_vol` became live genes on 2026-08-26 (OPT-C1, OPT-C3). Both
-#    fail CLOSED when implied volatility cannot be measured, which is correct — but the current
-#    option cache carries no greeks at all, so `get_atm_iv` returns None on every bar. With each
-#    gate independently enabled at p=0.5, roughly 75% of every generation will score the
-#    zero-trade sentinel, and a plain (non-optimize) option backtest will trade nothing at all.
-#    The search recovers once the data lands; until then the run is mostly burning CPU on
-#    -1e9. TastyTrade collection was in progress on another machine — confirm it finished,
-#    AND that the run actually reads it (see precondition 1: the parquet store is readable
-#    now, but only when `options_store: "parquet"` is selected; the sqlite default still has
-#    no greeks). On the parquet store `get_atm_iv` DOES return a number — the greeks are
-#    Black-Scholes-inverted per bar at read time (`option_greeks.compute_iv_and_greeks`,
-#    the same function that filled the sqlite store's) rather than baked in at build time.
-#    Sharper since 2026-08-26: `_compute_atm_iv` no longer falls back to the frozen
-#    chain-snapshot row, so where a stale row used to supply a number it now honestly supplies
-#    None. That removes a lookahead, and it also removes the last thing masking this gap.
+#    fail CLOSED when implied volatility cannot be measured, and this note used to say that was
+#    the normal case: "the current option cache carries no greeks at all, so `get_atm_iv`
+#    returns None on every bar", therefore ~75% of every generation scores the zero-trade
+#    sentinel. THAT PREMISE IS FALSE. On the sqlite store `option_bar` carries iv and the four
+#    greeks on 17,185,281 of 19,484,995 rows (88.2%, all 101 underlyings), and
+#    `option_chain` on 663,111 of 1,440,782 (46.0%, 98 of 101) — see
+#    `option_selector._publishes_spread`, the single re-verified record. `_compute_atm_iv`
+#    reads the BAR, so `get_atm_iv` returns a number on the overwhelming majority of them.
+#    On the parquet store it returns a number too, by a different route: the greeks are
+#    Black-Scholes-inverted per bar at read time (`option_greeks.compute_iv_and_greeks`, the
+#    same function that filled the sqlite store's) rather than baked in at build time.
+#    THE OPERATOR ACTION IS THEREFORE NIL — neither store needs waiting on, and no store
+#    choice can be justified by "the other one has no greeks". Pick the store on the WINDOW
+#    it can serve (precondition 1), which is the only axis that actually separates them.
+#    Still true, and the part worth keeping: `_compute_atm_iv` no longer falls back to the
+#    frozen chain-snapshot row (2026-08-26), so a contract with no bar on or before the clock
+#    honestly supplies None instead of an IV inverted from a future price. That removes a
+#    lookahead. It removes no data that the bars did not already carry.
 #
 #    RELATED, AND IT WILL BITE THE LONG TERMS SPECIFICALLY: `fetch_options._EXPIRY_TAIL_DAYS`
 #    is 60, so the cache only holds contracts expiring within 60 days of the run's END date.
@@ -2547,6 +3042,8 @@ _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 #    option positions with no TradeAction and no risk manager at all (its only rails are
 #    `_within_rails` / `_book_totals`). A grid arm using PremiumSeller is not exercising any of
 #    the option RM work.
+#    [2026-08-31: the fourth path is GONE — PremiumSeller was deleted (option-model plan Task 12,
+#    operator decision); every option entry now goes through a path the option RM covers.]
 #
 # CLOSED 2026-08-26: `_option_consistent_annual_return` -- the DEFAULT fitness for pure-option
 # grids -- now takes its trade frequency from `_trades_per_year` (STRUCTURES) instead of
@@ -2627,7 +3124,64 @@ def _assert_option_window_excludes_holdout(strat_kinds, end) -> None:
 # comparable to S2 and to every prior O_STK run (see _rm_opt_for's docstring for the same
 # carve-out reasoning on a different knob) -- widening the fitness in the name of the option
 # arms would corrupt the control the option arms are measured against.
-_OPTION_CAR_STRATEGIES = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"}
+# O_CONVEX (AND ITS TWO MEMBERS) ARE EXCLUDED HERE, EXPLICITLY (plan Task 13). "O_CONVEX" is a
+# member of ``_PURE_OPTION_STRATEGIES`` via ``set(_OPTION_GROUPS)``, and "O_CONVEXC"/
+# "O_CONVEXP" are members via ``set(_OPTION_STRATS)`` (they have rows there); without this
+# subtraction any of the three would join ``_OPTION_CAR_STRATEGIES`` by construction and
+# ``_resolve_fitness`` would silently default an unflagged ``--strategy O_CONVEX`` run to
+# ``option_consistent_annual_return`` -- the one default the design (§3) says the convex-
+# harvest grid must never get. The convex grid has NO implicit default at all (see
+# ``_CONVEX_FITNESS`` below): every O_CONVEX job must name ``--fitness option_convex``
+# explicitly, and ``_refuse_convex_fitness_mismatch`` enforces it.
+_OPTION_CAR_STRATEGIES = ((_PURE_OPTION_STRATEGIES | {"O_CC", "O_PP"})
+                          - _CONVEX_OPTION_STRATEGIES - _CONVEX_MEMBER_KEYS)
+
+# The CONVEX-HARVEST fitness (docs/superpowers/specs/2026-08-31-convex-harvest-grid-design.md
+# §3, registered in strategy_fitness.py). Ranks a book of cheap far-OTM long-dated tickets on
+# its end-of-window total return behind a breadth floor, because the CAR family would teach the
+# GA to gut the convexity to fake smoothness. It is SELECTABLE TODAY -- an explicit
+# ``--fitness option_convex`` wins over the resolution below, which is how the convex matrix
+# will ask for it.
+_CONVEX_FITNESS = "option_convex"
+
+
+def _refuse_convex_fitness_mismatch(command: str, strat_kind: str, fitness: str) -> None:
+    """Task 13 seam: O_CONVEX and every other strategy score under MUTUALLY EXCLUSIVE fitness
+    metrics, and the split must never be silent -- the exact trap the 2026-08-04 CAR-scale
+    change taught us never to allow (comparing numbers across two fitness metrics), and design
+    §8's whole reason the convex work is a separate grid rather than a matrix row.
+
+    Called AFTER ``_resolve_fitness`` (so an implicit default is checked exactly like an
+    explicit ``--fitness``), on the EFFECTIVE fitness -- an O_CONVEX job that took no
+    ``--fitness`` at all still has to land on ``option_convex`` to pass, and ``_resolve_fitness``
+    never defaults a kind to it (see ``_CONVEX_FITNESS``'s comment), so a bare
+    ``--strategy O_CONVEX`` refuses here rather than silently scoring under the equity/CAR
+    default.
+
+    Two directions, one function, one message shape per direction (Task 13 text: "REFUSED at
+    launch with a message naming the mismatch"):
+      * O_CONVEX + anything but ``option_convex`` -- refused.
+      * ``option_convex`` + anything but O_CONVEX -- refused (covers every equity AND every
+        other option kind; the design ties the metric to exactly one structure).
+    """
+    is_convex_kind = strat_kind in _CONVEX_OPTION_STRATEGIES
+    is_convex_fitness = fitness == _CONVEX_FITNESS
+    if is_convex_kind and not is_convex_fitness:
+        sys.exit(
+            f"ba2-test {command}: --strategy {strat_kind} (the convex-harvest grid) must run "
+            f"under --fitness {_CONVEX_FITNESS}, got {fitness!r}. The option_car family "
+            f"rewards smooth equity and would teach the GA to gut the convexity O_CONVEX "
+            f"exists to buy (design 2026-08-31-convex-harvest-grid-design.md §3/§8). Pass "
+            f"--fitness {_CONVEX_FITNESS} explicitly -- it is never a default.")
+    if is_convex_fitness and not is_convex_kind:
+        sys.exit(
+            f"ba2-test {command}: --fitness {_CONVEX_FITNESS} is O_CONVEX-only, got "
+            f"--strategy {strat_kind!r}. {_CONVEX_FITNESS} ranks uncapped end-of-window "
+            f"return behind a breadth floor tuned for a lottery-ticket book -- scoring any "
+            f"other structure with it would silently cross the option_car grid and the "
+            f"convex-harvest grid (design §8), the exact trap the 2026-08-04 CAR-scale "
+            f"change taught us never to allow. Use --strategy O_CONVEX, or drop "
+            f"--fitness {_CONVEX_FITNESS}.")
 
 
 def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: str) -> str:
@@ -2650,6 +3204,10 @@ def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: st
     ``option_consistent_annual_return`` (aliases ``option_car`` / ``ocar``) is registered in
     ``strategy_fitness.py`` on the ``option-fitness`` branch; this returns its NAME, and
     ``compute_fitness`` resolves it once that branch is merged.
+
+    ``option_convex`` (``_CONVEX_FITNESS``) is NOT a default for any kind: the convex-harvest
+    grid names it explicitly, and the ``cli_fitness`` short-circuit above is what carries it.
+    See ``_refuse_convex_fitness_mismatch`` for the Task-13 mutual-refusal seam.
     """
     if cli_fitness:
         return cli_fitness
@@ -2696,6 +3254,7 @@ def _option_entry_action_for(kind: str) -> dict:
     _apply_option_sizing_gene(cfg)
     _apply_option_min_arc_gene(cfg)
     _apply_option_entry_cross_gene(cfg)
+    _apply_option_selection_weight_genes(cfg, kind)
     return cfg
 
 
@@ -2735,11 +3294,17 @@ _ARC_FULL_NOTIONAL = (0.0, 0.30, 0.05)
 _ARC_REG_T_NAKED = (0.0, 6.0, 1.0)
 _ARC_DEFINED_RISK = (0.0, 3.0, 0.5)
 
-#: option ACTION TYPE -> (reserve-table strategy name, ARC band). Only the CREDIT builders
-#: appear: those are the ones that consult the gate, and they are exactly the reserve table's
-#: `RESERVING_STRATEGIES` that have a builder of their own (`credit_spread` / `naked_put` /
-#: `debit_spread` are pricing aliases with no action). A DEBIT structure posts no collateral,
-#: so a floor there would refuse every one of them -- see the ZERO_RESERVE note below.
+#: option ACTION TYPE -> (reserve-table strategy name, ARC band). Only the builders that
+#: CONSULT the gate appear. A DEBIT structure posts no collateral, so a floor there would
+#: refuse every one of them -- see the ZERO_RESERVE note below.
+#:
+#: NOT "exactly the RESERVING_STRATEGIES that have a builder" -- that was the rule until
+#: 2026-09-01 and is no longer. The exemptions are enumerated in
+#: `ba2_common.core.option_economics.ARC_FLOOR_EXEMPT_STRATEGIES`, which
+#: `test_option_min_arc_gene.test_the_band_table_covers_every_credit_builder` subtracts:
+#: the three pricing aliases (`credit_spread` / `naked_put` / `debit_spread`, no action at
+#: all) and the two 1x2 BACKSPREADS, which reserve and have builders but deliberately never
+#: consult the gate (near-zero-or-debit net by design; a floor would delete them).
 _OPTION_ARC_BANDS = {
     "sell_cash_secured_put": ("cash_secured_put", _ARC_FULL_NOTIONAL),
     "open_jade_lizard": ("jade_lizard", _ARC_FULL_NOTIONAL),
@@ -2800,6 +3365,12 @@ _OPTION_SIZING_BANDS = {
     # budget is equity * MIN(this, max_virtual_equity_per_instrument_percent) — so this row and
     # _OPTION_RM_OVERRIDE have to move together or neither moves anything.
     20.0: (5.0, 50.0, 5.0),
+    # CONVEX-HARVEST (plan Task 13, design 2026-08-31-convex-harvest-grid-design.md §2):
+    # "per-ticket premium sizing 0.5-2.0% of sleeve -- many small tickets, no single ticket may
+    # dominate ex-ante". A NEW row: no existing authored value's band reaches below 1.0% (the
+    # 5.0 row's floor), and the design's own ceiling (2.0%) sits BELOW that row's floor entirely
+    # -- sharing it would either refuse the whole band or silently widen it past the design.
+    1.0: (0.5, 2.0, 0.25),
 }
 _missing_sizings = sorted({cfg["option_sizing"] for cfg in _OPTION_STRATS.values()
                            if cfg.get("option_sizing") is not None}
@@ -2839,7 +3410,7 @@ def _apply_option_sizing_gene(cfg: dict) -> dict:
 # precisely the OPT-C3 naming bug). ``strategy_param_space._apply_option_strike`` writes
 # whichever one matches the decoded method.
 #
-# ONLY where the builder honours it. Eight of the seventeen ``_OptionEntryAction`` subclasses
+# ONLY where the builder honours it. Eight of the nineteen ``_OptionEntryAction`` subclasses
 # hard-code ``method="percent_otm"`` and leave ``strike_method`` a dead attribute (OPT-S2), so
 # offering the choice there would be a gene the simulation cannot see -- the exact defect this
 # whole track is fixing. ``types.honours_strike_method`` is the registry, drift-guarded against
@@ -2854,11 +3425,26 @@ def _apply_option_strike_method_gene(cfg: dict) -> dict:
 
     A no-op for the eight builders that ignore ``strike_method``, and for an action whose
     percent param is not itself optimizable (there would be nothing to switch between).
+
+    ALSO A NO-OP FOR A FIXED-METHOD ROW (grid 2, amendment 1, 2026-09-01). A row that
+    AUTHORS ``option_strike_method: "delta"`` has decided its unit: its bands are deltas in
+    (0,1), and the alternative this gene would offer -- ``percent_otm`` -- would read 0.80 as
+    0.8% OTM, i.e. at the money, on a key whose whole thesis is a 0.80-delta stock
+    replacement. The categorical gene shares ONE ``option_strike_param`` domain between the
+    two methods, so there is no domain that is correct for both; the honest answer is that a
+    fixed-method key does not search the method.
+    Belt AND braces on purpose: today's grid-2 rows also decline ``option_strike_param_
+    optimize`` (they search ``option_strike_delta`` instead), so the guard above would
+    already cover them -- but that is a property of how they happen to be written, and this
+    one is a property of what they DECLARE. Adding a percent gene to a grid-2 row later must
+    not silently re-arm the method gene.
     """
     from ba2_common.core.types import honours_strike_method
 
     at = str(cfg.get("action_type") or "")
     if not honours_strike_method(at):
+        return cfg
+    if str(cfg.get("option_strike_method") or "percent_otm") != "percent_otm":
         return cfg
     if not cfg.get("option_strike_param_optimize"):
         return cfg
@@ -2906,7 +3492,7 @@ _OPTION_ENTRY_CROSS_BAND = (0.0, 1.0, 0.25)
 def _apply_option_entry_cross_gene(cfg: dict) -> dict:
     """Make the entry-quote concession searchable, in place, on ANY option entry action.
 
-    No exemption list, deliberately: every one of the seventeen entry builders ends at
+    No exemption list, deliberately: every one of the nineteen entry builders ends at
     ``_OptionEntryAction._submit_option_order``, which is where the concession is applied, so
     there is no builder for which this gene is inert -- the failure mode that forced
     ``_apply_option_sizing_gene`` and ``_apply_option_min_arc_gene`` to carry one.
@@ -2917,6 +3503,178 @@ def _apply_option_entry_cross_gene(cfg: dict) -> dict:
     cfg.setdefault("option_entry_cross_min", lo)
     cfg.setdefault("option_entry_cross_max", hi)
     cfg.setdefault("option_entry_cross_step", step)
+    return cfg
+
+
+# --- SelectionPolicy weights as genes (Task 7/10, design 2026-08-29 §7-§8) ------------------
+#
+# ``SelectionPolicy`` chooses WHICH contract inside a rule's box wins; its weights were built
+# as genes from day one and searched by nothing (F17: none GA-wired). This table is their gene
+# domains. Emission/sharing lives in ``_apply_option_selection_weight_genes`` (Task 10); the
+# table is declared separately because ONE row of it is itself a behaviour change:
+#
+# ``w_premium`` IS SIGNED (-2.0..2.0), THE DESIGN'S §9.5 CORRECTION (§8). The original domain
+# was 0.0..2.0 on the claim that premium richness has an unambiguous good direction. It does
+# not: a premium SELLER wants rich premium and a BUYER wants cheap — the identical asymmetry
+# that made ``w_iv`` the one signed weight ("selling structures want rich vol and buying
+# structures want cheap vol"). Unsigned, a debit member could only ever express "prefer
+# richer", so the gene would be half dead across the entire debit half. The signed weights are
+# now exactly those whose good direction depends on whether the structure is long or short
+# premium: ``w_premium`` and ``w_iv``. ``w_rvol`` stays unsigned — nobody wants an illiquid
+# contract.
+#
+# STEP 0.5 puts 0.0 exactly on the lattice. 0.0 is the no-op level (``score_all`` skips
+# zero-weight features entirely, so a weight at 0.0 costs nothing and changes nothing), which
+# gives the GA the same control arm every other option gene has and keeps the un-searched run
+# reproducible as a sampled trial. 9 levels for the signed weights, 5 for the unsigned one —
+# the same order of resolution as option_entry_cross's 5.
+#
+# WHAT IS DELIBERATELY NOT IN THIS TABLE (each withheld on recorded evidence, the F15
+# standard — a gene the GA can never move is budget burned on a dead search dimension):
+#   * ``w_spread`` — reads ``spread_pct``, which is degenerate on the store this grid
+#     actually reads. THE LOAD-BEARING PREMISE IS WHICH STORE THAT IS, and the earlier
+#     version of this note never stated it: an option job here runs on PARQUET, not sqlite.
+#     ``tools/run_options_matrix.py`` defaults ``--start 2023-01-01`` and
+#     ``daily_backtest_handler.validate_options_window`` enforces the history floor of the
+#     vendor serving the run's store (Alpaca 2024-01-18), so an option job left on the
+#     DEFAULT sqlite store RAISES before it runs; only ``options_store=parquet``
+#     (TastyTrade/dxfeed, floor 2022-10-01) can serve that window at all.
+#     ON PARQUET THE COLUMN FAILS OPEN, NOT CLOSED — the correction that matters, because
+#     the direction was recorded backwards. ``parquet_options_provider`` gets no vendor
+#     bid/ask (dxfeed serves no historical NBBO for dead contracts) and SYNTHESISES
+#     ``bid = ask = close`` (see its ``contract()``), so ``spread_pct`` is a constant 0.0
+#     for every candidate; ``_minimise`` maps that degenerate range to 0.0 and inverts it to
+#     1.0 — the BEST score — for all of them. Uniformly best, never uniformly rejected.
+#     ON SQLITE (unreachable for this grid, recorded so the two stores are not conflated)
+#     the column is NOT uniform. Measured 2026-08-31 against the only cache
+#     ``CACHE_FOLDER`` resolves to: ``option_chain`` holds 1,440,782 rows in a SINGLE
+#     ``as_of`` snapshot (2024-02-01), ``bid <> ask`` on 0 of them, and 357,211 (24.8%)
+#     carry NULL bid/ask/last. So ``spread_pct`` is 0.0 where quoted and None where not,
+#     which through ``_minimise`` becomes 1.0 / 0.0 — a binary "was this contract quoted in
+#     that one snapshot" flag, never a comparison of spreads.
+#     EITHER WAY THE GENE CANNOT GRADE A SPREAD, which is what withholds it — the
+#     conclusion is unchanged, only its reasoning is now true. The WEIGHT stays in
+#     SelectionPolicy: live chains carry real spreads.
+#   * ``w_rr`` — operator decision 2026-08-30 (design §7): Spearman(rr, premium) 0.98-1.0
+#     within real chains, a second gene searching the axis w_premium already owns.
+#   * ``w_profit`` — needs ``PolicyContext.structure_fn`` to score anything, and NO entry
+#     builder supplies one yet (teaching them is explicitly out of the plan's scope, and each
+#     closure must close the _size_by_cost premium-vs-max-loss gap with it), so the gene's
+#     emission set is empty today: provably inert on every real pick. The F15 discrimination
+#     evidence is nonetheless recorded in test_option_selection_weight_genes.py: within one
+#     expiry it is collinear with w_premium (the review's rho 0.98-1.0), but across the
+#     multi-expiry candidate sets every grid DTE window produces, the annualisation
+#     denominator makes them genuinely diverge — so when a builder is taught its closure,
+#     w_profit becomes worth emitting FOR THAT BUILDER, on that recorded evidence.
+#   * ``w_box_center`` — pinned 1.0, not a gene: scaling every weight by one factor changes
+#     no ranking, so a free box_center is a degenerate search direction (design §7).
+#
+# WHAT THE EMITTED THREE WERE ACTUALLY MEASURED ON (added 2026-08-31, correcting an
+# overstatement rather than a decision). The three above were emitted on a DEAD-GENE GUARD
+# that feeds synthetic ladders through the policy. That proves the PLUMBING — a weight change
+# reaches the pick — and it does not prove APPLICABILITY: that the column varies on the data
+# a grid job will actually see. Those are the two different failures F15 and F17 are about,
+# and only the first had been tested.
+#
+# Nor does the run-time report close the gap. ``option_selection_policy.inapplicable_features``
+# can only ever name ``profit`` and ``rr`` (see its docstring) — the two weights withheld
+# BELOW. It will never say a word about ``w_premium``/``w_iv``/``w_rvol``, so "an inert gene
+# and a live-but-unhelpful one stop looking identical" holds for the withheld pair and for
+# none of the emitted three. This block is the substitute, and it is a per-STORE claim
+# because applicability is a property of the store, not of the gene.
+#
+# MEASURED ON PARQUET — the store an option job actually reads (see w_spread below for why
+# sqlite is unreachable here).
+#
+# METHOD, so the next reader can reproduce it rather than trust it. ``random.Random(7)``;
+# N=200 draws; each draw picks an underlying uniformly from the 857 in
+# ``CACHE_FOLDER/TastyTradeOptionsProvider``, then an ``exp=`` partition uniformly within it,
+# then a ``bar_date`` uniformly within that partition — one CHAIN being one bar_date of one
+# expiry partition, the same unit the selector scores. A column is LIVE for a chain when it
+# takes >1 distinct NON-NULL value there. Measured 2026-08-31.
+#
+# READ THE >=3-ROW LINE, NOT THE HEADLINE. 36 of the 200 chains hold 1 or 2 rows, and a
+# 1-row chain is degenerate on EVERY column by arithmetic — including ``close``, which
+# cannot degenerate for any real reason. Those chains are not evidence about a column; they
+# are chains the ranking has nothing to rank. The restricted figure is the one that speaks
+# to whether a weight can discriminate:
+#                                       all N=200        >=3 rows (n=164)
+#   * ``w_iv``       vendor ``iv``        167/200            157/164   LIVE
+#   * ``w_rvol``     ``volume``           182/200            164/164   LIVE
+#   * ``w_premium``  ``close``            183/200            164/164   LIVE
+#   versus ``spread_pct``, degenerate on 200/200 and 164/164 BY CONSTRUCTION (the reader
+#   synthesises bid = ask = close; see w_spread below). That contrast is the point: the
+#   three emitted weights fail to discriminate only where NOTHING could, and the withheld
+#   one fails everywhere.
+#
+# IT REPRODUCES, which the figure it replaces did not. Reran at seeds 1/3/7/11/42, N=200:
+# on the >=3-row subset iv 147-157 of 154-164 (95-96%), volume 151-164 (98-100%), close
+# 154-164 (100% at every seed). The previous note recorded a single un-seeded draw of 20 as
+# a per-STORE property ("iv 19/20, volume 20/20"); re-drawing moved those numbers by up to 7
+# of 20, so the sample was reporting its own draw. An un-seeded n=20 statistic used to
+# justify keeping three GA genes is the same defect this whole line of work exists to remove.
+#
+# NB on ``w_iv``: the selector ranks on the INVERTED iv the reader derives per bar, not on
+# this vendor column; the vendor column is the dispersion PROXY, and a derived iv cannot be
+# constant where the closes it is inverted from are not (``close``: 100% live at >=3 rows).
+# NB on ``w_premium``: it is the one weight whose column cannot degenerate without the bars
+# themselves being constant, which is what the 164/164 says.
+# ON SQLITE (recorded only so the two stores are not conflated — no option job can run there)
+# ``w_rvol`` is NOT safe: ``option_chain.volume`` is 100% NULL, and what the selector sees is
+# ``option_bar.volume``, so a chain whose contracts have no bar that day collapses to a
+# constant 0. Reported dead in 14/20 chains by the Task 7/10 review — an un-seeded n=20 of
+# the kind replaced above, so read it as "often" and not as a rate. Not re-measured, because
+# the store is unreachable for this grid and no number would change the conclusion: the
+# mechanism (chain volume 100% NULL, bar volume absent for an untraded contract) is a schema
+# fact, not a sampling one.
+_OPTION_SELECTION_WEIGHT_BANDS = {
+    #  weight: (min, max, step)
+    "w_premium": (-2.0, 2.0, 0.5),   # SIGNED — the Task 7 sign fix, see above
+    "w_iv": (-2.0, 2.0, 0.5),        # signed — the design's original signed weight
+    "w_rvol": (0.0, 2.0, 0.5),
+}
+
+
+def _apply_option_selection_weight_genes(cfg: dict, member: str) -> dict:
+    """Make the SelectionPolicy weights searchable, in place, SHARED per debit/credit half.
+
+    The sharing tier (design §7): the gene key is ``optsel:<half>:<w>`` — derived from the
+    ``option_selection_half`` stamped here, NOT from the rule id — so every member of a half
+    collapses onto ONE gene per weight (OS1: 3 genes, not 15) and a stage-1 single-member
+    winner carries exactly the keys the stage-2 group space searches (encode_params drops
+    unknown keys silently, so a per-member key shape would strand every seed).
+
+    The halves are the launcher's own asserted-total partition: which way "good premium"
+    points is precisely what flips at the debit/credit line, and the two halves get two
+    independent genes rather than one averaged compromise.
+
+    Members only. The O_CC/O_PP overlays sit outside the partition (no _OPTION_STRATS row),
+    so they have no half to share with — their option leg keeps the default policy, which is
+    the proven no-op.
+    """
+    # REFUSE AN UNKNOWN MEMBER, do not default it to "credit". The partition below is
+    # asserted total (``_DEBIT_OPTION_MEMBERS | _CREDIT_OPTION_MEMBERS == _OPTION_STRATS``),
+    # so this cannot fire today -- but an ``else "credit"`` makes the safety come from that
+    # assertion holding rather than from this line, and a member added to _OPTION_STRATS on a
+    # branch where the assertion is relaxed would silently join the credit half and share its
+    # premium gene with the wrong thesis. ``strategy_param_space`` already refuses the exact
+    # mirror of this (a weight flag with no half); the two ends of one feature should not
+    # disagree about whether an unknown half is an error.
+    if member in _DEBIT_OPTION_MEMBERS:
+        half = "debit"
+    elif member in _CREDIT_OPTION_MEMBERS:
+        half = "credit"
+    else:
+        raise ValueError(
+            f"{member!r} is in neither the debit nor the credit option half, so it has no "
+            f"selection-weight gene to share; add it to _DEBIT_OPTION_KINDS or to "
+            f"_OPTION_STRATS' credit side before giving it selection weights")
+    cfg.setdefault("option_selection_half", half)
+    for w, (lo, hi, step) in _OPTION_SELECTION_WEIGHT_BANDS.items():
+        cfg.setdefault(f"option_{w}_optimize", True)
+        cfg.setdefault(f"option_{w}_min", lo)
+        cfg.setdefault(f"option_{w}_max", hi)
+        cfg.setdefault(f"option_{w}_step", step)
     return cfg
 
 
@@ -2979,15 +3737,31 @@ def _screener_gate_base_for_strategy(kind: str) -> dict:
         return dict(_OPTION_STRATS[kind].get("screener_gate_base") or {})
     merged: dict = {}
     for member in _OPTION_GROUPS.get(kind, []):
-        # CAVEAT (review fix, 2026-08-30): "later member wins" is a MERGE, not a per-member
-        # gate -- a capped member's price_max here would gate every OTHER active member's
-        # entries too, including an uncapped, defined-risk one. OS2 = [O_SSTG, O_SSTD, O_IC]:
-        # O_SSTG/O_SSTD now carry a real $300 cap, so OS2's merged block currently applies
-        # $300 to O_IC's entries as well, even though defined-risk O_IC is deliberately
-        # uncapped as a STANDALONE job (grid design §6). Inert TODAY -- stage 1 runs no groups
-        # (stage1_run.sh lists single-strategy keys only) -- but a stage that DOES run OS2/OS3
-        # would need a per-member gate, not this merge, before trusting O_IC's numbers inside
-        # the group.
+        # "Later member wins" is a MERGE, not a per-member gate: a capped member's price_max
+        # here would gate every OTHER active member's entries too, including an uncapped
+        # defined-risk one. That hazard is REAL IN SHAPE and UNREACHABLE IN FACT on this tree,
+        # and the distinction matters because the previous note here claimed the opposite.
+        #
+        # MEASURED 2026-09-01 (review 2026-08-30 dev-merge, FIX 3): every gate-carrying row is
+        # a full-notional or naked-vol structure -- O_CSP / O_JL / O_RS ($100) and O_SSTG /
+        # O_SSTD ($300) -- and ``_OPTION_GROUPS`` filters all five out of every group, so all
+        # four groups resolve to ``{}``:
+        #
+        #     OS1 [O_LC, O_LP, O_VERT, O_BF, O_BULLCS] -> {}
+        #     OS2 [O_IC]                               -> {}
+        #     OS3 [O_BEARCS, O_BULLPS]                 -> {}
+        #     OS4 [O_STRD, O_STRG]                     -> {}
+        #
+        # The earlier caveat read "OS2 = [O_SSTG, O_SSTD, O_IC], so O_SSTG's $300 currently
+        # applies to O_IC's entries" -- true before the naked-vol structures left the searched
+        # set on 2026-08-31 (``_UNDEFINED_RISK_MEMBERS``), and false since: OS2 is [O_IC]
+        # alone. ``test_an_excluded_members_override_never_reaches_its_group`` in
+        # ``testplatform/backend/tests/test_launcher_screener_gate.py`` pins exactly that -- an
+        # override placed on the EXCLUDED O_SSTG row must not appear in OS2's block.
+        #
+        # So the note to carry forward is not "O_IC is mis-priced today" but "if a defined-risk
+        # member is ever grouped WITH a gate-carrying one, this merge would need to become a
+        # per-member gate first".
         merged.update(_OPTION_STRATS[member].get("screener_gate_base") or {})
     return merged
 
@@ -3033,7 +3807,31 @@ def _screener_gate_opt_block(args, strategy_key: str) -> "dict | None":
 
 # DEBIT structures (long premium): OS1/OS4 and their members. The TP band differs by payoff
 # profile (see _option_exit_rules).
+#
+# GRID 2 joins by its IV-RANK THESIS, which is what this partition is FOR (amendment 5): the
+# debit half's gate says "only buy vol when it is cheap" and the credit half's says the
+# opposite, and the GA never searches an operator, so a member on the wrong side gets a gate
+# that is backwards for it. Every phase-1 grid-2 key is long premium by thesis:
+#   * O_LEAPC / O_LEAPP -- a bought LEAPS call/put. Net debit, unambiguous.
+#   * O_ERN             -- a bought straddle/strangle, and the design's own entry gate is
+#                          "buy vol only when iv-rank is LOW" (§2). Debit.
+#   * O_CBS / O_PBS     -- a 1x2 backspread is NET LONG an option (two longs against one
+#                          short) and is opened to OWN convexity; the short exists to finance
+#                          it. Its net can price to a credit on the day's skew, and that does
+#                          NOT move it: the sign of one day's fill is not the thesis. Debit.
+# The partition is asserted TOTAL below, so a future key that lands in neither set fails at
+# import rather than inheriting the credit thesis by omission.
+#   * O_CONVEX / O_CONVEXC / O_CONVEXP -- bought far-OTM calls/puts. Cheap long premium by
+#                          construction; the design's own thesis is "own convexity", which only
+#                          a debit thesis can express. Debit. Both the GROUP key ("O_CONVEX",
+#                          needed by ``_option_exit_rules``'s ``debit = kind in
+#                          _DEBIT_OPTION_KINDS`` check, called with the group name) and its two
+#                          MEMBERS (needed by the debit/credit partition assertion below, which
+#                          is keyed off ``set(_OPTION_STRATS)``) must be listed -- the same
+#                          dual listing OS1/OS4 already use alongside their own members.
 _DEBIT_OPTION_KINDS = {"O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS", "O_STRD", "O_STRG",
+                       "O_LEAP", "O_LEAPC", "O_LEAPP", "O_PMCC", "O_ERN", "O_CBS", "O_PBS",
+                       "O_CONVEX", "O_CONVEXC", "O_CONVEXP",
                        "OS1", "OS4"}
 
 # The same split at MEMBER granularity (the group keys removed). Entry gates are authored per
@@ -3045,6 +3843,167 @@ _CREDIT_OPTION_MEMBERS = set(_OPTION_STRATS) - _DEBIT_OPTION_MEMBERS
 # credit half's iv_rank gate (the wrong thesis) with nothing to notice it.
 if _DEBIT_OPTION_MEMBERS | _CREDIT_OPTION_MEMBERS != set(_OPTION_STRATS):
     raise RuntimeError("option members are not partitioned into debit/credit halves")
+
+
+# --- GRID 2 exit bands (design 2026-08-31 §2) -----------------------------------------------
+#
+# ``opt_dte`` is the REMAINING-LIFE exit, and its default band (0..21 step 3) was set for the
+# 25-45-DTE structures the first grid searched. A LEAPS position with 400 days of life can
+# never reach 21 DTE inside a 3-year window without being held to the last month of its life
+# -- the decay/gamma zone the design exits BEFORE -- so on a grid-2 key the default band is
+# not a loose gene, it is an exit that never fires. One band per key, from the design.
+#
+#   kind:     (default, min, max, step)                        levels
+_OPTION_DTE_EXIT_BANDS = {
+    # Keyed on the GROUP key: ``_option_exit_rules`` is called with the launched kind, and
+    # after the 2026-09-02 merge that is "O_LEAP" (the two arms share one exit ruleset, which
+    # is the whole point of the group shape -- see _OPTION_GROUPS_ALL).
+    "O_LEAP":  (150, 90, 240, 30),   # 6: design §2 "roll/exit DTE floor 90-240"
+    # The PMCC "shares the LEAPS roll-floor gene" (design §2), and here the exit is the LONG
+    # leg's remaining life by construction: ``DaysToExpiryCondition`` reads the long leg for a
+    # declared multi-expiry structure, so this band never fires on the 30-45-DTE overlay.
+    "O_PMCC":  (150, 90, 240, 30),   # 6
+    "O_CBS":   (30, 20, 45, 5),      # 6: design §2 "exit DTE floor 20-45"
+    "O_PBS":   (30, 20, 45, 5),      # 6
+    # O_ERN keeps the DEFAULT band: its expiry is 7-30 DTE, which is exactly the range the
+    # 0..21 band was authored for, and its real exit is the event exit below.
+    # CONVEX-HARVEST (plan Task 13): the convex-harvest design §2 states no explicit roll/exit
+    # DTE floor, but O_CONVEX's own entry DTE (180-540, decoded windows as low as [180,300])
+    # has the SAME shape as O_LEAPC's problem above -- the platform default (0..21) sits well
+    # inside the terminal decay/gamma zone a 180-540-day position should exit BEFORE, not the
+    # zone it should live in. 30-120 step 15 (7 levels) stays comfortably below every decoded
+    # entry window's floor (>=180), so the exit is always reachable without ever firing at
+    # entry (pinned by test_the_dte_exit_ceiling_never_reaches_the_entry_floor).
+    "O_CONVEX": (60, 30, 120, 15),   # 7
+}
+
+# TAKE PROFIT AS A MULTIPLE OF THE PREMIUM PAID (``profit_multiple_of_premium``, plan Task 4).
+# Design §2 gives the backspreads "take-profit multiple 2x-6x | to expiry" -- the "| to
+# expiry" arm IS the rule's own ``toggle_optimize`` gene switched off, not a sentinel value.
+#
+# WHY NOT ``opt_tp``'s percent for these. ``profit_loss_percent`` on a structure whose entry
+# net can be a CREDIT has no stable denominator (the design's own note: a backspread prices to
+# either sign on the day's skew), while a multiple of the net DEBIT is scale-free and REFUSES
+# to fire on a credit entry rather than reporting a meaningless ratio -- the Task-4 contract.
+#   kind:    (default, min, max, step)                         levels
+_OPTION_TP_MULTIPLE_BANDS = {
+    "O_CBS": (3, 2, 6, 1),   # 5
+    "O_PBS": (3, 2, 6, 1),   # 5
+    # CONVEX-HARVEST (plan Task 13, design §2): "take-profit multiple 3x-10x premium, plus
+    # hold-to-expiry". The hold-to-expiry arm is this SAME ``toggle_optimize`` gene switched
+    # off -- identical mechanism to the backspreads' "| to expiry" above, not a new one: with
+    # the rule off, the position rides opt_dte/opt_time/expiry itself instead of a TP multiple.
+    "O_CONVEX": (5, 3, 10, 1),   # 8
+}
+
+# ``opt_time`` (the ELAPSED-time exit, ``days_opened > N``) PER-KEY OVERRIDE (review finding,
+# 2026-09-02). The shared debit/credit ``td`` band below (28 default, 10-45) was set for the
+# 25-45-DTE structures the first grid searched, and it is authored ON BY DEFAULT everywhere --
+# a real close trigger, not a loose gene. O_CONVEX's median entry is a ~300-DTE ticket
+# (option_dte centre 240-480), so the SHARED band would close a lottery ticket 28 days into a
+# thesis built to run for the better part of a year -- the same "wrong band for this tenor"
+# defect ``_OPTION_DTE_EXIT_BANDS`` already exists to fix for the REMAINING-life exit, just on
+# the ELAPSED-time exit instead. Fixed the SAME way: a wider band (90-360 step 30, 10 levels)
+# AND authored OFF by default (the ``opt_sl_ml``/``_OPTION_SL_ML_AUTHORED_OFF`` removal idiom,
+# not a flag -- see ``strategy_param_space._decode_rule_list``'s and
+# ``rules_convert.live_actions_from_trade_rule``'s docstrings for why removal, not a flag) so a
+# default/unsearched genome never closes the ticket at 28 days; the GA can still discover a
+# time stop is worth it and turn the rule on.
+_OPTION_TIME_EXIT_OVERRIDE = {
+    "O_CONVEX": {"value": 180, "value_min": 90, "value_max": 360, "value_step": 30},
+}
+_OPTION_TIME_EXIT_AUTHORED_OFF = {"O_CONVEX"}
+
+# ``opt_sl_ml`` AUTHORED OFF (still searched). Design §2 for O_ERN: "opt_sl_ml searchable,
+# default OFF -- the thesis is binary; a stop mid-event amputates it", and the same sentence
+# for the backspreads. The rule keeps its ``toggle_optimize`` gene, so the GA still explores
+# both; what changes is the ruleset the launcher EMITS, which is what an unsearched run, a
+# seeded live deploy and the persisted top-N ruleset all read.
+#
+# O_CONVEX (plan Task 13, design §2): "opt_sl_ml stop searchable with default OFF -- stopping
+# a lottery ticket at a % of its premium amputates the convexity the strategy exists to buy.
+# The GA may still discover a stop helps; it must not be imposed." Same mechanism, same
+# reasoning as O_ERN/O_CBS/O_PBS above.
+# O_PMCC (plan Task 6): the same reasoning one structure further on. Its max loss is the
+# LEAPS debit less every credit collected, RESTAMPED downward at each roll, so a fixed % of it
+# is a stop whose dollar level moves under the position -- and stopping a stock replacement at
+# 50% of a floor that the overlay is steadily paying down amputates exactly the position the
+# strategy exists to hold. Searchable, authored OFF.
+_OPTION_SL_ML_AUTHORED_OFF = {"O_ERN", "O_CBS", "O_PBS", "O_CONVEX", "O_PMCC"}
+
+# The exit that terminates an EVENT thesis: N days after the stamped earnings date. Design §2
+# searches 0-2. NOT toggleable, unlike every other exit here, and that is the point -- O_ERN's
+# whole thesis is "own vol across the print, then get out"; with this exit off the strategy is
+# not O_ERN, it is an unmanaged straddle waiting for ``opt_dte``. The other exits stay
+# toggleable beside it, so the GA can still choose to leave via a TP or the DTE floor first
+# (first match wins).
+_OPTION_EVENT_EXIT_BANDS = {
+    "O_ERN": (1, 0, 2, 1),   # 3 levels
+}
+
+# --- GRID 2: THE TWO-EXPIRY OVERLAY RULES (design 2026-08-31 §4, plan Task 6) ---------------
+#
+# The keys whose OPEN_POSITIONS ruleset carries a roll loop. A set rather than a bare `== `
+# check because ``O_CAL`` joins it in phase 2 with the identical machinery -- the calendar's
+# short leg is rolled the same way, for the same reason, by the same action.
+_OVERLAY_ROLL_KINDS = {"O_PMCC"}
+
+# THE ROLL WINDOW, on the SHORT leg. Days before the overlay's own expiry at which it is bought
+# back and re-sold. Design §2 says "rolled at expiry"; 1-7 rather than a band reaching 0 is a
+# FILL-MODEL fact, not a preference: under next_bar_open an order placed on the expiry day
+# fills the day AFTER the contract has already settled, so a 0 arm would not roll, it would be
+# assigned. Default 3, step 1 (7 levels).
+_OVERLAY_ROLL_DTE_BAND = {"value": 3, "value_min": 1, "value_max": 7, "value_step": 1}
+
+# THE BUYBACK TRIGGER: roll early once N % of the overlay's own credit has decayed (design §4,
+# "% of credit decayed -- searched"). 50-90 step 10 (5 levels): below 50 the roll pays the
+# spread twice for premium it has not yet earned, and at 100 it never fires (an option rarely
+# reaches exactly zero bid before expiry, and the DTE rule has it by then anyway).
+_OVERLAY_BUYBACK_BAND = {"value": 70, "value_min": 50, "value_max": 90, "value_step": 10}
+
+# THE DELTA FLOOR (design §4: "or (PMCC) LEAPS delta < ~0.50 (searched on/off)"). A stock
+# replacement whose long has stopped tracking the underlying is no longer the position that was
+# opened. 0.40-0.60 step 0.05 (5 levels) brackets the design's ~0.50 on both sides.
+_OVERLAY_DELTA_FLOOR_BAND = {"value": 0.50, "value_min": 0.40, "value_max": 0.60,
+                             "value_step": 0.05}
+
+
+def _overlay_rules(kind: str):
+    """The roll loop + the delta floor, for the keys that manage a two-expiry structure.
+
+    THREE RULES, NOT ONE, and the split is forced rather than stylistic. Leaves inside one rule
+    are ANDed (``rule_builders.tree_leaves`` flattens a tree into one trigger dict and
+    ``TradeActionEvaluator`` requires all of them), so "roll at the expiry window OR at the
+    buyback trigger" cannot be a nested OR -- it is two rules, exactly as ``opt_dte`` is its own
+    rule rather than another leaf on ``opt_time``.
+
+    THE TWO ROLL RULES CARRY ``continue_processing``: a bar that rolls the overlay must still
+    reach the closing rules behind it, or a position could not be rolled and stopped out on the
+    same day. The wheel's covered-call overlay is spliced the same way and for the same reason.
+
+    ``pmcc_roll_dte`` is the one rule here WITHOUT a ``toggle_optimize`` gene, and that is the
+    point (the same call ``opt_event`` makes for O_ERN): with the roll switched off a PMCC is
+    not a PMCC, it is a diagonal waiting to have its short assigned. The BUYBACK trigger and the
+    DELTA FLOOR are both genuinely optional refinements and keep their on/off genes.
+    """
+    if kind not in _OVERLAY_ROLL_KINDS:
+        return []
+    return [
+        {"id": "pmcc_roll_dte", "action_type": "roll_pmcc_short",
+         "continue_processing": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "roll_dte", "field": "short_leg_days_to_expiry", "op": "<=",
+              "optimize": True, **_OVERLAY_ROLL_DTE_BAND}]}},
+        {"id": "pmcc_roll_buyback", "action_type": "roll_pmcc_short",
+         "toggle_optimize": True, "continue_processing": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "roll_buyback", "field": "credit_decayed_pct", "op": ">=",
+              "optimize": True, **_OVERLAY_BUYBACK_BAND}]}},
+        {"id": "pmcc_delta_floor", "action_type": "close_option", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "delta_floor", "field": "long_leg_delta", "op": "<",
+              "optimize": True, **_OVERLAY_DELTA_FLOOR_BAND}]}},
+    ]
 
 
 def _option_exit_rules(kind: str):
@@ -3061,7 +4020,14 @@ def _option_exit_rules(kind: str):
     56-87% win rate but only 3.8-18% TR — small wins eaten by uncapped losers).
 
     ``opt_dte`` (``days_to_expiry <= N``) is the roll-at-DTE exit, and it is NOT split by
-    payoff profile — one band for debit and credit alike:
+    payoff profile — one band for debit and credit alike.
+
+    WHICH LEG IT READS: for a strategy declared multi-expiry in
+    ``option_expiry.MULTI_EXPIRY_OPTION_STRATEGIES`` (``pmcc``), ``days_to_expiry`` reads the
+    LONG leg — the structure-exit / roll-floor question, so a PMCC is not closed merely
+    because its short overlay is expiring on schedule. (``option_lifecycle._dte`` asks the
+    other question, the roll WINDOW, and reads the SHORT leg.) Single-expiry structures are
+    unaffected, and mixed expiries on an UNDECLARED strategy stay unevaluable.
 
     * ``days_opened`` cannot express it. The entry DTE window is itself a gene
       (``option_dte``, decoded to a >= 14-day-wide window), so "28 days after opening"
@@ -3081,35 +4047,108 @@ def _option_exit_rules(kind: str):
     +/-10 half-width), so a higher threshold only buys a degenerate open-and-immediately-
     close region that burns GA budget. Step 3 lands exactly on the conventional 21 / 14 /
     7 / 0 points without inflating the search.
+
+    ``opt_sl_ml`` (``loss_pct_of_max_loss > N``) is the max-loss-scaled stop, emitted only
+    for strategies with at least one MEASURED-max-loss structure — see the inline comment at
+    its append site and ``_UNDEFINED_RISK_MEMBERS`` for the applicability derivation.
     """
     debit = kind in _DEBIT_OPTION_KINDS
+    dte_default, dte_lo, dte_hi, dte_step = _OPTION_DTE_EXIT_BANDS.get(kind, (21, 0, 21, 3))
     tp = ({"value": 100, "value_min": 25, "value_max": 200, "value_step": 25} if debit
           else {"value": 50, "value_min": 25, "value_max": 75, "value_step": 5})
-    td = ({"value": 28, "value_min": 10, "value_max": 45, "value_step": 5} if debit
-          else {"value": 21, "value_min": 10, "value_max": 35, "value_step": 5})
-    rules = [
+    td = _OPTION_TIME_EXIT_OVERRIDE.get(kind) or (
+        {"value": 28, "value_min": 10, "value_max": 45, "value_step": 5} if debit
+        else {"value": 21, "value_min": 10, "value_max": 35, "value_step": 5})
+    opt_time = {"id": "opt_time", "action_type": "close_option", "toggle_optimize": True,
+                "conditions": {"type": "AND", "conditions": [
+                    {"id": "td", "field": "days_opened", "op": ">",
+                     "optimize": True, **td}]}}
+    # See _OPTION_TIME_EXIT_OVERRIDE's comment: O_CONVEX authors this OFF (removal idiom, not
+    # a flag) so a default/unsearched genome never closes a ~300-DTE ticket at the shared
+    # 25-45-DTE band's 28-day default.
+    if kind in _OPTION_TIME_EXIT_AUTHORED_OFF:
+        opt_time["enabled"] = False
+    # THE OVERLAY RULES GO FIRST (design §4, plan Task 6). Front placement is the O_WHEEL
+    # idiom and it is load-bearing here for the same reason: ``opt_tp`` and ``opt_time``
+    # compare fields a PMCC also carries, so either could match on the very bar the overlay is
+    # due and break the walk with a close_option before the roll was ever reached. The roll
+    # rules carry ``continue_processing``, so the closes behind them still run on the same bar.
+    rules = _overlay_rules(kind) + [
         {"id": "opt_tp", "action_type": "close_option", "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [
              {"id": "tp", "field": "profit_loss_percent", "op": ">",
               "optimize": True, **tp}]}},
-        {"id": "opt_time", "action_type": "close_option", "toggle_optimize": True,
-         "conditions": {"type": "AND", "conditions": [
-             {"id": "td", "field": "days_opened", "op": ">",
-              "optimize": True, **td}]}},
+        opt_time,
         # Its OWN rule, not another leaf on opt_time: leaves inside one rule are ANDed, so
         # folding it in would demand "held N days AND M days left" and would cost the DTE
         # exit its own on/off gene.
         {"id": "opt_dte", "action_type": "close_option", "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [
-             {"id": "dte", "field": "days_to_expiry", "op": "<=", "value": 21,
-              "optimize": True, "value_min": 0, "value_max": 21, "value_step": 3}]}},
+             {"id": "dte", "field": "days_to_expiry", "op": "<=", "value": dte_default,
+              "optimize": True, "value_min": dte_lo, "value_max": dte_hi,
+              "value_step": dte_step}]}},
     ]
+    # GRID 2: the take-profit MULTIPLE (backspreads). Its own rule, not another leaf on
+    # ``opt_tp``: leaves inside one rule are ANDed, so folding it in would demand BOTH
+    # thresholds at once and cost each its own on/off gene -- the identical reasoning that
+    # gave ``opt_dte`` its own rule.
+    tp_mult = _OPTION_TP_MULTIPLE_BANDS.get(kind)
+    if tp_mult is not None:
+        mdef, mlo, mhi, mstep = tp_mult
+        rules.append(
+            {"id": "opt_tp_mult", "action_type": "close_option", "toggle_optimize": True,
+             "conditions": {"type": "AND", "conditions": [
+                 {"id": "tp_mult", "field": "profit_multiple_of_premium", "op": ">=",
+                  "value": mdef, "optimize": True, "value_min": mlo, "value_max": mhi,
+                  "value_step": mstep}]}})
+    # GRID 2: the EVENT exit (O_ERN). Reads ``days_after_event``, which is stamped from the
+    # recommendation's own event date -- never a second calendar lookup -- and can therefore
+    # never fire on a position whose recommendation carried no event.
+    ev = _OPTION_EVENT_EXIT_BANDS.get(kind)
+    if ev is not None:
+        edef, elo, ehi, estep = ev
+        rules.append(
+            {"id": "opt_event", "action_type": "close_option",
+             "conditions": {"type": "AND", "conditions": [
+                 {"id": "days_after", "field": "days_after_event", "op": ">=",
+                  "value": edef, "optimize": True, "value_min": elo, "value_max": ehi,
+                  "value_step": estep}]}})
     if not debit:
         rules.append(
             {"id": "opt_sl", "action_type": "close_option", "toggle_optimize": True,
              "conditions": {"type": "AND", "conditions": [
                  {"id": "sl", "field": "profit_loss_percent", "op": "<", "value": -100,
                   "optimize": True, "value_min": -200, "value_max": -50, "value_step": 25}]}})
+    # ``opt_sl_ml`` -- close when the loss reaches N% of the structure's MEASURED max loss
+    # (design 2026-08-29 S6). A SEPARATE rule, not a "basis" gene on ``opt_sl``: the sensible
+    # threshold range differs by basis (-200..-50% of credit vs 25..75% of max loss), so one
+    # threshold gene would need a domain conditional on another gene; two independently
+    # toggleable rules let the GA select the basis the way it already selects
+    # opt_tp/opt_time/opt_dte/opt_sl -- by toggling which rule is live. Both stops may be live
+    # at once; first match wins, as the OPEN_POSITIONS ruleset already does. They are
+    # correlated but not redundant: N% of max loss is scale-free (always that fraction of the
+    # defined risk) while -100% of credit drifts with however much credit the trial collected.
+    #
+    # Emitted only where at least one of the strategy's structures has a MEASURED max loss
+    # (see _UNDEFINED_RISK_MEMBERS for the corrected per-structure derivation). A group emits
+    # it if ANY member is measured -- the exit list is shared, and on an unbounded member's
+    # positions the condition self-disarms for want of a persisted max_loss_per_contract, so
+    # dropping the rule would deny the measured members a stop to protect the ones that never
+    # had a denominator anyway.
+    members = _OPTION_GROUPS.get(kind, [kind])
+    if any(m not in _UNDEFINED_RISK_MEMBERS for m in members):
+        sl_ml = {"id": "opt_sl_ml", "action_type": "close_option", "toggle_optimize": True,
+                 "conditions": {"type": "AND", "conditions": [
+                     {"id": "sl_ml", "field": "loss_pct_of_max_loss", "op": ">",
+                      "value": 50, "optimize": True,
+                      "value_min": 25, "value_max": 75, "value_step": 5}]}}
+        # GRID 2: AUTHORED off for the binary-thesis keys (see _OPTION_SL_ML_AUTHORED_OFF).
+        # ``enabled`` is a RULE-level key (rule_models._RULE_LEVEL_KEYS) and TradeRule keeps
+        # unknown keys verbatim, so it survives normalisation into the emitted ruleset. The
+        # ``toggle_optimize`` gene is untouched -- this changes the DEFAULT, not the search.
+        if kind in _OPTION_SL_ML_AUTHORED_OFF:
+            sl_ml["enabled"] = False
+        rules.append(sl_ml)
     return rules
 
 
@@ -3194,10 +4233,50 @@ _IV_RANK_GATE = {
 }
 _IV_RANK_STEP = 5.0
 
+# PER-MEMBER OVERRIDE of the half's WINDOW. Only the window: the OPERATOR still comes from the
+# half, and that is deliberate rather than incidental. "Which way does this gate point" is the
+# one thing the debit/credit partition exists to answer, the GA never searches an operator, and
+# ``test_launcher_iv_rank_gene`` re-derives the expected direction from the structure's own
+# action_type precisely so a per-member operator cannot drift from its half. The design writes
+# O_ERN's gate as "iv-rank <= X"; at a step of 5 on a continuous 0-100 rank, ``<=`` and ``<``
+# differ on exactly one point and buy nothing, so the half's ``<`` stands.
+#
+# WHAT DOES MOVE is the ceiling. O_ERN (design 2026-08-31 §2): "iv-rank entry gate (only when
+# iv-rank <= X, X searched 30-70 or off -- buying vol only when it is not already bid)". An
+# earnings straddle is bought INTO a vol run-up by construction, so the debit default's 60
+# ceiling would refuse most real prints; 70 is the design's number.
+#
+# THE FLOOR STAYS AT THE PLATFORM'S 10, NOT THE DESIGN'S 30 -- a deliberate SUPERSET, recorded
+# because it is a departure from the design's literal band. Every debit member must be able to
+# demand a genuinely cheap rank (``test_the_debit_half_can_demand_a_genuinely_low_rank`` pins
+# min <= 20 across the whole half); a 30 floor would leave O_ERN's buyer unable to express
+# "only when vol is actually cheap", which is half of the gate's own thesis. The design's
+# 30-70 region is entirely inside 10-70, so nothing it asked for is lost -- the search is 13
+# levels instead of 9.
+_IV_RANK_GATE_OVERRIDE = {
+    "O_ERN": {"value": 50.0, "value_min": 10.0, "value_max": 70.0},  # 13 levels
+}
+
 
 def _iv_rank_gate(m: str, member: str) -> dict:
     """The iv_rank entry gate leaf for member prefix ``m`` (see above)."""
-    spec = _IV_RANK_GATE[member in _DEBIT_OPTION_MEMBERS]
+    # SCOPE NOTE, LATENT AND DELIBERATELY NOT FIXED (2026-08-31). This bare boolean index is
+    # the same fail-open shape ``_apply_option_selection_weight_genes`` refuses by raising:
+    # a member in NEITHER half indexes False and silently takes the CREDIT thesis ("sell vol
+    # when it is expensive"), which is backwards for a long-premium structure such as O_PP.
+    # It is unreachable today — the debit/credit partition over ``_OPTION_STRATS`` is asserted
+    # total at import, and O_CC/O_PP are overlays outside ``_OPTION_STRATS`` that build via
+    # their own equity-entry builders and never reach ``_option_entry_rule`` — so this stays a
+    # note rather than a behaviour change: closing it belongs with whatever relaxes the
+    # partition, not with a docs pass. ``_iv_rv_gate`` carries the identical shape.
+    # The HALF decides the operator; a per-member override may only move the WINDOW (see
+    # _IV_RANK_GATE_OVERRIDE's note). Dropping ``op`` from the override rather than letting
+    # it win is what makes that a rule instead of a convention: an override that grew one
+    # would be ignored, loudly, by every direction test that re-derives the expected operator
+    # from the structure's own action_type.
+    spec = dict(_IV_RANK_GATE[member in _DEBIT_OPTION_MEMBERS])
+    spec.update({k: v for k, v in _IV_RANK_GATE_OVERRIDE.get(member, {}).items()
+                 if k != "op"})
     return {"id": f"{m}-iv_rank", "field": "iv_rank", "op": spec["op"],
             "value": spec["value"], "optimize": True,
             "value_min": spec["value_min"], "value_max": spec["value_max"],
@@ -3253,6 +4332,9 @@ def _relative_volume_gate() -> dict:
 
 def _iv_rv_gate(m: str, member: str) -> dict:
     """The IV/realised-vol entry gate leaf for member prefix ``m``."""
+    # Same latent fail-open as ``_iv_rank_gate`` — an unclassified member indexes False and
+    # takes the credit thesis. See that function's SCOPE NOTE; unreachable for the same
+    # reason, and left unchanged for the same reason.
     spec = _IV_RV_GATE[member in _DEBIT_OPTION_MEMBERS]
     return {"id": f"{m}-iv_rv", "field": "iv_to_realized_vol", "op": spec["op"],
             "value": spec["value"], "optimize": True, "toggle_optimize": True,
@@ -3280,6 +4362,70 @@ def _expected_profit_gate(m: str) -> dict:
     """The expected-profit entry gate leaf for member prefix ``m``."""
     return {"id": f"{m}-exp_profit", "field": "expected_profit_target_percent", "op": ">",
             "optimize": True, "toggle_optimize": True, **_EXPECTED_PROFIT_GATE}
+
+
+# --- the EVENT entry window (grid 2, O_ERN) -------------------------------------------------
+#
+# The design's timing split (§9): the EXPERT owns the ranking and surfaces every event inside
+# a fixed look-ahead (``earnings_days_look``, a plain setting); the STRATEGY owns the timing,
+# as ONE searched gene. Entry fires at most X days before the print, X in 1..5.
+#
+# THE FIELD IS ``rec_days_to_earnings``, NOT ``days_to_earnings`` (amendment 3). The latter is
+# the legacy condition that goes and FETCHES a calendar; this one reads the number the
+# recommendation was STAMPED with, so the entry decision and the expert's ranking cannot
+# disagree about when the print is, and a recommendation with no stamp can never fire.
+#
+# NOT toggleable, deliberately, and it is the same call ``-flat`` gets: with the window off,
+# the strategy buys straddles on every bar the expert publishes, which is not O_ERN with a
+# gate disabled -- it is a different strategy. The GA has one timing knob here, not two.
+_EVENT_ENTRY_MEMBERS = {"O_ERN"}
+_EVENT_ENTRY_DAYS = {"value": 3, "value_min": 1, "value_max": 5, "value_step": 1}
+
+
+def _days_to_earnings_gate(m: str) -> dict:
+    """The days-before-earnings entry gate leaf for member prefix ``m``."""
+    return {"id": f"{m}-days_to_earnings", "field": "rec_days_to_earnings", "op": "<=",
+            "optimize": True, **_EVENT_ENTRY_DAYS}
+
+
+def _assert_option_expiry_clears_event_window(kind: str) -> None:
+    """The straddle's expiry must land AFTER the print (amendment 2).
+
+    Implicit is not pinned. The constraint held only because the authored DTE numbers happened
+    to sit above the entry window, and nothing re-checked it when either band moved -- so a
+    later widening of ``option_dte_min_range`` (or of the entry gene's ceiling) would quietly
+    start emitting genomes that buy an expiry the earnings print outlives, i.e. a vol bet
+    settled BEFORE the event it is a bet on. Those genomes would trade, score, and look like
+    evidence about O_ERN.
+
+    Derived from the tables rather than restated: ``_apply_option_dte`` decodes the gene as a
+    window CENTRE and subtracts a half-width fixed by the AUTHORED window, so the MINIMUM
+    ``dte_min`` any genome can decode to is ``option_dte_min_range - hw``. That must exceed
+    the entry gene's own CEILING (the largest number of days before the print an entry may
+    fire), which is what makes the expiry strictly later than the event on every genome.
+
+    Raises at IMPORT, where a bad table is a code error, rather than at decode, where it would
+    be one refused genome in a population of 40 -- and 39 scored ones.
+    """
+    cfg = _OPTION_STRATS[kind]
+    base_min, base_max = int(cfg["option_dte_min"]), int(cfg["option_dte_max"])
+    hw = max(int((base_max - base_min) // 2) if base_max > base_min else 0, 7)  # _apply_option_dte
+    lowest_dte_min = max(0, int(cfg["option_dte_min_range"]) - hw)
+    entry_ceiling = int(_EVENT_ENTRY_DAYS["value_max"])
+    if lowest_dte_min <= entry_ceiling:
+        raise RuntimeError(
+            f"{kind}: the option_dte gene can decode to dte_min={lowest_dte_min} "
+            f"(option_dte_min_range={cfg['option_dte_min_range']} minus the half-width "
+            f"{hw} that _apply_option_dte derives from the authored window "
+            f"[{base_min},{base_max}]), which is NOT strictly greater than the "
+            f"{entry_ceiling}-day entry ceiling (_EVENT_ENTRY_DAYS['value_max']). Such a "
+            f"genome buys an expiry that can settle BEFORE the earnings print it is a bet "
+            f"on. Raise option_dte_min_range, widen the authored window, or lower the entry "
+            f"ceiling -- see design 2026-08-31 §2 and plan Task 10 amendment 2.")
+
+
+for _ern_kind in sorted(_EVENT_ENTRY_MEMBERS):
+    _assert_option_expiry_clears_event_window(_ern_kind)
 
 
 # Strategy kinds whose OWN rules manage stock delivered by an option assignment, and which
@@ -3372,6 +4518,10 @@ def _option_entry_rule(member: str, *, toggleable: bool = False,
             _relative_volume_gate(),
             _iv_rv_gate(m, member),
             _expected_profit_gate(m),
+            # EVENT-TIMED members only (O_ERN): the days-before-earnings window. Appended
+            # rather than folded into an existing leaf so it keeps its own threshold gene,
+            # and NOT toggle_optimize -- see _days_to_earnings_gate.
+            *([_days_to_earnings_gate(m)] if member in _EVENT_ENTRY_MEMBERS else []),
         ]},
         "actions": [_option_entry_action_for(member)],
         "continue_processing": False,
@@ -3675,6 +4825,26 @@ _STRATEGY_BUILDERS = {
     "O_BULLPS": _build_strategy_option,
     "O_CSP": _build_strategy_option, "O_STRD": _build_strategy_option,
     "O_STRG": _build_strategy_option,
+    # GRID 2 phase 1 (design 2026-08-31 §2) — singles, no umbrella group key.
+    # O_LEAP is a GROUP key (call arm + put arm; see _OPTION_GROUPS_ALL["O_LEAP"]). O_LEAPC/
+    # O_LEAPP have no row of their own -- they are members only, never independently
+    # launchable, exactly like O_CONVEXC/O_CONVEXP.
+    "O_LEAP": _build_strategy_option_group,
+    "O_ERN": _build_strategy_option,
+    "O_CBS": _build_strategy_option, "O_PBS": _build_strategy_option,
+    # CONVEX-HARVEST GRID (design 2026-08-31-convex-harvest-grid-design.md, plan Task 13) —
+    # separate grid, GROUP builder (call arm + put arm, two toggleable entry rules; see
+    # _OPTION_GROUPS_ALL["O_CONVEX"] and the row comments in _OPTION_STRATS). O_CONVEXC/
+    # O_CONVEXP are NOT registered here -- they are group members only, never independently
+    # launchable (mirrors OS1-OS4's members, which ARE independently launchable because they
+    # pre-existed as grid-1 singles; O_CONVEXC/O_CONVEXP have no such standalone history).
+    "O_CONVEX": _build_strategy_option_group,
+    # O_PMCC joined phase 1 on 2026-09-02 (plan Task 6): the two-expiry lifecycle it was gated
+    # behind now exists, so it builds like any other single. O_CAL stays phase 2 — registered so
+    # the key is KNOWN to argparse and the operator gets the phase-gate reason instead of
+    # argparse's "invalid choice"; its builder refuses (see _PHASE_GATED_OPTION_STRATEGIES).
+    "O_PMCC": _build_strategy_option,
+    "O_CAL": _build_strategy_phase_gated,
     "O_CC": _build_strategy_covered_call, "O_STK": _build_strategy_stock,
     "O_PP": _build_strategy_protective_put,
     # O_CSP's option entry + O_CC's covered-call overlay, gated on has_assigned_shares.
@@ -3781,10 +4951,13 @@ def _cmd_optimize(args) -> int:
     spec = _EXPERT_OPT.get(expert)
     if spec is None:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
-    # Pure-option kinds AND options experts (PremiumSeller — --strategy is ignored for it)
+    _refuse_unbounded_strategy_request("optimize", [args.strategy])
+    _refuse_phase_gated_strategy("optimize", [args.strategy])
+    # Pure-option kinds AND options experts (spec key `options` — --strategy is ignored)
     # default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
     fitness = _resolve_fitness(args.fitness, args.strategy,
                                "consistent_annual_return" if spec.get("options") else "sharpe_ratio")
+    _refuse_convex_fitness_mismatch("optimize", args.strategy, fitness)
     _assert_option_window_excludes_holdout([args.strategy], args.end)
     universe = [s.strip().upper() for s in args.universe.split(",") if s.strip()]
     if not universe:
@@ -3872,6 +5045,8 @@ def _cmd_optimize(args) -> int:
         # expert, so _apply_options_seam is a no-op for it while it is exactly the kind of job
         # that needs the parquet store.
         _apply_options_store(args, backtest_block)
+        # GRID 2: the long-dated keys' lower trade-frequency objective (no-op elsewhere).
+        _apply_option_trade_floor(None if bypass else args.strategy, backtest_block)
 
         # Screener-settings optimization: when --screener, attach a screener_opt block to the
         # backtest config (store + base settings + scan cadence — an OPTIMIZATION config option,
@@ -4106,6 +5281,8 @@ def _cmd_optimize_batch(args) -> int:
     for e in experts:
         if e not in _EXPERT_OPT:
             sys.exit(f"optimize-batch: expert {e!r} not configured; have {sorted(_EXPERT_OPT)}")
+    _refuse_unbounded_strategy_request("optimize-batch", strategies)
+    _refuse_phase_gated_strategy("optimize-batch", strategies)
     # Build the (expert, strategy) job grid. Bypass experts (FactorRanker) have no enter/exit
     # rulesets, so they run ONCE (their factor-model params), not per strategy variant.
     jobs = []  # (expert, strategy_kind)
@@ -4135,12 +5312,13 @@ def _cmd_optimize_batch(args) -> int:
         spec = _EXPERT_OPT[expert]
         bypass = bool(spec.get("bypass"))
         prefix = args.name_prefix or "phase1"
-        # Per-job resolution: pure-option kinds AND options experts (PremiumSeller — bypass,
-        # so strat_kind is "FACTOR" and carries no option-kind default) default to
+        # Per-job resolution: pure-option kinds AND options experts (spec key `options` — a
+        # bypass one's strat_kind is "FACTOR" and carries no option-kind default) default to
         # consistent_annual_return; stock kinds keep this command's historical calmar_ratio
         # default.
         fitness = _resolve_fitness(args.fitness, strat_kind,
                                    "consistent_annual_return" if spec.get("options") else "calmar_ratio")
+        _refuse_convex_fitness_mismatch("optimize-batch", strat_kind, fitness)
         name = f"{prefix}-{expert}-{strat_kind}-{fitness}"
         db = SessionLocal()
         try:
@@ -4194,6 +5372,8 @@ def _cmd_optimize_batch(args) -> int:
             # that fans out to remote workers, so it is the one for which "the store came from an
             # exported env var" is a silent lie (see _apply_options_store).
             _apply_options_store(args, backtest_block)
+            # GRID 2: the long-dated keys' lower trade-frequency objective (no-op elsewhere).
+            _apply_option_trade_floor(None if bypass else strat_kind, backtest_block)
             # Target-anchored variants (S4): the TP-on-target anchoring lives on the Strategy row
             # itself (strat.entry_actions, seeded by _build_strategy_S4) — nothing to thread onto
             # the run config here.
@@ -4209,11 +5389,11 @@ def _cmd_optimize_batch(args) -> int:
                 "earlyStoppingGenerations": int(args.early_stop),
                 "elitismPercent": float(args.elitism_percent), "seed": int(args.seed),
                 "parallelIndividuals": int(args.parallel),
-                # Bypass experts (FactorRanker, PremiumSeller) size their own portfolio and skip
+                # Bypass experts (FactorRanker) size their own portfolio and skip
                 # the full RM block + per-day schedule genes, but carry _BYPASS_RM_OPT
                 # (risk_per_trade_pct, which prices FactorRanker's resting protective stop)
-                # UNLESS the spec opts out via no_bypass_rm (PremiumSeller's manager owns its
-                # exits — the gene would be dead weight); ruleset experts get the full
+                # UNLESS the spec opts out via no_bypass_rm (a manager that owns its exits
+                # leaves the gene dead weight — no current spec); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
                                   else {**spec["expert_params"], **_rm_opt_for(strat_kind),
@@ -4870,10 +6050,11 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--strategy", choices=sorted(_STRATEGY_BUILDERS), default="S2",
                     help="Strategy/exit variant for a ruleset expert: S1 live-import / S2 bracket / "
                          "S3 trailing / S4 target-anchored; or an option/equity strategy "
-                         "(O_LC long-call, O_VERT bear-put, O_SSTG short-strangle, O_SSTD "
-                         "short-straddle, O_IC iron-condor, O_JL jade-lizard, O_BF call-butterfly, "
-                         "O_RS put-ratio-spread, O_CC covered-call, O_STK equity). "
-                         "Ignored for bypass experts (FactorRanker).")
+                         "(O_LC long-call, O_VERT bear-put, O_IC iron-condor, O_JL jade-lizard, "
+                         "O_BF call-butterfly, O_RS put-ratio-spread, O_CC covered-call, "
+                         "O_STK equity). O_SSTG/O_SSTD are UNBOUNDED-risk and refuse "
+                         "(operator decision 2026-08-31). Ignored for bypass experts "
+                         "(FactorRanker).")
     op.add_argument("--universe", required=True, help="Comma-separated symbols.")
     op.add_argument("--start", required=True, help="ISO start date.")
     op.add_argument("--end", required=True, help="ISO end date.")
@@ -4887,7 +6068,11 @@ def main(argv: "list | None" = None) -> int:
                          "EVERY year: (adjusted) annualized return, hard >=30 trades/yr gate, "
                          "soft drawdown penalty beyond 20%%, x worst-year/mean-year consistency "
                          "(--fitness-trade-scale is a no-op for it); the option default is that "
-                         "shape applied to an option book.")
+                         "shape applied to an option book. 'option_convex' is the "
+                         "CONVEX-HARVEST metric (end-of-window total return, drawdown free "
+                         "below 50%%, breadth floor >=30 tickets/yr AND >=20 underlyings, hit "
+                         "rate/concentration recorded not scored) -- never a default, name it "
+                         "explicitly, and never compare its scores with a CAR-family score.")
     op.add_argument("--generations", type=int, default=6)
     op.add_argument("--population", type=int, default=10)
     op.add_argument("--parallel", type=int, default=4, help="Parallel trials (ThreadPoolExecutor).")
@@ -5048,7 +6233,7 @@ def main(argv: "list | None" = None) -> int:
                          "use_atr_stop) are inert and drift random, so a crossover that flipped "
                          "the mode would score it with unselected parameters and bias the "
                          "comparison toward whichever mode dominates the population. No effect "
-                         "on bypass experts (FactorRanker, PremiumSeller) — they skip "
+                         "on bypass experts (FactorRanker) — they skip "
                          "TradeRiskManagement entirely, so sizing_mode is never read. ALWAYS "
                          "give the two runs different --name suffixes, or the second is SKIPped "
                          "as an already-completed run.")
@@ -5097,7 +6282,8 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--strategies", default="S1,S2,S3",
                     help="Comma-separated strategy variants per ruleset expert (S1 live-import / "
                          "S2 bracket / S3 trailing / S4 target-anchored; or option/equity strategies "
-                         "O_LC,O_VERT,O_SSTG,O_SSTD,O_IC,O_JL,O_BF,O_RS,O_CC,O_STK). Each is "
+                         "O_LC,O_VERT,O_IC,O_JL,O_BF,O_RS,O_CC,O_STK -- O_SSTG/O_SSTD are "
+                         "UNBOUNDED-risk and refuse, operator decision 2026-08-31). Each is "
                          "dispatched through _build_strategy. Bypass experts (FactorRanker) ignore this.")
     ob.add_argument("--universe", required=True, help="Comma-separated symbols (shared by all jobs).")
     ob.add_argument("--start", required=True, help="ISO start date.")

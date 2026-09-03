@@ -22,6 +22,10 @@ uses (BA2TradePlatform/.../core/TradeManager.py lines ~901-1190):
             ``get_latest_atr``), then ``account.submit_order(order)`` for each sized order;
     4. ``account.refresh_orders()`` (the fill engine) + ``account.refresh_transactions()``
        (inherited WAITING->OPENED->CLOSED lifecycle) roll the bar's order/transaction state;
+    4c. for a ``classic_options`` sleeve ONLY: ``update_sleeve_breaker`` — the SAME shared
+       transition the live exit pass calls — ratchets the sleeve's peak equity and trips or
+       re-arms its drawdown breaker, whose latch the entry gate then reads on the next bar.
+       An equity trial never reaches it (see ``_option_sleeves``);
     5. ``account.snapshot_equity(as_of)`` records the per-bar equity curve point.
 
 The decision logic is NOT perturbed: ``analyze_as_of`` is byte-identical to the Phase-1
@@ -58,6 +62,9 @@ from ba2_common.core.types import (
     RiskLevel,
     TimeHorizon,
     TransactionStatus,
+)
+from ba2_common.core.OptionRiskManagement import (
+    option_risk_manager_enabled, update_sleeve_breaker,
 )
 from ba2_common.core.regime_overlay import reset_stressed, set_stressed
 from ba2_common.logger import logger
@@ -234,34 +241,12 @@ def _schedule_allows_entry(as_of_dt: datetime, schedule: Optional[Dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
-# BYPASS-expert seams (spec §3.3): manager-class resolution + run cadence.
+# BYPASS experts run their ENTRY pass on entry bars and rebalance through
+# FactorRanker's FactorPortfolioManager. (The spec §3.3 seams that let an expert
+# declare its own manager class — ``portfolio_manager_classpath`` — and a
+# manage-bar exit pass — ``manages_between_entries`` — were deleted 2026-08-31
+# with their sole producer, PremiumSeller; option-model plan Task 12.)
 # ---------------------------------------------------------------------------
-def _resolve_bypass_manager_class(expert) -> Any:
-    """Portfolio-manager class for a bypass expert.
-
-    Experts may declare ``portfolio_manager_classpath`` (dotted path); the
-    default is FactorRanker's FactorPortfolioManager — byte-identical for every
-    existing bypass expert (spec §3.3.1)."""
-    import importlib
-    classpath = getattr(expert, "portfolio_manager_classpath", None)
-    if not classpath:
-        from ba2_experts.FactorRanker.portfolio import FactorPortfolioManager
-        return FactorPortfolioManager
-    module, _, name = classpath.rpartition(".")
-    return getattr(importlib.import_module(module), name)
-
-
-def _bypass_run_kind(expert, entry_ok: bool, manage_ok: bool) -> Optional[str]:
-    """Which pass a bypass expert runs this bar: "entry" on entry bars (always),
-    "manage" on manage bars ONLY when the expert declares
-    ``manages_between_entries`` (default False — FactorRanker unchanged)."""
-    if entry_ok:
-        return "entry"
-    if manage_ok and getattr(expert, "manages_between_entries", False):
-        return "manage"
-    return None
-
-
 # ---------------------------------------------------------------------------
 # Option expiry / exercise / assignment
 # ---------------------------------------------------------------------------
@@ -412,7 +397,7 @@ class DailyBacktestEngine:
         # set only changes per scan date (weekly cadence), so it's computed once per scan date and
         # reused for every bar in that period (vs recomputing the full-store filter every 5min bar).
         self._screened_cache: Dict[str, List[str]] = {}
-        # BYPASS-expert (FactorRanker/PremiumSeller) per-run manager cache. The portfolio manager
+        # BYPASS-expert (FactorRanker) per-run manager cache. The portfolio manager
         # holds only run-CONSTANT state (the resolver expert/account instances + ids), so building
         # it ONCE per expert avoids an ExpertInstance DB query on every rebalance bar.
         # (``_bypass_veq_pct`` lived here too until 2026-08-06; it existed solely to feed the
@@ -431,21 +416,26 @@ class DailyBacktestEngine:
             a = ea.get("action_type") or ea.get("action") or ea.get("option_strategy")
             self._entry_is_option = bool(a and is_option_action(str(a)))
 
+        # The option sleeves whose drawdown breaker this run transitions per bar, as
+        # (expert, expert_instance_id). Filled in by ``run()`` from the SAME
+        # ``option_risk_manager_enabled`` dispatch the entry gate uses, and EMPTY for every
+        # equity run -- which is what keeps the option risk manager out of an equity trial
+        # entirely rather than merely making it cheap.
+        self._option_sleeves: List[Tuple[Any, int]] = []
+
     def _bypass_manager(self, expert_id: int) -> Any:
         """Lazily build + cache the portfolio manager for a bypass expert (run-constant).
 
-        The manager class comes from ``_resolve_bypass_manager_class`` (default:
-        FactorRanker's FactorPortfolioManager; PremiumSeller declares its
-        OptionPortfolioManager via ``portfolio_manager_classpath``).
+        Always FactorRanker's FactorPortfolioManager (the per-expert manager-class seam
+        went with PremiumSeller, 2026-08-31 — see the module-level note).
 
         The manager is stable for the whole run; it reads live account state on every call.
         """
         pm = self._bypass_pm.get(expert_id)
         if pm is None:
-            from ba2_common.core.instance_resolver import get_instance_resolver
+            from ba2_experts.FactorRanker.portfolio import FactorPortfolioManager
 
-            expert = get_instance_resolver().get_expert_instance(expert_id)
-            pm = _resolve_bypass_manager_class(type(expert))(expert_id)
+            pm = FactorPortfolioManager(expert_id)
             self._bypass_pm[expert_id] = pm
         return pm
 
@@ -547,6 +537,21 @@ class DailyBacktestEngine:
             return any(_schedule_allows_entry(aw, s, _is_intraday, _ctx) for s in _scheds)
 
         analysis_idx = [j for j, a in enumerate(days) if _day_is_analysis(a)]
+
+        # THE option-sleeve gate, evaluated ONCE per run rather than once per bar. The check
+        # is ``option_risk_manager_enabled`` over ``expert.settings`` -- byte for byte the
+        # dispatch ``TradeActions._option_risk_manager`` uses for the ENTRY gate, so the bar
+        # loop's breaker and the entry rails engage on exactly the same experts. An equity
+        # trial leaves this list EMPTY and therefore makes ZERO calls to the option risk
+        # manager per bar (pinned by call count, not by timing). ``risk_manager_mode`` cannot
+        # change mid-run, so hoisting the check out of the loop changes no answer -- it only
+        # keeps the hot path a single truthiness test.
+        self._option_sleeves = [
+            (expert, expert_id)
+            for expert, expert_id, _settings, _ruleset in self.experts
+            if option_risk_manager_enabled(getattr(expert, "settings", None),
+                                           expert_instance_id=expert_id)
+        ]
 
         i = 0
         n_days = len(days)
@@ -668,22 +673,11 @@ class DailyBacktestEngine:
                     analyzed_manage_days.add(_day_key)
                 book_dirty = True  # an analysis/management pass runs -> orders may be created
                 if getattr(expert, "bypasses_classic_rm", False):
-                    # Bypass experts rebalance on their ENTRY cadence; experts that
-                    # declare manages_between_entries (PremiumSeller) also run a
-                    # manage pass on MANAGE bars (exits only). Default: entry-only
-                    # (FactorRanker byte-identical).
-                    kind = _bypass_run_kind(expert, entry_ok, manage_ok)
-                    if kind == "entry":
+                    # Bypass experts rebalance on their ENTRY cadence only (FactorRanker
+                    # byte-identical). The manage-bar exit pass (manages_between_entries)
+                    # was deleted with its sole producer, PremiumSeller — 2026-08-31.
+                    if entry_ok:
                         self._run_bypass_expert_bar(expert, expert_id, settings, as_of_dt)
-                    elif kind == "manage":
-                        try:
-                            self._bypass_manager(expert_id).manage_open(as_of_dt)
-                        except Exception as e:  # noqa: BLE001 — one bar must not abort the run
-                            from app.services.backtest.price_source import BacktestCacheMiss
-                            from ba2_providers.fmp_common import FMPHistoryCacheMiss
-                            if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
-                                raise
-                            self._log(f"bypass manage_open failed for expert {expert_id} @ {as_of_dt:%Y-%m-%d}: {e}")
                     continue
                 if getattr(expert, "analyzes_as_basket", False):
                     # Basket experts (e.g. FMPSenateTraderWeight/FMPSenateTraderCopy) call
@@ -727,6 +721,34 @@ class DailyBacktestEngine:
             #     roll — extracted into _fills_and_settlements so the bar tail is
             #     testable on its own.
             self._fills_and_settlements(as_of_dt)
+
+            # 4c. the option sleeve's drawdown circuit breaker, once per bar, for a
+            #     ``classic_options`` expert and no other. Until 2026-09-01 the breaker
+            #     TRANSITIONED only in the live tree (``option_lifecycle_service``, off
+            #     ``JobManager``), so a backtest never ratcheted the peak, never tripped and
+            #     never re-armed: ``RAIL_BREAKER_HALTED`` was unreachable here and a
+            #     classic_options backtest was systematically MORE PERMISSIVE than live.
+            #     This is the same shared function live calls -- one implementation, two
+            #     callers -- and it reads the sleeve's equity through
+            #     ``sleeve_true_equity`` -> ``ReadOnlyAccountInterface.true_equity``, NOT
+            #     through ``AccountSnapshot.equity`` (review 2026-08-30 dev-merge, FIX 6:
+            #     the earlier wording named the snapshot and would invite putting it back).
+            #     The distinction is the whole point of the 2026-09-01 fix: on
+            #     ``BacktestAccount`` the snapshot resolves to
+            #     ``deployed_equity() = min(cap, equity())``, and that clamp is ONE-SIDED --
+            #     it compresses peaks and never troughs, so a capped account falling
+            #     100k -> 64k reports a 0.0 % drawdown and never stands down. Live, where
+            #     there is no cap, ``true_equity`` and the snapshot are the same number and
+            #     nothing changes. The sizing rails keep the capped reader
+            #     (``sleeve_equity``); only this LOSS measurement looks past it.
+            #
+            #     HERE, deliberately: after the expiry settlement and the margin-call
+            #     liquidation have marked this bar and BEFORE ``snapshot_equity``, so the
+            #     breaker measures exactly the equity the reported curve records. The entry
+            #     pass (step 3) reads the latch on the NEXT bar, which is the same ordering
+            #     live has (the exit pass transitions; the next entry cycle is gated).
+            if self._option_sleeves:
+                self._update_option_breakers()
 
             # 5. record per-bar equity / drawdown point.
             self.account.snapshot_equity(as_of_dt)
@@ -1518,6 +1540,28 @@ class DailyBacktestEngine:
                     f"option expiry failed for {pos.contract_symbol} @ {as_of_date}: {e}"
                 )
         return settled_any
+
+    def _update_option_breakers(self) -> None:
+        """Transition every ``classic_options`` sleeve's drawdown breaker for this bar.
+
+        ONE line of real work per sleeve, and it is a call into the SHARED
+        ``OptionRiskManagement.update_sleeve_breaker`` -- the function the live exit pass
+        calls. The engine deliberately owns no breaker arithmetic of its own: a backtest-only
+        copy of the transition is precisely the divergence this wiring exists to remove, and
+        ``test_the_backtest_engine_carries_no_option_risk_manager_of_its_own`` fails if one
+        appears here.
+
+        Never aborts the run. A sleeve whose equity cannot be read leaves the breaker BLIND
+        (``update_breaker`` says so and refuses to report a drawdown it did not measure), and
+        an unexpected failure is logged and the bar continues -- a bookkeeping fault must not
+        invalidate a trial that has already traded.
+        """
+        for expert, expert_id in self._option_sleeves:
+            try:
+                update_sleeve_breaker(expert=expert, account=self.account,
+                                      expert_instance_id=expert_id)
+            except Exception as e:  # noqa: BLE001 — see the docstring
+                self._log(f"option breaker update failed for expert {expert_id}: {e}")
 
     def _size_and_submit(self, expert_id: int, indicator_provider: Any,
                          as_of_dt: Optional[datetime] = None) -> None:

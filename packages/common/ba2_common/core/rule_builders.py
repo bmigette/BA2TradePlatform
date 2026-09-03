@@ -33,11 +33,26 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     # Exit (open_positions) numeric conditions.
     "profit_loss_percent": ExpertEventType.N_PROFIT_LOSS_PERCENT,
     "profit_loss_amount": ExpertEventType.N_PROFIT_LOSS_AMOUNT,
+    # Loss as a % of the persisted max_loss_per_contract (defined-risk stop, design
+    # 2026-08-29 S6/S8.2). UNEVALUABLE -- fires in neither direction -- when the submit
+    # path stamped no measured max loss on the parent order.
+    "loss_pct_of_max_loss": ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS,
+    # Take-profit for a LONG (debit) option structure, scaled to what it cost: current
+    # value / entry premium. UNEVALUABLE for a credit (SELL) entry -- see the condition
+    # class docstring. A PROFIT-side gate, never a stop.
+    "profit_multiple_of_premium": ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM,
     "days_opened": ExpertEventType.N_DAYS_OPENED,
     # Remaining option life (expiry - the evaluation date), the complement of days_opened.
     # MUST be listed here or the leaf is silently dropped by triggers_from_condition_tree
     # ("an unknown field is skipped") and the engine never sees the gate at all.
     "days_to_expiry": ExpertEventType.N_DAYS_TO_EXPIRY,
+    # THE THREE PER-LEG READERS (plan Task 6). Same "list it here or the leaf is silently
+    # dropped" rule as days_to_expiry above -- and on these it is sharper still, because two
+    # of them drive a ROLL rather than a close: a dropped leaf leaves a PMCC's overlay to
+    # expire unrolled while every log claims the rule is configured.
+    "short_leg_days_to_expiry": ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY,
+    "credit_decayed_pct": ExpertEventType.N_CREDIT_DECAYED_PCT,
+    "long_leg_delta": ExpertEventType.N_LONG_LEG_DELTA,
     "percent_to_current_target": ExpertEventType.N_PERCENT_TO_CURRENT_TARGET,
     "new_target_percent": ExpertEventType.N_NEW_TARGET_PERCENT,
     # --- registered-but-unmapped numeric conditions -----------------------------------
@@ -63,6 +78,13 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     "relative_volume": ExpertEventType.N_RELATIVE_VOLUME,
     "iv_to_realized_vol": ExpertEventType.N_IV_TO_REALIZED_VOL,
     "days_to_earnings": ExpertEventType.N_DAYS_TO_EARNINGS,
+    # The O_ERN TIMING SPLIT (design 2026-08-31 leaps-grid S9). Entry: days-to-earnings as
+    # the ranking expert STAMPED it on the recommendation -- not a second calendar fetch.
+    # Exit: calendar days since the event date the entry order carried forward. Both are
+    # UNEVALUABLE (fire in NEITHER direction) without their stamp, which is every
+    # recommendation and every position that did not come from an earnings-event expert.
+    "rec_days_to_earnings": ExpertEventType.N_REC_DAYS_TO_EARNINGS,
+    "days_after_event": ExpertEventType.N_DAYS_AFTER_EVENT,
 }
 
 # Flag (boolean) condition fields -> ExpertEventType (no operator/value). Used by exit
@@ -215,6 +237,12 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("strike_param", ("option_strike_param",)),
     ("dte_min", ("option_dte_min",)),
     ("dte_max", ("option_dte_max",)),
+    # THE SECOND EXPIRY WINDOW, read only by ``OpenPMCCAction`` (plan Task 6): the OVERLAY's
+    # own DTE band, distinct from the LEAPS band above. Absent for every single-expiry
+    # structure, which is what keeps them byte-identical -- only keys present in a config are
+    # forwarded.
+    ("short_dte_min", ("option_short_dte_min",)),
+    ("short_dte_max", ("option_short_dte_max",)),
     ("sizing", ("option_sizing",)),
     ("min_open_interest", ("option_min_oi", "option_min_open_interest")),
     ("max_spread_pct", ("option_max_spread_pct", "option_max_spread")),
@@ -232,6 +260,14 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     # engine already models). Absent or 0.0 is the pre-F3 quote EXACTLY. See
     # ``core.option_entry_quote``.
     ("entry_cross", ("option_entry_cross",)),
+    # SELECTION-POLICY WEIGHTS (design 2026-08-29 §7): which contract inside the rule's box
+    # wins. GA genes, shared per debit/credit half by the launcher; absent means the default
+    # policy, which is a proven no-op over the legacy selector. w_profit/w_rr are deliberately
+    # unmapped -- no builder supplies the structure_fn they need, so mapping them would
+    # forward a knob the pick cannot see (the silently-inert-gene defect).
+    ("w_premium", ("option_w_premium",)),
+    ("w_iv", ("option_w_iv",)),
+    ("w_rvol", ("option_w_rvol",)),
 )
 
 
@@ -262,7 +298,22 @@ def action_from_rule(rule: dict, key: str = "act") -> Optional[Dict[str, dict]]:
     open_strangle/close_option, ...) emit an action config carrying the option selection
     params (strike_method/strike_param/dte_min/dte_max/sizing/liquidity) in the EXACT shape
     the ``TradeActionEvaluator`` reads — so the BACKTEST builds the option ``TradeAction``
-    identically to live."""
+    identically to live.
+
+    ``rule.get("enabled") is False`` -> None, UNCONDITIONALLY, before anything else runs —
+    including before the option branch, which returns early and would otherwise let an
+    authored-off option rule (``opt_sl_ml`` is exactly that) straight through. This is the
+    LEGACY-shape half of the 2026-09-02 fail-closed guard: ``live_actions_from_trade_rule``
+    covers the ordered-``actions`` pair (``default_rulesets.seed_ruleset_from_rules`` +
+    ``rules_convert.trade_rules_to_live_export``), and THIS covers the one-action-per-rule
+    pair that never reaches it — ``rules_convert.strategy_to_live_export``'s exit loop (live)
+    and ``default_rulesets.seed_open_positions_ruleset`` (backtest). Both shapes, both
+    runtimes, same rule: an ``enabled: False`` rule produces no action at all rather than an
+    inert flag nothing downstream reads. ``is False`` and not falsiness, so an absent key and
+    an explicit ``True`` both convert normally (pinned in
+    packages/common/tests/test_live_actions_enabled_flag.py)."""
+    if rule.get("enabled") is False:
+        return None
     raw = rule.get("action_type") or rule.get("action")
     if is_option_action(str(raw)):
         return {key: _option_action_config(str(raw), rule)}

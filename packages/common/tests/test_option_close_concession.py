@@ -154,6 +154,93 @@ def test_dte_and_loss_side_exits_classify_as_forced():
     assert forced_option_exit(flag_only) is False
 
 
+def test_the_grid_emitted_exit_rules_classify_per_the_review_table():
+    """Review 2026-08-30 dev-merge FIX 1 — the four exit rules the option grid actually
+    emits (``_option_exit_rules``), classified as the review's table requires.
+
+    ``opt_sl_ml`` is the one that regressed: ``loss_pct_of_max_loss`` is a loss MAGNITUDE
+    (positive while losing, S8.2), so its stop operator is ``>`` — the inverse of the
+    ``profit_loss_*`` convention. Enumerating only the P&L convention made it match no
+    test and classify like a take-profit, and on the 9 DEBIT kinds it is the ONLY stop
+    emitted (``opt_sl`` is credit-only), so every one of its firings took the
+    discretionary mid-quote path F7 exists to remove."""
+    from ba2_common.core.TradeActionEvaluator import forced_option_exit
+
+    # Exactly the triggers ba2test_launcher._option_exit_rules emits, defaults included.
+    opt_sl_ml = _event_action(
+        {"c0": {"event_type": "loss_pct_of_max_loss", "operator": ">", "value": 50}})
+    opt_sl = _event_action(
+        {"c0": {"event_type": "profit_loss_percent", "operator": "<", "value": -100}})
+    opt_dte = _event_action(
+        {"c0": {"event_type": "days_to_expiry", "operator": "<=", "value": 21}})
+    opt_tp = _event_action(
+        {"c0": {"event_type": "profit_loss_percent", "operator": ">", "value": 50}})
+    # Task 4 (+ follow-up 2026-09-01): the debit-structure take-profit multiple.
+    # ``>=`` is the profit side (like opt_tp) -- discretionary. ``<`` is a de-facto
+    # loss-side stop (worth less than paid, affine-identical to profit_loss_percent < 0)
+    # -- registered in _LOSS_SIDE_STOP_OPERATORS under the SIGNED-RESULT convention, so
+    # it must classify forced, exactly like opt_sl.
+    opt_tp_mult = _event_action(
+        {"c0": {"event_type": "profit_multiple_of_premium", "operator": ">=", "value": 3.0}})
+    opt_tp_mult_loss_side = _event_action(
+        {"c0": {"event_type": "profit_multiple_of_premium", "operator": "<", "value": 1.0}})
+
+    assert forced_option_exit(opt_sl_ml) is True    # loss-side of an INVERTED-sign field
+    assert forced_option_exit(opt_sl) is True       # loss-side of a signed-P&L field
+    assert forced_option_exit(opt_dte) is True      # the DTE/roll exit
+    assert forced_option_exit(opt_tp) is False      # a take-profit is discretionary
+    assert forced_option_exit(opt_tp_mult) is False  # profit-multiple TP (>=) is discretionary
+    assert forced_option_exit(opt_tp_mult_loss_side) is True  # profit-multiple stop (<) is forced
+
+
+def test_loss_pct_of_max_loss_take_profit_side_stays_discretionary():
+    """The inverted convention cuts BOTH ways: ``loss_pct_of_max_loss < N`` reads
+    "the loss is SHALLOWER than N% of max loss" — a profit-side gate, not a stop."""
+    from ba2_common.core.TradeActionEvaluator import forced_option_exit
+
+    assert forced_option_exit(_event_action(
+        {"c0": {"event_type": "loss_pct_of_max_loss", "operator": "<", "value": -25}})) is False
+
+
+def test_profit_multiple_of_premium_below_one_classifies_as_forced():
+    """The SIGNED-RESULT convention cuts BOTH ways too: ``profit_multiple_of_premium``
+    below 1.0 reads "worth less than what was paid" -- a de-facto loss-side stop,
+    affine-identical to ``profit_loss_percent < 0`` (``multiple = 1 + percent / 100``).
+    Mirrors ``test_loss_pct_of_max_loss_take_profit_side_stays_discretionary`` above, but
+    for the OTHER direction: there the inverted field's ``<`` side stays discretionary,
+    here the signed-result field's ``<`` side is the stop."""
+    from ba2_common.core.TradeActionEvaluator import forced_option_exit
+
+    assert forced_option_exit(_event_action(
+        {"c0": {"event_type": "profit_multiple_of_premium", "operator": "<", "value": 1.0}})) is True
+
+
+def test_an_opt_sl_ml_close_pays_the_full_modelled_spread():
+    """End to end from the firing rule to the quote: the grid's ``opt_sl_ml`` rule must
+    reach ``_close_limit_price`` as a FORCED exit and pay the whole modelled half-spread
+    (``ENTRY_CROSS_FULL``), not the entry's ``entry_cross`` fraction."""
+    from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
+    from ba2_common.core.types import OrderRecommendation
+
+    ev = TradeActionEvaluator.__new__(TradeActionEvaluator)
+    ev.account = _QuoteAccount(bid=MID, ask=MID, modelled_half=HALF)
+    rec = SimpleNamespace(id=1, instance_id=None,
+                          recommended_action=OrderRecommendation.SELL)
+    sl_ml_rule = _event_action(
+        {"c0": {"event_type": "loss_pct_of_max_loss", "operator": ">", "value": 50}})
+
+    action = ev._create_trade_action(
+        ExpertActionType.CLOSE_OPTION, {"action_type": "close_option"}, "XYZ",
+        OrderRecommendation.SELL, None, rec, event_action=sl_ml_rule)
+    assert isinstance(action, CloseOptionAction) and action.forced_exit is True
+
+    # The entry conceded only ENTRY_FRACTION; a forced close must ignore that.
+    buy_back = action._close_limit_price(_position(OrderDirection.SELL), _entry_order())
+    assert buy_back == pytest.approx(MID + HALF)                    # 10.50, not 10.20
+    sell = action._close_limit_price(_position(OrderDirection.BUY), _entry_order())
+    assert sell == pytest.approx(MID - HALF)                        # 9.50, not 9.80
+
+
 def test_the_evaluator_threads_the_forced_flag_into_the_close_action():
     from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
     from ba2_common.core.types import OrderRecommendation

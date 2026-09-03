@@ -32,7 +32,11 @@ Namespacing:
   exit:<rid>:a<i>:option_strike_param  option strike PERCENT-OTM (option actions; was
                                        misnamed option_delta, still accepted on decode)
   exit:<rid>:a<i>:option_strike_method strike selection method (choice: percent_otm | delta)
-  exit:<rid>:a<i>:option_strike_delta  option strike DELTA (used when the method is delta)
+  exit:<rid>:a<i>:option_strike_delta  option strike DELTA (used when the method is delta;
+                                   the SHORT leg when a _long companion is declared)
+  exit:<rid>:a<i>:option_strike_delta_long  the LONG leg's DELTA for a two-leg builder that
+                                   targets its legs independently (backspreads)
+  exit:<rid>:a<i>:option_structure which option ACTION TYPE the entry submits (choice)
   exit:<rid>:a<i>:option_dte       option DTE window center
   exit:<rid>:a<i>:option_wing_width  option wing width %
   exit:<rid>:a<i>:option_sizing    option position size (% of equity per structure)
@@ -41,6 +45,12 @@ Namespacing:
   exit:<rid>:a<i>:option_entry_cross  fraction of the contract's own MODELLED bid-ask
                                    spread the entry gives up when it quotes (0 = mid,
                                    1 = the far touch the fill engine models)
+  optsel:<half>:<w>                a SelectionPolicy weight (w_premium | w_iv | w_rvol),
+                                   SHARED across every option entry action of one
+                                   debit/credit half (keyed on the action's stamped
+                                   option_selection_half, NOT on the rule id) -- one gene
+                                   per half per weight, identical keys in single-member and
+                                   group jobs so stage-1 winners seed the stage-2 space
   schedule:<day>                   ON/OFF toggle for that weekday's entry scan
   screener:<setting>               screener settings
 
@@ -57,6 +67,14 @@ logger = logging.getLogger(__name__)
 
 # Fixed order so the gene list (and therefore reproducibility) is stable across runs.
 SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+#: The SelectionPolicy weights emitted as shared per-half genes (``optsel:<half>:<w>``).
+#: Deliberately NOT w_spread (the parquet store this grid reads synthesises bid == ask, so
+#: spread_pct is a constant 0.0 that scores uniformly BEST -- it fails OPEN, not closed),
+#: NOT w_rr (F15: collinear with premium within a chain), NOT w_profit (needs a structure_fn
+#: no builder supplies yet) -- see the launcher's _OPTION_SELECTION_WEIGHT_BANDS for the
+#: full evidence trail, including why an option job cannot run on the sqlite store at all.
+OPTION_SELECTION_WEIGHTS = ("w_premium", "w_iv", "w_rvol")
 
 # Actions that must NEVER be dropped by a per-action toggle: removing the open action would
 # turn an entry rule into a no-op bracket; guards must stay. (Rule-level toggles can still
@@ -214,7 +232,7 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
     # proposition -- while delta is normalised across symbols and is the live default. Emitted
     # only where the producer asked for it; the producer is responsible for asking only on
     # actions whose builder actually reads strike_method (types.honours_strike_method), since
-    # eight of the seventeen builders hard-code percent_otm and would make this gene inert.
+    # eight of the nineteen builders hard-code percent_otm and would make this gene inert.
     if action.get("option_strike_method_optimize"):
         choices = list(action["option_strike_method_choices"])
         if len(choices) < 2:
@@ -238,6 +256,52 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
             action.get("option_strike_delta_max"),
             action.get("option_strike_delta_step"), is_int=False,
         )
+    # THE SECOND LEG's delta, for the two-leg builders that target the legs INDEPENDENTLY.
+    #
+    # ``option_strike_delta`` alone cannot express a backspread (grid-2 O_CBS/O_PBS, design
+    # 2026-08-31 §2: short leg 0.35-0.50, long leg 0.15-0.30). ``_spread_params`` on the
+    # builder side already accepts a per-leg pair -- ``[long, short]`` or
+    # ``{"long":..,"short":..}`` -- and every vertical/backspread builder reads it; what was
+    # missing was a GENE for the second target, so a single value had to serve both legs and
+    # the selector merely picked the two nearest strikes to ONE delta. That is not the
+    # structure the design searches.
+    #
+    # ``option_strike_delta`` is the SHORT leg and this is the LONG leg whenever both are
+    # declared (see ``_apply_option_strike``); a builder declaring only the first is
+    # unchanged, so no existing action's genome moves.
+    if action.get("option_strike_delta_long_optimize"):
+        out[f"{prefix}:option_strike_delta_long"] = _range_entry(
+            action.get("option_strike_delta_long_min"),
+            action.get("option_strike_delta_long_max"),
+            action.get("option_strike_delta_long_step"), is_int=False,
+        )
+    # STRUCTURE as a categorical gene: which option ACTION TYPE the entry submits.
+    #
+    # Grid-2's ``O_ERN`` searches "straddle or strangle" (design §2), which is a choice
+    # between two BUILDERS rather than between two parameter values. Expressed as one choice
+    # gene on the action rather than as two toggleable entry rules because the alternative
+    # duplicates the entry rule's whole gate set (signal/iv_rank/iv_rv/expected_profit) for a
+    # single either/or, and both rules' ``has_no_position`` guard means only one could ever
+    # fire anyway -- so the second copy would be pure gene budget at a population of 40.
+    #
+    # The producer is responsible for offering only OPTION action types (the decode below
+    # writes ``action_type`` verbatim); ``_UNDROPPABLE_ACTIONS`` and the rest of the action
+    # machinery are keyed off that field, so an equity value here would be a category error.
+    if action.get("option_structure_optimize"):
+        choices = list(action["option_structure_choices"])
+        if len(choices) < 2:
+            raise ValueError(
+                f"{prefix}: option_structure_optimize needs >= 2 choices, got {choices}")
+        from ba2_common.core.types import is_option_action
+        non_option = [c for c in choices if not is_option_action(str(c))]
+        if non_option:
+            raise ValueError(
+                f"{prefix}: option_structure_choices must all be OPTION action types; "
+                f"{non_option} are not")
+        out[f"{prefix}:option_structure"] = {
+            "type": "choice", "choices": choices,
+            "min": 0, "max": len(choices) - 1, "step": 1,
+        }
     if action.get("option_dte_optimize"):
         out[f"{prefix}:option_dte"] = _range_entry(
             action.get("option_dte_min_range"),
@@ -283,6 +347,31 @@ def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
             action.get("option_entry_cross_max"),
             action.get("option_entry_cross_step"), is_int=False,
         )
+    # SELECTION-POLICY WEIGHTS, SHARED PER HALF. The key is ``optsel:<half>:<w>`` -- built
+    # from the action's stamped ``option_selection_half``, NOT from ``prefix`` -- so every
+    # member action of one half collapses onto ONE gene per weight (dict identity), and a
+    # single-member job emits exactly the keys the group job searches (the seeding
+    # requirement; encode_params silently drops keys the target space lacks). Two guards:
+    # a flag with no half has nothing to share on and must not silently fall back to a
+    # per-rule key shape, and two members declaring different domains for one shared key
+    # would otherwise resolve by dict-overwrite, last member silently winning.
+    for w in OPTION_SELECTION_WEIGHTS:
+        if not action.get(f"option_{w}_optimize"):
+            continue
+        half = action.get("option_selection_half")
+        if half not in ("debit", "credit"):
+            raise ValueError(
+                f"{prefix}: option_{w}_optimize is set but option_selection_half is "
+                f"{half!r}; a selection-weight gene is shared per debit/credit half and "
+                f"cannot be emitted without one")
+        key = f"optsel:{half}:{w}"
+        spec = _range_entry(action.get(f"option_{w}_min"), action.get(f"option_{w}_max"),
+                            action.get(f"option_{w}_step"), is_int=False)
+        if key in out and out[key] != spec:
+            raise ValueError(
+                f"{prefix}: conflicting domains for shared gene {key}: {out[key]} vs "
+                f"{spec}; members of one half must declare identical bands")
+        out[key] = spec
 
 
 def _collect_rule_list(rules, ns: str, out: Dict[str, Any]) -> None:
@@ -479,6 +568,14 @@ def _apply_option_strike(action: Dict[str, Any], agenes: Dict[str, Any]) -> None
     ``option_delta`` is the LEGACY gene name for the percent param (it never carried a delta,
     despite the name -- OPT-C3). Accepted so persisted best-params blobs and warm starts from
     older optimizations still decode to what they meant.
+
+    PER-LEG TARGETS. A two-leg builder that aims its legs INDEPENDENTLY (the grid-2
+    backspreads: short 0.35-0.50, long 0.15-0.30) declares BOTH ``option_strike_delta`` (the
+    SHORT leg) and ``option_strike_delta_long``; the decoded pair is written as the
+    ``[long, short]`` sequence ``TradeActions._spread_params`` already destructures -- the
+    ordering it has used since it was promoted to the base class, and the ordering
+    ``test_backspread_builders``'s ``DELTAS = [0.20, 0.40]`` pins. A single value stays a
+    single value, so no existing action's decode moves.
     """
     method = agenes.get("option_strike_method")
     if method is not None:
@@ -486,6 +583,17 @@ def _apply_option_strike(action: Dict[str, Any], agenes: Dict[str, Any]) -> None
     effective = str(method if method is not None
                     else (action.get("option_strike_method") or "percent_otm"))
     if effective == "delta":
+        long_delta = agenes.get("option_strike_delta_long",
+                                action.get("option_strike_delta_long"))
+        if long_delta is not None:
+            short_delta = agenes.get("option_strike_delta",
+                                     action.get("option_strike_delta"))
+            if short_delta is None:
+                raise ValueError(
+                    f"option action {action.get('action_type')!r} declares a LONG-leg delta "
+                    f"but no short-leg delta; a per-leg pair needs both targets")
+            action["option_strike_param"] = [long_delta, short_delta]
+            return
         if "option_strike_delta" in agenes:
             action["option_strike_param"] = agenes["option_strike_delta"]
         elif action.get("option_strike_delta") is not None:
@@ -507,10 +615,24 @@ def _apply_option_strike(action: Dict[str, Any], agenes: Dict[str, Any]) -> None
 
 def _decode_rule_list(rules, ns: str,
                       rule_genes: Dict[str, Dict[str, Any]],
-                      cond_by_id: Dict[str, Dict[str, Any]]):
+                      cond_by_id: Dict[str, Dict[str, Any]],
+                      optsel_by_half: Optional[Dict[str, Dict[str, Any]]] = None):
     """Deep-copy ONE TradeRule list applying decoded genes: drop toggle-disabled rules,
     substitute per-action values / option params, drop toggle-disabled (non-open) actions,
-    and substitute condition values."""
+    apply the shared per-half selection-weight genes, and substitute condition values.
+
+    AUTHORED-OFF RULES (``rule["enabled"] is False`` -- the launcher's
+    ``_OPTION_SL_ML_AUTHORED_OFF`` convention) get the OPPOSITE default from every other
+    toggleable rule: normal rules are KEPT unless the GA's gene explicitly decodes to 0;
+    an authored-off rule is DROPPED unless the gene explicitly decodes to 1. Reviewer finding
+    (2026-09-02): the old code kept the AUTHORED ``enabled: False`` key verbatim on a rule the
+    GA left untouched (no gene in the genome at all -- the default/unsearched-run case), and
+    NOTHING downstream ever consulted that key for a backtest run, so "authored off" was
+    genuinely inert for exactly the case it exists to cover. This is the emit-time half of the
+    fix (removal, matching ``_option_entry_rule``'s own "REMOVED, not flagged enabled: False"
+    idiom for --gates-off); ``rules_convert.live_actions_from_trade_rule`` is the shared
+    fail-closed half that also covers a Strategy built WITHOUT ever calling ``decode_params``
+    (an unsearched run seeded straight from ``_option_exit_rules()``)."""
     out = []
     for rule in copy.deepcopy(rules or []):
         if not isinstance(rule, dict):
@@ -518,7 +640,12 @@ def _decode_rule_list(rules, ns: str,
             continue
         rid = rule.get("id")
         genes = rule_genes.get(rid or "", {})
-        if genes.get("enabled") == 0:
+        gene_enabled = genes.get("enabled")
+        if rule.get("enabled") is False:
+            if gene_enabled != 1:
+                continue  # authored OFF, and the GA did not explicitly turn it on
+            del rule["enabled"]  # GA turned it ON -- emit it, with no stale enabled key
+        elif gene_enabled == 0:
             continue  # whole rule dropped by the GA
         actions = []
         for idx, action in enumerate(a for a in (rule.get("actions") or [])
@@ -530,6 +657,10 @@ def _decode_rule_list(rules, ns: str,
             if "action_value" in agenes:
                 action["action_value"] = agenes["action_value"]
                 action["value"] = agenes["action_value"]
+            # STRUCTURE first: the action TYPE decides which builder the rest of the
+            # option params are read by, so it must be settled before they are written.
+            if "option_structure" in agenes:
+                action["action_type"] = agenes["option_structure"]
             _apply_option_strike(action, agenes)
             if "option_dte" in agenes:
                 _apply_option_dte(action, agenes["option_dte"])
@@ -541,6 +672,13 @@ def _decode_rule_list(rules, ns: str,
                 action["option_min_arc"] = agenes["option_min_arc"]
             if "option_entry_cross" in agenes:
                 action["option_entry_cross"] = agenes["option_entry_cross"]
+            # Shared per-half selection weights: applied to EVERY action stamped with the
+            # matching half (that is what "shared" means mechanically); an action with no
+            # stamp -- every equity action, and the O_CC/O_PP overlays -- is untouched.
+            half = action.get("option_selection_half")
+            if optsel_by_half and half in optsel_by_half:
+                for w, wval in optsel_by_half[half].items():
+                    action[f"option_{w}"] = wval
             actions.append(action)
         rule["actions"] = actions
         if rule.get("conditions"):
@@ -571,6 +709,7 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     expert_overrides: Dict[str, Any] = {}
     screener_overrides: Dict[str, Any] = {}
     schedule_by_day: Dict[str, Any] = {}
+    optsel_by_half: Dict[str, Dict[str, Any]] = {}
 
     def _rule_gene(store: Dict[str, Dict[str, Any]], rid: str, rest: str, val: Any) -> None:
         genes = store.setdefault(rid, {})
@@ -598,6 +737,9 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         elif key.startswith("exit:"):
             _, rid, rest = key.split(":", 2)
             _rule_gene(exit_genes, rid, rest, val)
+        elif key.startswith("optsel:"):
+            _, half, w = key.split(":", 2)
+            optsel_by_half.setdefault(half, {})[w] = val
         else:
             raise ValueError(f"Unknown decoded param namespace: {key!r}")
 
@@ -610,9 +752,11 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     # signal as "no template" the way `[] or []` truthiness checks would.
     _template_entry = getattr(strategy, "entry_rules", None)
     _template_exit = getattr(strategy, "exit_rules", None)
-    entry_rules = (_decode_rule_list(_template_entry, "entry", entry_genes, cond_by_id)
+    entry_rules = (_decode_rule_list(_template_entry, "entry", entry_genes, cond_by_id,
+                                     optsel_by_half)
                    if _template_entry else None)
-    exit_rules = (_decode_rule_list(_template_exit, "exit", exit_genes, cond_by_id)
+    exit_rules = (_decode_rule_list(_template_exit, "exit", exit_genes, cond_by_id,
+                                    optsel_by_half)
                   if _template_exit else None)
 
     # Repair, don't reject: an all-days-OFF individual would never scan for entries at all (a
