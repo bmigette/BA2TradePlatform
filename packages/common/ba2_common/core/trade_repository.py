@@ -262,6 +262,7 @@ class TradeRepository(ABC):
         strike, expiry, multiplier and fill price a close needs). Ordered by contract symbol
         so two callers on one book see the same list in the same order.
         """
+        from ba2_common.core.failure_modes import must_measure
         from ba2_common.core.types import OptionRight, OrderDirection, OrderStatus as _OS
 
         rows = self.open_option_orders(expert_id=expert_id, underlying=underlying,
@@ -272,7 +273,17 @@ class TradeRepository(ABC):
         for o in rows:
             if o.status not in executed or not o.contract_symbol:
                 continue
-            qty = abs(float(o.filled_qty or o.quantity or 0.0))
+            # UNMEASURED IS NOT ZERO. An EXECUTED row whose quantity nobody recorded means
+            # the broker said contracts moved and never said how many; reading that as 0
+            # would net the contract flat, report "no covered call is held", and silently
+            # stop closing a call that is still short. ``must_measure`` raises instead, and
+            # both callers turn that into their own loud answer -- the condition into
+            # UNEVALUABLE (never fires, either direction), the action into a refusal.
+            # A MEASURED 0.0 filled_qty passes and contributes nothing, which is correct:
+            # an executed order that filled nothing moved nothing.
+            qty = abs(must_measure(
+                o.filled_qty if o.filled_qty is not None else o.quantity,
+                f"the executed quantity of {o.contract_symbol} on order {o.id}"))
             if qty <= 0:
                 continue
             sign = 1.0 if o.side == OrderDirection.BUY else -1.0

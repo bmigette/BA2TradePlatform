@@ -3823,10 +3823,18 @@ class CoveredCallDaysToExpiryCondition(CompareCondition):
                     "no evaluation date on the recommendation — 'days remaining' has no "
                     "reference point")
 
+            from ba2_common.core.failure_modes import UnmeasuredValue
             from ba2_common.core.trade_repository import get_trade_repository
-            rows = get_trade_repository().held_covered_calls(
-                expert_id=self.expert_recommendation.instance_id,
-                underlying=self.instrument_name)
+            try:
+                rows = get_trade_repository().held_covered_calls(
+                    expert_id=self.expert_recommendation.instance_id,
+                    underlying=self.instrument_name)
+            except UnmeasuredValue as e:
+                # NAMED, not left to the broad handler below: under BA2_ERROR_MODE=enforce
+                # that one re-raises anything it does not name, and an unmeasured executed
+                # quantity is a RUNTIME condition this reader must answer for, not a defect
+                # that should take the bar down. The answer is unevaluable -- never a fire.
+                return self._unevaluable(str(e))
             if not rows:
                 return self._unevaluable(
                     f"no covered call is held on {self.instrument_name} — there is no "

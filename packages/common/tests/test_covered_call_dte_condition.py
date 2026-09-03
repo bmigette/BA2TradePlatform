@@ -210,6 +210,54 @@ def test_a_call_that_was_BOUGHT_BACK_stops_being_measured(tmp_path):
     assert cond.get_calculated_value() is None
 
 
+def test_an_EXECUTED_call_whose_quantity_nobody_recorded_is_UNEVALUABLE(tmp_path):
+    """UNMEASURED IS NOT ZERO, on the one field that decides whether the call is still held.
+
+    An executed row with neither ``filled_qty`` nor ``quantity`` means the broker said
+    contracts moved and never said how many. Reading that as 0 would net the contract flat,
+    answer "no covered call is held", and silently stop closing a call that is still short.
+    ``must_measure`` raises instead and both readers turn it into their own loud answer.
+    """
+    from ba2_common.core import trade_store as ts
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import TradingOrder
+
+    _setup_db(tmp_path)
+    # THE IN-MEMORY (backtest) store, because that is where the state is reachable: SQLite
+    # declares ``tradingorder.quantity`` NOT NULL, so a both-unrecorded row cannot be
+    # persisted there — while the backtest store has no such constraint and a broker payload
+    # can arrive that way before it is written. One repository serves both, so the guard has
+    # to hold on the side that can actually produce the row.
+    with ts.inmem_trades():
+        db_mod = __import__("ba2_common.core.db", fromlist=["x"])
+        stock, call_txn = _written_call(db_mod, expiry=SIM_TODAY + timedelta(days=5))
+        row = [o for o in ts.store_all(TradingOrder) if o.contract_symbol == CALL][0]
+        row.filled_qty = None
+        row.quantity = None
+
+        cond = _cond(stock, op="<=", value=7)
+        assert cond.evaluate() is False
+        assert cond.get_calculated_value() is None
+        assert "unmeasured" in cond.get_actual_value_display().lower()
+        # ...and the close refuses the same book rather than closing an unknown quantity.
+        assert _close_action(stock)._resolve_option_order() is None
+
+
+def test_a_MEASURED_zero_fill_contributes_nothing_and_is_not_an_error(tmp_path):
+    """A measured 0.0 is an ANSWER: an executed order that filled nothing moved nothing."""
+    db = _setup_db(tmp_path)
+    stock, call_txn = _written_call(db, expiry=SIM_TODAY + timedelta(days=5))
+    from ba2_common.core.db import get_all_instances, update_instance
+    from ba2_common.core.models import TradingOrder
+    row = [o for o in get_all_instances(TradingOrder) if o.contract_symbol == CALL][0]
+    row.filled_qty = 0.0
+    update_instance(row)
+
+    cond = _cond(stock, op="<=", value=7)
+    assert cond.evaluate() is False
+    assert "no covered call is held" in cond.get_actual_value_display()
+
+
 def test_a_held_call_with_no_recorded_expiry_is_UNEVALUABLE(tmp_path):
     db = _setup_db(tmp_path)
     stock, _ = _written_call(db, expiry=None)

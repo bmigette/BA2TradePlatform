@@ -116,7 +116,36 @@ Assessed and **not** recommended as a fix for this finding, for three independen
 
 ---
 
-## STOPPED — question for the operator
+## OUTCOME (2026-09-03) — A' chosen, then extended to the roll-DTE close
+
+The operator chose **A'** and, after the second STOP below, the roll-DTE deletion as well.
+What landed is recorded in the final review's §10 addendum. Two things belong here, because
+they are the parts of this note that turned out to be wrong or incomplete:
+
+**(c) was incomplete.** A' alone leaves a PMCC deployed without a roll rule silently unrolled.
+That is why the shipped version does not merely record `ROLL_SHORT` but RAISES
+`UnownedRollError` when nothing owns the roll.
+
+**(d) changed once the roll-DTE close moved.** With `decide()` no longer closing a
+single-expiry structure at its expiry, `O_CC` and `O_WHEEL` needed an exit of their own — and
+`opt_dte` could not be it. THE STANDING RULE this produced, which is the most reusable thing on
+this page:
+
+> An option exit condition anchored on the evaluated TRANSACTION is inert for a stock-anchored
+> overlay key. Both runtimes evaluate an OPEN_POSITIONS ruleset once per SYMBOL against the
+> OLDEST entry order — the stock on `O_CC`/`O_WHEEL` — while the call is written on its own
+> transaction. `days_to_expiry` there never fires in EITHER direction while carrying a searched
+> gene. Overlay keys must use REPOSITORY-resolved conditions, the shape `has_covered_call`
+> already used.
+
+Measured, not argued: an engine run with a plain `opt_dte` rule on `O_CC` was identical to the
+run with the rule deleted. So `O_CC`/`O_WHEEL` emit `cc_dte`
+(`covered_call_days_to_expiry <= N` -> `close_option(close_target='covered_call')`), both keys
+are a new results baseline, and every live instance of them needs re-export/re-import.
+
+---
+
+## STOPPED — question for the operator (answered: A', then the roll-DTE deletion)
 
 The finding as written cannot be fixed by the shape the mandate prefers, and the shape the
 mandate prefers is a separate feature with a stage-1 gene-space cost. Awaiting a decision

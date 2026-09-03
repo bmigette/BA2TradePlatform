@@ -703,3 +703,83 @@ this work; it still wants either a fixture fix or a place on the known-bad list.
 * **No `version.py` bump.** Merger checklist item 2 still owns it — and note `dcc91137` touches
   `packages/`, so it is `testplatform/version.py` that bumps, at a matrix3 job boundary and never
   mid-run.
+
+---
+
+## 10. POST-MERGE-READY ADDENDUM (2026-09-03) — the §1b/A1 follow-up, implemented
+
+**Nothing above this section was rewritten.** The reviewer's findings stand as written; this
+records what was built on top of them, under a new operator rule: *no silent failure anywhere
+— a computed decision must be acted on or refused loudly, never dropped.*
+
+### 10a. A1's premise was narrower than recorded, and the fix is not the one recommended
+
+`LIFECYCLE_ROLL_SHORT` is emitted **only** for a transaction tagged `pmcc`:
+`is_multi_expiry_strategy` is membership in `frozenset({PMCC_STRATEGY})`
+(`option_expiry.py:90-114`), fail-closed for `None`/`""`/anything unrecognised. A stock-covered
+call is `covered_call` — single-expiry — so it took the `elif` and produced
+`LIFECYCLE_ROLL_DTE`, a CLOSING reason the pass acted on. **No covered call, wheel or other
+non-PMCC structure could reach the discard.** The recommendation in §2b (delete the branch) was
+therefore not enough on its own: deleting it leaves a PMCC deployed without a roll rule
+silently unrolled — the same failure class, moved one layer out.
+
+### 10b. What shipped
+
+| Commit | What |
+|---|---|
+| `bfd58fcc` | DESIGN NOTE: the nine-row `decide()` reason table, the per-key backtest counterparts, three candidate fix shapes. |
+| `95a0ed36` | **The dispatch is TOTAL.** `LIFECYCLE_DISPOSITIONS` names what happens to every reason (close / report / rule-owned / no action); the loop is driven off it and a reason with no entry RAISES. The `if not decision.should_close: continue` fall-through is gone. `ROLL_SHORT` is recorded (`roll_due`) and never rolled here; `UnownedRollError` is raised — after everything else is acted on — when a two-expiry structure is due to roll and the ruleset carries no `roll_pmcc_short` rule. Shared, not re-derived: `rule_builders.action_type_of`/`rule_carries_action` and `db.ruleset_event_actions` (the ordered eager load `TradeActionEvaluator` already needed; it now calls it too). |
+| `07514a05` | **`covered_call_days_to_expiry` + `close_option(close_target='covered_call')`**, both resolving through `trade_repository.held_covered_calls` — one lookup, netted over executed rows, `covered_call`-tagged only. A parameter rather than a second action, so there stays ONE close implementation. |
+| `4e33a620` | **`O_CC`/`O_WHEEL` emit `cc_dte`** at the front of their exit list, plus the engine e2e that is its pin. |
+| `5427aca3` | **`decide()` stops emitting `LIFECYCLE_ROLL_DTE`** — constant, `LIFECYCLE_CLOSING_REASONS` membership and branch deleted. The `opt_dte` rule owns that exit in both runtimes. Plus the parity test. |
+
+### 10c. The finding this work produced, and it generalises
+
+**An option exit condition anchored on the evaluated TRANSACTION is inert for a stock-anchored
+overlay key.** `daily_engine._manage_open_positions:1230` and the live
+`TradeManager.process_open_positions_recommendations` it mirrors both evaluate the
+OPEN_POSITIONS ruleset once per SYMBOL with `existing_order = _oldest_entry_order(txns)`. On
+`O_CC` (and on `O_WHEEL` after assignment) that is the STOCK, while `SellCoveredCallAction`
+writes the call on its own transaction — so `DaysToExpiryCondition._resolve_expiry` finds no
+option legs, is unevaluable, and **never fires in either direction while carrying a searched
+gene**.
+
+Measured, not argued: the first version of `tests/backtest/test_covered_call_engine.py` emitted
+a plain `opt_dte` rule on `O_CC`, and the run was identical to the run with the rule DELETED —
+`exit_time 2024-02-06, exit_price 0.0` both times, the call expired worthless. **Overlay keys
+must use repository-resolved conditions.** Recorded in the STATE note as standing.
+
+### 10d. Mutations executed
+
+| Mutation | Result |
+|---|---|
+| Drop `LIFECYCLE_ROLL_SHORT` from `LIFECYCLE_DISPOSITIONS` | **5 FAIL**, led by the reflection pin `test_every_lifecycle_reason_has_a_disposition` |
+| Re-add the silent `if not decision.should_close: continue` | **5 FAIL** (the roll is dropped again; the no-disposition raise stops firing) |
+| Remove `cc_dte` from `O_CC`'s emitted ruleset (in-test, `_run(drop_dte=True)`) | The written call **rides to expiry at price 0.0** — pre-branch behaviour, restored |
+
+Each file mutation restored by file copy; `git status --short` clean after each. Both decider
+mutations were re-run on the FINAL table (after the roll-DTE deletion), not only on the interim
+one.
+
+### 10e. Suites, post-merge with `origin/dev` (`bfb19508`, `TEST_APP_VERSION 2026.09.0013`, no bump)
+
+* backend `pytest tests/`: **4558 passed / 158 skipped / 7 failed** — the 7 are EXACTLY the
+  known pre-existing set (2 `test_seam_wiring` F3 + 5 `curve_uneven` frozen-baseline).
+  A second full run of the SAME tree reported 8, the extra being
+  `test_dashboard_hot_path.py::test_dashboard_stats_route_never_touches_the_blobs` — a test
+  `origin/dev` brought in (`b46a2433`), which PASSES in isolation, passed in the first full
+  run of this identical tree, and passes when run alongside this branch's own new backend
+  tests. It is a new instance of the suite's known ORDER DEPENDENCE (F3), from dev's side, not
+  a regression of this work. Worth adding to the known-bad list or fixing with F3.
+* `packages/common`: **3161+ passed / 1** (the known float-dust flake).
+* Goldens **18, both fingerprints unmoved** — and no refreeze was needed. That is arithmetic:
+  the equity golden runs an equity key, the option golden (`9a126d13`) is `O_LEAP`, and
+  `cc_dte` is emitted only for `_COVERED_CALL_OVERLAY_KINDS = {O_CC, O_WHEEL}`, neither of which
+  has a golden. `O_CSP`/`O_PP`/`O_PMCC` emit byte-identical rule lists (checked by execution).
+* `test_option_grid_foundations.py` **215 from the worktree root** as well as from `backend/`.
+
+### 10f. What this does NOT close
+
+B1 (short-leg delta), C1 (breaker flatten), C3/C4/C5, C7-C10 and D are untouched and still
+ranked in the STATE note. `EXPERTS.md:164`'s warning narrows but does not disappear: roll-DTE is
+now genuinely shared, and profit-capture / tested-delta / the credit stops remain live-only.

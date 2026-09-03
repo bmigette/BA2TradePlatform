@@ -138,6 +138,41 @@ alternative (wiring the reason through the service) creates a second roller the 
 not have, i.e. a NEW parity gap. **This is a live-behaviour decision on real money. It is not
 a tooling change, and it was deliberately left for the operator to judge.**
 
+### A1 — RESOLVED 2026-09-03. Read this before acting on the list below.
+
+`LIFECYCLE_ROLL_SHORT` is no longer discarded, and A1's premise turned out to be narrower
+than recorded here: the reason is emitted ONLY for a transaction tagged `pmcc`
+(`is_multi_expiry_strategy` is membership in `frozenset({"pmcc"})`, fail-closed), so no
+covered call, wheel or other single-expiry structure could ever reach the discard. What
+shipped instead of the recommended deletion:
+
+* **The service's dispatch is TOTAL.** `LIFECYCLE_DISPOSITIONS` names what happens to every
+  reason `decide` can return (close / report / rule-owned / no action), the loop is driven
+  off it, and a reason with no entry RAISES. The `if not decision.should_close: continue`
+  fall-through — a correct reading of HOLD and a wrong one of everything else — is gone.
+* **The roll is still not performed by the pass.** `roll_pmcc_short` is a RULE walked by both
+  runtimes; a roller here would race the searched trigger on an unsearched threshold. The
+  decision is RECORDED (`LifecyclePassResult.roll_due`) and the one thing the rule cannot
+  report about itself is raised: `UnownedRollError` when a two-expiry structure is due to
+  roll and the sleeve's ruleset carries no `roll_pmcc_short` rule. Raised AFTER every other
+  decision is acted on, and contained by `JobManager`'s existing guard.
+* **C6 (the DTE roll/close) is closed too, in the same direction.** `decide` no longer emits
+  `LIFECYCLE_ROLL_DTE` at all: the `opt_dte` rule the GA already searches owns that exit in
+  both runtimes, so live stopped carrying a second copy of it on an unsearched threshold.
+* **C2 (covered-call exits) is closed for the DTE case.** A NEW standing rule came out of it,
+  and it generalises beyond this task: **an option exit condition anchored on the evaluated
+  TRANSACTION is inert for a stock-anchored overlay key.** Both runtimes evaluate an
+  OPEN_POSITIONS ruleset once per SYMBOL against the OLDEST entry order — the stock on
+  `O_CC`/`O_WHEEL` — while the call is written on its own transaction, so `days_to_expiry`
+  there never fires in either direction while carrying a searched gene. Overlay keys must use
+  REPOSITORY-resolved conditions (`covered_call_days_to_expiry` +
+  `close_option(close_target='covered_call')`, the shape `has_covered_call` already used).
+  `O_CC` and `O_WHEEL` now emit `cc_dte`; **both keys are a new results baseline** (plan
+  comparability entry 4) and **every live instance of them needs re-export/re-import**
+  (final-review merger-checklist item 8).
+
+Still open on this list: B1 (short-leg delta), C1 (breaker flatten), C3/C4/C5, C7-C10, and D.
+
 ### B. The tested-delta gap — the only live rule with NO backtest counterpart
 
 **B1. Add a `ShortLegDeltaCondition`.** Tested-delta management (`option_lifecycle.py:536-568`,

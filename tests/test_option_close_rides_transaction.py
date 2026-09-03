@@ -153,6 +153,11 @@ def test_close_option_action_through_the_real_seam_rides_the_transaction(
     action.instrument_name = "AAPL"
     action.existing_order = entry
     action.submit_to_broker = True
+    # The bare fixture must set every attribute the code under test READS. ``close_target``
+    # (2026-09-03) selects the repository lookup an equity-anchored overlay key needs; None
+    # is the transaction-anchored path this test is about.
+    action.close_target = None
+    action.expert_recommendation = None
     monkeypatch.setattr(action, "create_and_save_action_result",
                         lambda **kw: kw, raising=False)
 

@@ -5443,8 +5443,18 @@ class CloseOptionAction(TradeAction):
                                f"evaluation carries no expert instance, so the written call "
                                f"cannot be looked up")
                 return None
-            held = get_trade_repository().held_covered_calls(
-                expert_id=expert_id, underlying=self.instrument_name)
+            from ba2_common.core.failure_modes import UnmeasuredValue
+            try:
+                held = get_trade_repository().held_covered_calls(
+                    expert_id=expert_id, underlying=self.instrument_name)
+            except UnmeasuredValue as e:
+                # The same runtime condition the matching CONDITION answers as unevaluable,
+                # named here for the same reason (the broad handler re-raises under
+                # BA2_ERROR_MODE=enforce). Resolving nothing is the fail-closed answer: a
+                # close sized off a quantity nobody recorded is the trade not to place.
+                logger.error(f"close_option(covered_call) for {self.instrument_name}: "
+                             f"refusing to close — {e}")
+                return None
             if not held:
                 return None
             if len(held) > 1:
