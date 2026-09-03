@@ -55,6 +55,12 @@ class _FakeAccount:
     from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
     has_pending_closing_order = ReadOnlyAccountInterface.has_pending_closing_order
 
+    #: The one price the re-anchor measurement needs: what a share is worth right now. A
+    #: number, not a stub that refuses — the point of that test is that the wrong subject
+    #: produces a confident number rather than an unevaluable.
+    def get_instrument_current_price(self, symbol):
+        return 18.0
+
 
 def _working_close(call_txn):
     """A buy-to-close SUBMITTED and not yet filled, on the call's own transaction."""
@@ -171,3 +177,87 @@ def test_the_LIVE_LIFECYCLE_PASS_no_longer_closes_the_same_structure(tmp_path):
     assert decision.should_close is False
     assert "5 DTE" in decision.detail        # measured, and reported, just not acted on
     assert "roll_dte" not in {r for r in LIFECYCLE_CLOSING_REASONS}
+
+
+# ---------------------------------------------------------------------------
+# M7 — the wheel's put-phase rules must not re-anchor onto the assigned stock,
+# and the answer must be the same on both stores.
+# ---------------------------------------------------------------------------
+def _assigned_stock_book():
+    """The STOCK phase: an assigned lot, no put left, no call written yet.
+
+    ``meta_data["origin"]`` is what makes it ASSIGNED rather than bought — the fact
+    ``HasAssignedSharesCondition`` reads and ``wheel_stock_guard`` gates on.
+    """
+    from ba2_common.core.types import TXN_ORIGIN_CSP_ASSIGNMENT
+
+    eq = add_instance(Transaction(
+        symbol=SYMBOL, quantity=100.0, side=OrderDirection.BUY,
+        status=TransactionStatus.OPENED, asset_class=AssetClass.EQUITY,
+        expert_id=EXPERT, multiplier=1, open_price=20.0,   # the assigned cost basis
+        meta_data={"origin": TXN_ORIGIN_CSP_ASSIGNMENT}))
+    stock = TradingOrder(
+        account_id=1, symbol=SYMBOL, quantity=100.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, status=OrderStatus.FILLED, transaction_id=eq,
+        asset_class=AssetClass.EQUITY, open_price=20.0, filled_qty=100.0)
+    add_instance(stock, expunge_after_flush=True)
+    return stock
+
+
+def _guard_and_reanchor(stock):
+    """(does the stock guard hold, what a put-phase P&L rule WOULD read off the stock).
+
+    The second half is the damage the guard prevents, measured rather than asserted: with
+    ``opt_tp``'s subject swapped to the stock, ``profit_loss_percent`` returns a NUMBER — a
+    share position's P&L compared against a threshold authored for a short put's credit.
+    """
+    from ba2_common.core.TradeConditions import (
+        HasAssignedSharesCondition, ProfitLossPercentCondition)
+
+    guard = HasAssignedSharesCondition(
+        account=_FakeAccount(), instrument_name=SYMBOL, expert_recommendation=_rec(),
+        existing_order=stock)
+    reanchored = ProfitLossPercentCondition(
+        account=_FakeAccount(), instrument_name=SYMBOL, expert_recommendation=_rec(),
+        operator_str=">", value=50.0, existing_order=stock)
+    reanchored.evaluate()
+    return guard.evaluate(), reanchored.get_calculated_value()
+
+
+def test_the_stock_guard_holds_on_the_BACKTEST_shaped_store(tmp_path):
+    with ts.inmem_trades():
+        stock = _assigned_stock_book()
+        holds, _reanchored = _guard_and_reanchor(stock)
+        assert holds is True, (
+            "has_assigned_shares is false on an assigned lot, so wheel_stock_guard would "
+            "never halt and every put-phase rule would re-anchor onto the stock")
+
+
+def test_the_stock_guard_holds_IDENTICALLY_on_the_LIVE_shaped_store(tmp_path):
+    """The defect class ``trade_repository`` exists for: a raw select() against a RAM-only
+    trial returns EMPTY rather than raising, so a guard read that way would hold in live and
+    silently not in the backtest — the worst possible split for this particular rule."""
+    from ba2_common.core import db
+    db.configure_db(str(tmp_path / "wheel_guard_parity.sqlite"))
+    db.init_db()
+    stock = _assigned_stock_book()
+    holds, _reanchored = _guard_and_reanchor(stock)
+    assert holds is True
+
+
+def test_a_put_phase_rule_WOULD_read_the_stock_which_is_why_the_guard_exists(tmp_path):
+    """The measurement that makes the guard non-decorative.
+
+    ``profit_loss_percent`` does not refuse an equity anchor — ``_get_pnl_for_condition``
+    falls through to equity pricing — so a put-phase rule reached in the stock phase gets a
+    real number and compares it against a short put's credit band. Unevaluable would have
+    been survivable; a confident wrong number is not.
+    """
+    from ba2_common.core import db
+    db.configure_db(str(tmp_path / "wheel_reanchor.sqlite"))
+    db.init_db()
+    stock = _assigned_stock_book()
+    _holds, reanchored = _guard_and_reanchor(stock)
+    assert reanchored is not None, (
+        "profit_loss_percent refused the equity anchor after all — if that is now true the "
+        "guard's justification has changed and this design should be revisited")

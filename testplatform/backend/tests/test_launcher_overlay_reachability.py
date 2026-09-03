@@ -263,3 +263,110 @@ def test_the_dte_close_is_REACHABLE_while_a_covered_call_is_open(kind):
     assert "cc_dte" in reached, (
         f"{kind}: on a bar where the written call is at its DTE floor the walk stopped "
         f"before cc_dte (reached {reached}) — the call has no exit in either runtime")
+
+
+# ---------------------------------------------------------------------------
+# M7 — O_WHEEL's inherited O_CSP exits must never be reached with the STOCK as
+# their subject.
+#
+# The wheel is ONE ruleset over a position that changes identity halfway through, and both
+# runtimes evaluate it once per SYMBOL against the OLDEST entry order: the put while the put
+# is open, the assigned STOCK afterwards. Three of the five inherited exits do not notice the
+# swap — ``opt_tp``/``opt_sl`` re-anchor onto the stock's P&L and ``opt_time`` onto the stock
+# transaction's open_date — and then fire a ``close_option`` that resolves nothing while
+# consuming the bar's first-match slot. ``opt_dte``/``opt_sl_ml`` are inert there only by
+# accident (no option legs; no persisted max_loss_per_contract).
+#
+# ``wheel_stock_guard`` makes all five inert BY CONSTRUCTION. These pins are per rule and per
+# phase, so a reorder that re-exposes ONE of them fails on that one.
+# ---------------------------------------------------------------------------
+#: The five exits O_WHEEL inherits from O_CSP. Every one is authored for the SHORT PUT.
+_PUT_PHASE_RULES = ("opt_tp", "opt_time", "opt_dte", "opt_sl", "opt_sl_ml")
+
+
+def _wheel_rules():
+    return list(mod._build_strategy("O_WHEEL", "O_WHEEL", "FMPRating").exit_rules or [])
+
+
+def _walk(rules, *, assigned_shares, covered_call, fires=()):
+    """The first-match walk for ONE wheel bar, driven by the two flags that decide the phase.
+
+    ``fires`` names the value-condition rules whose own trigger holds on this bar — the whole
+    question being whether they are ever REACHED to be asked.
+    """
+    def matched(rule):
+        rid = rule.get("id")
+        if rid == "cc_guard":
+            return covered_call
+        if rid in ("cc_sell", "wheel_stock_guard"):
+            return assigned_shares
+        if rid == "cc_dte":
+            return covered_call and "cc_dte" in fires
+        return rid in fires
+
+    return _walk_until_break(rules, matched=matched)
+
+
+@pytest.mark.parametrize("rid", _PUT_PHASE_RULES)
+def test_the_put_phase_rules_are_REACHED_while_the_put_is_open(rid):
+    """The control. Inert-by-construction must not mean inert everywhere: these rules manage
+    the cash-secured put and keep doing so."""
+    reached = _walk(_wheel_rules(), assigned_shares=False, covered_call=False, fires=(rid,))
+    assert rid in reached, (
+        f"{rid} is not reached in the PUT phase, so the wheel no longer manages its short "
+        f"put at all: {reached}")
+
+
+@pytest.mark.parametrize("rid", _PUT_PHASE_RULES)
+def test_the_put_phase_rules_are_NOT_reached_once_the_shares_are_ASSIGNED(rid):
+    """The bar this fixes: stock held, no call written yet (the assignment bar, and every bar
+    after a call is bought back). Without the guard ``opt_tp``/``opt_time``/``opt_sl`` fire
+    here against the STOCK and break the walk with a close that resolves nothing."""
+    reached = _walk(_wheel_rules(), assigned_shares=True, covered_call=False, fires=(rid,))
+    assert rid not in reached, (
+        f"{rid} is reached with the assigned STOCK as its subject: {reached}. Its threshold "
+        f"was authored for a short put's credit and its close_option resolves nothing.")
+
+
+@pytest.mark.parametrize("rid", _PUT_PHASE_RULES)
+def test_the_put_phase_rules_are_NOT_reached_while_a_covered_call_is_open(rid):
+    reached = _walk(_wheel_rules(), assigned_shares=True, covered_call=True, fires=(rid,))
+    assert rid not in reached, f"{rid} is reached during the covered-call phase: {reached}"
+
+
+def test_the_stock_guard_sits_between_the_overlay_and_the_inherited_closes():
+    """Placement IS the design: after ``cc_sell`` (so the call is still written) and before
+    every inherited close (so none is reached with the stock as its subject)."""
+    ids = [r.get("id") for r in _wheel_rules()]
+    assert "wheel_stock_guard" in ids, f"the wheel emits no stock guard: {ids}"
+    assert ids.index("cc_sell") < ids.index("wheel_stock_guard"), (
+        f"the guard halts before the covered call is written: {ids}")
+    for rid in _PUT_PHASE_RULES:
+        assert ids.index("wheel_stock_guard") < ids.index(rid), (
+            f"{rid} sits ahead of the guard and can still re-anchor: {ids}")
+
+
+def test_the_written_calls_own_exit_still_runs_in_BOTH_stock_sub_phases():
+    """``cc_dte`` is repository-resolved and names its subject, so it must stay AHEAD of both
+    guards — the halt protects the put-phase rules, it must not disarm the call's exit."""
+    ids = [r.get("id") for r in _wheel_rules()]
+    assert ids.index("cc_dte") < ids.index("cc_guard") < ids.index("wheel_stock_guard")
+    reached = _walk(_wheel_rules(), assigned_shares=True, covered_call=True, fires=("cc_dte",))
+    assert reached[0] == "cc_dte", f"the call's own exit is not reached first: {reached}"
+
+
+def test_the_stock_guard_carries_NO_on_off_gene():
+    """A protection the GA can switch off is not a protection — and the shadow it prevents
+    would then be unconditional in half the population (the OPT-B1 lesson, exactly)."""
+    guard = _rule_by_id(_wheel_rules(), "wheel_stock_guard")
+    assert guard.get("toggle_optimize") is not True, (
+        "wheel_stock_guard declares a toggle gene, so a genome can re-expose the put-phase "
+        "rules to the assigned stock")
+
+
+def test_only_the_wheel_gets_the_stock_guard():
+    """O_CSP has no stock phase and O_CC's equity rules are authored FOR the stock; a guard on
+    either would halt a ruleset that is doing the right thing."""
+    for kind in ("O_CSP", "O_CC", "O_PP", "O_STK"):
+        ids = [r.get("id") for r in (mod._build_strategy(kind, kind, "FMPRating").exit_rules or [])]
+        assert "wheel_stock_guard" not in ids, f"{kind} gained the wheel's stock guard: {ids}"

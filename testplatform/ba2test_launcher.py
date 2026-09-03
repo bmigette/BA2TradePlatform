@@ -4850,7 +4850,59 @@ def _build_strategy_wheel(kind: str):
          "continue_processing": True},
         anchor="front")
     s.exit_rules = _prepend_covered_call_exit(kind, s.exit_rules)
+    s.exit_rules = _insert_wheel_stock_guard(s.exit_rules)
     return s
+
+
+def _insert_wheel_stock_guard(exit_rules):
+    """Halt the wheel's ruleset once the position is ASSIGNED STOCK, after the overlay pair.
+
+    THE DEFECT THIS CLOSES (M7). ``O_WHEEL`` is one ruleset over a position that changes
+    identity halfway through, and both runtimes evaluate it once per SYMBOL against the
+    OLDEST entry order -- the put while the put is open, the STOCK once it has been assigned.
+    The five exits inherited from ``O_CSP`` were written for the put, and three of them do not
+    notice the swap: ``opt_tp`` and ``opt_sl`` re-anchor onto the assigned STOCK's P&L
+    (``TradeConditions._get_pnl_for_condition`` falls through to equity pricing for a
+    non-option order) and ``opt_time`` onto the stock transaction's ``open_date``. Each then
+    FIRES -- against the wrong subject, on a threshold authored for a short put's credit --
+    and its ``close_option`` resolves nothing, because there is no option on the evaluated
+    transaction. It still consumes the bar's first-match slot on the way past. ``opt_dte`` and
+    ``opt_sl_ml`` are inert there, but only by accident: one finds no option legs, the other
+    no persisted ``max_loss_per_contract``.
+
+    So the guard makes all five INERT BY CONSTRUCTION in the stock phase rather than
+    evaluated-and-unmeasurable. It is the codebase's NOT idiom, the same shape as ``cc_guard``,
+    reading the same condition ``cc_sell`` already uses.
+
+    PLACEMENT is the whole design. AFTER ``cc_sell``, so the covered call is still written
+    against the assigned shares; BEFORE the inherited closes, so none of them is ever reached
+    with the stock as its subject. ``cc_dte`` sits ahead of both guards, so the written call's
+    own exit keeps working -- it is repository-resolved and names its subject.
+
+    NO ``toggle_optimize``, exactly as ``cc_guard`` carries none: a protection the GA can
+    switch off is not a protection, and the shadow it prevents would be unconditional in half
+    the population. This therefore adds no gene.
+
+    The written call is NOT abandoned by the halt: ``cc_dte`` runs before it, and the shares
+    themselves have no exit in this ruleset either way -- that is the wheel's documented shape
+    (``_build_strategy_wheel``'s KNOWN LIMIT), not something this guard introduces.
+    """
+    rules = list(exit_rules or [])
+    guard = {"id": "wheel_stock_guard",
+             "conditions": {"type": "AND", "conditions": [
+                 {"id": "wheel_assigned", "field": "has_assigned_shares"}]},
+             "actions": [{"action_type": "stop_processing"}],
+             "continue_processing": False}
+    if rules and "actions" in rules[0]:
+        from ba2_common.core.rule_models import trade_rules_from_legacy
+        guard = trade_rules_from_legacy(exit_conditions=[guard])["exit_rules"][0]
+    for idx, rule in enumerate(rules):
+        if rule.get("id") == "cc_sell":
+            return rules[:idx + 1] + [guard] + rules[idx + 1:]
+    raise ValueError(
+        "_insert_wheel_stock_guard: no cc_sell rule to anchor the stock guard behind; got "
+        f"{[r.get('id') for r in rules]}. The guard must sit AFTER the overlay is written "
+        "and BEFORE the put-phase closes -- see this function's docstring.")
 
 
 def _build_strategy_stock(kind: str):
