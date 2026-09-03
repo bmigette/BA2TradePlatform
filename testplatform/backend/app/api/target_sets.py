@@ -24,7 +24,7 @@ router = APIRouter()
 
 
 @router.get("", response_model=TargetSetListResponse)
-async def list_target_sets(db: Session = Depends(get_db)):
+def list_target_sets(db: Session = Depends(get_db)):
     """
     List all saved target sets.
 
@@ -47,7 +47,7 @@ async def list_target_sets(db: Session = Depends(get_db)):
 
 
 @router.get("/{target_set_id}", response_model=TargetSetResponse)
-async def get_target_set(target_set_id: int, db: Session = Depends(get_db)):
+def get_target_set(target_set_id: int, db: Session = Depends(get_db)):
     """
     Get a single target set by ID.
 
@@ -67,7 +67,7 @@ async def get_target_set(target_set_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("", response_model=TargetSetResponse, status_code=status.HTTP_201_CREATED)
-async def create_target_set(
+def create_target_set(
     target_set_data: TargetSetCreate,
     db: Session = Depends(get_db)
 ):
@@ -114,7 +114,7 @@ async def create_target_set(
 
 
 @router.put("/{target_set_id}", response_model=TargetSetResponse)
-async def update_target_set(
+def update_target_set(
     target_set_id: int,
     target_set_data: TargetSetUpdate,
     db: Session = Depends(get_db)
@@ -169,7 +169,7 @@ async def update_target_set(
 
 
 @router.delete("/{target_set_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_target_set(target_set_id: int, db: Session = Depends(get_db)):
+def delete_target_set(target_set_id: int, db: Session = Depends(get_db)):
     """
     Delete a target set.
 

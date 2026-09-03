@@ -68,7 +68,7 @@ def verify_admin_token(authorization: str):
 
 
 @router.get("/version")
-async def get_version(authorization: str = Header(default=None)):
+def get_version(authorization: str = Header(default=None)):
     """Report the running code identity (app version + git commit + repo root).
 
     Remote workers poll this to detect a code mismatch with the master: a distributed GA trial
@@ -79,7 +79,7 @@ async def get_version(authorization: str = Header(default=None)):
 
 
 @router.post("/update")
-async def update_server(
+def update_server(
     authorization: str = Header(default=None),
     reinstall: str = Query(
         default="auto",
@@ -120,7 +120,7 @@ async def update_server(
 
 
 @router.get("/logs/{level}")
-async def read_logs(
+def read_logs(
     level: str,
     lines: int = Query(default=100, ge=1, le=10000),
     search: Optional[str] = Query(default=None),
@@ -180,7 +180,7 @@ async def read_logs(
 
 
 @router.post("/db-cleanup")
-async def db_cleanup(authorization: str = Header(default=None)):
+def db_cleanup(authorization: str = Header(default=None)):
     """
     Clean up the database: clear stale task results, VACUUM to reclaim space.
 

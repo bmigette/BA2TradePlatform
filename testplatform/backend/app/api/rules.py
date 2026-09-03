@@ -53,7 +53,7 @@ def _rules_to_tree(rules: Any, root_id: str) -> Dict[str, Any]:
 
 
 @router.post("/import-rules")
-async def import_rules(req: ImportRulesRequest):
+def import_rules(req: ImportRulesRequest):
     """Convert a v1.1 ruleset JSON into a Strategy condition tree."""
     if req.which not in _VALID_WHICH:
         raise HTTPException(status_code=422,
@@ -66,7 +66,7 @@ async def import_rules(req: ImportRulesRequest):
 
 
 @router.get("/{strategy_id}/export-rules")
-async def export_rules(
+def export_rules(
     strategy_id: int,
     which: str,
     db: Session = Depends(get_db),

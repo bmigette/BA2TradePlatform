@@ -22,7 +22,7 @@ router = APIRouter()
 
 
 @router.get("/news/fetch")
-async def fetch_news(
+def fetch_news(
     symbol: Optional[str] = Query(None, description="Stock ticker symbol (e.g., AAPL). Leave empty for global news."),
     provider: str = Query("fmp", description="News provider (fmp, alpaca, alphavantage)"),
     news_type: str = Query("company", description="Type of news: 'company' (requires symbol) or 'global' (market/general news)"),
@@ -120,7 +120,7 @@ async def fetch_news(
 
 
 @router.post("/news/analyze-single")
-async def analyze_single_article(
+def analyze_single_article(
     title: str = Query(..., description="Article title"),
     content: str = Query("", description="Article content/summary")
 ):
@@ -177,7 +177,7 @@ async def analyze_single_article(
 
 
 @router.get("/news/providers")
-async def list_news_providers():
+def list_news_providers():
     """
     List available news providers and their status.
 
@@ -246,7 +246,7 @@ from app.paths import NEWS_EXPORTS_DIR, MODELS_DIR
 
 
 @router.post("/news/export")
-async def export_news_to_json(
+def export_news_to_json(
     symbol: Optional[str] = Query(None, description="Stock ticker symbol (required for company news)"),
     provider: str = Query(..., description="Provider used to fetch the news"),
     news_type: str = Query("company", description="Type of news: 'company' or 'global'"),
@@ -343,7 +343,7 @@ async def export_news_to_json(
 
 
 @router.get("/news/exports")
-async def list_news_exports():
+def list_news_exports():
     """
     List all exported news files.
 
@@ -377,7 +377,7 @@ async def list_news_exports():
 
 
 @router.get("/fundamentals/providers")
-async def list_fundamentals_providers():
+def list_fundamentals_providers():
     """
     List available fundamentals providers and their capabilities.
 
@@ -712,7 +712,7 @@ async def _fetch_fundamentals_overview(symbol: str, provider: str, as_of_date: d
 
 
 @router.get("/macro/fetch")
-async def fetch_macro(
+def fetch_macro(
     indicators: str = Query(..., description="Comma-separated list of indicators (e.g., interest_rate,gdp,inflation)"),
     provider: str = Query("fred", description="Provider: fred (only FRED is currently supported)"),
     start_date: Optional[str] = Query(None, description="Start date (YYYY-MM-DD). Defaults to 1 year ago."),
@@ -824,7 +824,7 @@ async def fetch_macro(
 
 
 @router.get("/maintenance/orphan-models")
-async def scan_orphan_models():
+def scan_orphan_models():
     """
     Scan for orphan models - models in trained_models folder that:
     1. Are not saved in the model inventory
@@ -851,7 +851,8 @@ async def scan_orphan_models():
 
         # Get all model file paths from the inventory
         inventory_paths = set()
-        for model in models_store.values():
+        # snapshot: routes run in the thread pool now, and the task-queue threads mutate this dict
+        for model in list(models_store.values()):
             if model.get('filePath'):
                 inventory_paths.add(Path(model['filePath']).resolve())
 
@@ -900,7 +901,7 @@ async def scan_orphan_models():
 
 
 @router.delete("/maintenance/orphan-models")
-async def cleanup_orphan_models(dry_run: bool = Query(True, description="If True, only report what would be deleted")):
+def cleanup_orphan_models(dry_run: bool = Query(True, description="If True, only report what would be deleted")):
     """
     Clean up orphan models - delete model files that:
     1. Are not saved in the model inventory
@@ -931,7 +932,7 @@ async def cleanup_orphan_models(dry_run: bool = Query(True, description="If True
 
         # Get all model file paths from the inventory
         inventory_paths = set()
-        for model in models_store.values():
+        for model in list(models_store.values()):
             if model.get('filePath'):
                 inventory_paths.add(Path(model['filePath']).resolve())
 
@@ -994,7 +995,7 @@ async def cleanup_orphan_models(dry_run: bool = Query(True, description="If True
 # ============================================================================
 
 @router.get("/ohlcv/providers")
-async def list_ohlcv_providers():
+def list_ohlcv_providers():
     """
     List available OHLCV data providers and their configuration status.
 
@@ -1068,7 +1069,7 @@ def get_ohlcv_bars(symbol: str, start: str, end: str, interval: str = "1d", prov
 
 
 @router.post("/ohlcv/fetch-cache")
-async def fetch_ohlcv_cache(request: Dict[str, Any]):
+def fetch_ohlcv_cache(request: Dict[str, Any]):
     """
     Queue OHLCV cache fetch jobs for multiple symbols and timeframes.
 
@@ -1175,7 +1176,7 @@ def _read_ohlcv_dates(fp: Path):
 
 
 @router.get("/ohlcv/cache-status")
-async def get_ohlcv_cache_status():
+def get_ohlcv_cache_status():
     """
     Get information about existing OHLCV cache files.
 
@@ -1232,7 +1233,7 @@ async def get_ohlcv_cache_status():
 
 
 @router.get("/ohlcv/check-gaps")
-async def check_ohlcv_gaps():
+def check_ohlcv_gaps():
     """
     Analyze all OHLCV cache files for internal data gaps.
 
@@ -1300,7 +1301,7 @@ async def check_ohlcv_gaps():
 
 
 @router.post("/news/batch-fetch")
-async def batch_fetch_news(request: Dict[str, Any]):
+def batch_fetch_news(request: Dict[str, Any]):
     """
     Queue news batch fetch jobs for multiple symbols.
 
@@ -1371,7 +1372,7 @@ async def batch_fetch_news(request: Dict[str, Any]):
 
 
 @router.get("/news/cache-status")
-async def get_news_cache_status():
+def get_news_cache_status():
     """
     Get news cache statistics from the database.
 

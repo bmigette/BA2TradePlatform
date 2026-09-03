@@ -175,7 +175,7 @@ class BacktestListResponse(BaseModel):
 
 
 @router.get("")
-async def list_backtests(
+def list_backtests(
     expert: Optional[str] = None,
     optimization_id: Optional[int] = None,
     saved: Optional[bool] = None,
@@ -300,7 +300,7 @@ async def list_backtests(
 
 
 @router.post("")
-async def create_backtest(
+def create_backtest(
     backtest: BacktestCreate,
     db: Session = Depends(get_db)
 ):
@@ -615,7 +615,7 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
 
 
 @router.patch("/{backtest_id}")
-async def update_backtest(
+def update_backtest(
     backtest_id: int,
     update: dict,
     db: Session = Depends(get_db)
@@ -641,7 +641,7 @@ async def update_backtest(
 
 
 @router.post("/{backtest_id}/rerun")
-async def rerun_backtest(backtest_id: int, db: Session = Depends(get_db)):
+def rerun_backtest(backtest_id: int, db: Session = Depends(get_db)):
     """Re-run a saved daily-expert backtest IN PLACE: re-execute its ORIGINAL config against the
     CURRENT data/code and overwrite this row's results (same id/name/optimization link).
 
@@ -678,7 +678,7 @@ async def rerun_backtest(backtest_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/daily")
-async def create_daily_backtest(
+def create_daily_backtest(
     request: DailyBacktestCreate,
     db: Session = Depends(get_db)
 ):
@@ -760,7 +760,7 @@ async def create_daily_backtest(
 # Robustness GET routes are declared BEFORE the catch-all ``/{backtest_id}`` so that the literal
 # path segment ``robustness`` is matched here rather than tried (and rejected 422) as an int id.
 @router.get("/robustness")
-async def list_robustness(backtest_id: int, db: Session = Depends(get_db)):
+def list_robustness(backtest_id: int, db: Session = Depends(get_db)):
     """List the robustness runs (status + results) for a backtest, newest first."""
     from app.models.backtest import RobustnessRun
 
@@ -778,7 +778,7 @@ async def list_robustness(backtest_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/robustness/{run_id}")
-async def get_robustness_run(run_id: int, db: Session = Depends(get_db)):
+def get_robustness_run(run_id: int, db: Session = Depends(get_db)):
     """Get one robustness run's status + results.
 
     For a ``schedule`` run we first call ``collect_schedule_results`` lazily so a polling client sees
@@ -800,7 +800,7 @@ async def get_robustness_run(run_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{backtest_id}")
-async def get_backtest(
+def get_backtest(
     backtest_id: int,
     db: Session = Depends(get_db)
 ):
@@ -813,7 +813,7 @@ async def get_backtest(
 
 
 @router.get("/{backtest_id}/yearly")
-async def get_backtest_yearly_breakdown(
+def get_backtest_yearly_breakdown(
     backtest_id: int,
     db: Session = Depends(get_db),
 ):
@@ -841,7 +841,7 @@ class WhatIfRequest(BaseModel):
 
 
 @router.post("/{backtest_id}/whatif")
-async def backtest_whatif(
+def backtest_whatif(
     backtest_id: int,
     body: WhatIfRequest,
     db: Session = Depends(get_db),
@@ -925,7 +925,7 @@ class RobustnessRequest(BaseModel):
 
 
 @router.post("/robustness")
-async def launch_robustness(request: RobustnessRequest, db: Session = Depends(get_db)):
+def launch_robustness(request: RobustnessRequest, db: Session = Depends(get_db)):
     """Create + launch robustness runs for the requested backtests.
 
     Guards (fail-early): 404 for an unknown backtest_id; 400 when schedule is enabled for a
@@ -1024,7 +1024,7 @@ def _robustness_run_out(run) -> dict:
 
 
 @router.delete("/{backtest_id}")
-async def delete_backtest(
+def delete_backtest(
     backtest_id: int,
     db: Session = Depends(get_db)
 ):
@@ -1333,7 +1333,7 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
 
 
 @router.get("/{backtest_id}/export")
-async def export_backtest_json(
+def export_backtest_json(
     backtest_id: int,
     kind: str = "expert_settings",
     db: Session = Depends(get_db)
@@ -1351,7 +1351,7 @@ async def export_backtest_json(
 
 
 @router.post("/{backtest_id}/export")
-async def export_backtest(
+def export_backtest(
     backtest_id: int,
     format: str = "csv",
     db: Session = Depends(get_db)
@@ -1436,7 +1436,7 @@ async def export_backtest(
 
 
 @router.post("/compare")
-async def compare_backtests(
+def compare_backtests(
     backtest_ids: List[int],
     db: Session = Depends(get_db)
 ):
@@ -1488,7 +1488,7 @@ class BacktestSave(BaseModel):
 
 
 @router.post("/{backtest_id}/save")
-async def save_backtest(
+def save_backtest(
     backtest_id: int,
     save_data: BacktestSave,
     background_tasks: BackgroundTasks,
@@ -1520,7 +1520,7 @@ async def save_backtest(
 
 
 @router.delete("/unsaved")
-async def clear_unsaved_backtests(
+def clear_unsaved_backtests(
     db: Session = Depends(get_db)
 ):
     """Delete all unsaved backtests."""

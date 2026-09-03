@@ -184,7 +184,7 @@ def extract_required_fields(entry_rules: list = None, exit_rules: list = None) -
 
 
 @router.get("")
-async def list_strategies(
+def list_strategies(
     search: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
@@ -203,7 +203,7 @@ async def list_strategies(
 
 
 @router.post("")
-async def create_strategy(
+def create_strategy(
     strategy: StrategyCreate,
     db: Session = Depends(get_db)
 ):
@@ -228,7 +228,7 @@ async def create_strategy(
 
 
 @router.get("/compatible/{model_id}")
-async def get_compatible_strategies(
+def get_compatible_strategies(
     model_id: int,
     db: Session = Depends(get_db)
 ):
@@ -468,7 +468,7 @@ def export_optimization_settings(opt_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{strategy_id}")
-async def get_strategy(
+def get_strategy(
     strategy_id: int,
     db: Session = Depends(get_db)
 ):
@@ -480,7 +480,7 @@ async def get_strategy(
 
 
 @router.put("/{strategy_id}")
-async def update_strategy(
+def update_strategy(
     strategy_id: int,
     update: StrategyUpdate,
     db: Session = Depends(get_db)
@@ -515,7 +515,7 @@ async def update_strategy(
 
 
 @router.delete("/{strategy_id}")
-async def delete_strategy(
+def delete_strategy(
     strategy_id: int,
     db: Session = Depends(get_db)
 ):
@@ -569,7 +569,7 @@ class OptimizeRequest(BaseModel):
 
 
 @router.post("/{strategy_id}/optimize")
-async def optimize_strategy(
+def optimize_strategy(
     strategy_id: int,
     req: OptimizeRequest,
     db: Session = Depends(get_db)
@@ -674,7 +674,7 @@ class OptimizeBatchRequest(BaseModel):
 
 
 @router.post("/optimize-batch")
-async def optimize_batch(req: OptimizeBatchRequest, db: Session = Depends(get_db)):
+def optimize_batch(req: OptimizeBatchRequest, db: Session = Depends(get_db)):
     """Create + enqueue one optimization job per expert (fan-out).
 
     Validates the strategy exists + experts is non-empty (fail-early), then for each expert:

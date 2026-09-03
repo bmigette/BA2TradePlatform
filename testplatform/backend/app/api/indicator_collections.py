@@ -60,7 +60,7 @@ def validate_indicator_timeframe(indicator_timeframe: str, dataset_timeframe: st
 
 
 @router.get("", response_model=IndicatorCollectionListResponse)
-async def list_collections(db: Session = Depends(get_db)):
+def list_collections(db: Session = Depends(get_db)):
     """
     List all indicator collections.
 
@@ -86,7 +86,7 @@ async def list_collections(db: Session = Depends(get_db)):
 
 
 @router.get("/supported-indicators")
-async def get_supported_indicators():
+def get_supported_indicators():
     """
     Get list of supported indicators and their configurations.
 
@@ -101,7 +101,7 @@ async def get_supported_indicators():
 
 
 @router.get("/{collection_id}", response_model=IndicatorCollectionResponse)
-async def get_collection(collection_id: int, db: Session = Depends(get_db)):
+def get_collection(collection_id: int, db: Session = Depends(get_db)):
     """
     Get an indicator collection by ID.
 
@@ -135,7 +135,7 @@ async def get_collection(collection_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("", response_model=IndicatorCollectionResponse, status_code=status.HTTP_201_CREATED)
-async def create_collection(
+def create_collection(
     collection_create: IndicatorCollectionCreate,
     db: Session = Depends(get_db)
 ):
@@ -189,7 +189,7 @@ async def create_collection(
 
 
 @router.put("/{collection_id}", response_model=IndicatorCollectionResponse)
-async def update_collection(
+def update_collection(
     collection_id: int,
     collection_update: IndicatorCollectionUpdate,
     db: Session = Depends(get_db)
@@ -258,7 +258,7 @@ async def update_collection(
 
 
 @router.delete("/{collection_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_collection(collection_id: int, db: Session = Depends(get_db)):
+def delete_collection(collection_id: int, db: Session = Depends(get_db)):
     """
     Delete an indicator collection.
 
@@ -300,7 +300,7 @@ async def delete_collection(collection_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/validate-timeframes", response_model=TimeframeValidationResponse)
-async def validate_timeframes(request: TimeframeValidationRequest):
+def validate_timeframes(request: TimeframeValidationRequest):
     """
     Validate that all indicator timeframes are >= dataset timeframe.
 
@@ -331,7 +331,7 @@ async def validate_timeframes(request: TimeframeValidationRequest):
 
 
 @router.post("/init-defaults")
-async def initialize_default_collections(db: Session = Depends(get_db)):
+def initialize_default_collections(db: Session = Depends(get_db)):
     """
     Initialize default indicator collections (one per supported timeframe).
 

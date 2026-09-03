@@ -159,10 +159,9 @@ class TestOHLCVProviderEndpoint:
     def test_providers_list_structure(self):
         """Test that providers endpoint returns expected structure."""
         # Import and call the endpoint function directly
-        import asyncio
         from app.api.tools import list_ohlcv_providers
 
-        result = asyncio.get_event_loop().run_until_complete(list_ohlcv_providers())
+        result = list_ohlcv_providers()
 
         assert 'providers' in result
         assert 'default' in result
@@ -180,19 +179,17 @@ class TestOHLCVCacheStatusEndpoint:
 
     def test_cache_status_empty_dir(self):
         """Test cache status with no native OHLCV provider dirs."""
-        import asyncio
         from app.api.tools import get_ohlcv_cache_status
 
         # Repoint the unified-cache root resolver at nothing (the new scan source).
         with patch('app.api.tools._ohlcv_cache_roots', return_value=[]):
-            result = asyncio.get_event_loop().run_until_complete(get_ohlcv_cache_status())
+            result = get_ohlcv_cache_status()
 
             assert result['count'] == 0
             assert result['cache_files'] == []
 
     def test_cache_status_with_files(self):
         """Test cache status correctly parses native parquet cache files."""
-        import asyncio
         from pathlib import Path as RealPath
         from app.api.tools import get_ohlcv_cache_status
 
@@ -207,7 +204,7 @@ class TestOHLCVCacheStatusEndpoint:
             }).to_parquet(root / "AAPL_1d.parquet", index=False)
 
             with patch('app.api.tools._ohlcv_cache_roots', return_value=[root]):
-                result = asyncio.get_event_loop().run_until_complete(get_ohlcv_cache_status())
+                result = get_ohlcv_cache_status()
 
                 assert result['count'] == 1
                 assert result['cache_files'][0]['provider'] == 'FMPOHLCVProvider'

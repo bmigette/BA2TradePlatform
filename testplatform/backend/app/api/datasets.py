@@ -744,7 +744,7 @@ def _regenerate_dataset_in_background(dataset_id: int, regen_config: dict):
 
 
 @router.post("", response_model=DatasetResponse, status_code=status.HTTP_201_CREATED)
-async def create_dataset(
+def create_dataset(
     dataset_create: DatasetCreate,
     db: Session = Depends(get_db)
 ):
@@ -846,7 +846,7 @@ async def create_dataset(
 
 
 @router.post("/batch", status_code=status.HTTP_201_CREATED)
-async def create_batch_datasets(
+def create_batch_datasets(
     batch_request: dict,
     db: Session = Depends(get_db)
 ):
@@ -976,7 +976,7 @@ async def create_batch_datasets(
 
 
 @router.post("/check-compatibility")
-async def check_compatibility_endpoint(request: dict, db: Session = Depends(get_db)):
+def check_compatibility_endpoint(request: dict, db: Session = Depends(get_db)):
     """Check if multiple datasets have identical columns for multi-dataset training."""
     dataset_ids = request.get('dataset_ids', [])
     if len(dataset_ids) < 2:
@@ -1001,7 +1001,7 @@ async def check_compatibility_endpoint(request: dict, db: Session = Depends(get_
 
 
 @router.get("", response_model=DatasetListResponse)
-async def list_datasets(db: Session = Depends(get_db)):
+def list_datasets(db: Session = Depends(get_db)):
     """
     List all datasets
 
@@ -1026,7 +1026,7 @@ async def list_datasets(db: Session = Depends(get_db)):
 
 
 @router.patch("/{dataset_id}/rename", response_model=DatasetResponse)
-async def rename_dataset(
+def rename_dataset(
     dataset_id: int,
     new_name: str = Query(..., description="New name for the dataset"),
     db: Session = Depends(get_db)
@@ -1073,7 +1073,7 @@ async def rename_dataset(
 
 
 @router.get("/{dataset_id}", response_model=DatasetResponse)
-async def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
+def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
     """
     Get a single dataset by ID
 
@@ -1103,7 +1103,7 @@ async def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{dataset_id}/preview")
-async def get_dataset_preview(
+def get_dataset_preview(
     dataset_id: int,
     columns: Optional[str] = Query(None, description="Comma-separated list of columns to include (default: all columns)"),
     max_rows: int = Query(2000, description="Maximum rows to return (0 for all, default: 2000)"),
@@ -1201,7 +1201,7 @@ async def get_dataset_preview(
 
 
 @router.post("/{dataset_id}/preview-targets")
-async def preview_prediction_targets(
+def preview_prediction_targets(
     dataset_id: int,
     request_body: Dict[str, Any],
     db: Session = Depends(get_db)
@@ -1333,7 +1333,7 @@ async def preview_prediction_targets(
 
 
 @router.post("/{dataset_id}/calculate-indicators")
-async def calculate_indicators(
+def calculate_indicators(
     dataset_id: int,
     request_body: Dict[str, Any],
     db: Session = Depends(get_db)
@@ -1452,7 +1452,7 @@ async def calculate_indicators(
 
 
 @router.post("/{dataset_id}/calculate-targets")
-async def calculate_prediction_targets_v2(
+def calculate_prediction_targets_v2(
     dataset_id: int,
     request_body: Dict[str, Any],
     db: Session = Depends(get_db)
@@ -1532,7 +1532,7 @@ async def calculate_prediction_targets_v2(
 
 
 @router.get("/{dataset_id}/stats")
-async def get_dataset_stats(dataset_id: int, db: Session = Depends(get_db)):
+def get_dataset_stats(dataset_id: int, db: Session = Depends(get_db)):
     """
     Get comprehensive statistics for a dataset
 
@@ -1629,7 +1629,7 @@ async def get_dataset_stats(dataset_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{dataset_id}/columns")
-async def get_dataset_columns(dataset_id: int, db: Session = Depends(get_db)):
+def get_dataset_columns(dataset_id: int, db: Session = Depends(get_db)):
     """
     Get all columns in a dataset, categorized by type.
 
@@ -1734,7 +1734,7 @@ async def get_dataset_columns(dataset_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{dataset_id}", response_model=DatasetResponse)
-async def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
+def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
     """
     Get dataset details by ID
 
@@ -1767,7 +1767,7 @@ async def get_dataset(dataset_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{dataset_id}/export")
-async def export_dataset(dataset_id: int, db: Session = Depends(get_db)):
+def export_dataset(dataset_id: int, db: Session = Depends(get_db)):
     """
     Export dataset as CSV file for download
 
@@ -1816,7 +1816,7 @@ async def export_dataset(dataset_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{dataset_id}/export/parquet")
-async def export_dataset_parquet(dataset_id: int, db: Session = Depends(get_db)):
+def export_dataset_parquet(dataset_id: int, db: Session = Depends(get_db)):
     """
     Export dataset as Parquet file for download
 
@@ -1874,7 +1874,7 @@ async def export_dataset_parquet(dataset_id: int, db: Session = Depends(get_db))
 
 
 @router.delete("/{dataset_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
+def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
     """
     Delete a dataset
 
@@ -1915,7 +1915,7 @@ async def delete_dataset(dataset_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{dataset_id}/regenerate", response_model=DatasetResponse)
-async def regenerate_dataset(
+def regenerate_dataset(
     dataset_id: int,
     regen_options: Optional[DatasetRegenerate] = None,
     db: Session = Depends(get_db)
@@ -2005,7 +2005,7 @@ async def regenerate_dataset(
 
 
 @router.post("/batch-regenerate")
-async def batch_regenerate_datasets(
+def batch_regenerate_datasets(
     request: BatchRegenerateRequest,
     db: Session = Depends(get_db)
 ):
@@ -2078,7 +2078,7 @@ async def batch_regenerate_datasets(
 
 
 @router.post("/{dataset_id}/duplicate", response_model=DatasetResponse, status_code=status.HTTP_201_CREATED)
-async def duplicate_dataset(
+def duplicate_dataset(
     dataset_id: int,
     duplicate_request: DatasetDuplicate,
     db: Session = Depends(get_db)
@@ -2227,7 +2227,7 @@ async def duplicate_dataset(
 
 
 @router.put("/{dataset_id}", response_model=DatasetResponse)
-async def update_dataset(
+def update_dataset(
     dataset_id: int,
     dataset_update: DatasetUpdate
 ):
@@ -2490,7 +2490,7 @@ async def update_dataset(
 
 
 @router.post("/{dataset_id}/calculate-indicators")
-async def calculate_multi_timeframe_indicators(
+def calculate_multi_timeframe_indicators(
     dataset_id: int,
     timeframes: List[str] = None,
     indicators: dict = None,
@@ -2668,7 +2668,7 @@ async def calculate_multi_timeframe_indicators(
 
 
 @router.get("/supported-indicators")
-async def get_supported_indicators():
+def get_supported_indicators():
     """
     Get list of supported technical indicators and timeframes.
 
@@ -2683,7 +2683,7 @@ async def get_supported_indicators():
 
 
 @router.post("/{dataset_id}/calculate-fundamentals")
-async def calculate_fundamental_features(
+def calculate_fundamental_features(
     dataset_id: int,
     metrics: List[str] = None,
     db: Session = Depends(get_db)
@@ -2775,7 +2775,7 @@ async def calculate_fundamental_features(
 
 
 @router.get("/{dataset_id}/fundamentals")
-async def get_fundamental_data(dataset_id: int, db: Session = Depends(get_db)):
+def get_fundamental_data(dataset_id: int, db: Session = Depends(get_db)):
     """
     Get fundamental data for the ticker in a dataset.
 
@@ -2814,7 +2814,7 @@ async def get_fundamental_data(dataset_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{dataset_id}/calculate-macro")
-async def calculate_macro_features(
+def calculate_macro_features(
     dataset_id: int,
     indicators: List[str] = None,
     include_yield_curve: bool = True,
@@ -2896,7 +2896,7 @@ async def calculate_macro_features(
 
 
 @router.get("/supported-macro-indicators")
-async def get_supported_macro_indicators():
+def get_supported_macro_indicators():
     """
     Get list of supported macroeconomic indicators.
 
@@ -2910,7 +2910,7 @@ async def get_supported_macro_indicators():
 
 
 @router.post("/{dataset_id}/calculate-sentiment")
-async def calculate_sentiment_features(
+def calculate_sentiment_features(
     dataset_id: int,
     db: Session = Depends(get_db)
 ):
@@ -3008,7 +3008,7 @@ async def calculate_sentiment_features(
 
 
 @router.get("/sentiment-feature-descriptions")
-async def get_sentiment_feature_descriptions():
+def get_sentiment_feature_descriptions():
     """
     Get descriptions for all sentiment features.
 
@@ -3024,7 +3024,7 @@ async def get_sentiment_feature_descriptions():
 
 
 @router.post("/{dataset_id}/analyze-news")
-async def analyze_news_for_dataset(
+def analyze_news_for_dataset(
     dataset_id: int,
     db: Session = Depends(get_db)
 ):
@@ -3095,7 +3095,7 @@ async def analyze_news_for_dataset(
 # ============= Multi-Dataset Endpoints =============
 
 @router.post("/validate-compatibility")
-async def validate_dataset_compatibility(
+def validate_dataset_compatibility(
     dataset_ids: List[int],
     db: Session = Depends(get_db)
 ):
@@ -3195,7 +3195,7 @@ async def validate_dataset_compatibility(
 
 
 @router.post("/combine-preview")
-async def combine_datasets_preview(
+def combine_datasets_preview(
     dataset_ids: List[int],
     db: Session = Depends(get_db)
 ):
@@ -3283,7 +3283,7 @@ async def combine_datasets_preview(
 
 
 @router.post("/check-timeframe-match")
-async def check_timeframe_match(
+def check_timeframe_match(
     dataset_ids: List[int],
     db: Session = Depends(get_db)
 ):
@@ -3334,7 +3334,7 @@ async def check_timeframe_match(
 
 
 @router.get("/{dataset_id}/sentiment")
-async def get_dataset_sentiment(
+def get_dataset_sentiment(
     dataset_id: int,
     provider: str = Query("fmp", description="News provider (fmp, alphavantage, google, finnhub, alpaca)"),
     db: Session = Depends(get_db)
@@ -3416,7 +3416,7 @@ async def get_dataset_sentiment(
 
 
 @router.get("/{dataset_id}/trends")
-async def get_dataset_trends(
+def get_dataset_trends(
     dataset_id: int,
     method: str = "moving_average",
     lookback_period: int = 20,

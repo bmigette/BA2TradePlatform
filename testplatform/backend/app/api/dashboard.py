@@ -18,9 +18,42 @@ from app.models.dataset import Dataset
 from app.models.backtest import Backtest
 from app.api.jobs import jobs_store
 
+from sqlalchemy import select
+from app.models.strategy_optimization import StrategyOptimization
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Activity queries select ONLY columns held by the covering indexes (db_migrate/031 /
+# Backtest.__table_args__), never the blobs, with LIMIT in SQL. A full-row ORM load here read
+# 20 x ~10 MB rows after an 18 s / 2-min scan and froze the event loop (2026-09-02). Compiled
+# strings are exposed so tests can EXPLAIN the exact statements.
+_RECENT_BACKTESTS_STMT = (
+    select(Backtest.id, Backtest.name, Backtest.engine_type, Backtest.status,
+           Backtest.created_at, Backtest.started_at, Backtest.completed_at)
+    .order_by(Backtest.created_at.desc())
+)
+_RECENT_OPTIMIZATIONS_STMT = (
+    select(StrategyOptimization.id, StrategyOptimization.name, StrategyOptimization.status,
+           StrategyOptimization.created_at, StrategyOptimization.started_at,
+           StrategyOptimization.completed_at)
+    .order_by(StrategyOptimization.created_at.desc())
+)
+_RECENT_BACKTESTS_SQL = str(_RECENT_BACKTESTS_STMT.limit(20).compile(
+    compile_kwargs={"literal_binds": True}))
+_RECENT_OPTIMIZATIONS_SQL = str(_RECENT_OPTIMIZATIONS_STMT.limit(20).compile(
+    compile_kwargs={"literal_binds": True}))
+
+
+def _recent_backtests(db: Session, limit: int):
+    """Newest `limit` backtests as lightweight Row objects (no blobs)."""
+    return db.execute(_RECENT_BACKTESTS_STMT.limit(limit)).all()
+
+
+def _recent_optimizations(db: Session, limit: int):
+    """Newest `limit` strategy optimizations as lightweight Row objects (no all_results)."""
+    return db.execute(_RECENT_OPTIMIZATIONS_STMT.limit(limit)).all()
 
 
 class JobStats(BaseModel):
@@ -69,8 +102,11 @@ class DashboardResponse(BaseModel):
     workers: List[WorkerStat] = []
 
 
+# Plain `def` ON PURPOSE: this handler does blocking SQLAlchemy + sync httpx (remote worker
+# /health probes) work. As `async def` it ran on the event loop and a single slow query froze
+# every route for minutes (2026-09-02). tests/test_routes_do_not_block_event_loop.py pins this.
 @router.get("/stats", response_model=DashboardResponse)
-async def get_dashboard_stats(db: Session = Depends(get_db)):
+def get_dashboard_stats(db: Session = Depends(get_db)):
     """
     Get aggregated dashboard statistics.
 
@@ -88,7 +124,8 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
         "total": 0
     }
 
-    for job in jobs_store.values():
+    # snapshot: routes run in the thread pool now, and the task-queue threads mutate this dict
+    for job in list(jobs_store.values()):
         status = job.get("status", "unknown")
         if status in job_stats:
             job_stats[status] += 1
@@ -102,7 +139,6 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
                    "cancelled": "cancelled"}
     try:
         from sqlalchemy import func
-        from app.models.strategy_optimization import StrategyOptimization
         for st, n in (db.query(StrategyOptimization.status, func.count())
                       .group_by(StrategyOptimization.status).all()):
             bucket = _OPT_BUCKET.get(st or "pending")
@@ -116,7 +152,7 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
     activities: List[ActivityItem] = []
 
     # Add job activities
-    for job_id, job in jobs_store.items():
+    for job_id, job in list(jobs_store.items()):
         status = job.get("status", "unknown")
 
         # Job created activity
@@ -183,8 +219,7 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
     # The engine_type discriminator (migration 018) lets us label which engine produced
     # each run so daily multi-asset expert backtests surface alongside ML backtests.
     try:
-        backtests = db.query(Backtest).order_by(Backtest.created_at.desc()).limit(20).all()
-        for bt in backtests:
+        for bt in _recent_backtests(db, limit=20):
             engine_type = (bt.engine_type or "ml")
             kind = "Daily expert backtest" if engine_type == "daily_expert" else "Backtest"
             ts = (bt.completed_at or bt.started_at or bt.created_at)
@@ -201,11 +236,8 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
 
     # Add strategy/expert optimization activities (the GA optimizer jobs themselves).
     try:
-        from app.models.strategy_optimization import StrategyOptimization
         _OPT_ACTION = {"running": "started", "completed": "completed", "failed": "failed"}
-        opts = (db.query(StrategyOptimization)
-                .order_by(StrategyOptimization.created_at.desc()).limit(20).all())
-        for opt in opts:
+        for opt in _recent_optimizations(db, limit=20):
             st = opt.status or "pending"
             ts = (opt.completed_at or opt.started_at or opt.created_at)
             activities.append(ActivityItem(

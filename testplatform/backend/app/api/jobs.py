@@ -370,17 +370,24 @@ def sync_job_from_task(job_id: str) -> Optional[Dict[str, Any]]:
     task_queue = get_task_queue()
     task_status = task_queue.get_task_status(job_id)
 
+    # Re-fetch instead of re-indexing `jobs_store[job_id]` below: this runs in the thread pool
+    # now, so a concurrent DELETE can drop the job between the membership check above and the
+    # writes that follow, and the indexing would raise KeyError.
+    job = jobs_store.get(job_id)
+    if job is None:
+        return None
+
     if task_status:
         # Update local job store from task queue
-        jobs_store[job_id]["status"] = task_status.get("status", "queued")
-        jobs_store[job_id]["progress"] = task_status.get("progress", 0)
+        job["status"] = task_status.get("status", "queued")
+        job["progress"] = task_status.get("progress", 0)
 
         if task_status.get("started_at"):
-            jobs_store[job_id]["startedAt"] = task_status["started_at"]
+            job["startedAt"] = task_status["started_at"]
         if task_status.get("completed_at"):
-            jobs_store[job_id]["completedAt"] = task_status["completed_at"]
+            job["completedAt"] = task_status["completed_at"]
         if task_status.get("error_message"):
-            jobs_store[job_id]["error"] = task_status["error_message"]
+            job["error"] = task_status["error_message"]
         if task_status.get("progress_message"):
             # Parse progress message for current generation info
             msg = task_status["progress_message"]
@@ -389,7 +396,7 @@ def sync_job_from_task(job_id: str) -> Optional[Dict[str, Any]]:
                     # Extract generation from message like "LSTM: Gen 5/50, Fitness: 0.85"
                     gen_part = msg.split("Gen ")[1].split(",")[0]
                     current, total = gen_part.split("/")
-                    jobs_store[job_id]["currentGeneration"] = int(current)
+                    job["currentGeneration"] = int(current)
                 except (IndexError, ValueError):
                     pass
 
@@ -399,36 +406,36 @@ def sync_job_from_task(job_id: str) -> Optional[Dict[str, Any]]:
 
             # Check result status for failures
             if result.get("status") == "failed":
-                jobs_store[job_id]["error"] = result.get("error", "Training failed")
+                job["error"] = result.get("error", "Training failed")
 
             # Extract best model info if available
             if result.get("best_model"):
                 best = result["best_model"]
-                jobs_store[job_id]["bestFitness"] = best.get("best_fitness")
+                job["bestFitness"] = best.get("best_fitness")
                 if best.get("metrics"):
-                    jobs_store[job_id]["currentAccuracy"] = best["metrics"].get("fitness")
+                    job["currentAccuracy"] = best["metrics"].get("fitness")
 
             # Store models trained count
             if "models_trained" in result:
-                jobs_store[job_id]["modelsTrained"] = result["models_trained"]
+                job["modelsTrained"] = result["models_trained"]
             if "total_models" in result:
-                jobs_store[job_id]["totalModels"] = result["total_models"]
+                job["totalModels"] = result["total_models"]
 
             # Store dataset statistics
             if "train_rows" in result:
-                jobs_store[job_id]["trainRows"] = result["train_rows"]
+                job["trainRows"] = result["train_rows"]
             if "test_rows" in result:
-                jobs_store[job_id]["testRows"] = result["test_rows"]
+                job["testRows"] = result["test_rows"]
             if "target_column" in result:
-                jobs_store[job_id]["targetColumn"] = result["target_column"]
+                job["targetColumn"] = result["target_column"]
             if "train_positives" in result:
-                jobs_store[job_id]["trainPositives"] = result["train_positives"]
+                job["trainPositives"] = result["train_positives"]
             if "test_positives" in result:
-                jobs_store[job_id]["testPositives"] = result["test_positives"]
+                job["testPositives"] = result["test_positives"]
             if "train_positives_pct" in result:
-                jobs_store[job_id]["trainPositivesPct"] = result["train_positives_pct"]
+                job["trainPositivesPct"] = result["train_positives_pct"]
             if "test_positives_pct" in result:
-                jobs_store[job_id]["testPositivesPct"] = result["test_positives_pct"]
+                job["testPositivesPct"] = result["test_positives_pct"]
 
     # Read training state from checkpoint_data (written by subprocess workers)
     try:
@@ -446,7 +453,7 @@ def sync_job_from_task(job_id: str) -> Optional[Dict[str, Any]]:
                             "trainPositives", "testPositives", "trainPositivesPct", "testPositivesPct",
                             "epochHistory"):
                     if key in cp:
-                        jobs_store[job_id][key] = cp[key]
+                        job[key] = cp[key]
         finally:
             db.close()
     except Exception:
@@ -456,7 +463,7 @@ def sync_job_from_task(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def create_job(job_create: JobCreate):
+def create_job(job_create: JobCreate):
     """
     Create a new optimization job.
 
@@ -596,7 +603,7 @@ async def create_job(job_create: JobCreate):
 
 
 @router.get("", response_model=JobListResponse)
-async def list_jobs():
+def list_jobs():
     """
     List all optimization jobs.
 
@@ -613,7 +620,8 @@ async def list_jobs():
         for job_id in list(jobs_store.keys()):
             sync_job_from_task(job_id)
 
-        jobs = [JobResponse(**job) for job in jobs_store.values()]
+        # snapshot: routes run in the thread pool now, and the task-queue threads mutate this dict
+        jobs = [JobResponse(**job) for job in list(jobs_store.values())]
         # Sort by createdAt descending
         jobs.sort(key=lambda x: x.createdAt, reverse=True)
 
@@ -693,7 +701,7 @@ def _profile_to_response(profile: OptimizationProfileModel) -> ProfileResponse:
 
 
 @router.post("/profiles", response_model=ProfileResponse, status_code=status.HTTP_201_CREATED)
-async def create_profile(profile: OptimizationProfileCreate, db: Session = Depends(get_db)):
+def create_profile(profile: OptimizationProfileCreate, db: Session = Depends(get_db)):
     """
     Create a new optimization profile.
 
@@ -738,7 +746,7 @@ async def create_profile(profile: OptimizationProfileCreate, db: Session = Depen
 
 
 @router.get("/profiles")
-async def list_profiles(db: Session = Depends(get_db)):
+def list_profiles(db: Session = Depends(get_db)):
     """
     List all optimization profiles.
 
@@ -754,7 +762,7 @@ async def list_profiles(db: Session = Depends(get_db)):
 
 
 @router.get("/profiles/{profile_id}", response_model=ProfileResponse)
-async def get_profile(profile_id: int, db: Session = Depends(get_db)):
+def get_profile(profile_id: int, db: Session = Depends(get_db)):
     """
     Get a specific optimization profile.
 
@@ -775,7 +783,7 @@ async def get_profile(profile_id: int, db: Session = Depends(get_db)):
 
 
 @router.delete("/profiles/{profile_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_profile(profile_id: int, db: Session = Depends(get_db)):
+def delete_profile(profile_id: int, db: Session = Depends(get_db)):
     """
     Delete an optimization profile.
 
@@ -795,7 +803,7 @@ async def delete_profile(profile_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/profiles/{profile_id}/apply")
-async def apply_profile_to_job(profile_id: int, dataset_id: int, db: Session = Depends(get_db)):
+def apply_profile_to_job(profile_id: int, dataset_id: int, db: Session = Depends(get_db)):
     """
     Create a new job using settings from a profile.
 
@@ -825,11 +833,11 @@ async def apply_profile_to_job(profile_id: int, dataset_id: int, db: Session = D
     )
 
     # Reuse create_job logic
-    return await create_job(job_create)
+    return create_job(job_create)
 
 
 @router.put("/profiles/{profile_id}", response_model=ProfileResponse)
-async def update_profile(profile_id: int, profile: OptimizationProfileCreate, db: Session = Depends(get_db)):
+def update_profile(profile_id: int, profile: OptimizationProfileCreate, db: Session = Depends(get_db)):
     """
     Update an existing optimization profile.
 
@@ -865,7 +873,7 @@ async def update_profile(profile_id: int, profile: OptimizationProfileCreate, db
 
 
 @router.get("/profiles/{profile_id}/export")
-async def export_profile(profile_id: int, db: Session = Depends(get_db)):
+def export_profile(profile_id: int, db: Session = Depends(get_db)):
     """
     Export optimization profile to JSON format.
 
@@ -901,7 +909,7 @@ async def export_profile(profile_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/profiles/import", response_model=ProfileResponse)
-async def import_profile(profile_data: Dict[str, Any], db: Session = Depends(get_db)):
+def import_profile(profile_data: Dict[str, Any], db: Session = Depends(get_db)):
     """
     Import optimization profile from JSON format.
 
@@ -935,7 +943,7 @@ async def import_profile(profile_data: Dict[str, Any], db: Session = Depends(get
         )
 
         # Create as new profile
-        return await create_profile(profile, db)
+        return create_profile(profile, db)
 
     except HTTPException:
         raise
@@ -952,7 +960,7 @@ async def import_profile(profile_data: Dict[str, Any], db: Session = Depends(get
 # ============================================================================
 
 @router.get("/{job_id}", response_model=JobResponse)
-async def get_job(job_id: str):
+def get_job(job_id: str):
     """
     Get a specific job by ID.
 
@@ -980,7 +988,7 @@ async def get_job(job_id: str):
 
 
 @router.delete("/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_job(job_id: str):
+def delete_job(job_id: str):
     """
     Delete a job by ID.
 
@@ -1014,15 +1022,16 @@ async def delete_job(job_id: str):
     finally:
         db.close()
 
-    # Delete from in-memory stores
-    del jobs_store[job_id]
-    if job_id in job_progress_data:
-        del job_progress_data[job_id]
+    # Delete from in-memory stores. `pop(..., None)`, not `del`: this route runs in the thread
+    # pool now, so two concurrent DELETEs can both pass the 404 check above and the second `del`
+    # would raise KeyError -> 500 instead of the 204 the caller already earned.
+    jobs_store.pop(job_id, None)
+    job_progress_data.pop(job_id, None)
     logger.info(f"Deleted job {job_id}")
 
 
 @router.get("/{job_id}/progress", response_model=JobProgressResponse)
-async def get_job_progress(job_id: str):
+def get_job_progress(job_id: str):
     """
     Get detailed progress information for a job including metrics and logs.
 
@@ -1077,7 +1086,7 @@ async def get_job_progress(job_id: str):
 
 
 @router.post("/{job_id}/pause")
-async def pause_job(job_id: str):
+def pause_job(job_id: str):
     """
     Pause a running job.
 
@@ -1118,7 +1127,7 @@ async def pause_job(job_id: str):
 
 
 @router.post("/{job_id}/resume")
-async def resume_job(job_id: str):
+def resume_job(job_id: str):
     """
     Resume a paused or stopped (crashed) job.
 
@@ -1160,7 +1169,7 @@ async def resume_job(job_id: str):
 
 
 @router.post("/{job_id}/cancel")
-async def cancel_job(job_id: str):
+def cancel_job(job_id: str):
     """
     Cancel a running or paused job.
 
@@ -1252,7 +1261,7 @@ async def generate_sse_events(job_id: str):
 
 
 @router.get("/{job_id}/sse")
-async def get_job_progress_sse(job_id: str):
+def get_job_progress_sse(job_id: str):
     """
     Get live job progress via Server-Sent Events (SSE).
 
@@ -1283,7 +1292,7 @@ async def get_job_progress_sse(job_id: str):
 
 
 @router.get("/{job_id}/logs")
-async def get_job_logs(job_id: str, limit: int = 100):
+def get_job_logs(job_id: str, limit: int = 100):
     """
     Get training logs for a job.
 
@@ -1312,7 +1321,7 @@ async def get_job_logs(job_id: str, limit: int = 100):
 
 
 @router.get("/{job_id}/individuals")
-async def get_job_individuals(job_id: str, generation: Optional[int] = None, model_type: Optional[str] = None):
+def get_job_individuals(job_id: str, generation: Optional[int] = None, model_type: Optional[str] = None):
     """
     Get all individuals evaluated during optimization for visualization.
 
@@ -1400,7 +1409,7 @@ async def get_job_individuals(job_id: str, generation: Optional[int] = None, mod
 
 
 @router.get("/{job_id}/generations")
-async def get_job_generations(job_id: str):
+def get_job_generations(job_id: str):
     """
     Get generation-by-generation summary of optimization progress.
 
@@ -1414,7 +1423,7 @@ async def get_job_generations(job_id: str):
         List of generation summaries
     """
     # Get all individuals
-    individuals_response = await get_job_individuals(job_id)
+    individuals_response = get_job_individuals(job_id)
     all_individuals = individuals_response["individuals"]
 
     # Group by generation
@@ -1475,7 +1484,7 @@ class SaveToInventoryRequest(BaseModel):
 
 
 @router.get("/{job_id}/elite-models")
-async def get_job_elite_models(job_id: str):
+def get_job_elite_models(job_id: str):
     """
     Get elite models saved for a completed job.
 
@@ -1494,7 +1503,7 @@ async def get_job_elite_models(job_id: str):
 
 
 @router.post("/{job_id}/elite-models/{rank}/save-to-inventory")
-async def save_elite_to_inventory(
+def save_elite_to_inventory(
     job_id: str,
     rank: int,
     request: SaveToInventoryRequest,
@@ -1641,7 +1650,7 @@ class RetrainJobCreate(BaseModel):
 
 
 @router.post("/retrain", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def create_retrain_job(retrain_request: RetrainJobCreate):
+def create_retrain_job(retrain_request: RetrainJobCreate):
     """
     Create a retrain job for an existing model.
 
@@ -1797,7 +1806,7 @@ class RetrainSaveRequest(BaseModel):
 
 
 @router.post("/{job_id}/retrain-save")
-async def save_retrain_results(job_id: str, request: RetrainSaveRequest):
+def save_retrain_results(job_id: str, request: RetrainSaveRequest):
     """
     Save retrain job results - either update the original model or save as new.
 
@@ -1955,7 +1964,7 @@ async def save_retrain_results(job_id: str, request: RetrainSaveRequest):
 # ============================================================================
 
 @router.get("/jobs/{job_id}/datasets")
-async def get_job_datasets(job_id: str):
+def get_job_datasets(job_id: str):
     """
     Get information about cached datasets for a training job.
 
@@ -1975,7 +1984,7 @@ async def get_job_datasets(job_id: str):
 
 
 @router.get("/jobs/{job_id}/datasets/{filename}")
-async def download_job_dataset(job_id: str, filename: str):
+def download_job_dataset(job_id: str, filename: str):
     """
     Download a specific dataset file for a training job.
 

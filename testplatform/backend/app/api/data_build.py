@@ -66,7 +66,7 @@ class PrewarmRequest(BaseModel):
 
 
 @router.post("/build-ohlcv")
-async def build_ohlcv(req: BuildOhlcvRequest):
+def build_ohlcv(req: BuildOhlcvRequest):
     """Enqueue one ``ohlcv_cache_fetch`` task per symbol on the OHLCV queue.
 
     Returns the list of created task ids (one per symbol)."""
@@ -100,7 +100,7 @@ async def build_ohlcv(req: BuildOhlcvRequest):
 
 
 @router.post("/build-screener-metrics")
-async def build_screener_metrics(req: BuildScreenerMetricsRequest):
+def build_screener_metrics(req: BuildScreenerMetricsRequest):
     """Enqueue a ``build_screener_metrics`` task on the main queue. Returns {task_id}.
 
     ``store`` defaults to the shared ba2_common screener store dir (trade bucket)
@@ -128,7 +128,7 @@ async def build_screener_metrics(req: BuildScreenerMetricsRequest):
 
 
 @router.post("/build-options")
-async def build_options(req: BuildOptionsRequest):
+def build_options(req: BuildOptionsRequest):
     """Enqueue a ``build_options`` task on the main queue. Returns {task_id}."""
     underlyings = [s.strip().upper() for s in (req.underlyings or []) if s and s.strip()]
     if not underlyings:
@@ -153,7 +153,7 @@ async def build_options(req: BuildOptionsRequest):
 
 
 @router.post("/prewarm")
-async def prewarm(req: PrewarmRequest):
+def prewarm(req: PrewarmRequest):
     """Enqueue a ``prewarm`` task on the main queue. Returns {task_id}."""
     symbols = [s.strip().upper() for s in (req.symbols or []) if s and s.strip()]
     if not symbols:
