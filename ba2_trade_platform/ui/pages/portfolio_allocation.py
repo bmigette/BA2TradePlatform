@@ -110,9 +110,11 @@ from ...core.models import ExpertInstance
 from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
-    LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
+    LabelTarget, SymbolTarget, blocking_messages, build_base_snapshot,
+    compute_allocation,
     compute_base_notional, compute_label_investment, current_value,
-    format_unrealised_pnl, unconsumed_income_notice,
+    format_unrealised_pnl, is_blocking_message, unconsumed_income_notice,
+    validate_symbol_weights,
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
@@ -718,6 +720,12 @@ MARKER_LABEL_ICON = 'pf-label-icon'
 #: The orange count beside that icon: symbols in the label whose share is 0% or
 #: unset. Marked because its text is a bare integer that repeats all over the row.
 MARKER_LABEL_ZERO_BADGE = 'pf-label-zero-badge'
+#: The warning triangle beside it: this label's symbol weights do not total
+#: 100% -- either short (advisory) or over (the same thing that blocks Submit).
+#: A separate icon rather than folded into the zero-share badge because the two
+#: questions are different ("which symbols get nothing" vs "does this label's
+#: split even add up") and a label can have either without the other.
+MARKER_LABEL_WEIGHT_WARNING = 'pf-label-weight-warning'
 #: One preset colour chip. Bare divs whose entire content is a background colour.
 MARKER_COLOR_SWATCH = 'pf-color-swatch'
 #: The "no colour" chip, which is NOT a colour and therefore not one of the above.
@@ -931,6 +939,9 @@ def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
     # even though nothing else on the label header is. Its own writer, so this
     # path and ``_apply_bars`` cannot drift apart.
     _apply_zero_badge(live, label)
+    # ...and whether the split still adds to 100% at all -- the other thing a
+    # symbol edit changes that the label bars do not.
+    _apply_symbol_weight_warning(live, label)
 
 
 #: What a second press is told while the first is still solving. An 'info', not a
@@ -1021,6 +1032,47 @@ def _apply_zero_badge(live: Dict[str, Any], label: str) -> None:
             count=zeroes, total=len(members), label=label))
 
 
+def _apply_symbol_weight_warning(live: Dict[str, Any], label: str) -> None:
+    """Restate one label's weight-total warning icon: does the symbol split add
+    to 100%?
+
+    Same dual-call-site reasoning as ``_apply_zero_badge`` right above -- a
+    symbol-share edit changes this label's TOTAL just as much as it changes
+    which symbols sit at zero, and the label bars still must not move for it.
+
+    Reuses the engine's OWN ``validate_symbol_weights`` rather than
+    re-deriving the 100% check here, so the icon's tooltip can never drift from
+    what the submit gate (``AllocationWizard._target_block`` /
+    ``run_allocation``) actually enforces: an OVER split still blocks Submit
+    (``ERROR_SYMBOL_OVER_FMT``) and an UNDER split is advisory only
+    (``WARNING_SYMBOL_UNDER_FMT``, 2026-09-05) -- a shortfall just leaves part
+    of THIS label's own money undeployed, which is worth showing and not worth
+    refusing Submit over. Both render the SAME icon here: the icon says "look at
+    this", the tooltip -- in the engine's own words -- says whether Submit will
+    actually be refused.
+
+    A symbol with no live weight at all (unmeasurable, or genuinely not in the
+    map yet) is silently excluded, exactly as ``symbol_total_bar`` already
+    excludes it from the SAME sum inside the expanded body -- the two indicators
+    must read the same total or one of them is lying.
+    """
+    widgets = live['bars'].get(label)
+    if not widgets:
+        return
+    icon = widgets.get('weight_warning')
+    if icon is None:
+        return
+    weights = live['weights'].get(label) or {}
+    target = LabelTarget(label=label, target_pct=0.0,
+                         symbols=[SymbolTarget(symbol=s, weight_pct=w)
+                                 for s, w in weights.items()])
+    messages = validate_symbol_weights(target)
+    icon.set_visibility(bool(messages))
+    tooltip = widgets.get('weight_warning_tooltip')
+    if tooltip is not None:
+        tooltip.set_text(' '.join(messages))
+
+
 def _apply_bars(live: Dict[str, Any]) -> None:
     """Redraw every mini-bar, header line and status word. In place.
 
@@ -1053,6 +1105,7 @@ def _apply_bars(live: Dict[str, Any]) -> None:
             # carried the right value the whole time.
             icon.style(replace=important_color_style(bar.color))
         _apply_zero_badge(live, bar.label)
+        _apply_symbol_weight_warning(live, bar.label)
         widgets['value'].set_text(f'${bar.current_value:,.2f}')
         # Every string below is the PURE layer's, not this module's: the
         # denominator rule, the "(real N%)" parenthetical and the over/under
@@ -2199,7 +2252,14 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # only place a symbol's other managed labels are named, and it reads this.
         'labels': ', '.join(r.labels),
         'current_value': round(r.current_value, 2),
+        # BOTH label denominators travel to the browser. ``pct_of_label_target`` is
+        # what the "% of label tgt" COLUMN prints -- the label's target money, so an
+        # over-subscribed label's rows sum past 100% instead of always landing on it
+        # (2026-09-05). ``pct_of_label`` stays because ``_write_row_deltas`` feeds it
+        # to ``symbol_delta`` for the share-point hint under the Share-of-label box,
+        # which is only meaningful against the label's own composition.
         'pct_of_label': round(r.pct_of_label, 2),
+        'pct_of_label_target': round(r.pct_of_label_target, 2),
         'pct_of_total': round(r.pct_of_total, 2),
         # None, never 0.0: a symbol with no stored weight and a page with no base
         # notional have no target, and 0.00 there would be a claim rather than a gap.
@@ -2250,7 +2310,15 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # the slot below draws a button over it.
         {'name': 'info', 'label': '', 'field': 'symbol', 'align': 'center'},
         {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
-        {'name': 'pct_of_label', 'label': '% of label', 'field': 'pct_of_label', 'sortable': True, 'align': 'right'},
+        # AGAINST THE LABEL'S TARGET MONEY, not against what the label happens to
+        # hold (2026-09-05). The old denominator was the label's own held total, so
+        # the column summed to exactly 100% on every label whatever its funding --
+        # a label holding twice its target read as perfectly balanced. Over 100%
+        # here now means over-subscribed and under means under-invested, which is
+        # what the reader is looking for. The header names the denominator: an
+        # unqualified "% of label" is what made the old figure misread.
+        {'name': 'pct_of_label_target', 'label': '% of label tgt',
+         'field': 'pct_of_label_target', 'sortable': True, 'align': 'right'},
         {'name': 'pct_of_total', 'label': '% of total', 'field': 'pct_of_total', 'sortable': True, 'align': 'right'},
         # "Share of label %", not "Target %": the label header above prints a target
         # too, and that one is a share of the PORTFOLIO. Two different quantities
@@ -2632,6 +2700,18 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             with zero_badge:
                 widgets['zero_tooltip'] = ui.tooltip('')
             widgets['zero_badge'] = zero_badge
+            # THIS LABEL'S OWN SPLIT DOES NOT ADD TO 100% -- a plain triangle, not
+            # a count: there is exactly one fact to flag, not a number of them.
+            # Hidden, not zeroed, when the split is exactly 100% -- same reasoning
+            # as the zero-share badge. An OVER split is also what blocks Submit
+            # (ERROR_SYMBOL_OVER_FMT); an UNDER split is advisory only
+            # (WARNING_SYMBOL_UNDER_FMT) -- the tooltip says which, using the
+            # engine's own wording so the two can never disagree.
+            weight_warning = ui.icon('warning').props('color=orange size=xs') \
+                .classes('shrink-0 cursor-help').mark(MARKER_LABEL_WEIGHT_WARNING)
+            with weight_warning:
+                widgets['weight_warning_tooltip'] = ui.tooltip('')
+            widgets['weight_warning'] = weight_warning
             ui.label(view.label).classes('w-48 truncate font-medium')
             widgets['value'] = ui.label('').classes('w-28 text-right')
             # THE bar component, shared with the per-label symbol-share total and

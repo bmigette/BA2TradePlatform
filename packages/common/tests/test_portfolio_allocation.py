@@ -440,16 +440,18 @@ def test_a_total_above_one_hundred_is_still_a_hard_ERROR():
     assert pa.blocking_messages(messages) == messages
 
 
-def test_symbol_weights_inside_a_label_must_STILL_total_exactly_one_hundred():
-    """The reserve is a LABEL-level idea only. A label whose symbol weights total 60
-    leaves 40% of THAT label's money undeployed with nothing on the plan to record
-    it -- ``compute_allocation`` multiplies the weights straight through -- so this
-    rule does not relax with the other one."""
+def test_symbol_weights_inside_a_label_short_of_one_hundred_is_reported_but_advisory():
+    """BUG FIX 2026-09-05: this used to assert the symbol-total shortfall blocked
+    Submit exactly like the label-level one -- the operator asked for that not to
+    be the case (a 90% split on a live label was refusing Submit). A label whose
+    symbol weights total 60 leaves 40% of THAT label's money undeployed, which is
+    a fact worth reporting -- STILL on the plan -- and no longer a reason to
+    refuse Submit, unlike the cross-label shortfall this rule used to mirror."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0)])]
     messages = pa.validate_label_targets(labels)
 
-    assert messages == [pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=60.0)]
-    assert pa.blocking_messages(messages) == messages
+    assert messages == [pa.WARNING_SYMBOL_UNDER_FMT.format(label="A", total=60.0, under=40.0)]
+    assert pa.blocking_messages(messages) == []
 
 
 def test_an_under_allocated_set_still_reports_its_real_errors():
@@ -531,21 +533,26 @@ def test_validate_label_targets_rejects_symbol_weights_totalling_one_fifty():
     over-deploy the label."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0), SymbolTarget("BBB", 50.0)])]
     errors = pa.validate_label_targets(labels)
-    assert errors == [pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=150.0)]
-    assert errors == ["label 'A' symbol weights total 150.00% - must total 100%"]
+    assert errors == [pa.ERROR_SYMBOL_OVER_FMT.format(label="A", total=150.0, over=50.0)]
+    assert errors == ["label 'A' symbol weights total 150.00% - over 100% by 50.00%"]
+    assert pa.blocking_messages(errors) == errors
 
 
-def test_validate_label_targets_rejects_a_naive_two_dp_symbol_split():
-    """3 x 33.33 = 99.99, one hair OUTSIDE the 0.01pp tolerance -- use even_split_pct."""
+def test_validate_label_targets_flags_a_naive_two_dp_symbol_split():
+    """3 x 33.33 = 99.99, one hair OUTSIDE the 0.01pp tolerance -- use even_split_pct.
+    Reported (never silently accepted), but a shortfall this small is advisory."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget(s, 33.33) for s in ("AAA", "BBB", "CCC")])]
-    assert pa.validate_label_targets(labels) == [
-        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=99.99)]
+    messages = pa.validate_label_targets(labels)
+    assert messages == [pa.WARNING_SYMBOL_UNDER_FMT.format(label="A", total=99.99, under=0.01)]
+    assert pa.blocking_messages(messages) == []
 
 
 def test_validate_label_targets_rejects_symbol_weights_just_over_the_tolerance():
+    """OVER still blocks -- it is the direction that over-deploys the label."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.01)])]
-    assert pa.validate_label_targets(labels) == [
-        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=100.01)]
+    messages = pa.validate_label_targets(labels)
+    assert messages == [pa.ERROR_SYMBOL_OVER_FMT.format(label="A", total=100.01, over=0.01)]
+    assert pa.blocking_messages(messages) == messages
 
 
 def test_validate_label_targets_accepts_an_even_split_pct_symbol_set():
@@ -626,17 +633,20 @@ def test_validate_symbol_weights_accepts_an_even_split():
 def test_validate_symbol_weights_rejects_a_one_fifty_total():
     """The INVEST_LABEL gate: 150% would turn a 10k budget into 15k of buys."""
     label = LabelTarget("A", 40.0, [SymbolTarget("AAA", 100.0), SymbolTarget("BBB", 50.0)])
-    assert pa.validate_symbol_weights(label) == [
-        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=150.0)]
-    assert pa.validate_symbol_weights(label) == [
-        "label 'A' symbol weights total 150.00% - must total 100%"]
+    messages = pa.validate_symbol_weights(label)
+    assert messages == [pa.ERROR_SYMBOL_OVER_FMT.format(label="A", total=150.0, over=50.0)]
+    assert messages == ["label 'A' symbol weights total 150.00% - over 100% by 50.00%"]
+    assert pa.blocking_messages(messages) == messages
 
 
-def test_validate_symbol_weights_rejects_a_total_under_one_hundred():
-    """Concern 3: weights totalling 60 would silently leave 40% of the budget as cash."""
+def test_validate_symbol_weights_reports_a_total_under_one_hundred_as_advisory():
+    """BUG FIX 2026-09-05: weights totalling 60 leave 40% of the budget undeployed
+    -- still reported, no longer blocking (see the REBALANCE-level test above for
+    the full reasoning)."""
     label = LabelTarget("A", 40.0, [SymbolTarget("AAA", 60.0)])
-    assert pa.validate_symbol_weights(label) == [
-        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=60.0)]
+    messages = pa.validate_symbol_weights(label)
+    assert messages == [pa.WARNING_SYMBOL_UNDER_FMT.format(label="A", total=60.0, under=40.0)]
+    assert pa.blocking_messages(messages) == []
 
 
 def test_validate_symbol_weights_rejects_a_negative_weight():
@@ -676,7 +686,7 @@ def test_validate_label_targets_forwards_its_tolerance_to_the_symbol_check():
     """Pre-existing behaviour: a widened tolerance loosens BOTH levels, not just labels."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 99.0)])]
     assert pa.validate_label_targets(labels) == [
-        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=99.0)]
+        pa.WARNING_SYMBOL_UNDER_FMT.format(label="A", total=99.0, under=1.0)]
     assert pa.validate_label_targets(labels, tolerance=5.0) == []
     assert pa.validate_symbol_weights(labels[0], tolerance=5.0) == []
 
@@ -2964,10 +2974,17 @@ def test_a_label_total_below_one_hundred_is_a_hard_ERROR_again():
 
 
 def test_nothing_in_the_advisory_fragments_lets_a_label_total_through_any_more():
-    """The advisory fragment 6fd532c added is GONE, so both halves of the rule
-    block by default -- the safe direction to be wrong in."""
-    assert pa.ADVISORY_MESSAGE_FRAGMENTS == (pa._INVEST_EXCEEDS_BP_FRAGMENT,)
+    """The advisory fragment 6fd532c added for the CROSS-LABEL rule is GONE, so
+    both halves of THAT rule still block by default -- the safe direction to be
+    wrong in. ``_SYMBOL_UNDER_FRAGMENT`` (2026-09-05) is a second, DELIBERATE
+    advisory fragment for a different rule (the WITHIN-one-label shortfall) and
+    its presence here is not a regression of this one -- the real guarantee is
+    that it must never ALSO match the cross-label message, checked directly
+    rather than by asserting the tuple has exactly one element forever."""
     assert not hasattr(pa, "ADVISORY_LABEL_UNDER_FMT")
+    cross_label_under = pa.ERROR_LABEL_UNDER_FMT.format(total=60.0, under=40.0)
+    assert pa.is_blocking_message(cross_label_under)
+    assert pa._SYMBOL_UNDER_FRAGMENT not in cross_label_under
 
 
 def test_an_empty_label_set_is_an_error_not_an_advisory():

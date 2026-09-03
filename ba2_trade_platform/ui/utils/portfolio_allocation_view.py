@@ -688,6 +688,24 @@ class SymbolRow:
     price: Optional[float] = None
     market_value: Optional[float] = None
     pct_of_label: float = 0.0
+    #: The SAME money as ``pct_of_label`` over a DIFFERENT denominator: the label's
+    #: TARGET value (its ``target_pct`` of the investable pool), not the sum of what
+    #: the label currently holds. Added 2026-09-05 on the operator's reading of the
+    #: table: ``pct_of_label`` divides the label's own held total, so it sums to
+    #: exactly 100% across the held rows NO MATTER how far the label as a whole is
+    #: from its target -- a label holding twice its target looked perfectly balanced.
+    #: This one sums to MORE than 100% when the label is over-subscribed and less
+    #: when it is under-invested, which is the question "is this label's money where
+    #: it should be" actually asks.
+    #:
+    #: BOTH are kept, and neither replaces the other. ``pct_of_label`` is what
+    #: ``symbol_delta`` subtracts from the typed ``weight_pct`` to get the share-point
+    #: hint under the Share-of-label box -- that comparison is only meaningful while
+    #: both sides divide the same label-composition denominator, so feeding it this
+    #: field instead would silently turn a composition delta into a nonsense figure.
+    #: 0.0 when there is no target to divide by (no base, or a label targeting 0%),
+    #: matching how ``pct_of_label`` reports a label holding nothing.
+    pct_of_label_target: float = 0.0
     pct_of_total: float = 0.0
     comment: Optional[str] = None
     weight_pct: Optional[float] = None
@@ -950,6 +968,12 @@ def build_label_views(managed,
                 price=price,
                 market_value=market_value,
                 pct_of_label=(row_value / label_value * 100.0) if label_value else 0.0,
+                # Against the label's TARGET money, so the column can say "this
+                # label is over-subscribed" -- see the field's own docstring for
+                # why both denominators are kept rather than one replacing the
+                # other.
+                pct_of_label_target=((row_value / label_target_value * 100.0)
+                                     if label_target_value else 0.0),
                 pct_of_total=(row_value / total_value * 100.0) if total_value else 0.0,
                 comment=comments.get((entry.label, sym)),
                 weight_pct=resolved[sym].weight_pct,

@@ -19,7 +19,8 @@ from ba2_common.core.portfolio_allocation import (
     ERROR_INVEST_AMOUNT_FMT,
     ERROR_INVEST_LABEL_EMPTY_FMT,
     ERROR_INVEST_NO_LABEL,
-    ERROR_SYMBOL_TOTAL_FMT,
+    ERROR_SYMBOL_OVER_FMT,
+    WARNING_SYMBOL_UNDER_FMT,
     REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT,
     REASON_BELOW_MIN_ORDER_FMT,
     VALUATION_MODE_COST,
@@ -1166,7 +1167,8 @@ def test_steps_validation_does_not_report_a_symbol_total_twice():
     (Task 22). A second loop here emitted the identical string a second time."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 40.0), SymbolTarget("BBB", 40.0)])]
     messages = steps_validation_messages(labels)
-    assert messages.count(ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=80.0)) == 1
+    assert messages.count(
+        WARNING_SYMBOL_UNDER_FMT.format(label="A", total=80.0, under=20.0)) == 1
 
 
 def test_steps_validation_is_empty_for_a_fully_valid_set():
@@ -1189,10 +1191,12 @@ def test_steps_validation_includes_the_label_target_messages_too():
     assert any("under 100%" in m for m in under)
     assert blocking_messages(under) == under
 
+    # BUG FIX 2026-09-05: a symbol-total shortfall is now ADVISORY, not blocking
+    # -- unlike step 1's label-level under case just above.
     bad_weights = steps_validation_messages(
         [LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0)])])
-    assert any("must total 100%" in m for m in bad_weights)
-    assert blocking_messages(bad_weights) == bad_weights
+    assert any("under 100%" in m for m in bad_weights)
+    assert blocking_messages(bad_weights) == []
 
 
 def test_validate_invest_amount_accepts_a_positive_amount_within_buying_power():
@@ -1221,7 +1225,8 @@ def test_invest_validation_blocks_a_symbol_weight_set_that_does_not_total_100():
                                          SymbolTarget("BBB", 50.0)])
     messages = invest_validation_messages(label, 10_000.0,
                                           available_buying_power=50_000.0)
-    assert messages == [ERROR_SYMBOL_TOTAL_FMT.format(label="Income", total=150.0)]
+    assert messages == [ERROR_SYMBOL_OVER_FMT.format(label="Income", total=150.0, over=50.0)]
+    assert blocking_messages(messages) == messages
 
 
 def test_invest_validation_ignores_the_labels_own_percentage():
@@ -1248,7 +1253,7 @@ def test_invest_validation_rejects_a_label_that_can_absorb_nothing():
 def test_invest_validation_reports_the_weights_and_the_amount_together():
     label = LabelTarget("Income", 40.0, [SymbolTarget("AAA", 90.0)])
     messages = invest_validation_messages(label, 0.0, available_buying_power=50_000.0)
-    assert ERROR_SYMBOL_TOTAL_FMT.format(label="Income", total=90.0) in messages
+    assert WARNING_SYMBOL_UNDER_FMT.format(label="Income", total=90.0, under=10.0) in messages
     assert ERROR_INVEST_AMOUNT_FMT.format(amount=0.0) in messages
 
 

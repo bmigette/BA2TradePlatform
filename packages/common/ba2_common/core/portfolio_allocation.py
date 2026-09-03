@@ -115,8 +115,8 @@ __all__ = [
     "WARNING_EMPTY_LABEL_FMT", "WARNING_PRECHECK_DISAGREED_FMT",
     "ERROR_LABEL_TOTAL_FMT", "ERROR_LABEL_UNDER_FMT", "ERROR_UNALLOCATED_RANGE_FMT",
     "ERROR_LABEL_NEGATIVE_FMT", "ERROR_LABEL_DUPLICATE_FMT",
-    "ERROR_LABEL_NO_SYMBOLS_FMT", "ERROR_SYMBOL_TOTAL_FMT", "ERROR_SYMBOL_NEGATIVE_FMT",
-    "ERROR_SYMBOL_DUPLICATE_FMT",
+    "ERROR_LABEL_NO_SYMBOLS_FMT", "ERROR_SYMBOL_OVER_FMT", "WARNING_SYMBOL_UNDER_FMT",
+    "ERROR_SYMBOL_NEGATIVE_FMT", "ERROR_SYMBOL_DUPLICATE_FMT",
     # engine
     "current_value", "UnrealisedPnL", "unrealised_pnl", "format_unrealised_pnl",
     "PNL_UNMEASURABLE_MARK", "PNL_NO_PRICE_MARK", "PNL_PCT_FMT", "PNL_NO_COST_NOTE",
@@ -440,7 +440,37 @@ ERROR_UNALLOCATED_RANGE_FMT = (
 ERROR_LABEL_NEGATIVE_FMT = "label '{label}' has a negative target ({pct:.2f}%)"
 ERROR_LABEL_DUPLICATE_FMT = "duplicate label '{label}'"
 ERROR_LABEL_NO_SYMBOLS_FMT = "label '{label}' has target {pct:.2f}% but no symbols"
-ERROR_SYMBOL_TOTAL_FMT = "label '{label}' symbol weights total {total:.2f}% - must total 100%"
+
+#: OVER 100 WITHIN one label. Hard, mirroring ERROR_LABEL_TOTAL_FMT at the symbol
+#: scope: compute_allocation multiplies the weights straight through with no cap,
+#: so a symbol split over 100% deploys MORE than the label's own target -- a 150%
+#: split turns a label's share of the base into 1.5x that money, the same
+#: over-deploy risk the cross-label check exists to catch, just scoped to one
+#: label instead of the whole account.
+ERROR_SYMBOL_OVER_FMT = ("label '{label}' symbol weights total {total:.2f}% - over 100% "
+                         "by {over:.2f}%")
+
+#: UNDER 100 WITHIN one label -- ADVISORY, unlike every other total-100 check in
+#: this module (2026-09-05, live use: a 90% split was blocking Submit and the
+#: operator asked for it not to). The two "under 100" checks LOOK identical but
+#: are not: the cross-label one (ERROR_LABEL_UNDER_FMT) leaves a share of the
+#: WHOLE ACCOUNT unaccounted for and the design deliberately reversed a prior
+#: "shortfall is the reserve" reading to catch that as a mistake. A shortfall
+#: HERE only ever leaves part of THIS ONE LABEL's own money undeployed -- exactly
+#: the same harmless shape as an empty label's WARNING_EMPTY_LABEL_FMT, and
+#: sometimes exactly what the user wants (a slice of a label held back on
+#: purpose). Blocking Submit over it told the user to go fix a number that was
+#: never wrong.
+#:
+#: The fragment is what ``is_blocking_message`` reads to tell this apart from
+#: ``ERROR_SYMBOL_OVER_FMT`` (shares "symbol weights total") and from
+#: ``ERROR_LABEL_UNDER_FMT`` (shares "under 100% by") -- neither of those two may
+#: become advisory, so the fragment has to be text that occurs in THIS message
+#: alone. Chosen to also read as a plain-English explanation on screen rather
+#: than an opaque marker.
+_SYMBOL_UNDER_FRAGMENT = "undeployed within this label"
+WARNING_SYMBOL_UNDER_FMT = ("label '{label}' symbol weights total {total:.2f}% - under 100% "
+                            "by {under:.2f}%; the shortfall stays " + _SYMBOL_UNDER_FRAGMENT)
 ERROR_SYMBOL_NEGATIVE_FMT = "label '{label}' symbol '{symbol}' has a negative weight ({pct:.2f}%)"
 ERROR_SYMBOL_DUPLICATE_FMT = "label '{label}' has duplicate symbol '{symbol}'"
 
@@ -1512,25 +1542,39 @@ def validate_symbol_weights(label: LabelTarget, *,
     SINGLE label and spends an explicit amount on it, so that label's percentage
     is meaningless and the labels-total-100 rule would fire spuriously.
 
-    This is the INVEST_LABEL submit gate. Without it ``compute_label_investment``
-    multiplies whatever weights it is handed straight through, so a hand-edited
-    150% set turns a 10,000 budget into 15,000 of buys, and a 60% set silently
-    leaves 40% of the amount as cash with nothing on the plan to say so.
+    This is the INVEST_LABEL submit gate. Without the OVER half
+    (``ERROR_SYMBOL_OVER_FMT``) ``compute_label_investment`` multiplies whatever
+    weights it is handed straight through, so a hand-edited 150% set turns a
+    10,000 budget into 15,000 of buys.
+
+    OVER 100 blocks (``ERROR_SYMBOL_OVER_FMT``); UNDER 100 is ADVISORY
+    (``WARNING_SYMBOL_UNDER_FMT``, 2026-09-05) -- a 60% set leaves 40% of the
+    label's own money undeployed, which is a fact worth showing and not a reason
+    to refuse Submit; see ``WARNING_SYMBOL_UNDER_FMT``'s own docstring for why
+    that is a different risk from the cross-label shortfall
+    ``validate_label_targets`` still blocks.
 
     A label with NO symbols returns no errors -- it has no weights to be wrong.
     Whether an empty label may be invested into is the caller's decision.
 
     Returns:
-        List[str]: ``ERROR_SYMBOL_*`` strings naming the offending label and
-        symbol, ready to show verbatim; EMPTY means valid. ``validate_label_targets``
+        List[str]: ``ERROR_SYMBOL_*`` / ``WARNING_SYMBOL_UNDER_FMT`` strings
+        naming the offending label and symbol, ready to show verbatim; EMPTY
+        means valid. Not all of them BLOCK -- pass through ``blocking_messages``
+        before refusing Submit on the strength of one. ``validate_label_targets``
         calls this for its per-label symbol checks, so the two can never drift.
     """
     errors = []
     if not label.symbols:
         return errors
     weight_total = sum(float(st.weight_pct or 0.0) for st in label.symbols)
-    if abs(weight_total - 100.0) > tolerance:
-        errors.append(ERROR_SYMBOL_TOTAL_FMT.format(label=label.label, total=weight_total))
+    over = weight_total - 100.0
+    if over > tolerance:
+        errors.append(ERROR_SYMBOL_OVER_FMT.format(label=label.label, total=weight_total,
+                                                    over=over))
+    elif -over > tolerance:
+        errors.append(WARNING_SYMBOL_UNDER_FMT.format(label=label.label, total=weight_total,
+                                                       under=-over))
     seen_symbols = set()
     for st in label.symbols:
         weight = float(st.weight_pct or 0.0)
@@ -1564,19 +1608,22 @@ def validate_label_targets(labels: List[LabelTarget], *,
     whatever the reserve leaves investable, and they do not change when the reserve
     does. That is the point -- the user never does the arithmetic.
 
-    SYMBOL weights inside a label follow exactly the same rule, and always did:
-    a label whose weights total 60 leaves 40% of THAT label's money undeployed with
-    nothing on the plan to record it, because ``compute_allocation`` multiplies the
-    weights straight through.
+    SYMBOL weights inside a label do NOT follow exactly the same rule (changed
+    2026-09-05). A label whose weights total 60 leaves 40% of THAT label's money
+    undeployed -- unlike the cross-label shortfall above, that is scoped to one
+    label's own money, not the whole account, and it is now ADVISORY rather than
+    blocking; see ``WARNING_SYMBOL_UNDER_FMT``. Over 100% still blocks: it
+    deploys MORE than the label's target, which ``compute_allocation`` multiplies
+    straight through with no cap.
 
     SYMBOL level, per label that HAS symbols: delegated in full to
     ``validate_symbol_weights`` (weights total 100 +/- the same ``tolerance``; no
     negative weight; no symbol repeated within the label) so that the REBALANCE
     gate here and the INVEST_LABEL gate there can never disagree. The same symbol
     appearing in DIFFERENT labels is legal and its targets sum (decision 7) --
-    only a repeat inside one label is an error. Without these checks a hand-edited
-    weight set totalling 150% would silently over-deploy its label, since
-    ``compute_allocation`` multiplies the weights straight through.
+    only a repeat inside one label is an error. Without the OVER check a
+    hand-edited weight set totalling 150% would silently over-deploy its label,
+    since ``compute_allocation`` multiplies the weights straight through.
 
     A label with no symbols is skipped here (an empty label at 0% stays valid; a
     non-zero one is already reported by ``ERROR_LABEL_NO_SYMBOLS_FMT``).
@@ -1585,10 +1632,12 @@ def validate_label_targets(labels: List[LabelTarget], *,
     build defaults with ``even_split_pct`` and both levels pass by construction.
 
     Returns:
-        List[str]: human-readable error strings built from the ``ERROR_LABEL_*``
-        and ``ERROR_SYMBOL_*`` formats, each naming the offending label (and
-        symbol) so the UI can show it verbatim; EMPTY means valid. Submit must be
-        blocked while this is non-empty (decision 3).
+        List[str]: human-readable error/warning strings built from the
+        ``ERROR_LABEL_*``, ``ERROR_SYMBOL_*`` and ``WARNING_SYMBOL_UNDER_FMT``
+        formats, each naming the offending label (and symbol) so the UI can show
+        it verbatim; EMPTY means valid. NOT every entry blocks Submit any more --
+        pass the result through ``blocking_messages`` before refusing on the
+        strength of it (decision 3 still requires that call to be non-empty).
     """
     errors = []
     total = sum(float(lt.target_pct or 0.0) for lt in labels or [])
@@ -3028,7 +3077,7 @@ WARNING_INVEST_EXCEEDS_BP_FMT = ("amount {amount:,.2f}" + _INVEST_EXCEEDS_BP_FRA
 #: Fragments identifying a message that EXPLAINS rather than blocks. Everything
 #: the validators produce blocks by default: a new error added without touching
 #: this tuple stops Submit, which is the safe direction to be wrong in.
-ADVISORY_MESSAGE_FRAGMENTS = (_INVEST_EXCEEDS_BP_FRAGMENT,)
+ADVISORY_MESSAGE_FRAGMENTS = (_INVEST_EXCEEDS_BP_FRAGMENT, _SYMBOL_UNDER_FRAGMENT)
 
 
 def even_split_targets(labels: List[LabelTarget]) -> List[LabelTarget]:
