@@ -183,6 +183,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "had been fetched. Each chunk's contract lists are released once "
                         "that chunk has been fetched, so plan memory stays flat at one "
                         "chunk's worth. Nothing about WHAT gets written changes.")
+    p.add_argument("--total-units", type=int,
+                   help="How many units the WHOLE run is expected to fetch, so the run-wide "
+                        "'cumulative:' line can print an ETA. Chunking resets the per-chunk "
+                        "progress line's own i/total every chunk, and no chunk knows how much "
+                        "work the later ones hold, so the total has to be supplied: take it "
+                        "from the 'TOTAL ... units to fetch' figure of a prior --dry-run over "
+                        "the same symbols and window. Without it the cumulative line still "
+                        "reports throughput, just no ETA.")
     p.add_argument("--strike-band-pct", type=float, default=40.0,
                    help="Keep strikes within this %% of the underlying's price range "
                         "(default 40). Only used by --discovery synthetic.")
@@ -553,6 +561,16 @@ def _fmt_secs(seconds: float) -> str:
     return f"{s}s"
 
 
+def _fmt_hhmm(seconds: float) -> str:
+    """``h:mm`` — the shape an operator reads off a multi-day run.
+
+    Deliberately NOT ``_fmt_secs``: that one's compact ``12h34m`` belongs to ``run_units``'
+    own per-chunk progress line, whose format is pinned by tests and left untouched.
+    """
+    total_minutes = int(max(0.0, seconds) // 60)
+    return f"{total_minutes // 60}:{total_minutes % 60:02d}"
+
+
 def _fmt_bytes(n: int) -> str:
     x = float(n)
     for unit in ("bytes", "KB", "MB", "GB", "TB"):
@@ -733,17 +751,45 @@ def run_units_concurrent(plan: Plan, provider, store: OptionHistoryParquetStore,
     for r in results:
         if r is None:
             continue
-        merged.units_written += r.units_written
-        merged.units_empty += r.units_empty
-        merged.units_failed += r.units_failed
-        merged.rows += r.rows
-        merged.empty_contracts += r.empty_contracts
+        merged.merge(r)
     return merged
 
 
 # --------------------------------------------------------------------------- #
 # reporting
 # --------------------------------------------------------------------------- #
+def _progress_line(stats: RunStats, plan: Plan, ns: argparse.Namespace,
+                   t0: datetime, clock: Callable[[], datetime]) -> str:
+    """The body of the run-wide ``cumulative:`` line logged after every chunk.
+
+    ``run_units`` reports ``i/total`` over the units it was handed, so under chunking that
+    total is one chunk's and the line restarts every chunk. This one spans the whole run --
+    but no chunk can know how much work the LATER chunks hold, so the denominator for an ETA
+    has to come from outside: ``--total-units``, taken from a prior --dry-run's TOTAL. Without
+    it the throughput is still real and only the ETA is withheld, rather than invented from a
+    denominator that grows as the run discovers more work.
+    """
+    elapsed = (clock() - t0).total_seconds()
+    processed = stats.units_written + stats.units_empty + stats.units_failed
+    rate_per_hour = (processed / elapsed * 3600.0) if elapsed > 0 else 0.0
+
+    if ns.total_units is None:
+        eta = "ETA n/a (pass --total-units)"
+    else:
+        remaining = max(0, ns.total_units - processed)
+        if remaining == 0:
+            eta = f"ETA {_fmt_hhmm(0)} for --total-units {ns.total_units}"
+        elif rate_per_hour > 0:
+            eta = (f"ETA {_fmt_hhmm(remaining / rate_per_hour * 3600.0)} "
+                   f"for --total-units {ns.total_units}")
+        else:
+            eta = f"ETA n/a (no throughput yet) for --total-units {ns.total_units}"
+
+    return (f"{stats.units_written} written, {stats.units_empty} empty, "
+            f"{stats.units_failed} failed of {plan.units_pending} planned so far | "
+            f"elapsed {_fmt_hhmm(elapsed)} | {rate_per_hour:.0f} units/h | {eta}")
+
+
 def print_plan(plan: Plan, store: OptionHistoryParquetStore, symbols: Sequence[str],
                start: date, end: date, ns: argparse.Namespace,
                log: Callable[[str], None]) -> None:
@@ -857,6 +903,11 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
     total_budget = ns.limit if ns.limit and ns.limit > 0 else None
     aggregate = Plan()
     stats = RunStats()
+    # RUN-WIDE, not per chunk. run_units' own `progress i/total ... ETA` line is scoped to the
+    # units it was handed, so under chunking it restarts at 1/N every chunk and its ETA only
+    # ever covers the chunk in flight -- useless for "when does this 857-symbol run finish".
+    # This clock spans the whole run.
+    t0 = clock()
     for k, chunk in enumerate(chunks, 1):
         # --limit is a budget for the RUN: each chunk may only plan what is left of it, and
         # once it is spent the remaining chunks are not even discovered.
@@ -873,12 +924,11 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
                 aggregate.units = chunk_plan.units[:1]
             continue
         log(f"plan chunk {k}/{len(chunks)}: {chunk[0]}..{chunk[-1]} — "
-            f"{chunk_plan.units_pending} units pending (cumulative: done "
-            f"{aggregate.units_done}, written {stats.units_written}, "
-            f"failed {stats.units_failed})")
+            f"{chunk_plan.units_pending} units pending")
         stats.merge(run_units_concurrent(chunk_plan, provider, store, start, end, ns,
                                         clock=clock, sleep=sleep, log=log,
                                         concurrency=ns.concurrency))
+        log(f"cumulative: {_progress_line(stats, aggregate, ns, t0, clock)}")
 
     _LAST_PLAN = aggregate
     if aggregate.discovery_failed:

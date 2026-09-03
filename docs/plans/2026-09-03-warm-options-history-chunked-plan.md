@@ -81,8 +81,10 @@ Expected: FAIL (unknown `--plan-chunk-symbols`; `last_plan().units` not empty; e
 1. `Plan`: replace the two `@property`s with plain counter fields `units_pending: int = 0` and
    `contracts_pending: int = 0`, maintained by `build_plan` when it appends a unit (`+1`,
    `+len(contracts)`). Add `def absorb(self, other: "Plan") -> None` that sums the four counters,
-   updates `per_symbol` and `discovery_failed`, and keeps `self.units` as-is (the aggregate never
-   copies units; it keeps at most the first unit it ever saw, for `print_plan`'s "would write" line).
+   updates `per_symbol` and `discovery_failed`, and leaves `self.units` untouched — `absorb` never
+   copies units, so after a real run the aggregate's `units` is empty. `main` alone puts a single
+   unit there, and only on the dry-run path: the very first unit planned, kept solely so
+   `print_plan` can still name the file it would write.
    Grep for every use of `units_pending`/`contracts_pending` (print_plan, main, tests) — they keep
    working as attributes.
 2. `build_plan(..., budget: Optional[int] = None)`: take the budget as a parameter (default: derived

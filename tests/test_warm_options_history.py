@@ -450,7 +450,10 @@ def test_progress_lines_carry_done_remaining_and_an_eta(provider, store):
                "--rate-limit", "0", "--discovery", "rest", "--progress-every", "1"],
               provider=provider, store=store, clock=clock,
               sleep=lambda s: clock.advance(s), log=lines.append)
-    progress = [ln for ln in lines if "ETA" in ln]
+    # run_units' OWN progress lines. main() also logs a run-wide "cumulative: ... ETA ..."
+    # line per chunk, so "ETA" alone no longer identifies this one; the assertions below are
+    # unchanged and still about run_units' per-unit i/total counter.
+    progress = [ln for ln in lines if ln.startswith("progress ") and "ETA" in ln]
     assert len(progress) >= 3, lines
     assert "1/3" in progress[0], progress[0]
     assert "3/3" in progress[-1], progress[-1]
@@ -984,6 +987,27 @@ def test_main_plans_in_symbol_chunks_and_never_holds_more_than_one_chunk_of_unit
         "every unit must still be fetched and written -- chunking changes WHEN, not WHAT"
     assert warm.last_plan().units == [], \
         "the aggregate plan must never retain a chunk's units (that list is the memory)"
+
+
+def test_a_run_wide_cumulative_line_carries_progress_and_an_eta_across_chunks(provider, store):
+    """run_units' own `progress i/total ... ETA` line is scoped to the units it was handed, so
+    under chunking it restarts at 1/N every chunk and its ETA only ever covers the chunk in
+    flight -- an 857-symbol run would have no whole-run ETA at all. One cumulative line per
+    chunk, spanning the run, fixes that. The denominator can only come from outside (no chunk
+    knows what the later ones hold), hence --total-units from a prior --dry-run's TOTAL."""
+    _seed_chunk_symbols(provider)
+    rc, lines = _run(provider, store,
+                     ["--symbols", ",".join(CHUNK_SYMBOLS),
+                      "--plan-chunk-symbols", "2", "--total-units", "10"])
+    assert rc == 0
+
+    cumulative = [l for l in lines if l.startswith("cumulative:")]
+    assert len(cumulative) == 3, f"one per chunk (2+2+1 symbols), got {cumulative}"
+    assert "10 written" in cumulative[-1], cumulative[-1]
+    assert "of 10 planned so far" in cumulative[-1], cumulative[-1]
+    assert "ETA 0:00 for --total-units 10" in cumulative[-1], cumulative[-1]
+    # The per-chunk header must no longer carry stale cumulative figures of its own.
+    assert not any("cumulative" in l for l in lines if l.startswith("plan chunk ")), lines
 
 
 def test_last_plan_aggregates_counts_and_per_symbol_across_chunks(provider, store):
