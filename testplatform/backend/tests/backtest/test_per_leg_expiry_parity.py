@@ -199,9 +199,16 @@ class _Account(OptionsAccountInterface):
 
 
 @pytest.fixture
-def written_pmcc(tmp_path):
+def written_pmcc(tmp_path, _seed_backtest_credentials):
     """A real PMCC, written by the real shared writer, then given a STALE structure-level
-    expiry that matches neither leg — the trap described in the module docstring."""
+    expiry that matches neither leg — the trap described in the module docstring.
+
+    Repoints ``ba2_common.core.db`` back to the session's seeded-credentials DB on teardown
+    (see ``conftest.py::_seed_backtest_credentials``): this fixture's ``configure_db`` is a
+    raw GLOBAL reassignment (not the per-thread/backtest-run overrides that restore
+    themselves), so leaving it pointed at this test's throwaway db starved every later test in
+    the session of the seeded FMP/finnhub keys.
+    """
     from ba2_common.core import db
     db.configure_db(str(tmp_path / "parity.sqlite"))
     db.init_db()
@@ -222,7 +229,10 @@ def written_pmcc(tmp_path):
     parent.expiry = STALE_EXPIRY
     update_instance(parent)
 
-    return SimpleNamespace(parent=parent, txn_id=parent.transaction_id, db=db)
+    try:
+        yield SimpleNamespace(parent=parent, txn_id=parent.transaction_id, db=db)
+    finally:
+        db.configure_db(str(_seed_backtest_credentials))
 
 
 def test_the_writer_persisted_one_row_per_leg_with_its_own_expiry(written_pmcc):
@@ -336,49 +346,64 @@ def _submit_and_describe(account):
     return parent.expiry, txn.expiry, {(c.side, c.expiry) for c in children}
 
 
-def test_the_two_runtimes_persist_IDENTICAL_per_leg_rows(tmp_path):
-    """The interface path and the backtest override, same legs, same result."""
+def test_the_two_runtimes_persist_IDENTICAL_per_leg_rows(tmp_path, _seed_backtest_credentials):
+    """The interface path and the backtest override, same legs, same result.
+
+    Restores the seeded-credentials DB on exit -- see ``written_pmcc``'s docstring for why a
+    raw ``configure_db`` here must not outlive this test.
+    """
     from ba2_common.core import db
 
-    db.configure_db(str(tmp_path / "live_side.sqlite"))
-    db.init_db()
-    live_side = _submit_and_describe(_Account())
+    try:
+        db.configure_db(str(tmp_path / "live_side.sqlite"))
+        db.init_db()
+        live_side = _submit_and_describe(_Account())
 
-    db.configure_db(str(tmp_path / "backtest_side.sqlite"))
-    db.init_db()
-    backtest_account = _backtest_shaped_account()
-    backtest_side = _submit_and_describe(backtest_account)
+        db.configure_db(str(tmp_path / "backtest_side.sqlite"))
+        db.init_db()
+        backtest_account = _backtest_shaped_account()
+        backtest_side = _submit_and_describe(backtest_account)
 
-    assert backtest_side == live_side
-    assert live_side[0] is None and live_side[1] is None, \
-        "neither runtime may stamp a single expiry on a two-expiry structure"
-    assert live_side[2] == {(OrderDirection.BUY, LONG_EXPIRY),
-                            (OrderDirection.SELL, SHORT_EXPIRY)}
-    assert backtest_account.cache_invalidations == 1, \
-        "the override's own job (dropping the order cache) still happened"
+        assert backtest_side == live_side
+        assert live_side[0] is None and live_side[1] is None, \
+            "neither runtime may stamp a single expiry on a two-expiry structure"
+        assert live_side[2] == {(OrderDirection.BUY, LONG_EXPIRY),
+                                (OrderDirection.SELL, SHORT_EXPIRY)}
+        assert backtest_account.cache_invalidations == 1, \
+            "the override's own job (dropping the order cache) still happened"
+    finally:
+        db.configure_db(str(_seed_backtest_credentials))
 
 
-def test_the_guard_refuses_an_undeclared_structure_in_the_BACKTEST_runtime_too(tmp_path):
-    """Fail-closed is not a live-only property. The override must not open a hole."""
+def test_the_guard_refuses_an_undeclared_structure_in_the_BACKTEST_runtime_too(
+        tmp_path, _seed_backtest_credentials):
+    """Fail-closed is not a live-only property. The override must not open a hole.
+
+    Restores the seeded-credentials DB on exit -- see ``written_pmcc``'s docstring for why a
+    raw ``configure_db`` here must not outlive this test.
+    """
     from sqlmodel import Session, select
 
     from ba2_common.core import db
 
-    db.configure_db(str(tmp_path / "backtest_refusal.sqlite"))
-    db.init_db()
-    account = _backtest_shaped_account()
+    try:
+        db.configure_db(str(tmp_path / "backtest_refusal.sqlite"))
+        db.init_db()
+        account = _backtest_shaped_account()
 
-    with pytest.raises(ValueError, match="single expiry"):
-        account.submit_option_order(_pmcc_legs(), quantity=1, order_type="limit",
-                                    limit_price=18.0, option_strategy="calendar_spread")
+        with pytest.raises(ValueError, match="single expiry"):
+            account.submit_option_order(_pmcc_legs(), quantity=1, order_type="limit",
+                                        limit_price=18.0, option_strategy="calendar_spread")
 
-    with Session(db.get_engine()) as session:
-        assert session.exec(select(TradingOrder)).all() == [], \
-            "a refused structure left order rows behind in the backtest runtime"
-        assert session.exec(select(Transaction)).all() == [], \
-            "a refused structure left a Transaction behind in the backtest runtime"
-    assert account.cache_invalidations == 0, \
-        "a refusal must not even reach the override's post-step"
+        with Session(db.get_engine()) as session:
+            assert session.exec(select(TradingOrder)).all() == [], \
+                "a refused structure left order rows behind in the backtest runtime"
+            assert session.exec(select(Transaction)).all() == [], \
+                "a refused structure left a Transaction behind in the backtest runtime"
+        assert account.cache_invalidations == 0, \
+            "a refusal must not even reach the override's post-step"
+    finally:
+        db.configure_db(str(_seed_backtest_credentials))
 
 
 def test_the_shared_accessor_gives_those_same_two_answers_directly(written_pmcc):

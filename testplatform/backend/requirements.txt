@@ -17,6 +17,14 @@ python-dotenv>=1.0.1
 sqlalchemy>=2.0.36
 alembic>=1.14.0
 
+# NYSE market calendar (ba2_common.core.market_calendar._nyse_calendar). Proper home is
+# packages/common/pyproject.toml's `dependencies` (already pinned there, commit aed95d82) —
+# a `pip install -e packages/common` picks it up transitively. Pinned again here only so a
+# plain `pip install -r requirements.txt` (or a bare PYTHONPATH-based checkout that never runs
+# `pip install -e packages/common`) also has it; without it, tests/backtest/test_backtest_iv_rank.py
+# falls back to a weekday-count calendar (silently wrong holiday handling) instead of failing.
+pandas-market-calendars>=5.1.1
+
 # Data Processing
 pandas>=2.2.0,<3.0.0
 numpy>=2.0.0
@@ -60,6 +68,14 @@ pandas-ta>=0.4.67b0
 
 # Sentiment Analysis
 transformers>=4.47.0
+
+# Broker SDKs — not used by the backtest engine itself, but importing the live
+# ba2_trade_platform.modules.accounts package (tests/backtest/conftest.py puts the live tree on
+# sys.path for the live<->backtest parity tests) runs modules/accounts/__init__.py, which
+# unconditionally imports AlpacaAccount, IBKRAccount and TastyTradeAccount together. Small, pure
+# add-on SDKs — no nicegui/heavy transitive deps pulled in.
+ib_async>=2.1.0
+tastytrade>=13.2.0
 
 # Data Providers
 yfinance>=0.2.40
