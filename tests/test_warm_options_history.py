@@ -450,7 +450,10 @@ def test_progress_lines_carry_done_remaining_and_an_eta(provider, store):
                "--rate-limit", "0", "--discovery", "rest", "--progress-every", "1"],
               provider=provider, store=store, clock=clock,
               sleep=lambda s: clock.advance(s), log=lines.append)
-    progress = [ln for ln in lines if "ETA" in ln]
+    # run_units' OWN progress lines. main() also logs a run-wide "cumulative: ... ETA ..."
+    # line per chunk, so "ETA" alone no longer identifies this one; the assertions below are
+    # unchanged and still about run_units' per-unit i/total counter.
+    progress = [ln for ln in lines if ln.startswith("progress ") and "ETA" in ln]
     assert len(progress) >= 3, lines
     assert "1/3" in progress[0], progress[0]
     assert "3/3" in progress[-1], progress[-1]
@@ -922,3 +925,175 @@ def test_the_vendor_debug_cap_survives_the_sdks_own_lazy_import(provider, store)
     rc, _lines = _run(provider, store)
     assert rc == 0
     assert logging.getLogger("tastytrade").level == logging.WARNING
+
+
+# --------------------------------------------------------------------------- #
+# --plan-chunk-symbols — the plan itself was the memory hog (measured 2026-09-03)
+#
+# On the live 857-symbol ThetaData backfill the process reached 6 GB private after 10 minutes
+# and 10.3 GB a few minutes later while STILL INSIDE build_plan -- before a single bar had been
+# fetched -- and starved the two GA grids sharing the box down to 0.9 % free RAM. The bars are
+# not what accumulates (run_units writes each unit and drops it): it is Plan.units, one WorkUnit
+# per pending (underlying, expiry) holding its FULL contract list (every strike x right),
+# ~49,640 units for the universe, all built eagerly for ALL symbols before the first fetch.
+# So main() must plan and fetch a few symbols at a time and never hold more than one chunk's
+# contract lists at once.
+# --------------------------------------------------------------------------- #
+CHUNK_SYMBOLS = ["CAAA", "CBBB", "CCCC", "CDDD", "CEEE"]
+CHUNK_EXPIRIES = EXPIRIES[:2]
+
+
+def _seed_chunk_symbols(provider, symbols=CHUNK_SYMBOLS, expiries=CHUNK_EXPIRIES):
+    """Give every symbol in ``symbols`` the same ``expiries``, one strike each, with one real
+    bar apiece.
+
+    ``FakeProvider.batches`` is keyed by expiry ALONE, so every symbol's bar for a shared
+    expiry lives in the same CandleBatch; ``fetch_bars_detailed`` then filters it down to the
+    contracts actually being asked for, which is exactly how the real provider behaves.
+    """
+    for symbol in symbols:
+        provider.contracts[symbol] = [_contract(symbol, e, 150.0) for e in expiries]
+    for e in expiries:
+        provider.batches[e] = CandleBatch(
+            bars=[_bar(occ_symbol(s, e, "C", 150.0), date(2023, 1, 3)) for s in symbols],
+            empty=set())
+
+
+def _manifests_under(root):
+    return [p for p in _files_under(root) if os.path.basename(p) == "_manifest.json"]
+
+
+def test_main_plans_in_symbol_chunks_and_never_holds_more_than_one_chunk_of_units(
+        provider, store, monkeypatch):
+    """THE FIX. 5 symbols at --plan-chunk-symbols 2 must be planned as 2+2+1, each chunk
+    FETCHED before the next one is planned, and the surviving aggregate plan must hold no
+    WorkUnit at all -- that list of contract lists is the 10 GB."""
+    _seed_chunk_symbols(provider)
+    planned_sizes: List[int] = []
+    real_run = warm.run_units_concurrent
+
+    def _recording(plan, *a, **kw):
+        planned_sizes.append(plan.units_pending)
+        return real_run(plan, *a, **kw)
+
+    monkeypatch.setattr(warm, "run_units_concurrent", _recording)
+    rc, _lines = _run(provider, store,
+                      ["--symbols", ",".join(CHUNK_SYMBOLS), "--plan-chunk-symbols", "2"])
+
+    assert rc == 0
+    assert planned_sizes == [4, 4, 2], \
+        f"expected one run per 2-symbol chunk (2+2+1 symbols x 2 expiries), got {planned_sizes}"
+    assert len(_manifests_under(store.root)) == 10, \
+        "every unit must still be fetched and written -- chunking changes WHEN, not WHAT"
+    assert warm.last_plan().units == [], \
+        "the aggregate plan must never retain a chunk's units (that list is the memory)"
+
+
+def test_a_run_wide_cumulative_line_carries_progress_and_an_eta_across_chunks(provider, store):
+    """run_units' own `progress i/total ... ETA` line is scoped to the units it was handed, so
+    under chunking it restarts at 1/N every chunk and its ETA only ever covers the chunk in
+    flight -- an 857-symbol run would have no whole-run ETA at all. One cumulative line per
+    chunk, spanning the run, fixes that. The denominator can only come from outside (no chunk
+    knows what the later ones hold), hence --total-units from a prior --dry-run's TOTAL."""
+    _seed_chunk_symbols(provider)
+    rc, lines = _run(provider, store,
+                     ["--symbols", ",".join(CHUNK_SYMBOLS),
+                      "--plan-chunk-symbols", "2", "--total-units", "10"])
+    assert rc == 0
+
+    cumulative = [l for l in lines if l.startswith("cumulative:")]
+    assert len(cumulative) == 3, f"one per chunk (2+2+1 symbols), got {cumulative}"
+    assert "10 written" in cumulative[-1], cumulative[-1]
+    assert "of 10 planned so far" in cumulative[-1], cumulative[-1]
+    assert "ETA 0:00 for --total-units 10" in cumulative[-1], cumulative[-1]
+    # The per-chunk header must no longer carry stale cumulative figures of its own.
+    assert not any("cumulative" in l for l in lines if l.startswith("plan chunk ")), lines
+
+
+def test_last_plan_aggregates_counts_and_per_symbol_across_chunks(provider, store):
+    """The reported totals must be the whole universe's, not the last chunk's."""
+    _seed_chunk_symbols(provider)
+    # One partition already COMPLETE and one already EMPTY, in two different chunks.
+    store.write_partition("CAAA", CHUNK_EXPIRIES[0],
+                          [_bar(occ_symbol("CAAA", CHUNK_EXPIRIES[0], "C", 150.0),
+                                date(2023, 1, 3))],
+                          START, END, empty_contracts=[])
+    store.write_partition("CCCC", CHUNK_EXPIRIES[0], [], START, END,
+                          empty_contracts=[occ_symbol("CCCC", CHUNK_EXPIRIES[0], "C", 150.0)])
+
+    rc, _lines = _run(provider, store,
+                      ["--symbols", ",".join(CHUNK_SYMBOLS), "--plan-chunk-symbols", "2"])
+    assert rc == 0
+
+    plan = warm.last_plan()
+    assert plan.units_pending == 8, "10 units minus the one complete and the one empty"
+    assert plan.units_done == 1
+    assert plan.units_empty == 1
+    assert plan.contracts_pending == 8, "one contract per pending unit"
+    assert sorted(plan.per_symbol) == sorted(CHUNK_SYMBOLS), \
+        f"every chunk's per-symbol rows must survive into the aggregate: {plan.per_symbol}"
+
+
+def test_limit_is_a_global_budget_across_chunks(provider, store):
+    """--limit is a budget for the RUN, not for each chunk -- otherwise --limit 3 against 857
+    symbols would fetch 3 units per chunk, i.e. the whole universe."""
+    symbols = CHUNK_SYMBOLS[:3]
+    _seed_chunk_symbols(provider, symbols=symbols)
+
+    rc, _lines = _run(provider, store,
+                      ["--symbols", ",".join(symbols),
+                       "--plan-chunk-symbols", "1", "--limit", "3"])
+    assert rc == 0
+    assert len(_manifests_under(store.root)) == 3, "exactly the budget, across chunk boundaries"
+    assert warm.last_plan().units_pending == 3
+    assert symbols[2] not in provider.discovered, \
+        ("once the budget is spent the loop must stop, so a later chunk's symbol is never "
+         f"even discovered: {provider.discovered}")
+
+
+def test_dry_run_across_chunks_reports_totals_without_retaining_units(provider, store):
+    """A dry run streams the same way: real totals, one sample file path, no unit hoard."""
+    symbols = CHUNK_SYMBOLS[:3]
+    _seed_chunk_symbols(provider, symbols=symbols)
+
+    rc, lines = _run(provider, store,
+                     ["--symbols", ",".join(symbols),
+                      "--plan-chunk-symbols", "1", "--dry-run"])
+    assert rc == 0
+    text = "\n".join(lines)
+    assert "6 units to fetch" in text, text
+    assert "6 contracts" in text, text
+
+    would_write = [l for l in lines if l.startswith("would write:")]
+    assert len(would_write) == 1, lines
+    assert store.bars_path(symbols[0], CHUNK_EXPIRIES[0]) in would_write[0], would_write[0]
+
+    plan = warm.last_plan()
+    assert len(plan.units) <= 1, \
+        f"the aggregate may keep the one sample unit it names, never a chunk: {plan.units}"
+
+
+def test_discovery_failure_in_one_chunk_does_not_abort_later_chunks(provider, store,
+                                                                    monkeypatch):
+    """The per-symbol discovery guard (the 2026-08-25 hyphenated-ticker incident) must survive
+    chunking: a bad symbol costs its own chunk's symbol, and the CHUNKS AFTER IT still run."""
+    real_discover = provider.discover_contracts
+
+    def _flaky(underlying, **kw):
+        if underlying == "BADCO":
+            raise ValueError("not an OCC option symbol: 'BADCO230120C00150000'")
+        return real_discover(underlying, **kw)
+
+    monkeypatch.setattr(provider, "discover_contracts", _flaky)
+    rc, _lines = _run(provider, store,
+                      ["--symbols", "BADCO,AAPL", "--plan-chunk-symbols", "1"])
+
+    assert rc == 0
+    for e in EXPIRIES:
+        assert store.partition_state("AAPL", e, START, END) is PartitionState.COMPLETE, \
+            "the good symbol sits in a LATER chunk and must still be fetched"
+    plan = warm.last_plan()
+    assert plan.discovery_failed == {
+        "BADCO": "not an OCC option symbol: 'BADCO230120C00150000'"}
+    assert "BADCO" not in plan.per_symbol
+    assert "AAPL" in plan.per_symbol
