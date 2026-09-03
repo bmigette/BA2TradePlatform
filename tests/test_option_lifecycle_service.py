@@ -37,7 +37,7 @@ from ba2_trade_platform.core.types import (
 )
 from ba2_common.core.option_lifecycle import (
     LIFECYCLE_BREAKER, LIFECYCLE_CREDIT_STOP, LIFECYCLE_HOLD, LIFECYCLE_PROFIT_CAPTURE,
-    LIFECYCLE_ROLL_DTE, LIFECYCLE_ROLL_SHORT, LIFECYCLE_TESTED, LIFECYCLE_UNKNOWN,
+    LIFECYCLE_ROLL_SHORT, LIFECYCLE_TESTED, LIFECYCLE_UNKNOWN,
 )
 
 from tests.conftest import MockAccount
@@ -74,6 +74,13 @@ BASE_SETTINGS = {
     "max_concurrent_structures": 10,
     "circuit_breaker_pct": 20.0,
 }
+
+
+#: Quote overrides that put a 2.00-credit spread at +75%, i.e. past ``profit_capture_pct``.
+#: THE EXIT VOCABULARY CHANGED ON 2026-09-03: ``expiry=EXPIRY_NEAR`` alone used to make this
+#: pass close a structure (``LIFECYCLE_ROLL_DTE``), and that exit now belongs to the
+#: ``opt_dte`` RULE in both runtimes. A test that needs the PASS to act says ``**CAPTURED``.
+CAPTURED = {"short_px": 0.40, "long_px": 0.10}
 
 
 def occ(underlying: str, expiry: date, right: str, strike: float) -> str:
@@ -377,7 +384,9 @@ def test_the_lifecycle_pass_submits_no_market_analysis(monkeypatch, wired):
 
     account, expert, expert_row = wired
     open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
-    quote_spread(account, expiry=EXPIRY_NEAR)
+    # Priced at a capture, not merely inside the roll window: since 2026-09-03 the roll-DTE
+    # close belongs to the ``opt_dte`` RULE, so a window alone no longer makes this pass act.
+    quote_spread(account, expiry=EXPIRY_NEAR, short_px=0.40, long_px=0.10)
 
     submit_market_analysis = MagicMock()
     monkeypatch.setattr(JobManager, "submit_market_analysis", submit_market_analysis)
@@ -389,7 +398,7 @@ def test_the_lifecycle_pass_submits_no_market_analysis(monkeypatch, wired):
     from ba2_common.core.db import get_all_instances
     assert get_all_instances(MarketAnalysis) == [], "the pass wrote a MarketAnalysis row"
     # ...and it still did its job.
-    assert [d.reason for d in result.decisions] == [LIFECYCLE_ROLL_DTE]
+    assert [d.reason for d in result.decisions] == [LIFECYCLE_PROFIT_CAPTURE]
     assert len(result.submitted) == 1
 
 
@@ -402,7 +411,7 @@ def test_a_close_is_guarded_against_a_pending_close(wired):
     """
     account, expert, expert_row = wired
     txn, parent, _, _ = open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
-    quote_spread(account, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR, short_px=0.40, long_px=0.10)  # captures
     # A close submitted on an earlier cycle, still working.
     create_trading_order(
         account.id, symbol="ACN", quantity=1, side=OrderDirection.BUY,
@@ -416,7 +425,7 @@ def test_a_close_is_guarded_against_a_pending_close(wired):
     assert txn.id in result.skipped_pending_close
     # The decision itself is still made and still visible — we skipped the ACTION, not the
     # measurement. A silent skip would hide a close that never happens.
-    assert [d.reason for d in result.decisions] == [LIFECYCLE_ROLL_DTE]
+    assert [d.reason for d in result.decisions] == [LIFECYCLE_PROFIT_CAPTURE]
 
 
 def test_a_broker_that_cannot_answer_stops_the_pass_for_that_account(monkeypatch, wired):
@@ -446,7 +455,7 @@ def test_running_the_pass_twice_with_no_state_change_submits_nothing_the_second_
     """It runs on a schedule. Two runs over one unchanged book close one position, once."""
     account, expert, expert_row = wired
     txn, *_ = open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
-    quote_spread(account, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR, **CAPTURED)
 
     first = run(expert_row)
     assert len(first.submitted) == 1
@@ -572,7 +581,7 @@ def test_the_close_is_a_market_order_tagged_close_on_the_same_transaction(wired)
     """
     account, expert, expert_row = wired
     txn, *_ = open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
-    quote_spread(account, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR, **CAPTURED)
 
     order = run(expert_row).submitted[0].order
 
@@ -626,6 +635,13 @@ def test_a_fractional_contract_count_refuses_the_whole_close(monkeypatch, wired)
     from ba2_common.core.db import update_instance
     short.filled_qty = 0.5
     update_instance(short)
+    # THE BREAKER is the vehicle, deliberately: it flattens every structure whatever its
+    # P&L says, so the close is decided for a position whose own contract count is broken —
+    # exactly the case the whole-contract refusal exists for. (Before 2026-09-03 the roll
+    # window closed it; that exit belongs to the ``opt_dte`` rule now.)
+    account._balance = 100_000.0
+    run(expert_row)                                # ratchets the peak
+    account._balance = 79_000.0                    # -21%: past circuit_breaker_pct 20
     errors = _capture_errors(monkeypatch)
 
     result = run(expert_row)
@@ -643,10 +659,13 @@ def test_the_structure_expiry_comes_from_the_transaction_when_the_legs_carry_non
 
     result = run(expert_row)
 
-    assert [d.reason for d in result.decisions] == [LIFECYCLE_ROLL_DTE]
+    # HOLD, not UNKNOWN: the DTE was MEASURED off the transaction and it is in the detail.
+    # (The roll-DTE CLOSE moved to the ``opt_dte`` rule on 2026-09-03; what this test is
+    # about — where the expiry comes from — is unchanged, and an unmeasured one would read
+    # as UNKNOWN here rather than as a number.)
+    assert [d.reason for d in result.decisions] == [LIFECYCLE_HOLD]
     assert "15 DTE" in result.decisions[0].detail
-    # ...and the chain was still located for the legs, so the exit is priced. A close
-    # outranks an unmeasurable input, so an unpriced roll would look identical here.
+    # ...and the chain was still located for the legs, so the structure is priced.
     assert result.decisions[0].pnl_pct is not None
 
 
@@ -658,9 +677,10 @@ def test_the_structure_expiry_comes_from_the_legs_when_the_transaction_carries_n
 
     result = run(expert_row)
 
-    assert [d.reason for d in result.decisions] == [LIFECYCLE_ROLL_DTE]
-    # The chain window came off the LEG, so the exit is priced. Asking only the parent
-    # (NULL here) would find no chain at all and the roll would fire unpriced.
+    assert [d.reason for d in result.decisions] == [LIFECYCLE_HOLD]
+    assert "15 DTE" in result.decisions[0].detail
+    # The chain window came off the LEG, so the structure is priced. Asking only the parent
+    # (NULL here) would find no chain at all and the DTE would be reported unpriced.
     assert result.decisions[0].pnl_pct is not None
 
 
@@ -725,7 +745,7 @@ def test_an_entry_that_has_not_finished_filling_is_not_managed(monkeypatch, wire
         contract_symbol=occ("ACN", EXPIRY_NEAR, "P", 100.0), option_type=OptionRight.PUT,
         strike=100.0, expiry=EXPIRY_NEAR, underlying_symbol="ACN",
         open_price=3.0, filled_qty=1)
-    quote_spread(account, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR, **CAPTURED)
     warnings = _capture_warnings(monkeypatch)
 
     result = run(expert_row)
@@ -758,7 +778,7 @@ def test_the_close_targets_the_deciding_transaction(wired):
     rolling, *_ = open_credit_spread(account, expert_row, underlying="MSFT",
                                      expiry=EXPIRY_NEAR)
     quote_spread(account, underlying="ACN")
-    quote_spread(account, underlying="MSFT", expiry=EXPIRY_NEAR)
+    quote_spread(account, underlying="MSFT", expiry=EXPIRY_NEAR, **CAPTURED)
 
     result = run(expert_row)
 
@@ -1020,7 +1040,9 @@ def test_a_structure_whose_legs_have_all_netted_flat_submits_nothing(monkeypatch
 
     result = run(expert_row)
 
-    assert [d.reason for d in result.decisions] == [LIFECYCLE_ROLL_DTE]
+    # UNKNOWN, and that is the honest answer: with no held legs there is no P&L to measure,
+    # so the pass says so rather than reporting a comfortable hold.
+    assert [d.reason for d in result.decisions] == [LIFECYCLE_UNKNOWN]
     assert result.submitted == [], "a close was recorded for a structure with no legs left"
     assert close_orders(txn.id) == []
     assert result.book.structure_count == 1, "it still occupies its slot"
@@ -1069,8 +1091,8 @@ def test_a_broker_rejection_on_one_structure_does_not_stop_the_others(monkeypatc
                                  expiry=EXPIRY_NEAR)
     good, *_ = open_credit_spread(account, expert_row, underlying="MSFT",
                                   expiry=EXPIRY_NEAR)
-    quote_spread(account, underlying="ACN", expiry=EXPIRY_NEAR)     # both roll at 15 DTE
-    quote_spread(account, underlying="MSFT", expiry=EXPIRY_NEAR)
+    quote_spread(account, underlying="ACN", expiry=EXPIRY_NEAR, **CAPTURED)   # both exit
+    quote_spread(account, underlying="MSFT", expiry=EXPIRY_NEAR, **CAPTURED)
     account.submit_error_on_txn = bad.id
     errors = _capture_errors(monkeypatch)
 
@@ -1093,7 +1115,7 @@ def test_a_chain_outage_makes_a_structure_unknown_and_leaves_the_rest_managed(mo
     blind, *_ = open_credit_spread(account, expert_row, underlying="ACN")
     rolling, *_ = open_credit_spread(account, expert_row, underlying="MSFT",
                                      expiry=EXPIRY_NEAR)
-    quote_spread(account, underlying="MSFT", expiry=EXPIRY_NEAR)
+    quote_spread(account, underlying="MSFT", expiry=EXPIRY_NEAR, **CAPTURED)
     real_chain = account.get_option_chain
 
     def flaky(underlying, expiry_min, expiry_max, **kw):
@@ -1117,8 +1139,8 @@ def test_an_exception_closing_one_structure_does_not_abort_the_others(monkeypatc
     account, expert, expert_row = wired
     bad, *_ = open_credit_spread(account, expert_row, underlying="ACN", expiry=EXPIRY_NEAR)
     good, *_ = open_credit_spread(account, expert_row, underlying="MSFT", expiry=EXPIRY_NEAR)
-    quote_spread(account, underlying="ACN", expiry=EXPIRY_NEAR)
-    quote_spread(account, underlying="MSFT", expiry=EXPIRY_NEAR)
+    quote_spread(account, underlying="ACN", expiry=EXPIRY_NEAR, **CAPTURED)
+    quote_spread(account, underlying="MSFT", expiry=EXPIRY_NEAR, **CAPTURED)
     account.submit_raises_on_txn = bad.id
     errors = _capture_errors(monkeypatch)
 
@@ -1519,17 +1541,17 @@ def test_the_same_structure_NOT_tagged_two_expiry_is_never_a_roll(wired):
     assert close_orders(txn.id) == []
 
 
-def test_a_single_expiry_short_at_the_roll_window_still_CLOSES(wired):
-    """The other side of the same branch: one expiry, so the roll window IS the end of the
-    position. ``LIFECYCLE_ROLL_DTE`` is a closing reason and this pass submits it — the
-    disposition table and ``LIFECYCLE_CLOSING_REASONS`` agreeing, executed rather than
-    asserted."""
+def test_a_single_expiry_short_at_the_roll_window_is_left_to_the_RULE(wired):
+    """The other side of the same branch, and it changed on 2026-09-03: one expiry means
+    the roll window IS the end of the position, which is a CLOSE — and the close belongs to
+    the ``opt_dte`` rule, walked by both runtimes, not to this pass. So the pass records a
+    hold and submits nothing, and the ruleset does the closing."""
     account, expert, expert_row = wired
     txn, _, _, _ = open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
     quote_spread(account, expiry=EXPIRY_NEAR)
 
     result = run(expert_row)
 
-    assert [d.reason for d in result.decisions] == [LIFECYCLE_ROLL_DTE]
+    assert [d.reason for d in result.decisions] == [LIFECYCLE_HOLD]
     assert result.roll_due == []
-    assert len(close_orders(txn.id)) == 1
+    assert close_orders(txn.id) == []

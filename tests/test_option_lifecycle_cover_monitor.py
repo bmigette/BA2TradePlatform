@@ -45,7 +45,8 @@ from tests.factories import (
 # ``has_pending_closing_order`` and ``submit_option_order`` are all the inherited
 # implementations), and a second copy of that double is how two views of one book drift.
 from tests.test_option_lifecycle_service import (
-    BASE_SETTINGS, EXPIRY_FAR, EXPIRY_NEAR, FROZEN_NOW, FakeAccount, FakeExpert,
+    BASE_SETTINGS, CAPTURED, EXPIRY_FAR, EXPIRY_NEAR, FROZEN_NOW, FakeAccount,
+    FakeExpert,
     _capture_errors, _contract, occ, open_credit_spread, quote_spread, run,
 )
 
@@ -342,13 +343,13 @@ def test_a_cover_lost_structure_does_not_block_any_other_exit(wired):
     quote_call(account)
     spread_txn, *_ = open_credit_spread(account, expert_row, underlying="MSFT",
                                         expiry=EXPIRY_NEAR)
-    quote_spread(account, underlying="MSFT", expiry=EXPIRY_NEAR)
+    quote_spread(account, underlying="MSFT", expiry=EXPIRY_NEAR, **CAPTURED)
     account.positions_result = []                    # a MEASURED zero: the cover is gone
 
     result = run(expert_row)
     submitted = {s.transaction_id: s.reason for s in result.submitted}
     assert submitted[cc.id] == LIFECYCLE_COVER_LOST
-    assert submitted[spread_txn.id] == "roll_dte"
+    assert submitted[spread_txn.id] == "profit_capture"
     assert result.failed == []
 
 

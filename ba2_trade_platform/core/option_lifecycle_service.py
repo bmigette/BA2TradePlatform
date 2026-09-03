@@ -156,7 +156,7 @@ from ba2_common.core.OptionRiskManagement import update_sleeve_breaker
 from ba2_common.core.option_lifecycle import (
     COVER_REQUIREMENT_UNMEASURABLE, COVERED_CALL_STRATEGY, LIFECYCLE_BREAKER,
     LIFECYCLE_CLOSING_REASONS, LIFECYCLE_COVER_LOST, LIFECYCLE_CREDIT_STOP, LIFECYCLE_HOLD,
-    LIFECYCLE_PROFIT_CAPTURE, LIFECYCLE_ROLL_DTE, LIFECYCLE_ROLL_SHORT, LIFECYCLE_TESTED,
+    LIFECYCLE_PROFIT_CAPTURE, LIFECYCLE_ROLL_SHORT, LIFECYCLE_TESTED,
     LIFECYCLE_UNKNOWN, LifecycleDecision, LifecycleLeg, OptionStructure, decide,
 )
 from ba2_common.core.option_types import OptionContract, OptionLeg
@@ -211,7 +211,9 @@ LIFECYCLE_DISPOSITIONS: Dict[str, str] = {
     LIFECYCLE_PROFIT_CAPTURE: DISPOSITION_CLOSE,
     LIFECYCLE_CREDIT_STOP: DISPOSITION_CLOSE,
     LIFECYCLE_TESTED: DISPOSITION_CLOSE,
-    LIFECYCLE_ROLL_DTE: DISPOSITION_CLOSE,
+    # NO roll-DTE close. It was removed from ``decide`` on 2026-09-03 and the ``opt_dte``
+    # RULE owns that exit in both runtimes; a disposition for it here would be a table entry
+    # for a reason that can no longer arrive, and the reflection pin refuses one.
     LIFECYCLE_ROLL_SHORT: DISPOSITION_RULE_OWNED,
     LIFECYCLE_UNKNOWN: DISPOSITION_REPORT,
     LIFECYCLE_HOLD: DISPOSITION_NO_ACTION,

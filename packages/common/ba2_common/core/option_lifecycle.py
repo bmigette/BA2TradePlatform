@@ -43,9 +43,20 @@ Exactly one decision per structure, from the first rule that fires:
 3. ``LIFECYCLE_PROFIT_CAPTURE``
 4. ``LIFECYCLE_CREDIT_STOP``
 5. ``LIFECYCLE_TESTED``
-6. ``LIFECYCLE_ROLL_DTE``
+6. ``LIFECYCLE_ROLL_SHORT``  — a DECLARED two-expiry structure's overlay is due to be
+   rolled. NOT a closing reason, and not performed by the decider's caller either: the
+   ``roll_pmcc_short`` RULE owns it, in both runtimes.
 7. ``LIFECYCLE_UNKNOWN``     — nothing fired, but some input could not be measured
 8. ``LIFECYCLE_HOLD``        — nothing fired, and everything was measurable
+
+**There is no roll-DTE CLOSE here any more** (2026-09-03). A single-expiry structure whose
+expiry is upon it used to return ``LIFECYCLE_ROLL_DTE``, which the live pass closed — an
+exit the backtest had no counterpart for unless the strategy's ruleset happened to carry
+an ``opt_dte`` rule, so live exited more aggressively than any grid result could show. The
+rule now owns that exit outright: ``days_to_expiry <= N`` -> ``DaysToExpiryCondition`` ->
+``close_option``, walked by the live ``TradeManager`` and by ``daily_engine`` through the
+same evaluator. One owner, two callers. A structure at its expiry therefore reaches
+``LIFECYCLE_HOLD`` here — "no rule THIS module owns fired" — and the ruleset closes it.
 
 **Why cover_lost outranks the premium rules.** A covered call that has lost its shares
 is a NAKED short call, and that is true whether it is up 60% or down 200%. Ranking it
@@ -54,24 +65,22 @@ the reason the position *happened* to be at, and the sleeve's attribution would 
 show a strategy quietly closing winners for no recorded cause — the same blindness
 that hid the dead roll gene. The reason is the alarm.
 
-**Why profit capture outranks the roll window** (the interesting case: a structure can
-easily be at +60% *and* inside its 21-DTE window at once). The *action* is identical —
-both close — so precedence only decides the recorded reason, and the reason is what
-reaches the outcome table and the GA's attribution. Crediting a target hit to the
-roll would make ``roll_dte`` look profitable and ``profit_capture_pct`` look inert,
-which is the same class of blindness that hid the dead roll gene. Attribute the exit
-to the rule the position actually earned. It also preserves ``_should_close``'s branch
-order, so promoting the logic does not silently re-label historical exits.
+**Why profit capture outranks the roll window** (the interesting case: a two-expiry
+structure can easily be at +60% *and* inside its overlay's roll window at once). Here the
+actions genuinely differ — capture CLOSES the structure, the roll keeps it and replaces the
+overlay — so the precedence decides what happens, not merely what is recorded: a PMCC that
+has hit its capture target is taken off rather than maintained. It also preserves
+``_should_close``'s original branch order, so promoting the logic did not silently
+re-label historical exits.
 
 Breaker first, and profit/stop before tested/roll, are ``manage_open``'s and
 ``_should_close``'s original order, kept deliberately. Every step is pinned by a named
 test — an unpinned precedence is a silent behaviour change the first time someone
 reorders the branches.
 
-**A definite close outranks an unmeasurable input.** ``LIFECYCLE_UNKNOWN`` replaces a
-silent *hold*, not a decision we can actually make: a structure at 18 DTE still rolls
-even if its greeks are missing. Unknown only surfaces once every closing rule has
-declined.
+**A definite action outranks an unmeasurable input.** ``LIFECYCLE_UNKNOWN`` replaces a
+silent *hold*, not a decision we can actually make: an overlay at 3 DTE still rolls even
+if its greeks are missing. Unknown only surfaces once every other rule has declined.
 
 
 Cover that we cannot see is not cover that is gone
@@ -110,17 +119,20 @@ from ba2_common.core.types import OptionRight, OrderDirection
 LIFECYCLE_HOLD = "hold"
 LIFECYCLE_PROFIT_CAPTURE = "profit_capture"
 LIFECYCLE_CREDIT_STOP = "credit_stop"
-LIFECYCLE_ROLL_DTE = "roll_dte"
 #: ROLL THE OVERLAY, DO NOT CLOSE THE STRUCTURE. The two-expiry answer to the roll window,
 #: and deliberately NOT a member of ``LIFECYCLE_CLOSING_REASONS``.
 #:
-#: ``_dte`` reads the SHORT leg for the roll window (the Task 6-PRE rule), which is right for
-#: both kinds of structure and means the OPPOSITE thing for each. On a single-expiry structure
-#: the short IS the structure, so its expiry approaching is the end of the position:
-#: ``LIFECYCLE_ROLL_DTE``, a close. On a declared two-expiry structure the short is an OVERLAY
-#: over a long that has a year left, so its expiry approaching is a scheduled maintenance
-#: event: buy the overlay back, sell the next one, keep the long. Returning the CLOSING reason
-#: there would throw a LEAPS away every month, on schedule, and call it a roll.
+#: ``roll_window_dte`` reads the SHORT leg, and on a declared two-expiry structure the short
+#: is an OVERLAY over a long that has a year left, so its expiry approaching is a scheduled
+#: maintenance event: buy the overlay back, sell the next one, keep the long. Returning a
+#: CLOSING reason here would throw a LEAPS away every month, on schedule, and call it a roll.
+#:
+#: THE SINGLE-EXPIRY HALF OF THIS QUESTION IS NOT ASKED HERE ANY MORE (2026-09-03). It used
+#: to return ``LIFECYCLE_ROLL_DTE``, a close, which is the right ACTION and was the wrong
+#: OWNER: the backtest expresses it as the ``opt_dte`` rule (``days_to_expiry <= N`` ->
+#: ``close_option``), so live carried a second, unsearched copy of an exit the GA was
+#: simultaneously tuning. The rule owns it in both runtimes now, and this module answers only
+#: the question the rule cannot: an overlay roll, which is not a close.
 LIFECYCLE_ROLL_SHORT = "roll_short"
 LIFECYCLE_TESTED = "tested"
 LIFECYCLE_BREAKER = "circuit_breaker"
@@ -133,8 +145,7 @@ LIFECYCLE_COVER_LOST = "cover_lost"
 LIFECYCLE_UNKNOWN = "unknown"
 
 LIFECYCLE_CLOSING_REASONS = (LIFECYCLE_PROFIT_CAPTURE, LIFECYCLE_CREDIT_STOP,
-                             LIFECYCLE_ROLL_DTE, LIFECYCLE_TESTED, LIFECYCLE_BREAKER,
-                             LIFECYCLE_COVER_LOST)
+                             LIFECYCLE_TESTED, LIFECYCLE_BREAKER, LIFECYCLE_COVER_LOST)
 
 #: The ONE strategy tag that promises SHARE cover, and so the only one ``cover_lost``
 #: polices. It must stay equal to ``OptionsAccountInterface.COVERED_CALL_STRATEGY`` --
@@ -1104,10 +1115,19 @@ def _decide_one(structure: OptionStructure,
         if tested:
             return LifecycleDecision(txn, LIFECYCLE_TESTED, tested_detail, pnl_pct)
 
-    # 6. the time stop / roll. ONE question -- "is the short leg's expiry upon us?" -- with
-    #    two answers, because on a DECLARED two-expiry structure the short is an overlay over
-    #    a long that outlives it. There the answer is ROLL THE OVERLAY (not a closing reason);
-    #    everywhere else it is the pre-existing close. See LIFECYCLE_ROLL_SHORT.
+    # 6. the OVERLAY ROLL, and only the overlay roll. "Is the short leg's expiry upon us?"
+    #    has two answers, and this module now owns exactly one of them: on a DECLARED
+    #    two-expiry structure the short is an overlay over a long that outlives it, so the
+    #    answer is ROLL THE OVERLAY -- not a close, and not something any ruleset condition
+    #    can ask, which is why it is asked here.
+    #
+    #    The single-expiry answer (the expiry IS the end of the position, so close) was
+    #    removed on 2026-09-03: it duplicated the ``opt_dte`` rule the GA already searches,
+    #    giving live an unsearched second exit the backtest could not model. The rule owns
+    #    it now, in both runtimes. A single-expiry structure at its expiry falls through to
+    #    the blind check and then to HOLD -- "nothing THIS module owns fired" -- and the
+    #    ruleset closes it. ``dte_blind`` is still collected, because an unmeasurable roll
+    #    window is still worth reporting.
     roll_dte = int(_require(settings, "roll_dte"))
     dte, dte_blind = roll_window_dte(structure, as_of)
     if is_multi_expiry_strategy(structure.strategy):
@@ -1117,9 +1137,6 @@ def _decide_one(structure: OptionStructure,
             structure, chain_by_symbol, as_of, roll_dte=roll_dte, buyback_pct=buyback)
         if due:
             return LifecycleDecision(txn, LIFECYCLE_ROLL_SHORT, roll_detail, pnl_pct)
-    elif dte is not None and dte <= roll_dte:
-        return LifecycleDecision(txn, LIFECYCLE_ROLL_DTE,
-                                 f"{dte} DTE <= roll_dte {roll_dte}", pnl_pct)
 
     # 7. nothing fired. If anything we needed was unmeasurable, say so -- loudly, and
     #    naming the input. A hold here would be a guess wearing a decision's clothes.

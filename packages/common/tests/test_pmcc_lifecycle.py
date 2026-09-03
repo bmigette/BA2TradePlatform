@@ -610,7 +610,7 @@ def test_the_action_is_documented():
 # 8. THE PURE LIFECYCLE FUNCTIONS — one implementation, two runtimes
 # ======================================================================================
 from ba2_common.core.option_lifecycle import (  # noqa: E402  (grouped with its own section)
-    LIFECYCLE_HOLD, LIFECYCLE_ROLL_DTE, LIFECYCLE_ROLL_SHORT, LifecycleLeg, OptionStructure,
+    LIFECYCLE_HOLD, LIFECYCLE_ROLL_SHORT, LifecycleLeg, OptionStructure,
     PMCC_ROLL_STRATEGY, SETTING_PMCC_BUYBACK_PCT, close_legs_are_fail_closed,
     credit_decay_pct, decide, held_long_leg, held_short_leg, pmcc_roll_due,
     restamped_max_loss, roll_legs_are_fail_closed, roll_window_dte, uncovered_short_calls,
@@ -802,8 +802,13 @@ def test_a_SINGLE_expiry_structure_still_closes_on_the_same_input():
              "SHORT": _chain_row("SHORT", 0.4, 0.5)}
     decision = decide([structure], chain, _LIFECYCLE_SETTINGS, TODAY)[0]
 
-    assert decision.reason == LIFECYCLE_ROLL_DTE
-    assert decision.should_close
+    # NOT a roll: an undeclared single-expiry structure has no overlay to roll, and since
+    # 2026-09-03 it has no roll-DTE CLOSE here either -- the ``opt_dte`` rule owns that exit
+    # in both runtimes. The point of the control is unchanged: the two-expiry branch must be
+    # reachable ONLY through the strategy tag.
+    assert decision.reason == LIFECYCLE_HOLD
+    assert decision.reason != LIFECYCLE_ROLL_SHORT
+    assert not decision.should_close
 
 
 def test_the_buyback_trigger_rolls_an_overlay_that_is_nowhere_near_expiry():

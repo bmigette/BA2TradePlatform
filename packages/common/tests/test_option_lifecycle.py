@@ -24,7 +24,6 @@ from ba2_common.core.option_lifecycle import (
     LIFECYCLE_CREDIT_STOP,
     LIFECYCLE_HOLD,
     LIFECYCLE_PROFIT_CAPTURE,
-    LIFECYCLE_ROLL_DTE,
     LIFECYCLE_TESTED,
     LIFECYCLE_UNKNOWN,
     UNDEFINED_RISK_STRATEGIES,
@@ -128,15 +127,22 @@ def test_a_structure_past_the_credit_multiple_stop_is_closed():
     assert d.pnl_pct == pytest.approx(-225.0)
 
 
-def test_a_structure_inside_the_roll_dte_window_is_closed():
-    """18 DTE against roll_dte 21. Healthy P&L, healthy delta -- the calendar alone closes it."""
+def test_a_single_expiry_structure_in_its_roll_window_is_NOT_closed_HERE():
+    """18 DTE against roll_dte 21, and this module no longer owns that exit (2026-09-03).
+
+    It used to return ``LIFECYCLE_ROLL_DTE`` and the live pass closed it -- an exit the
+    backtest could only reproduce if the strategy's ruleset happened to carry ``opt_dte``,
+    so live exited more aggressively than any grid result could show. The rule owns it in
+    both runtimes now, so the decider says HOLD: nothing IT owns fired. The DTE is still
+    measured and still reported in the detail, because a hold that cannot say how much life
+    is left is the blindness this module exists to refuse.
+    """
     st = put_credit_spread(expiry=date(2026, 3, 20))      # 18 DTE
     d = only(decide([st], spread_chain(), settings(), AS_OF))
-    assert d.reason == LIFECYCLE_ROLL_DTE
-    assert d.should_close is True
-    assert d.detail == "18 DTE <= roll_dte 21"
-    # Every decision carries the P&L at the moment it was taken; the outcome table
-    # needs to know what a roll actually banked, not just that it happened.
+    assert d.reason == LIFECYCLE_HOLD
+    assert d.should_close is False
+    assert "18 DTE" in d.detail
+    # Every decision still carries the P&L at the moment it was taken.
     assert d.pnl_pct == pytest.approx(40.0)
 
 
@@ -262,7 +268,7 @@ def test_unknown_is_never_folded_into_hold():
 
 
 def test_every_closing_reason_reports_should_close():
-    for reason in (LIFECYCLE_PROFIT_CAPTURE, LIFECYCLE_CREDIT_STOP, LIFECYCLE_ROLL_DTE,
+    for reason in (LIFECYCLE_PROFIT_CAPTURE, LIFECYCLE_CREDIT_STOP,
                    LIFECYCLE_TESTED, LIFECYCLE_BREAKER):
         assert LifecycleDecision(1, reason, "d").should_close is True
     for reason in (LIFECYCLE_HOLD, LIFECYCLE_UNKNOWN):
@@ -277,8 +283,10 @@ def test_the_expiry_comes_from_the_legs_when_the_parent_row_has_none():
     The legs always knew. Use them."""
     st = put_credit_spread(expiry=date(2026, 3, 20), declared_expiry=None)
     d = only(decide([st], spread_chain(), settings(), AS_OF))
-    assert d.reason == LIFECYCLE_ROLL_DTE
-    assert d.detail == "18 DTE <= roll_dte 21"
+    # HOLD, not UNKNOWN: the legs supplied the expiry, so the DTE was MEASURED (and is in
+    # the detail). An unmeasurable one would have been reported as UNKNOWN instead.
+    assert d.reason == LIFECYCLE_HOLD
+    assert "18 DTE" in d.detail
 
 
 def test_conflicting_leg_expiries_are_unknown_not_a_guess():
@@ -312,7 +320,8 @@ def test_a_leg_without_an_expiry_does_not_veto_the_one_that_has_it():
     chain = {"A": contract("A", bid=1.2, ask=1.3, delta=-0.2),
              "B": contract("B", bid=0.1, ask=0.15, delta=-0.08)}
     d = only(decide([st], chain, settings(), AS_OF))
-    assert d.reason == LIFECYCLE_ROLL_DTE
+    assert d.reason == LIFECYCLE_HOLD
+    assert "18 DTE" in d.detail       # measured, not vetoed by the blank leg
 
 
 # --------------------------------------------------------------------------
@@ -352,12 +361,18 @@ def test_a_hair_short_of_the_credit_stop_is_a_hold():
     assert d.reason == LIFECYCLE_HOLD
 
 
-def test_the_roll_window_is_inclusive_at_the_boundary():
-    """Exactly roll_dte closes -- '<=', not '<'."""
+def test_the_roll_window_boundary_closes_nothing_here_any_more():
+    """Exactly ``roll_dte``, the case that used to close on '<=' rather than '<'.
+
+    The boundary itself did not move -- it moved HOUSE. ``days_to_expiry <= N`` in the
+    ``opt_dte`` rule is where a single-expiry structure's expiry exit is decided now, in
+    both runtimes; ``pmcc_roll_due`` keeps the same '<=' for the overlay roll. What this
+    module must not do is close it a second time on a threshold nothing searched.
+    """
     st = put_credit_spread(expiry=NEAR_EXPIRY)            # 21 DTE, roll_dte 21
     d = only(decide([st], spread_chain(), settings(), AS_OF))
-    assert d.reason == LIFECYCLE_ROLL_DTE
-    assert d.detail == "21 DTE <= roll_dte 21"
+    assert d.reason == LIFECYCLE_HOLD
+    assert d.should_close is False
 
 
 def test_one_day_outside_the_roll_window_is_a_hold():
@@ -366,11 +381,17 @@ def test_one_day_outside_the_roll_window_is_a_hold():
     assert d.reason == LIFECYCLE_HOLD
 
 
-def test_an_already_expired_structure_is_inside_the_roll_window():
+def test_an_already_expired_structure_is_measured_as_negative_never_clamped():
+    """Past expiry is a real (and alarming) state, and the sign carries it: ``-3``, not 0.
+
+    Clamping to 0 would make ``days_to_expiry > 0`` answer "still alive" for a structure
+    that expired three days ago -- and the ``opt_dte`` rule that now owns the exit reads the
+    same sign convention.
+    """
     st = put_credit_spread(expiry=date(2026, 2, 27))      # -3 DTE
     d = only(decide([st], spread_chain(), settings(), AS_OF))
-    assert d.reason == LIFECYCLE_ROLL_DTE
-    assert d.detail == "-3 DTE <= roll_dte 21"
+    assert d.reason == LIFECYCLE_HOLD
+    assert "-3 DTE" in d.detail
 
 
 def test_the_tested_delta_threshold_is_inclusive_at_the_boundary():
@@ -626,11 +647,17 @@ def test_an_untripped_breaker_changes_nothing():
 
 def test_a_definite_close_outranks_an_unmeasurable_input():
     """UNKNOWN exists to replace a silent HOLD, not to veto a decision we CAN make.
-    18 DTE with no greek anywhere still rolls."""
-    st = put_credit_spread(expiry=date(2026, 3, 20))                # 18 DTE
-    chain = spread_chain(short_delta=None, long_delta=None)
+
+    A structure at its capture target still closes with no greek anywhere -- the missing
+    delta only leaves the TESTED rule unasked. (The vehicle was the roll-DTE close until
+    2026-09-03, when the ``opt_dte`` rule took that exit over; the principle is unchanged
+    and is now pinned on profit capture.)
+    """
+    st = put_credit_spread(credit=2.00)
+    chain = spread_chain(short_ask=0.90, long_bid=0.10,             # 0.80 to close -> +60%
+                         short_delta=None, long_delta=None)
     d = only(decide([st], chain, settings(), AS_OF))
-    assert d.reason == LIFECYCLE_ROLL_DTE
+    assert d.reason == LIFECYCLE_PROFIT_CAPTURE
 
 
 def test_several_missing_inputs_are_all_named_in_one_detail():
@@ -875,8 +902,8 @@ def test_cover_lost_outranks_profit_capture():
     assert d.pnl_pct == pytest.approx(55.0)
 
 
-def test_cover_lost_outranks_the_credit_stop_and_the_roll_window():
-    st = covered_call(credit=2.00, expiry=date(2026, 3, 20))     # 18 DTE, would roll
+def test_cover_lost_outranks_the_credit_stop():
+    st = covered_call(credit=2.00, expiry=date(2026, 3, 20))     # 18 DTE
     chain = call_chain(ask=6.60, bid=6.50)                        # -230%, would stop
     d = only(decide([st], chain, settings(), AS_OF,
                     cover_shares_required=100, cover_shares_held=0))
@@ -892,12 +919,15 @@ def test_the_circuit_breaker_still_outranks_cover_lost():
 
 
 def test_a_definite_close_outranks_an_unmeasurable_cover():
-    """UNKNOWN replaces a silent hold, never a decision we CAN make: an 18-DTE
-    structure still rolls while its cover is unreadable."""
-    st = covered_call(expiry=date(2026, 3, 20))                   # 18 DTE
-    d = only(decide([st], call_chain(), settings(), AS_OF,
+    """UNKNOWN replaces a silent hold, never a decision we CAN make: a covered call at its
+    capture target still closes while its cover is unreadable.
+
+    (The vehicle was the roll-DTE close until 2026-09-03, when the ``opt_dte`` rule took
+    that exit over. Same principle, a rule this module still owns.)"""
+    st = covered_call(credit=2.00)
+    d = only(decide([st], call_chain(ask=0.90, bid=0.80), settings(), AS_OF,
                     cover_shares_required=100, cover_shares_held=None))
-    assert d.reason == LIFECYCLE_ROLL_DTE
+    assert d.reason == LIFECYCLE_PROFIT_CAPTURE
 
 
 def test_cover_is_supplied_per_transaction_over_a_book():
@@ -1003,7 +1033,9 @@ def test_no_structures_is_no_decisions():
 def test_a_plain_date_as_of_is_accepted():
     st = put_credit_spread(expiry=date(2026, 3, 20))
     d = only(decide([st], spread_chain(), settings(), date(2026, 3, 2)))
-    assert d.detail == "18 DTE <= roll_dte 21"
+    # The DTE is still computed off a bare ``date`` (no datetime coercion needed) and the
+    # number reaches the detail — which is all this test was ever about.
+    assert "18 DTE" in d.detail
 
 
 def test_a_missing_required_setting_is_an_error_not_a_default():
