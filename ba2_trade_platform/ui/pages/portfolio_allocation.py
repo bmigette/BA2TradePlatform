@@ -1650,38 +1650,58 @@ async def _save_label_comment(account_id: int, label: str, value: str) -> None:
 
 
 def _write_symbol_comment(account_id: int, label: str, symbol: str, value: str,
-                          label_symbols: List[str]) -> None:
+                          label_symbols: List[str], *,
+                          displayed_weight: Optional[float] = None) -> None:
     """Persist a symbol's comment WITHOUT moving its allocation. Blocking.
 
     ``set_symbol_weight`` is the one writer for this row, and creating a row makes
     the weight EXPLICIT — a bare ``comment=`` write would create it at the model
     default of 0.0 and the engine reads 0 as "hold none of this", so the next
     rebalance would sell a position the user only wrote a note about. So the
-    symbol's current EFFECTIVE weight (its stored value, or the even-split default
-    it was silently taking) is passed alongside the comment, which pins it at
-    exactly the number it already had. ``weight_pct == 0.0`` deliberately stays a
-    legitimate explicit zero and is never re-read as "unstored" — doing that would
-    re-introduce drift from the engine's ``build_symbol_targets``.
+    symbol's current EFFECTIVE weight is passed alongside the comment, which pins
+    it at exactly the number it already had. ``weight_pct == 0.0`` deliberately
+    stays a legitimate explicit zero and is never re-read as "unstored" — doing
+    that would re-introduce drift from the engine's ``build_symbol_targets``.
 
-    ``label_symbols`` must be the label's FULL symbol list: the even-split default
-    is only correct when every symbol sharing the 100% is known.
+    ``displayed_weight`` -- THE FIX (2026-09-04). It used to be read back from
+    ``get_symbol_weights`` (the STORE's own default, an EVEN split of whatever is
+    left of 100% among the unstored symbols), while the table's Weight column
+    shows ``resolve_symbol_weights`` (the VIEW's default: each unstored symbol's
+    share of the label's HELD VALUE). The two defaults are different algorithms
+    and disagree whenever a label's holdings are uneven and unsaved: on a 90/10
+    market-value split the table showed 90%, a comment on that row silently wrote
+    50% (the even split of two symbols) -- invisible until reload, and the next
+    rebalance sold most of the position toward a target the user never typed.
+    Passing what the page is ACTUALLY SHOWING closes that gap; the two
+    computations no longer need to agree because only one of them is ever
+    written.
 
-    Side effect, accepted: the symbol's weight stops floating with the even split,
-    so a symbol added to the label later re-splits only what is left. That is the
-    documented meaning of a stored row, and it is strictly better than the zeroing
-    it replaces.
+    ``label_symbols`` is the fallback path's input (the label's FULL symbol
+    list, so its even-split default is only wrong when the caller has no live
+    figure at all to hand over -- normally never reached from the page).
     """
-    effective = get_symbol_weights(account_id, label, label_symbols)
-    set_symbol_weight(account_id, label, symbol,
-                      weight_pct=effective.get(symbol), comment=value or "")
+    weight = displayed_weight
+    if weight is None:
+        effective = get_symbol_weights(account_id, label, label_symbols)
+        weight = effective.get(symbol)
+    set_symbol_weight(account_id, label, symbol, weight_pct=weight, comment=value or "")
 
 
-async def _save_symbol_comment(account_id: int, label: str, symbol: str, value: str,
+async def _save_symbol_comment(account_id: int, live: Dict[str, Any], label: str,
+                               symbol: str, value: str,
                                label_symbols: List[str]) -> None:
-    """Comment-cell handler: two DB round trips, both off the event loop."""
+    """Comment-cell handler: two DB round trips, both off the event loop.
+
+    ``live['weights']`` is read on the EVENT LOOP, before the thread hop -- it is
+    the same in-memory registry ``_save_symbol_weight`` patches after every
+    accepted edit, so this reads exactly what the cell beside the comment box is
+    showing at the moment the debounce fires, not a value that might change while
+    the write is in flight.
+    """
+    displayed = (live.get('weights', {}).get(label) or {}).get(symbol)
     try:
         await asyncio.to_thread(_write_symbol_comment, account_id, label, symbol, value,
-                                label_symbols)
+                                label_symbols, displayed_weight=displayed)
     except Exception as e:
         logger.error(f"Saving comment for {label}/{symbol} failed: {e}", exc_info=True)
         ui.notify(f'Could not save comment: {e}', type='negative')
@@ -2375,7 +2395,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     ''')
     table.on('commentChange',
              lambda e, lbl=view.label, syms=label_symbols: _save_symbol_comment(
-                 account_id, lbl, e.args[0], e.args[1], syms))
+                 account_id, live, lbl, e.args[0], e.args[1], syms))
 
     async def _remove_selected() -> None:
         symbols = _selected_symbols(table)

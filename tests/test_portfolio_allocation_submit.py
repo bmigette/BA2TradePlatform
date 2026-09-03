@@ -237,7 +237,13 @@ class FakeAccount:
                 trading_order,
                 f"[{BrokerOrderErrorReason.INSUFFICIENT_FUNDS.value}] broker rejected")
         if trading_order.symbol in self.washtrade_symbols:
+            # PERSISTED, matching AccountInterface.submit_order's own gate
+            # (AccountInterface.py:396-397: sets the status, then
+            # update_instance immediately) -- callers that re-read the order
+            # from the DB (portfolio_allocation_service._order_is_washtrade_locked)
+            # must see the lock, not the PENDING this method wrote a few lines up.
             trading_order.status = OrderStatus.WASHTRADE_LOCKED
+            update_instance(trading_order)
             return trading_order
         if trading_order.symbol in self.accepted_symbols:
             trading_order.status = OrderStatus.ACCEPTED
@@ -1178,6 +1184,36 @@ def test_submit_plan_add_to_position_the_broker_refused_is_not_reported_submitte
     assert outcomes[0].order_ids
     refused = get_instance(TradingOrder, outcomes[0].order_ids[0])
     assert refused.status == OrderStatus.ERROR
+
+
+def test_submit_plan_add_to_position_wash_trade_locked_is_reported_locked_not_failed():
+    """BUG FIX 2026-09-04: this add-to-position used to come back OUTCOME_FAILED,
+    on a leg that is actually still PENDING at our end -- TradeManager retries a
+    WASHTRADE_LOCKED order the moment its blocker clears, so it is not dead the
+    way a broker rejection is. Reporting it FAILED told the user nothing more
+    would happen, right before the platform bought the position back on its own
+    with no further warning."""
+    account = FakeAccount(account_id=96)
+    account.positions = [FakePosition("AAPL", 10.0, 1060.0, 1060.0)]
+    account.washtrade_symbols = {"AAPL"}
+    txn_id = make_open_transaction(96, "AAPL", 10.0)
+    row = make_row("AAPL", OrderDirection.BUY, 5.0, 530.0, 530.0, price=106.0)
+    row.target_quantity = 15.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=10.0, price=106.0,
+                                     transaction_ids=[txn_id])}
+
+    outcomes = svc.submit_plan(account, plan, current, run_tag="96",
+                               allow_fractional=False)
+
+    assert outcomes[0].action == ACTION_ADJUST
+    assert outcomes[0].status == svc.OUTCOME_WASHTRADE_LOCKED
+    assert txn_quantity(txn_id) == pytest.approx(10.0)
+    # The locked order is still reported, so a later fill can be traced to it --
+    # and it is genuinely still armed, not a dead end.
+    assert outcomes[0].order_ids
+    locked = get_instance(TradingOrder, outcomes[0].order_ids[0])
+    assert locked.status == OrderStatus.WASHTRADE_LOCKED
 
 
 def test_submit_plan_add_to_position_the_broker_took_is_reported_submitted():
@@ -4190,3 +4226,172 @@ def test_the_unpriced_holding_refusal_is_checked_before_the_market_gate():
 
     assert result["blocked"] is True
     assert "DARK" in result["blocked_reason"]
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX 2026-09-04: decision 3 ("label targets must total 100%; Submit is
+# blocked otherwise") had no enforcement anywhere before this. compute_allocation
+# deliberately does not renormalise a bad target set, and nothing called
+# validate_label_targets before Submit -- so a REBALANCE plan whose label or
+# symbol percentages did not total 100% solved and SENT anyway, over- or
+# under-deploying the account with no warning. run_allocation is the real
+# enforcement (the wizard's own check is only the polite half); these pin it
+# server-side, independent of any UI.
+# ---------------------------------------------------------------------------
+
+from ba2_trade_platform.core.portfolio_allocation import (  # noqa: E402
+    ALLOCATION_BASIS_BUDGET, LabelTarget, OrderDirection, SymbolTarget,
+)
+
+
+def _rebalance_plan(labels, *, buying_power=10_000.0):
+    row = make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0, price=160.0)
+    return AllocationPlan(rows=[row], available_buying_power=buying_power,
+                          labels=labels)
+
+
+def test_run_allocation_refuses_a_rebalance_whose_label_targets_overshoot_100():
+    account = FakeAccount(account_id=201)
+    account.positions = []
+    labels = [LabelTarget("ARK26", 70.0, [SymbolTarget("AAPL", 100.0)]),
+             LabelTarget("NASDAQ30", 70.0, [SymbolTarget("MSFT", 100.0)])]
+
+    result = svc.run_allocation(account, _rebalance_plan(labels), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is True
+    assert result["run_id"] is None
+    assert "100%" in result["blocked_reason"]
+    assert account.submitted == []               # NOTHING reached the broker
+
+
+def test_run_allocation_refuses_a_rebalance_whose_label_targets_undershoot_100():
+    account = FakeAccount(account_id=202)
+    account.positions = []
+    labels = [LabelTarget("ARK26", 40.0, [SymbolTarget("AAPL", 100.0)])]
+
+    result = svc.run_allocation(account, _rebalance_plan(labels), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is True
+    assert result["run_id"] is None
+
+
+def test_run_allocation_refuses_a_label_whose_symbol_weights_do_not_total_100():
+    """Even when the LABEL total is exactly 100 -- the per-label symbol split can
+    still be wrong on its own, and it must be caught too."""
+    account = FakeAccount(account_id=203)
+    account.positions = []
+    labels = [LabelTarget("ARK26", 100.0, [SymbolTarget("AAPL", 60.0),
+                                           SymbolTarget("MSFT", 60.0)])]
+
+    result = svc.run_allocation(account, _rebalance_plan(labels), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is True
+    assert result["run_id"] is None
+
+
+def test_run_allocation_allows_a_rebalance_whose_targets_total_exactly_100(activity):
+    account = FakeAccount(account_id=204)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 1.0, 160.0)}
+    labels = [LabelTarget("ARK26", 100.0, [SymbolTarget("AAPL", 100.0)])]
+
+    result = svc.run_allocation(account, _rebalance_plan(labels), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is False
+    assert result["run_id"] is not None
+
+
+def test_the_target_gate_never_reconciles_or_writes_a_run_row_when_it_refuses():
+    """Same contract as the base/market gates: a blocked attempt must write
+    NOTHING, not even a run row, so the reconcile step never sees it."""
+    account = FakeAccount(account_id=205)
+    account.positions = []
+    labels = [LabelTarget("ARK26", 40.0, [SymbolTarget("AAPL", 100.0)])]
+
+    svc.run_allocation(account, _rebalance_plan(labels), {}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE)
+
+    assert svc.get_unconsumed_runs(account.id) == []
+
+
+def test_the_target_gate_is_skipped_for_an_invest_label_run(activity):
+    """Decision 3's 100% rule is a REBALANCE rule about dividing the whole
+    investable pool. An INVEST_LABEL run spends an explicit amount on ONE label
+    and has its own gate (invest_validation_messages, checked before the dry run
+    even opens) -- this must not double-refuse it."""
+    account = FakeAccount(account_id=206)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 1.0, 100.0)}
+    row = make_row("AAPL", OrderDirection.BUY, 1.0, 100.0, 100.0, price=100.0)
+    # A single-label INVEST_LABEL plan's own target_pct is not meaningful the way
+    # a REBALANCE's is (compute_label_investment ignores it), so an arbitrary
+    # non-100 value here must not block the run.
+    labels = [LabelTarget("ARK26", 40.0, [SymbolTarget("AAPL", 100.0)])]
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0,
+                          labels=labels, allocation_basis=ALLOCATION_BASIS_BUDGET)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_INVEST_LABEL, scope_label="ARK26")
+
+    assert result["blocked"] is False
+
+
+def test_the_target_gate_is_skipped_when_the_plan_carries_no_labels_at_all(activity):
+    """A plan with an EMPTY label list is not "0% of 100%" -- the page already
+    refuses to open a dry run with zero managed labels, so this is a different,
+    already-handled situation and must not be misreported as a bad total."""
+    account = FakeAccount(account_id=207)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 1.0, 160.0)}
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)  # labels defaults to []
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is False
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX 2026-09-04: WASHTRADE_LOCKED is not settled. run_allocation must NOT
+# consume income for a run whose only order is locked -- the order is still
+# armed and TradeManager may resubmit and fill it hours later. Consuming at 0
+# now would mean nothing ever charges the ledger for that later fill, and the
+# next rebalance would deploy the same income again.
+# ---------------------------------------------------------------------------
+
+def test_run_allocation_does_not_consume_income_for_a_washtrade_locked_run(activity):
+    account = FakeAccount(account_id=210)
+    account.positions = []
+    account.washtrade_symbols = {"AAPL"}
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is False
+    assert result["settled"] is False
+    assert result["income_consumed"] == 0.0
+    assert result["run_id"] in [r.id for r in svc.get_unconsumed_runs(account.id)]
+
+
+def test_leg_status_combinations():
+    """Direct coverage of the four-way split, including the new ``locked`` axis."""
+    assert svc._leg_status(10.0, 0, 0) == svc.OUTCOME_SUBMITTED
+    assert svc._leg_status(10.0, 1, 0) == svc.OUTCOME_PARTIAL
+    assert svc._leg_status(0.0, 1, 0) == svc.OUTCOME_FAILED
+    # Every non-succeeding leg was a wash-trade lock, nothing genuinely failed.
+    assert svc._leg_status(0.0, 0, 2) == svc.OUTCOME_WASHTRADE_LOCKED
+    # A lock alongside a real success is still "some of it happened".
+    assert svc._leg_status(10.0, 0, 1) == svc.OUTCOME_PARTIAL
+    # A lock alongside a REAL failure must not read as "just pending" -- the
+    # dead leg needs the user's attention.
+    assert svc._leg_status(0.0, 1, 1) == svc.OUTCOME_FAILED
+    assert svc._leg_status(10.0, 1, 1) == svc.OUTCOME_PARTIAL

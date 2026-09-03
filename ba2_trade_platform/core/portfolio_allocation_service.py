@@ -24,12 +24,14 @@ from .db import InstanceNotFound, add_instance, get_db, get_instance, log_activi
 from .models import Transaction, TradingOrder
 from .portfolio_allocation import (
     ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP, ACTION_UNACTIONABLE,
+    ALLOCATION_BASIS_POSITION,
     FRACTIONAL_PATH_WHOLE,
     AllocationPlan, BaseSnapshot, FilledTotals, MarginInfo, OrderFill,
     PositionFetchFailed, PositionState,
-    apply_order_impacts, decide_symbol_action, held_no_price_block,
+    apply_order_impacts, blocking_messages, decide_symbol_action,
+    held_no_price_block,
     measure_filled_values, plan_quantity_attempts, signed_position_values,
-    split_delta_fifo,
+    split_delta_fifo, validate_label_targets,
 )
 from .TransactionHelper import TransactionHelper
 from .types import (
@@ -612,8 +614,34 @@ def _note_unacted_legs(outcome: RowOutcome, state) -> RowOutcome:
     return outcome
 
 
-def _leg_status(succeeded: float, failed: int) -> str:
-    """The row status for a multi-leg symbol: SUBMITTED / PARTIAL / FAILED.
+def _order_is_washtrade_locked(order_id: Optional[int]) -> bool:
+    """True when the freshest read of ``order_id`` sits at WASHTRADE_LOCKED.
+
+    Used to tell a leg the wash-trade GATE held back from one the broker really
+    refused -- the two reach ``TransactionHelper.adjust_quantity_with_tpsl`` as
+    the same ``success: False``, but they are not the same fact: a locked order
+    is PENDING at our end and ``TradeManager._check_all_washtrade_locked_orders``
+    re-submits it the moment the blocking order clears (for up to 24h before
+    giving up). Calling it FAILED told the user nothing more would happen, on an
+    order that could still fill hours later with no further warning.
+
+    Reads the DB rather than trusting ``result['message']``: the helper's own
+    return contract carries only a free-text reason, never the order's status, so
+    the order row is the one place this fact actually lives. Never raises --
+    a vanished or unreadable row is simply not a lock.
+    """
+    if not order_id:
+        return False
+    try:
+        order = get_instance(TradingOrder, order_id)
+    except Exception:  # noqa: BLE001 -- InstanceNotFound and anything else
+        return False
+    return order is not None and order.status == OrderStatus.WASHTRADE_LOCKED
+
+
+def _leg_status(succeeded: float, failed: int, locked: int = 0) -> str:
+    """The row status for a multi-leg symbol: SUBMITTED / PARTIAL / FAILED /
+    WASHTRADE_LOCKED.
 
     A row is one SYMBOL, but a close or a trim can be several transactions and
     each is its own order. Collapsing "2 of 3 legs went out" to FAILED is not a
@@ -623,9 +651,19 @@ def _leg_status(succeeded: float, failed: int) -> str:
     -- ``collect_order_fills`` measures every order id the row created, whatever
     the row's status -- but the report is.) Collapsing it to SUBMITTED is the
     opposite lie: the user is told the position is at target when it is not.
+
+    ``locked`` counts legs whose ONLY refusal was the wash-trade gate -- see
+    ``_order_is_washtrade_locked``. When every non-succeeding leg was locked and
+    none genuinely failed, the row reports WASHTRADE_LOCKED rather than FAILED or
+    PARTIAL: "failed" is a dead end the user has to act on, and this is not one.
+    A row with even one REAL failure keeps the old FAILED/PARTIAL verdict --
+    mixing a dead leg into a "still pending" status would hide the one that
+    actually needs attention.
     """
-    if not failed:
+    if not failed and not locked:
         return OUTCOME_SUBMITTED
+    if not failed and succeeded <= 0:
+        return OUTCOME_WASHTRADE_LOCKED
     return OUTCOME_PARTIAL if succeeded > 0 else OUTCOME_FAILED
 
 
@@ -742,6 +780,7 @@ def _adjust_symbol(account, row, state, *, on_order_id=_noop_order_id) -> RowOut
     messages: List[str] = []
     sent = 0.0
     failed = 0
+    locked = 0
     for txn_id, qty_change in splits:
         magnitude = abs(float(qty_change))
         current = held.get(txn_id, 0.0)
@@ -780,12 +819,21 @@ def _adjust_symbol(account, row, state, *, on_order_id=_noop_order_id) -> RowOut
             touched.append(txn_id)
             sent += magnitude
         else:
-            failed += 1
+            # The add-to-position order was submitted BEFORE this failure branch
+            # runs (adjust_quantity_with_tpsl's Step 1); if the wash-trade gate
+            # is what refused it, that order still exists, PENDING at our end,
+            # and TradeManager retries it once the blocker clears -- it is not
+            # dead the way a broker rejection is. Reported distinctly so the
+            # row's status stops claiming a leg that may still fill is finished.
+            if any(_order_is_washtrade_locked(oid) for oid in created):
+                locked += 1
+            else:
+                failed += 1
             messages.append(f"txn {txn_id}: {result.get('message')}")
 
     return RowOutcome(
         symbol=row.symbol, action=ACTION_ADJUST,
-        status=_leg_status(sent, failed),
+        status=_leg_status(sent, failed, locked),
         quantity=sent, order_ids=order_ids,
         transaction_ids=touched, message="; ".join(messages),
     )
@@ -1472,13 +1520,16 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     """Submit a reviewed plan and record it. The single Submit entry point.
 
     Order of operations:
-      0. GATE, twice: on the BASE (market valuation with a held symbol nobody could
-         price -- ``held_no_price_block``) and then on MARKET HOURS. Either returns
-         ``blocked=True`` having written nothing at all -- no run row, no stamped
-         order comments and, above all, no income consumed. This is the FIRST
-         statement in the function, above the reconcile in step 1: a blocked
-         attempt must not move an earlier run's money either. The base gate comes
-         first because its reason is the one the user can act on immediately.
+      0. GATE, three times: on the TARGET TOTALS (decision 3 -- REBALANCE only,
+         ``validate_label_targets``), then the BASE (market valuation with a held
+         symbol nobody could price -- ``held_no_price_block``), then MARKET HOURS.
+         Any of the three returns ``blocked=True`` having written nothing at all --
+         no run row, no stamped order comments and, above all, no income consumed.
+         This is the FIRST statement in the function, above the reconcile in step
+         1: a blocked attempt must not move an earlier run's money either. The
+         target and base gates come before the clock because their reason is one
+         the user can act on immediately; target comes first of those two because
+         it needs no broker call to be true.
       1. RECONCILE any earlier run whose income was left unconsumed, so this run's
          ledger reflects reality before it spends from it.
       2. INSERT the ``portfolio_allocation_run`` row with the plan snapshot and
@@ -1536,10 +1587,30 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     # no-price rows are never tickable, so filter_plan_rows drops them and the
     # filtered plan that arrives here looks clean.
     #
+    # THE TARGET-TOTAL gate, ahead of both of the above. Decision 3 -- "Managed
+    # label percentages must total exactly 100%. Submit is blocked otherwise" --
+    # had no enforcement anywhere in the app until this: ``compute_allocation``
+    # deliberately does not renormalise a bad target set, and the wizard's own
+    # check (``AllocationWizard._target_block``) is only the polite half -- a
+    # stale client or a call that reaches this function some other way must not
+    # get past it. Read off ``plan.labels``, the SAME ``LabelTarget`` list the
+    # plan was solved with (``filter_plan_rows`` carries it through unfiltered),
+    # so this can only ever describe the targets the plan was actually built
+    # from. Skipped for an INVEST_LABEL run: that solves one label against an
+    # explicit amount and has its own gate (``invest_validation_messages``,
+    # checked before the dry run even opens).
+    # Skipped when ``plan.labels`` is empty -- see the wizard's ``_target_block``
+    # for why that is "nothing to validate" rather than "0% is short of 100%".
+    reason = None
+    if plan.allocation_basis == ALLOCATION_BASIS_POSITION and plan.labels:
+        errors = blocking_messages(validate_label_targets(plan.labels))
+        if errors:
+            reason = 'label/symbol targets are off 100%: ' + '; '.join(errors)
     # Checked BEFORE the market gate on purpose: both refuse, but a failed quote is
     # something the user can retry now while a closed market is only something to
     # wait out, so the actionable reason is the one they are told.
-    reason = held_no_price_block(base.unpriced_held_symbols)
+    if reason is None:
+        reason = held_no_price_block(base.unpriced_held_symbols)
     if reason is None:
         reason = _market_blocked_reason(fetch_market_hours(account))
     if reason is not None:

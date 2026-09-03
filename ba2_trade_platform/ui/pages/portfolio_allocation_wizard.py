@@ -70,6 +70,7 @@ from nicegui import ui
 # module one edit away from having a target editor again. (Their names are
 # deliberately not spelled out in this comment -- the test looks for the strings.)
 from ...core.portfolio_allocation import (
+    ALLOCATION_BASIS_POSITION,
     ALLOCATION_MODE_INVEST_LABEL,
     LEVERAGE_LEVERAGED,
     LEVERAGE_NONE,
@@ -95,6 +96,7 @@ from ...core.portfolio_allocation import (
     redistribution_notice,
     summarise_plan,
     unconsumed_income_notice,
+    validate_label_targets,
     whole_share_notice,
 )
 from ..utils.portfolio_allocation_view import (
@@ -297,6 +299,17 @@ MARKER_WORKING_ORDERS = 'income-working-orders'
 
 #: Marker on the dry run's reserve chip.
 MARKER_RESERVED = 'dry-run-reserved'
+
+#: Marker on the TARGET-TOTAL block: label percentages off 100%, or a label's
+#: symbol weights off 100% within it. Decision 3 -- "Submit is blocked otherwise"
+#: -- had no live enforcement anywhere in the app until this: ``compute_allocation``
+#: deliberately does not renormalise ("blocking submission is the validator's job"),
+#: and nothing called ``validate_label_targets`` before Submit. Two boxes at 100%
+#: each used to buy DOUBLE the base with no warning on screen.
+MARKER_TARGET_BLOCK = 'target-block'
+#: Prefixes the joined validator errors so the banner reads as one sentence
+#: rather than a bare semicolon-joined dump of ``ERROR_LABEL_*`` strings.
+TARGET_BLOCK_PREFIX = 'Submit is off until the targets are fixed: '
 
 #: Marker on the footer line that puts the expected cash next to the reserve.
 MARKER_CASH_VS_RESERVE = 'dry-run-cash-vs-reserve'
@@ -701,6 +714,7 @@ class AllocationWizard:
         self.selected = self._default_selection(plan)
         self.dialog = None
         self._banner_container = None
+        self._base_block_container = None
         self._notices_container = None
         self._badge_container = None
         self._rows_container = None
@@ -725,12 +739,12 @@ class AllocationWizard:
             # numbers, they say SUBMIT IS OFF. A refusal behind an unopened tab is
             # a refusal that was not shown.
             #
-            # A CONTAINER for the banner, not a bare render: Refresh re-reads the
-            # clock, and a banner drawn straight into the card could never be
-            # taken down again. The base block is drawn once because it is derived
-            # from the frozen base, which Refresh does not replace (see
-            # ``_base_block``).
+            # A CONTAINER EACH, not a bare render: Refresh re-reads the clock and
+            # re-solves the plan, and a banner drawn straight into the card could
+            # never be taken down again -- or, for the target block, never
+            # updated to a NEW plan's targets.
             self._banner_container = ui.column().classes('w-full shrink-0')
+            self._base_block_container = ui.column().classes('w-full shrink-0')
             self._render_market_banner()
             self._render_base_block()
             with ui.tabs().classes('w-full shrink-0') as tabs:
@@ -846,6 +860,63 @@ class AllocationWizard:
         """
         return held_no_price_block(self.base.unpriced_held_symbols)
 
+    def _target_block(self) -> Optional[str]:
+        """Decision 3, finally enforced: ``None`` unless the label percentages or
+        a label's symbol weights are off 100%.
+
+        ``compute_allocation`` deliberately does not renormalise a bad target set
+        -- its own docstring says "Blocking submission is the validator's job, not
+        this function's" -- and nothing else in the app called
+        ``validate_label_targets`` before Submit. Typing 100 into two symbol boxes
+        of one label used to solve and SEND a plan that bought the label at twice
+        its target, with no warning anywhere on screen; two labels totalling 60%
+        deployed 60% of the account and called it done.
+
+        Read off ``self.plan.labels`` -- the SAME ``LabelTarget`` list the plan
+        was solved with, carried on the plan for exactly this (``plan_json``
+        reproducibility) -- rather than re-reading the page's live boxes: the
+        wizard has no editor for them, so this can only ever describe the plan
+        actually on screen, never a value the user has since changed elsewhere.
+
+        ONLY for a REBALANCE (``allocation_basis == ALLOCATION_BASIS_POSITION``).
+        An INVEST_LABEL run solves a single label against an explicit amount, and
+        decision 3's "100%" is a REBALANCE rule about dividing the whole
+        investable pool -- ``compute_label_investment`` has its own gate
+        (``invest_validation_messages``, checked before the dry run even opens).
+
+        ALSO skipped when ``plan.labels`` is EMPTY -- not one label, not zero
+        symbols in a label with a percentage, but literally nothing to divide.
+        The page already refuses to open a REBALANCE dry run with no managed
+        labels at all (``_open_allocation_flow``: "No managed labels yet"), so a
+        plan with an empty label list reaching this far is not the "I typed a bad
+        percentage" case decision 3 is about, and treating it as a 100%-short
+        target would misreport a different, already-handled situation.
+        """
+        if self.plan.allocation_basis != ALLOCATION_BASIS_POSITION:
+            return None
+        if not self.plan.labels:
+            return None
+        errors = blocking_messages(validate_label_targets(self.plan.labels))
+        if not errors:
+            return None
+        return TARGET_BLOCK_PREFIX + '; '.join(errors)
+
+    def _first_plan_block(self) -> Optional[str]:
+        """The FIRST reason this whole plan may not be submitted, or ``None``.
+
+        Used by ``_sync_submit_button`` ONLY, which always has a real ``self.plan``
+        (it runs from ``open``/``_refresh``, both well after construction) -- so
+        both halves are safe to read eagerly here. ``_submit`` does NOT use this;
+        see its own docstring for why its check has to stay lazier than this one.
+        ``_render_base_block`` does not use it either -- it draws both banners
+        independently, because a screen may need to show two reasons at once even
+        though Submit only needs to refuse for one.
+        """
+        base_block = self._base_block()
+        if base_block is not None:
+            return base_block
+        return self._target_block()
+
     def _sync_submit_button(self):
         """Point the Submit button at the CURRENT gate. Idempotent.
 
@@ -854,18 +925,18 @@ class AllocationWizard:
         and from every ``_refresh``, because the gate moves while the dialog sits
         there and the button is only a mirror of it.
 
-        TWO independent refusals, and the tooltip names whichever is in force: the
-        market-hours gate (moves while the dialog is open) and ``_base_block`` (a
-        held symbol with no quote, which does not). The base block is checked FIRST
-        because it is the one the user can act on straight away.
+        THREE independent refusals, and the tooltip names whichever is in force,
+        base-block-or-target-block FIRST: the market-hours gate moves while the
+        dialog is open, but the plan blocks are what the user can act on right
+        now.
         """
         if self._submit_button is None:
             return
-        base_block = self._base_block()
-        blocked = base_block is not None or not self.market.allowed
+        plan_block = self._first_plan_block()
+        blocked = plan_block is not None or not self.market.allowed
         self._submit_button.set_enabled(not blocked and not self._submitted)
         if self._submit_tooltip is not None:
-            reason = base_block if base_block is not None else (
+            reason = plan_block if plan_block is not None else (
                 self.market.message if not self.market.allowed else '')
             self._submit_tooltip.set_text(reason)
             self._submit_tooltip.set_visibility(blocked)
@@ -1000,22 +1071,37 @@ class AllocationWizard:
                 if not r['skipped'] and not r['suppressed']}
 
     def _render_base_block(self):
-        """The one banner that says the whole plan may not be submitted.
+        """The banner(s) that say the whole plan may not be submitted: the base
+        block and the target block, one ``div`` each so a test (and the user's
+        eye) can tell which reason is in force.
 
-        DANGER, and drawn ABOVE THE TABS rather than inside one. It does not
-        merely qualify the numbers below it -- it says they are wrong and Submit
-        is off -- so it may not be behind a tab the user has not opened.
+        DANGER, and drawn ABOVE THE TABS rather than inside one. Neither merely
+        qualifies the numbers below it -- each says they are wrong and Submit is
+        off -- so neither may sit behind a tab the user has not opened.
 
-        Drawn ONCE. ``_base_block`` reads the frozen base, which ``_refresh`` does
-        not replace; see its docstring for why that errs the safe way.
+        REDRAWN on every refresh, unlike the name suggests: ``_base_block`` reads
+        the frozen base (which ``_refresh`` never replaces, so that HALF is inert
+        on a redraw) but ``_target_block`` reads ``self.plan.labels``, which
+        ``_refresh`` DOES replace. A stale target banner that outlived the plan it
+        described would be exactly the "the two screens disagree" class of bug
+        this feature exists to remove. Idempotent: the container is cleared first.
         """
-        base_block = self._base_block()
-        if base_block is None:
+        if self._base_block_container is None:
             return
-        with ui.element('div').classes('alert-banner danger w-full p-3 shrink-0'):
-            with ui.row().classes('items-center gap-2'):
-                ui.icon('price_change')
-                ui.label(base_block).classes('text-sm').mark(MARKER_BASE_BLOCK)
+        self._base_block_container.clear()
+        with self._base_block_container:
+            base_block = self._base_block()
+            if base_block is not None:
+                with ui.element('div').classes('alert-banner danger w-full p-3 shrink-0'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('price_change')
+                        ui.label(base_block).classes('text-sm').mark(MARKER_BASE_BLOCK)
+            target_block = self._target_block()
+            if target_block is not None:
+                with ui.element('div').classes('alert-banner danger w-full p-3 shrink-0'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('percent')
+                        ui.label(target_block).classes('text-sm').mark(MARKER_TARGET_BLOCK)
 
     def _render_base_figures(self):
         with ui.row().classes('w-full gap-6 items-center'):
@@ -1502,6 +1588,7 @@ class AllocationWizard:
             return
         self.selected = self._default_selection(self.plan)
         self._render_market_banner()
+        self._render_base_block()
         self._sync_submit_button()
         self._render_notices()
         self._render_rows()
@@ -1530,20 +1617,32 @@ class AllocationWizard:
 
         An EMPTY submit does not latch: nothing was sent, and the user still has
         to be able to tick a row and press Submit for real. Neither does a submit
-        the MARKET GATE or ``_base_block`` refuses.
+        the MARKET GATE, ``_base_block`` or ``_target_block`` refuses.
         """
         # FIRST, before touching any other state: the button is disabled, but a
         # stale client or a keyboard activation must not get past this either. The
         # real enforcement is in run_allocation, which re-reads the clock AND
-        # re-derives the base block; this is the polite half, and it is deliberately
+        # re-derives every gate; this is the polite half, and it is deliberately
         # ahead of the one-shot latch so a refused click leaves the dialog exactly
         # as it found it.
+        #
+        # STRICT ORDER, LAZILY: ``_base_block`` and the market check touch only
+        # ``self.base`` / ``self.market``, which exist the instant the instance is
+        # constructed; ``_target_block`` touches ``self.plan``, which does not,
+        # in the one caller that proves this precondition
+        # (``test_wizard_submit_bails_on_the_gate_before_it_touches_anything_else``
+        # builds the wizard with ``object.__new__`` and no ``plan`` at all). Each
+        # check therefore runs only once the one before it has already passed.
         base_block = self._base_block()
         if base_block is not None:
             ui.notify(base_block, type='negative')
             return
         if not self.market.allowed:
             ui.notify(self.market.message, type=self.market.severity)
+            return
+        target_block = self._target_block()
+        if target_block is not None:
+            ui.notify(target_block, type='negative')
             return
         if self._submitted:
             logger.warning('Allocation submit ignored: this dry run has already been '

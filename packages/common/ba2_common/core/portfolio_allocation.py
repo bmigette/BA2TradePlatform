@@ -2137,13 +2137,20 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                 current_quantity=row.current_quantity)
         else:
             # Target a SHARE COUNT: target_notional / price, delta vs what is held.
-            ideal_quantity = round_quantity(target_notional, row.price, m,
-                                            allow_fractional=allow_fractional,
-                                            apply_min_order_size=False)
             raw_delta = float(target_notional) / float(row.price) - row.current_quantity
-            # Round the DELTA, not just the target: an on-grid target minus an
-            # off-grid holding is off-grid, and the delta is what is submitted.
-            delta = _round_delta_shares(ideal_quantity - row.current_quantity, m,
+            # Round the DELTA ITSELF -- never the target first. Flooring the
+            # TARGET to a whole share count and then subtracting the holding is
+            # off by exactly the fractional part of the target: a $50 target on a
+            # $150 stock floors to 0 target shares, and "0 minus the 1 share
+            # held" sells the WHOLE position on a trim the user never asked for
+            # -- then the next run's target is still sub-share, so it buys the
+            # share straight back. ``round_delta_quantity`` (COST mode, two
+            # branches up) already rounds the delta and not the target for
+            # exactly this reason; this mirrors it via the same
+            # ``_round_delta_shares``, so a trim that cannot be sent on the grid
+            # leaves the position where it is instead of closing it -- matching
+            # ``grid_zeroed`` below, which is what "leave it alone" means.
+            delta = _round_delta_shares(raw_delta, m,
                                         allow_fractional=allow_fractional,
                                         current_quantity=row.current_quantity)
         if abs(delta) < QUANTITY_EPSILON:
@@ -3835,11 +3842,20 @@ def _absorber_order(members: List["AllocationRow"]) -> List["AllocationRow"]:
         or ``SIZING_OUTCOME_SKIPPED_TOO_LARGE``) -- it already says "no order" on its
         face, and giving it one anyway makes the two halves of the row contradict
         each other;
-      * a skipped or unpriced row -- there is nothing to measure or to trade.
+      * a skipped or unpriced row -- there is nothing to measure or to trade;
+      * a row with an EXPLICIT ZERO TARGET (``target_notional <= 0``) -- decision
+        14 closes such a position outright and ``scale_pct_to_total``'s own rule
+        is that a weight of 0 is "hold NONE of this", not "hold whatever
+        redistribution leaves". Without this a label with room left over could
+        un-close a ``REASON_CLOSE_TO_ZERO`` row (selling less than everything,
+        so the position it was told to flatten survives at a residual size) or
+        open a fresh position in a symbol the user weighted at 0%, on a row that
+        had no order at all until redistribution invented one.
     """
     absorbers = [r for r in members
                  if r.sizing_outcome == SIZING_OUTCOME_NORMAL
-                 and float(r.unmet_notional or 0.0) <= MONEY_EPSILON]
+                 and float(r.unmet_notional or 0.0) <= MONEY_EPSILON
+                 and float(r.target_notional or 0.0) > MONEY_EPSILON]
     return sorted(absorbers, key=lambda r: (0 if r.fractional else 1,
                                             0 if r.delta_quantity else 1,
                                             r.symbol))
@@ -4206,21 +4222,33 @@ def redistribution_notice(summary: Dict[str, Any]) -> Optional[str]:
 #:
 #: ``OrderStatus.get_terminal_statuses()`` is the broker-side "will not change
 #: anymore" set -- CLOSED / REJECTED / CANCELED / EXPIRED / STOPPED / ERROR /
-#: REPLACED. Three more belong here for the ledger's purposes:
+#: REPLACED. Two more belong here for the ledger's purposes:
 #:
 #:   FILLED            complete by definition, and NOT in the terminal set.
 #:   DONE_FOR_DAY      the broker will send no further update today, so an
 #:                     unfilled residue never fills; waiting on it would wedge
 #:                     the run's income overnight. (User decision D5.)
-#:   WASHTRADE_LOCKED  our own gate. The order was never sent, so it is as final
-#:                     as an order can be, and it is worth exactly 0.
 #:
-#: UNKNOWN is deliberately ABSENT. "We do not know what this order did" is not
-#: "this order is over", and the difference is whether income gets spent.
+#: WASHTRADE_LOCKED is DELIBERATELY ABSENT (bug fix 2026-09-04 -- it used to be
+#: here on the premise "our own gate, the order was never sent, so it is as
+#: final as an order can be"). That premise is false:
+#: ``TradeManager._check_all_washtrade_locked_orders`` re-submits a locked order
+#: the moment its blocker clears, for up to ``_WASHTRADE_LOCK_MAX_AGE_HOURS``
+#: (24h) before giving up and expiring it into a real terminal status. Counting
+#: it as settled-at-zero here made ``run_allocation`` finalise the run and stamp
+#: its income consumed at 0 while the order was still armed -- so when the lock
+#: cleared and the buy filled hours later, no run's ledger was ever charged for
+#: it, and the SAME income got deployed again by the next rebalance. Leaving it
+#: out means a locked order reads as still WORKING, exactly like any other
+#: order that has not resolved yet: the run stays in ``get_unconsumed_runs()``
+#: until the lock clears (fills, at which point it settles for real) or expires
+#: (which is a terminal status already in the set above).
+#:
+#: UNKNOWN is deliberately ABSENT too. "We do not know what this order did" is
+#: not "this order is over", and the difference is whether income gets spent.
 SETTLED_ORDER_STATUSES = frozenset(OrderStatus.get_terminal_statuses()) | {
     OrderStatus.FILLED,
     OrderStatus.DONE_FOR_DAY,
-    OrderStatus.WASHTRADE_LOCKED,
 }
 
 #: Statuses that are THEMSELVES a measurement of zero, so a missing
@@ -4230,7 +4258,10 @@ SETTLED_ORDER_STATUSES = frozenset(OrderStatus.get_terminal_statuses()) | {
 #:                     share of it can have traded.
 #:   ERROR             our own stamp for a submission that failed
 #:                     (``AccountInterface._handle_order_submit_error``).
-#:   WASHTRADE_LOCKED  our own gate. The order was never sent.
+#:
+#: WASHTRADE_LOCKED is absent here too, for the same reason it left
+#: ``SETTLED_ORDER_STATUSES`` -- it is not settled at all, so it is not a
+#: measurement of zero either; it is UNKNOWN (still working) until it resolves.
 #:
 #: Needed because a refused allocation order reaches the ledger with a NULL
 #: quantity and NOT an explicit 0.0: the row is persisted with ``filled_qty``
@@ -4248,7 +4279,6 @@ SETTLED_ORDER_STATUSES = frozenset(OrderStatus.get_terminal_statuses()) | {
 UNEXECUTED_ORDER_STATUSES = frozenset({
     OrderStatus.REJECTED,
     OrderStatus.ERROR,
-    OrderStatus.WASHTRADE_LOCKED,
 })
 
 

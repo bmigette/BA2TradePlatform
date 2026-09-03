@@ -2611,3 +2611,154 @@ def test_the_header_and_the_cells_cannot_DRIFT_out_of_step():
     assert len(names) == len(set(names)) == 18
     with pytest.raises(KeyError):
         wiz._col('a-column-the-header-does-not-declare')
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX 2026-09-04: decision 3 ("label targets must total 100%; Submit is
+# blocked otherwise") had no enforcement anywhere in the wizard. Typing 100
+# into two symbol boxes of one label used to solve and SEND a plan that
+# double-bought the label, with no warning on screen.
+# ---------------------------------------------------------------------------
+
+def _plan_with_labels(labels, *, allocation_basis=None):
+    from ba2_trade_platform.core.portfolio_allocation import ALLOCATION_BASIS_POSITION
+    plan = _mixed_plan()
+    plan.labels = labels
+    plan.allocation_basis = allocation_basis or ALLOCATION_BASIS_POSITION
+    return plan
+
+
+def _overshooting_labels():
+    return [LabelTarget("ARK26", 70.0, [SymbolTarget("AAPL", 100.0)]),
+           LabelTarget("NASDAQ30", 70.0, [SymbolTarget("MSFT", 100.0)])]
+
+
+def test_a_bad_label_total_draws_the_target_block_and_disables_submit(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _plan_with_labels(_overshooting_labels()),
+            market=_open_market(), on_refresh=lambda f: pytest.fail("not called"),
+            on_submit=lambda p: pytest.fail("must not submit"))
+        wizard.open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_TARGET_BLOCK)
+
+    assert wizard._submit_button.enabled is False
+    assert len(drawn) == 1
+    assert "100%" in drawn[0]
+
+
+def test_a_bad_symbol_split_within_one_label_also_blocks(nicegui_client):
+    """The label total can be exactly 100 while the SYMBOL split inside it is
+    still wrong -- validate_label_targets catches both, and so must the wizard."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("ARK26", 100.0, [SymbolTarget("AAPL", 60.0),
+                                           SymbolTarget("MSFT", 60.0)])]
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _plan_with_labels(labels), market=_open_market(),
+            on_refresh=lambda f: pytest.fail("not called"),
+            on_submit=lambda p: pytest.fail("must not submit"))
+        wizard.open()
+
+    assert wizard._submit_button.enabled is False
+
+
+def test_a_bad_label_total_refuses_the_submit_click_itself(nicegui_client):
+    """The disabled button is a mirror and a mirror can be stale. The handler
+    re-checks, same contract as the base block."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    calls = []
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _plan_with_labels(_overshooting_labels()), market=_open_market(),
+            on_refresh=lambda f: pytest.fail("not called"),
+            on_submit=lambda p: calls.append(p))
+        wizard.open()
+        wizard._submit()
+
+    assert calls == []
+    assert wizard._submitted is False
+
+
+def test_a_label_total_of_exactly_100_draws_no_target_block(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("ARK26", 100.0, [SymbolTarget("AAPL", 100.0)])]
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _plan_with_labels(labels), market=_open_market(),
+            on_refresh=lambda f: (_plan_with_labels(labels), _open_market()),
+            on_submit=lambda p: None)
+        wizard.open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_TARGET_BLOCK)
+
+    assert drawn == []
+    assert wizard._submit_button.enabled is True
+
+
+def test_an_invest_label_plan_is_never_target_blocked(nicegui_client):
+    """An INVEST_LABEL run solves ONE label against an explicit amount and has
+    its own gate before the dry run even opens -- decision 3's 100% rule is a
+    REBALANCE rule and must not double-refuse this one."""
+    from ba2_trade_platform.core.portfolio_allocation import ALLOCATION_BASIS_BUDGET
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    # An arbitrary, non-100 target_pct: compute_label_investment does not read it,
+    # so it must not block an INVEST_LABEL submit either.
+    labels = [LabelTarget("ARK26", 40.0, [SymbolTarget("AAPL", 100.0)])]
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _plan_with_labels(labels, allocation_basis=ALLOCATION_BASIS_BUDGET),
+            market=_open_market(),
+            on_refresh=lambda f: pytest.fail("not called"), on_submit=lambda p: None)
+        wizard.open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_TARGET_BLOCK)
+
+    assert drawn == []
+    assert wizard._submit_button.enabled is True
+
+
+def test_the_target_block_and_the_base_block_can_both_show_at_once(nicegui_client):
+    """Two independent reasons, two independent banners -- neither may hide
+    behind the other."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base_with_an_unpriced_holding(),
+            _plan_with_labels(_overshooting_labels()), market=_open_market(),
+            on_refresh=lambda f: pytest.fail("not called"),
+            on_submit=lambda p: pytest.fail("must not submit"))
+        wizard.open()
+        base_drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_BASE_BLOCK)
+        target_drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_TARGET_BLOCK)
+
+    assert len(base_drawn) == 1
+    assert len(target_drawn) == 1
+    assert wizard._submit_button.enabled is False
+
+
+def test_a_target_block_that_clears_on_refresh_re_enables_submit(nicegui_client):
+    """``self.plan`` IS replaced by ``_refresh`` (unlike ``self.base``), so the
+    target block has to be re-derived every time -- a stale banner naming targets
+    that no longer apply would be its own version of the bug this closes."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    fixed_labels = [LabelTarget("ARK26", 100.0, [SymbolTarget("AAPL", 100.0)])]
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _plan_with_labels(_overshooting_labels()), market=_open_market(),
+            on_refresh=lambda f: (_plan_with_labels(fixed_labels), _open_market()),
+            on_submit=lambda p: None)
+        wizard.open()
+        assert wizard._submit_button.enabled is False
+
+        wizard._refresh(False)
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_TARGET_BLOCK)
+
+    assert drawn == []
+    assert wizard._submit_button.enabled is True

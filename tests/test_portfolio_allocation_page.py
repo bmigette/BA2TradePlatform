@@ -571,9 +571,79 @@ def test_a_failed_symbol_comment_save_is_reported_not_raised(monkeypatch, accoun
     monkeypatch.setattr(page, '_write_symbol_comment',
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError('db gone')))
 
-    asyncio.run(page._save_symbol_comment(account_id, 'ARK26', 'AAPL', 'x', ['AAPL']))
+    live = page._new_live_state()
+    asyncio.run(page._save_symbol_comment(account_id, live, 'ARK26', 'AAPL', 'x', ['AAPL']))
     assert any(kind == 'negative' for _, kind in sent)
     assert any('db gone' in m for m in errors)
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX 2026-09-04: a comment used to pin the STORE's even-split default
+# (get_symbol_weights) rather than what the table is actually SHOWING
+# (resolve_symbol_weights, off the held VALUE). On an uneven, unsaved holding
+# the two disagree, and the comment silently rewrote the symbol's target to a
+# number the user never typed or saw.
+# ---------------------------------------------------------------------------
+
+def test_a_comment_pins_the_DISPLAYED_weight_not_the_stores_even_split(account_id):
+    """The user's shape: AAPL $900 / MSFT $100 (90/10 by value), nothing saved.
+    The table shows 90/10 (resolve_symbol_weights); the store's own even split
+    would be 50/50. A comment on AAPL must pin 90, never 50."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    live = page._new_live_state()
+    live['weights']['ARK26'] = {'AAPL': 90.0, 'MSFT': 10.0}
+
+    asyncio.run(page._save_symbol_comment(account_id, live, 'ARK26', 'AAPL',
+                                          'watch the gap', ['AAPL', 'MSFT']))
+
+    row = get_symbol_rows(account_id, 'ARK26')['AAPL']
+    assert row.comment == 'watch the gap'
+    assert row.weight_pct == 90.0
+
+
+def test_a_comment_falls_back_to_the_store_default_with_no_live_figure_at_all(
+        account_id):
+    """The page always populates ``live['weights']`` before a comment box can be
+    typed into, but the writer must still do SOMETHING sane -- never write None
+    and never silently zero the row -- if it is ever called without one."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    live = page._new_live_state()  # no 'ARK26' key at all
+
+    asyncio.run(page._save_symbol_comment(account_id, live, 'ARK26', 'AAPL',
+                                          'no live figure', ['AAPL', 'MSFT']))
+
+    row = get_symbol_rows(account_id, 'ARK26')['AAPL']
+    assert row.weight_pct == 50.0          # the store's even split, not 0.0
+    assert row.comment == 'no live figure'
+
+
+def test_a_comment_on_a_stored_weight_still_pins_the_stored_value_not_the_display(
+        account_id):
+    """A stored row already has a real weight -- the displayed figure and the
+    stored one must agree, and either source landing on it is correct. Proves
+    the fix did not regress the already-covered explicit-weight case."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=70.0)
+    live = page._new_live_state()
+    live['weights']['ARK26'] = {'AAPL': 70.0, 'MSFT': 30.0}
+
+    asyncio.run(page._save_symbol_comment(account_id, live, 'ARK26', 'AAPL',
+                                          'still 70', ['AAPL', 'MSFT']))
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].weight_pct == 70.0
+
+
+def test_a_comment_pins_a_displayed_explicit_zero_not_the_stores_fallback(account_id):
+    """0.0 is a legitimate 'hold none' when it is what the page is SHOWING, and
+    must not be treated as 'no live figure' and replaced by a fallback split."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    live = page._new_live_state()
+    live['weights']['ARK26'] = {'AAPL': 0.0, 'MSFT': 100.0}
+
+    asyncio.run(page._save_symbol_comment(account_id, live, 'ARK26', 'AAPL',
+                                          'exited', ['AAPL', 'MSFT']))
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].weight_pct == 0.0
 
 
 # ---------------------------------------------------------------------------

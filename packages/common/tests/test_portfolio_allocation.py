@@ -2173,11 +2173,18 @@ def test_an_order_that_errored_before_reaching_the_broker_is_worth_nothing():
     assert totals.settled is True
 
 
-def test_a_washtrade_locked_order_is_settled_and_worth_nothing():
-    """Our own gate: never sent, so it is as final as an order gets."""
+def test_a_washtrade_locked_order_is_NOT_settled_it_can_still_be_resubmitted():
+    """BUG FIX 2026-09-04: this used to assert ``settled is True`` on the premise
+    that a locked order was "never sent, so it is as final as an order gets" --
+    false. ``TradeManager._check_all_washtrade_locked_orders`` re-submits a
+    locked order the moment its blocker clears, for up to 24h. Treating it as
+    settled-at-zero made ``run_allocation`` finalise the run and consume its
+    income at 0 while the order was still armed; when it filled hours later, no
+    run's ledger was ever charged, and the income could be spent again."""
     totals = measure_filled_values([
         _fill(1, OrderDirection.BUY, OrderStatus.WASHTRADE_LOCKED)])
-    assert totals.settled is True
+    assert totals.settled is False
+    assert totals.working_order_ids == [1]
     assert totals.buy_value == 0.0
 
 
@@ -2329,16 +2336,31 @@ def test_a_refused_order_with_no_quantity_at_all_is_worth_zero_not_unmeasurable(
     the status, so a rejected row reaches the ledger as REJECTED with a NULL
     quantity -- never an explicit 0.0. Reading that NULL as "unknown" would strand
     the income of every run that had a single row refused, which is the most
-    ordinary outcome there is.
+    ordinary outcome there is. WASHTRADE_LOCKED is NOT one of these any more --
+    see ``test_a_washtrade_locked_order_with_no_quantity_is_working_not_settled``
+    below -- because unlike REJECTED/ERROR it is not actually over.
     """
-    for status in (OrderStatus.REJECTED, OrderStatus.ERROR,
-                   OrderStatus.WASHTRADE_LOCKED):
+    for status in (OrderStatus.REJECTED, OrderStatus.ERROR):
         totals = measure_filled_values([
             _fill(1, OrderDirection.BUY, status, qty=None, price=None)])
         assert totals.settled is True, status
         assert totals.buy_value == 0.0, status
         assert totals.unmeasurable_order_ids == [], status
         assert totals.working_order_ids == [], status
+
+
+def test_a_washtrade_locked_order_with_no_quantity_is_working_not_settled():
+    """The status does NOT prove nothing executed -- it proves the order was
+    never SENT this time, but ``TradeManager`` can still send it later. Genuinely
+    both working (might still trade) and unmeasurable (there is nothing to price
+    yet) -- neither list is exclusive of the other, and either one alone already
+    keeps the run open."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.WASHTRADE_LOCKED, qty=None, price=None)])
+    assert totals.settled is False
+    assert totals.buy_value == 0.0
+    assert 1 in totals.working_order_ids
+    assert 1 in totals.unmeasurable_order_ids
 
 
 def test_a_null_quantity_on_a_settled_status_that_can_carry_a_fill_still_stalls():
@@ -2458,9 +2480,13 @@ def test_settled_statuses_cover_every_terminal_status_plus_filled():
     assert OrderStatus.get_terminal_statuses() <= SETTLED_ORDER_STATUSES
     assert OrderStatus.FILLED in SETTLED_ORDER_STATUSES
     assert OrderStatus.DONE_FOR_DAY in SETTLED_ORDER_STATUSES
-    assert OrderStatus.WASHTRADE_LOCKED in SETTLED_ORDER_STATUSES
     assert OrderStatus.PARTIALLY_FILLED not in SETTLED_ORDER_STATUSES
     assert OrderStatus.UNKNOWN not in SETTLED_ORDER_STATUSES
+    # BUG FIX 2026-09-04: NOT settled -- TradeManager re-submits a locked order
+    # once its blocker clears, so it is still working, not final. See
+    # SETTLED_ORDER_STATUSES' own docstring.
+    assert OrderStatus.WASHTRADE_LOCKED not in SETTLED_ORDER_STATUSES
+    assert OrderStatus.WASHTRADE_LOCKED not in UNEXECUTED_ORDER_STATUSES
 
 
 def test_filled_totals_to_dict_is_json_safe():
@@ -3115,3 +3141,128 @@ def test_redistribution_still_converges_against_a_reserved_base():
     assert plan.total_buy_value <= 9_000.0 + pa.MONEY_EPSILON
     assert plan.total_buy_value > 9_000.0 - 100.0     # inside one BBB share
     assert plan.reserved_notional == pytest.approx(1_000.0)
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX 2026-09-04: a whole-share MARKET-mode trim under one share was a
+# full liquidation, and the next run bought the position straight back.
+#
+# ``compute_allocation`` used to floor the TARGET to a whole share count first
+# and only then subtract the holding. A $50 target on a $150 stock, holding 1
+# share, floored the target to 0 shares and "0 minus 1 held" sold the whole
+# position -- on a target that was never an instruction to hold none of it.
+# Cost mode never had this defect: it always rounded the DELTA, not the
+# target. Market mode now does the same via ``_round_delta_shares``.
+# ---------------------------------------------------------------------------
+
+def test_a_sub_share_market_mode_trim_leaves_the_position_alone_not_a_full_sell():
+    current = {"XXX": _pos("XXX", 150.0, quantity=1.0, cost_basis=150.0)}
+    margin = {"XXX": MarginInfo(symbol="XXX", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+
+    # base 100 x 100% target -> $100 target on a $150 stock: a 0.667-share
+    # target, held 1 whole share, fractional trading OFF.
+    plan = pa.compute_allocation(100.0, 100.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert row.target_quantity == 1.0            # the holding, untouched
+    assert row.unmet_notional > 0.0
+    assert any(reason.startswith("-0.") and "rounds to zero" not in reason.lower()
+              or "rounds to" in reason for reason in row.reasons)
+
+
+def test_the_sub_share_trim_fix_does_not_touch_a_genuine_zero_target():
+    """The other branch of the same ``if``: an EXPLICIT zero target (weight 0, or
+    the label got 0%) must still close the position outright -- this is decision
+    14, unrelated to the rounding fix above."""
+    current = {"XXX": _pos("XXX", 150.0, quantity=1.0, cost_basis=150.0)}
+    margin = {"XXX": MarginInfo(symbol="XXX", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 0.0)])]
+
+    plan = pa.compute_allocation(100.0, 100.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    row = plan.rows[0]
+    assert row.delta_quantity == -1.0
+    assert row.side == OrderDirection.SELL
+    assert pa.REASON_CLOSE_TO_ZERO in row.reasons
+
+
+def test_a_sub_share_market_mode_trim_does_not_oscillate_across_two_runs():
+    """The user-visible symptom: run it twice with nothing else changing and the
+    SECOND run must be a no-op, not a buy-back of what the first run sold."""
+    current_after_bug = {"XXX": _pos("XXX", 150.0, quantity=0.0, cost_basis=0.0)}
+    margin = {"XXX": MarginInfo(symbol="XXX", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+
+    held = {"XXX": _pos("XXX", 150.0, quantity=1.0, cost_basis=150.0)}
+    first = pa.compute_allocation(100.0, 1_000.0, labels, held, margin,
+                                  allow_fractional=False, default_bp_factor=1.0,
+                                  valuation_mode=pa.VALUATION_MODE_MARKET)
+    assert first.rows[0].delta_quantity == 0.0   # no sell -> nothing to buy back
+
+    second = pa.compute_allocation(100.0, 1_000.0, labels, current_after_bug, margin,
+                                   allow_fractional=False, default_bp_factor=1.0,
+                                   valuation_mode=pa.VALUATION_MODE_MARKET)
+    # Starting from FLAT (what the bug would have produced) a new position still
+    # opens -- the fix changes only the TRIM case, never a fresh buy.
+    assert second.rows[0].delta_quantity == 1.0
+    assert second.rows[0].side == OrderDirection.BUY
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX 2026-09-04: label residual redistribution could un-close a
+# REASON_CLOSE_TO_ZERO row, and could open a fresh position in a symbol
+# weighted at 0% within its label.
+#
+# ``_absorber_order`` filtered on ``sizing_outcome`` and ``unmet_notional``
+# only, so a row with an explicit zero target (a closed position, or a
+# 0%-weight flat symbol) was still eligible to have redistribution move it --
+# contradicting decision 14 ("a zero target closes the transaction") and
+# ``scale_pct_to_total``'s own rule that a slot at 0 means hold none of it.
+# ---------------------------------------------------------------------------
+
+def test_redistribution_never_un_closes_a_zero_target_position():
+    current = {"AAA": _pos("AAA", 111.0, quantity=3.0, cost_basis=333.0),
+              "BBB": _pos("BBB", 10.0, quantity=10.0, cost_basis=100.0)}
+    margin = {s: MarginInfo(symbol=s, fractionable=False, bp_factor=1.0)
+             for s in ("AAA", "BBB")}
+    # AAA targets its whole 100%; BBB is weighted 0 within the same label, so its
+    # target is 0 and it must close outright, however much residual AAA leaves.
+    labels = [LabelTarget("L", 100.0, [SymbolTarget("AAA", 100.0),
+                                       SymbolTarget("BBB", 0.0)])]
+
+    plan = pa.compute_allocation(1_100.0, 1_100.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    bbb = next(r for r in plan.rows if r.symbol == "BBB")
+    assert bbb.delta_quantity == -10.0            # the FULL holding, not "sells less"
+    assert bbb.target_quantity == 0.0
+    assert pa.REASON_CLOSE_TO_ZERO in bbb.reasons
+    assert bbb.redistributed is False
+
+
+def test_redistribution_never_opens_a_zero_weight_flat_symbol():
+    current = {"AAA": _pos("AAA", 99.0, quantity=0.0, cost_basis=0.0)}
+    # BBB is not held and carries no PositionState at all -- genuinely flat.
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=True, bp_factor=1.0),
+             "BBB": MarginInfo(symbol="BBB", fractionable=True, bp_factor=1.0)}
+    labels = [LabelTarget("L", 100.0, [SymbolTarget("AAA", 100.0),
+                                       SymbolTarget("BBB", 0.0)])]
+
+    plan = pa.compute_allocation(1_000.0, 1_000.0, labels, current, margin,
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    bbb = next((r for r in plan.rows if r.symbol == "BBB"), None)
+    # Either absent from the plan (delta 0, no side) or present with no order --
+    # never a BUY on a symbol the user weighted at 0%.
+    if bbb is not None:
+        assert bbb.side != OrderDirection.BUY
+        assert (bbb.delta_quantity or 0.0) == 0.0
