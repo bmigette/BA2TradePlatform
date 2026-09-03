@@ -21,7 +21,39 @@ Important safety properties:
 """
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
 import pytest
+
+
+def _ensure_live_tree_on_path() -> None:
+    """Put the repo root (the checkout's ``ba2_trade_platform`` live tree) on ``sys.path``.
+
+    A handful of live<->backtest parity tests (``test_option_breaker_parity.py``,
+    ``test_per_leg_expiry_parity.py``) import the LIVE tree directly -- e.g.
+    ``ba2_trade_platform.modules.accounts.AlpacaAccount`` -- to prove identity/parity against
+    the real live account classes, not a double. ``ba2_trade_platform`` lives at the repo root
+    (three directories above ``testplatform/backend``), which is on no import path when pytest
+    runs from ``testplatform/backend`` (the working directory this suite is always run from),
+    so those imports raise ``ModuleNotFoundError`` unless something adds it. Walk up from this
+    file (rather than hard-coding a parent count) to the first ancestor that actually contains
+    a ``ba2_trade_platform`` package, and prepend it.
+    """
+    try:
+        import ba2_trade_platform  # noqa: F401  (already importable -- nothing to do)
+        return
+    except ModuleNotFoundError:
+        pass
+
+    here = Path(__file__).resolve()
+    for candidate in here.parents:
+        if (candidate / "ba2_trade_platform" / "__init__.py").is_file():
+            sys.path.insert(0, str(candidate))
+            return
+
+
+_ensure_live_tree_on_path()
 
 # Dummy credential values seeded into the throwaway test DB so provider __init__ calls
 # that read get_app_setting(...) do not raise. These are NOT real keys.
@@ -33,7 +65,19 @@ _SEED_KEYS = {
 
 @pytest.fixture(scope="session", autouse=True)
 def _seed_backtest_credentials(tmp_path_factory):
-    """Point ba2_common at a throwaway DB and seed dummy credential keys for the session."""
+    """Point ba2_common at a throwaway DB and seed dummy credential keys for the session.
+
+    Yields the ``db_file`` path (rather than ``None``) so a test whose OWN fixture calls
+    ``ba2_common.core.db.configure_db(...)`` directly (a raw global reassignment, not the
+    per-thread ``configure_db_threadlocal`` override backtests use, and not the
+    ``backtest_trading_db()`` context manager, both of which restore themselves) can request
+    this fixture by name to get back the ONE db file that has these credentials seeded, and
+    repoint the global engine at it in its own ``finally``. Without that restore, whichever
+    test in the session configures the db last and never repoints it back leaves every
+    LATER test that assumes the seeded credentials exist (e.g. constructing a real
+    ``FMPOHLCVProvider``) failing with "FMP API key not configured" -- an order-dependent
+    failure with nothing wrong at the failing test itself.
+    """
     from ba2_common.core import db as common_db
     from ba2_common.core.models import AppSetting
     from sqlmodel import Session, select
@@ -53,4 +97,4 @@ def _seed_backtest_credentials(tmp_path_factory):
                 session.add(AppSetting(key=key, value_str=value))
         session.commit()
 
-    yield
+    yield db_file
