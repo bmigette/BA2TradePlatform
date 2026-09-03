@@ -490,6 +490,15 @@ class ExpertEventType(str, Enum):
     # LONG leg, because that one asks the structure-exit question. Unevaluable (never fires,
     # in EITHER direction) on a structure with no held short leg.
     N_SHORT_LEG_DAYS_TO_EXPIRY = "short_leg_days_to_expiry"
+    # Calendar days of life left on the covered CALL an equity-entry overlay key wrote --
+    # resolved through the trade REPOSITORY (expert + underlying), not through the evaluated
+    # transaction. That is the whole reason it is a separate event type rather than a reuse of
+    # ``days_to_expiry``: on ``O_CC``/``O_WHEEL`` the manage pass is anchored to the STOCK
+    # position, so a transaction-anchored DTE reader finds no option legs and is INERT (never
+    # fires, in either direction, in either runtime). Same source ``has_covered_call`` uses.
+    # Unevaluable when no covered call is held, when one is held whose expiry is not recorded,
+    # or when two different expiries are held at once (a contradiction, never a min()).
+    N_COVERED_CALL_DAYS_TO_EXPIRY = "covered_call_days_to_expiry"
     # How much of the short overlay's own collected credit has decayed, as a percent: 0 the
     # day it was sold, 100 when it can be bought back for nothing, NEGATIVE when it has gone
     # against us. The buyback trigger of design 2026-08-31 leaps-grid §4. Unevaluable when the
@@ -647,6 +656,7 @@ def get_numeric_event_values():
         ExpertEventType.N_LOSS_PCT_OF_MAX_LOSS.value,
         ExpertEventType.N_PROFIT_MULTIPLE_OF_PREMIUM.value,
         ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY.value,
+        ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY.value,
         ExpertEventType.N_CREDIT_DECAYED_PCT.value,
         ExpertEventType.N_LONG_LEG_DELTA.value,
     ]

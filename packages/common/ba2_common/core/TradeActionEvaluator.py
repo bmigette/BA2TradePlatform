@@ -1155,6 +1155,12 @@ class TradeActionEvaluator:
                 # whether to cross the modelled spread fully (SL/DTE) or concede the
                 # entry's fraction. Inert in live (no modelled spread).
                 kwargs['forced_exit'] = forced_option_exit(event_action)
+                # WHICH option to close. Absent on every pre-existing rule (unchanged
+                # behaviour: the evaluated order, else its transaction's option entry).
+                # Present only on the equity-entry overlay keys, whose evaluated order is
+                # the STOCK -- see CloseOptionAction.close_target.
+                if action_config.get('close_target'):
+                    kwargs['close_target'] = action_config.get('close_target')
             elif action_type in _OPTION_ENTRY_ACTION_TYPES:
                 # Option ENTRY actions: pull strike/dte/sizing/liquidity/wing params from config.
                 # Only forward keys that are present so the action's own defaults apply otherwise.

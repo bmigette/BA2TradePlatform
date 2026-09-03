@@ -236,6 +236,56 @@ class TradeRepository(ABC):
             out.append(o)
         return out
 
+    def held_covered_calls(self, *, expert_id: int, underlying: str,
+                           option_strategy: str = "covered_call") -> List[TradingOrder]:
+        """The short CALL contracts this expert STILL HOLDS on ``underlying``, one row each.
+
+        THE ONE RESOLVER for "which option did the covered-call overlay write", and it exists
+        because the ordinary answer does not work for these keys. Every other option rule
+        reads the option off ``existing_order.transaction_id`` — but on an equity-entry
+        overlay key (``O_CC``, and ``O_WHEEL`` once its put has been assigned) the manage pass
+        is anchored to the STOCK: ``daily_engine._manage_open_positions`` and the live
+        ``TradeManager.process_open_positions_recommendations`` both evaluate once per SYMBOL
+        with the OLDEST entry order, and ``SellCoveredCallAction`` puts the written call on
+        its own transaction. A transaction-anchored option condition is therefore not merely
+        wrong there, it is INERT — measured, both runtimes. So the written call is resolved
+        the way ``HasCoveredCallCondition`` already resolves its existence: through this
+        repository, keyed on (expert, underlying).
+
+        NETTED OVER EXECUTED ROWS, which the existence check does not do and this must: a
+        call that has been bought back still has its ``sell_to_open`` row on an open
+        transaction, so a resolver that merely filtered ``side=SELL`` would keep reporting a
+        position that is gone — and a DTE rule reading it would re-submit a close every bar.
+        A contract is HELD when its signed executed quantity is still short.
+
+        The returned row is the SELL that opened each still-held contract (it carries the
+        strike, expiry, multiplier and fill price a close needs). Ordered by contract symbol
+        so two callers on one book see the same list in the same order.
+        """
+        from ba2_common.core.types import OptionRight, OrderDirection, OrderStatus as _OS
+
+        rows = self.open_option_orders(expert_id=expert_id, underlying=underlying,
+                                       option_type=OptionRight.CALL)
+        executed = _OS.get_executed_statuses()
+        net: dict = {}
+        opener: dict = {}
+        for o in rows:
+            if o.status not in executed or not o.contract_symbol:
+                continue
+            qty = abs(float(o.filled_qty or o.quantity or 0.0))
+            if qty <= 0:
+                continue
+            sign = 1.0 if o.side == OrderDirection.BUY else -1.0
+            net[o.contract_symbol] = net.get(o.contract_symbol, 0.0) + sign * qty
+            # The opening SELL, and only one tagged as the overlay: a short call that is the
+            # leg of a SPREAD is not a covered call, and closing it as one would break the
+            # spread. The tag is what ``submit_option_order`` stamped at entry.
+            if (sign < 0 and (o.option_strategy or "").strip().lower() == option_strategy
+                    and o.contract_symbol not in opener):
+                opener[o.contract_symbol] = o
+        return [opener[c] for c in sorted(opener)
+                if net.get(c, 0.0) < -1e-9]
+
     @staticmethod
     def _newest_close_first(txns: List[Transaction]) -> List[Transaction]:
         out = [t for t in txns if t.close_date is not None]

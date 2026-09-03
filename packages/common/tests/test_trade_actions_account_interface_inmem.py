@@ -71,6 +71,11 @@ def test_resolve_option_order_finds_option_leg_via_transaction_in_mem():
                                 asset_class=AssetClass.EQUITY)
         action = CloseOptionAction.__new__(CloseOptionAction)
         action.existing_order = existing
+        # The bare fixture must set every attribute the method under test READS.
+        # ``close_target`` (2026-09-03) selects the repository lookup an equity-anchored
+        # overlay key needs; None is the transaction-anchored path this test is about.
+        action.close_target = None
+        action.expert_recommendation = None
         resolved = action._resolve_option_order()
         assert resolved is not None and resolved.id == option_id
 

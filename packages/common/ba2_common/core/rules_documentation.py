@@ -387,6 +387,25 @@ def get_event_type_documentation() -> dict:
             "type": "numeric",
             "example": "Roll the overlay when short_leg_days_to_expiry <= 3"
         },
+        ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY.value: {
+            "name": "Covered Call Days to Expiry (the written call's own clock)",
+            "description": (
+                "Calendar days of life remaining on the covered CALL this expert wrote on the "
+                "underlying. Use it on a strategy whose ENTRY is the stock and whose call is an "
+                "overlay (a covered-call or wheel strategy): pair it with a close_option action "
+                "targeting the covered call to buy the call back before it expires, leaving the "
+                "shares held so the next one can be written. It is NOT interchangeable with "
+                "days_to_expiry: that one measures the option on the position being evaluated, "
+                "which on a stock-entry strategy is the stock, so it can never see the written "
+                "call. This condition looks the call up by expert and underlying instead, the "
+                "same way has_covered_call does. Unevaluable - and so never firing, in either "
+                "direction - when no covered call is held (none written yet, or already bought "
+                "back), when the held call has no recorded expiry, or when two calls with "
+                "different expiries are held at once."
+            ),
+            "type": "numeric",
+            "example": "Buy the written call back when covered_call_days_to_expiry <= 7"
+        },
         ExpertEventType.N_CREDIT_DECAYED_PCT.value: {
             "name": "Credit Decayed % (the buyback trigger)",
             "description": (

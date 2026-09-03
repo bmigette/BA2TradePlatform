@@ -44,6 +44,7 @@ _FIELD_ABBR: Dict[str, str] = {
     # short_leg_days_* field. Uniqueness across every event is pinned by
     # tests/test_condition_registry_coverage.py.
     "short_leg_days_to_expiry": "shortToExp",
+    "covered_call_days_to_expiry": "ccToExp",
     "credit_decayed_pct": "credDecay",
     "long_leg_delta": "longDelta",
     "loss_pct_of_max_loss": "lossOfMax",

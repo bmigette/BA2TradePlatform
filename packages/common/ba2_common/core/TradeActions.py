@@ -4612,7 +4612,7 @@ class OpenPutBackspreadAction(_BackspreadAction):
 # is the pure module and its import-leak gate forbids reaching back here), so there is no cycle.
 from ba2_common.core.option_expiry import PMCC_STRATEGY, is_multi_expiry_strategy
 from ba2_common.core.option_lifecycle import (
-    ORDER_PMCC_OVERLAY_KEY, PMCC_OVERLAY_SPEC_KEYS, PMCC_ROLL_STRATEGY,
+    COVERED_CALL_STRATEGY, ORDER_PMCC_OVERLAY_KEY, PMCC_OVERLAY_SPEC_KEYS, PMCC_ROLL_STRATEGY,
     close_legs_are_fail_closed, restamped_max_loss, roll_legs_are_fail_closed,
 )
 
@@ -5273,12 +5273,23 @@ class CloseOptionAction(TradeAction):
                  order_recommendation: OrderRecommendation,
                  existing_order: Optional[TradingOrder] = None,
                  expert_recommendation: Optional[ExpertRecommendation] = None,
-                 forced_exit: bool = False, **kwargs):
+                 forced_exit: bool = False, close_target: Optional[str] = None,
+                 **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
         #: True when this close is a RISK exit (stop-loss / DTE roll) rather than a
         #: discretionary one — a forced close crosses the modelled spread fully.
         self.forced_exit = bool(forced_exit)
+        #: WHICH option this close resolves, when the evaluation is not anchored to it.
+        #: ``None`` (every pre-existing rule) is the unchanged behaviour: the evaluated
+        #: order, else its transaction's option entry order. ``'covered_call'`` resolves the
+        #: written call through ``trade_repository.held_covered_calls`` instead — the ONE
+        #: lookup ``covered_call_days_to_expiry`` uses, because on an equity-entry overlay
+        #: key the evaluated order is the STOCK and there is nothing else to anchor to.
+        #: A PARAMETER rather than a second close action, deliberately: one close
+        #: implementation means one exit-quote concession, one multi-leg path and one
+        #: forced/discretionary rule, in both runtimes.
+        self.close_target = (close_target or "").strip().lower() or None
 
     # -- exit-quote concession helpers (backtest-only by construction) -----------
     def _modelled_half(self, contract_symbol: str) -> Optional[float]:
@@ -5409,7 +5420,41 @@ class CloseOptionAction(TradeAction):
 
     def _resolve_option_order(self) -> Optional[TradingOrder]:
         """Find the option order to close: prefer existing_order, else the
-        transaction's filled option entry order."""
+        transaction's filled option entry order.
+
+        ``close_target='covered_call'`` takes neither: it asks the trade REPOSITORY which
+        covered call this expert still holds on the underlying (see
+        ``held_covered_calls``), because on an equity-entry overlay key both of the
+        anchors above are the STOCK. Nothing else about the close changes -- the same
+        quote, the same concession, the same submit -- which is the point of doing it here
+        rather than in a second action.
+
+        It REFUSES on more than one held contract rather than picking: two written calls
+        with different strikes or expiries are two positions, and closing "one of them" on
+        an arbitrary ordering is the silent-choice this codebase does not make. The
+        matching condition reports the same shape as unevaluable.
+        """
+        if self.close_target == COVERED_CALL_STRATEGY:
+            from ba2_common.core.trade_repository import get_trade_repository
+            rec = self.expert_recommendation
+            expert_id = getattr(rec, "instance_id", None) if rec is not None else None
+            if expert_id is None:
+                logger.warning(f"close_option(covered_call) for {self.instrument_name}: the "
+                               f"evaluation carries no expert instance, so the written call "
+                               f"cannot be looked up")
+                return None
+            held = get_trade_repository().held_covered_calls(
+                expert_id=expert_id, underlying=self.instrument_name)
+            if not held:
+                return None
+            if len(held) > 1:
+                logger.warning(
+                    f"close_option(covered_call) for {self.instrument_name}: "
+                    f"{len(held)} covered calls are held "
+                    f"({[o.contract_symbol for o in held]}) — refusing to close one of them "
+                    f"on an arbitrary ordering")
+                return None
+            return held[0]
         if self.existing_order is not None and self.existing_order.asset_class == AssetClass.OPTION:
             return self.existing_order
         # Fall back to the OPENED transaction's option entry order

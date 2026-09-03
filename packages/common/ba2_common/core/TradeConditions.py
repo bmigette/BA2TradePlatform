@@ -3765,6 +3765,107 @@ class HasOptionPositionCondition(FlagCondition):
         return f"Option position found: {'Yes' if has else 'No'}"
 
 
+class CoveredCallDaysToExpiryCondition(CompareCondition):
+    """Calendar days of life left on the COVERED CALL this expert wrote on the underlying.
+
+    WHY THIS IS NOT ``days_to_expiry``. That condition resolves its option through
+    ``existing_order.transaction_id``, and on an equity-entry overlay key it is handed the
+    STOCK: both runtimes evaluate the OPEN_POSITIONS ruleset once per SYMBOL against the
+    OLDEST entry order (``daily_engine._manage_open_positions``; live
+    ``TradeManager.process_open_positions_recommendations``), and ``SellCoveredCallAction``
+    writes the call on its own transaction. The anchored transaction therefore carries no
+    option legs, the expiry is unmeasurable, and ``days_to_expiry`` is INERT on ``O_CC`` and
+    on the wheel's covered-call phase — emitted, searched by the GA, and never able to fire.
+    That was MEASURED end to end (``tests/backtest/test_covered_call_engine.py``: the written
+    call expired worthless with the rule live and with it removed, identically).
+
+    So this one resolves the written call the way ``HasCoveredCallCondition`` resolves its
+    existence — through ``trade_repository.held_covered_calls`` (expert + underlying) — and
+    ``close_option`` with ``close_target='covered_call'`` closes THAT call through the SAME
+    resolver. One lookup, one contract, both runtimes.
+
+    THE STANDING RULE this is the first instance of: an option exit condition anchored on the
+    evaluated transaction is inert for a stock-anchored overlay key. Overlay keys must use
+    repository-resolved conditions.
+
+    Sign and unknown-discipline are ``DaysToExpiryCondition``'s, verbatim: positive while the
+    call is alive, ``0`` on its expiry date, NEGATIVE past it; and an unmeasurable input
+    leaves ``calculated_value`` at ``None``, returns False for EVERY operator, and renders the
+    REASON rather than a plausible number. The three unmeasurable cases are all real:
+
+    * NO covered call is held — the overlay has not written one yet, or it has already been
+      bought back. "Nothing to close" is not "0 days left";
+    * a held call whose ``expiry`` was never recorded;
+    * TWO different expiries held at once. That is a contradiction, not a quantity: picking
+      ``min()`` closes the wrong contract early and ``max()`` never closes at all, and the
+      close action refuses the same shape for the same reason.
+    """
+
+    #: Rendered instead of a number when the measurement could not be made.
+    unknown_reason: Optional[str] = None
+
+    def _unevaluable(self, reason: str) -> bool:
+        self.calculated_value = None
+        self.unknown_reason = reason
+        logger.warning(f"covered_call_days_to_expiry for {self.instrument_name} is "
+                       f"unevaluable: {reason}")
+        return False
+
+    def evaluate(self) -> bool:
+        try:
+            self.calculated_value = None
+            self.unknown_reason = None
+            as_of = DaysToExpiryCondition._as_of_to_date(
+                getattr(self.expert_recommendation, "created_at", None)) \
+                if getattr(self.expert_recommendation, "created_at", None) is not None else None
+            if as_of is None:
+                return self._unevaluable(
+                    "no evaluation date on the recommendation — 'days remaining' has no "
+                    "reference point")
+
+            from ba2_common.core.trade_repository import get_trade_repository
+            rows = get_trade_repository().held_covered_calls(
+                expert_id=self.expert_recommendation.instance_id,
+                underlying=self.instrument_name)
+            if not rows:
+                return self._unevaluable(
+                    f"no covered call is held on {self.instrument_name} — there is no "
+                    f"written call whose remaining life could be measured")
+            expiries = {DaysToExpiryCondition._as_of_to_date(o.expiry)
+                        for o in rows if o.expiry is not None}
+            if not expiries:
+                return self._unevaluable(
+                    f"the covered call(s) held on {self.instrument_name} carry no recorded "
+                    f"expiry — their remaining life is unknown, not zero")
+            if len(expiries) > 1:
+                return self._unevaluable(
+                    f"{len(expiries)} different expiries are held as covered calls on "
+                    f"{self.instrument_name} ({sorted(expiries)}) — 'the' remaining life is "
+                    f"not a quantity, and neither min() nor max() would be an answer")
+            days = (next(iter(expiries)) - as_of).days
+            self.calculated_value = days
+            return self.operator_func(days, self.value)
+        except Exception as e:
+            absorb_if_benign(e)
+            logger.error(f"Error evaluating covered_call_days_to_expiry for "
+                         f"{self.instrument_name}: {e}", exc_info=True)
+            self.calculated_value = None
+            self.unknown_reason = f"error computing the covered call's remaining life: {e}"
+            return False
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            reason = getattr(self, "unknown_reason", None)
+            return f"unknown ({reason})" if reason else None
+        days = int(self.calculated_value)
+        return (f"{days} DTE on the covered call" if days >= 0
+                else f"{days} DTE on the covered call (expired {abs(days)}d ago)")
+
+    def get_description(self) -> str:
+        return (f"Check if days until the covered call written on {self.instrument_name} "
+                f"expires is {self.operator_str} {self.value}")
+
+
 class HasCoveredCallCondition(FlagCondition):
     """Check if this expert has an open covered call (short CALL) on the underlying."""
 
@@ -3959,6 +4060,7 @@ CONDITION_MAP: Dict[ExpertEventType, type] = {
     ExpertEventType.N_DAYS_AFTER_EVENT: DaysAfterEventCondition,
     ExpertEventType.N_DAYS_TO_EXPIRY: DaysToExpiryCondition,
     ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY: ShortLegDaysToExpiryCondition,
+    ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY: CoveredCallDaysToExpiryCondition,
     ExpertEventType.N_CREDIT_DECAYED_PCT: CreditDecayedPctCondition,
     ExpertEventType.N_LONG_LEG_DELTA: LongLegDeltaCondition,
     ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,

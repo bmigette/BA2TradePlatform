@@ -51,6 +51,7 @@ FIELD_EVENT: Dict[str, ExpertEventType] = {
     # of them drive a ROLL rather than a close: a dropped leaf leaves a PMCC's overlay to
     # expire unrolled while every log claims the rule is configured.
     "short_leg_days_to_expiry": ExpertEventType.N_SHORT_LEG_DAYS_TO_EXPIRY,
+    "covered_call_days_to_expiry": ExpertEventType.N_COVERED_CALL_DAYS_TO_EXPIRY,
     "credit_decayed_pct": ExpertEventType.N_CREDIT_DECAYED_PCT,
     "long_leg_delta": ExpertEventType.N_LONG_LEG_DELTA,
     "percent_to_current_target": ExpertEventType.N_PERCENT_TO_CURRENT_TARGET,
@@ -313,6 +314,14 @@ def _option_action_config(raw: str, rule: dict) -> dict:
     params (mirrors live, where CLOSE_OPTION takes none)."""
     cfg: dict = {"action_type": raw}
     if raw == ExpertActionType.CLOSE_OPTION.value:
+        # ...with ONE exception: WHICH option. A close on an equity-entry overlay key cannot
+        # resolve its contract from the evaluated position (that is the stock), so the rule
+        # names the target and ``CloseOptionAction`` looks it up through the trade
+        # repository. Forwarded only when present, so every pre-existing close_option rule
+        # emits the identical config it always did.
+        target = rule.get("close_target") or rule.get("option_close_target")
+        if target:
+            cfg["close_target"] = target
         return cfg
     for cfg_key, source_keys in _OPTION_ACTION_PARAM_KEYS:
         for src in source_keys:
