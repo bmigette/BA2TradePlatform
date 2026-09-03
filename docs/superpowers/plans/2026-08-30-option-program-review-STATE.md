@@ -171,6 +171,13 @@ shipped instead of the recommended deletion:
   comparability entry 4) and **every live instance of them needs re-export/re-import**
   (final-review merger-checklist item 8).
 
+**MERGER NOTE — the version bump.** `packages/` changed AFTER `origin/dev`'s
+`TEST_APP_VERSION = "2026.09.0013"` bump (`bfb19508`), so the follow-up merge takes it to
+**0014**. The operator does that bump at merge time, at a matrix3 job boundary and never
+mid-run: distributed workers compare `TEST_APP_VERSION` alone to decide whether to
+self-update, and shared `packages/` code that reaches them without a bump leaves workers
+running different `ba2_common` from the master. No bump was taken on the branch.
+
 Still open on this list: B1 (short-leg delta), C1 (breaker flatten), C3/C4/C5, C7-C10, and D.
 
 ### B. The tested-delta gap — the only live rule with NO backtest counterpart

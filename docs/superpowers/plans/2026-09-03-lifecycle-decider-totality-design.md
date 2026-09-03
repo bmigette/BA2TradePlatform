@@ -24,13 +24,19 @@ precedence ladder with exactly nine terminal `return`s. The service
 | 3 | `profit_capture` | `:1071-1079` | CLOSING → `_close` | `opt_tp` → `ProfitLossPercentCondition` → `close_option` (same arithmetic, two implementations — C3) |
 | 4 | `credit_stop` | `:1081-1097` | CLOSING → `_close` | `opt_sl` / `opt_sl_ml` → `LossPctOfMaxLossCondition` → `close_option` (different partition — C5) |
 | 5 | `tested` | `:1099-1105` | CLOSING → `_close` | **none** — no short-leg delta field exists (review B1) |
-| 6 | `roll_dte` | `:1120-1122`, **single-expiry branch only** | CLOSING → `_close` | `opt_dte` → `DaysToExpiryCondition` → `close_option` (long leg on a multi-expiry structure — C6) |
-| 7 | `roll_short` | `:1113-1119`, **multi-expiry branch only** | **NOWHERE — silently dropped.** Not in `LIFECYCLE_CLOSING_REASONS` (`:135-137`), no branch in the service | `pmcc_roll_dte` / `pmcc_roll_buyback` → `RollPMCCShortAction` — reached by BOTH runtimes (review §2c) |
-| 8 | `unknown` | `:1124-1130` | named branch `service:397-404` — WARNING + `result.unknown`, loud by construction | per-condition `_unevaluable` only, no aggregate (C7) |
-| 9 | `hold` | `:1132-1136` | no action, correctly | n/a |
+| 6 | `roll_short` | `:1113-1119`, **multi-expiry branch only** | **NOWHERE — silently dropped.** Not in `LIFECYCLE_CLOSING_REASONS` (`:135-137`), no branch in the service | `pmcc_roll_dte` / `pmcc_roll_buyback` → `RollPMCCShortAction` — reached by BOTH runtimes (review §2c) |
+| 7 | `unknown` | `:1124-1130` | named branch `service:397-404` — WARNING + `result.unknown`, loud by construction | per-condition `_unevaluable` only, no aggregate (C7) |
+| 8 | `hold` | `:1132-1136` | no action, correctly | n/a |
 
-Row 7 is the whole finding. Rows 1, 2, 5 are the *other* asymmetries; they are recorded in the
+Row 6 is the whole finding. Rows 1, 2, 5 are the *other* asymmetries; they are recorded in the
 STATE note's follow-up list and are out of this mandate's scope.
+
+**THE TABLE IS THE FINAL 8-REASON STATE.** As investigated there were NINE rows: a
+`roll_dte` between `tested` and `roll_short`, emitted on the single-expiry branch and closed
+by the pass. It was DELETED (`5427aca3`) — the `opt_dte` rule owns that exit in both runtimes
+— so the row is gone from the ladder, from `LIFECYCLE_CLOSING_REASONS` and from the service's
+disposition table, and the reflection pin refuses a disposition for a reason that can no
+longer arrive. See the OUTCOME section.
 
 ## (b) Which live structures can produce `LIFECYCLE_ROLL_SHORT`
 

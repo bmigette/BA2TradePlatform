@@ -5464,7 +5464,29 @@ class CloseOptionAction(TradeAction):
                     f"({[o.contract_symbol for o in held]}) — refusing to close one of them "
                     f"on an arbitrary ordering")
                 return None
-            return held[0]
+            call = held[0]
+            # A CLOSE ALREADY IN FLIGHT. ``held_covered_calls`` nets over EXECUTED rows only,
+            # so a submitted-but-unfilled buy-to-close leaves the contract still held —
+            # correct as a position statement, and fatal without this guard: ``cc_dte`` fires
+            # on every cycle the working close takes to fill and each one submits ANOTHER
+            # ticket for the same contract. That is the 2026-07-21 options-grid runaway,
+            # documented on ``has_pending_closing_order`` itself.
+            #
+            # The manage passes' own guard cannot cover this path: it filters the EVALUATED
+            # transaction set, which on a stock-anchored overlay key is the STOCK, while the
+            # call lives on its own transaction. And the backtest would HIDE it (its closes
+            # fill on the next bar), so it is exactly the live-only asymmetry this branch's
+            # work exists to remove — hence the check goes here, in shared code, on the ONE
+            # close implementation both runtimes walk. The deleted live pass had it
+            # (``option_lifecycle_service._close`` -> ``skipped_pending_close``); this
+            # replaces it rather than dropping it.
+            if self.account.has_pending_closing_order(call.transaction_id):
+                logger.info(
+                    f"close_option(covered_call) for {self.instrument_name}: a close for "
+                    f"{call.contract_symbol} (transaction {call.transaction_id}) is already "
+                    f"working — not submitting a second one")
+                return None
+            return call
         if self.existing_order is not None and self.existing_order.asset_class == AssetClass.OPTION:
             return self.existing_order
         # Fall back to the OPENED transaction's option entry order

@@ -48,7 +48,22 @@ def _rec():
 
 
 class _FakeAccount:
+    """The REAL ``has_pending_closing_order`` bound in: the guard under test must not be
+    faked away, and it reads the same rows on both stores."""
     id = 1
+
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+    has_pending_closing_order = ReadOnlyAccountInterface.has_pending_closing_order
+
+
+def _working_close(call_txn):
+    """A buy-to-close SUBMITTED and not yet filled, on the call's own transaction."""
+    add_instance(TradingOrder(
+        account_id=1, symbol=CALL, quantity=1.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, status=OrderStatus.NEW, transaction_id=call_txn,
+        asset_class=AssetClass.OPTION, contract_symbol=CALL, underlying_symbol=SYMBOL,
+        option_type=OptionRight.CALL, strike=200.0, multiplier=100, expiry=CALL_EXPIRY,
+        option_strategy="close"), expunge_after_flush=True)
 
 
 def _build_the_book():
@@ -78,7 +93,7 @@ def _build_the_book():
         option_type=OptionRight.CALL, strike=200.0, multiplier=100, expiry=CALL_EXPIRY,
         option_strategy="covered_call", open_price=2.0, filled_qty=1.0)
     add_instance(call, expunge_after_flush=True)
-    return stock
+    return stock, call_txn
 
 
 def _answers(stock):
@@ -102,8 +117,12 @@ def _answers(stock):
 def test_the_backtest_shaped_store_fires_the_rule_and_targets_the_written_call(tmp_path):
     """The BACKTEST side: ``trade_store``'s in-memory dicts, the store a GA trial runs on."""
     with ts.inmem_trades():
-        stock = _build_the_book()
+        stock, call_txn = _build_the_book()
         assert _answers(stock) == (True, 5, CALL)
+        # ...and the guard answers the same way on this store: with a close already
+        # working, the rule still fires and the close resolves NOTHING.
+        _working_close(call_txn)
+        assert _answers(stock) == (True, 5, None)
 
 
 def test_the_live_shaped_store_answers_IDENTICALLY(tmp_path):
@@ -116,8 +135,10 @@ def test_the_live_shaped_store_answers_IDENTICALLY(tmp_path):
     from ba2_common.core import db
     db.configure_db(str(tmp_path / "cc_parity.sqlite"))
     db.init_db()
-    stock = _build_the_book()
+    stock, call_txn = _build_the_book()
     assert _answers(stock) == (True, 5, CALL)
+    _working_close(call_txn)
+    assert _answers(stock) == (True, 5, None)
 
 
 def test_the_LIVE_LIFECYCLE_PASS_no_longer_closes_the_same_structure(tmp_path):

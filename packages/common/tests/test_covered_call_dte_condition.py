@@ -41,7 +41,17 @@ def _setup_db(tmp_path):
 
 
 class _FakeAccount:
+    """The REAL ``has_pending_closing_order`` over the real store, not a stub.
+
+    That method is what stops a second close going out while the first is still working, so
+    faking it would fake away the guard under test. ``ReadOnlyAccountInterface`` cannot be
+    instantiated here (it wants broker wiring), so its implementation is bound directly --
+    the same code, reading the same rows.
+    """
     id = 1
+
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+    has_pending_closing_order = ReadOnlyAccountInterface.has_pending_closing_order
 
 
 def _rec(as_of=SIM_AS_OF, symbol="AAPL", instance_id=1):
@@ -305,6 +315,15 @@ def test_a_short_call_that_is_a_SPREAD_leg_is_not_a_covered_call(tmp_path):
 # ---------------------------------------------------------------------------
 # the close that targets it — ONE close implementation, one lookup
 # ---------------------------------------------------------------------------
+def _working_close(db, call_txn, *, contract=CALL, status=None):
+    """A buy-to-close SUBMITTED and not yet filled — the state that made the runaway."""
+    from ba2_common.core.types import OrderDirection, OrderStatus
+    return _call_order(db, call_txn, contract=contract,
+                       expiry=SIM_TODAY + timedelta(days=5),
+                       side=OrderDirection.BUY, strategy="close",
+                       status=status or OrderStatus.NEW)
+
+
 def _close_action(order, *, target="covered_call", rec=None):
     from ba2_common.core.TradeActions import CloseOptionAction
     from ba2_common.core.types import OrderRecommendation
@@ -350,6 +369,40 @@ def test_the_close_finds_nothing_once_the_call_is_bought_back(tmp_path):
     _call_order(db, call_txn, expiry=SIM_TODAY + timedelta(days=5),
                 side=OrderDirection.BUY, strategy="close")
 
+    assert _close_action(stock)._resolve_option_order() is None
+
+
+def test_a_WORKING_close_stops_a_SECOND_ticket_going_out(tmp_path):
+    """THE GUARD. ``held_covered_calls`` nets over EXECUTED rows, so a submitted-but-unfilled
+    buy-to-close leaves the contract still held — a true statement about the position, and
+    fatal without this check: ``cc_dte`` fires on every cycle the working close takes to fill
+    and each one would submit another ticket for the same contract (the 2026-07-21
+    options-grid runaway, documented on ``has_pending_closing_order``).
+
+    The condition still FIRES — the call genuinely is held and genuinely is at its floor —
+    which is exactly why the guard has to live in the close.
+    """
+    db = _setup_db(tmp_path)
+    stock, call_txn = _written_call(db, expiry=SIM_TODAY + timedelta(days=5))
+    _working_close(db, call_txn)
+
+    assert _cond(stock, op="<=", value=7).evaluate() is True, (
+        "precondition: the rule still fires, so only the close can stop the second ticket")
+    assert _close_action(stock)._resolve_option_order() is None
+
+
+def test_once_the_close_FILLS_there_is_nothing_left_to_fire_on(tmp_path):
+    """The other side of the same state: a FILLED buy-to-close nets the contract flat, so the
+    condition goes unevaluable and the guard is not what is doing the work any more."""
+    from ba2_common.core.types import OrderStatus
+
+    db = _setup_db(tmp_path)
+    stock, call_txn = _written_call(db, expiry=SIM_TODAY + timedelta(days=5))
+    _working_close(db, call_txn, status=OrderStatus.FILLED)
+
+    cond = _cond(stock, op="<=", value=7)
+    assert cond.evaluate() is False
+    assert "no covered call is held" in cond.get_actual_value_display()
     assert _close_action(stock)._resolve_option_order() is None
 
 
