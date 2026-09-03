@@ -17,8 +17,27 @@ What the pass does, in order, for ONE expert sleeve:
 5. measure the shares still covering every ``covered_call`` (``held_shares_for_cover``),
    one position read per ticker;
 6. ask ``option_lifecycle.decide`` for exactly one decision per structure;
-7. submit a close for every ``should_close``, each one guarded by
-   ``has_pending_closing_order``.
+7. dispatch EVERY decision through ``LIFECYCLE_DISPOSITIONS``: submit a close for each
+   closing reason (guarded by ``has_pending_closing_order``), report the unknowns, record
+   a due roll the ruleset owns, and RAISE on a reason the table does not name.
+
+
+Every decision is acted on or refused loudly
+--------------------------------------------
+There is no path here on which ``decide`` returns a decision and nothing happens except
+``LIFECYCLE_HOLD``, which is the one reason that means "nothing is due". The dispatch used
+to end in ``if not decision.should_close: continue``, which is a correct reading of HOLD and
+a wrong one of everything else -- and ``LIFECYCLE_ROLL_SHORT``, deliberately not a closing
+reason, fell through it in silence for an entire branch (final review §1b/A1). The table is
+now the loop's only guide and an unlisted reason raises, so the next reason added upstream
+cannot be ignored here by omission.
+
+The roll is the one decision this pass computes and does not perform, and that is not a
+gap: ``roll_pmcc_short`` is a RULE, walked by both runtimes off the same ruleset. Rolling
+here as well would give live a second roller on a different threshold. So the decision is
+recorded (``roll_due``), and the case the rule cannot report on itself -- a sleeve holding a
+two-expiry structure whose ruleset has no roll rule -- is raised as ``UnownedRollError``
+after everything else in the pass has been acted on.
 
 
 It must not invoke an expert, and that is the point
@@ -135,10 +154,14 @@ from ba2_common.core.option_book import (
 )
 from ba2_common.core.OptionRiskManagement import update_sleeve_breaker
 from ba2_common.core.option_lifecycle import (
-    COVER_REQUIREMENT_UNMEASURABLE, COVERED_CALL_STRATEGY, LIFECYCLE_COVER_LOST,
+    COVER_REQUIREMENT_UNMEASURABLE, COVERED_CALL_STRATEGY, LIFECYCLE_BREAKER,
+    LIFECYCLE_CLOSING_REASONS, LIFECYCLE_COVER_LOST, LIFECYCLE_CREDIT_STOP, LIFECYCLE_HOLD,
+    LIFECYCLE_PROFIT_CAPTURE, LIFECYCLE_ROLL_DTE, LIFECYCLE_ROLL_SHORT, LIFECYCLE_TESTED,
     LIFECYCLE_UNKNOWN, LifecycleDecision, LifecycleLeg, OptionStructure, decide,
 )
 from ba2_common.core.option_types import OptionContract, OptionLeg
+from ba2_common.core.rule_builders import rule_carries_action
+from ba2_common.core.types import ExpertActionType
 
 from ..logger import logger
 
@@ -162,6 +185,60 @@ OPTIONAL_SETTINGS: Tuple[str, ...] = (
     "max_deployment_pct", "undefined_risk_max_pct", "max_notional_leverage",
     "max_concurrent_structures",
 )
+
+
+# ---------------------------------------------------------------------------
+# THE TOTALITY TABLE: what this pass does with every reason ``decide`` can return
+# ---------------------------------------------------------------------------
+#: What the dispatch loop does with a decision. Four dispositions, and every
+#: ``LIFECYCLE_*`` reason has exactly one.
+DISPOSITION_CLOSE = "close"            # submit a closing order
+DISPOSITION_REPORT = "report"          # no order; recorded and logged as an alarm
+DISPOSITION_RULE_OWNED = "rule-owned"  # no order HERE; a ruleset action performs it
+DISPOSITION_NO_ACTION = "no action"    # nothing is wrong and nothing is due
+
+#: EVERY reason ``option_lifecycle.decide`` can return, and what happens to it. The dispatch
+#: loop is driven off this table and RAISES on a reason that is not in it, so a new
+#: ``LIFECYCLE_*`` constant cannot be added upstream and quietly ignored here -- which is
+#: exactly how ``LIFECYCLE_ROLL_SHORT`` came to be computed and then dropped on the floor for
+#: an entire branch (final review §1b/A1). Totality is pinned by
+#: ``tests/test_option_lifecycle_service.py::test_every_lifecycle_reason_has_a_disposition``,
+#: which enumerates the constants by REFLECTION over ``option_lifecycle`` rather than by a
+#: hand-copied list, so the pin cannot go stale either.
+LIFECYCLE_DISPOSITIONS: Dict[str, str] = {
+    LIFECYCLE_BREAKER: DISPOSITION_CLOSE,
+    LIFECYCLE_COVER_LOST: DISPOSITION_CLOSE,     # AND reported: it is an incident
+    LIFECYCLE_PROFIT_CAPTURE: DISPOSITION_CLOSE,
+    LIFECYCLE_CREDIT_STOP: DISPOSITION_CLOSE,
+    LIFECYCLE_TESTED: DISPOSITION_CLOSE,
+    LIFECYCLE_ROLL_DTE: DISPOSITION_CLOSE,
+    LIFECYCLE_ROLL_SHORT: DISPOSITION_RULE_OWNED,
+    LIFECYCLE_UNKNOWN: DISPOSITION_REPORT,
+    LIFECYCLE_HOLD: DISPOSITION_NO_ACTION,
+}
+
+#: The ruleset action that OWNS a ``LIFECYCLE_ROLL_SHORT``. The roll is a RULE, not an engine
+#: hook (``TradeActions.RollPMCCShortAction``'s own argument), and it is walked by BOTH
+#: runtimes through ``TradeActionEvaluator``. This pass therefore must not roll: a second
+#: roller here would be a live-only mechanism with its own threshold (``roll_dte``, a setting)
+#: racing the searched one (``pmcc_roll_dte``, a ruleset param), i.e. a NEW parity gap. What
+#: it must do is refuse to be silent -- see ``_report_roll_due``.
+ROLL_SHORT_OWNER_ACTION: str = ExpertActionType.ROLL_PMCC_SHORT.value
+
+
+class UnownedRollError(RuntimeError):
+    """A maintenance roll is DUE and nothing in either runtime will perform it.
+
+    Raised at the END of the dispatch loop, after every other decision has been acted on, so
+    one misconfigured structure cannot stop the rest of the sleeve being closed. The caller
+    (``JobManager._run_open_positions_analysis``) already contains a raising pass and logs it
+    at ERROR before continuing with the analyses, so this surfaces as a loud, named
+    configuration failure rather than either a crash or a silence.
+
+    The configuration it names is real and reachable: a ``pmcc`` structure whose expert's
+    OPEN_POSITIONS ruleset carries no ``roll_pmcc_short`` rule has an overlay that will expire
+    against a LEAPS nobody bought back -- assignment, not a roll.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +288,15 @@ class LifecyclePassResult:
     #: "the cover is gone" and "I could not tell" are different facts, and an operator
     #: seeing no action needs to know which one he is looking at.
     cover_unmeasurable: List[int] = field(default_factory=list)
+    #: Decisions whose reason is LIFECYCLE_ROLL_SHORT: a two-expiry structure whose overlay
+    #: is due to be rolled. This pass does NOT roll them (``ROLL_SHORT_OWNER_ACTION`` does,
+    #: in both runtimes) — but it observes them, because a decision that is computed and
+    #: then dropped is the exact failure this bucket exists to make impossible.
+    roll_due: List[LifecycleDecision] = field(default_factory=list)
+    #: Transaction ids from ``roll_due`` whose expert has NO ``roll_pmcc_short`` rule, so
+    #: the roll is due and NOTHING will perform it. An ``UnownedRollError`` is raised for
+    #: these after the rest of the sleeve has been acted on.
+    roll_unowned: List[int] = field(default_factory=list)
     book: Optional[BookTotals] = None
     breaker: BreakerState = field(default_factory=BreakerState)
 
@@ -391,10 +477,33 @@ def run_option_lifecycle_pass(expert_instance_id: int,
                       f"{len(structures)} open option structure(s) needs ({e}) — refusing to "
                       f"substitute a default. These positions are NOT being managed.")
 
-    # 8. Act.
+    # 8. Act — and the dispatch is TOTAL. Every reason resolves to one of the four
+    #    dispositions in LIFECYCLE_DISPOSITIONS, and an unlisted reason RAISES. The
+    #    fall-through that used to sit here ("if not decision.should_close: continue") read
+    #    every non-closing reason as "nothing to do", which is true of LIFECYCLE_HOLD and
+    #    false of LIFECYCLE_ROLL_SHORT — so a computed roll was discarded in silence.
     by_id = {s.transaction_id: s for s in structures}
     txn_by_id = {t.id: t for t in transactions}
     for decision in result.decisions:
+        disposition = LIFECYCLE_DISPOSITIONS.get(decision.reason)
+        if disposition is None:
+            raise ValueError(
+                f"Option lifecycle: transaction {decision.transaction_id} decided "
+                f"{decision.reason!r}, which this pass has no disposition for "
+                f"({decision.detail}). A reason with no entry in LIFECYCLE_DISPOSITIONS "
+                f"cannot be acted on, and acting on nothing while the sleeve holds the "
+                f"position is the failure this refusal exists to prevent — add the reason "
+                f"to the table with what should happen to it.")
+
+        if disposition == DISPOSITION_NO_ACTION:
+            continue
+
+        if disposition == DISPOSITION_RULE_OWNED:
+            # Computed here, PERFORMED by the ruleset action, in both runtimes. Observed
+            # either way, and loud when nothing owns it.
+            _report_roll_due(instance, decision, by_id[decision.transaction_id], result)
+            continue
+
         if decision.reason == LIFECYCLE_UNKNOWN:
             # NOT a hold, and never silent: name the transaction and the missing input.
             result.unknown.append(decision)
@@ -412,8 +521,18 @@ def run_option_lifecycle_pass(expert_instance_id: int,
                 f"({by_id[decision.transaction_id].underlying}) has LOST ITS COVER — "
                 f"{decision.detail}. Closing it. Nothing in this platform sold those "
                 f"shares this pass, so check for a broker-side stop or a manual sale.")
+        # DISPOSITION_CLOSE and DISPOSITION_REPORT converge here: UNKNOWN has already
+        # `continue`d, so every reason still standing is a closing one. The old
+        # ``if not decision.should_close: continue`` guard is gone — it was the silent
+        # fall-through — and the equivalence is asserted instead, because a closing
+        # disposition on a reason ``should_close`` denies would submit nothing at all.
         if not decision.should_close:
-            continue
+            raise ValueError(
+                f"Option lifecycle: transaction {decision.transaction_id} decided "
+                f"{decision.reason!r}, which LIFECYCLE_DISPOSITIONS marks {disposition!r} "
+                f"but LIFECYCLE_CLOSING_REASONS does not contain "
+                f"({sorted(LIFECYCLE_CLOSING_REASONS)}). The two tables disagree, and the "
+                f"position would be neither closed nor reported.")
         _close(account, txn_by_id[decision.transaction_id], by_id[decision.transaction_id],
                decision, result)
 
@@ -422,8 +541,72 @@ def run_option_lifecycle_pass(expert_instance_id: int,
         f"{len(result.submitted)} closed, {len(result.skipped_pending_close)} already "
         f"closing, {len(result.failed)} failed, {len(result.unknown)} unknown, "
         f"{len(result.cover_lost)} cover-lost, {len(result.cover_unmeasurable)} with an "
-        f"unmeasurable cover")
+        f"unmeasurable cover, {len(result.roll_due)} due to roll "
+        f"({len(result.roll_unowned)} with NO rule to roll them)")
+
+    # LAST, deliberately: every close above has already been submitted, so one misconfigured
+    # structure cannot stop the rest of the sleeve being managed. See ``UnownedRollError``.
+    if result.roll_unowned:
+        raise UnownedRollError(
+            f"expert {expert_instance_id}: transaction(s) "
+            f"{sorted(result.roll_unowned)} need their short overlay rolled, and this "
+            f"expert's OPEN_POSITIONS ruleset carries no {ROLL_SHORT_OWNER_ACTION!r} rule "
+            f"— nothing in the platform will roll them, and the overlay will run to expiry "
+            f"against a long nobody bought it back for. This pass deliberately does NOT "
+            f"roll (a second roller here would race the searched rule); add the rule to the "
+            f"ruleset, or close the structure.")
     return result
+
+
+def _report_roll_due(instance, decision: LifecycleDecision, structure: OptionStructure,
+                     result: LifecyclePassResult) -> None:
+    """A two-expiry overlay is due to be rolled. Record it; never roll it here.
+
+    THE ROLL IS A RULE. ``RollPMCCShortAction`` is walked by the live ``TradeManager`` and by
+    ``daily_engine`` through the same ``TradeActionEvaluator``, off the same OPEN_POSITIONS
+    ruleset — one implementation, two callers, which is the whole reason the backtest can be
+    read as evidence about rolling at all. A roll issued from this pass would be a second
+    mechanism that only live has, triggered by a different threshold (the ``roll_dte``
+    expert setting rather than the searched ``pmcc_roll_dte`` rule parameter), and the two
+    could disagree about the same bar.
+
+    What this pass owes the operator is therefore not the roll but the FACT, and one alarm
+    the rule cannot raise for itself: an expert holding a ``pmcc`` whose ruleset has no
+    ``roll_pmcc_short`` rule reaches its overlay's expiry with nothing scheduled to buy it
+    back. That is recorded here and raised at the end of the pass.
+    """
+    result.roll_due.append(decision)
+    if _ruleset_carries_roll(getattr(instance, "open_positions_ruleset_id", None)):
+        logger.info(
+            f"Option lifecycle: transaction {decision.transaction_id} "
+            f"({structure.underlying}) is due to roll its overlay — {decision.detail}. "
+            f"NOT rolled here: the {ROLL_SHORT_OWNER_ACTION!r} rule in this expert's "
+            f"OPEN_POSITIONS ruleset owns it, in both runtimes.")
+        return
+    result.roll_unowned.append(decision.transaction_id)
+    logger.error(
+        f"Option lifecycle: transaction {decision.transaction_id} ({structure.underlying}) "
+        f"is due to roll its overlay — {decision.detail} — and this expert's OPEN_POSITIONS "
+        f"ruleset carries NO {ROLL_SHORT_OWNER_ACTION!r} rule. Nothing will roll it. The "
+        f"short leg will run to expiry against a long that outlives it, i.e. assignment "
+        f"rather than a roll.")
+
+
+def _ruleset_carries_roll(ruleset_id: Optional[int]) -> bool:
+    """Does this OPEN_POSITIONS ruleset contain the action that owns the roll?
+
+    ``None`` (no ruleset configured at all) is False, not an error: the question asked is
+    "will anything roll this?", and no ruleset is the loudest possible no.
+    """
+    if ruleset_id is None:
+        return False
+    from ba2_common.core.db import ruleset_event_actions
+
+    # The SAME ordered eager load ``TradeActionEvaluator`` walks, not a second query: the
+    # question here is "is the rule the evaluator will walk present?", so reading a
+    # different row set would be able to answer yes about rules the evaluator never sees.
+    return any(rule_carries_action(getattr(rule, "actions", None), ROLL_SHORT_OWNER_ACTION)
+               for rule in ruleset_event_actions(ruleset_id))
 
 
 def _abort(result: LifecyclePassResult, reason: str) -> LifecyclePassResult:

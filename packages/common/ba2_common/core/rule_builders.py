@@ -172,6 +172,40 @@ def _operator_of(leaf: dict) -> str:
     return _WORD_TO_SYMBOL.get(str(raw).strip().lower(), raw)
 
 
+def action_type_of(action_config: Any) -> Optional[str]:
+    """The action-type string of ONE entry in an ``EventAction.actions`` dict.
+
+    TWO SPELLINGS reach the database and both are live. ``action_type`` is what every
+    builder in this module writes and what ``TradeActionEvaluator`` resolves against
+    ``ExpertActionType``; ``type`` is the older API/UI spelling still present in seeded and
+    hand-edited rulesets. Reading only one of them silently mis-reads half the rows -- a rule
+    that IS a ``roll_pmcc_short`` would read as carrying no action at all -- so the pair is
+    read HERE, once, in the order every consumer already used.
+
+    Falsy-first ``or`` semantics are preserved deliberately: an entry that carries
+    ``action_type: ""`` falls through to ``type``, exactly as the inline reads did. Anything
+    that is not a mapping, and a mapping with neither key, answers ``None`` -- "this entry
+    declares no action" -- rather than raising, because a caller asking *which* action a rule
+    carries is asking a question a malformed row is allowed to answer with "none".
+    """
+    if not isinstance(action_config, dict):
+        return None
+    return action_config.get("action_type") or action_config.get("type") or None
+
+
+def rule_carries_action(actions: Any, action_type: str) -> bool:
+    """Does ONE ``EventAction.actions`` dict carry an action of ``action_type``?
+
+    The dict is keyed by an arbitrary slot name ("act", "act2", ...), so the answer is over
+    its VALUES. Used by the live lifecycle pass to ask whether a sleeve's OPEN_POSITIONS
+    ruleset actually contains the action that owns a maintenance decision -- the difference
+    between "the rule will do it" and "nothing will do it".
+    """
+    if not isinstance(actions, dict):
+        return False
+    return any(action_type_of(entry) == action_type for entry in actions.values())
+
+
 def tree_leaves(node: Any) -> Iterable[dict]:
     """Yield leaf condition dicts (those with a 'field') from an AND/OR condition tree."""
     if not isinstance(node, dict):

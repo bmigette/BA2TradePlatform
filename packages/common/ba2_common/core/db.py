@@ -150,6 +150,33 @@ def cached_ruleset_eventactions(ruleset_id, loader):
     return cache[ruleset_id]
 
 
+def ruleset_event_actions(ruleset_id):
+    """A ruleset's EventAction rows, IN ORDER, loaded eagerly.
+
+    ONE loader, because there are two readers with the same requirement and a subtle trap
+    between them. ``Ruleset.event_actions`` is a lazy relationship and every accessor here
+    hands back a DETACHED instance (``expunge_after_flush``), so touching the attribute
+    outside a session raises ``DetachedInstanceError`` rather than returning the rules. The
+    join is therefore run inside the session and the rows come back materialised.
+
+    Order is ``RulesetEventActionLink.order_index`` and it is load-bearing: the evaluator is
+    FIRST-MATCH, so the sequence is the rule precedence.
+    """
+    from sqlmodel import select
+
+    from ba2_common.core.models import EventAction, RulesetEventActionLink
+
+    with get_db() as session:
+        statement = (
+            select(EventAction)
+            .join(RulesetEventActionLink,
+                  EventAction.id == RulesetEventActionLink.eventaction_id)
+            .where(RulesetEventActionLink.ruleset_id == ruleset_id)
+            .order_by(RulesetEventActionLink.order_index)
+        )
+        return session.exec(statement).all()
+
+
 def get_engine():
     """Lazily build (and memoize) the SQLModel engine. A per-thread override wins; otherwise
     the shared global engine. No DB I/O happens at import."""

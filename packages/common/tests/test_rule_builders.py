@@ -109,3 +109,64 @@ def test_close_option_action_carries_no_selection_params():
     strike/dte/sizing params (mirrors live, where CLOSE_OPTION takes none)."""
     a = action_from_rule({"action": "close_option"})
     assert a["act"] == {"action_type": "close_option"}
+
+
+# ---------------------------------------------------------------------------
+# action_type_of / rule_carries_action -- "which action does this rule carry?"
+#
+# The live option lifecycle pass asks this to tell "the rule will roll it" from "nothing
+# will roll it", so a mis-read here turns a loud refusal into a false all-clear.
+# ---------------------------------------------------------------------------
+def test_both_spellings_of_the_action_type_are_read():
+    """``action_type`` is what the builders write; ``type`` is the older API/UI spelling
+    still present in seeded rulesets. Reading one silently mis-reads half the rows."""
+    from ba2_common.core.rule_builders import action_type_of
+
+    assert action_type_of({"action_type": "roll_pmcc_short"}) == "roll_pmcc_short"
+    assert action_type_of({"type": "roll_pmcc_short"}) == "roll_pmcc_short"
+
+
+def test_action_type_prefers_action_type_and_falls_through_an_empty_one():
+    """Falsy-first, exactly as the inline reads it replaces."""
+    from ba2_common.core.rule_builders import action_type_of
+
+    assert action_type_of({"action_type": "close_option", "type": "buy"}) == "close_option"
+    assert action_type_of({"action_type": "", "type": "buy"}) == "buy"
+
+
+def test_an_entry_that_declares_no_action_answers_None_rather_than_raising():
+    from ba2_common.core.rule_builders import action_type_of
+
+    assert action_type_of({}) is None
+    assert action_type_of({"value": 3}) is None
+    assert action_type_of(None) is None
+    assert action_type_of("roll_pmcc_short") is None
+
+
+def test_a_rule_carries_an_action_regardless_of_its_slot_name():
+    """``EventAction.actions`` is keyed by an arbitrary slot ("act", "act2", ...), so the
+    answer is over its VALUES -- a search over the keys would find nothing."""
+    from ba2_common.core.rule_builders import rule_carries_action
+
+    actions = {"act": {"action_type": "close_option"},
+               "act2": {"action_type": "roll_pmcc_short"}}
+    assert rule_carries_action(actions, "roll_pmcc_short") is True
+    assert rule_carries_action(actions, "close_option") is True
+    assert rule_carries_action(actions, "sell_covered_call") is False
+
+
+def test_a_rule_with_no_actions_carries_nothing():
+    from ba2_common.core.rule_builders import rule_carries_action
+
+    assert rule_carries_action({}, "roll_pmcc_short") is False
+    assert rule_carries_action(None, "roll_pmcc_short") is False
+
+
+def test_the_builder_and_the_reader_agree_on_the_shape():
+    """END TO END over the one shape that matters: what ``action_from_rule`` WRITES is what
+    ``rule_carries_action`` READS. Two functions in this module disagreeing about the key
+    would make the live roll-ownership check answer about a shape nothing emits."""
+    from ba2_common.core.rule_builders import action_from_rule, rule_carries_action
+
+    built = action_from_rule({"action": "roll_pmcc_short"})
+    assert rule_carries_action(built, "roll_pmcc_short") is True

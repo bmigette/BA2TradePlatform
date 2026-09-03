@@ -276,21 +276,17 @@ class TradeActionEvaluator:
             # times per run — cached_ruleset_eventactions memoises it per-thread FOR THE BACKTEST
             # ONLY (live always reloads, since a user can edit a ruleset between analyses). The
             # cached EventAction rows are read-only here.
-            from ba2_common.core.db import cached_ruleset_eventactions
+            from ba2_common.core.db import cached_ruleset_eventactions, ruleset_event_actions
 
             def _load_ruleset_and_actions():
                 rs = get_instance(Ruleset, ruleset_id)
                 if not rs:
                     return None, []
-                from ba2_common.core.models import RulesetEventActionLink
-                with get_db() as session:
-                    statement = (
-                        select(EventAction)
-                        .join(RulesetEventActionLink, EventAction.id == RulesetEventActionLink.eventaction_id)
-                        .where(RulesetEventActionLink.ruleset_id == ruleset_id)
-                        .order_by(RulesetEventActionLink.order_index)
-                    )
-                    return rs, session.exec(statement).all()
+                # The ordered join lives in ``db.ruleset_event_actions`` -- the live option
+                # lifecycle pass asks the same question (does this ruleset carry the action
+                # that owns a roll?) and must not re-derive the load, least of all the
+                # detached-relationship trap it works around.
+                return rs, ruleset_event_actions(ruleset_id)
 
             ruleset, event_actions = cached_ruleset_eventactions(ruleset_id, _load_ruleset_and_actions)
             if not ruleset:

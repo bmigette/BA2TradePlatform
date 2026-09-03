@@ -37,7 +37,7 @@ from ba2_trade_platform.core.types import (
 )
 from ba2_common.core.option_lifecycle import (
     LIFECYCLE_BREAKER, LIFECYCLE_CREDIT_STOP, LIFECYCLE_HOLD, LIFECYCLE_PROFIT_CAPTURE,
-    LIFECYCLE_ROLL_DTE, LIFECYCLE_TESTED, LIFECYCLE_UNKNOWN,
+    LIFECYCLE_ROLL_DTE, LIFECYCLE_ROLL_SHORT, LIFECYCLE_TESTED, LIFECYCLE_UNKNOWN,
 )
 
 from tests.conftest import MockAccount
@@ -1291,3 +1291,245 @@ def test_an_account_without_option_support_is_skipped(monkeypatch, sleeve):
 
     assert result.aborted is False
     assert result.decisions == []
+
+
+# ===========================================================================
+# TOTALITY: every reason ``decide`` can return is acted on, or refused loudly
+#
+# The defect this section exists to make impossible (final review §1b/A1): the dispatch
+# ended in ``if not decision.should_close: continue``, which reads every non-closing reason
+# as "nothing to do". That is true of LIFECYCLE_HOLD and false of LIFECYCLE_ROLL_SHORT, so
+# the pass computed a due roll and dropped it on the floor. Nothing failed, nothing logged,
+# and the sleeve was protected by one of the two mechanisms that appeared to exist.
+# ===========================================================================
+def open_pmcc(account, expert_row, *, underlying="ACN", long_expiry=EXPIRY_FAR,
+              short_expiry=EXPIRY_NEAR, long_strike=90.0, short_strike=110.0,
+              long_fill=10.00, short_fill=2.00, qty=1, strategy="pmcc"):
+    """One OPENED two-expiry structure: a LEAPS call plus a nearer short-call overlay.
+
+    ``strategy`` is a parameter because the tag is the ONLY thing that makes this a roll
+    rather than a close -- ``is_multi_expiry_strategy`` is membership in a frozenset of one --
+    and a test that flips it proves the branch is reached for the reason it claims.
+    """
+    net_debit = long_fill - short_fill
+    txn = create_transaction(
+        symbol=underlying, quantity=qty, side=OrderDirection.BUY,
+        status=TransactionStatus.OPENED, open_price=net_debit, expert_id=expert_row.id,
+        multiplier=100, asset_class=AssetClass.OPTION, option_strategy=strategy,
+        expiry=long_expiry)
+    parent = create_trading_order(
+        account.id, symbol=underlying, quantity=qty, side=OrderDirection.BUY,
+        order_type=OrderType.BUY_LIMIT, status=OrderStatus.FILLED, transaction_id=txn.id,
+        asset_class=AssetClass.OPTION, multiplier=100, option_strategy=strategy,
+        underlying_symbol=underlying, expiry=long_expiry, limit_price=net_debit,
+        open_price=net_debit, filled_qty=qty)
+    for expiry, strike, side, fill in (
+            (long_expiry, long_strike, OrderDirection.BUY, long_fill),
+            (short_expiry, short_strike, OrderDirection.SELL, short_fill)):
+        contract = occ(underlying, expiry, "C", strike)
+        create_trading_order(
+            account.id, symbol=contract, quantity=qty, side=side,
+            order_type=OrderType.BUY_LIMIT if side is OrderDirection.BUY
+            else OrderType.SELL_LIMIT,
+            status=OrderStatus.FILLED, transaction_id=txn.id, asset_class=AssetClass.OPTION,
+            multiplier=100, contract_symbol=contract, option_type=OptionRight.CALL,
+            strike=strike, expiry=expiry, underlying_symbol=underlying,
+            parent_order_id=parent.id, open_price=fill, filled_qty=qty)
+    return txn, parent
+
+
+def quote_pmcc(account, *, underlying="ACN", long_expiry=EXPIRY_FAR,
+               short_expiry=EXPIRY_NEAR, long_strike=90.0, short_strike=110.0,
+               long_bid=10.00, short_ask=2.00):
+    """Price the overlay FLAT against its 8.00 entry debit: the long sells for 10.00, the
+    short costs 2.00 to buy back, so P&L is 0% -- nowhere near ``profit_capture_pct`` 50 and
+    nowhere near a stop. The roll window is then the ONLY thing that can fire."""
+    long_row = _contract(underlying, long_expiry, OptionRight.CALL, long_strike,
+                         bid=long_bid, ask=long_bid + 0.10, last=long_bid, delta=0.80)
+    short_row = _contract(underlying, short_expiry, OptionRight.CALL, short_strike,
+                          bid=short_ask - 0.10, ask=short_ask, last=short_ask, delta=0.20)
+    account.chain[long_row.symbol] = long_row
+    account.chain[short_row.symbol] = short_row
+
+
+def give_roll_rule(expert_row, *, action_type=None):
+    """Attach an OPEN_POSITIONS ruleset carrying the action that OWNS the roll.
+
+    Shaped exactly as ``ba2test_launcher._overlay_rules`` emits it and as
+    ``rule_builders.action_from_rule`` writes it: ``EventAction.actions`` is keyed by an
+    arbitrary slot name, and the action type lives under ``action_type``.
+    """
+    from ba2_common.core.db import get_instance as _get, update_instance
+    from ba2_trade_platform.core.models import ExpertInstance
+    from tests.factories import create_event_action, create_ruleset, link_rule_to_ruleset
+
+    action_type = action_type or svc.ROLL_SHORT_OWNER_ACTION
+    ruleset = create_ruleset(name="open positions")
+    rule = create_event_action(
+        name="pmcc_roll_dte",
+        actions={"act": {"action_type": action_type}},
+        continue_processing=True)
+    link_rule_to_ruleset(ruleset.id, rule.id)
+    row = _get(ExpertInstance, expert_row.id)
+    row.open_positions_ruleset_id = ruleset.id
+    update_instance(row)
+    return ruleset
+
+
+def test_every_lifecycle_reason_has_a_disposition():
+    """THE TOTALITY PIN. Enumerated by REFLECTION, so a new reason upstream fails here.
+
+    A hand-copied list would have gone stale the moment ``LIFECYCLE_ROLL_SHORT`` was added --
+    which is precisely what happened to the dispatch it is pinning.
+    """
+    import ba2_common.core.option_lifecycle as ol
+
+    reasons = {value for name, value in vars(ol).items()
+               if name.startswith("LIFECYCLE_") and isinstance(value, str)}
+    assert len(reasons) >= 8, (
+        f"reflection found only {sorted(reasons)} -- if the constants were renamed this "
+        f"test stops proving anything")
+
+    undispositioned = sorted(reasons - set(svc.LIFECYCLE_DISPOSITIONS))
+    assert undispositioned == [], (
+        f"{undispositioned} can be returned by decide() and the dispatch loop has no "
+        f"disposition for them -- they would be dropped in silence")
+
+    invented = sorted(set(svc.LIFECYCLE_DISPOSITIONS) - reasons)
+    assert invented == [], f"{invented} are dispositioned but no longer exist upstream"
+
+
+def test_every_closing_reason_is_dispositioned_to_close():
+    """The two tables must agree: a reason ``should_close`` accepts must reach ``_close``."""
+    from ba2_common.core.option_lifecycle import LIFECYCLE_CLOSING_REASONS
+
+    for reason in LIFECYCLE_CLOSING_REASONS:
+        assert svc.LIFECYCLE_DISPOSITIONS[reason] == svc.DISPOSITION_CLOSE, reason
+    for reason, disposition in svc.LIFECYCLE_DISPOSITIONS.items():
+        if disposition == svc.DISPOSITION_CLOSE:
+            assert reason in LIFECYCLE_CLOSING_REASONS, reason
+
+
+def test_a_reason_with_no_disposition_raises_rather_than_being_dropped(monkeypatch, wired):
+    """The refusal, executed. A future LIFECYCLE_* constant cannot be ignored by omission."""
+    account, expert, expert_row = wired
+    txn, _, _, _ = open_credit_spread(account, expert_row)
+    quote_spread(account)
+    from ba2_common.core.option_lifecycle import LifecycleDecision
+
+    monkeypatch.setattr(svc, "decide", lambda *a, **k: [
+        LifecycleDecision(txn.id, "a_reason_invented_next_year", "detail", 1.0)])
+
+    with pytest.raises(ValueError, match="a_reason_invented_next_year"):
+        run(expert_row)
+    assert account.submitted == []
+
+
+def test_a_due_roll_is_recorded_and_NOT_rolled_here(monkeypatch, wired):
+    """The finding, fixed: the decision is computed, observed, and left to the rule.
+
+    Not rolled HERE on purpose -- ``roll_pmcc_short`` is walked by both runtimes off the same
+    ruleset, and a second roller in this pass would fire on the ``roll_dte`` SETTING while
+    the searched ``pmcc_roll_dte`` RULE fired on its own parameter.
+    """
+    account, expert, expert_row = wired
+    txn, _ = open_pmcc(account, expert_row)
+    quote_pmcc(account)
+    give_roll_rule(expert_row)
+    errors = _capture_errors(monkeypatch)
+
+    result = run(expert_row)
+
+    assert [d.reason for d in result.decisions] == [LIFECYCLE_ROLL_SHORT]
+    assert [d.transaction_id for d in result.roll_due] == [txn.id]
+    assert result.roll_unowned == []
+    # and nothing was traded by this pass
+    assert account.submitted == []
+    assert close_orders(txn.id) == []
+    assert result.submitted == []
+    assert errors == []
+
+
+def test_a_due_roll_with_no_rule_to_perform_it_is_a_LOUD_refusal(monkeypatch, wired):
+    """Nothing will roll it. The overlay expires against a long nobody bought it back for.
+
+    This is the case the rule cannot report on itself -- it does not exist -- and the one the
+    old silent discard made indistinguishable from a healthy sleeve.
+    """
+    account, expert, expert_row = wired
+    txn, _ = open_pmcc(account, expert_row)
+    quote_pmcc(account)
+    errors = _capture_errors(monkeypatch)
+
+    with pytest.raises(svc.UnownedRollError, match=str(txn.id)):
+        run(expert_row)
+
+    assert any(svc.ROLL_SHORT_OWNER_ACTION in m for m in errors), errors
+    assert account.submitted == []
+
+
+def test_a_ruleset_whose_rules_are_all_something_else_does_not_count_as_a_roller(wired):
+    """A ruleset is not the answer; the ACTION in it is."""
+    account, expert, expert_row = wired
+    open_pmcc(account, expert_row)
+    quote_pmcc(account)
+    give_roll_rule(expert_row, action_type="close_option")
+
+    with pytest.raises(svc.UnownedRollError):
+        run(expert_row)
+
+
+def test_an_unowned_roll_does_not_stop_the_rest_of_the_sleeve_being_closed(wired):
+    """The refusal is raised LAST, after every other decision has been acted on.
+
+    A configuration error on one structure must not leave a profit-capture close unsubmitted
+    on another -- that would trade a silent failure for a loud one that costs more money.
+    """
+    account, expert, expert_row = wired
+    pmcc_txn, _ = open_pmcc(account, expert_row)
+    quote_pmcc(account)
+    spread_txn, _, _, _ = open_credit_spread(account, expert_row, underlying="MMM")
+    quote_spread(account, underlying="MMM", short_px=0.40, long_px=0.10)  # captures profit
+
+    with pytest.raises(svc.UnownedRollError):
+        run(expert_row)
+
+    assert len(close_orders(spread_txn.id)) == 1, "the healthy structure was still closed"
+    assert close_orders(pmcc_txn.id) == []
+
+
+def test_the_same_structure_NOT_tagged_two_expiry_is_never_a_roll(wired):
+    """The TAG is the whole difference, and it is checked rather than assumed.
+
+    Identical legs, identical quotes, identical roll window. Tagged ``pmcc`` the decision is
+    a roll the rule owns; tagged anything else the two expiries are not licensed, so
+    ``resolve_structure_expiry`` refuses and the decision is ``LIFECYCLE_UNKNOWN`` — the
+    fail-closed answer, reported, never a roll. Without this control the roll test could
+    pass for the wrong reason (any two-legged call structure at 15 DTE).
+    """
+    account, expert, expert_row = wired
+    txn, _ = open_pmcc(account, expert_row, strategy="call_calendar")
+    quote_pmcc(account)
+
+    result = run(expert_row)
+
+    assert [d.reason for d in result.decisions] == [LIFECYCLE_UNKNOWN]
+    assert result.roll_due == []
+    assert result.roll_unowned == []
+    assert close_orders(txn.id) == []
+
+
+def test_a_single_expiry_short_at_the_roll_window_still_CLOSES(wired):
+    """The other side of the same branch: one expiry, so the roll window IS the end of the
+    position. ``LIFECYCLE_ROLL_DTE`` is a closing reason and this pass submits it — the
+    disposition table and ``LIFECYCLE_CLOSING_REASONS`` agreeing, executed rather than
+    asserted."""
+    account, expert, expert_row = wired
+    txn, _, _, _ = open_credit_spread(account, expert_row, expiry=EXPIRY_NEAR)
+    quote_spread(account, expiry=EXPIRY_NEAR)
+
+    result = run(expert_row)
+
+    assert [d.reason for d in result.decisions] == [LIFECYCLE_ROLL_DTE]
+    assert result.roll_due == []
+    assert len(close_orders(txn.id)) == 1
