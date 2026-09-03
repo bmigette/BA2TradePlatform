@@ -1,6 +1,17 @@
 #!/usr/bin/env python
 """Autonomous driver for OPTIONS GRID 2 -- the multi-structure option matrix.
 
+OPERATOR CHECKLIST BEFORE LAUNCHING (2026-09-03, options-grid2 closeout) -- the full list lives
+at the top of tools/run_options_matrix.py; the items that gate THIS launcher:
+  1. Retarget the window to 2020-01-01 on the ThetaData store, after provider-parity pins
+     (store layout, per-worker chain cache, BS/greeks fallback, the depth probe).
+  2. Option-cache optimization first: ~3.6 s / ~22 MB per symbol cold on the 2024+ store, ~x3 at
+     2020 -> one parquet per symbol + a higher _MAX_TASKS_PER_CHILD for option jobs; size local
+     slots from the measured MB/symbol.
+  3. Baselines are split (BS mark fallback; the 683c7379 stress restatement; O_CC/O_WHEEL after
+     cc_dte + wheel_stock_guard) -- never compare across them.
+  4. Merge only at a grid job boundary (see run_options_matrix.py item 4).
+
 Design: docs/superpowers/specs/2026-08-31-leaps-grid-design.md (Sections 2, 5, 7).
 Plan:   docs/superpowers/plans/2026-08-31-options-grid2-convex-earnings-impl.md (Task 10).
 

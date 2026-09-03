@@ -1,5 +1,23 @@
 """Autonomous driver for the 5min screener CAP-BAND optimization matrix.
 
+OPERATOR CHECKLIST FOR THE NEXT GRID LAUNCH (2026-09-03, learned on matrix3):
+  1. BT_BAR_CACHE_TRIALS=0 (default) flushes the bar cache before EVERY individual, so each
+     individual re-preloads its whole working set (matrix3: 778 preloads, mean 39 s, ~8.35 h by
+     2026-09-02). Evaluate a non-zero value: it retains the UNION of per-individual symbol sets
+     until the worker recycle, so budget memory for the full band, not one individual's set.
+  2. Never merge into this checkout while a grid runs from it: a long-lived master lazily imports
+     new modules against the enums it loaded at start and dies at its persist phase
+     (AttributeError N_LOSS_PCT_OF_MAX_LOSS, 2026-09-03). Merge at a job boundary: stop ONLY the
+     wrapper bash shells (verified by cmdline), let the master finish, merge + ONE
+     TEST_APP_VERSION bump, mark dangling 'running' rows failed, relaunch from GIT BASH
+     (PowerShell Start-Process nohup resolves to WSL bash and fails). Lost TOP-N ranks:
+     tools/recover_missing_topn.py <worker> <opt>:<ranks> (retry after the worker's version
+     self-update, which forgets in-flight jobs).
+  3. The default --fitness here is calmar_ratio; every grid wrapper passes
+     consistent_annual_return explicitly. A bare run of this driver started before 683c7379 is
+     on the old (inert-stress) calmar scale.
+  4. Option grids have their own checklist at the top of tools/run_options_matrix.py.
+
 Runs `ba2-test optimize --screener --screener-cap-band <band> --strategy <S?>` SEQUENTIALLY
 (one job at a time — each 5min job preloads 500-1100 symbols, so parallel runs would blow memory)
 over the planned matrix, in PRIORITY order (large band first = fastest, then mid, then small):

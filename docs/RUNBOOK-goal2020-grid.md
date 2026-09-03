@@ -24,6 +24,36 @@ bash tools/grid_stop.sh            # stop it
 Relaunching after a stop is the *same launch command* — completed jobs are skipped and an
 interrupted job resumes at its last completed generation.
 
+## Operator checklist (2026-09-03, options-grid2 closeout)
+
+Standing items, also carried as header comments in the launchers
+(`tools/run_options_matrix.py` for the option grids, `tools/run_screener_capband_matrix.py` for
+the equity grids):
+
+1. **Never merge into this checkout while a grid runs from it.** A long-lived master lazily
+   imports new modules against the enums it loaded at start and dies at its persist phase
+   (`AttributeError N_LOSS_PCT_OF_MAX_LOSS`, 2026-09-03). Merge at a job boundary: stop ONLY the
+   wrapper bash shells (verify their cmdline), let the master finish, merge + ONE
+   `TEST_APP_VERSION` bump, mark dangling `running` rows failed, relaunch from Git Bash
+   (PowerShell `Start-Process nohup` resolves to WSL bash and fails). Lost TOP-N ranks:
+   `tools/recover_missing_topn.py <worker> <opt>:<ranks>` (retry after the worker's version
+   self-update, which forgets in-flight jobs).
+2. **Live O_CC / O_WHEEL ExpertInstances deployed before 2026-09-03 must be re-exported and
+   re-imported** (`tools/export_deploy_payload.py` / `tools/import_deploy_payload.py`, then
+   `/api/reload`): the live lifecycle pass no longer closes the written call at the roll window;
+   the ruleset's `cc_dte` rule owns that exit in both runtimes.
+3. **Option grids: retarget to 2020-01-01 on the ThetaData store** after provider-parity pins,
+   and do the option-cache optimization first (~3.6 s / ~22 MB per symbol cold on the 2024+
+   store, ~x3 at 2020 → one parquet per symbol, higher `_MAX_TASKS_PER_CHILD` for option jobs,
+   local slots sized from measured MB/symbol).
+4. **`BT_BAR_CACHE_TRIALS=0`** re-preloads bars before every individual (matrix3 paid ~8 h);
+   evaluate a non-zero value for the next equity launch (memory: the union of per-individual
+   symbol sets is retained until recycle).
+5. **Results baselines are split** — see `docs/` results-comparability note: BS mark fallback
+   (options), the 683c7379 stress restatement (return / total_return / calmar fitness), O_CC and
+   O_WHEEL after `cc_dte` + `wheel_stock_guard`. Never compare across a split.
+6. **Agents' test suites compete with the grid for RAM**: targeted files, one pytest at a time.
+
 ---
 
 ## 1. What this grid is for

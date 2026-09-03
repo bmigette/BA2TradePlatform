@@ -2,6 +2,14 @@
 """Autonomous driver for the CONVEX-HARVEST GRID -- the separate, single-key matrix that scores
 `O_CONVEX` under `option_convex` and NEVER under grid 2's `option_car`.
 
+OPERATOR CHECKLIST BEFORE LAUNCHING (2026-09-03, options-grid2 closeout) -- full list at the top
+of tools/run_options_matrix.py: (1) retarget to 2020-01-01 on ThetaData after provider-parity pins;
+(2) option-cache optimization first (~3.6 s / ~22 MB per symbol cold, ~x3 at 2020: one parquet per
+symbol + higher _MAX_TASKS_PER_CHILD for option jobs; size local slots from measured MB/symbol);
+(3) baselines are split (BS mark fallback; 683c7379 stress restatement) -- never compare across
+them; (4) merge only at a grid job boundary. Design section 7 still applies: a bull window is the
+friendliest possible test -- a WIN here is weak evidence, a LOSS is strong evidence against.
+
 Design: docs/superpowers/specs/2026-08-31-convex-harvest-grid-design.md (Sections 2, 4, 5, 6, 8).
 Plan:   docs/superpowers/plans/2026-08-31-options-grid2-convex-earnings-impl.md (Task 13).
 

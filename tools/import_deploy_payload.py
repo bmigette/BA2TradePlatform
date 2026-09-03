@@ -10,6 +10,14 @@ allow_automated_trade_opening is forced ON for a freshly created instance: it de
 and an instance that silently never places an order looks identical to one whose strategy simply
 found no setup -- a trap this project has already hit once.
 
+OPERATOR NOTE (2026-09-03): every live O_CC / O_WHEEL ExpertInstance deployed BEFORE 2026-09-03
+must be re-exported and re-imported through this pair of tools (then POST /api/reload): the live
+option lifecycle pass no longer closes the written call at the roll window -- the ruleset's
+`cc_dte` rule (repository-resolved, identical in backtest and live) owns that exit, and an old
+payload does not carry it. The forced/derived settings the backtest handler applies now travel in
+the payload through the shared table in ba2_common.core.deploy_parity (pinned by
+testplatform/backend/tests/backtest/test_deploy_round_trip_parity.py).
+
 For each entry: converts entry/exit TradeRule lists to a live ruleset export via
 ``trade_rules_to_live_export``, imports it as NEW Ruleset+EventAction rows via
 ``RulesImporter.import_multiple_rulesets`` (never touches the existing rulesets -- old ones are

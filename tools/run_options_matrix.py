@@ -1,5 +1,25 @@
 """Autonomous driver for the OPTIONS strategy optimization matrix.
 
+OPERATOR CHECKLIST BEFORE LAUNCHING ANY OPTION GRID (2026-09-03, options-grid2 closeout):
+  1. Window: retarget --start to 2020-01-01 on the ThetaData store (the TastyTrade parquet is a
+     bull-only 2024-02+ window). Provider PARITY first: the parquet store layout, the per-worker
+     chain cache (_WORKER_RAW_CACHE), the BS/greeks fallback and tools/probe_option_chain_depth.py
+     must behave identically on ThetaData partitions -- pin it the way BT/live parity is pinned.
+  2. Option-cache cost before a 2020 window: measured 2026-09-02 (GA probe, opt 429) ~3.6 s and
+     ~22 MB per symbol cold on the 2024+ store, ~x3 at 2020 (~7 GB of cached chains per worker for
+     105 symbols). Do the optimization first: one parquet per symbol (184 per-expiry files today)
+     and a higher _MAX_TASKS_PER_CHILD for option jobs; size local slots from the measured MB/symbol.
+  3. Results baselines are SPLIT (docs results-comparability note): pre-Task-3 numbers (BS mark
+     fallback), pre-683c7379 stress restatement (return/total_return/calmar fitness), and the O_CC /
+     O_WHEEL rulesets after cc_dte + wheel_stock_guard -- never compare across them.
+  4. Never merge into the checkout a running grid imports from mid-job: long-lived masters lazily
+     import new modules against old enums at their persist phase (AttributeError 2026-09-03). Merge
+     at a job boundary (stop the wrapper shells only, let the master finish, merge + ONE
+     TEST_APP_VERSION bump, relaunch from GIT BASH).
+  5. Equity grids: BT_BAR_CACHE_TRIALS=0 re-preloads bars before EVERY individual (matrix3 paid
+     ~8 h); evaluate a non-zero value for the next launch (memory: the union of per-individual
+     symbol sets is retained until recycle).
+
 Runs `ba2-test optimize --strategy <OS?/O_?>` SEQUENTIALLY (one job at a time) over the
 option-strategy matrix on the top-100 large-cap universe covered by the offline options
 cache (built via `ba2-test fetch-options`; see tools/options_universe_top100.txt — the
