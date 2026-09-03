@@ -71,6 +71,13 @@ _M = _launcher()
 CASES = [
     ("O_ERN", "FMPEarningsEvent", "o_ern-entry"),
     ("O_CONVEX", "FMPRating", "o_convexc-entry"),
+    # O_WHEEL (2026-09-03): the key with the most moving parts on the deploy path -- it
+    # reuses O_CSP's entry ids verbatim, carries the repository-resolved ``cc_dte`` (whose
+    # ``close_target`` has to survive the export converter) and the gene-free
+    # ``wheel_stock_guard``. A round trip that dropped any of those would deploy a wheel that
+    # writes calls it cannot close, or one whose put-phase rules re-anchor onto assigned
+    # stock.
+    ("O_WHEEL", "FMPRating", "o_csp-entry"),
 ]
 
 

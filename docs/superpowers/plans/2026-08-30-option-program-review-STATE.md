@@ -190,6 +190,19 @@ there only by accident. MEASURED: 52 bars per rule in one engine run. `wheel_sto
 closes, with no on/off gene) makes all five inert BY CONSTRUCTION. No gene added; `O_WHEEL`
 only; `O_WHEEL` was already a new baseline under comparability entry 4.
 
+**M8 (2026-09-03) closed the SILENT STEADY STATE the M7 review found.** On a wheel bar
+holding assigned shares with no written call, `cc_sell` MATCHES (its trigger is
+`has_assigned_shares`) so `wheel_stock_guard` halts the ruleset behind it and nothing else can
+act — while the assignment liquidation is a no-op under `hold_assigned_stock`, the lot has no
+bracket and there is no end-of-run flatten. `SellCoveredCallAction` could decline on six paths
+that logged nothing. Each now returns a NAMED reason on the result data and emits exactly one
+WARNING naming symbol, share count and cause, formatted in ONE place. The backtest counts
+consecutive uncovered-assigned bars into `results["uncovered_assigned_bars"]` (max / total /
+by-symbol with the last reason) — **recorded, not scored** — and logs ERROR once when a symbol
+crosses 5 consecutive bars. **No auto-liquidation**: selling assigned shares is the operator's
+decision. The metric earned itself immediately, reporting a 51-bar uncovered tail in the wheel
+e2e's own fixture.
+
 Still open on this list: B1 (short-leg delta), C1 (breaker flatten), C3/C4/C5, C7-C10, and D.
 
 ### B. The tested-delta gap — the only live rule with NO backtest counterpart

@@ -423,6 +423,14 @@ class DailyBacktestEngine:
         # entirely rather than merely making it cheap.
         self._option_sleeves: List[Tuple[Any, int]] = []
 
+        # UNCOVERED-ASSIGNED telemetry (M8): per symbol, the current consecutive streak of
+        # bars on which a covered call was asked for and declined, plus the running max and
+        # total. See ``_record_uncovered_assigned`` for why this state is worth carrying.
+        self._uncovered_assigned_streak: Dict[str, int] = {}
+        self._uncovered_assigned_max: Dict[str, int] = {}
+        self._uncovered_assigned_total: Dict[str, int] = {}
+        self._uncovered_assigned_reasons: Dict[str, str] = {}
+
     def _bypass_manager(self, expert_id: int) -> Any:
         """Lazily build + cache the portfolio manager for a bypass expert (run-constant).
 
@@ -1240,6 +1248,7 @@ class DailyBacktestEngine:
                 # allow_automated_trade_modification): Close/Adjust-TP/SL act DIRECTLY on the
                 # position/legs (no RM sizing); a Sell that stages a PENDING order is sized below.
                 results = evaluator.execute(submit_to_broker=True)
+                self._record_uncovered_assigned(symbol, results, as_of)
                 if any(r.get("success") and (r.get("data") or {}).get("order_id") for r in results):
                     created_any = True
             except Exception as e:  # noqa: BLE001
@@ -1248,6 +1257,66 @@ class DailyBacktestEngine:
 
         if created_any:
             self._size_and_submit(expert_id, self._indicator_provider, as_of)
+
+    #: Consecutive bars a symbol has been UNCOVERED-ASSIGNED before this is shouted about.
+    #: Not a liquidation trigger -- selling assigned shares is a strategy decision the
+    #: operator owns -- just the point at which a WARNING per bar stops being enough.
+    UNCOVERED_ASSIGNED_ALARM_BARS = 5
+
+    def _record_uncovered_assigned(self, symbol: str, results: Any, as_of: datetime) -> None:
+        """Count the bars on which the wheel wanted a covered call and did not get one.
+
+        THE STATE THIS MEASURES is a reachable steady one, and it is silent by construction
+        without this: on a bar holding assigned shares with no written call, ``cc_sell``
+        MATCHES (its trigger is ``has_assigned_shares``), so ``wheel_stock_guard`` halts the
+        ruleset behind it and no other rule can act. The assignment liquidation is a no-op
+        under ``hold_assigned_stock``, the lot carries no bracket, and there is no end-of-run
+        flatten -- so if ``SellCoveredCallAction`` declines, the sleeve holds naked-long stock
+        for as long as the decline persists.
+
+        RECORDED, NOT SCORED. It lands in the results payload beside the other telemetry so a
+        run can be read for it afterwards; nothing here feeds fitness, because a wheel that
+        cannot write a call this week is not thereby a worse genome -- it is a genome whose
+        result needs explaining.
+        """
+        from ba2_common.core.TradeActions import COVERED_CALL_DECLINE_KEY
+
+        reason = next((str((r.get("data") or {}).get(COVERED_CALL_DECLINE_KEY))
+                       for r in (results or [])
+                       if isinstance(r, dict) and (r.get("data") or {}).get(
+                           COVERED_CALL_DECLINE_KEY)), None)
+        if reason is None:
+            # A call was written (or nothing asked for one): the streak, if any, is over.
+            self._uncovered_assigned_streak.pop(symbol, None)
+            return
+        streak = self._uncovered_assigned_streak.get(symbol, 0) + 1
+        self._uncovered_assigned_streak[symbol] = streak
+        self._uncovered_assigned_total[symbol] = (
+            self._uncovered_assigned_total.get(symbol, 0) + 1)
+        self._uncovered_assigned_max[symbol] = max(
+            self._uncovered_assigned_max.get(symbol, 0), streak)
+        self._uncovered_assigned_reasons[symbol] = reason
+        if streak == self.UNCOVERED_ASSIGNED_ALARM_BARS:
+            # ONCE, on the bar it crosses -- not every bar after, which would bury it.
+            logger.error(
+                f"[daily_engine] {symbol} has held ASSIGNED SHARES with NO covered call for "
+                f"{streak} consecutive bars (as of {as_of:%Y-%m-%d}); latest reason: "
+                f"{reason}. Nothing in the ruleset can act on this position while it lasts. "
+                f"No liquidation is taken -- that is a strategy decision.")
+
+    def _uncovered_assigned_metric(self) -> Dict[str, Any]:
+        """The results-payload shape. Empty dicts for a run that never held assigned stock,
+        so an equity run's payload gains nothing but the key."""
+        return {
+            "max_consecutive": max(self._uncovered_assigned_max.values(), default=0),
+            "total_bars": sum(self._uncovered_assigned_total.values()),
+            "by_symbol": {
+                sym: {"max_consecutive": self._uncovered_assigned_max.get(sym, 0),
+                      "total_bars": count,
+                      "last_reason": self._uncovered_assigned_reasons.get(sym)}
+                for sym, count in sorted(self._uncovered_assigned_total.items())
+            },
+        }
 
     def _held_transactions(self, expert_id: int) -> Dict[str, List[Any]]:
         """{symbol: [OPENED Transaction, ...]} for this expert.
@@ -1701,6 +1770,8 @@ class DailyBacktestEngine:
             "trades": self.account.get_filled_trades(),
             "final_equity": self.account.equity(),
             "initial_capital": float(self.account._cfg["starting_cash"]),
+            # RECORDED, NOT SCORED -- see ``_record_uncovered_assigned``.
+            "uncovered_assigned_bars": self._uncovered_assigned_metric(),
         }
 
     @staticmethod

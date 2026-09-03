@@ -359,8 +359,8 @@ def run_result():
         # at the fixture cache for the duration is what the other engine e2e tests in this
         # directory do, for exactly this reason.
         with hermetic_providers():
-            engine.run()
-        yield account, dict(seen), list(_orders(931)), exit_rules
+            results = engine.run()
+        yield account, dict(seen), list(_orders(931)), exit_rules, results
     finally:
         mp.undo()
         ctx.__exit__(None, None, None)
@@ -376,7 +376,7 @@ def _by_contract(orders, contract):
 # the cycle actually happened
 # ===========================================================================
 def test_the_wheel_sells_a_put_and_has_it_ASSIGNED(run_result):
-    account, seen, orders, _ = run_result
+    account, seen, orders, _ = run_result[:4]
     puts = _by_contract(orders, PUT)
     assert puts, f"no put was ever sold: {[o.contract_symbol for o in orders]}"
 
@@ -389,7 +389,7 @@ def test_the_wheel_sells_a_put_and_has_it_ASSIGNED(run_result):
 
 
 def test_ONE_covered_call_is_written_over_the_assigned_shares(run_result):
-    account, seen, orders, _ = run_result
+    account, seen, orders, _ = run_result[:4]
     from ba2_common.core.types import OrderDirection
 
     writes = [o for o in _by_contract(orders, CALL) if o.side is OrderDirection.SELL]
@@ -398,7 +398,7 @@ def test_ONE_covered_call_is_written_over_the_assigned_shares(run_result):
 
 
 def test_the_written_call_is_BOUGHT_BACK_by_cc_dte_not_called_away(run_result):
-    account, seen, orders, _ = run_result
+    account, seen, orders, _ = run_result[:4]
     from ba2_common.core.types import OrderDirection
 
     closes = [o for o in _by_contract(orders, CALL) if o.side is OrderDirection.BUY]
@@ -418,7 +418,7 @@ def test_the_written_call_is_BOUGHT_BACK_by_cc_dte_not_called_away(run_result):
 # ===========================================================================
 def test_every_emitted_rule_is_accounted_for(run_result):
     """No rule may be left out of the audit below by being forgotten."""
-    _account, seen, _orders_, exit_rules = run_result
+    _account, seen, _orders_, exit_rules = run_result[:4]
     emitted = {r.get("id") for r in exit_rules}
     assert emitted == {"cc_dte", "cc_guard", "cc_sell", "wheel_stock_guard",
                        "opt_tp", "opt_time", "opt_dte", "opt_sl", "opt_sl_ml"}, emitted
@@ -435,7 +435,7 @@ def test_no_put_phase_rule_is_EVALUATED_after_the_shares_are_assigned(run_result
     put's credit, applied to a share position, firing a ``close_option`` that resolves
     nothing while consuming the bar's first-match slot.
     """
-    _account, seen, orders, _ = run_result
+    _account, seen, orders, _ = run_result[:4]
     from ba2_common.core.types import OrderDirection
 
     assigned_from = min(
@@ -463,17 +463,140 @@ def test_no_put_phase_rule_is_EVALUATED_after_the_shares_are_assigned(run_result
 @pytest.mark.parametrize("rid", ["opt_tp", "opt_time", "opt_dte", "opt_sl", "opt_sl_ml"])
 def test_every_put_phase_rule_IS_evaluated_while_the_put_is_open(run_result, rid):
     """The control: the guard must not have made them inert everywhere. They manage the
-    cash-secured put and are asked on every put-phase bar."""
-    _account, seen, _orders_, _ = run_result
+    cash-secured put and are asked on EVERY put-phase bar, not merely on one.
+
+    Asserted against ``cc_guard``'s own bar count, which is the number of manage bars this
+    run had: the two are reached on the same walk until the guard halts it, so a put-phase
+    rule seen on fewer bars than the guard means something shadowed it.
+    """
+    _account, seen, _orders_, _ = run_result[:4]
     assert seen.get(rid), (
         f"{rid} was never evaluated at all — the wheel stopped managing its short put, "
         f"which is a bigger defect than the one M7 fixes")
+    put_phase_bars = [b for b in seen.get("cc_guard", []) if b in set(seen[rid])]
+    assert len(seen[rid]) == len(put_phase_bars), (
+        f"{rid} was evaluated on {len(seen[rid])} bars but only {len(put_phase_bars)} of "
+        f"them are bars the walk reached at all")
+    assert len(seen[rid]) >= 5, (
+        f"{rid} was evaluated on only {len(seen[rid])} bar(s) — too few for the control to "
+        f"mean anything about the put phase")
 
 
 def test_the_stock_phase_rules_ARE_evaluated_and_act_on_their_own_subjects(run_result):
     """The other half of "acts on a named subject or is absent": the three rules that DO run
     in the stock phase are the three whose subject is named there."""
-    _account, seen, _orders_, _ = run_result
+    _account, seen, _orders_, _ = run_result[:4]
     for rid in ("cc_dte", "cc_guard", "cc_sell"):
         assert seen.get(rid), f"{rid} was never evaluated, so the stock phase is unmanaged"
     assert seen.get("wheel_stock_guard"), "the guard itself was never evaluated"
+
+
+# ===========================================================================
+# M8 — the uncovered-assigned telemetry
+#
+# The state is silent by construction without it: on a bar holding assigned shares with no
+# written call, ``cc_sell`` matches (its trigger is ``has_assigned_shares``), so
+# ``wheel_stock_guard`` halts the ruleset behind it and nothing else can act; the assignment
+# liquidation is a no-op under ``hold_assigned_stock``, the lot has no bracket, and there is
+# no end-of-run flatten. RECORDED, NOT SCORED.
+# ===========================================================================
+def _engine_with_counter():
+    """A bare engine carrying only the counter state the metric reads."""
+    from app.services.backtest.daily_engine import DailyBacktestEngine
+
+    e = DailyBacktestEngine.__new__(DailyBacktestEngine)
+    e._uncovered_assigned_streak = {}
+    e._uncovered_assigned_max = {}
+    e._uncovered_assigned_total = {}
+    e._uncovered_assigned_reasons = {}
+    return e
+
+
+def _declined(reason="empty_chain"):
+    from ba2_common.core.TradeActions import COVERED_CALL_DECLINE_KEY
+    return [{"success": False, "data": {COVERED_CALL_DECLINE_KEY: reason}}]
+
+
+def _written():
+    return [{"success": True, "data": {"order_id": 7}}]
+
+
+def test_three_uncovered_bars_are_counted_as_three(monkeypatch):
+    e = _engine_with_counter()
+    for i in range(3):
+        e._record_uncovered_assigned(SYMBOL, _declined(), START + timedelta(days=i))
+
+    metric = e._uncovered_assigned_metric()
+    assert metric["max_consecutive"] == 3
+    assert metric["total_bars"] == 3
+    assert metric["by_symbol"][SYMBOL]["last_reason"] == "empty_chain"
+
+
+def test_writing_the_call_ENDS_the_streak_but_not_the_total(monkeypatch):
+    """The streak is what an operator acts on; the total is what a results reader counts."""
+    e = _engine_with_counter()
+    for i in range(3):
+        e._record_uncovered_assigned(SYMBOL, _declined(), START + timedelta(days=i))
+    e._record_uncovered_assigned(SYMBOL, _written(), START + timedelta(days=3))
+    e._record_uncovered_assigned(SYMBOL, _declined(), START + timedelta(days=4))
+
+    metric = e._uncovered_assigned_metric()
+    assert metric["max_consecutive"] == 3, "the max must survive the reset"
+    assert metric["total_bars"] == 4
+    assert e._uncovered_assigned_streak[SYMBOL] == 1, "the streak restarted"
+
+
+def test_the_alarm_fires_ONCE_when_the_streak_crosses(monkeypatch):
+    """Once, on the bar it crosses — every bar after would bury it."""
+    from app.services.backtest import daily_engine as DE
+
+    e = _engine_with_counter()
+    errors = []
+    monkeypatch.setattr(DE.logger, "error", lambda msg, *a, **k: errors.append(str(msg)))
+    for i in range(e.UNCOVERED_ASSIGNED_ALARM_BARS + 3):
+        e._record_uncovered_assigned(SYMBOL, _declined(), START + timedelta(days=i))
+
+    assert len(errors) == 1, f"expected one alarm, got {len(errors)}"
+    assert SYMBOL in errors[0] and "ASSIGNED SHARES" in errors[0]
+    assert "No liquidation is taken" in errors[0], (
+        "the alarm must say the platform is NOT selling the shares — that is the operator's "
+        "decision, and an alarm that reads like an action would be worse than none")
+
+
+def test_a_run_that_never_held_assigned_stock_reports_zeroes():
+    e = _engine_with_counter()
+    metric = e._uncovered_assigned_metric()
+    assert metric == {"max_consecutive": 0, "total_bars": 0, "by_symbol": {}}
+
+
+def test_the_real_run_REPORTS_the_uncovered_tail_it_actually_had(run_result):
+    """END TO END, and it caught something on its first run.
+
+    This fixture publishes ONE call contract. Once ``cc_dte`` buys it back there is nothing
+    left to write, so the wheel holds assigned shares uncovered for the REST OF THE RUN —
+    ``cc_sell`` declining ``empty_chain`` on every bar, ``wheel_stock_guard`` halting behind
+    it, and nothing else able to act. That is precisely the silent steady state M8 exists to
+    surface, occurring by accident in a fixture built for something else, which is the best
+    evidence available that the state is reachable rather than theoretical.
+
+    So the assertion is the honest one: the run reports the tail, names the reason, and the
+    streak begins only AFTER the call was closed — not that a wheel never has one.
+    """
+    _account, _seen, orders, _exits, results = run_result
+    from ba2_common.core.types import OrderDirection
+
+    assert "uncovered_assigned_bars" in results, sorted(results)
+    metric = results["uncovered_assigned_bars"]
+    assert set(metric) == {"max_consecutive", "total_bars", "by_symbol"}
+
+    assert metric["max_consecutive"] > 0 and metric["total_bars"] > 0, (
+        "the fixture's post-buyback tail is uncovered-assigned and the metric reported "
+        "nothing — it is not counting")
+    assert metric["by_symbol"][SYMBOL]["last_reason"] == "empty_chain", metric
+
+    # The streak is the TAIL, not the whole run: while the call was open the wheel was
+    # covered, so the count must be well short of the number of manage bars.
+    closed = [o for o in _by_contract(orders, CALL) if o.side is OrderDirection.BUY]
+    assert closed, "precondition: the call was bought back"
+    assert metric["max_consecutive"] < len(DAYS), (
+        f"every bar counted as uncovered, including the covered ones: {metric}")

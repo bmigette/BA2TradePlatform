@@ -4887,15 +4887,21 @@ def _insert_wheel_stock_guard(exit_rules):
     themselves have no exit in this ruleset either way -- that is the wheel's documented shape
     (``_build_strategy_wheel``'s KNOWN LIMIT), not something this guard introduces.
     """
+    from ba2_common.core.rule_models import trade_rules_from_legacy
+
     rules = list(exit_rules or [])
-    guard = {"id": "wheel_stock_guard",
-             "conditions": {"type": "AND", "conditions": [
-                 {"id": "wheel_assigned", "field": "has_assigned_shares"}]},
-             "actions": [{"action_type": "stop_processing"}],
-             "continue_processing": False}
-    if rules and "actions" in rules[0]:
-        from ba2_common.core.rule_models import trade_rules_from_legacy
-        guard = trade_rules_from_legacy(exit_conditions=[guard])["exit_rules"][0]
+    # ALWAYS converted, not conditionally: the one caller is ``_build_strategy_wheel``, whose
+    # list has been through ``trade_rules_from_legacy`` twice by now (``_build_strategy_option``
+    # builds it, ``_prepend_covered_call_exit`` re-converts what it adds). A legacy-shaped row
+    # spliced into that list keeps a top-level ``action_type`` with an EMPTY ``actions`` list,
+    # and the shared exporter reads ``actions`` -- so the guard would export with no action at
+    # all and halt nothing. A conditional here would only hide that.
+    guard = trade_rules_from_legacy(exit_conditions=[
+        {"id": "wheel_stock_guard",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "wheel_assigned", "field": "has_assigned_shares"}]},
+         "actions": [{"action_type": "stop_processing"}],
+         "continue_processing": False}])["exit_rules"][0]
     for idx, rule in enumerate(rules):
         if rule.get("id") == "cc_sell":
             return rules[:idx + 1] + [guard] + rules[idx + 1:]

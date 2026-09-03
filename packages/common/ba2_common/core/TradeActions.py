@@ -3296,13 +3296,69 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
         return f"Open bear put spread on {self.instrument_name}"
 
 
+#: WHY NO COVERED CALL WAS WRITTEN on a bar the ruleset asked for one. Named reasons rather
+#: than prose, because two different readers consume them: the backtest counts consecutive
+#: uncovered-assigned bars into its results payload, and the live status path shows the reason
+#: on the action result. Free text at each site would give both of them a string to parse.
+COVERED_CALL_DECLINE_NO_OPTIONS = "account_has_no_options"
+COVERED_CALL_DECLINE_UNMEASURABLE_SHARES = "unmeasurable_shares"
+COVERED_CALL_DECLINE_SUB_LOT = "sub_lot_shares"
+COVERED_CALL_DECLINE_EMPTY_CHAIN = "empty_chain"
+COVERED_CALL_DECLINE_NO_CONTRACT = "no_eligible_contract"
+COVERED_CALL_DECLINE_NO_BID = "no_bid"
+COVERED_CALL_DECLINE_COVER_SHORT = "cover_short"
+
+#: The key a declined covered call carries on its ``TradeActionResult`` data, and the
+#: greppable marker on its one log line.
+COVERED_CALL_DECLINE_KEY = "covered_call_decline"
+COVERED_CALL_DECLINE_MARKER = "COVERED CALL NOT WRITTEN"
+
+
 class SellCoveredCallAction(_OptionEntryAction):
-    """Sell a covered call against a held equity long (one contract per 100 shares)."""
+    """Sell a covered call against a held equity long (one contract per 100 shares).
+
+    EVERY DECLINE IS NAMED AND LOGGED, exactly once per bar (M8). This action sits at the
+    centre of a reachable SILENT steady state: on a wheel holding assigned shares with no
+    call written, ``cc_sell`` still MATCHES (its trigger is ``has_assigned_shares``), so
+    ``wheel_stock_guard`` halts the ruleset behind it and nothing else can act on the
+    position -- while the assignment liquidation is a no-op under ``hold_assigned_stock``,
+    there is no bracket on the lot, and the engine has no end-of-run flatten. If this action
+    then declines without saying so, the sleeve sits on uncovered stock indefinitely and
+    every log is quiet. Six paths could do that; each now returns a named reason.
+
+    It does NOT auto-liquidate at any threshold. Selling assigned shares is a strategy
+    decision the operator owns; the platform's job is to make the state impossible to miss.
+    """
 
     OPTION_TYPE = OptionRight.CALL
 
     def _action_type_value(self) -> str:
         return ExpertActionType.SELL_COVERED_CALL.value
+
+    def _decline(self, reason: str, detail: str,
+                 held: Optional[float] = None) -> Dict[str, Any]:
+        """ONE place formats the warning and stamps the reason.
+
+        Per-site logging would drift in wording and in what it names; a caller counting these
+        bars needs the REASON as a value, and an operator reading the log needs the symbol and
+        the share count on the same line as the cause.
+        """
+        shares = "unknown" if held is None else f"{held:g}"
+        logger.warning(
+            f"{COVERED_CALL_DECLINE_MARKER} on {self.instrument_name} "
+            f"(shares held: {shares}) -- {reason}: {detail}")
+        return self._result(False, detail,
+                            data={COVERED_CALL_DECLINE_KEY: reason, "held_shares": held})
+
+    def execute(self) -> "TradeActionResult":
+        # The non-options account is refused by the BASE execute with a plain result; named
+        # here instead, so all six decline paths carry a reason and exactly one warning.
+        if not self._supports_options():
+            return self._decline(
+                COVERED_CALL_DECLINE_NO_OPTIONS,
+                f"account does not support options, so no covered call can be written on "
+                f"{self.instrument_name}")
+        return super().execute()
 
     def _build_and_submit(self) -> Dict[str, Any]:
         held = self._held_equity_shares()
@@ -3311,20 +3367,23 @@ class SellCoveredCallAction(_OptionEntryAction):
             # the broker did not say how many shares moved; sizing a SHORT CALL off a count
             # that may already be wrong is how a naked contract gets written. FIRST, before
             # any chain fetch — nothing downstream can improve an unknown share count.
-            return self._result(False,
-                                f"Share count for {self.instrument_name} is UNMEASURABLE — an executed "
-                                f"equity order carries no filled_qty, so how many shares are held cannot "
-                                f"be measured and a covered call written against them could be naked. "
-                                f"Repair the order's filled_qty; unknown is not zero.")
+            return self._decline(
+                COVERED_CALL_DECLINE_UNMEASURABLE_SHARES,
+                f"Share count for {self.instrument_name} is UNMEASURABLE — an executed "
+                f"equity order carries no filled_qty, so how many shares are held cannot "
+                f"be measured and a covered call written against them could be naked. "
+                f"Repair the order's filled_qty; unknown is not zero.")
         quantity = int(math.floor(held / 100.0)) if held > 0 else 0
         if quantity < 1:
-            return self._result(False,
-                                f"Held equity below one contract lot for covered call on {self.instrument_name} "
-                                f"(shares={held}, 100 required per contract) - size the equity BUY with "
-                                f"lot_size=100 or pick a cheaper underlying")
+            return self._decline(
+                COVERED_CALL_DECLINE_SUB_LOT,
+                f"Held equity below one contract lot for covered call on {self.instrument_name} "
+                f"(shares={held}, 100 required per contract) - size the equity BUY with "
+                f"lot_size=100 or pick a cheaper underlying", held=held)
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
-            return self._result(False, f"Empty option chain for {self.instrument_name}")
+            return self._decline(COVERED_CALL_DECLINE_EMPTY_CHAIN,
+                                 f"Empty option chain for {self.instrument_name}", held=held)
         liq = self._liq(chain)
         spot = self._spot()
         contract = select_single(
@@ -3333,11 +3392,13 @@ class SellCoveredCallAction(_OptionEntryAction):
             today=self._today(), target_price=self._consensus_target(),
             policy=self.selection_policy, **liq)
         if contract is None:
-            return self._result(False, self._pick_refusal_message(
+            return self._decline(COVERED_CALL_DECLINE_NO_CONTRACT, self._pick_refusal_message(
                 chain, option_type=self.OPTION_TYPE, liq=liq,
-                generic_message=f"No liquid call contract for covered call on {self.instrument_name}"))
+                generic_message=f"No liquid call contract for covered call on "
+                                f"{self.instrument_name}"), held=held)
         if contract.bid is None or contract.bid <= 0:
-            return self._result(False, f"No bid price for {contract.symbol}")
+            return self._decline(COVERED_CALL_DECLINE_NO_BID,
+                                 f"No bid price for {contract.symbol}", held=held)
         limit_price = contract.bid                          # sell at BID
         leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.SELL,
                         position_intent="sell_to_open", option_type=self.OPTION_TYPE,
@@ -3350,7 +3411,11 @@ class SellCoveredCallAction(_OptionEntryAction):
         # an exception that skips every action queued behind this one.
         refusal = self._refuse_if_cover_is_short([leg], quantity, "covered_call")
         if refusal is not None:
-            return refusal
+            # The seam decided it and worded it; this only gives it the same NAME and the
+            # same one-line warning as the other five, so a counter sees every decline.
+            return self._decline(COVERED_CALL_DECLINE_COVER_SHORT,
+                                 str((refusal or {}).get("message") or "cover is short"),
+                                 held=held)
         # THE STOCK COVER (2026-08-31, operator decision): both holding checks have now
         # passed -- this expert's own filled buys hold >= 100 shares/contract AND the
         # account-wide cover verdict is ok -- so the cover leg may be supplied to the
