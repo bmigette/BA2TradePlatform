@@ -90,14 +90,29 @@ class Plan:
     #: straight through this loop and kill the ENTIRE worker process -- abandoning every other
     #: symbol in that worker's chunk, not just the one bad ticker. See discovery_failed below.
     discovery_failed: Dict[str, str] = field(default_factory=dict)
+    #: COUNTERS, not properties over ``units``. ``main`` plans one small chunk of symbols at a
+    #: time and absorbs each chunk's plan into an aggregate that deliberately holds NO units
+    #: (see ``absorb`` and ``--plan-chunk-symbols``), so the totals have to survive the units
+    #: being dropped. For a plan built by ``build_plan`` these still equal ``len(self.units)``
+    #: and the sum of its contract lists, exactly as the properties did.
+    units_pending: int = 0
+    contracts_pending: int = 0
 
-    @property
-    def units_pending(self) -> int:
-        return len(self.units)
+    def absorb(self, other: "Plan") -> None:
+        """Add ``other``'s totals to this aggregate WITHOUT taking its units.
 
-    @property
-    def contracts_pending(self) -> int:
-        return sum(len(u.contracts) for u in self.units)
+        The units are the memory: one ``WorkUnit`` per (underlying, expiry) carrying every
+        strike x right of that chain. The aggregate exists to report the whole run's numbers,
+        so it takes the four counters, the per-symbol rows and the discovery failures, and
+        leaves ``self.units`` untouched -- the chunk's contract lists become garbage as soon
+        as the chunk has been fetched.
+        """
+        self.units_pending += other.units_pending
+        self.contracts_pending += other.contracts_pending
+        self.units_done += other.units_done
+        self.units_empty += other.units_empty
+        self.per_symbol.update(other.per_symbol)
+        self.discovery_failed.update(other.discovery_failed)
 
 
 @dataclass
@@ -107,6 +122,14 @@ class RunStats:
     units_failed: int = 0
     rows: int = 0
     empty_contracts: int = 0
+
+    def merge(self, other: "RunStats") -> None:
+        """Add another chunk's (or thread's) totals into this one, in place."""
+        self.units_written += other.units_written
+        self.units_empty += other.units_empty
+        self.units_failed += other.units_failed
+        self.rows += other.rows
+        self.empty_contracts += other.empty_contracts
 
 
 def last_plan() -> Optional[Plan]:
@@ -149,7 +172,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "bars are downloaded and no file is created.")
     p.add_argument("--limit", type=int,
                    help="Stop after this many units of work (counts only units that would "
-                        "actually be fetched, never skipped ones).")
+                        "actually be fetched, never skipped ones). It is a budget for the "
+                        "whole RUN, spent across --plan-chunk-symbols chunks, not per chunk.")
+    p.add_argument("--plan-chunk-symbols", type=int, default=8,
+                   help="Plan and fetch this many underlyings at a time (default 8, min 1). "
+                        "WHY: the plan itself was the memory hog. Planning ALL symbols up "
+                        "front holds one work unit per (underlying, expiry) with its full "
+                        "contract list -- every strike x right -- so the 857-symbol universe "
+                        "reached 10+ GB while still building the plan, before a single bar "
+                        "had been fetched. Each chunk's contract lists are released once "
+                        "that chunk has been fetched, so plan memory stays flat at one "
+                        "chunk's worth. Nothing about WHAT gets written changes.")
     p.add_argument("--strike-band-pct", type=float, default=40.0,
                    help="Keep strikes within this %% of the underlying's price range "
                         "(default 40). Only used by --discovery synthetic.")
@@ -204,7 +237,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help="Rotate --log-file after this many bytes (default 10 MiB).")
     p.add_argument("--log-backups", type=int, default=5,
                    help="How many rotated --log-file backups to keep (default 5).")
-    return p.parse_args(list(argv) if argv is not None else None)
+    ns = p.parse_args(list(argv) if argv is not None else None)
+    if ns.plan_chunk_symbols < 1:
+        p.error("--plan-chunk-symbols must be >= 1")
+    return ns
 
 
 def _configure_rotating_log(path: str, max_bytes: int, backups: int) -> Callable[[str], None]:
@@ -447,10 +483,18 @@ def _price_range(underlying: str, start: date, end: date):
 
 def build_plan(provider, store: OptionHistoryParquetStore, symbols: Sequence[str],
                start: date, end: date, ns: argparse.Namespace, *, persist: bool,
-               log: Optional[Callable[[str], None]] = None) -> Plan:
+               log: Optional[Callable[[str], None]] = None,
+               budget: Optional[int] = None) -> Plan:
+    """The pending work for ``symbols``, capped at ``budget`` units.
+
+    ``budget`` defaults to ``--limit`` (unchanged behaviour for a caller that plans the whole
+    symbol list in one go). ``main`` plans in chunks and passes the REMAINING global budget,
+    so ``--limit`` stays a budget for the run rather than becoming one per chunk.
+    """
     log = log or print
     plan = Plan()
-    budget = ns.limit if ns.limit and ns.limit > 0 else None
+    if budget is None:
+        budget = ns.limit if ns.limit and ns.limit > 0 else None
     for symbol in symbols:
         try:
             contracts = discover(provider, store, symbol, start, end, ns, persist)
@@ -480,9 +524,10 @@ def build_plan(provider, store: OptionHistoryParquetStore, symbols: Sequence[str
             # The limit is spent only on work that would actually be FETCHED, so
             # `--limit 1` against a mostly-warm store still makes progress.
             if budget is None or len(plan.units) < budget:
-                plan.units.append(WorkUnit(symbol, expiry,
-                                           sorted(by_expiry[expiry],
-                                                  key=lambda c: c.occ_symbol)))
+                contracts_for_expiry = sorted(by_expiry[expiry], key=lambda c: c.occ_symbol)
+                plan.units.append(WorkUnit(symbol, expiry, contracts_for_expiry))
+                plan.units_pending += 1
+                plan.contracts_pending += len(contracts_for_expiry)
         plan.units_done += done
         plan.units_empty += empty
         plan.per_symbol[symbol] = {
@@ -797,23 +842,53 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
             f"accepting the window would build a cache with silently unusable leading "
             f"months. Use --start {floor} or later.")
 
-    plan = build_plan(provider, store, symbols, start, end, ns, persist=not ns.dry_run, log=log)
-    _LAST_PLAN = plan
-    if plan.discovery_failed:
-        log(f"discovery  : {len(plan.discovery_failed)} symbol(s) failed and were skipped: "
-            f"{', '.join(sorted(plan.discovery_failed))}")
+    if not ns.dry_run:
+        log(f"store root : {store.root}")
+        log(f"window     : {start.isoformat()} .. {end.isoformat()}")
+
+    # PLAN AND FETCH IN CHUNKS. Building the whole universe's plan first held one WorkUnit per
+    # pending (underlying, expiry) -- each with its complete contract list -- for all 857
+    # symbols at once: 10.3 GB of plan state before the first bar was even requested. A chunk's
+    # units are handed straight to run_units_concurrent (which writes each partition and drops
+    # it) and then become garbage, so plan memory stays at one chunk's worth no matter how big
+    # the universe is. Only the aggregate's counters survive, never its units.
+    chunk_size = ns.plan_chunk_symbols
+    chunks = [symbols[i:i + chunk_size] for i in range(0, len(symbols), chunk_size)]
+    total_budget = ns.limit if ns.limit and ns.limit > 0 else None
+    aggregate = Plan()
+    stats = RunStats()
+    for k, chunk in enumerate(chunks, 1):
+        # --limit is a budget for the RUN: each chunk may only plan what is left of it, and
+        # once it is spent the remaining chunks are not even discovered.
+        remaining = None if total_budget is None else total_budget - aggregate.units_pending
+        if remaining is not None and remaining <= 0:
+            break
+        chunk_plan = build_plan(provider, store, chunk, start, end, ns,
+                               persist=not ns.dry_run, log=log, budget=remaining)
+        aggregate.absorb(chunk_plan)
+        if ns.dry_run:
+            # Keep exactly ONE unit -- the very first one planned -- so print_plan can still
+            # name the file it would write. Never a chunk's worth.
+            if not aggregate.units and chunk_plan.units:
+                aggregate.units = chunk_plan.units[:1]
+            continue
+        log(f"plan chunk {k}/{len(chunks)}: {chunk[0]}..{chunk[-1]} — "
+            f"{chunk_plan.units_pending} units pending (cumulative: done "
+            f"{aggregate.units_done}, written {stats.units_written}, "
+            f"failed {stats.units_failed})")
+        stats.merge(run_units_concurrent(chunk_plan, provider, store, start, end, ns,
+                                        clock=clock, sleep=sleep, log=log,
+                                        concurrency=ns.concurrency))
+
+    _LAST_PLAN = aggregate
+    if aggregate.discovery_failed:
+        log(f"discovery  : {len(aggregate.discovery_failed)} symbol(s) failed and were "
+            f"skipped: {', '.join(sorted(aggregate.discovery_failed))}")
 
     if ns.dry_run:
-        print_plan(plan, store, symbols, start, end, ns, log)
+        print_plan(aggregate, store, symbols, start, end, ns, log)
         return 0
 
-    log(f"store root : {store.root}")
-    log(f"window     : {start.isoformat()} .. {end.isoformat()}")
-    log(f"units      : {plan.units_pending} to fetch "
-        f"({plan.units_done} complete, {plan.units_empty} known empty already on disk)")
-    stats = run_units_concurrent(plan, provider, store, start, end, ns,
-                                 clock=clock, sleep=sleep, log=log,
-                                 concurrency=ns.concurrency)
     log(f"done: {stats.units_written} partitions written, {stats.units_empty} empty, "
         f"{stats.units_failed} failed, {stats.rows} rows, "
         f"{stats.empty_contracts} empty contracts recorded, "
