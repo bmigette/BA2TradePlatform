@@ -191,6 +191,19 @@ class MarginInfo:
     bp_factor: float
     marginable: bool = True
     fractionable: Optional[bool] = None    # TRI-STATE: True / False / None = "broker did not say"
+    #: Will the broker accept an order for this symbol AT ALL. TRI-STATE on the
+    #: same terms as ``fractionable``: ``False`` is the broker SAYING no (Alpaca
+    #: ``Asset.tradable is False`` -- a delisted, halted or never-supported name),
+    #: ``None`` is "nobody said", which is what a symbol omitted from
+    #: ``get_symbol_margin_info()`` means and must never be read as a refusal.
+    #:
+    #: DISTINCT FROM ``marginable``, which is about how much buying power the
+    #: order costs; this is about whether there is an order at all. A plan sized
+    #: perfectly against a non-tradable symbol is a plan with a guaranteed
+    #: rejection in it, and until this field existed nothing in the allocation
+    #: path asked the question -- Alpaca publishes it on the same ``Asset`` row
+    #: every other field here already comes from.
+    tradable: Optional[bool] = None
     min_order_size: Optional[float] = None          # SHARES
     min_trade_increment: Optional[float] = None     # SHARES
     min_fractional_notional: Optional[float] = None  # DOLLARS, fractional orders only

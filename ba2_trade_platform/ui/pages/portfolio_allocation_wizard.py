@@ -300,6 +300,41 @@ MARKER_WORKING_ORDERS = 'income-working-orders'
 #: Marker on the dry run's reserve chip.
 MARKER_RESERVED = 'dry-run-reserved'
 
+#: THE VALIDATE STEP: test the ticked orders against the broker before sending
+#: any of them, then offer to drop the ones that would be refused.
+MARKER_VALIDATE_BUTTON = 'dry-run-validate'
+MARKER_VALIDATION_RESULT = 'dry-run-validation-result'
+MARKER_VALIDATION_FINDING = 'dry-run-validation-finding'
+MARKER_VALIDATION_DROP = 'dry-run-validation-drop'
+VALIDATE_BUTTON_LABEL = 'Validate'
+VALIDATE_TOOLTIP = (
+    'Test the ticked orders against the broker without sending any of them. '
+    'Anything that would be refused is listed, and you can drop just those and '
+    'submit the rest.')
+#: The clean result. Deliberately does NOT say "these will fill" -- passing the
+#: checks is the absence of a known refusal, not a promise about the fill.
+VALIDATION_CLEAN_FMT = (
+    'Nothing found against {count} order(s). {precheck} No check can promise a '
+    'fill: a market order is priced when it reaches the exchange.')
+VALIDATION_FOUND_FMT = '{count} order(s) would be refused:'
+#: What the broker itself was asked, spelled out. "0 of 7 broker-prechecked" is a
+#: materially different statement from a clean bill of health, and Alpaca -- the
+#: live account -- is always 0: it publishes no order-preview endpoint at all, so
+#: nothing can be asked of it without actually sending the order.
+VALIDATION_PRECHECK_FMT = '{done} of {total} buy(s) were checked by the broker itself.'
+VALIDATION_NO_PRECHECK = (
+    'This broker offers no order preview, so every check was made locally.')
+#: The button that acts on the findings.
+VALIDATION_DROP_FMT = 'Un-tick the {count} flagged order(s) and keep the rest'
+
+#: THE RETRY STEP on the results table: try again on just the rows that failed.
+MARKER_OUTCOME_RETRY = 'outcome-retry'
+RETRY_FAILED_FMT = 'Retry the {count} that failed'
+RETRY_TOOLTIP = (
+    'Re-solve against the positions as they are now and open a fresh dry run. '
+    'What filled is already out of the new plan; what failed is still in it. '
+    'Nothing is re-sent without another Submit.')
+
 #: Marker on the TARGET-TOTAL block: label percentages off 100%, or a label's
 #: symbol weights off 100% within it. Decision 3 -- "Submit is blocked otherwise"
 #: -- had no live enforcement anywhere in the app until this: ``compute_allocation``
@@ -702,6 +737,7 @@ class AllocationWizard:
         market: MarketGateResult,
         on_refresh: Callable[[bool], Tuple[AllocationPlan, MarketGateResult]],
         on_submit: Callable[[AllocationPlan], None],
+        on_validate: Optional[Callable[[AllocationPlan], Dict]] = None,
         title: str = 'Portfolio allocation - dry run',
     ):
         self.base = base
@@ -709,12 +745,17 @@ class AllocationWizard:
         self.market = market
         self.on_refresh = on_refresh
         self.on_submit = on_submit
+        #: ``portfolio_allocation_service.validate_plan``, or None for a caller
+        #: that has no broker to test against (the button is then not drawn at
+        #: all rather than drawn dead).
+        self.on_validate = on_validate
         self.title = title
         self.allow_fractional = bool(plan.allow_fractional)
         self.selected = self._default_selection(plan)
         self.dialog = None
         self._banner_container = None
         self._base_block_container = None
+        self._validation_container = None
         self._notices_container = None
         self._badge_container = None
         self._rows_container = None
@@ -794,8 +835,18 @@ class AllocationWizard:
             self._render_rows()
             self._render_no_order_rows()
             self._render_totals()
+            # The validation verdict, ABOVE the buttons and inside the card so it
+            # cannot be lost behind a tab. Empty until Validate is pressed.
+            self._validation_container = ui.column().classes('w-full shrink-0')
             with ui.row().classes('w-full justify-end gap-2 shrink-0'):
                 ui.button('Refresh', on_click=lambda: self._refresh(self.allow_fractional)).props('outline')
+                # TEST THE PLAN BEFORE SENDING IT. See ``_validate``: the broker's
+                # own dry run where it has one, the locally knowable rejections
+                # everywhere else. Never sends an order.
+                if self.on_validate is not None:
+                    ui.button(VALIDATE_BUTTON_LABEL, on_click=self._validate) \
+                        .props('outline').mark(MARKER_VALIDATE_BUTTON) \
+                        .tooltip(VALIDATE_TOOLTIP)
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 self._submit_button = ui.button('Submit', on_click=self._submit) \
                     .props('color=primary')
@@ -1558,6 +1609,91 @@ class AllocationWizard:
             if required > budget:
                 _label(BP_OVER_BUDGET_NOTE, f'{TOTALS_NOTE_CLASSES} text-orange-400')
 
+    def _validate(self):
+        """Test the TICKED orders against the broker, and offer to drop the bad ones.
+
+        Sends nothing. ``on_validate`` re-reads the broker's per-symbol facts and
+        runs its order preview where one exists (TastyTrade); on Alpaca, which
+        publishes no preview endpoint, every check is local and the panel says so
+        rather than implying the broker signed the plan off.
+
+        Runs over ``filter_plan_rows``, not the whole plan: validating rows the
+        user has already un-ticked would report problems with orders that are not
+        going to be sent, and the drop button would then have nothing to drop.
+
+        The verdict panel is REPLACED on every press and cleared by ``_refresh``:
+        a validation describes one exact set of orders, and a re-solve makes it a
+        statement about a plan that no longer exists.
+        """
+        if self.on_validate is None or self._validation_container is None:
+            return
+        selected_plan = filter_plan_rows(self.plan, sorted(self.selected))
+        if not selected_plan.rows:
+            ui.notify('Nothing selected to validate', type='warning')
+            return
+        try:
+            report = self.on_validate(selected_plan)
+        except Exception as e:
+            logger.error(f"Allocation validation failed: {e}", exc_info=True)
+            ui.notify(f'Validation failed: {e}', type='negative')
+            return
+        self._render_validation(report, checked=len(selected_plan.rows))
+
+    def _render_validation(self, report: Dict, *, checked: int):
+        """Draw one validation verdict. Idempotent; the container is cleared first."""
+        self._validation_container.clear()
+        findings = list(report.get('findings') or [])
+        symbols = list(report.get('symbols') or [])
+        budget = report.get('budget')
+        prechecked = int(report.get('prechecked') or 0)
+        buy_rows = int(report.get('buy_rows') or 0)
+        precheck_note = (VALIDATION_PRECHECK_FMT.format(done=prechecked, total=buy_rows)
+                         if prechecked else VALIDATION_NO_PRECHECK)
+        with self._validation_container:
+            css = 'alert-banner warning' if findings else 'alert-banner info'
+            with ui.element('div').classes(f'{css} w-full p-3 mt-1') \
+                    .mark(MARKER_VALIDATION_RESULT):
+                if findings:
+                    _label(VALIDATION_FOUND_FMT.format(count=len(symbols)),
+                           'text-sm font-medium text-orange-400')
+                    for _symbol, reason in findings:
+                        _label(f'• {reason}', 'text-sm text-orange-400') \
+                            .mark(MARKER_VALIDATION_FINDING)
+                    _label(precheck_note, 'text-xs text-gray-400')
+                else:
+                    _label(VALIDATION_CLEAN_FMT.format(count=checked,
+                                                       precheck=precheck_note),
+                           'text-sm text-gray-400')
+                # The PLAN-level advisory, drawn whether or not there are row
+                # findings: running out of buying power truncates the smallest
+                # buys, and no row can be un-ticked to fix it.
+                if budget:
+                    _label(str(budget), 'text-sm text-orange-400') \
+                        .mark(MARKER_VALIDATION_FINDING)
+                if symbols:
+                    ui.button(VALIDATION_DROP_FMT.format(count=len(symbols)),
+                              on_click=lambda syms=list(symbols): self._drop(syms)) \
+                        .props('outline dense').classes('mt-2') \
+                        .mark(MARKER_VALIDATION_DROP)
+
+    def _drop(self, symbols: List[str]):
+        """Un-tick exactly the symbols validation flagged, and say what is left.
+
+        The "continue without those" half of the request: the rest of the plan is
+        untouched and immediately submittable, and the verdict panel is redrawn
+        from the NEW selection so it cannot go on naming orders that are no longer
+        going to be sent.
+        """
+        self.selected -= set(symbols)
+        self._render_rows()
+        self._render_table_footer()
+        self._render_totals()
+        remaining = len(self.selected)
+        ui.notify(f'{len(symbols)} order(s) un-ticked; {remaining} still selected',
+                  type='info')
+        if self._validation_container is not None:
+            self._validation_container.clear()
+
     def _toggle(self, symbol: str, checked: bool):
         if checked:
             self.selected.add(symbol)
@@ -1587,6 +1723,9 @@ class AllocationWizard:
             ui.notify(f'Refresh failed: {e}', type='negative')
             return
         self.selected = self._default_selection(self.plan)
+        # A verdict describes ONE exact set of orders. This is a different plan.
+        if self._validation_container is not None:
+            self._validation_container.clear()
         self._render_market_banner()
         self._render_base_block()
         self._sync_submit_button()
@@ -1668,9 +1807,15 @@ def open_allocation_wizard(
     market: MarketGateResult,
     on_refresh: Callable[[bool], Tuple[AllocationPlan, MarketGateResult]],
     on_submit: Callable[[AllocationPlan], None],
+    on_validate: Optional[Callable[[AllocationPlan], Dict]] = None,
     title: str = 'Portfolio allocation - dry run',
 ) -> AllocationWizard:
     """Open the dry-run dialog. Returns the wizard so the caller can keep a handle.
+
+    ``on_validate`` is ``portfolio_allocation_service.validate_plan`` -- given the
+    FILTERED plan it re-reads the broker's facts, runs its order preview where one
+    exists, and returns the findings. Optional: omitted, the Validate button is not
+    drawn at all rather than drawn dead.
 
     ``market`` is REQUIRED and has no default: a default would mean a caller that
     forgets it submits into a closed market. Build it with
@@ -1685,7 +1830,8 @@ def open_allocation_wizard(
     froze the gate at whatever it was when the wizard opened.
     """
     wizard = AllocationWizard(base, plan, market=market, on_refresh=on_refresh,
-                              on_submit=on_submit, title=title)
+                              on_submit=on_submit, on_validate=on_validate,
+                              title=title)
     wizard.open()
     return wizard
 
@@ -1961,7 +2107,27 @@ OUTCOME_COLOURS = {
 MARKER_OUTCOME_FILLED = 'outcome-filled'
 
 
-def render_outcomes(outcomes: List, *, run_id: Optional[int] = None) -> None:
+def retryable_outcomes(outcomes: List) -> List[str]:
+    """The symbols worth a second attempt, in table order and de-duplicated. Pure.
+
+    FAILED only. Deliberately NOT ``OUTCOME_WASHTRADE_LOCKED`` -- that order is
+    still armed and TradeManager re-submits it once the blocker clears, so a
+    retry here would queue a SECOND order for the same symbol and both would
+    eventually fill. Nor ``OUTCOME_UNACTIONABLE``, which no retry can help (every
+    open transaction behind the position is one the equity planner does not act
+    on -- a human has to unwind it), nor ``OUTCOME_PARTIAL``, where the rest of
+    the order may still be working at the broker.
+    """
+    seen, out = set(), []
+    for outcome in outcomes or []:
+        if outcome.status == OUTCOME_FAILED and outcome.symbol not in seen:
+            seen.add(outcome.symbol)
+            out.append(outcome.symbol)
+    return out
+
+
+def render_outcomes(outcomes: List, *, run_id: Optional[int] = None,
+                    on_retry: Optional[Callable[[List[str]], None]] = None) -> None:
     """Per-row outcome table shown after Submit.
 
     Partial failure is normal: a failed row sits next to a filled one and nothing
@@ -1972,6 +2138,12 @@ def render_outcomes(outcomes: List, *, run_id: Optional[int] = None) -> None:
     whole shares. ``filled_quantity is None`` means the broker reported no fill
     at all -- an accepted market order before the open looks exactly like that --
     and is drawn as "-", never as 0, which would read as "nothing filled".
+
+    ``on_retry`` is offered ONLY when something actually failed
+    (``retryable_outcomes``). Re-running the flow re-solves against the positions
+    as they are NOW, so the rows that filled are already gone from the new plan
+    and the ones that failed are still in it -- the retry is a re-solve, never a
+    replay of the orders that were just sent.
     """
     with ui.dialog() as dialog, ui.card().classes('w-full max-w-3xl'):
         title = f'Allocation run {run_id} - results' if run_id else 'Allocation run - results'
@@ -1993,7 +2165,18 @@ def render_outcomes(outcomes: List, *, run_id: Optional[int] = None) -> None:
                     .classes('w-24').mark(MARKER_OUTCOME_FILLED)
                 ui.label(outcome.path or '-').classes('w-24')
                 ui.label(outcome.message or '').classes('flex-1 text-xs text-gray-400')
-        with ui.row().classes('w-full justify-end mt-2'):
+        retryable = retryable_outcomes(outcomes)
+        with ui.row().classes('w-full justify-end mt-2 gap-2'):
+            if retryable and on_retry is not None:
+                def _retry(symbols=list(retryable)):
+                    # Closed FIRST: the retry re-solves and opens a fresh dry run,
+                    # and two stacked dialogs describing two different plans is
+                    # exactly the confusion this feature exists to remove.
+                    dialog.close()
+                    on_retry(symbols)
+                ui.button(RETRY_FAILED_FMT.format(count=len(retryable)),
+                          on_click=_retry).props('outline') \
+                    .mark(MARKER_OUTCOME_RETRY).tooltip(RETRY_TOOLTIP)
             ui.button('Close', on_click=dialog.close).props('flat')
     dialog.open()
 

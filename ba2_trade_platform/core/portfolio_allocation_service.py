@@ -31,7 +31,8 @@ from .portfolio_allocation import (
     apply_order_impacts, blocking_messages, decide_symbol_action,
     held_no_price_block,
     measure_filled_values, plan_quantity_attempts, signed_position_values,
-    split_delta_fifo, validate_label_targets,
+    split_delta_fifo, validate_label_targets, validate_plan_budget,
+    validate_plan_rows,
 )
 from .TransactionHelper import TransactionHelper
 from .types import (
@@ -275,6 +276,104 @@ def precheck_plan(account, plan: AllocationPlan, *, available_buying_power: floa
     return apply_order_impacts(plan, impacts,
                                available_buying_power=available_buying_power,
                                margin=margin)
+
+
+def collect_order_impacts(account, plan: AllocationPlan) -> Dict[str, Any]:
+    """The broker's OWN verdict on each buy in this plan, where it has one.
+
+    The same dry-run seam ``precheck_plan`` uses at solve time, called again at
+    VALIDATE time and for a different purpose: that one re-SOLVES against the
+    broker's buying-power numbers, this one keeps the ``OrderImpact`` objects so
+    ``validate_plan_rows`` can read ``accepted`` / ``errors`` -- the broker
+    saying "I would refuse this" in its own words.
+
+    ``{}`` on a broker without the seam (Alpaca publishes no order-preview
+    endpoint, so every allocation validated against it is checked locally and
+    only locally) and on a symbol whose preview raised. Never a fabricated
+    accepted-looking impact: an absent entry means "not prechecked", which
+    ``validate_plan_rows`` treats as no evidence either way.
+
+    BUYS ONLY, exactly as ``precheck_plan`` explains at length: a sell preview
+    cannot change the plan, and a flaky one refusing a close is how a position
+    the user asked to exit quietly stays open.
+    """
+    preview = getattr(account, "preview_order_impact", None)
+    if preview is None:
+        return {}
+    impacts: Dict[str, Any] = {}
+    for row in plan.buy_rows:
+        candidate = TradingOrder(
+            account_id=account.id,
+            symbol=row.symbol,
+            quantity=abs(row.delta_quantity),
+            side=row.side,
+            order_type=OrderType.MARKET,
+            good_for='day',
+            status=OrderStatus.PENDING,
+        )
+        try:
+            impact = preview(candidate, is_closing_order=False)
+        except Exception as e:
+            logger.error(f"Allocation validate: preview_order_impact failed for "
+                         f"{row.symbol}: {e}", exc_info=True)
+            continue
+        if impact is not None:
+            impacts[row.symbol] = impact
+    return impacts
+
+
+def validate_plan(account, plan: AllocationPlan) -> Dict[str, Any]:
+    """Test a reviewed plan against the broker BEFORE any of it is sent.
+
+    What the user asked for -- "can we test the plan, and on failure report the
+    failing orders and let me continue without those" -- as far as the brokers
+    actually allow it. There are two halves and they are not equal:
+
+      * THE BROKER'S OWN DRY RUN, where one exists. TastyTrade prices every
+        order through ``place_order(dry_run=True)`` and answers with an
+        ``OrderImpact``; a refusal there is the broker's verdict, in the broker's
+        words, and needs no interpreting. ALPACA HAS NO SUCH ENDPOINT -- there is
+        no way to ask it "would you take this?" without sending it -- so on the
+        live account this half returns nothing and the answer rests entirely on:
+      * THE LOCAL CHECKS (``validate_plan_rows``), against facts re-read from the
+        broker HERE rather than at solve time: tradability, fractional
+        eligibility, the minimum order size and the fractional money floor, and
+        whether a price still exists. These are the rejections whose cause is
+        knowable without sending anything.
+
+    Nothing is written, nothing is submitted, and the plan is not modified. The
+    caller decides what to do with the findings -- the wizard offers to un-tick
+    exactly the symbols named here.
+
+    Returns:
+        Dict[str, Any]:
+          ``findings``   -- ``[(symbol, reason)]``, one entry per problem.
+          ``symbols``    -- the DISTINCT symbols named, for un-ticking.
+          ``budget``     -- the plan-level buying-power advisory, or None.
+          ``prechecked`` -- how many rows the BROKER actually answered for. 0
+                            means nothing was broker-tested (Alpaca), which the
+                            UI must say out loud rather than implying a clean
+                            bill of health.
+          ``buy_rows``   -- how many buys were offered for precheck, so the UI can
+                            say "0 of 7 prechecked" rather than a bare 0.
+    """
+    symbols = sorted({row.symbol for row in plan.rows
+                      if row.side is not None and row.delta_quantity})
+    margin = fetch_margin_info(account, symbols)
+    impacts = collect_order_impacts(account, plan)
+    findings = validate_plan_rows(plan, margin, impacts)
+    budget = validate_plan_budget(plan)
+    logger.info(
+        f"Allocation validate for account {account.id}: {len(findings)} finding(s) "
+        f"over {len(symbols)} symbol(s); {len(impacts)} of {len(plan.buy_rows)} buy(s) "
+        f"broker-prechecked")
+    return {
+        "findings": findings,
+        "symbols": sorted({symbol for symbol, _reason in findings}),
+        "budget": budget,
+        "prechecked": len(impacts),
+        "buy_rows": len(plan.buy_rows),
+    }
 
 
 # ---------------------------------------------------------------------------

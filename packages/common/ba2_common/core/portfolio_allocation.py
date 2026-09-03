@@ -79,6 +79,12 @@ __all__ = [
     "BaseSnapshot", "build_base_snapshot", "WARNING_NO_MULTIPLIER",
     "held_symbols_without_price", "held_no_price_block", "ERROR_HELD_NO_PRICE_FMT",
     "dry_run_rows", "filter_plan_rows", "summarise_plan", "DRY_RUN_QUANTITY_DECIMALS",
+    # pre-submit validation
+    "validate_plan_rows", "validate_plan_budget",
+    "REFUSAL_NOT_TRADABLE_FMT", "REFUSAL_FRACTIONAL_NOT_ELIGIBLE_FMT",
+    "REFUSAL_BELOW_MIN_ORDER_FMT", "REFUSAL_BELOW_MIN_NOTIONAL_FMT",
+    "REFUSAL_NO_PRICE_FMT", "REFUSAL_PRECHECK_FMT", "REFUSAL_OVER_BUDGET_FMT",
+    "PRECHECK_REASON_UNKNOWN",
     "even_split_targets", "steps_validation_messages", "validate_invest_amount",
     "load_previous_targets", "has_previous_targets",
     "load_previous_symbol_weights", "has_previous_symbol_weights",
@@ -2832,6 +2838,133 @@ def bp_leverage(row: "AllocationRow") -> Tuple[Optional[float], str]:
     return ratio, LEVERAGE_NONE
 
 
+# ---------------------------------------------------------------------------
+# PRE-SUBMIT VALIDATION. Pure -- the live service refreshes the broker facts and
+# runs the broker's own precheck around it.
+# ---------------------------------------------------------------------------
+
+#: A row the broker is EXPECTED to refuse, and why. One per finding, so a symbol
+#: with two problems is reported twice rather than losing one of them.
+REFUSAL_NOT_TRADABLE_FMT = "{symbol}: the broker does not accept orders for this symbol"
+REFUSAL_FRACTIONAL_NOT_ELIGIBLE_FMT = (
+    "{symbol}: {quantity:g} is a fractional quantity and the broker does not split "
+    "this symbol")
+REFUSAL_BELOW_MIN_ORDER_FMT = (
+    "{symbol}: {quantity:g} share(s) is below the broker's {minimum:g}-share minimum")
+REFUSAL_BELOW_MIN_NOTIONAL_FMT = (
+    "{symbol}: a fractional order of ${value:,.2f} is below the broker's ${minimum:g} "
+    "minimum")
+REFUSAL_NO_PRICE_FMT = "{symbol}: no price, so the order cannot be sized"
+REFUSAL_PRECHECK_FMT = "{symbol}: the broker's own precheck refused it - {reason}"
+#: NOT per-row: the plan as a whole asks for more buying power than the budget.
+#: An advisory rather than a refusal, because the broker fills what it can and
+#: the shortfall truncates the SMALLEST buys (they are submitted last).
+REFUSAL_OVER_BUDGET_FMT = (
+    "the selected orders need ${required:,.2f} of buying power against ${budget:,.2f} "
+    "available - the smallest buys will be refused as it runs out")
+
+#: What ``validate_plan_rows`` returns per finding.
+PRECHECK_REASON_UNKNOWN = "no reason given"
+
+
+def validate_plan_rows(plan: "AllocationPlan",
+                       margin: Optional[Dict[str, MarginInfo]] = None,
+                       impacts: Optional[Dict[str, "OrderImpact"]] = None,
+                       ) -> List[Tuple[str, str]]:
+    """Which of this plan's orders the broker is expected to REFUSE. Pure.
+
+    The dry run already suppresses the rows the SOLVE knew about, and those never
+    reach here -- a suppressed row carries no order and is not tickable. This
+    answers the different question the solve cannot: given the broker facts AS
+    THEY ARE NOW, which of the orders about to be sent would come back rejected?
+    Two things make that different from re-reading the plan:
+
+      * ``MarginInfo.tradable`` is not part of sizing at all, so nothing upstream
+        has ever looked at it. A halted or delisted symbol sizes perfectly and is
+        refused every time.
+      * the facts are re-read at COMMIT time. A plan solved twenty minutes ago
+        was sized against the buying power, prices and asset flags of then.
+
+    ``impacts`` is the broker's OWN answer where it has one
+    (``AccountInterface.preview_order_impact``): an impact with ``accepted=False``
+    is a refusal in the broker's own words and outranks every local guess. Alpaca
+    publishes no such endpoint and passes ``None``/``{}``; TastyTrade fills it.
+
+    A missing ``MarginInfo`` (or a ``None`` tri-state field) is NEVER a refusal --
+    "the broker did not say" is not "the broker said no", the same rule
+    ``fractionable`` has carried since it became tri-state. This function's whole
+    value is that a finding here is worth acting on; one false positive that
+    un-ticks a good order costs more than the check saves.
+
+    Args:
+        plan: the FILTERED plan -- exactly the rows the user has ticked.
+        margin: ``{symbol: MarginInfo}`` re-read at validation time.
+        impacts: ``{symbol: OrderImpact}`` from the broker's precheck, where it has one.
+
+    Returns:
+        List[Tuple[str, str]]: ``(symbol, reason)`` per finding, in plan order.
+        EMPTY means nothing local says these orders will be refused -- which is
+        not a promise that they will fill, only that nothing known says otherwise.
+    """
+    margin = margin or {}
+    impacts = impacts or {}
+    findings: List[Tuple[str, str]] = []
+    for row in plan.rows:
+        if row.skipped or row.side is None or not row.delta_quantity:
+            continue
+        symbol = row.symbol
+        quantity = abs(float(row.delta_quantity))
+        m = margin.get(symbol)
+
+        impact = impacts.get(symbol)
+        if impact is not None and not impact.accepted:
+            reason = "; ".join(impact.errors) or PRECHECK_REASON_UNKNOWN
+            findings.append((symbol, REFUSAL_PRECHECK_FMT.format(
+                symbol=symbol, reason=reason)))
+
+        if m is not None and m.tradable is False:
+            findings.append((symbol, REFUSAL_NOT_TRADABLE_FMT.format(symbol=symbol)))
+
+        if row.price is None or float(row.price) <= 0:
+            findings.append((symbol, REFUSAL_NO_PRICE_FMT.format(symbol=symbol)))
+
+        fractional = _is_fractional_quantity(quantity)
+        if fractional and m is not None and m.fractionable is False:
+            findings.append((symbol, REFUSAL_FRACTIONAL_NOT_ELIGIBLE_FMT.format(
+                symbol=symbol, quantity=quantity)))
+
+        if (m is not None and m.min_order_size is not None
+                and quantity < float(m.min_order_size)):
+            findings.append((symbol, REFUSAL_BELOW_MIN_ORDER_FMT.format(
+                symbol=symbol, quantity=quantity, minimum=float(m.min_order_size))))
+
+        if (fractional and m is not None and m.min_fractional_notional is not None
+                and row.price is not None and float(row.price) > 0):
+            value = quantity * float(row.price)
+            if value < float(m.min_fractional_notional):
+                findings.append((symbol, REFUSAL_BELOW_MIN_NOTIONAL_FMT.format(
+                    symbol=symbol, value=value,
+                    minimum=float(m.min_fractional_notional))))
+    return findings
+
+
+def validate_plan_budget(plan: "AllocationPlan") -> Optional[str]:
+    """The one PLAN-level finding: the ticked buys ask for more buying power than
+    the budget (published plus what this plan's own sells free). Pure.
+
+    Advisory, not a refusal, and deliberately separate from ``validate_plan_rows``
+    for that reason: the broker does not reject the plan, it fills until the money
+    runs out. Buys go out in descending value, so what gets refused is the
+    SMALLEST ones -- which is worth saying before the user commits, and is not a
+    row anybody can un-tick to fix.
+    """
+    required = float(plan.required_buying_power or 0.0)
+    budget = float(plan.total_buying_power or 0.0)
+    if required <= budget + MONEY_EPSILON:
+        return None
+    return REFUSAL_OVER_BUDGET_FMT.format(required=required, budget=budget)
+
+
 def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
     """One display dict per row the user must look at, in plan order.
 
@@ -3875,7 +4008,9 @@ def _apply_absorption(row: "AllocationRow", move: float, label: str,
         before=baseline, after=after, label=label))
 
 
-def _absorber_order(members: List["AllocationRow"]) -> List["AllocationRow"]:
+def _absorber_order(members: List["AllocationRow"],
+                    wanted: Optional[Dict[str, float]] = None,
+                    ) -> List["AllocationRow"]:
     """The rows a label may move, best first, deterministically.
 
     FRACTIONABLE first (they absorb the residual almost exactly, on a 4dp grid,
@@ -3892,19 +4027,40 @@ def _absorber_order(members: List["AllocationRow"]) -> List["AllocationRow"]:
         face, and giving it one anyway makes the two halves of the row contradict
         each other;
       * a skipped or unpriced row -- there is nothing to measure or to trade;
-      * a row with an EXPLICIT ZERO TARGET (``target_notional <= 0``) -- decision
-        14 closes such a position outright and ``scale_pct_to_total``'s own rule
-        is that a weight of 0 is "hold NONE of this", not "hold whatever
-        redistribution leaves". Without this a label with room left over could
-        un-close a ``REASON_CLOSE_TO_ZERO`` row (selling less than everything,
-        so the position it was told to flatten survives at a residual size) or
-        open a fresh position in a symbol the user weighted at 0%, on a row that
-        had no order at all until redistribution invented one.
+      * a row being CLOSED to a zero target (``REASON_CLOSE_TO_ZERO``) -- decision
+        14 flattens such a position outright, and absorbing into it means selling
+        LESS than everything, so the position it was told to flatten survives at
+        a residual size that nobody chose. "Sell it all" is an instruction, not a
+        rounding a later pass may trim;
+      * a symbol this LABEL wants NONE of, that is NOT HELD, and that has NO
+        ORDER YET -- a 0%-weighted member the account is flat in. Absorbing into
+        one opens a position out of nothing, on a row that had nothing to do
+        until redistribution invented it, and ``scale_pct_to_total``'s own rule
+        is that a slot at 0 is a symbol the user asked to hold NONE of.
+
+        ALL THREE halves are required, and each excludes a legitimate absorber
+        on its own: "wants none" alone would exclude the ordinary over-target
+        seller (a HELD symbol whose target is 0 is exactly what an
+        over-subscribed label gives back into); "not held" alone would exclude
+        every legitimate new buy; "no order yet" alone would exclude every row
+        being shrunk. Together they name one thing only -- a row that would go
+        from nothing at all to an order nobody asked for.
+
+        ``wanted`` is the LABEL'S OWN SPLIT rather than ``row.target_notional``
+        because a multi-label symbol's row carries the SUM of its labels'
+        targets, so the row-level figure cannot answer "does THIS label want any
+        of it". It is optional: a caller testing this ordering in isolation gets
+        the old behaviour, and ``redistribute_label_residuals`` always passes it.
     """
+    wanted = wanted or {}
     absorbers = [r for r in members
                  if r.sizing_outcome == SIZING_OUTCOME_NORMAL
                  and float(r.unmet_notional or 0.0) <= MONEY_EPSILON
-                 and float(r.target_notional or 0.0) > MONEY_EPSILON]
+                 and REASON_CLOSE_TO_ZERO not in r.reasons
+                 and not (wanted
+                          and float(wanted.get(r.symbol, 0.0) or 0.0) <= MONEY_EPSILON
+                          and abs(float(r.current_quantity or 0.0)) <= QUANTITY_EPSILON
+                          and abs(float(r.delta_quantity or 0.0)) <= QUANTITY_EPSILON)]
     return sorted(absorbers, key=lambda r: (0 if r.fractional else 1,
                                             0 if r.delta_quantity else 1,
                                             r.symbol))
@@ -3988,7 +4144,7 @@ def redistribute_label_residuals(plan: "AllocationPlan",
         if not members:
             continue
         target_total = sum(float(wanted.get(r.symbol, 0.0) or 0.0) for r in members)
-        absorbers = _absorber_order(members)
+        absorbers = _absorber_order(members, wanted)
         baselines = {r.symbol: float(r.delta_quantity or 0.0) for r in members}
         residual = _label_residual(target_total, members, mode, basis)
         passes = 0

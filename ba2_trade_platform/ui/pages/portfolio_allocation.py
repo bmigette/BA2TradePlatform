@@ -3088,8 +3088,22 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         def _on_submit(selected_plan) -> None:
             ui.timer(0.1, lambda: _do_submit(selected_plan), once=True)
 
+        def _on_validate(selected_plan):
+            """Called from the wizard (sync): test the ticked orders, send nothing.
+
+            Broker IO on the event loop, like ``_on_refresh`` beside it and for
+            the same reason -- the wizard's buttons are sync handlers and NiceGUI
+            dispatches them directly. It is one margin re-read plus at most one
+            preview per buy, and it happens while the user waits for an answer
+            they asked for.
+            """
+            from ...core.utils import get_account_instance_from_id
+            return svc.validate_plan(get_account_instance_from_id(account_id),
+                                     selected_plan)
+
         open_allocation_wizard(new_base, plan, market=_market_gate_for(hours),
-                               on_refresh=_on_refresh, on_submit=_on_submit)
+                               on_refresh=_on_refresh, on_submit=_on_submit,
+                               on_validate=_on_validate)
 
     async def _do_submit(selected_plan) -> None:
         try:
@@ -3105,7 +3119,22 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             # sit open across 16:00 and the banner it was built with is now stale.
             ui.notify(result['blocked_reason'], type='warning')
             return
-        render_outcomes(result['outcomes'], run_id=result['run_id'])
+        def _on_retry(symbols) -> None:
+            """"Retry the N that failed": re-solve and open a FRESH dry run.
+
+            Deliberately a full re-solve rather than a replay of the rows that
+            failed. The positions have moved -- what filled is now held, so the
+            new plan does not ask for it again, while what failed is still off
+            target and comes back in. ``symbols`` is carried for the log only: the
+            new plan is the whole account's, and the user re-ticks in the dry run
+            exactly as they would on any other run.
+            """
+            logger.info(f"Allocation retry requested for {len(symbols)} failed "
+                        f"row(s) on account {account_id}: {', '.join(symbols)}")
+            ui.timer(0.1, _run_dry_run, once=True)
+
+        render_outcomes(result['outcomes'], run_id=result['run_id'],
+                        on_retry=_on_retry)
         note = working_orders_notice(settled=result['settled'],
                                      working_order_ids=result['working_order_ids'],
                                      refresh_failed=result['refresh_failed'])
