@@ -212,6 +212,23 @@ class MarginInfo:
     source: str = MARGIN_SOURCE_DEFAULT
 
 
+def leverage_of(initial_margin_rate: Optional[float]) -> Optional[float]:
+    """Buying power per dollar of equity implied by an initial margin rate.
+
+    ``0.5`` -> ``2.0`` (Reg-T 2:1), ``1.0`` -> ``1.0`` (no borrowing). ``None`` in gives
+    ``None`` out: an unpublished rate is not 1x, it is UNKNOWN, and rendering "1x" for it
+    would state a broker fact nobody supplied. A non-positive rate is equally unusable --
+    it divides to infinity -- and is refused the same way.
+
+    Lives HERE, beside ``MarginInfo``, rather than in ``symbol_facts``: it is pure
+    arithmetic over one field, and its callers include the allocator's view module, which
+    is pinned by test to import without the DB (``symbol_facts`` pulls SQLAlchemy).
+    """
+    if initial_margin_rate is None or initial_margin_rate <= 0:
+        return None
+    return 1.0 / initial_margin_rate
+
+
 @dataclass
 class OrderImpact:
     """Result of a broker-side order dry-run (precheck).

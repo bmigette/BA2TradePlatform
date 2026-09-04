@@ -37,6 +37,7 @@ tested without a browser. ``SymbolInfoPanel`` is a thin renderer over it.
 """
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -516,13 +517,23 @@ def _category_dates(*bundles) -> List[str]:
 
 
 def _aligned(mapping: Mapping[str, Optional[float]],
-             categories: Sequence[str]) -> List[Optional[float]]:
+             categories: Sequence[str], *, digits: Optional[int] = None) -> List[Optional[float]]:
     """``None`` where the series has no observation — never ``0.0``.
 
     ECharts renders ``None`` as a gap and ``0`` as a data point on the zero
     line; the second would claim a measurement that was never made.
+
+    ``digits`` rounds the plotted value. It exists for the TOOLTIP, which prints
+    whatever is in the data array verbatim: an unrounded float arrives as
+    ``126.23655913978493``, seventeen digits of which about four are meaningful and
+    none are readable. Rounding here rather than formatting in the tooltip keeps it
+    a plain option dict with no JavaScript in it. ``None`` leaves the value exactly
+    as the data layer measured it — used where the sub-cent matters (dividends).
     """
-    return [mapping.get(c) for c in categories]
+    values = (mapping.get(c) for c in categories)
+    if digits is None:
+        return list(values)
+    return [None if v is None else round(float(v), digits) for v in values]
 
 
 def _split_marklines(bundle) -> Dict[str, Any]:
@@ -545,7 +556,8 @@ def _price_series(info, categories):
         "name": f"{info.symbol} price (close)",
         "type": "line", "yAxisIndex": 0, "showSymbol": False, "connectNulls": True,
         "smooth": False, "lineStyle": {"width": 2}, "color": COLOR_PRICE,
-        "data": _aligned(closes, categories),
+        # 2dp: a close is quoted in cents, and the tooltip prints this verbatim.
+        "data": _aligned(closes, categories, digits=2),
         "markLine": _split_marklines(bundle),
     }
 
@@ -564,7 +576,8 @@ def _return_series(info, categories, *, axis_index: int, color: str):
         "name": f"{info.symbol} total return (reinvested)",
         "type": "line", "yAxisIndex": axis_index, "showSymbol": False,
         "connectNulls": True, "lineStyle": {"width": 2}, "color": color,
-        "data": _aligned(cumulative, categories),
+        # 2dp: a total-return percentage is read to the tenth at best.
+        "data": _aligned(cumulative, categories, digits=2),
     }
 
 
@@ -576,19 +589,152 @@ def _dividend_series(info, categories):
         "_kind": KIND_DIVIDEND, "_symbol": info.symbol,
         "name": f"{info.symbol} dividend paid (cash / share)",
         "type": "bar", "yAxisIndex": 2, "barMaxWidth": 8, "color": COLOR_DIVIDEND,
+        # NO rounding: dividends live in the sub-cent (fmt_per_share uses 4dp),
+        # so 2dp here would round a real $0.0008 payment to $0.00.
         "data": _aligned(amounts, categories),
     }
 
 
+#: Vertical stagger for the two RIGHT-hand axis names. Both are drawn at the top of
+#: their own axis line, and those lines are only ``offset`` apart horizontally -- so
+#: two names of this length ("Total return % (reinvested)", "Dividend paid (cash /
+#: share)") overlapped into an unreadable smear. ``nameGap`` lifts the second one
+#: clear; it is a VERTICAL separation because the horizontal room is what ran out.
+NAME_GAP_DEFAULT = 15
+NAME_GAP_STACKED = 38
+
+
 def _axis(name: str, *, position: str, offset: int = 0,
-          formatter: str = "{value}", split_line: bool = True) -> Dict[str, Any]:
+          formatter: str = "{value}", split_line: bool = True,
+          name_gap: int = NAME_GAP_DEFAULT) -> Dict[str, Any]:
     return {
         "type": "value", "name": name, "position": position, "offset": offset,
-        "scale": True, "nameTextStyle": {"color": "#a0aec0"},
+        "scale": True, "nameGap": name_gap,
+        "nameTextStyle": {"color": "#a0aec0"},
         "axisLabel": {"color": "#a0aec0", "formatter": formatter},
         "splitLine": {"show": split_line,
                       "lineStyle": {"color": "rgba(255, 255, 255, 0.05)"}},
     }
+
+
+#: Chart height. Taller than the 380px it was: a total-return overlay spanning five
+#: years of daily bars is a SHAPE comparison, and at 380px the lines of three symbols
+#: sat inside ~250px of plot with the legend and axis eating the rest.
+CHART_HEIGHT_PX = 560
+
+#: The range buttons, in the order they are drawn. ``all`` is last and is the DEFAULT:
+#: the chart has always opened on the full history and a range control that silently
+#: cropped it on open would change what the reader is looking at without being asked.
+CHART_RANGES: Tuple[Tuple[str, str], ...] = (
+    ("YTD", "ytd"), ("1Y", "1y"), ("3Y", "3y"), ("5Y", "5y"), ("10Y", "10y"),
+    ("Max", "all"),
+)
+DEFAULT_CHART_RANGE = "all"
+#: Years back per key; ``ytd`` and ``all`` are handled separately.
+_RANGE_YEARS: Dict[str, int] = {"1y": 1, "3y": 3, "5y": 5, "10y": 10}
+
+
+def _years_before(day: date, years: int) -> date:
+    """``day`` minus whole years, surviving 29 February (-> 28 Feb)."""
+    try:
+        return day.replace(year=day.year - years)
+    except ValueError:
+        return day.replace(year=day.year - years, day=28)
+
+
+def range_start_iso(categories: Sequence[str], key: str,
+                    today: Optional[date] = None) -> Optional[str]:
+    """The first category at or after the window ``key`` opens. Pure.
+
+    Returns an ACTUAL MEMBER of ``categories`` rather than a computed date, because
+    the x axis is categorical: ECharts matches ``dataZoom.startValue`` against the
+    category values themselves, and a date that happens to be a weekend or a holiday
+    is in no category at all -- the zoom would then silently fall back to the full
+    range and the button would look broken.
+
+    ``None`` when there are no categories. A window that starts before the data does
+    yields the FIRST category: "10Y" on three years of history shows the three years
+    there are, which is the honest answer, rather than an empty chart.
+    """
+    if not categories:
+        return None
+    if key == "all":
+        return categories[0]
+    day = today or date.today()
+    if key == "ytd":
+        start = day.replace(month=1, day=1)
+    elif key in _RANGE_YEARS:
+        start = _years_before(day, _RANGE_YEARS[key])
+    else:
+        return categories[0]
+    wanted = _iso(start)
+    index = bisect.bisect_left(list(categories), wanted)
+    return categories[index] if index < len(categories) else categories[-1]
+
+
+#: Why a range button is dead. A range that reaches further back than the data does
+#: resolves to the whole history -- which is what is already on screen -- so pressing
+#: it moves nothing. That is correct arithmetic and an invisible UI: reported as
+#: "clicking 10Y or Max doesn't seem to do anything" on a symbol carrying five weeks
+#: of prices, where EVERY button was a no-op. They are disabled and say why instead.
+RANGE_UNAVAILABLE_FMT = ("Only {span} of history here ({first} to {last}), which is "
+                         "less than this range covers — the chart already shows all "
+                         "of it.")
+
+
+def _describe_span(first: str, last: str) -> str:
+    """``2026-07-29``/``2026-09-04`` -> ``5 weeks``. Approximate on purpose: the
+    sentence explains why a button is inert, not how long the series is."""
+    try:
+        days = (date.fromisoformat(last) - date.fromisoformat(first)).days
+    except (TypeError, ValueError):
+        return "the available history"
+    if days >= 730:
+        return f"{days // 365} years"
+    if days >= 365:
+        return "about a year"
+    if days >= 60:
+        return f"about {days // 30} months"
+    if days >= 14:
+        return f"about {days // 7} weeks"
+    days = max(days, 1)
+    return f"{days} day" if days == 1 else f"{days} days"
+
+
+def range_is_usable(categories: Sequence[str], key: str,
+                    today: Optional[date] = None) -> bool:
+    """Would pressing this range actually change what is shown? Pure.
+
+    ``all`` is always usable -- it is the way back from a zoom, so it stays live even
+    when it happens to be where you already are. Every other range is usable only if
+    it CROPS something: one that resolves to the first category shows the whole
+    history, which is what ``all`` shows, and pressing it does nothing observable.
+    """
+    if not categories:
+        return False
+    if key == "all":
+        return True
+    return range_start_iso(categories, key, today) != categories[0]
+
+
+def _data_zoom(categories: Sequence[str], key: str = DEFAULT_CHART_RANGE) -> List[Dict[str, Any]]:
+    """Scroll/pinch to zoom INSIDE the plot, plus a draggable slider under it.
+
+    Both entries carry the same window so the slider handles and the plot agree the
+    moment the chart is drawn; ECharts keeps them in step afterwards.
+    """
+    start = range_start_iso(categories, key)
+    end = categories[-1] if categories else None
+    window = {"startValue": start, "endValue": end}
+    return [
+        {"type": "inside", **window},
+        {"type": "slider", **window, "height": 16, "bottom": 6,
+         "backgroundColor": "transparent",
+         "borderColor": "rgba(255, 255, 255, 0.1)",
+         "fillerColor": "rgba(77, 171, 247, 0.18)",
+         "handleStyle": {"color": "#4dabf7"},
+         "textStyle": {"color": "#a0aec0"}},
+    ]
 
 
 def build_single_chart_options(info: SymbolInfo) -> Dict[str, Any]:
@@ -605,9 +751,15 @@ def build_single_chart_options(info: SymbolInfo) -> Dict[str, Any]:
                     "backgroundColor": "rgba(37, 43, 59, 0.95)",
                     "borderColor": "rgba(255, 255, 255, 0.1)",
                     "textStyle": {"color": "#ffffff"}},
-        "legend": {"data": [s["name"] for s in series],
+        # ANCHORED, not left to ECharts' default placement: the legend and the zoom
+        # slider both want the bottom of the chart, and unpositioned the legend landed
+        # on top of the slider. Stacked explicitly from the bottom edge up:
+        # slider 6..22, legend 36..54, then the x-axis labels, then the plot.
+        "legend": {"data": [s["name"] for s in series], "bottom": 36,
                    "textStyle": {"color": "#a0aec0"}},
-        "grid": {"left": 60, "right": 130, "top": 60, "bottom": 50,
+        # ``top`` clears the lifted dividend axis name; ``bottom`` clears the legend
+        # AND the slider beneath it.
+        "grid": {"left": 60, "right": 130, "top": 90, "bottom": 96,
                  "containLabel": True},
         "xAxis": {"type": "category", "data": categories,
                   "axisLabel": {"color": "#a0aec0"},
@@ -619,9 +771,11 @@ def build_single_chart_options(info: SymbolInfo) -> Dict[str, Any]:
             # Zero-based and gridless: bars measure a magnitude from zero, and a
             # third set of grid lines would be unreadable.
             {**_axis(AXIS_NAME_DIVIDEND, position="right", offset=70,
-                     formatter="${value}", split_line=False),
+                     formatter="${value}", split_line=False,
+                     name_gap=NAME_GAP_STACKED),
              "scale": False, "min": 0},
         ],
+        "dataZoom": _data_zoom(categories),
         "series": series,
     }
 
@@ -653,15 +807,19 @@ def build_comparison_chart_options(infos: Sequence[SymbolInfo]) -> Dict[str, Any
         # ~1200px box (``PANEL_WIDTH_COMPARE``), where eight or nine tickers are
         # enough to wrap. Scrolling PAGES the legend instead, so every series stays
         # reachable and none of them is drawn over the chart.
+        # Anchored above the zoom slider -- see the single chart for the stacking.
         "legend": {"data": [s["name"] for s in series],
-                   "type": "scroll",
+                   "type": "scroll", "bottom": 36,
                    "textStyle": {"color": "#a0aec0"}},
-        "grid": {"left": 60, "right": 40, "top": 60, "bottom": 50,
+        # ``bottom`` clears the legend and the zoom slider stacked beneath the plot;
+        # ``top`` no longer reserves a legend row, since the legend moved down.
+        "grid": {"left": 60, "right": 40, "top": 40, "bottom": 96,
                  "containLabel": True},
         "xAxis": {"type": "category", "data": categories,
                   "axisLabel": {"color": "#a0aec0"},
                   "axisLine": {"lineStyle": {"color": "rgba(255, 255, 255, 0.1)"}}},
         "yAxis": [_axis(AXIS_NAME_RETURN, position="left", formatter="{value}%")],
+        "dataZoom": _data_zoom(categories),
         "series": series,
     }
 
@@ -928,11 +1086,52 @@ def render_chart(infos: Sequence[SymbolInfo]) -> None:
     infos = list(infos)
     if not infos:
         return
+    categories = _category_dates(*[i.series for i in infos])
     with ui.card().classes("w-full"):
-        title = (f"{infos[0].symbol} — price, dividends and total return"
-                 if len(infos) == 1 else "Total return comparison")
-        ui.label(title).classes("text-base font-bold")
-        ui.echart(build_chart_options(infos)).style("width: 100%; height: 380px;")
+        with ui.row().classes("w-full items-center justify-between no-wrap"):
+            title = (f"{infos[0].symbol} — price, dividends and total return"
+                     if len(infos) == 1 else "Total return comparison")
+            ui.label(title).classes("text-base font-bold")
+            range_row = ui.row().classes("items-center gap-1 no-wrap")
+        chart = ui.echart(build_chart_options(infos))             .style(f"width: 100%; height: {CHART_HEIGHT_PX}px;")
+
+        def _set_range(key: str) -> None:
+            """Move BOTH dataZoom entries -- the inside one and the slider -- together.
+
+            Written straight onto the option dict and pushed with ``update()`` rather
+            than dispatched as an action, because the slider handles are rendered from
+            these values: moving only the inside zoom leaves the slider showing a
+            window the plot is not in.
+            """
+            start = range_start_iso(categories, key)
+            end = categories[-1] if categories else None
+            for zoom in chart.options.get("dataZoom", []):
+                zoom["startValue"] = start
+                zoom["endValue"] = end
+            chart.update()
+            for button, button_key in buttons:
+                # Only the colour changes -- ``props`` merges, so re-sending the
+                # layout props would be noise and re-sending ``disable`` would
+                # re-enable a range that has no history to show.
+                button.props(f"color={'primary' if button_key == key else 'grey'}")
+
+        buttons = []
+        span = (_describe_span(categories[0], categories[-1]) if categories else "")
+        with range_row:
+            for label, key in CHART_RANGES:
+                usable = range_is_usable(categories, key)
+                # ``key=key`` binds the loop variable: a closure over ``key`` alone
+                # would give every button the last range in the tuple.
+                button = ui.button(label, on_click=lambda _=None, key=key: _set_range(key))                     .props("flat dense no-caps"
+                           + (" color=primary" if key == DEFAULT_CHART_RANGE else " color=grey"))
+                if not usable:
+                    # DISABLED, not hidden: the reader asked for a ten-year view and
+                    # deserves to be told there is not ten years of data, rather than
+                    # to find the button missing or -- worse -- inert.
+                    button.disable()
+                    button.tooltip(RANGE_UNAVAILABLE_FMT.format(
+                        span=span, first=categories[0], last=categories[-1]))
+                buttons.append((button, key))
         for note in build_chart_notes(infos):
             render_cell(note)
 

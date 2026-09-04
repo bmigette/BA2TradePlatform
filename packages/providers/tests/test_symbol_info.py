@@ -779,15 +779,24 @@ def test_ytd_is_based_on_the_prior_year_close_not_the_first_january_bar(monkeypa
     assert ytd.total_return_pct == pytest.approx(20.0), "not the 9.09% from Jan 3"
 
 
-def test_price_history_is_fetched_with_a_buffer_before_the_longest_window(monkeypatch):
-    """The 5y base bar is the last bar ON OR BEFORE 2020-08-22, so the request
-    must start EARLIER than that or the base can never be in the payload."""
+def test_price_history_is_fetched_with_a_buffer_before_the_span_it_needs(monkeypatch):
+    """The base bar for the longest span is the last bar ON OR BEFORE that span's
+    start, so the request must begin EARLIER than it or the base is never in the
+    payload.
+
+    Measured against the span ACTUALLY fetched rather than a hardcoded 5y date: since
+    2026-09-05 the chart asks for ``CHART_HISTORY_YEARS`` of history independently of
+    the return WINDOWS (a 10Y range button cannot work on five years of data), so the
+    request legitimately starts further back than any window needs.
+    """
     calls = _install_fetchers(monkeypatch, profile={"symbol": "X", "isEtf": False})
     SI.get_symbol_info("key", "X", as_of=AS_OF)
     (_, _, start, end) = calls["fetch_price_history"][0][0]
+    span_start = SI.years_before(AS_OF, max(SI._longest_window_years(SI.WINDOWS),
+                                            SI.CHART_HISTORY_YEARS))
     assert end == AS_OF
-    assert start < date(2020, 8, 22), "no buffer -> the 5y base bar is unreachable"
-    assert start >= date(2020, 6, 22), "the buffer should be weeks, not months"
+    assert start < span_start, "no buffer -> the base bar is unreachable"
+    assert (span_start - start).days <= SI.PRICE_FETCH_BUFFER_DAYS + 1,         "the buffer should be weeks, not months"
 
 
 def test_get_symbols_info_returns_one_consistent_entry_per_symbol(monkeypatch):
@@ -826,7 +835,11 @@ def test_symbol_info_to_dict_is_json_serializable(monkeypatch):
     assert d["returns"]["1y"]["total_return_pct"] is not None
     # ``series.start`` is the REQUESTED window start; the first bar lands on or
     # after it (markets are shut on most calendar days).
-    assert d["series"]["start"] == "2020-08-22"
+    # Tracks CHART_HISTORY_YEARS, not a hardcoded 5y: see
+    # test_price_history_is_fetched_with_a_buffer_before_the_span_it_needs.
+    assert d["series"]["start"] == SI.years_before(
+        AS_OF, max(SI._longest_window_years(SI.WINDOWS),
+                   SI.CHART_HISTORY_YEARS)).isoformat()
     assert d["series"]["points"][0]["date"] >= d["series"]["start"]
     assert d["series"]["points"][-1]["date"] <= d["series"]["end"]
 

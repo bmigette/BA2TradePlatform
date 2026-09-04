@@ -12,7 +12,9 @@ import math
 import re
 from collections import namedtuple
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from ba2_common.core.account_types import leverage_of
 
 from ...core.portfolio_allocation import (
     ERROR_LABEL_TOTAL_FMT, ERROR_LABEL_UNDER_FMT, LABEL_TOTAL_TOLERANCE_PCT,
@@ -641,6 +643,64 @@ def count_zero_share_symbols(symbols, weights) -> int:
         if share is None or abs(float(share)) < ZERO_SHARE_EPSILON_PCT:
             total += 1
     return total
+
+
+#: The two broker facts shown beside a symbol's ⓘ, as small chips.
+#:
+#: ABSENCE OF A CHIP MEANS "THE BROKER DID NOT SAY", NEVER "NO". Both facts are
+#: tri-state all the way from ``MarginInfo`` (see ``account_types.py``) through
+#: ``AccountSymbolFacts`` to here, and a chip is drawn only where there is a real
+#: answer -- so an account whose facts have never been refreshed shows no chips at
+#: all rather than a page full of claims nobody made.
+FRACTIONABLE_BADGE = 'F'
+FRACTIONABLE_TOOLTIP = ('Fractional orders accepted: the broker will take a partial '
+                        'share of this symbol, so a target that does not divide into '
+                        'whole shares can still be filled exactly.')
+NOT_FRACTIONABLE_TOOLTIP = ('Whole shares only: the broker refuses fractional '
+                            'quantities for this symbol, so its order is rounded down '
+                            'and the remainder stays in cash.')
+#: ROUNDED TO A WHOLE NUMBER in the chip, because the chip answers "is there leverage
+#: here, and roughly how much" at a glance and a real rate is almost always exactly 1,
+#: 2 or 4 (cash / Reg-T / day-trading). The TOOLTIP keeps the exact figure and the
+#: underlying rate, so the precision is never lost -- only the glance is simplified.
+LEVERAGE_BADGE_FMT = 'Lx:{lev:.0f}'
+LEVERAGE_TOOLTIP_FMT = ('{lev:g}x leverage: the broker requires {rate:.0%} of the '
+                        'notional up front for this symbol in this account.')
+NO_LEVERAGE_TOOLTIP = ('No leverage: this symbol must be paid for in full in this '
+                       'account (100% of the notional required up front).')
+
+
+def fractionable_badge(fractionable: Optional[bool]) -> Optional[Tuple[str, str]]:
+    """``(chip, tooltip)`` for a symbol's fractional eligibility, or ``None``.
+
+    ``None`` in -> ``None`` out: the broker did not say, and a chip either way would
+    be a claim. ``False`` still earns a chip -- "whole shares only" is a fact the
+    reader wants, and it is what makes a rounded-down order explicable -- but it is
+    struck through so the two readings are never confused at a glance.
+    """
+    if fractionable is True:
+        return FRACTIONABLE_BADGE, FRACTIONABLE_TOOLTIP
+    if fractionable is False:
+        return FRACTIONABLE_BADGE, NOT_FRACTIONABLE_TOOLTIP
+    return None
+
+
+def leverage_badge(initial_margin_rate: Optional[float]) -> Optional[Tuple[str, str]]:
+    """``(chip, tooltip)`` for the leverage this symbol carries, or ``None``.
+
+    Leverage is ``1 / initial_margin_rate``, and the rate is a property of the
+    SYMBOL AND THE ACCOUNT together -- the same marginable name is 2x in a Reg-T
+    margin account and 1x in a cash one, which is why these facts are stored per
+    account. An unpublished rate yields ``None``: 1x would be a statement that the
+    broker requires full payment, which is a different thing from not knowing.
+    """
+    lev = leverage_of(initial_margin_rate)
+    if lev is None:
+        return None
+    if lev <= 1.0:
+        return LEVERAGE_BADGE_FMT.format(lev=lev), NO_LEVERAGE_TOOLTIP
+    return (LEVERAGE_BADGE_FMT.format(lev=lev),
+            LEVERAGE_TOOLTIP_FMT.format(lev=lev, rate=float(initial_margin_rate)))
 
 
 @dataclass

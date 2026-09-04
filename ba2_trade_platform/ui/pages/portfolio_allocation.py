@@ -107,6 +107,7 @@ from ...core import portfolio_allocation_service as svc
 from ...core.db import get_db
 from ...core.instrument_enrichment import enrich_instruments
 from ...core.models import ExpertInstance
+from ba2_common.core.symbol_facts import load_symbol_facts, save_symbol_facts
 from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
@@ -157,6 +158,7 @@ from ..utils.portfolio_allocation_view import (
     LABEL_TOTAL_BAR_CAPTION, LABEL_TOTAL_BAR_LEGEND, LABEL_TOTAL_CLASSES,
     LABEL_TOTAL_COLORS, LABEL_TOTAL_TOOLTIP, ZERO_SHARE_BADGE_TOOLTIP_FMT,
     class_color_style, count_zero_share_symbols,
+    fractionable_badge, leverage_badge,
     label_total_readout,
     load_current_symbol_shares, load_last_symbol_shares, managed_total_value,
     important_color_style,
@@ -233,7 +235,8 @@ def _load_gate(account_id: Optional[int]) -> GateResult:
     return evaluate_gate(account_id, manual, _enabled_expert_names(account_id))
 
 
-def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
+def _load_view_payload(account_id: int, valuation_mode: str,
+                       base_override: Optional[float] = None) -> Dict[str, Any]:
     """One render's worth of data: managed labels, membership, positions, prices.
 
     ``valuation_mode`` is threaded through to ``build_label_views`` and echoed back
@@ -289,6 +292,13 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
         if state.price is None:
             state.price = prices.get(symbol)
 
+    # Broker facts (fractionability, margin rate) for the ⓘ chips. Refreshed HERE,
+    # which is what the Refresh button re-runs, and cached in the DB so the chips
+    # survive a broker that will not answer: a failed fetch falls back to the last
+    # stored answer rather than blanking facts that were true five minutes ago.
+    # Never fatal -- the page's job is the label table, and the chips are on top.
+    facts = refresh_symbol_facts(account, account_id, symbols)
+
     comments: Dict[tuple, str] = {}
     weights: Dict[str, Dict[str, float]] = {}
     previous_weights: Dict[str, Dict[str, Optional[float]]] = {}
@@ -341,6 +351,39 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
     # dry run will solve with; every "current" figure keeps dividing the gross base.
     unallocated_pct = float(get_allocation_config(account_id).unallocated_pct or 0.0)
 
+    # SIMULATION. A what-if base replaces the measured one for every figure DERIVED
+    # from it -- target money, % of base, the reserve row -- and nothing else. The
+    # held positions, prices, buying power and account value stay exactly as the
+    # broker reported them, because those are measurements and a simulation of them
+    # would be a fabricated broker answer. The real base is carried alongside so the
+    # banner can name what was replaced, and ``simulated_base`` is what every consumer
+    # tests rather than comparing two floats.
+    real_base_notional = base_notional
+    simulated = base_override is not None and float(base_override) > 0
+    if simulated:
+        # WHICH TERM ABSORBS THE CHANGE. ``compute_base_notional`` defines
+        # base = managed + free buying power, and the whole page leans on that being an
+        # IDENTITY: ``format_base_composition``, the reserve row and the allocation bar
+        # all derive the managed side as ``base - buying_power`` rather than re-summing
+        # it. Replacing the base alone therefore did not simulate a bigger account -- it
+        # silently inflated MANAGED by the difference, so an $8,500 what-if over $4,764
+        # of real positions reported "$8,036.72 managed" and 94% allocated.
+        #
+        # Simulating a bigger base means simulating more CASH: the positions are a
+        # measurement (real quantities at real prices) and cannot be what-if'd, so free
+        # buying power is the derived term and the identity holds again. Allocated then
+        # falls as the base grows, which is the question being asked.
+        #
+        # Left signed rather than clamped at zero: a base BELOW the managed value is a
+        # legitimate what-if (positions financed on margin), and the page already renders
+        # an over-100% allocation. Clamping would restore a number at the cost of
+        # breaking the identity a second time.
+        managed_real = (None if real_base_notional is None or buying_power is None
+                        else float(real_base_notional) - float(buying_power))
+        base_notional = float(base_override)
+        if managed_real is not None:
+            buying_power = base_notional - managed_real
+
     return {
         'views': build_label_views(managed, symbols_by_label, positions, prices, comments,
                                    valuation_mode=valuation_mode,
@@ -360,7 +403,44 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
         # managed positions' market value. ``None`` is UNKNOWN, never 0.0.
         'account_value': account_value,
         'unallocated_pct': unallocated_pct,
+        #: True while the base above is a user's what-if rather than a measurement.
+        'simulated_base': simulated,
+        #: The MEASURED base the simulation replaced. None when the broker could not
+        #: supply one -- which is a legitimate reason to simulate in the first place.
+        'real_base_notional': real_base_notional,
+        #: ``{symbol: AccountSymbolFacts}``. A symbol the broker has never described
+        #: is simply absent, and the row then draws no chips -- see
+        #: ``fractionable_badge`` / ``leverage_badge``.
+        'symbol_facts': facts,
     }
+
+
+def refresh_symbol_facts(account, account_id: int, symbols):
+    """Re-ask the broker what it knows about ``symbols``, store it, return it.
+
+    The chips exist to answer "can this be split?" and "what does it cost in buying
+    power?" without opening a dialog, and both answers are per ACCOUNT -- so they are
+    fetched through the account's own seam and cached against its id.
+
+    A fetch that fails or comes back empty falls back to the STORED rows rather than
+    to nothing: the previous answer is still the best available statement of a fact
+    that changes rarely (Alpaca revokes marginability, it does not churn it), and
+    blanking the chips would read as "the broker says no" when the truth is "the
+    broker did not answer just now".
+    """
+    if not symbols:
+        return {}
+    try:
+        info = svc.fetch_margin_info(account, list(symbols))
+        if info:
+            save_symbol_facts(account_id, info)
+    except Exception as e:  # noqa: BLE001 -- the chips are never worth the page
+        logger.warning(f"Refreshing symbol facts for account {account_id} failed: {e}")
+    try:
+        return load_symbol_facts(account_id, symbols)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Reading stored symbol facts for account {account_id} failed: {e}")
+        return {}
 
 
 def _is_unmeasurable_holding(state, valuation_mode: str) -> bool:
@@ -732,6 +812,29 @@ MARKER_COLOR_SWATCH = 'pf-color-swatch'
 MARKER_COLOR_CLEAR = 'pf-color-clear'
 #: The custom-colour input.
 MARKER_COLOR_CUSTOM = 'pf-color-custom'
+#: The simulation control in the money card, and the banner it raises. Marked
+#: separately: the switch can be ON with the banner missing only if the payload and
+#: the control have gone out of step, which is the one failure that would let a
+#: what-if page pass for the real one.
+MARKER_SIM_TOGGLE = 'pf-sim-toggle'
+MARKER_SIM_INPUT = 'pf-sim-input'
+MARKER_SIM_BANNER = 'pf-sim-banner'
+#: Deliberately loud, and it names BOTH halves: what is simulated and what is not.
+SIM_BANNER_FMT = ('SIMULATION — base set to ${base:,.2f} instead of the measured '
+                  # ``{real}`` arrives ALREADY formatted, because it is either money or
+                  # the word "unknown" and only the caller knows which.
+                  '{real}. The extra is simulated CASH: your positions are real '
+                  'quantities at real prices and cannot be what-if\'d, so free buying '
+                  'power is the figure that moves with the base. Review is disabled '
+                  'until you switch this off.')
+SIM_BANNER_NO_REAL = 'unknown'
+SIM_TOGGLE_LABEL = 'Simulate base'
+SIM_TOGGLE_TOOLTIP = ('Try an arbitrary account base and see how every target and '
+                      'percentage would look. Display only — nothing is saved and no '
+                      'order can be placed while it is on.')
+SIM_REVIEW_BLOCKED = ('Review is disabled while the base is simulated: the plan would '
+                      'solve against your REAL money while the page shows what-if '
+                      'percentages.')
 #: The summary stat-card row, and the reserve card that no longer sits inside it.
 MARKER_SUMMARY_ROW = 'pf-summary-row'
 MARKER_RESERVE_CARD = 'pf-reserve-card'
@@ -833,7 +936,8 @@ def _paint_mini_bar(widgets: Dict[str, Any], *, fraction: float,
 
 def _new_live_state(*, base_notional: Optional[float] = None,
                     available_buying_power: Optional[float] = None,
-                    unallocated_pct: float = 0.0) -> Dict[str, Any]:
+                    unallocated_pct: float = 0.0,
+                    symbol_facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One render's mutable view of what is on screen. Not persisted anywhere.
 
     ``views`` is the ORDERED ``LabelView`` list and is the single source for every
@@ -846,6 +950,9 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         'base_notional': base_notional,
         'available_buying_power': available_buying_power,
         'unallocated_pct': float(unallocated_pct or 0.0),
+        # {symbol: AccountSymbolFacts} for the ⓘ chips. A symbol the broker has never
+        # described is ABSENT, and its row then draws no chips at all.
+        'symbol_facts': symbol_facts or {},
         'views': [],            # ordered LabelView list, MUTATED on an accepted edit
         'view_by_label': {},
         'weights': {},          # label -> {symbol: effective weight %}
@@ -2203,6 +2310,27 @@ def _render_gate_blocked(gate: GateResult) -> None:
                           on_click=lambda: ui.navigate.to('/settings')).props('outline')
 
 
+def _symbol_fact_fields(facts) -> Dict[str, Any]:
+    """The ⓘ chips for one symbol, as flat row fields the Quasar template can print.
+
+    Resolved in Python, not in the template: every field here is '' when the broker
+    has not answered, and '' is the ONLY thing the template treats as "draw nothing".
+    A ``v-if`` on the raw tri-state would render ``None`` and ``False`` identically,
+    which is exactly the conflation the whole chain from ``MarginInfo`` down exists
+    to prevent -- "the broker did not say" is not "the broker said no".
+    """
+    frac = fractionable_badge(getattr(facts, 'fractionable', None))
+    lev = leverage_badge(getattr(facts, 'initial_margin_rate', None))
+    return {
+        'frac_badge': frac[0] if frac else '',
+        'frac_tip': frac[1] if frac else '',
+        #: True only for an explicit broker "no", so the chip can be struck through.
+        'frac_strike': getattr(facts, 'fractionable', None) is False,
+        'lev_badge': lev[0] if lev else '',
+        'lev_tip': lev[1] if lev else '',
+    }
+
+
 def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     """One managed label's target box, comment box, symbol table and controls.
 
@@ -2251,6 +2379,13 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # KEPT although the Labels COLUMN is gone: the ⚠ cell's tooltip is now the
         # only place a symbol's other managed labels are named, and it reads this.
         'labels': ', '.join(r.labels),
+        # The two broker-fact chips beside the ⓘ, PRE-RESOLVED here rather than
+        # decided in the Vue template: '' means "no chip", which is what an absent
+        # fact must produce, and keeping the tri-state reasoning in Python is what
+        # stops a ``v-if`` on a falsy None from quietly reading as "the broker
+        # said no". ``frac_strike`` marks the False case, so "whole shares only"
+        # is never mistaken for "fractionable" at a glance.
+        **_symbol_fact_fields(live['symbol_facts'].get(r.symbol)),
         'current_value': round(r.current_value, 2),
         # BOTH label denominators travel to the browser. ``pct_of_label_target`` is
         # what the "% of label tgt" COLUMN prints -- the label's target money, so an
@@ -2383,16 +2518,44 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     # -- and the identity has to travel with the click or every row opens the same
     # symbol. That is the same wiring ``weightChange`` and ``commentChange`` below
     # use, and it leaves no loop variable for a handler to close over.
+    # The two broker-fact chips sit BESIDE the ⓘ, in the same cell. They are facts
+    # about the symbol, so they belong next to its identity rather than in columns of
+    # their own -- and as fixed-width text they cost no horizontal room in a table
+    # that already runs to thirteen columns. Each is drawn only when its string is
+    # non-empty (see ``_symbol_fact_fields``): an absent broker answer draws nothing.
     table.add_slot('body-cell-info', r'''
         <q-td :props="props">
-            <q-btn dense flat round size="sm" icon="info" color="grey-5"
-                   @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
-                <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
-                    <div class="text-weight-bold">{{ props.row.symbol }}</div>
-                    <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
-                    <div>Holdings, dividends and total return</div>
-                </q-tooltip>
-            </q-btn>
+            <div class="row items-center no-wrap justify-center" style="gap:6px">
+                <q-btn dense flat round size="sm" icon="info" color="grey-5"
+                       @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        <div class="text-weight-bold">{{ props.row.symbol }}</div>
+                        <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
+                        <div>Holdings, dividends and total return</div>
+                    </q-tooltip>
+                </q-btn>
+                <span v-if="props.row.frac_badge"
+                      class="text-caption text-weight-bold"
+                      style="width:0.9rem;text-align:center"
+                      :style="props.row.frac_strike
+                              ? 'color:#94a3b8;text-decoration:line-through'
+                              : 'color:#4ade80'">
+                    {{ props.row.frac_badge }}
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        {{ props.row.frac_tip }}
+                    </q-tooltip>
+                </span>
+                <span v-if="props.row.lev_badge"
+                      class="text-caption"
+                      style="color:#cbd5e1;background:rgba(148,163,184,0.18);
+                             border-radius:4px;padding:0 4px;line-height:1.25;
+                             font-variant-numeric:tabular-nums;white-space:nowrap">
+                    {{ props.row.lev_badge }}
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        {{ props.row.lev_tip }}
+                    </q-tooltip>
+                </span>
+            </div>
         </q-td>
     ''')
     table.on('symbolInfo', lambda e: _open_symbol_info([emitted_value(e)]))
@@ -2758,9 +2921,31 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
         _render_label_body(account_id, view, refresh, live=live)
 
 
+def _render_sim_banner(payload: Dict[str, Any]) -> None:
+    """The what-if warning. Drawn from the PAYLOAD, never from the switch.
+
+    The switch says what the user asked for; the payload says what the numbers on
+    screen were actually computed with. Reading the payload is what makes it
+    impossible for a simulated page to render without saying so -- a toggle that had
+    not yet reached a refresh would otherwise leave real numbers under a warning, or
+    worse, simulated ones without.
+    """
+    if not payload.get('simulated_base'):
+        return
+    real = payload.get('real_base_notional')
+    with ui.element('div').classes('alert-banner warning w-full p-3').mark(MARKER_SIM_BANNER):
+        ui.label(SIM_BANNER_FMT.format(
+            base=float(payload.get('base_notional') or 0.0),
+            real=f"${float(real):,.2f}" if real is not None else SIM_BANNER_NO_REAL))
+
+
 def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # Biggest holding first. The 39.5% row used to sit between two 1-5% rows,
     # because the order was whatever ``sort_order`` happened to be.
+    # BEFORE the empty-label early return: an account with no labels can still be
+    # simulating, and the warning must not depend on there being a table under it.
+    _render_sim_banner(payload)
+
     views = sort_label_views(payload['views'])
     if not views:
         with ui.element('div').classes('alert-banner info w-full p-3'):
@@ -2772,7 +2957,8 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     buying_power = payload['available_buying_power']
     live = _new_live_state(base_notional=base_notional,
                            available_buying_power=buying_power,
-                           unallocated_pct=payload['unallocated_pct'])
+                           unallocated_pct=payload['unallocated_pct'],
+                           symbol_facts=payload.get('symbol_facts') or {})
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)
@@ -3204,6 +3390,10 @@ async def content() -> None:
         body = ui.column().classes('w-full gap-3')
         try:
             mode_state = {'value': await asyncio.to_thread(_load_valuation_mode, account_id)}
+            # SESSION-ONLY, deliberately not persisted: a what-if that survived a
+            # reload would be indistinguishable from the real page the next time it
+            # was opened, which is the one way this feature could mislead.
+            sim_state: Dict[str, Any] = {'on': False, 'base': None}
         except Exception as e:
             logger.error(f"Portfolio allocation: valuation mode unreadable for account "
                          f"{account_id}: {e}", exc_info=True)
@@ -3217,7 +3407,8 @@ async def content() -> None:
                 ui.spinner(size='lg').classes('self-center')
             try:
                 payload = await asyncio.to_thread(
-                    _load_view_payload, account_id, mode_state['value'])
+                    _load_view_payload, account_id, mode_state['value'],
+                    sim_state['base'] if sim_state['on'] else None)
             except PositionFetchFailed as e:
                 logger.error(f"Portfolio allocation: position fetch failed: {e}")
                 body.clear()
@@ -3276,9 +3467,45 @@ async def content() -> None:
         async def _review() -> None:
             """The Review button: ONE dry run per press, however many times it is
             pressed. See ``ClickLatch``."""
+            # THE INTERLOCK, re-checked at press time and not only by disabling the
+            # button. The dry run solves against the broker's REAL base -- it has to,
+            # it is going to place real orders -- so reviewing while the page shows
+            # what-if percentages would put two different sets of numbers in front of
+            # the user under one heading. Disabling is the affordance; this is the
+            # guarantee.
+            if sim_state['on']:
+                ui.notify(SIM_REVIEW_BLOCKED, type='warning', multi_line=True,
+                          close_button=True, classes='break-words')
+                return
             await review_latch.run(
                 lambda: _open_allocation_flow(account_id, mode_state['value'],
                                               _refresh))
+
+        async def _apply_simulation() -> None:
+            """Re-render on the simulated base, and lock Review while it is on."""
+            if sim_state['on'] and not sim_state['base']:
+                ui.notify('Enter a base to simulate first.', type='warning')
+                return
+            button = review_latch.button
+            if button is not None:
+                (button.disable if sim_state['on'] else button.enable)()
+            await _refresh()
+
+        async def _toggle_simulation(event) -> None:
+            sim_state['on'] = bool(event.value)
+            await _apply_simulation()
+
+        async def _set_simulated_base(event) -> None:
+            raw = event.value
+            try:
+                value = float(raw) if raw not in (None, '') else None
+            except (TypeError, ValueError):
+                return
+            # A non-positive base is not a simulation, it is a division by zero
+            # waiting to happen in every percentage on the page.
+            sim_state['base'] = value if value and value > 0 else None
+            if sim_state['on']:
+                await _apply_simulation()
 
         with toolbar:
             review_latch.button = ui.button(
@@ -3293,5 +3520,10 @@ async def content() -> None:
             ui.button('Manage labels', icon='pie_chart',
                       on_click=lambda: _open_label_picker(account_id, _refresh)).props('outline')
             ui.button('Refresh', icon='refresh', on_click=_refresh).props('outline')
+            # The what-if control sits in the TOOLBAR, beside Valuation: both change
+            # how every number below is computed, and neither is a number itself.
+            ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation)                 .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
+            ui.number(label='Simulated base', format='%.2f', min=0,
+                      on_change=_set_simulated_base)                 .props('dense outlined prefix=$').classes('w-40').mark(MARKER_SIM_INPUT)
 
         await _refresh()

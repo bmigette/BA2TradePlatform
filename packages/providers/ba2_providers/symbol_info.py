@@ -117,6 +117,7 @@ __all__ = [
     "fetch_price_history", "fetch_dividends", "fetch_splits",
     # constants + the error callers may want to catch
     "WINDOWS", "TOP_N_HOLDINGS", "CACHE_TTL_SECONDS", "PRICE_FETCH_BUFFER_DAYS",
+    "CHART_HISTORY_YEARS", "years_before",
     "FMPError",
 ]
 
@@ -301,6 +302,20 @@ class SymbolInfo(Unknowable):
 # ---------------------------------------------------------------------------
 # pure computation — no network, no clock
 # ---------------------------------------------------------------------------
+def years_before(as_of: date, years: int) -> date:
+    """``as_of`` minus whole years, folding 29 February to 28. Pure.
+
+    Split out of :func:`window_start_date` so the CHART can ask for a span that is
+    not one of the return :data:`WINDOWS`. Those two spans used to be the same
+    number, which is why a ten-year chart range could never work: the returns table
+    needs at most five years, so five years was all that was ever fetched.
+    """
+    try:
+        return as_of.replace(year=as_of.year - years)
+    except ValueError:      # 29 Feb -> 28 Feb
+        return as_of.replace(year=as_of.year - years, day=28)
+
+
 def window_start_date(window: str, as_of: date) -> date:
     """The date a window is measured FROM.
 
@@ -313,11 +328,7 @@ def window_start_date(window: str, as_of: date) -> date:
     if window not in _YEARS_BACK:
         raise ValueError(
             f"unknown window {window!r} — expected one of {WINDOWS}")
-    years = _YEARS_BACK[window]
-    try:
-        return as_of.replace(year=as_of.year - years)
-    except ValueError:      # 29 Feb -> 28 Feb
-        return as_of.replace(year=as_of.year - years, day=28)
+    return years_before(as_of, _YEARS_BACK[window])
 
 
 def _last_at_or_before(points: Sequence[PricePoint], cutoff: date) -> Optional[PricePoint]:
@@ -987,6 +998,20 @@ def _reason(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+#: Years of price history fetched FOR THE CHART, independent of :data:`WINDOWS`.
+#:
+#: The two were the same number until 2026-09-05, and that was a bug with no visible
+#: symptom: the returns table needs at most five years, so five years was all that was
+#: ever fetched, so the chart's 10Y range silently showed the same five years on a
+#: twenty-year-old ETF. Reported as "clicking 10Y or Max doesn't seem to do anything"
+#: against XLK, which has traded since 1998.
+#:
+#: It costs roughly double the price payload per symbol. That is paid once per panel
+#: open (the fetchers are cached for ``CACHE_TTL_SECONDS``) and buys a range control
+#: that tells the truth; the alternative was to delete the 10Y button.
+CHART_HISTORY_YEARS = 10
+
+
 def _longest_window_years(windows: Sequence[str]) -> int:
     """Years of history the requested windows need (``ytd`` needs one)."""
     return max([_YEARS_BACK[w] for w in windows if w in _YEARS_BACK] or [1])
@@ -1019,6 +1044,7 @@ def get_symbol_info(
     *,
     as_of: date,
     windows: Sequence[str] = WINDOWS,
+    chart_years: int = CHART_HISTORY_YEARS,
 ) -> SymbolInfo:
     """Everything the symbol-info panel needs for ONE symbol.
 
@@ -1079,8 +1105,11 @@ def get_symbol_info(
                 etf.details[name] = f"{prefix} ({extra[marker]}) — {name} is unknown"
 
     # --- prices / dividends / splits ------------------------------------
-    years = _longest_window_years(windows)
-    series_start = window_start_date(f"{years}y", as_of)
+    # The LONGER of what the returns table needs and what the chart draws -- see
+    # CHART_HISTORY_YEARS. Taking the max rather than the chart figure alone keeps a
+    # caller that asks for narrower windows from silently losing chart history.
+    years = max(_longest_window_years(windows), chart_years)
+    series_start = years_before(as_of, years)
     fetch_start = date.fromordinal(series_start.toordinal() - PRICE_FETCH_BUFFER_DAYS)
 
     points: List[PricePoint] = []
@@ -1147,6 +1176,7 @@ def get_symbols_info(
     *,
     as_of: date,
     windows: Sequence[str] = WINDOWS,
+    chart_years: int = CHART_HISTORY_YEARS,
 ) -> Dict[str, SymbolInfo]:
     """:func:`get_symbol_info` for several symbols — the comparison view.
 
@@ -1164,7 +1194,8 @@ def get_symbols_info(
         if sym in out:
             continue
         try:
-            out[sym] = get_symbol_info(api_key, sym, as_of=as_of, windows=windows)
+            out[sym] = get_symbol_info(api_key, sym, as_of=as_of, windows=windows,
+                                       chart_years=chart_years)
         except Exception as e:      # defence in depth: get_symbol_info shouldn't raise
             logger.error(f"symbol_info: {sym} failed entirely: {e}", exc_info=True)
             reason = f"{sym} could not be loaded ({_reason(e)})"
