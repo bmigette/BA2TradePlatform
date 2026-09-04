@@ -1,4 +1,6 @@
 import { API_BASE } from '../lib/config';
+import { actionRefOf, actionValueOf } from '../lib/actionValues';
+import { boldNumbers } from '../lib/textParts';
 import {
   contractValue, groupTradesByStructure, isOptionTrade, optionBadge, summariseStructure,
 } from '../lib/optionTrades';
@@ -538,23 +540,97 @@ function fmtConditionLeaf(c: any): string {
 // Human-readable description of what an exit rule DOES (its action), separate from WHEN it fires
 // (its conditions). Without this the Strategy tab showed only the gating condition (e.g.
 // "has_position") and dropped the action, making a stop-loss adjustment look like a bare trigger.
-const _EXIT_REF_LABEL: Record<string, string> = {
-  order_open_price: 'entry',
-  expert_target_price: 'analyst target',
-  current_price: 'price',
-};
 function fmtExitAction(rule: any): string {
   const action = rule?.action_type ?? rule?.action ?? '';
-  const ref = rule?.reference_value ? (_EXIT_REF_LABEL[rule.reference_value] ?? rule.reference_value) : '';
-  const v = rule?.action_value;
+  const ref = actionRefOf(rule);
+  const v = actionValueOf(rule);
   const pct = typeof v === 'number' ? `${v >= 0 ? '+' : ''}${v}%` : (v != null ? String(v) : '');
   const target = [ref, pct].filter(Boolean).join(' ');
   switch (action) {
     case 'close': return 'Close position';
+    case 'buy': return 'Buy';
+    case 'sell': return 'Sell';
     case 'adjust_stop_loss': return `Move stop loss → ${target || 'reference'}`;
     case 'adjust_take_profit': return `Move take profit → ${target || 'reference'}`;
     default: return action ? String(action).replace(/_/g, ' ') : 'Exit';
   }
+}
+
+// A rule line with its thresholds emphasised — the numbers are what the GA tuned and what
+// distinguishes two otherwise identical rules, so they carry the information.
+function BoldNumbers({ text }: { text: string }) {
+  return (
+    <>
+      {boldNumbers(text).map((p, i) => (
+        p.bold ? <b key={i} className="font-semibold">{p.text}</b> : <span key={i}>{p.text}</span>
+      ))}
+    </>
+  );
+}
+
+// One rule = its conditions AND the actions those conditions fire, shown together.
+//
+// This is the shape the live trade UI shows and the shape the engine evaluates: a TradeRule is a
+// gate plus the actions bound to it. The Strategy tab used to flatten entry rules into a single
+// OR-tree of conditions plus one pooled "Entry Actions" list, which silently destroyed the
+// pairing — two entry rules with different brackets (say, target -6%/entry -8% on the strict gate
+// and target +8%/entry -16% on the loose one) rendered as four unattributed actions, and no
+// reader could tell which bracket a given entry would actually get. Entry and exit share this
+// renderer so the two can never drift apart again.
+// bg-*-50, never bg-*-100: dark mode here is `.dark .<light-class>` overrides in index.css and
+// only the -50 shade has one (see the "Colored light backgrounds" block there).
+const _RULE_TONE = {
+  entry: 'bg-blue-50 dark:bg-blue-900/20 text-blue-800 dark:text-blue-300',
+  exit: 'bg-yellow-50 dark:bg-yellow-900/20 text-yellow-800 dark:text-yellow-300',
+} as const;
+
+function RuleCard({ rule, title, tone }: { rule: any; title: string; tone: 'entry' | 'exit' }) {
+  // New-shape TradeRules carry actions[] (possibly >1 — e.g. an SL ratchet + TP extension fired
+  // together from ONE rule); legacy rows inline a single action's fields directly on the rule
+  // object. Normalize to an array so a multi-action rule is never shown as if only its first
+  // action existed.
+  const ruleActions = Array.isArray(rule?.actions) ? rule.actions : [rule];
+  const conds = (rule?.conditions?.conditions ?? []).map(fmtConditionLeaf).filter(Boolean);
+  // The gate's own operator joins the WHEN lines; the actions all fire together, so THEN is
+  // always joined by AND. With the joiner printed on every line, the old "all of" / "any of"
+  // chip said the same thing a second time and is gone.
+  const condJoin = rule?.conditions?.operator === 'OR' || rule?.conditions?.type === 'OR' ? 'or' : 'and';
+  return (
+    <div className={`text-sm rounded px-3 py-2 ${_RULE_TONE[tone]}`}>
+      <div className="flex items-baseline gap-2 flex-wrap">
+        <span className="font-semibold">{rule?.name || title}</span>
+        {rule?.continue_processing && (
+          <span className="text-[10px] uppercase tracking-wide rounded px-1 bg-orange-100 dark:bg-orange-800/40 text-orange-700 dark:text-orange-300"
+            title="Evaluation continues to the next rule even after this one matches (instead of stopping here)">
+            continues
+          </span>
+        )}
+      </div>
+      {/* Read as one sentence: WHEN <gate> ... THEN <action> ... — the order the engine
+          evaluates in, and the order the live trade UI states a rule in. */}
+      <ClauseLines label="when" joiner={condJoin} lines={conds.length ? conds : ['always']} />
+      <ClauseLines label="then" joiner="and" lines={ruleActions.map(fmtExitAction).filter(Boolean)} />
+    </div>
+  );
+}
+
+// One clause of a rule sentence, one item per line, with the joining word in the left gutter.
+// The gutter is a fixed width so WHEN/THEN and the AND/OR beneath them share a right edge and
+// the clause bodies line up in a single column.
+function ClauseLines({ label, joiner, lines }: { label: string; joiner: string; lines: string[] }) {
+  if (!lines.length) return null;
+  return (
+    <div className="mt-0.5 space-y-0.5">
+      {lines.map((text, i) => (
+        <div key={i} className="flex items-baseline gap-2">
+          <span className="text-[10px] uppercase w-10 shrink-0 text-right opacity-50">
+            {i === 0 ? label : joiner}
+          </span>
+          <span className="font-mono"><BoldNumbers text={text} /></span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // Render a condition GROUP with its boolean structure made explicit: a single condition renders
@@ -563,14 +639,14 @@ function fmtExitAction(rule: any): string {
 function ConditionGroupLines({ group }: { group: any }) {
   const conds: any[] = group?.conditions ?? [];
   if (conds.length === 0) return <span className="opacity-60 italic">always</span>;
-  if (conds.length === 1) return <span className="font-mono">{fmtConditionLeaf(conds[0]) || '—'}</span>;
+  if (conds.length === 1) return <span className="font-mono"><BoldNumbers text={fmtConditionLeaf(conds[0]) || '—'} /></span>;
   const op = group?.operator === 'OR' || group?.type === 'OR' ? 'OR' : 'AND';
   return (
     <div className="mt-0.5 space-y-0.5">
       {conds.map((c, i) => (
         <div key={i} className="flex items-baseline gap-2">
           <span className="text-[10px] uppercase w-7 shrink-0 text-right opacity-50">{i === 0 ? '' : op}</span>
-          <span className="font-mono">{fmtConditionLeaf(c) || '—'}</span>
+          <span className="font-mono"><BoldNumbers text={fmtConditionLeaf(c) || '—'} /></span>
         </div>
       ))}
     </div>
@@ -3321,29 +3397,48 @@ const Backtesting: React.FC = () => {
                         const newExitRules = (sp?.exitRules ?? sp?.exit_rules) as TradeRule[] | undefined;
                         const hasNewShapeRules = !hasLegacyConditionShape
                           && (Array.isArray(newEntryRules) || Array.isArray(newExitRules));
-                        // Only the entry rule's OWN protective actions belong in "Entry Actions" —
-                        // the buy/sell action that OPENS the position is shown implicitly via the
-                        // Entry Conditions block below, not repeated here.
-                        const newEntryExtraActions = hasNewShapeRules
-                          ? (newEntryRules ?? []).flatMap((r) =>
+                        // New-shape runs render one card PER ENTRY RULE (gate + its own actions),
+                        // matching the live trade UI and the engine's own model. Only legacy rows —
+                        // which genuinely are "one buy tree + one flat bracket applied to it" —
+                        // fall back to the pooled Entry Actions list below.
+                        const entryRuleCards = hasNewShapeRules ? (newEntryRules ?? []) : [];
+                        const legacyEntryActions = (sp?.entryActions ?? sp?.entry_actions ?? []) as any[];
+                        // Every entry-side protective action, whichever shape it came from — used
+                        // only for the two summary cards.
+                        const allEntryActions: any[] = entryRuleCards.length
+                          ? entryRuleCards.flatMap((r) =>
                               (r.actions ?? []).filter((a) => a.action_type !== 'buy' && a.action_type !== 'sell'))
-                          : [];
-                        // The entry-time TP/SL bracket now rides on entryActions (a rule list,
-                        // same shape as exitConditions) instead of the deleted scalar
-                        // initialTpPercent/initialSlPercent fields. Pull the adjust_take_profit /
-                        // adjust_stop_loss rule's value for the quick-glance cards below.
-                        const entryActionsList = (sp?.entryActions ?? sp?.entry_actions ?? newEntryExtraActions) as any[];
-                        const tpRule = entryActionsList.find((r) => (r?.action ?? r?.action_type) === 'adjust_take_profit');
-                        const slRule = entryActionsList.find((r) => (r?.action ?? r?.action_type) === 'adjust_stop_loss');
-                        const tp = tpRule ? (tpRule.actionValue ?? tpRule.action_value) : undefined;
-                        const sl = slRule ? (slRule.actionValue ?? slRule.action_value) : undefined;
-                        // Entry condition TREES aren't lossy (only extra actions are), so the legacy
-                        // editor's buy/sell tree merge is fine to reuse just for this part.
-                        const legacyEntryTrees = hasNewShapeRules
-                          ? tradeRulesToLegacyEditor(newEntryRules ?? [], [])
-                          : null;
-                        const buyConditions = sp?.buyEntryConditions?.conditions || legacyEntryTrees?.buyTree?.conditions || [];
-                        const sellConditions = sp?.sellEntryConditions?.conditions || legacyEntryTrees?.sellTree?.conditions || [];
+                          : legacyEntryActions;
+                        // Distinct bracket settings of one kind. These percentages are OFFSETS FROM
+                        // A REFERENCE, not absolute brackets: "-10" against expert_target_price
+                        // means "take profit 10% BELOW the analyst target", a different statement
+                        // from "-10% from entry" — so the reference is part of the identity, and
+                        // two rules only agree when both the value and the reference match.
+                        const distinctBrackets = (kind: string) => {
+                          const seen = new Map<string, { value: number | undefined; ref: string }>();
+                          for (const a of allEntryActions) {
+                            if ((a?.action ?? a?.action_type) !== kind) continue;
+                            const value = actionValueOf(a);
+                            const ref = actionRefOf(a);
+                            seen.set(`${ref}|${value}`, { value, ref });
+                          }
+                          return [...seen.values()];
+                        };
+                        // When entry rules disagree about their bracket there IS no single take
+                        // profit for the run, so the card must not invent one by showing the first.
+                        const tps = distinctBrackets('adjust_take_profit');
+                        const sls = distinctBrackets('adjust_stop_loss');
+                        // LEGACY ROWS ONLY. New-shape runs render per entry rule above and never
+                        // reach these, which is what lets this display path honour the warning at
+                        // the top of this block: tradeRulesToLegacyEditor is not used here at all
+                        // any more. Merging entry rules into one OR-tree was what pooled two rules'
+                        // separate brackets into an unattributed list in the first place.
+                        // Resolve the GROUP once and read its conditions from it, so the header
+                        // count and the rendered body can never come from different objects.
+                        const buyGroup = sp?.buyEntryConditions;
+                        const sellGroup = sp?.sellEntryConditions;
+                        const buyConditions = buyGroup?.conditions || [];
+                        const sellConditions = sellGroup?.conditions || [];
                         const exitConditions = sp?.exitConditions || (hasNewShapeRules ? (newExitRules ?? []) : []);
                         const stratName = sp?.strategyName;
                         // Flat optimized genes (model:*/cond:*/exit:*/entry:*) — surfaced as a
@@ -3377,48 +3472,78 @@ const Backtesting: React.FC = () => {
                             <div className="grid grid-cols-2 gap-4">
                               <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
                                 <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">Take Profit</div>
-                                {tp != null && tp < 200 ? (
-                                  <div className="text-lg font-bold text-green-600">{tp}%</div>
+                                {tps.length > 1 ? (
+                                  <div><span className="text-lg font-bold text-gray-400">Varies</span><span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· per entry rule</span></div>
+                                ) : tps.length === 1 && tps[0].value != null && tps[0].value < 200 ? (
+                                  <div>
+                                    <span className="text-lg font-bold text-green-600">{tps[0].value! > 0 ? '+' : ''}{tps[0].value}%</span>
+                                    {tps[0].ref && <span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· vs {tps[0].ref}</span>}
+                                  </div>
                                 ) : (
                                   <div><span className="text-lg font-bold text-gray-400">Off</span><span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· via exit rules</span></div>
                                 )}
                               </div>
                               <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
                                 <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">Stop Loss</div>
-                                {sl != null && sl < 200 ? (
-                                  <div className="text-lg font-bold text-red-600">{sl}%</div>
+                                {sls.length > 1 ? (
+                                  <div><span className="text-lg font-bold text-gray-400">Varies</span><span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· per entry rule</span></div>
+                                ) : sls.length === 1 && sls[0].value != null && sls[0].value < 200 ? (
+                                  <div>
+                                    <span className="text-lg font-bold text-red-600">{sls[0].value! > 0 ? '+' : ''}{sls[0].value}%</span>
+                                    {sls[0].ref && <span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· vs {sls[0].ref}</span>}
+                                  </div>
                                 ) : (
                                   <div><span className="text-lg font-bold text-gray-400">Off</span><span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· via exit rules</span></div>
                                 )}
                               </div>
                             </div>
-                            {buyConditions.length > 0 && (
+                            {entryRuleCards.length > 0 ? (
                               <div>
-                                <h4 className="text-sm font-semibold text-green-600 mb-2">Entry Conditions ({buyConditions.length})</h4>
-                                <div className="text-sm bg-green-50 dark:bg-green-900/20 rounded px-3 py-2 text-green-800 dark:text-green-300">
-                                  <ConditionGroupLines group={sp.buyEntryConditions} />
+                                <div className="flex items-baseline gap-2 mb-2">
+                                  <h4 className="text-sm font-semibold text-blue-600">Entry Rules ({entryRuleCards.length})</h4>
+                                  {entryRuleCards.length > 1 && (
+                                    <span className="text-[11px] text-gray-500 dark:text-gray-400">— each gate fires its OWN actions</span>
+                                  )}
                                 </div>
-                              </div>
-                            )}
-                            {sellConditions.length > 0 && (
-                              <div>
-                                <h4 className="text-sm font-semibold text-red-600 mb-2">Short Entry Conditions ({sellConditions.length})</h4>
-                                <div className="text-sm bg-red-50 dark:bg-red-900/20 rounded px-3 py-2 text-red-800 dark:text-red-300">
-                                  <ConditionGroupLines group={sp.sellEntryConditions} />
-                                </div>
-                              </div>
-                            )}
-                            {entryActionsList.length > 0 && (
-                              <div>
-                                <h4 className="text-sm font-semibold text-blue-600 mb-2">Entry Actions ({entryActionsList.length})</h4>
                                 <div className="space-y-1.5">
-                                  {entryActionsList.map((rule: any, i: number) => (
-                                    <div key={i} className="text-sm bg-blue-50 dark:bg-blue-900/20 rounded px-3 py-2 text-blue-800 dark:text-blue-300">
-                                      {fmtExitAction(rule)}
-                                    </div>
+                                  {entryRuleCards.map((rule: any, i: number) => (
+                                    <RuleCard key={i} rule={rule} title={`Entry Rule ${i + 1}`} tone="entry" />
                                   ))}
                                 </div>
                               </div>
+                            ) : (
+                              <>
+                                {buyConditions.length > 0 && (
+                                  <div>
+                                    <h4 className="text-sm font-semibold text-green-600 mb-2">Entry Conditions ({buyConditions.length})</h4>
+                                    <div className="text-sm bg-green-50 dark:bg-green-900/20 rounded px-3 py-2 text-green-800 dark:text-green-300">
+                                      <ConditionGroupLines group={buyGroup} />
+                                    </div>
+                                  </div>
+                                )}
+                                {sellConditions.length > 0 && (
+                                  <div>
+                                    <h4 className="text-sm font-semibold text-red-600 mb-2">Short Entry Conditions ({sellConditions.length})</h4>
+                                    <div className="text-sm bg-red-50 dark:bg-red-900/20 rounded px-3 py-2 text-red-800 dark:text-red-300">
+                                      <ConditionGroupLines group={sellGroup} />
+                                    </div>
+                                  </div>
+                                )}
+                                {/* Legacy rows really ARE one flat bracket applied to the whole buy
+                                    tree, so pooling them here is faithful to that data model. */}
+                                {legacyEntryActions.length > 0 && (
+                                  <div>
+                                    <h4 className="text-sm font-semibold text-blue-600 mb-2">Entry Actions ({legacyEntryActions.length})</h4>
+                                    <div className="space-y-1.5">
+                                      {legacyEntryActions.map((rule: any, i: number) => (
+                                        <div key={i} className="text-sm bg-blue-50 dark:bg-blue-900/20 rounded px-3 py-2 text-blue-800 dark:text-blue-300">
+                                          {fmtExitAction(rule)}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                              </>
                             )}
                             {exitConditions.length > 0 && !bestParams && (
                               <div>
@@ -3429,39 +3554,9 @@ const Backtesting: React.FC = () => {
                                   )}
                                 </div>
                                 <div className="space-y-1.5">
-                                  {exitConditions.map((rule: any, i: number) => {
-                                    const nConds = (rule.conditions?.conditions ?? []).length;
-                                    const grpOp = rule.conditions?.operator === 'OR' || rule.conditions?.type === 'OR' ? 'any of' : 'all of';
-                                    // New-shape TradeRules carry actions[] (possibly >1 — e.g. an SL
-                                    // ratchet + TP extension fired together from one rule); legacy
-                                    // rows inline a single action's fields directly on the rule
-                                    // object. Normalize to an array so a multi-action rule is never
-                                    // silently shown as if only its first action existed.
-                                    const ruleActions = Array.isArray(rule.actions) ? rule.actions : [rule];
-                                    return (
-                                      <div key={i} className="text-sm bg-yellow-50 dark:bg-yellow-900/20 rounded px-3 py-2 text-yellow-800 dark:text-yellow-300">
-                                        <div className="flex items-baseline gap-2 flex-wrap">
-                                          <span className="font-semibold">{rule.name || `Exit Rule ${i + 1}`}</span>
-                                          {ruleActions.map((a: any, ai: number) => (
-                                            <span key={ai} className="text-[11px] font-semibold rounded px-1.5 py-0.5 bg-yellow-200/70 dark:bg-yellow-700/40 text-yellow-900 dark:text-yellow-200">
-                                              {fmtExitAction(a)}
-                                            </span>
-                                          ))}
-                                          {nConds > 1 && <span className="text-[10px] uppercase tracking-wide rounded px-1 bg-yellow-100 dark:bg-yellow-800/40 text-yellow-700 dark:text-yellow-300">{grpOp}</span>}
-                                          {rule.continue_processing && (
-                                            <span className="text-[10px] uppercase tracking-wide rounded px-1 bg-orange-100 dark:bg-orange-800/40 text-orange-700 dark:text-orange-300"
-                                              title="Evaluation continues to the next exit rule even after this one matches (instead of stopping here)">
-                                              continues
-                                            </span>
-                                          )}
-                                        </div>
-                                        <div className="flex items-baseline gap-2 mt-0.5">
-                                          <span className="text-[10px] uppercase opacity-50 shrink-0">when</span>
-                                          <ConditionGroupLines group={rule.conditions} />
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
+                                  {exitConditions.map((rule: any, i: number) => (
+                                    <RuleCard key={i} rule={rule} title={`Exit Rule ${i + 1}`} tone="exit" />
+                                  ))}
                                 </div>
                               </div>
                             )}
@@ -3471,7 +3566,8 @@ const Backtesting: React.FC = () => {
                               </div>
                             )}
                             {buyConditions.length === 0 && sellConditions.length === 0 && exitConditions.length === 0
-                              && entryActionsList.length === 0 && optimizedGenes.length > 0 && (
+                              && entryRuleCards.length === 0 && legacyEntryActions.length === 0
+                              && optimizedGenes.length > 0 && (
                               <div>
                                 <h4 className="text-sm font-semibold text-gray-600 dark:text-gray-300 mb-2">Optimized Parameters ({optimizedGenes.length})</h4>
                                 <div className="grid grid-cols-2 gap-x-4 gap-y-1">

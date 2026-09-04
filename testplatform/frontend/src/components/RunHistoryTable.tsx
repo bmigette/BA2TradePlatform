@@ -3,6 +3,8 @@ import { listBacktests, saveBacktest, fetchBacktestExport, deleteBacktest } from
 import type { ExportKind } from '../lib/btApi';
 import { ExportDialog } from './ExportDialog';
 import { usePersistentState } from '../lib/usePersistentState';
+import { matchesLabels } from '../lib/labelFilter';
+import type { LabelMatchMode } from '../lib/labelFilter';
 
 // Trigger a browser download of a JSON object via a Blob + temporary <a download>.
 // No server filesystem write — the bytes are produced entirely client-side.
@@ -51,11 +53,11 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
   const [minRet, setMinRet] = usePersistentState(ns + 'minRet', '');
   const [maxDD, setMaxDD] = usePersistentState(ns + 'maxDD', '');
   const [minWin, setMinWin] = usePersistentState(ns + 'minWin', '');
-  // Labels filter: a run's `labels` array (e.g. ["goal6", "S4"] — grid/batch id + strategy tags
-  // set by the grid driver, see tools/run_screener_capband_matrix.py) must contain EVERY selected
-  // label (AND, not OR) so picking "goal6" + "S4" narrows down to exactly that job's results
-  // across every cap-band, not to "any run tagged with either".
+  // Labels filter: which of a run's `labels` (e.g. ["goal6", "S4"] — grid/batch id + strategy
+  // tags set by the grid driver, see tools/run_screener_capband_matrix.py) must match, and
+  // whether ALL or ANY of them have to. See lib/labelFilter.ts for why both modes are wanted.
   const [selectedLabels, setSelectedLabels] = usePersistentState<string[]>(ns + 'labels', []);
+  const [labelMode, setLabelMode] = usePersistentState<LabelMatchMode>(ns + 'labelMode', 'all');
   // Sort state: column key + direction. Default newest-first (id desc).
   const [sortKey, setSortKey] = usePersistentState<string>(ns + 'sortKey', 'id');
   const [sortDir, setSortDir] = usePersistentState<'asc' | 'desc'>(ns + 'sortDir', 'desc');
@@ -139,7 +141,7 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
     dd: r => num(r.maxDrawdown ?? r.max_drawdown),
     win: r => num(r.winRate ?? r.win_rate),
     name: r => String(r.name ?? '').toLowerCase(),
-    labels: r => String((r.labels ?? []).join(',')).toLowerCase(),
+    labels: r => String((Array.isArray(r.labels) ? r.labels : []).join(',')).toLowerCase(),
   };
 
   // Number of active filter-menu thresholds (drives the "Filters (N)" badge + Clear button).
@@ -158,10 +160,7 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
     // DD is stored signed-negative; "max drawdown %" caps the magnitude.
     if (maxDD !== '' && !(Math.abs(num(r.maxDrawdown ?? r.max_drawdown)) <= Number(maxDD))) return false;
     if (minWin !== '' && !(num(r.winRate ?? r.win_rate) >= Number(minWin))) return false;
-    if (selectedLabels.length > 0) {
-      const rowLabels: string[] = r.labels ?? [];
-      if (!selectedLabels.every(l => rowLabels.includes(l))) return false;
-    }
+    if (!matchesLabels(r.labels, selectedLabels, labelMode)) return false;
     return true;
   });
 
@@ -248,7 +247,40 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
           </label>
           {allLabels.length > 0 && (
             <label className="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-300 col-span-2 sm:col-span-3 lg:col-span-4">
-              labels {selectedLabels.length > 0 ? <span className="text-gray-400">(must have all selected)</span> : null}
+              <span className="flex items-center gap-2">
+                labels
+                {/* The mode is always visible, not just once labels are picked: it tells you how
+                    the chips below will behave BEFORE you start clicking them. */}
+                <span className="inline-flex rounded border border-gray-300 dark:border-gray-600 overflow-hidden">
+                  {(['all', 'any'] as LabelMatchMode[]).map(mode => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => setLabelMode(mode)}
+                      title={mode === 'all'
+                        ? 'match all: a run must carry every selected label'
+                        : 'match any: a run must carry at least one selected label'}
+                      // bg-blue-50, NOT bg-blue-100: dark mode here is driven by
+                      // `.dark .<light-class>` overrides in index.css, and only the `-50`
+                      // shade has one. A `-100` surface stays near-white while the paired
+                      // text-blue-700 IS darkened to light blue -> unreadable. See the
+                      // "Colored light backgrounds" block in index.css.
+                      className={`px-2 py-0.5 text-xs ${labelMode === mode
+                        ? 'bg-blue-50 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300'
+                        : 'text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'}`}
+                    >
+                      match {mode}
+                    </button>
+                  ))}
+                </span>
+                {selectedLabels.length > 1 && (
+                  <span className="text-gray-400">
+                    {labelMode === 'all'
+                      ? `must have all ${selectedLabels.length}`
+                      : `must have any of ${selectedLabels.length}`}
+                  </span>
+                )}
+              </span>
               <div className="flex flex-wrap gap-1">
                 {allLabels.map(l => {
                   const active = selectedLabels.includes(l);
@@ -257,8 +289,9 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
                       key={l}
                       type="button"
                       onClick={() => toggleLabel(l)}
+                      // bg-blue-50 for the same reason as the match-mode buttons above.
                       className={`px-2 py-0.5 text-xs rounded-full border whitespace-nowrap ${active
-                        ? 'border-blue-400 dark:border-blue-500 bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300'
+                        ? 'border-blue-400 dark:border-blue-500 bg-blue-50 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300'
                         : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'}`}
                     >
                       {l}
@@ -315,7 +348,7 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100"><div className="max-w-[9rem] truncate" title={r.name}>{r.name}</div></td>
               <td className="px-2 py-1 text-sm">
                 <div className="flex flex-wrap gap-0.5 max-w-[8rem]">
-                  {((r.labels as string[] | undefined) ?? []).map(l => (
+                  {(Array.isArray(r.labels) ? (r.labels as string[]) : []).map(l => (
                     <span key={l} className="px-1.5 py-0.5 text-[10px] rounded-full border border-blue-300 dark:border-blue-700 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300 whitespace-nowrap">
                       {l}
                     </span>
