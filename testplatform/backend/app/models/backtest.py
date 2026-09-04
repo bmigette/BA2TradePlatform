@@ -238,6 +238,30 @@ class Backtest(Base):
                 'pnlPercent': trade.get('pnl_pct', 0),
                 'duration': trade.get('bars_held', 0),
                 'exitReason': trade.get('exit_reason', 'unknown'),
+                # OPTION IDENTITY (2026-09-04). The recorder has published these for
+                # a while and this transform dropped every one of them, so the trade
+                # list showed an option leg as a bare symbol and a price -- a $4.20
+                # entry that is a premium per share reads exactly like a $4.20 stock,
+                # and nothing said call or put, which strike, which expiry, or that
+                # four of the rows were one condor.
+                #
+                # ``None`` on every equity row, and that is the discriminator the UI
+                # keys on: no ``optionType`` means it is not an option, rather than
+                # some separate flag that could disagree with the data beside it.
+                'contractSymbol': trade.get('contract_symbol'),
+                'underlyingSymbol': trade.get('underlying_symbol'),
+                'optionType': trade.get('option_type'),
+                'strike': trade.get('strike'),
+                'expiry': trade.get('expiry'),
+                # WHAT ONE CONTRACT CONTROLS -- 100 for an option, 1 for equity. The
+                # UI needs it to turn a per-share premium into the money that actually
+                # moved (premium x size x multiplier), which is the number a reader
+                # means by "the premium" on a contract.
+                'multiplier': trade.get('multiplier', 1),
+                # THE STRUCTURE this leg belongs to. Rows are per-LEG; the legs of one
+                # spread share this id, which is what lets the list fold four rows into
+                # one condor and still show each leg underneath.
+                'transactionId': trade.get('transaction_id'),
             })
         return transformed
 

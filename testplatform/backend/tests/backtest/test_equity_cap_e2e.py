@@ -89,6 +89,13 @@ def test_a_run_with_no_cap_is_identical_to_before_the_feature(name, make_payload
     ``fixtures/equity_cap_golden.json`` was produced by running this exact hermetic payload in
     a detached worktree at commit 346fdabb -- the commit immediately before the first
     equity-cap change -- and is re-generated the same way if the engine legitimately changes.
+
+    2026-09-04: the trade rows gained ``option_type`` / ``strike`` / ``expiry`` so the test
+    platform's trade list can say what an option leg IS. The golden was NOT re-generated for
+    it -- the three keys were inserted as nulls, by hand, leaving every existing value byte
+    for byte. That is the whole point of the fixture: a SCHEMA addition that is null on every
+    equity row moved no number, and re-running to capture it would have hidden any number
+    that did move behind the same refresh.
     """
     with open(_GOLDEN_PATH, encoding="utf-8") as fh:
         golden = json.load(fh)

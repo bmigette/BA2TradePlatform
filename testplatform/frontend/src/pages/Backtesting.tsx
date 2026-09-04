@@ -1,4 +1,7 @@
 import { API_BASE } from '../lib/config';
+import {
+  contractValue, groupTradesByStructure, isOptionTrade, optionBadge, summariseStructure,
+} from '../lib/optionTrades';
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -12,6 +15,7 @@ import {
   Calendar,
   Settings,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   ChevronsUpDown,
   BarChart3,
@@ -204,6 +208,20 @@ interface Trade {
   pnlPercent: number;
   duration: number;
   exitReason: string;
+  // OPTION LEGS ONLY. `optionType` absent === not an option: the UI keys every
+  // option-specific piece of chrome off that one field so the badge, the premium
+  // and the leg grouping cannot disagree about what a row is.
+  contractSymbol?: string | null;
+  underlyingSymbol?: string | null;
+  optionType?: 'call' | 'put' | null;
+  strike?: number | null;
+  expiry?: string | null;
+  // 100 for an option contract, 1 for equity. Turns the per-share premium the
+  // price columns carry into the money that actually moved.
+  multiplier?: number | null;
+  // The STRUCTURE id. Legs of one spread share it, which is what the trade list
+  // folds on; null/absent on equity rows and on single-leg option trades.
+  transactionId?: number | string | null;
 }
 
 interface BacktestResults {
@@ -299,6 +317,10 @@ const formatTradeDate = (s?: string): string => {
   const [date, time] = s.split('T');
   return time ? `${date} ${time.slice(0, 5)}` : date;
 };
+
+// OPTION ROWS in the trade list. The arithmetic and the grouping live in
+// ``lib/optionTrades`` -- pure, and testable without mounting React; see that
+// module for why each figure is computed the way it is.
 
 // Recompute the headline metrics from a (possibly trimmed) set of trades — used by the per-trade
 // "hide" toggle to show, on the fly, what the result looks like with some trades excluded.
@@ -1045,6 +1067,12 @@ const Backtesting: React.FC = () => {
   // Per-trade "hide" toggle (Trade List): excluded trade ids, for the on-the-fly what-if recompute
   // of the headline metrics. Session-only; cleared whenever a different backtest is selected.
   const [hiddenTradeIds, setHiddenTradeIds] = useState<Set<string>>(new Set());
+  // Which multi-leg structures are expanded in the Trade List. A spread is ONE bet
+  // recorded as one row per leg, so the list folds the legs into a structure row and
+  // opens them on demand; collapsed is the default because four rows per condor is
+  // what made an options run unreadable in the first place. Session-only, keyed by
+  // the legs' shared transactionId.
+  const [expandedStructures, setExpandedStructures] = useState<Set<string>>(new Set());
   // Backend EXACT recompute of the hidden-trade what-if (curves + metrics reconstructed from the
   // trade ledger + OHLCV cache — see backend/app/services/backtest/whatif.py). Keyed by the sorted
   // excluded-id list so a stale response for a different selection is ignored. The client-side
@@ -2139,6 +2167,114 @@ const Backtesting: React.FC = () => {
     });
   };
 
+  // Hide or show a whole structure at once. A spread is one bet: hiding three of a
+  // condor's four legs would leave the what-if metrics measuring a position that
+  // never existed, so the parent's toggle moves every leg together. Direction is
+  // decided ONCE from the group (all-hidden -> show all, else hide all) rather than
+  // per leg, so a half-hidden structure resolves instead of inverting.
+  const toggleHideStructure = (legs: Trade[]) => {
+    const ids = legs.map(l => String(l.id));
+    setHiddenTradeIds(prev => {
+      const next = new Set(prev);
+      const allHidden = ids.every(id => next.has(id));
+      ids.forEach(id => { if (allHidden) next.delete(id); else next.add(id); });
+      return next;
+    });
+  };
+
+  const toggleStructure = (key: string) => {
+    setExpandedStructures(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
+
+  // ONE row renderer for a stand-alone trade AND for a leg inside an expanded
+  // structure, so the two can never drift into different-looking rows. ``asLeg``
+  // only indents and drops the row's own background.
+  //
+  // AN OPTION ROW SAYS WHAT IT IS. The symbol cell carries the underlying plus a
+  // call/put + strike + expiry badge, and the price cells carry BOTH the premium
+  // per share (what the chain quotes, and what these columns have always held)
+  // and the money that actually moved (premium x contracts x 100) -- without the
+  // second figure a 4.20 option entry reads exactly like a 4.20 stock.
+  const tradeRow = (trade: Trade, asLeg = false) => {
+    const isHidden = hiddenTradeIds.has(trade.id);
+    const option = isOptionTrade(trade);
+    const badge = optionBadge(trade);
+    const entryCash = contractValue(trade.entryPrice, trade.size, trade.multiplier);
+    const exitCash = contractValue(trade.exitPrice, trade.size, trade.multiplier);
+    return (
+      <tr key={trade.id}
+          onClick={() => setChartTrade(trade)}
+          title="Click to view the daily chart with entry/exit markers"
+          className={`cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 ${isHidden ? 'opacity-40' : ''}`}>
+        <td className="px-2 py-2 text-center" onClick={(e) => { e.stopPropagation(); toggleHideTrade(trade.id); }}>
+          <button type="button"
+                  title={isHidden ? 'Show: include this trade in the metrics again' : 'Hide: exclude this trade and recompute the metrics'}
+                  className="text-gray-400 hover:text-amber-600 dark:hover:text-amber-400">
+            {isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+          </button>
+        </td>
+        <td className={`px-2 py-1.5 font-medium text-gray-900 dark:text-gray-100 ${isHidden ? 'line-through' : ''} ${asLeg ? 'pl-7' : ''}`}>
+          <span className="inline-flex items-center gap-1">
+            {/* The UNDERLYING for an option -- the OCC string is on the tooltip,
+                where it is available without making every row 20 characters wide. */}
+            <span title={trade.contractSymbol || undefined}>
+              {(option ? (trade.underlyingSymbol || trade.symbol) : trade.symbol) || '—'}
+            </span>
+            {badge && (
+              <span className={`px-1.5 py-0.5 rounded text-[11px] font-semibold ${
+                trade.optionType === 'call'
+                  ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300'
+                  : 'bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300'}`}
+                    title={`${trade.optionType === 'call' ? 'CALL' : 'PUT'}`
+                           + `${trade.strike != null ? ` · strike ${trade.strike}` : ''}`
+                           + `${trade.expiry ? ` · expires ${trade.expiry}` : ''}`
+                           + `${trade.contractSymbol ? ` · ${trade.contractSymbol}` : ''}`}>
+                {badge}
+              </span>
+            )}
+          </span>
+        </td>
+        <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(trade.entryDate)}</td>
+        <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(trade.exitDate)}</td>
+        <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+            title={option ? `Premium ${trade.entryPrice.toFixed(2)}/share x ${trade.size} x ${Number(trade.multiplier) || 100} = $${entryCash.toFixed(2)}` : undefined}>
+          ${trade.entryPrice.toFixed(2)}
+          {option && <span className="block text-[10px] text-gray-400">${entryCash.toFixed(2)}</span>}
+        </td>
+        <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+            title={option ? `Premium ${trade.exitPrice.toFixed(2)}/share x ${trade.size} x ${Number(trade.multiplier) || 100} = $${exitCash.toFixed(2)}` : undefined}>
+          ${trade.exitPrice.toFixed(2)}
+          {option && <span className="block text-[10px] text-gray-400">${exitCash.toFixed(2)}</span>}
+        </td>
+        <td className="px-2 py-1.5 text-center">
+          <span className={`px-2 py-0.5 rounded text-xs font-semibold text-white ${
+            trade.direction === 'long' ? 'bg-green-600' : 'bg-red-600'
+          }`}>
+            {trade.direction}
+          </span>
+        </td>
+        <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+            title={option ? `${trade.size} contract(s)` : undefined}>{trade.size}</td>
+        <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+          {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
+        </td>
+        <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+          {displayPnlPct(trade) >= 0 ? '+' : ''}{displayPnlPct(trade).toFixed(2)}%
+        </td>
+        <td className="px-2 py-1.5 text-center whitespace-nowrap text-gray-900 dark:text-gray-100">{formatDuration(tradeDurationMs(trade))}</td>
+        <td className="px-2 py-1.5 text-center">
+          <span className="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-xs text-gray-700 dark:text-gray-300">
+            {trade.exitReason}
+          </span>
+        </td>
+      </tr>
+    );
+  };
+
   // When any trade is hidden, recompute the headline metrics from the remaining trades (what-if).
   const hiding = hiddenTradeIds.size > 0;
   // Backend EXACT result, if it matches the CURRENT hidden set (else null -> use the JS fallback).
@@ -3047,46 +3183,85 @@ const Backtesting: React.FC = () => {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                            {getFilteredTrades().map(trade => {
-                              const isHidden = hiddenTradeIds.has(trade.id);
+                            {/* One row per TRADE, except that the legs of a multi-leg option
+                                structure fold into one row that opens on a chevron -- a condor
+                                is one bet, and four rows of it drowned the list. Both shapes
+                                render through ``tradeRow`` so a leg and a stand-alone trade can
+                                never drift into two different-looking rows. */}
+                            {groupTradesByStructure(getFilteredTrades()).map(group => {
+                              if (group.kind === 'single') return tradeRow(group.trade);
+                              const s = summariseStructure(group.legs);
+                              const open = expandedStructures.has(group.key);
+                              const ids = group.legs.map(l => String(l.id));
+                              const allHidden = ids.every(id => hiddenTradeIds.has(id));
+                              const someHidden = !allHidden && ids.some(id => hiddenTradeIds.has(id));
                               return (
-                              <tr key={trade.id}
-                                  onClick={() => setChartTrade(trade)}
-                                  title="Click to view the daily chart with entry/exit markers"
-                                  className={`cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 ${isHidden ? 'opacity-40' : ''}`}>
-                                <td className="px-2 py-2 text-center" onClick={(e) => { e.stopPropagation(); toggleHideTrade(trade.id); }}>
-                                  <button type="button"
-                                          title={isHidden ? 'Show: include this trade in the metrics again' : 'Hide: exclude this trade and recompute the metrics'}
-                                          className="text-gray-400 hover:text-amber-600 dark:hover:text-amber-400">
-                                    {isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                                  </button>
-                                </td>
-                                <td className={`px-2 py-1.5 font-medium text-gray-900 dark:text-gray-100 ${isHidden ? 'line-through' : ''}`}>{trade.symbol || '—'}</td>
-                                <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(trade.entryDate)}</td>
-                                <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(trade.exitDate)}</td>
-                                <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100">${trade.entryPrice.toFixed(2)}</td>
-                                <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100">${trade.exitPrice.toFixed(2)}</td>
-                                <td className="px-2 py-1.5 text-center">
-                                  <span className={`px-2 py-0.5 rounded text-xs font-semibold text-white ${
-                                    trade.direction === 'long' ? 'bg-green-600' : 'bg-red-600'
-                                  }`}>
-                                    {trade.direction}
-                                  </span>
-                                </td>
-                                <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100">{trade.size}</td>
-                                <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                  {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
-                                </td>
-                                <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                  {displayPnlPct(trade) >= 0 ? '+' : ''}{displayPnlPct(trade).toFixed(2)}%
-                                </td>
-                                <td className="px-2 py-1.5 text-center whitespace-nowrap text-gray-900 dark:text-gray-100">{formatDuration(tradeDurationMs(trade))}</td>
-                                <td className="px-2 py-1.5 text-center">
-                                  <span className="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-xs text-gray-700 dark:text-gray-300">
-                                    {trade.exitReason}
-                                  </span>
-                                </td>
-                              </tr>
+                                <React.Fragment key={group.key}>
+                                  <tr onClick={() => toggleStructure(group.key)}
+                                      title="Click to show or hide this structure's legs"
+                                      className={`cursor-pointer bg-gray-50/60 dark:bg-gray-800/40 hover:bg-blue-50 dark:hover:bg-blue-900/20 ${allHidden ? 'opacity-40' : ''}`}>
+                                    <td className="px-2 py-2 text-center"
+                                        onClick={(e) => { e.stopPropagation(); toggleHideStructure(group.legs); }}>
+                                      <button type="button"
+                                              title={allHidden
+                                                ? 'Show: include this structure in the metrics again'
+                                                : 'Hide: exclude every leg of this structure and recompute the metrics'}
+                                              className={`hover:text-amber-600 dark:hover:text-amber-400 ${someHidden ? 'text-amber-500' : 'text-gray-400'}`}>
+                                        {allHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                      </button>
+                                    </td>
+                                    <td className={`px-2 py-1.5 font-medium text-gray-900 dark:text-gray-100 ${allHidden ? 'line-through' : ''}`}>
+                                      <span className="inline-flex items-center gap-1">
+                                        {open ? <ChevronDown className="w-3.5 h-3.5 text-gray-400" />
+                                              : <ChevronRight className="w-3.5 h-3.5 text-gray-400" />}
+                                        {s.symbol || '—'}
+                                        <span className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/40 text-[11px] font-semibold text-indigo-700 dark:text-indigo-300"
+                                              title={`${s.legCount} legs: ${s.longLegs} long / ${s.shortLegs} short. One structure, one bet.`}>
+                                          {s.legCount} legs
+                                        </span>
+                                      </span>
+                                    </td>
+                                    <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(s.entryDate)}</td>
+                                    <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(s.exitDate)}</td>
+                                    {/* NET MONEY, not a sum of per-share premiums: two legs at
+                                        4.20 and 1.10 do not make 5.30 of anything. Positive is a
+                                        debit paid, negative a credit received. */}
+                                    <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+                                        title={s.netCost >= 0 ? 'Net DEBIT paid to open the structure'
+                                                              : 'Net CREDIT received to open the structure'}>
+                                      {s.netCost >= 0 ? '' : '-'}${Math.abs(s.netCost).toFixed(2)}
+                                      <span className="text-[10px] text-gray-400 ml-1">net</span>
+                                    </td>
+                                    <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+                                        title="What the structure was worth when it closed, on the same sign convention">
+                                      {s.netValue >= 0 ? '' : '-'}${Math.abs(s.netValue).toFixed(2)}
+                                      <span className="text-[10px] text-gray-400 ml-1">net</span>
+                                    </td>
+                                    <td className="px-2 py-1.5 text-center">
+                                      <span className="px-2 py-0.5 rounded text-xs font-semibold bg-indigo-600 text-white"
+                                            title={`${s.longLegs} long / ${s.shortLegs} short`}>
+                                        spread
+                                      </span>
+                                    </td>
+                                    <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+                                        title="Total contracts across the legs">{s.contracts}</td>
+                                    <td className={`px-2 py-1.5 text-right font-medium ${s.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                      {s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}
+                                    </td>
+                                    <td className={`px-2 py-1.5 text-right font-medium ${s.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                      {s.pnlPercent >= 0 ? '+' : ''}{s.pnlPercent.toFixed(2)}%
+                                    </td>
+                                    <td className="px-2 py-1.5 text-center whitespace-nowrap text-gray-900 dark:text-gray-100">
+                                      {formatDuration(tradeDurationMs({ entryDate: s.entryDate, exitDate: s.exitDate }))}
+                                    </td>
+                                    <td className="px-2 py-1.5 text-center">
+                                      <span className="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-xs text-gray-700 dark:text-gray-300">
+                                        {s.exitReason}
+                                      </span>
+                                    </td>
+                                  </tr>
+                                  {open && group.legs.map(leg => tradeRow(leg, true))}
+                                </React.Fragment>
                               );
                             })}
                           </tbody>

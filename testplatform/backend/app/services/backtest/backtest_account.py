@@ -3295,6 +3295,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     # look up delta/underlying bars without re-deriving them from the order set.
                     "contract_symbol": getattr(opening, "contract_symbol", None),
                     "underlying_symbol": getattr(opening, "underlying_symbol", None),
+                    # WHAT THE CONTRACT IS, published rather than left to be parsed back out
+                    # of the OCC string. The opening order carries all three as real columns
+                    # (models.py: option_type / strike / expiry), so a reader -- the trade
+                    # list, an export, an analysis notebook -- never has to slice
+                    # "AAPL240119C00150000" and get the strike's implied 3 decimal places
+                    # wrong. ``None`` on every equity row, which is what tells the two apart.
+                    "option_type": (opening.option_type.value
+                                    if getattr(opening, "option_type", None) is not None
+                                    else None),
+                    "strike": getattr(opening, "strike", None),
+                    "expiry": (opening.expiry.isoformat()
+                               if getattr(opening, "expiry", None) is not None else None),
                     # The STRUCTURE this row belongs to. Rows are per-LEG (see the group key
                     # above), but a multi-leg spread is ONE economic bet: results.py's profit
                     # cap re-joins the legs on this id so a condor is capped on its NET P&L

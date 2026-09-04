@@ -391,10 +391,18 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         "pnl_pct": _finite(trade.get("pnl_pct"), "trade.pnl_pct", default=0.0),
         "bars_held": int(trade.get("bars_held", 0) or 0),
         "exit_reason": trade.get("exit_reason", "unknown"),
-        # Only set for option legs (passed through unchanged, no frontend consumer today) --
-        # lets the intraday_drawdown refinement look up delta/underlying bars per trade.
+        # Only set for option legs -- lets the intraday_drawdown refinement look up
+        # delta/underlying bars per trade, and (since 2026-09-04) lets the trade list
+        # say WHAT was traded: an option row that prints only "AAPL, entry 4.20" is
+        # indistinguishable from an equity row at $4.20, and the reader cannot tell a
+        # long call from a short put from a leg of a condor.
         "contract_symbol": trade.get("contract_symbol"),
         "underlying_symbol": trade.get("underlying_symbol"),
+        # The contract's own terms, carried as columns rather than parsed back out of
+        # the OCC string by every consumer in turn.
+        "option_type": trade.get("option_type"),
+        "strike": trade.get("strike"),
+        "expiry": trade.get("expiry"),
         # Structure identity + contract size for the profit cap (see _cap_groups /
         # _deployed_capital): option legs sharing a transaction_id are ONE economic bet, and an
         # option leg's cost basis is premium x contracts x multiplier. Both are recorded by
