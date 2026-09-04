@@ -635,3 +635,71 @@ def test_an_underlying_with_no_partitions_warns(caplog, provider):
         provider.get_chain("NOPE", date(2023, 1, 10), expiry_min=date(2023, 1, 1),
                            expiry_max=date(2023, 12, 31))
     assert any("NO partitions for NOPE" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# REAL QUOTES (2026-09-03). The TastyTrade tree predates the bid/ask columns and falls back
+# to the zero-spread close proxy above; ThetaData partitions carry real NBBO, and where they
+# do the reader must use it -- that is what makes max_spread_pct and the GA's w_spread do
+# anything at all (with a constant 0.0 spread they gate nothing and rank everything alike).
+#
+# A no-trade day is the case that matters: close is NULL there (an option that did not trade
+# has no trade price), and the row's mark is the quote mid. Storing 0.0 instead would price a
+# genuinely $55-bid contract at zero.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def quoted_store_root(tmp_path):
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    root = str(tmp_path / "ThetaDataOptionsProvider")
+    store = OptionHistoryParquetStore(root=root)
+    store.write_partition(
+        _UNDER, date(2023, 1, 20),
+        [
+            # traded day: real OHLC AND a real quote around it
+            OptionEodBar(occ_symbol=_C100, bar_date=date(2023, 1, 3),
+                         open=5.0, high=5.5, low=4.8, close=5.2, volume=100,
+                         bid=5.10, ask=5.30, open_interest=900, iv=0.30),
+            # NO-TRADE day: no OHLC at all, but a real two-sided quote
+            OptionEodBar(occ_symbol=_C100, bar_date=date(2023, 1, 5),
+                         open=None, high=None, low=None, close=None, volume=0,
+                         bid=55.10, ask=56.20, open_interest=900, iv=0.31),
+        ],
+        start=date(2023, 1, 1), end=date(2023, 3, 31))
+    clear_worker_parquet_options_cache()
+    yield root
+    clear_worker_parquet_options_cache()
+
+
+def test_a_store_with_quotes_serves_the_real_bid_ask_not_the_close_proxy(quoted_store_root):
+    p = ParquetOptionsProvider(quoted_store_root, spot_source=_spot_source,
+                               risk_free_rate=_RATE, spot_scope="test")
+    row = {c.symbol: c for c in p.get_chain(_UNDER, date(2023, 1, 3),
+                                            expiry_min=date(2023, 1, 1),
+                                            expiry_max=date(2023, 12, 31))}[_C100]
+    assert row.bid == pytest.approx(5.10)
+    assert row.ask == pytest.approx(5.30)
+    assert row.bid != row.ask, "a real spread, not the zero-spread proxy"
+    assert row.last == pytest.approx(5.2), "`last` stays the TRADE price"
+    assert row.spread_pct is not None and row.spread_pct > 0, (
+        "a real spread must make spread_pct non-degenerate -- a constant 0.0 ranks BEST and "
+        "silently disables max_spread_pct and the GA's w_spread")
+
+
+def test_a_no_trade_day_is_marked_at_the_quote_not_at_zero(quoted_store_root):
+    p = ParquetOptionsProvider(quoted_store_root, spot_source=_spot_source,
+                               risk_free_rate=_RATE, spot_scope="test")
+    row = {c.symbol: c for c in p.get_chain(_UNDER, date(2023, 1, 5),
+                                            expiry_min=date(2023, 1, 1),
+                                            expiry_max=date(2023, 12, 31))}[_C100]
+    assert row.bid == pytest.approx(55.10) and row.ask == pytest.approx(56.20)
+    assert row.mid == pytest.approx(55.65)
+    assert row.last is None, "there was no trade, so there is no last price"
+    assert row.mid != 0.0, "0.0 here would mark a $55-bid contract worthless"
+
+    bar = p.get_bar(_C100, date(2023, 1, 5))
+    assert bar["close"] is None, "a no-trade day must not report a 0.0 close"
+
+    q = p.get_quote(_C100, date(2023, 1, 5))
+    assert (q.bid, q.ask) == (pytest.approx(55.10), pytest.approx(56.20)), (
+        "get_quote and get_chain must price identically (options_provider bug B4)")

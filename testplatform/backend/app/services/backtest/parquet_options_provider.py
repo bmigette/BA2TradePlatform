@@ -231,7 +231,7 @@ class _RawUnderlying:
         "c_is_call", "c_expiry_date", "c_expiry_iso", "c_type_str", "c_right",
         "starts", "stops", "starts_l", "stops_l",
         "bar_ord", "bar_ord_l", "open", "high", "low", "close", "volume", "open_interest",
-        "vendor_iv", "iso_of_ord", "date_of_ord",
+        "vendor_iv", "iso_of_ord", "date_of_ord", "bid", "ask", "has_quotes",
     )
 
     def __init__(self, underlying: str, df):
@@ -252,8 +252,10 @@ class _RawUnderlying:
             self.starts_l = []
             self.stops_l = []
             self.bar_ord_l = []
+            self.has_quotes = False
             for name in ("c_strike", "c_expiry_ord", "c_is_call", "starts", "stops", "bar_ord",
-                         "open", "high", "low", "close", "volume", "open_interest", "vendor_iv"):
+                         "open", "high", "low", "close", "volume", "open_interest", "vendor_iv",
+                         "bid", "ask"):
                 setattr(self, name, np.empty(0))
             return
 
@@ -285,6 +287,32 @@ class _RawUnderlying:
         # distinguishable from a recorded 0, which is a fact about a strike nobody trades.
         self.volume = df["volume"].to_numpy(dtype="float64", na_value=np.nan)
         self.open_interest = df["open_interest"].to_numpy(dtype="float64", na_value=np.nan)
+
+        # REAL QUOTES, when the store has them. The TastyTrade tree predates the bid/ask
+        # columns entirely and its partitions do not carry them; ThetaData's do. Absent
+        # columns => all-NaN => `contract()` falls back to the historical zero-spread close
+        # proxy, so a TastyTrade-backed run is byte-identical to before this existed.
+        self.has_quotes = "bid" in df.columns and "ask" in df.columns
+        if self.has_quotes:
+            self.bid = df["bid"].to_numpy(dtype="float64", na_value=np.nan)
+            self.ask = df["ask"].to_numpy(dtype="float64", na_value=np.nan)
+        else:
+            self.bid = np.full(n, np.nan)
+            self.ask = np.full(n, np.nan)
+
+        # INVARIANT: every stored row has a price -- a trade close, or a quote, or both. A row
+        # with neither cannot be priced, and (per option_selector.passes_liquidity) a contract
+        # whose mark is None SKIPS the penny-contract gate instead of being rejected by it, so
+        # it would survive selection unpriced. Providers drop such rows at ingest; this counts
+        # them once per underlying rather than per contract, so a store that violates the
+        # invariant says so loudly instead of quietly mis-selecting.
+        priceless = int(np.count_nonzero(
+            np.isnan(self.close) & np.isnan(self.bid) & np.isnan(self.ask)))
+        if priceless:
+            logger.error(
+                "%s: %d of %d option bar rows have NO price at all (no close, no bid, no "
+                "ask). These cannot be marked or liquidity-gated. The store is malformed -- "
+                "re-warm this underlying.", underlying, priceless, n)
 
         # -- native-Python projections, built once (measured 1.5 ms for GOOG's 27,974 rows /
         #    1,374 contracts, against a ~130 ms parquet read) ------------------------------
@@ -329,7 +357,7 @@ class _Underlying:
         "raw", "underlying", "rate", "n_rows",
         "c_occ", "c_index", "c_strike", "c_expiry_ord", "c_is_call", "starts", "stops",
         "bar_ord", "bar_ord_l", "starts_l", "stops_l",
-        "open", "high", "low", "close", "volume", "open_interest", "vendor_iv",
+        "open", "high", "low", "close", "volume", "open_interest", "vendor_iv", "bid", "ask",
         "_g_done", "_g_iv", "_g_delta", "_g_gamma", "_g_theta", "_g_vega",
         "_spot_cache", "_bar_memo",
     )
@@ -345,7 +373,8 @@ class _Underlying:
         self.n_rows = n
         for name in ("c_occ", "c_index", "c_strike", "c_expiry_ord", "c_is_call",
                      "starts", "stops", "starts_l", "stops_l", "bar_ord", "bar_ord_l",
-                     "open", "high", "low", "close", "volume", "open_interest", "vendor_iv"):
+                     "open", "high", "low", "close", "volume", "open_interest", "vendor_iv",
+                     "bid", "ask"):
             setattr(self, name, getattr(raw, name))
 
         self._g_done = np.zeros(n, dtype=bool)
@@ -463,17 +492,27 @@ class _Underlying:
         raw = self.raw
         iv, delta, gamma, theta, vega = self.greeks_tuple(i, ci, spot_source)
         close = _f(self.close[i])
-        # ZERO-SPREAD PREMIUM PROXY, identical in effect to the sqlite store (bid == ask on
-        # every one of its quoted rows). The tradeable spread is modelled by
-        # option_spread_pct; note this makes spread_pct a constant 0.0, which RANKS BEST
-        # rather than not ranking -- see the module docstring's bid/ask bullet.
+        bid, ask = _f(self.bid[i]), _f(self.ask[i])
+        if bid is None or ask is None:
+            # ZERO-SPREAD PREMIUM PROXY -- the pre-2026-09 behaviour, still used for stores
+            # with no quote columns (the whole TastyTrade tree) and identical in effect to the
+            # sqlite store (bid == ask on every one of its quoted rows). It makes spread_pct a
+            # constant 0.0, which RANKS BEST rather than not ranking, so max_spread_pct gates
+            # nothing and w_spread scores every candidate alike -- see the module docstring's
+            # bid/ask bullet. A store WITH real quotes (ThetaData) takes the branch above and
+            # those two knobs start working.
+            bid = ask = close
         vol = _i(self.volume[i])
         return OptionContract(
             symbol=raw.c_occ[ci], underlying=self.underlying,
             option_type=raw.c_right[ci],
             strike=raw.c_strike_f[ci],
             expiry=raw.c_expiry_date[ci],
-            bid=close, ask=close, last=close,
+            # `last` stays the TRADE price and is None on a day the contract did not trade;
+            # the mark for such a row is the quote mid, which OptionContract.mid derives from
+            # the real bid/ask above. Never substitute the mid into `last` -- callers use the
+            # two to tell an actual print from a quote.
+            bid=bid, ask=ask, last=close,
             implied_volatility=iv, delta=delta, gamma=gamma, theta=theta, vega=vega,
             open_interest=_i(self.open_interest[i]),
             # NO BAR => impossible here (a clamped row is always a bar), but an absent volume
@@ -644,15 +683,20 @@ class ParquetOptionsProvider:
         if i < 0:
             return None
         close = _f(u.close[i])
-        # Same zero-spread proxy get_chain uses: entry actions price off chain rows while
-        # close actions price off quotes, and the two must agree (options_provider bug B4).
+        bid, ask = _f(u.bid[i]), _f(u.ask[i])
+        if bid is None or ask is None:
+            bid = ask = close
+        # Same pricing rule get_chain's ``contract()`` uses, and it MUST stay a twin: entry
+        # actions price off chain rows while close actions price off quotes, and the two must
+        # agree (options_provider bug B4). Real quotes when the store has them, the
+        # zero-spread close proxy when it does not; `last` is the trade print either way.
         #
         # GREEKS TOO (plan Task 6), from the SAME per-row inversion ``get_chain`` uses -- the
         # sqlite reader's twin change, and it must be a twin or a rule that reads a held
         # contract's delta answers differently on the two backends. Memoised per row by
         # ``greeks_tuple``, so a quote costs no extra inversion once the chain has priced it.
         delta, iv = u.delta_iv_of_row(i, ci, self.spot_source)
-        return OptionQuote(symbol=occ_symbol, bid=close, ask=close, last=close,
+        return OptionQuote(symbol=occ_symbol, bid=bid, ask=ask, last=close,
                            delta=delta, implied_volatility=iv)
 
     def get_bar(self, occ_symbol: str, as_of: date) -> Optional[dict]:

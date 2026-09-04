@@ -713,10 +713,12 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
     # sample (seeded, so a re-run is comparable) is enough to catch a systemic regression (every
     # row null) vs. normal sparse-quote NaNs.
     iv_res = {"sampled": 0, "rows": 0, "iv_nonnull_pct": None, "oi_nonnull_pct": None,
-              "volume_nonnull_pct": None, "unreadable": []}
+              "volume_nonnull_pct": None, "close_nonnull_pct": None,
+              "quote_nonnull_pct": None, "priceless_rows": 0, "unreadable": []}
     pool = sorted(with_data)
     sample_syms = pool if len(pool) <= iv_sample else random.Random(1337).sample(pool, iv_sample)
     iv_nonnull = oi_nonnull = vol_nonnull = rows = 0
+    close_nonnull = quote_nonnull = priceless = 0
     for sym in sample_syms:
         try:
             df = store.read_underlying(sym)
@@ -730,11 +732,28 @@ def check_options_cache(universe_path: Optional[str] = None, iv_sample: int = 15
         iv_nonnull += int(df["iv"].notna().sum())
         oi_nonnull += int(df["open_interest"].notna().sum())
         vol_nonnull += int(df["volume"].notna().sum())
+        # CLOSE and QUOTE coverage. close is NULL on a day the contract did not trade, which
+        # is normal and common (44.9% of a liquid ThetaData chain) -- so a low close rate is
+        # NOT itself a fault. What IS a fault is a row with neither a close nor a quote: it
+        # cannot be marked, and a price-less chain row skips the selector's penny-contract
+        # gate instead of being rejected by it. Counted explicitly because the previous
+        # version of this check sampled only iv/oi/volume and could not see either column.
+        close_nn = df["close"].notna()
+        close_nonnull += int(close_nn.sum())
+        if "bid" in df.columns and "ask" in df.columns:
+            quote_nn = df["bid"].notna() & df["ask"].notna()
+        else:
+            quote_nn = close_nn & False  # store predates the quote columns
+        quote_nonnull += int(quote_nn.sum())
+        priceless += int((~close_nn & ~quote_nn).sum())
     iv_res["rows"] = rows
+    iv_res["priceless_rows"] = priceless
     if rows:
         iv_res["iv_nonnull_pct"] = round(iv_nonnull / rows * 100.0, 1)
         iv_res["oi_nonnull_pct"] = round(oi_nonnull / rows * 100.0, 1)
         iv_res["volume_nonnull_pct"] = round(vol_nonnull / rows * 100.0, 1)
+        iv_res["close_nonnull_pct"] = round(close_nonnull / rows * 100.0, 1)
+        iv_res["quote_nonnull_pct"] = round(quote_nonnull / rows * 100.0, 1)
 
     # Expiry gaps: see docstring point 4. The oracle is every Friday --discovery synthetic
     # would have PLANNED to fetch; comparing that against completed_expiries() (which counts

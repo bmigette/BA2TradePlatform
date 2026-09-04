@@ -42,9 +42,9 @@ def store(tmp_path):
 
 
 def _bar(occ="AAPL230120C00150000", d=date(2023, 1, 3), *, iv=0.2841, oi=12345,
-         close=7.25):
+         close=7.25, bid=None, ask=None):
     return OptionEodBar(occ_symbol=occ, bar_date=d, open=7.0, high=7.5, low=6.8,
-                        close=close, volume=911, bid=None, ask=None,
+                        close=close, volume=911, bid=bid, ask=ask,
                         open_interest=oi, iv=iv)
 
 
@@ -423,6 +423,35 @@ def test_iv_and_open_interest_survive_the_round_trip(store):
     got = df.sort_values("bar_date")
     assert [round(float(v), 5) for v in got["iv"]] == [0.2841, 0.31159]
     assert [int(v) for v in got["open_interest"]] == [12345, 13001]
+
+
+def test_bid_and_ask_survive_the_round_trip(store):
+    """2026-09-03: this store silently dropped bid/ask on every write (COLUMNS/_frame never
+    named them), even though OptionEodBar carries both and ThetaData's EOD report populates
+    them (TastyTrade never does -- dxfeed serves no historical NBBO for dead contracts, so
+    its bars are always bid=None/ask=None here, same as before this fix)."""
+    exp = date(2023, 1, 20)
+    store.write_partition("AAPL", exp, [
+        _bar(d=date(2023, 1, 3), bid=7.10, ask=7.40),
+        _bar(d=date(2023, 1, 4), bid=7.20, ask=7.55),
+    ], *WINDOW, empty_contracts=[])
+
+    df = store.read_partition("AAPL", exp)
+    assert list(df.columns).count("bid") == 1
+    assert list(df.columns).count("ask") == 1
+    got = df.sort_values("bar_date")
+    assert [round(float(v), 2) for v in got["bid"]] == [7.10, 7.20]
+    assert [round(float(v), 2) for v in got["ask"]] == [7.40, 7.55]
+
+
+def test_a_missing_bid_ask_stays_missing_and_does_not_become_zero(store):
+    """TastyTrade partitions (bid/ask always None) must round-trip as a null column, not a
+    fabricated 0.0 spread -- the same rule iv/open_interest already follow."""
+    exp = date(2023, 1, 20)
+    store.write_partition("AAPL", exp, [_bar(bid=None, ask=None)], *WINDOW, empty_contracts=[])
+    df = store.read_partition("AAPL", exp)
+    assert df["bid"].isna().all()
+    assert df["ask"].isna().all()
 
 
 def test_open_interest_round_trips_as_an_integer_not_a_float(store):

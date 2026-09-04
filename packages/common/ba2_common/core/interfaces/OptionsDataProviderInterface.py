@@ -49,13 +49,34 @@ class OptionEodBar:
     cannot run at all where the close is missing. A vendor that does NOT serve IV leaves
     this ``None`` and the platform inverts as before; ``None`` must never be coerced to 0.0,
     which downstream reads as a free option rather than as "unknown".
+
+    OHLC IS OPTIONAL, AND FOR THE SAME REASON (2026-09-03). An EOD bar's OHLC is a TRADE
+    statistic: on a day the contract did not trade there is no open, high, low or close, and
+    the vendors say so by reporting 0.0. Measured on ThetaData across 4 underlyings x 4 years
+    (4,944 rows, zero exceptions): ``close > 0`` if and only if ``volume > 0``, and on a
+    no-trade row open/high/low are 0.0 too. 44.9% of a liquid chain's rows are no-trade days,
+    and 28.3% of the chain carries a real two-sided quote on such a day at a MEDIAN MID OF
+    $60.75 — i.e. storing that 0.0 as a price marks a $60 option worthless.
+
+    So ``None`` here means "did not trade", NOT "worthless", and consumers must treat the two
+    differently. A no-trade row is NOT price-less: ``bid``/``ask`` carry the day's real quote,
+    which is the correct mark for it. Only a row with neither a trade nor a quote is genuinely
+    empty, and providers drop those rather than emit them.
+
+    ``bid`` may legitimately be 0.0 and that is a REAL quote, not a missing one — it means
+    nobody is bidding, which is exactly the information a liquidity gate needs. (Verified on
+    ThetaData: a 0.00 bid still carries a real ``bid_exchange`` stamp and a real ask with
+    size.) Coercing a 0.0 bid to ``None`` destroys the distinction between "we know nobody
+    bids" and "we do not know", so it must not be done.
     """
     occ_symbol: str
     bar_date: date
-    open: float
-    high: float
-    low: float
-    close: float
+    #: OHLC of the day's TRADES, or None on a day the contract did not trade (see above).
+    #: None must never be coerced to 0.0 — that reads downstream as a free option.
+    open: Optional[float]
+    high: Optional[float]
+    low: Optional[float]
+    close: Optional[float]
     volume: Optional[int] = None
     bid: Optional[float] = None
     ask: Optional[float] = None

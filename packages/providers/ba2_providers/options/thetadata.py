@@ -13,23 +13,36 @@ other historical-options source): TastyTrade/dxfeed's IV coverage floors around 
 (measured) — real, but recent. A live probe against ThetaData with a real key found AAPL
 option EXPIRATIONS back to 2012-06-01, comfortably covering a 2020 backfill.
 
-DATA SHAPE. Unlike the old local-terminal REST endpoint (one CSV call returned a whole chain's
-OHLC across ALL expirations for a window), the cloud library requires ONE (underlying, single
-expiration) call per request. That call CAN span a multi-week date window in one shot
-(confirmed: a 2-week AAPL window in one ``option_history_greeks_eod`` call) but NOT an
-arbitrary one: the server enforces a hard 365-DAY CAP per request (measured live 2026-09-02:
-"Too many days between start and end date; max 365 days allowed", grpc StatusCode.
-INVALID_ARGUMENT) — a multi-year backfill window is chunked into <=365-day sub-requests by
-``_chunk_window`` and looped over per (underlying, expiry), rather than sent as one call. So
-the natural unit of work is the SAME as TastyTrade's: one (underlying, expiry) partition,
-fetched with (up to) two calls PER WINDOW CHUNK instead of TastyTrade's one call total.
+DATA SHAPE. There are TWO request shapes here, and for a bulk backfill only one of them is
+sane:
 
-That window is narrowed to end at the EXPIRY, not the run's global end, before chunking: an
-option never trades past its own expiration, so a 2020-01-17 expiry queried all the way to a
-2026-09 run end wasted 6 of 7 chunk-pairs getting NoDataFoundError for years the contract
-could never have traded in (measured live: ~9.5 min for that ONE unit). Only the END is
-narrowed, never the START -- a LEAPS contract can legitimately have started trading long
-before the run's start date, so narrowing that side risks losing real data.
+  * WIDE (``fetch_underlying_eod_bars``) — ``expiration="*"`` returns the whole chain, every
+    listed expiration at once, for every day in the window. ~2,950 rows/s measured. THIS IS
+    THE ONE TO USE for backfills.
+  * PER-EXPIRY (``fetch_eod_bars``) — one (underlying, single expiration) per request, looped.
+    43 rows/s effective. Kept because it satisfies the OptionsDataProviderInterface contract
+    (a caller asking for a specific contract list) and because the greeks endpoint has no
+    wide form, but it must NOT be used to move bulk history.
+
+The per-expiry shape was originally believed to be the only one available: a
+``"When expiration=*, you must request data a day-at-a-time"`` rejection was observed on
+``option_history_greeks_eod`` and wrongly assumed to hold for every endpoint. Re-measured
+2026-09-03, it does not: ``option_history_eod`` and ``option_history_open_interest`` both
+accept ``expiration="*"`` across a full 365-day range, and only the greeks endpoint enforces
+the day-at-a-time rule. That single mistake made a ~6-day backfill look like an ~80-150 day
+one. See docs/2026-09-03-thetadata-eod-backfill-assessment.md §4.
+
+Both shapes still obey the server's hard 365-DAY CAP per request (measured live 2026-09-02:
+"Too many days between start and end date; max 365 days allowed", grpc StatusCode.
+INVALID_ARGUMENT), so a multi-year window is chunked by ``_chunk_window``.
+
+In the PER-EXPIRY shape the window is narrowed to end at the EXPIRY, not the run's global end,
+before chunking: an option never trades past its own expiration, so a 2020-01-17 expiry
+queried all the way to a 2026-09 run end wasted 6 of 7 chunk-pairs getting NoDataFoundError
+for years the contract could never have traded in (measured live: ~9.5 min for that ONE unit).
+Only the END is narrowed, never the START -- a LEAPS contract can legitimately have started
+trading long before the run's start date, so narrowing that side risks losing real data. The
+WIDE shape needs none of this: it has no per-expiry loop to clamp.
 
   * ``option_history_greeks_eod`` — OHLC + bid/ask/size + the full greeks block, INCLUDING
     ``implied_vol`` (a superset of the plain ``option_history_eod`` endpoint, so that one is
@@ -86,12 +99,25 @@ _DEFAULT_HISTORY_YEARS = float(os.getenv("THETADATA_HISTORY_YEARS", "8"))
 
 #: The server's hard per-request cap: "Too many days between start and end date; max 365
 #: days allowed" (grpc StatusCode.INVALID_ARGUMENT, measured live 2026-09-02). A window wider
-#: than this must be split into consecutive sub-requests -- see _chunk_window.
+#: than this must be split into consecutive sub-requests -- see _chunk_window. This is the
+#: CEILING, not the size we ask for: see _REQUEST_WINDOW_DAYS.
 _MAX_WINDOW_DAYS = 365
+
+#: The window size we actually REQUEST, well under the server's 365-day cap. The reason is
+#: MEMORY, not speed: throughput is flat across window sizes in the wide shape (measured
+#: 2026-09-03: 2,981 rows/s at 30 days vs 2,949 at 365), but a 30-day window holds ~44k rows
+#: (~10 MB) in flight where a 365-day one holds ~565k (~130 MB). A previous backfill was
+#: killed at 17.9 GB resident, so 13x less resident for the same rate is free.
+#:
+#: (This constant previously cited ThetaData support's "one month per request" guidance and a
+#: claimed 12x scan saving. That guidance was given about the PER-EXPIRY shape and does not
+#: describe the wide one, where the measured difference is ~1%.)
+#: https://docs.thetadata.us/Articles/Data-And-Requests/Request-Sizing.html
+_REQUEST_WINDOW_DAYS = 30
 
 
 def _chunk_window(start: date, end: date,
-                  max_days: int = _MAX_WINDOW_DAYS) -> List[Tuple[date, date]]:
+                  max_days: int = _REQUEST_WINDOW_DAYS) -> List[Tuple[date, date]]:
     """Split ``[start, end]`` (inclusive) into consecutive, non-overlapping sub-windows each
     spanning at most ``max_days``. A window already within the cap returns a single chunk
     identical to the input -- no behaviour change for the common (narrow-window) case.
@@ -162,6 +188,121 @@ def _occ_symbol(underlying: str, expiry: date, right: Any, strike: float) -> str
     the TastyTrade-built caches) key on. Matches ``tastytrade.py``'s ``occ_symbol``."""
     cp = "C" if _right_word(right) == "call" else "P"
     return f"{underlying.upper()}{expiry:%y%m%d}{cp}{int(round(float(strike) * 1000)):08d}"
+
+
+#: The exchange ThetaData's "current day" is measured in. US options trade on US Eastern, and
+#: a backfill machine anywhere else will disagree with the server about what "today" is for
+#: part of every 24 hours -- see the clamp in fetch_underlying_eod_bars.
+_EXCHANGE_TZ = "America/New_York"
+
+
+def _exchange_today() -> date:
+    """Today's date AT THE EXCHANGE, not on this machine.
+
+    Falls back to the local date if the tz database is unavailable (a bare Windows install
+    without ``tzdata``): a wrong-by-one date is far better than a provider that cannot fetch
+    at all, and the caller subtracts a further day on top of this.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo(_EXCHANGE_TZ)).date()
+    except Exception:  # noqa: BLE001 -- see docstring; must never break a fetch
+        logger.warning("thetadata: no %s tz data; falling back to the local date for the "
+                       "current-day clamp", _EXCHANGE_TZ)
+        return date.today()
+
+
+def _traded(close: Optional[float]) -> bool:
+    """Did this contract actually trade on this bar's day?
+
+    ThetaData reports EOD OHLC as a TRADE statistic and returns 0.0 for every field on a day
+    with no trade. An option can never print at 0.00, so a non-positive close is exactly the
+    no-trade sentinel -- verified live 2026-09-03 on MSFT/F/GE/KO across 2020-2023 plus AAPL
+    2024 (4,944 rows): ``close > 0`` holds if and only if ``volume > 0``, zero exceptions in
+    either direction, with open/high/low 0.0 on every no-trade row.
+
+    Kept as ONE function so the wide and per-expiry paths cannot drift apart on the rule.
+    """
+    return close is not None and close > 0
+
+
+def _quote(bid: Optional[float],
+           ask: Optional[float]) -> Tuple[Optional[float], Optional[float]]:
+    """``(bid, ask)`` as a real NBBO, or ``(None, None)`` when there is no quote at all.
+
+    The two zeros mean OPPOSITE things and must not be collapsed:
+
+      * ``ask == 0`` -- there is no quote. A listed option always has an offer, so a zero ask
+        is ThetaData's "nothing here" sentinel, and passing it through as a real price makes
+        the contract look free to the no-arb guard. That is the artifact class that produced
+        fabricated option profits, so it stays nulled.
+      * ``bid == 0`` with a real ask -- a GENUINE quote meaning nobody is bidding. Verified
+        live 2026-09-03: such rows still carry a ``bid_exchange`` stamp and an ask with real
+        size, and they are 16.6% of a liquid chain (3,024 of 3,101 with real open interest).
+        Nulling this would erase the difference between "we know nobody bids" -- which is
+        exactly what a liquidity gate needs -- and "we do not know".
+    """
+    if ask is None or ask <= 0:
+        return None, None
+    return bid, ask
+
+
+#: Above this, a vendor "implied volatility" is not a measurement. IV is stored as a DECIMAL
+#: (0.2841 == 28.41%), so 100.0 is 10,000% annualised -- already far past anything a real
+#: contract prints. The cutoff exists because ThetaData signals "could not invert" with an
+#: INT32_MAX sentinel rather than a null, at more than one scale factor. Measured on the live
+#: backfill 2026-09-04: 214748.3646 (== 2147483646/10000) and 21474.8365 (/100000) both
+#: appear, together with a tail of 10^2-10^3 values, totalling 0.4% of rows. Storing those as
+#: real numbers puts a 21,474 into anything that reads vendor IV.
+_MAX_PLAUSIBLE_IV = 100.0
+
+
+def _clean_iv(value: Any) -> Optional[float]:
+    """A vendor implied_vol as a usable decimal, or None when it is not a measurement.
+
+    ONE function so the wide and per-expiry paths cannot drift apart on the rule -- they write
+    into the same store, and an `iv` whose meaning depended on which code path fetched it
+    would be worse than no iv at all.
+    """
+    iv = _num(value)
+    if iv is None or iv == 0.0 or iv > _MAX_PLAUSIBLE_IV:
+        return None
+    return iv
+
+
+def _index_implied_vol(df: Any) -> Dict[Tuple[float, str, date], float]:
+    """(strike, 'call'|'put', bar_date) -> implied_vol, from an ``option_history_greeks_eod``
+    dataframe. Same join key as ``_index_open_interest``; separate function because the date
+    lives in a different column (``timestamp``, not ``created``).
+
+    TWO vendor "no value" encodings are dropped rather than stored, both for the same reason
+    the class docstring gives for ``iv``: None must never be coerced to a number, because
+    downstream reads a number as a measurement.
+
+      * ``0.0``            -- "could not invert this", not a contract with zero volatility.
+      * ``> _MAX_PLAUSIBLE_IV`` -- an INT32_MAX sentinel (see that constant).
+    """
+    out: Dict[Tuple[float, str, date], float] = {}
+    if df is None or len(df) == 0:
+        return out
+    dropped = 0
+    for row in df.itertuples(index=False):
+        r = row._asdict()
+        strike = _num(r.get("strike"))
+        bar_date = _parse_date(r.get("timestamp") or r.get("created"))
+        raw = _num(r.get("implied_vol"))
+        iv = _clean_iv(raw)
+        if strike is None or bar_date is None or iv is None:
+            if raw is not None and raw > _MAX_PLAUSIBLE_IV:
+                dropped += 1
+            continue
+        out[(strike, _right_word(r.get("right")), bar_date)] = iv
+    if dropped:
+        # Counted and reported, not silently discarded: a sudden jump in this number means the
+        # vendor changed an encoding, which is exactly the thing that must not pass unnoticed.
+        logger.warning("thetadata: dropped %d implied_vol value(s) above %.0f (vendor "
+                       "sentinel, not a measurement)", dropped, _MAX_PLAUSIBLE_IV)
+    return out
 
 
 def _index_open_interest(df: Any) -> Dict[Tuple[float, str, date], int]:
@@ -317,12 +458,32 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
             group_end = min(end, expiry)
             if group_end < start:
                 continue  # this expiry is entirely before the window -- nothing to fetch
+            # A contract does not exist before it is LISTED, and the run's start date says
+            # nothing about when that was: AAPL's 2024-06-21 expiry first traded 2022-03-11,
+            # so a 2020-01-01 run start scans 2.2 years this contract could not have traded
+            # in (measured live 2026-09-03; its 2022-03-18 expiry wastes 68% of the range,
+            # and a weekly -- listed weeks, not years, before expiry -- wastes nearly all of
+            # it). option_list_dates answers that in one small call, so ask rather than scan.
+            # Best-effort by construction: any failure leaves `group_start` at the caller's
+            # own start, which is exactly today's behaviour.
+            group_start = start
+            try:
+                dates_df = client.option_list_dates(
+                    request_type="quote", symbol=underlying, expiration=expiry)
+                first_traded = _parse_date(
+                    dates_df.iloc[0].get("date")) if dates_df is not None and len(dates_df) else None
+                if first_traded is not None and first_traded > group_start:
+                    group_start = first_traded
+            except Exception:  # noqa: BLE001 -- an optimisation must never fail a fetch
+                pass
+            if group_end < group_start:
+                continue
             # One (underlying, expiry) partition, but the window may be wider than the
             # server's 365-day-per-request cap -- see _chunk_window. Chunks are
             # non-overlapping, so no bar_date can appear in two of them: concatenating the
             # per-chunk results (by just yielding as each chunk is processed) is safe without
             # any cross-chunk de-duplication.
-            windows = _chunk_window(start, group_end)
+            windows = _chunk_window(group_start, group_end)
             for w_start, w_end in windows:
                 try:
                     bars_df = client.option_history_greeks_eod(
@@ -356,22 +517,186 @@ class ThetaDataOptionsProvider(OptionsDataProviderInterface):
                     occ = _occ_symbol(underlying, expiry, right, strike)
                     if occ not in wanted:
                         continue
-                    close = _num(r.get("close"))
-                    if close is None:
-                        continue  # a row with no close is not a usable bar
+                    o, h, l, close = (_num(r.get(k))
+                                      for k in ("open", "high", "low", "close"))
+                    bid, ask = _quote(_num(r.get("bid")), _num(r.get("ask")))
+                    # Same no-trade / zero-bid rules as the wide path -- see _traded and
+                    # fetch_underlying_eod_bars. Kept identical on purpose: the two shapes
+                    # write into the SAME parquet store, so a divergence here would make a
+                    # partition's meaning depend on which code path happened to fetch it.
+                    if not _traded(close):
+                        o = h = l = close = None
+                    if close is None and bid is None and ask is None:
+                        continue  # neither a trade nor a quote: no information at all
                     yield OptionEodBar(
                         occ_symbol=occ, bar_date=bar_date,
-                        open=_num(r.get("open")) if _num(r.get("open")) is not None else close,
-                        high=_num(r.get("high")) if _num(r.get("high")) is not None else close,
-                        low=_num(r.get("low")) if _num(r.get("low")) is not None else close,
-                        close=close,
+                        open=o, high=h, low=l, close=close,
                         volume=(int(_num(r.get("volume"))) if _num(r.get("volume")) is not None
                                else None),
-                        bid=_num(r.get("bid")) or None,   # 0 -> None: "no quote"
-                        ask=_num(r.get("ask")) or None,
+                        bid=bid, ask=ask,   # see _quote: 0 ask == no quote, 0 bid == real quote
                         open_interest=oi_map.get((strike, _right_word(right), bar_date)),
-                        iv=_num(r.get("implied_vol")),
+                        iv=_clean_iv(r.get("implied_vol")),
                     )
+
+    def fetch_underlying_eod_bars(self, underlying: str, *, start: date,
+                                  end: date) -> Iterator[OptionEodBar]:
+        """EVERY expiration of one underlying, via ``expiration="*"`` — the WIDE shape.
+
+        This replaces the per-(underlying, expiry) loop in ``fetch_eod_bars`` for bulk
+        backfills, and it is 40-68x faster. Measured live 2026-09-03 on AAPL:
+
+            option_history_eod  exp="*"  365-day range   ~2,950 rows/s
+            per-expiry loop, one whole unit                  43 rows/s effective
+
+        The gap was never a server throughput ceiling (the earlier assessment's claim); it was
+        per-request overhead across tens of thousands of small windows. One call returns the
+        whole chain -- ~16 simultaneously-live expirations for a large-cap -- for every day in
+        the window. Verified row-for-row identical to the per-expiry path over the same expiry
+        and window: 0 rows lost, 0 extra, 0 differing closes.
+
+        THREE endpoints, because the fields we need are split across them and only one of them
+        takes a wide date range:
+
+          * ``option_history_eod``            bars + bid/ask.  exp="*" + 365-day range: OK
+          * ``option_history_open_interest``  open interest.   exp="*" + 365-day range: OK
+          * ``option_history_greeks_eod``     implied_vol.     exp="*" is ONE DAY AT A TIME
+
+        That last restriction is a hard server rule, not a size cap: measured live, neither
+        ``max_dte`` (30/60/200) nor ``strike_range`` (5/20) nor both together lifts it at any
+        range -- every combination returns "When expiration=*, you must request data a
+        day-at-a-time". So IV costs one request per trading day while bars and OI cost one per
+        window, and IV is consequently ~40% of a backfill's wall clock.
+
+        WINDOW SIZE is ``_REQUEST_WINDOW_DAYS`` (30) rather than the server's 365-day cap even
+        though throughput is flat between them (2,981 vs 2,949 rows/s measured). The reason is
+        MEMORY, not speed: a 30-day window holds ~44k rows (~10 MB) in flight, a 365-day one
+        ~565k (~130 MB), and a previous backfill was killed at 17.9 GB. Same speed, 13x less
+        resident -- so the narrow window is free.
+
+        Yields every contract the server returns, NOT only a caller-supplied contract list:
+        the wide call reports the REAL listed chain, which is strictly better than the
+        synthetic Friday x strike ladder our discovery guesses at.
+        """
+        client = self._get_client()
+        underlying = underlying.upper()
+
+        # NO CURRENT-DAY DATA IN THE WIDE SHAPE. ThetaData rejects a window touching TODAY
+        # with "Cannot fetch current-day data without specifying an expiration"
+        # (INVALID_ARGUMENT, measured live 2026-09-03) -- the restriction is specific to
+        # expiration="*", which is exactly what this method uses.
+        #
+        # This has to be clamped here rather than left to the caller. A backfill's window ends
+        # at "today" by default, so the LAST chunk of EVERY symbol would hit it -- and it hits
+        # at the END, after the whole 6.7-year fetch has already been paid for. Observed live:
+        # ABEV failed after 941 s having written nothing, and the error is permanent (not
+        # transient), so the retry loop does not save it. Every symbol would have failed
+        # identically and the run would have produced zero partitions.
+        #
+        # Yesterday, not today: an EOD bar for the current session does not exist until that
+        # session closes, so nothing is lost by excluding it.
+        #
+        # "Today" is EXCHANGE-LOCAL, not machine-local, and that distinction is load-bearing.
+        # Measured live: with the machine on CET, this clamp used date.today() and worked all
+        # evening, then started failing again the moment local midnight passed -- 01:01 CET on
+        # the 4th is 19:01 ET on the 3rd, so "local yesterday" (the 3rd) was still the CURRENT
+        # day in New York and the server refused it. Every symbol processed after local
+        # midnight lost its last windows to this. Any machine west of the Atlantic hits the
+        # mirror image of the same bug.
+        end = min(end, _exchange_today() - timedelta(days=1))
+        if end < start:
+            return
+
+        for w_start, w_end in _chunk_window(start, end):
+            try:
+                bars_df = client.option_history_eod(
+                    symbol=underlying, expiration="*", strike="*", right="both",
+                    start_date=w_start, end_date=w_end)
+            except self._no_data_exc:
+                continue  # no chain at all in this window -- normal, not an error
+            if bars_df is None or len(bars_df) == 0:
+                continue
+
+            try:
+                oi_df = client.option_history_open_interest(
+                    symbol=underlying, expiration="*", strike="*", right="both",
+                    start_date=w_start, end_date=w_end)
+            except self._no_data_exc:
+                oi_df = None  # bars alone are still worth keeping
+            oi_map = _index_open_interest(oi_df)
+
+            # IV: one request per TRADING DAY (see the day-at-a-time rule above). Only days
+            # that actually returned bars are asked for -- asking for a market holiday would
+            # spend a request to be told there is nothing.
+            iv_map: Dict[Tuple[float, str, date], float] = {}
+            for day in sorted({d for d in (
+                    _parse_date(v) for v in bars_df["created"]) if d is not None}):
+                try:
+                    greeks_df = client.option_history_greeks_eod(
+                        symbol=underlying, expiration="*", strike="*", right="both",
+                        start_date=day, end_date=day)
+                except self._no_data_exc:
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    # IV is the one field we cannot re-derive, but a single bad day must not
+                    # cost the whole window's bars -- log loudly and carry on without it.
+                    logger.warning("thetadata: implied_vol fetch failed for %s %s: %s: %s",
+                                   underlying, day, type(e).__name__, e)
+                    continue
+                iv_map.update(_index_implied_vol(greeks_df))
+
+            # ORDERING CONTRACT: bars are yielded in NON-DECREASING bar_date order, across the
+            # whole call. Windows are already walked oldest-first, but the server's row order
+            # WITHIN a window is its own (contract-major, not date-major), so the frame is
+            # sorted here to make the guarantee hold end to end.
+            #
+            # tools/warm_options_history.py depends on this: it writes an expiry's partition
+            # as soon as a bar dated after that expiry arrives, which is only sound if no
+            # earlier-dated bar can follow. Without the sort, a later date appearing early in
+            # a window would close an expiry that still had rows further down the SAME window,
+            # silently truncating that partition.
+            # NOT wrapped in a try: a failure here must propagate. Yielding unsorted rows
+            # would not look like an error, it would look like slightly smaller partitions --
+            # the exact silent-truncation this ordering exists to prevent. `created` is
+            # load-bearing anyway (it is the bar_date below), so a frame that cannot be sorted
+            # by it has nothing usable in it.
+            bars_df = bars_df.sort_values("created", kind="mergesort")
+
+            for row in bars_df.itertuples(index=False):
+                r = row._asdict()
+                strike = _num(r.get("strike"))
+                bar_date = _parse_date(r.get("created"))
+                expiry = _parse_date(r.get("expiration"))
+                right = r.get("right")
+                if strike is None or bar_date is None or expiry is None:
+                    continue
+                o, h, l, close = (_num(r.get(k)) for k in ("open", "high", "low", "close"))
+                bid, ask = _quote(_num(r.get("bid")), _num(r.get("ask")))
+                if not _traded(close):
+                    # ThetaData's EOD OHLC is a TRADE statistic and it reports 0.0 for a day
+                    # the contract did not trade -- measured across 4 underlyings x 4 years,
+                    # close > 0 iff volume > 0, with open/high/low 0.0 alongside. Passing that
+                    # 0.0 through as a price marks a contract that merely did not trade as
+                    # worthless; on a liquid chain that is 44.9% of rows, 28.3% of which are
+                    # quoted at a median $60.75 mid. So the whole OHLC block becomes None
+                    # ("did not trade"), and bid/ask below carry the day's real mark.
+                    o = h = l = close = None
+                if close is None and bid is None and ask is None:
+                    # Neither a trade nor a quote: genuinely no information about this
+                    # contract on this day. Measured at 0.0% of rows, but a bar with no price
+                    # at all must not reach the store -- a chain row with no price silently
+                    # skips the selector's penny-contract gate instead of being rejected.
+                    continue
+                key = (strike, _right_word(right), bar_date)
+                yield OptionEodBar(
+                    occ_symbol=_occ_symbol(underlying, expiry, right, strike),
+                    bar_date=bar_date,
+                    open=o, high=h, low=l, close=close,
+                    volume=(int(_num(r.get("volume"))) if _num(r.get("volume")) is not None
+                           else None),
+                    bid=bid, ask=ask,   # see _quote: 0 ask == no quote, 0 bid == real quote
+                    open_interest=oi_map.get(key),
+                    iv=iv_map.get(key),
+                )
 
     def fetch_bars_detailed(self, contracts: Iterable[OptionContractMeta], *,
                             start: date, end: date) -> CandleBatch:
