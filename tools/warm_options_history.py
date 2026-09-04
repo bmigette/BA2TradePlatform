@@ -43,6 +43,7 @@ import json
 import logging
 import math
 import os
+import queue
 import sqlite3
 import sys
 import threading
@@ -55,7 +56,7 @@ from typing import Callable, Dict, List, Optional, Sequence
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ba2_common.core.interfaces.OptionsDataProviderInterface import (  # noqa: E402
-    OptionContractMeta,
+    OptionContractMeta, OptionEodBar,
 )
 from ba2_providers.options.tastytrade import StreamInterrupted  # noqa: E402
 from ba2_providers.options.parquet_store import (  # noqa: E402
@@ -78,6 +79,26 @@ class WorkUnit:
     """One (underlying, expiry) chain — one download, one parquet partition."""
     underlying: str
     expiry: date
+    contracts: List[OptionContractMeta]
+
+
+@dataclass(frozen=True)
+class SymbolUnit:
+    """One UNDERLYING — one wide download, MANY parquet partitions (``--wide``).
+
+    The wide shape (``expiration="*"``) returns every listed expiration in one request, so the
+    per-expiry WorkUnit stops being the unit of work: fetching a symbol expiry-by-expiry would
+    re-request the same wide response once per expiry. This unit therefore carries the symbol
+    plus the expiries still PENDING for it, and one fetch fans out into that many partitions.
+
+    ``pending_expiries`` is what gets written; expiries already COMPLETE/EMPTY in the store are
+    excluded at plan time, so a resumed run re-fetches the symbol but only writes what is
+    missing. (The wide call has no way to ask for a subset of expirations, so a resume does
+    re-pay the fetch for a partially-done symbol -- at ~6 min/symbol that is cheap next to the
+    per-expiry path it replaces.)
+    """
+    underlying: str
+    pending_expiries: List[date]
     contracts: List[OptionContractMeta]
 
 
@@ -221,6 +242,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         "keep using tools/run_option_warmup_parallel.py's --workers "
                         "(separate processes) instead; this is for providers whose session "
                         "must be shared in-process.")
+    p.add_argument("--wide", action="store_true",
+                   help="ThetaData only. Fetch each underlying's WHOLE chain per request "
+                        "(expiration='*') instead of looping expiry by expiry, then fan the "
+                        "result out into the same per-expiry partitions. Measured 2026-09-03: "
+                        "~2,950 rows/s vs 43 rows/s effective for the per-expiry loop, and "
+                        "verified row-for-row identical over the same expiry+window. Turns a "
+                        "~6-day backfill into what was projected as ~80-150 days. The unit of "
+                        "work becomes the SYMBOL, so --limit and progress counts are in "
+                        "symbols, not expiries.")
     p.add_argument("--max-retries", type=int, default=4,
                    help="Attempts per unit before giving up on it (default 4). A unit that "
                         "never completes leaves NO manifest, so the next run redoes it.")
@@ -551,6 +581,45 @@ def build_plan(provider, store: OptionHistoryParquetStore, symbols: Sequence[str
     return plan
 
 
+def parse_occ_expiry(occ: str) -> Optional[date]:
+    """The expiry encoded in an OCC id (ROOT + YYMMDD + C/P + strike x 1000), or ``None``.
+
+    Deliberately TOTAL where ``ba2_providers.options.tastytrade.parse_occ`` raises: that one
+    validates the ROOT against the OCC letters+digits pattern and throws for real tickers like
+    'BF-B' (which previously killed an entire warmer process). Here a single unparseable
+    symbol must cost that symbol's bar and nothing else, so only the fixed-width 15-character
+    tail is read and the root is never inspected at all.
+    """
+    tail = occ.strip()[-15:]
+    if len(tail) != 15 or tail[6] not in ("C", "P"):
+        return None
+    try:
+        return datetime.strptime(tail[:6], "%y%m%d").date()
+    except ValueError:
+        return None
+
+
+def to_symbol_units(plan: Plan) -> List[SymbolUnit]:
+    """Collapse a per-expiry ``Plan`` into one ``SymbolUnit`` per underlying (``--wide``).
+
+    Built from the SAME plan the per-expiry path uses, so every resume rule already encoded in
+    ``build_plan`` (COMPLETE/EMPTY partitions skipped, ``--limit`` budget, discovery failures)
+    applies unchanged -- this only regroups what that plan decided was pending.
+    """
+    by_symbol: Dict[str, List[WorkUnit]] = {}
+    for unit in plan.units:
+        by_symbol.setdefault(unit.underlying, []).append(unit)
+    out: List[SymbolUnit] = []
+    for symbol, units in by_symbol.items():
+        contracts: List[OptionContractMeta] = []
+        for u in units:
+            contracts.extend(u.contracts)
+        out.append(SymbolUnit(underlying=symbol,
+                              pending_expiries=sorted(u.expiry for u in units),
+                              contracts=contracts))
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # execution
 # --------------------------------------------------------------------------- #
@@ -693,6 +762,227 @@ def run_units(plan: Plan, provider, store: OptionHistoryParquetStore,
                 f"{stats.units_empty} empty, {stats.units_failed} failed)  "
                 f"elapsed {_fmt_secs(elapsed)}  ETA {_fmt_secs(eta)}")
     return stats
+
+
+class _SharedProgress:
+    """A run-wide "n of total symbols" counter shared across worker threads.
+
+    Without it, a queue-fed worker calls ``run_symbol_units`` with ONE unit at a time and every
+    progress line reads "1/1", which says nothing about the run. Ticked under a lock because
+    four threads finish symbols concurrently.
+    """
+
+    def __init__(self, total: int):
+        self.total = total
+        self.done = 0
+        self._lock = threading.Lock()
+
+    def tick(self) -> Tuple[int, int]:
+        with self._lock:
+            self.done += 1
+            return self.done, self.total
+
+
+def run_symbol_units(units: Sequence[SymbolUnit], provider,
+                     store: OptionHistoryParquetStore, start: date, end: date,
+                     ns: argparse.Namespace, *, clock: Callable[[], datetime],
+                     sleep: Callable[[float], None],
+                     log: Callable[[str], None],
+                     progress: Optional["_SharedProgress"] = None) -> RunStats:
+    """``--wide``: one wide fetch per underlying, fanned out into per-expiry partitions.
+
+    Mirrors ``run_units``' retry/backoff/give-up semantics deliberately -- same flags, same
+    "no manifest means redo it next run" resume contract -- but the unit is the SYMBOL, so a
+    give-up costs one symbol's worth of partitions rather than one expiry's.
+
+    INCREMENTAL FLUSH. A partition is written the moment it can no longer receive data,
+    rather than at the end of the symbol. Once a bar dated after expiry E arrives, E's chain
+    is closed -- an expired contract cannot trade again -- so tracking that high-water mark
+    lets each expiry be written and freed mid-fetch.
+
+    THIS RELIES ON ``fetch_underlying_eod_bars`` YIELDING IN NON-DECREASING ``bar_date``
+    ORDER, which that method guarantees explicitly (it sorts each window before yielding, and
+    walks windows oldest-first). The dependency is load-bearing rather than cosmetic: if an
+    earlier-dated bar could arrive after a later one, it would land on an expiry already
+    written and be dropped, silently truncating that partition rather than raising.
+
+    This matters for two reasons, and the second one is why it exists:
+
+      * MEMORY. Without it, a symbol's ENTIRE history is buffered before anything is written
+        -- ~3.8M bars for AAPL over 6.7 years. With it, only the currently-live expiries are
+        held (a few hundred contracts), so peak memory stops scaling with the run's length.
+      * DURABILITY. Without it, a failure anywhere in the fetch discards everything already
+        downloaded. Observed live 2026-09-03: ABEV died 941 s in, on the very last window, and
+        wrote nothing. With the flush, that failure keeps every partition that had already
+        closed and only the still-open tail is retried.
+
+    Flushed expiries are removed from ``pending``, so a retry re-fetches the symbol (the wide
+    call cannot ask for a subset) but re-buffers only what is still owed, and no partition is
+    ever written twice.
+    """
+    stats = RunStats()
+    total = len(units)
+    t0 = clock()
+    for i, unit in enumerate(units, 1):
+        wanted_by_expiry: Dict[date, set] = {}
+        for c in unit.contracts:
+            wanted_by_expiry.setdefault(c.expiry, set()).add(c.occ_symbol)
+        pending = set(unit.pending_expiries)
+
+        by_expiry: Dict[date, List[OptionEodBar]] = {}
+        completed = False
+        backoff = ns.backoff
+
+        def _flush(expiry: date) -> None:
+            """Write one expiry's partition and drop it from the work still owed."""
+            bars = by_expiry.pop(expiry, [])
+            seen = {b.occ_symbol for b in bars}
+            empties = sorted(wanted_by_expiry.get(expiry, set()) - seen)
+            manifest = store.write_partition(unit.underlying, expiry, bars, start, end,
+                                             empty_contracts=empties)
+            stats.rows += manifest["rows"]
+            stats.empty_contracts += len(empties)
+            if manifest["status"] == "empty":
+                stats.units_empty += 1
+            else:
+                stats.units_written += 1
+            # Removed from `pending` BEFORE any retry: the partition is durable now, so a
+            # later attempt must neither re-buffer nor rewrite it.
+            pending.discard(expiry)
+
+        for attempt in range(1, max(1, ns.max_retries) + 1):
+            by_expiry = {}
+            high_water: Optional[date] = None
+            try:
+                for bar in provider.fetch_underlying_eod_bars(unit.underlying,
+                                                              start=start, end=end):
+                    expiry = parse_occ_expiry(bar.occ_symbol)
+                    if expiry is None or expiry not in pending:
+                        # Not a partition this run owes: unparseable, already COMPLETE/EMPTY
+                        # in the store, or already flushed above. Dropping it here is what
+                        # keeps a resumed run from rewriting partitions it has finished.
+                        continue
+                    by_expiry.setdefault(expiry, []).append(bar)
+                    if high_water is None or bar.bar_date > high_water:
+                        high_water = bar.bar_date
+                        # Every buffered expiry strictly before the high-water mark is closed.
+                        for done in [e for e in by_expiry if e < high_water]:
+                            _flush(done)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:  # noqa: BLE001 — classified below, never silently swallowed
+                if not _is_transient(e):
+                    log(f"  [{unit.underlying}] attempt {attempt} failed (permanent, not "
+                        f"retrying): {type(e).__name__}: {e}")
+                    break
+                log(f"  [{unit.underlying}] attempt {attempt} failed: "
+                    f"{type(e).__name__}: {e}")
+            else:
+                completed = True
+                break
+            if attempt < max(1, ns.max_retries):
+                sleep(backoff)
+                backoff *= 2
+
+        if not completed:
+            # Whatever the flush already wrote is durable and is NOT counted as failed --
+            # `pending` holds only what never closed.
+            if pending:
+                stats.units_failed += len(pending)
+                log(f"  [{unit.underlying}] GIVING UP after {ns.max_retries} attempts — "
+                    f"{len(pending)} expiry partition(s) left unfetched, re-run to retry")
+        else:
+            # The tail: expiries still open at the end of the window (nothing dated later than
+            # them was ever seen), plus any that returned no bars at all.
+            for expiry in sorted(pending):
+                _flush(expiry)
+            by_expiry = {}  # free the symbol's buffer before the next one is fetched
+
+        if ns.rate_limit:
+            sleep(ns.rate_limit)
+
+        # Under the shared queue a worker is handed one unit at a time, so `i`/`total` are
+        # both 1 and meaningless; the run-wide counter is the real position.
+        shown_i, shown_total = progress.tick() if progress is not None else (i, total)
+        if ns.progress_every and (shown_i % ns.progress_every == 0 or shown_i == shown_total):
+            elapsed = (clock() - t0).total_seconds()
+            per_unit = elapsed / i if i else 0.0
+            log(f"progress {shown_i}/{shown_total} symbols  ({stats.units_written} partitions, "
+                f"{stats.rows} rows, {stats.units_empty} empty, {stats.units_failed} failed)  "
+                f"{per_unit:.0f}s/symbol  elapsed {_fmt_secs(elapsed)}")
+    return stats
+
+
+def run_symbol_units_concurrent(units: Sequence[SymbolUnit], provider,
+                                store: OptionHistoryParquetStore, start: date, end: date,
+                                ns: argparse.Namespace, *, clock: Callable[[], datetime],
+                                sleep: Callable[[float], None],
+                                log: Callable[[str], None], concurrency: int) -> RunStats:
+    """``run_symbol_units`` across ``concurrency`` threads, one contiguous symbol slice each.
+
+    Threads rather than processes for the same reason the per-expiry path uses them: ThetaData
+    authenticates ONE session per API key and the shared session lives in a Python object that
+    cannot cross a process boundary (see the provider's CONCURRENCY docstring).
+    """
+    units = list(units)
+    if concurrency <= 1 or len(units) <= 1:
+        return run_symbol_units(units, provider, store, start, end, ns,
+                                clock=clock, sleep=sleep, log=log)
+
+    # A SHARED QUEUE, not fixed slices. Symbol cost ranges over two orders of magnitude --
+    # measured 2026-09-04: AEFC 18 s (no listed options) against AAPL ~3.7 h -- so a static
+    # contiguous split leaves threads idle on a straggler. Observed live: with 7 symbols over
+    # 4 threads, t3 finished its whole slice and sat idle for ~2 h while t1 ground through
+    # AAPL, and the chunk could not close until t1 did.
+    #
+    # Pulling one symbol at a time means a thread that draws cheap symbols simply takes more
+    # of them. It cannot fix the join barrier at the END of a chunk (the last symbol still
+    # gates it), so the win is real but bounded -- and smaller than a naive "4 threads idle
+    # 50% of the time" reading suggests, because threads contend for the one ThetaData session
+    # and the survivors speed up when others go idle.
+    work: "queue.Queue[SymbolUnit]" = queue.Queue()
+    for u in units:
+        work.put(u)
+
+    n = min(concurrency, len(units))
+    results: List[Optional[RunStats]] = [None] * n
+    errors: List[Optional[BaseException]] = [None] * n
+    progress = _SharedProgress(len(units))
+
+    def _worker(idx: int) -> None:
+        thread_log = lambda msg, i=idx: log(f"[t{i}] {msg}")  # noqa: E731 -- tiny, scoped
+        mine = RunStats()
+        try:
+            while True:
+                try:
+                    unit = work.get_nowait()
+                except queue.Empty:
+                    break
+                mine.merge(run_symbol_units([unit], provider, store, start, end, ns,
+                                            clock=clock, sleep=sleep, log=thread_log,
+                                            progress=progress))
+        except BaseException as e:  # noqa: BLE001 -- re-raised on the main thread below
+            errors[idx] = e
+        finally:
+            # Set even on failure: whatever this thread DID finish is already written to the
+            # store, so its counters must not be dropped just because it died later.
+            results[idx] = mine
+
+    threads = [threading.Thread(target=_worker, args=(i,), name=f"warmup-w{i}", daemon=True)
+               for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for e in errors:
+        if e is not None:
+            raise e
+
+    merged = RunStats()
+    for r in results:
+        if r is not None:
+            merged.merge(r)
+    return merged
 
 
 def run_units_concurrent(plan: Plan, provider, store: OptionHistoryParquetStore,
@@ -927,11 +1217,23 @@ def main(argv: Optional[Sequence[str]] = None, *, provider=None, store=None,
             if not aggregate.units and chunk_plan.units:
                 aggregate.units = chunk_plan.units[:1]
             continue
-        log(f"plan chunk {k}/{len(chunks)}: {chunk[0]}..{chunk[-1]} — "
-            f"{chunk_plan.units_pending} units pending")
-        stats.merge(run_units_concurrent(chunk_plan, provider, store, start, end, ns,
-                                        clock=clock, sleep=sleep, log=log,
-                                        concurrency=ns.concurrency))
+        if ns.wide:
+            # Same plan, regrouped: one wide fetch per underlying instead of one per expiry.
+            # build_plan has already dropped every COMPLETE/EMPTY partition, so a resumed run
+            # still only WRITES what is missing (it does re-fetch the symbol -- the wide call
+            # cannot ask for a subset of expirations -- which at ~6 min/symbol is cheap).
+            symbol_units = to_symbol_units(chunk_plan)
+            log(f"plan chunk {k}/{len(chunks)}: {chunk[0]}..{chunk[-1]} — "
+                f"{len(symbol_units)} symbols, {chunk_plan.units_pending} partitions pending")
+            stats.merge(run_symbol_units_concurrent(symbol_units, provider, store, start, end,
+                                                    ns, clock=clock, sleep=sleep, log=log,
+                                                    concurrency=ns.concurrency))
+        else:
+            log(f"plan chunk {k}/{len(chunks)}: {chunk[0]}..{chunk[-1]} — "
+                f"{chunk_plan.units_pending} units pending")
+            stats.merge(run_units_concurrent(chunk_plan, provider, store, start, end, ns,
+                                            clock=clock, sleep=sleep, log=log,
+                                            concurrency=ns.concurrency))
         log(f"cumulative: {_progress_line(stats, aggregate, ns, t0, clock)}")
 
     _LAST_PLAN = aggregate
