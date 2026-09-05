@@ -1,6 +1,7 @@
 import { API_BASE } from '../lib/config';
 import { actionRefOf, actionValueOf } from '../lib/actionValues';
 import { boldNumbers } from '../lib/textParts';
+import { capitalUsageSeries, summariseUsage, IDLE_PCT, HEAVY_PCT } from '../lib/capitalUsage';
 import {
   contractValue, groupTradesByStructure, isOptionTrade, optionBadge, summariseStructure,
 } from '../lib/optionTrades';
@@ -31,6 +32,7 @@ import {
   X,
   Database,
   Layers,
+  Gauge,
   Sliders,
   Shield,
   Download,
@@ -1195,7 +1197,7 @@ const Backtesting: React.FC = () => {
       setError(err instanceof Error ? err.message : 'Failed to remove label');
     }
   };
-  const [activeTab, setActiveTab] = useState<'equity' | 'drawdown' | 'trades' | 'strategy' | 'yearly'>('equity');
+  const [activeTab, setActiveTab] = useState<'equity' | 'drawdown' | 'capital' | 'trades' | 'strategy' | 'yearly'>('equity');
   // Yearly Breakdown tab: fetched lazily (only once the tab is opened) from the FULL
   // (non-downsampled) curves server-side — see app/services/backtest/results.py::yearly_breakdown.
   const [yearlyRows, setYearlyRows] = useState<YearlyBreakdownRow[] | null>(null);
@@ -3099,13 +3101,14 @@ const Backtesting: React.FC = () => {
                     {[
                       { id: 'equity', label: 'Equity Curve', icon: TrendingUp },
                       { id: 'drawdown', label: 'Drawdown', icon: TrendingDown },
+                      { id: 'capital', label: 'Capital Used', icon: Gauge },
                       { id: 'trades', label: 'Trade List', icon: Activity },
                       { id: 'strategy', label: 'Strategy', icon: Award },
                       { id: 'yearly', label: 'Yearly Breakdown', icon: Calendar }
                     ].map(tab => (
                       <button
                         key={tab.id}
-                        onClick={() => setActiveTab(tab.id as 'equity' | 'drawdown' | 'trades' | 'strategy' | 'yearly')}
+                        onClick={() => setActiveTab(tab.id as 'equity' | 'drawdown' | 'capital' | 'trades' | 'strategy' | 'yearly')}
                         className={`flex items-center gap-2 px-4 py-3 border-b-2 transition-colors text-sm ${
                           activeTab === tab.id
                             ? 'border-blue-500 text-blue-600'
@@ -3193,6 +3196,87 @@ const Backtesting: React.FC = () => {
                       </ResponsiveContainer>
                     </div>
                   )}
+
+                  {activeTab === 'capital' && (() => {
+                    // Computed here, not stored: it is one pass over the trades and one
+                    // over the equity curve, both already in this payload, so a column
+                    // and a migration would buy nothing.
+                    const usage = capitalUsageSeries(
+                      selectedBacktest.results?.trades,
+                      adjEquityCurve ?? selectedBacktest.results?.equityCurve);
+                    const stats = summariseUsage(usage);
+                    if (!usage.length) {
+                      return (
+                        <p className="text-sm text-gray-500 dark:text-gray-400 py-8 text-center">
+                          No equity curve for this run, so capital usage cannot be measured.
+                        </p>
+                      );
+                    }
+                    const card = (label: string, value: string, hint: string) => (
+                      <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
+                        <p className="text-xs text-gray-500 dark:text-gray-400">{label}</p>
+                        <p className="text-lg font-bold text-gray-900 dark:text-gray-100">{value}</p>
+                        <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">{hint}</p>
+                      </div>
+                    );
+                    return (
+                      <div>
+                        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+                          {card('Average', `${stats.avgPct.toFixed(1)}%`,
+                                'of equity committed on a typical day')}
+                          {card('Peak', `${stats.maxPct.toFixed(1)}%`,
+                                stats.peakDate ? `on ${stats.peakDate}` : '')}
+                          {card('Idle days', `${stats.idleDaysPct.toFixed(0)}%`,
+                                `under ${IDLE_PCT}% used — room for another strategy`)}
+                          {card('Heavy days', `${stats.heavyDaysPct.toFixed(0)}%`,
+                                `over ${HEAVY_PCT}% used — competing for cash`)}
+                        </div>
+                        {/* The point of the chart, stated once: this is NOT exposureTime,
+                            which reads ~100% for every run because it asks a different
+                            question ("was anything open") than this one ("how much"). */}
+                        <p className="text-[11px] text-gray-500 dark:text-gray-400 mb-2">
+                          Open position notional as a share of account equity that day —
+                          how much of the account this strategy actually occupies, and so
+                          how much is left for another to run alongside it.
+                        </p>
+                        <div className="h-80">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <AreaChart data={usage}>
+                              <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                              <XAxis
+                                dataKey="date"
+                                tickFormatter={(d: string) => {
+                                  const date = new Date(d);
+                                  return `${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getFullYear().toString().slice(2)}`;
+                                }}
+                                tick={{ fontSize: 11 }}
+                                interval="preserveStartEnd"
+                              />
+                              <YAxis
+                                domain={[0, 'auto']}
+                                tickFormatter={(v: number) => `${v.toFixed(0)}%`}
+                                width={50}
+                                tick={{ fontSize: 11 }}
+                              />
+                              <RechartsTooltip
+                                formatter={(value, name) => (
+                                  name === 'pct'
+                                    ? [`${((value as number) ?? 0).toFixed(1)}%`, 'Equity used']
+                                    : [String(value), 'Open positions'])}
+                                labelFormatter={(label) => new Date(String(label)).toLocaleDateString()}
+                              />
+                              {/* The two thresholds the summary cards count against, so the
+                                  bands and the numbers above cannot tell different stories. */}
+                              <ReferenceLine y={IDLE_PCT} stroke="#6b7280" strokeDasharray="4 4" />
+                              <ReferenceLine y={HEAVY_PCT} stroke="#f59e0b" strokeDasharray="4 4" />
+                              <Area type="monotone" dataKey="pct" stroke="#3b82f6"
+                                    fill="#3b82f6" fillOpacity={0.3} />
+                            </AreaChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+                    );
+                  })()}
 
                   {activeTab === 'trades' && selectedBacktest.results?.trades && (
                     <div>
