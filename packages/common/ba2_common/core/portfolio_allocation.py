@@ -115,7 +115,7 @@ __all__ = [
     "WARNING_RESIDUAL_LEFT_FMT", "WARNING_RESIDUAL_UNCONVERGED_FMT",
     "REASON_FRACTIONAL_FLOOR_BUMPED_FMT", "REASON_FRACTIONAL_FLOOR_SKIPPED_FMT",
     "REASON_BELOW_MIN_ORDER_FMT", "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT",
-    "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT",
+    "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT", "REASON_RECLAIMED_FMT",
     "REASON_SCALED_PREFIX", "REASON_BELOW_MIN_ORDER_PREFIX",
     "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX",
     "WARNING_EMPTY_LABEL_FMT", "WARNING_PRECHECK_DISAGREED_FMT",
@@ -379,6 +379,10 @@ REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT = (
 #: the full list including the current label is the useful information.
 REASON_MULTI_LABEL_FMT = "⚠ in {labels}"
 REASON_SCALED_FMT = "scaled ×{factor:.2f} to fit buying power"
+#: A row the pro-rata scale rounded away, then funded again out of the slack the
+#: OTHER rows' rounding left behind. See ``_reclaim_rounding_slack``.
+REASON_RECLAIMED_FMT = ("restored {qty:g} share(s) from the ${slack:,.2f} the "
+                        "rounding left unspent")
 #: The fixed part of REASON_SCALED_FMT, derived from it so the two cannot drift.
 #: Used to RECOGNISE a scaling reason a row already carries, so that a plan scaled
 #: twice (first solve, then broker precheck) reports ONE reason with the compounded
@@ -1958,7 +1962,87 @@ def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, 
             r.side = None
             # The whole pre-scaling intent is unmet, not just the scaled-away part.
             r.unmet_notional = abs(prev_qty) * float(r.price or 0.0)
+    _reclaim_rounding_slack(buys, avail, margin=margin, allow_fractional=allow_fractional)
     return scale
+
+
+def _reclaim_rounding_slack(buys: List[AllocationRow], avail: float, *,
+                            margin: Optional[Dict[str, MarginInfo]],
+                            allow_fractional: bool) -> None:
+    """Fund rows the pro-rata scale rounded away, out of the slack rounding left.
+
+    THE PROBLEM THIS SOLVES, from live use (2026-09-05). Scaling multiplies every buy
+    by one factor and THEN rounds, so a whole-share symbol whose target was 1.43
+    shares becomes 0.93 and floors to nothing -- while every fractionable symbol beside
+    it keeps its fraction. The dropped row's budget is not reallocated, so the plan
+    ends with cash it declined to spend: one real plan reported seven untraded rows and
+    $334.36 unallocated while a $105.89 share of CARZ sat rounded to zero. The bias is
+    systematic and falls entirely on symbols the broker will not split.
+
+    Rounding slack is REAL, not notional: fractional rows round down to a 5-decimal
+    grid and whole-share rows floor, so the plan always consumes less than the budget
+    the scale factor assumed. This hands that remainder back to the rows that got
+    nothing, largest denied first, one tradeable unit at a time.
+
+    Three limits, each of which is the point rather than a detail:
+      * only rows the SCALING zeroed -- a row stopped by ``min_order_size`` is refused
+        by the broker, not by arithmetic, and topping it up would rebuild an order the
+        broker will reject;
+      * never past what the row would have had UNSCALED, so a symbol whose true target
+        is half a share is not handed a whole one it was never owed;
+      * only while the slack actually covers the unit's buying-power cost, so this can
+        never turn a fitted plan into an over-committed one.
+    """
+    if not buys:
+        return
+    slack = float(avail) - sum(r.bp_cost for r in buys)
+    if slack <= MONEY_EPSILON:
+        return
+    denied = [r for r in buys
+              if r.delta_quantity <= 0
+              and r.unmet_notional
+              and float(r.price or 0.0) > 0
+              # NORMAL rows only. A BUMPED row is one whose target was UNDER a whole
+              # unit and which the sizer deliberately rounded UP -- an over-allocation
+              # granted while money was loose. The scaler cutting it back to nothing is
+              # that generosity being withdrawn when money is tight, which is correct;
+              # re-funding it here would spend the slack on a symbol that was never
+              # owed a whole share, ahead of one that was.
+              and r.sizing_outcome == SIZING_OUTCOME_NORMAL
+              # Neither broker floor: both are the broker refusing an order, not
+              # arithmetic losing one, and topping either up rebuilds a rejection.
+              and not any(x.startswith(REASON_BELOW_MIN_ORDER_PREFIX)
+                          or x.startswith(REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX)
+                          for x in r.reasons)]
+    # Largest denied intent first: the biggest hole in the plan is the one worth
+    # closing, and it keeps the outcome independent of row order.
+    for r in sorted(denied, key=lambda x: -float(x.unmet_notional or 0.0)):
+        m = (margin or {}).get(r.symbol)
+        unit = tradeable_unit(m, allow_fractional=allow_fractional)
+        # WHOLE-SHARE ROWS ONLY. This exists because pro-rata scaling rounds a
+        # non-fractionable symbol DOWN THROUGH ONE WHOLE SHARE to nothing while its
+        # fractionable neighbours keep a proportional slice -- a bias that falls
+        # entirely on symbols the broker will not split. A fractional row loses at
+        # most one 1e-5 step to the same rounding, so "restoring" it would hand back
+        # a third of a cent and mean nothing.
+        if unit < 1.0:
+            continue
+        price = float(r.price)
+        wanted = float(r.unmet_notional or 0.0) / price      # the unscaled share count
+        if wanted + QUANTITY_EPSILON < unit:
+            continue                                          # never owed a whole unit
+        cost = unit * price * float(r.bp_factor or 1.0)
+        if cost > slack + MONEY_EPSILON:
+            continue                                          # try the next one down
+        slack -= cost
+        r.delta_quantity = unit
+        r.target_quantity = r.current_quantity + unit
+        r.estimated_value = unit * price
+        r.bp_cost = cost
+        r.skipped = False
+        r.side = OrderDirection.BUY
+        r.unmet_notional = max(0.0, float(r.unmet_notional or 0.0) - r.estimated_value)
+        r.reasons.append(REASON_RECLAIMED_FMT.format(qty=unit, slack=slack + cost))
 
 
 def compute_allocation(base_notional: float, available_buying_power: float,
@@ -2496,9 +2580,18 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
             row.reasons.extend(impact.errors)
             continue
         row.estimated_fees = impact.estimated_fees
-        if row.is_buy and abs(impact.bp_cost - row.bp_cost) > 0.005:
-            out.warnings.append(WARNING_PRECHECK_DISAGREED_FMT.format(symbol=row.symbol))
-            row.bp_cost = impact.bp_cost
+        if row.is_buy:
+            # THE SOURCE MOVES WITH THE NUMBER. ``bp_leverage`` shows "?" instead of a
+            # multiple whenever ``margin_source`` is MARGIN_SOURCE_DEFAULT, because a
+            # default-sourced ratio is the account's conservative fallback rather than
+            # a fact. Once the BROKER has measured this order that reasoning no longer
+            # applies -- the ratio is now the realised charge the broker itself quoted
+            # -- but the source was left saying "default", so every TastyTrade dry run
+            # reported a genuinely measured buying-power cost as unknown (2026-09-05).
+            row.margin_source = MARGIN_SOURCE_PRECHECK
+            if abs(impact.bp_cost - row.bp_cost) > 0.005:
+                out.warnings.append(WARNING_PRECHECK_DISAGREED_FMT.format(symbol=row.symbol))
+                row.bp_cost = impact.bp_cost
     factor = _apply_bp_scaling(out.rows, out.available_buying_power,
                                allow_fractional=out.allow_fractional, margin=margin)
     out.scale_factor = float(plan.scale_factor) * factor
@@ -3034,6 +3127,10 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
             # the table's only holding figure is the post-trade projection, so the
             # user cannot see what they already own.
             "current_quantity": round(row.current_quantity, DRY_RUN_QUANTITY_DECIMALS),
+            # WHERE THE ROW ENDS UP, beside where it starts, so the Held column can
+            # read "7 -> 5.37" instead of making the reader add the signed quantity
+            # to the holding in their head (asked for 2026-09-05).
+            "projected_quantity": round(row.target_quantity, DRY_RUN_QUANTITY_DECIMALS),
             "current_cost_basis": round(row.current_cost_basis, 2),
             "current_value": (None if row.price is None
                               else round(row.current_quantity * row.price, 2)),

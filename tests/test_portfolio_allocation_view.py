@@ -2764,7 +2764,7 @@ def test_the_target_shown_first_is_the_one_the_user_TYPED():
                            unallocated_pct=10.0)[0]
     assert bar.target_pct == 30.0
     assert bar.effective_pct == pytest.approx(27.0)
-    assert bar.target_text == 'tgt 30.0% (real 27.0%)'
+    assert bar.target_text == 'tgt 30.0% (real 27.0% — $2,700.00)'
 
 
 def test_a_zero_reserve_prints_the_target_ONCE_not_twice():
@@ -2772,7 +2772,7 @@ def test_a_zero_reserve_prints_the_target_ONCE_not_twice():
     the common case noisier in order to explain the uncommon one."""
     bar = build_label_bars([_view('A', 4_500.0, 30.0)], base_notional=10_000.0,
                            unallocated_pct=0.0)[0]
-    assert bar.target_text == 'tgt 30.0%'
+    assert bar.target_text == 'tgt 30.0% ($3,000.00)'
     assert 'real' not in bar.target_text
 
 
@@ -2782,7 +2782,7 @@ def test_the_parenthetical_is_the_DERIVED_of_base_figure_not_the_typed_one():
     target."""
     bar = build_label_bars([_view('A', 0.0, 40.0)], base_notional=10_000.0,
                            unallocated_pct=25.0)[0]
-    assert bar.target_text == 'tgt 40.0% (real 30.0%)'
+    assert bar.target_text == 'tgt 40.0% (real 30.0% — $3,000.00)'
 
 
 def test_the_delta_is_the_plain_difference_between_two_numbers_on_ONE_scale():

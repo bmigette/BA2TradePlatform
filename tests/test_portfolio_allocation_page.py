@@ -3646,7 +3646,7 @@ def test_moving_the_reserve_moves_the_notch_and_the_delta(nicegui_client,
 
     # The typed target is still 100% of a pool that is now $5,000 -- which is
     # exactly what is held, so the label lands on target.
-    assert 'tgt 100.0% (real 50.0%)' in ' | '.join(_texts(root))
+    assert 'tgt 100.0% (real 50.0%' in ' | '.join(_texts(root))
     assert 'on target' in _texts(root)
 
 
@@ -4105,7 +4105,8 @@ def test_the_rendered_BAR_carries_the_money_and_the_share_beside_it(nicegui_clie
     assert '$5,000.00' in texts          # B's own money, on its bar row
     assert '$2,500.00' in texts          # A's
     assert '50.0%' in texts and '25.0%' in texts
-    assert 'tgt 60.0%' in texts and 'tgt 40.0%' in texts
+    assert any(t.startswith('tgt 60.0%') for t in texts)
+    assert any(t.startswith('tgt 40.0%') for t in texts)
 
 
 def test_the_rendered_bar_figures_follow_a_label_target_edit(nicegui_client,
@@ -4118,7 +4119,7 @@ def test_the_rendered_bar_figures_follow_a_label_target_edit(nicegui_client,
     _drive_value(_target_box(root, 0), 20.0)
 
     texts = _texts(root)
-    assert 'tgt 20.0%' in texts
+    assert any(t.startswith('tgt 20.0%') for t in texts)
     assert '$2,500.00' in texts       # the holding did not move
     assert '25.0%' in texts
     assert 'over by 5.0pp ($500.00)' in texts   # 25% held against a 20% target
@@ -4183,7 +4184,7 @@ def test_the_money_and_the_percentages_keep_a_consistent_precision(nicegui_clien
     texts = _texts(root)
     assert '$2,500.00' in texts          # money: always two decimals
     assert '25.0%' in texts              # percentages: always one
-    assert 'tgt 40.0%' in texts
+    assert any(t.startswith('tgt 40.0%') for t in texts)
 
 
 def test_choosing_a_colour_retints_the_swatch_beside_the_row(monkeypatch,
@@ -4708,7 +4709,7 @@ def test_the_row_shows_the_typed_target_FIRST_and_the_derived_one_in_brackets(
                    weights={'A': {'AAPL': 100.0}})
     root = _draw(nicegui_client, account_id, views, reserve=10.0)
 
-    assert 'tgt 15.0% (real 13.5%)' in _texts(root)
+    assert any(t.startswith('tgt 15.0% (real 13.5%') for t in _texts(root))
 
 
 def test_a_zero_reserve_row_prints_the_target_once(nicegui_client, account_id):
@@ -4716,7 +4717,7 @@ def test_a_zero_reserve_row_prints_the_target_once(nicegui_client, account_id):
                    weights={'A': {'AAPL': 100.0}})
     texts = _texts(_draw(nicegui_client, account_id, views))
 
-    assert 'tgt 15.0%' in texts
+    assert any(t.startswith('tgt 15.0%') for t in texts)
     assert not any('real' in t for t in texts if t.startswith('tgt'))
 
 

@@ -152,9 +152,23 @@ def _rendered_texts(element) -> list:
 
 
 def _marked_texts(element, marker: str) -> list:
-    """The captions of the elements carrying ``marker``, in document order."""
-    return [d.text for d in element.descendants()
-            if marker in getattr(d, '_markers', [])]
+    """The captions of the elements carrying ``marker``, in document order.
+
+    A marked element may be a CONTAINER rather than a label -- the Held cell became
+    one when it started drawing "held -> projected" with the destination painted by
+    side (2026-09-05) -- so a container contributes its descendants' text joined,
+    which is what the cell reads as on screen.
+    """
+    out = []
+    for d in element.descendants():
+        if marker not in getattr(d, '_markers', []):
+            continue
+        text = getattr(d, 'text', None)
+        if text is None:
+            text = ' '.join(c.text for c in d.descendants()
+                            if getattr(c, 'text', None))
+        out.append(text)
+    return out
 
 
 def _mixed_plan():
@@ -218,7 +232,7 @@ def test_the_dry_run_says_per_symbol_whether_the_order_is_fractional(nicegui_cli
     # one that separates "sized on the fractional grid" from "IS a fractional
     # order" -- it was sized fractionally and landed on exactly 4 shares.
     assert order_kinds == ["whole shares", "fractional", "whole shares",
-                           "whole shares", "no order"]
+                           "whole shares", "no order (fractional)"]
     assert wiz.FRACTIONAL_IS_MARKET_ONLY_NOTE in texts
 
 
@@ -327,8 +341,10 @@ def test_the_dry_run_shows_what_is_held_what_it_cost_and_what_it_is_worth(
     averaging down?" is unanswerable from the dry run."""
     wiz = _open_leverage_wizard(nicegui_client)
 
+    # "held -> projected" wherever the plan moves the quantity, and the bare holding
+    # where it does not (2026-09-05).
     assert _marked_texts(nicegui_client.layout, wiz.MARKER_ROW_HELD) == [
-        "10", "0", "0", "10"]
+        "10 → 20", "0 → 100", "0 → 10", "10 → 5"]
     assert _marked_texts(nicegui_client.layout, wiz.MARKER_ROW_COST) == [
         "1,200.00", "0.00", "0.00", "3,000.00"]
     assert _marked_texts(nicegui_client.layout, wiz.MARKER_ROW_VALUE) == [
@@ -2593,7 +2609,8 @@ def test_the_numeric_columns_are_RIGHT_ALIGNED_in_the_header_AND_the_cells(
     for numeric in ('Held', 'Cost', 'Value', 'Qty', 'Est. value', 'Target',
                     'BP effect', 'BP %'):
         assert 'text-right' in headers[numeric], numeric
-    for textual in ('Symbol', 'Side', 'Order', 'Sizing', 'Outcome', 'Reasons'):
+    # 'Sizing' and 'Outcome' were folded into 'Order' and 'Reasons' (2026-09-05).
+    for textual in ('Symbol', 'Side', 'Order', 'Reasons'):
         assert 'text-right' not in headers[textual], textual
     # ...and the CELLS carry exactly the header's classes, because both read the
     # same column spec.
@@ -2608,7 +2625,10 @@ def test_the_header_and_the_cells_cannot_DRIFT_out_of_step():
     wiz = _wiz()
     names = [name for name, _h, _w, _n in wiz.DRY_RUN_COLUMNS]
 
-    assert len(names) == len(set(names)) == 18
+    # 16 since 2026-09-05: Order and Sizing collapsed into one column (they said
+    # the same word on every trading row) and Outcome was removed, its abnormal
+    # values moving into Reasons in red.
+    assert len(names) == len(set(names)) == 16
     with pytest.raises(KeyError):
         wiz._col('a-column-the-header-does-not-declare')
 

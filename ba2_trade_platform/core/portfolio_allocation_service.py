@@ -565,6 +565,77 @@ def _record_order_ids(on_order_id, order_ids) -> None:
                          f"run: {e}", exc_info=True)
 
 
+#: THE LIVE-RUN AUDIT TRAIL. Everything below is INFO and unconditional.
+#:
+#: The dry run is a screen, and a screen is gone the moment the dialog closes -- so
+#: when a live submission goes wrong the only durable record was an ActivityLog row
+#: carrying counts ("3 submitted, 1 failed"), which says nothing about WHICH row, at
+#: what quantity, against what price, or what the broker answered. These lines make a
+#: run reconstructable from the log file alone, keyed on ``run_tag`` so one grep
+#: recovers the whole run:
+#:
+#:     grep 'alloc[<run_tag>]' <db folder>/logs/*.log
+#:
+#: Deliberately NOT debug: a live order is a rare, consequential event, and a log
+#: level that has to be turned on in advance is one nobody had on when it mattered.
+_AUDIT = "alloc[{run_tag}]"
+
+
+def log_plan_snapshot(plan: AllocationPlan, *, run_tag: str, account_id: Any,
+                      mode: str = "", scope_label: str = "") -> None:
+    # ``mode`` is the VALUATION mode and ``scope_label`` the allocation basis; both are
+    # on the plan, so the line describes the plan that was solved rather than what a
+    # caller believed it had asked for.
+    """Write the plan as SOLVED, immediately before the first order leaves.
+
+    One header carrying the money the plan was measured against, then one line per
+    ACTIONABLE row. Suppressed and skipped rows are counted in the header rather than
+    listed: a 200-symbol book would otherwise bury the dozen rows that trade.
+
+    Never raises. Instrumentation that can break a submission is worse than none.
+    """
+    try:
+        tag = _AUDIT.format(run_tag=run_tag)
+        buys, sells = plan.buy_rows, plan.sell_rows
+        actionable = list(sells) + list(buys)
+        logger.info(
+            f"{tag} PLAN account={account_id} valuation={mode or '?'} "
+            f"basis={scope_label or '-'} rows={len(plan.rows)} "
+            f"buys={len(buys)} sells={len(sells)} "
+            f"skipped={len(plan.rows) - len(actionable)} "
+            f"base={plan.base_notional:,.2f} bp={plan.available_buying_power:,.2f} "
+            f"scale={plan.scale_factor:.4f} fractional={plan.allow_fractional} "
+            f"buy_value={sum(r.estimated_value for r in buys):,.2f} "
+            f"sell_value={sum(r.estimated_value for r in sells):,.2f} "
+            f"bp_required={sum(r.bp_cost for r in buys):,.2f}")
+        for row in actionable:
+            side = getattr(row.side, 'value', row.side)
+            logger.info(
+                f"{tag} ROW {row.symbol} {side} qty={row.delta_quantity:g} "
+                f"@{row.price if row.price is None else f'{row.price:,.4f}'} "
+                f"held={row.current_quantity:g}->{row.target_quantity:g} "
+                f"est={row.estimated_value:,.2f} target={row.target_notional:,.2f} "
+                f"bp_cost={row.bp_cost:,.2f} bp_factor={row.bp_factor:g} "
+                f"src={row.margin_source} outcome={row.sizing_outcome} "
+                f"labels={'/'.join(row.labels)} "
+                f"reasons={'; '.join(row.reasons) or '-'}")
+    except Exception as e:  # noqa: BLE001 -- never let the audit trail stop a run
+        logger.warning(f"Allocation: could not log the plan snapshot: {e}")
+
+
+def log_row_outcome(outcome: "RowOutcome", *, run_tag: str) -> None:
+    """What the broker actually did with one row. Never raises."""
+    try:
+        logger.info(
+            f"{_AUDIT.format(run_tag=run_tag)} DONE {outcome.symbol} "
+            f"action={outcome.action} status={outcome.status} "
+            f"orders={_txn_id_list(outcome.order_ids) or '-'} "
+            f"msg={outcome.message or '-'}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Allocation: could not log the outcome for "
+                       f"{getattr(outcome, 'symbol', '?')}: {e}")
+
+
 def submit_plan(account, plan: AllocationPlan, current: Dict[str, PositionState],
                 *, run_tag: str, allow_fractional: bool,
                 on_order_id=_noop_order_id) -> List[RowOutcome]:
@@ -614,15 +685,26 @@ def submit_plan(account, plan: AllocationPlan, current: Dict[str, PositionState]
         )
 
     outcomes: List[RowOutcome] = []
+    # BEFORE the first order: if the run dies mid-way, the log still says exactly what
+    # was about to be sent.
+    log_plan_snapshot(plan, run_tag=run_tag, account_id=getattr(account, 'id', '?'),
+                      mode=plan.valuation_mode, scope_label=plan.allocation_basis)
 
+    # SELLS FIRST, and the log shows it: they free the buying power the buys are
+    # sized against, so a buy that fails after a sell that did not is a different
+    # story from one that failed on its own.
     for row in plan.sell_rows:
-        outcomes.append(_submit_row(account, row, current.get(row.symbol),
-                                    run_tag=run_tag, allow_fractional=allow_fractional,
-                                    on_order_id=on_order_id))
+        outcome = _submit_row(account, row, current.get(row.symbol),
+                              run_tag=run_tag, allow_fractional=allow_fractional,
+                              on_order_id=on_order_id)
+        log_row_outcome(outcome, run_tag=run_tag)
+        outcomes.append(outcome)
     for row in plan.buy_rows:
-        outcomes.append(_submit_row(account, row, current.get(row.symbol),
-                                    run_tag=run_tag, allow_fractional=allow_fractional,
-                                    on_order_id=on_order_id))
+        outcome = _submit_row(account, row, current.get(row.symbol),
+                              run_tag=run_tag, allow_fractional=allow_fractional,
+                              on_order_id=on_order_id)
+        log_row_outcome(outcome, run_tag=run_tag)
+        outcomes.append(outcome)
 
     traded = {o.symbol for o in outcomes}
     for row in plan.rows:

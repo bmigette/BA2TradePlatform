@@ -1449,6 +1449,14 @@ ALLOCATION_BAR_LEGEND = 'Allocated — the reserve is the gap at the end'
 #: line both render it, so they cannot disagree about which figure leads.
 TARGET_PAIR_FMT = '{target_pct:.1f}%'
 TARGET_PAIR_WITH_REAL_FMT = '{target_pct:.1f}% (real {effective_pct:.1f}%)'
+#: The same pair with the MONEY the real share comes to. Asked for from live use
+#: (2026-09-05): "real 4.5%" is the share of the gross base left after the reserve, and
+#: a share is only actionable once you know what it buys. The money is the target's, so
+#: it belongs beside the target and not in a tooltip nobody opens while comparing rows.
+TARGET_PAIR_WITH_REAL_MONEY_FMT = (
+    '{target_pct:.1f}% (real {effective_pct:.1f}% — ${target_value:,.2f})')
+#: With no reserve the two percentages coincide, so only the money is added.
+TARGET_PAIR_WITH_MONEY_FMT = '{target_pct:.1f}% (${target_value:,.2f})'
 #: The row cell's prefix. Split out so the header can reuse the pair without
 #: swallowing a "tgt" in the middle of a sentence.
 TARGET_CELL_PREFIX = 'tgt '
@@ -1553,7 +1561,8 @@ RESERVE_CAPTION_NO_BASE = ('no base notional yet — the broker published no buy
                            'power, so this reserve has no dollar figure')
 
 
-def format_target_pair(target_pct: float, unallocated_pct: float) -> str:
+def format_target_pair(target_pct: float, unallocated_pct: float,
+                       target_value: Optional[float] = None) -> str:
     """``30.0%`` or ``30.0% (real 27.0%)``. THE one place the pair is spelled. Pure.
 
     What the user TYPED leads -- "put something like 15% (real 13.5%) so we know" --
@@ -1568,9 +1577,19 @@ def format_target_pair(target_pct: float, unallocated_pct: float) -> str:
     """
     target = float(target_pct or 0.0)
     effective = effective_target_pct(target, unallocated_pct)
-    if abs(effective - target) < 0.05:      # under the 1dp both are printed at
-        return TARGET_PAIR_FMT.format(target_pct=target)
-    return TARGET_PAIR_WITH_REAL_FMT.format(target_pct=target, effective_pct=effective)
+    # ``target_value is None`` is "no base to price it against", which is a real state
+    # (the broker published no buying power) and NOT zero money -- so the money clause
+    # is omitted entirely rather than printed as $0.00.
+    same = abs(effective - target) < 0.05   # under the 1dp both are printed at
+    if target_value is None:
+        return (TARGET_PAIR_FMT.format(target_pct=target) if same
+                else TARGET_PAIR_WITH_REAL_FMT.format(target_pct=target,
+                                                      effective_pct=effective))
+    if same:
+        return TARGET_PAIR_WITH_MONEY_FMT.format(target_pct=target,
+                                                 target_value=float(target_value))
+    return TARGET_PAIR_WITH_REAL_MONEY_FMT.format(
+        target_pct=target, effective_pct=effective, target_value=float(target_value))
 
 
 def format_label_header(*, label: str, current_value: float, target_pct: float,
@@ -2930,7 +2949,8 @@ def build_label_bars(views, *, base_notional: Optional[float],
             status=status,
             current_text=(LABEL_CURRENT_UNKNOWN if share is None
                           else LABEL_CURRENT_FMT.format(pct=share)),
-            target_text=TARGET_CELL_PREFIX + format_target_pair(target, unallocated_pct),
+            target_text=TARGET_CELL_PREFIX + format_target_pair(
+                target, unallocated_pct, target_value),
             delta_text=format_label_delta(status=status, delta_pct=delta_pct,
                                           delta_value=delta_value),
             previous_target_pct=view.previous_target_pct,

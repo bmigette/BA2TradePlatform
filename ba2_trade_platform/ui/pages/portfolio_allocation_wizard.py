@@ -78,6 +78,7 @@ from ...core.portfolio_allocation import (
     LEVERAGE_PENALISED,
     LEVERAGE_UNKNOWN,
     MONEY_EPSILON,
+    QUANTITY_EPSILON,
     VALUATION_MODE_MARKET,
     AllocationPlan,
     BaseSnapshot,
@@ -523,9 +524,13 @@ DRY_RUN_COLUMNS = (
     ('value', 'Value', 'w-24', True),
     ('side', 'Side', 'w-16', False),
     ('qty', 'Qty', 'w-24', True),
-    ('order', 'Order', 'w-24', False),
-    ('sizing', 'Sizing', 'w-20', False),
-    ('outcome', 'Outcome', 'w-28', False),
+    # ONE column, not three. ``Order`` and ``Sizing`` said the same word on every
+    # row that traded ('fractional'/'fractional'), and differed only where the row
+    # did NOT trade -- which is where the grid is the explanation, so that case now
+    # reads "no order (whole)". ``Outcome`` was 'normal' on every healthy row and is
+    # gone: an abnormal sizing outcome is a REASON, and now appears in that column
+    # in red beside the reason it caused (2026-09-05).
+    ('order', 'Order', 'w-32', False),
     ('estimated_value', 'Est. value', 'w-24', True),
     ('target', 'Target', 'w-24', True),
     ('projected', 'Projected ({mode})', 'w-32', True),
@@ -631,7 +636,7 @@ def _label(text: str, classes: str = '', *, color: Optional[str] = None):
     return _paint(ui.label(text), classes, color=color)
 
 
-def _reasons_cell(text: str, classes: str):
+def _reasons_cell(text: str, classes: str, *, alert: str = ""):
     """A Reasons cell: WRAPPED, clamped, and with the whole text one hover away.
 
     THE ONE DOOR for the free-text column, used by both tables in this dialog --
@@ -645,6 +650,18 @@ def _reasons_cell(text: str, classes: str):
     NO TOOLTIP ON AN EMPTY CELL. Most rows on a healthy plan have no reason at
     all, and a tooltip that opens onto nothing is worse than none.
     """
+    if alert:
+        # A ROW, so the alert can carry its own colour: ``_paint`` sets one inline
+        # colour per element, so a red fragment inside a grey cell has to be its own
+        # element. The tooltip below still carries both halves as one sentence.
+        with ui.row().classes(classes).style(REASONS_CELL_STYLE) as cell:
+            _paint(ui.label(alert), 'text-xs text-red-400 font-medium')
+            if text:
+                _paint(ui.label(text), 'text-xs')
+        cell.mark(MARKER_ROW_REASONS)
+        with cell:
+            ui.tooltip(f"{alert} — {text}" if text else alert)
+        return cell
     cell = _paint(ui.label(text), classes).mark(MARKER_ROW_REASONS)
     # MERGED, not replaced: ``_paint`` has already put the inline colour on this
     # element and NiceGUI's ``style()`` adds to what is there.
@@ -653,6 +670,77 @@ def _reasons_cell(text: str, classes: str):
         with cell:
             ui.tooltip(text)
     return cell
+
+
+#: The sizing outcome that needs no telling: the row was sized by the ordinary grid
+#: rules. Every other value is a deviation the reader has to know about.
+OUTCOME_NORMAL = 'normal'
+
+
+def _render_held(row: Dict) -> None:
+    """The Held cell: ``7`` unchanged, or ``7 → 5.3673`` with the DESTINATION painted
+    green for a buy and red for a sell.
+
+    The colour goes on the projected half only. Both halves painted would say nothing
+    (the row already has a Side column); the arrow's head is the number that is about
+    to become true, and its colour is the same green/red vocabulary the Side and BP
+    effect columns already use, so the row reads consistently across.
+    """
+    held = row['current_quantity']
+    projected = row.get('projected_quantity')
+    if projected is None or abs(float(projected) - float(held)) <= QUANTITY_EPSILON:
+        _label(_shares(held), _col('held', 'text-gray-400')).mark(MARKER_ROW_HELD)
+        return
+    side = row['side']
+    colour = ('text-green-500' if side == 'BUY'
+              else 'text-red-500' if side == 'SELL' else 'text-gray-400')
+    with ui.row().classes(_col('held')).style('gap:4px') as cell:
+        _paint(ui.label(f"{_shares(held)} →"), 'text-gray-400')
+        _paint(ui.label(_shares(projected)), colour + ' font-medium')
+    cell.mark(MARKER_ROW_HELD)
+
+
+def _order_kind(row: Dict) -> Tuple[str, str]:
+    """The single Order cell: what will be sent, and the grid it was sized on. Pure.
+
+    ``Order`` and ``Sizing`` used to be two columns that printed the same word on
+    every row that traded. The grid is only news when the row did NOT trade -- it is
+    then the whole explanation ("1.43 shares became 0.93 and there is no such thing as
+    0.93 of this symbol") -- so it is appended in exactly that case and nowhere else.
+    """
+    if row['suppressed']:
+        return f"no order ({row['sizing']})", 'text-orange-400'
+    if row['fractional']:
+        return 'fractional', 'text-blue-400'
+    return 'whole shares', 'text-gray-400'
+
+
+def _outcome_alert(row: Dict) -> str:
+    """The sizing outcome, when it is worth saying. ``''`` on an ordinary row.
+
+    Replaces the Outcome COLUMN, which read 'normal' on every healthy row and so
+    spent a column of a fourteen-column table saying nothing. A deviation -- a bump,
+    a bump the scaler took back, a row too large to size -- is a reason, belongs with
+    the reasons, and is painted red there because it is the one thing in that cell
+    the user did not ask for.
+    """
+    outcome = row.get('outcome') or OUTCOME_NORMAL
+    return '' if outcome == OUTCOME_NORMAL else str(outcome)
+
+
+def _held_text(row: Dict) -> str:
+    """The Held cell: ``7`` when nothing changes, ``7 → 5.37`` when it does. Pure.
+
+    The projected side is the row's own ``target_quantity``, not ``current + delta``
+    re-added here: the two would be the same number computed twice, and the one place
+    they could disagree -- a row the scaler or a precheck cut back after the delta was
+    set -- is exactly the row a reader is checking.
+    """
+    held = row['current_quantity']
+    projected = row.get('projected_quantity')
+    if projected is None or abs(float(projected) - float(held)) <= QUANTITY_EPSILON:
+        return _shares(held)
+    return f"{_shares(held)} → {_shares(projected)}"
 
 
 def _leverage_cell(row: Dict) -> Tuple[str, str, str]:
@@ -1297,8 +1385,6 @@ class AllocationWizard:
                 ui.label('').classes(_col('side'))
                 ui.label('').classes(_col('qty'))
                 ui.label('').classes(_col('order'))
-                ui.label('').classes(_col('sizing'))
-                ui.label('').classes(_col('outcome'))
                 with ui.column().classes(_col('estimated_value', 'gap-0 leading-tight')):
                     _label(f"B {buys:,.2f}", 'text-green-500 text-xs')
                     _label(f"S {sells:,.2f}", 'text-red-500 text-xs')
@@ -1394,8 +1480,10 @@ class AllocationWizard:
             checkbox.set_enabled(not blocked)
             ui.label(row['symbol']).classes(_col('symbol', 'font-medium'))
             # THE BASIS THIS ROW IS TRADING AGAINST.
-            _label(_shares(row['current_quantity']),
-                   _col('held', 'text-gray-400')).mark(MARKER_ROW_HELD)
+            # "held -> projected", and ONLY when they differ: a row that trades
+            # nothing would otherwise print "0 -> 0", which is noise on the majority
+            # of rows in a plan that mostly leaves things alone.
+            _render_held(row)
             _label(f"{row['current_cost_basis']:,.2f}",
                    _col('cost', 'text-gray-400')).mark(MARKER_ROW_COST)
             value = row['current_value']
@@ -1409,26 +1497,9 @@ class AllocationWizard:
                 'side', 'text-green-500' if row['side'] == 'BUY'
                 else 'text-red-500' if row['side'] == 'SELL' else 'text-gray-400'))
             ui.label(_shares(row['quantity'])).classes(_col('qty'))
-            if row['suppressed']:
-                order_kind, order_class = 'no order', 'text-orange-400'
-            elif row['fractional']:
-                order_kind, order_class = 'fractional', 'text-blue-400'
-            else:
-                order_kind, order_class = 'whole shares', 'text-gray-400'
+            order_kind, order_class = _order_kind(row)
             _label(order_kind, _col('order', 'text-xs ' + order_class)) \
                 .mark(MARKER_ORDER_KIND)
-            # The GRID the row was sized on, which is the column to scan when a
-            # quarter of the book cannot trade fractionally at all.
-            _label(row['sizing'], _col(
-                'sizing', 'text-xs ' + ('text-blue-400'
-                                        if row['sizing'] == 'fractional'
-                                        else 'text-orange-400')))
-            # WHICH RULE produced the quantity. A bumped row holds MORE than the
-            # weights asked for, and that must never be silent.
-            _label(row['outcome'], _col(
-                'outcome', 'text-xs ' + ('text-orange-400'
-                                         if row['outcome'] != 'normal'
-                                         else 'text-gray-400')))
             ui.label(f"{row['estimated_value']:,.2f}").classes(_col('estimated_value'))
             ui.label(f"{row['target_notional']:,.2f}").classes(_col('target'))
             projected = row['projected_notional']
@@ -1459,9 +1530,12 @@ class AllocationWizard:
                     .mark(MARKER_LEVERAGE):
                 ui.tooltip(tip)
             ui.label(f"{row['bp_usage_pct']:.1f}%").classes(_col('bp_pct'))
+            # An abnormal sizing outcome is a REASON and is drawn RED at the front
+            # of that column; the rest of the reasons keep their own colour.
             _reasons_cell(row['reasons'], _col(
                 'reasons', 'text-xs ' + ('text-orange-400' if row['suppressed']
-                                         else 'text-gray-400')))
+                                         else 'text-gray-400')),
+                          alert=_outcome_alert(row))
 
     @staticmethod
     def _render_bp_effect(row: Dict):
