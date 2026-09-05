@@ -58,6 +58,7 @@ behind an unopened tab has not been shown. See the block comment above
 It stays MODAL. A commit gate for real orders should be a deliberate stop, not
 something reachable by scrolling.
 """
+import asyncio
 from typing import Callable, Dict, List, Optional, Tuple
 
 from nicegui import ui
@@ -857,6 +858,12 @@ class AllocationWizard:
         self._footer_container = None
         self._submit_button = None
         self._submit_tooltip = None
+        self._validate_button = None
+        #: True while a validation is in flight. The broker work now runs in a
+        #: thread, so the dialog stays responsive -- which means the button is
+        #: still there to be clicked a second time, and two concurrent margin
+        #: sweeps would race each other's verdict into the same container.
+        self._validating = False
         #: One-shot latch. See ``_submit``: NiceGUI runs a sync click handler
         #: directly on the event loop, so the dialog stays on screen -- and
         #: clickable -- for the whole of a blocking submit.
@@ -936,9 +943,10 @@ class AllocationWizard:
                 # own dry run where it has one, the locally knowable rejections
                 # everywhere else. Never sends an order.
                 if self.on_validate is not None:
-                    ui.button(VALIDATE_BUTTON_LABEL, on_click=self._validate) \
-                        .props('outline').mark(MARKER_VALIDATE_BUTTON) \
-                        .tooltip(VALIDATE_TOOLTIP)
+                    self._validate_button = \
+                        ui.button(VALIDATE_BUTTON_LABEL, on_click=self._validate) \
+                        .props('outline').mark(MARKER_VALIDATE_BUTTON)
+                    self._validate_button.tooltip(VALIDATE_TOOLTIP)
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 self._submit_button = ui.button('Submit', on_click=self._submit) \
                     .props('color=primary')
@@ -1687,7 +1695,7 @@ class AllocationWizard:
             if required > budget:
                 _label(BP_OVER_BUDGET_NOTE, f'{TOTALS_NOTE_CLASSES} text-orange-400')
 
-    def _validate(self):
+    async def _validate(self):
         """Test the TICKED orders against the broker, and offer to drop the bad ones.
 
         Sends nothing. ``on_validate`` re-reads the broker's per-symbol facts and
@@ -1699,22 +1707,47 @@ class AllocationWizard:
         user has already un-ticked would report problems with orders that are not
         going to be sent, and the drop button would then have nothing to drop.
 
+        ASYNC, AND THE BROKER CALL GOES TO A THREAD. ``on_validate`` re-reads margin
+        for every symbol in the plan -- on Alpaca that is a REST round trip per
+        symbol -- and a sync click handler runs directly on the event loop, so
+        NOTHING reaches the browser until it returns (the same fact ``_submit``
+        documents at length). On a 40-row plan that outlasted the websocket
+        heartbeat: the page reported "Connection lost. Trying to reconnect...", and
+        the reconnect re-rendered the page and took the dialog with it -- reported
+        as "clicking validate hangs the UI and eventually closes the dry run
+        dialog". The work is unchanged; it just no longer runs where the heartbeat
+        lives.
+
         The verdict panel is REPLACED on every press and cleared by ``_refresh``:
         a validation describes one exact set of orders, and a re-solve makes it a
         statement about a plan that no longer exists.
         """
         if self.on_validate is None or self._validation_container is None:
             return
+        if self._validating:
+            return
         selected_plan = filter_plan_rows(self.plan, sorted(self.selected))
         if not selected_plan.rows:
             ui.notify('Nothing selected to validate', type='warning')
             return
+        # The button says what it is doing and refuses a second press while it
+        # does it: the call takes tens of seconds against a live broker, and until
+        # this ran off the event loop there was nothing on screen to say so.
+        button, self._validating = self._validate_button, True
+        if button is not None:
+            button.props('loading')
+            button.disable()
         try:
-            report = self.on_validate(selected_plan)
+            report = await asyncio.to_thread(self.on_validate, selected_plan)
         except Exception as e:
             logger.error(f"Allocation validation failed: {e}", exc_info=True)
             ui.notify(f'Validation failed: {e}', type='negative')
             return
+        finally:
+            self._validating = False
+            if button is not None:
+                button.props(remove='loading')
+                button.enable()
         self._render_validation(report, checked=len(selected_plan.rows))
 
     def _render_validation(self, report: Dict, *, checked: int):
@@ -1780,7 +1813,7 @@ class AllocationWizard:
         self._render_table_footer()
         self._render_totals()
 
-    def _refresh(self, allow_fractional: bool):
+    async def _refresh(self, allow_fractional: bool):
         """Re-solve, and re-read the CLOCK with it.
 
         ``on_refresh`` returns ``(plan, market)`` from ONE solve, which is the same
@@ -1792,10 +1825,16 @@ class AllocationWizard:
         A refresh that RAISES changes nothing at all -- not the plan, not the gate.
         Unlocking Submit because the clock could not be re-read would be exactly
         backwards.
+
+        OFF THE EVENT LOOP, for the reason spelled out in ``_validate``: ``on_refresh``
+        re-reads positions, quotes and the clock and then solves the whole plan again.
+        Run inline it blocks every browser this server is serving, and past the
+        websocket heartbeat it costs the user the dialog.
         """
         self.allow_fractional = allow_fractional
         try:
-            self.plan, self.market = self.on_refresh(allow_fractional)
+            self.plan, self.market = await asyncio.to_thread(
+                self.on_refresh, allow_fractional)
         except Exception as e:
             logger.error(f"Allocation dry-run refresh failed: {e}", exc_info=True)
             ui.notify(f'Refresh failed: {e}', type='negative')

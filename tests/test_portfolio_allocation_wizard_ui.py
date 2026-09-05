@@ -34,6 +34,39 @@ from ba2_trade_platform.core.portfolio_allocation import (
 from ba2_trade_platform.core.types import OrderDirection
 
 
+def _run(coro):
+    """Run one of the wizard's async click handlers to completion.
+
+    ``_validate`` and ``_refresh`` are async because their broker call goes to a
+    thread -- run inline on the event loop they outlived the websocket heartbeat
+    and cost the user the dialog. Called from a sync test the coroutine would
+    never start, and every assertion after it would pass on an unchanged page.
+
+    THE SLOT IS RE-ENTERED INSIDE THE NEW TASK, which is not ceremony: NiceGUI
+    keys its slot stack on the current TASK (``context.slot``), so a coroutine run
+    by ``asyncio.run`` starts with an empty one and a bare ``ui.notify`` raises
+    "the slot stack for this task is empty". That is exactly what
+    ``events.handle_event`` does for a real click
+    (``_await_and_handle_in_context``), so running it any other way here would
+    test a context the browser never produces.
+    """
+    import asyncio
+    from contextlib import nullcontext
+
+    from nicegui import context
+
+    try:
+        slot = context.slot
+    except RuntimeError:
+        slot = nullcontext()
+
+    async def _in_slot():
+        with slot:
+            return await coro
+
+    return asyncio.run(_in_slot())
+
+
 def test_wizard_module_imports_and_exposes_its_entry_points():
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
@@ -680,7 +713,7 @@ def test_a_failing_refresh_keeps_the_previous_plan(nicegui_client):
         wizard = wiz.AllocationWizard(_base(), original, market=_open_market(), on_refresh=_boom,
                                       on_submit=lambda p: None)
         wizard.open()
-        wizard._refresh(True)
+        _run(wizard._refresh(True))
 
     assert wizard.plan is original
     assert wizard.selected == {"AAPL", "FRAC", "ONGRID", "MSFT"}
@@ -1557,7 +1590,7 @@ def test_a_refresh_that_returns_only_a_plan_is_refused_not_half_applied(nicegui_
                                       on_refresh=lambda f: _mixed_plan(),
                                       on_submit=lambda p: None)
         wizard.open()
-        wizard._refresh(wizard.allow_fractional)
+        _run(wizard._refresh(wizard.allow_fractional))
 
     assert wizard.plan is original
     assert wizard.market.allowed is False
@@ -1576,7 +1609,7 @@ def test_refreshing_after_the_bell_re_enables_submit_and_drops_the_banner(nicegu
         assert wizard._submit_button.enabled is False
         assert len(_marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER)) == 1
 
-        wizard._refresh(wizard.allow_fractional)
+        _run(wizard._refresh(wizard.allow_fractional))
 
         assert wizard.market.allowed is True
         assert wizard._submit_button.enabled is True
@@ -1595,7 +1628,7 @@ def test_refreshing_after_the_close_disables_submit_and_raises_the_banner(nicegu
         wizard.open()
         assert wizard._submit_button.enabled is True
 
-        wizard._refresh(wizard.allow_fractional)
+        _run(wizard._refresh(wizard.allow_fractional))
 
         assert wizard.market.allowed is False
         assert wizard._submit_button.enabled is False
@@ -1616,7 +1649,7 @@ def test_a_refresh_that_closed_the_market_also_refuses_the_next_submit(nicegui_c
             on_refresh=lambda f: (_mixed_plan(), _closed_market()),
             on_submit=submitted.append)
         wizard.open()
-        wizard._refresh(wizard.allow_fractional)
+        _run(wizard._refresh(wizard.allow_fractional))
         wizard._submit()
 
     assert submitted == []
@@ -1634,7 +1667,7 @@ def test_a_failed_refresh_leaves_the_gate_exactly_where_it_was(nicegui_client):
         wizard = wiz.AllocationWizard(_base(), _mixed_plan(), market=_closed_market(),
                                       on_refresh=_boom, on_submit=lambda p: None)
         wizard.open()
-        wizard._refresh(wizard.allow_fractional)
+        _run(wizard._refresh(wizard.allow_fractional))
 
     assert wizard.market.allowed is False
     assert wizard._submit_button.enabled is False
@@ -1682,7 +1715,7 @@ def test_refreshing_onto_a_fallback_open_raises_the_caveat_that_was_not_there(
         wizard.open()
         assert _marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER) == []
 
-        wizard._refresh(wizard.allow_fractional)
+        _run(wizard._refresh(wizard.allow_fractional))
 
         drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER)
     assert len(drawn) == 1
@@ -2378,7 +2411,7 @@ def test_the_plan_warnings_are_REDRAWN_by_refresh(nicegui_client):
             on_refresh=lambda f: (second, _open_market()),
             on_submit=lambda p: None)
         wizard.open()
-        wizard._refresh(False)
+        _run(wizard._refresh(False))
         lines = _marked_texts(nicegui_client.layout, wiz.MARKER_PLAN_WARNING)
 
     assert len(lines) == 1
@@ -2777,7 +2810,7 @@ def test_a_target_block_that_clears_on_refresh_re_enables_submit(nicegui_client)
         wizard.open()
         assert wizard._submit_button.enabled is False
 
-        wizard._refresh(False)
+        _run(wizard._refresh(False))
         drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_TARGET_BLOCK)
 
     assert drawn == []

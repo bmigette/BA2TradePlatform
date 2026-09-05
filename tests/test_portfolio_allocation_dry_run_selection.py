@@ -30,6 +30,39 @@ from ba2_trade_platform.core.portfolio_allocation import (
 from ba2_trade_platform.core.types import OrderDirection
 
 
+def _run(coro):
+    """Run one of the wizard's async click handlers to completion.
+
+    ``_validate`` and ``_refresh`` are async because their broker call goes to a
+    thread -- run inline on the event loop they outlived the websocket heartbeat
+    and cost the user the dialog. Called from a sync test the coroutine would
+    never start, and every assertion after it would pass on an unchanged page.
+
+    THE SLOT IS RE-ENTERED INSIDE THE NEW TASK, which is not ceremony: NiceGUI
+    keys its slot stack on the current TASK (``context.slot``), so a coroutine run
+    by ``asyncio.run`` starts with an empty one and a bare ``ui.notify`` raises
+    "the slot stack for this task is empty". That is exactly what
+    ``events.handle_event`` does for a real click
+    (``_await_and_handle_in_context``), so running it any other way here would
+    test a context the browser never produces.
+    """
+    import asyncio
+    from contextlib import nullcontext
+
+    from nicegui import context
+
+    try:
+        slot = context.slot
+    except RuntimeError:
+        slot = nullcontext()
+
+    async def _in_slot():
+        with slot:
+            return await coro
+
+    return asyncio.run(_in_slot())
+
+
 # ---------------------------------------------------------------------------
 # fixtures
 # ---------------------------------------------------------------------------
@@ -269,7 +302,7 @@ def test_the_footer_and_the_toolbar_are_rebuilt_not_stacked_on_refresh(nicegui_c
             on_refresh=lambda f: (_labelled_plan(), _open_market()),
             on_submit=lambda p: None)
         wizard.open()
-        wizard._refresh(True)
+        _run(wizard._refresh(True))
         root = nicegui_client.layout
         foots = _marked(root, wiz.MARKER_TABLE_FOOT)
         selects = _buttons_marked(root, wiz.MARKER_SELECT_ALL)

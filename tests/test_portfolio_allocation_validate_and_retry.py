@@ -22,6 +22,39 @@ from ba2_trade_platform.core.portfolio_allocation import (
 from ba2_trade_platform.core.types import OrderDirection
 
 
+def _run(coro):
+    """Run one of the wizard's async click handlers to completion.
+
+    ``_validate`` and ``_refresh`` are async because their broker call goes to a
+    thread -- run inline on the event loop they outlived the websocket heartbeat
+    and cost the user the dialog. Called from a sync test the coroutine would
+    never start, and every assertion after it would pass on an unchanged page.
+
+    THE SLOT IS RE-ENTERED INSIDE THE NEW TASK, which is not ceremony: NiceGUI
+    keys its slot stack on the current TASK (``context.slot``), so a coroutine run
+    by ``asyncio.run`` starts with an empty one and a bare ``ui.notify`` raises
+    "the slot stack for this task is empty". That is exactly what
+    ``events.handle_event`` does for a real click
+    (``_await_and_handle_in_context``), so running it any other way here would
+    test a context the browser never produces.
+    """
+    import asyncio
+    from contextlib import nullcontext
+
+    from nicegui import context
+
+    try:
+        slot = context.slot
+    except RuntimeError:
+        slot = nullcontext()
+
+    async def _in_slot():
+        with slot:
+            return await coro
+
+    return asyncio.run(_in_slot())
+
+
 class _Account:
     """The two seams ``validate_plan`` uses, and nothing else.
 
@@ -267,12 +300,92 @@ def test_a_wizard_with_no_validator_draws_no_validate_button(nicegui_client):
     assert buttons == []
 
 
+# -- off the event loop ------------------------------------------------------
+#
+# "Clicking validate here is hanging ui and eventually close the dry run dialog".
+# ``on_validate`` re-reads margin for every symbol in the plan -- on Alpaca a REST
+# round trip each -- and NiceGUI runs a sync click handler directly on the event
+# loop, so nothing reaches the browser until it returns. On a 40-row plan that
+# outlasted the websocket heartbeat, and the reconnect took the dialog with it.
+
+
+def test_the_broker_call_does_not_run_on_the_EVENT_LOOP(nicegui_client):
+    """The fix, pinned where it can be seen: the callback runs on a worker thread.
+
+    Asserting the handler is merely ``async`` would not catch the regression --
+    an async handler that awaits nothing blocks the loop exactly as hard.
+    """
+    import threading
+    seen = {}
+
+    def _slow_broker_call(_selected):
+        seen['main_thread'] = threading.current_thread() is threading.main_thread()
+        return {'findings': [], 'symbols': [], 'budget': None, 'prechecked': 0,
+                'buy_rows': 2}
+
+    with nicegui_client:
+        wiz = _wiz()
+        wizard = wiz.AllocationWizard(
+            _base(), _two_row_plan(), market=_open_market(),
+            on_refresh=lambda f: pytest.fail("refresh not expected"),
+            on_submit=lambda p: None, on_validate=_slow_broker_call)
+        wizard.open()
+        _run(wizard._validate())
+
+    assert seen['main_thread'] is False
+
+
+def test_the_RESOLVE_does_not_run_on_the_event_loop_either(nicegui_client):
+    """Same defect, same dialog: Refresh re-reads positions and quotes and solves
+    the whole plan again."""
+    import threading
+    seen = {}
+
+    def _slow_resolve(_allow_fractional):
+        seen['main_thread'] = threading.current_thread() is threading.main_thread()
+        return _two_row_plan(), _open_market()
+
+    with nicegui_client:
+        wiz = _wiz()
+        wizard = wiz.AllocationWizard(
+            _base(), _two_row_plan(), market=_open_market(),
+            on_refresh=_slow_resolve, on_submit=lambda p: None)
+        wizard.open()
+        _run(wizard._refresh(False))
+
+    assert seen['main_thread'] is False
+
+
+def test_a_second_click_while_a_validation_is_in_flight_is_ignored(nicegui_client):
+    """Running the broker call off the loop keeps the dialog RESPONSIVE, which
+    means the button is still there to be pressed again -- and two concurrent
+    margin sweeps would race their verdicts into the same container."""
+    calls = []
+
+    def _on_validate(_selected):
+        calls.append(1)
+        return {'findings': [], 'symbols': [], 'budget': None, 'prechecked': 0,
+                'buy_rows': 2}
+
+    with nicegui_client:
+        wiz = _wiz()
+        wizard = wiz.AllocationWizard(
+            _base(), _two_row_plan(), market=_open_market(),
+            on_refresh=lambda f: pytest.fail("refresh not expected"),
+            on_submit=lambda p: None, on_validate=_on_validate)
+        wizard.open()
+        wizard._validating = True          # as the in-flight press leaves it
+        _run(wizard._validate())
+
+    assert calls == []
+
+
 def test_a_clean_validation_says_so_without_promising_a_fill(nicegui_client):
     with nicegui_client:
         wiz, wizard = _open_wizard(nicegui_client,
                                    {'findings': [], 'symbols': [], 'budget': None,
                                     'prechecked': 0, 'buy_rows': 2})
-        wizard._validate()
+        _run(wizard._validate())
         result = _marked(nicegui_client.layout, wiz.MARKER_VALIDATION_RESULT)
         texts = ' '.join(_texts(nicegui_client.layout))
 
@@ -290,7 +403,7 @@ def test_a_validation_that_found_something_lists_every_finding(nicegui_client):
         wiz, wizard = _open_wizard(nicegui_client,
                                    {'findings': findings, 'symbols': ["DEAD"],
                                     'budget': None, 'prechecked': 0, 'buy_rows': 2})
-        wizard._validate()
+        _run(wizard._validate())
         drawn = _marked(nicegui_client.layout, wiz.MARKER_VALIDATION_FINDING)
 
     assert len(drawn) == 2
@@ -305,7 +418,7 @@ def test_the_drop_button_unticks_exactly_the_flagged_symbols(nicegui_client):
                                     'prechecked': 0, 'buy_rows': 2},
                                    submitted=submitted)
         assert wizard.selected == {"AAA", "DEAD"}
-        wizard._validate()
+        _run(wizard._validate())
         drop = _marked(nicegui_client.layout, wiz.MARKER_VALIDATION_DROP)
         assert len(drop) == 1
         wizard._drop(["DEAD"])
@@ -323,7 +436,7 @@ def test_dropping_clears_the_verdict_it_came_from(nicegui_client):
                                    {'findings': [("DEAD", "DEAD: no")],
                                     'symbols': ["DEAD"], 'budget': None,
                                     'prechecked': 0, 'buy_rows': 2})
-        wizard._validate()
+        _run(wizard._validate())
         wizard._drop(["DEAD"])
         result = _marked(nicegui_client.layout, wiz.MARKER_VALIDATION_RESULT)
 
@@ -335,7 +448,7 @@ def test_a_clean_validation_offers_no_drop_button(nicegui_client):
         wiz, wizard = _open_wizard(nicegui_client,
                                    {'findings': [], 'symbols': [], 'budget': None,
                                     'prechecked': 2, 'buy_rows': 2})
-        wizard._validate()
+        _run(wizard._validate())
         drop = _marked(nicegui_client.layout, wiz.MARKER_VALIDATION_DROP)
 
     assert drop == []
@@ -357,7 +470,7 @@ def test_validation_only_ever_tests_the_TICKED_rows(nicegui_client):
                     'prechecked': 0, 'buy_rows': 1})
         wizard.open()
         wizard._toggle("DEAD", False)
-        wizard._validate()
+        _run(wizard._validate())
 
     assert seen['symbols'] == ["AAA"]
 
@@ -373,7 +486,7 @@ def test_a_validation_that_raises_is_reported_and_changes_nothing(nicegui_client
                                       on_refresh=lambda f: None,
                                       on_submit=lambda p: None, on_validate=_boom)
         wizard.open()
-        wizard._validate()
+        _run(wizard._validate())
         result = _marked(nicegui_client.layout, wiz.MARKER_VALIDATION_RESULT)
 
     assert result == []
@@ -388,7 +501,7 @@ def test_the_budget_advisory_is_drawn_even_with_no_row_findings(nicegui_client):
             nicegui_client,
             {'findings': [], 'symbols': [], 'prechecked': 0, 'buy_rows': 2,
              'budget': 'the selected orders need $9,000.00 of buying power'})
-        wizard._validate()
+        _run(wizard._validate())
         drawn = _marked(nicegui_client.layout, wiz.MARKER_VALIDATION_FINDING)
 
     assert len(drawn) == 1
@@ -407,9 +520,9 @@ def test_a_refresh_clears_a_stale_verdict(nicegui_client):
                                    'symbols': ["DEAD"], 'budget': None,
                                    'prechecked': 0, 'buy_rows': 2})
         wizard.open()
-        wizard._validate()
+        _run(wizard._validate())
         assert _marked(nicegui_client.layout, wiz.MARKER_VALIDATION_RESULT)
-        wizard._refresh(False)
+        _run(wizard._refresh(False))
         result = _marked(nicegui_client.layout, wiz.MARKER_VALIDATION_RESULT)
 
     assert result == []

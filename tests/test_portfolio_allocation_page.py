@@ -2710,11 +2710,37 @@ def _drive(handler, arguments):
                   for p in inspect.signature(handler).parameters.values())
     result = handler(arguments) if expects else handler()
     if inspect.isawaitable(result):
-        asyncio.run(_await(result))
+        _run_in_slot(result)
 
 
 async def _await(awaitable):
     return await awaitable
+
+
+def _run_in_slot(awaitable):
+    """Run one handler coroutine with the CURRENT slot entered, as NiceGUI does.
+
+    NiceGUI keys its slot stack on the running TASK, so a coroutine started by
+    ``asyncio.run`` begins with an empty one and a bare ``ui.notify`` inside the
+    handler raises "the slot stack for this task is empty". The real dispatcher
+    re-enters the sender's slot inside the new task
+    (``events._await_and_handle_in_context``); running it any other way here would
+    test a context the browser never produces.
+    """
+    from contextlib import nullcontext
+
+    from nicegui import context
+
+    try:
+        slot = context.slot
+    except RuntimeError:
+        slot = nullcontext()
+
+    async def _in_slot():
+        with slot:
+            return await awaitable
+
+    return asyncio.run(_in_slot())
 
 
 def _emit(element, event_name, args):
@@ -6112,7 +6138,7 @@ def test_toggling_the_fractional_switch_RE_SOLVES_the_plan(monkeypatch,
         before = wizard.plan.rows[0].delta_quantity
         switch = [el for el in nicegui_client.layout.descendants()
                   if isinstance(el, ui.switch)][0]
-        switch.set_value(False)
+        _drive_value(switch, False)
         after = wizard.plan.rows[0].delta_quantity
 
     assert before != after
@@ -6147,7 +6173,7 @@ def test_the_re_solved_plan_is_what_SUBMIT_would_send(monkeypatch, nicegui_clien
         wizard.open()
         switch = [el for el in nicegui_client.layout.descendants()
                   if isinstance(el, ui.switch)][0]
-        switch.set_value(False)
+        _drive_value(switch, False)
         wizard._submit()
 
     assert [r.delta_quantity for r in submitted[0].rows] == [166.0]
@@ -6180,7 +6206,7 @@ def test_the_fractional_toggle_is_remembered_for_the_next_run(monkeypatch,
         wizard.open()
         switch = [el for el in nicegui_client.layout.descendants()
                   if isinstance(el, ui.switch)][0]
-        switch.set_value(False)
+        _drive_value(switch, False)
 
     assert get_allocation_config(account_id).allow_fractional is False
 

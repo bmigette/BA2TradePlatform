@@ -47,6 +47,39 @@ from ba2_trade_platform.core.portfolio_allocation import (
 from ba2_trade_platform.core.types import OrderDirection
 
 
+def _run(coro):
+    """Run one of the wizard's async click handlers to completion.
+
+    ``_validate`` and ``_refresh`` are async because their broker call goes to a
+    thread -- run inline on the event loop they outlived the websocket heartbeat
+    and cost the user the dialog. Called from a sync test the coroutine would
+    never start, and every assertion after it would pass on an unchanged page.
+
+    THE SLOT IS RE-ENTERED INSIDE THE NEW TASK, which is not ceremony: NiceGUI
+    keys its slot stack on the current TASK (``context.slot``), so a coroutine run
+    by ``asyncio.run`` starts with an empty one and a bare ``ui.notify`` raises
+    "the slot stack for this task is empty". That is exactly what
+    ``events.handle_event`` does for a real click
+    (``_await_and_handle_in_context``), so running it any other way here would
+    test a context the browser never produces.
+    """
+    import asyncio
+    from contextlib import nullcontext
+
+    from nicegui import context
+
+    try:
+        slot = context.slot
+    except RuntimeError:
+        slot = nullcontext()
+
+    async def _in_slot():
+        with slot:
+            return await coro
+
+    return asyncio.run(_in_slot())
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -247,7 +280,7 @@ def test_the_badge_survives_a_refresh(nicegui_client):
                                       on_refresh=lambda f: (second, _open_market()),
                                       on_submit=lambda p: None)
         wizard.open()
-        wizard._refresh(False)
+        _run(wizard._refresh(False))
 
     assert _marked_texts(nicegui_client.layout, wiz.MARKER_NOTICE_COUNT) == ['1']
 
