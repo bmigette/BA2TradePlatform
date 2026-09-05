@@ -38,6 +38,7 @@ tested without a browser. ``SymbolInfoPanel`` is a thin renderer over it.
 from __future__ import annotations
 
 import bisect
+import statistics
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -241,6 +242,78 @@ def price_failure_reason(info: SymbolInfo) -> str:
     return info.series.why("points")
 
 
+#: How often the fund actually pays. DERIVED from the ex-dividend dates rather than
+#: read from a provider field: FMP publishes no reliable frequency for the income ETFs
+#: this panel is used to compare, and the dates are already fetched for the dividend
+#: bars, so the answer is measured from the same evidence the chart draws.
+#:
+#: Matched on the MEDIAN gap, not the count in a trailing year: a fund that changed
+#: cadence, listed mid-year, or skipped a month would be misread by a count, whereas
+#: the median is the cadence it actually keeps. Bands are generous because real
+#: schedules drift (a "monthly" payer lands anywhere from 28 to 35 days apart).
+PAYOUT_BANDS: Tuple[Tuple[float, float, str], ...] = (
+    (0.0, 10.0, "Weekly"),
+    (10.0, 20.0, "Bi-weekly"),
+    (20.0, 45.0, "Monthly"),
+    (45.0, 120.0, "Quarterly"),
+    (120.0, 250.0, "Semi-annual"),
+    (250.0, 450.0, "Annual"),
+)
+#: Two dates make one gap, which is an interval and not yet a cadence. One dividend
+#: is a FACT about the fund (it has paid once) and still cannot answer "how often".
+PAYOUT_NEED_TWO = ("only {n} distribution(s) on record, so there is no interval to "
+                   "measure a cadence from")
+PAYOUT_NONE = "no distributions on record in the fetched history"
+PAYOUT_IRREGULAR_FMT = "irregular (~{days:.0f}d median)"
+PAYOUT_FMT = "{name} (~{days:.0f}d)"
+LABEL_PAYOUT_FREQ = "Payout frequency"
+
+
+def payout_frequency(info: SymbolInfo) -> Cell:
+    """How often this symbol distributes, measured from its ex-dividend dates.
+
+    THREE OUTCOMES, and they are different claims:
+      * a cadence -- the median gap fell in a known band;
+      * ``-`` (not applicable) -- the history was fetched and contains NO
+        distributions, which is a fact about a non-payer and not a gap in our data;
+      * ``n/a`` plus a reason -- the dividend history could not be fetched, or there
+        are too few dates to measure an interval at all.
+
+    A median outside every band still reports the number, marked irregular: "we
+    measured 63 days and have no name for it" is worth more than n/a.
+    """
+    # THE WHOLE-SYMBOL FAILURE COMES FIRST. A symbol whose fetch failed outright has
+    # an empty dividend list for the same reason it has no price -- nothing came back
+    # -- and reporting that as "no distributions on record" would state a fact about
+    # the fund from an absence of evidence about it.
+    failed = failure_reason(info)
+    if failed:
+        return Cell.na(failed)
+    series = info.series
+    if series.is_unknown("dividends"):
+        return Cell.na(series.why("dividends"))
+    events = sorted(d.ex_date for d in (series.dividends or []) if d.ex_date)
+    if not events:
+        return Cell.not_applicable(PAYOUT_NONE)
+    if len(events) < 2:
+        return Cell.na(PAYOUT_NEED_TWO.format(n=len(events)))
+    # Most recent 12 gaps: a fund that switched from quarterly to weekly should read
+    # as what it does NOW, and its whole history would average the two into nonsense.
+    gaps = [(b - a).days for a, b in zip(events, events[1:]) if (b - a).days > 0]
+    if not gaps:
+        return Cell.na(PAYOUT_NEED_TWO.format(n=len(events)))
+    recent = gaps[-12:]
+    median = statistics.median(recent)
+    for low, high, name in PAYOUT_BANDS:
+        if low < median <= high:
+            return Cell.value(PAYOUT_FMT.format(name=name, days=median),
+                              note=f"median of the last {len(recent)} interval(s) "
+                                   f"between ex-dividend dates")
+    return Cell.value(PAYOUT_IRREGULAR_FMT.format(days=median),
+                      note=f"median of the last {len(recent)} interval(s) between "
+                           f"ex-dividend dates; outside every named cadence")
+
+
 def build_overview_rows(info: SymbolInfo) -> List[Tuple[str, Cell]]:
     """``[(label, Cell), ...]`` for the overview block.
 
@@ -261,6 +334,9 @@ def build_overview_rows(info: SymbolInfo) -> List[Tuple[str, Cell]]:
                                   income.payout_ratio_pct, fmt_pct)),
         (LABEL_TTM_DIV, field_cell(income, "trailing_12m_dividend_per_share",
                                    income.trailing_12m_dividend_per_share, fmt_per_share)),
+        # Beside the yield it explains: 51.94% paid weekly and 51.94% paid once a
+        # year are the same number describing very different instruments.
+        (LABEL_PAYOUT_FREQ, payout_frequency(info)),
         (LABEL_HISTORY_START, field_cell(info, "history_start", info.history_start,
                                          fmt_date, fallback_reason=price_reason)),
     ]
@@ -935,6 +1011,10 @@ def _comparison_specs() -> List[Tuple[str, Callable[[SymbolInfo], Cell]]]:
         (LABEL_DIV_YIELD, overview(LABEL_DIV_YIELD)),
         (LABEL_PAYOUT, overview(LABEL_PAYOUT)),
         (LABEL_TTM_DIV, overview(LABEL_TTM_DIV)),
+        # The cadence belongs next to the yield in a COMPARISON above all: these are
+        # income funds, and a 51.94% yield paid weekly is a different instrument from
+        # the same number paid annually.
+        (LABEL_PAYOUT_FREQ, overview(LABEL_PAYOUT_FREQ)),
         (LABEL_HISTORY_START, overview(LABEL_HISTORY_START)),
         (LABEL_HOLDINGS_COUNT, etf_row(LABEL_HOLDINGS_COUNT)),
         (LABEL_TOP10, etf_row(LABEL_TOP10)),

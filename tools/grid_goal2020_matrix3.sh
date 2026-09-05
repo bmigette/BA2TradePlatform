@@ -209,6 +209,10 @@ ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 9 ;; small) echo 17 ;;
 # Sized on MEASURED per-trial footprint, which is a property of the BAND, not the expert:
 #   large  ~105 screened symbols, ~2.5-3.5 GB/trial  -> 12 ran fine for three jobs
 #   mid    ~765 screened symbols, ~6 GB/trial        -> 12 starved a 65 GB box
+#   small  MEASURED 2026-09-05 on remote227 (256 GB): 10-13 GB/trial, NOT the ~6 GB
+#          the mid figure suggested -- 24 slots put 28 children x ~11 GB = 237 GB on
+#          the box and left 12 GB free, which throttled the governor immediately.
+#          Budget ~11.5 GB/trial for mid/small at this window and universe.
 #
 # This used to be engagement-only and therefore did nothing for memory: pool children were
 # spawned once at daemon start and stayed resident with their last working set whether or not
