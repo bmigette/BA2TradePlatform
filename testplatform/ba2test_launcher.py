@@ -5121,6 +5121,53 @@ def _cmd_optimize(args) -> int:
     manage_sched = _daily_manage_schedule()
 
     init_db()
+
+    # ALREADY DONE? SKIP IT.
+    #
+    # A grid that loops over jobs and calls this command directly had no idempotence
+    # of its own, so every restart re-ran the jobs that had already finished. The
+    # Senate phase of tools/grid_goal2020_matrix3.sh did exactly that:
+    # sen-S1-goal2020-risk_atr completed as optimization 434, again as 442 with the
+    # same fitness to fourteen decimal places, and a third copy was a quarter of the
+    # way through ~6h of remote work before it was spotted. Nothing deduped it either
+    # -- each launch mints a fresh Strategy row -- and a duplicate completed run is
+    # indistinguishable from a first one after the fact.
+    #
+    # The matrix DRIVER has checked this by NAME since it was written
+    # (tools/run_screener_capband_matrix.py:_completed_names), which is why phase B
+    # never had the problem; and this command's own --sizing-mode help already
+    # promises the behaviour ("or the second is SKIPped as an already-completed run"),
+    # which until now was true only when the driver happened to be in the middle. The
+    # check belongs HERE, where every caller gets it -- a bash loop cannot be given
+    # the guard while it is running (see the "NEVER EDIT A RUNNING SHELL SCRIPT"
+    # header of grid_goal2020_matrix3.sh), and the next grid to call the launcher
+    # directly would have needed its own copy.
+    #
+    # EXIT 0, deliberately: a skip is not a failure, and a caller that treats a
+    # non-zero rc as "the job broke" would turn a correctly-skipped job into a red
+    # grid. The line says WHICH optimization already answered, so a skip can be
+    # audited rather than taken on trust.
+    #
+    # --rerun repeats one on purpose (a code change, a reproducibility check). Opt-in,
+    # because the accident this prevents is silent and costs hours of cluster time
+    # while the inconvenience it causes is one flag.
+    _opt_name = args.name or f"opt-{expert}"
+    if not getattr(args, "rerun", False):
+        _db = SessionLocal()
+        try:
+            _prior = (_db.query(StrategyOptimization)
+                      .filter(StrategyOptimization.name == _opt_name,
+                              StrategyOptimization.status == "completed")
+                      .order_by(StrategyOptimization.id.desc()).first())
+            _prior = (_prior.id, _prior.best_fitness) if _prior is not None else None
+        finally:
+            _db.close()
+        if _prior is not None:
+            print(f"optimize: SKIP {_opt_name} — already completed as optimization "
+                  f"#{_prior[0]} (best fitness {_prior[1]}). Pass --rerun to run it "
+                  f"again.", flush=True)
+            return 0
+
     db = SessionLocal()
     try:
         bypass = bool(spec.get("bypass"))
@@ -6365,6 +6412,13 @@ def main(argv: "list | None" = None) -> int:
                          "selection for those runs. Bypass experts (FactorRanker) don't get the "
                          "schedule genes, so this flag still fully controls their day(s).")
     op.add_argument("--name", default=None)
+    op.add_argument("--rerun", action="store_true",
+                    help="Run even if an optimization with this --name has already "
+                         "COMPLETED. Without it the run is skipped (exit 0) and the "
+                         "prior optimization id is printed — which is what stops a "
+                         "restarted grid loop from re-running the jobs it already "
+                         "finished. Use it for a deliberate repeat: a code change to "
+                         "re-measure against, or a reproducibility check.")
     op.add_argument("--sizing-mode", choices=("notional", "risk_atr"), default=None,
                     help="Override the expert spec's pinned sizing_mode for this run. Omit to "
                          "keep the spec default (risk_atr for the classic experts). Exists so "
