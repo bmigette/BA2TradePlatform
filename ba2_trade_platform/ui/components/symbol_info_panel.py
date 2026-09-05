@@ -314,6 +314,93 @@ def payout_frequency(info: SymbolInfo) -> Cell:
                            f"ex-dividend dates; outside every named cadence")
 
 
+#: Dividend GROWTH: what the fund pays now against what it paid before, per share.
+#:
+#: Computed from the same ex-dividend history as the cadence above, on TRAILING
+#: 12-MONTH TOTALS rather than per-payment amounts -- a weekly payer that moved to
+#: monthly would otherwise look like a 4x cut, and a fund that shifted an ex-date
+#: across a year boundary would show growth it never delivered. Totals absorb both.
+#:
+#: Split-adjusted (``chart_amount``, i.e. FMP's adjDividend where present), because
+#: an as-declared amount is not comparable across a split -- the one thing that would
+#: silently turn a 2:1 split into a "50% dividend cut".
+DIV_GROWTH_LABELS: Dict[int, str] = {1: "Dividend growth 1Y", 3: "Dividend growth 3Y (CAGR)"}
+#: A window whose EARLIER year predates the fund's first distribution cannot be a
+#: growth rate: it would compare a full year against a partial one and report the
+#: listing as spectacular growth. TSMY (first paid 2024-08) is exactly this case.
+DIV_GROWTH_TOO_YOUNG = ("first distribution on {first} — a {years}Y comparison would "
+                        "measure a partial year against a full one, not growth")
+DIV_GROWTH_NO_BASE = ("nothing was paid in the 12 months ending {end}, so there is no "
+                      "base to grow from")
+DIV_GROWTH_NEEDS_HISTORY = "no dividend history, so growth cannot be measured"
+
+
+def _paid_between(dividends, start: date, end: date) -> Optional[float]:
+    """Split-adjusted total paid in ``(start, end]``, or ``None`` if any amount is
+    missing -- a partial sum would understate the total and read as a cut."""
+    amounts = [d.chart_amount for d in dividends if start < d.ex_date <= end]
+    if any(a is None for a in amounts):
+        return None
+    return float(sum(amounts))
+
+
+def dividend_growth(info: SymbolInfo, years: int) -> Cell:
+    """Per-share dividend growth over ``years``, as a percent. 3Y is annualised.
+
+    1Y is the plain change between the trailing 12 months and the 12 before it. 3Y is
+    a CAGR, not a total change: "grew 90% over three years" and "grew 24% a year" are
+    the same fact, and only the second is comparable against the 1Y figure beside it.
+
+    KNOWN SENSITIVITY, stated because the number looks more precise than it is: a
+    trailing-12-month window can catch 12 or 13 payments from the same monthly payer
+    depending on where the ex-dates fall, which is +/-8% of phantom growth on a
+    perfectly flat distribution (and +/-2% for a weekly payer). Totals are still the
+    right basis -- per-payment amounts turn a cadence change into a 4x move, which is
+    a far larger lie -- but read a single-digit figure as noise, not as a trend. The
+    note on the cell carries both totals so the reader can see what was divided.
+    """
+    failed = failure_reason(info)
+    if failed:
+        return Cell.na(failed)
+    series = info.series
+    if series.is_unknown("dividends"):
+        return Cell.na(series.why("dividends"))
+    events = [d for d in (series.dividends or []) if d.ex_date]
+    if not events:
+        return Cell.not_applicable(DIV_GROWTH_NEEDS_HISTORY)
+
+    as_of = info.as_of
+    recent_start = _years_before_date(as_of, 1)
+    base_end = _years_before_date(as_of, years)
+    base_start = _years_before_date(as_of, years + 1)
+
+    first = min(d.ex_date for d in events)
+    if first > base_start:
+        return Cell.na(DIV_GROWTH_TOO_YOUNG.format(first=first.isoformat(), years=years))
+
+    recent = _paid_between(events, recent_start, as_of)
+    base = _paid_between(events, base_start, base_end)
+    if recent is None or base is None:
+        return Cell.na("some dividend records carry no amount, so a total would be "
+                       "understated and the growth wrong")
+    if base <= 0:
+        return Cell.na(DIV_GROWTH_NO_BASE.format(end=base_end.isoformat()))
+
+    ratio = recent / base
+    pct = ((ratio ** (1.0 / years)) - 1.0) * 100.0 if years > 1 else (ratio - 1.0) * 100.0
+    note = (f"${recent:,.4f} paid in the last 12m vs ${base:,.4f} in the 12m ending "
+            f"{base_end.isoformat()}" + (f", annualised over {years}y" if years > 1 else ""))
+    return Cell.value(fmt_signed_pct(pct), note=note)
+
+
+def _years_before_date(day: date, years: int) -> date:
+    """``day`` minus whole years, folding 29 February to 28."""
+    try:
+        return day.replace(year=day.year - years)
+    except ValueError:
+        return day.replace(year=day.year - years, day=28)
+
+
 def build_overview_rows(info: SymbolInfo) -> List[Tuple[str, Cell]]:
     """``[(label, Cell), ...]`` for the overview block.
 
@@ -337,6 +424,10 @@ def build_overview_rows(info: SymbolInfo) -> List[Tuple[str, Cell]]:
         # Beside the yield it explains: 51.94% paid weekly and 51.94% paid once a
         # year are the same number describing very different instruments.
         (LABEL_PAYOUT_FREQ, payout_frequency(info)),
+        # Is the income growing or shrinking? A high trailing yield on a shrinking
+        # distribution is a different proposition from the same yield on a rising one.
+        (DIV_GROWTH_LABELS[1], dividend_growth(info, 1)),
+        (DIV_GROWTH_LABELS[3], dividend_growth(info, 3)),
         (LABEL_HISTORY_START, field_cell(info, "history_start", info.history_start,
                                          fmt_date, fallback_reason=price_reason)),
     ]
@@ -1015,6 +1106,8 @@ def _comparison_specs() -> List[Tuple[str, Callable[[SymbolInfo], Cell]]]:
         # income funds, and a 51.94% yield paid weekly is a different instrument from
         # the same number paid annually.
         (LABEL_PAYOUT_FREQ, overview(LABEL_PAYOUT_FREQ)),
+        (DIV_GROWTH_LABELS[1], overview(DIV_GROWTH_LABELS[1])),
+        (DIV_GROWTH_LABELS[3], overview(DIV_GROWTH_LABELS[3])),
         (LABEL_HISTORY_START, overview(LABEL_HISTORY_START)),
         (LABEL_HOLDINGS_COUNT, etf_row(LABEL_HOLDINGS_COUNT)),
         (LABEL_TOP10, etf_row(LABEL_TOP10)),
