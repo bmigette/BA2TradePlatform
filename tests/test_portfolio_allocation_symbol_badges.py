@@ -101,3 +101,62 @@ class TestRowFields:
         f = self._fields(_Row())
         assert f['frac_badge'] == ''
         assert f['lev_badge'] == 'Lx:1'
+
+
+class TestTooltipStatFields:
+    """The ⓘ tooltip's yield / 1Y / 3Y lines.
+
+    Asked for on 2026-09-05. Exactly ONE of stat_line / stat_pending / stat_error is
+    ever non-empty: the template draws whichever is set, and '' is the only thing it
+    treats as "draw nothing".
+    """
+
+    def _fields(self, stats):
+        from ba2_trade_platform.ui.pages.portfolio_allocation import _symbol_stat_fields
+        return _symbol_stat_fields(stats)
+
+    def _one_of(self, f):
+        return sum(1 for k in ('stat_line', 'stat_pending', 'stat_error') if f[k])
+
+    def test_a_full_row_renders_all_three_figures(self):
+        class _S:
+            dividend_yield_pct, total_return_1y_pct, total_return_3y_pct = 69.73, 34.95, 126.25
+            error = None
+        f = self._fields(_S())
+        assert '69.73%' in f['stat_line'] and '+34.95%' in f['stat_line'] and '+126.25%' in f['stat_line']
+        assert self._one_of(f) == 1
+
+    def test_a_non_payer_shows_a_real_zero_not_a_dash(self):
+        # 0.00% is a measured fact about the fund; a dash would invent a missing one.
+        class _S:
+            dividend_yield_pct, total_return_1y_pct, total_return_3y_pct = 0.0, 12.0, 5.0
+            error = None
+        assert 'Yield 0.00%' in self._fields(_S())['stat_line']
+
+    def test_an_unmeasured_window_is_a_dash_not_a_zero(self):
+        class _S:
+            dividend_yield_pct, total_return_1y_pct, total_return_3y_pct = 5.0, 12.0, None
+            error = None
+        assert '3Y -' in self._fields(_S())['stat_line']
+
+    def test_a_symbol_not_yet_fetched_says_so(self):
+        # A third state beside "0.00%" and a figure: we have not looked yet.
+        f = self._fields(None)
+        assert f['stat_line'] == '' and 'not fetched' in f['stat_pending']
+        assert self._one_of(f) == 1
+
+    def test_a_failed_fetch_shows_the_reason_rather_than_a_blank(self):
+        class _S:
+            error = 'FMP timed out'
+        f = self._fields(_S())
+        assert 'FMP timed out' in f['stat_error']
+        assert f['stat_line'] == '' and f['stat_pending'] == ''
+        assert self._one_of(f) == 1
+
+    def test_the_returns_are_signed_and_the_yield_is_not(self):
+        # A negative yield is not a thing; the returns' direction is the whole point.
+        class _S:
+            dividend_yield_pct, total_return_1y_pct, total_return_3y_pct = 3.0, -8.0, 4.0
+            error = None
+        line = self._fields(_S())['stat_line']
+        assert 'Yield 3.00%' in line and '1Y -8.00%' in line and '3Y +4.00%' in line

@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlmodel import select
 
+from ..config import get_app_setting
 from ..logger import logger
 from .db import InstanceNotFound, add_instance, get_db, get_instance, log_activity
 from .models import Transaction, TradingOrder
@@ -634,6 +635,59 @@ def log_row_outcome(outcome: "RowOutcome", *, run_tag: str) -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Allocation: could not log the outcome for "
                        f"{getattr(outcome, 'symbol', '?')}: {e}")
+
+
+#: How many symbols one background refresh will ask the provider about.
+#:
+#: BOUNDED on purpose. A first render of a 35-symbol account would otherwise make
+#: several FMP calls per symbol in one go, and the live platform shares that rate
+#: limit with the experts that actually trade. The refresh is incremental instead:
+#: each pass tops up the oldest/missing rows, so the table fills in over a few
+#: refreshes and no single one is slow or rude to the API.
+STATS_REFRESH_BATCH = 8
+
+
+def refresh_symbol_stats(symbols, *, limit: int = STATS_REFRESH_BATCH) -> int:
+    """Top up the cached yield / 1Y / 3Y for the stalest ``symbols``. Returns rows written.
+
+    Runs OFF the render path -- the caller starts it in a background thread and does
+    not wait -- because the page must render from whatever the cache already holds.
+    A symbol the provider cannot describe is stored WITH its error rather than left
+    absent, so the next pass does not retry it immediately and the UI can say why the
+    figures are missing instead of showing a blank.
+    """
+    try:
+        from ba2_common.core.symbol_stats import save_symbol_stats, stale_symbols
+        from ba2_providers.symbol_info import get_symbols_info
+
+        due = stale_symbols(symbols)[:limit]
+        if not due:
+            return 0
+        api_key = get_app_setting('FMP_API_KEY') or get_app_setting('fmp_api_key')
+        if not api_key:
+            logger.warning("Symbol stats refresh skipped: no FMP API key configured")
+            return 0
+        infos = get_symbols_info(api_key, due, as_of=Date.today())
+        rows: Dict[str, Dict[str, Any]] = {}
+        for symbol in due:
+            info = infos.get(symbol)
+            if info is None:
+                rows[symbol] = {'error': 'the data layer returned no entry for this symbol'}
+                continue
+            returns = info.returns or {}
+            rows[symbol] = {
+                'dividend_yield_pct': info.income.dividend_yield_pct,
+                'total_return_1y_pct': getattr(returns.get('1y'), 'total_return_pct', None),
+                'total_return_3y_pct': getattr(returns.get('3y'), 'total_return_pct', None),
+                'company_name': info.company_name,
+                'error': info.details.get('*') or None,
+            }
+        written = save_symbol_stats(rows)
+        logger.info(f"Symbol stats refreshed for {written} symbol(s): {', '.join(due)}")
+        return written
+    except Exception as e:  # noqa: BLE001 -- a cache top-up must never break a render
+        logger.warning(f"Symbol stats refresh failed: {e}")
+        return 0
 
 
 def submit_plan(account, plan: AllocationPlan, current: Dict[str, PositionState],

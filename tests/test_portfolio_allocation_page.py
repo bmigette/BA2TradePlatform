@@ -5235,7 +5235,25 @@ def test_the_info_control_says_what_it_will_show(nicegui_client, account_id):
     root = _draw(nicegui_client, account_id, _one_label(account_id))
     template = _tables(root)[0].slots['body-cell-info'].template
 
-    assert 'Holdings, dividends and total return' in template
+    # "Click for ..." since 2026-09-05: the tooltip now shows the yield and returns
+    # itself, so the old bare phrase read as a description of the hover rather than
+    # as the promise of the dialog behind it.
+    assert 'Click for holdings, dividends and total return' in template
+
+
+def test_the_info_tooltip_carries_the_income_and_return_figures(nicegui_client, account_id):
+    """The ⓘ hover answers "what does this pay and how has it done" without opening
+    anything. Read off ``props.row`` like every other field in this slot: a NiceGUI
+    cell slot is rendered ONCE and reused for every row, so a per-row lookup is not
+    available inside the template."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-info'].template
+
+    for field in ('stat_line', 'stat_pending', 'stat_error'):
+        assert f'props.row.{field}' in template, field
+    # Each is guarded, so exactly the one that is set draws -- an unguarded line would
+    # render an empty row for a symbol the background refresh has not reached.
+    assert template.count('v-if="props.row.stat') == 3
 
 
 def test_the_info_tooltip_names_the_symbol_and_the_instrument(nicegui_client, account_id):

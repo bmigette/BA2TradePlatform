@@ -1110,6 +1110,43 @@ class AccountSymbolFacts(SQLModel, table=True):
     fetched_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
 
+class SymbolMarketStats(SQLModel, table=True):
+    """Headline market facts for one SYMBOL, cached so a page render costs no REST.
+
+    GLOBAL, not per-account -- unlike ``AccountSymbolFacts`` next door. A dividend
+    yield and a total return are properties of the instrument: every account holding
+    GDXY sees the same 69.73%, whereas fractionability and the margin rate are answers
+    a specific broker gives a specific account. Keying this per account would multiply
+    identical rows and invite them to disagree.
+
+    A CACHE of ``ba2_providers.symbol_info.get_symbols_info``, whose own cache is an
+    in-memory 24h TTL -- so without this table every process restart re-fetches several
+    FMP calls per symbol, and a 35-symbol allocation page pays that on first render.
+    Refreshed in the BACKGROUND (never on the render path) and read with its
+    ``fetched_at`` so a reader can judge the age instead of assuming freshness.
+
+    Every figure is NULLABLE and null means UNKNOWN, never zero: a fund that pays no
+    dividend has ``dividend_yield_pct = 0.0``, and a symbol whose fetch failed has
+    ``None``. Those are different facts and the UI renders them differently.
+    """
+    __tablename__ = "symbol_market_stats"
+    __table_args__ = (UniqueConstraint('symbol', name='uix_symbol_market_stats_symbol'),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    symbol: str = Field(index=True, description="Normalised (.strip().upper()) symbol")
+    #: Trailing-twelve-month dividend yield, 1-100 (not a fraction).
+    dividend_yield_pct: float | None = Field(default=None)
+    #: Reinvested TOTAL return over the window, 1-100. Distinct from price return.
+    total_return_1y_pct: float | None = Field(default=None)
+    total_return_3y_pct: float | None = Field(default=None)
+    #: The instrument's human name, so a caller with this row needs no second lookup.
+    company_name: str | None = Field(default=None)
+    #: Set when the provider could not describe the symbol at all; the figures are then
+    #: None and this says why, rather than the row simply looking like a non-payer.
+    error: str | None = Field(default=None)
+    fetched_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
+
 class PortfolioIncomeEvent(SQLModel, table=True):
     """One deposit or dividend, consumed oldest-first by allocation runs.
 

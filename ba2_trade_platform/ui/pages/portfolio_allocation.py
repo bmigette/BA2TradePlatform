@@ -96,6 +96,7 @@ keeps the registries out of THIS module's own graph, so the deferral survives if
 the package ``__init__`` is ever trimmed.
 """
 import asyncio
+import threading
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -108,6 +109,7 @@ from ...core.db import get_db
 from ...core.instrument_enrichment import enrich_instruments
 from ...core.models import ExpertInstance
 from ba2_common.core.symbol_facts import load_symbol_facts, save_symbol_facts
+from ba2_common.core.symbol_stats import load_symbol_stats
 from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
@@ -298,6 +300,15 @@ def _load_view_payload(account_id: int, valuation_mode: str,
     # stored answer rather than blanking facts that were true five minutes ago.
     # Never fatal -- the page's job is the label table, and the chips are on top.
     facts = refresh_symbol_facts(account, account_id, symbols)
+    # READ ONLY. The yield and the 1Y/3Y return need several FMP calls per symbol,
+    # far too slow for a render, so the page draws whatever is already cached (nothing
+    # on a cold start) and the top-up runs from the PAGE's refresh handler instead.
+    #
+    # The refresh deliberately does NOT start here: this function is called directly by
+    # the page tests, and a daemon thread doing DB work outlives the test that started
+    # it -- which raced the fixture's teardown into a Windows access violation. A
+    # loader that spawns background work is a loader that cannot be called safely.
+    stats = load_symbol_stats(symbols)
 
     comments: Dict[tuple, str] = {}
     weights: Dict[str, Dict[str, float]] = {}
@@ -412,6 +423,9 @@ def _load_view_payload(account_id: int, valuation_mode: str,
         #: is simply absent, and the row then draws no chips -- see
         #: ``fractionable_badge`` / ``leverage_badge``.
         'symbol_facts': facts,
+        #: ``{symbol: SymbolMarketStats}`` for the ⓘ tooltip. Absent until the
+        #: background refresh has reached that symbol.
+        'symbol_stats': stats,
     }
 
 
@@ -937,7 +951,8 @@ def _paint_mini_bar(widgets: Dict[str, Any], *, fraction: float,
 def _new_live_state(*, base_notional: Optional[float] = None,
                     available_buying_power: Optional[float] = None,
                     unallocated_pct: float = 0.0,
-                    symbol_facts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                    symbol_facts: Optional[Dict[str, Any]] = None,
+                    symbol_stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One render's mutable view of what is on screen. Not persisted anywhere.
 
     ``views`` is the ORDERED ``LabelView`` list and is the single source for every
@@ -953,6 +968,9 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         # {symbol: AccountSymbolFacts} for the ⓘ chips. A symbol the broker has never
         # described is ABSENT, and its row then draws no chips at all.
         'symbol_facts': symbol_facts or {},
+        # {symbol: SymbolMarketStats} for the ⓘ tooltip; absent until the
+        # background refresh has reached that symbol.
+        'symbol_stats': symbol_stats or {},
         'views': [],            # ordered LabelView list, MUTATED on an accepted edit
         'view_by_label': {},
         'weights': {},          # label -> {symbol: effective weight %}
@@ -2310,6 +2328,45 @@ def _render_gate_blocked(gate: GateResult) -> None:
                           on_click=lambda: ui.navigate.to('/settings')).props('outline')
 
 
+#: Shown in the ⓘ tooltip while the background refresh has not reached this symbol
+#: yet. NOT a blank line and NOT a zero: "we have not looked" is a third state beside
+#: "0.00%" (a real non-payer) and a figure.
+STAT_PENDING = 'yield / returns: not fetched yet'
+
+
+def _fmt_stat_pct(value) -> str:
+    """A percent for the tooltip, or ``-`` when it is genuinely unknown.
+
+    ``0.0`` is a MEASURED value and prints as 0.00%: a fund that pays nothing really
+    does yield zero, and rendering that as ``-`` would invent a missing fact.
+    """
+    return '-' if value is None else f"{float(value):+.2f}%"
+
+
+def _symbol_stat_fields(stats) -> Dict[str, Any]:
+    """The ⓘ tooltip's income/return lines, pre-resolved into flat row fields.
+
+    Resolved in Python for the same reason the fact chips are: '' is the ONLY thing
+    the Quasar template treats as "draw nothing", and a ``v-if`` on a raw None would
+    render "not fetched" and "the provider said zero" identically.
+    """
+    if stats is None:
+        return {'stat_line': '', 'stat_pending': STAT_PENDING, 'stat_error': ''}
+    if getattr(stats, 'error', None):
+        return {'stat_line': '', 'stat_pending': '',
+                'stat_error': f"could not be fetched: {stats.error}"}
+    y = getattr(stats, 'dividend_yield_pct', None)
+    return {
+        # Yield is unsigned (a negative yield is not a thing); the returns are signed
+        # because their direction is the whole point.
+        'stat_line': (f"Yield {'-' if y is None else f'{float(y):.2f}%'}"
+                      f"  ·  1Y {_fmt_stat_pct(getattr(stats, 'total_return_1y_pct', None))}"
+                      f"  ·  3Y {_fmt_stat_pct(getattr(stats, 'total_return_3y_pct', None))}"),
+        'stat_pending': '',
+        'stat_error': '',
+    }
+
+
 def _symbol_fact_fields(facts) -> Dict[str, Any]:
     """The ⓘ chips for one symbol, as flat row fields the Quasar template can print.
 
@@ -2386,6 +2443,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # said no". ``frac_strike`` marks the False case, so "whole shares only"
         # is never mistaken for "fractionable" at a glance.
         **_symbol_fact_fields(live['symbol_facts'].get(r.symbol)),
+        **_symbol_stat_fields(live['symbol_stats'].get(r.symbol)),
         'current_value': round(r.current_value, 2),
         # BOTH label denominators travel to the browser. ``pct_of_label_target`` is
         # what the "% of label tgt" COLUMN prints -- the label's target money, so an
@@ -2531,7 +2589,16 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                     <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
                         <div class="text-weight-bold">{{ props.row.symbol }}</div>
                         <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
-                        <div>Holdings, dividends and total return</div>
+                        <!-- Income and total return, from the cached provider stats.
+                             Exactly one of these three lines is ever non-empty: the
+                             figures, "not fetched yet", or the fetch error. -->
+                        <div v-if="props.row.stat_line" class="text-weight-medium"
+                             style="margin-top:4px">{{ props.row.stat_line }}</div>
+                        <div v-if="props.row.stat_pending" style="opacity:0.7">
+                            {{ props.row.stat_pending }}</div>
+                        <div v-if="props.row.stat_error" style="opacity:0.7">
+                            {{ props.row.stat_error }}</div>
+                        <div style="margin-top:4px">Click for holdings, dividends and total return</div>
                     </q-tooltip>
                 </q-btn>
                 <span v-if="props.row.frac_badge"
@@ -2967,7 +3034,8 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     live = _new_live_state(base_notional=base_notional,
                            available_buying_power=buying_power,
                            unallocated_pct=payload['unallocated_pct'],
-                           symbol_facts=payload.get('symbol_facts') or {})
+                           symbol_facts=payload.get('symbol_facts') or {},
+                           symbol_stats=payload.get('symbol_stats') or {})
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)
@@ -3438,6 +3506,13 @@ async def content() -> None:
             body.clear()
             with body:
                 _render_labels(account_id, payload, _refresh)
+            # Top up the ⓘ tooltip's cached yield / 1Y / 3Y for next time, off the
+            # render path and never joined: a slow provider must not hold the page,
+            # and a failed top-up costs a tooltip line rather than the table.
+            managed = [r.symbol for view in payload['views'] for r in view.rows]
+            if managed:
+                threading.Thread(target=svc.refresh_symbol_stats, args=(managed,),
+                                 name='symbol-stats-refresh', daemon=True).start()
                 try:
                     events, open_total, working_note = await asyncio.to_thread(
                         _load_income_panel, account_id)
