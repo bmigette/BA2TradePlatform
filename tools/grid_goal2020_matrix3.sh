@@ -225,9 +225,24 @@ ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 9 ;; small) echo 17 ;;
 # OVERRIDABLE, because the right number is a property of the BOX and this driver now runs
 # against more than one. The defaults below are remote150's (65 GB, daemon ceiling 12);
 # remote227 is 32 cores / 256 GB with a ceiling of 24, so it takes DS_REMOTE_SLOTS_LARGE=24
-# DS_REMOTE_SLOTS_OTHER=24 SENATE_REMOTE_SLOTS=16 (Senate is ~12 GB/trial, so 24 would ask
-# for 288 GB of 256). Still clamped by the expert's own max_remote_worker_slots and by the
-# daemon ceiling, so this can only ever REDUCE concurrency below what the box allows.
+# DS_REMOTE_SLOTS_OTHER=14 SENATE_REMOTE_SLOTS=16. Still clamped by the expert's own
+# max_remote_worker_slots and by the daemon ceiling, so this can only ever REDUCE concurrency
+# below what the box allows.
+#
+# SENATE, MEASURED TWICE ON remote227 (2026-09-05) -- the old "~12 GB/trial" here was wrong and
+# cost a night:
+#   * BEFORE eb4d4c71: 15.3-18.5 GB/child, peaking at 19.8 GB. 14 slots put 234 GB on a 251.8 GB
+#     box; it ran at 94-95% and the kernel OOM-killed pool children, which the worker recovered
+#     from by rebuilding (BrokenProcessPool -> the master requeued the lost trials). SIZE ON THE
+#     PEAK CHILD, NEVER THE MEAN: 14 x 18.5 = 259 GB, past the box before the OS gets a byte.
+#   * AFTER eb4d4c71 (the payload/projection fix): ~5-6 GB of that was decoded JSON pinned for
+#     the life of the worker -- measured with tracemalloc, json/decoder.py holding 2,465 MB in
+#     44.6M live objects against 69.7 MB for the {date: open} maps distilled from them. Budget
+#     ~13 GB/child and re-measure /diag/memory after the first generation.
+#
+# The number that matters is CHILDREN RESIDENT, not slots dispatched: children are spawned once
+# and keep their working set whatever the master sends them, so lowering BA2_MAX_REMOTE_SLOTS
+# alone frees nothing -- only the pre-flight POST /pool/resize does.
 DS_REMOTE_SLOTS_LARGE="${DS_REMOTE_SLOTS_LARGE:-12}"
 DS_REMOTE_SLOTS_OTHER="${DS_REMOTE_SLOTS_OTHER:-6}"
 ds_remote_slots_for() {
