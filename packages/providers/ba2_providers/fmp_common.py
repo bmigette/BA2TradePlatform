@@ -254,7 +254,8 @@ def _fmp_history_cache_dir() -> str:
 
 
 def fmp_history_disk_cached(namespace: str, symbol: str, fetch_fn: Callable[[], Any],
-                            max_age_days: float = _FMP_HISTORY_DISK_MAX_AGE_DAYS) -> Any:
+                            max_age_days: float = _FMP_HISTORY_DISK_MAX_AGE_DAYS,
+                            *, retain: bool = True) -> Any:
     """Disk-persist a per-symbol FMP *history* payload so spawned backtest workers read it from
     disk instead of re-fetching from FMP.
 
@@ -265,6 +266,16 @@ def fmp_history_disk_cached(namespace: str, symbol: str, fetch_fn: Callable[[], 
     newly-published rows). Best-effort: any disk error falls back to a live ``fetch_fn`` so a
     cache problem can never break a run. The atomic tmp+replace write means concurrent workers
     never read a half-written file.
+
+    ``retain=False`` takes the payload WITHOUT pinning it in the in-process memo below. For a
+    caller that reads a history once and immediately projects it down to something small, the
+    memo is pure cost: measured 2026-09-05 with tracemalloc on one FMPSenateTraderWeight trial,
+    ``json/decoder.py`` held 2,465 MB in 44.6M live objects and was still climbing linearly past
+    the (flat, 2,145 MB) bar cache -- decoded ``historical_price_full`` payloads for the ~1,800
+    tickers the Senate feed discloses, every one of them already reduced to a
+    ``{date: open}`` map by its caller. An entry ALREADY memoized is still served from the memo:
+    the flag declines to ADD, it never bypasses a hit, so mixing retaining and non-retaining
+    callers of the same key cannot produce two different objects.
     """
     if not _is_ttl_frozen():
         return fetch_fn()  # live path: never cache to disk; always pull fresh from the API
@@ -274,8 +285,14 @@ def fmp_history_disk_cached(namespace: str, symbol: str, fetch_fn: Callable[[], 
     # per-symbol history every bar — the dominant backtest bottleneck (FMPRating sidestepped it
     # with its own TTLCache; this generalises that to every disk-cached history). Returns the SAME
     # object across calls, so callers' per-row date memoization (e.g. ``_pd``/``_td_memo``) sticks.
+    key = f"{namespace}__{symbol.upper()}"
+    if not retain:
+        hit = _HISTORY_MEM_CACHE.peek(key)
+        if hit is not _MISSING:
+            return hit
+        return _fmp_history_disk_read_or_fetch(namespace, symbol, fetch_fn, max_age_days)
     return _HISTORY_MEM_CACHE.get_or_call(
-        f"{namespace}__{symbol.upper()}",
+        key,
         lambda: _fmp_history_disk_read_or_fetch(namespace, symbol, fetch_fn, max_age_days),
     )
 
@@ -337,6 +354,10 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
     return data
 
 
+#: Sentinel for "no entry", distinct from a cached ``None``. See ``TTLCache.peek``.
+_MISSING = object()
+
+
 class TTLCache:
     """Tiny thread-safe time-to-live cache to dedupe identical fetches across callers.
 
@@ -355,6 +376,19 @@ class TTLCache:
         self._clock = clock
         self._store: dict = {}
         self._lock = threading.Lock()
+
+    def peek(self, key) -> Any:
+        """The cached value, or ``_MISSING`` -- NEVER calls ``fn``, never stores.
+
+        For ``retain=False``: a value someone else already memoized is free to reuse, but this
+        caller must not be the one that puts it there. ``_MISSING`` rather than ``None`` because
+        ``None`` is a legitimate cached value here (``get_or_call`` caches it deliberately).
+        """
+        with self._lock:
+            item = self._store.get(key)
+            if item is not None and (_is_ttl_frozen() or self._clock() < item[1]):
+                return item[0]
+        return _MISSING
 
     def invalidate(self, key) -> None:
         """Drop one entry. Used to un-memoize a hermetic cache-miss empty (see

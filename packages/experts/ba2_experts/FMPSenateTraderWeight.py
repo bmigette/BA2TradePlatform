@@ -107,6 +107,30 @@ _WORKER_SCORING_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 # of distinct files one trial loads, and see test_scoring_cache_lru.py which pins that.
 _WORKER_SCORING_CACHE_MAX = int(os.environ.get("BA2_SCORING_LRU_MAX", "3"))
 
+#: ``{SYMBOL: {date_str: open}}`` -- the daily-open projection of a symbol's price history,
+#: memoized at MODULE level so a long-lived pool child parses each history once across the whole
+#: GA population rather than once per trial.
+#:
+#: WHAT THIS REPLACED, and why it is worth a module global. The projection used to live on the
+#: expert INSTANCE (per trial) while ``fmp_history_disk_cached``'s own memo held the raw decoded
+#: JSON per process -- so the cross-trial saving was real but it was paid for by pinning the
+#: PAYLOAD. Measured 2026-09-05 with tracemalloc on one trial: ``json/decoder.py`` held 2,465 MB
+#: in 44.6M live objects and was still climbing linearly, past the (flat, 2,145 MB) bar cache,
+#: because the Senate feed discloses ~1,800 distinct tickers against the 498 actually traded and
+#: every one of their ``historical_price_full`` payloads stayed resident for the life of the
+#: worker. The projection is ~275 KB per symbol against ~3.1 MB decoded.
+#:
+#: BOUNDED, unlike the memo it replaces: a pool child outlives the job, and an unbounded map
+#: would accumulate every universe the box ever runs. LRU by symbol, same shape as
+#: ``_WORKER_SCORING_CACHE`` above.
+_PRICE_MAP_MEM: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_PRICE_MAP_MEM_MAX = int(os.environ.get("BA2_SENATE_PRICE_MAP_MAX", "4096"))
+
+
+def clear_price_map_memo() -> None:
+    """Drop the projection memo (tests / between unrelated universes)."""
+    _PRICE_MAP_MEM.clear()
+
 
 def _shard_filename(base_filename: str, suffix: str) -> str:
     """``("congress_skill_scores.json", "60|5|50|12")`` -> ``congress_skill_scores__60_5_50_12.json``.
@@ -1430,10 +1454,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         The per-symbol FULL daily history is fetched ONCE and disk-cached (backtest-only, via
         ``fmp_history_disk_cached``) so spawned grid workers read it from disk instead of
         re-hitting FMP for every (symbol, exec-date) on every analysis bar — the dominant cold
-        cost of a Senate backtest. An in-memory date->open map dedups repeat lookups within a run
-        (live path too: a symbol with K trades fetches once, not K times). The per-date open is
-        byte-identical to the old single-day ``from=to=date`` query; the live path (freeze flag
-        off) passes through to a fresh fetch exactly as before.
+        cost of a Senate backtest. The per-date open is byte-identical to the old single-day
+        ``from=to=date`` query; the live path (freeze flag off) passes through to a fresh fetch
+        exactly as before.
+
+        WHAT IS MEMOIZED IS THE ``{date: open}`` MAP, AND ONLY THAT — see ``_PRICE_MAP_MEM``.
         """
         if not self._api_key:
             return None
@@ -1443,18 +1468,23 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         if not sym:
             return None
 
-        price_maps = getattr(self, "_hp_price_map", None)
-        if price_maps is None:
-            price_maps = self._hp_price_map = {}
-        smap = price_maps.get(sym)
+        smap = _PRICE_MAP_MEM.get(sym)
         if smap is None:
             from ba2_providers.fmp_common import fmp_history_disk_cached
+            # ``retain=False``: the decoded payload dies with this call. Everything this
+            # expert wants from it is the projection built on the next line -- ~275 KB
+            # against ~3.1 MB decoded -- and the projection is what gets memoized.
             hist = fmp_history_disk_cached(
                 "historical_price_full", sym,
                 lambda: self._fetch_price_history_uncached(sym),
+                retain=False,
             ) or []
             smap = {row.get("date"): row.get("open") for row in hist if row.get("date")}
-            price_maps[sym] = smap
+            _PRICE_MAP_MEM[sym] = smap
+            while len(_PRICE_MAP_MEM) > _PRICE_MAP_MEM_MAX:
+                _PRICE_MAP_MEM.popitem(last=False)
+        else:
+            _PRICE_MAP_MEM.move_to_end(sym)
 
         return smap.get(date.strftime("%Y-%m-%d"))
 
