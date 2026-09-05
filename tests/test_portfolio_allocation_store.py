@@ -352,6 +352,51 @@ def test_income_events_since_excludes_older_events(account_id):
     assert [e.external_id for e in recent] == ["new"]
 
 
+# --- dividends per symbol, for the P&L column -------------------------------
+
+def test_dividends_by_symbol_totals_the_payouts_of_each_symbol(account_id):
+    store.upsert_income_event(account_id, "d1", date(2026, 8, 1), "DIVIDEND", 3.18,
+                              symbol="GDXY")
+    store.upsert_income_event(account_id, "d2", date(2026, 9, 4), "DIVIDEND", 0.06,
+                              symbol="GDXY")
+    store.upsert_income_event(account_id, "d3", date(2026, 8, 31), "DIVIDEND", 1.14,
+                              symbol="BLOX")
+
+    assert store.get_dividends_by_symbol(account_id) == {
+        "GDXY": pytest.approx(3.24), "BLOX": pytest.approx(1.14)}
+
+
+def test_dividends_by_symbol_leaves_out_deposits_and_unattributed_payments(account_id):
+    """A deposit is not a return on anything, and a DIVIDEND with no symbol would
+    otherwise land on whichever holding happened to sort first."""
+    store.upsert_income_event(account_id, "dep", date(2026, 9, 4), "DEPOSIT", 1500.0)
+    store.upsert_income_event(account_id, "orphan", date(2026, 9, 4), "DIVIDEND", 9.0)
+    store.upsert_income_event(account_id, "d", date(2026, 9, 4), "DIVIDEND", 1.0,
+                              symbol="O")
+
+    assert store.get_dividends_by_symbol(account_id) == {"O": pytest.approx(1.0)}
+
+
+def test_a_symbol_that_never_paid_is_ABSENT_rather_than_zero(account_id):
+    """"Paid nothing" and "we have no ledger for it" are different facts, and the
+    P&L column shows the adjusted return for only one of them."""
+    store.upsert_income_event(account_id, "d", date(2026, 9, 4), "DIVIDEND", 1.0,
+                              symbol="O")
+
+    assert "AAPL" not in store.get_dividends_by_symbol(account_id)
+
+
+def test_dividends_stay_counted_after_a_run_has_spent_them(account_id):
+    """Consumption says which cash funded the next BUY. It says nothing about
+    whether the position earned it, and this column asks the second question."""
+    store.upsert_income_event(account_id, "d", date(2026, 8, 1), "DIVIDEND", 100.0,
+                              symbol="O")
+    consume(account_id, 100.0)
+
+    assert store.get_open_income_total(account_id) == pytest.approx(0.0)
+    assert store.get_dividends_by_symbol(account_id) == {"O": pytest.approx(100.0)}
+
+
 # --- FIFO consumption ------------------------------------------------------
 
 def test_consuming_with_a_zero_or_negative_net_buy_value_consumes_nothing(account_id):

@@ -6895,6 +6895,62 @@ def test_all_three_bars_share_one_track_style(nicegui_client, account_id):
         ';'.join(f'{k}:{v}' for k, v in t._style.items()) for t in tracks}
 
 
+def _label_rows_after_a_repaint(client, account_id):
+    """Two labels whose verdict sentences are very different lengths.
+
+    "on target" against "under by 65.0pp ($6,500.00)" -- a 9-character cell beside
+    a 27-character one, which is exactly the spread that used to pull the two rows'
+    bars to different lengths.
+    """
+    views = _views([ManagedLabel('A', 25.0), ManagedLabel('B', 90.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT']},
+                   weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
+    return _draw(client, account_id, views)
+
+
+def test_a_repaint_does_not_drop_the_delta_and_pnl_CELL_WIDTHS(nicegui_client,
+                                                               account_id):
+    """``classes(replace=...)`` replaces the WHOLE list, colour classes included.
+
+    Both cells were rendered with a width and then re-classed on every redraw with
+    colour only, so from the first repaint each was as wide as its own sentence --
+    and the growing bar beside them got whatever each row happened to leave.
+    """
+    root = _label_rows_after_a_repaint(nicegui_client, account_id)
+
+    # BY THE ROW, not by the sentence: the per-label symbol-share bar draws a delta
+    # in the same vocabulary, so 'on target' alone finds four cells on this page.
+    pnls = _marked(root, page.MARKER_LABEL_PNL)
+    assert len(pnls) == 2
+    for pnl in pnls:
+        assert page.PNL_CELL_CLASSES.split()[0] in pnl._classes
+        row = pnl.parent_slot.parent
+        deltas = [el for el in row.descendants()
+                  if (el._text or '').startswith(('on target', 'under by'))]
+        assert len(deltas) == 1
+        assert page.DELTA_CELL_CLASSES.split()[0] in deltas[0]._classes
+
+
+def test_every_label_bar_is_the_same_track_however_long_its_row_reads(nicegui_client,
+                                                                     account_id):
+    """"the bars do not all have same lenght now, not good".
+
+    The bars are read by comparing their fills DOWN the column, so a track whose
+    length changes per row makes an under-target label look on-target. Equal
+    classes is as close as a Python test gets to equal pixels -- what it pins is
+    that no row's track is special-cased and that the growing bar's neighbours are
+    all pinned, which together are what make the widths agree.
+    """
+    root = _label_rows_after_a_repaint(nicegui_client, account_id)
+
+    tracks = [el.parent_slot.parent for el in _marked(root, page.MARKER_BAR_FILL)]
+    assert len(tracks) == 2
+    assert len({' '.join(sorted(t._classes)) for t in tracks}) == 1
+    # ...and it GROWS. Pinning the bar itself passes the assertion above while
+    # leaving a third of a wide row empty -- the fix that caused the complaint.
+    assert 'flex-1' in tracks[0]._classes
+
+
 # ---------------------------------------------------------------------------
 # THE MANAGE-LABELS DIALOG, after the user looked at it
 # ---------------------------------------------------------------------------

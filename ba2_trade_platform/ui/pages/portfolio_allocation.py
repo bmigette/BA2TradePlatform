@@ -121,6 +121,7 @@ from ...core.portfolio_allocation import (
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
+    get_dividends_by_symbol,
     get_previous_symbol_weights, get_symbol_rows, get_symbol_weights,
     remove_symbols_from_label, replace_managed_labels, save_allocation_targets,
     set_allocation_config, set_managed_label, set_symbol_weight,
@@ -405,6 +406,13 @@ def _load_view_payload(account_id: int, valuation_mode: str,
                                    # row: the ⓘ tooltip is the only consumer and it is
                                    # not worth a lookup per cell.
                                    company_names=get_company_names(symbols),
+                                   # ONE query over the account's income ledger, for
+                                   # the "w/ div" half of the P&L column. A local
+                                   # read, so unlike the yield and 1Y/3Y stats it
+                                   # costs no REST call and needs no background
+                                   # top-up.
+                                   dividends_by_symbol=get_dividends_by_symbol(
+                                       account_id),
                                    unallocated_pct=unallocated_pct),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
@@ -913,6 +921,30 @@ COLOR_SWATCH_STYLE = ('width:20px;height:20px;border-radius:50%;cursor:pointer;'
 COLOR_DEBOUNCE_MS = 400
 
 
+#: Layout classes for the cells a REPAINT re-classes, kept here because
+#: ``element.classes(replace=...)`` replaces the WHOLE class list. The delta and
+#: P&L cells were rendered with a width and then re-classed on every redraw with
+#: colour classes only, which dropped the width on the first repaint; from then on
+#: each cell was as wide as its own sentence ("on target" vs "under by 32.4pp
+#: ($2,711.66)"), the row's fixed part differed per row, and the growing bar beside
+#: it got a different share of what was left. That is why the tracks came out
+#: ragged. Every repaint site now prefixes these, so the width survives.
+#:
+#: ``truncate`` is not decoration: a flex item's default ``min-width:auto`` lets it
+#: grow past its own ``w-*`` to fit its content, and only a non-visible overflow
+#: pins it. Without it the width class is advisory.
+DELTA_CELL_CLASSES = 'w-56 shrink-0 truncate '
+#: Wide enough for the dividend clause: "P&L -50.20 (-4.27%, w/ div: +1.20%)"
+#: is ~35 characters, and a truncated P&L would hide the half of the sentence
+#: that was added because the other half misreads a distribution-paying holding.
+PNL_CELL_CLASSES = 'w-72 shrink-0 truncate '
+SYMBOL_DELTA_CELL_CLASSES = 'w-44 shrink-0 truncate '
+RESERVE_DELTA_CELL_CLASSES = 'w-52 shrink-0 truncate '
+#: The label header's bar. It GROWS -- the tracks stay equal because everything to
+#: their right is pinned above, not because the bar itself is nailed down.
+LABEL_BAR_CLASSES = 'flex-1 min-w-[120px]'
+
+
 def _render_mini_bar(*, fill_marker: str, notch_marker: str,
                      classes: str = 'flex-grow min-w-[80px]') -> Dict[str, Any]:
     """Draw ONE bar track and hand back its two positioned divs.
@@ -1243,7 +1275,8 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         # "over by" at any distance and for an "under by" that has left the target
         # band; the figures are handed over so ``label_status_color`` can ask the
         # BAR's own predicate rather than carry a second copy of the threshold.
-        widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+        widgets['delta'].classes(
+            replace=DELTA_CELL_CLASSES + 'text-xs ' + LABEL_STATUS_CLASSES[bar.status])
         widgets['delta'].style(replace=important_color_style(
             label_status_color(bar.status, value_pct=bar.current_pct,
                                target_pct=bar.target_pct)))
@@ -1253,7 +1286,7 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         # nothing has to remember which of the row's figures are live.
         widgets['last'].set_text(bar.last_text)
         widgets['pnl'].set_text(bar.pnl_text)
-        widgets['pnl'].classes(replace=pnl_classes(bar.pnl))
+        widgets['pnl'].classes(replace=PNL_CELL_CLASSES + pnl_classes(bar.pnl))
         # Green up, red down, neutral inside the epsilon band -- and painted, not
         # merely classed, for the reason above.
         widgets['pnl'].style(replace=important_color_style(pnl_color(bar.pnl)))
@@ -1290,7 +1323,8 @@ def _apply_symbol_bar(live: Dict[str, Any], label: str) -> None:
                     notch_fraction=bar.notch_fraction, color=widgets['color'])
     widgets['pct'].set_text(bar.current_text)
     widgets['delta'].set_text(bar.delta_text)
-    widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+    widgets['delta'].classes(
+        replace=SYMBOL_DELTA_CELL_CLASSES + 'text-xs ' + LABEL_STATUS_CLASSES[bar.status])
     # PAINTED, like the label row's delta and the reserve row's -- and this one was
     # the odd bar out: it wore the status class and nothing painted it, so its
     # verdict rendered in plain white while the two identical readouts either side
@@ -1342,7 +1376,8 @@ def _apply_reserve_bar(live: Dict[str, Any]) -> None:
     widgets['pct'].set_text(bar.current_text)
     widgets['target'].set_text(bar.target_text)
     widgets['delta'].set_text(bar.delta_text)
-    widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+    widgets['delta'].classes(
+        replace=RESERVE_DELTA_CELL_CLASSES + 'text-xs ' + LABEL_STATUS_CLASSES[bar.status])
     # The SAME two figures the fill above was just coloured from, so the sentence
     # and the bar cannot disagree: this text goes orange in the same step the
     # track goes yellow.
@@ -2557,8 +2592,8 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         ui.label(SYMBOL_TOTAL_BAR_CAPTION).classes('w-40 text-xs text-secondary-custom')
         symbol_bar_widgets = _render_mini_bar(
             fill_marker=MARKER_SYMBOL_BAR_FILL, notch_marker=MARKER_SYMBOL_BAR_NOTCH)
-        symbol_bar_widgets['pct'] = ui.label('').classes('w-16 text-right')
-        symbol_bar_widgets['delta'] = ui.label('').classes('w-44')
+        symbol_bar_widgets['pct'] = ui.label('').classes('w-16 shrink-0 text-right')
+        symbol_bar_widgets['delta'] = ui.label('').classes(SYMBOL_DELTA_CELL_CLASSES)
         # The LABEL's own colour, resolved through the one helper the icon and the
         # header bar use, so a recolour reaches all three or none.
         symbol_bar_widgets['color'] = resolve_label_icon_color(view.color)
@@ -2844,9 +2879,11 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
             reserve_bar_widgets = _render_mini_bar(
                 fill_marker=MARKER_RESERVE_BAR_FILL,
                 notch_marker=MARKER_RESERVE_BAR_NOTCH)
-            reserve_bar_widgets['pct'] = ui.label('').classes('w-16 text-right')
-            reserve_bar_widgets['target'] = ui.label('').classes('w-28 text-right')
-            reserve_bar_widgets['delta'] = ui.label('').classes('w-52')
+            reserve_bar_widgets['pct'] = ui.label('').classes('w-16 shrink-0 text-right')
+            reserve_bar_widgets['target'] = ui.label('').classes(
+                'w-28 shrink-0 text-right')
+            reserve_bar_widgets['delta'] = ui.label('').classes(
+                RESERVE_DELTA_CELL_CLASSES)
             reserve_bar_widgets['color'] = DEFAULT_LABEL_ICON_COLOR
         live['reserve_bar'] = reserve_bar_widgets
         # The one denominator change on the page, said where the control is.
@@ -2946,39 +2983,41 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             widgets['value'] = ui.label('').classes('w-28 text-right')
             # THE bar component, shared with the per-label symbol-share total and
             # the unallocated row so the three read as one visual language.
-            # FIXED WIDTH, NOT ``flex-grow``. A flex item's default ``min-width:auto``
-            # means it will not shrink below its own content, so the target and delta
-            # cells -- whose text length varies per row ("on target" vs "under by
-            # 32.4pp ($2,711.66)") -- each took a different amount of the row and left
-            # the grow-bar a different width. The bars are read by COMPARING their
-            # fills down the column, which only works if every track is the same
-            # length; a bar whose scale changes per row is worse than no bar.
+            # IT GROWS, and every track still comes out the same length, because
+            # every cell to its right is pinned by a ``*_CELL_CLASSES`` width that a
+            # repaint can no longer drop and its own text can no longer widen. The
+            # bars are read by COMPARING their fills down the column, so equal
+            # tracks are the whole requirement -- but pinning the BAR instead
+            # (``w-96 shrink-0``) bought that equality by fixing the one element on
+            # the row whose LENGTH is the information, and left a third of a wide
+            # row empty. Pin the text, grow the bar.
             widgets.update(_render_mini_bar(
                 fill_marker=MARKER_BAR_FILL, notch_marker=MARKER_BAR_NOTCH,
-                classes='w-96 shrink-0'))
-            widgets['pct'] = ui.label('').classes('w-16 text-right')
+                classes=LABEL_BAR_CLASSES))
+            widgets['pct'] = ui.label('').classes('w-16 shrink-0 text-right')
             # WIDE ENOUGH FOR THE MONEY, NOWRAP, and LEFT-aligned. The cell carries
             # "tgt 18.0% (real 16.2% — $1,357.00)" since the money was added
             # (2026-09-05) -- ~33 characters, which wrapped at the old w-36 and made
             # every row taller. Fixed width so the column starts at the same x down
             # the page; left-aligned so the gap lands AFTER the sentence rather than
-            # between the bar and its own label. The bar stays ``flex-grow`` and
-            # absorbs whatever is left, which is what keeps a wide screen from
-            # opening a hole in the middle of the row.
+            # between the bar and its own label. The bar absorbs whatever is left,
+            # which is what keeps a wide screen from opening a hole in the row.
             widgets['target'] = ui.label('').classes(
-                'w-64 text-left whitespace-nowrap')
+                'w-72 shrink-0 truncate text-left')
             # THE number that says what to do. It replaced the bare status word --
             # "over" beside a bar already sitting past its notch said nothing the
             # geometry had not -- and it keeps that word's COLOUR, so the row still
             # scans at a glance without printing the same fact three times.
-            widgets['delta'] = ui.label('').classes('w-52')
+            widgets['delta'] = ui.label('').classes(DELTA_CELL_CLASSES)
             # The wizard's step-1 caption, minus its denominator clause. "last" is
             # the target the previous RUN used, and it is already on the investable
             # basis (it is a stored target), so unlike the wizard's "% of base"
             # wording it needs no restating -- see ``LAST_TARGET_FMT``.
-            widgets['last'] = ui.label('').classes('w-28 text-xs text-secondary-custom') \
+            widgets['last'] = ui.label('') \
+                .classes('w-28 shrink-0 truncate text-xs text-secondary-custom') \
                 .mark(MARKER_LABEL_LAST)
-            widgets['pnl'] = ui.label('').classes('w-52').mark(MARKER_LABEL_PNL)
+            widgets['pnl'] = ui.label('').classes(PNL_CELL_CLASSES) \
+                .mark(MARKER_LABEL_PNL)
             # The pencil. It OPENS the label and focuses its target box; it never
             # closes one, because "edit this" is not a toggle.
             ui.icon('edit').classes('cursor-pointer text-secondary-custom') \

@@ -126,7 +126,7 @@ __all__ = [
     # engine
     "current_value", "UnrealisedPnL", "unrealised_pnl", "format_unrealised_pnl",
     "PNL_UNMEASURABLE_MARK", "PNL_NO_PRICE_MARK", "PNL_PCT_FMT", "PNL_NO_COST_NOTE",
-    "PNL_UNPRICED_FMT", "PNL_FMT",
+    "PNL_UNPRICED_FMT", "PNL_FMT", "PNL_WITH_DIV_FMT",
     "round_quantity", "round_delta_quantity", "even_split_pct",
     "split_pct_across", "scale_pct_to_total",
     "build_symbol_targets", "validate_symbol_weights", "validate_label_targets",
@@ -1032,6 +1032,18 @@ PNL_UNPRICED_FMT = '{count} unpriced excluded'
 #: readable without colour -- colour is an accent here, never the message.
 PNL_FMT = '{amount:+,.2f} ({notes})'
 
+#: Appended when the income ledger holds DIVIDENDS for the holding: the same return
+#: with the cash the position has already paid out put back in. A covered-call ETF
+#: is bought FOR that cash and hands most of its total return over as distributions,
+#: so the price-only column reads as a loss on a position that is up -- which is the
+#: whole reason this clause exists.
+#:
+#: A PERCENTAGE only, never a second money figure. The money on the left is
+#: unrealised -- it moves with the next quote and reverses -- while a paid dividend
+#: is banked, and adding the two into one signed number would invite reading realised
+#: cash as something that can be lost again.
+PNL_WITH_DIV_FMT = 'w/ div: {pct:+.2f}%'
+
 
 @dataclass
 class UnrealisedPnL:
@@ -1069,9 +1081,23 @@ class UnrealisedPnL:
     abs_cost_basis: float = 0.0
     priced: int = 0
     unpriced: int = 0
+    #: Dividend cash the account has BANKED on these holdings, from the income
+    #: ledger. 0.0 means the ledger has nothing for them -- which on a synced
+    #: account is a measurement ("this pays nothing yet") and on an unsynced one is
+    #: an absence. Neither is worth a 0.00% on screen, which is why the two
+    #: ``total_*`` figures below stay ``None`` until there is actual cash.
+    dividends: float = 0.0
+    #: ``amount + dividends``, and ``None`` whenever there is no dividend to add or
+    #: no ``amount`` to add it to. A caller therefore tests ONE field to decide
+    #: whether the adjusted return may be shown, rather than re-deriving the
+    #: threshold and drifting from this module's answer.
+    total_amount: Optional[float] = None
+    #: ``total_amount`` over the same ``abs_cost_basis`` the plain ``pct`` uses, so
+    #: the two percentages are comparable by construction.
+    total_pct: Optional[float] = None
 
 
-def unrealised_pnl(states) -> UnrealisedPnL:
+def unrealised_pnl(states, *, dividends: float = 0.0) -> UnrealisedPnL:
     """Unrealised P&L over ``states``: money and percent. Pure; never raises.
 
     **Takes no ``valuation_mode``, deliberately, and must never grow one.** In
@@ -1091,6 +1117,17 @@ def unrealised_pnl(states) -> UnrealisedPnL:
     valued at 0.
 
     Args:
+        dividends: dividend cash BANKED on these holdings, from the account's
+            income ledger -- 0.0 when there is none, and never negative. It is
+            reported and used for ``total_amount``/``total_pct`` only; ``amount``
+            and ``pct`` stay strictly unrealised, because a realised distribution
+            and an unrealised move are different kinds of money and one column
+            adding them together is how a banked payout starts looking reversible.
+
+            It is the ledger's total for the symbol, NOT "dividends received while
+            this lot was held": the ledger begins when the account started syncing
+            and knows nothing of a position that was closed and reopened, so on a
+            re-entered holding the adjusted figure credits the earlier lot too.
         states: an iterable of ``Optional[PositionState]``. ``None`` entries and
             genuinely flat states (no quantity AND no cost) are skipped entirely.
             Pass one state for a symbol, or a label's whole membership for the
@@ -1101,7 +1138,7 @@ def unrealised_pnl(states) -> UnrealisedPnL:
     Returns:
         UnrealisedPnL: over the PRICED holdings only, with the unpriced counted.
     """
-    out = UnrealisedPnL()
+    out = UnrealisedPnL(dividends=max(0.0, float(dividends or 0.0)))
     for state in (states or []):
         if state is None:
             continue
@@ -1122,6 +1159,13 @@ def unrealised_pnl(states) -> UnrealisedPnL:
         out.amount = out.market_value - out.cost_basis
         if out.abs_cost_basis > MONEY_EPSILON:
             out.pct = out.amount / out.abs_cost_basis * 100.0
+        # Only with cash actually in the ledger, and only over a real basis. A
+        # dividend-adjusted figure identical to the plain one is not an adjustment,
+        # and a return on a zero basis is not a number.
+        if out.dividends > MONEY_EPSILON:
+            out.total_amount = out.amount + out.dividends
+            if out.abs_cost_basis > MONEY_EPSILON:
+                out.total_pct = out.total_amount / out.abs_cost_basis * 100.0
     return out
 
 
@@ -1135,6 +1179,8 @@ def format_unrealised_pnl(pnl: UnrealisedPnL) -> str:
     if pnl.amount is None:
         return PNL_NO_PRICE_MARK if pnl.unpriced else PNL_UNMEASURABLE_MARK
     notes = [PNL_NO_COST_NOTE if pnl.pct is None else PNL_PCT_FMT.format(pct=pnl.pct)]
+    if pnl.total_pct is not None:
+        notes.append(PNL_WITH_DIV_FMT.format(pct=pnl.total_pct))
     if pnl.unpriced:
         notes.append(PNL_UNPRICED_FMT.format(count=pnl.unpriced))
     return PNL_FMT.format(amount=pnl.amount, notes=', '.join(notes))

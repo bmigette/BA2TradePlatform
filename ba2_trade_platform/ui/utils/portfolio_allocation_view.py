@@ -849,6 +849,7 @@ def build_label_views(managed,
                       symbol_weights=None,
                       symbol_previous_weights=None,
                       company_names=None,
+                      dividends_by_symbol=None,
                       unallocated_pct: float = 0.0) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
@@ -886,6 +887,10 @@ def build_label_views(managed,
             ``None`` rather than falling back to the CURRENT weight -- the whole
             point of the figure is that it may differ from what is on screen, and
             "there is no last" is what the page's Load-last button reads.
+        dividends_by_symbol: ``{SYMBOL: dividend cash}`` from
+            ``get_dividends_by_symbol``. Optional; an absent symbol simply has no
+            dividend-adjusted figure, which is what an unsynced ledger should look
+            like rather than a page-wide 0.00%.
         company_names: ``{SYMBOL: company_name}`` from the instrument table; optional.
             A symbol absent here, or mapped to a blank, keeps ``company_name=None`` —
             "this instrument has no stored name" and "it is named after its ticker" are
@@ -919,6 +924,8 @@ def build_label_views(managed,
     weights_by_label = symbol_weights or {}
     previous_by_label = symbol_previous_weights or {}
 
+    dividends = dividends_by_symbol or {}
+
     def _pnl_of(sym: str) -> UnrealisedPnL:
         """One symbol's unrealised P&L, on the LIVE quote in either mode.
 
@@ -932,7 +939,8 @@ def build_label_views(managed,
             return unrealised_pnl([])
         return unrealised_pnl([PositionState(
             symbol=state.symbol, quantity=state.quantity,
-            cost_basis=state.cost_basis, price=(prices or {}).get(sym))])
+            cost_basis=state.cost_basis, price=(prices or {}).get(sym))],
+            dividends=dividends.get(sym, 0.0))
 
     def _clean(label: str) -> List[str]:
         seen, out = set(), []
@@ -1064,11 +1072,16 @@ def build_label_views(managed,
             # the rows' own figures: the engine sums market value and gross cost
             # first and divides once, which is what makes the percentage
             # money-weighted rather than a mean of the symbols' percentages.
-            pnl=unrealised_pnl([
-                PositionState(symbol=s, quantity=positions[s].quantity,
-                              cost_basis=positions[s].cost_basis,
-                              price=(prices or {}).get(s))
-                for s in symbols if s in positions]),
+            pnl=unrealised_pnl(
+                [PositionState(symbol=s, quantity=positions[s].quantity,
+                               cost_basis=positions[s].cost_basis,
+                               price=(prices or {}).get(s))
+                 for s in symbols if s in positions],
+                # The label's dividends are its MEMBERS' dividends -- summed over the
+                # same membership the states came from, so a symbol whose position is
+                # gone contributes neither a state nor its old payouts.
+                dividends=sum(dividends.get(s, 0.0)
+                              for s in symbols if s in positions)),
         ))
 
     return views

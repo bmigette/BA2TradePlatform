@@ -3310,6 +3310,47 @@ def test_a_label_view_carries_the_TOTAL_pnl_of_its_symbols():
     assert pnl.pct == pytest.approx(1_500.0 / 91_000.0 * 100.0)
 
 
+def test_a_symbol_row_carries_the_dividend_adjusted_return_when_the_ledger_has_one():
+    """"can you show adjusted p&l including the dividends?" A $1,000 holding now
+    worth $900 that has paid $60 is -10% on price and -4% with the cash back in."""
+    views = build_label_views([ManagedLabel('WHEEL_L2_MR', 10.0)],
+                              {'WHEEL_L2_MR': ['O']},
+                              {'O': _pos('O', 10, 1000.0)}, {'O': 90.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              dividends_by_symbol={'O': 60.0})
+    pnl = views[0].rows[0].pnl
+
+    assert pnl.amount == pytest.approx(-100.0)      # unrealised, untouched
+    assert pnl.total_pct == pytest.approx(-4.0)
+
+
+def test_a_symbol_with_no_ledger_entry_gets_no_adjusted_figure():
+    views = build_label_views([ManagedLabel('WHEEL_L2_MR', 10.0)],
+                              {'WHEEL_L2_MR': ['O']},
+                              {'O': _pos('O', 10, 1000.0)}, {'O': 90.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              dividends_by_symbol={'MAIN': 60.0})
+
+    assert views[0].rows[0].pnl.total_pct is None
+
+
+def test_a_labels_adjusted_return_sums_the_dividends_of_the_symbols_it_HOLDS():
+    """Money-weighted like the plain figure, and over the same membership the
+    states came from -- a managed symbol that is not held contributes neither."""
+    views = build_label_views([ManagedLabel('WHEEL_L2_MR', 10.0)],
+                              {'WHEEL_L2_MR': ['O', 'MAIN', 'SPYI']},
+                              {'O': _pos('O', 10, 1000.0),
+                               'MAIN': _pos('MAIN', 10, 1000.0)},
+                              {'O': 90.0, 'MAIN': 90.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              dividends_by_symbol={'O': 60.0, 'MAIN': 40.0,
+                                                   'SPYI': 999.0})
+    pnl = views[0].pnl
+
+    assert pnl.dividends == pytest.approx(100.0)    # SPYI is not held
+    assert pnl.total_pct == pytest.approx(-100.0 / 2_000.0 * 100.0)
+
+
 def test_an_unpriced_holding_is_excluded_from_the_pnl_rather_than_valued_at_zero():
     views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
                               {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': None},

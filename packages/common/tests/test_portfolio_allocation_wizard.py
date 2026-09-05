@@ -2351,6 +2351,92 @@ def test_format_unrealised_pnl_of_an_unpriced_holding_names_the_missing_price():
     assert '0.00' not in text
 
 
+# -- the dividend-adjusted return -------------------------------------------
+#
+# "Under p&l, can you show adjusted p&l including the dividends?" A covered-call
+# ETF is BOUGHT for its distributions and hands most of its total return over as
+# cash, so the price-only column reads as a loss on a position that is up.
+
+
+def test_dividends_never_move_the_unrealised_figure():
+    """They are realised cash. The left-hand money stays strictly unrealised."""
+    plain = pa.unrealised_pnl([_held("O", 10.0, 1_000.0, 90.0)])
+    withdiv = pa.unrealised_pnl([_held("O", 10.0, 1_000.0, 90.0)], dividends=60.0)
+
+    assert withdiv.amount == plain.amount == pytest.approx(-100.0)
+    assert withdiv.pct == plain.pct == pytest.approx(-10.0)
+
+
+def test_the_dividend_adjusted_return_adds_the_banked_cash_over_the_same_basis():
+    pnl = pa.unrealised_pnl([_held("O", 10.0, 1_000.0, 90.0)], dividends=60.0)
+
+    assert pnl.dividends == pytest.approx(60.0)
+    assert pnl.total_amount == pytest.approx(-40.0)
+    assert pnl.total_pct == pytest.approx(-4.0)
+
+
+def test_a_holding_with_no_dividend_has_no_adjusted_figure_at_all():
+    """Not 0.00%. An adjusted figure identical to the plain one is not an
+    adjustment, and on an unsynced ledger it would be a claim nobody measured."""
+    pnl = pa.unrealised_pnl([_held("A", 10.0, 1_000.0, 120.0)])
+
+    assert pnl.dividends == 0.0
+    assert pnl.total_amount is None and pnl.total_pct is None
+    assert 'div' not in pa.format_unrealised_pnl(pnl)
+
+
+def test_the_adjusted_return_needs_a_cost_basis_like_the_plain_one_does():
+    pnl = pa.unrealised_pnl([_held("GIFT", 10.0, 0.0, 5.0)], dividends=4.0)
+
+    assert pnl.pct is None and pnl.total_pct is None
+    assert pnl.total_amount == pytest.approx(54.0)
+
+
+def test_an_unpriceable_holding_gets_no_adjusted_return_either():
+    """``amount`` is None, so there is nothing to add the cash to. The dividend is
+    still REPORTED -- it was received -- it just cannot be turned into a return."""
+    pnl = pa.unrealised_pnl([_held("DARK", 5.0, 5_000.0, None)], dividends=25.0)
+
+    assert pnl.dividends == pytest.approx(25.0)
+    assert pnl.total_amount is None and pnl.total_pct is None
+    assert pa.format_unrealised_pnl(pnl) == pa.PNL_NO_PRICE_MARK
+
+
+def test_a_negative_dividend_is_not_a_dividend():
+    """The ledger stores positive cash; a withdrawal is never written to it. A
+    negative slipping in would silently DEDUCT from a return."""
+    assert pa.unrealised_pnl([_held("A", 10.0, 1_000.0, 120.0)],
+                             dividends=-50.0).dividends == 0.0
+
+
+def test_format_unrealised_pnl_prints_the_adjusted_return_as_a_percentage():
+    text = pa.format_unrealised_pnl(
+        pa.unrealised_pnl([_held("O", 10.0, 1_000.0, 90.0)], dividends=60.0))
+
+    assert text == '-100.00 (-10.00%, w/ div: -4.00%)'
+
+
+def test_the_adjusted_clause_comes_before_the_unpriced_note():
+    """The notes read outward: this holding's return, then what was left out."""
+    text = pa.format_unrealised_pnl(pa.unrealised_pnl([
+        _held("A", 10.0, 1_000.0, 120.0),
+        _held("DARK", 5.0, 5_000.0, None),
+    ], dividends=50.0))
+
+    assert text == '+200.00 (+20.00%, w/ div: +25.00%, 1 unpriced excluded)'
+
+
+def test_a_label_sums_its_members_dividends_before_dividing_once():
+    """Money-weighted, exactly as the plain percentage is: sum the cash and the
+    gross basis, then divide -- never average the members' percentages."""
+    pnl = pa.unrealised_pnl([_held("A", 10.0, 1_000.0, 120.0),
+                             _held("B", 10.0, 3_000.0, 300.0)],
+                            dividends=40.0)
+
+    assert pnl.total_amount == pytest.approx(200.0 + 0.0 + 40.0)
+    assert pnl.total_pct == pytest.approx(240.0 / 4_000.0 * 100.0)
+
+
 def test_format_unrealised_pnl_says_how_many_rows_it_left_out():
     text = pa.format_unrealised_pnl(pa.unrealised_pnl([
         _held("A", 10.0, 1_000.0, 120.0),
