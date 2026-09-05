@@ -5992,10 +5992,10 @@ def test_the_four_migrated_buttons_land_LEFT_of_the_space_beside_Fill_100(
              if isinstance(el, (ui.button, ui.space))]
     captions = [el._props.get('label', '<space>') if isinstance(el, ui.button)
                 else '<space>' for el in order]
-    assert captions[:7] == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
-                            'Load current', 'Wipe', 'Compare']
-    assert captions[7] == '<space>'
-    assert captions[8] == 'Remove selected from label'
+    assert captions[:8] == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
+                            'Load current', 'Wipe', 'Fetch data', 'Compare']
+    assert captions[8] == '<space>'
+    assert captions[9] == 'Remove selected from label'
 
 
 # ---------------------------------------------------------------------------
@@ -6665,8 +6665,8 @@ def test_load_current_joins_the_group_and_stays_on_the_harmless_side(nicegui_cli
                 else '<space>' for el in row.descendants()
                 if isinstance(el, (ui.button, ui.space))]
     assert captions == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
-                        'Load current', 'Wipe', 'Compare', '<space>',
-                        'Remove selected from label']
+                        'Load current', 'Wipe', 'Fetch data', 'Compare',
+                        '<space>', 'Remove selected from label']
 
 
 # ---------------------------------------------------------------------------
@@ -6949,6 +6949,129 @@ def test_every_label_bar_is_the_same_track_however_long_its_row_reads(nicegui_cl
     # ...and it GROWS. Pinning the bar itself passes the assertion above while
     # leaving a third of a wide row empty -- the fix that caused the complaint.
     assert 'flex-1' in tracks[0]._classes
+
+
+# ---------------------------------------------------------------------------
+# FETCH DATA -- the per-label pull of yield / 1Y / 3Y
+#
+# "Add a button in the label control to fetch data so we can have the dividend
+# etc". The background top-up on every page refresh is capped at a batch and
+# works through the WHOLE account, so a label can read "not fetched yet" for
+# several refreshes running.
+# ---------------------------------------------------------------------------
+
+def _fetch_calls(monkeypatch, *, written=None, due=None):
+    """Intercept the provider pull. Returns the growing list of (symbols, limit)."""
+    calls = []
+
+    def _fake(symbols, *, limit=None):
+        calls.append((list(symbols), limit))
+        return len(symbols) if written is None else written
+
+    monkeypatch.setattr(page.svc, 'refresh_symbol_stats', _fake)
+    if due is not None:
+        import ba2_common.core.symbol_stats as stats_mod
+        monkeypatch.setattr(stats_mod, 'stale_symbols', lambda symbols: list(due))
+    return calls
+
+
+def test_every_label_has_its_own_fetch_button(nicegui_client, account_id):
+    views = _views([ManagedLabel('A', 50.0), ManagedLabel('B', 50.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT']})
+    root = _draw(nicegui_client, account_id, views)
+
+    assert len(_marked_buttons(root, page.MARKER_FETCH_STATS)) == 2
+
+
+def test_fetch_asks_for_THIS_labels_symbols_and_no_others(monkeypatch,
+                                                          nicegui_client,
+                                                          account_id):
+    """The closure bug this row's every button guards against, at provider cost."""
+    _capture_notifications(monkeypatch)
+    calls = _fetch_calls(monkeypatch)
+    views = _views([ManagedLabel('A', 50.0), ManagedLabel('B', 50.0)],
+                   {'A': ['AAPL', 'MSFT'], 'B': ['NVDA']})
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert [c[0] for c in calls] == [['AAPL', 'MSFT']]
+
+
+def test_fetch_asks_for_THE_WHOLE_label_not_the_background_batch(monkeypatch,
+                                                                 nicegui_client,
+                                                                 account_id):
+    """The background pass takes ``STATS_REFRESH_BATCH`` at a time and works the
+    account; this button was pressed on ONE label, and half of it is not an answer."""
+    _capture_notifications(monkeypatch)
+    calls = _fetch_calls(monkeypatch)
+    symbols = [f'SYM{i}' for i in range(12)]
+    views = _views([ManagedLabel('A', 100.0)], {'A': symbols})
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert calls[0][1] == 12 > page.svc.STATS_REFRESH_BATCH
+
+
+def test_fetch_says_so_when_everything_is_already_cached(monkeypatch,
+                                                        nicegui_client, account_id):
+    sent = _capture_notifications(monkeypatch)
+    calls = _fetch_calls(monkeypatch, due=[])
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('A', 100.0)], {'A': ['AAPL']}))
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert calls == []                                   # no provider call at all
+    assert any('12 hours' in m for m, _t in sent)
+
+
+def test_fetching_NOTHING_when_work_was_due_is_reported_as_a_failure(monkeypatch,
+                                                                     nicegui_client,
+                                                                     account_id):
+    """``refresh_symbol_stats`` returns 0 both when there is nothing to do and when
+    the provider refused -- no API key, a failed call. Rendering those two the same
+    way is a button that stays silent about a misconfiguration."""
+    sent = _capture_notifications(monkeypatch)
+    _fetch_calls(monkeypatch, written=0, due=['AAPL'])
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('A', 100.0)], {'A': ['AAPL']}))
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert any(kind == 'negative' for _m, kind in sent)
+
+
+def test_a_partial_fetch_says_how_many_it_got(monkeypatch, nicegui_client,
+                                              account_id):
+    sent = _capture_notifications(monkeypatch)
+    _fetch_calls(monkeypatch, written=1, due=['AAPL', 'MSFT'])
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('A', 100.0)], {'A': ['AAPL', 'MSFT']}))
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert any('1 of 2' in m and kind == 'warning' for m, kind in sent)
+
+
+def test_a_provider_that_raises_is_reported_and_not_swallowed(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    sent = _capture_notifications(monkeypatch)
+    errors = _capture_errors(monkeypatch)
+
+    def _boom(symbols, *, limit=None):
+        raise RuntimeError('FMP is down')
+
+    monkeypatch.setattr(page.svc, 'refresh_symbol_stats', _boom)
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('A', 100.0)], {'A': ['AAPL']}))
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert any('FMP is down' in m and kind == 'negative' for m, kind in sent)
+    assert any('FMP is down' in m for m in errors)
 
 
 # ---------------------------------------------------------------------------

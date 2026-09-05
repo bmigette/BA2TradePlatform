@@ -900,6 +900,7 @@ MARKER_FILL_REST_SYMBOLS = 'pf-fill-rest-symbols'
 MARKER_LOAD_LAST_SYMBOLS = 'pf-load-last-symbols'
 MARKER_LOAD_CURRENT_SYMBOLS = 'pf-load-current-symbols'
 MARKER_WIPE_SYMBOLS = 'pf-wipe-symbols'
+MARKER_FETCH_STATS = 'pf-fetch-stats'
 
 #: The mini-bar track. Height and radius only -- the FILL's colour comes from the
 #: label's own palette entry, which is what makes the bars tell labels apart.
@@ -1656,6 +1657,71 @@ async def _fill_label_to_100(account_id: int, live: Dict[str, Any],
         account_id, live, label,
         fill_label_to_100(label, live['weights'].get(label) or {}),
         what='Fill 100%')
+
+
+async def _fetch_label_stats(label: str, symbols, refresh) -> None:
+    """Fetch the yield and 1Y/3Y total return for ONE label's symbols, then redraw.
+
+    The page already tops these up in the background on every refresh, but that
+    pass is capped at ``STATS_REFRESH_BATCH`` symbols and works through the whole
+    account -- so on 76 managed symbols a particular label can read "not fetched
+    yet" for several refreshes running. This button asks for the ones actually in
+    front of the user, ALL of them, and waits for the answer.
+
+    Off the event loop (``asyncio.to_thread``) because the provider needs several
+    REST calls per symbol: run inline, a twenty-symbol label would freeze every
+    other browser tab this server is serving.
+
+    It reports what happened in all four cases -- nothing to fetch, fetched,
+    partially fetched, and fetched NOTHING although work was due. The last is the
+    one worth the noise: ``refresh_symbol_stats`` returns 0 both when there was
+    nothing to do and when the provider refused (no API key, a failed call), and a
+    button that renders those two identically is a button that lies about a
+    misconfiguration.
+    """
+    from ba2_common.core.symbol_stats import stale_symbols
+
+    wanted = sorted({(sym or '').strip().upper() for sym in (symbols or [])
+                     if (sym or '').strip()})
+    if not wanted:
+        ui.notify(f"'{label}' has no symbols to fetch", type='warning')
+        return
+    try:
+        # WHAT IS DUE, computed here rather than left to the service, so that "all
+        # of these were fetched within the last 12 hours" can be SAID instead of
+        # being indistinguishable from a failure.
+        due = await asyncio.to_thread(stale_symbols, wanted)
+    except Exception as e:
+        logger.error(f"Could not read the symbol-stats cache for '{label}': {e}",
+                     exc_info=True)
+        ui.notify(f'Could not read the cached figures: {e}', type='negative')
+        return
+    if not due:
+        ui.notify(f"Every symbol in '{label}' was already fetched within the last "
+                  f"12 hours", type='info')
+        await refresh()
+        return
+
+    ui.notify(f"Fetching yield and total return for {len(due)} symbol(s) in "
+              f"'{label}' — this takes a few seconds each")
+    try:
+        # ``limit`` is the WHOLE label, not the background pass's batch: the user
+        # asked for this label, and half of it is not an answer.
+        written = await asyncio.to_thread(svc.refresh_symbol_stats, due,
+                                          limit=len(due))
+    except Exception as e:
+        logger.error(f"Symbol stats fetch failed for '{label}': {e}", exc_info=True)
+        ui.notify(f'Fetch failed: {e}', type='negative')
+        return
+    if not written:
+        ui.notify(f"Fetched nothing for '{label}' — check the FMP API key and the "
+                  f"log", type='negative')
+    elif written < len(due):
+        ui.notify(f"Fetched {written} of {len(due)} symbol(s) in '{label}'",
+                  type='warning')
+    else:
+        ui.notify(f"Fetched {written} symbol(s) in '{label}'", type='positive')
+    await refresh()
 
 
 # ---------------------------------------------------------------------------
@@ -2800,6 +2866,16 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                   ).props('outline dense').mark(MARKER_WIPE_SYMBOLS) \
             .tooltip('Clear every share in this label to 0% so it can be redone. '
                      '"Load last" undoes it — the history is not touched.')
+        # THE ONLY BUTTON ON THE ROW THAT TALKS TO A PROVIDER, and the only one
+        # that takes seconds rather than milliseconds -- which is why it says so in
+        # its tooltip and reports what it got.
+        ui.button('Fetch data', icon='cloud_download',
+                  on_click=lambda lbl=view.label, syms=label_symbols:
+                      _fetch_label_stats(lbl, syms, refresh)
+                  ).props('outline dense').mark(MARKER_FETCH_STATS) \
+            .tooltip('Fetch the dividend yield and 1Y / 3Y total return for every '
+                     'symbol in this label, then redraw. A few seconds per symbol '
+                     'the first time; cached for 12 hours after that.')
         # LEFT of the space, with the harmless buttons. Compare reads the same
         # ticked rows Remove does, but it only READS them; sitting it against the
         # one button on this row that deletes things is how a mis-aimed click stops
