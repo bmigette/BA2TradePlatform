@@ -2946,8 +2946,16 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             widgets['value'] = ui.label('').classes('w-28 text-right')
             # THE bar component, shared with the per-label symbol-share total and
             # the unallocated row so the three read as one visual language.
-            widgets.update(_render_mini_bar(fill_marker=MARKER_BAR_FILL,
-                                            notch_marker=MARKER_BAR_NOTCH))
+            # FIXED WIDTH, NOT ``flex-grow``. A flex item's default ``min-width:auto``
+            # means it will not shrink below its own content, so the target and delta
+            # cells -- whose text length varies per row ("on target" vs "under by
+            # 32.4pp ($2,711.66)") -- each took a different amount of the row and left
+            # the grow-bar a different width. The bars are read by COMPARING their
+            # fills down the column, which only works if every track is the same
+            # length; a bar whose scale changes per row is worse than no bar.
+            widgets.update(_render_mini_bar(
+                fill_marker=MARKER_BAR_FILL, notch_marker=MARKER_BAR_NOTCH,
+                classes='w-96 shrink-0'))
             widgets['pct'] = ui.label('').classes('w-16 text-right')
             # WIDE ENOUGH FOR THE MONEY, NOWRAP, and LEFT-aligned. The cell carries
             # "tgt 18.0% (real 16.2% — $1,357.00)" since the money was added
