@@ -2879,10 +2879,21 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             widgets['value'] = ui.label('').classes('w-28 text-right')
             # THE bar component, shared with the per-label symbol-share total and
             # the unallocated row so the three read as one visual language.
-            widgets.update(_render_mini_bar(fill_marker=MARKER_BAR_FILL,
-                                            notch_marker=MARKER_BAR_NOTCH))
+            # ``max-w`` so the bar yields space to the text beside it rather than
+            # stretching across a wide screen: the geometry is a glance, the numbers
+            # are the answer.
+            widgets.update(_render_mini_bar(
+                fill_marker=MARKER_BAR_FILL, notch_marker=MARKER_BAR_NOTCH,
+                classes='flex-grow min-w-[80px] max-w-[26rem]'))
             widgets['pct'] = ui.label('').classes('w-16 text-right')
-            widgets['target'] = ui.label('').classes('w-36 text-right')
+            # WIDE ENOUGH FOR THE MONEY, and NOWRAP. The target cell carries
+            # "tgt 18.0% (real 16.2% — $1,357.00)" since the money was added
+            # (2026-09-05), which is ~33 characters; at w-36 it wrapped to a second
+            # line and pushed every row taller. The bar beside it is ``flex-grow``,
+            # so widening this cell is what makes the bar smaller -- the two share
+            # the same row and there is no third place for the space to come from.
+            widgets['target'] = ui.label('').classes(
+                'w-64 text-right whitespace-nowrap')
             # THE number that says what to do. It replaced the bare status word --
             # "over" beside a bar already sitting past its notch said nothing the
             # geometry had not -- and it keeps that word's COLOUR, so the row still

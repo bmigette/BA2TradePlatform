@@ -218,7 +218,17 @@ ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 9 ;; small) echo 17 ;;
 # lever. The 2026-08-19 starvation was mostly a master-side dispatcher leak (fe1cba3), not
 # footprint, so these numbers are deliberately conservative until re-measured against a run
 # with correct concurrency.
-ds_remote_slots_for() { case "$1" in large) echo 12 ;; *) echo 6 ;; esac; }
+# OVERRIDABLE, because the right number is a property of the BOX and this driver now runs
+# against more than one. The defaults below are remote150's (65 GB, daemon ceiling 12);
+# remote227 is 32 cores / 256 GB with a ceiling of 24, so it takes DS_REMOTE_SLOTS_LARGE=24
+# DS_REMOTE_SLOTS_OTHER=24 SENATE_REMOTE_SLOTS=16 (Senate is ~12 GB/trial, so 24 would ask
+# for 288 GB of 256). Still clamped by the expert's own max_remote_worker_slots and by the
+# daemon ceiling, so this can only ever REDUCE concurrency below what the box allows.
+DS_REMOTE_SLOTS_LARGE="${DS_REMOTE_SLOTS_LARGE:-12}"
+DS_REMOTE_SLOTS_OTHER="${DS_REMOTE_SLOTS_OTHER:-6}"
+ds_remote_slots_for() {
+  case "$1" in large) echo "$DS_REMOTE_SLOTS_LARGE" ;; *) echo "$DS_REMOTE_SLOTS_OTHER" ;; esac
+}
 
 # PHASE B runs TWICE, mirroring tools/grid_goal2020.sh. The S1/S2/S3 answer lands FIRST so the
 # primary result is available early; S5/S6/S7 then run as a purely additive second pass.
