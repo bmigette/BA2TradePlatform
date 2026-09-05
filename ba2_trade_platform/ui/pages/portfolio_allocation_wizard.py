@@ -519,7 +519,10 @@ DRY_RUN_COLUMNS = (
     ('tick', '', 'w-10', False),
     ('symbol', 'Symbol', 'w-24', False),
     # WHERE THE ROW STARTS -- the basis being traded against.
-    ('held', 'Held', 'w-20', True),
+    # w-32: the cell reads "7 -> 6.33622" since it started showing the
+    # projected quantity beside the held one (2026-09-05), and at w-20 that
+    # wrapped onto two lines and doubled every row's height.
+    ('held', 'Held', 'w-32', True),
     ('cost', 'Cost', 'w-24', True),
     ('value', 'Value', 'w-24', True),
     ('side', 'Side', 'w-16', False),
@@ -694,7 +697,8 @@ def _render_held(row: Dict) -> None:
     side = row['side']
     colour = ('text-green-500' if side == 'BUY'
               else 'text-red-500' if side == 'SELL' else 'text-gray-400')
-    with ui.row().classes(_col('held')).style('gap:4px') as cell:
+    with ui.row().classes(
+            _col('held', 'no-wrap justify-end items-baseline')).style('gap:4px') as cell:
         _paint(ui.label(f"{_shares(held)} →"), 'text-gray-400')
         _paint(ui.label(_shares(projected)), colour + ' font-medium')
     cell.mark(MARKER_ROW_HELD)
