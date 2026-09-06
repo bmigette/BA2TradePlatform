@@ -4,6 +4,7 @@ import type { ExportKind } from '../lib/btApi';
 import { ExportDialog } from './ExportDialog';
 import { usePersistentState } from '../lib/usePersistentState';
 import { matchesLabels } from '../lib/labelFilter';
+import { RunHoverCard } from './RunHoverCard';
 import type { LabelMatchMode } from '../lib/labelFilter';
 
 // Trigger a browser download of a JSON object via a Blob + temporary <a download>.
@@ -46,6 +47,9 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
   const [refresh, setRefresh] = useState(0);
   // The run whose Export dialog is open (null = closed).
   const [exportRow, setExportRow] = useState<any | null>(null);
+  // The row under the cursor + where the cursor is. One piece of state for the whole
+  // table: only one card is ever open, and clearing it is then a single null.
+  const [hover, setHover] = useState<{ row: any; x: number; y: number } | null>(null);
   // Collapsible filter menu + numeric thresholds (client-side; expert/optId stay server-side).
   const [showFilters, setShowFilters] = usePersistentState(ns + 'showFilters', false);
   const [minSharpe, setMinSharpe] = usePersistentState(ns + 'minSharpe', '');
@@ -316,9 +320,16 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
             <th className="px-2 py-1 text-left text-xs font-medium text-gray-700 dark:text-gray-300">Actions</th>
           </tr>
         </thead>
-        <tbody>
+        <tbody onMouseLeave={() => setHover(null)}>
           {sorted.map(r => (
+            // The hover card opens on mouseenter with NO timer -- the delay was the complaint --
+            // and tracks mousemove so it follows the cursor instead of anchoring wherever the row
+            // was entered. Costs no request; see RunHoverCard.
             <tr key={r.id} onClick={() => onSelect(r.id)}
+              onMouseEnter={e => setHover({ row: r, x: e.clientX, y: e.clientY })}
+              onMouseMove={e => setHover(h => (h && h.row.id === r.id
+                ? { row: r, x: e.clientX, y: e.clientY } : h))}
+              onMouseLeave={() => setHover(h => (h && h.row.id === r.id ? null : h))}
               className={`border-b border-gray-200 dark:border-gray-600 cursor-pointer transition-colors ${
                 r.id === selectedId
                   ? 'bg-blue-50 dark:bg-blue-900/30 ring-1 ring-inset ring-blue-400 dark:ring-blue-600'
@@ -345,7 +356,7 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.totalTrades ?? r.total_trades) ?? '—'}</td>
               <td className="px-2 py-1 text-sm text-red-600 dark:text-red-400">{fmtDrawdown(r.maxDrawdown ?? r.max_drawdown)}</td>
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(() => { const w = r.winRate ?? r.win_rate; return w != null ? `${Number(w).toFixed(1)}%` : '—'; })()}</td>
-              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100"><div className="max-w-[9rem] truncate" title={r.name}>{r.name}</div></td>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100"><div className="max-w-[9rem] truncate">{r.name}</div></td>
               <td className="px-2 py-1 text-sm">
                 <div className="flex flex-wrap gap-0.5 max-w-[8rem]">
                   {(Array.isArray(r.labels) ? (r.labels as string[]) : []).map(l => (
@@ -398,6 +409,7 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
         </tbody>
       </table>
     </div>
+    <RunHoverCard row={hover?.row ?? null} x={hover?.x ?? 0} y={hover?.y ?? 0} />
     <ExportDialog
       isOpen={exportRow != null}
       backtestId={exportRow?.id ?? 0}
