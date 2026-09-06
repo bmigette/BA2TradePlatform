@@ -27,6 +27,35 @@ Everything below is OWED as of 2026-09-06. Delete lines as they land; delete the
    361, 366, 439**. Renaming also frees the name so a post-fix grid re-runs them properly.
 5. **Triage the 30 failed goal2020 jobs.**
 
+## Static-balance ("ok1000") screen — AFTER the ATR fix merges
+
+Requested 2026-09-06, to run once the goal2020 grid finishes.
+
+1. From the top results, select those whose **average equity usage is < 50%**. That is
+   `capitalUsage.ts`'s `avgPct` (open notional over equity AT THE TIME); port it to Python and
+   run it server-side over the completed rows — read-only, so it can be done the moment the grid
+   lands.
+2. Re-run those settings with the static-balance feature at **$1000** and label them `ok1000`.
+   Remote150 or local, operator's choice.
+
+**MUST come after the ATR fix merges.** Run on today's code and every ok1000 result inherits the
+swapped stop/size genes, so a bad result could not be attributed to the static-balance feature
+rather than the defect.
+
+Prep already done:
+* The feature is `--equity-cap` (`equity_cap` in the run config), exposed on `optimize` and
+  `optimize-batch` only. The payload supports it generally but there is no plain
+  `backtest --equity-cap` CLI — settle the invocation before the batch.
+* Never used: 0 rows in `backtests.strategy_params` or
+  `strategy_optimizations.parameter_ranges` mention it. The operator's warning that it may be
+  buggy is well founded on usage, though **81 tests pass** (`test_equity_cap.py`,
+  `test_equity_cap_e2e.py`).
+* Design is sound where it matters: `deployed_equity()` is capped and is what the sizer, buying
+  power, margin and option rails see, while `scoring_curve()` divides REAL equity returns by the
+  fixed cap — so a strategy does not appear to stop earning once it exceeds the cap.
+* Do ONE smoke run before any batch, and assert the sizer actually sees $1000. Today proved this
+  codebase can carry a knob that looks wired and is not (see the ATR gene).
+
 ## Audit findings still open (see docs/plans/2026-09-06-audit-fix-design.md)
 
 - Options, free to fix (nothing optimized yet): opt #6 breaker state surviving
