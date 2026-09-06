@@ -494,13 +494,42 @@ def put_assignment_cost(strike: Optional[float],
 # ---------------------------------------------------------------------------
 # the three measurements each rule needs
 # ---------------------------------------------------------------------------
+def _quote_side(row: OptionContract, *, want_ask: bool) -> Optional[float]:
+    """The side of ``row`` a trade actually lifts, or ``None`` when it is unknowable.
+
+    Prefers the real side. Falls back to ``last`` when that side is absent -- a print is
+    the only evidence left on a row that quotes nothing -- but ONLY where it does not
+    contradict the side that IS present. ``ask >= bid`` always holds, so:
+
+      * buying back (want_ask) a row quoting ``bid=3``: a ``last`` of 0.50 is below the
+        standing bid and cannot be what the buyback costs.
+      * selling out (want bid) a row quoting ``ask=0.9``: a ``last`` of 2.00 is above the
+        standing offer and cannot be what the sale fetches.
+
+    Both are refused rather than believed. Without this bracket the substitution does not
+    degrade gracefully, it INVERTS decisions: a short sold for 2.00 on ``bid=3, ask=None,
+    last=0.50`` reads as +75% captured and takes profit, when the published bid alone
+    proves the buyback costs at least 3.00 -- a >100% loss. Refusing makes the mark
+    unknown, which ``_pnl_pct`` turns into ``LIFECYCLE_UNKNOWN`` naming the input: the
+    alarm this module's docstring promises, not a confident wrong number.
+    """
+    have = row.ask if want_ask else row.bid
+    if have is not None:
+        return have
+    last = row.last
+    if last is None:
+        return None
+    other = row.bid if want_ask else row.ask
+    if other is not None and (last < other if want_ask else last > other):
+        return None
+    return last
+
+
 def _exit_mark(leg: LifecycleLeg, row: OptionContract) -> Optional[float]:
     """What flattening this leg trades at: sell the long at the bid, buy the short
     back at the ask, ``last`` only when that side of the quote is missing. Swapping
     the two flatters every position by the width of the spread."""
-    if leg.is_short:
-        return row.ask if row.ask is not None else row.last
-    return row.bid if row.bid is not None else row.last
+    return _quote_side(row, want_ask=leg.is_short)
 
 
 def _pnl_pct(structure: OptionStructure,
@@ -532,8 +561,11 @@ def _pnl_pct(structure: OptionStructure,
                           f"P&L is unmeasurable")
         mark = _exit_mark(leg, row)
         if mark is None:
-            return None, (f"no usable mark for {leg.contract_symbol} (bid/ask/last all "
-                          f"missing) — the structure's P&L is unmeasurable")
+            side = "ask" if leg.is_short else "bid"
+            return None, (f"no usable {side} for {leg.contract_symbol} — flattening a "
+                          f"{'short' if leg.is_short else 'long'} leg trades on that side of "
+                          f"the quote, and neither it nor a `last` consistent with the other "
+                          f"side is available — the structure's P&L is unmeasurable")
         # Flattening signed qty -net at the mark: a long (net>0) is sold for +net*mark,
         # a short (net<0) is bought back for net*mark (negative cash). One expression.
         flatten_cash += leg.net_qty * mark
@@ -699,7 +731,10 @@ def pmcc_credit_decay(structure: OptionStructure,
     if row is None:
         return None, (f"no chain row for the overlay {short.contract_symbol} — what it costs "
                       f"to buy back is unknown")
-    ask = row.ask if row.ask is not None else row.last
+    # Same bracketed fallback ``_exit_mark`` uses, and it must stay the same: a stale print
+    # BELOW the standing bid reports decay the live market does not offer. Missing ask with
+    # no usable stand-in => the decayed fraction is unmeasurable, reported below.
+    ask = _quote_side(row, want_ask=True)
     pct = credit_decay_pct(short.entry_premium, ask)
     if pct is None:
         return None, (f"the overlay {short.contract_symbol} cannot be priced against its own "

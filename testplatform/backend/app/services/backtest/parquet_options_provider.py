@@ -493,7 +493,7 @@ class _Underlying:
         iv, delta, gamma, theta, vega = self.greeks_tuple(i, ci, spot_source)
         close = _f(self.close[i])
         bid, ask = _f(self.bid[i]), _f(self.ask[i])
-        if bid is None or ask is None:
+        if bid is None and ask is None:
             # ZERO-SPREAD PREMIUM PROXY -- the pre-2026-09 behaviour, still used for stores
             # with no quote columns (the whole TastyTrade tree) and identical in effect to the
             # sqlite store (bid == ask on every one of its quoted rows). It makes spread_pct a
@@ -501,6 +501,14 @@ class _Underlying:
             # nothing and w_spread scores every candidate alike -- see the module docstring's
             # bid/ask bullet. A store WITH real quotes (ThetaData) takes the branch above and
             # those two knobs start working.
+            #
+            # BOTH SIDES, NOT EITHER: the proxy answers "this store quotes nothing", which is a
+            # property of the store, not of the row. A HALF-quoted row (ThetaData publishes one
+            # side and not the other) keeps the side it really has and leaves the other None, so
+            # spread_pct stays None and _minimise scores it _WORST. Substituting close for the
+            # missing side instead would discard a real bid AND manufacture a 0.0 spread, which
+            # normalises to the BEST rank -- turning a correctly-handled "unknown" into a
+            # top-ranked fabrication, the exact fail-open _minimise's docstring exists to stop.
             bid = ask = close
         vol = _i(self.volume[i])
         return OptionContract(
@@ -684,7 +692,7 @@ class ParquetOptionsProvider:
             return None
         close = _f(u.close[i])
         bid, ask = _f(u.bid[i]), _f(u.ask[i])
-        if bid is None or ask is None:
+        if bid is None and ask is None:
             bid = ask = close
         # Same pricing rule get_chain's ``contract()`` uses, and it MUST stay a twin: entry
         # actions price off chain rows while close actions price off quotes, and the two must

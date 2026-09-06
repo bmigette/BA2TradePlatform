@@ -13,7 +13,7 @@ congressional holdings. It was invisible at EVERY window length, so no lookback 
 The gap only reaches the trading path in BASKET mode (which discovers symbols from the feed);
 ``BRK`` is absent from the static senate universe, which is why a per-symbol run never surfaced it.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
 
@@ -26,7 +26,12 @@ def _expert():
 
 def _t(who, sym, ttype, date, amount="$15,001 - $50,000"):
     return {"representative": who, "symbol": sym, "type": ttype,
-            "transactionDate": date, "amount": amount}
+            "transactionDate": date,
+            # Disclosure lag, as in test_senate_still_held's fixtures: knowledge time is the
+            # disclosure date, so a row without one is never public and would be dropped.
+            "disclosureDate": (datetime.strptime(date, "%Y-%m-%d")
+                               + timedelta(days=30)).strftime("%Y-%m-%d"),
+            "amount": amount}
 
 
 # --------------------------------------------------------------------------- #

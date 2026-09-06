@@ -472,6 +472,35 @@ def test_last_is_used_only_when_that_side_of_the_quote_is_missing():
     assert d.pnl_pct == pytest.approx(60.0)   # 0.90 - 0.10 = 0.80 to close
 
 
+def test_a_last_below_the_standing_bid_cannot_price_a_short_buyback():
+    """``bid=3, ask=None, last=0.50``: the print is BELOW the standing bid, so it cannot be
+    what buying the short back costs. Believing it turns a >100% loser into a +75% winner
+    and takes profit; the mark must go UNKNOWN instead."""
+    st = put_credit_spread(credit=2.00)
+    chain = {
+        "XYZ_P100": contract("XYZ_P100", bid=3.0, ask=None, last=0.50, delta=-0.2),
+        "XYZ_P95": contract("XYZ_P95", bid=0.05, ask=0.10, last=0.07, delta=-0.02),
+    }
+    d = only(decide([st], chain, settings(profit_capture_pct=50.0), AS_OF))
+    assert d.pnl_pct is None
+    assert d.reason == LIFECYCLE_UNKNOWN
+    assert "XYZ_P100" in d.detail and "ask" in d.detail
+
+
+def test_a_last_above_the_standing_offer_cannot_price_a_long_sale():
+    """The mirror: selling the long lifts the bid, and a print ABOVE the standing ask is
+    not a price that sale could fetch."""
+    st = put_credit_spread(credit=2.00)
+    chain = {
+        "XYZ_P100": contract("XYZ_P100", bid=0.50, ask=0.60, last=0.55, delta=-0.2),
+        "XYZ_P95": contract("XYZ_P95", bid=None, ask=0.10, last=2.00, delta=-0.02),
+    }
+    d = only(decide([st], chain, settings(profit_capture_pct=1000.0), AS_OF))
+    assert d.pnl_pct is None
+    assert d.reason == LIFECYCLE_UNKNOWN
+    assert "XYZ_P95" in d.detail and "bid" in d.detail
+
+
 def test_cash_already_banked_on_a_closed_leg_counts_toward_the_pnl():
     """A structure whose short wing was bought back for 0.40 has REALISED that cost;
     pricing only the legs still held would report it as a bigger winner than it is."""

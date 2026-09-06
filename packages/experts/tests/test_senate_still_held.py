@@ -10,7 +10,7 @@ Two DISTINCT settings, deliberately not folded into the existing consensus knobs
   min_still_holders   -- CONSENSUS floor on OPEN positions, independent of min_traders (which
                          counts anyone who traded in the window, sold or not)
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -41,9 +41,26 @@ def _clock_advanced_past_ttl():
 
 
 
-def _t(who, sym, ttype, date, amount="$15,001 - $50,000"):
+def _t(who, sym, ttype, date, amount="$15,001 - $50,000", disclosed=None):
+    """A disclosure row. ``disclosed`` defaults to transactionDate + 30 days.
+
+    THE DEFAULT MATTERS. Until 2026-09-06 this fixture emitted NO disclosureDate at all, so
+    the whole still-held suite only ever exercised execution-date netting -- which is exactly
+    where a lookahead hid: the gate cut on execution date, so a sale executed before the as-of
+    date but disclosed weeks later counted as already-known. Real data always carries the field
+    (0 of 66,869 rows measured missing) and congressional reporting lags 30-45 days, so a
+    fixture without it was modelling a world that does not exist. Pass ``disclosed`` explicitly
+    to test the lag itself.
+    """
+    if disclosed is None:
+        try:
+            disclosed = (datetime.strptime(date, "%Y-%m-%d")
+                         + timedelta(days=30)).strftime("%Y-%m-%d")
+        except ValueError:
+            disclosed = date      # malformed exec date -> malformed disclosure; the row is
+            #                       meant to be dropped, and the helper must not raise first.
     return {"representative": who, "symbol": sym, "type": ttype,
-            "transactionDate": date, "amount": amount}
+            "transactionDate": date, "disclosureDate": disclosed, "amount": amount}
 
 
 def _expert():
@@ -99,7 +116,10 @@ def test_a_later_sale_does_not_retroactively_close_an_earlier_bar():
     e = _expert()
     trades = [_t("Alice", "UBER", "purchase", "2024-01-10"),
               _t("Alice", "UBER", "sale", "2024-05-01")]
-    early = datetime(2024, 2, 1, tzinfo=timezone.utc)
+    # 2024-03-01: after the buy is public (01-10 -> 02-09) and well before the sale is
+    # (05-01 -> 05-31). The old probe was 02-01, which asserted knowledge of a purchase that
+    # had not been disclosed yet -- the assertion itself encoded a lookahead.
+    early = datetime(2024, 3, 1, tzinfo=timezone.utc)
     assert e._still_held_by(trades, "UBER", now=early) == {"Alice": True}
     assert e._still_held_by(trades, "UBER", now=NOW) == {"Alice": False}
 
@@ -157,7 +177,7 @@ def test_non_buy_sell_rows_are_ignored():
 def test_symbol_matching_is_case_insensitive():
     e = _expert()
     trades = [{"representative": "Alice", "ticker": "uber", "type": "purchase",
-               "transactionDate": "2024-01-10", "amount": "$15,001 - $50,000"}]
+               "transactionDate": "2024-01-10", "disclosureDate": "2024-02-09", "amount": "$15,001 - $50,000"}]
     assert e._still_held_by(trades, "UBER", now=NOW) == {"Alice": True}
 
 
@@ -177,13 +197,19 @@ def test_repeat_calls_in_the_same_day_are_memoized():
 
 
 def test_memo_is_per_day_not_forever():
-    """Holdings change across days, so a later day must recompute."""
+    """Holdings change across days, so a later day must recompute.
+
+    Probe dates sit AFTER each disclosure (buy 01-10 -> public 02-09; sale 03-10 -> public
+    04-09). The old version probed 2024-02-01 and expected "held", which asserted knowledge of
+    a purchase that was not public until 02-09 -- the assertion encoded the lookahead this
+    fixture change exists to expose.
+    """
     e = _expert()
     trades = [_t("Alice", "UBER", "purchase", "2024-01-10"),
               _t("Alice", "UBER", "sale", "2024-03-10")]
-    feb = e._still_held_by(trades, "UBER", now=datetime(2024, 2, 1, tzinfo=timezone.utc))
+    mar = e._still_held_by(trades, "UBER", now=datetime(2024, 3, 1, tzinfo=timezone.utc))
     jun = e._still_held_by(trades, "UBER", now=NOW)
-    assert feb == {"Alice": True} and jun == {"Alice": False}
+    assert mar == {"Alice": True} and jun == {"Alice": False}
 
 
 def test_intraday_bars_share_one_entry():
@@ -241,7 +267,8 @@ def _t_named(first, last, office, sym, ttype, date, amount="$15,001 - $50,000"):
     them. 51 of 285 traders are like this in the live feed (20.9% of all rows) -- e.g.
     office='A. Mitchell McConnell' vs 'Mitch McConnell', 'Cory A Booker' vs 'Cory Booker'."""
     return {"firstName": first, "lastName": last, "office": office, "symbol": sym,
-            "type": ttype, "transactionDate": date, "amount": amount}
+            "type": ttype, "transactionDate": date,
+            "disclosureDate": (datetime.strptime(date, "%Y-%m-%d") + timedelta(days=30)).strftime("%Y-%m-%d"), "amount": amount}
 
 
 def test_held_by_is_keyed_by_trader_name_not_office():
@@ -281,9 +308,15 @@ def test_a_mismatched_office_trader_who_sold_is_still_dropped():
 # --------------------------------------------------------------------------- #
 # live cache invalidation
 # --------------------------------------------------------------------------- #
-def _named(first, last, sym, ttype, date):
+def _named(first, last, sym, ttype, date, disclosed=None):
+    """Same disclosure-lag default as ``_t`` -- see its docstring for why a fixture without a
+    disclosureDate models a world that does not exist."""
+    if disclosed is None:
+        disclosed = (datetime.strptime(date, "%Y-%m-%d")
+                     + timedelta(days=30)).strftime("%Y-%m-%d")
     return {"firstName": first, "lastName": last, "symbol": sym, "type": ttype,
-            "transactionDate": date, "amount": "$15,001 - $50,000"}
+            "transactionDate": date, "disclosureDate": disclosed,
+            "amount": "$15,001 - $50,000"}
 
 
 _BASE = [_named("A", "a", "UBER", "purchase", "2024-01-10"),
@@ -335,3 +368,60 @@ def test_within_the_ttl_the_cache_is_deliberately_reused():
     e = _expert()
     assert e._holder_count_as_of(_GREW, "UBER", NOW, is_live=True) == 3
     assert e._holder_count_as_of(_AMEND, "UBER", NOW, is_live=True) == 3  # same window -> cached
+
+
+# --------------------------------------------------------------------------- #
+# LOOKAHEAD: knowledge time is the DISCLOSURE date, not the execution date (2026-09-06)
+#
+# Found by audit, confirmed in source: the gate cut on exec_dt, so a sale EXECUTED before the
+# as-of date but DISCLOSED weeks later counted as already-known. With the 30-45 day
+# congressional reporting lag this expert is built around, that window is wide -- and because
+# require_still_held / min_still_holders are GATES, the leak silently excluded symbols the
+# strategy could not yet know were being sold. That biases results OPTIMISTIC.
+#
+# All four completed goal2020 Senate optimizations ran with min_still_holders=2, so this path
+# was live in every one of them.
+# --------------------------------------------------------------------------- #
+def test_a_sale_executed_but_not_yet_disclosed_does_not_close_the_position():
+    """THE BUG. Sale executed 03-01, disclosed 04-15. On 03-20 the public cannot know."""
+    e = _expert()
+    trades = [_t("Alice", "UBER", "purchase", "2024-01-10", disclosed="2024-02-09"),
+              _t("Alice", "UBER", "sale", "2024-03-01", disclosed="2024-04-15")]
+    mid = datetime(2024, 3, 20, tzinfo=timezone.utc)
+    assert e._still_held_by(trades, "UBER", now=mid) == {"Alice": True}, (
+        "the sale was not public on 2024-03-20 -- gating on execution date leaks it")
+    after = datetime(2024, 4, 20, tzinfo=timezone.utc)
+    assert e._still_held_by(trades, "UBER", now=after) == {"Alice": False}, (
+        "once disclosed on 04-15 the exit must be honoured")
+
+
+def test_a_purchase_is_invisible_until_it_is_disclosed():
+    """The mirror case: an undisclosed BUY must not count as a holding either."""
+    e = _expert()
+    trades = [_t("Alice", "UBER", "purchase", "2024-01-10", disclosed="2024-03-01")]
+    assert e._still_held_by(trades, "UBER", now=datetime(2024, 2, 1, tzinfo=timezone.utc)) == {}
+    assert e._still_held_by(trades, "UBER", now=datetime(2024, 3, 5, tzinfo=timezone.utc)) \
+        == {"Alice": True}
+
+
+def test_holder_count_timeline_steps_on_disclosure_not_execution():
+    """min_still_holders bisects this timeline, so its x-axis must be knowledge time."""
+    e = _expert()
+    trades = [_t("A", "UBER", "purchase", "2024-01-05", disclosed="2024-02-10"),
+              _t("B", "UBER", "purchase", "2024-01-06", disclosed="2024-02-10"),
+              _t("C", "UBER", "purchase", "2024-01-07", disclosed="2024-04-01")]
+    # Between the two disclosure dates only A and B are public, though all three had EXECUTED.
+    mar = datetime(2024, 3, 1, tzinfo=timezone.utc)
+    assert e._holder_count_as_of(trades, "UBER", mar) == 2, (
+        "C executed in January but was not disclosed until April")
+    apr = datetime(2024, 4, 10, tzinfo=timezone.utc)
+    assert e._holder_count_as_of(trades, "UBER", apr) == 3
+
+
+def test_a_row_with_no_disclosure_date_is_never_treated_as_public():
+    """Fails CLOSED. 0 of 66,869 real rows lack the field, so this is a guard -- but the safe
+    direction for an unestablished disclosure is 'not yet known', never 'known'."""
+    e = _expert()
+    trades = [{"representative": "Ghost", "symbol": "UBER", "type": "purchase",
+               "transactionDate": "2024-01-10", "amount": "$15,001 - $50,000"}]
+    assert e._still_held_by(trades, "UBER", now=NOW) == {}
