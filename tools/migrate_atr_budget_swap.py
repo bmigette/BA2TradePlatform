@@ -34,6 +34,18 @@ WHAT IS NOT TOUCHED, and why each is already correct:
 REVERSIBLE WITHOUT A 10.9 GB DB COPY. Each migrated JSON gains ``_atr_swap_migration`` recording
 the original pair, so a row can be restored (and a re-run of this tool skips it).
 
+THIS TOOL DOES NOT TOUCH LIVE EXPERT SETTINGS, which is a trap if anything is deployed BEFORE the
+code fix lands. ``import_deploy_payload.py`` pushes a whole genome through
+``expert.save_settings``, so deploying one writes ``atr_risk_budget_pct`` onto a live
+ExpertInstance for the FIRST time -- no live instance sets it today, which is the only reason the
+swap is inert in live trading. That deployment AGREES with its backtest while both run the
+swapped wiring, and then silently becomes a DIFFERENT strategy the moment the fix merges, because
+the live settings were never migrated: a 0.25-3.0 budget starts setting stop distance and a
+0.5-10.0 stop gene starts setting position size, on real money, with nothing in any log saying so.
+
+So: deploy AFTER the fix, from migrated genomes. If something must go out sooner, extend this
+tool to the ``expertsetting`` rows of every affected instance and run both halves in one step.
+
 CAVEAT WORTH KNOWING. After the swap a value may sit outside its gene's declared range
 (``atr_risk_budget_pct`` is declared 0.25-3.0 but can receive up to 10.0; ``risk_per_trade_pct``
 is declared 0.5-10.0 but can receive 0.25). That is correct for REPRODUCTION and harmless to read
