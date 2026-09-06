@@ -397,3 +397,40 @@ class DataPreparationService:
             List of column names that were dropped due to zero variance
         """
         return self.dropped_columns.copy()
+
+
+def purged_train_row_count(n_train_rows: int, label_horizon: int) -> int:
+    """Number of training rows that survive a horizon purge at the split boundary.
+
+    Forward-looking labels are pre-computed over the WHOLE frame and only then cut
+    at ``split_idx``. A label on training row ``i`` with a ``label_horizon`` of ``h``
+    bars is decided by the close at row ``i + h`` -- so for the last ``h`` training
+    rows that answer lies inside the validation block. Training on them feeds
+    validation-period outcomes into the fit and makes the held-out score optimistic
+    by construction. Dropping the last ``h`` training rows leaves only labels whose
+    outcome window closes strictly before the boundary.
+
+    ``label_horizon`` of 0 means the label is causal (e.g. an RSI-cross reversal
+    that reads no future bar) and nothing is purged.
+
+    Args:
+        n_train_rows: Rows on the training side of the chronological split.
+        label_horizon: Bars of look-ahead built into the label, in the frame's own
+            timeframe. Must be a known non-negative integer -- an unknown horizon
+            is a refusal, never a silent 0 (that would purge nothing and quietly
+            restore the leak).
+
+    Returns:
+        Row count to keep, counting from the start of the training block. 0 when
+        the horizon consumes the whole block.
+
+    Raises:
+        ValueError: If either argument is negative or the horizon is not an int.
+    """
+    if n_train_rows < 0:
+        raise ValueError(f"n_train_rows must be >= 0, got {n_train_rows}")
+    if not isinstance(label_horizon, (int, np.integer)) or isinstance(label_horizon, bool):
+        raise ValueError(f"label_horizon must be an int, got {label_horizon!r}")
+    if label_horizon < 0:
+        raise ValueError(f"label_horizon must be >= 0, got {label_horizon}")
+    return max(0, n_train_rows - int(label_horizon))

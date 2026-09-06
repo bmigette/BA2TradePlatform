@@ -15,6 +15,7 @@ from pathlib import Path
 
 from app.models.database import SessionLocal
 from app.models.dataset import Dataset
+from app.services.data_preparation import purged_train_row_count
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,108 @@ MULTISTEP_MODELS = ['nbeats', 'tcn', 'transformer', 'tft']
 # Sparse indicators that should be forward-filled at training time
 # These indicators have NaN between pivot points which can cause training issues
 SPARSE_INDICATOR_PATTERNS = ['zigzag', 'zigzag_direction']
+
+# Raw OHLCV/bookkeeping columns. These are inputs to target CONSTRUCTION and to
+# the indicator pass, never model features in their own right.
+NON_FEATURE_COLUMNS = ('Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'ticker')
+
+# Legacy price-based targets (PredictionTargetService.calculate_prediction_targets)
+# are not registered in the caller's target list, so they are recognised by name.
+LEGACY_TARGET_PREFIX = 'price_'
+
+
+def select_feature_columns(
+    all_columns: List[str],
+    target_columns: Optional[List[str]] = None,
+    selected_target: Optional[str] = None
+) -> List[str]:
+    """Choose the model input columns for a prepared training frame.
+
+    Every generated prediction target is excluded, not just the legacy
+    ``price_*`` family. This used to exclude ``price_*`` only, which left the
+    directional labels (``direction_up_5bar``), the trend-reversal labels
+    (``zigzag_bullish_reversal``), ``triple_barrier_*`` and ``volatility_*`` in
+    the feature list -- including the very column being predicted. Because the
+    caller passes ``prediction_horizon=0`` (targets are pre-shifted at build
+    time), the last timestep of every input sequence then carried the exact label
+    as a feature: ``X[:, label_feature, -1] == y`` for every sample. A model
+    scored that way measures nothing but its ability to copy one input, and the
+    feature cannot even be computed at inference time because it is derived from
+    a future bar.
+
+    Args:
+        all_columns: Columns of the prepared frame, in order.
+        target_columns: Every target column generated for this job (all of them,
+            not only the one being trained -- a non-selected target is just as
+            future-derived and just as unavailable live).
+        selected_target: The target actually being predicted. Passed separately
+            because the legacy path builds targets without registering them.
+
+    Returns:
+        Feature column names, in the frame's own column order.
+    """
+    excluded = set(NON_FEATURE_COLUMNS)
+    excluded.update(target_columns or ())
+    if selected_target:
+        excluded.add(selected_target)
+    excluded.update(c for c in all_columns if c.startswith(LEGACY_TARGET_PREFIX))
+    return [c for c in all_columns if c not in excluded]
+
+
+def build_directional_target(close: pd.Series, horizon: int, direction: str) -> pd.Series:
+    """Build a directional label: did Close move the wanted way ``horizon`` bars later?
+
+    Returns 1.0 / 0.0 where the future bar exists and NaN for the final ``horizon``
+    bars, whose outcome simply has not happened yet.
+
+    That NaN is the point. This used to be
+    ``(close.shift(-horizon) > close).astype(int)``: comparing against the shift's
+    trailing NaN is False, and the cast turned "unknowable" into a confirmed 0. Those
+    fabricated negatives entered the class balance and the held-out
+    precision/recall/F1 as if they were observed outcomes -- proportionally worse the
+    shorter the dataset or the longer the horizon (a 2-bar horizon on a 12-row frame
+    invents 2 negatives out of 12). Missing is the honest label; the rows are dropped
+    before the split.
+
+    Args:
+        close: Close price series, chronologically ordered.
+        horizon: Bars ahead the label looks.
+        direction: 'up'/'bullish' for an upward move, anything else for downward.
+
+    Returns:
+        Float series (1.0/0.0/NaN) aligned to ``close``.
+    """
+    future_close = close.shift(-horizon)
+    if direction in ('up', 'bullish'):
+        outcome = future_close > close
+    else:
+        outcome = future_close < close
+    return outcome.astype(float).where(future_close.notna())
+
+
+def drop_unobservable_target_rows(
+    df: pd.DataFrame, target_column: str
+) -> Tuple[pd.DataFrame, int]:
+    """Remove rows whose target outcome has not happened within the data.
+
+    Every forward-looking target leaves an unobservable tail. A row there carries no
+    label at all, so it must reach neither training nor scoring: as a 0 it is a
+    fabricated negative, and as a NaN it reaches ``astype(np.int64)`` in the tsai
+    preparation and becomes the int64 overflow sentinel -- a nonsense class id that
+    trains and scores silently.
+
+    Args:
+        df: Prepared frame, chronologically ordered.
+        target_column: The target actually being trained on.
+
+    Returns:
+        (frame without the unlabelled rows, number of rows removed).
+    """
+    unobservable = df[target_column].isna()
+    n_dropped = int(unobservable.sum())
+    if n_dropped == 0:
+        return df, 0
+    return df[~unobservable].reset_index(drop=True), n_dropped
 
 
 def split_datasets_by_role(dfs: list, dataset_ids: list, test_dataset_ids: list) -> tuple:
@@ -1326,6 +1429,8 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
         logger.info(f"Dataset timeframe: {dataset_timeframe}")
 
         # Calculate prediction targets
+        all_target_columns: List[str] = []
+        target_label_horizons: Dict[str, int] = {}
         if prediction_targets:
             update_job_progress(task_id, 15, "Calculating prediction targets...")
 
@@ -1340,7 +1445,10 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                 target_service = PredictionTargetService()
 
                 target_column = None
-                all_target_columns = []  # Collect all generated target column names for model metadata
+                # Every branch below records its column in all_target_columns (so it is
+                # kept out of the features) and its look-ahead in target_label_horizons,
+                # in DATASET timeframe bars (so the split boundary can be purged). A
+                # missing horizon is refused at the split, never defaulted to 0.
                 for pt in prediction_targets:
                     pt_type = pt.get('type')
                     # Support both old format (config) and new format (indicatorParams)
@@ -1355,6 +1463,10 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
 
                     # Prepare working_df for multi-timeframe (if applicable)
                     working_df = combined_df
+                    # How many base-timeframe bars one target-timeframe bar spans. A target
+                    # computed on a higher timeframe looks further ahead once aligned back,
+                    # so its purge horizon has to be expressed in base bars.
+                    bars_per_target_bar = 1
                     if use_multi_tf:
                         try:
                             from app.services.indicators import resample_ohlcv_to_timeframe, align_higher_timeframe_to_lower
@@ -1362,6 +1474,8 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                                 combined_df, target_timeframe, source_timeframe=dataset_timeframe
                             )
                             logger.info(f"Resampled to {target_timeframe} for target: {len(combined_df)} -> {len(working_df)} bars")
+                            if len(working_df) > 0:
+                                bars_per_target_bar = max(1, int(np.ceil(len(combined_df) / len(working_df))))
                         except ValueError as e:
                             logger.warning(f"Cannot resample to {target_timeframe}: {e}. Using base timeframe.")
                             use_multi_tf = False
@@ -1391,6 +1505,12 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
 
                             combined_df[col_name] = target_series
                             all_target_columns.append(col_name)
+                            # rsi/macd/sar reversals only compare bar i against bar i-1 --
+                            # genuinely causal, horizon 0. zigzag reads zigzag.iloc[i+1] to
+                            # see the slope flip, so it looks one target-timeframe bar ahead.
+                            target_label_horizons[col_name] = (
+                                bars_per_target_bar if indicator == 'zigzag' else 0
+                            )
                             if target_column is None:
                                 target_column = col_name
                             logger.info(f"Created trend reversal target: {col_name}, positives: {int(target_series.sum())}")
@@ -1410,15 +1530,19 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                         col_name = f"direction_{dir_label}_{horizon}bar"
                         if use_multi_tf:
                             col_name = f"{col_name}_{target_timeframe}"
-                        # Directional is calculated on base timeframe (uses shift), no resampling needed
-                        if direction in ['up', 'bullish']:
-                            combined_df[col_name] = (combined_df['Close'].shift(-horizon) > combined_df['Close']).astype(int)
-                        else:
-                            combined_df[col_name] = (combined_df['Close'].shift(-horizon) < combined_df['Close']).astype(int)
+                        # Directional is calculated on base timeframe (uses shift), no resampling needed.
+                        # The final `horizon` bars come back NaN, not 0 -- see build_directional_target.
+                        combined_df[col_name] = build_directional_target(
+                            combined_df['Close'], horizon, direction
+                        )
                         all_target_columns.append(col_name)
+                        target_label_horizons[col_name] = horizon
                         if target_column is None:
                             target_column = col_name
-                        logger.info(f"Created directional target: {col_name}")
+                        logger.info(
+                            f"Created directional target: {col_name} "
+                            f"({int(combined_df[col_name].isna().sum())} unobservable tail rows left as NaN)"
+                        )
 
                     elif pt_type == 'price_based':
                         # Price-based target with profit target, max drawdown, and time window
@@ -1457,6 +1581,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                                         combined_df[col_name] = target_series[c]
                                         break
                             all_target_columns.append(col_name)
+                            target_label_horizons[col_name] = time_bars
                             if target_column is None:
                                 target_column = col_name
                             positive_count = int(combined_df[col_name].sum()) if col_name in combined_df.columns else 0
@@ -1502,6 +1627,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                                 labels.append(label)
                             combined_df[col_name] = labels
                             all_target_columns.append(col_name)
+                            target_label_horizons[col_name] = max_bars
                             if target_column is None:
                                 target_column = col_name
                             logger.info(f"Created triple_barrier target: {col_name}")
@@ -1536,6 +1662,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                             else:
                                 return {'status': 'failed', 'error': f'Unknown volatility method: {method}'}
                             all_target_columns.append(col_name)
+                            target_label_horizons[col_name] = horizon
                             if target_column is None:
                                 target_column = col_name
                             logger.info(f"Created volatility target: {col_name}")
@@ -1551,7 +1678,6 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                 logger.info(f"Created {len(all_target_columns)} target columns: {all_target_columns}")
 
             else:
-                all_target_columns = []  # For legacy format
                 # Legacy price-based format
                 target_service = PredictionTargetService()
 
@@ -1582,16 +1708,68 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                 if targets:
                     combined_df = target_service.calculate_prediction_targets(combined_df, targets)
                     target_column = f"price_up_{targets[0]['profit_pct']}pct_{targets[0]['max_dd']}dd_{targets[0]['days']}d"
+                    for t in targets:
+                        legacy_col = f"price_{t['direction']}_{t['profit_pct']}pct_{t['max_dd']}dd_{t['days']}d"
+                        all_target_columns.append(legacy_col)
+                        target_label_horizons[legacy_col] = t['days']
                 else:
                     return {'status': 'failed', 'error': 'No valid price-based targets configured'}
         else:
-            # Default: use Close for regression
+            # Default: use Close for regression. Close at bar i is observed at bar i --
+            # a genuinely causal target, so nothing is purged at the split boundary.
             target_column = 'Close'
+            target_label_horizons['Close'] = 0
+
+        # Every forward-looking target leaves an unobservable tail: for the last
+        # `label_horizon` bars the outcome window runs past the end of the data.
+        # Those rows carry no label -- they must not reach training or scoring as
+        # if they did. (Before this, directional targets stored them as 0 and
+        # triple_barrier's NaN reached `astype(np.int64)` as an integer overflow
+        # sentinel.)
+        if target_column not in combined_df.columns:
+            return {'status': 'failed', 'error': f'Target column {target_column} missing from prepared dataset'}
+        n_rows_before = len(combined_df)
+        combined_df, n_unobservable = drop_unobservable_target_rows(combined_df, target_column)
+        if n_unobservable:
+            logger.info(
+                f"Dropped {n_unobservable} rows with no observable "
+                f"'{target_column}' outcome (of {n_rows_before})"
+            )
+            if len(combined_df) == 0:
+                return {'status': 'failed', 'error': f'No rows have an observable {target_column} outcome'}
+
+        # Look-ahead purge budget for the chronological split. A missing entry means
+        # a target branch forgot to declare its horizon; refuse rather than assume 0,
+        # which would silently reinstate the boundary leak.
+        if target_column not in target_label_horizons:
+            return {
+                'status': 'failed',
+                'error': f'No label horizon recorded for target {target_column}; cannot purge the train/test boundary'
+            }
+        label_horizon = int(target_label_horizons[target_column])
 
         # Train/test split
         update_job_progress(task_id, 20, "Splitting train/test data...")
         train_ratio = train_test_split / 100.0
         train_df, test_df = DatasetSplitter.train_test_split(combined_df, train_ratio=train_ratio)
+
+        # Purge the training rows whose outcome window reaches into the test block.
+        # Targets are computed over the COMBINED frame and only then cut at the split
+        # index, so without this the last `label_horizon` training labels are decided
+        # by test-period bars.
+        if label_horizon > 0:
+            keep = purged_train_row_count(len(train_df), label_horizon)
+            if keep == 0:
+                return {
+                    'status': 'failed',
+                    'error': (f'Label horizon {label_horizon} consumes the entire {len(train_df)}-row '
+                              f'training block; use more data or a shorter horizon')
+                }
+            logger.info(
+                f"Purged {len(train_df) - keep} boundary training rows "
+                f"(label horizon {label_horizon} bars)"
+            )
+            train_df = train_df.iloc[:keep].copy()
 
         logger.info(f"Train: {len(train_df)} rows, Test: {len(test_df)} rows")
 
@@ -1619,11 +1797,12 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                 logger.warning(f"WARNING: No positive samples in test set for {target_column}!")
                 logger.warning("F1/precision/recall will be 0 since there are no positives to evaluate.")
 
-        # Get feature columns (exclude Date, OHLCV, and target columns)
-        exclude_cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'ticker']
-        target_cols = [c for c in combined_df.columns if c.startswith('price_')]
-        exclude_cols.extend(target_cols)
-        feature_columns = [c for c in combined_df.columns if c not in exclude_cols]
+        # Get feature columns (exclude Date, OHLCV, and EVERY generated target column)
+        feature_columns = select_feature_columns(
+            list(combined_df.columns),
+            target_columns=all_target_columns,
+            selected_target=target_column,
+        )
 
         # Save datasets for debugging and download
         update_job_progress(task_id, 22, "Saving datasets to cache...")
@@ -1712,6 +1891,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                     metrics_config=metrics_config,
                     prediction_horizon=prediction_horizon,
                     prediction_modes=prediction_modes,
+                    label_horizon=label_horizon,
                     progress_base=25,
                     progress_range=65,
                     timeframe=timeframe
@@ -1743,6 +1923,7 @@ def handle_training_job(task_id: str, payload: Dict[str, Any], dry_run: bool = F
                     genetic_config=genetic_config,
                     metrics_config=metrics_config,
                     prediction_horizon=prediction_horizon,
+                    label_horizon=label_horizon,
                     progress_base=25,
                     progress_range=65,
                     timeframe=timeframe
@@ -2234,6 +2415,7 @@ def train_classification_optimization(
     metrics_config: Dict[str, Any],
     prediction_horizon: int,
     prediction_modes: List[str],
+    label_horizon: int,
     progress_base: float,
     progress_range: float,
     timeframe: str = 'daily'
@@ -2342,7 +2524,8 @@ def train_classification_optimization(
                     feature_columns=feature_columns,
                     seq_len=current_seq_len,
                     prediction_horizon=0,  # Target already pre-shifted
-                    prediction_mode=mode
+                    prediction_mode=mode,
+                    label_horizon=label_horizon  # purge the boundary rows the pre-shift leaks
                 )
                 c_out = 2 if mode == 'shift' else prediction_horizon
                 # Get the actual valid columns used after dropping zero-variance columns
@@ -2806,6 +2989,7 @@ def train_unified_optimization(
     genetic_config: Dict[str, Any],
     metrics_config: Dict[str, Any],
     prediction_horizon: int,
+    label_horizon: int,
     progress_base: float,
     progress_range: float,
     timeframe: str = 'daily'
@@ -2852,7 +3036,10 @@ def train_unified_optimization(
             train_ratio=train_ratio,
             target_column=rnn_target_column,
             feature_columns=feature_columns,
-            timeframe=timeframe
+            timeframe=timeframe,
+            # An extra `prediction_horizon` shift was applied above for the RNN target,
+            # so its outcome window reaches that much further past the split.
+            label_horizon=label_horizon + max(0, prediction_horizon)
         )
         logger.info(f"RNN data prepared: train={len(rnn_train_series)}, test={len(rnn_test_series)} samples (target: {rnn_target_column})")
 
@@ -2862,7 +3049,8 @@ def train_unified_optimization(
             train_ratio=train_ratio,
             target_column=target_column,
             feature_columns=feature_columns,
-            timeframe=timeframe
+            timeframe=timeframe,
+            label_horizon=label_horizon
         )
         logger.info(f"Multi-step data prepared: train={len(ms_train_series)}, test={len(ms_test_series)} samples (target: {target_column})")
 
