@@ -185,10 +185,21 @@ inside a multi-day window, which the next scan catches.
 ## Out of scope
 
 The design audit's ten per-expert strategy overlays (sections A–F of
-`audit_gpt6_strategy_design.md`) get their **own design doc**. They are blocked on
-instrumentation we do not currently persist — daily positions, equity, reserved buying power,
-and capital-days — which the audit names as the missing input for ranking candidates on
-capital efficiency and pairwise overlap.
+`audit_gpt6_strategy_design.md`) get their **own design doc**.
+
+They are **not** blocked on missing instrumentation, contrary to both the audit's claim and an
+earlier version of this document. `testplatform/frontend/src/lib/capitalUsage.ts` (2026-09-04,
+currently untracked) already computes utilisation — `avgPct`, `maxPct`, `idleDaysPct`,
+`heavyDaysPct`, `peakDate` — from `TradeLike` (entryDate/exitDate/entryPrice/size/multiplier)
+and `EquityLike` (date/equity), both of which are already persisted on every backtest row as
+the `trades` JSON and `equity_curve`. It measures open notional over equity AT THE TIME rather
+than over starting capital, which is the correct denominator for the stackable-strategies
+question.
+
+So the audit's "we need daily positions, market values, equity, reserved buying power and
+capital-days" is satisfiable from what we already store, and the same logic can be run
+server-side over the ForwardTest shortlist to rank candidates on capital-in-use and pairwise
+overlap. The overlay design should start there rather than with new instrumentation.
 
 ---
 

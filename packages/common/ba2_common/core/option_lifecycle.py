@@ -546,6 +546,13 @@ def _pnl_pct(structure: OptionStructure,
         return None, ("no held option legs — the structure's P&L is unmeasurable")
     if structure.entry_net_premium is None:
         return None, "entry net premium is unknown — the P&L percent basis is undefined"
+    # FINITENESS, not just None. NaN fails every comparison below, so `abs(nan) < _EPS` is
+    # False and a NaN basis sailed through to produce a NaN percentage with an EMPTY error
+    # string — which `decide` reads as a measured answer and reports as "P&L nan%" on a
+    # healthy HOLD. Same rule option_max_loss and the selection pick already apply.
+    if not math.isfinite(structure.entry_net_premium):
+        return None, (f"entry net premium is {structure.entry_net_premium!r} — the P&L "
+                      f"percent basis is not a finite number")
     if abs(structure.entry_net_premium) < _EPS:
         return None, "entry net premium is 0 — the P&L percent basis is undefined"
     if structure.quantity is None or abs(structure.quantity) < _EPS:
@@ -560,6 +567,9 @@ def _pnl_pct(structure: OptionStructure,
             return None, (f"no chain row for {leg.contract_symbol} — the structure's "
                           f"P&L is unmeasurable")
         mark = _exit_mark(leg, row)
+        if mark is not None and not math.isfinite(mark):
+            return None, (f"the mark for {leg.contract_symbol} is {mark!r} — a non-finite "
+                          f"quote cannot price flattening the leg")
         if mark is None:
             side = "ask" if leg.is_short else "bid"
             return None, (f"no usable {side} for {leg.contract_symbol} — flattening a "
@@ -601,6 +611,13 @@ def _tested(structure: OptionStructure,
             continue
         if row.delta is None:
             blind = blind or (f"no delta for short {leg.contract_symbol} — the "
+                              f"tested-delta check is blind")
+            continue
+        if not math.isfinite(row.delta):
+            # A NaN delta answers `abs(d) >= threshold` with False, which is the same silent
+            # hold dressed as an answer that the None case above exists to refuse. Unknown is
+            # unknown however it is spelled.
+            blind = blind or (f"delta for short {leg.contract_symbol} is {row.delta!r} — the "
                               f"tested-delta check is blind")
             continue
         if abs(row.delta) >= threshold:
