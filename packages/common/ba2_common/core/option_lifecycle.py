@@ -836,20 +836,63 @@ def uncovered_short_calls(legs: Iterable[LifecycleLeg]) -> Tuple[str, ...]:
 
     Contracts come back sorted, so a refusal message is the same on every run.
     """
-    shorts, longs = [], 0.0
+    # PER UNDERLYING, and a long must OUTLIVE the short it covers. Pooling every long call
+    # against every short call made a long AAPL call answer for a short TSLA call, and a long
+    # expiring in January answer for a short expiring in February -- which is naked from the
+    # January expiry onward, the exact unbounded shape this guard exists to forbid.
+    #
+    # Both are conservative in the safe direction: an UNKNOWN underlying or expiry still
+    # covers, so a caller that cannot read those fields gets today's answer rather than a new
+    # refusal. This gate blocks closes and rolls, and over-refusing strands the very position
+    # it protects (see TradeActions' close-path note), so "unknown" must not mean "naked".
+    shorts, longs = [], []
     for leg in legs:
         if leg.option_type != OptionRight.CALL or not leg.is_held:
             continue
-        if leg.is_short:
-            shorts.append(leg)
-        else:
-            longs += leg.net_qty
+        (shorts if leg.is_short else longs).append(leg)
     if not shorts:
         return ()
-    short_qty = sum(abs(l.net_qty) for l in shorts)
-    if longs + _EPS >= short_qty:
-        return ()
-    return tuple(sorted(l.contract_symbol for l in shorts))
+
+    def _covers(lng: LifecycleLeg, srt: LifecycleLeg) -> bool:
+        if lng.underlying is not None and srt.underlying is not None \
+                and lng.underlying != srt.underlying:
+            return False
+        if lng.expiry is not None and srt.expiry is not None and lng.expiry < srt.expiry:
+            return False
+        return True
+
+    # Hardest first: the longest-dated short is coverable by the fewest longs, so satisfying
+    # it before the near-dated ones stops a long that could ONLY cover it being spent early.
+    def _key(leg: LifecycleLeg):
+        return (leg.expiry is not None, leg.expiry or date.min)
+
+    groups = {}
+    for srt in shorts:
+        groups.setdefault(srt.underlying, []).append(srt)
+
+    naked: List[str] = []
+    for underlying, group in groups.items():
+        available = {id(l): abs(l.net_qty) for l in longs}
+        short_fall = False
+        for srt in sorted(group, key=_key, reverse=True):
+            need = abs(srt.net_qty)
+            for lng in sorted(longs, key=_key, reverse=True):
+                if need <= _EPS:
+                    break
+                if not _covers(lng, srt):
+                    continue
+                take = min(need, available[id(lng)])
+                available[id(lng)] -= take
+                need -= take
+            if need > _EPS:
+                short_fall = True
+        # ALL of an under-covered group's shorts, not just the arithmetic excess. With one
+        # long against two shorts, WHICH short is the naked one is not a fact -- the cover is
+        # fungible -- so naming one would invent a detail. The refusal is identical either
+        # way (a non-empty answer); this only decides what the message can honestly say.
+        if short_fall:
+            naked.extend(l.contract_symbol for l in group)
+    return tuple(sorted(naked))
 
 
 def _intents(legs: Sequence[OptionLeg]) -> List[str]:

@@ -123,14 +123,24 @@ def compute_risk_based_quantity(
         return out
 
     # Clamp by the per-instrument notional ceiling.
-    if max_position_value and max_position_value > 0:
+    #
+    # `is not None`, NOT truthiness: a ceiling of 0 is the most RESTRICTIVE value this
+    # parameter takes ("no notional permitted"), and 0 is falsy, so the old test skipped the
+    # cap entirely on exactly the input that forbids the trade. None alone means "no ceiling".
+    # A negative ceiling floors max_by_notional below 1 and lands on the same refusal, which
+    # is the right answer for a nonsensical limit.
+    if max_position_value is not None:
         max_by_notional = int(max_position_value // current_price)
         if qty > max_by_notional:
             qty = max_by_notional
             out["capped_by"] = "notional"
 
     # Clamp by available cash.
-    if available_balance is not None and available_balance >= 0:
+    #
+    # No `>= 0` guard: a NEGATIVE balance is an account that can spend nothing, and skipping
+    # the cash cap for it read "overdrawn" as "unlimited". The max(0.0, ...) below already
+    # floors it, so a negative balance now sizes to 0 and refuses.
+    if available_balance is not None:
         # Reserve the round-trip commission before dividing — a fill costs qty*price + commission,
         # so raw cash / price over-sizes by up to one commission at near-full deployment.
         max_by_cash = int(max(0.0, available_balance - float(commission_per_trade or 0.0)) // current_price)

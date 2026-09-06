@@ -693,6 +693,39 @@ def test_the_invariant_catches_TWO_shorts_against_one_long():
     assert uncovered_short_calls(legs) == ("SHORT", "SHORT2")
 
 
+def test_a_long_on_a_DIFFERENT_underlying_does_not_cover_a_short():
+    """The guard's docstring always promised "a net-long call of the SAME underlying", but the
+    code pooled every long against every short, so one long AAPL call answered for a short
+    TSLA call whose loss is unbounded."""
+    legs = [LifecycleLeg(contract_symbol="AAPL_C", net_qty=1.0, strike=100.0,
+                         option_type=OptionRight.CALL, expiry=ROLL_EXPIRY, underlying="AAPL"),
+            LifecycleLeg(contract_symbol="TSLA_C", net_qty=-1.0, strike=100.0,
+                         option_type=OptionRight.CALL, expiry=ROLL_EXPIRY, underlying="TSLA")]
+    assert uncovered_short_calls(legs) == ("TSLA_C",)
+
+
+def test_a_long_expiring_BEFORE_the_short_does_not_cover_it():
+    """A roll that picks a short outliving the long leaves a naked call from the long's expiry
+    onward. Counting quantities alone called that covered."""
+    legs = [LifecycleLeg(contract_symbol="LONG", net_qty=1.0, strike=100.0,
+                         option_type=OptionRight.CALL, expiry=OVERLAY_EXPIRY, underlying="X"),
+            LifecycleLeg(contract_symbol="SHORT", net_qty=-1.0, strike=110.0,
+                         option_type=OptionRight.CALL, expiry=ROLL_EXPIRY, underlying="X")]
+    assert OVERLAY_EXPIRY < ROLL_EXPIRY, "fixture assumption: the roll goes further out"
+    assert uncovered_short_calls(legs) == ("SHORT",)
+
+
+def test_an_unknown_underlying_or_expiry_still_covers():
+    """Conservative in the safe direction. This gate blocks closes and rolls, so a caller that
+    cannot read those fields must get the old answer, not a new refusal that strands the
+    position the guard exists to protect."""
+    legs = [LifecycleLeg(contract_symbol="LONG", net_qty=1.0, strike=100.0,
+                         option_type=OptionRight.CALL),
+            LifecycleLeg(contract_symbol="SHORT", net_qty=-1.0, strike=110.0,
+                         option_type=OptionRight.CALL)]
+    assert uncovered_short_calls(legs) == ()
+
+
 def test_the_invariant_does_not_police_short_PUTS():
     """A short put is bounded below (strike minus credit, at an underlying of zero), so it is
     a risk this codebase MEASURES rather than an invariant it forbids. Folding it in here
