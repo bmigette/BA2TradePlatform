@@ -37,17 +37,17 @@ Free rein: nothing has been run, so nothing can be voided. Eight of the eleven a
 `bid = ask = close` defect already fixed.
 
 **A1 — Guards that must refuse instead of pass.**
-- opt #2: `option_risk_manager_enabled()` catches a malformed `risk_manager_mode` and returns
-  `False`, so a typo (`classic_option` for `classic_options`) silently disables the option
-  rails. Must raise, not disable.
-- opt #3: `eligible()` treats a missing `structure_fn` like a disabled ceiling, so
-  `max_loss_ceiling=0` admits a contract without measuring its loss.
 - opt #8: the minimum-premium floor applies only when `mark is not None`, so an unpriced
   contract passes a gate that cannot measure it.
 - code #7: the no-arb gate returns `None` on missing contract terms or spot, which the caller
   reads as "no rejection".
 
 Each becomes a refusal naming the missing input.
+
+**opt #2 and opt #3 were attempted and REVERTED — see "Rejected".** Both are false positives:
+the codebase had already reasoned about the exact trade-off and pinned the decision in tests.
+Lesson for the rest of Bucket A: read the pinning tests BEFORE changing a guard, because the
+audit saw the shape of a fail-open without the context that makes it correct.
 
 **A2 — Missing ranked as best.**
 - opt #9: `_WORST = 0` multiplied by a NEGATIVE weight is the *best* contribution, not the
@@ -151,6 +151,26 @@ fired, in which case it cannot change any result.
 ---
 
 ## Rejected
+
+**opt #2 — option RM disabled by an invalid mode.** Attempted, reverted (4 tests failed).
+`normalise_risk_manager_mode` raises on a non-empty unadmitted mode, and
+`option_risk_manager_enabled` catches it and returns `False`. Making it propagate looks right
+until you read `test_the_string_None_reads_as_no_setting_at_all`: `ExtendableSettingsInterface`
+once wrote `str(None)` to the settings table, so **live rows carry the literal `"None"`**, and
+under a raising gate that value killed the entry pass of a CLASSIC expert. The catch is
+load-bearing for a real production population, and the fail-open is scoped to *whether the
+option RM is being asked* -- an expert that did select `classic_options` and cannot produce
+its rails still refuses the entry.
+
+**opt #3 — max-loss ceiling with no `structure_fn`.** Attempted, reverted
+(`test_without_a_structure_fn_the_ceiling_is_inapplicable_rather_than_total`). The asymmetry is
+deliberate and correct: *one absent value is a defect in THAT candidate; an empty column is a
+defect in the QUESTION*. With a `structure_fn` present, refusing an unmeasurable candidate
+costs one contract. With no `structure_fn` at all, nothing can be measured, so fail-closed
+refuses **100% of every chain** -- an untaught builder handed a ceiling would silently stop
+trading altogether while the setting read as configured. With no seam the filter is inert and
+byte-identical to the pre-ceiling pick, so nothing can regress.
+
 
 **code #15 — EarningsDrift live-only calendar shortcut.** The audit overstated this. The bulk
 call is `earning_calendar(from_date=now-max_days, to_date=today)`, deduped to the latest row
