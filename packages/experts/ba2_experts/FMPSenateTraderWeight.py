@@ -107,6 +107,30 @@ _WORKER_SCORING_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 # of distinct files one trial loads, and see test_scoring_cache_lru.py which pins that.
 _WORKER_SCORING_CACHE_MAX = int(os.environ.get("BA2_SCORING_LRU_MAX", "3"))
 
+#: ``{SYMBOL: {date_str: open}}`` -- the daily-open projection of a symbol's price history,
+#: memoized at MODULE level so a long-lived pool child parses each history once across the whole
+#: GA population rather than once per trial.
+#:
+#: WHAT THIS REPLACED, and why it is worth a module global. The projection used to live on the
+#: expert INSTANCE (per trial) while ``fmp_history_disk_cached``'s own memo held the raw decoded
+#: JSON per process -- so the cross-trial saving was real but it was paid for by pinning the
+#: PAYLOAD. Measured 2026-09-05 with tracemalloc on one trial: ``json/decoder.py`` held 2,465 MB
+#: in 44.6M live objects and was still climbing linearly, past the (flat, 2,145 MB) bar cache,
+#: because the Senate feed discloses ~1,800 distinct tickers against the 498 actually traded and
+#: every one of their ``historical_price_full`` payloads stayed resident for the life of the
+#: worker. The projection is ~275 KB per symbol against ~3.1 MB decoded.
+#:
+#: BOUNDED, unlike the memo it replaces: a pool child outlives the job, and an unbounded map
+#: would accumulate every universe the box ever runs. LRU by symbol, same shape as
+#: ``_WORKER_SCORING_CACHE`` above.
+_PRICE_MAP_MEM: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_PRICE_MAP_MEM_MAX = int(os.environ.get("BA2_SENATE_PRICE_MAP_MAX", "4096"))
+
+
+def clear_price_map_memo() -> None:
+    """Drop the projection memo (tests / between unrelated universes)."""
+    _PRICE_MAP_MEM.clear()
+
 
 def _shard_filename(base_filename: str, suffix: str) -> str:
     """``("congress_skill_scores.json", "60|5|50|12")`` -> ``congress_skill_scores__60_5_50_12.json``.
@@ -1430,10 +1454,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         The per-symbol FULL daily history is fetched ONCE and disk-cached (backtest-only, via
         ``fmp_history_disk_cached``) so spawned grid workers read it from disk instead of
         re-hitting FMP for every (symbol, exec-date) on every analysis bar — the dominant cold
-        cost of a Senate backtest. An in-memory date->open map dedups repeat lookups within a run
-        (live path too: a symbol with K trades fetches once, not K times). The per-date open is
-        byte-identical to the old single-day ``from=to=date`` query; the live path (freeze flag
-        off) passes through to a fresh fetch exactly as before.
+        cost of a Senate backtest. The per-date open is byte-identical to the old single-day
+        ``from=to=date`` query; the live path (freeze flag off) passes through to a fresh fetch
+        exactly as before.
+
+        WHAT IS MEMOIZED IS THE ``{date: open}`` MAP, AND ONLY THAT — see ``_PRICE_MAP_MEM``.
         """
         if not self._api_key:
             return None
@@ -1443,18 +1468,23 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         if not sym:
             return None
 
-        price_maps = getattr(self, "_hp_price_map", None)
-        if price_maps is None:
-            price_maps = self._hp_price_map = {}
-        smap = price_maps.get(sym)
+        smap = _PRICE_MAP_MEM.get(sym)
         if smap is None:
             from ba2_providers.fmp_common import fmp_history_disk_cached
+            # ``retain=False``: the decoded payload dies with this call. Everything this
+            # expert wants from it is the projection built on the next line -- ~275 KB
+            # against ~3.1 MB decoded -- and the projection is what gets memoized.
             hist = fmp_history_disk_cached(
                 "historical_price_full", sym,
                 lambda: self._fetch_price_history_uncached(sym),
+                retain=False,
             ) or []
             smap = {row.get("date"): row.get("open") for row in hist if row.get("date")}
-            price_maps[sym] = smap
+            _PRICE_MAP_MEM[sym] = smap
+            while len(_PRICE_MAP_MEM) > _PRICE_MAP_MEM_MAX:
+                _PRICE_MAP_MEM.popitem(last=False)
+        else:
+            _PRICE_MAP_MEM.move_to_end(sym)
 
         return smap.get(date.strftime("%Y-%m-%d"))
 
@@ -1770,12 +1800,26 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         self._save_scoring_cache_throttled("_confidence_cache", shard, key, result, is_live)
         return result
 
-    def _price_on_or_after(self, symbol: str, date: datetime, max_walk_days: int = 5) -> Optional[float]:
+    def _price_on_or_after(self, symbol: str, date: datetime, max_walk_days: int = 5,
+                           ceiling: Optional[datetime] = None) -> Optional[float]:
         """First available open on/after ``date`` (walks weekends/holidays, up to
         ``max_walk_days`` forward). Used by the skill scorer, whose dates (disclosure
-        exec dates, exec+horizon) routinely land on non-trading days."""
+        exec dates, exec+horizon) routinely land on non-trading days.
+
+        ``ceiling`` (the as-of date) BOUNDS THE WALK and is not optional in a backtest.
+        LOOKAHEAD FIXED 2026-09-06: the walk previously had no upper bound, so a scored trade
+        whose ``exec + horizon`` landed within ``max_walk_days`` of the as-of date could be
+        graded on a price from AFTER it. The skill window itself is cut correctly
+        (``exec + horizon <= now``); the leak was entirely in this forward walk overshooting
+        that cut by up to 5 days, and it fired precisely when the target date was a weekend or
+        holiday. Returning None past the ceiling makes the caller drop the trade from scoring,
+        which is the honest outcome: at the as-of date that forward return is not yet known.
+        """
         for offset in range(max_walk_days + 1):
-            price = self._get_price_at_date(symbol, date + timedelta(days=offset))
+            probe = date + timedelta(days=offset)
+            if ceiling is not None and probe > ceiling:
+                return None
+            price = self._get_price_at_date(symbol, probe)
             if price:
                 return price
         return None
@@ -1898,8 +1942,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         for exec_date, sym in window:
             if len(returns) >= max_past_trades:
                 break
-            entry = self._price_on_or_after(sym, exec_date)
-            fwd = self._price_on_or_after(sym, exec_date + timedelta(days=horizon_days))
+            # ``now`` is the as-of date: neither the entry nor the forward observation may
+            # be read from beyond it (see _price_on_or_after's ceiling).
+            entry = self._price_on_or_after(sym, exec_date, ceiling=now)
+            fwd = self._price_on_or_after(sym, exec_date + timedelta(days=horizon_days),
+                                          ceiling=now)
             if not entry or not fwd:
                 continue
             returns.append((fwd - entry) / entry * 100.0)
@@ -2027,9 +2074,17 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
         latest: Dict[str, tuple] = {}          # trader -> (exec_dt, is_buy)
         for t in index.get(sym, ()):
-            exec_dt, is_buy, is_sell, who = t
-            if now is not None and exec_dt > now:
-                continue
+            exec_dt, is_buy, is_sell, who, disc_dt = t
+            # LOOKAHEAD FIXED 2026-09-06: this gated on exec_dt, so a sale EXECUTED before the
+            # as-of date but DISCLOSED weeks later counted as already-known -- and with the
+            # 30-45 day congressional reporting lag this expert is built around, that window is
+            # wide. It mattered because require_still_held / min_still_holders are GATES: the
+            # leak silently excluded symbols the strategy could not yet know were being sold,
+            # which biases results OPTIMISTIC. Knowledge time is the disclosure date; execution
+            # time still orders what the trader actually did.
+            if now is not None:
+                if disc_dt is None or disc_dt > now:
+                    continue
             prev = latest.get(who)
             # On a same-day buy+sale, the SALE wins: assume the exit, never the entry.
             if prev is None or exec_dt > prev[0] or (exec_dt == prev[0] and not is_buy):
@@ -2097,7 +2152,13 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             # variants). That silently OVER-COUNTED min_still_holders -- one person could be two
             # "holders" -- and made held_by un-joinable with every other per-trader map.
             who = self._trader_name(t)
-            index.setdefault(sym, []).append((exec_dt, is_buy, is_sell, who))
+            # disc_dt is the date the trade became PUBLIC. It is carried alongside exec_dt
+            # because the two answer different questions: exec_dt orders what a trader did,
+            # disc_dt says when anyone else could know it. Consumers must gate on disc_dt.
+            # An unparseable/missing disclosure date yields None, which consumers treat as
+            # NOT-YET-KNOWN in a backtest (the safe direction) -- measured 0 of 66,869 rows.
+            disc_dt = self._trade_disclosure_dt(t)
+            index.setdefault(sym, []).append((exec_dt, is_buy, is_sell, who, disc_dt))
 
         self._holdings_index = (len(trades), index, time.time())
         return index
@@ -2144,16 +2205,24 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             latest: Dict[str, tuple] = {}
             dates: List[datetime] = []
             counts: List[int] = []
-            for exec_dt, is_buy, _is_sell, who in sorted(events, key=lambda e: e[0]):
+            # WALK IN DISCLOSURE ORDER, CHECKPOINT AT THE DISCLOSURE DATE. The holder count is
+            # bisected by an as-of date, so its x-axis must be when the market LEARNED of each
+            # trade, not when the trade happened -- keying it on exec_dt let a not-yet-disclosed
+            # sale lower the count early (the same leak fixed in _still_held_by). Netting still
+            # uses exec_dt: among trades already public, a trader's latest EXECUTED action is
+            # what they hold. Rows with no disclosure date are skipped -- they can never be
+            # established as public knowledge at any date.
+            known = [e for e in events if e[4] is not None]
+            for exec_dt, is_buy, _is_sell, who, disc_dt in sorted(known, key=lambda e: (e[4], e[0])):
                 prev = latest.get(who)
                 # Same-day buy+sale resolves to the SALE, matching _still_held_by exactly.
                 if prev is None or exec_dt > prev[0] or (exec_dt == prev[0] and not is_buy):
                     latest[who] = (exec_dt, is_buy)
                 held = sum(1 for _d, b in latest.values() if b)
-                if dates and dates[-1] == exec_dt:
+                if dates and dates[-1] == disc_dt:
                     counts[-1] = held          # collapse same-day events to one checkpoint
                 else:
-                    dates.append(exec_dt)
+                    dates.append(disc_dt)
                     counts.append(held)
             timeline[sym] = (dates, counts)
 
@@ -2178,6 +2247,29 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         try:
             return _parse_ymd_utc(str(raw)[:10])
         except Exception:  # noqa: BLE001 — a malformed date just drops the trade from netting
+            return None
+
+    def _trade_disclosure_dt(self, trade: Dict[str, Any]) -> Optional[datetime]:
+        """DISCLOSURE datetime of a trade -- when it became public -- or None when absent or
+        unparseable.
+
+        Distinct from ``_trade_exec_dt`` on purpose, and the distinction is the whole
+        no-lookahead story for this expert: a congressional trade is EXECUTED weeks before it
+        is DISCLOSED (30-45 days is the reporting window ``max_disclose_date_days`` is built
+        around). Anything asking "what could we know on date D" must gate on this; only
+        ordering "what did the trader actually do" may use the execution date.
+
+        Returning None rather than a fallback is deliberate: a row whose disclosure date cannot
+        be established can never be shown to have been public, and callers drop it in a
+        backtest. Measured 2026-09-06 across 66,869 real rows: 0 are missing or unparseable, so
+        this is a guard, not a live code path.
+        """
+        raw = trade.get("disclosureDate") or ""
+        if not raw:
+            return None
+        try:
+            return _parse_ymd_utc(str(raw)[:10])
+        except Exception:  # noqa: BLE001 -- unestablished disclosure == not public
             return None
 
     def _filter_trades(self, trades: List[Dict[str, Any]],

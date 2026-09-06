@@ -124,6 +124,39 @@ describe('tradeRulesToLegacyEditor', () => {
     });
   });
 
+  it('carries every condition of a single AND entry rule into buyTree', () => {
+    // The shape a daily_expert optimization run actually stores (backtest 1001,
+    // DeterministicScorer S2): ONE `enter-buy` rule whose conditions group ANDs five gates,
+    // and no legacy buyEntryConditions key at all. The Strategy tab counts the header from
+    // this tree, so if it came back empty the panel printed "Entry Conditions (5)" over a
+    // body reading "always" -- a run whose entry gates were plainly doing work described as
+    // unconditional.
+    return import('./tradeRules').then(({ tradeRulesToLegacyEditor }) => {
+      const entryRule = {
+        id: 'enter-buy', name: 'enter-buy', continue_processing: false,
+        actions: [{ action_type: 'buy' }],
+        conditions: {
+          id: 'root', operator: 'AND', type: 'AND',
+          conditions: [
+            { id: 'buy-bullish', field: 'bullish', field_type: 'flag', comparison: 'is_true' },
+            { id: 'buy-flat', field: 'has_no_position', field_type: 'flag', comparison: 'is_true' },
+            { id: 'gate_expected_profit', field: 'expected_profit', field_type: 'numeric', comparison: '>', value: 9 },
+            { id: 'gate_days_since_close', field: 'days_since_last_close', field_type: 'numeric', comparison: '>', value: 0 },
+            { id: 'gate_days_since_profit', field: 'days_since_last_profitable_close', field_type: 'numeric', comparison: '>', value: 25 },
+          ],
+        },
+      } as never as TradeRule;
+
+      const legacy = tradeRulesToLegacyEditor([entryRule], []);
+      const conds = legacy.buyTree?.conditions ?? [];
+      expect(conds).toHaveLength(5);
+      expect(new Set(conds.map((c) => (c as { field?: string }).field))).toEqual(new Set([
+        'bullish', 'has_no_position', 'expected_profit',
+        'days_since_last_close', 'days_since_last_profitable_close',
+      ]));
+    });
+  });
+
   it('keeps only the first action of a multi-action exit rule, with a warning', () => {
     return import('./tradeRules').then(({ tradeRulesToLegacyEditor }) => {
       const legacy = tradeRulesToLegacyEditor([], [{

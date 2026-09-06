@@ -191,12 +191,42 @@ class MarginInfo:
     bp_factor: float
     marginable: bool = True
     fractionable: Optional[bool] = None    # TRI-STATE: True / False / None = "broker did not say"
+    #: Will the broker accept an order for this symbol AT ALL. TRI-STATE on the
+    #: same terms as ``fractionable``: ``False`` is the broker SAYING no (Alpaca
+    #: ``Asset.tradable is False`` -- a delisted, halted or never-supported name),
+    #: ``None`` is "nobody said", which is what a symbol omitted from
+    #: ``get_symbol_margin_info()`` means and must never be read as a refusal.
+    #:
+    #: DISTINCT FROM ``marginable``, which is about how much buying power the
+    #: order costs; this is about whether there is an order at all. A plan sized
+    #: perfectly against a non-tradable symbol is a plan with a guaranteed
+    #: rejection in it, and until this field existed nothing in the allocation
+    #: path asked the question -- Alpaca publishes it on the same ``Asset`` row
+    #: every other field here already comes from.
+    tradable: Optional[bool] = None
     min_order_size: Optional[float] = None          # SHARES
     min_trade_increment: Optional[float] = None     # SHARES
     min_fractional_notional: Optional[float] = None  # DOLLARS, fractional orders only
     initial_margin_rate: Optional[float] = None
     maintenance_margin_rate: Optional[float] = None
     source: str = MARGIN_SOURCE_DEFAULT
+
+
+def leverage_of(initial_margin_rate: Optional[float]) -> Optional[float]:
+    """Buying power per dollar of equity implied by an initial margin rate.
+
+    ``0.5`` -> ``2.0`` (Reg-T 2:1), ``1.0`` -> ``1.0`` (no borrowing). ``None`` in gives
+    ``None`` out: an unpublished rate is not 1x, it is UNKNOWN, and rendering "1x" for it
+    would state a broker fact nobody supplied. A non-positive rate is equally unusable --
+    it divides to infinity -- and is refused the same way.
+
+    Lives HERE, beside ``MarginInfo``, rather than in ``symbol_facts``: it is pure
+    arithmetic over one field, and its callers include the allocator's view module, which
+    is pinned by test to import without the DB (``symbol_facts`` pulls SQLAlchemy).
+    """
+    if initial_margin_rate is None or initial_margin_rate <= 0:
+        return None
+    return 1.0 / initial_margin_rate
 
 
 @dataclass

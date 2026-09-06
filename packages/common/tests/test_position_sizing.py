@@ -29,3 +29,31 @@ def test_derive_stop_reduces_qty_to_keep_min_stop():
     assert out["quantity"] == 142
     assert out["rejected"] is False
     assert out["sl_price"] < 100.0
+
+
+def test_a_zero_notional_ceiling_permits_no_position():
+    """0 is the MOST restrictive value max_position_value takes, and it is falsy — so the
+    truthiness guard skipped the cap on exactly the input that forbids the trade. The audit's
+    case: equity 10k, price 100, stop 90, risk 1% sizes to 10 shares, and a $0 ceiling left
+    all 10 standing."""
+    out = compute_risk_based_quantity(10_000, 100.0, 1.0, stop_price=90.0,
+                                      max_position_value=0)
+    assert out["quantity"] == 0
+    assert out["reason"]
+
+
+def test_an_overdrawn_balance_permits_no_position():
+    """A negative available_balance is an account that can spend nothing; the old `>= 0`
+    guard skipped the cash cap for it, reading overdrawn as unlimited."""
+    out = compute_risk_based_quantity(10_000, 100.0, 1.0, stop_price=90.0,
+                                      available_balance=-1)
+    assert out["quantity"] == 0
+    assert out["reason"]
+
+
+def test_an_absent_notional_ceiling_still_means_no_ceiling():
+    """None must keep meaning "uncapped" — the fix must not turn a missing limit into 0."""
+    out = compute_risk_based_quantity(10_000, 100.0, 1.0, stop_price=90.0,
+                                      max_position_value=None)
+    assert out["quantity"] == 10
+    assert out["capped_by"] is None

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import json
 
-from app.services.data_preparation import DataPreparationService
+from app.services.data_preparation import DataPreparationService, purged_train_row_count
 
 logger = logging.getLogger(__name__)
 
@@ -162,7 +162,8 @@ class TSAITrainingService(ITrainingService):
         timeframe: str = 'daily',
         seq_len: int = 24,
         prediction_horizon: int = 0,
-        prediction_mode: str = 'shift'
+        prediction_mode: str = 'shift',
+        label_horizon: int = 0
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
         Prepare and split data into train/test sets.
@@ -180,6 +181,9 @@ class TSAITrainingService(ITrainingService):
             seq_len: Sequence length for sliding window
             prediction_horizon: How many bars ahead to predict (0 = predict at end of sequence)
             prediction_mode: 'shift' for single target at T+N, 'multistep' for T+1...T+N
+            label_horizon: Bars of look-ahead already baked into ``target_column``.
+                The last ``label_horizon`` training rows are dropped because their
+                labels are decided by test-period bars.
 
         Returns:
             Tuple of (X_train, X_test, y_train, y_test)
@@ -187,23 +191,31 @@ class TSAITrainingService(ITrainingService):
         if not TSAI_AVAILABLE:
             raise RuntimeError("tsai library not available")
 
-        # For backtesting on known data: fit normalization on FULL dataset
-        # This ensures test data won't exceed normalization range
-        # (For live prediction, you'd fit only on train data)
-        if self.normalize:
-            self.data_prep = DataPreparationService(buffer_pct=self.buffer_pct)
-            _ = self.data_prep.fit_transform(df, feature_columns, method="minmax_buffered")
-            logger.info(f"Fitted normalization on full dataset ({len(df)} samples) before split")
-
-        # Split DataFrame
+        # Split FIRST, then fit. The scaler used to be fitted on the whole frame
+        # "so test data won't exceed the normalization range" -- but that hands the
+        # training transform the future's extrema and its column availability, so
+        # the held-out block is no longer out of sample and the numbers stop
+        # matching what the same model sees live, where only the past exists.
+        # The 35% buffer, not the test rows, is what gives out-of-range headroom;
+        # transform() clips anything past it.
         split_idx = int(len(df) * train_ratio)
         df_train = df.iloc[:split_idx]
         df_test = df.iloc[split_idx:]
 
-        # Prepare train data (scaler already fitted on full data)
+        # Purge training rows whose pre-shifted label is decided inside the test
+        # block. Cutting at split_idx alone leaves the last `label_horizon` training
+        # labels reading test-period closes.
+        keep = purged_train_row_count(len(df_train), label_horizon)
+        if keep < len(df_train):
+            logger.info(
+                f"Purged {len(df_train) - keep} boundary training rows (label horizon {label_horizon})"
+            )
+            df_train = df_train.iloc[:keep]
+
+        # Prepare train data (fits the scaler on the TRAINING rows only)
         X_train, y_train = self.prepare_data(
             df_train, target_column, feature_columns, timeframe, seq_len,
-            prediction_horizon, prediction_mode, fit_scaler=False
+            prediction_horizon, prediction_mode, fit_scaler=self.normalize
         )
 
         # Prepare test data (use same fitted scaler)
@@ -219,34 +231,43 @@ class TSAITrainingService(ITrainingService):
         self, dataframes: List[pd.DataFrame], train_ratio: float,
         target_column: str, feature_columns: List[str],
         timeframe: str = 'daily', seq_len: int = 24,
-        prediction_horizon: int = 0, prediction_mode: str = 'shift'
+        prediction_horizon: int = 0, prediction_mode: str = 'shift',
+        label_horizon: int = 0
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Prepare multiple datasets: window each separately, then concatenate.
 
         Each dataset is split and windowed independently to prevent windows
-        from spanning across dataset boundaries. Normalization is fitted on
-        all datasets combined.
+        from spanning across dataset boundaries. Normalization is fitted on the
+        TRAINING portion of every dataset combined -- never on the test portions,
+        which would put each symbol's future extrema into the training transform.
         """
         if not TSAI_AVAILABLE:
             raise RuntimeError("tsai library not available")
 
-        # Fit normalization on all datasets combined
+        # Per-dataset chronological split, with the boundary purge applied first so
+        # the scaler is fitted on exactly the rows that will be trained on.
+        train_frames, test_frames = [], []
+        for df in dataframes:
+            split_idx = int(len(df) * train_ratio)
+            keep = purged_train_row_count(split_idx, label_horizon)
+            train_frames.append(df.iloc[:keep])
+            test_frames.append(df.iloc[split_idx:])
+
+        # Fit normalization on the combined TRAINING rows only
         if self.normalize:
-            combined_df = pd.concat(dataframes, ignore_index=True)
+            combined_train = pd.concat(train_frames, ignore_index=True)
             self.data_prep = DataPreparationService(buffer_pct=self.buffer_pct)
-            _ = self.data_prep.fit_transform(combined_df, feature_columns, method="minmax_buffered")
-            logger.info(f"Fitted normalization on {len(dataframes)} datasets ({len(combined_df)} total rows)")
+            _ = self.data_prep.fit_transform(combined_train, feature_columns, method="minmax_buffered")
+            logger.info(
+                f"Fitted normalization on the training rows of {len(dataframes)} datasets "
+                f"({len(combined_train)} rows)"
+            )
 
         all_X_train, all_X_test = [], []
         all_y_train, all_y_test = [], []
 
-        for i, df in enumerate(dataframes):
-            # Split DataFrame
-            split_idx = int(len(df) * train_ratio)
-            df_train = df.iloc[:split_idx]
-            df_test = df.iloc[split_idx:]
-
-            # Prepare each split (scaler already fitted on combined data)
+        for i, (df_train, df_test) in enumerate(zip(train_frames, test_frames)):
+            # Prepare each split (scaler already fitted on the combined training rows)
             X_train, y_train = self.prepare_data(
                 df_train, target_column, feature_columns, timeframe, seq_len,
                 prediction_horizon, prediction_mode, fit_scaler=False

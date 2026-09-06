@@ -5168,8 +5168,13 @@ class RollPMCCShortAction(_OptionEntryAction):
         # THE INVARIANT, measured on the position this ticket would leave behind: the old
         # overlay nets to zero, the new one takes its place, the long is untouched.
         after = [l for l in structure.held_legs if l.contract_symbol != short.contract_symbol]
+        # expiry/underlying too: uncovered_short_calls requires a long to OUTLIVE the short it
+        # covers, and a roll that picks a short expiring after the long LEAPS is precisely the
+        # leg set that leaves a naked call. Both are in hand from `picked` (see the ticket leg
+        # built above); omitting them made the invariant a quantity count that could not see it.
         after.append(LifecycleLeg(contract_symbol=picked.symbol, net_qty=-contracts,
-                                  option_type=self.OPTION_TYPE))
+                                  option_type=self.OPTION_TYPE,
+                                  expiry=picked.expiry, underlying=picked.underlying))
         stranded = uncovered_short_calls(after)
         if stranded:
             return self._refuse(

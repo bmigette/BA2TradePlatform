@@ -96,6 +96,7 @@ keeps the registries out of THIS module's own graph, so the deferral survives if
 the package ``__init__`` is ever trimmed.
 """
 import asyncio
+import threading
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -107,15 +108,20 @@ from ...core import portfolio_allocation_service as svc
 from ...core.db import get_db
 from ...core.instrument_enrichment import enrich_instruments
 from ...core.models import ExpertInstance
+from ba2_common.core.symbol_facts import load_symbol_facts, save_symbol_facts
+from ba2_common.core.symbol_stats import load_symbol_stats
 from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
-    LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
+    LabelTarget, SymbolTarget, blocking_messages, build_base_snapshot,
+    compute_allocation,
     compute_base_notional, compute_label_investment, current_value,
-    format_unrealised_pnl, unconsumed_income_notice,
+    format_unrealised_pnl, is_blocking_message, unconsumed_income_notice,
+    validate_symbol_weights,
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
+    get_dividends_by_symbol,
     get_previous_symbol_weights, get_symbol_rows, get_symbol_weights,
     remove_symbols_from_label, replace_managed_labels, save_allocation_targets,
     set_allocation_config, set_managed_label, set_symbol_weight,
@@ -153,7 +159,9 @@ from ..utils.portfolio_allocation_view import (
     ALLOCATION_BAR_LEGEND, allocation_bar, band_color, RESERVE_SELL_WARNING,
     SHARE_DEFAULT_NOTE, symbol_total_bar, SYMBOL_TOTAL_BAR_CAPTION,
     LABEL_TOTAL_BAR_CAPTION, LABEL_TOTAL_BAR_LEGEND, LABEL_TOTAL_CLASSES,
-    LABEL_TOTAL_COLORS, LABEL_TOTAL_TOOLTIP, class_color_style,
+    LABEL_TOTAL_COLORS, LABEL_TOTAL_TOOLTIP, ZERO_SHARE_BADGE_TOOLTIP_FMT,
+    class_color_style, count_zero_share_symbols,
+    fractionable_badge, leverage_badge,
     label_total_readout,
     load_current_symbol_shares, load_last_symbol_shares, managed_total_value,
     important_color_style,
@@ -230,7 +238,8 @@ def _load_gate(account_id: Optional[int]) -> GateResult:
     return evaluate_gate(account_id, manual, _enabled_expert_names(account_id))
 
 
-def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
+def _load_view_payload(account_id: int, valuation_mode: str,
+                       base_override: Optional[float] = None) -> Dict[str, Any]:
     """One render's worth of data: managed labels, membership, positions, prices.
 
     ``valuation_mode`` is threaded through to ``build_label_views`` and echoed back
@@ -286,6 +295,22 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
         if state.price is None:
             state.price = prices.get(symbol)
 
+    # Broker facts (fractionability, margin rate) for the ⓘ chips. Refreshed HERE,
+    # which is what the Refresh button re-runs, and cached in the DB so the chips
+    # survive a broker that will not answer: a failed fetch falls back to the last
+    # stored answer rather than blanking facts that were true five minutes ago.
+    # Never fatal -- the page's job is the label table, and the chips are on top.
+    facts = refresh_symbol_facts(account, account_id, symbols)
+    # READ ONLY. The yield and the 1Y/3Y return need several FMP calls per symbol,
+    # far too slow for a render, so the page draws whatever is already cached (nothing
+    # on a cold start) and the top-up runs from the PAGE's refresh handler instead.
+    #
+    # The refresh deliberately does NOT start here: this function is called directly by
+    # the page tests, and a daemon thread doing DB work outlives the test that started
+    # it -- which raced the fixture's teardown into a Windows access violation. A
+    # loader that spawns background work is a loader that cannot be called safely.
+    stats = load_symbol_stats(symbols)
+
     comments: Dict[tuple, str] = {}
     weights: Dict[str, Dict[str, float]] = {}
     previous_weights: Dict[str, Dict[str, Optional[float]]] = {}
@@ -338,6 +363,39 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
     # dry run will solve with; every "current" figure keeps dividing the gross base.
     unallocated_pct = float(get_allocation_config(account_id).unallocated_pct or 0.0)
 
+    # SIMULATION. A what-if base replaces the measured one for every figure DERIVED
+    # from it -- target money, % of base, the reserve row -- and nothing else. The
+    # held positions, prices, buying power and account value stay exactly as the
+    # broker reported them, because those are measurements and a simulation of them
+    # would be a fabricated broker answer. The real base is carried alongside so the
+    # banner can name what was replaced, and ``simulated_base`` is what every consumer
+    # tests rather than comparing two floats.
+    real_base_notional = base_notional
+    simulated = base_override is not None and float(base_override) > 0
+    if simulated:
+        # WHICH TERM ABSORBS THE CHANGE. ``compute_base_notional`` defines
+        # base = managed + free buying power, and the whole page leans on that being an
+        # IDENTITY: ``format_base_composition``, the reserve row and the allocation bar
+        # all derive the managed side as ``base - buying_power`` rather than re-summing
+        # it. Replacing the base alone therefore did not simulate a bigger account -- it
+        # silently inflated MANAGED by the difference, so an $8,500 what-if over $4,764
+        # of real positions reported "$8,036.72 managed" and 94% allocated.
+        #
+        # Simulating a bigger base means simulating more CASH: the positions are a
+        # measurement (real quantities at real prices) and cannot be what-if'd, so free
+        # buying power is the derived term and the identity holds again. Allocated then
+        # falls as the base grows, which is the question being asked.
+        #
+        # Left signed rather than clamped at zero: a base BELOW the managed value is a
+        # legitimate what-if (positions financed on margin), and the page already renders
+        # an over-100% allocation. Clamping would restore a number at the cost of
+        # breaking the identity a second time.
+        managed_real = (None if real_base_notional is None or buying_power is None
+                        else float(real_base_notional) - float(buying_power))
+        base_notional = float(base_override)
+        if managed_real is not None:
+            buying_power = base_notional - managed_real
+
     return {
         'views': build_label_views(managed, symbols_by_label, positions, prices, comments,
                                    valuation_mode=valuation_mode,
@@ -348,6 +406,13 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
                                    # row: the ⓘ tooltip is the only consumer and it is
                                    # not worth a lookup per cell.
                                    company_names=get_company_names(symbols),
+                                   # ONE query over the account's income ledger, for
+                                   # the "w/ div" half of the P&L column. A local
+                                   # read, so unlike the yield and 1Y/3Y stats it
+                                   # costs no REST call and needs no background
+                                   # top-up.
+                                   dividends_by_symbol=get_dividends_by_symbol(
+                                       account_id),
                                    unallocated_pct=unallocated_pct),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
@@ -357,7 +422,47 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
         # managed positions' market value. ``None`` is UNKNOWN, never 0.0.
         'account_value': account_value,
         'unallocated_pct': unallocated_pct,
+        #: True while the base above is a user's what-if rather than a measurement.
+        'simulated_base': simulated,
+        #: The MEASURED base the simulation replaced. None when the broker could not
+        #: supply one -- which is a legitimate reason to simulate in the first place.
+        'real_base_notional': real_base_notional,
+        #: ``{symbol: AccountSymbolFacts}``. A symbol the broker has never described
+        #: is simply absent, and the row then draws no chips -- see
+        #: ``fractionable_badge`` / ``leverage_badge``.
+        'symbol_facts': facts,
+        #: ``{symbol: SymbolMarketStats}`` for the ⓘ tooltip. Absent until the
+        #: background refresh has reached that symbol.
+        'symbol_stats': stats,
     }
+
+
+def refresh_symbol_facts(account, account_id: int, symbols):
+    """Re-ask the broker what it knows about ``symbols``, store it, return it.
+
+    The chips exist to answer "can this be split?" and "what does it cost in buying
+    power?" without opening a dialog, and both answers are per ACCOUNT -- so they are
+    fetched through the account's own seam and cached against its id.
+
+    A fetch that fails or comes back empty falls back to the STORED rows rather than
+    to nothing: the previous answer is still the best available statement of a fact
+    that changes rarely (Alpaca revokes marginability, it does not churn it), and
+    blanking the chips would read as "the broker says no" when the truth is "the
+    broker did not answer just now".
+    """
+    if not symbols:
+        return {}
+    try:
+        info = svc.fetch_margin_info(account, list(symbols))
+        if info:
+            save_symbol_facts(account_id, info)
+    except Exception as e:  # noqa: BLE001 -- the chips are never worth the page
+        logger.warning(f"Refreshing symbol facts for account {account_id} failed: {e}")
+    try:
+        return load_symbol_facts(account_id, symbols)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Reading stored symbol facts for account {account_id} failed: {e}")
+        return {}
 
 
 def _is_unmeasurable_holding(state, valuation_mode: str) -> bool:
@@ -714,12 +819,44 @@ MARKER_LABEL_PNL = 'pf-label-pnl'
 #: several on the row and its whole content is an inline colour -- and because the
 #: user's complaint was precisely that it disagreed with the bar beside it.
 MARKER_LABEL_ICON = 'pf-label-icon'
+#: The orange count beside that icon: symbols in the label whose share is 0% or
+#: unset. Marked because its text is a bare integer that repeats all over the row.
+MARKER_LABEL_ZERO_BADGE = 'pf-label-zero-badge'
+#: The warning triangle beside it: this label's symbol weights do not total
+#: 100% -- either short (advisory) or over (the same thing that blocks Submit).
+#: A separate icon rather than folded into the zero-share badge because the two
+#: questions are different ("which symbols get nothing" vs "does this label's
+#: split even add up") and a label can have either without the other.
+MARKER_LABEL_WEIGHT_WARNING = 'pf-label-weight-warning'
 #: One preset colour chip. Bare divs whose entire content is a background colour.
 MARKER_COLOR_SWATCH = 'pf-color-swatch'
 #: The "no colour" chip, which is NOT a colour and therefore not one of the above.
 MARKER_COLOR_CLEAR = 'pf-color-clear'
 #: The custom-colour input.
 MARKER_COLOR_CUSTOM = 'pf-color-custom'
+#: The simulation control in the money card, and the banner it raises. Marked
+#: separately: the switch can be ON with the banner missing only if the payload and
+#: the control have gone out of step, which is the one failure that would let a
+#: what-if page pass for the real one.
+MARKER_SIM_TOGGLE = 'pf-sim-toggle'
+MARKER_SIM_INPUT = 'pf-sim-input'
+MARKER_SIM_BANNER = 'pf-sim-banner'
+#: Deliberately loud, and it names BOTH halves: what is simulated and what is not.
+SIM_BANNER_FMT = ('SIMULATION — base set to ${base:,.2f} instead of the measured '
+                  # ``{real}`` arrives ALREADY formatted, because it is either money or
+                  # the word "unknown" and only the caller knows which.
+                  '{real}. The extra is simulated CASH: your positions are real '
+                  'quantities at real prices and cannot be what-if\'d, so free buying '
+                  'power is the figure that moves with the base. Review is disabled '
+                  'until you switch this off.')
+SIM_BANNER_NO_REAL = 'unknown'
+SIM_TOGGLE_LABEL = 'Simulate base'
+SIM_TOGGLE_TOOLTIP = ('Try an arbitrary account base and see how every target and '
+                      'percentage would look. Display only — nothing is saved and no '
+                      'order can be placed while it is on.')
+SIM_REVIEW_BLOCKED = ('Review is disabled while the base is simulated: the plan would '
+                      'solve against your REAL money while the page shows what-if '
+                      'percentages.')
 #: The summary stat-card row, and the reserve card that no longer sits inside it.
 MARKER_SUMMARY_ROW = 'pf-summary-row'
 MARKER_RESERVE_CARD = 'pf-reserve-card'
@@ -763,6 +900,7 @@ MARKER_FILL_REST_SYMBOLS = 'pf-fill-rest-symbols'
 MARKER_LOAD_LAST_SYMBOLS = 'pf-load-last-symbols'
 MARKER_LOAD_CURRENT_SYMBOLS = 'pf-load-current-symbols'
 MARKER_WIPE_SYMBOLS = 'pf-wipe-symbols'
+MARKER_FETCH_STATS = 'pf-fetch-stats'
 
 #: The mini-bar track. Height and radius only -- the FILL's colour comes from the
 #: label's own palette entry, which is what makes the bars tell labels apart.
@@ -782,6 +920,30 @@ COLOR_SWATCH_STYLE = ('width:20px;height:20px;border-radius:50%;cursor:pointer;'
 #: value on every pixel of a drag; without this each one is a SELECT + UPDATE +
 #: commit on the event loop.
 COLOR_DEBOUNCE_MS = 400
+
+
+#: Layout classes for the cells a REPAINT re-classes, kept here because
+#: ``element.classes(replace=...)`` replaces the WHOLE class list. The delta and
+#: P&L cells were rendered with a width and then re-classed on every redraw with
+#: colour classes only, which dropped the width on the first repaint; from then on
+#: each cell was as wide as its own sentence ("on target" vs "under by 32.4pp
+#: ($2,711.66)"), the row's fixed part differed per row, and the growing bar beside
+#: it got a different share of what was left. That is why the tracks came out
+#: ragged. Every repaint site now prefixes these, so the width survives.
+#:
+#: ``truncate`` is not decoration: a flex item's default ``min-width:auto`` lets it
+#: grow past its own ``w-*`` to fit its content, and only a non-visible overflow
+#: pins it. Without it the width class is advisory.
+DELTA_CELL_CLASSES = 'w-56 shrink-0 truncate '
+#: Wide enough for the dividend clause: "P&L -50.20 (-4.27%, w/ div: +1.20%)"
+#: is ~35 characters, and a truncated P&L would hide the half of the sentence
+#: that was added because the other half misreads a distribution-paying holding.
+PNL_CELL_CLASSES = 'w-72 shrink-0 truncate '
+SYMBOL_DELTA_CELL_CLASSES = 'w-44 shrink-0 truncate '
+RESERVE_DELTA_CELL_CLASSES = 'w-52 shrink-0 truncate '
+#: The label header's bar. It GROWS -- the tracks stay equal because everything to
+#: their right is pinned above, not because the bar itself is nailed down.
+LABEL_BAR_CLASSES = 'flex-1 min-w-[120px]'
 
 
 def _render_mini_bar(*, fill_marker: str, notch_marker: str,
@@ -821,7 +983,9 @@ def _paint_mini_bar(widgets: Dict[str, Any], *, fraction: float,
 
 def _new_live_state(*, base_notional: Optional[float] = None,
                     available_buying_power: Optional[float] = None,
-                    unallocated_pct: float = 0.0) -> Dict[str, Any]:
+                    unallocated_pct: float = 0.0,
+                    symbol_facts: Optional[Dict[str, Any]] = None,
+                    symbol_stats: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One render's mutable view of what is on screen. Not persisted anywhere.
 
     ``views`` is the ORDERED ``LabelView`` list and is the single source for every
@@ -834,6 +998,12 @@ def _new_live_state(*, base_notional: Optional[float] = None,
         'base_notional': base_notional,
         'available_buying_power': available_buying_power,
         'unallocated_pct': float(unallocated_pct or 0.0),
+        # {symbol: AccountSymbolFacts} for the ⓘ chips. A symbol the broker has never
+        # described is ABSENT, and its row then draws no chips at all.
+        'symbol_facts': symbol_facts or {},
+        # {symbol: SymbolMarketStats} for the ⓘ tooltip; absent until the
+        # background refresh has reached that symbol.
+        'symbol_stats': symbol_stats or {},
         'views': [],            # ordered LabelView list, MUTATED on an accepted edit
         'view_by_label': {},
         'weights': {},          # label -> {symbol: effective weight %}
@@ -923,6 +1093,142 @@ def _apply_symbol_figures(live: Dict[str, Any], label: str) -> None:
     # The label's own share-of-100 bar, from the SAME map the cells were written
     # from -- so the picture and the column cannot disagree about the total.
     _apply_symbol_bar(live, label)
+    # ...and the count of symbols left at zero, which IS moved by a symbol edit
+    # even though nothing else on the label header is. Its own writer, so this
+    # path and ``_apply_bars`` cannot drift apart.
+    _apply_zero_badge(live, label)
+    # ...and whether the split still adds to 100% at all -- the other thing a
+    # symbol edit changes that the label bars do not.
+    _apply_symbol_weight_warning(live, label)
+
+
+#: What a second press is told while the first is still solving. An 'info', not a
+#: warning: the user did nothing wrong, the answer is simply not back yet.
+REVIEW_BUSY_NOTICE = 'Still solving the plan against the broker — one moment'
+
+
+class ClickLatch:
+    """ONE in-flight run of a button's handler, and the button that shows it.
+
+    The dry-run solve is a broker round trip -- positions, bulk quotes, per-symbol
+    margin, a precheck order per buy -- and NiceGUI dispatches every click as its
+    own task (``nicegui/events.py``: ``handle_event`` schedules the coroutine and
+    returns at once). So a slow solve left the button live and a second press
+    started a SECOND flow: two dry runs stacked, each with its own Submit, and the
+    one underneath solved against positions the one on top was about to change.
+    Reported from live use -- "clicking review here is not instant. So I click
+    twice then screens opens twice".
+
+    TWO defences, because either alone leaves a hole. The button is DISABLED and
+    shows Quasar's spinner, which is also the honest answer to "is anything
+    happening?"; and the flag refuses a call that arrives anyway -- a queued
+    click, a keyboard activation, a stale client. The flag is what makes the
+    refusal true rather than merely unlikely.
+
+    Released in a ``finally``: a latch a failure does not release is a button that
+    never works again. Deliberately NOT one-shot, unlike the dry run's own submit
+    latch -- that one guards orders already sent, this one guards a solve that
+    ordered nothing, and the user must be able to press it again.
+    """
+
+    def __init__(self, busy_notice: str, button=None):
+        self.busy_notice = busy_notice
+        self.button = button
+        self.busy = False
+
+    async def run(self, factory) -> bool:
+        """Await ``factory()`` unless a run is already in flight. Returns whether
+        this call ran -- so a caller can tell "done" from "refused"."""
+        if self.busy:
+            logger.debug(f"ClickLatch: refused a re-entrant press ({self.busy_notice})")
+            ui.notify(self.busy_notice, type='info')
+            return False
+        self.busy = True
+        if self.button is not None:
+            self.button.set_enabled(False)
+            self.button.props('loading')
+        try:
+            await factory()
+        finally:
+            self.busy = False
+            if self.button is not None:
+                self.button.props(remove='loading')
+                self.button.set_enabled(True)
+        return True
+
+
+def _apply_zero_badge(live: Dict[str, Any], label: str) -> None:
+    """Restate one label's zero-share badge: how many of its symbols get NOTHING.
+
+    ONE writer, called from two places on purpose. ``_apply_bars`` covers every
+    change that moves the label rows (a target, the reserve, a reload); a SYMBOL
+    share edit deliberately does not go through there -- the label bars must not
+    move for it -- and the badge is the one thing on the row that such an edit
+    does change. Typing 0 into the last funded symbol has to raise the badge
+    without a reload, or the row goes on looking healthy while the plan sells the
+    position out.
+
+    Read from ``live['weights']``, the SAME map the Share-of-label column is
+    written from, so the badge and the column cannot disagree about which rows sit
+    at zero. Hidden rather than zeroed when every symbol has a share: an orange 0
+    beside a healthy label is the noise that makes a real badge easy to miss.
+    """
+    widgets = live['bars'].get(label)
+    if not widgets:
+        return
+    badge = widgets.get('zero_badge')
+    if badge is None:
+        return
+    view = live['view_by_label'].get(label)
+    members = [row.symbol for row in view.rows] if view is not None else []
+    zeroes = count_zero_share_symbols(members, live['weights'].get(label))
+    badge.set_text(str(zeroes))
+    badge.set_visibility(zeroes > 0)
+    tooltip = widgets.get('zero_tooltip')
+    if tooltip is not None:
+        tooltip.set_text(ZERO_SHARE_BADGE_TOOLTIP_FMT.format(
+            count=zeroes, total=len(members), label=label))
+
+
+def _apply_symbol_weight_warning(live: Dict[str, Any], label: str) -> None:
+    """Restate one label's weight-total warning icon: does the symbol split add
+    to 100%?
+
+    Same dual-call-site reasoning as ``_apply_zero_badge`` right above -- a
+    symbol-share edit changes this label's TOTAL just as much as it changes
+    which symbols sit at zero, and the label bars still must not move for it.
+
+    Reuses the engine's OWN ``validate_symbol_weights`` rather than
+    re-deriving the 100% check here, so the icon's tooltip can never drift from
+    what the submit gate (``AllocationWizard._target_block`` /
+    ``run_allocation``) actually enforces: an OVER split still blocks Submit
+    (``ERROR_SYMBOL_OVER_FMT``) and an UNDER split is advisory only
+    (``WARNING_SYMBOL_UNDER_FMT``, 2026-09-05) -- a shortfall just leaves part
+    of THIS label's own money undeployed, which is worth showing and not worth
+    refusing Submit over. Both render the SAME icon here: the icon says "look at
+    this", the tooltip -- in the engine's own words -- says whether Submit will
+    actually be refused.
+
+    A symbol with no live weight at all (unmeasurable, or genuinely not in the
+    map yet) is silently excluded, exactly as ``symbol_total_bar`` already
+    excludes it from the SAME sum inside the expanded body -- the two indicators
+    must read the same total or one of them is lying.
+    """
+    widgets = live['bars'].get(label)
+    if not widgets:
+        return
+    icon = widgets.get('weight_warning')
+    if icon is None:
+        return
+    weights = live['weights'].get(label) or {}
+    target = LabelTarget(label=label, target_pct=0.0,
+                         symbols=[SymbolTarget(symbol=s, weight_pct=w)
+                                 for s, w in weights.items()])
+    messages = validate_symbol_weights(target)
+    icon.set_visibility(bool(messages))
+    tooltip = widgets.get('weight_warning_tooltip')
+    if tooltip is not None:
+        tooltip.set_text(' '.join(messages))
 
 
 def _apply_bars(live: Dict[str, Any]) -> None:
@@ -956,6 +1262,8 @@ def _apply_bars(live: Dict[str, Any]) -> None:
             # twice, and invisible to every Python test because the element
             # carried the right value the whole time.
             icon.style(replace=important_color_style(bar.color))
+        _apply_zero_badge(live, bar.label)
+        _apply_symbol_weight_warning(live, bar.label)
         widgets['value'].set_text(f'${bar.current_value:,.2f}')
         # Every string below is the PURE layer's, not this module's: the
         # denominator rule, the "(real N%)" parenthetical and the over/under
@@ -968,7 +1276,8 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         # "over by" at any distance and for an "under by" that has left the target
         # band; the figures are handed over so ``label_status_color`` can ask the
         # BAR's own predicate rather than carry a second copy of the threshold.
-        widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+        widgets['delta'].classes(
+            replace=DELTA_CELL_CLASSES + 'text-xs ' + LABEL_STATUS_CLASSES[bar.status])
         widgets['delta'].style(replace=important_color_style(
             label_status_color(bar.status, value_pct=bar.current_pct,
                                target_pct=bar.target_pct)))
@@ -978,7 +1287,7 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         # nothing has to remember which of the row's figures are live.
         widgets['last'].set_text(bar.last_text)
         widgets['pnl'].set_text(bar.pnl_text)
-        widgets['pnl'].classes(replace=pnl_classes(bar.pnl))
+        widgets['pnl'].classes(replace=PNL_CELL_CLASSES + pnl_classes(bar.pnl))
         # Green up, red down, neutral inside the epsilon band -- and painted, not
         # merely classed, for the reason above.
         widgets['pnl'].style(replace=important_color_style(pnl_color(bar.pnl)))
@@ -1015,7 +1324,8 @@ def _apply_symbol_bar(live: Dict[str, Any], label: str) -> None:
                     notch_fraction=bar.notch_fraction, color=widgets['color'])
     widgets['pct'].set_text(bar.current_text)
     widgets['delta'].set_text(bar.delta_text)
-    widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+    widgets['delta'].classes(
+        replace=SYMBOL_DELTA_CELL_CLASSES + 'text-xs ' + LABEL_STATUS_CLASSES[bar.status])
     # PAINTED, like the label row's delta and the reserve row's -- and this one was
     # the odd bar out: it wore the status class and nothing painted it, so its
     # verdict rendered in plain white while the two identical readouts either side
@@ -1067,7 +1377,8 @@ def _apply_reserve_bar(live: Dict[str, Any]) -> None:
     widgets['pct'].set_text(bar.current_text)
     widgets['target'].set_text(bar.target_text)
     widgets['delta'].set_text(bar.delta_text)
-    widgets['delta'].classes(replace='text-xs ' + LABEL_STATUS_CLASSES[bar.status])
+    widgets['delta'].classes(
+        replace=RESERVE_DELTA_CELL_CLASSES + 'text-xs ' + LABEL_STATUS_CLASSES[bar.status])
     # The SAME two figures the fill above was just coloured from, so the sentence
     # and the bar cannot disagree: this text goes orange in the same step the
     # track goes yellow.
@@ -1348,6 +1659,71 @@ async def _fill_label_to_100(account_id: int, live: Dict[str, Any],
         what='Fill 100%')
 
 
+async def _fetch_label_stats(label: str, symbols, refresh) -> None:
+    """Fetch the yield and 1Y/3Y total return for ONE label's symbols, then redraw.
+
+    The page already tops these up in the background on every refresh, but that
+    pass is capped at ``STATS_REFRESH_BATCH`` symbols and works through the whole
+    account -- so on 76 managed symbols a particular label can read "not fetched
+    yet" for several refreshes running. This button asks for the ones actually in
+    front of the user, ALL of them, and waits for the answer.
+
+    Off the event loop (``asyncio.to_thread``) because the provider needs several
+    REST calls per symbol: run inline, a twenty-symbol label would freeze every
+    other browser tab this server is serving.
+
+    It reports what happened in all four cases -- nothing to fetch, fetched,
+    partially fetched, and fetched NOTHING although work was due. The last is the
+    one worth the noise: ``refresh_symbol_stats`` returns 0 both when there was
+    nothing to do and when the provider refused (no API key, a failed call), and a
+    button that renders those two identically is a button that lies about a
+    misconfiguration.
+    """
+    from ba2_common.core.symbol_stats import stale_symbols
+
+    wanted = sorted({(sym or '').strip().upper() for sym in (symbols or [])
+                     if (sym or '').strip()})
+    if not wanted:
+        ui.notify(f"'{label}' has no symbols to fetch", type='warning')
+        return
+    try:
+        # WHAT IS DUE, computed here rather than left to the service, so that "all
+        # of these were fetched within the last 12 hours" can be SAID instead of
+        # being indistinguishable from a failure.
+        due = await asyncio.to_thread(stale_symbols, wanted)
+    except Exception as e:
+        logger.error(f"Could not read the symbol-stats cache for '{label}': {e}",
+                     exc_info=True)
+        ui.notify(f'Could not read the cached figures: {e}', type='negative')
+        return
+    if not due:
+        ui.notify(f"Every symbol in '{label}' was already fetched within the last "
+                  f"12 hours", type='info')
+        await refresh()
+        return
+
+    ui.notify(f"Fetching yield and total return for {len(due)} symbol(s) in "
+              f"'{label}' — this takes a few seconds each")
+    try:
+        # ``limit`` is the WHOLE label, not the background pass's batch: the user
+        # asked for this label, and half of it is not an answer.
+        written = await asyncio.to_thread(svc.refresh_symbol_stats, due,
+                                          limit=len(due))
+    except Exception as e:
+        logger.error(f"Symbol stats fetch failed for '{label}': {e}", exc_info=True)
+        ui.notify(f'Fetch failed: {e}', type='negative')
+        return
+    if not written:
+        ui.notify(f"Fetched nothing for '{label}' — check the FMP API key and the "
+                  f"log", type='negative')
+    elif written < len(due):
+        ui.notify(f"Fetched {written} of {len(due)} symbol(s) in '{label}'",
+                  type='warning')
+    else:
+        ui.notify(f"Fetched {written} symbol(s) in '{label}'", type='positive')
+    await refresh()
+
+
 # ---------------------------------------------------------------------------
 # THE PER-LABEL BUTTON GROUP -- migrated off the wizard's step 2
 #
@@ -1553,38 +1929,58 @@ async def _save_label_comment(account_id: int, label: str, value: str) -> None:
 
 
 def _write_symbol_comment(account_id: int, label: str, symbol: str, value: str,
-                          label_symbols: List[str]) -> None:
+                          label_symbols: List[str], *,
+                          displayed_weight: Optional[float] = None) -> None:
     """Persist a symbol's comment WITHOUT moving its allocation. Blocking.
 
     ``set_symbol_weight`` is the one writer for this row, and creating a row makes
     the weight EXPLICIT — a bare ``comment=`` write would create it at the model
     default of 0.0 and the engine reads 0 as "hold none of this", so the next
     rebalance would sell a position the user only wrote a note about. So the
-    symbol's current EFFECTIVE weight (its stored value, or the even-split default
-    it was silently taking) is passed alongside the comment, which pins it at
-    exactly the number it already had. ``weight_pct == 0.0`` deliberately stays a
-    legitimate explicit zero and is never re-read as "unstored" — doing that would
-    re-introduce drift from the engine's ``build_symbol_targets``.
+    symbol's current EFFECTIVE weight is passed alongside the comment, which pins
+    it at exactly the number it already had. ``weight_pct == 0.0`` deliberately
+    stays a legitimate explicit zero and is never re-read as "unstored" — doing
+    that would re-introduce drift from the engine's ``build_symbol_targets``.
 
-    ``label_symbols`` must be the label's FULL symbol list: the even-split default
-    is only correct when every symbol sharing the 100% is known.
+    ``displayed_weight`` -- THE FIX (2026-09-04). It used to be read back from
+    ``get_symbol_weights`` (the STORE's own default, an EVEN split of whatever is
+    left of 100% among the unstored symbols), while the table's Weight column
+    shows ``resolve_symbol_weights`` (the VIEW's default: each unstored symbol's
+    share of the label's HELD VALUE). The two defaults are different algorithms
+    and disagree whenever a label's holdings are uneven and unsaved: on a 90/10
+    market-value split the table showed 90%, a comment on that row silently wrote
+    50% (the even split of two symbols) -- invisible until reload, and the next
+    rebalance sold most of the position toward a target the user never typed.
+    Passing what the page is ACTUALLY SHOWING closes that gap; the two
+    computations no longer need to agree because only one of them is ever
+    written.
 
-    Side effect, accepted: the symbol's weight stops floating with the even split,
-    so a symbol added to the label later re-splits only what is left. That is the
-    documented meaning of a stored row, and it is strictly better than the zeroing
-    it replaces.
+    ``label_symbols`` is the fallback path's input (the label's FULL symbol
+    list, so its even-split default is only wrong when the caller has no live
+    figure at all to hand over -- normally never reached from the page).
     """
-    effective = get_symbol_weights(account_id, label, label_symbols)
-    set_symbol_weight(account_id, label, symbol,
-                      weight_pct=effective.get(symbol), comment=value or "")
+    weight = displayed_weight
+    if weight is None:
+        effective = get_symbol_weights(account_id, label, label_symbols)
+        weight = effective.get(symbol)
+    set_symbol_weight(account_id, label, symbol, weight_pct=weight, comment=value or "")
 
 
-async def _save_symbol_comment(account_id: int, label: str, symbol: str, value: str,
+async def _save_symbol_comment(account_id: int, live: Dict[str, Any], label: str,
+                               symbol: str, value: str,
                                label_symbols: List[str]) -> None:
-    """Comment-cell handler: two DB round trips, both off the event loop."""
+    """Comment-cell handler: two DB round trips, both off the event loop.
+
+    ``live['weights']`` is read on the EVENT LOOP, before the thread hop -- it is
+    the same in-memory registry ``_save_symbol_weight`` patches after every
+    accepted edit, so this reads exactly what the cell beside the comment box is
+    showing at the moment the debounce fires, not a value that might change while
+    the write is in flight.
+    """
+    displayed = (live.get('weights', {}).get(label) or {}).get(symbol)
     try:
         await asyncio.to_thread(_write_symbol_comment, account_id, label, symbol, value,
-                                label_symbols)
+                                label_symbols, displayed_weight=displayed)
     except Exception as e:
         logger.error(f"Saving comment for {label}/{symbol} failed: {e}", exc_info=True)
         ui.notify(f'Could not save comment: {e}', type='negative')
@@ -2033,6 +2429,66 @@ def _render_gate_blocked(gate: GateResult) -> None:
                           on_click=lambda: ui.navigate.to('/settings')).props('outline')
 
 
+#: Shown in the ⓘ tooltip while the background refresh has not reached this symbol
+#: yet. NOT a blank line and NOT a zero: "we have not looked" is a third state beside
+#: "0.00%" (a real non-payer) and a figure.
+STAT_PENDING = 'yield / returns: not fetched yet'
+
+
+def _fmt_stat_pct(value) -> str:
+    """A percent for the tooltip, or ``-`` when it is genuinely unknown.
+
+    ``0.0`` is a MEASURED value and prints as 0.00%: a fund that pays nothing really
+    does yield zero, and rendering that as ``-`` would invent a missing fact.
+    """
+    return '-' if value is None else f"{float(value):+.2f}%"
+
+
+def _symbol_stat_fields(stats) -> Dict[str, Any]:
+    """The ⓘ tooltip's income/return lines, pre-resolved into flat row fields.
+
+    Resolved in Python for the same reason the fact chips are: '' is the ONLY thing
+    the Quasar template treats as "draw nothing", and a ``v-if`` on a raw None would
+    render "not fetched" and "the provider said zero" identically.
+    """
+    if stats is None:
+        return {'stat_line': '', 'stat_pending': STAT_PENDING, 'stat_error': ''}
+    if getattr(stats, 'error', None):
+        return {'stat_line': '', 'stat_pending': '',
+                'stat_error': f"could not be fetched: {stats.error}"}
+    y = getattr(stats, 'dividend_yield_pct', None)
+    return {
+        # Yield is unsigned (a negative yield is not a thing); the returns are signed
+        # because their direction is the whole point.
+        'stat_line': (f"Yield {'-' if y is None else f'{float(y):.2f}%'}"
+                      f"  ·  1Y {_fmt_stat_pct(getattr(stats, 'total_return_1y_pct', None))}"
+                      f"  ·  3Y {_fmt_stat_pct(getattr(stats, 'total_return_3y_pct', None))}"),
+        'stat_pending': '',
+        'stat_error': '',
+    }
+
+
+def _symbol_fact_fields(facts) -> Dict[str, Any]:
+    """The ⓘ chips for one symbol, as flat row fields the Quasar template can print.
+
+    Resolved in Python, not in the template: every field here is '' when the broker
+    has not answered, and '' is the ONLY thing the template treats as "draw nothing".
+    A ``v-if`` on the raw tri-state would render ``None`` and ``False`` identically,
+    which is exactly the conflation the whole chain from ``MarginInfo`` down exists
+    to prevent -- "the broker did not say" is not "the broker said no".
+    """
+    frac = fractionable_badge(getattr(facts, 'fractionable', None))
+    lev = leverage_badge(getattr(facts, 'initial_margin_rate', None))
+    return {
+        'frac_badge': frac[0] if frac else '',
+        'frac_tip': frac[1] if frac else '',
+        #: True only for an explicit broker "no", so the chip can be struck through.
+        'frac_strike': getattr(facts, 'fractionable', None) is False,
+        'lev_badge': lev[0] if lev else '',
+        'lev_tip': lev[1] if lev else '',
+    }
+
+
 def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     """One managed label's target box, comment box, symbol table and controls.
 
@@ -2081,8 +2537,23 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # KEPT although the Labels COLUMN is gone: the ⚠ cell's tooltip is now the
         # only place a symbol's other managed labels are named, and it reads this.
         'labels': ', '.join(r.labels),
+        # The two broker-fact chips beside the ⓘ, PRE-RESOLVED here rather than
+        # decided in the Vue template: '' means "no chip", which is what an absent
+        # fact must produce, and keeping the tri-state reasoning in Python is what
+        # stops a ``v-if`` on a falsy None from quietly reading as "the broker
+        # said no". ``frac_strike`` marks the False case, so "whole shares only"
+        # is never mistaken for "fractionable" at a glance.
+        **_symbol_fact_fields(live['symbol_facts'].get(r.symbol)),
+        **_symbol_stat_fields(live['symbol_stats'].get(r.symbol)),
         'current_value': round(r.current_value, 2),
+        # BOTH label denominators travel to the browser. ``pct_of_label_target`` is
+        # what the "% of label tgt" COLUMN prints -- the label's target money, so an
+        # over-subscribed label's rows sum past 100% instead of always landing on it
+        # (2026-09-05). ``pct_of_label`` stays because ``_write_row_deltas`` feeds it
+        # to ``symbol_delta`` for the share-point hint under the Share-of-label box,
+        # which is only meaningful against the label's own composition.
         'pct_of_label': round(r.pct_of_label, 2),
+        'pct_of_label_target': round(r.pct_of_label_target, 2),
         'pct_of_total': round(r.pct_of_total, 2),
         # None, never 0.0: a symbol with no stored weight and a page with no base
         # notional have no target, and 0.00 there would be a claim rather than a gap.
@@ -2133,7 +2604,15 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         # the slot below draws a button over it.
         {'name': 'info', 'label': '', 'field': 'symbol', 'align': 'center'},
         {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
-        {'name': 'pct_of_label', 'label': '% of label', 'field': 'pct_of_label', 'sortable': True, 'align': 'right'},
+        # AGAINST THE LABEL'S TARGET MONEY, not against what the label happens to
+        # hold (2026-09-05). The old denominator was the label's own held total, so
+        # the column summed to exactly 100% on every label whatever its funding --
+        # a label holding twice its target read as perfectly balanced. Over 100%
+        # here now means over-subscribed and under means under-invested, which is
+        # what the reader is looking for. The header names the denominator: an
+        # unqualified "% of label" is what made the old figure misread.
+        {'name': 'pct_of_label_target', 'label': '% of label tgt',
+         'field': 'pct_of_label_target', 'sortable': True, 'align': 'right'},
         {'name': 'pct_of_total', 'label': '% of total', 'field': 'pct_of_total', 'sortable': True, 'align': 'right'},
         # "Share of label %", not "Target %": the label header above prints a target
         # too, and that one is a share of the PORTFOLIO. Two different quantities
@@ -2179,8 +2658,8 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
         ui.label(SYMBOL_TOTAL_BAR_CAPTION).classes('w-40 text-xs text-secondary-custom')
         symbol_bar_widgets = _render_mini_bar(
             fill_marker=MARKER_SYMBOL_BAR_FILL, notch_marker=MARKER_SYMBOL_BAR_NOTCH)
-        symbol_bar_widgets['pct'] = ui.label('').classes('w-16 text-right')
-        symbol_bar_widgets['delta'] = ui.label('').classes('w-44')
+        symbol_bar_widgets['pct'] = ui.label('').classes('w-16 shrink-0 text-right')
+        symbol_bar_widgets['delta'] = ui.label('').classes(SYMBOL_DELTA_CELL_CLASSES)
         # The LABEL's own colour, resolved through the one helper the icon and the
         # header bar use, so a recolour reaches all three or none.
         symbol_bar_widgets['color'] = resolve_label_icon_color(view.color)
@@ -2198,16 +2677,53 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     # -- and the identity has to travel with the click or every row opens the same
     # symbol. That is the same wiring ``weightChange`` and ``commentChange`` below
     # use, and it leaves no loop variable for a handler to close over.
+    # The two broker-fact chips sit BESIDE the ⓘ, in the same cell. They are facts
+    # about the symbol, so they belong next to its identity rather than in columns of
+    # their own -- and as fixed-width text they cost no horizontal room in a table
+    # that already runs to thirteen columns. Each is drawn only when its string is
+    # non-empty (see ``_symbol_fact_fields``): an absent broker answer draws nothing.
     table.add_slot('body-cell-info', r'''
         <q-td :props="props">
-            <q-btn dense flat round size="sm" icon="info" color="grey-5"
-                   @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
-                <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
-                    <div class="text-weight-bold">{{ props.row.symbol }}</div>
-                    <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
-                    <div>Holdings, dividends and total return</div>
-                </q-tooltip>
-            </q-btn>
+            <div class="row items-center no-wrap justify-center" style="gap:6px">
+                <q-btn dense flat round size="sm" icon="info" color="grey-5"
+                       @click="() => $parent.$emit('symbolInfo', props.row.symbol)">
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        <div class="text-weight-bold">{{ props.row.symbol }}</div>
+                        <div v-if="props.row.company_name">{{ props.row.company_name }}</div>
+                        <!-- Income and total return, from the cached provider stats.
+                             Exactly one of these three lines is ever non-empty: the
+                             figures, "not fetched yet", or the fetch error. -->
+                        <div v-if="props.row.stat_line" class="text-weight-medium"
+                             style="margin-top:4px">{{ props.row.stat_line }}</div>
+                        <div v-if="props.row.stat_pending" style="opacity:0.7">
+                            {{ props.row.stat_pending }}</div>
+                        <div v-if="props.row.stat_error" style="opacity:0.7">
+                            {{ props.row.stat_error }}</div>
+                        <div style="margin-top:4px">Click for holdings, dividends and total return</div>
+                    </q-tooltip>
+                </q-btn>
+                <span v-if="props.row.frac_badge"
+                      class="text-caption text-weight-bold"
+                      style="width:0.9rem;text-align:center"
+                      :style="props.row.frac_strike
+                              ? 'color:#94a3b8;text-decoration:line-through'
+                              : 'color:#4ade80'">
+                    {{ props.row.frac_badge }}
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        {{ props.row.frac_tip }}
+                    </q-tooltip>
+                </span>
+                <span v-if="props.row.lev_badge"
+                      class="text-caption"
+                      style="color:#cbd5e1;background:rgba(148,163,184,0.18);
+                             border-radius:4px;padding:0 4px;line-height:1.25;
+                             font-variant-numeric:tabular-nums;white-space:nowrap">
+                    {{ props.row.lev_badge }}
+                    <q-tooltip class="text-body2" style="font-size:0.95rem;max-width:22rem">
+                        {{ props.row.lev_tip }}
+                    </q-tooltip>
+                </span>
+            </div>
         </q-td>
     ''')
     table.on('symbolInfo', lambda e: _open_symbol_info([emitted_value(e)]))
@@ -2278,7 +2794,7 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
     ''')
     table.on('commentChange',
              lambda e, lbl=view.label, syms=label_symbols: _save_symbol_comment(
-                 account_id, lbl, e.args[0], e.args[1], syms))
+                 account_id, live, lbl, e.args[0], e.args[1], syms))
 
     async def _remove_selected() -> None:
         symbols = _selected_symbols(table)
@@ -2350,6 +2866,16 @@ def _render_label_body(account_id: int, view, refresh, *, live=None) -> None:
                   ).props('outline dense').mark(MARKER_WIPE_SYMBOLS) \
             .tooltip('Clear every share in this label to 0% so it can be redone. '
                      '"Load last" undoes it — the history is not touched.')
+        # THE ONLY BUTTON ON THE ROW THAT TALKS TO A PROVIDER, and the only one
+        # that takes seconds rather than milliseconds -- which is why it says so in
+        # its tooltip and reports what it got.
+        ui.button('Fetch data', icon='cloud_download',
+                  on_click=lambda lbl=view.label, syms=label_symbols:
+                      _fetch_label_stats(lbl, syms, refresh)
+                  ).props('outline dense').mark(MARKER_FETCH_STATS) \
+            .tooltip('Fetch the dividend yield and 1Y / 3Y total return for every '
+                     'symbol in this label, then redraw. A few seconds per symbol '
+                     'the first time; cached for 12 hours after that.')
         # LEFT of the space, with the harmless buttons. Compare reads the same
         # ticked rows Remove does, but it only READS them; sitting it against the
         # one button on this row that deletes things is how a mis-aimed click stops
@@ -2429,9 +2955,11 @@ def _render_reserve_card(account_id: int, live: Dict[str, Any]) -> None:
             reserve_bar_widgets = _render_mini_bar(
                 fill_marker=MARKER_RESERVE_BAR_FILL,
                 notch_marker=MARKER_RESERVE_BAR_NOTCH)
-            reserve_bar_widgets['pct'] = ui.label('').classes('w-16 text-right')
-            reserve_bar_widgets['target'] = ui.label('').classes('w-28 text-right')
-            reserve_bar_widgets['delta'] = ui.label('').classes('w-52')
+            reserve_bar_widgets['pct'] = ui.label('').classes('w-16 shrink-0 text-right')
+            reserve_bar_widgets['target'] = ui.label('').classes(
+                'w-28 shrink-0 text-right')
+            reserve_bar_widgets['delta'] = ui.label('').classes(
+                RESERVE_DELTA_CELL_CLASSES)
             reserve_bar_widgets['color'] = DEFAULT_LABEL_ICON_COLOR
         live['reserve_bar'] = reserve_bar_widgets
         # The one denominator change on the page, said where the control is.
@@ -2503,26 +3031,69 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
                         lambda hexed, stored, lbl=view.label: _recolour_label(
                         live, lbl, stored))
             widgets['icon'] = icon
+            # HOW MANY SYMBOLS IN THIS LABEL GET NOTHING -- a 0% share or none set
+            # at all. Beside the tag icon because that is where the eye lands on a
+            # collapsed row, and the whole point is to see it WITHOUT opening the
+            # label. Drawn empty and filled in by ``_apply_bars`` from the live
+            # weights, so it follows a share the user types rather than describing
+            # the page as it loaded; ``_apply_bars`` also hides it when every
+            # symbol has a share, because a badge reading 0 is noise.
+            zero_badge = ui.badge('').props('color=orange') \
+                .classes('shrink-0').mark(MARKER_LABEL_ZERO_BADGE)
+            with zero_badge:
+                widgets['zero_tooltip'] = ui.tooltip('')
+            widgets['zero_badge'] = zero_badge
+            # THIS LABEL'S OWN SPLIT DOES NOT ADD TO 100% -- a plain triangle, not
+            # a count: there is exactly one fact to flag, not a number of them.
+            # Hidden, not zeroed, when the split is exactly 100% -- same reasoning
+            # as the zero-share badge. An OVER split is also what blocks Submit
+            # (ERROR_SYMBOL_OVER_FMT); an UNDER split is advisory only
+            # (WARNING_SYMBOL_UNDER_FMT) -- the tooltip says which, using the
+            # engine's own wording so the two can never disagree.
+            weight_warning = ui.icon('warning').props('color=orange size=xs') \
+                .classes('shrink-0 cursor-help').mark(MARKER_LABEL_WEIGHT_WARNING)
+            with weight_warning:
+                widgets['weight_warning_tooltip'] = ui.tooltip('')
+            widgets['weight_warning'] = weight_warning
             ui.label(view.label).classes('w-48 truncate font-medium')
             widgets['value'] = ui.label('').classes('w-28 text-right')
             # THE bar component, shared with the per-label symbol-share total and
             # the unallocated row so the three read as one visual language.
-            widgets.update(_render_mini_bar(fill_marker=MARKER_BAR_FILL,
-                                            notch_marker=MARKER_BAR_NOTCH))
-            widgets['pct'] = ui.label('').classes('w-16 text-right')
-            widgets['target'] = ui.label('').classes('w-36 text-right')
+            # IT GROWS, and every track still comes out the same length, because
+            # every cell to its right is pinned by a ``*_CELL_CLASSES`` width that a
+            # repaint can no longer drop and its own text can no longer widen. The
+            # bars are read by COMPARING their fills down the column, so equal
+            # tracks are the whole requirement -- but pinning the BAR instead
+            # (``w-96 shrink-0``) bought that equality by fixing the one element on
+            # the row whose LENGTH is the information, and left a third of a wide
+            # row empty. Pin the text, grow the bar.
+            widgets.update(_render_mini_bar(
+                fill_marker=MARKER_BAR_FILL, notch_marker=MARKER_BAR_NOTCH,
+                classes=LABEL_BAR_CLASSES))
+            widgets['pct'] = ui.label('').classes('w-16 shrink-0 text-right')
+            # WIDE ENOUGH FOR THE MONEY, NOWRAP, and LEFT-aligned. The cell carries
+            # "tgt 18.0% (real 16.2% — $1,357.00)" since the money was added
+            # (2026-09-05) -- ~33 characters, which wrapped at the old w-36 and made
+            # every row taller. Fixed width so the column starts at the same x down
+            # the page; left-aligned so the gap lands AFTER the sentence rather than
+            # between the bar and its own label. The bar absorbs whatever is left,
+            # which is what keeps a wide screen from opening a hole in the row.
+            widgets['target'] = ui.label('').classes(
+                'w-72 shrink-0 truncate text-left')
             # THE number that says what to do. It replaced the bare status word --
             # "over" beside a bar already sitting past its notch said nothing the
             # geometry had not -- and it keeps that word's COLOUR, so the row still
             # scans at a glance without printing the same fact three times.
-            widgets['delta'] = ui.label('').classes('w-52')
+            widgets['delta'] = ui.label('').classes(DELTA_CELL_CLASSES)
             # The wizard's step-1 caption, minus its denominator clause. "last" is
             # the target the previous RUN used, and it is already on the investable
             # basis (it is a stored target), so unlike the wizard's "% of base"
             # wording it needs no restating -- see ``LAST_TARGET_FMT``.
-            widgets['last'] = ui.label('').classes('w-28 text-xs text-secondary-custom') \
+            widgets['last'] = ui.label('') \
+                .classes('w-28 shrink-0 truncate text-xs text-secondary-custom') \
                 .mark(MARKER_LABEL_LAST)
-            widgets['pnl'] = ui.label('').classes('w-52').mark(MARKER_LABEL_PNL)
+            widgets['pnl'] = ui.label('').classes(PNL_CELL_CLASSES) \
+                .mark(MARKER_LABEL_PNL)
             # The pencil. It OPENS the label and focuses its target box; it never
             # closes one, because "edit this" is not a toggle.
             ui.icon('edit').classes('cursor-pointer text-secondary-custom') \
@@ -2549,9 +3120,31 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
         _render_label_body(account_id, view, refresh, live=live)
 
 
+def _render_sim_banner(payload: Dict[str, Any]) -> None:
+    """The what-if warning. Drawn from the PAYLOAD, never from the switch.
+
+    The switch says what the user asked for; the payload says what the numbers on
+    screen were actually computed with. Reading the payload is what makes it
+    impossible for a simulated page to render without saying so -- a toggle that had
+    not yet reached a refresh would otherwise leave real numbers under a warning, or
+    worse, simulated ones without.
+    """
+    if not payload.get('simulated_base'):
+        return
+    real = payload.get('real_base_notional')
+    with ui.element('div').classes('alert-banner warning w-full p-3').mark(MARKER_SIM_BANNER):
+        ui.label(SIM_BANNER_FMT.format(
+            base=float(payload.get('base_notional') or 0.0),
+            real=f"${float(real):,.2f}" if real is not None else SIM_BANNER_NO_REAL))
+
+
 def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # Biggest holding first. The 39.5% row used to sit between two 1-5% rows,
     # because the order was whatever ``sort_order`` happened to be.
+    # BEFORE the empty-label early return: an account with no labels can still be
+    # simulating, and the warning must not depend on there being a table under it.
+    _render_sim_banner(payload)
+
     views = sort_label_views(payload['views'])
     if not views:
         with ui.element('div').classes('alert-banner info w-full p-3'):
@@ -2563,7 +3156,9 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     buying_power = payload['available_buying_power']
     live = _new_live_state(base_notional=base_notional,
                            available_buying_power=buying_power,
-                           unallocated_pct=payload['unallocated_pct'])
+                           unallocated_pct=payload['unallocated_pct'],
+                           symbol_facts=payload.get('symbol_facts') or {},
+                           symbol_stats=payload.get('symbol_stats') or {})
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
     # while every pct_of_total below was divided by the DISTINCT total.
     total = managed_total_value(views)
@@ -2879,8 +3474,22 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         def _on_submit(selected_plan) -> None:
             ui.timer(0.1, lambda: _do_submit(selected_plan), once=True)
 
+        def _on_validate(selected_plan):
+            """Called from the wizard (sync): test the ticked orders, send nothing.
+
+            Broker IO on the event loop, like ``_on_refresh`` beside it and for
+            the same reason -- the wizard's buttons are sync handlers and NiceGUI
+            dispatches them directly. It is one margin re-read plus at most one
+            preview per buy, and it happens while the user waits for an answer
+            they asked for.
+            """
+            from ...core.utils import get_account_instance_from_id
+            return svc.validate_plan(get_account_instance_from_id(account_id),
+                                     selected_plan)
+
         open_allocation_wizard(new_base, plan, market=_market_gate_for(hours),
-                               on_refresh=_on_refresh, on_submit=_on_submit)
+                               on_refresh=_on_refresh, on_submit=_on_submit,
+                               on_validate=_on_validate)
 
     async def _do_submit(selected_plan) -> None:
         try:
@@ -2896,7 +3505,22 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             # sit open across 16:00 and the banner it was built with is now stale.
             ui.notify(result['blocked_reason'], type='warning')
             return
-        render_outcomes(result['outcomes'], run_id=result['run_id'])
+        def _on_retry(symbols) -> None:
+            """"Retry the N that failed": re-solve and open a FRESH dry run.
+
+            Deliberately a full re-solve rather than a replay of the rows that
+            failed. The positions have moved -- what filled is now held, so the
+            new plan does not ask for it again, while what failed is still off
+            target and comes back in. ``symbols`` is carried for the log only: the
+            new plan is the whole account's, and the user re-ticks in the dry run
+            exactly as they would on any other run.
+            """
+            logger.info(f"Allocation retry requested for {len(symbols)} failed "
+                        f"row(s) on account {account_id}: {', '.join(symbols)}")
+            ui.timer(0.1, _run_dry_run, once=True)
+
+        render_outcomes(result['outcomes'], run_id=result['run_id'],
+                        on_retry=_on_retry)
         note = working_orders_notice(settled=result['settled'],
                                      working_order_ids=result['working_order_ids'],
                                      refresh_failed=result['refresh_failed'])
@@ -2966,6 +3590,10 @@ async def content() -> None:
         body = ui.column().classes('w-full gap-3')
         try:
             mode_state = {'value': await asyncio.to_thread(_load_valuation_mode, account_id)}
+            # SESSION-ONLY, deliberately not persisted: a what-if that survived a
+            # reload would be indistinguishable from the real page the next time it
+            # was opened, which is the one way this feature could mislead.
+            sim_state: Dict[str, Any] = {'on': False, 'base': None}
         except Exception as e:
             logger.error(f"Portfolio allocation: valuation mode unreadable for account "
                          f"{account_id}: {e}", exc_info=True)
@@ -2979,7 +3607,8 @@ async def content() -> None:
                 ui.spinner(size='lg').classes('self-center')
             try:
                 payload = await asyncio.to_thread(
-                    _load_view_payload, account_id, mode_state['value'])
+                    _load_view_payload, account_id, mode_state['value'],
+                    sim_state['base'] if sim_state['on'] else None)
             except PositionFetchFailed as e:
                 logger.error(f"Portfolio allocation: position fetch failed: {e}")
                 body.clear()
@@ -3000,6 +3629,13 @@ async def content() -> None:
             body.clear()
             with body:
                 _render_labels(account_id, payload, _refresh)
+            # Top up the ⓘ tooltip's cached yield / 1Y / 3Y for next time, off the
+            # render path and never joined: a slow provider must not hold the page,
+            # and a failed top-up costs a tooltip line rather than the table.
+            managed = [r.symbol for view in payload['views'] for r in view.rows]
+            if managed:
+                threading.Thread(target=svc.refresh_symbol_stats, args=(managed,),
+                                 name='symbol-stats-refresh', daemon=True).start()
                 try:
                     events, open_total, working_note = await asyncio.to_thread(
                         _load_income_panel, account_id)
@@ -3033,10 +3669,54 @@ async def content() -> None:
             ui.notify(f'Valuation mode: {chosen}', type='info')
             await _refresh()
 
+        review_latch = ClickLatch(REVIEW_BUSY_NOTICE)
+
+        async def _review() -> None:
+            """The Review button: ONE dry run per press, however many times it is
+            pressed. See ``ClickLatch``."""
+            # THE INTERLOCK, re-checked at press time and not only by disabling the
+            # button. The dry run solves against the broker's REAL base -- it has to,
+            # it is going to place real orders -- so reviewing while the page shows
+            # what-if percentages would put two different sets of numbers in front of
+            # the user under one heading. Disabling is the affordance; this is the
+            # guarantee.
+            if sim_state['on']:
+                ui.notify(SIM_REVIEW_BLOCKED, type='warning', multi_line=True,
+                          close_button=True, classes='break-words')
+                return
+            await review_latch.run(
+                lambda: _open_allocation_flow(account_id, mode_state['value'],
+                                              _refresh))
+
+        async def _apply_simulation() -> None:
+            """Re-render on the simulated base, and lock Review while it is on."""
+            if sim_state['on'] and not sim_state['base']:
+                ui.notify('Enter a base to simulate first.', type='warning')
+                return
+            button = review_latch.button
+            if button is not None:
+                (button.disable if sim_state['on'] else button.enable)()
+            await _refresh()
+
+        async def _toggle_simulation(event) -> None:
+            sim_state['on'] = bool(event.value)
+            await _apply_simulation()
+
+        async def _set_simulated_base(event) -> None:
+            raw = event.value
+            try:
+                value = float(raw) if raw not in (None, '') else None
+            except (TypeError, ValueError):
+                return
+            # A non-positive base is not a simulation, it is a division by zero
+            # waiting to happen in every percentage on the page.
+            sim_state['base'] = value if value and value > 0 else None
+            if sim_state['on']:
+                await _apply_simulation()
+
         with toolbar:
-            ui.button(REVIEW_BUTTON_LABEL, icon='fact_check',
-                      on_click=lambda: _open_allocation_flow(
-                          account_id, mode_state['value'], _refresh)) \
+            review_latch.button = ui.button(
+                REVIEW_BUTTON_LABEL, icon='fact_check', on_click=_review) \
                 .props('color=primary') \
                 .tooltip('Solve the plan against the broker and show it for review. '
                          'Nothing is ordered until you press Submit in the dry run.')
@@ -3047,5 +3727,10 @@ async def content() -> None:
             ui.button('Manage labels', icon='pie_chart',
                       on_click=lambda: _open_label_picker(account_id, _refresh)).props('outline')
             ui.button('Refresh', icon='refresh', on_click=_refresh).props('outline')
+            # The what-if control sits in the TOOLBAR, beside Valuation: both change
+            # how every number below is computed, and neither is a number itself.
+            ui.switch(SIM_TOGGLE_LABEL, on_change=_toggle_simulation)                 .props('dense').tooltip(SIM_TOGGLE_TOOLTIP).mark(MARKER_SIM_TOGGLE)
+            ui.number(label='Simulated base', format='%.2f', min=0,
+                      on_change=_set_simulated_base)                 .props('dense outlined prefix=$').classes('w-40').mark(MARKER_SIM_INPUT)
 
         await _refresh()

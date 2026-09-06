@@ -1,4 +1,10 @@
 import { API_BASE } from '../lib/config';
+import { actionRefOf, actionValueOf } from '../lib/actionValues';
+import { boldNumbers } from '../lib/textParts';
+import { capitalUsageSeries, summariseUsage, IDLE_PCT, HEAVY_PCT } from '../lib/capitalUsage';
+import {
+  contractValue, groupTradesByStructure, isOptionTrade, optionBadge, summariseStructure,
+} from '../lib/optionTrades';
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -12,6 +18,7 @@ import {
   Calendar,
   Settings,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   ChevronsUpDown,
   BarChart3,
@@ -25,6 +32,7 @@ import {
   X,
   Database,
   Layers,
+  Gauge,
   Sliders,
   Shield,
   Download,
@@ -204,6 +212,20 @@ interface Trade {
   pnlPercent: number;
   duration: number;
   exitReason: string;
+  // OPTION LEGS ONLY. `optionType` absent === not an option: the UI keys every
+  // option-specific piece of chrome off that one field so the badge, the premium
+  // and the leg grouping cannot disagree about what a row is.
+  contractSymbol?: string | null;
+  underlyingSymbol?: string | null;
+  optionType?: 'call' | 'put' | null;
+  strike?: number | null;
+  expiry?: string | null;
+  // 100 for an option contract, 1 for equity. Turns the per-share premium the
+  // price columns carry into the money that actually moved.
+  multiplier?: number | null;
+  // The STRUCTURE id. Legs of one spread share it, which is what the trade list
+  // folds on; null/absent on equity rows and on single-leg option trades.
+  transactionId?: number | string | null;
 }
 
 interface BacktestResults {
@@ -299,6 +321,10 @@ const formatTradeDate = (s?: string): string => {
   const [date, time] = s.split('T');
   return time ? `${date} ${time.slice(0, 5)}` : date;
 };
+
+// OPTION ROWS in the trade list. The arithmetic and the grouping live in
+// ``lib/optionTrades`` -- pure, and testable without mounting React; see that
+// module for why each figure is computed the way it is.
 
 // Recompute the headline metrics from a (possibly trimmed) set of trades — used by the per-trade
 // "hide" toggle to show, on the fly, what the result looks like with some trades excluded.
@@ -516,23 +542,97 @@ function fmtConditionLeaf(c: any): string {
 // Human-readable description of what an exit rule DOES (its action), separate from WHEN it fires
 // (its conditions). Without this the Strategy tab showed only the gating condition (e.g.
 // "has_position") and dropped the action, making a stop-loss adjustment look like a bare trigger.
-const _EXIT_REF_LABEL: Record<string, string> = {
-  order_open_price: 'entry',
-  expert_target_price: 'analyst target',
-  current_price: 'price',
-};
 function fmtExitAction(rule: any): string {
   const action = rule?.action_type ?? rule?.action ?? '';
-  const ref = rule?.reference_value ? (_EXIT_REF_LABEL[rule.reference_value] ?? rule.reference_value) : '';
-  const v = rule?.action_value;
+  const ref = actionRefOf(rule);
+  const v = actionValueOf(rule);
   const pct = typeof v === 'number' ? `${v >= 0 ? '+' : ''}${v}%` : (v != null ? String(v) : '');
   const target = [ref, pct].filter(Boolean).join(' ');
   switch (action) {
     case 'close': return 'Close position';
+    case 'buy': return 'Buy';
+    case 'sell': return 'Sell';
     case 'adjust_stop_loss': return `Move stop loss → ${target || 'reference'}`;
     case 'adjust_take_profit': return `Move take profit → ${target || 'reference'}`;
     default: return action ? String(action).replace(/_/g, ' ') : 'Exit';
   }
+}
+
+// A rule line with its thresholds emphasised — the numbers are what the GA tuned and what
+// distinguishes two otherwise identical rules, so they carry the information.
+function BoldNumbers({ text }: { text: string }) {
+  return (
+    <>
+      {boldNumbers(text).map((p, i) => (
+        p.bold ? <b key={i} className="font-semibold">{p.text}</b> : <span key={i}>{p.text}</span>
+      ))}
+    </>
+  );
+}
+
+// One rule = its conditions AND the actions those conditions fire, shown together.
+//
+// This is the shape the live trade UI shows and the shape the engine evaluates: a TradeRule is a
+// gate plus the actions bound to it. The Strategy tab used to flatten entry rules into a single
+// OR-tree of conditions plus one pooled "Entry Actions" list, which silently destroyed the
+// pairing — two entry rules with different brackets (say, target -6%/entry -8% on the strict gate
+// and target +8%/entry -16% on the loose one) rendered as four unattributed actions, and no
+// reader could tell which bracket a given entry would actually get. Entry and exit share this
+// renderer so the two can never drift apart again.
+// bg-*-50, never bg-*-100: dark mode here is `.dark .<light-class>` overrides in index.css and
+// only the -50 shade has one (see the "Colored light backgrounds" block there).
+const _RULE_TONE = {
+  entry: 'bg-blue-50 dark:bg-blue-900/20 text-blue-800 dark:text-blue-300',
+  exit: 'bg-yellow-50 dark:bg-yellow-900/20 text-yellow-800 dark:text-yellow-300',
+} as const;
+
+function RuleCard({ rule, title, tone }: { rule: any; title: string; tone: 'entry' | 'exit' }) {
+  // New-shape TradeRules carry actions[] (possibly >1 — e.g. an SL ratchet + TP extension fired
+  // together from ONE rule); legacy rows inline a single action's fields directly on the rule
+  // object. Normalize to an array so a multi-action rule is never shown as if only its first
+  // action existed.
+  const ruleActions = Array.isArray(rule?.actions) ? rule.actions : [rule];
+  const conds = (rule?.conditions?.conditions ?? []).map(fmtConditionLeaf).filter(Boolean);
+  // The gate's own operator joins the WHEN lines; the actions all fire together, so THEN is
+  // always joined by AND. With the joiner printed on every line, the old "all of" / "any of"
+  // chip said the same thing a second time and is gone.
+  const condJoin = rule?.conditions?.operator === 'OR' || rule?.conditions?.type === 'OR' ? 'or' : 'and';
+  return (
+    <div className={`text-sm rounded px-3 py-2 ${_RULE_TONE[tone]}`}>
+      <div className="flex items-baseline gap-2 flex-wrap">
+        <span className="font-semibold">{rule?.name || title}</span>
+        {rule?.continue_processing && (
+          <span className="text-[10px] uppercase tracking-wide rounded px-1 bg-orange-100 dark:bg-orange-800/40 text-orange-700 dark:text-orange-300"
+            title="Evaluation continues to the next rule even after this one matches (instead of stopping here)">
+            continues
+          </span>
+        )}
+      </div>
+      {/* Read as one sentence: WHEN <gate> ... THEN <action> ... — the order the engine
+          evaluates in, and the order the live trade UI states a rule in. */}
+      <ClauseLines label="when" joiner={condJoin} lines={conds.length ? conds : ['always']} />
+      <ClauseLines label="then" joiner="and" lines={ruleActions.map(fmtExitAction).filter(Boolean)} />
+    </div>
+  );
+}
+
+// One clause of a rule sentence, one item per line, with the joining word in the left gutter.
+// The gutter is a fixed width so WHEN/THEN and the AND/OR beneath them share a right edge and
+// the clause bodies line up in a single column.
+function ClauseLines({ label, joiner, lines }: { label: string; joiner: string; lines: string[] }) {
+  if (!lines.length) return null;
+  return (
+    <div className="mt-0.5 space-y-0.5">
+      {lines.map((text, i) => (
+        <div key={i} className="flex items-baseline gap-2">
+          <span className="text-[10px] uppercase w-10 shrink-0 text-right opacity-50">
+            {i === 0 ? label : joiner}
+          </span>
+          <span className="font-mono"><BoldNumbers text={text} /></span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // Render a condition GROUP with its boolean structure made explicit: a single condition renders
@@ -541,14 +641,14 @@ function fmtExitAction(rule: any): string {
 function ConditionGroupLines({ group }: { group: any }) {
   const conds: any[] = group?.conditions ?? [];
   if (conds.length === 0) return <span className="opacity-60 italic">always</span>;
-  if (conds.length === 1) return <span className="font-mono">{fmtConditionLeaf(conds[0]) || '—'}</span>;
+  if (conds.length === 1) return <span className="font-mono"><BoldNumbers text={fmtConditionLeaf(conds[0]) || '—'} /></span>;
   const op = group?.operator === 'OR' || group?.type === 'OR' ? 'OR' : 'AND';
   return (
     <div className="mt-0.5 space-y-0.5">
       {conds.map((c, i) => (
         <div key={i} className="flex items-baseline gap-2">
           <span className="text-[10px] uppercase w-7 shrink-0 text-right opacity-50">{i === 0 ? '' : op}</span>
-          <span className="font-mono">{fmtConditionLeaf(c) || '—'}</span>
+          <span className="font-mono"><BoldNumbers text={fmtConditionLeaf(c) || '—'} /></span>
         </div>
       ))}
     </div>
@@ -1045,6 +1145,12 @@ const Backtesting: React.FC = () => {
   // Per-trade "hide" toggle (Trade List): excluded trade ids, for the on-the-fly what-if recompute
   // of the headline metrics. Session-only; cleared whenever a different backtest is selected.
   const [hiddenTradeIds, setHiddenTradeIds] = useState<Set<string>>(new Set());
+  // Which multi-leg structures are expanded in the Trade List. A spread is ONE bet
+  // recorded as one row per leg, so the list folds the legs into a structure row and
+  // opens them on demand; collapsed is the default because four rows per condor is
+  // what made an options run unreadable in the first place. Session-only, keyed by
+  // the legs' shared transactionId.
+  const [expandedStructures, setExpandedStructures] = useState<Set<string>>(new Set());
   // Backend EXACT recompute of the hidden-trade what-if (curves + metrics reconstructed from the
   // trade ledger + OHLCV cache — see backend/app/services/backtest/whatif.py). Keyed by the sorted
   // excluded-id list so a stale response for a different selection is ignored. The client-side
@@ -1091,7 +1197,7 @@ const Backtesting: React.FC = () => {
       setError(err instanceof Error ? err.message : 'Failed to remove label');
     }
   };
-  const [activeTab, setActiveTab] = useState<'equity' | 'drawdown' | 'trades' | 'strategy' | 'yearly'>('equity');
+  const [activeTab, setActiveTab] = useState<'equity' | 'drawdown' | 'capital' | 'trades' | 'strategy' | 'yearly'>('equity');
   // Yearly Breakdown tab: fetched lazily (only once the tab is opened) from the FULL
   // (non-downsampled) curves server-side — see app/services/backtest/results.py::yearly_breakdown.
   const [yearlyRows, setYearlyRows] = useState<YearlyBreakdownRow[] | null>(null);
@@ -2139,6 +2245,114 @@ const Backtesting: React.FC = () => {
     });
   };
 
+  // Hide or show a whole structure at once. A spread is one bet: hiding three of a
+  // condor's four legs would leave the what-if metrics measuring a position that
+  // never existed, so the parent's toggle moves every leg together. Direction is
+  // decided ONCE from the group (all-hidden -> show all, else hide all) rather than
+  // per leg, so a half-hidden structure resolves instead of inverting.
+  const toggleHideStructure = (legs: Trade[]) => {
+    const ids = legs.map(l => String(l.id));
+    setHiddenTradeIds(prev => {
+      const next = new Set(prev);
+      const allHidden = ids.every(id => next.has(id));
+      ids.forEach(id => { if (allHidden) next.delete(id); else next.add(id); });
+      return next;
+    });
+  };
+
+  const toggleStructure = (key: string) => {
+    setExpandedStructures(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key); else next.add(key);
+      return next;
+    });
+  };
+
+  // ONE row renderer for a stand-alone trade AND for a leg inside an expanded
+  // structure, so the two can never drift into different-looking rows. ``asLeg``
+  // only indents and drops the row's own background.
+  //
+  // AN OPTION ROW SAYS WHAT IT IS. The symbol cell carries the underlying plus a
+  // call/put + strike + expiry badge, and the price cells carry BOTH the premium
+  // per share (what the chain quotes, and what these columns have always held)
+  // and the money that actually moved (premium x contracts x 100) -- without the
+  // second figure a 4.20 option entry reads exactly like a 4.20 stock.
+  const tradeRow = (trade: Trade, asLeg = false) => {
+    const isHidden = hiddenTradeIds.has(trade.id);
+    const option = isOptionTrade(trade);
+    const badge = optionBadge(trade);
+    const entryCash = contractValue(trade.entryPrice, trade.size, trade.multiplier);
+    const exitCash = contractValue(trade.exitPrice, trade.size, trade.multiplier);
+    return (
+      <tr key={trade.id}
+          onClick={() => setChartTrade(trade)}
+          title="Click to view the daily chart with entry/exit markers"
+          className={`cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 ${isHidden ? 'opacity-40' : ''}`}>
+        <td className="px-2 py-2 text-center" onClick={(e) => { e.stopPropagation(); toggleHideTrade(trade.id); }}>
+          <button type="button"
+                  title={isHidden ? 'Show: include this trade in the metrics again' : 'Hide: exclude this trade and recompute the metrics'}
+                  className="text-gray-400 hover:text-amber-600 dark:hover:text-amber-400">
+            {isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+          </button>
+        </td>
+        <td className={`px-2 py-1.5 font-medium text-gray-900 dark:text-gray-100 ${isHidden ? 'line-through' : ''} ${asLeg ? 'pl-7' : ''}`}>
+          <span className="inline-flex items-center gap-1">
+            {/* The UNDERLYING for an option -- the OCC string is on the tooltip,
+                where it is available without making every row 20 characters wide. */}
+            <span title={trade.contractSymbol || undefined}>
+              {(option ? (trade.underlyingSymbol || trade.symbol) : trade.symbol) || '—'}
+            </span>
+            {badge && (
+              <span className={`px-1.5 py-0.5 rounded text-[11px] font-semibold ${
+                trade.optionType === 'call'
+                  ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300'
+                  : 'bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300'}`}
+                    title={`${trade.optionType === 'call' ? 'CALL' : 'PUT'}`
+                           + `${trade.strike != null ? ` · strike ${trade.strike}` : ''}`
+                           + `${trade.expiry ? ` · expires ${trade.expiry}` : ''}`
+                           + `${trade.contractSymbol ? ` · ${trade.contractSymbol}` : ''}`}>
+                {badge}
+              </span>
+            )}
+          </span>
+        </td>
+        <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(trade.entryDate)}</td>
+        <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(trade.exitDate)}</td>
+        <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+            title={option ? `Premium ${trade.entryPrice.toFixed(2)}/share x ${trade.size} x ${Number(trade.multiplier) || 100} = $${entryCash.toFixed(2)}` : undefined}>
+          ${trade.entryPrice.toFixed(2)}
+          {option && <span className="block text-[10px] text-gray-400">${entryCash.toFixed(2)}</span>}
+        </td>
+        <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+            title={option ? `Premium ${trade.exitPrice.toFixed(2)}/share x ${trade.size} x ${Number(trade.multiplier) || 100} = $${exitCash.toFixed(2)}` : undefined}>
+          ${trade.exitPrice.toFixed(2)}
+          {option && <span className="block text-[10px] text-gray-400">${exitCash.toFixed(2)}</span>}
+        </td>
+        <td className="px-2 py-1.5 text-center">
+          <span className={`px-2 py-0.5 rounded text-xs font-semibold text-white ${
+            trade.direction === 'long' ? 'bg-green-600' : 'bg-red-600'
+          }`}>
+            {trade.direction}
+          </span>
+        </td>
+        <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+            title={option ? `${trade.size} contract(s)` : undefined}>{trade.size}</td>
+        <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+          {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
+        </td>
+        <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+          {displayPnlPct(trade) >= 0 ? '+' : ''}{displayPnlPct(trade).toFixed(2)}%
+        </td>
+        <td className="px-2 py-1.5 text-center whitespace-nowrap text-gray-900 dark:text-gray-100">{formatDuration(tradeDurationMs(trade))}</td>
+        <td className="px-2 py-1.5 text-center">
+          <span className="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-xs text-gray-700 dark:text-gray-300">
+            {trade.exitReason}
+          </span>
+        </td>
+      </tr>
+    );
+  };
+
   // When any trade is hidden, recompute the headline metrics from the remaining trades (what-if).
   const hiding = hiddenTradeIds.size > 0;
   // Backend EXACT result, if it matches the CURRENT hidden set (else null -> use the JS fallback).
@@ -2887,13 +3101,14 @@ const Backtesting: React.FC = () => {
                     {[
                       { id: 'equity', label: 'Equity Curve', icon: TrendingUp },
                       { id: 'drawdown', label: 'Drawdown', icon: TrendingDown },
+                      { id: 'capital', label: 'Capital Used', icon: Gauge },
                       { id: 'trades', label: 'Trade List', icon: Activity },
                       { id: 'strategy', label: 'Strategy', icon: Award },
                       { id: 'yearly', label: 'Yearly Breakdown', icon: Calendar }
                     ].map(tab => (
                       <button
                         key={tab.id}
-                        onClick={() => setActiveTab(tab.id as 'equity' | 'drawdown' | 'trades' | 'strategy' | 'yearly')}
+                        onClick={() => setActiveTab(tab.id as 'equity' | 'drawdown' | 'capital' | 'trades' | 'strategy' | 'yearly')}
                         className={`flex items-center gap-2 px-4 py-3 border-b-2 transition-colors text-sm ${
                           activeTab === tab.id
                             ? 'border-blue-500 text-blue-600'
@@ -2982,6 +3197,87 @@ const Backtesting: React.FC = () => {
                     </div>
                   )}
 
+                  {activeTab === 'capital' && (() => {
+                    // Computed here, not stored: it is one pass over the trades and one
+                    // over the equity curve, both already in this payload, so a column
+                    // and a migration would buy nothing.
+                    const usage = capitalUsageSeries(
+                      selectedBacktest.results?.trades,
+                      adjEquityCurve ?? selectedBacktest.results?.equityCurve);
+                    const stats = summariseUsage(usage);
+                    if (!usage.length) {
+                      return (
+                        <p className="text-sm text-gray-500 dark:text-gray-400 py-8 text-center">
+                          No equity curve for this run, so capital usage cannot be measured.
+                        </p>
+                      );
+                    }
+                    const card = (label: string, value: string, hint: string) => (
+                      <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
+                        <p className="text-xs text-gray-500 dark:text-gray-400">{label}</p>
+                        <p className="text-lg font-bold text-gray-900 dark:text-gray-100">{value}</p>
+                        <p className="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">{hint}</p>
+                      </div>
+                    );
+                    return (
+                      <div>
+                        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+                          {card('Average', `${stats.avgPct.toFixed(1)}%`,
+                                'of equity committed on a typical day')}
+                          {card('Peak', `${stats.maxPct.toFixed(1)}%`,
+                                stats.peakDate ? `on ${stats.peakDate}` : '')}
+                          {card('Idle days', `${stats.idleDaysPct.toFixed(0)}%`,
+                                `under ${IDLE_PCT}% used — room for another strategy`)}
+                          {card('Heavy days', `${stats.heavyDaysPct.toFixed(0)}%`,
+                                `over ${HEAVY_PCT}% used — competing for cash`)}
+                        </div>
+                        {/* The point of the chart, stated once: this is NOT exposureTime,
+                            which reads ~100% for every run because it asks a different
+                            question ("was anything open") than this one ("how much"). */}
+                        <p className="text-[11px] text-gray-500 dark:text-gray-400 mb-2">
+                          Open position notional as a share of account equity that day —
+                          how much of the account this strategy actually occupies, and so
+                          how much is left for another to run alongside it.
+                        </p>
+                        <div className="h-80">
+                          <ResponsiveContainer width="100%" height="100%">
+                            <AreaChart data={usage}>
+                              <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                              <XAxis
+                                dataKey="date"
+                                tickFormatter={(d: string) => {
+                                  const date = new Date(d);
+                                  return `${(date.getMonth() + 1).toString().padStart(2, '0')}/${date.getFullYear().toString().slice(2)}`;
+                                }}
+                                tick={{ fontSize: 11 }}
+                                interval="preserveStartEnd"
+                              />
+                              <YAxis
+                                domain={[0, 'auto']}
+                                tickFormatter={(v: number) => `${v.toFixed(0)}%`}
+                                width={50}
+                                tick={{ fontSize: 11 }}
+                              />
+                              <RechartsTooltip
+                                formatter={(value, name) => (
+                                  name === 'pct'
+                                    ? [`${((value as number) ?? 0).toFixed(1)}%`, 'Equity used']
+                                    : [String(value), 'Open positions'])}
+                                labelFormatter={(label) => new Date(String(label)).toLocaleDateString()}
+                              />
+                              {/* The two thresholds the summary cards count against, so the
+                                  bands and the numbers above cannot tell different stories. */}
+                              <ReferenceLine y={IDLE_PCT} stroke="#6b7280" strokeDasharray="4 4" />
+                              <ReferenceLine y={HEAVY_PCT} stroke="#f59e0b" strokeDasharray="4 4" />
+                              <Area type="monotone" dataKey="pct" stroke="#3b82f6"
+                                    fill="#3b82f6" fillOpacity={0.3} />
+                            </AreaChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   {activeTab === 'trades' && selectedBacktest.results?.trades && (
                     <div>
                       {/* Trade Filters */}
@@ -3047,46 +3343,85 @@ const Backtesting: React.FC = () => {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                            {getFilteredTrades().map(trade => {
-                              const isHidden = hiddenTradeIds.has(trade.id);
+                            {/* One row per TRADE, except that the legs of a multi-leg option
+                                structure fold into one row that opens on a chevron -- a condor
+                                is one bet, and four rows of it drowned the list. Both shapes
+                                render through ``tradeRow`` so a leg and a stand-alone trade can
+                                never drift into two different-looking rows. */}
+                            {groupTradesByStructure(getFilteredTrades()).map(group => {
+                              if (group.kind === 'single') return tradeRow(group.trade);
+                              const s = summariseStructure(group.legs);
+                              const open = expandedStructures.has(group.key);
+                              const ids = group.legs.map(l => String(l.id));
+                              const allHidden = ids.every(id => hiddenTradeIds.has(id));
+                              const someHidden = !allHidden && ids.some(id => hiddenTradeIds.has(id));
                               return (
-                              <tr key={trade.id}
-                                  onClick={() => setChartTrade(trade)}
-                                  title="Click to view the daily chart with entry/exit markers"
-                                  className={`cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 ${isHidden ? 'opacity-40' : ''}`}>
-                                <td className="px-2 py-2 text-center" onClick={(e) => { e.stopPropagation(); toggleHideTrade(trade.id); }}>
-                                  <button type="button"
-                                          title={isHidden ? 'Show: include this trade in the metrics again' : 'Hide: exclude this trade and recompute the metrics'}
-                                          className="text-gray-400 hover:text-amber-600 dark:hover:text-amber-400">
-                                    {isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
-                                  </button>
-                                </td>
-                                <td className={`px-2 py-1.5 font-medium text-gray-900 dark:text-gray-100 ${isHidden ? 'line-through' : ''}`}>{trade.symbol || '—'}</td>
-                                <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(trade.entryDate)}</td>
-                                <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(trade.exitDate)}</td>
-                                <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100">${trade.entryPrice.toFixed(2)}</td>
-                                <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100">${trade.exitPrice.toFixed(2)}</td>
-                                <td className="px-2 py-1.5 text-center">
-                                  <span className={`px-2 py-0.5 rounded text-xs font-semibold text-white ${
-                                    trade.direction === 'long' ? 'bg-green-600' : 'bg-red-600'
-                                  }`}>
-                                    {trade.direction}
-                                  </span>
-                                </td>
-                                <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100">{trade.size}</td>
-                                <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                  {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
-                                </td>
-                                <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                  {displayPnlPct(trade) >= 0 ? '+' : ''}{displayPnlPct(trade).toFixed(2)}%
-                                </td>
-                                <td className="px-2 py-1.5 text-center whitespace-nowrap text-gray-900 dark:text-gray-100">{formatDuration(tradeDurationMs(trade))}</td>
-                                <td className="px-2 py-1.5 text-center">
-                                  <span className="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-xs text-gray-700 dark:text-gray-300">
-                                    {trade.exitReason}
-                                  </span>
-                                </td>
-                              </tr>
+                                <React.Fragment key={group.key}>
+                                  <tr onClick={() => toggleStructure(group.key)}
+                                      title="Click to show or hide this structure's legs"
+                                      className={`cursor-pointer bg-gray-50/60 dark:bg-gray-800/40 hover:bg-blue-50 dark:hover:bg-blue-900/20 ${allHidden ? 'opacity-40' : ''}`}>
+                                    <td className="px-2 py-2 text-center"
+                                        onClick={(e) => { e.stopPropagation(); toggleHideStructure(group.legs); }}>
+                                      <button type="button"
+                                              title={allHidden
+                                                ? 'Show: include this structure in the metrics again'
+                                                : 'Hide: exclude every leg of this structure and recompute the metrics'}
+                                              className={`hover:text-amber-600 dark:hover:text-amber-400 ${someHidden ? 'text-amber-500' : 'text-gray-400'}`}>
+                                        {allHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                      </button>
+                                    </td>
+                                    <td className={`px-2 py-1.5 font-medium text-gray-900 dark:text-gray-100 ${allHidden ? 'line-through' : ''}`}>
+                                      <span className="inline-flex items-center gap-1">
+                                        {open ? <ChevronDown className="w-3.5 h-3.5 text-gray-400" />
+                                              : <ChevronRight className="w-3.5 h-3.5 text-gray-400" />}
+                                        {s.symbol || '—'}
+                                        <span className="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/40 text-[11px] font-semibold text-indigo-700 dark:text-indigo-300"
+                                              title={`${s.legCount} legs: ${s.longLegs} long / ${s.shortLegs} short. One structure, one bet.`}>
+                                          {s.legCount} legs
+                                        </span>
+                                      </span>
+                                    </td>
+                                    <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(s.entryDate)}</td>
+                                    <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(s.exitDate)}</td>
+                                    {/* NET MONEY, not a sum of per-share premiums: two legs at
+                                        4.20 and 1.10 do not make 5.30 of anything. Positive is a
+                                        debit paid, negative a credit received. */}
+                                    <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+                                        title={s.netCost >= 0 ? 'Net DEBIT paid to open the structure'
+                                                              : 'Net CREDIT received to open the structure'}>
+                                      {s.netCost >= 0 ? '' : '-'}${Math.abs(s.netCost).toFixed(2)}
+                                      <span className="text-[10px] text-gray-400 ml-1">net</span>
+                                    </td>
+                                    <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+                                        title="What the structure was worth when it closed, on the same sign convention">
+                                      {s.netValue >= 0 ? '' : '-'}${Math.abs(s.netValue).toFixed(2)}
+                                      <span className="text-[10px] text-gray-400 ml-1">net</span>
+                                    </td>
+                                    <td className="px-2 py-1.5 text-center">
+                                      <span className="px-2 py-0.5 rounded text-xs font-semibold bg-indigo-600 text-white"
+                                            title={`${s.longLegs} long / ${s.shortLegs} short`}>
+                                        spread
+                                      </span>
+                                    </td>
+                                    <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100"
+                                        title="Total contracts across the legs">{s.contracts}</td>
+                                    <td className={`px-2 py-1.5 text-right font-medium ${s.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                      {s.pnl >= 0 ? '+' : ''}${s.pnl.toFixed(2)}
+                                    </td>
+                                    <td className={`px-2 py-1.5 text-right font-medium ${s.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                      {s.pnlPercent >= 0 ? '+' : ''}{s.pnlPercent.toFixed(2)}%
+                                    </td>
+                                    <td className="px-2 py-1.5 text-center whitespace-nowrap text-gray-900 dark:text-gray-100">
+                                      {formatDuration(tradeDurationMs({ entryDate: s.entryDate, exitDate: s.exitDate }))}
+                                    </td>
+                                    <td className="px-2 py-1.5 text-center">
+                                      <span className="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-xs text-gray-700 dark:text-gray-300">
+                                        {s.exitReason}
+                                      </span>
+                                    </td>
+                                  </tr>
+                                  {open && group.legs.map(leg => tradeRow(leg, true))}
+                                </React.Fragment>
                               );
                             })}
                           </tbody>
@@ -3146,29 +3481,48 @@ const Backtesting: React.FC = () => {
                         const newExitRules = (sp?.exitRules ?? sp?.exit_rules) as TradeRule[] | undefined;
                         const hasNewShapeRules = !hasLegacyConditionShape
                           && (Array.isArray(newEntryRules) || Array.isArray(newExitRules));
-                        // Only the entry rule's OWN protective actions belong in "Entry Actions" —
-                        // the buy/sell action that OPENS the position is shown implicitly via the
-                        // Entry Conditions block below, not repeated here.
-                        const newEntryExtraActions = hasNewShapeRules
-                          ? (newEntryRules ?? []).flatMap((r) =>
+                        // New-shape runs render one card PER ENTRY RULE (gate + its own actions),
+                        // matching the live trade UI and the engine's own model. Only legacy rows —
+                        // which genuinely are "one buy tree + one flat bracket applied to it" —
+                        // fall back to the pooled Entry Actions list below.
+                        const entryRuleCards = hasNewShapeRules ? (newEntryRules ?? []) : [];
+                        const legacyEntryActions = (sp?.entryActions ?? sp?.entry_actions ?? []) as any[];
+                        // Every entry-side protective action, whichever shape it came from — used
+                        // only for the two summary cards.
+                        const allEntryActions: any[] = entryRuleCards.length
+                          ? entryRuleCards.flatMap((r) =>
                               (r.actions ?? []).filter((a) => a.action_type !== 'buy' && a.action_type !== 'sell'))
-                          : [];
-                        // The entry-time TP/SL bracket now rides on entryActions (a rule list,
-                        // same shape as exitConditions) instead of the deleted scalar
-                        // initialTpPercent/initialSlPercent fields. Pull the adjust_take_profit /
-                        // adjust_stop_loss rule's value for the quick-glance cards below.
-                        const entryActionsList = (sp?.entryActions ?? sp?.entry_actions ?? newEntryExtraActions) as any[];
-                        const tpRule = entryActionsList.find((r) => (r?.action ?? r?.action_type) === 'adjust_take_profit');
-                        const slRule = entryActionsList.find((r) => (r?.action ?? r?.action_type) === 'adjust_stop_loss');
-                        const tp = tpRule ? (tpRule.actionValue ?? tpRule.action_value) : undefined;
-                        const sl = slRule ? (slRule.actionValue ?? slRule.action_value) : undefined;
-                        // Entry condition TREES aren't lossy (only extra actions are), so the legacy
-                        // editor's buy/sell tree merge is fine to reuse just for this part.
-                        const legacyEntryTrees = hasNewShapeRules
-                          ? tradeRulesToLegacyEditor(newEntryRules ?? [], [])
-                          : null;
-                        const buyConditions = sp?.buyEntryConditions?.conditions || legacyEntryTrees?.buyTree?.conditions || [];
-                        const sellConditions = sp?.sellEntryConditions?.conditions || legacyEntryTrees?.sellTree?.conditions || [];
+                          : legacyEntryActions;
+                        // Distinct bracket settings of one kind. These percentages are OFFSETS FROM
+                        // A REFERENCE, not absolute brackets: "-10" against expert_target_price
+                        // means "take profit 10% BELOW the analyst target", a different statement
+                        // from "-10% from entry" — so the reference is part of the identity, and
+                        // two rules only agree when both the value and the reference match.
+                        const distinctBrackets = (kind: string) => {
+                          const seen = new Map<string, { value: number | undefined; ref: string }>();
+                          for (const a of allEntryActions) {
+                            if ((a?.action ?? a?.action_type) !== kind) continue;
+                            const value = actionValueOf(a);
+                            const ref = actionRefOf(a);
+                            seen.set(`${ref}|${value}`, { value, ref });
+                          }
+                          return [...seen.values()];
+                        };
+                        // When entry rules disagree about their bracket there IS no single take
+                        // profit for the run, so the card must not invent one by showing the first.
+                        const tps = distinctBrackets('adjust_take_profit');
+                        const sls = distinctBrackets('adjust_stop_loss');
+                        // LEGACY ROWS ONLY. New-shape runs render per entry rule above and never
+                        // reach these, which is what lets this display path honour the warning at
+                        // the top of this block: tradeRulesToLegacyEditor is not used here at all
+                        // any more. Merging entry rules into one OR-tree was what pooled two rules'
+                        // separate brackets into an unattributed list in the first place.
+                        // Resolve the GROUP once and read its conditions from it, so the header
+                        // count and the rendered body can never come from different objects.
+                        const buyGroup = sp?.buyEntryConditions;
+                        const sellGroup = sp?.sellEntryConditions;
+                        const buyConditions = buyGroup?.conditions || [];
+                        const sellConditions = sellGroup?.conditions || [];
                         const exitConditions = sp?.exitConditions || (hasNewShapeRules ? (newExitRules ?? []) : []);
                         const stratName = sp?.strategyName;
                         // Flat optimized genes (model:*/cond:*/exit:*/entry:*) — surfaced as a
@@ -3202,48 +3556,78 @@ const Backtesting: React.FC = () => {
                             <div className="grid grid-cols-2 gap-4">
                               <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
                                 <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">Take Profit</div>
-                                {tp != null && tp < 200 ? (
-                                  <div className="text-lg font-bold text-green-600">{tp}%</div>
+                                {tps.length > 1 ? (
+                                  <div><span className="text-lg font-bold text-gray-400">Varies</span><span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· per entry rule</span></div>
+                                ) : tps.length === 1 && tps[0].value != null && tps[0].value < 200 ? (
+                                  <div>
+                                    <span className="text-lg font-bold text-green-600">{tps[0].value! > 0 ? '+' : ''}{tps[0].value}%</span>
+                                    {tps[0].ref && <span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· vs {tps[0].ref}</span>}
+                                  </div>
                                 ) : (
                                   <div><span className="text-lg font-bold text-gray-400">Off</span><span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· via exit rules</span></div>
                                 )}
                               </div>
                               <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
                                 <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">Stop Loss</div>
-                                {sl != null && sl < 200 ? (
-                                  <div className="text-lg font-bold text-red-600">{sl}%</div>
+                                {sls.length > 1 ? (
+                                  <div><span className="text-lg font-bold text-gray-400">Varies</span><span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· per entry rule</span></div>
+                                ) : sls.length === 1 && sls[0].value != null && sls[0].value < 200 ? (
+                                  <div>
+                                    <span className="text-lg font-bold text-red-600">{sls[0].value! > 0 ? '+' : ''}{sls[0].value}%</span>
+                                    {sls[0].ref && <span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· vs {sls[0].ref}</span>}
+                                  </div>
                                 ) : (
                                   <div><span className="text-lg font-bold text-gray-400">Off</span><span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· via exit rules</span></div>
                                 )}
                               </div>
                             </div>
-                            {buyConditions.length > 0 && (
+                            {entryRuleCards.length > 0 ? (
                               <div>
-                                <h4 className="text-sm font-semibold text-green-600 mb-2">Entry Conditions ({buyConditions.length})</h4>
-                                <div className="text-sm bg-green-50 dark:bg-green-900/20 rounded px-3 py-2 text-green-800 dark:text-green-300">
-                                  <ConditionGroupLines group={sp.buyEntryConditions} />
+                                <div className="flex items-baseline gap-2 mb-2">
+                                  <h4 className="text-sm font-semibold text-blue-600">Entry Rules ({entryRuleCards.length})</h4>
+                                  {entryRuleCards.length > 1 && (
+                                    <span className="text-[11px] text-gray-500 dark:text-gray-400">— each gate fires its OWN actions</span>
+                                  )}
                                 </div>
-                              </div>
-                            )}
-                            {sellConditions.length > 0 && (
-                              <div>
-                                <h4 className="text-sm font-semibold text-red-600 mb-2">Short Entry Conditions ({sellConditions.length})</h4>
-                                <div className="text-sm bg-red-50 dark:bg-red-900/20 rounded px-3 py-2 text-red-800 dark:text-red-300">
-                                  <ConditionGroupLines group={sp.sellEntryConditions} />
-                                </div>
-                              </div>
-                            )}
-                            {entryActionsList.length > 0 && (
-                              <div>
-                                <h4 className="text-sm font-semibold text-blue-600 mb-2">Entry Actions ({entryActionsList.length})</h4>
                                 <div className="space-y-1.5">
-                                  {entryActionsList.map((rule: any, i: number) => (
-                                    <div key={i} className="text-sm bg-blue-50 dark:bg-blue-900/20 rounded px-3 py-2 text-blue-800 dark:text-blue-300">
-                                      {fmtExitAction(rule)}
-                                    </div>
+                                  {entryRuleCards.map((rule: any, i: number) => (
+                                    <RuleCard key={i} rule={rule} title={`Entry Rule ${i + 1}`} tone="entry" />
                                   ))}
                                 </div>
                               </div>
+                            ) : (
+                              <>
+                                {buyConditions.length > 0 && (
+                                  <div>
+                                    <h4 className="text-sm font-semibold text-green-600 mb-2">Entry Conditions ({buyConditions.length})</h4>
+                                    <div className="text-sm bg-green-50 dark:bg-green-900/20 rounded px-3 py-2 text-green-800 dark:text-green-300">
+                                      <ConditionGroupLines group={buyGroup} />
+                                    </div>
+                                  </div>
+                                )}
+                                {sellConditions.length > 0 && (
+                                  <div>
+                                    <h4 className="text-sm font-semibold text-red-600 mb-2">Short Entry Conditions ({sellConditions.length})</h4>
+                                    <div className="text-sm bg-red-50 dark:bg-red-900/20 rounded px-3 py-2 text-red-800 dark:text-red-300">
+                                      <ConditionGroupLines group={sellGroup} />
+                                    </div>
+                                  </div>
+                                )}
+                                {/* Legacy rows really ARE one flat bracket applied to the whole buy
+                                    tree, so pooling them here is faithful to that data model. */}
+                                {legacyEntryActions.length > 0 && (
+                                  <div>
+                                    <h4 className="text-sm font-semibold text-blue-600 mb-2">Entry Actions ({legacyEntryActions.length})</h4>
+                                    <div className="space-y-1.5">
+                                      {legacyEntryActions.map((rule: any, i: number) => (
+                                        <div key={i} className="text-sm bg-blue-50 dark:bg-blue-900/20 rounded px-3 py-2 text-blue-800 dark:text-blue-300">
+                                          {fmtExitAction(rule)}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                              </>
                             )}
                             {exitConditions.length > 0 && !bestParams && (
                               <div>
@@ -3254,39 +3638,9 @@ const Backtesting: React.FC = () => {
                                   )}
                                 </div>
                                 <div className="space-y-1.5">
-                                  {exitConditions.map((rule: any, i: number) => {
-                                    const nConds = (rule.conditions?.conditions ?? []).length;
-                                    const grpOp = rule.conditions?.operator === 'OR' || rule.conditions?.type === 'OR' ? 'any of' : 'all of';
-                                    // New-shape TradeRules carry actions[] (possibly >1 — e.g. an SL
-                                    // ratchet + TP extension fired together from one rule); legacy
-                                    // rows inline a single action's fields directly on the rule
-                                    // object. Normalize to an array so a multi-action rule is never
-                                    // silently shown as if only its first action existed.
-                                    const ruleActions = Array.isArray(rule.actions) ? rule.actions : [rule];
-                                    return (
-                                      <div key={i} className="text-sm bg-yellow-50 dark:bg-yellow-900/20 rounded px-3 py-2 text-yellow-800 dark:text-yellow-300">
-                                        <div className="flex items-baseline gap-2 flex-wrap">
-                                          <span className="font-semibold">{rule.name || `Exit Rule ${i + 1}`}</span>
-                                          {ruleActions.map((a: any, ai: number) => (
-                                            <span key={ai} className="text-[11px] font-semibold rounded px-1.5 py-0.5 bg-yellow-200/70 dark:bg-yellow-700/40 text-yellow-900 dark:text-yellow-200">
-                                              {fmtExitAction(a)}
-                                            </span>
-                                          ))}
-                                          {nConds > 1 && <span className="text-[10px] uppercase tracking-wide rounded px-1 bg-yellow-100 dark:bg-yellow-800/40 text-yellow-700 dark:text-yellow-300">{grpOp}</span>}
-                                          {rule.continue_processing && (
-                                            <span className="text-[10px] uppercase tracking-wide rounded px-1 bg-orange-100 dark:bg-orange-800/40 text-orange-700 dark:text-orange-300"
-                                              title="Evaluation continues to the next exit rule even after this one matches (instead of stopping here)">
-                                              continues
-                                            </span>
-                                          )}
-                                        </div>
-                                        <div className="flex items-baseline gap-2 mt-0.5">
-                                          <span className="text-[10px] uppercase opacity-50 shrink-0">when</span>
-                                          <ConditionGroupLines group={rule.conditions} />
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
+                                  {exitConditions.map((rule: any, i: number) => (
+                                    <RuleCard key={i} rule={rule} title={`Exit Rule ${i + 1}`} tone="exit" />
+                                  ))}
                                 </div>
                               </div>
                             )}
@@ -3296,7 +3650,8 @@ const Backtesting: React.FC = () => {
                               </div>
                             )}
                             {buyConditions.length === 0 && sellConditions.length === 0 && exitConditions.length === 0
-                              && entryActionsList.length === 0 && optimizedGenes.length > 0 && (
+                              && entryRuleCards.length === 0 && legacyEntryActions.length === 0
+                              && optimizedGenes.length > 0 && (
                               <div>
                                 <h4 className="text-sm font-semibold text-gray-600 dark:text-gray-300 mb-2">Optimized Parameters ({optimizedGenes.length})</h4>
                                 <div className="grid grid-cols-2 gap-x-4 gap-y-1">

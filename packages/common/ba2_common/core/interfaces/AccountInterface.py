@@ -1871,7 +1871,20 @@ class AccountInterface(ReadOnlyAccountInterface):
         )
 
         if last_broker_canceled_order_id:
-            close_order.status = OrderStatus.PENDING
+            # WAITING_TRIGGER, NOT PENDING. This close is a DEPENDENT order -- it must not reach
+            # the broker until the resting stop it is chained on is confirmed CANCELED, or the
+            # account would hold a resting stop and a market sell on the same shares (the
+            # 40310000 wash-trade rejection). Every other dependent leg in this codebase is
+            # written WAITING_TRIGGER (TransactionHelper: ``WAITING_TRIGGER if trigger_order_id
+            # else PENDING``), and the ONLY thing that ever promotes a dependent order is
+            # TradeManager's scanner, which selects ``status == WAITING_TRIGGER``. Written
+            # PENDING, this order was invisible to it: found live 2026-09-06 after a batch
+            # close left four "Closing position for transaction N" orders PENDING with
+            # broker_order_id NULL, their transactions stuck CLOSING, and no path that would
+            # ever submit them. classify_waiting_trigger checks the trigger match first, so
+            # parent CANCELED with trigger CANCELED resolves to "submit" as soon as the row is
+            # the status the scanner looks for.
+            close_order.status = OrderStatus.WAITING_TRIGGER
             close_order.depends_on_order = last_broker_canceled_order_id
             close_order.depends_order_status_trigger = OrderStatus.CANCELED
             order_id = add_instance(close_order, expunge_after_flush=True)

@@ -209,6 +209,10 @@ ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 9 ;; small) echo 17 ;;
 # Sized on MEASURED per-trial footprint, which is a property of the BAND, not the expert:
 #   large  ~105 screened symbols, ~2.5-3.5 GB/trial  -> 12 ran fine for three jobs
 #   mid    ~765 screened symbols, ~6 GB/trial        -> 12 starved a 65 GB box
+#   small  MEASURED 2026-09-05 on remote227 (256 GB): 10-13 GB/trial, NOT the ~6 GB
+#          the mid figure suggested -- 24 slots put 28 children x ~11 GB = 237 GB on
+#          the box and left 12 GB free, which throttled the governor immediately.
+#          Budget ~11.5 GB/trial for mid/small at this window and universe.
 #
 # This used to be engagement-only and therefore did nothing for memory: pool children were
 # spawned once at daemon start and stayed resident with their last working set whether or not
@@ -218,7 +222,41 @@ ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 9 ;; small) echo 17 ;;
 # lever. The 2026-08-19 starvation was mostly a master-side dispatcher leak (fe1cba3), not
 # footprint, so these numbers are deliberately conservative until re-measured against a run
 # with correct concurrency.
-ds_remote_slots_for() { case "$1" in large) echo 12 ;; *) echo 6 ;; esac; }
+# OVERRIDABLE, because the right number is a property of the BOX and this driver now runs
+# against more than one. The defaults below are remote150's (65 GB, daemon ceiling 12);
+# remote227 is 32 cores / 256 GB with a ceiling of 24, so it takes DS_REMOTE_SLOTS_LARGE=24
+# DS_REMOTE_SLOTS_OTHER=14 SENATE_REMOTE_SLOTS=16. Still clamped by the expert's own
+# max_remote_worker_slots and by the daemon ceiling, so this can only ever REDUCE concurrency
+# below what the box allows.
+#
+# SENATE, MEASURED TWICE ON remote227 (2026-09-05) -- the old "~12 GB/trial" here was wrong and
+# cost a night:
+#   * BEFORE eb4d4c71: 15.3-18.5 GB/child, peaking at 19.8 GB. 14 slots put 234 GB on a 251.8 GB
+#     box; it ran at 94-95% and the kernel OOM-killed pool children, which the worker recovered
+#     from by rebuilding (BrokenProcessPool -> the master requeued the lost trials). SIZE ON THE
+#     PEAK CHILD, NEVER THE MEAN: 14 x 18.5 = 259 GB, past the box before the OS gets a byte.
+#   * AFTER eb4d4c71 (the payload/projection fix): ~6 GB of that was decoded JSON pinned for
+#     the life of the worker -- measured with tracemalloc, json/decoder.py holding 2,465 MB in
+#     44.6M live objects against 69.7 MB for the {date: open} maps distilled from them.
+#   * MEASURED AGAIN over 4h of sen-S3 at 16 slots (2026-09-06): the peak child GREW 7.5 -> 12.2
+#     GB through generation 1-2 and then PLATEAUED -- 12.3 GB across the whole of generations 2
+#     and 3, with the box at 53-58% and 105 GB free. 12.3 GB is the steady state; the growth
+#     everyone watches for in the first hour is children filling toward it, not a leak.
+#
+# RUNNING AT 18 (operator's call, 2026-09-06): 18 x 12.3 = 221 GB of ~235 usable, ~88%. That is
+# a deliberate trade of margin for throughput on a plateau that held flat for two hours. It
+# leaves ~30 GB -- roughly two children -- so a genuine spike is absorbed but a return to the
+# pre-fix footprint would not be. Re-measure /diag/memory after generation 2 of any job whose
+# shape changes (a wider universe, a longer window, a different expert).
+#
+# The number that matters is CHILDREN RESIDENT, not slots dispatched: children are spawned once
+# and keep their working set whatever the master sends them, so lowering BA2_MAX_REMOTE_SLOTS
+# alone frees nothing -- only the pre-flight POST /pool/resize does.
+DS_REMOTE_SLOTS_LARGE="${DS_REMOTE_SLOTS_LARGE:-12}"
+DS_REMOTE_SLOTS_OTHER="${DS_REMOTE_SLOTS_OTHER:-6}"
+ds_remote_slots_for() {
+  case "$1" in large) echo "$DS_REMOTE_SLOTS_LARGE" ;; *) echo "$DS_REMOTE_SLOTS_OTHER" ;; esac
+}
 
 # PHASE B runs TWICE, mirroring tools/grid_goal2020.sh. The S1/S2/S3 answer lands FIRST so the
 # primary result is available early; S5/S6/S7 then run as a purely additive second pass.

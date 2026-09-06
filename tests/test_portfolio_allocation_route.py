@@ -95,10 +95,16 @@ def test_the_allocate_button_exists_and_calls_the_flow():
 
     Keyed on the CAPTION CONSTANT and on the caption itself: the button is called
     ``Review and Submit`` now (it opens a review gate and orders nothing), and a
-    grep for the old word would have gone green on a page with no button at all."""
+    grep for the old word would have gone green on a page with no button at all.
+
+    The button is BUILT INTO ``review_latch.button`` rather than dropped on the
+    floor, which is what lets the latch disable it for the length of a solve -- see
+    ``ClickLatch``. A construction that does not hand the element over would leave
+    a live button in front of a broker round trip."""
     source = _page_source()
     assert "REVIEW_BUTTON_LABEL = 'Review and Submit'" in source
-    assert "ui.button(REVIEW_BUTTON_LABEL" in source
+    assert "review_latch.button = ui.button(" in source
+    assert "REVIEW_BUTTON_LABEL, icon='fact_check', on_click=_review" in source
     assert "_open_allocation_flow(" in source
 
 

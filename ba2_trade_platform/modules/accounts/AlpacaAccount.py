@@ -2381,6 +2381,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 # REQUIRED non-Optional field (models.py:65) -- read it directly. A
                 # getattr default here is the failure-becomes-False antipattern.
                 fractionable=bool(asset.fractionable),
+                # Alpaca's own "some Assets are not tradable with Alpaca ... marked
+                # with the flag tradable=false" (models.py:34-36, 61). REQUIRED and
+                # non-Optional there too, so it is read directly for the same reason.
+                # An order on one of these is refused every time, and until the
+                # allocation pre-submit check existed nothing here ever asked.
+                tradable=bool(asset.tradable),
                 min_order_size=self._safe_float(getattr(asset, 'min_order_size', None)),
                 min_trade_increment=self._safe_float(getattr(asset, 'min_trade_increment', None)),
                 initial_margin_rate=initial_rate,

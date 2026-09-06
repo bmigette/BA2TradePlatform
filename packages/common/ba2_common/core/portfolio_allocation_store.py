@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlmodel import select
 
+from ba2_common.core.account_types import CASH_TRANSFER_DIVIDEND
 from ba2_common.core.db import get_db
 from ba2_common.core.models import (
     PortfolioAllocationConfig,
@@ -680,6 +681,38 @@ def get_income_events_since(account_id: int, since: Date) -> List[PortfolioIncom
         rows = list(rows)
         session.expunge_all()
         return rows
+
+
+def get_dividends_by_symbol(account_id: int) -> Dict[str, float]:
+    """``{SYMBOL: dividend cash banked}`` for one account. Never raises.
+
+    CONSUMED OR NOT. Consumption is about which cash an allocation run spent on the
+    next buy; it says nothing about whether the position earned it, and the P&L
+    column is asking the second question.
+
+    Deposits are excluded (they are not a return on anything) and so is a DIVIDEND
+    row with no symbol -- a payment nothing can be attributed to would silently land
+    on whichever holding sorted first.
+
+    Returns:
+        Dict[str, float]: totals keyed by UPPERCASE symbol. A symbol that has never
+        paid is ABSENT rather than 0.0, so a caller can still tell "paid nothing"
+        from "we have no ledger for it".
+    """
+    out: Dict[str, float] = {}
+    with get_db() as session:
+        rows = session.exec(
+            select(PortfolioIncomeEvent)
+            .where(PortfolioIncomeEvent.account_id == account_id,
+                   PortfolioIncomeEvent.event_type == CASH_TRANSFER_DIVIDEND)
+        ).all()
+        for row in rows:
+            symbol = (row.symbol or '').strip().upper()
+            if not symbol:
+                continue
+            out[symbol] = out.get(symbol, 0.0) + float(row.amount or 0.0)
+        session.expunge_all()
+    return out
 
 
 def _apply_income_consumption(session, account_id: int,

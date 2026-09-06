@@ -290,7 +290,15 @@ def list_backtests(
             if raw:
                 import json as _json
                 try:
-                    bt["labels"] = _json.loads(raw)
+                    parsed = _json.loads(raw)
+                    # A handful of rows were written double-encoded (a JSON STRING holding
+                    # JSON text, e.g. from a script that called json.dumps() before handing
+                    # the value to the ORM's JSON column, which then encoded it AGAIN) --
+                    # json.loads on those returns a str, not the list the frontend renders
+                    # with .map(). Fixed at the data layer for the known rows (794/795,
+                    # 2026-09-03), but this guard is what stops the NEXT one from crashing
+                    # RunHistoryTable instead of just showing empty labels for that row.
+                    bt["labels"] = parsed if isinstance(parsed, list) else []
                 except (TypeError, ValueError):
                     bt["labels"] = []
             idx += 1

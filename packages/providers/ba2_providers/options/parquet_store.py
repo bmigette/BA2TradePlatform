@@ -100,10 +100,14 @@ class OptionHistoryParquetStore:
 
     #: The columns every partition carries. ``iv`` and ``open_interest`` are the entire
     #: reason this pipeline exists and are declared even when wholly null, so a concat
-    #: across partitions never loses them.
+    #: across partitions never loses them. ``bid``/``ask`` (added 2026-09-03): TastyTrade
+    #: never has them (dxfeed serves no historical NBBO for dead contracts, hence always
+    #: None here), but ThetaData's EOD report does — OptionEodBar.bid/ask carried the
+    #: values all along, this store just dropped them on the floor at write time. Declared
+    #: even when wholly null for the same concat-safety reason as iv/open_interest.
     COLUMNS: Sequence[str] = (
         "occ_symbol", "underlying", "option_type", "strike", "expiry", "bar_date",
-        "open", "high", "low", "close", "volume", "iv", "open_interest",
+        "open", "high", "low", "close", "volume", "bid", "ask", "iv", "open_interest",
     )
 
     def __init__(self, root: Optional[str] = None,
@@ -289,9 +293,15 @@ class OptionHistoryParquetStore:
                 "strike": float(meta.strike),
                 "expiry": meta.expiry.isoformat(),
                 "bar_date": b.bar_date.isoformat(),
-                "open": float(b.open), "high": float(b.high),
-                "low": float(b.low), "close": float(b.close),
+                # NOT float(): OHLC is Optional -- None means "did not trade that day", and
+                # float(None) raises. Left as None here and typed by the astype("float64")
+                # below, which stores it as a parquet NULL and reads back as NaN. Coercing it
+                # to 0.0 instead would mark a contract that merely did not trade -- 44.9% of a
+                # liquid chain's rows, some quoted at a $60 mid -- as worthless.
+                "open": b.open, "high": b.high, "low": b.low, "close": b.close,
                 "volume": b.volume,
+                "bid": b.bid,
+                "ask": b.ask,
                 "iv": b.iv,
                 "open_interest": b.open_interest,
             })
@@ -299,7 +309,7 @@ class OptionHistoryParquetStore:
         # Explicit dtypes so an ALL-NULL iv/open_interest column still round-trips as a
         # typed column rather than as object/null (which a cross-partition concat drops or
         # chokes on), and so open_interest comes back an integer rather than 12345.0.
-        for col in ("open", "high", "low", "close", "strike", "iv"):
+        for col in ("open", "high", "low", "close", "strike", "bid", "ask", "iv"):
             df[col] = df[col].astype("float64")
         for col in ("volume", "open_interest"):
             df[col] = df[col].astype("Int64")

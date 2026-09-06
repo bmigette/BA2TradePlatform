@@ -19,7 +19,8 @@ from ba2_common.core.portfolio_allocation import (
     ERROR_INVEST_AMOUNT_FMT,
     ERROR_INVEST_LABEL_EMPTY_FMT,
     ERROR_INVEST_NO_LABEL,
-    ERROR_SYMBOL_TOTAL_FMT,
+    ERROR_SYMBOL_OVER_FMT,
+    WARNING_SYMBOL_UNDER_FMT,
     REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT,
     REASON_BELOW_MIN_ORDER_FMT,
     VALUATION_MODE_COST,
@@ -1166,7 +1167,8 @@ def test_steps_validation_does_not_report_a_symbol_total_twice():
     (Task 22). A second loop here emitted the identical string a second time."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 40.0), SymbolTarget("BBB", 40.0)])]
     messages = steps_validation_messages(labels)
-    assert messages.count(ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=80.0)) == 1
+    assert messages.count(
+        WARNING_SYMBOL_UNDER_FMT.format(label="A", total=80.0, under=20.0)) == 1
 
 
 def test_steps_validation_is_empty_for_a_fully_valid_set():
@@ -1189,10 +1191,12 @@ def test_steps_validation_includes_the_label_target_messages_too():
     assert any("under 100%" in m for m in under)
     assert blocking_messages(under) == under
 
+    # BUG FIX 2026-09-05: a symbol-total shortfall is now ADVISORY, not blocking
+    # -- unlike step 1's label-level under case just above.
     bad_weights = steps_validation_messages(
         [LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0)])])
-    assert any("must total 100%" in m for m in bad_weights)
-    assert blocking_messages(bad_weights) == bad_weights
+    assert any("under 100%" in m for m in bad_weights)
+    assert blocking_messages(bad_weights) == []
 
 
 def test_validate_invest_amount_accepts_a_positive_amount_within_buying_power():
@@ -1221,7 +1225,8 @@ def test_invest_validation_blocks_a_symbol_weight_set_that_does_not_total_100():
                                          SymbolTarget("BBB", 50.0)])
     messages = invest_validation_messages(label, 10_000.0,
                                           available_buying_power=50_000.0)
-    assert messages == [ERROR_SYMBOL_TOTAL_FMT.format(label="Income", total=150.0)]
+    assert messages == [ERROR_SYMBOL_OVER_FMT.format(label="Income", total=150.0, over=50.0)]
+    assert blocking_messages(messages) == messages
 
 
 def test_invest_validation_ignores_the_labels_own_percentage():
@@ -1248,7 +1253,7 @@ def test_invest_validation_rejects_a_label_that_can_absorb_nothing():
 def test_invest_validation_reports_the_weights_and_the_amount_together():
     label = LabelTarget("Income", 40.0, [SymbolTarget("AAA", 90.0)])
     messages = invest_validation_messages(label, 0.0, available_buying_power=50_000.0)
-    assert ERROR_SYMBOL_TOTAL_FMT.format(label="Income", total=90.0) in messages
+    assert WARNING_SYMBOL_UNDER_FMT.format(label="Income", total=90.0, under=10.0) in messages
     assert ERROR_INVEST_AMOUNT_FMT.format(amount=0.0) in messages
 
 
@@ -2344,6 +2349,92 @@ def test_format_unrealised_pnl_of_an_unpriced_holding_names_the_missing_price():
 
     assert text == pa.PNL_NO_PRICE_MARK
     assert '0.00' not in text
+
+
+# -- the dividend-adjusted return -------------------------------------------
+#
+# "Under p&l, can you show adjusted p&l including the dividends?" A covered-call
+# ETF is BOUGHT for its distributions and hands most of its total return over as
+# cash, so the price-only column reads as a loss on a position that is up.
+
+
+def test_dividends_never_move_the_unrealised_figure():
+    """They are realised cash. The left-hand money stays strictly unrealised."""
+    plain = pa.unrealised_pnl([_held("O", 10.0, 1_000.0, 90.0)])
+    withdiv = pa.unrealised_pnl([_held("O", 10.0, 1_000.0, 90.0)], dividends=60.0)
+
+    assert withdiv.amount == plain.amount == pytest.approx(-100.0)
+    assert withdiv.pct == plain.pct == pytest.approx(-10.0)
+
+
+def test_the_dividend_adjusted_return_adds_the_banked_cash_over_the_same_basis():
+    pnl = pa.unrealised_pnl([_held("O", 10.0, 1_000.0, 90.0)], dividends=60.0)
+
+    assert pnl.dividends == pytest.approx(60.0)
+    assert pnl.total_amount == pytest.approx(-40.0)
+    assert pnl.total_pct == pytest.approx(-4.0)
+
+
+def test_a_holding_with_no_dividend_has_no_adjusted_figure_at_all():
+    """Not 0.00%. An adjusted figure identical to the plain one is not an
+    adjustment, and on an unsynced ledger it would be a claim nobody measured."""
+    pnl = pa.unrealised_pnl([_held("A", 10.0, 1_000.0, 120.0)])
+
+    assert pnl.dividends == 0.0
+    assert pnl.total_amount is None and pnl.total_pct is None
+    assert 'div' not in pa.format_unrealised_pnl(pnl)
+
+
+def test_the_adjusted_return_needs_a_cost_basis_like_the_plain_one_does():
+    pnl = pa.unrealised_pnl([_held("GIFT", 10.0, 0.0, 5.0)], dividends=4.0)
+
+    assert pnl.pct is None and pnl.total_pct is None
+    assert pnl.total_amount == pytest.approx(54.0)
+
+
+def test_an_unpriceable_holding_gets_no_adjusted_return_either():
+    """``amount`` is None, so there is nothing to add the cash to. The dividend is
+    still REPORTED -- it was received -- it just cannot be turned into a return."""
+    pnl = pa.unrealised_pnl([_held("DARK", 5.0, 5_000.0, None)], dividends=25.0)
+
+    assert pnl.dividends == pytest.approx(25.0)
+    assert pnl.total_amount is None and pnl.total_pct is None
+    assert pa.format_unrealised_pnl(pnl) == pa.PNL_NO_PRICE_MARK
+
+
+def test_a_negative_dividend_is_not_a_dividend():
+    """The ledger stores positive cash; a withdrawal is never written to it. A
+    negative slipping in would silently DEDUCT from a return."""
+    assert pa.unrealised_pnl([_held("A", 10.0, 1_000.0, 120.0)],
+                             dividends=-50.0).dividends == 0.0
+
+
+def test_format_unrealised_pnl_prints_the_adjusted_return_as_a_percentage():
+    text = pa.format_unrealised_pnl(
+        pa.unrealised_pnl([_held("O", 10.0, 1_000.0, 90.0)], dividends=60.0))
+
+    assert text == '-100.00 (-10.00%, w/ div: -4.00%)'
+
+
+def test_the_adjusted_clause_comes_before_the_unpriced_note():
+    """The notes read outward: this holding's return, then what was left out."""
+    text = pa.format_unrealised_pnl(pa.unrealised_pnl([
+        _held("A", 10.0, 1_000.0, 120.0),
+        _held("DARK", 5.0, 5_000.0, None),
+    ], dividends=50.0))
+
+    assert text == '+200.00 (+20.00%, w/ div: +25.00%, 1 unpriced excluded)'
+
+
+def test_a_label_sums_its_members_dividends_before_dividing_once():
+    """Money-weighted, exactly as the plain percentage is: sum the cash and the
+    gross basis, then divide -- never average the members' percentages."""
+    pnl = pa.unrealised_pnl([_held("A", 10.0, 1_000.0, 120.0),
+                             _held("B", 10.0, 3_000.0, 300.0)],
+                            dividends=40.0)
+
+    assert pnl.total_amount == pytest.approx(200.0 + 0.0 + 40.0)
+    assert pnl.total_pct == pytest.approx(240.0 / 4_000.0 * 100.0)
 
 
 def test_format_unrealised_pnl_says_how_many_rows_it_left_out():

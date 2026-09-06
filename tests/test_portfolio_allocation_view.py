@@ -2764,7 +2764,7 @@ def test_the_target_shown_first_is_the_one_the_user_TYPED():
                            unallocated_pct=10.0)[0]
     assert bar.target_pct == 30.0
     assert bar.effective_pct == pytest.approx(27.0)
-    assert bar.target_text == 'tgt 30.0% (real 27.0%)'
+    assert bar.target_text == 'tgt 30.0% (real 27.0% — $2,700.00)'
 
 
 def test_a_zero_reserve_prints_the_target_ONCE_not_twice():
@@ -2772,7 +2772,7 @@ def test_a_zero_reserve_prints_the_target_ONCE_not_twice():
     the common case noisier in order to explain the uncommon one."""
     bar = build_label_bars([_view('A', 4_500.0, 30.0)], base_notional=10_000.0,
                            unallocated_pct=0.0)[0]
-    assert bar.target_text == 'tgt 30.0%'
+    assert bar.target_text == 'tgt 30.0% ($3,000.00)'
     assert 'real' not in bar.target_text
 
 
@@ -2782,7 +2782,7 @@ def test_the_parenthetical_is_the_DERIVED_of_base_figure_not_the_typed_one():
     target."""
     bar = build_label_bars([_view('A', 0.0, 40.0)], base_notional=10_000.0,
                            unallocated_pct=25.0)[0]
-    assert bar.target_text == 'tgt 40.0% (real 30.0%)'
+    assert bar.target_text == 'tgt 40.0% (real 30.0% — $3,000.00)'
 
 
 def test_the_delta_is_the_plain_difference_between_two_numbers_on_ONE_scale():
@@ -3308,6 +3308,47 @@ def test_a_label_view_carries_the_TOTAL_pnl_of_its_symbols():
     pnl = views[0].pnl
     assert pnl.amount == pytest.approx(1_500.0)
     assert pnl.pct == pytest.approx(1_500.0 / 91_000.0 * 100.0)
+
+
+def test_a_symbol_row_carries_the_dividend_adjusted_return_when_the_ledger_has_one():
+    """"can you show adjusted p&l including the dividends?" A $1,000 holding now
+    worth $900 that has paid $60 is -10% on price and -4% with the cash back in."""
+    views = build_label_views([ManagedLabel('WHEEL_L2_MR', 10.0)],
+                              {'WHEEL_L2_MR': ['O']},
+                              {'O': _pos('O', 10, 1000.0)}, {'O': 90.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              dividends_by_symbol={'O': 60.0})
+    pnl = views[0].rows[0].pnl
+
+    assert pnl.amount == pytest.approx(-100.0)      # unrealised, untouched
+    assert pnl.total_pct == pytest.approx(-4.0)
+
+
+def test_a_symbol_with_no_ledger_entry_gets_no_adjusted_figure():
+    views = build_label_views([ManagedLabel('WHEEL_L2_MR', 10.0)],
+                              {'WHEEL_L2_MR': ['O']},
+                              {'O': _pos('O', 10, 1000.0)}, {'O': 90.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              dividends_by_symbol={'MAIN': 60.0})
+
+    assert views[0].rows[0].pnl.total_pct is None
+
+
+def test_a_labels_adjusted_return_sums_the_dividends_of_the_symbols_it_HOLDS():
+    """Money-weighted like the plain figure, and over the same membership the
+    states came from -- a managed symbol that is not held contributes neither."""
+    views = build_label_views([ManagedLabel('WHEEL_L2_MR', 10.0)],
+                              {'WHEEL_L2_MR': ['O', 'MAIN', 'SPYI']},
+                              {'O': _pos('O', 10, 1000.0),
+                               'MAIN': _pos('MAIN', 10, 1000.0)},
+                              {'O': 90.0, 'MAIN': 90.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              dividends_by_symbol={'O': 60.0, 'MAIN': 40.0,
+                                                   'SPYI': 999.0})
+    pnl = views[0].pnl
+
+    assert pnl.dividends == pytest.approx(100.0)    # SPYI is not held
+    assert pnl.total_pct == pytest.approx(-100.0 / 2_000.0 * 100.0)
 
 
 def test_an_unpriced_holding_is_excluded_from_the_pnl_rather_than_valued_at_zero():
@@ -5056,3 +5097,88 @@ def test_green_is_up_red_is_down_and_neither_claims_a_direction_it_lacks():
     assert delta_color(-1.0) == 'negative'
     assert delta_color(0.0) == 'grey-5'
     assert delta_color(None) == 'grey-5', "unmeasurable must not be coloured as a move"
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX 2026-09-05: "% of label" divided the label's OWN held total, so it
+# summed to exactly 100% across the held rows however far the label was from
+# its target -- a label holding twice its target read as perfectly balanced.
+# ``pct_of_label_target`` divides the label's TARGET money instead.
+# ---------------------------------------------------------------------------
+
+def test_pct_of_label_target_sums_past_100_when_the_label_is_over_subscribed():
+    """The operator's live case: a label targeting 15% of the pool that actually
+    holds ~28% of it. Its three held symbols must read MORE than 100% between
+    them, because they hold more than the label's target money."""
+    managed = [ManagedLabel('TECH', 10.0), ManagedLabel('REST', 90.0)]
+    # base 10,000, no reserve -> TECH's target is 10% = 1,000. It holds 2,000.
+    positions = {'AAA': _pos('AAA', 10, 1200.0), 'BBB': _pos('BBB', 10, 800.0)}
+    views = build_label_views(managed, {'TECH': ['AAA', 'BBB'], 'REST': []},
+                              positions, {}, valuation_mode=VALUATION_MODE_COST,
+                              base_notional=10_000.0)
+
+    tech = views[0]
+    by = {r.symbol: r for r in tech.rows}
+    # The OLD figure, unchanged and still summing to exactly 100.
+    assert by['AAA'].pct_of_label == 60.0
+    assert by['BBB'].pct_of_label == 40.0
+    # The NEW one: 1,200 and 800 against a 1,000 target.
+    assert by['AAA'].pct_of_label_target == 120.0
+    assert by['BBB'].pct_of_label_target == 80.0
+    assert (by['AAA'].pct_of_label_target
+            + by['BBB'].pct_of_label_target) == 200.0
+
+
+def test_pct_of_label_target_reads_under_100_when_the_label_is_under_invested():
+    managed = [ManagedLabel('TECH', 50.0), ManagedLabel('REST', 50.0)]
+    positions = {'AAA': _pos('AAA', 10, 1000.0)}
+    views = build_label_views(managed, {'TECH': ['AAA'], 'REST': []},
+                              positions, {}, valuation_mode=VALUATION_MODE_COST,
+                              base_notional=10_000.0)
+
+    # Target 50% of 10,000 = 5,000; holding 1,000 is a fifth of it.
+    assert views[0].rows[0].pct_of_label_target == 20.0
+    # ...while the old column still insists this symbol IS the whole label.
+    assert views[0].rows[0].pct_of_label == 100.0
+
+
+def test_pct_of_label_target_follows_the_cash_reserve():
+    """The target money is a share of what the reserve LEAVES, so raising the
+    reserve raises every symbol's percentage of it -- same money, smaller pool."""
+    managed = [ManagedLabel('TECH', 100.0)]
+    positions = {'AAA': _pos('AAA', 10, 1000.0)}
+    no_reserve = build_label_views(managed, {'TECH': ['AAA']}, positions, {},
+                                   valuation_mode=VALUATION_MODE_COST,
+                                   base_notional=10_000.0)
+    with_reserve = build_label_views(managed, {'TECH': ['AAA']}, positions, {},
+                                     valuation_mode=VALUATION_MODE_COST,
+                                     base_notional=10_000.0, unallocated_pct=50.0)
+
+    assert no_reserve[0].rows[0].pct_of_label_target == 10.0     # 1,000 of 10,000
+    assert with_reserve[0].rows[0].pct_of_label_target == 20.0   # 1,000 of 5,000
+
+
+def test_pct_of_label_target_is_zero_when_there_is_no_target_to_divide_by():
+    """No base at all, and a label targeting 0%: neither has a denominator, and a
+    percentage of nothing is not a number to invent."""
+    positions = {'AAA': _pos('AAA', 10, 1000.0)}
+    no_base = build_label_views([ManagedLabel('TECH', 100.0)], {'TECH': ['AAA']},
+                                positions, {}, valuation_mode=VALUATION_MODE_COST)
+    zero_target = build_label_views([ManagedLabel('TECH', 0.0)], {'TECH': ['AAA']},
+                                    positions, {}, valuation_mode=VALUATION_MODE_COST,
+                                    base_notional=10_000.0)
+
+    assert no_base[0].rows[0].pct_of_label_target == 0.0
+    assert zero_target[0].rows[0].pct_of_label_target == 0.0
+
+
+def test_the_share_point_hint_still_reads_the_COMPOSITION_percentage():
+    """``symbol_delta`` subtracts the typed share from ``pct_of_label``; feeding it
+    the target-based figure would turn a composition delta into nonsense. Pinned
+    because the two fields now sit side by side and are easy to swap."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import symbol_delta
+
+    # 25% typed against a 60% actual share of the label's own money.
+    d = symbol_delta(weight_pct=25.0, pct_of_label=60.0, target_value=None,
+                     current_value=None, quantity=None, price=None)
+    assert d.share == -35.0

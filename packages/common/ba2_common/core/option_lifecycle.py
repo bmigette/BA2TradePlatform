@@ -494,13 +494,42 @@ def put_assignment_cost(strike: Optional[float],
 # ---------------------------------------------------------------------------
 # the three measurements each rule needs
 # ---------------------------------------------------------------------------
+def _quote_side(row: OptionContract, *, want_ask: bool) -> Optional[float]:
+    """The side of ``row`` a trade actually lifts, or ``None`` when it is unknowable.
+
+    Prefers the real side. Falls back to ``last`` when that side is absent -- a print is
+    the only evidence left on a row that quotes nothing -- but ONLY where it does not
+    contradict the side that IS present. ``ask >= bid`` always holds, so:
+
+      * buying back (want_ask) a row quoting ``bid=3``: a ``last`` of 0.50 is below the
+        standing bid and cannot be what the buyback costs.
+      * selling out (want bid) a row quoting ``ask=0.9``: a ``last`` of 2.00 is above the
+        standing offer and cannot be what the sale fetches.
+
+    Both are refused rather than believed. Without this bracket the substitution does not
+    degrade gracefully, it INVERTS decisions: a short sold for 2.00 on ``bid=3, ask=None,
+    last=0.50`` reads as +75% captured and takes profit, when the published bid alone
+    proves the buyback costs at least 3.00 -- a >100% loss. Refusing makes the mark
+    unknown, which ``_pnl_pct`` turns into ``LIFECYCLE_UNKNOWN`` naming the input: the
+    alarm this module's docstring promises, not a confident wrong number.
+    """
+    have = row.ask if want_ask else row.bid
+    if have is not None:
+        return have
+    last = row.last
+    if last is None:
+        return None
+    other = row.bid if want_ask else row.ask
+    if other is not None and (last < other if want_ask else last > other):
+        return None
+    return last
+
+
 def _exit_mark(leg: LifecycleLeg, row: OptionContract) -> Optional[float]:
     """What flattening this leg trades at: sell the long at the bid, buy the short
     back at the ask, ``last`` only when that side of the quote is missing. Swapping
     the two flatters every position by the width of the spread."""
-    if leg.is_short:
-        return row.ask if row.ask is not None else row.last
-    return row.bid if row.bid is not None else row.last
+    return _quote_side(row, want_ask=leg.is_short)
 
 
 def _pnl_pct(structure: OptionStructure,
@@ -517,6 +546,13 @@ def _pnl_pct(structure: OptionStructure,
         return None, ("no held option legs — the structure's P&L is unmeasurable")
     if structure.entry_net_premium is None:
         return None, "entry net premium is unknown — the P&L percent basis is undefined"
+    # FINITENESS, not just None. NaN fails every comparison below, so `abs(nan) < _EPS` is
+    # False and a NaN basis sailed through to produce a NaN percentage with an EMPTY error
+    # string — which `decide` reads as a measured answer and reports as "P&L nan%" on a
+    # healthy HOLD. Same rule option_max_loss and the selection pick already apply.
+    if not math.isfinite(structure.entry_net_premium):
+        return None, (f"entry net premium is {structure.entry_net_premium!r} — the P&L "
+                      f"percent basis is not a finite number")
     if abs(structure.entry_net_premium) < _EPS:
         return None, "entry net premium is 0 — the P&L percent basis is undefined"
     if structure.quantity is None or abs(structure.quantity) < _EPS:
@@ -531,9 +567,15 @@ def _pnl_pct(structure: OptionStructure,
             return None, (f"no chain row for {leg.contract_symbol} — the structure's "
                           f"P&L is unmeasurable")
         mark = _exit_mark(leg, row)
+        if mark is not None and not math.isfinite(mark):
+            return None, (f"the mark for {leg.contract_symbol} is {mark!r} — a non-finite "
+                          f"quote cannot price flattening the leg")
         if mark is None:
-            return None, (f"no usable mark for {leg.contract_symbol} (bid/ask/last all "
-                          f"missing) — the structure's P&L is unmeasurable")
+            side = "ask" if leg.is_short else "bid"
+            return None, (f"no usable {side} for {leg.contract_symbol} — flattening a "
+                          f"{'short' if leg.is_short else 'long'} leg trades on that side of "
+                          f"the quote, and neither it nor a `last` consistent with the other "
+                          f"side is available — the structure's P&L is unmeasurable")
         # Flattening signed qty -net at the mark: a long (net>0) is sold for +net*mark,
         # a short (net<0) is bought back for net*mark (negative cash). One expression.
         flatten_cash += leg.net_qty * mark
@@ -569,6 +611,13 @@ def _tested(structure: OptionStructure,
             continue
         if row.delta is None:
             blind = blind or (f"no delta for short {leg.contract_symbol} — the "
+                              f"tested-delta check is blind")
+            continue
+        if not math.isfinite(row.delta):
+            # A NaN delta answers `abs(d) >= threshold` with False, which is the same silent
+            # hold dressed as an answer that the None case above exists to refuse. Unknown is
+            # unknown however it is spelled.
+            blind = blind or (f"delta for short {leg.contract_symbol} is {row.delta!r} — the "
                               f"tested-delta check is blind")
             continue
         if abs(row.delta) >= threshold:
@@ -699,7 +748,10 @@ def pmcc_credit_decay(structure: OptionStructure,
     if row is None:
         return None, (f"no chain row for the overlay {short.contract_symbol} — what it costs "
                       f"to buy back is unknown")
-    ask = row.ask if row.ask is not None else row.last
+    # Same bracketed fallback ``_exit_mark`` uses, and it must stay the same: a stale print
+    # BELOW the standing bid reports decay the live market does not offer. Missing ask with
+    # no usable stand-in => the decayed fraction is unmeasurable, reported below.
+    ask = _quote_side(row, want_ask=True)
     pct = credit_decay_pct(short.entry_premium, ask)
     if pct is None:
         return None, (f"the overlay {short.contract_symbol} cannot be priced against its own "
@@ -801,20 +853,63 @@ def uncovered_short_calls(legs: Iterable[LifecycleLeg]) -> Tuple[str, ...]:
 
     Contracts come back sorted, so a refusal message is the same on every run.
     """
-    shorts, longs = [], 0.0
+    # PER UNDERLYING, and a long must OUTLIVE the short it covers. Pooling every long call
+    # against every short call made a long AAPL call answer for a short TSLA call, and a long
+    # expiring in January answer for a short expiring in February -- which is naked from the
+    # January expiry onward, the exact unbounded shape this guard exists to forbid.
+    #
+    # Both are conservative in the safe direction: an UNKNOWN underlying or expiry still
+    # covers, so a caller that cannot read those fields gets today's answer rather than a new
+    # refusal. This gate blocks closes and rolls, and over-refusing strands the very position
+    # it protects (see TradeActions' close-path note), so "unknown" must not mean "naked".
+    shorts, longs = [], []
     for leg in legs:
         if leg.option_type != OptionRight.CALL or not leg.is_held:
             continue
-        if leg.is_short:
-            shorts.append(leg)
-        else:
-            longs += leg.net_qty
+        (shorts if leg.is_short else longs).append(leg)
     if not shorts:
         return ()
-    short_qty = sum(abs(l.net_qty) for l in shorts)
-    if longs + _EPS >= short_qty:
-        return ()
-    return tuple(sorted(l.contract_symbol for l in shorts))
+
+    def _covers(lng: LifecycleLeg, srt: LifecycleLeg) -> bool:
+        if lng.underlying is not None and srt.underlying is not None \
+                and lng.underlying != srt.underlying:
+            return False
+        if lng.expiry is not None and srt.expiry is not None and lng.expiry < srt.expiry:
+            return False
+        return True
+
+    # Hardest first: the longest-dated short is coverable by the fewest longs, so satisfying
+    # it before the near-dated ones stops a long that could ONLY cover it being spent early.
+    def _key(leg: LifecycleLeg):
+        return (leg.expiry is not None, leg.expiry or date.min)
+
+    groups = {}
+    for srt in shorts:
+        groups.setdefault(srt.underlying, []).append(srt)
+
+    naked: List[str] = []
+    for underlying, group in groups.items():
+        available = {id(l): abs(l.net_qty) for l in longs}
+        short_fall = False
+        for srt in sorted(group, key=_key, reverse=True):
+            need = abs(srt.net_qty)
+            for lng in sorted(longs, key=_key, reverse=True):
+                if need <= _EPS:
+                    break
+                if not _covers(lng, srt):
+                    continue
+                take = min(need, available[id(lng)])
+                available[id(lng)] -= take
+                need -= take
+            if need > _EPS:
+                short_fall = True
+        # ALL of an under-covered group's shorts, not just the arithmetic excess. With one
+        # long against two shorts, WHICH short is the naked one is not a fact -- the cover is
+        # fungible -- so naming one would invent a detail. The refusal is identical either
+        # way (a non-empty answer); this only decides what the message can honestly say.
+        if short_fall:
+            naked.extend(l.contract_symbol for l in group)
+    return tuple(sorted(naked))
 
 
 def _intents(legs: Sequence[OptionLeg]) -> List[str]:

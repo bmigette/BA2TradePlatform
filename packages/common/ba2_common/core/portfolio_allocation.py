@@ -79,6 +79,12 @@ __all__ = [
     "BaseSnapshot", "build_base_snapshot", "WARNING_NO_MULTIPLIER",
     "held_symbols_without_price", "held_no_price_block", "ERROR_HELD_NO_PRICE_FMT",
     "dry_run_rows", "filter_plan_rows", "summarise_plan", "DRY_RUN_QUANTITY_DECIMALS",
+    # pre-submit validation
+    "validate_plan_rows", "validate_plan_budget",
+    "REFUSAL_NOT_TRADABLE_FMT", "REFUSAL_FRACTIONAL_NOT_ELIGIBLE_FMT",
+    "REFUSAL_BELOW_MIN_ORDER_FMT", "REFUSAL_BELOW_MIN_NOTIONAL_FMT",
+    "REFUSAL_NO_PRICE_FMT", "REFUSAL_PRECHECK_FMT", "REFUSAL_OVER_BUDGET_FMT",
+    "PRECHECK_REASON_UNKNOWN",
     "even_split_targets", "steps_validation_messages", "validate_invest_amount",
     "load_previous_targets", "has_previous_targets",
     "load_previous_symbol_weights", "has_previous_symbol_weights",
@@ -109,18 +115,18 @@ __all__ = [
     "WARNING_RESIDUAL_LEFT_FMT", "WARNING_RESIDUAL_UNCONVERGED_FMT",
     "REASON_FRACTIONAL_FLOOR_BUMPED_FMT", "REASON_FRACTIONAL_FLOOR_SKIPPED_FMT",
     "REASON_BELOW_MIN_ORDER_FMT", "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT",
-    "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT",
+    "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT", "REASON_RECLAIMED_FMT",
     "REASON_SCALED_PREFIX", "REASON_BELOW_MIN_ORDER_PREFIX",
     "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX",
     "WARNING_EMPTY_LABEL_FMT", "WARNING_PRECHECK_DISAGREED_FMT",
     "ERROR_LABEL_TOTAL_FMT", "ERROR_LABEL_UNDER_FMT", "ERROR_UNALLOCATED_RANGE_FMT",
     "ERROR_LABEL_NEGATIVE_FMT", "ERROR_LABEL_DUPLICATE_FMT",
-    "ERROR_LABEL_NO_SYMBOLS_FMT", "ERROR_SYMBOL_TOTAL_FMT", "ERROR_SYMBOL_NEGATIVE_FMT",
-    "ERROR_SYMBOL_DUPLICATE_FMT",
+    "ERROR_LABEL_NO_SYMBOLS_FMT", "ERROR_SYMBOL_OVER_FMT", "WARNING_SYMBOL_UNDER_FMT",
+    "ERROR_SYMBOL_NEGATIVE_FMT", "ERROR_SYMBOL_DUPLICATE_FMT",
     # engine
     "current_value", "UnrealisedPnL", "unrealised_pnl", "format_unrealised_pnl",
     "PNL_UNMEASURABLE_MARK", "PNL_NO_PRICE_MARK", "PNL_PCT_FMT", "PNL_NO_COST_NOTE",
-    "PNL_UNPRICED_FMT", "PNL_FMT",
+    "PNL_UNPRICED_FMT", "PNL_FMT", "PNL_WITH_DIV_FMT",
     "round_quantity", "round_delta_quantity", "even_split_pct",
     "split_pct_across", "scale_pct_to_total",
     "build_symbol_targets", "validate_symbol_weights", "validate_label_targets",
@@ -373,6 +379,10 @@ REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT = (
 #: the full list including the current label is the useful information.
 REASON_MULTI_LABEL_FMT = "⚠ in {labels}"
 REASON_SCALED_FMT = "scaled ×{factor:.2f} to fit buying power"
+#: A row the pro-rata scale rounded away, then funded again out of the slack the
+#: OTHER rows' rounding left behind. See ``_reclaim_rounding_slack``.
+REASON_RECLAIMED_FMT = ("restored {qty:g} share(s) from the ${slack:,.2f} the "
+                        "rounding left unspent")
 #: The fixed part of REASON_SCALED_FMT, derived from it so the two cannot drift.
 #: Used to RECOGNISE a scaling reason a row already carries, so that a plan scaled
 #: twice (first solve, then broker precheck) reports ONE reason with the compounded
@@ -440,7 +450,37 @@ ERROR_UNALLOCATED_RANGE_FMT = (
 ERROR_LABEL_NEGATIVE_FMT = "label '{label}' has a negative target ({pct:.2f}%)"
 ERROR_LABEL_DUPLICATE_FMT = "duplicate label '{label}'"
 ERROR_LABEL_NO_SYMBOLS_FMT = "label '{label}' has target {pct:.2f}% but no symbols"
-ERROR_SYMBOL_TOTAL_FMT = "label '{label}' symbol weights total {total:.2f}% - must total 100%"
+
+#: OVER 100 WITHIN one label. Hard, mirroring ERROR_LABEL_TOTAL_FMT at the symbol
+#: scope: compute_allocation multiplies the weights straight through with no cap,
+#: so a symbol split over 100% deploys MORE than the label's own target -- a 150%
+#: split turns a label's share of the base into 1.5x that money, the same
+#: over-deploy risk the cross-label check exists to catch, just scoped to one
+#: label instead of the whole account.
+ERROR_SYMBOL_OVER_FMT = ("label '{label}' symbol weights total {total:.2f}% - over 100% "
+                         "by {over:.2f}%")
+
+#: UNDER 100 WITHIN one label -- ADVISORY, unlike every other total-100 check in
+#: this module (2026-09-05, live use: a 90% split was blocking Submit and the
+#: operator asked for it not to). The two "under 100" checks LOOK identical but
+#: are not: the cross-label one (ERROR_LABEL_UNDER_FMT) leaves a share of the
+#: WHOLE ACCOUNT unaccounted for and the design deliberately reversed a prior
+#: "shortfall is the reserve" reading to catch that as a mistake. A shortfall
+#: HERE only ever leaves part of THIS ONE LABEL's own money undeployed -- exactly
+#: the same harmless shape as an empty label's WARNING_EMPTY_LABEL_FMT, and
+#: sometimes exactly what the user wants (a slice of a label held back on
+#: purpose). Blocking Submit over it told the user to go fix a number that was
+#: never wrong.
+#:
+#: The fragment is what ``is_blocking_message`` reads to tell this apart from
+#: ``ERROR_SYMBOL_OVER_FMT`` (shares "symbol weights total") and from
+#: ``ERROR_LABEL_UNDER_FMT`` (shares "under 100% by") -- neither of those two may
+#: become advisory, so the fragment has to be text that occurs in THIS message
+#: alone. Chosen to also read as a plain-English explanation on screen rather
+#: than an opaque marker.
+_SYMBOL_UNDER_FRAGMENT = "undeployed within this label"
+WARNING_SYMBOL_UNDER_FMT = ("label '{label}' symbol weights total {total:.2f}% - under 100% "
+                            "by {under:.2f}%; the shortfall stays " + _SYMBOL_UNDER_FRAGMENT)
 ERROR_SYMBOL_NEGATIVE_FMT = "label '{label}' symbol '{symbol}' has a negative weight ({pct:.2f}%)"
 ERROR_SYMBOL_DUPLICATE_FMT = "label '{label}' has duplicate symbol '{symbol}'"
 
@@ -992,6 +1032,18 @@ PNL_UNPRICED_FMT = '{count} unpriced excluded'
 #: readable without colour -- colour is an accent here, never the message.
 PNL_FMT = '{amount:+,.2f} ({notes})'
 
+#: Appended when the income ledger holds DIVIDENDS for the holding: the same return
+#: with the cash the position has already paid out put back in. A covered-call ETF
+#: is bought FOR that cash and hands most of its total return over as distributions,
+#: so the price-only column reads as a loss on a position that is up -- which is the
+#: whole reason this clause exists.
+#:
+#: A PERCENTAGE only, never a second money figure. The money on the left is
+#: unrealised -- it moves with the next quote and reverses -- while a paid dividend
+#: is banked, and adding the two into one signed number would invite reading realised
+#: cash as something that can be lost again.
+PNL_WITH_DIV_FMT = 'w/ div: {pct:+.2f}%'
+
 
 @dataclass
 class UnrealisedPnL:
@@ -1029,9 +1081,23 @@ class UnrealisedPnL:
     abs_cost_basis: float = 0.0
     priced: int = 0
     unpriced: int = 0
+    #: Dividend cash the account has BANKED on these holdings, from the income
+    #: ledger. 0.0 means the ledger has nothing for them -- which on a synced
+    #: account is a measurement ("this pays nothing yet") and on an unsynced one is
+    #: an absence. Neither is worth a 0.00% on screen, which is why the two
+    #: ``total_*`` figures below stay ``None`` until there is actual cash.
+    dividends: float = 0.0
+    #: ``amount + dividends``, and ``None`` whenever there is no dividend to add or
+    #: no ``amount`` to add it to. A caller therefore tests ONE field to decide
+    #: whether the adjusted return may be shown, rather than re-deriving the
+    #: threshold and drifting from this module's answer.
+    total_amount: Optional[float] = None
+    #: ``total_amount`` over the same ``abs_cost_basis`` the plain ``pct`` uses, so
+    #: the two percentages are comparable by construction.
+    total_pct: Optional[float] = None
 
 
-def unrealised_pnl(states) -> UnrealisedPnL:
+def unrealised_pnl(states, *, dividends: float = 0.0) -> UnrealisedPnL:
     """Unrealised P&L over ``states``: money and percent. Pure; never raises.
 
     **Takes no ``valuation_mode``, deliberately, and must never grow one.** In
@@ -1051,6 +1117,17 @@ def unrealised_pnl(states) -> UnrealisedPnL:
     valued at 0.
 
     Args:
+        dividends: dividend cash BANKED on these holdings, from the account's
+            income ledger -- 0.0 when there is none, and never negative. It is
+            reported and used for ``total_amount``/``total_pct`` only; ``amount``
+            and ``pct`` stay strictly unrealised, because a realised distribution
+            and an unrealised move are different kinds of money and one column
+            adding them together is how a banked payout starts looking reversible.
+
+            It is the ledger's total for the symbol, NOT "dividends received while
+            this lot was held": the ledger begins when the account started syncing
+            and knows nothing of a position that was closed and reopened, so on a
+            re-entered holding the adjusted figure credits the earlier lot too.
         states: an iterable of ``Optional[PositionState]``. ``None`` entries and
             genuinely flat states (no quantity AND no cost) are skipped entirely.
             Pass one state for a symbol, or a label's whole membership for the
@@ -1061,7 +1138,7 @@ def unrealised_pnl(states) -> UnrealisedPnL:
     Returns:
         UnrealisedPnL: over the PRICED holdings only, with the unpriced counted.
     """
-    out = UnrealisedPnL()
+    out = UnrealisedPnL(dividends=max(0.0, float(dividends or 0.0)))
     for state in (states or []):
         if state is None:
             continue
@@ -1082,6 +1159,13 @@ def unrealised_pnl(states) -> UnrealisedPnL:
         out.amount = out.market_value - out.cost_basis
         if out.abs_cost_basis > MONEY_EPSILON:
             out.pct = out.amount / out.abs_cost_basis * 100.0
+        # Only with cash actually in the ledger, and only over a real basis. A
+        # dividend-adjusted figure identical to the plain one is not an adjustment,
+        # and a return on a zero basis is not a number.
+        if out.dividends > MONEY_EPSILON:
+            out.total_amount = out.amount + out.dividends
+            if out.abs_cost_basis > MONEY_EPSILON:
+                out.total_pct = out.total_amount / out.abs_cost_basis * 100.0
     return out
 
 
@@ -1095,6 +1179,8 @@ def format_unrealised_pnl(pnl: UnrealisedPnL) -> str:
     if pnl.amount is None:
         return PNL_NO_PRICE_MARK if pnl.unpriced else PNL_UNMEASURABLE_MARK
     notes = [PNL_NO_COST_NOTE if pnl.pct is None else PNL_PCT_FMT.format(pct=pnl.pct)]
+    if pnl.total_pct is not None:
+        notes.append(PNL_WITH_DIV_FMT.format(pct=pnl.total_pct))
     if pnl.unpriced:
         notes.append(PNL_UNPRICED_FMT.format(count=pnl.unpriced))
     return PNL_FMT.format(amount=pnl.amount, notes=', '.join(notes))
@@ -1512,25 +1598,39 @@ def validate_symbol_weights(label: LabelTarget, *,
     SINGLE label and spends an explicit amount on it, so that label's percentage
     is meaningless and the labels-total-100 rule would fire spuriously.
 
-    This is the INVEST_LABEL submit gate. Without it ``compute_label_investment``
-    multiplies whatever weights it is handed straight through, so a hand-edited
-    150% set turns a 10,000 budget into 15,000 of buys, and a 60% set silently
-    leaves 40% of the amount as cash with nothing on the plan to say so.
+    This is the INVEST_LABEL submit gate. Without the OVER half
+    (``ERROR_SYMBOL_OVER_FMT``) ``compute_label_investment`` multiplies whatever
+    weights it is handed straight through, so a hand-edited 150% set turns a
+    10,000 budget into 15,000 of buys.
+
+    OVER 100 blocks (``ERROR_SYMBOL_OVER_FMT``); UNDER 100 is ADVISORY
+    (``WARNING_SYMBOL_UNDER_FMT``, 2026-09-05) -- a 60% set leaves 40% of the
+    label's own money undeployed, which is a fact worth showing and not a reason
+    to refuse Submit; see ``WARNING_SYMBOL_UNDER_FMT``'s own docstring for why
+    that is a different risk from the cross-label shortfall
+    ``validate_label_targets`` still blocks.
 
     A label with NO symbols returns no errors -- it has no weights to be wrong.
     Whether an empty label may be invested into is the caller's decision.
 
     Returns:
-        List[str]: ``ERROR_SYMBOL_*`` strings naming the offending label and
-        symbol, ready to show verbatim; EMPTY means valid. ``validate_label_targets``
+        List[str]: ``ERROR_SYMBOL_*`` / ``WARNING_SYMBOL_UNDER_FMT`` strings
+        naming the offending label and symbol, ready to show verbatim; EMPTY
+        means valid. Not all of them BLOCK -- pass through ``blocking_messages``
+        before refusing Submit on the strength of one. ``validate_label_targets``
         calls this for its per-label symbol checks, so the two can never drift.
     """
     errors = []
     if not label.symbols:
         return errors
     weight_total = sum(float(st.weight_pct or 0.0) for st in label.symbols)
-    if abs(weight_total - 100.0) > tolerance:
-        errors.append(ERROR_SYMBOL_TOTAL_FMT.format(label=label.label, total=weight_total))
+    over = weight_total - 100.0
+    if over > tolerance:
+        errors.append(ERROR_SYMBOL_OVER_FMT.format(label=label.label, total=weight_total,
+                                                    over=over))
+    elif -over > tolerance:
+        errors.append(WARNING_SYMBOL_UNDER_FMT.format(label=label.label, total=weight_total,
+                                                       under=-over))
     seen_symbols = set()
     for st in label.symbols:
         weight = float(st.weight_pct or 0.0)
@@ -1564,19 +1664,22 @@ def validate_label_targets(labels: List[LabelTarget], *,
     whatever the reserve leaves investable, and they do not change when the reserve
     does. That is the point -- the user never does the arithmetic.
 
-    SYMBOL weights inside a label follow exactly the same rule, and always did:
-    a label whose weights total 60 leaves 40% of THAT label's money undeployed with
-    nothing on the plan to record it, because ``compute_allocation`` multiplies the
-    weights straight through.
+    SYMBOL weights inside a label do NOT follow exactly the same rule (changed
+    2026-09-05). A label whose weights total 60 leaves 40% of THAT label's money
+    undeployed -- unlike the cross-label shortfall above, that is scoped to one
+    label's own money, not the whole account, and it is now ADVISORY rather than
+    blocking; see ``WARNING_SYMBOL_UNDER_FMT``. Over 100% still blocks: it
+    deploys MORE than the label's target, which ``compute_allocation`` multiplies
+    straight through with no cap.
 
     SYMBOL level, per label that HAS symbols: delegated in full to
     ``validate_symbol_weights`` (weights total 100 +/- the same ``tolerance``; no
     negative weight; no symbol repeated within the label) so that the REBALANCE
     gate here and the INVEST_LABEL gate there can never disagree. The same symbol
     appearing in DIFFERENT labels is legal and its targets sum (decision 7) --
-    only a repeat inside one label is an error. Without these checks a hand-edited
-    weight set totalling 150% would silently over-deploy its label, since
-    ``compute_allocation`` multiplies the weights straight through.
+    only a repeat inside one label is an error. Without the OVER check a
+    hand-edited weight set totalling 150% would silently over-deploy its label,
+    since ``compute_allocation`` multiplies the weights straight through.
 
     A label with no symbols is skipped here (an empty label at 0% stays valid; a
     non-zero one is already reported by ``ERROR_LABEL_NO_SYMBOLS_FMT``).
@@ -1585,10 +1688,12 @@ def validate_label_targets(labels: List[LabelTarget], *,
     build defaults with ``even_split_pct`` and both levels pass by construction.
 
     Returns:
-        List[str]: human-readable error strings built from the ``ERROR_LABEL_*``
-        and ``ERROR_SYMBOL_*`` formats, each naming the offending label (and
-        symbol) so the UI can show it verbatim; EMPTY means valid. Submit must be
-        blocked while this is non-empty (decision 3).
+        List[str]: human-readable error/warning strings built from the
+        ``ERROR_LABEL_*``, ``ERROR_SYMBOL_*`` and ``WARNING_SYMBOL_UNDER_FMT``
+        formats, each naming the offending label (and symbol) so the UI can show
+        it verbatim; EMPTY means valid. NOT every entry blocks Submit any more --
+        pass the result through ``blocking_messages`` before refusing on the
+        strength of it (decision 3 still requires that call to be non-empty).
     """
     errors = []
     total = sum(float(lt.target_pct or 0.0) for lt in labels or [])
@@ -1903,7 +2008,87 @@ def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, 
             r.side = None
             # The whole pre-scaling intent is unmet, not just the scaled-away part.
             r.unmet_notional = abs(prev_qty) * float(r.price or 0.0)
+    _reclaim_rounding_slack(buys, avail, margin=margin, allow_fractional=allow_fractional)
     return scale
+
+
+def _reclaim_rounding_slack(buys: List[AllocationRow], avail: float, *,
+                            margin: Optional[Dict[str, MarginInfo]],
+                            allow_fractional: bool) -> None:
+    """Fund rows the pro-rata scale rounded away, out of the slack rounding left.
+
+    THE PROBLEM THIS SOLVES, from live use (2026-09-05). Scaling multiplies every buy
+    by one factor and THEN rounds, so a whole-share symbol whose target was 1.43
+    shares becomes 0.93 and floors to nothing -- while every fractionable symbol beside
+    it keeps its fraction. The dropped row's budget is not reallocated, so the plan
+    ends with cash it declined to spend: one real plan reported seven untraded rows and
+    $334.36 unallocated while a $105.89 share of CARZ sat rounded to zero. The bias is
+    systematic and falls entirely on symbols the broker will not split.
+
+    Rounding slack is REAL, not notional: fractional rows round down to a 5-decimal
+    grid and whole-share rows floor, so the plan always consumes less than the budget
+    the scale factor assumed. This hands that remainder back to the rows that got
+    nothing, largest denied first, one tradeable unit at a time.
+
+    Three limits, each of which is the point rather than a detail:
+      * only rows the SCALING zeroed -- a row stopped by ``min_order_size`` is refused
+        by the broker, not by arithmetic, and topping it up would rebuild an order the
+        broker will reject;
+      * never past what the row would have had UNSCALED, so a symbol whose true target
+        is half a share is not handed a whole one it was never owed;
+      * only while the slack actually covers the unit's buying-power cost, so this can
+        never turn a fitted plan into an over-committed one.
+    """
+    if not buys:
+        return
+    slack = float(avail) - sum(r.bp_cost for r in buys)
+    if slack <= MONEY_EPSILON:
+        return
+    denied = [r for r in buys
+              if r.delta_quantity <= 0
+              and r.unmet_notional
+              and float(r.price or 0.0) > 0
+              # NORMAL rows only. A BUMPED row is one whose target was UNDER a whole
+              # unit and which the sizer deliberately rounded UP -- an over-allocation
+              # granted while money was loose. The scaler cutting it back to nothing is
+              # that generosity being withdrawn when money is tight, which is correct;
+              # re-funding it here would spend the slack on a symbol that was never
+              # owed a whole share, ahead of one that was.
+              and r.sizing_outcome == SIZING_OUTCOME_NORMAL
+              # Neither broker floor: both are the broker refusing an order, not
+              # arithmetic losing one, and topping either up rebuilds a rejection.
+              and not any(x.startswith(REASON_BELOW_MIN_ORDER_PREFIX)
+                          or x.startswith(REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX)
+                          for x in r.reasons)]
+    # Largest denied intent first: the biggest hole in the plan is the one worth
+    # closing, and it keeps the outcome independent of row order.
+    for r in sorted(denied, key=lambda x: -float(x.unmet_notional or 0.0)):
+        m = (margin or {}).get(r.symbol)
+        unit = tradeable_unit(m, allow_fractional=allow_fractional)
+        # WHOLE-SHARE ROWS ONLY. This exists because pro-rata scaling rounds a
+        # non-fractionable symbol DOWN THROUGH ONE WHOLE SHARE to nothing while its
+        # fractionable neighbours keep a proportional slice -- a bias that falls
+        # entirely on symbols the broker will not split. A fractional row loses at
+        # most one 1e-5 step to the same rounding, so "restoring" it would hand back
+        # a third of a cent and mean nothing.
+        if unit < 1.0:
+            continue
+        price = float(r.price)
+        wanted = float(r.unmet_notional or 0.0) / price      # the unscaled share count
+        if wanted + QUANTITY_EPSILON < unit:
+            continue                                          # never owed a whole unit
+        cost = unit * price * float(r.bp_factor or 1.0)
+        if cost > slack + MONEY_EPSILON:
+            continue                                          # try the next one down
+        slack -= cost
+        r.delta_quantity = unit
+        r.target_quantity = r.current_quantity + unit
+        r.estimated_value = unit * price
+        r.bp_cost = cost
+        r.skipped = False
+        r.side = OrderDirection.BUY
+        r.unmet_notional = max(0.0, float(r.unmet_notional or 0.0) - r.estimated_value)
+        r.reasons.append(REASON_RECLAIMED_FMT.format(qty=unit, slack=slack + cost))
 
 
 def compute_allocation(base_notional: float, available_buying_power: float,
@@ -2137,13 +2322,20 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                 current_quantity=row.current_quantity)
         else:
             # Target a SHARE COUNT: target_notional / price, delta vs what is held.
-            ideal_quantity = round_quantity(target_notional, row.price, m,
-                                            allow_fractional=allow_fractional,
-                                            apply_min_order_size=False)
             raw_delta = float(target_notional) / float(row.price) - row.current_quantity
-            # Round the DELTA, not just the target: an on-grid target minus an
-            # off-grid holding is off-grid, and the delta is what is submitted.
-            delta = _round_delta_shares(ideal_quantity - row.current_quantity, m,
+            # Round the DELTA ITSELF -- never the target first. Flooring the
+            # TARGET to a whole share count and then subtracting the holding is
+            # off by exactly the fractional part of the target: a $50 target on a
+            # $150 stock floors to 0 target shares, and "0 minus the 1 share
+            # held" sells the WHOLE position on a trim the user never asked for
+            # -- then the next run's target is still sub-share, so it buys the
+            # share straight back. ``round_delta_quantity`` (COST mode, two
+            # branches up) already rounds the delta and not the target for
+            # exactly this reason; this mirrors it via the same
+            # ``_round_delta_shares``, so a trim that cannot be sent on the grid
+            # leaves the position where it is instead of closing it -- matching
+            # ``grid_zeroed`` below, which is what "leave it alone" means.
+            delta = _round_delta_shares(raw_delta, m,
                                         allow_fractional=allow_fractional,
                                         current_quantity=row.current_quantity)
         if abs(delta) < QUANTITY_EPSILON:
@@ -2434,9 +2626,18 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
             row.reasons.extend(impact.errors)
             continue
         row.estimated_fees = impact.estimated_fees
-        if row.is_buy and abs(impact.bp_cost - row.bp_cost) > 0.005:
-            out.warnings.append(WARNING_PRECHECK_DISAGREED_FMT.format(symbol=row.symbol))
-            row.bp_cost = impact.bp_cost
+        if row.is_buy:
+            # THE SOURCE MOVES WITH THE NUMBER. ``bp_leverage`` shows "?" instead of a
+            # multiple whenever ``margin_source`` is MARGIN_SOURCE_DEFAULT, because a
+            # default-sourced ratio is the account's conservative fallback rather than
+            # a fact. Once the BROKER has measured this order that reasoning no longer
+            # applies -- the ratio is now the realised charge the broker itself quoted
+            # -- but the source was left saying "default", so every TastyTrade dry run
+            # reported a genuinely measured buying-power cost as unknown (2026-09-05).
+            row.margin_source = MARGIN_SOURCE_PRECHECK
+            if abs(impact.bp_cost - row.bp_cost) > 0.005:
+                out.warnings.append(WARNING_PRECHECK_DISAGREED_FMT.format(symbol=row.symbol))
+                row.bp_cost = impact.bp_cost
     factor = _apply_bp_scaling(out.rows, out.available_buying_power,
                                allow_fractional=out.allow_fractional, margin=margin)
     out.scale_factor = float(plan.scale_factor) * factor
@@ -2776,6 +2977,133 @@ def bp_leverage(row: "AllocationRow") -> Tuple[Optional[float], str]:
     return ratio, LEVERAGE_NONE
 
 
+# ---------------------------------------------------------------------------
+# PRE-SUBMIT VALIDATION. Pure -- the live service refreshes the broker facts and
+# runs the broker's own precheck around it.
+# ---------------------------------------------------------------------------
+
+#: A row the broker is EXPECTED to refuse, and why. One per finding, so a symbol
+#: with two problems is reported twice rather than losing one of them.
+REFUSAL_NOT_TRADABLE_FMT = "{symbol}: the broker does not accept orders for this symbol"
+REFUSAL_FRACTIONAL_NOT_ELIGIBLE_FMT = (
+    "{symbol}: {quantity:g} is a fractional quantity and the broker does not split "
+    "this symbol")
+REFUSAL_BELOW_MIN_ORDER_FMT = (
+    "{symbol}: {quantity:g} share(s) is below the broker's {minimum:g}-share minimum")
+REFUSAL_BELOW_MIN_NOTIONAL_FMT = (
+    "{symbol}: a fractional order of ${value:,.2f} is below the broker's ${minimum:g} "
+    "minimum")
+REFUSAL_NO_PRICE_FMT = "{symbol}: no price, so the order cannot be sized"
+REFUSAL_PRECHECK_FMT = "{symbol}: the broker's own precheck refused it - {reason}"
+#: NOT per-row: the plan as a whole asks for more buying power than the budget.
+#: An advisory rather than a refusal, because the broker fills what it can and
+#: the shortfall truncates the SMALLEST buys (they are submitted last).
+REFUSAL_OVER_BUDGET_FMT = (
+    "the selected orders need ${required:,.2f} of buying power against ${budget:,.2f} "
+    "available - the smallest buys will be refused as it runs out")
+
+#: What ``validate_plan_rows`` returns per finding.
+PRECHECK_REASON_UNKNOWN = "no reason given"
+
+
+def validate_plan_rows(plan: "AllocationPlan",
+                       margin: Optional[Dict[str, MarginInfo]] = None,
+                       impacts: Optional[Dict[str, "OrderImpact"]] = None,
+                       ) -> List[Tuple[str, str]]:
+    """Which of this plan's orders the broker is expected to REFUSE. Pure.
+
+    The dry run already suppresses the rows the SOLVE knew about, and those never
+    reach here -- a suppressed row carries no order and is not tickable. This
+    answers the different question the solve cannot: given the broker facts AS
+    THEY ARE NOW, which of the orders about to be sent would come back rejected?
+    Two things make that different from re-reading the plan:
+
+      * ``MarginInfo.tradable`` is not part of sizing at all, so nothing upstream
+        has ever looked at it. A halted or delisted symbol sizes perfectly and is
+        refused every time.
+      * the facts are re-read at COMMIT time. A plan solved twenty minutes ago
+        was sized against the buying power, prices and asset flags of then.
+
+    ``impacts`` is the broker's OWN answer where it has one
+    (``AccountInterface.preview_order_impact``): an impact with ``accepted=False``
+    is a refusal in the broker's own words and outranks every local guess. Alpaca
+    publishes no such endpoint and passes ``None``/``{}``; TastyTrade fills it.
+
+    A missing ``MarginInfo`` (or a ``None`` tri-state field) is NEVER a refusal --
+    "the broker did not say" is not "the broker said no", the same rule
+    ``fractionable`` has carried since it became tri-state. This function's whole
+    value is that a finding here is worth acting on; one false positive that
+    un-ticks a good order costs more than the check saves.
+
+    Args:
+        plan: the FILTERED plan -- exactly the rows the user has ticked.
+        margin: ``{symbol: MarginInfo}`` re-read at validation time.
+        impacts: ``{symbol: OrderImpact}`` from the broker's precheck, where it has one.
+
+    Returns:
+        List[Tuple[str, str]]: ``(symbol, reason)`` per finding, in plan order.
+        EMPTY means nothing local says these orders will be refused -- which is
+        not a promise that they will fill, only that nothing known says otherwise.
+    """
+    margin = margin or {}
+    impacts = impacts or {}
+    findings: List[Tuple[str, str]] = []
+    for row in plan.rows:
+        if row.skipped or row.side is None or not row.delta_quantity:
+            continue
+        symbol = row.symbol
+        quantity = abs(float(row.delta_quantity))
+        m = margin.get(symbol)
+
+        impact = impacts.get(symbol)
+        if impact is not None and not impact.accepted:
+            reason = "; ".join(impact.errors) or PRECHECK_REASON_UNKNOWN
+            findings.append((symbol, REFUSAL_PRECHECK_FMT.format(
+                symbol=symbol, reason=reason)))
+
+        if m is not None and m.tradable is False:
+            findings.append((symbol, REFUSAL_NOT_TRADABLE_FMT.format(symbol=symbol)))
+
+        if row.price is None or float(row.price) <= 0:
+            findings.append((symbol, REFUSAL_NO_PRICE_FMT.format(symbol=symbol)))
+
+        fractional = _is_fractional_quantity(quantity)
+        if fractional and m is not None and m.fractionable is False:
+            findings.append((symbol, REFUSAL_FRACTIONAL_NOT_ELIGIBLE_FMT.format(
+                symbol=symbol, quantity=quantity)))
+
+        if (m is not None and m.min_order_size is not None
+                and quantity < float(m.min_order_size)):
+            findings.append((symbol, REFUSAL_BELOW_MIN_ORDER_FMT.format(
+                symbol=symbol, quantity=quantity, minimum=float(m.min_order_size))))
+
+        if (fractional and m is not None and m.min_fractional_notional is not None
+                and row.price is not None and float(row.price) > 0):
+            value = quantity * float(row.price)
+            if value < float(m.min_fractional_notional):
+                findings.append((symbol, REFUSAL_BELOW_MIN_NOTIONAL_FMT.format(
+                    symbol=symbol, value=value,
+                    minimum=float(m.min_fractional_notional))))
+    return findings
+
+
+def validate_plan_budget(plan: "AllocationPlan") -> Optional[str]:
+    """The one PLAN-level finding: the ticked buys ask for more buying power than
+    the budget (published plus what this plan's own sells free). Pure.
+
+    Advisory, not a refusal, and deliberately separate from ``validate_plan_rows``
+    for that reason: the broker does not reject the plan, it fills until the money
+    runs out. Buys go out in descending value, so what gets refused is the
+    SMALLEST ones -- which is worth saying before the user commits, and is not a
+    row anybody can un-tick to fix.
+    """
+    required = float(plan.required_buying_power or 0.0)
+    budget = float(plan.total_buying_power or 0.0)
+    if required <= budget + MONEY_EPSILON:
+        return None
+    return REFUSAL_OVER_BUDGET_FMT.format(required=required, budget=budget)
+
+
 def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
     """One display dict per row the user must look at, in plan order.
 
@@ -2845,6 +3173,10 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
             # the table's only holding figure is the post-trade projection, so the
             # user cannot see what they already own.
             "current_quantity": round(row.current_quantity, DRY_RUN_QUANTITY_DECIMALS),
+            # WHERE THE ROW ENDS UP, beside where it starts, so the Held column can
+            # read "7 -> 5.37" instead of making the reader add the signed quantity
+            # to the holding in their head (asked for 2026-09-05).
+            "projected_quantity": round(row.target_quantity, DRY_RUN_QUANTITY_DECIMALS),
             "current_cost_basis": round(row.current_cost_basis, 2),
             "current_value": (None if row.price is None
                               else round(row.current_quantity * row.price, 2)),
@@ -3021,7 +3353,7 @@ WARNING_INVEST_EXCEEDS_BP_FMT = ("amount {amount:,.2f}" + _INVEST_EXCEEDS_BP_FRA
 #: Fragments identifying a message that EXPLAINS rather than blocks. Everything
 #: the validators produce blocks by default: a new error added without touching
 #: this tuple stops Submit, which is the safe direction to be wrong in.
-ADVISORY_MESSAGE_FRAGMENTS = (_INVEST_EXCEEDS_BP_FRAGMENT,)
+ADVISORY_MESSAGE_FRAGMENTS = (_INVEST_EXCEEDS_BP_FRAGMENT, _SYMBOL_UNDER_FRAGMENT)
 
 
 def even_split_targets(labels: List[LabelTarget]) -> List[LabelTarget]:
@@ -3819,7 +4151,9 @@ def _apply_absorption(row: "AllocationRow", move: float, label: str,
         before=baseline, after=after, label=label))
 
 
-def _absorber_order(members: List["AllocationRow"]) -> List["AllocationRow"]:
+def _absorber_order(members: List["AllocationRow"],
+                    wanted: Optional[Dict[str, float]] = None,
+                    ) -> List["AllocationRow"]:
     """The rows a label may move, best first, deterministically.
 
     FRACTIONABLE first (they absorb the residual almost exactly, on a 4dp grid,
@@ -3835,11 +4169,41 @@ def _absorber_order(members: List["AllocationRow"]) -> List["AllocationRow"]:
         or ``SIZING_OUTCOME_SKIPPED_TOO_LARGE``) -- it already says "no order" on its
         face, and giving it one anyway makes the two halves of the row contradict
         each other;
-      * a skipped or unpriced row -- there is nothing to measure or to trade.
+      * a skipped or unpriced row -- there is nothing to measure or to trade;
+      * a row being CLOSED to a zero target (``REASON_CLOSE_TO_ZERO``) -- decision
+        14 flattens such a position outright, and absorbing into it means selling
+        LESS than everything, so the position it was told to flatten survives at
+        a residual size that nobody chose. "Sell it all" is an instruction, not a
+        rounding a later pass may trim;
+      * a symbol this LABEL wants NONE of, that is NOT HELD, and that has NO
+        ORDER YET -- a 0%-weighted member the account is flat in. Absorbing into
+        one opens a position out of nothing, on a row that had nothing to do
+        until redistribution invented it, and ``scale_pct_to_total``'s own rule
+        is that a slot at 0 is a symbol the user asked to hold NONE of.
+
+        ALL THREE halves are required, and each excludes a legitimate absorber
+        on its own: "wants none" alone would exclude the ordinary over-target
+        seller (a HELD symbol whose target is 0 is exactly what an
+        over-subscribed label gives back into); "not held" alone would exclude
+        every legitimate new buy; "no order yet" alone would exclude every row
+        being shrunk. Together they name one thing only -- a row that would go
+        from nothing at all to an order nobody asked for.
+
+        ``wanted`` is the LABEL'S OWN SPLIT rather than ``row.target_notional``
+        because a multi-label symbol's row carries the SUM of its labels'
+        targets, so the row-level figure cannot answer "does THIS label want any
+        of it". It is optional: a caller testing this ordering in isolation gets
+        the old behaviour, and ``redistribute_label_residuals`` always passes it.
     """
+    wanted = wanted or {}
     absorbers = [r for r in members
                  if r.sizing_outcome == SIZING_OUTCOME_NORMAL
-                 and float(r.unmet_notional or 0.0) <= MONEY_EPSILON]
+                 and float(r.unmet_notional or 0.0) <= MONEY_EPSILON
+                 and REASON_CLOSE_TO_ZERO not in r.reasons
+                 and not (wanted
+                          and float(wanted.get(r.symbol, 0.0) or 0.0) <= MONEY_EPSILON
+                          and abs(float(r.current_quantity or 0.0)) <= QUANTITY_EPSILON
+                          and abs(float(r.delta_quantity or 0.0)) <= QUANTITY_EPSILON)]
     return sorted(absorbers, key=lambda r: (0 if r.fractional else 1,
                                             0 if r.delta_quantity else 1,
                                             r.symbol))
@@ -3923,7 +4287,7 @@ def redistribute_label_residuals(plan: "AllocationPlan",
         if not members:
             continue
         target_total = sum(float(wanted.get(r.symbol, 0.0) or 0.0) for r in members)
-        absorbers = _absorber_order(members)
+        absorbers = _absorber_order(members, wanted)
         baselines = {r.symbol: float(r.delta_quantity or 0.0) for r in members}
         residual = _label_residual(target_total, members, mode, basis)
         passes = 0
@@ -4206,21 +4570,33 @@ def redistribution_notice(summary: Dict[str, Any]) -> Optional[str]:
 #:
 #: ``OrderStatus.get_terminal_statuses()`` is the broker-side "will not change
 #: anymore" set -- CLOSED / REJECTED / CANCELED / EXPIRED / STOPPED / ERROR /
-#: REPLACED. Three more belong here for the ledger's purposes:
+#: REPLACED. Two more belong here for the ledger's purposes:
 #:
 #:   FILLED            complete by definition, and NOT in the terminal set.
 #:   DONE_FOR_DAY      the broker will send no further update today, so an
 #:                     unfilled residue never fills; waiting on it would wedge
 #:                     the run's income overnight. (User decision D5.)
-#:   WASHTRADE_LOCKED  our own gate. The order was never sent, so it is as final
-#:                     as an order can be, and it is worth exactly 0.
 #:
-#: UNKNOWN is deliberately ABSENT. "We do not know what this order did" is not
-#: "this order is over", and the difference is whether income gets spent.
+#: WASHTRADE_LOCKED is DELIBERATELY ABSENT (bug fix 2026-09-04 -- it used to be
+#: here on the premise "our own gate, the order was never sent, so it is as
+#: final as an order can be"). That premise is false:
+#: ``TradeManager._check_all_washtrade_locked_orders`` re-submits a locked order
+#: the moment its blocker clears, for up to ``_WASHTRADE_LOCK_MAX_AGE_HOURS``
+#: (24h) before giving up and expiring it into a real terminal status. Counting
+#: it as settled-at-zero here made ``run_allocation`` finalise the run and stamp
+#: its income consumed at 0 while the order was still armed -- so when the lock
+#: cleared and the buy filled hours later, no run's ledger was ever charged for
+#: it, and the SAME income got deployed again by the next rebalance. Leaving it
+#: out means a locked order reads as still WORKING, exactly like any other
+#: order that has not resolved yet: the run stays in ``get_unconsumed_runs()``
+#: until the lock clears (fills, at which point it settles for real) or expires
+#: (which is a terminal status already in the set above).
+#:
+#: UNKNOWN is deliberately ABSENT too. "We do not know what this order did" is
+#: not "this order is over", and the difference is whether income gets spent.
 SETTLED_ORDER_STATUSES = frozenset(OrderStatus.get_terminal_statuses()) | {
     OrderStatus.FILLED,
     OrderStatus.DONE_FOR_DAY,
-    OrderStatus.WASHTRADE_LOCKED,
 }
 
 #: Statuses that are THEMSELVES a measurement of zero, so a missing
@@ -4230,7 +4606,10 @@ SETTLED_ORDER_STATUSES = frozenset(OrderStatus.get_terminal_statuses()) | {
 #:                     share of it can have traded.
 #:   ERROR             our own stamp for a submission that failed
 #:                     (``AccountInterface._handle_order_submit_error``).
-#:   WASHTRADE_LOCKED  our own gate. The order was never sent.
+#:
+#: WASHTRADE_LOCKED is absent here too, for the same reason it left
+#: ``SETTLED_ORDER_STATUSES`` -- it is not settled at all, so it is not a
+#: measurement of zero either; it is UNKNOWN (still working) until it resolves.
 #:
 #: Needed because a refused allocation order reaches the ledger with a NULL
 #: quantity and NOT an explicit 0.0: the row is persisted with ``filled_qty``
@@ -4248,7 +4627,6 @@ SETTLED_ORDER_STATUSES = frozenset(OrderStatus.get_terminal_statuses()) | {
 UNEXECUTED_ORDER_STATUSES = frozenset({
     OrderStatus.REJECTED,
     OrderStatus.ERROR,
-    OrderStatus.WASHTRADE_LOCKED,
 })
 
 

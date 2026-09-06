@@ -571,9 +571,79 @@ def test_a_failed_symbol_comment_save_is_reported_not_raised(monkeypatch, accoun
     monkeypatch.setattr(page, '_write_symbol_comment',
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError('db gone')))
 
-    asyncio.run(page._save_symbol_comment(account_id, 'ARK26', 'AAPL', 'x', ['AAPL']))
+    live = page._new_live_state()
+    asyncio.run(page._save_symbol_comment(account_id, live, 'ARK26', 'AAPL', 'x', ['AAPL']))
     assert any(kind == 'negative' for _, kind in sent)
     assert any('db gone' in m for m in errors)
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX 2026-09-04: a comment used to pin the STORE's even-split default
+# (get_symbol_weights) rather than what the table is actually SHOWING
+# (resolve_symbol_weights, off the held VALUE). On an uneven, unsaved holding
+# the two disagree, and the comment silently rewrote the symbol's target to a
+# number the user never typed or saw.
+# ---------------------------------------------------------------------------
+
+def test_a_comment_pins_the_DISPLAYED_weight_not_the_stores_even_split(account_id):
+    """The user's shape: AAPL $900 / MSFT $100 (90/10 by value), nothing saved.
+    The table shows 90/10 (resolve_symbol_weights); the store's own even split
+    would be 50/50. A comment on AAPL must pin 90, never 50."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    live = page._new_live_state()
+    live['weights']['ARK26'] = {'AAPL': 90.0, 'MSFT': 10.0}
+
+    asyncio.run(page._save_symbol_comment(account_id, live, 'ARK26', 'AAPL',
+                                          'watch the gap', ['AAPL', 'MSFT']))
+
+    row = get_symbol_rows(account_id, 'ARK26')['AAPL']
+    assert row.comment == 'watch the gap'
+    assert row.weight_pct == 90.0
+
+
+def test_a_comment_falls_back_to_the_store_default_with_no_live_figure_at_all(
+        account_id):
+    """The page always populates ``live['weights']`` before a comment box can be
+    typed into, but the writer must still do SOMETHING sane -- never write None
+    and never silently zero the row -- if it is ever called without one."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    live = page._new_live_state()  # no 'ARK26' key at all
+
+    asyncio.run(page._save_symbol_comment(account_id, live, 'ARK26', 'AAPL',
+                                          'no live figure', ['AAPL', 'MSFT']))
+
+    row = get_symbol_rows(account_id, 'ARK26')['AAPL']
+    assert row.weight_pct == 50.0          # the store's even split, not 0.0
+    assert row.comment == 'no live figure'
+
+
+def test_a_comment_on_a_stored_weight_still_pins_the_stored_value_not_the_display(
+        account_id):
+    """A stored row already has a real weight -- the displayed figure and the
+    stored one must agree, and either source landing on it is correct. Proves
+    the fix did not regress the already-covered explicit-weight case."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=70.0)
+    live = page._new_live_state()
+    live['weights']['ARK26'] = {'AAPL': 70.0, 'MSFT': 30.0}
+
+    asyncio.run(page._save_symbol_comment(account_id, live, 'ARK26', 'AAPL',
+                                          'still 70', ['AAPL', 'MSFT']))
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].weight_pct == 70.0
+
+
+def test_a_comment_pins_a_displayed_explicit_zero_not_the_stores_fallback(account_id):
+    """0.0 is a legitimate 'hold none' when it is what the page is SHOWING, and
+    must not be treated as 'no live figure' and replaced by a fallback split."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    live = page._new_live_state()
+    live['weights']['ARK26'] = {'AAPL': 0.0, 'MSFT': 100.0}
+
+    asyncio.run(page._save_symbol_comment(account_id, live, 'ARK26', 'AAPL',
+                                          'exited', ['AAPL', 'MSFT']))
+
+    assert get_symbol_rows(account_id, 'ARK26')['AAPL'].weight_pct == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -2640,11 +2710,37 @@ def _drive(handler, arguments):
                   for p in inspect.signature(handler).parameters.values())
     result = handler(arguments) if expects else handler()
     if inspect.isawaitable(result):
-        asyncio.run(_await(result))
+        _run_in_slot(result)
 
 
 async def _await(awaitable):
     return await awaitable
+
+
+def _run_in_slot(awaitable):
+    """Run one handler coroutine with the CURRENT slot entered, as NiceGUI does.
+
+    NiceGUI keys its slot stack on the running TASK, so a coroutine started by
+    ``asyncio.run`` begins with an empty one and a bare ``ui.notify`` inside the
+    handler raises "the slot stack for this task is empty". The real dispatcher
+    re-enters the sender's slot inside the new task
+    (``events._await_and_handle_in_context``); running it any other way here would
+    test a context the browser never produces.
+    """
+    from contextlib import nullcontext
+
+    from nicegui import context
+
+    try:
+        slot = context.slot
+    except RuntimeError:
+        slot = nullcontext()
+
+    async def _in_slot():
+        with slot:
+            return await awaitable
+
+    return asyncio.run(_in_slot())
 
 
 def _emit(element, event_name, args):
@@ -2680,22 +2776,46 @@ def _press(button):
     ``app.handle_exception``, which swallows them, so a handler that blew up would
     look identical to one that did nothing.
 
-    Both are intercepted here for the duration of the click: the queued coroutine is
+    Both are intercepted here for the duration of the click: the queued work is
     run, and an exception is re-raised instead of being logged into the void.
+
+    THE INTERCEPT IS ``create_or_defer``, not ``on_startup``. On nicegui 3.12
+    ``handle_event`` hands the coroutine to ``background_tasks.create_or_defer``,
+    which -- with no loop running -- queues ``lambda: create(awaitable)`` on
+    ``on_startup``. Catching it there yields a FUNCTION rather than an awaitable,
+    and calling that function walks straight into ``create``'s own
+    ``assert core.loop is not None``. Both failures presented as the click doing
+    nothing, so thirty-one tests on this file were passing their setup and failing
+    at their first assertion about a page that had never moved.
+
+    Taking ``create_or_defer`` gets the awaitable itself, before any of that.
+    ``on_startup`` stays patched as well, so a version that defers some other way
+    still cannot silently drop the coroutine on the floor.
     """
-    from nicegui import app, core
+    import inspect
+
+    from nicegui import app, background_tasks, core
 
     queued, failures = [], []
+    original_defer = background_tasks.create_or_defer
     original_startup, original_handler = app.on_startup, core.app.handle_exception
+    background_tasks.create_or_defer = lambda awaitable, **_kw: queued.append(awaitable)
     app.on_startup = queued.append
     core.app.handle_exception = failures.append
     try:
         _fire(button)
     finally:
+        background_tasks.create_or_defer = original_defer
         app.on_startup = original_startup
         core.app.handle_exception = original_handler
-    for coro in queued:
-        asyncio.run(_await(coro))
+
+    async def _run(item):
+        result = item if inspect.isawaitable(item) else item()
+        if inspect.isawaitable(result):
+            await result
+
+    for item in queued:
+        asyncio.run(_run(item))
     if failures:
         raise failures[0]
 
@@ -3552,7 +3672,7 @@ def test_moving_the_reserve_moves_the_notch_and_the_delta(nicegui_client,
 
     # The typed target is still 100% of a pool that is now $5,000 -- which is
     # exactly what is held, so the label lands on target.
-    assert 'tgt 100.0% (real 50.0%)' in ' | '.join(_texts(root))
+    assert 'tgt 100.0% (real 50.0%' in ' | '.join(_texts(root))
     assert 'on target' in _texts(root)
 
 
@@ -4011,7 +4131,8 @@ def test_the_rendered_BAR_carries_the_money_and_the_share_beside_it(nicegui_clie
     assert '$5,000.00' in texts          # B's own money, on its bar row
     assert '$2,500.00' in texts          # A's
     assert '50.0%' in texts and '25.0%' in texts
-    assert 'tgt 60.0%' in texts and 'tgt 40.0%' in texts
+    assert any(t.startswith('tgt 60.0%') for t in texts)
+    assert any(t.startswith('tgt 40.0%') for t in texts)
 
 
 def test_the_rendered_bar_figures_follow_a_label_target_edit(nicegui_client,
@@ -4024,7 +4145,7 @@ def test_the_rendered_bar_figures_follow_a_label_target_edit(nicegui_client,
     _drive_value(_target_box(root, 0), 20.0)
 
     texts = _texts(root)
-    assert 'tgt 20.0%' in texts
+    assert any(t.startswith('tgt 20.0%') for t in texts)
     assert '$2,500.00' in texts       # the holding did not move
     assert '25.0%' in texts
     assert 'over by 5.0pp ($500.00)' in texts   # 25% held against a 20% target
@@ -4089,7 +4210,7 @@ def test_the_money_and_the_percentages_keep_a_consistent_precision(nicegui_clien
     texts = _texts(root)
     assert '$2,500.00' in texts          # money: always two decimals
     assert '25.0%' in texts              # percentages: always one
-    assert 'tgt 40.0%' in texts
+    assert any(t.startswith('tgt 40.0%') for t in texts)
 
 
 def test_choosing_a_colour_retints_the_swatch_beside_the_row(monkeypatch,
@@ -4614,7 +4735,7 @@ def test_the_row_shows_the_typed_target_FIRST_and_the_derived_one_in_brackets(
                    weights={'A': {'AAPL': 100.0}})
     root = _draw(nicegui_client, account_id, views, reserve=10.0)
 
-    assert 'tgt 15.0% (real 13.5%)' in _texts(root)
+    assert any(t.startswith('tgt 15.0% (real 13.5%') for t in _texts(root))
 
 
 def test_a_zero_reserve_row_prints_the_target_once(nicegui_client, account_id):
@@ -4622,7 +4743,7 @@ def test_a_zero_reserve_row_prints_the_target_once(nicegui_client, account_id):
                    weights={'A': {'AAPL': 100.0}})
     texts = _texts(_draw(nicegui_client, account_id, views))
 
-    assert 'tgt 15.0%' in texts
+    assert any(t.startswith('tgt 15.0%') for t in texts)
     assert not any('real' in t for t in texts if t.startswith('tgt'))
 
 
@@ -5140,7 +5261,25 @@ def test_the_info_control_says_what_it_will_show(nicegui_client, account_id):
     root = _draw(nicegui_client, account_id, _one_label(account_id))
     template = _tables(root)[0].slots['body-cell-info'].template
 
-    assert 'Holdings, dividends and total return' in template
+    # "Click for ..." since 2026-09-05: the tooltip now shows the yield and returns
+    # itself, so the old bare phrase read as a description of the hover rather than
+    # as the promise of the dialog behind it.
+    assert 'Click for holdings, dividends and total return' in template
+
+
+def test_the_info_tooltip_carries_the_income_and_return_figures(nicegui_client, account_id):
+    """The ⓘ hover answers "what does this pay and how has it done" without opening
+    anything. Read off ``props.row`` like every other field in this slot: a NiceGUI
+    cell slot is rendered ONCE and reused for every row, so a per-row lookup is not
+    available inside the template."""
+    root = _draw(nicegui_client, account_id, _one_label(account_id))
+    template = _tables(root)[0].slots['body-cell-info'].template
+
+    for field in ('stat_line', 'stat_pending', 'stat_error'):
+        assert f'props.row.{field}' in template, field
+    # Each is guarded, so exactly the one that is set draws -- an unguarded line would
+    # render an empty row for a symbol the background refresh has not reached.
+    assert template.count('v-if="props.row.stat') == 3
 
 
 def test_the_info_tooltip_names_the_symbol_and_the_instrument(nicegui_client, account_id):
@@ -5879,10 +6018,10 @@ def test_the_four_migrated_buttons_land_LEFT_of_the_space_beside_Fill_100(
              if isinstance(el, (ui.button, ui.space))]
     captions = [el._props.get('label', '<space>') if isinstance(el, ui.button)
                 else '<space>' for el in order]
-    assert captions[:7] == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
-                            'Load current', 'Wipe', 'Compare']
-    assert captions[7] == '<space>'
-    assert captions[8] == 'Remove selected from label'
+    assert captions[:8] == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
+                            'Load current', 'Wipe', 'Fetch data', 'Compare']
+    assert captions[8] == '<space>'
+    assert captions[9] == 'Remove selected from label'
 
 
 # ---------------------------------------------------------------------------
@@ -5999,7 +6138,7 @@ def test_toggling_the_fractional_switch_RE_SOLVES_the_plan(monkeypatch,
         before = wizard.plan.rows[0].delta_quantity
         switch = [el for el in nicegui_client.layout.descendants()
                   if isinstance(el, ui.switch)][0]
-        switch.set_value(False)
+        _drive_value(switch, False)
         after = wizard.plan.rows[0].delta_quantity
 
     assert before != after
@@ -6034,7 +6173,7 @@ def test_the_re_solved_plan_is_what_SUBMIT_would_send(monkeypatch, nicegui_clien
         wizard.open()
         switch = [el for el in nicegui_client.layout.descendants()
                   if isinstance(el, ui.switch)][0]
-        switch.set_value(False)
+        _drive_value(switch, False)
         wizard._submit()
 
     assert [r.delta_quantity for r in submitted[0].rows] == [166.0]
@@ -6067,7 +6206,7 @@ def test_the_fractional_toggle_is_remembered_for_the_next_run(monkeypatch,
         wizard.open()
         switch = [el for el in nicegui_client.layout.descendants()
                   if isinstance(el, ui.switch)][0]
-        switch.set_value(False)
+        _drive_value(switch, False)
 
     assert get_allocation_config(account_id).allow_fractional is False
 
@@ -6552,8 +6691,8 @@ def test_load_current_joins_the_group_and_stays_on_the_harmless_side(nicegui_cli
                 else '<space>' for el in row.descendants()
                 if isinstance(el, (ui.button, ui.space))]
     assert captions == ['Fill 100%', 'Even split', 'Fill rest', 'Load last',
-                        'Load current', 'Wipe', 'Compare', '<space>',
-                        'Remove selected from label']
+                        'Load current', 'Wipe', 'Fetch data', 'Compare',
+                        '<space>', 'Remove selected from label']
 
 
 # ---------------------------------------------------------------------------
@@ -6780,6 +6919,185 @@ def test_all_three_bars_share_one_track_style(nicegui_client, account_id):
     assert len(tracks) == 3
     assert {page.BAR_TRACK_STYLE.rstrip(';')} == {
         ';'.join(f'{k}:{v}' for k, v in t._style.items()) for t in tracks}
+
+
+def _label_rows_after_a_repaint(client, account_id):
+    """Two labels whose verdict sentences are very different lengths.
+
+    "on target" against "under by 65.0pp ($6,500.00)" -- a 9-character cell beside
+    a 27-character one, which is exactly the spread that used to pull the two rows'
+    bars to different lengths.
+    """
+    views = _views([ManagedLabel('A', 25.0), ManagedLabel('B', 90.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT']},
+                   weights={'A': {'AAPL': 100.0}, 'B': {'MSFT': 100.0}})
+    return _draw(client, account_id, views)
+
+
+def test_a_repaint_does_not_drop_the_delta_and_pnl_CELL_WIDTHS(nicegui_client,
+                                                               account_id):
+    """``classes(replace=...)`` replaces the WHOLE list, colour classes included.
+
+    Both cells were rendered with a width and then re-classed on every redraw with
+    colour only, so from the first repaint each was as wide as its own sentence --
+    and the growing bar beside them got whatever each row happened to leave.
+    """
+    root = _label_rows_after_a_repaint(nicegui_client, account_id)
+
+    # BY THE ROW, not by the sentence: the per-label symbol-share bar draws a delta
+    # in the same vocabulary, so 'on target' alone finds four cells on this page.
+    pnls = _marked(root, page.MARKER_LABEL_PNL)
+    assert len(pnls) == 2
+    for pnl in pnls:
+        assert page.PNL_CELL_CLASSES.split()[0] in pnl._classes
+        row = pnl.parent_slot.parent
+        deltas = [el for el in row.descendants()
+                  if (el._text or '').startswith(('on target', 'under by'))]
+        assert len(deltas) == 1
+        assert page.DELTA_CELL_CLASSES.split()[0] in deltas[0]._classes
+
+
+def test_every_label_bar_is_the_same_track_however_long_its_row_reads(nicegui_client,
+                                                                     account_id):
+    """"the bars do not all have same lenght now, not good".
+
+    The bars are read by comparing their fills DOWN the column, so a track whose
+    length changes per row makes an under-target label look on-target. Equal
+    classes is as close as a Python test gets to equal pixels -- what it pins is
+    that no row's track is special-cased and that the growing bar's neighbours are
+    all pinned, which together are what make the widths agree.
+    """
+    root = _label_rows_after_a_repaint(nicegui_client, account_id)
+
+    tracks = [el.parent_slot.parent for el in _marked(root, page.MARKER_BAR_FILL)]
+    assert len(tracks) == 2
+    assert len({' '.join(sorted(t._classes)) for t in tracks}) == 1
+    # ...and it GROWS. Pinning the bar itself passes the assertion above while
+    # leaving a third of a wide row empty -- the fix that caused the complaint.
+    assert 'flex-1' in tracks[0]._classes
+
+
+# ---------------------------------------------------------------------------
+# FETCH DATA -- the per-label pull of yield / 1Y / 3Y
+#
+# "Add a button in the label control to fetch data so we can have the dividend
+# etc". The background top-up on every page refresh is capped at a batch and
+# works through the WHOLE account, so a label can read "not fetched yet" for
+# several refreshes running.
+# ---------------------------------------------------------------------------
+
+def _fetch_calls(monkeypatch, *, written=None, due=None):
+    """Intercept the provider pull. Returns the growing list of (symbols, limit)."""
+    calls = []
+
+    def _fake(symbols, *, limit=None):
+        calls.append((list(symbols), limit))
+        return len(symbols) if written is None else written
+
+    monkeypatch.setattr(page.svc, 'refresh_symbol_stats', _fake)
+    if due is not None:
+        import ba2_common.core.symbol_stats as stats_mod
+        monkeypatch.setattr(stats_mod, 'stale_symbols', lambda symbols: list(due))
+    return calls
+
+
+def test_every_label_has_its_own_fetch_button(nicegui_client, account_id):
+    views = _views([ManagedLabel('A', 50.0), ManagedLabel('B', 50.0)],
+                   {'A': ['AAPL'], 'B': ['MSFT']})
+    root = _draw(nicegui_client, account_id, views)
+
+    assert len(_marked_buttons(root, page.MARKER_FETCH_STATS)) == 2
+
+
+def test_fetch_asks_for_THIS_labels_symbols_and_no_others(monkeypatch,
+                                                          nicegui_client,
+                                                          account_id):
+    """The closure bug this row's every button guards against, at provider cost."""
+    _capture_notifications(monkeypatch)
+    calls = _fetch_calls(monkeypatch)
+    views = _views([ManagedLabel('A', 50.0), ManagedLabel('B', 50.0)],
+                   {'A': ['AAPL', 'MSFT'], 'B': ['NVDA']})
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert [c[0] for c in calls] == [['AAPL', 'MSFT']]
+
+
+def test_fetch_asks_for_THE_WHOLE_label_not_the_background_batch(monkeypatch,
+                                                                 nicegui_client,
+                                                                 account_id):
+    """The background pass takes ``STATS_REFRESH_BATCH`` at a time and works the
+    account; this button was pressed on ONE label, and half of it is not an answer."""
+    _capture_notifications(monkeypatch)
+    calls = _fetch_calls(monkeypatch)
+    symbols = [f'SYM{i}' for i in range(12)]
+    views = _views([ManagedLabel('A', 100.0)], {'A': symbols})
+    root = _draw(nicegui_client, account_id, views)
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert calls[0][1] == 12 > page.svc.STATS_REFRESH_BATCH
+
+
+def test_fetch_says_so_when_everything_is_already_cached(monkeypatch,
+                                                        nicegui_client, account_id):
+    sent = _capture_notifications(monkeypatch)
+    calls = _fetch_calls(monkeypatch, due=[])
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('A', 100.0)], {'A': ['AAPL']}))
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert calls == []                                   # no provider call at all
+    assert any('12 hours' in m for m, _t in sent)
+
+
+def test_fetching_NOTHING_when_work_was_due_is_reported_as_a_failure(monkeypatch,
+                                                                     nicegui_client,
+                                                                     account_id):
+    """``refresh_symbol_stats`` returns 0 both when there is nothing to do and when
+    the provider refused -- no API key, a failed call. Rendering those two the same
+    way is a button that stays silent about a misconfiguration."""
+    sent = _capture_notifications(monkeypatch)
+    _fetch_calls(monkeypatch, written=0, due=['AAPL'])
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('A', 100.0)], {'A': ['AAPL']}))
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert any(kind == 'negative' for _m, kind in sent)
+
+
+def test_a_partial_fetch_says_how_many_it_got(monkeypatch, nicegui_client,
+                                              account_id):
+    sent = _capture_notifications(monkeypatch)
+    _fetch_calls(monkeypatch, written=1, due=['AAPL', 'MSFT'])
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('A', 100.0)], {'A': ['AAPL', 'MSFT']}))
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert any('1 of 2' in m and kind == 'warning' for m, kind in sent)
+
+
+def test_a_provider_that_raises_is_reported_and_not_swallowed(monkeypatch,
+                                                              nicegui_client,
+                                                              account_id):
+    sent = _capture_notifications(monkeypatch)
+    errors = _capture_errors(monkeypatch)
+
+    def _boom(symbols, *, limit=None):
+        raise RuntimeError('FMP is down')
+
+    monkeypatch.setattr(page.svc, 'refresh_symbol_stats', _boom)
+    root = _draw(nicegui_client, account_id,
+                 _views([ManagedLabel('A', 100.0)], {'A': ['AAPL']}))
+
+    _press(_marked_buttons(root, page.MARKER_FETCH_STATS)[0])
+
+    assert any('FMP is down' in m and kind == 'negative' for m, kind in sent)
+    assert any('FMP is down' in m for m in errors)
 
 
 # ---------------------------------------------------------------------------
@@ -7639,3 +7957,252 @@ def test_a_blank_stored_name_is_treated_as_no_name():
     panel.display_names = {'AAPL': '   '}
 
     assert panel._titled(['AAPL']) == 'AAPL'
+
+
+# ---------------------------------------------------------------------------
+# THE ZERO-SHARE BADGE (2026-09-03)
+#
+# "near the label logo, put a orange badge with amount of symbols that is 0 or
+# null share. No badge if all are >0%"
+#
+# A symbol sitting in a label at 0% is invisible on a collapsed row: the label's
+# own bar, target and delta are all healthy, and the only place the zero shows is
+# a column inside the fold. The badge is what makes it countable without opening
+# anything.
+# ---------------------------------------------------------------------------
+
+
+def _zero_badge(root, index=0):
+    return _marked(root, page.MARKER_LABEL_ZERO_BADGE)[index]
+
+
+def test_the_label_row_badges_how_many_symbols_have_no_share(nicegui_client,
+                                                             account_id):
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT', 'TSLA'),
+                            weights={'AAPL': 100.0, 'MSFT': 0.0, 'TSLA': 0.0}))
+    badge = _zero_badge(root)
+
+    assert badge.text == '2'
+    assert badge.visible
+    assert 'orange' in badge._props.get('color', '')
+
+
+def test_a_label_whose_symbols_all_have_a_share_carries_NO_badge(nicegui_client,
+                                                                  account_id):
+    """"No badge if all are >0%" -- an orange 0 beside a healthy label is the
+    noise that makes a real one easy to miss."""
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT'),
+                            weights={'AAPL': 60.0, 'MSFT': 40.0}))
+
+    assert not _zero_badge(root).visible
+
+
+def test_the_badge_counts_an_UNSET_share_alongside_an_explicit_zero(nicegui_client,
+                                                                    account_id):
+    """Both end in the same place: the symbol is in the label and the plan buys
+    none of it."""
+    views = _views([ManagedLabel('ARK26', 40.0)],
+                   {'ARK26': ['AAPL', 'MSFT', 'TSLA']},
+                   # MSFT typed to zero; TSLA has no stored share at all, and the
+                   # label cannot be valued, so its share resolves to unknown.
+                   weights={'ARK26': {'AAPL': 100.0, 'MSFT': 0.0}})
+    for row in views[0].rows:
+        if row.symbol == 'TSLA':
+            row.weight_pct = None
+    root = _draw(nicegui_client, account_id, views)
+
+    assert _zero_badge(root).text == '2'
+
+
+def test_the_badge_tooltip_names_the_label_and_the_way_out(nicegui_client,
+                                                            account_id):
+    """A bare number on an icon is a riddle."""
+    from nicegui import ui
+
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT'),
+                            weights={'AAPL': 100.0, 'MSFT': 0.0}))
+    tooltips = [el._text for el in _zero_badge(root).descendants()
+                if isinstance(el, ui.tooltip)]
+
+    assert len(tooltips) == 1
+    assert 'ARK26' in tooltips[0]
+    assert 'no order' in tooltips[0] and 'remove' in tooltips[0]
+
+
+def test_the_badge_follows_a_share_typed_on_the_page(nicegui_client, account_id):
+    """It is written in ``_apply_bars`` from the SAME live weights the Share-of-label
+    column is written from, so the two cannot disagree about which rows are at
+    zero. Typing a share into the last empty symbol must clear the badge without a
+    reload."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT'),
+                            weights={'AAPL': 100.0, 'MSFT': 0.0}))
+    assert _zero_badge(root).text == '1'
+
+    with nicegui_client:
+        _emit(_tables(root)[0], 'weightChange', ['MSFT', 25.0])
+
+    assert not _zero_badge(root).visible
+
+
+def test_zeroing_a_share_on_the_page_raises_the_badge(nicegui_client, account_id):
+    """The direction that matters: the user has just told the plan to sell a
+    position out, and the row it happened on is now one fold away."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    root = _draw(nicegui_client, account_id,
+                 _one_label(account_id, symbols=('AAPL', 'MSFT'),
+                            weights={'AAPL': 60.0, 'MSFT': 40.0}))
+    assert not _zero_badge(root).visible
+
+    with nicegui_client:
+        _emit(_tables(root)[0], 'weightChange', ['MSFT', 0.0])
+
+    badge = _zero_badge(root)
+    assert badge.visible and badge.text == '1'
+
+
+# ---------------------------------------------------------------------------
+# REVIEW AND SUBMIT: ONE DIALOG PER PRESS (2026-09-03)
+#
+# "clicking review here is not instant. So I click twice then screens opens
+# twice". The solve is a broker round trip and NiceGUI schedules every click as
+# its own task, so the second one opened a SECOND dry run over the first -- two
+# plans, two Submit buttons, and the one underneath solved against pre-trade
+# positions.
+# ---------------------------------------------------------------------------
+
+
+def _ui():
+    from nicegui import ui
+    return ui
+
+
+def _review_button(root):
+    return next(el for el in root.descendants()
+                if isinstance(el, _ui().button)
+                and el._props.get('label') == page.REVIEW_BUTTON_LABEL)
+
+
+def _review_handler(button):
+    """The button's own click handler, so a test can re-enter it the way a second
+    click does -- which ``_press`` cannot, because it runs each click to
+    completion before firing the next."""
+    return next(listener.handler for listener in button._event_listeners.values()
+                if listener.type.split('.')[0] == 'click')
+
+
+def _drawn_page(monkeypatch, nicegui_client, account_id):
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=100.0)
+    monkeypatch.setattr(page, 'get_selected_account_id', lambda: account_id)
+    _run_in_client(nicegui_client, page.content)
+    return nicegui_client.layout
+
+
+def test_a_second_review_click_during_the_solve_opens_no_second_dry_run(
+        monkeypatch, nicegui_client):
+    """The user's report: "clicking review here is not instant. So I click twice
+    then screens opens twice". The solve is a broker round trip and NiceGUI gives
+    every click its own task, so the second press used to stack a second dry run --
+    with its own Submit, over positions the first one was about to change."""
+    _capture_notifications(monkeypatch)
+    latch = page.ClickLatch(page.REVIEW_BUSY_NOTICE)
+    runs, refused = [], []
+
+    async def _slow_flow():
+        runs.append(True)
+        # THE SECOND CLICK, arriving while this solve is still running.
+        refused.append(await latch.run(_slow_flow))
+
+    with nicegui_client:
+        assert asyncio.run(latch.run(_slow_flow)) is True
+
+    assert runs == [True]
+    assert refused == [False]
+    # ...and the latch is open again, because the solve ordered nothing and the
+    # user must be able to press Review a second time.
+    assert latch.busy is False
+
+
+def test_the_review_latch_tells_the_user_why_the_second_press_did_nothing(
+        monkeypatch, nicegui_client):
+    """A press that silently does nothing reads as a broken button."""
+    sent = _capture_notifications(monkeypatch)
+    latch = page.ClickLatch(page.REVIEW_BUSY_NOTICE)
+
+    async def _flow():
+        await latch.run(_flow)
+
+    with nicegui_client:
+        asyncio.run(latch.run(_flow))
+
+    assert (page.REVIEW_BUSY_NOTICE, 'info') in sent
+
+
+def test_the_review_latch_disables_its_button_while_it_works(monkeypatch,
+                                                              nicegui_client):
+    """The honest answer to "is anything happening?" -- and the half of the
+    defence the user can see."""
+    _capture_notifications(monkeypatch)
+    with nicegui_client:
+        button = _ui().button('Review and Submit')
+        latch = page.ClickLatch(page.REVIEW_BUSY_NOTICE, button=button)
+        seen = {}
+
+        async def _flow():
+            seen['enabled'] = button.enabled
+            seen['loading'] = button._props.get('loading')
+
+        asyncio.run(latch.run(_flow))
+
+    assert seen == {'enabled': False, 'loading': True}
+    assert button.enabled and 'loading' not in button._props
+
+
+def test_the_review_latch_reopens_after_a_solve_that_raises(monkeypatch,
+                                                             nicegui_client):
+    """A latch a failure does not release is a button that never works again."""
+    _capture_notifications(monkeypatch)
+    with nicegui_client:
+        button = _ui().button('Review and Submit')
+        latch = page.ClickLatch(page.REVIEW_BUSY_NOTICE, button=button)
+
+        async def _boom():
+            raise RuntimeError('broker connection reset')
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(latch.run(_boom))
+
+    assert latch.busy is False
+    assert button.enabled and 'loading' not in button._props
+
+
+def test_the_page_wires_the_review_button_through_the_latch(monkeypatch,
+                                                             nicegui_client,
+                                                             account_id):
+    """The wiring, not the mechanism: the button must actually be the latch's."""
+    source = _page_source_text()
+    assert 'ClickLatch(REVIEW_BUSY_NOTICE)' in source
+    assert 'review_latch.button = ui.button(' in source
+    assert 'await review_latch.run(' in source
+
+
+def _page_source_text():
+    from pathlib import Path
+    return Path(page.__file__).read_text(encoding='utf-8')
+
+
+def _ui():
+    from nicegui import ui
+    return ui

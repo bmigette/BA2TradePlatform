@@ -391,10 +391,18 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         "pnl_pct": _finite(trade.get("pnl_pct"), "trade.pnl_pct", default=0.0),
         "bars_held": int(trade.get("bars_held", 0) or 0),
         "exit_reason": trade.get("exit_reason", "unknown"),
-        # Only set for option legs (passed through unchanged, no frontend consumer today) --
-        # lets the intraday_drawdown refinement look up delta/underlying bars per trade.
+        # Only set for option legs -- lets the intraday_drawdown refinement look up
+        # delta/underlying bars per trade, and (since 2026-09-04) lets the trade list
+        # say WHAT was traded: an option row that prints only "AAPL, entry 4.20" is
+        # indistinguishable from an equity row at $4.20, and the reader cannot tell a
+        # long call from a short put from a leg of a condor.
         "contract_symbol": trade.get("contract_symbol"),
         "underlying_symbol": trade.get("underlying_symbol"),
+        # The contract's own terms, carried as columns rather than parsed back out of
+        # the OCC string by every consumer in turn.
+        "option_type": trade.get("option_type"),
+        "strike": trade.get("strike"),
+        "expiry": trade.get("expiry"),
         # Structure identity + contract size for the profit cap (see _cap_groups /
         # _deployed_capital): option legs sharing a transaction_id are ONE economic bet, and an
         # option leg's cost basis is premium x contracts x multiplier. Both are recorded by
@@ -545,6 +553,13 @@ def _compute_metrics(
             max_drawdown = refine_drawdown_fn(trades, max_drawdown)
         except Exception as e:  # noqa: BLE001 -- refinement must never fail the backtest
             logger.debug(f"intraday drawdown refinement failed, using daily-only figure: {e}")
+    # BOTH FIGURES SURVIVE. The refined value replaced the daily one in place, so a stored
+    # result could not say whether its max_drawdown was measured from the equity curve or
+    # estimated from a first-order delta re-pricing -- two different quantities under one
+    # name, and only the second moves when the refinement's method changes. Keeping the daily
+    # figure alongside makes a methodology change auditable after the fact and lets saved
+    # candidates be re-ranked on a like-for-like basis.
+    max_drawdown_daily = min(dd_values) if dd_values else 0.0
     neg_dd = [d for d in dd_values if d < 0]
     avg_drawdown = (sum(neg_dd) / len(neg_dd)) if neg_dd else 0.0
     max_dd_duration = _max_drawdown_duration_days(drawdown_curve)
@@ -772,6 +787,10 @@ def _compute_metrics(
         "volatility": round(_finite(volatility, "volatility"), 2),
         # Drawdown metrics
         "max_drawdown": round(_finite(max_drawdown, "max_drawdown"), 2),
+        # The equity-curve figure BEFORE any intraday refinement. Equal to max_drawdown on an
+        # equity-only run and on any run where the refinement found nothing; strictly less
+        # negative when it did. Kept so a stored result can say which quantity it reports.
+        "max_drawdown_daily": round(_finite(max_drawdown_daily, "max_drawdown_daily"), 2),
         "avg_drawdown": round(_finite(avg_drawdown, "avg_drawdown"), 2),
         "max_drawdown_duration": round(_finite(max_dd_duration, "max_drawdown_duration"), 1),
         # Trade quality metrics

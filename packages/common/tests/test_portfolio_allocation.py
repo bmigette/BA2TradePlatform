@@ -440,16 +440,18 @@ def test_a_total_above_one_hundred_is_still_a_hard_ERROR():
     assert pa.blocking_messages(messages) == messages
 
 
-def test_symbol_weights_inside_a_label_must_STILL_total_exactly_one_hundred():
-    """The reserve is a LABEL-level idea only. A label whose symbol weights total 60
-    leaves 40% of THAT label's money undeployed with nothing on the plan to record
-    it -- ``compute_allocation`` multiplies the weights straight through -- so this
-    rule does not relax with the other one."""
+def test_symbol_weights_inside_a_label_short_of_one_hundred_is_reported_but_advisory():
+    """BUG FIX 2026-09-05: this used to assert the symbol-total shortfall blocked
+    Submit exactly like the label-level one -- the operator asked for that not to
+    be the case (a 90% split on a live label was refusing Submit). A label whose
+    symbol weights total 60 leaves 40% of THAT label's money undeployed, which is
+    a fact worth reporting -- STILL on the plan -- and no longer a reason to
+    refuse Submit, unlike the cross-label shortfall this rule used to mirror."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0)])]
     messages = pa.validate_label_targets(labels)
 
-    assert messages == [pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=60.0)]
-    assert pa.blocking_messages(messages) == messages
+    assert messages == [pa.WARNING_SYMBOL_UNDER_FMT.format(label="A", total=60.0, under=40.0)]
+    assert pa.blocking_messages(messages) == []
 
 
 def test_an_under_allocated_set_still_reports_its_real_errors():
@@ -531,21 +533,26 @@ def test_validate_label_targets_rejects_symbol_weights_totalling_one_fifty():
     over-deploy the label."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0), SymbolTarget("BBB", 50.0)])]
     errors = pa.validate_label_targets(labels)
-    assert errors == [pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=150.0)]
-    assert errors == ["label 'A' symbol weights total 150.00% - must total 100%"]
+    assert errors == [pa.ERROR_SYMBOL_OVER_FMT.format(label="A", total=150.0, over=50.0)]
+    assert errors == ["label 'A' symbol weights total 150.00% - over 100% by 50.00%"]
+    assert pa.blocking_messages(errors) == errors
 
 
-def test_validate_label_targets_rejects_a_naive_two_dp_symbol_split():
-    """3 x 33.33 = 99.99, one hair OUTSIDE the 0.01pp tolerance -- use even_split_pct."""
+def test_validate_label_targets_flags_a_naive_two_dp_symbol_split():
+    """3 x 33.33 = 99.99, one hair OUTSIDE the 0.01pp tolerance -- use even_split_pct.
+    Reported (never silently accepted), but a shortfall this small is advisory."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget(s, 33.33) for s in ("AAA", "BBB", "CCC")])]
-    assert pa.validate_label_targets(labels) == [
-        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=99.99)]
+    messages = pa.validate_label_targets(labels)
+    assert messages == [pa.WARNING_SYMBOL_UNDER_FMT.format(label="A", total=99.99, under=0.01)]
+    assert pa.blocking_messages(messages) == []
 
 
 def test_validate_label_targets_rejects_symbol_weights_just_over_the_tolerance():
+    """OVER still blocks -- it is the direction that over-deploys the label."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.01)])]
-    assert pa.validate_label_targets(labels) == [
-        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=100.01)]
+    messages = pa.validate_label_targets(labels)
+    assert messages == [pa.ERROR_SYMBOL_OVER_FMT.format(label="A", total=100.01, over=0.01)]
+    assert pa.blocking_messages(messages) == messages
 
 
 def test_validate_label_targets_accepts_an_even_split_pct_symbol_set():
@@ -626,17 +633,20 @@ def test_validate_symbol_weights_accepts_an_even_split():
 def test_validate_symbol_weights_rejects_a_one_fifty_total():
     """The INVEST_LABEL gate: 150% would turn a 10k budget into 15k of buys."""
     label = LabelTarget("A", 40.0, [SymbolTarget("AAA", 100.0), SymbolTarget("BBB", 50.0)])
-    assert pa.validate_symbol_weights(label) == [
-        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=150.0)]
-    assert pa.validate_symbol_weights(label) == [
-        "label 'A' symbol weights total 150.00% - must total 100%"]
+    messages = pa.validate_symbol_weights(label)
+    assert messages == [pa.ERROR_SYMBOL_OVER_FMT.format(label="A", total=150.0, over=50.0)]
+    assert messages == ["label 'A' symbol weights total 150.00% - over 100% by 50.00%"]
+    assert pa.blocking_messages(messages) == messages
 
 
-def test_validate_symbol_weights_rejects_a_total_under_one_hundred():
-    """Concern 3: weights totalling 60 would silently leave 40% of the budget as cash."""
+def test_validate_symbol_weights_reports_a_total_under_one_hundred_as_advisory():
+    """BUG FIX 2026-09-05: weights totalling 60 leave 40% of the budget undeployed
+    -- still reported, no longer blocking (see the REBALANCE-level test above for
+    the full reasoning)."""
     label = LabelTarget("A", 40.0, [SymbolTarget("AAA", 60.0)])
-    assert pa.validate_symbol_weights(label) == [
-        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=60.0)]
+    messages = pa.validate_symbol_weights(label)
+    assert messages == [pa.WARNING_SYMBOL_UNDER_FMT.format(label="A", total=60.0, under=40.0)]
+    assert pa.blocking_messages(messages) == []
 
 
 def test_validate_symbol_weights_rejects_a_negative_weight():
@@ -676,7 +686,7 @@ def test_validate_label_targets_forwards_its_tolerance_to_the_symbol_check():
     """Pre-existing behaviour: a widened tolerance loosens BOTH levels, not just labels."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 99.0)])]
     assert pa.validate_label_targets(labels) == [
-        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=99.0)]
+        pa.WARNING_SYMBOL_UNDER_FMT.format(label="A", total=99.0, under=1.0)]
     assert pa.validate_label_targets(labels, tolerance=5.0) == []
     assert pa.validate_symbol_weights(labels[0], tolerance=5.0) == []
 
@@ -2173,11 +2183,18 @@ def test_an_order_that_errored_before_reaching_the_broker_is_worth_nothing():
     assert totals.settled is True
 
 
-def test_a_washtrade_locked_order_is_settled_and_worth_nothing():
-    """Our own gate: never sent, so it is as final as an order gets."""
+def test_a_washtrade_locked_order_is_NOT_settled_it_can_still_be_resubmitted():
+    """BUG FIX 2026-09-04: this used to assert ``settled is True`` on the premise
+    that a locked order was "never sent, so it is as final as an order gets" --
+    false. ``TradeManager._check_all_washtrade_locked_orders`` re-submits a
+    locked order the moment its blocker clears, for up to 24h. Treating it as
+    settled-at-zero made ``run_allocation`` finalise the run and consume its
+    income at 0 while the order was still armed; when it filled hours later, no
+    run's ledger was ever charged, and the income could be spent again."""
     totals = measure_filled_values([
         _fill(1, OrderDirection.BUY, OrderStatus.WASHTRADE_LOCKED)])
-    assert totals.settled is True
+    assert totals.settled is False
+    assert totals.working_order_ids == [1]
     assert totals.buy_value == 0.0
 
 
@@ -2329,16 +2346,31 @@ def test_a_refused_order_with_no_quantity_at_all_is_worth_zero_not_unmeasurable(
     the status, so a rejected row reaches the ledger as REJECTED with a NULL
     quantity -- never an explicit 0.0. Reading that NULL as "unknown" would strand
     the income of every run that had a single row refused, which is the most
-    ordinary outcome there is.
+    ordinary outcome there is. WASHTRADE_LOCKED is NOT one of these any more --
+    see ``test_a_washtrade_locked_order_with_no_quantity_is_working_not_settled``
+    below -- because unlike REJECTED/ERROR it is not actually over.
     """
-    for status in (OrderStatus.REJECTED, OrderStatus.ERROR,
-                   OrderStatus.WASHTRADE_LOCKED):
+    for status in (OrderStatus.REJECTED, OrderStatus.ERROR):
         totals = measure_filled_values([
             _fill(1, OrderDirection.BUY, status, qty=None, price=None)])
         assert totals.settled is True, status
         assert totals.buy_value == 0.0, status
         assert totals.unmeasurable_order_ids == [], status
         assert totals.working_order_ids == [], status
+
+
+def test_a_washtrade_locked_order_with_no_quantity_is_working_not_settled():
+    """The status does NOT prove nothing executed -- it proves the order was
+    never SENT this time, but ``TradeManager`` can still send it later. Genuinely
+    both working (might still trade) and unmeasurable (there is nothing to price
+    yet) -- neither list is exclusive of the other, and either one alone already
+    keeps the run open."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.WASHTRADE_LOCKED, qty=None, price=None)])
+    assert totals.settled is False
+    assert totals.buy_value == 0.0
+    assert 1 in totals.working_order_ids
+    assert 1 in totals.unmeasurable_order_ids
 
 
 def test_a_null_quantity_on_a_settled_status_that_can_carry_a_fill_still_stalls():
@@ -2458,9 +2490,13 @@ def test_settled_statuses_cover_every_terminal_status_plus_filled():
     assert OrderStatus.get_terminal_statuses() <= SETTLED_ORDER_STATUSES
     assert OrderStatus.FILLED in SETTLED_ORDER_STATUSES
     assert OrderStatus.DONE_FOR_DAY in SETTLED_ORDER_STATUSES
-    assert OrderStatus.WASHTRADE_LOCKED in SETTLED_ORDER_STATUSES
     assert OrderStatus.PARTIALLY_FILLED not in SETTLED_ORDER_STATUSES
     assert OrderStatus.UNKNOWN not in SETTLED_ORDER_STATUSES
+    # BUG FIX 2026-09-04: NOT settled -- TradeManager re-submits a locked order
+    # once its blocker clears, so it is still working, not final. See
+    # SETTLED_ORDER_STATUSES' own docstring.
+    assert OrderStatus.WASHTRADE_LOCKED not in SETTLED_ORDER_STATUSES
+    assert OrderStatus.WASHTRADE_LOCKED not in UNEXECUTED_ORDER_STATUSES
 
 
 def test_filled_totals_to_dict_is_json_safe():
@@ -2938,10 +2974,17 @@ def test_a_label_total_below_one_hundred_is_a_hard_ERROR_again():
 
 
 def test_nothing_in_the_advisory_fragments_lets_a_label_total_through_any_more():
-    """The advisory fragment 6fd532c added is GONE, so both halves of the rule
-    block by default -- the safe direction to be wrong in."""
-    assert pa.ADVISORY_MESSAGE_FRAGMENTS == (pa._INVEST_EXCEEDS_BP_FRAGMENT,)
+    """The advisory fragment 6fd532c added for the CROSS-LABEL rule is GONE, so
+    both halves of THAT rule still block by default -- the safe direction to be
+    wrong in. ``_SYMBOL_UNDER_FRAGMENT`` (2026-09-05) is a second, DELIBERATE
+    advisory fragment for a different rule (the WITHIN-one-label shortfall) and
+    its presence here is not a regression of this one -- the real guarantee is
+    that it must never ALSO match the cross-label message, checked directly
+    rather than by asserting the tuple has exactly one element forever."""
     assert not hasattr(pa, "ADVISORY_LABEL_UNDER_FMT")
+    cross_label_under = pa.ERROR_LABEL_UNDER_FMT.format(total=60.0, under=40.0)
+    assert pa.is_blocking_message(cross_label_under)
+    assert pa._SYMBOL_UNDER_FRAGMENT not in cross_label_under
 
 
 def test_an_empty_label_set_is_an_error_not_an_advisory():
@@ -3115,3 +3158,128 @@ def test_redistribution_still_converges_against_a_reserved_base():
     assert plan.total_buy_value <= 9_000.0 + pa.MONEY_EPSILON
     assert plan.total_buy_value > 9_000.0 - 100.0     # inside one BBB share
     assert plan.reserved_notional == pytest.approx(1_000.0)
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX 2026-09-04: a whole-share MARKET-mode trim under one share was a
+# full liquidation, and the next run bought the position straight back.
+#
+# ``compute_allocation`` used to floor the TARGET to a whole share count first
+# and only then subtract the holding. A $50 target on a $150 stock, holding 1
+# share, floored the target to 0 shares and "0 minus 1 held" sold the whole
+# position -- on a target that was never an instruction to hold none of it.
+# Cost mode never had this defect: it always rounded the DELTA, not the
+# target. Market mode now does the same via ``_round_delta_shares``.
+# ---------------------------------------------------------------------------
+
+def test_a_sub_share_market_mode_trim_leaves_the_position_alone_not_a_full_sell():
+    current = {"XXX": _pos("XXX", 150.0, quantity=1.0, cost_basis=150.0)}
+    margin = {"XXX": MarginInfo(symbol="XXX", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+
+    # base 100 x 100% target -> $100 target on a $150 stock: a 0.667-share
+    # target, held 1 whole share, fractional trading OFF.
+    plan = pa.compute_allocation(100.0, 100.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert row.target_quantity == 1.0            # the holding, untouched
+    assert row.unmet_notional > 0.0
+    assert any(reason.startswith("-0.") and "rounds to zero" not in reason.lower()
+              or "rounds to" in reason for reason in row.reasons)
+
+
+def test_the_sub_share_trim_fix_does_not_touch_a_genuine_zero_target():
+    """The other branch of the same ``if``: an EXPLICIT zero target (weight 0, or
+    the label got 0%) must still close the position outright -- this is decision
+    14, unrelated to the rounding fix above."""
+    current = {"XXX": _pos("XXX", 150.0, quantity=1.0, cost_basis=150.0)}
+    margin = {"XXX": MarginInfo(symbol="XXX", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 0.0)])]
+
+    plan = pa.compute_allocation(100.0, 100.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    row = plan.rows[0]
+    assert row.delta_quantity == -1.0
+    assert row.side == OrderDirection.SELL
+    assert pa.REASON_CLOSE_TO_ZERO in row.reasons
+
+
+def test_a_sub_share_market_mode_trim_does_not_oscillate_across_two_runs():
+    """The user-visible symptom: run it twice with nothing else changing and the
+    SECOND run must be a no-op, not a buy-back of what the first run sold."""
+    current_after_bug = {"XXX": _pos("XXX", 150.0, quantity=0.0, cost_basis=0.0)}
+    margin = {"XXX": MarginInfo(symbol="XXX", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+
+    held = {"XXX": _pos("XXX", 150.0, quantity=1.0, cost_basis=150.0)}
+    first = pa.compute_allocation(100.0, 1_000.0, labels, held, margin,
+                                  allow_fractional=False, default_bp_factor=1.0,
+                                  valuation_mode=pa.VALUATION_MODE_MARKET)
+    assert first.rows[0].delta_quantity == 0.0   # no sell -> nothing to buy back
+
+    second = pa.compute_allocation(100.0, 1_000.0, labels, current_after_bug, margin,
+                                   allow_fractional=False, default_bp_factor=1.0,
+                                   valuation_mode=pa.VALUATION_MODE_MARKET)
+    # Starting from FLAT (what the bug would have produced) a new position still
+    # opens -- the fix changes only the TRIM case, never a fresh buy.
+    assert second.rows[0].delta_quantity == 1.0
+    assert second.rows[0].side == OrderDirection.BUY
+
+
+# ---------------------------------------------------------------------------
+# BUG FIX 2026-09-04: label residual redistribution could un-close a
+# REASON_CLOSE_TO_ZERO row, and could open a fresh position in a symbol
+# weighted at 0% within its label.
+#
+# ``_absorber_order`` filtered on ``sizing_outcome`` and ``unmet_notional``
+# only, so a row with an explicit zero target (a closed position, or a
+# 0%-weight flat symbol) was still eligible to have redistribution move it --
+# contradicting decision 14 ("a zero target closes the transaction") and
+# ``scale_pct_to_total``'s own rule that a slot at 0 means hold none of it.
+# ---------------------------------------------------------------------------
+
+def test_redistribution_never_un_closes_a_zero_target_position():
+    current = {"AAA": _pos("AAA", 111.0, quantity=3.0, cost_basis=333.0),
+              "BBB": _pos("BBB", 10.0, quantity=10.0, cost_basis=100.0)}
+    margin = {s: MarginInfo(symbol=s, fractionable=False, bp_factor=1.0)
+             for s in ("AAA", "BBB")}
+    # AAA targets its whole 100%; BBB is weighted 0 within the same label, so its
+    # target is 0 and it must close outright, however much residual AAA leaves.
+    labels = [LabelTarget("L", 100.0, [SymbolTarget("AAA", 100.0),
+                                       SymbolTarget("BBB", 0.0)])]
+
+    plan = pa.compute_allocation(1_100.0, 1_100.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    bbb = next(r for r in plan.rows if r.symbol == "BBB")
+    assert bbb.delta_quantity == -10.0            # the FULL holding, not "sells less"
+    assert bbb.target_quantity == 0.0
+    assert pa.REASON_CLOSE_TO_ZERO in bbb.reasons
+    assert bbb.redistributed is False
+
+
+def test_redistribution_never_opens_a_zero_weight_flat_symbol():
+    current = {"AAA": _pos("AAA", 99.0, quantity=0.0, cost_basis=0.0)}
+    # BBB is not held and carries no PositionState at all -- genuinely flat.
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=True, bp_factor=1.0),
+             "BBB": MarginInfo(symbol="BBB", fractionable=True, bp_factor=1.0)}
+    labels = [LabelTarget("L", 100.0, [SymbolTarget("AAA", 100.0),
+                                       SymbolTarget("BBB", 0.0)])]
+
+    plan = pa.compute_allocation(1_000.0, 1_000.0, labels, current, margin,
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    bbb = next((r for r in plan.rows if r.symbol == "BBB"), None)
+    # Either absent from the plan (delta 0, no side) or present with no order --
+    # never a BUY on a symbol the user weighted at 0%.
+    if bbb is not None:
+        assert bbb.side != OrderDirection.BUY
+        assert (bbb.delta_quantity or 0.0) == 0.0

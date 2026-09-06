@@ -1058,6 +1058,95 @@ class PortfolioAllocationSymbol(SQLModel, table=True):
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
 
+class AccountSymbolFacts(SQLModel, table=True):
+    """What the BROKER says about one symbol, for one account.
+
+    PER ACCOUNT, not per instrument, and that is the whole point of the table:
+    fractionability and the margin rate are answers a specific broker gives a
+    specific account. The same ticker is fractionable at Alpaca and not at IBKR, and
+    a marginable name costs 1x buying power in a 2:1 account but 2x in a cash one --
+    so a single row on ``Instrument`` would be a fact stated about the wrong subject.
+
+    This is a CACHE of ``AccountInterface.get_symbol_margin_info()``, kept so the UI
+    can show the facts without a REST round-trip per page load. It is refreshed by an
+    explicit user action (the allocator's Refresh), never lazily on read: a stale row
+    that silently repairs itself is indistinguishable from a fresh one, and
+    ``fetched_at`` exists so a reader can see the age instead of guessing.
+
+    EVERY FLAG IS TRI-STATE, mirroring ``MarginInfo`` exactly: ``True``/``False`` are
+    the broker SAYING yes or no, and ``None`` is "the broker did not say" -- which is
+    also what a MISSING ROW means. Nothing here may be read with ``bool(...)``; see
+    the ``MarginInfo`` docstring in ``account_types.py``, which this table stores
+    verbatim rather than reinterpreting. A symbol the broker could not describe is
+    omitted from its answer, and is therefore simply absent here.
+    """
+    __tablename__ = "account_symbol_facts"
+    __table_args__ = (
+        UniqueConstraint('account_id', 'symbol', name='uix_account_symbol_facts'),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True)
+    symbol: str = Field(index=True, description="Normalised (.strip().upper()) instrument symbol")
+    #: TRI-STATE. True = broker says the symbol can be traded in fractions.
+    fractionable: bool | None = Field(default=None)
+    #: TRI-STATE. True = the symbol can be bought on margin in THIS account.
+    marginable: bool | None = Field(default=None)
+    #: TRI-STATE. True = the broker will accept an order for it at all.
+    tradable: bool | None = Field(default=None)
+    #: Dollars of buying power one dollar of notional consumes (1.0 = dollar for
+    #: dollar). Account-dependent: it already carries the account multiplier.
+    bp_factor: float | None = Field(default=None)
+    #: Fraction of notional required up front (0.5 = Reg-T 2:1). The LEVERAGE the UI
+    #: shows is 1 / this, and is None -- not 1.0 -- when the broker published no rate.
+    initial_margin_rate: float | None = Field(default=None)
+    maintenance_margin_rate: float | None = Field(default=None)
+    min_order_size: float | None = Field(default=None, description="SHARES, never dollars")
+    min_trade_increment: float | None = Field(default=None, description="SHARES, never dollars")
+    min_fractional_notional: float | None = Field(default=None, description="DOLLARS, fractional orders only")
+    #: Which broker seam produced the row (``MarginInfo.source``), so a default-derived
+    #: entry is never mistaken for one the broker actually stated.
+    source: str | None = Field(default=None)
+    fetched_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
+
+class SymbolMarketStats(SQLModel, table=True):
+    """Headline market facts for one SYMBOL, cached so a page render costs no REST.
+
+    GLOBAL, not per-account -- unlike ``AccountSymbolFacts`` next door. A dividend
+    yield and a total return are properties of the instrument: every account holding
+    GDXY sees the same 69.73%, whereas fractionability and the margin rate are answers
+    a specific broker gives a specific account. Keying this per account would multiply
+    identical rows and invite them to disagree.
+
+    A CACHE of ``ba2_providers.symbol_info.get_symbols_info``, whose own cache is an
+    in-memory 24h TTL -- so without this table every process restart re-fetches several
+    FMP calls per symbol, and a 35-symbol allocation page pays that on first render.
+    Refreshed in the BACKGROUND (never on the render path) and read with its
+    ``fetched_at`` so a reader can judge the age instead of assuming freshness.
+
+    Every figure is NULLABLE and null means UNKNOWN, never zero: a fund that pays no
+    dividend has ``dividend_yield_pct = 0.0``, and a symbol whose fetch failed has
+    ``None``. Those are different facts and the UI renders them differently.
+    """
+    __tablename__ = "symbol_market_stats"
+    __table_args__ = (UniqueConstraint('symbol', name='uix_symbol_market_stats_symbol'),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    symbol: str = Field(index=True, description="Normalised (.strip().upper()) symbol")
+    #: Trailing-twelve-month dividend yield, 1-100 (not a fraction).
+    dividend_yield_pct: float | None = Field(default=None)
+    #: Reinvested TOTAL return over the window, 1-100. Distinct from price return.
+    total_return_1y_pct: float | None = Field(default=None)
+    total_return_3y_pct: float | None = Field(default=None)
+    #: The instrument's human name, so a caller with this row needs no second lookup.
+    company_name: str | None = Field(default=None)
+    #: Set when the provider could not describe the symbol at all; the figures are then
+    #: None and this says why, rather than the row simply looking like a non-payer.
+    error: str | None = Field(default=None)
+    fetched_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
+
 class PortfolioIncomeEvent(SQLModel, table=True):
     """One deposit or dividend, consumed oldest-first by allocation runs.
 

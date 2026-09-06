@@ -39,6 +39,25 @@ _BARS_BATCH = 200
 _STANDARD_OCC = re.compile(r"^[A-Z]{1,6}\d{6}[CP]\d{8}$")
 
 
+def _bar_price(value: Any) -> Optional[float]:
+    """A bar OHLC field as a float, or None when it is absent or not a real trade price.
+
+    Non-positive maps to None deliberately: an option cannot print at or below 0.00, so a 0.0
+    is a vendor's "no trade" sentinel rather than a price, and passing it through would mark
+    the contract worthless (the same rule ``thetadata._traded`` applies). NaN maps to None for
+    the usual reason -- it is truthy and would otherwise propagate silently.
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f <= 0:  # NaN, or a no-trade sentinel
+        return None
+    return f
+
+
 class AlpacaOptionsProvider(OptionsDataProviderInterface):
     """Historical options via Alpaca's trading (contracts) + option-data (bars) APIs."""
 
@@ -184,10 +203,21 @@ class AlpacaOptionsProvider(OptionsDataProviderInterface):
                     ts = getattr(b, "timestamp", None)
                     if ts is None:
                         continue
+                    close = _bar_price(getattr(b, "close", None))
+                    if close is None:
+                        # Alpaca bars are trade aggregates, so a bar only exists for a day the
+                        # contract traded and close is always populated -- but OHLC is now
+                        # Optional platform-wide, and this provider carries NO bid/ask, so a
+                        # row with no close here would be price-less. A price-less chain row
+                        # SKIPS the selector's penny-contract gate rather than being rejected
+                        # by it, so drop it instead of emitting it.
+                        continue
                     yield OptionEodBar(
                         occ_symbol=occ, bar_date=ts.date(),
-                        open=float(b.open), high=float(b.high),
-                        low=float(b.low), close=float(b.close),
+                        open=_bar_price(getattr(b, "open", None)),
+                        high=_bar_price(getattr(b, "high", None)),
+                        low=_bar_price(getattr(b, "low", None)),
+                        close=close,
                         volume=int(b.volume) if getattr(b, "volume", None) is not None else None,
                         # Alpaca's bars endpoint carries no quote — the cache synthesizes a
                         # spread downstream. ThetaData supplies real bid/ask here.

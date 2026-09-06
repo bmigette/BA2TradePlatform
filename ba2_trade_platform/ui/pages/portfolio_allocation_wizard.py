@@ -58,6 +58,7 @@ behind an unopened tab has not been shown. See the block comment above
 It stays MODAL. A commit gate for real orders should be a deliberate stop, not
 something reachable by scrolling.
 """
+import asyncio
 from typing import Callable, Dict, List, Optional, Tuple
 
 from nicegui import ui
@@ -70,6 +71,7 @@ from nicegui import ui
 # module one edit away from having a target editor again. (Their names are
 # deliberately not spelled out in this comment -- the test looks for the strings.)
 from ...core.portfolio_allocation import (
+    ALLOCATION_BASIS_POSITION,
     ALLOCATION_MODE_INVEST_LABEL,
     LEVERAGE_LEVERAGED,
     LEVERAGE_NONE,
@@ -77,6 +79,7 @@ from ...core.portfolio_allocation import (
     LEVERAGE_PENALISED,
     LEVERAGE_UNKNOWN,
     MONEY_EPSILON,
+    QUANTITY_EPSILON,
     VALUATION_MODE_MARKET,
     AllocationPlan,
     BaseSnapshot,
@@ -95,6 +98,7 @@ from ...core.portfolio_allocation import (
     redistribution_notice,
     summarise_plan,
     unconsumed_income_notice,
+    validate_label_targets,
     whole_share_notice,
 )
 from ..utils.portfolio_allocation_view import (
@@ -271,6 +275,22 @@ MARKER_NOTICE_COUNT = 'dry-run-notice-count'
 MARKER_ROWS_VIEWPORT = 'dry-run-rows-viewport'
 #: The order table's sticky header row.
 MARKER_TABLE_HEAD = 'dry-run-table-head'
+#: The order table's sticky FOOTER row: the column totals over the TICKED rows.
+#: Rebuilt on every tick, so it can never describe a selection other than the one
+#: the boxes show.
+MARKER_TABLE_FOOT = 'dry-run-table-foot'
+#: The selection toolbar above the table: 'Select all' / 'Deselect all', then one
+#: ``all`` / ``none`` pair per label in the plan. Buttons, not links: they change
+#: what Submit will SEND.
+MARKER_SELECT_ALL = 'dry-run-select-all'
+MARKER_DESELECT_ALL = 'dry-run-deselect-all'
+MARKER_LABEL_SELECT = 'dry-run-label-select'
+SELECT_ALL_LABEL = 'Select all'
+DESELECT_ALL_LABEL = 'Deselect all'
+#: The caption of the footer's first cell: how many of the sendable rows are ticked.
+FOOTER_CAPTION_FMT = 'Total ({ticked}/{sendable} ticked)'
+FOOTER_TOOLTIP = ('Column totals over the TICKED rows only - exactly what Submit '
+                  'will send. Un-ticked rows are excluded here and are never ordered.')
 #: The free-text Reasons cell, on the order table and on the 'Not traded' table.
 #: By marker: every word in it also appears in a notice above, so a text search
 #: cannot tell which of the two drew it.
@@ -281,6 +301,52 @@ MARKER_WORKING_ORDERS = 'income-working-orders'
 
 #: Marker on the dry run's reserve chip.
 MARKER_RESERVED = 'dry-run-reserved'
+
+#: THE VALIDATE STEP: test the ticked orders against the broker before sending
+#: any of them, then offer to drop the ones that would be refused.
+MARKER_VALIDATE_BUTTON = 'dry-run-validate'
+MARKER_VALIDATION_RESULT = 'dry-run-validation-result'
+MARKER_VALIDATION_FINDING = 'dry-run-validation-finding'
+MARKER_VALIDATION_DROP = 'dry-run-validation-drop'
+VALIDATE_BUTTON_LABEL = 'Validate'
+VALIDATE_TOOLTIP = (
+    'Test the ticked orders against the broker without sending any of them. '
+    'Anything that would be refused is listed, and you can drop just those and '
+    'submit the rest.')
+#: The clean result. Deliberately does NOT say "these will fill" -- passing the
+#: checks is the absence of a known refusal, not a promise about the fill.
+VALIDATION_CLEAN_FMT = (
+    'Nothing found against {count} order(s). {precheck} No check can promise a '
+    'fill: a market order is priced when it reaches the exchange.')
+VALIDATION_FOUND_FMT = '{count} order(s) would be refused:'
+#: What the broker itself was asked, spelled out. "0 of 7 broker-prechecked" is a
+#: materially different statement from a clean bill of health, and Alpaca -- the
+#: live account -- is always 0: it publishes no order-preview endpoint at all, so
+#: nothing can be asked of it without actually sending the order.
+VALIDATION_PRECHECK_FMT = '{done} of {total} buy(s) were checked by the broker itself.'
+VALIDATION_NO_PRECHECK = (
+    'This broker offers no order preview, so every check was made locally.')
+#: The button that acts on the findings.
+VALIDATION_DROP_FMT = 'Un-tick the {count} flagged order(s) and keep the rest'
+
+#: THE RETRY STEP on the results table: try again on just the rows that failed.
+MARKER_OUTCOME_RETRY = 'outcome-retry'
+RETRY_FAILED_FMT = 'Retry the {count} that failed'
+RETRY_TOOLTIP = (
+    'Re-solve against the positions as they are now and open a fresh dry run. '
+    'What filled is already out of the new plan; what failed is still in it. '
+    'Nothing is re-sent without another Submit.')
+
+#: Marker on the TARGET-TOTAL block: label percentages off 100%, or a label's
+#: symbol weights off 100% within it. Decision 3 -- "Submit is blocked otherwise"
+#: -- had no live enforcement anywhere in the app until this: ``compute_allocation``
+#: deliberately does not renormalise ("blocking submission is the validator's job"),
+#: and nothing called ``validate_label_targets`` before Submit. Two boxes at 100%
+#: each used to buy DOUBLE the base with no warning on screen.
+MARKER_TARGET_BLOCK = 'target-block'
+#: Prefixes the joined validator errors so the banner reads as one sentence
+#: rather than a bare semicolon-joined dump of ``ERROR_LABEL_*`` strings.
+TARGET_BLOCK_PREFIX = 'Submit is off until the targets are fixed: '
 
 #: Marker on the footer line that puts the expected cash next to the reserve.
 MARKER_CASH_VS_RESERVE = 'dry-run-cash-vs-reserve'
@@ -429,6 +495,21 @@ NOTICE_BADGE_CLASSES = 'ml-2'
 #: colour and tooltips, which is why these rows stay hand-rolled.
 GRID_HEAD_CLASSES = 'pf-grid-head w-full min-w-max text-xs py-1 px-1'
 GRID_ROW_CLASSES = 'pf-grid-row w-full min-w-max text-sm items-center py-1 px-1'
+#: The footer: the header's opaque bar so rows scrolling under it stay hidden, but
+#: pinned to the BOTTOM of the viewport (``pf-grid-head`` pins to the top, so the
+#: inline style below overrides it). ``normal-case`` because the header's
+#: uppercase transform would shout every money figure.
+GRID_FOOT_CLASSES = ('pf-grid-head w-full min-w-max text-sm normal-case items-center '
+                     'py-1 px-1')
+GRID_FOOT_STYLE = 'top: auto; bottom: 0; border-top: 1px solid rgba(255,255,255,0.12);'
+
+#: The NOTICES tab was set in ``text-xs`` throughout and the user could not read it
+#: ("Text is too small here"). The notices are one size up and the totals two: the
+#: totals are the numbers Submit commits to and they were the smallest thing on the
+#: tab.
+NOTICE_TEXT_CLASSES = 'text-sm'
+TOTALS_TEXT_CLASSES = 'text-base'
+TOTALS_NOTE_CLASSES = 'text-sm'
 
 #: The order table's columns, ONCE. Header text, width, and whether the column is
 #: numeric -- ``(name, header, width, numeric)``. The header row and the cell row
@@ -439,14 +520,21 @@ DRY_RUN_COLUMNS = (
     ('tick', '', 'w-10', False),
     ('symbol', 'Symbol', 'w-24', False),
     # WHERE THE ROW STARTS -- the basis being traded against.
-    ('held', 'Held', 'w-20', True),
+    # w-32: the cell reads "7 -> 6.33622" since it started showing the
+    # projected quantity beside the held one (2026-09-05), and at w-20 that
+    # wrapped onto two lines and doubled every row's height.
+    ('held', 'Held', 'w-32', True),
     ('cost', 'Cost', 'w-24', True),
     ('value', 'Value', 'w-24', True),
     ('side', 'Side', 'w-16', False),
     ('qty', 'Qty', 'w-24', True),
-    ('order', 'Order', 'w-24', False),
-    ('sizing', 'Sizing', 'w-20', False),
-    ('outcome', 'Outcome', 'w-28', False),
+    # ONE column, not three. ``Order`` and ``Sizing`` said the same word on every
+    # row that traded ('fractional'/'fractional'), and differed only where the row
+    # did NOT trade -- which is where the grid is the explanation, so that case now
+    # reads "no order (whole)". ``Outcome`` was 'normal' on every healthy row and is
+    # gone: an abnormal sizing outcome is a REASON, and now appears in that column
+    # in red beside the reason it caused (2026-09-05).
+    ('order', 'Order', 'w-32', False),
     ('estimated_value', 'Est. value', 'w-24', True),
     ('target', 'Target', 'w-24', True),
     ('projected', 'Projected ({mode})', 'w-32', True),
@@ -552,7 +640,7 @@ def _label(text: str, classes: str = '', *, color: Optional[str] = None):
     return _paint(ui.label(text), classes, color=color)
 
 
-def _reasons_cell(text: str, classes: str):
+def _reasons_cell(text: str, classes: str, *, alert: str = ""):
     """A Reasons cell: WRAPPED, clamped, and with the whole text one hover away.
 
     THE ONE DOOR for the free-text column, used by both tables in this dialog --
@@ -566,6 +654,18 @@ def _reasons_cell(text: str, classes: str):
     NO TOOLTIP ON AN EMPTY CELL. Most rows on a healthy plan have no reason at
     all, and a tooltip that opens onto nothing is worse than none.
     """
+    if alert:
+        # A ROW, so the alert can carry its own colour: ``_paint`` sets one inline
+        # colour per element, so a red fragment inside a grey cell has to be its own
+        # element. The tooltip below still carries both halves as one sentence.
+        with ui.row().classes(classes).style(REASONS_CELL_STYLE) as cell:
+            _paint(ui.label(alert), 'text-xs text-red-400 font-medium')
+            if text:
+                _paint(ui.label(text), 'text-xs')
+        cell.mark(MARKER_ROW_REASONS)
+        with cell:
+            ui.tooltip(f"{alert} — {text}" if text else alert)
+        return cell
     cell = _paint(ui.label(text), classes).mark(MARKER_ROW_REASONS)
     # MERGED, not replaced: ``_paint`` has already put the inline colour on this
     # element and NiceGUI's ``style()`` adds to what is there.
@@ -574,6 +674,78 @@ def _reasons_cell(text: str, classes: str):
         with cell:
             ui.tooltip(text)
     return cell
+
+
+#: The sizing outcome that needs no telling: the row was sized by the ordinary grid
+#: rules. Every other value is a deviation the reader has to know about.
+OUTCOME_NORMAL = 'normal'
+
+
+def _render_held(row: Dict) -> None:
+    """The Held cell: ``7`` unchanged, or ``7 → 5.3673`` with the DESTINATION painted
+    green for a buy and red for a sell.
+
+    The colour goes on the projected half only. Both halves painted would say nothing
+    (the row already has a Side column); the arrow's head is the number that is about
+    to become true, and its colour is the same green/red vocabulary the Side and BP
+    effect columns already use, so the row reads consistently across.
+    """
+    held = row['current_quantity']
+    projected = row.get('projected_quantity')
+    if projected is None or abs(float(projected) - float(held)) <= QUANTITY_EPSILON:
+        _label(_shares(held), _col('held', 'text-gray-400')).mark(MARKER_ROW_HELD)
+        return
+    side = row['side']
+    colour = ('text-green-500' if side == 'BUY'
+              else 'text-red-500' if side == 'SELL' else 'text-gray-400')
+    with ui.row().classes(
+            _col('held', 'no-wrap justify-end items-baseline')).style('gap:4px') as cell:
+        _paint(ui.label(f"{_shares(held)} →"), 'text-gray-400')
+        _paint(ui.label(_shares(projected)), colour + ' font-medium')
+    cell.mark(MARKER_ROW_HELD)
+
+
+def _order_kind(row: Dict) -> Tuple[str, str]:
+    """The single Order cell: what will be sent, and the grid it was sized on. Pure.
+
+    ``Order`` and ``Sizing`` used to be two columns that printed the same word on
+    every row that traded. The grid is only news when the row did NOT trade -- it is
+    then the whole explanation ("1.43 shares became 0.93 and there is no such thing as
+    0.93 of this symbol") -- so it is appended in exactly that case and nowhere else.
+    """
+    if row['suppressed']:
+        return f"no order ({row['sizing']})", 'text-orange-400'
+    if row['fractional']:
+        return 'fractional', 'text-blue-400'
+    return 'whole shares', 'text-gray-400'
+
+
+def _outcome_alert(row: Dict) -> str:
+    """The sizing outcome, when it is worth saying. ``''`` on an ordinary row.
+
+    Replaces the Outcome COLUMN, which read 'normal' on every healthy row and so
+    spent a column of a fourteen-column table saying nothing. A deviation -- a bump,
+    a bump the scaler took back, a row too large to size -- is a reason, belongs with
+    the reasons, and is painted red there because it is the one thing in that cell
+    the user did not ask for.
+    """
+    outcome = row.get('outcome') or OUTCOME_NORMAL
+    return '' if outcome == OUTCOME_NORMAL else str(outcome)
+
+
+def _held_text(row: Dict) -> str:
+    """The Held cell: ``7`` when nothing changes, ``7 → 5.37`` when it does. Pure.
+
+    The projected side is the row's own ``target_quantity``, not ``current + delta``
+    re-added here: the two would be the same number computed twice, and the one place
+    they could disagree -- a row the scaler or a precheck cut back after the delta was
+    set -- is exactly the row a reader is checking.
+    """
+    held = row['current_quantity']
+    projected = row.get('projected_quantity')
+    if projected is None or abs(float(projected) - float(held)) <= QUANTITY_EPSILON:
+        return _shares(held)
+    return f"{_shares(held)} → {_shares(projected)}"
 
 
 def _leverage_cell(row: Dict) -> Tuple[str, str, str]:
@@ -658,6 +830,7 @@ class AllocationWizard:
         market: MarketGateResult,
         on_refresh: Callable[[bool], Tuple[AllocationPlan, MarketGateResult]],
         on_submit: Callable[[AllocationPlan], None],
+        on_validate: Optional[Callable[[AllocationPlan], Dict]] = None,
         title: str = 'Portfolio allocation - dry run',
     ):
         self.base = base
@@ -665,18 +838,32 @@ class AllocationWizard:
         self.market = market
         self.on_refresh = on_refresh
         self.on_submit = on_submit
+        #: ``portfolio_allocation_service.validate_plan``, or None for a caller
+        #: that has no broker to test against (the button is then not drawn at
+        #: all rather than drawn dead).
+        self.on_validate = on_validate
         self.title = title
         self.allow_fractional = bool(plan.allow_fractional)
         self.selected = self._default_selection(plan)
         self.dialog = None
         self._banner_container = None
+        self._base_block_container = None
+        self._validation_container = None
         self._notices_container = None
         self._badge_container = None
         self._rows_container = None
         self._no_order_container = None
         self._totals_container = None
+        self._selection_container = None
+        self._footer_container = None
         self._submit_button = None
         self._submit_tooltip = None
+        self._validate_button = None
+        #: True while a validation is in flight. The broker work now runs in a
+        #: thread, so the dialog stays responsive -- which means the button is
+        #: still there to be clicked a second time, and two concurrent margin
+        #: sweeps would race each other's verdict into the same container.
+        self._validating = False
         #: One-shot latch. See ``_submit``: NiceGUI runs a sync click handler
         #: directly on the event loop, so the dialog stays on screen -- and
         #: clickable -- for the whole of a blocking submit.
@@ -692,12 +879,12 @@ class AllocationWizard:
             # numbers, they say SUBMIT IS OFF. A refusal behind an unopened tab is
             # a refusal that was not shown.
             #
-            # A CONTAINER for the banner, not a bare render: Refresh re-reads the
-            # clock, and a banner drawn straight into the card could never be
-            # taken down again. The base block is drawn once because it is derived
-            # from the frozen base, which Refresh does not replace (see
-            # ``_base_block``).
+            # A CONTAINER EACH, not a bare render: Refresh re-reads the clock and
+            # re-solves the plan, and a banner drawn straight into the card could
+            # never be taken down again -- or, for the target block, never
+            # updated to a NEW plan's targets.
             self._banner_container = ui.column().classes('w-full shrink-0')
+            self._base_block_container = ui.column().classes('w-full shrink-0')
             self._render_market_banner()
             self._render_base_block()
             with ui.tabs().classes('w-full shrink-0') as tabs:
@@ -729,21 +916,37 @@ class AllocationWizard:
                         if not self.base.supports_fractional:
                             _label(NO_FRACTIONAL_SUPPORT_NOTE,
                                    'text-xs text-gray-400')
+                    # ABOVE the scrolling viewport, so the buttons that decide
+                    # what Submit sends never scroll out of reach.
+                    self._selection_container = ui.row() \
+                        .classes('w-full items-center gap-1 shrink-0 flex-wrap')
                     self._rows_container = ui.column().classes(DIALOG_ROWS_CLASSES) \
                         .mark(MARKER_ROWS_VIEWPORT)
                     self._no_order_container = ui.column().classes('w-full shrink-0')
                 with ui.tab_panel(TAB_NOTICES).classes(TAB_PANEL_CLASSES):
                     with ui.column().classes(DIALOG_NOTICES_CLASSES):
                         self._render_base_figures()
-                        _label(MARKET_ORDER_TIMING_NOTE, 'text-xs text-orange-400')
+                        _label(MARKET_ORDER_TIMING_NOTE,
+                               f'{NOTICE_TEXT_CLASSES} text-orange-400')
                         self._notices_container = ui.column().classes('w-full')
                         self._totals_container = ui.column().classes('w-full')
             self._render_notices()
             self._render_rows()
             self._render_no_order_rows()
             self._render_totals()
+            # The validation verdict, ABOVE the buttons and inside the card so it
+            # cannot be lost behind a tab. Empty until Validate is pressed.
+            self._validation_container = ui.column().classes('w-full shrink-0')
             with ui.row().classes('w-full justify-end gap-2 shrink-0'):
                 ui.button('Refresh', on_click=lambda: self._refresh(self.allow_fractional)).props('outline')
+                # TEST THE PLAN BEFORE SENDING IT. See ``_validate``: the broker's
+                # own dry run where it has one, the locally knowable rejections
+                # everywhere else. Never sends an order.
+                if self.on_validate is not None:
+                    self._validate_button = \
+                        ui.button(VALIDATE_BUTTON_LABEL, on_click=self._validate) \
+                        .props('outline').mark(MARKER_VALIDATE_BUTTON)
+                    self._validate_button.tooltip(VALIDATE_TOOLTIP)
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 self._submit_button = ui.button('Submit', on_click=self._submit) \
                     .props('color=primary')
@@ -808,6 +1011,63 @@ class AllocationWizard:
         """
         return held_no_price_block(self.base.unpriced_held_symbols)
 
+    def _target_block(self) -> Optional[str]:
+        """Decision 3, finally enforced: ``None`` unless the label percentages or
+        a label's symbol weights are off 100%.
+
+        ``compute_allocation`` deliberately does not renormalise a bad target set
+        -- its own docstring says "Blocking submission is the validator's job, not
+        this function's" -- and nothing else in the app called
+        ``validate_label_targets`` before Submit. Typing 100 into two symbol boxes
+        of one label used to solve and SEND a plan that bought the label at twice
+        its target, with no warning anywhere on screen; two labels totalling 60%
+        deployed 60% of the account and called it done.
+
+        Read off ``self.plan.labels`` -- the SAME ``LabelTarget`` list the plan
+        was solved with, carried on the plan for exactly this (``plan_json``
+        reproducibility) -- rather than re-reading the page's live boxes: the
+        wizard has no editor for them, so this can only ever describe the plan
+        actually on screen, never a value the user has since changed elsewhere.
+
+        ONLY for a REBALANCE (``allocation_basis == ALLOCATION_BASIS_POSITION``).
+        An INVEST_LABEL run solves a single label against an explicit amount, and
+        decision 3's "100%" is a REBALANCE rule about dividing the whole
+        investable pool -- ``compute_label_investment`` has its own gate
+        (``invest_validation_messages``, checked before the dry run even opens).
+
+        ALSO skipped when ``plan.labels`` is EMPTY -- not one label, not zero
+        symbols in a label with a percentage, but literally nothing to divide.
+        The page already refuses to open a REBALANCE dry run with no managed
+        labels at all (``_open_allocation_flow``: "No managed labels yet"), so a
+        plan with an empty label list reaching this far is not the "I typed a bad
+        percentage" case decision 3 is about, and treating it as a 100%-short
+        target would misreport a different, already-handled situation.
+        """
+        if self.plan.allocation_basis != ALLOCATION_BASIS_POSITION:
+            return None
+        if not self.plan.labels:
+            return None
+        errors = blocking_messages(validate_label_targets(self.plan.labels))
+        if not errors:
+            return None
+        return TARGET_BLOCK_PREFIX + '; '.join(errors)
+
+    def _first_plan_block(self) -> Optional[str]:
+        """The FIRST reason this whole plan may not be submitted, or ``None``.
+
+        Used by ``_sync_submit_button`` ONLY, which always has a real ``self.plan``
+        (it runs from ``open``/``_refresh``, both well after construction) -- so
+        both halves are safe to read eagerly here. ``_submit`` does NOT use this;
+        see its own docstring for why its check has to stay lazier than this one.
+        ``_render_base_block`` does not use it either -- it draws both banners
+        independently, because a screen may need to show two reasons at once even
+        though Submit only needs to refuse for one.
+        """
+        base_block = self._base_block()
+        if base_block is not None:
+            return base_block
+        return self._target_block()
+
     def _sync_submit_button(self):
         """Point the Submit button at the CURRENT gate. Idempotent.
 
@@ -816,18 +1076,18 @@ class AllocationWizard:
         and from every ``_refresh``, because the gate moves while the dialog sits
         there and the button is only a mirror of it.
 
-        TWO independent refusals, and the tooltip names whichever is in force: the
-        market-hours gate (moves while the dialog is open) and ``_base_block`` (a
-        held symbol with no quote, which does not). The base block is checked FIRST
-        because it is the one the user can act on straight away.
+        THREE independent refusals, and the tooltip names whichever is in force,
+        base-block-or-target-block FIRST: the market-hours gate moves while the
+        dialog is open, but the plan blocks are what the user can act on right
+        now.
         """
         if self._submit_button is None:
             return
-        base_block = self._base_block()
-        blocked = base_block is not None or not self.market.allowed
+        plan_block = self._first_plan_block()
+        blocked = plan_block is not None or not self.market.allowed
         self._submit_button.set_enabled(not blocked and not self._submitted)
         if self._submit_tooltip is not None:
-            reason = base_block if base_block is not None else (
+            reason = plan_block if plan_block is not None else (
                 self.market.message if not self.market.allowed else '')
             self._submit_tooltip.set_text(reason)
             self._submit_tooltip.set_visibility(blocked)
@@ -891,12 +1151,15 @@ class AllocationWizard:
                 for text in notices:
                     with ui.row().classes('w-full items-start gap-2 no-wrap'):
                         _paint(ui.icon('warning'), 'text-orange-400 text-sm shrink-0')
-                        _label(text, 'text-xs text-orange-400').mark(MARKER_PLAN_NOTICE)
+                        _label(text, f'{NOTICE_TEXT_CLASSES} text-orange-400') \
+                            .mark(MARKER_PLAN_NOTICE)
                 for text, severity in warnings:
                     # ``color=`` on purpose: 'info' is classed ``text-gray-400``,
                     # which the stylesheet DOES paint -- in #b0bec5, not the page's
                     # own ``NEUTRAL_TEXT_COLOR``. The severity's declared hex wins.
-                    _label(text, PLAN_WARNING_CLASSES[severity],
+                    # The view's classes carry ``text-xs``; the size is restated
+                    # here (last class wins) so this tab reads at ONE size.
+                    _label(text, f'{PLAN_WARNING_CLASSES[severity]} {NOTICE_TEXT_CLASSES}',
                            color=PLAN_WARNING_COLORS[severity]) \
                         .mark(MARKER_PLAN_WARNING)
 
@@ -959,22 +1222,37 @@ class AllocationWizard:
                 if not r['skipped'] and not r['suppressed']}
 
     def _render_base_block(self):
-        """The one banner that says the whole plan may not be submitted.
+        """The banner(s) that say the whole plan may not be submitted: the base
+        block and the target block, one ``div`` each so a test (and the user's
+        eye) can tell which reason is in force.
 
-        DANGER, and drawn ABOVE THE TABS rather than inside one. It does not
-        merely qualify the numbers below it -- it says they are wrong and Submit
-        is off -- so it may not be behind a tab the user has not opened.
+        DANGER, and drawn ABOVE THE TABS rather than inside one. Neither merely
+        qualifies the numbers below it -- each says they are wrong and Submit is
+        off -- so neither may sit behind a tab the user has not opened.
 
-        Drawn ONCE. ``_base_block`` reads the frozen base, which ``_refresh`` does
-        not replace; see its docstring for why that errs the safe way.
+        REDRAWN on every refresh, unlike the name suggests: ``_base_block`` reads
+        the frozen base (which ``_refresh`` never replaces, so that HALF is inert
+        on a redraw) but ``_target_block`` reads ``self.plan.labels``, which
+        ``_refresh`` DOES replace. A stale target banner that outlived the plan it
+        described would be exactly the "the two screens disagree" class of bug
+        this feature exists to remove. Idempotent: the container is cleared first.
         """
-        base_block = self._base_block()
-        if base_block is None:
+        if self._base_block_container is None:
             return
-        with ui.element('div').classes('alert-banner danger w-full p-3 shrink-0'):
-            with ui.row().classes('items-center gap-2'):
-                ui.icon('price_change')
-                ui.label(base_block).classes('text-sm').mark(MARKER_BASE_BLOCK)
+        self._base_block_container.clear()
+        with self._base_block_container:
+            base_block = self._base_block()
+            if base_block is not None:
+                with ui.element('div').classes('alert-banner danger w-full p-3 shrink-0'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('price_change')
+                        ui.label(base_block).classes('text-sm').mark(MARKER_BASE_BLOCK)
+            target_block = self._target_block()
+            if target_block is not None:
+                with ui.element('div').classes('alert-banner danger w-full p-3 shrink-0'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.icon('percent')
+                        ui.label(target_block).classes('text-sm').mark(MARKER_TARGET_BLOCK)
 
     def _render_base_figures(self):
         with ui.row().classes('w-full gap-6 items-center'):
@@ -999,7 +1277,143 @@ class AllocationWizard:
         # here went stale the moment the user pressed Refresh -- the previous
         # solve's complaint sitting above the new solve's table.
         for warning in self.base.warnings:
-            _label(warning, 'text-xs text-orange-400')
+            _label(warning, f'{NOTICE_TEXT_CLASSES} text-orange-400')
+
+    # -- selection ----------------------------------------------------------
+    def _sendable_rows(self) -> List[Dict]:
+        """The dry-run rows that CAN be ticked: neither suppressed nor skipped."""
+        return [r for r in dry_run_rows(self.plan)
+                if not r['suppressed'] and not r['skipped']]
+
+    def _symbol_labels(self) -> Dict[str, List[str]]:
+        """symbol -> the labels the plan says it came from, in plan order."""
+        return {row.symbol: list(row.labels) for row in self.plan.rows}
+
+    def _labels_in_table(self) -> List[str]:
+        """Every label carried by a sendable row, first-seen order, no repeats."""
+        by_symbol = self._symbol_labels()
+        seen: List[str] = []
+        for row in self._sendable_rows():
+            for label in by_symbol.get(row['symbol'], []):
+                if label not in seen:
+                    seen.append(label)
+        return seen
+
+    def _set_selection(self, symbols, checked: bool):
+        """Tick or un-tick ``symbols`` in one go, then redraw the boxes and totals.
+
+        Only SENDABLE symbols can enter the selection -- a suppressed row has no
+        order, and ticking it here would put a refused order into what Submit
+        sends, the exact thing ``_render_row`` disables its box to prevent.
+        """
+        sendable = {r['symbol'] for r in self._sendable_rows()}
+        wanted = {s for s in symbols if s in sendable}
+        if checked:
+            self.selected |= wanted
+        else:
+            self.selected -= wanted
+        self._render_rows()
+        self._render_totals()
+
+    def _select_all(self, checked: bool):
+        self._set_selection([r['symbol'] for r in self._sendable_rows()], checked)
+
+    def _select_label(self, label: str, checked: bool):
+        """Every sendable row carrying ``label`` -- INCLUDING one that also carries
+        another label. 'None for ARK26' means no ARK26 order goes out, whatever
+        else the symbol belongs to."""
+        by_symbol = self._symbol_labels()
+        self._set_selection([r['symbol'] for r in self._sendable_rows()
+                             if label in by_symbol.get(r['symbol'], [])], checked)
+
+    def _render_selection_toolbar(self):
+        """'Select all' / 'Deselect all', then an ``all`` / ``none`` pair per label.
+
+        Drawn only when there is something to tick. The per-label pairs answer the
+        question the table cannot: "send the NASDAQ30 rebalance but hold the ARK26
+        one back", without un-ticking twenty rows by hand.
+        """
+        if self._selection_container is None:
+            return
+        self._selection_container.clear()
+        if not self._sendable_rows():
+            return
+        labels = self._labels_in_table()
+        with self._selection_container:
+            ui.button(SELECT_ALL_LABEL, on_click=lambda: self._select_all(True)) \
+                .props('dense outline size=sm').mark(MARKER_SELECT_ALL)
+            ui.button(DESELECT_ALL_LABEL, on_click=lambda: self._select_all(False)) \
+                .props('dense outline size=sm').mark(MARKER_DESELECT_ALL)
+            for label in labels:
+                with ui.row().classes('items-center gap-0 ml-2 no-wrap'):
+                    _label(f'{label}:', 'text-xs text-gray-400 mr-1')
+                    ui.button('all', on_click=lambda _e, lbl=label: self._select_label(lbl, True)) \
+                        .props('dense flat size=sm').mark(MARKER_LABEL_SELECT) \
+                        .tooltip(f'Tick every {label} order')
+                    ui.button('none', on_click=lambda _e, lbl=label: self._select_label(lbl, False)) \
+                        .props('dense flat size=sm').mark(MARKER_LABEL_SELECT) \
+                        .tooltip(f'Un-tick every {label} order')
+
+    def _render_table_footer(self):
+        """The column totals over the TICKED rows, pinned to the table's foot.
+
+        Summed from ``dry_run_rows`` -- the numbers the cells above were drawn
+        from -- so the footer can never disagree with the column it closes. Money
+        columns only; a quantity total across different symbols means nothing.
+        ``Est. value`` is split into the buy and the sell total because the two
+        move in opposite directions and one net figure would hide a large sell
+        behind a large buy. ``None`` values (an unpriced holding) are EXCLUDED,
+        not counted as zero.
+        """
+        if self._footer_container is None:
+            return
+        self._footer_container.clear()
+        rows = [r for r in self._sendable_rows() if r['symbol'] in self.selected]
+        sendable = len(self._sendable_rows())
+        cost = sum(r['current_cost_basis'] for r in rows)
+        values = [r['current_value'] for r in rows if r['current_value'] is not None]
+        buys = sum(r['estimated_value'] for r in rows if r['side'] == 'BUY')
+        sells = sum(r['estimated_value'] for r in rows if r['side'] == 'SELL')
+        target = sum(r['target_notional'] for r in rows)
+        projected = [r['projected_notional'] for r in rows
+                     if r['projected_notional'] is not None]
+        weight = sum(r['weight_pct'] for r in rows)
+        projected_weight = sum(r['projected_weight_pct'] for r in rows)
+        bp_effect = sum(r['bp_effect'] for r in rows)
+        bp_pct = sum(r['bp_usage_pct'] for r in rows)
+        with self._footer_container:
+            with ui.row().classes(GRID_FOOT_CLASSES).style(GRID_FOOT_STYLE) \
+                    .mark(MARKER_TABLE_FOOT):
+                ui.label('').classes(_col('tick'))
+                with ui.label(FOOTER_CAPTION_FMT.format(ticked=len(rows),
+                                                        sendable=sendable)) \
+                        .classes(_col('symbol', 'font-medium')):
+                    ui.tooltip(FOOTER_TOOLTIP)
+                ui.label('').classes(_col('held'))
+                ui.label(f"{cost:,.2f}").classes(_col('cost'))
+                ui.label(f"{sum(values):,.2f}"
+                         + ('' if len(values) == len(rows) else ' *')) \
+                    .classes(_col('value'))
+                ui.label('').classes(_col('side'))
+                ui.label('').classes(_col('qty'))
+                ui.label('').classes(_col('order'))
+                with ui.column().classes(_col('estimated_value', 'gap-0 leading-tight')):
+                    _label(f"B {buys:,.2f}", 'text-green-500 text-xs')
+                    _label(f"S {sells:,.2f}", 'text-red-500 text-xs')
+                ui.label(f"{target:,.2f}").classes(_col('target'))
+                ui.label(f"{sum(projected):,.2f}"
+                         + ('' if len(projected) == len(rows) else ' *')) \
+                    .classes(_col('projected'))
+                _label(f"{weight:.2f}% → {projected_weight:.2f}%",
+                       _col('weight', 'text-xs text-gray-400'))
+                _label(f"{bp_effect:+,.2f}" if abs(bp_effect) >= 0.005 else '0.00',
+                       _col('bp_effect', 'text-green-500 font-medium'
+                            if bp_effect > 0 else ''))
+                ui.label('').classes(_col('bp_ratio'))
+                ui.label(f"{bp_pct:.1f}%").classes(_col('bp_pct'))
+                _label('* an unpriced row is left out of this total'
+                       if len(values) != len(rows) or len(projected) != len(rows)
+                       else '', _col('reasons', 'text-xs text-gray-400'))
 
     def _render_rows(self):
         """The dry-run table, left to right: what you HOLD, what will be DONE,
@@ -1028,6 +1442,8 @@ class AllocationWizard:
         right-aligned money column cannot line up under a left-aligned heading.
         """
         self._rows_container.clear()
+        self._footer_container = None
+        self._render_selection_toolbar()
         rows = dry_run_rows(self.plan)
         with self._rows_container:
             if not rows:
@@ -1043,6 +1459,10 @@ class AllocationWizard:
                         .classes(_col(name))
             for row in rows:
                 self._render_row(row)
+            # The footer lives INSIDE the viewport so it can stick to its bottom
+            # edge; its own container so a tick redraws the totals and nothing else.
+            self._footer_container = ui.column().classes('w-full min-w-max gap-0')
+        self._render_table_footer()
 
     def _render_row(self, row: Dict):
         """One line of the dry-run table.
@@ -1072,8 +1492,10 @@ class AllocationWizard:
             checkbox.set_enabled(not blocked)
             ui.label(row['symbol']).classes(_col('symbol', 'font-medium'))
             # THE BASIS THIS ROW IS TRADING AGAINST.
-            _label(_shares(row['current_quantity']),
-                   _col('held', 'text-gray-400')).mark(MARKER_ROW_HELD)
+            # "held -> projected", and ONLY when they differ: a row that trades
+            # nothing would otherwise print "0 -> 0", which is noise on the majority
+            # of rows in a plan that mostly leaves things alone.
+            _render_held(row)
             _label(f"{row['current_cost_basis']:,.2f}",
                    _col('cost', 'text-gray-400')).mark(MARKER_ROW_COST)
             value = row['current_value']
@@ -1087,26 +1509,9 @@ class AllocationWizard:
                 'side', 'text-green-500' if row['side'] == 'BUY'
                 else 'text-red-500' if row['side'] == 'SELL' else 'text-gray-400'))
             ui.label(_shares(row['quantity'])).classes(_col('qty'))
-            if row['suppressed']:
-                order_kind, order_class = 'no order', 'text-orange-400'
-            elif row['fractional']:
-                order_kind, order_class = 'fractional', 'text-blue-400'
-            else:
-                order_kind, order_class = 'whole shares', 'text-gray-400'
+            order_kind, order_class = _order_kind(row)
             _label(order_kind, _col('order', 'text-xs ' + order_class)) \
                 .mark(MARKER_ORDER_KIND)
-            # The GRID the row was sized on, which is the column to scan when a
-            # quarter of the book cannot trade fractionally at all.
-            _label(row['sizing'], _col(
-                'sizing', 'text-xs ' + ('text-blue-400'
-                                        if row['sizing'] == 'fractional'
-                                        else 'text-orange-400')))
-            # WHICH RULE produced the quantity. A bumped row holds MORE than the
-            # weights asked for, and that must never be silent.
-            _label(row['outcome'], _col(
-                'outcome', 'text-xs ' + ('text-orange-400'
-                                         if row['outcome'] != 'normal'
-                                         else 'text-gray-400')))
             ui.label(f"{row['estimated_value']:,.2f}").classes(_col('estimated_value'))
             ui.label(f"{row['target_notional']:,.2f}").classes(_col('target'))
             projected = row['projected_notional']
@@ -1137,9 +1542,12 @@ class AllocationWizard:
                     .mark(MARKER_LEVERAGE):
                 ui.tooltip(tip)
             ui.label(f"{row['bp_usage_pct']:.1f}%").classes(_col('bp_pct'))
+            # An abnormal sizing outcome is a REASON and is drawn RED at the front
+            # of that column; the rest of the reasons keep their own colour.
             _reasons_cell(row['reasons'], _col(
                 'reasons', 'text-xs ' + ('text-orange-400' if row['suppressed']
-                                         else 'text-gray-400')))
+                                         else 'text-gray-400')),
+                          alert=_outcome_alert(row))
 
     @staticmethod
     def _render_bp_effect(row: Dict):
@@ -1226,7 +1634,7 @@ class AllocationWizard:
             bp_line += BP_BUDGET_BREAKDOWN_FMT.format(
                 available=selected_plan.available_buying_power, released=released)
         with self._totals_container:
-            with ui.row().classes('w-full gap-6 mt-2 text-sm'):
+            with ui.row().classes(f'w-full gap-6 mt-2 {TOTALS_TEXT_CLASSES}'):
                 ui.label(f"Sell value: {selected_plan.total_sell_value:,.2f}")
                 ui.label(f"Buy value: {buy_value:,.2f}")
                 ui.label(bp_line).mark(MARKER_BP_BUDGET)
@@ -1241,13 +1649,13 @@ class AllocationWizard:
             if totals is not None and selected_plan.reserved_pct > LABEL_TOTAL_TOLERANCE_PCT:
                 cash_after = totals['estimated_cash_after']
                 reserved = selected_plan.reserved_notional
-                with ui.row().classes('w-full text-sm'):
+                with ui.row().classes(f'w-full {TOTALS_TEXT_CLASSES}'):
                     _label(CASH_VS_RESERVE_FMT.format(
                         cash=cash_after, reserved=reserved,
                         delta=cash_after - reserved),
                         'text-orange-400' if cash_after < reserved else '') \
                         .mark(MARKER_CASH_VS_RESERVE)
-            with ui.row().classes('w-full gap-6 text-sm'):
+            with ui.row().classes(f'w-full gap-6 {TOTALS_TEXT_CLASSES}'):
                 _label(f"Held cost: {held_cost:,.2f}", 'text-gray-400')
                 _label(f"Held value: {sum(priced):,.2f}"
                        + ('' if len(priced) == len(shown)
@@ -1260,9 +1668,9 @@ class AllocationWizard:
             if buy_value > MONEY_EPSILON:
                 _label(BP_IS_A_CHARGE_NOTE_FMT.format(
                     buy_value=buy_value, required=required,
-                    ratio=required / buy_value), 'text-xs text-gray-400') \
+                    ratio=required / buy_value), f'{TOTALS_NOTE_CLASSES} text-gray-400') \
                     .mark(MARKER_BP_NOTE)
-            with ui.row().classes('w-full gap-6 text-sm'):
+            with ui.row().classes(f'w-full gap-6 {TOTALS_TEXT_CLASSES}'):
                 # SIGNED: a bump's over-allocation nets against a rounding shortfall,
                 # which is what "how far off target will I be" actually means.
                 _label(f"Off target after rounding: {summary['residual_notional']:,.2f} "
@@ -1285,16 +1693,127 @@ class AllocationWizard:
                 # this line announce an over-allocation of 0.00.
             # Against the BUDGET, the same denominator the line above divides.
             if required > budget:
-                _label(BP_OVER_BUDGET_NOTE, 'text-xs text-orange-400')
+                _label(BP_OVER_BUDGET_NOTE, f'{TOTALS_NOTE_CLASSES} text-orange-400')
+
+    async def _validate(self):
+        """Test the TICKED orders against the broker, and offer to drop the bad ones.
+
+        Sends nothing. ``on_validate`` re-reads the broker's per-symbol facts and
+        runs its order preview where one exists (TastyTrade); on Alpaca, which
+        publishes no preview endpoint, every check is local and the panel says so
+        rather than implying the broker signed the plan off.
+
+        Runs over ``filter_plan_rows``, not the whole plan: validating rows the
+        user has already un-ticked would report problems with orders that are not
+        going to be sent, and the drop button would then have nothing to drop.
+
+        ASYNC, AND THE BROKER CALL GOES TO A THREAD. ``on_validate`` re-reads margin
+        for every symbol in the plan -- on Alpaca that is a REST round trip per
+        symbol -- and a sync click handler runs directly on the event loop, so
+        NOTHING reaches the browser until it returns (the same fact ``_submit``
+        documents at length). On a 40-row plan that outlasted the websocket
+        heartbeat: the page reported "Connection lost. Trying to reconnect...", and
+        the reconnect re-rendered the page and took the dialog with it -- reported
+        as "clicking validate hangs the UI and eventually closes the dry run
+        dialog". The work is unchanged; it just no longer runs where the heartbeat
+        lives.
+
+        The verdict panel is REPLACED on every press and cleared by ``_refresh``:
+        a validation describes one exact set of orders, and a re-solve makes it a
+        statement about a plan that no longer exists.
+        """
+        if self.on_validate is None or self._validation_container is None:
+            return
+        if self._validating:
+            return
+        selected_plan = filter_plan_rows(self.plan, sorted(self.selected))
+        if not selected_plan.rows:
+            ui.notify('Nothing selected to validate', type='warning')
+            return
+        # The button says what it is doing and refuses a second press while it
+        # does it: the call takes tens of seconds against a live broker, and until
+        # this ran off the event loop there was nothing on screen to say so.
+        button, self._validating = self._validate_button, True
+        if button is not None:
+            button.props('loading')
+            button.disable()
+        try:
+            report = await asyncio.to_thread(self.on_validate, selected_plan)
+        except Exception as e:
+            logger.error(f"Allocation validation failed: {e}", exc_info=True)
+            ui.notify(f'Validation failed: {e}', type='negative')
+            return
+        finally:
+            self._validating = False
+            if button is not None:
+                button.props(remove='loading')
+                button.enable()
+        self._render_validation(report, checked=len(selected_plan.rows))
+
+    def _render_validation(self, report: Dict, *, checked: int):
+        """Draw one validation verdict. Idempotent; the container is cleared first."""
+        self._validation_container.clear()
+        findings = list(report.get('findings') or [])
+        symbols = list(report.get('symbols') or [])
+        budget = report.get('budget')
+        prechecked = int(report.get('prechecked') or 0)
+        buy_rows = int(report.get('buy_rows') or 0)
+        precheck_note = (VALIDATION_PRECHECK_FMT.format(done=prechecked, total=buy_rows)
+                         if prechecked else VALIDATION_NO_PRECHECK)
+        with self._validation_container:
+            css = 'alert-banner warning' if findings else 'alert-banner info'
+            with ui.element('div').classes(f'{css} w-full p-3 mt-1') \
+                    .mark(MARKER_VALIDATION_RESULT):
+                if findings:
+                    _label(VALIDATION_FOUND_FMT.format(count=len(symbols)),
+                           'text-sm font-medium text-orange-400')
+                    for _symbol, reason in findings:
+                        _label(f'• {reason}', 'text-sm text-orange-400') \
+                            .mark(MARKER_VALIDATION_FINDING)
+                    _label(precheck_note, 'text-xs text-gray-400')
+                else:
+                    _label(VALIDATION_CLEAN_FMT.format(count=checked,
+                                                       precheck=precheck_note),
+                           'text-sm text-gray-400')
+                # The PLAN-level advisory, drawn whether or not there are row
+                # findings: running out of buying power truncates the smallest
+                # buys, and no row can be un-ticked to fix it.
+                if budget:
+                    _label(str(budget), 'text-sm text-orange-400') \
+                        .mark(MARKER_VALIDATION_FINDING)
+                if symbols:
+                    ui.button(VALIDATION_DROP_FMT.format(count=len(symbols)),
+                              on_click=lambda syms=list(symbols): self._drop(syms)) \
+                        .props('outline dense').classes('mt-2') \
+                        .mark(MARKER_VALIDATION_DROP)
+
+    def _drop(self, symbols: List[str]):
+        """Un-tick exactly the symbols validation flagged, and say what is left.
+
+        The "continue without those" half of the request: the rest of the plan is
+        untouched and immediately submittable, and the verdict panel is redrawn
+        from the NEW selection so it cannot go on naming orders that are no longer
+        going to be sent.
+        """
+        self.selected -= set(symbols)
+        self._render_rows()
+        self._render_table_footer()
+        self._render_totals()
+        remaining = len(self.selected)
+        ui.notify(f'{len(symbols)} order(s) un-ticked; {remaining} still selected',
+                  type='info')
+        if self._validation_container is not None:
+            self._validation_container.clear()
 
     def _toggle(self, symbol: str, checked: bool):
         if checked:
             self.selected.add(symbol)
         else:
             self.selected.discard(symbol)
+        self._render_table_footer()
         self._render_totals()
 
-    def _refresh(self, allow_fractional: bool):
+    async def _refresh(self, allow_fractional: bool):
         """Re-solve, and re-read the CLOCK with it.
 
         ``on_refresh`` returns ``(plan, market)`` from ONE solve, which is the same
@@ -1306,16 +1825,26 @@ class AllocationWizard:
         A refresh that RAISES changes nothing at all -- not the plan, not the gate.
         Unlocking Submit because the clock could not be re-read would be exactly
         backwards.
+
+        OFF THE EVENT LOOP, for the reason spelled out in ``_validate``: ``on_refresh``
+        re-reads positions, quotes and the clock and then solves the whole plan again.
+        Run inline it blocks every browser this server is serving, and past the
+        websocket heartbeat it costs the user the dialog.
         """
         self.allow_fractional = allow_fractional
         try:
-            self.plan, self.market = self.on_refresh(allow_fractional)
+            self.plan, self.market = await asyncio.to_thread(
+                self.on_refresh, allow_fractional)
         except Exception as e:
             logger.error(f"Allocation dry-run refresh failed: {e}", exc_info=True)
             ui.notify(f'Refresh failed: {e}', type='negative')
             return
         self.selected = self._default_selection(self.plan)
+        # A verdict describes ONE exact set of orders. This is a different plan.
+        if self._validation_container is not None:
+            self._validation_container.clear()
         self._render_market_banner()
+        self._render_base_block()
         self._sync_submit_button()
         self._render_notices()
         self._render_rows()
@@ -1344,20 +1873,32 @@ class AllocationWizard:
 
         An EMPTY submit does not latch: nothing was sent, and the user still has
         to be able to tick a row and press Submit for real. Neither does a submit
-        the MARKET GATE or ``_base_block`` refuses.
+        the MARKET GATE, ``_base_block`` or ``_target_block`` refuses.
         """
         # FIRST, before touching any other state: the button is disabled, but a
         # stale client or a keyboard activation must not get past this either. The
         # real enforcement is in run_allocation, which re-reads the clock AND
-        # re-derives the base block; this is the polite half, and it is deliberately
+        # re-derives every gate; this is the polite half, and it is deliberately
         # ahead of the one-shot latch so a refused click leaves the dialog exactly
         # as it found it.
+        #
+        # STRICT ORDER, LAZILY: ``_base_block`` and the market check touch only
+        # ``self.base`` / ``self.market``, which exist the instant the instance is
+        # constructed; ``_target_block`` touches ``self.plan``, which does not,
+        # in the one caller that proves this precondition
+        # (``test_wizard_submit_bails_on_the_gate_before_it_touches_anything_else``
+        # builds the wizard with ``object.__new__`` and no ``plan`` at all). Each
+        # check therefore runs only once the one before it has already passed.
         base_block = self._base_block()
         if base_block is not None:
             ui.notify(base_block, type='negative')
             return
         if not self.market.allowed:
             ui.notify(self.market.message, type=self.market.severity)
+            return
+        target_block = self._target_block()
+        if target_block is not None:
+            ui.notify(target_block, type='negative')
             return
         if self._submitted:
             logger.warning('Allocation submit ignored: this dry run has already been '
@@ -1383,9 +1924,15 @@ def open_allocation_wizard(
     market: MarketGateResult,
     on_refresh: Callable[[bool], Tuple[AllocationPlan, MarketGateResult]],
     on_submit: Callable[[AllocationPlan], None],
+    on_validate: Optional[Callable[[AllocationPlan], Dict]] = None,
     title: str = 'Portfolio allocation - dry run',
 ) -> AllocationWizard:
     """Open the dry-run dialog. Returns the wizard so the caller can keep a handle.
+
+    ``on_validate`` is ``portfolio_allocation_service.validate_plan`` -- given the
+    FILTERED plan it re-reads the broker's facts, runs its order preview where one
+    exists, and returns the findings. Optional: omitted, the Validate button is not
+    drawn at all rather than drawn dead.
 
     ``market`` is REQUIRED and has no default: a default would mean a caller that
     forgets it submits into a closed market. Build it with
@@ -1400,7 +1947,8 @@ def open_allocation_wizard(
     froze the gate at whatever it was when the wizard opened.
     """
     wizard = AllocationWizard(base, plan, market=market, on_refresh=on_refresh,
-                              on_submit=on_submit, title=title)
+                              on_submit=on_submit, on_validate=on_validate,
+                              title=title)
     wizard.open()
     return wizard
 
@@ -1676,7 +2224,27 @@ OUTCOME_COLOURS = {
 MARKER_OUTCOME_FILLED = 'outcome-filled'
 
 
-def render_outcomes(outcomes: List, *, run_id: Optional[int] = None) -> None:
+def retryable_outcomes(outcomes: List) -> List[str]:
+    """The symbols worth a second attempt, in table order and de-duplicated. Pure.
+
+    FAILED only. Deliberately NOT ``OUTCOME_WASHTRADE_LOCKED`` -- that order is
+    still armed and TradeManager re-submits it once the blocker clears, so a
+    retry here would queue a SECOND order for the same symbol and both would
+    eventually fill. Nor ``OUTCOME_UNACTIONABLE``, which no retry can help (every
+    open transaction behind the position is one the equity planner does not act
+    on -- a human has to unwind it), nor ``OUTCOME_PARTIAL``, where the rest of
+    the order may still be working at the broker.
+    """
+    seen, out = set(), []
+    for outcome in outcomes or []:
+        if outcome.status == OUTCOME_FAILED and outcome.symbol not in seen:
+            seen.add(outcome.symbol)
+            out.append(outcome.symbol)
+    return out
+
+
+def render_outcomes(outcomes: List, *, run_id: Optional[int] = None,
+                    on_retry: Optional[Callable[[List[str]], None]] = None) -> None:
     """Per-row outcome table shown after Submit.
 
     Partial failure is normal: a failed row sits next to a filled one and nothing
@@ -1687,6 +2255,12 @@ def render_outcomes(outcomes: List, *, run_id: Optional[int] = None) -> None:
     whole shares. ``filled_quantity is None`` means the broker reported no fill
     at all -- an accepted market order before the open looks exactly like that --
     and is drawn as "-", never as 0, which would read as "nothing filled".
+
+    ``on_retry`` is offered ONLY when something actually failed
+    (``retryable_outcomes``). Re-running the flow re-solves against the positions
+    as they are NOW, so the rows that filled are already gone from the new plan
+    and the ones that failed are still in it -- the retry is a re-solve, never a
+    replay of the orders that were just sent.
     """
     with ui.dialog() as dialog, ui.card().classes('w-full max-w-3xl'):
         title = f'Allocation run {run_id} - results' if run_id else 'Allocation run - results'
@@ -1708,7 +2282,18 @@ def render_outcomes(outcomes: List, *, run_id: Optional[int] = None) -> None:
                     .classes('w-24').mark(MARKER_OUTCOME_FILLED)
                 ui.label(outcome.path or '-').classes('w-24')
                 ui.label(outcome.message or '').classes('flex-1 text-xs text-gray-400')
-        with ui.row().classes('w-full justify-end mt-2'):
+        retryable = retryable_outcomes(outcomes)
+        with ui.row().classes('w-full justify-end mt-2 gap-2'):
+            if retryable and on_retry is not None:
+                def _retry(symbols=list(retryable)):
+                    # Closed FIRST: the retry re-solves and opens a fresh dry run,
+                    # and two stacked dialogs describing two different plans is
+                    # exactly the confusion this feature exists to remove.
+                    dialog.close()
+                    on_retry(symbols)
+                ui.button(RETRY_FAILED_FMT.format(count=len(retryable)),
+                          on_click=_retry).props('outline') \
+                    .mark(MARKER_OUTCOME_RETRY).tooltip(RETRY_TOOLTIP)
             ui.button('Close', on_click=dialog.close).props('flat')
     dialog.open()
 

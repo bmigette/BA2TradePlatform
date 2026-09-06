@@ -44,12 +44,12 @@ def _bare_account(multiplier="2"):
 
 def _asset(symbol="AAPL", marginable=True, fractionable=True,
            min_order_size=0.001, min_trade_increment=0.001,
-           maintenance_margin_requirement=30.0):
+           maintenance_margin_requirement=30.0, tradable=True):
     # `asset_class` is exposed under the pydantic alias "class", so it must be
     # passed via a dict splat -- Asset(asset_class=...) raises "Field required".
     return Asset(
         id=uuid4(), **{"class": AssetClass.US_EQUITY}, exchange=AssetExchange.NASDAQ,
-        symbol=symbol, status=AssetStatus.ACTIVE, tradable=True, marginable=marginable,
+        symbol=symbol, status=AssetStatus.ACTIVE, tradable=tradable, marginable=marginable,
         shortable=True, easy_to_borrow=True, fractionable=fractionable,
         min_order_size=min_order_size, min_trade_increment=min_trade_increment,
         maintenance_margin_requirement=maintenance_margin_requirement)
@@ -364,3 +364,36 @@ def test_no_margin_info_at_all_when_the_account_multiplier_is_unknown():
     acct.client.get_asset.side_effect = lambda s: _asset(s)
 
     assert acct.get_symbol_margin_info(["AAPL"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# `tradable` (2026-09-05). Alpaca publishes it on the same Asset row every other
+# field here comes from, and nothing in the allocation path had ever read it --
+# so a halted or delisted symbol sized perfectly and was refused every time. The
+# pre-submit validation pass is what needed it.
+# ---------------------------------------------------------------------------
+
+def test_a_tradable_symbol_reports_tradable_true():
+    acct = _bare_account()
+    acct.client.get_asset.return_value = _asset("AAPL", tradable=True)
+
+    assert acct.get_symbol_margin_info(["AAPL"])["AAPL"].tradable is True
+
+
+def test_a_symbol_alpaca_will_not_trade_reports_tradable_false():
+    """Alpaca own words: "Some Assets are not tradable with Alpaca. These Assets
+    are marked with the flag tradable=false" (trading/models.py:34-36)."""
+    acct = _bare_account()
+    acct.client.get_asset.return_value = _asset("DEAD", tradable=False)
+
+    assert acct.get_symbol_margin_info(["DEAD"])["DEAD"].tradable is False
+
+
+def test_a_symbol_alpaca_cannot_describe_is_omitted_rather_than_called_untradable():
+    """The failure-becomes-False antipattern, in the one place it would be most
+    expensive: an omitted symbol is "nobody said", and the validation pass reads
+    that as no evidence -- never as a refusal."""
+    acct = _bare_account()
+    acct.client.get_asset.side_effect = Exception("no such asset")
+
+    assert acct.get_symbol_margin_info(["NOPE"]) == {}

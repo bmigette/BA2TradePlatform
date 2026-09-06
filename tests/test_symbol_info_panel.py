@@ -1166,16 +1166,22 @@ def test_the_chart_is_built_at_RENDER_and_therefore_inside_the_sized_box(
 
 
 def test_the_COMPARE_legend_pages_instead_of_wrapping_over_the_plot():
-    """``grid.top`` is a fixed 60px, so a legend that wraps to a second row is
-    drawn on top of the chart. At the narrower Compare width eight or nine tickers
-    are enough to wrap, so the legend scrolls."""
+    """A legend that wraps to a second row is drawn over the chart, and at the
+    narrower Compare width eight or nine tickers are enough to wrap — so it scrolls.
+
+    The grid assertion moved from ``top`` to ``bottom`` when the zoom slider was added
+    (2026-09-05): the legend was anchored to the BOTTOM of the chart to get it off the
+    slider, so the margin that has to hold it is no longer the top one. The invariant
+    under test is unchanged — the legend must page, and the plot must not share space
+    with it.
+    """
     infos = [make_info(symbol=s) for s in
              ("XLK", "SPY", "QQQ", "IWM", "DIA", "VTI", "ARKK", "SMH", "SOXX")]
     options = panel.build_comparison_chart_options(infos)
 
     assert options["legend"]["type"] == "scroll"
     assert len(options["legend"]["data"]) == 9
-    assert options["grid"]["top"] == 60
+    assert options["grid"]["bottom"] > options["legend"]["bottom"]
 
 
 def test_every_compare_series_still_gets_its_own_colour_up_to_the_palette():

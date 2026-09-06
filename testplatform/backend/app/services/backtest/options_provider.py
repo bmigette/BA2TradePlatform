@@ -339,10 +339,22 @@ class HistoricalOptionsProvider:
         sqlite3 connection per call. The backtest's own pricing/entry path has already
         populated it for every underlying the trial touched.
         """
-        as_of = when.strftime("%Y-%m-%d") if hasattr(when, "strftime") else str(when)
+        # STRICTLY BEFORE the entry date -- the parquet reader's twin, and it must stay one or
+        # the two stores disagree about the same trade's entry delta. A snapshot is dated at
+        # the CLOSE, so the entry day's own snapshot has already absorbed the session,
+        # including the move that flagged this trade for refinement in the first place.
+        d = when.date() if hasattr(when, "date") and not isinstance(when, date) else when
+        if not isinstance(d, date):
+            try:
+                from datetime import datetime as _dt
+                d = _dt.fromisoformat(str(when)[:19].replace(" ", "T")).date()
+            except ValueError:
+                return None
+        as_of = (d - timedelta(days=1)).strftime("%Y-%m-%d")
         hist = _chain_history(self.db_path, underlying)
         snapshot = hist.latest_as_of(as_of)
         if snapshot is None:
+            # No PRIOR snapshot: None, never 0.0. The caller counts it as uncovered.
             return None
         for row in hist.by_asof.get(snapshot, []):
             if row.get("occ_symbol") == occ_symbol:

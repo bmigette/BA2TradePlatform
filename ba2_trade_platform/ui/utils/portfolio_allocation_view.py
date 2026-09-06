@@ -12,7 +12,9 @@ import math
 import re
 from collections import namedtuple
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from ba2_common.core.account_types import leverage_of
 
 from ...core.portfolio_allocation import (
     ERROR_LABEL_TOTAL_FMT, ERROR_LABEL_UNDER_FMT, LABEL_TOTAL_TOLERANCE_PCT,
@@ -607,6 +609,100 @@ def resolve_symbol_weights(symbols, *, saved, values, unmeasurable):
     return out
 
 
+#: Half a cent: the share boxes step by 0.01, so anything under this is a stored
+#: zero rather than a share somebody typed.
+ZERO_SHARE_EPSILON_PCT = 0.005
+
+#: The orange count beside a label's tag icon: how many of its symbols will get
+#: NOTHING. Its tooltip, because a bare number on an icon is a riddle -- and the
+#: sentence names the two ways out, since neither is discoverable from the badge.
+ZERO_SHARE_BADGE_TOOLTIP_FMT = (
+    '{count} of {total} symbol(s) in {label} have a 0% or unset share of this '
+    'label, so they receive no money and produce no order. Give each one a share, '
+    'or remove it from the label.')
+
+
+def count_zero_share_symbols(symbols, weights) -> int:
+    """How many of ``symbols`` have no share of their label. Pure.
+
+    A share of 0 and a share that is not set are counted TOGETHER on purpose: both
+    end in the same place -- the symbol is in the label, is listed on the page, and
+    the plan buys none of it -- and the user's question ("which of these are at
+    zero?") does not distinguish them. ``weights`` is the live ``{symbol: pct}``
+    map, which carries only the symbols that HAVE a share, so a missing key is an
+    unset share and not a lookup failure.
+
+    Deliberately not a percentage or a money figure: it is a count of rows to go
+    and look at, and turning it into a share of the label would make it a second
+    reading of the very column it is pointing at.
+    """
+    weights = weights or {}
+    total = 0
+    for symbol in (symbols or []):
+        share = weights.get(symbol)
+        if share is None or abs(float(share)) < ZERO_SHARE_EPSILON_PCT:
+            total += 1
+    return total
+
+
+#: The two broker facts shown beside a symbol's ⓘ, as small chips.
+#:
+#: ABSENCE OF A CHIP MEANS "THE BROKER DID NOT SAY", NEVER "NO". Both facts are
+#: tri-state all the way from ``MarginInfo`` (see ``account_types.py``) through
+#: ``AccountSymbolFacts`` to here, and a chip is drawn only where there is a real
+#: answer -- so an account whose facts have never been refreshed shows no chips at
+#: all rather than a page full of claims nobody made.
+FRACTIONABLE_BADGE = 'F'
+FRACTIONABLE_TOOLTIP = ('Fractional orders accepted: the broker will take a partial '
+                        'share of this symbol, so a target that does not divide into '
+                        'whole shares can still be filled exactly.')
+NOT_FRACTIONABLE_TOOLTIP = ('Whole shares only: the broker refuses fractional '
+                            'quantities for this symbol, so its order is rounded down '
+                            'and the remainder stays in cash.')
+#: ROUNDED TO A WHOLE NUMBER in the chip, because the chip answers "is there leverage
+#: here, and roughly how much" at a glance and a real rate is almost always exactly 1,
+#: 2 or 4 (cash / Reg-T / day-trading). The TOOLTIP keeps the exact figure and the
+#: underlying rate, so the precision is never lost -- only the glance is simplified.
+LEVERAGE_BADGE_FMT = 'Lx:{lev:.0f}'
+LEVERAGE_TOOLTIP_FMT = ('{lev:g}x leverage: the broker requires {rate:.0%} of the '
+                        'notional up front for this symbol in this account.')
+NO_LEVERAGE_TOOLTIP = ('No leverage: this symbol must be paid for in full in this '
+                       'account (100% of the notional required up front).')
+
+
+def fractionable_badge(fractionable: Optional[bool]) -> Optional[Tuple[str, str]]:
+    """``(chip, tooltip)`` for a symbol's fractional eligibility, or ``None``.
+
+    ``None`` in -> ``None`` out: the broker did not say, and a chip either way would
+    be a claim. ``False`` still earns a chip -- "whole shares only" is a fact the
+    reader wants, and it is what makes a rounded-down order explicable -- but it is
+    struck through so the two readings are never confused at a glance.
+    """
+    if fractionable is True:
+        return FRACTIONABLE_BADGE, FRACTIONABLE_TOOLTIP
+    if fractionable is False:
+        return FRACTIONABLE_BADGE, NOT_FRACTIONABLE_TOOLTIP
+    return None
+
+
+def leverage_badge(initial_margin_rate: Optional[float]) -> Optional[Tuple[str, str]]:
+    """``(chip, tooltip)`` for the leverage this symbol carries, or ``None``.
+
+    Leverage is ``1 / initial_margin_rate``, and the rate is a property of the
+    SYMBOL AND THE ACCOUNT together -- the same marginable name is 2x in a Reg-T
+    margin account and 1x in a cash one, which is why these facts are stored per
+    account. An unpublished rate yields ``None``: 1x would be a statement that the
+    broker requires full payment, which is a different thing from not knowing.
+    """
+    lev = leverage_of(initial_margin_rate)
+    if lev is None:
+        return None
+    if lev <= 1.0:
+        return LEVERAGE_BADGE_FMT.format(lev=lev), NO_LEVERAGE_TOOLTIP
+    return (LEVERAGE_BADGE_FMT.format(lev=lev),
+            LEVERAGE_TOOLTIP_FMT.format(lev=lev, rate=float(initial_margin_rate)))
+
+
 @dataclass
 class SymbolRow:
     """One symbol's line in the default view.
@@ -652,6 +748,24 @@ class SymbolRow:
     price: Optional[float] = None
     market_value: Optional[float] = None
     pct_of_label: float = 0.0
+    #: The SAME money as ``pct_of_label`` over a DIFFERENT denominator: the label's
+    #: TARGET value (its ``target_pct`` of the investable pool), not the sum of what
+    #: the label currently holds. Added 2026-09-05 on the operator's reading of the
+    #: table: ``pct_of_label`` divides the label's own held total, so it sums to
+    #: exactly 100% across the held rows NO MATTER how far the label as a whole is
+    #: from its target -- a label holding twice its target looked perfectly balanced.
+    #: This one sums to MORE than 100% when the label is over-subscribed and less
+    #: when it is under-invested, which is the question "is this label's money where
+    #: it should be" actually asks.
+    #:
+    #: BOTH are kept, and neither replaces the other. ``pct_of_label`` is what
+    #: ``symbol_delta`` subtracts from the typed ``weight_pct`` to get the share-point
+    #: hint under the Share-of-label box -- that comparison is only meaningful while
+    #: both sides divide the same label-composition denominator, so feeding it this
+    #: field instead would silently turn a composition delta into a nonsense figure.
+    #: 0.0 when there is no target to divide by (no base, or a label targeting 0%),
+    #: matching how ``pct_of_label`` reports a label holding nothing.
+    pct_of_label_target: float = 0.0
     pct_of_total: float = 0.0
     comment: Optional[str] = None
     weight_pct: Optional[float] = None
@@ -735,6 +849,7 @@ def build_label_views(managed,
                       symbol_weights=None,
                       symbol_previous_weights=None,
                       company_names=None,
+                      dividends_by_symbol=None,
                       unallocated_pct: float = 0.0) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
@@ -772,6 +887,10 @@ def build_label_views(managed,
             ``None`` rather than falling back to the CURRENT weight -- the whole
             point of the figure is that it may differ from what is on screen, and
             "there is no last" is what the page's Load-last button reads.
+        dividends_by_symbol: ``{SYMBOL: dividend cash}`` from
+            ``get_dividends_by_symbol``. Optional; an absent symbol simply has no
+            dividend-adjusted figure, which is what an unsynced ledger should look
+            like rather than a page-wide 0.00%.
         company_names: ``{SYMBOL: company_name}`` from the instrument table; optional.
             A symbol absent here, or mapped to a blank, keeps ``company_name=None`` —
             "this instrument has no stored name" and "it is named after its ticker" are
@@ -805,6 +924,8 @@ def build_label_views(managed,
     weights_by_label = symbol_weights or {}
     previous_by_label = symbol_previous_weights or {}
 
+    dividends = dividends_by_symbol or {}
+
     def _pnl_of(sym: str) -> UnrealisedPnL:
         """One symbol's unrealised P&L, on the LIVE quote in either mode.
 
@@ -818,7 +939,8 @@ def build_label_views(managed,
             return unrealised_pnl([])
         return unrealised_pnl([PositionState(
             symbol=state.symbol, quantity=state.quantity,
-            cost_basis=state.cost_basis, price=(prices or {}).get(sym))])
+            cost_basis=state.cost_basis, price=(prices or {}).get(sym))],
+            dividends=dividends.get(sym, 0.0))
 
     def _clean(label: str) -> List[str]:
         seen, out = set(), []
@@ -914,6 +1036,12 @@ def build_label_views(managed,
                 price=price,
                 market_value=market_value,
                 pct_of_label=(row_value / label_value * 100.0) if label_value else 0.0,
+                # Against the label's TARGET money, so the column can say "this
+                # label is over-subscribed" -- see the field's own docstring for
+                # why both denominators are kept rather than one replacing the
+                # other.
+                pct_of_label_target=((row_value / label_target_value * 100.0)
+                                     if label_target_value else 0.0),
                 pct_of_total=(row_value / total_value * 100.0) if total_value else 0.0,
                 comment=comments.get((entry.label, sym)),
                 weight_pct=resolved[sym].weight_pct,
@@ -944,11 +1072,16 @@ def build_label_views(managed,
             # the rows' own figures: the engine sums market value and gross cost
             # first and divides once, which is what makes the percentage
             # money-weighted rather than a mean of the symbols' percentages.
-            pnl=unrealised_pnl([
-                PositionState(symbol=s, quantity=positions[s].quantity,
-                              cost_basis=positions[s].cost_basis,
-                              price=(prices or {}).get(s))
-                for s in symbols if s in positions]),
+            pnl=unrealised_pnl(
+                [PositionState(symbol=s, quantity=positions[s].quantity,
+                               cost_basis=positions[s].cost_basis,
+                               price=(prices or {}).get(s))
+                 for s in symbols if s in positions],
+                # The label's dividends are its MEMBERS' dividends -- summed over the
+                # same membership the states came from, so a symbol whose position is
+                # gone contributes neither a state nor its old payouts.
+                dividends=sum(dividends.get(s, 0.0)
+                              for s in symbols if s in positions)),
         ))
 
     return views
@@ -1329,6 +1462,14 @@ ALLOCATION_BAR_LEGEND = 'Allocated — the reserve is the gap at the end'
 #: line both render it, so they cannot disagree about which figure leads.
 TARGET_PAIR_FMT = '{target_pct:.1f}%'
 TARGET_PAIR_WITH_REAL_FMT = '{target_pct:.1f}% (real {effective_pct:.1f}%)'
+#: The same pair with the MONEY the real share comes to. Asked for from live use
+#: (2026-09-05): "real 4.5%" is the share of the gross base left after the reserve, and
+#: a share is only actionable once you know what it buys. The money is the target's, so
+#: it belongs beside the target and not in a tooltip nobody opens while comparing rows.
+TARGET_PAIR_WITH_REAL_MONEY_FMT = (
+    '{target_pct:.1f}% (real {effective_pct:.1f}% — ${target_value:,.2f})')
+#: With no reserve the two percentages coincide, so only the money is added.
+TARGET_PAIR_WITH_MONEY_FMT = '{target_pct:.1f}% (${target_value:,.2f})'
 #: The row cell's prefix. Split out so the header can reuse the pair without
 #: swallowing a "tgt" in the middle of a sentence.
 TARGET_CELL_PREFIX = 'tgt '
@@ -1433,7 +1574,8 @@ RESERVE_CAPTION_NO_BASE = ('no base notional yet — the broker published no buy
                            'power, so this reserve has no dollar figure')
 
 
-def format_target_pair(target_pct: float, unallocated_pct: float) -> str:
+def format_target_pair(target_pct: float, unallocated_pct: float,
+                       target_value: Optional[float] = None) -> str:
     """``30.0%`` or ``30.0% (real 27.0%)``. THE one place the pair is spelled. Pure.
 
     What the user TYPED leads -- "put something like 15% (real 13.5%) so we know" --
@@ -1448,9 +1590,19 @@ def format_target_pair(target_pct: float, unallocated_pct: float) -> str:
     """
     target = float(target_pct or 0.0)
     effective = effective_target_pct(target, unallocated_pct)
-    if abs(effective - target) < 0.05:      # under the 1dp both are printed at
-        return TARGET_PAIR_FMT.format(target_pct=target)
-    return TARGET_PAIR_WITH_REAL_FMT.format(target_pct=target, effective_pct=effective)
+    # ``target_value is None`` is "no base to price it against", which is a real state
+    # (the broker published no buying power) and NOT zero money -- so the money clause
+    # is omitted entirely rather than printed as $0.00.
+    same = abs(effective - target) < 0.05   # under the 1dp both are printed at
+    if target_value is None:
+        return (TARGET_PAIR_FMT.format(target_pct=target) if same
+                else TARGET_PAIR_WITH_REAL_FMT.format(target_pct=target,
+                                                      effective_pct=effective))
+    if same:
+        return TARGET_PAIR_WITH_MONEY_FMT.format(target_pct=target,
+                                                 target_value=float(target_value))
+    return TARGET_PAIR_WITH_REAL_MONEY_FMT.format(
+        target_pct=target, effective_pct=effective, target_value=float(target_value))
 
 
 def format_label_header(*, label: str, current_value: float, target_pct: float,
@@ -2810,7 +2962,8 @@ def build_label_bars(views, *, base_notional: Optional[float],
             status=status,
             current_text=(LABEL_CURRENT_UNKNOWN if share is None
                           else LABEL_CURRENT_FMT.format(pct=share)),
-            target_text=TARGET_CELL_PREFIX + format_target_pair(target, unallocated_pct),
+            target_text=TARGET_CELL_PREFIX + format_target_pair(
+                target, unallocated_pct, target_value),
             delta_text=format_label_delta(status=status, delta_pct=delta_pct,
                                           delta_value=delta_value),
             previous_target_pct=view.previous_target_pct,

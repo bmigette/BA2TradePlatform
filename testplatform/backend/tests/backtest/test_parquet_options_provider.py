@@ -389,15 +389,23 @@ def test_atm_iv_memo_caches_none_too(monkeypatch, store_root):
 # --------------------------------------------------------------------------- #
 # 4b. delta_at_entry — the intraday-drawdown refinement's seam (results.py)
 # --------------------------------------------------------------------------- #
-def test_delta_at_entry_is_the_clamped_bars_delta(provider):
-    """Same as-of discipline as the chain: the LATEST bar on or before the entry date."""
+def test_delta_at_entry_is_the_last_bar_STRICTLY_BEFORE_entry(provider):
+    """NOT on-or-before. A daily bar is dated at the CLOSE, so the entry day's own bar has
+    already absorbed the whole session — and the refinement only asks about trades flagged
+    BECAUSE the underlying moved, so that delta embeds the very move whose drawdown is being
+    estimated. Calling it "delta at entry" is circular, and it feeds
+    strategy_fitness.option_consistent_annual_return.
+
+    The prior session's delta is stale, not wrong: it describes a real market state that
+    preceded the entry. Staleness is a bounded approximation; lookahead is not."""
     d5 = {c.symbol: c for c in _wide(provider, date(2023, 1, 5))}[_C100].delta
     d10 = {c.symbol: c for c in _wide(provider, date(2023, 1, 10))}[_C100].delta
-    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) == d5
-    # 01-07 has no bar; the clamp must serve 01-05's delta, never 01-10's.
-    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 7)) == d5
-    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 10)) == d10
     assert d5 != d10
+    # 01-07 has no bar of its own; the latest STRICTLY BEFORE it is 01-05's.
+    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 7)) == d5
+    # 01-10 HAS a bar, and that is exactly the one that must not be served: entering on 01-10
+    # cannot see 01-10's close, so the answer stays 01-05's.
+    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 10)) == d5
 
 
 @pytest.mark.parametrize("when", [
@@ -437,9 +445,12 @@ def test_both_backends_answer_delta_at_entry(tmp_path, provider):
          "delta": 0.61}])
     try:
         sq = HistoricalOptionsProvider(db)
-        assert sq.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) == pytest.approx(0.61)
+        # 01-06, not 01-05: both readers now serve the last snapshot STRICTLY BEFORE entry, so
+        # the only snapshot (01-05) answers an entry on the 6th and NOT one on the 5th itself.
+        assert sq.delta_at_entry(_UNDER, _C100, date(2023, 1, 6)) == pytest.approx(0.61)
+        assert sq.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) is None
         assert sq.delta_at_entry(_UNDER, _C100, date(2022, 1, 1)) is None
-        assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) is not None
+        assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 6)) is not None
     finally:
         _WORKER_CHAIN_CACHE.clear()
 
@@ -635,3 +646,71 @@ def test_an_underlying_with_no_partitions_warns(caplog, provider):
         provider.get_chain("NOPE", date(2023, 1, 10), expiry_min=date(2023, 1, 1),
                            expiry_max=date(2023, 12, 31))
     assert any("NO partitions for NOPE" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------------------------- #
+# REAL QUOTES (2026-09-03). The TastyTrade tree predates the bid/ask columns and falls back
+# to the zero-spread close proxy above; ThetaData partitions carry real NBBO, and where they
+# do the reader must use it -- that is what makes max_spread_pct and the GA's w_spread do
+# anything at all (with a constant 0.0 spread they gate nothing and rank everything alike).
+#
+# A no-trade day is the case that matters: close is NULL there (an option that did not trade
+# has no trade price), and the row's mark is the quote mid. Storing 0.0 instead would price a
+# genuinely $55-bid contract at zero.
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+def quoted_store_root(tmp_path):
+    from ba2_providers.options.parquet_store import OptionHistoryParquetStore
+
+    root = str(tmp_path / "ThetaDataOptionsProvider")
+    store = OptionHistoryParquetStore(root=root)
+    store.write_partition(
+        _UNDER, date(2023, 1, 20),
+        [
+            # traded day: real OHLC AND a real quote around it
+            OptionEodBar(occ_symbol=_C100, bar_date=date(2023, 1, 3),
+                         open=5.0, high=5.5, low=4.8, close=5.2, volume=100,
+                         bid=5.10, ask=5.30, open_interest=900, iv=0.30),
+            # NO-TRADE day: no OHLC at all, but a real two-sided quote
+            OptionEodBar(occ_symbol=_C100, bar_date=date(2023, 1, 5),
+                         open=None, high=None, low=None, close=None, volume=0,
+                         bid=55.10, ask=56.20, open_interest=900, iv=0.31),
+        ],
+        start=date(2023, 1, 1), end=date(2023, 3, 31))
+    clear_worker_parquet_options_cache()
+    yield root
+    clear_worker_parquet_options_cache()
+
+
+def test_a_store_with_quotes_serves_the_real_bid_ask_not_the_close_proxy(quoted_store_root):
+    p = ParquetOptionsProvider(quoted_store_root, spot_source=_spot_source,
+                               risk_free_rate=_RATE, spot_scope="test")
+    row = {c.symbol: c for c in p.get_chain(_UNDER, date(2023, 1, 3),
+                                            expiry_min=date(2023, 1, 1),
+                                            expiry_max=date(2023, 12, 31))}[_C100]
+    assert row.bid == pytest.approx(5.10)
+    assert row.ask == pytest.approx(5.30)
+    assert row.bid != row.ask, "a real spread, not the zero-spread proxy"
+    assert row.last == pytest.approx(5.2), "`last` stays the TRADE price"
+    assert row.spread_pct is not None and row.spread_pct > 0, (
+        "a real spread must make spread_pct non-degenerate -- a constant 0.0 ranks BEST and "
+        "silently disables max_spread_pct and the GA's w_spread")
+
+
+def test_a_no_trade_day_is_marked_at_the_quote_not_at_zero(quoted_store_root):
+    p = ParquetOptionsProvider(quoted_store_root, spot_source=_spot_source,
+                               risk_free_rate=_RATE, spot_scope="test")
+    row = {c.symbol: c for c in p.get_chain(_UNDER, date(2023, 1, 5),
+                                            expiry_min=date(2023, 1, 1),
+                                            expiry_max=date(2023, 12, 31))}[_C100]
+    assert row.bid == pytest.approx(55.10) and row.ask == pytest.approx(56.20)
+    assert row.mid == pytest.approx(55.65)
+    assert row.last is None, "there was no trade, so there is no last price"
+    assert row.mid != 0.0, "0.0 here would mark a $55-bid contract worthless"
+
+    bar = p.get_bar(_C100, date(2023, 1, 5))
+    assert bar["close"] is None, "a no-trade day must not report a 0.0 close"
+
+    q = p.get_quote(_C100, date(2023, 1, 5))
+    assert (q.bid, q.ask) == (pytest.approx(55.10), pytest.approx(56.20)), (
+        "get_quote and get_chain must price identically (options_provider bug B4)")
