@@ -679,7 +679,13 @@ def refresh_symbol_stats(symbols, *, limit: int = STATS_REFRESH_BATCH) -> int:
                 'dividend_yield_pct': info.income.dividend_yield_pct,
                 'total_return_1y_pct': getattr(returns.get('1y'), 'total_return_pct', None),
                 'total_return_3y_pct': getattr(returns.get('3y'), 'total_return_pct', None),
-                'company_name': info.company_name,
+                # NO company_name here. SymbolInfo has never carried one (it is a returns/
+                # income/series bundle), and save_symbol_stats persists only the three numeric
+                # fields above -- so this key was dead on both ends, and reading it raised
+                # AttributeError on EVERY refresh. The broad except below turned that into a
+                # warning and `return 0`, which is why the allocation page's "Fetch data" button
+                # silently did nothing (found live 2026-09-06). The view sources names from
+                # Instrument.company_name via its own company_names map, not from stats.
                 'error': info.details.get('*') or None,
             }
         written = save_symbol_stats(rows)

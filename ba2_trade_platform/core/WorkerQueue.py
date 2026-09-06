@@ -120,6 +120,9 @@ class WorkerQueue:
         self._task_keys: Dict[str, str] = {}  # Maps task_key to task_id for duplicate checking
         self._queue_counter = 0  # Counter for tiebreaking in priority queue
         self._risk_manager_lock = threading.Lock()  # Lock for risk manager processing per expert
+        #: OPEN_POSITIONS passes parked until the same expert's ENTER_MARKET pass has been
+        #: processed, keyed by expert id. See defer_open_positions_if_entry_in_flight.
+        self._deferred_open_positions: Dict[int, Dict[str, Any]] = {}
         self._processing_experts: Set[int] = set()  # Track which experts are currently being processed
         
         # Batch analysis tracking for activity logging
@@ -1395,6 +1398,73 @@ class WorkerQueue:
             if task.status in [WorkerTaskStatus.COMPLETED, WorkerTaskStatus.FAILED]:
                 self._remove_persisted_task(task.id)
     
+    # ------------------------------------------------------------------------------------
+    # ENTRY BEFORE MANAGE -- the backtest's order, made deterministic in live.
+    #
+    # daily_engine._run_expert_bar runs the entry pass and THEN `_manage_open_positions` on a
+    # bar where both are due. Live had no such order: the ENTER_MARKET and OPEN_POSITIONS jobs
+    # for one expert fire at the same minute as independent scheduler jobs and land in this
+    # parallel queue, so whichever analysis finished first processed its orders first. That is
+    # not cosmetic -- entry sizing reads available balance, so whether exits had already
+    # released cash changed Monday's position sizes from week to week.
+    #
+    # The fix parks the OPEN_POSITIONS expansion while an ENTER_MARKET pass for the same expert
+    # is in flight, and releases it from the ENTER_MARKET branch of
+    # _check_and_process_expert_recommendations, i.e. AFTER process_expert_recommendations_after_analysis
+    # has created the entry orders. JobManager also arms a one-shot safety timer, so a parked
+    # pass can never be lost to an entry pass that dies before reaching that hook.
+    # ------------------------------------------------------------------------------------
+    def defer_open_positions_if_entry_in_flight(self, expert_instance_id: int,
+                                                batch_id: Optional[str]) -> bool:
+        """Park an OPEN_POSITIONS pass if this expert's ENTER_MARKET pass is still in flight.
+
+        "In flight" is either the entry order-processing lock being held, or any PENDING/RUNNING
+        ENTER_MARKET task for the expert -- the SCREENER/DYNAMIC expansion task counts, because
+        at the moment both scheduled jobs fire the expansion is all that exists and its analysis
+        fan-out has not been created yet. Returns True when parked (caller must NOT submit).
+        """
+        entry_key = f"expert_{expert_instance_id}_{AnalysisUseCase.ENTER_MARKET.value}"
+        with self._risk_manager_lock:
+            in_flight = entry_key in self._processing_experts
+            if not in_flight:
+                with self._task_lock:
+                    for task in self._tasks.values():
+                        if (getattr(task, "expert_instance_id", None) == expert_instance_id
+                                and getattr(task, "subtype", None) == AnalysisUseCase.ENTER_MARKET
+                                and task.status in (WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING)):
+                            in_flight = True
+                            break
+            if not in_flight:
+                return False
+            self._deferred_open_positions[expert_instance_id] = {
+                "batch_id": batch_id, "registered_at": time.time()}
+        logger.info(f"[ORDER] OPEN_POSITIONS for expert {expert_instance_id} parked: an "
+                    f"ENTER_MARKET pass is in flight; it runs after entry orders are processed")
+        return True
+
+    def release_deferred_open_positions(self, expert_instance_id: int, reason: str) -> Optional[str]:
+        """Submit a parked OPEN_POSITIONS expansion, if one exists. Idempotent: the entry hook
+        and the safety timer can both call this and only the first submits."""
+        with self._risk_manager_lock:
+            pending = self._deferred_open_positions.pop(expert_instance_id, None)
+        if pending is None:
+            return None
+        try:
+            task_id = self.submit_instrument_expansion_task(
+                expert_instance_id=expert_instance_id,
+                expansion_type="OPEN_POSITIONS",
+                subtype=AnalysisUseCase.OPEN_POSITIONS,
+                priority=10,
+                batch_id=pending.get("batch_id"),
+            )
+        except ValueError as e:  # already pending/running -- nothing to do
+            logger.warning(f"[ORDER] parked OPEN_POSITIONS for expert {expert_instance_id} "
+                           f"was already queued ({e})")
+            return None
+        logger.info(f"[ORDER] released parked OPEN_POSITIONS for expert {expert_instance_id} "
+                    f"({reason}) as task {task_id}")
+        return task_id
+
     def _check_and_process_expert_recommendations(self, expert_instance_id: int, use_case: AnalysisUseCase = AnalysisUseCase.ENTER_MARKET) -> None:
         """
         Check if there are any pending analysis tasks for an expert.
@@ -1585,6 +1655,12 @@ class WorkerQueue:
                                 logger.info(f"[RISK_MGR_TRIGGER] Automated processing created {len(created_orders)} orders for expert {expert_instance_id}")
                             else:
                                 logger.debug(f"[RISK_MGR_TRIGGER] No orders created by automated processing for expert {expert_instance_id}")
+                            if use_case == AnalysisUseCase.ENTER_MARKET:
+                                # Entry orders exist now: this is the backtest's
+                                # `_manage_open_positions`-after-`_run_expert_bar` point. Release
+                                # any OPEN_POSITIONS pass parked behind this entry pass.
+                                self.release_deferred_open_positions(
+                                    expert_instance_id, "entry pass processed")
                             # THE OPTION RUN RECORD. Everything the option risk manager
                             # decided this pass -- every admission and every refused rail --
                             # is written as ONE ``RiskManagerRun`` row with mode="options",

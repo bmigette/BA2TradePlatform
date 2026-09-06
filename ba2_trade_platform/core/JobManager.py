@@ -1158,6 +1158,26 @@ class JobManager:
             logger.error(f"Error parsing schedule '{schedule_setting}': {e}", exc_info=True)
             return None
             
+    def _release_parked_open_positions(self, expert_instance_id: int) -> None:
+        """Safety timer for an OPEN_POSITIONS pass parked behind an ENTER_MARKET pass.
+
+        Normally the queue releases it the moment entry orders are processed and this is a
+        no-op. It only does work when that entry pass never reached its hook -- an expansion
+        that raised, an exception before order processing -- in which case the exit pass still
+        has to run: leaving open positions unmanaged because the ENTRY side broke is the worse
+        failure of the two.
+        """
+        try:
+            released = get_worker_queue().release_deferred_open_positions(
+                expert_instance_id, "safety timer: entry pass did not release it")
+            if released:
+                logger.warning(f"Parked OPEN_POSITIONS for expert {expert_instance_id} was released "
+                               f"by the SAFETY TIMER, not by the entry pass -- check why the "
+                               f"ENTER_MARKET pass never reached order processing")
+        except Exception as e:  # noqa: BLE001 -- a timer must never take the scheduler down
+            logger.error(f"Safety release of parked OPEN_POSITIONS for expert "
+                         f"{expert_instance_id} failed: {e}", exc_info=True)
+
     def _execute_scheduled_analysis(self, expert_instance_id: int, symbol: str, subtype: str = AnalysisUseCase.ENTER_MARKET):
         """Execute a scheduled analysis job."""
         try:
@@ -1176,6 +1196,27 @@ class JobManager:
                 logger.info(f"Special symbol '{symbol}' detected in scheduled analysis - queuing expansion task with batch_id={batch_id}")
                 try:
                     worker_queue = get_worker_queue()
+                    if symbol == "OPEN_POSITIONS" and worker_queue.defer_open_positions_if_entry_in_flight(
+                            expert_instance_id, batch_id):
+                        # ENTRY BEFORE MANAGE (see WorkerQueue.defer_open_positions_if_entry_in_flight):
+                        # the entry pass that fired this same minute runs first, exactly as the
+                        # backtest's _run_expert_bar precedes _manage_open_positions. The queue
+                        # releases this pass right after entry orders are processed; the one-shot
+                        # timer below is the safety net for an entry pass that dies before then,
+                        # so a parked exit pass can never be lost -- and release is idempotent, so
+                        # firing both is harmless.
+                        self._scheduler.add_job(
+                            func=self._release_parked_open_positions,
+                            trigger='date',
+                            run_date=now + timedelta(minutes=15),
+                            args=[expert_instance_id],
+                            id=f"parked_open_positions_{expert_instance_id}_{batch_id}",
+                            name=f"Safety release: parked OPEN_POSITIONS for expert {expert_instance_id}",
+                            replace_existing=True,
+                            max_instances=1,
+                            coalesce=True,
+                        )
+                        return
                     task_id = worker_queue.submit_instrument_expansion_task(
                         expert_instance_id=expert_instance_id,
                         expansion_type=symbol,
