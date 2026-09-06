@@ -120,9 +120,22 @@ fired, in which case it cannot change any result.
   from, leaving *when* cash and positions are applied unchanged. Trade history becomes
   truthful and live parity improves (live records real fill timestamps; backtest recorded the
   decision bar). The equity curve — and therefore every metric — is bit-identical.
-- **#1b (voids, defer):** defer the whole fill application to the next bar. This moves the
-  cash impact one bar later, shifting the equity curve and max-DD. Waits for a grid boundary
-  plus a rerun.
+- **#1b (REJECTED):** deferring the whole fill application to the next bar was considered and
+  dropped. It would move the cash impact a bar later, voiding every existing backtest, and
+  buys almost nothing:
+  - The equity snapshot is consumed **only** for reporting (`bt.equity_curve`, and the
+    Sharpe/max-DD computed from it). Nothing feeds it back into a decision — sizing reads the
+    account balance live, and the sole non-reporting consumer is the
+    `net_liquidating_value <= 0` ruin flag, which a rounding-scale blip cannot flip.
+  - The error does **not accumulate**: bar N carries `qty x (close_N - open_N+1)`, and at bar
+    N+1 the position marks normally and it is gone. So **CAR is entirely unaffected** (final
+    equity is identical), and only max-DD and Sharpe see single-bar, random-sign noise
+    bounded by position weight x overnight gap — order 0.025% of equity against drawdowns of
+    10-16%.
+
+  Voiding every result for a sub-basis-point cosmetic correction to two metrics is a bad
+  trade. #1a delivers the part that matters — truthful trade dates and live parity in the
+  trade record — for free.
 
 ---
 
@@ -165,4 +178,5 @@ capital efficiency and pairwise overlap.
 2. Run the Bucket D probes; report blast radius for anything that did fire.
 3. **One** `TEST_APP_VERSION` bump, one commit, one push.
 4. Leave the Senate rerun running throughout — nothing here disturbs it.
-5. #1b and any non-free Bucket D fix wait for a grid boundary.
+5. Any non-free Bucket D fix waits for a grid boundary. #1b is rejected outright, so with a
+   clean Bucket D there is nothing left needing a rerun.
