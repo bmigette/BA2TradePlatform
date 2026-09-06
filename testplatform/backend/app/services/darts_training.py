@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import json
 
+from app.services.data_preparation import purged_train_row_count
 from app.services.model_interface import ITrainingService
 
 logger = logging.getLogger(__name__)
@@ -63,13 +64,15 @@ class DartsTrainingService(ITrainingService):
             self.models_dir = Path(models_dir)
         self.models_dir.mkdir(parents=True, exist_ok=True)
         self.scaler = None
+        self.cov_scaler = None
 
     def prepare_data(
         self,
         df: pd.DataFrame,
         target_column: str = 'Close',
         feature_columns: List[str] = None,
-        timeframe: str = 'daily'
+        timeframe: str = 'daily',
+        scaler_fit_ratio: Optional[float] = None
     ) -> Tuple[Any, Any]:
         """
         Prepare data for Darts model training.
@@ -79,6 +82,16 @@ class DartsTrainingService(ITrainingService):
             target_column: Column to predict
             feature_columns: Optional covariate columns
             timeframe: Dataset timeframe for frequency inference
+            scaler_fit_ratio: Fit the target and covariate scalers on only the
+                leading ``ratio`` fraction of the built series, then transform the
+                whole series with them. Expressed as a fraction rather than a row
+                count so it lands on exactly the same index the caller will split at
+                (prepare_data drops NaN-target rows and may fill missing dates, so a
+                row count taken from the input frame would not line up). ``None``
+                fits on everything, which is only correct when the caller has already
+                restricted ``df`` to training rows -- fitting on a frame that still
+                contains the held-out tail puts the future's min/max into the
+                training transform.
 
         Returns:
             Tuple of (target_series, covariates_series)
@@ -120,9 +133,15 @@ class DartsTrainingService(ITrainingService):
                 freq=freq
             )
 
-        # Scale the data
+        # Scale the data. When scaler_fit_ratio is given, the scaler sees ONLY the
+        # leading (training) slice; the rest of the series is merely transformed by it.
         self.scaler = Scaler()
-        target_series = self.scaler.fit_transform(target_series)
+        if scaler_fit_ratio is None:
+            self.scaler.fit(target_series)
+        else:
+            n_fit = max(1, int(len(target_series) * scaler_fit_ratio))
+            self.scaler.fit(target_series[:n_fit])
+        target_series = self.scaler.transform(target_series)
 
         # Always convert to float32 for compatibility with loss functions
         # (FocalLoss and other classification losses require float targets)
@@ -151,9 +170,14 @@ class DartsTrainingService(ITrainingService):
                             fill_missing_dates=True,
                             freq=freq
                         )
-                    # Scale covariates
-                    cov_scaler = Scaler()
-                    covariates = cov_scaler.fit_transform(covariates)
+                    # Scale covariates (same train-only fit rule as the target)
+                    self.cov_scaler = Scaler()
+                    if scaler_fit_ratio is None:
+                        self.cov_scaler.fit(covariates)
+                    else:
+                        n_fit = max(1, int(len(covariates) * scaler_fit_ratio))
+                        self.cov_scaler.fit(covariates[:n_fit])
+                    covariates = self.cov_scaler.transform(covariates)
 
                     # MPS (Apple Silicon GPU) doesn't support float64
                     if MPS_WILL_BE_USED:
@@ -171,7 +195,8 @@ class DartsTrainingService(ITrainingService):
         train_ratio: float = 0.8,
         target_column: str = 'Close',
         feature_columns: List[str] = None,
-        timeframe: str = 'daily'
+        timeframe: str = 'daily',
+        label_horizon: int = 0
     ) -> Tuple[Any, Any, Any, Any]:
         """
         Prepare data and split into train/test TimeSeries with continuous indices.
@@ -185,27 +210,41 @@ class DartsTrainingService(ITrainingService):
             target_column: Column to predict
             feature_columns: Optional covariate columns
             timeframe: Dataset timeframe for frequency inference
+            label_horizon: Bars of look-ahead already baked into ``target_column``.
+                The last ``label_horizon`` training points are dropped because
+                their values are decided by test-period bars.
 
         Returns:
             Tuple of (train_series, test_series, train_covariates, test_covariates)
         """
-        # Prepare full data as one TimeSeries
+        # Prepare the full series, but fit the scalers on the training fraction ONLY.
+        # Fitting on the whole frame first (the previous behaviour) let the test
+        # block's extrema set the training scale, so the held-out score was not
+        # strictly out of sample and did not match causal deployment. The same ratio
+        # is used below for split_idx, so the fit window is exactly the train block.
         full_series, full_covariates = self.prepare_data(
-            df, target_column, feature_columns, timeframe
+            df, target_column, feature_columns, timeframe,
+            scaler_fit_ratio=train_ratio
         )
 
         # Calculate split point
         split_idx = int(len(full_series) * train_ratio)
 
-        # Split series using slicing (preserves index continuity)
-        train_series = full_series[:split_idx]
+        # Split series using slicing (preserves index continuity), then purge the
+        # training points whose outcome window reaches into the test block.
+        train_end = purged_train_row_count(split_idx, label_horizon)
+        if train_end < split_idx:
+            logger.info(
+                f"Purged {split_idx - train_end} boundary training points (label horizon {label_horizon})"
+            )
+        train_series = full_series[:train_end]
         test_series = full_series[split_idx:]
 
         # Split covariates if present
         train_covariates = None
         test_covariates = None
         if full_covariates is not None:
-            train_covariates = full_covariates[:split_idx]
+            train_covariates = full_covariates[:train_end]
             test_covariates = full_covariates[split_idx:]
 
         logger.info(f"Split data: train={len(train_series)}, test={len(test_series)} "
@@ -230,16 +269,21 @@ class DartsTrainingService(ITrainingService):
     def prepare_multi_series_split(
         self, dataframes: List[pd.DataFrame], train_ratio: float = 0.8,
         target_column: str = 'Close', feature_columns: List[str] = None,
-        timeframe: str = 'daily'
+        timeframe: str = 'daily', label_horizon: int = 0
     ) -> Tuple[List[Any], List[Any], List[Any], List[Any]]:
-        """Prepare and split multiple DataFrames into train/test TimeSeries lists."""
+        """Prepare and split multiple DataFrames into train/test TimeSeries lists.
+
+        Each series is split, scaled and boundary-purged on its own, so one symbol's
+        held-out block never sets another symbol's training scale.
+        """
         train_series_list = []
         test_series_list = []
         train_cov_list = []
         test_cov_list = []
         for i, df in enumerate(dataframes):
             train_s, test_s, train_c, test_c = self.prepare_data_split(
-                df, train_ratio, target_column, feature_columns, timeframe
+                df, train_ratio, target_column, feature_columns, timeframe,
+                label_horizon=label_horizon
             )
             train_series_list.append(train_s)
             test_series_list.append(test_s)

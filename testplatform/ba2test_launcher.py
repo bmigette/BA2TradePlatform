@@ -1479,7 +1479,20 @@ _OPTION_RM_OVERRIDE = {
 }
 
 
-def _rm_opt_for(kind: str) -> dict:
+def _effective_sizing_mode(spec: dict, args) -> "str | None":
+    """The sizing mode a run will ACTUALLY use, or None when it cannot be determined.
+
+    ``--sizing-mode`` wins (that is what ``_sizing_overrides`` applies), else the spec's own
+    ``fixed_settings``. None means "unknown" and callers must treat it as the permissive case --
+    never guess ``notional`` from absence, because that would silently drop a live gene.
+    """
+    mode = getattr(args, "sizing_mode", None)
+    if mode:
+        return mode
+    return ((spec or {}).get("fixed_settings") or {}).get("sizing_mode")
+
+
+def _rm_opt_for(kind: str, sizing_mode: "str | None" = None) -> dict:
     """The classic-RM gene block for a strategy kind: ``_RM_OPT``, plus the option override.
 
     EVERY option kind gets the 50% ceiling EXCEPT ``O_STK``, and that exclusion is the whole
@@ -1496,9 +1509,23 @@ def _rm_opt_for(kind: str) -> dict:
     Gating on ``_PURE_OPTION_STRATEGIES`` instead would be the natural-looking fix and is wrong
     for that reason.
     """
-    if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK":
-        return {**_RM_OPT, **_OPTION_RM_OVERRIDE}
-    return dict(_RM_OPT)
+    block = ({**_RM_OPT, **_OPTION_RM_OVERRIDE}
+             if kind in _OPTION_STRATEGY_KEYS and kind != "O_STK" else dict(_RM_OPT))
+    # atr_risk_budget_pct IS THE SIZING BUDGET, and only ``_risk_atr_quantity`` reads it -- which
+    # runs solely under ``sizing_mode == 'risk_atr'``. In a notional run it is therefore a DEAD
+    # gene: two genomes differing only in it score identically, so the GA spends population slots,
+    # crossover and mutation on a knob that cannot move the result, and the persisted best_params
+    # advertise a budget that never applied.
+    #
+    # It was NOT dead before the wiring fix -- while the two genes drove each other's jobs this
+    # one set the stop distance, which applies in BOTH modes -- so this gating only becomes
+    # correct alongside that fix, and would have silently changed notional results before it.
+    #
+    # Dropped ONLY when the mode is positively known to be notional. Unknown stays permissive:
+    # inferring notional from absence would delete a live gene from a risk_atr run.
+    if sizing_mode == "notional":
+        block.pop("atr_risk_budget_pct", None)
+    return block
 
 
 # Bypass experts (FactorRanker) size their own portfolio and skip the classic per-trade RM
@@ -5371,7 +5398,7 @@ def _cmd_optimize(args) -> int:
             # spec opts out via no_bypass_rm — not the full _RM_OPT). Screener genes (screener:*
             # namespace) are merged in ONLY when --screener is set.
             "expert_params": ({**_bypass_gene_space(spec), **screener_genes} if bypass
-                              else {**spec["expert_params"], **_rm_opt_for(args.strategy),
+                              else {**spec["expert_params"], **_rm_opt_for(args.strategy, _effective_sizing_mode(spec, args)),
                                     **screener_genes, **schedule_genes}),
             "backtest": backtest_block,
         }
@@ -5584,7 +5611,7 @@ def _cmd_optimize_batch(args) -> int:
                 # leaves the gene dead weight — no current spec); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
-                                  else {**spec["expert_params"], **_rm_opt_for(strat_kind),
+                                  else {**spec["expert_params"], **_rm_opt_for(strat_kind, _effective_sizing_mode(spec, args)),
                                         **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
                 "backtest": backtest_block,
             }

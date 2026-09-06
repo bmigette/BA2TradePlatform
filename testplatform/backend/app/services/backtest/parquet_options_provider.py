@@ -756,8 +756,23 @@ class ParquetOptionsProvider:
         ci = u.c_index.get(occ_symbol)
         if ci is None:
             return None
-        i = u.latest_row_on_or_before(ci, d.toordinal())
+        # STRICTLY BEFORE the entry date (`- 1`), never the entry day's own bar. A daily bar is
+        # dated at the CLOSE, so including it returned a delta that had already absorbed the
+        # whole session -- and this refinement only ASKS about trades flagged because the
+        # underlying moved, so that delta embeds the very move whose drawdown is being
+        # estimated. Calling it "delta at entry" is circular, and it feeds
+        # strategy_fitness.option_consistent_annual_return.
+        #
+        # The prior session's delta is stale, not wrong: it describes a real market state that
+        # preceded the entry. Staleness is a bounded approximation; lookahead is not. A later
+        # refinement can reprice delta causally (prior-snapshot IV + the underlying price at
+        # entry + remaining time to expiry) to close the staleness gap without reintroducing
+        # the close.
+        i = u.latest_row_on_or_before(ci, d.toordinal() - 1)
         if i < 0:
+            # No PRIOR snapshot. None, never 0.0 -- a zero delta claims the premium does not
+            # move with the underlying, which would silently report a refined drawdown of
+            # exactly the daily one. The caller counts this as uncovered.
             return None
         return u.greeks_tuple(i, ci, self.spot_source)[1]
 

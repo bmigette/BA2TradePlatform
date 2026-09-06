@@ -1194,15 +1194,18 @@ class TradeRiskManagement:
             return
         from ba2_common.core.position_sizing import get_latest_atr, synthesize_safeguard_stop
 
-        # SIZING budget. Prefer the dedicated atr_risk_budget_pct; fall back to risk_per_trade_pct
-        # when unset so existing configs behave exactly as before. These are decoupled because
-        # risk_per_trade_pct ALSO sets the stop DISTANCE (synthesize_safeguard_stop) in both sizing
-        # modes -- one gene doing two jobs meant a range wide enough for stop search drove the
-        # risk-based size past the per-instrument cap, collapsing risk_atr onto notional.
-        _budget = expert.get_setting_with_interface_default('atr_risk_budget_pct', log_warning=False)
-        if _budget is None:
-            _budget = expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False)
-        risk_pct = float(_budget or 1.0)
+        # STOP DISTANCE, and therefore risk_per_trade_pct -- NOT the sizing budget.
+        #
+        # dd1f912e (2026-08-16, "ATR budget gene") introduced atr_risk_budget_pct to carry the
+        # SIZE budget so that risk_per_trade_pct could keep owning stop distance. Its own commit
+        # message says exactly that. But the edit landed in THIS function, the stop synthesiser,
+        # and never touched _risk_atr_quantity -- so the two genes ended up driving each other's
+        # jobs: a 0.25-3.0 budget set the stop, and a 0.5-10.0 stop gene set the size. A stop
+        # gene ranging to 10% driving SIZE is precisely what pushes the risk-based quantity past
+        # the per-instrument cap and collapses risk_atr onto notional, which is the failure the
+        # decoupling existed to prevent.
+        risk_pct = float(
+            expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False) or 1.0)
         atr_mult = float(expert.get_setting_with_interface_default('atr_multiplier', log_warning=False) or 2.0)
         atr_period = int(expert.get_setting_with_interface_default('atr_period', log_warning=False) or 14)
         min_stop_pct = float(expert.get_setting_with_interface_default('min_stop_loss_pct', log_warning=False) or 0.0)
@@ -1252,7 +1255,19 @@ class TradeRiskManagement:
         from ba2_common.core.position_sizing import compute_risk_based_quantity
 
         equity = expert.get_virtual_balance()
-        risk_pct = float(expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False) or 1.0)
+        # SIZING budget. Prefer the dedicated atr_risk_budget_pct; fall back to risk_per_trade_pct
+        # when unset so a config that never declared the gene behaves exactly as before. The two
+        # are decoupled because risk_per_trade_pct ALSO sets the stop DISTANCE
+        # (synthesize_safeguard_stop, via _ensure_safeguard_stop below) in both sizing modes --
+        # one gene doing two jobs meant a range wide enough for stop search drove the risk-based
+        # size past the per-instrument cap, collapsing risk_atr onto notional.
+        #
+        # THIS is the function dd1f912e meant to edit; it changed the stop synthesiser instead,
+        # leaving the two genes wired to each other's jobs. See _ensure_safeguard_stop.
+        _budget = expert.get_setting_with_interface_default('atr_risk_budget_pct', log_warning=False)
+        if _budget is None:
+            _budget = expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False)
+        risk_pct = float(_budget or 1.0)
         atr_mult = float(expert.get_setting_with_interface_default('atr_multiplier', log_warning=False) or 2.0)
         min_stop_pct = float(expert.get_setting_with_interface_default('min_stop_loss_pct', log_warning=False) or 0.0)
 

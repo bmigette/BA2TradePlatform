@@ -114,17 +114,71 @@ def test_notional_mode_is_structurally_untouched():
         f"gene may now affect notional runs. Context:\n{window}")
 
 
-def test_stop_synthesis_still_takes_risk_per_trade_pct_not_the_budget():
-    """Stop distance is a SEPARATE job that applies in BOTH modes. If the budget ever reaches it,
-    changing position sizing would silently move every stop."""
-    import pathlib
-    src = pathlib.Path(__file__).resolve().parents[1] / "ba2_common" / "core" / "TradeRiskManagement.py"
-    text = src.read_text(encoding="utf-8")
-    idx = text.find("synthesize_safeguard_stop(")
-    assert idx > 0
-    call = text[idx:idx + 320]
-    assert "risk_pct" in call, call
-    assert "atr_risk_budget_pct" not in call, "the sizing budget must not drive the stop distance"
+def test_the_budget_sizes_and_risk_per_trade_sets_the_stop_THROUGH_THE_REAL_METHODS():
+    """THE WIRING, exercised end to end -- the check the previous two tests could not make.
+
+    They inspected SOURCE TEXT: one counted `atr_risk_budget_pct` readers without checking which
+    FUNCTION held the reader, the other sliced 320 chars after `synthesize_safeguard_stop(` and
+    asserted the literal `atr_risk_budget_pct` was absent there. The call site passes a local
+    `risk_pct`, so that literal was never present regardless of where the value came from. Both
+    passed for the whole time the two genes were driving each other's jobs.
+
+    dd1f912e introduced the budget gene but edited `_ensure_safeguard_stop` instead of
+    `_risk_atr_quantity`, so a 0.25-3.0 SIZE budget set the stop and a 0.5-10.0 STOP gene set the
+    size -- the exact coupling this module's docstring says the split removes, still in place and
+    now inverted.
+
+    The numbers are the audit's reproduction. Budget 1% and stop gene 8% are deliberately far
+    apart so a swap cannot pass: correct wiring gives an 8% stop and a $1,000 risk (125 shares);
+    the swap gives a 7% stop (the min_stop floor catching the 1% budget) and sizes off 8% of
+    equity -- 1,142 shares, clamped to 300 by the $30k cap, risking $2,100 against a $1,000
+    budget.
+    """
+    from ba2_common.core.TradeRiskManagement import TradeRiskManagement
+    from ba2_common.core.types import OrderDirection
+
+    class _Order:
+        side = OrderDirection.BUY
+        stop_price = None
+        data = None
+
+    expert = _Expert(atr_risk_budget_pct=1.0,     # SIZE budget
+                     risk_per_trade_pct=8.0,      # STOP distance
+                     min_stop_loss_pct=7.0,
+                     use_atr_stop=False,          # no ATR -> stop is the gene vs the floor
+                     atr_multiplier=2.0, atr_period=14)
+    order = _Order()
+    qty = TradeRiskManagement()._risk_atr_quantity(
+        order, "XYZ", 100.0, expert, max_position_value=30_000.0, available_balance=1_000_000.0)
+
+    assert order.stop_price == pytest.approx(92.0), (
+        f"stop must come from risk_per_trade_pct=8% -> $92, got {order.stop_price}. "
+        f"$93 means the 1% SIZE budget drove the stop and the min_stop floor caught it.")
+    assert qty == 125, (
+        f"size must come from atr_risk_budget_pct=1% of 100k = $1,000 over an $8 stop = 125, "
+        f"got {qty}. 300 means it sized off the 8% stop gene and hit the $30k cap.")
+    assert qty * (100.0 - order.stop_price) == pytest.approx(1_000.0),         "realized loss at the stop must equal the configured budget -- the module's invariant"
+
+
+def test_an_absent_budget_still_falls_back_to_risk_per_trade_pct():
+    """The fallback keeps every config that never declared the gene byte-identical, which is what
+    makes the fix safe to land on existing expert settings."""
+    from ba2_common.core.TradeRiskManagement import TradeRiskManagement
+    from ba2_common.core.types import OrderDirection
+
+    class _Order:
+        side = OrderDirection.BUY
+        stop_price = None
+        data = None
+
+    expert = _Expert(risk_per_trade_pct=8.0, min_stop_loss_pct=7.0,
+                     use_atr_stop=False, atr_multiplier=2.0, atr_period=14)
+    order = _Order()
+    qty = TradeRiskManagement()._risk_atr_quantity(
+        order, "XYZ", 100.0, expert, max_position_value=30_000.0, available_balance=1_000_000.0)
+    # 8% budget over an 8% stop = 1000 shares of $100 = $100k, clamped by the $30k cap.
+    assert order.stop_price == pytest.approx(92.0)
+    assert qty == 300
 
 
 def test_use_atr_stop_off_is_unchanged_when_the_budget_is_unset():
