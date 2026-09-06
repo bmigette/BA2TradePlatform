@@ -389,15 +389,23 @@ def test_atm_iv_memo_caches_none_too(monkeypatch, store_root):
 # --------------------------------------------------------------------------- #
 # 4b. delta_at_entry — the intraday-drawdown refinement's seam (results.py)
 # --------------------------------------------------------------------------- #
-def test_delta_at_entry_is_the_clamped_bars_delta(provider):
-    """Same as-of discipline as the chain: the LATEST bar on or before the entry date."""
+def test_delta_at_entry_is_the_last_bar_STRICTLY_BEFORE_entry(provider):
+    """NOT on-or-before. A daily bar is dated at the CLOSE, so the entry day's own bar has
+    already absorbed the whole session — and the refinement only asks about trades flagged
+    BECAUSE the underlying moved, so that delta embeds the very move whose drawdown is being
+    estimated. Calling it "delta at entry" is circular, and it feeds
+    strategy_fitness.option_consistent_annual_return.
+
+    The prior session's delta is stale, not wrong: it describes a real market state that
+    preceded the entry. Staleness is a bounded approximation; lookahead is not."""
     d5 = {c.symbol: c for c in _wide(provider, date(2023, 1, 5))}[_C100].delta
     d10 = {c.symbol: c for c in _wide(provider, date(2023, 1, 10))}[_C100].delta
-    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) == d5
-    # 01-07 has no bar; the clamp must serve 01-05's delta, never 01-10's.
-    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 7)) == d5
-    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 10)) == d10
     assert d5 != d10
+    # 01-07 has no bar of its own; the latest STRICTLY BEFORE it is 01-05's.
+    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 7)) == d5
+    # 01-10 HAS a bar, and that is exactly the one that must not be served: entering on 01-10
+    # cannot see 01-10's close, so the answer stays 01-05's.
+    assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 10)) == d5
 
 
 @pytest.mark.parametrize("when", [
@@ -437,9 +445,12 @@ def test_both_backends_answer_delta_at_entry(tmp_path, provider):
          "delta": 0.61}])
     try:
         sq = HistoricalOptionsProvider(db)
-        assert sq.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) == pytest.approx(0.61)
+        # 01-06, not 01-05: both readers now serve the last snapshot STRICTLY BEFORE entry, so
+        # the only snapshot (01-05) answers an entry on the 6th and NOT one on the 5th itself.
+        assert sq.delta_at_entry(_UNDER, _C100, date(2023, 1, 6)) == pytest.approx(0.61)
+        assert sq.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) is None
         assert sq.delta_at_entry(_UNDER, _C100, date(2022, 1, 1)) is None
-        assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 5)) is not None
+        assert provider.delta_at_entry(_UNDER, _C100, date(2023, 1, 6)) is not None
     finally:
         _WORKER_CHAIN_CACHE.clear()
 

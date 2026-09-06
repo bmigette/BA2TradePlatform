@@ -553,6 +553,13 @@ def _compute_metrics(
             max_drawdown = refine_drawdown_fn(trades, max_drawdown)
         except Exception as e:  # noqa: BLE001 -- refinement must never fail the backtest
             logger.debug(f"intraday drawdown refinement failed, using daily-only figure: {e}")
+    # BOTH FIGURES SURVIVE. The refined value replaced the daily one in place, so a stored
+    # result could not say whether its max_drawdown was measured from the equity curve or
+    # estimated from a first-order delta re-pricing -- two different quantities under one
+    # name, and only the second moves when the refinement's method changes. Keeping the daily
+    # figure alongside makes a methodology change auditable after the fact and lets saved
+    # candidates be re-ranked on a like-for-like basis.
+    max_drawdown_daily = min(dd_values) if dd_values else 0.0
     neg_dd = [d for d in dd_values if d < 0]
     avg_drawdown = (sum(neg_dd) / len(neg_dd)) if neg_dd else 0.0
     max_dd_duration = _max_drawdown_duration_days(drawdown_curve)
@@ -780,6 +787,10 @@ def _compute_metrics(
         "volatility": round(_finite(volatility, "volatility"), 2),
         # Drawdown metrics
         "max_drawdown": round(_finite(max_drawdown, "max_drawdown"), 2),
+        # The equity-curve figure BEFORE any intraday refinement. Equal to max_drawdown on an
+        # equity-only run and on any run where the refinement found nothing; strictly less
+        # negative when it did. Kept so a stored result can say which quantity it reports.
+        "max_drawdown_daily": round(_finite(max_drawdown_daily, "max_drawdown_daily"), 2),
         "avg_drawdown": round(_finite(avg_drawdown, "avg_drawdown"), 2),
         "max_drawdown_duration": round(_finite(max_dd_duration, "max_drawdown_duration"), 1),
         # Trade quality metrics

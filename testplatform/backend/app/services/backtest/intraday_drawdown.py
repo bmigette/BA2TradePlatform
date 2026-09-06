@@ -116,6 +116,8 @@ def refine_max_drawdown(
     even as a hypothetical estimate.
     """
     refined = max_drawdown
+    flagged = 0        # trades that reached the delta lookup (already past the dip filter)
+    uncovered = 0      # of those, the ones with no usable entry delta / underlying price
     for t in trades:
         contract = t.get("contract_symbol")
         underlying = t.get("underlying_symbol")
@@ -126,9 +128,17 @@ def refine_max_drawdown(
             prior_low = prior_daily_bar_low(underlying, t.get("exit_time"))
             if not is_flagged_for_intraday_check(t, prior_low, exit_low):
                 continue
+            flagged += 1
             delta = delta_at_entry(underlying, contract, t.get("entry_time"))
             entry_underlying_px = underlying_price_at(underlying, t.get("entry_time"))
             if delta is None or entry_underlying_px is None:
+                # UNCOVERED, not "no dip". Skipping is right -- a missing delta cannot be
+                # coerced to 0.0, which would claim the premium does not move with the
+                # underlying and silently report the daily drawdown as refined. But a run
+                # where most flagged trades are uncovered has a refined figure that means
+                # something different from one where all of them were, and nothing in the
+                # result could show that. Counted and reported below.
+                uncovered += 1
                 continue
             bars = bars_5m_between(underlying, t.get("entry_time"), t.get("exit_time"))
             direction_sign = 1.0 if t.get("direction") == "buy" else -1.0
@@ -156,4 +166,13 @@ def refine_max_drawdown(
         except Exception as e:  # noqa: BLE001 - best-effort refinement, never break the backtest
             logger.debug(f"intraday drawdown refinement skipped for a trade: {e}")
             continue
+    if flagged:
+        pct = uncovered / flagged * 100.0
+        # WARNING, not debug, past a third: the refinement moved from the entry day's own
+        # snapshot to the last one strictly BEFORE it, so a contract whose first snapshot IS
+        # its entry day now has no prior and drops out. That is the correct answer, but it
+        # changes what the refined figure covers, and coverage is not visible in the result.
+        (logger.warning if pct >= 33.0 else logger.info)(
+            f"intraday drawdown refinement: {flagged - uncovered}/{flagged} flagged trade(s) "
+            f"had a usable pre-entry delta ({pct:.0f}% uncovered)")
     return max(refined, -100.0)
