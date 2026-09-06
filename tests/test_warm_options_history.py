@@ -820,6 +820,36 @@ def test_a_grpc_unavailable_error_is_recognised_as_transient():
     assert warm._is_transient(_FakeRpcError())
 
 
+def test_a_grpc_internal_server_crash_is_recognised_as_transient():
+    """THE 2026-09-06 LOSS. ThetaData's Java backend threw ArrayIndexOutOfBoundsException on
+    16 symbols (CNC..DAL) inside a 2-minute window. INTERNAL was absent from the transient
+    list, so each was abandoned on attempt 1, dropping ~336 partitions apiece -- 4,714 units,
+    6.3% of everything planned to that point. A server-side index error says nothing about
+    our request: neighbouring symbols in the same chunk succeeded with the identical call."""
+    class _FakeRpcError(Exception):
+        def __repr__(self):
+            return ("<_MultiThreadedRendezvous of RPC that terminated with:\n\tstatus = "
+                   "StatusCode.INTERNAL\n\tdetails = "
+                   "\"java.lang.ArrayIndexOutOfBoundsException\">")
+    assert warm._is_transient(_FakeRpcError())
+
+
+def test_giving_up_reports_attempts_SPENT_not_the_retry_budget(provider, store):
+    """The permanent path breaks out on attempt 1, but the give-up line used to print
+    ns.max_retries -- so a misclassified server crash read as "we tried 4 times and the
+    vendor really is out". That wording is what let the INTERNAL loss look like exhausted
+    retries in the log."""
+    provider.raise_exc = {EXPIRIES[1]: RuntimeError("401 Unauthorized")}
+    lines = []
+    warm.main(["--symbols", "AAPL", "--start", START.isoformat(), "--end", END.isoformat(),
+              "--rate-limit", "0", "--discovery", "rest", "--max-retries", "4"],
+             provider=provider, store=store, clock=FakeClock(),
+             sleep=lambda s: None, log=lines.append)
+    give_up = [ln for ln in lines if "GIVING UP" in ln]
+    assert give_up, "a permanently-failed unit must still log GIVING UP"
+    assert "after 1 attempt" in give_up[0],         f"must report the 1 attempt actually spent, not the budget of 4: {give_up[0]!r}"
+
+
 def test_a_grpc_invalid_argument_error_is_NOT_transient():
     """A malformed request (e.g. bad symbol) fails identically on every retry."""
     class _FakeRpcError(Exception):

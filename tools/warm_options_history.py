@@ -681,7 +681,18 @@ def _is_transient(e: Exception) -> bool:
         # UNAUTHENTICATED/INVALID_ARGUMENT/PERMISSION_DENIED are deliberately NOT here: those
         # are a bad key/request, identical on every retry.
         "StatusCode.UNAVAILABLE", "StatusCode.RESOURCE_EXHAUSTED",
-        "StatusCode.DEADLINE_EXCEEDED", "StatusCode.ABORTED"))
+        "StatusCode.DEADLINE_EXCEEDED", "StatusCode.ABORTED",
+        # INTERNAL is the vendor's SERVER crashing, not our request being wrong: observed
+        # 2026-09-06 as `INTERNAL:java.lang.ArrayIndexOutOfBoundsException` on 16 symbols
+        # (CNC..DAL) within a 2-minute window, which abandoned ~336 partitions EACH -- 4,714
+        # units, 6.3% of everything planned to that point -- on attempt 1.
+        #
+        # A Java index error on their side says nothing about the request; the identical
+        # request succeeded for neighbouring symbols in the same chunk. The asymmetry decides
+        # it: if it really is permanent we spend `max_retries` attempts and reach exactly
+        # today's outcome, whereas classifying it permanent when it is not silently drops
+        # thousands of partitions that only a human noticing the count would ever recover.
+        "StatusCode.INTERNAL"))
 
 
 def run_units(plan: Plan, provider, store: OptionHistoryParquetStore,
@@ -739,8 +750,12 @@ def run_units(plan: Plan, provider, store: OptionHistoryParquetStore,
             # No manifest is written, so the whole unit is redone on the next run. That is
             # strictly better than persisting a partial chain that no re-run revisits.
             stats.units_failed += 1
-            log(f"  [{unit.underlying} {unit.expiry}] GIVING UP after {ns.max_retries} "
-                f"attempts — left unfetched, re-run to retry")
+            # `attempt`, not ns.max_retries: a permanent classification breaks out on the
+            # FIRST attempt, and reporting the budget instead of the spend read as "we tried
+            # 4 times and the vendor really is out", which is how a misclassified server
+            # crash hid as an exhausted retry.
+            log(f"  [{unit.underlying} {unit.expiry}] GIVING UP after {attempt} "
+                f"attempt(s) — left unfetched, re-run to retry")
         else:
             manifest = store.write_partition(unit.underlying, unit.expiry, bars, start, end,
                                              empty_contracts=sorted(empties))
@@ -889,7 +904,7 @@ def run_symbol_units(units: Sequence[SymbolUnit], provider,
             # `pending` holds only what never closed.
             if pending:
                 stats.units_failed += len(pending)
-                log(f"  [{unit.underlying}] GIVING UP after {ns.max_retries} attempts — "
+                log(f"  [{unit.underlying}] GIVING UP after {attempt} attempt(s) — "
                     f"{len(pending)} expiry partition(s) left unfetched, re-run to retry")
         else:
             # The tail: expiries still open at the end of the window (nothing dated later than
