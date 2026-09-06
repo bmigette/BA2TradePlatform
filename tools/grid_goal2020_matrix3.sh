@@ -235,10 +235,19 @@ ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 9 ;; small) echo 17 ;;
 #     box; it ran at 94-95% and the kernel OOM-killed pool children, which the worker recovered
 #     from by rebuilding (BrokenProcessPool -> the master requeued the lost trials). SIZE ON THE
 #     PEAK CHILD, NEVER THE MEAN: 14 x 18.5 = 259 GB, past the box before the OS gets a byte.
-#   * AFTER eb4d4c71 (the payload/projection fix): ~5-6 GB of that was decoded JSON pinned for
+#   * AFTER eb4d4c71 (the payload/projection fix): ~6 GB of that was decoded JSON pinned for
 #     the life of the worker -- measured with tracemalloc, json/decoder.py holding 2,465 MB in
-#     44.6M live objects against 69.7 MB for the {date: open} maps distilled from them. Budget
-#     ~13 GB/child and re-measure /diag/memory after the first generation.
+#     44.6M live objects against 69.7 MB for the {date: open} maps distilled from them.
+#   * MEASURED AGAIN over 4h of sen-S3 at 16 slots (2026-09-06): the peak child GREW 7.5 -> 12.2
+#     GB through generation 1-2 and then PLATEAUED -- 12.3 GB across the whole of generations 2
+#     and 3, with the box at 53-58% and 105 GB free. 12.3 GB is the steady state; the growth
+#     everyone watches for in the first hour is children filling toward it, not a leak.
+#
+# RUNNING AT 18 (operator's call, 2026-09-06): 18 x 12.3 = 221 GB of ~235 usable, ~88%. That is
+# a deliberate trade of margin for throughput on a plateau that held flat for two hours. It
+# leaves ~30 GB -- roughly two children -- so a genuine spike is absorbed but a return to the
+# pre-fix footprint would not be. Re-measure /diag/memory after generation 2 of any job whose
+# shape changes (a wider universe, a longer window, a different expert).
 #
 # The number that matters is CHILDREN RESIDENT, not slots dispatched: children are spawned once
 # and keep their working set whatever the master sends them, so lowering BA2_MAX_REMOTE_SLOTS
