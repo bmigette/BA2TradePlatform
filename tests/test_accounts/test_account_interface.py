@@ -979,6 +979,45 @@ class TestCloseNeverFallsBackToTheOrderedQuantity:
         assert "flat" in result["message"].lower(), result["message"]
         assert result["success"] is True
 
+    def test_a_deferred_close_is_WAITING_TRIGGER_so_the_scanner_can_ever_submit_it(self, monkeypatch):
+        """THE BUG. A close chained on the cancel of a resting stop is a DEPENDENT order, and the
+        only thing that ever promotes a dependent order is TradeManager's scanner, which selects
+        ``status == WAITING_TRIGGER``. This branch wrote PENDING, so the close was invisible to
+        it: found live 2026-09-06 after a batch close left four "Closing position for
+        transaction N" orders PENDING with broker_order_id NULL, their transactions stuck
+        CLOSING, and no path that would ever submit them.
+
+        The deferred branch writes straight to the DB and must NOT go through submit_order --
+        that is the whole point of waiting for the cancel -- so the proof reads the row back."""
+        acct_def = create_account_definition()
+        account = MockAccount(acct_def.id)
+        submitted = []
+        monkeypatch.setattr(account, "submit_order",
+                            lambda o, **k: submitted.append(o) or o)
+        transaction = self._txn_with_orders(
+            acct_def, ordered_qty=100.0,
+            fills=[(OrderDirection.BUY, 100.0)],
+        )
+        resting_stop = create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", quantity=100.0,
+            side=OrderDirection.SELL, status=OrderStatus.PENDING_CANCEL,
+            transaction_id=transaction.id,
+        )
+
+        result = account.submit_close_order_for_transaction(
+            transaction, last_broker_canceled_order_id=resting_stop.id
+        )
+
+        assert result["success"] is True
+        assert submitted == [], "a deferred close must wait for the cancel, not hit the broker"
+        close = get_instance(TradingOrder, result["close_order_id"])
+        assert close.status == OrderStatus.WAITING_TRIGGER, (
+            f"deferred close must be WAITING_TRIGGER (the only status the activation scanner "
+            f"reads), got {close.status}")
+        assert close.depends_on_order == resting_stop.id
+        assert close.depends_order_status_trigger == OrderStatus.CANCELED
+        assert close.quantity == 100.0
+
     def test_partial_exit_closes_the_remainder_not_the_ordered_quantity(self, monkeypatch):
         """THE INVERSE #1: a real, measured net must still be closed -- and it is the
         REMAINDER (60), never the ordered 100. The ACTIVITY LOG has its own copy of
@@ -2450,12 +2489,16 @@ class TestTheExitGuardNetsSalesAlreadyInFlight:
         assert two["success"] is False, "the second lot did not see the first"
         assert PLEDGED_COVER_REFUSAL in two["message"], two["message"]
         assert "already committed to be sold" in two["message"], two["message"]
+        # A deferred close is WAITING_TRIGGER (the status the activation scanner reads --
+        # written PENDING it could never be submitted); the substance here is unchanged:
+        # exactly ONE 100-share sale is queued, not 200 against a 100-share pledge.
         queued = [o for o in orders_where(account_id=acct_def.id)
                   if o.side == OrderDirection.SELL
                   and o.order_type == OrderType.MARKET
-                  and o.status == OrderStatus.PENDING]
+                  and o.status in (OrderStatus.WAITING_TRIGGER, OrderStatus.PENDING)]
         assert [o.quantity for o in queued] == [100.0], \
             "200 of the 200 held shares were queued to sell against a 100-share pledge"
+        assert queued[0].status == OrderStatus.WAITING_TRIGGER
         assert sent == [], "the deferred branch must not reach the broker at all"
 
     def test_the_IMMEDIATE_close_of_a_second_lot_sees_the_first(self, monkeypatch):
