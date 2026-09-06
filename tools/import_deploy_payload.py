@@ -146,6 +146,30 @@ def main() -> int:
             # Defaults to False; without it the instance analyses and never trades. The export
             # now carries it explicitly (deploy_parity), so this is a floor for an OLD payload.
             expert_params.setdefault("allow_automated_trade_opening", True)
+            # THE SCHEDULE, same failure mode as the flag above and previously dropped entirely.
+            #
+            # The payload carries the backtest's own cadence as execution.run_schedule_override,
+            # but nothing here ever wrote it, so a freshly deployed instance came up enabled,
+            # correctly configured, and with NO schedule -- it loads, shows in the UI, and never
+            # fires. Indistinguishable from a strategy that simply found no setup, which is the
+            # exact trap the allow_automated_trade_opening line above exists to close. Found live
+            # 2026-09-06 on five instances whose Scheduled Jobs table was empty.
+            sched = ((entry["settings"].get("execution") or {}).get("run_schedule_override") or {})
+            if sched.get("days"):
+                days = {d: bool(v) for d, v in sched["days"].items()}
+                times = sched.get("times") or ["09:30"]
+                expert_params.setdefault("execution_schedule_enter_market",
+                                         {"days": days, "times": times, "time_basis": "market"})
+                # EXITS RUN EVERY WEEKDAY, not on the entry cadence. Entry is typically Mondays
+                # only (that is when the screener re-ranks), but an open position's stop and
+                # target have to be evaluated daily -- inheriting a Monday-only schedule here
+                # would leave live positions unmanaged from Tuesday to Friday.
+                expert_params.setdefault("execution_schedule_open_positions", {
+                    "days": {d: d not in ("saturday", "sunday") for d in days},
+                    "times": times, "time_basis": "market"})
+            else:
+                print("  WARNING: payload carries no run_schedule_override -- the instance will "
+                      "have NO schedule and will never fire. Set one before enabling it.")
         expert.save_settings({k: (v, None) for k, v in expert_params.items()})
         print(f"expertsetting: saved {len(expert_params)} keys for instance {inst_id}"
               + ("  (incl. allow_automated_trade_opening)" if created else ""))
