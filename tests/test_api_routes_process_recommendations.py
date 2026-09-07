@@ -29,9 +29,19 @@ def _client() -> TestClient:
 
 
 def _expert_exists(monkeypatch, *ids):
-    """``get_instance(ExpertInstance, id)`` answers a record for ``ids`` and None otherwise."""
-    monkeypatch.setattr("ba2_trade_platform.core.db.get_instance",
-                        lambda model, ident: SimpleNamespace(id=ident) if ident in ids else None)
+    """``get_instance(ExpertInstance, id)`` answers a record for ``ids`` and RAISES otherwise.
+
+    Raises, because that is the real contract: ``get_instance`` enforces raise-if-not-found
+    (its docstring says None). A fake that returned None here is exactly how the first live
+    probe of this route came back as a bare 500 -- the test encoded the wrong contract.
+    """
+    from ba2_trade_platform.core.db import InstanceNotFound
+
+    def fake(model, ident):
+        if ident in ids:
+            return SimpleNamespace(id=ident)
+        raise InstanceNotFound(f"Instance with id {ident}/{model} not found.")
+    monkeypatch.setattr("ba2_trade_platform.core.db.get_instance", fake)
 
 
 def _fake_trade_manager(monkeypatch, *, orders=(), raises=None):

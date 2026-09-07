@@ -189,13 +189,20 @@ def process_recommendations(body: ProcessRecommendationsRequest):
     enabled -- so calling this twice is safe; the second call finds nothing left to do.
     """
     from ..core.TradeManager import get_trade_manager
-    from ..core.db import get_instance
+    from ..core.db import InstanceNotFound, get_instance
     from ..core.models import ExpertInstance
 
     if body.lookback_days < 1:
         raise HTTPException(status_code=400,
                             detail=f"lookback_days must be >= 1, got {body.lookback_days}")
-    if get_instance(ExpertInstance, body.expert_instance_id) is None:
+    # ``get_instance`` RAISES on a missing row (its docstring says None; the code enforces a
+    # raise-if-not-found contract, and the first live probe of this route learned that as a
+    # bare 500). Both spellings are handled so the answer is a 404 either way.
+    try:
+        record = get_instance(ExpertInstance, body.expert_instance_id)
+    except InstanceNotFound:
+        record = None
+    if record is None:
         raise HTTPException(status_code=404,
                             detail=f"No expert instance with id {body.expert_instance_id}")
     try:
