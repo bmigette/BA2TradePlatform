@@ -126,6 +126,7 @@ __all__ = [
     "ERROR_SYMBOL_NEGATIVE_FMT", "ERROR_SYMBOL_DUPLICATE_FMT",
     # engine
     "current_value", "UnrealisedPnL", "unrealised_pnl", "format_unrealised_pnl",
+    "split_unrealised_pnl",
     "PNL_UNMEASURABLE_MARK", "PNL_NO_PRICE_MARK", "PNL_PCT_FMT", "PNL_NO_COST_NOTE",
     "PNL_UNPRICED_FMT", "PNL_FMT", "PNL_WITH_DIV_FMT",
     "round_quantity", "round_delta_quantity", "even_split_pct",
@@ -1247,6 +1248,38 @@ def format_unrealised_pnl(pnl: UnrealisedPnL) -> str:
     if pnl.unpriced:
         notes.append(PNL_UNPRICED_FMT.format(count=pnl.unpriced))
     return PNL_FMT.format(amount=pnl.amount, notes=', '.join(notes))
+
+
+def split_unrealised_pnl(pnl: UnrealisedPnL) -> Tuple[str, Optional[str], str]:
+    """``format_unrealised_pnl`` cut into three, so the caller can colour the middle.
+
+    THE TWO NUMBERS HAVE DIFFERENT SIGNS, and one colour cannot say so. A holding
+    down 4.27% on price that is up 4.28% once its dividends are counted is a real and
+    common shape for an income sleeve -- it is the whole point of holding one -- and
+    painting the entire caption red because the FIRST number is negative reports the
+    opposite of what the second one says. Operator, 2026-09-07: "keep the raw red,
+    and div green".
+
+    Returns ``(head, dividend_note, tail)`` where ``head + (dividend_note or "") +
+    tail`` is EXACTLY ``format_unrealised_pnl(pnl)``. That invariant is the point of
+    doing the split here rather than with a regex in the view: the caption keeps one
+    definition, and a caller that ignores the split still renders the same string.
+
+    ``dividend_note`` is ``None`` when there is no dividend-adjusted figure to show,
+    which is also every "nothing measurable" case -- there is nothing to colour
+    separately and the head carries the whole caption.
+    """
+    full = format_unrealised_pnl(pnl)
+    if pnl is None or pnl.amount is None or pnl.total_pct is None:
+        return full, None, ''
+    note = PNL_WITH_DIV_FMT.format(pct=pnl.total_pct)
+    # Built from the SAME constant format_unrealised_pnl used, so it is present.
+    # find(), not index(), because a caption that somehow lost the note must degrade
+    # to "one colour" rather than raise inside a render loop.
+    at = full.find(note)
+    if at < 0:
+        return full, None, ''
+    return full[:at], note, full[at + len(note):]
 
 
 def _round_shares(raw: float, margin: Optional[MarginInfo], *,

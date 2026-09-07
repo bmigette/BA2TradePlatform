@@ -5182,3 +5182,54 @@ def test_the_share_point_hint_still_reads_the_COMPOSITION_percentage():
     d = symbol_delta(weight_pct=25.0, pct_of_label=60.0, target_value=None,
                      current_value=None, quantity=None, price=None)
     assert d.share == -35.0
+
+
+class TestTheDividendHalfCarriesItsOwnSign:
+    """``pnl_div_color`` / ``pnl_div_classes``, added 2026-09-07.
+
+    Deliberately NOT ``pnl_color``: the two numbers disagree on exactly the rows worth
+    reading, and that disagreement is the information the row exists to carry.
+    """
+
+    def _pnl(self, total_pct):
+        # Imported locally, as the other late-arriving suites in this file do: the
+        # module's top import block is a fixed public surface and this class only
+        # needs the one type.
+        from ba2_trade_platform.core.portfolio_allocation import UnrealisedPnL
+        return UnrealisedPnL(amount=-50.20, pct=-4.27, total_pct=total_pct)
+
+    @property
+    def view(self):
+        from ba2_trade_platform.ui.utils import portfolio_allocation_view
+        return portfolio_allocation_view
+
+    def test_a_positive_dividend_return_is_green_beside_a_red_loss(self):
+        pnl = self._pnl(4.28)
+        view = self.view
+        assert 'text-green-500' in view.pnl_div_classes(pnl)
+        assert view.pnl_div_color(pnl) == view.PNL_POSITIVE_COLOR
+        # THE POINT: the money half stays red on the same row.
+        assert view.pnl_color(pnl) == view.PNL_NEGATIVE_COLOR
+
+    def test_a_negative_dividend_return_is_still_red(self):
+        pnl = self._pnl(-1.5)
+        view = self.view
+        assert 'text-red-500' in view.pnl_div_classes(pnl)
+        assert view.pnl_div_color(pnl) == view.PNL_NEGATIVE_COLOR
+
+    def test_a_flat_dividend_return_is_neutral_not_a_verdict(self):
+        view = self.view
+        for flat in (0.0, 0.004, -0.004):
+            assert view.pnl_div_color(self._pnl(flat)) == view.NEUTRAL_TEXT_COLOR
+
+    def test_no_dividend_figure_is_neutral(self):
+        view = self.view
+        assert view.pnl_div_color(self._pnl(None)) == view.NEUTRAL_TEXT_COLOR
+        assert view.pnl_div_color(None) == view.NEUTRAL_TEXT_COLOR
+
+    def test_the_caption_parts_rebuild_the_caption(self):
+        pnl = self._pnl(4.28)
+        view = self.view
+        head, dividend, tail = view.format_pnl_caption_parts(pnl)
+        assert head + (dividend or '') + tail == view.format_pnl_caption(pnl)
+        assert head.startswith('P&L ')

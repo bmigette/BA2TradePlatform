@@ -251,6 +251,16 @@ class TastyTradeAccount(AccountInterface):
         "read-only token 403s every write endpoint."
     )
 
+    #: TastyTrade's refusal code for an opening MARKET order outside session hours.
+    #: It applies to a DRY RUN too -- the SDK routes preview_order_impact through
+    #: place_order(dry_run=True), so an out-of-hours preview raises exactly as a
+    #: submission would. That is expected, not a fault: it is why a capital
+    #: requirement cannot be measured out of hours.
+    #:
+    #: Matched as a SUBSTRING of the broker's own message, which is returned verbatim
+    #: by _describe_broker_error.
+    _CLOSED_MARKET_PREVIEW_CODE = "tif_no_after_hours_opening_market_orders"
+
     @classmethod
     def _describe_broker_error(cls, exc: Exception, operation: str) -> str:
         """A human-actionable rendering of a broker exception, for logs and comments.
@@ -1281,10 +1291,24 @@ class TastyTradeAccount(AccountInterface):
             response = self._run_async(
                 self._account.place_order(self._session, new_order, dry_run=True))
         except Exception as e:
+            described = self._describe_broker_error(e, 'the order preview (dry run)')
+            # NOT AN ERROR, and it must not read like one. The broker declines to price
+            # an opening market order while the market is closed -- including the dry
+            # run -- so every out-of-hours allocation preview raised here once per
+            # symbol, at ERROR, with a stack trace naming ``place_order``. 940 such
+            # lines in one prod log read as "the platform is trying to submit orders
+            # with the market shut", which is the opposite of what happened: nothing
+            # was ever sent. One INFO line, no traceback, and it says what it means.
+            if self._CLOSED_MARKET_PREVIEW_CODE in described:
+                logger.info(
+                    f"[Account {self.id}] No preview for {trading_order.symbol}: the "
+                    f"market is closed and the broker will not price an opening market "
+                    f"order out of hours. Nothing was submitted; the row simply has no "
+                    f"broker-measured buying power or margin requirement.")
+                return None
             logger.error(
                 f"[Account {self.id}] Order preview failed for {trading_order.symbol}: "
-                f"{self._describe_broker_error(e, 'the order preview (dry run)')}",
-                exc_info=True)
+                f"{described}", exc_info=True)
             return None
 
         effect = response.buying_power_effect

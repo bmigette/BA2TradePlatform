@@ -6946,7 +6946,12 @@ def test_a_repaint_does_not_drop_the_delta_and_pnl_CELL_WIDTHS(nicegui_client,
 
     # BY THE ROW, not by the sentence: the per-label symbol-share bar draws a delta
     # in the same vocabulary, so 'on target' alone finds four cells on this page.
-    pnls = _marked(root, page.MARKER_LABEL_PNL)
+    # The P&L CELL, not the first half of its sentence: the caption became two spans
+    # (price return, then dividend-adjusted return) so each can carry its own sign's
+    # colour, and the width moved to the cell that holds them. Keeping the assertion on
+    # the inner label would have passed while the w-72 sat there filling the cell and
+    # hiding the dividend half.
+    pnls = _marked(root, page.MARKER_LABEL_PNL_CELL)
     assert len(pnls) == 2
     for pnl in pnls:
         assert page.PNL_CELL_CLASSES.split()[0] in pnl._classes

@@ -22,7 +22,7 @@ from ...core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed, PositionState,
     UnrealisedPnL,
     clamp_unallocated_pct, current_value, effective_target_pct,
-    format_unrealised_pnl, investable_notional,
+    format_unrealised_pnl, investable_notional, split_unrealised_pnl,
     position_sign, reserved_notional_for, scale_pct_to_total, signed_position_values,
     split_pct_across, unrealised_pnl, validate_unallocated_pct,
 )
@@ -2748,10 +2748,57 @@ def format_last_target(previous: Optional[float]) -> str:
     return LAST_TARGET_FMT.format(previous=format_last_pct(previous))
 
 
+#: Below this, a dividend-adjusted percentage is drawn NEUTRAL rather than green or
+#: red. Half of the last digit the caption prints (``{pct:+.2f}%``), so the colour can
+#: never disagree with the number beside it -- the same rule
+#: ``LEVERAGE_RATIO_TOLERANCE`` follows for the same reason. ``pnl_color``'s band is
+#: MONEY_EPSILON because it keys off an amount; this half is a percentage.
+PNL_PCT_EPSILON = 0.005
+
+
 def format_pnl_caption(pnl: UnrealisedPnL) -> str:
     """``P&L +1,500.00 (+150.00%)``. Pure; the arithmetic and the wording are the
     engine's ``format_unrealised_pnl``, so this adds a name and nothing else."""
     return PNL_CAPTION_FMT.format(pnl=format_unrealised_pnl(pnl))
+
+
+def format_pnl_caption_parts(pnl: UnrealisedPnL) -> Tuple[str, Optional[str], str]:
+    """The caption in three pieces, so the dividend half can carry its own colour.
+
+    Pure. ``head + (dividend or "") + tail`` is EXACTLY ``format_pnl_caption(pnl)``
+    -- the engine's ``split_unrealised_pnl`` guarantees it and a test pins it, so
+    the row cannot drift from the single-string form the tooltips and tests use.
+
+    ``dividend`` is ``None`` when there is nothing dividend-adjusted to show; the
+    caller then draws the head alone and the row looks exactly as it did.
+    """
+    head, dividend, tail = split_unrealised_pnl(pnl)
+    return PNL_CAPTION_FMT.format(pnl=head), dividend, tail
+
+
+def pnl_div_color(pnl: UnrealisedPnL) -> str:
+    """The colour for the ``w/ div`` half, driven by ITS OWN sign. Pure.
+
+    Deliberately NOT ``pnl_color``: the two numbers disagree on exactly the rows
+    worth looking at (an income sleeve down on price and up on total return), and
+    that disagreement is the information. Same neutral band as ``pnl_color`` for the
+    same reason -- a flat 0.00% is not a verdict.
+
+    The BAND IS ON THE PERCENTAGE, not on ``pnl.amount``: this half is a percentage,
+    and keying its colour off the money would paint the dividend figure by the sign
+    of the number it is there to contradict.
+    """
+    if pnl is None or pnl.total_pct is None or abs(pnl.total_pct) <= PNL_PCT_EPSILON:
+        return NEUTRAL_TEXT_COLOR
+    return PNL_POSITIVE_COLOR if pnl.total_pct > 0 else PNL_NEGATIVE_COLOR
+
+
+def pnl_div_classes(pnl: UnrealisedPnL) -> str:
+    """CSS for the ``w/ div`` half. Pure; the colour twin of ``pnl_div_color``."""
+    if pnl is None or pnl.total_pct is None or abs(pnl.total_pct) <= PNL_PCT_EPSILON:
+        return 'text-xs text-secondary-custom'
+    return 'text-xs font-medium ' + ('text-green-500' if pnl.total_pct > 0
+                                     else 'text-red-500')
 
 
 def pnl_classes(pnl: UnrealisedPnL) -> str:

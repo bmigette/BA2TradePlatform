@@ -507,3 +507,51 @@ class TestCashDividendsBySymbol:
         P&L column simply has no dividend-adjusted figure."""
         assert pa.cash_dividends_by_symbol(None) == {}
         assert pa.cash_dividends_by_symbol([]) == {}
+
+
+class TestTheTwoHalvesOfThePnlCaptionCanDisagree:
+    """``split_unrealised_pnl``, added 2026-09-07.
+
+    An income sleeve down 4.27% on price and UP 4.28% once its dividends count is not
+    an edge case -- it is the point of holding one. The caption stated both numbers and
+    painted the whole line by the sign of the first, so the row reported the opposite
+    of what its second number said. Operator: "if the w/div part is positive, should be
+    green" / "keep the raw red, and div green".
+    """
+
+    def _pnl(self, **kw):
+        base = dict(amount=-50.20, pct=-4.27, total_pct=4.28)
+        base.update(kw)
+        return pa.UnrealisedPnL(**base)
+
+    def test_the_three_pieces_rebuild_the_caption_exactly(self):
+        """THE INVARIANT, and the reason the split lives in the engine rather than in a
+        regex in the view: the caption keeps ONE definition."""
+        pnl = self._pnl()
+        head, dividend, tail = pa.split_unrealised_pnl(pnl)
+        assert head + (dividend or "") + tail == pa.format_unrealised_pnl(pnl)
+
+    def test_the_dividend_half_is_isolated(self):
+        head, dividend, tail = pa.split_unrealised_pnl(self._pnl())
+        assert dividend == "w/ div: +4.28%"
+        assert "w/ div" not in head and "w/ div" not in tail
+        assert "-4.27%" in head, "the price return stays with the money it belongs to"
+
+    def test_no_dividend_figure_leaves_the_caption_whole(self):
+        """A row with nothing dividend-adjusted must draw byte-for-byte what it drew
+        before the split existed."""
+        pnl = self._pnl(total_pct=None)
+        head, dividend, tail = pa.split_unrealised_pnl(pnl)
+        assert (head, dividend, tail) == (pa.format_unrealised_pnl(pnl), None, "")
+
+    def test_an_unmeasurable_pnl_is_not_split(self):
+        pnl = pa.UnrealisedPnL(amount=None, pct=None, total_pct=None)
+        assert pa.split_unrealised_pnl(pnl) == (pa.format_unrealised_pnl(pnl), None, "")
+
+    def test_a_note_after_the_dividend_one_stays_out_of_the_coloured_span(self):
+        """``2 unpriced excluded`` is not a return and must not be painted like one."""
+        pnl = self._pnl(unpriced=2)
+        head, dividend, tail = pa.split_unrealised_pnl(pnl)
+        assert dividend == "w/ div: +4.28%"
+        assert "unpriced" in tail
+        assert head + dividend + tail == pa.format_unrealised_pnl(pnl)

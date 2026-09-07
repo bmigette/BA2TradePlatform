@@ -4431,3 +4431,85 @@ def test_an_unusable_cache_degrades_to_no_cache(bad):
 
     assert info["MSFT"].source == MARGIN_SOURCE_DEFAULT
     assert info["MSFT"].bp_factor == 1.0
+
+
+def _preview_account(raiser):
+    """A bare account whose ONE broker call raises. ``_account``/``_session`` exist
+    because ``self._account.place_order(...)`` is evaluated before ``_run_async``
+    ever runs -- the fake has to get that far to reach the handler under test."""
+    from ba2_trade_platform.modules.accounts.TastyTradeAccount import TastyTradeAccount
+
+    acct = object.__new__(TastyTradeAccount)
+    acct._account = SimpleNamespace(place_order=lambda *a, **k: None)
+    acct._session = object()
+    acct._check_authentication = lambda: True
+    acct._build_new_order = lambda order, is_closing_order=False: object()
+    acct._run_async = raiser
+    acct.__dict__["id"] = 2
+    return acct
+
+
+def _capture_all(monkeypatch):
+    """``{level: [message]}`` plus whether exc_info was passed. Same reason as
+    ``_capture_errors``: caplog never sees this module's records."""
+    import sys
+    from ba2_trade_platform.modules.accounts.TastyTradeAccount import TastyTradeAccount
+
+    TT = sys.modules[TastyTradeAccount.__module__]
+    seen = {"info": [], "error": [], "traceback": []}
+
+    def _info(msg, *a, **k):
+        seen["info"].append(str(msg))
+
+    def _error(msg, *a, **k):
+        seen["error"].append(str(msg))
+        seen["traceback"].append(bool(k.get("exc_info")))
+
+    monkeypatch.setattr(TT.logger, "info", _info)
+    monkeypatch.setattr(TT.logger, "error", _error)
+    return seen
+
+
+def _raise_closed_market(_coro):
+    raise RuntimeError(
+        "tif_no_after_hours_opening_market_orders: Opening market orders not allowed "
+        "when market closed.")
+
+
+def test_a_closed_market_preview_is_information_not_an_error(monkeypatch):
+    """The broker declines to price an OPENING MARKET order out of hours -- including
+    the dry run, because ``preview_order_impact`` routes through
+    ``place_order(dry_run=True)``.
+
+    Reported from a prod log holding 940 of these at ERROR with a stack trace naming
+    ``place_order``: "I see in logs we're trying to submit orders while market is off".
+    Nothing was ever submitted. One INFO line, no traceback, and it says so.
+    """
+    seen = _capture_all(monkeypatch)
+    account = _preview_account(_raise_closed_market)
+
+    assert account.preview_order_impact(SimpleNamespace(symbol="NASA"),
+                                        is_closing_order=False) is None
+
+    assert not seen["error"], "an expected refusal at ERROR reads as a failed submission"
+    assert len(seen["info"]) == 1, seen["info"]
+    message = seen["info"][0]
+    assert "NASA" in message, "the row must still say why it has no broker figures"
+    assert "market is closed" in message
+    assert "Nothing was submitted" in message
+
+
+def test_a_real_preview_failure_is_still_a_loud_error(monkeypatch):
+    """The inverse, and why the check is a SUBSTRING of the broker's own refusal code
+    rather than "anything raised during a preview": a genuine rejection keeps its ERROR
+    and its traceback."""
+    def _boom(_coro):
+        raise RuntimeError("insufficient_buying_power: not enough buying power")
+
+    seen = _capture_all(monkeypatch)
+    account = _preview_account(_boom)
+
+    assert account.preview_order_impact(SimpleNamespace(symbol="NASA"),
+                                        is_closing_order=False) is None
+    assert len(seen["error"]) == 1 and seen["traceback"] == [True]
+    assert not seen["info"]

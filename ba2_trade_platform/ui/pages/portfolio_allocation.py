@@ -164,7 +164,8 @@ from ..utils.portfolio_allocation_view import (
     label_total_readout,
     load_current_symbol_shares, load_last_symbol_shares, managed_total_value,
     important_color_style,
-    missing_quote_symbols, picker_options, pnl_classes, pnl_color,
+    format_pnl_caption_parts, missing_quote_symbols, picker_options, pnl_classes,
+    pnl_color, pnl_div_classes, pnl_div_color,
     positions_by_symbol,
     resolve_label_icon_color, resolve_symbol_weights,
     sort_label_views, store_color_value,
@@ -838,6 +839,14 @@ MARKER_BAR_ROW = 'pf-bar-row'
 #: that can be coloured, and NiceGUI colours whole elements.
 MARKER_LABEL_LAST = 'pf-label-last'
 MARKER_LABEL_PNL = 'pf-label-pnl'
+#: The fixed-width CELL holding the P&L caption. The caption is two elements now
+#: -- the money with its price return, then the dividend-adjusted return -- because
+#: the two carry OPPOSITE signs on exactly the rows worth reading (an income sleeve
+#: down on price and up on total return) and one colour cannot say so.
+#: MARKER_LABEL_PNL stays on the first, which is what every reader of "the P&L
+#: text" means, and the cell keeps the width.
+MARKER_LABEL_PNL_CELL = 'pf-label-pnl-cell'
+MARKER_LABEL_PNL_DIV = 'pf-label-pnl-div'
 #: The tag icon LEFT OF THE LABEL NAME. Marked because it is one ``ui.icon`` among
 #: several on the row and its whole content is an inline colour -- and because the
 #: user's complaint was precisely that it disagreed with the bar beside it.
@@ -1309,11 +1318,25 @@ def _apply_bars(live: Dict[str, Any]) -> None:
         # this render opened with. They are rewritten in the same loop anyway, so
         # nothing has to remember which of the row's figures are live.
         widgets['last'].set_text(bar.last_text)
-        widgets['pnl'].set_text(bar.pnl_text)
-        widgets['pnl'].classes(replace=PNL_CELL_CLASSES + pnl_classes(bar.pnl))
+        # head + dividend + tail is EXACTLY ``bar.pnl_text``; the engine's
+        # ``split_unrealised_pnl`` guarantees it, so only the COLOURING is split.
+        head, dividend, tail = format_pnl_caption_parts(bar.pnl)
+        widgets['pnl'].set_text(head)
+        # 'truncate', not PNL_CELL_CLASSES: the w-72 now lives on the CELL around
+        # both halves. Left on this label it would fill the cell by itself and
+        # push the dividend half out of sight -- which is the whole point of the
+        # split, silently undone.
+        widgets['pnl'].classes(replace='truncate ' + pnl_classes(bar.pnl))
         # Green up, red down, neutral inside the epsilon band -- and painted, not
         # merely classed, for the reason above.
         widgets['pnl'].style(replace=important_color_style(pnl_color(bar.pnl)))
+        # The dividend half by ITS OWN sign. Blank and unstyled when there is none, so
+        # a row with no dividend figure draws exactly what it drew before.
+        widgets['pnl_div'].set_text('' if dividend is None else dividend + tail)
+        widgets['pnl_div'].classes(
+            replace='truncate ' + ('' if dividend is None else pnl_div_classes(bar.pnl)))
+        widgets['pnl_div'].style(
+            replace='' if dividend is None else important_color_style(pnl_div_color(bar.pnl)))
         widgets['tooltip'].set_text(format_label_target_tooltip(
             target_pct=bar.target_pct, base_notional=live['base_notional'],
             unallocated_pct=live['unallocated_pct']))
@@ -3115,8 +3138,15 @@ def _render_label_bar_row(account_id: int, live: Dict[str, Any], view, refresh) 
             widgets['last'] = ui.label('') \
                 .classes('w-28 shrink-0 truncate text-xs text-secondary-custom') \
                 .mark(MARKER_LABEL_LAST)
-            widgets['pnl'] = ui.label('').classes(PNL_CELL_CLASSES) \
-                .mark(MARKER_LABEL_PNL)
+            # TWO spans in ONE fixed-width cell. ``gap-0`` because the split is
+            # invisible: the halves must read as the one sentence they were before,
+            # and the engine guarantees head + dividend + tail is that sentence.
+            with ui.row().classes(PNL_CELL_CLASSES + 'gap-0 flex-nowrap items-baseline') \
+                    .mark(MARKER_LABEL_PNL_CELL):
+                widgets['pnl'] = ui.label('').classes('truncate') \
+                    .mark(MARKER_LABEL_PNL)
+                widgets['pnl_div'] = ui.label('').classes('truncate') \
+                    .mark(MARKER_LABEL_PNL_DIV)
             # The pencil. It OPENS the label and focuses its target box; it never
             # closes one, because "edit this" is not a toggle.
             ui.icon('edit').classes('cursor-pointer text-secondary-custom') \
