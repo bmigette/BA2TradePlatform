@@ -112,6 +112,7 @@ __all__ = [
     "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
     "REASON_BUMPED_TO_ONE_SHARE_FMT", "REASON_BELOW_ONE_SHARE_FMT",
     "REASON_BUMP_BLOCKED_MIN_ORDER_FMT", "REASON_ROUNDS_TO_ZERO_FMT",
+    "REASON_SELL_ROUNDED_UP_FMT",
     "REASON_REDISTRIBUTED_FMT", "REASON_REDISTRIBUTED_PREFIX",
     "WARNING_RESIDUAL_LEFT_FMT", "WARNING_RESIDUAL_UNCONVERGED_FMT",
     "REASON_FRACTIONAL_FLOOR_BUMPED_FMT", "REASON_FRACTIONAL_FLOOR_SKIPPED_FMT",
@@ -364,6 +365,11 @@ REASON_BUMP_BLOCKED_MIN_ORDER_FMT = (
 #: away. Never bumped: the position already exists, and turning a -0.4 trim into a
 #: whole-share sale is a trade nobody asked for.
 REASON_ROUNDS_TO_ZERO_FMT = "{raw:+.4f} shares rounds to 0 on the tradeable grid - no order"
+#: A whole-share SELL that was rounded UP to the nearest share. Says the size
+#: asked for and the size sent, because the row now trades MORE than the weights
+#: requested and that must never be silent.
+REASON_SELL_ROUNDED_UP_FMT = (
+    "{raw:.4f} shares wanted, sold {sent:g} - nearest whole share")
 
 #: How many redistribution passes a label gets before the engine gives up and
 #: reports what is left. The loop is finite on its own arithmetic -- every step is
@@ -1317,12 +1323,41 @@ def _round_delta_shares(delta: float, margin: Optional[MarginInfo], *,
     holding, and against a SHORT position it is clamped to zero rather than to the
     negative quantity, so the engine can only ever buy a short back (targets are
     long-only).
+
+    A WHOLE-SHARE SELL ROUNDS TO THE NEAREST SHARE, not down. Flooring is right for a
+    buy -- overshooting spends money nobody authorised -- but on a sell it leaves the
+    position FURTHER from target than the alternative: IYRI wanted -0.8773 shares and
+    got 0, when selling 1 misses by 0.12 instead of 0.88. Both rows sat about twice
+    their target weight and no run could ever correct them, because every run recomputed
+    the same sub-share trim and floored it away again (live 2026-09-07, IYRI and NIHI).
+    Reported by the operator: "we should have similar logic, sell down to rounded int".
+
+    SYMMETRIC WITH THE BUY BUMP, and that is what makes it safe rather than churning.
+    ``size_sub_unit_target`` bumps a sub-unit BUY up to one share when the raw target is
+    at least half a share; rounding a sell half-up applies the same threshold from the
+    other side, so the two cannot fight: a 0.6-share target rounds to one share whether
+    the position is being opened or trimmed to it, and a 0.3-share target rounds to none
+    from either direction. (Flooring the TARGET, as an earlier version of the caller
+    warned, is a different and genuinely broken thing: it would sell a whole 1-share
+    holding down to a 0.33-share target, then buy it straight back next run.)
+
+    THE HOLDING'S OWN FRACTION IS NOT SELLABLE, so the clamp is ``floor(held)``. A
+    non-fractionable symbol can still be HELD in fractions -- DRIP pays them -- but
+    ``validate_plan_rows`` treats any fractional quantity on such a symbol as a broker
+    refusal, sells included. Clamping to the whole part means the residue stays put
+    rather than the row being planned and then rejected; nothing on the whole-share grid
+    can clear it.
     """
     magnitude = _round_shares(abs(float(delta or 0.0)), margin,
                               allow_fractional=allow_fractional)
     if delta >= 0:
         return magnitude
-    return -min(magnitude, max(0.0, float(current_quantity or 0.0)))
+    held = max(0.0, float(current_quantity or 0.0))
+    if not (allow_fractional and margin is not None and margin.fractionable):
+        # Round HALF UP, then clamp to the sellable (whole) part of the holding.
+        magnitude = math.floor(abs(float(delta or 0.0)) + 0.5)
+        return -min(float(magnitude), math.floor(held))
+    return -min(magnitude, held)
 
 
 def tradeable_unit(margin: Optional[MarginInfo], *, allow_fractional: bool) -> float:
@@ -2470,11 +2505,24 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             # ``_round_delta_shares``, so a trim that cannot be sent on the grid
             # leaves the position where it is instead of closing it -- matching
             # ``grid_zeroed`` below, which is what "leave it alone" means.
+            #
+            # NOT contradicted by the half-up rounding _round_delta_shares now applies
+            # to a whole-share sell: that rounds the DELTA to the nearest share, which
+            # is bounded by the trim that was asked for. Flooring the TARGET is
+            # unbounded -- it discards the whole fractional part of the target, however
+            # large the holding -- which is why one is safe and the other sells a
+            # position out from under a sub-share target.
             delta = _round_delta_shares(raw_delta, m,
                                         allow_fractional=allow_fractional,
                                         current_quantity=row.current_quantity)
         if abs(delta) < QUANTITY_EPSILON:
             delta = 0.0
+        # A whole-share SELL rounded UP to the nearest share trades MORE than the
+        # weights asked for, and an over-sale the user cannot see is exactly the kind
+        # of quiet overshoot the bump rule is made to announce on the buy side.
+        if delta < 0 and abs(delta) > abs(raw_delta) + QUANTITY_EPSILON:
+            row.reasons.append(REASON_SELL_ROUNDED_UP_FMT.format(
+                raw=abs(raw_delta), sent=abs(delta)))
         # D1, and it runs BEFORE _suppress_below_min_order on purpose (L8b): the
         # suppression zeroes the row, and a bump that runs afterwards finds nothing
         # left to decide about.

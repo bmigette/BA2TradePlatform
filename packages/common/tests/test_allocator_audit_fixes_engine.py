@@ -555,3 +555,69 @@ class TestTheTwoHalvesOfThePnlCaptionCanDisagree:
         assert dividend == "w/ div: +4.28%"
         assert "unpriced" in tail
         assert head + dividend + tail == pa.format_unrealised_pnl(pnl)
+
+
+class TestAWholeShareSellRoundsToTheNearestShare:
+    """Reported live 2026-09-07: IYRI and NIHI, both about twice their target weight,
+    both planning NO order run after run.
+
+    Each holds a fractional quantity (2.047 / 2.04341) of a symbol the broker will not
+    split -- DRIP pays fractions even where fractional TRADING is off. The trim came out
+    at -0.8773 and -0.9558 shares, the whole-share grid floored it to zero, and the next
+    run recomputed the same sub-share trim and floored it away again. Selling one share
+    misses target by 0.12; selling none misses by 0.88.
+
+    Operator: "we should have similar logic, sell down to rounded int".
+    """
+
+    WHOLE = MarginInfo(symbol="IYRI", bp_factor=1.0, fractionable=False)
+
+    def _sell(self, delta, held):
+        return pa._round_delta_shares(delta, self.WHOLE, allow_fractional=False,
+                                      current_quantity=held)
+
+    def test_the_two_live_rows_now_sell_a_share(self):
+        assert self._sell(-0.8773, 2.047) == -1.0
+        assert self._sell(-0.9558, 2.04341) == -1.0
+
+    def test_below_half_a_share_still_sends_nothing(self):
+        """The threshold is HALF a share, which is what makes this symmetric with the
+        buy-side bump rather than a licence to over-sell."""
+        assert self._sell(-0.4, 5.0) == 0.0
+        assert self._sell(-0.6, 5.0) == -1.0
+
+    def test_it_never_sells_more_than_the_whole_part_of_the_holding(self):
+        """The holding's own fraction is NOT sellable: validate_plan_rows treats a
+        fractional quantity on a non-fractionable symbol as a broker refusal, sells
+        included. So 0.047 stays put -- nothing on this grid can clear it."""
+        assert self._sell(-3.0, 2.047) == -2.0
+        assert self._sell(-1.747, 2.047) == -2.0
+        assert self._sell(-0.4, 0.5) == 0.0
+
+    def test_a_buy_is_untouched_and_still_floors(self):
+        """Overshooting a BUY spends money nobody authorised; the asymmetry is the
+        point. The sub-unit bump is a separate, bounded decision (D1)."""
+        assert self._sell(+0.8773, 0.0) == 0.0
+        assert self._sell(+1.9, 0.0) == 1.0
+
+    def test_a_fractional_grid_is_unchanged(self):
+        """Only the whole-share grid changes: on a fractional grid the increments are
+        small enough that flooring the delta loses nothing worth a rule."""
+        frac = MarginInfo(symbol="AAA", bp_factor=1.0, fractionable=True,
+                          min_trade_increment=0.001)
+        got = pa._round_delta_shares(-0.8773, frac, allow_fractional=True,
+                                     current_quantity=2.047)
+        assert got == pytest.approx(-0.877, abs=1e-9)
+
+    def test_the_row_says_it_sold_more_than_asked(self):
+        """An over-sale the user cannot see is exactly the quiet overshoot the buy-side
+        bump exists to announce."""
+        current = {"AAA": PositionState("AAA", quantity=2.047, cost_basis=200.0, price=100)}
+        margin = {"AAA": self.WHOLE}
+        plan = pa.compute_allocation(
+            1000, 10_000, _labels(("AAA", 11.7)), current, margin,
+            allow_fractional=False, default_bp_factor=1.0,
+            valuation_mode=pa.VALUATION_MODE_MARKET)
+        row = next(r for r in plan.rows if r.symbol == "AAA")
+        assert row.delta_quantity == -1.0
+        assert any("nearest whole share" in r for r in row.reasons), row.reasons
