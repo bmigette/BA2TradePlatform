@@ -1,0 +1,278 @@
+{
+  "individual": [
+    {
+      "name": "Large DS",
+      "expert_id": 7,
+      "parent": 1107,
+      "capped": 1407,
+      "total_return": 413.59,
+      "annualized_return": 31.39,
+      "max_drawdown": -19.7,
+      "profit_factor": 2.2,
+      "win_rate": 63.08,
+      "total_trades": 344,
+      "param_diff_parent": {},
+      "live_numeric_setting_diffs": [],
+      "ordered_rules_match": true,
+      "first_equity": 1000.0,
+      "last_equity": 2707.6014325609576,
+      "fixed_cap_drawdown_pct": -19.698541820801164,
+      "hold_days_mean": 17.246467215762273,
+      "hold_days_median": 16.12847222222222,
+      "top5_trade_pnl_share_pct": 9.540896663200888,
+      "top5_issuer_pnl_share_pct": 48.816036037010946,
+      "top_issuers": {
+        "NVDA": 261.26,
+        "AMAT": 161.21,
+        "PLTR": 155.62,
+        "SHOP": 149.4,
+        "AVGO": 106.1
+      },
+      "curve_points": 111861,
+      "open_position_count": 2,
+      "closed_pnl": 1707.601432561178,
+      "reconstructed_pnl": 1707.6014325609576
+    },
+    {
+      "name": "Mid Insider",
+      "expert_id": 8,
+      "parent": 1298,
+      "capped": 1420,
+      "total_return": 144.95,
+      "annualized_return": 16.12,
+      "max_drawdown": -14.74,
+      "profit_factor": 2.4,
+      "win_rate": 77.23,
+      "total_trades": 224,
+      "param_diff_parent": {},
+      "live_numeric_setting_diffs": [],
+      "ordered_rules_match": true,
+      "first_equity": 1000.0,
+      "last_equity": 1941.6310683640609,
+      "fixed_cap_drawdown_pct": -14.743792215407895,
+      "hold_days_mean": 17.07178509424603,
+      "hold_days_median": 2.267361111111111,
+      "top5_trade_pnl_share_pct": 25.886403703039363,
+      "top5_issuer_pnl_share_pct": 32.19601013891689,
+      "top_issuers": {
+        "ALLY": 101.97,
+        "KEY": 60.24,
+        "FITB": 51.75,
+        "FCX": 48.32,
+        "EQT": 40.88
+      },
+      "curve_points": 92604,
+      "open_position_count": 3,
+      "closed_pnl": 941.6310683642018,
+      "reconstructed_pnl": 941.6310683640609
+    },
+    {
+      "name": "Small Earnings",
+      "expert_id": 9,
+      "parent": 1363,
+      "capped": 1423,
+      "total_return": 105.46,
+      "annualized_return": 12.77,
+      "max_drawdown": -17.39,
+      "profit_factor": 1.77,
+      "win_rate": 19.24,
+      "total_trades": 369,
+      "param_diff_parent": {},
+      "live_numeric_setting_diffs": [],
+      "ordered_rules_match": true,
+      "first_equity": 1000.0,
+      "last_equity": 1779.922330555177,
+      "fixed_cap_drawdown_pct": -17.385697393438203,
+      "hold_days_mean": 57.13679990966576,
+      "hold_days_median": 16.0,
+      "top5_trade_pnl_share_pct": 44.11740207579008,
+      "top5_issuer_pnl_share_pct": 45.91511268756542,
+      "top_issuers": {
+        "CNR": 150.08,
+        "MHO": 58.49,
+        "LXU": 52.77,
+        "TIGR": 52.12,
+        "MTSI": 44.64
+      },
+      "curve_points": 112612,
+      "open_position_count": 14,
+      "closed_pnl": 779.9223305554036,
+      "reconstructed_pnl": 779.922330555177
+    },
+    {
+      "name": "Mid DS",
+      "expert_id": 10,
+      "parent": 1173,
+      "capped": 1409,
+      "total_return": 123.14,
+      "annualized_return": 14.34,
+      "max_drawdown": -13.33,
+      "profit_factor": 2.56,
+      "win_rate": 54.93,
+      "total_trades": 142,
+      "param_diff_parent": {},
+      "live_numeric_setting_diffs": [],
+      "ordered_rules_match": true,
+      "first_equity": 1000.0,
+      "last_equity": 1838.641609992892,
+      "fixed_cap_drawdown_pct": -13.328130900000257,
+      "hold_days_mean": 24.417987089201876,
+      "hold_days_median": 28.0,
+      "top5_trade_pnl_share_pct": 40.882324632432905,
+      "top5_issuer_pnl_share_pct": 44.314410240520026,
+      "top_issuers": {
+        "HIMS": 139.17,
+        "CRDO": 67.59,
+        "HMY": 67.25,
+        "RKLB": 55.37,
+        "APLD": 42.27
+      },
+      "curve_points": 73362,
+      "open_position_count": 0,
+      "closed_pnl": 838.6416099929995,
+      "reconstructed_pnl": 838.641609992892
+    }
+  ],
+  "combined_independent_sleeves": {
+    "initial": 4000.0,
+    "final": 8267.796441473087,
+    "total_return_pct": 106.69491103682715,
+    "fixed_cap_drawdown_pct": -9.62429884212654,
+    "ordinary_wealth_drawdown_pct": -7.326871568838833,
+    "worst_daily_pnl": -91.42315189373221,
+    "annual_pnl_pct_initial_4000": {
+      "2020": 28.23,
+      "2021": 17.23,
+      "2022": 3.26,
+      "2023": 9.53,
+      "2024": 22.25,
+      "2025": 26.18
+    },
+    "daily_pnl_correlations": {
+      "Large DS": {
+        "Large DS": 1.0,
+        "Mid Insider": 0.139,
+        "Small Earnings": 0.322,
+        "Mid DS": 0.301
+      },
+      "Mid Insider": {
+        "Large DS": 0.139,
+        "Mid Insider": 1.0,
+        "Small Earnings": 0.212,
+        "Mid DS": 0.125
+      },
+      "Small Earnings": {
+        "Large DS": 0.322,
+        "Mid Insider": 0.212,
+        "Small Earnings": 1.0,
+        "Mid DS": 0.293
+      },
+      "Mid DS": {
+        "Large DS": 0.301,
+        "Mid Insider": 0.125,
+        "Small Earnings": 0.293,
+        "Mid DS": 1.0
+      }
+    },
+    "leave_one_out": {
+      "Large DS": {
+        "fixed_cap_drawdown_pct": -8.26579949656819,
+        "net_pnl_pct_initial_3000": 85.33983363040434
+      },
+      "Mid Insider": {
+        "fixed_cap_drawdown_pct": -11.74344845308057,
+        "net_pnl_pct_initial_3000": 110.87217910363421
+      },
+      "Small Earnings": {
+        "fixed_cap_drawdown_pct": -9.602201890267317,
+        "net_pnl_pct_initial_3000": 116.26247036393033
+      },
+      "Mid DS": {
+        "fixed_cap_drawdown_pct": -10.15947355413491,
+        "net_pnl_pct_initial_3000": 114.30516104933983
+      }
+    },
+    "entry_cost_deployment_proxy": {
+      "mean_dollars": 1185.15048789892,
+      "peak_dollars": 2712.7398530625005,
+      "mean_by_sleeve": {
+        "Large DS": 399.4,
+        "Mid DS": 164.67,
+        "Mid Insider": 181.08,
+        "Small Earnings": 440.0
+      }
+    }
+  },
+  "yearly_pnl_pct_1000": {
+    "Large DS": {
+      "2020": 34.74,
+      "2021": 38.98,
+      "2022": 5.12,
+      "2023": 18.39,
+      "2024": 33.97,
+      "2025": 39.56
+    },
+    "Mid Insider": {
+      "2020": 59.57,
+      "2021": 4.35,
+      "2022": 3.11,
+      "2023": 9.24,
+      "2024": 2.19,
+      "2025": 15.71
+    },
+    "Small Earnings": {
+      "2020": 17.16,
+      "2021": 13.18,
+      "2022": 6.5,
+      "2023": 4.73,
+      "2024": 19.9,
+      "2025": 16.53
+    },
+    "Mid DS": {
+      "2020": 1.45,
+      "2021": 12.43,
+      "2022": -1.68,
+      "2023": 5.78,
+      "2024": 32.96,
+      "2025": 32.93
+    }
+  },
+  "overlap": [
+    {
+      "a": "Large DS",
+      "b": "Mid Insider",
+      "common_symbols_ever": 0,
+      "simultaneously_held_symbols": []
+    },
+    {
+      "a": "Large DS",
+      "b": "Small Earnings",
+      "common_symbols_ever": 0,
+      "simultaneously_held_symbols": []
+    },
+    {
+      "a": "Large DS",
+      "b": "Mid DS",
+      "common_symbols_ever": 0,
+      "simultaneously_held_symbols": []
+    },
+    {
+      "a": "Mid Insider",
+      "b": "Small Earnings",
+      "common_symbols_ever": 3,
+      "simultaneously_held_symbols": []
+    },
+    {
+      "a": "Mid Insider",
+      "b": "Mid DS",
+      "common_symbols_ever": 15,
+      "simultaneously_held_symbols": []
+    },
+    {
+      "a": "Small Earnings",
+      "b": "Mid DS",
+      "common_symbols_ever": 5,
+      "simultaneously_held_symbols": []
+    }
+  ]
+}

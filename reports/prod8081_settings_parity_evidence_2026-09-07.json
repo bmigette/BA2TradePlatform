@@ -1,0 +1,3233 @@
+{
+  "timestamp_utc": "2026-09-07T05:59:10.932246+00:00",
+  "live_db": "C:\\Users\\basti\\Documents\\ba2_trade_platform-prod\\db.sqlite",
+  "test_db": "C:\\Users\\basti\\Documents\\ba2\\test\\dl_forecasting.db",
+  "instances": [
+    {
+      "instance": {
+        "id": 7,
+        "account_id": 1,
+        "expert": "DeterministicScorer",
+        "enabled": 1,
+        "alias": "goal2020-large_DS_S6top1",
+        "user_description": "Deployed from goal2020-large_DS_S6top1 (backtest 1107). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 20,
+        "open_positions_ruleset_id": 21
+      },
+      "source_backtest": 1107,
+      "source_name": "TOP1-scr-large-DeterministicScorer-S6-goal2020-risk_atr-ds",
+      "source_entry_days": {
+        "Monday": 451
+      },
+      "source_schedule_genes": {
+        "monday": true,
+        "tuesday": false,
+        "wednesday": false,
+        "thursday": false,
+        "friday": false,
+        "saturday": true,
+        "sunday": false
+      },
+      "payload_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "source_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "live_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "live_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "expected_settings": {
+        "sizing_mode": "risk_atr",
+        "w_technical": 0.6000000000000001,
+        "w_fundamental": 0.30000000000000004,
+        "w_analyst": 0.0,
+        "w_earnings": 0.1,
+        "macro_mode": "off",
+        "theta_buy": 0.25,
+        "theta_sell": 0.30000000000000004,
+        "k_stop": 1.5,
+        "k_target": 3.0,
+        "risk_per_trade_pct": 0.5,
+        "atr_risk_budget_pct": 7.0,
+        "atr_multiplier": 6.0,
+        "atr_period": 21,
+        "min_stop_loss_pct": 14.0,
+        "use_atr_stop": 1,
+        "max_virtual_equity_per_instrument_percent": 25.0,
+        "regime_overlay_enabled": 1,
+        "regime_risk_scale": 0.75,
+        "regime_stop_scale": 1.25,
+        "regime_tp_scale": 1.5,
+        "allow_automated_trade_opening": true,
+        "enable_buy": true,
+        "allow_automated_trade_modification": true,
+        "enable_sell": false,
+        "screener_market_cap_min": 20000000000.0,
+        "screener_relative_volume_min": 0.1,
+        "screener_price_drop_pct": 5.0,
+        "screener_price_drop_days": 8,
+        "screener_max_stocks": 30,
+        "screener_weinstein_stage2_only": 1,
+        "instrument_selection_method": "screener"
+      },
+      "live_runtime_settings": {
+        "allow_automated_trade_modification": true,
+        "allow_automated_trade_opening": true,
+        "atr_multiplier": 6.0,
+        "atr_period": 21,
+        "atr_risk_budget_pct": 7.0,
+        "enable_buy": true,
+        "enable_sell": false,
+        "execution_schedule_enter_market": {
+          "days": {
+            "monday": true,
+            "tuesday": false,
+            "wednesday": false,
+            "thursday": false,
+            "friday": false,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "execution_schedule_open_positions": {
+          "days": {
+            "monday": true,
+            "tuesday": true,
+            "wednesday": true,
+            "thursday": true,
+            "friday": true,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "instrument_selection_method": "screener",
+        "k_stop": 1.5,
+        "k_target": 3.0,
+        "macro_mode": "off",
+        "max_virtual_equity_per_instrument_percent": 25.0,
+        "min_stop_loss_pct": 14.0,
+        "regime_overlay_enabled": false,
+        "regime_risk_scale": 0.75,
+        "regime_stop_scale": 1.25,
+        "regime_tp_scale": 1.5,
+        "risk_per_trade_pct": 0.5,
+        "screener_market_cap_min": 20000000000,
+        "screener_max_stocks": 30,
+        "screener_price_drop_days": 8,
+        "screener_price_drop_pct": 5.0,
+        "screener_relative_volume_min": 0.1,
+        "screener_weinstein_stage2_only": false,
+        "sizing_mode": "risk_atr",
+        "theta_buy": 0.25,
+        "theta_sell": 0.30000000000000004,
+        "use_atr_stop": false,
+        "w_analyst": 0.0,
+        "w_earnings": 0.1,
+        "w_fundamental": 0.30000000000000004,
+        "w_technical": 0.6000000000000001
+      },
+      "unknown_payload_settings": [],
+      "duplicate_setting_keys": {},
+      "settings_differences": [
+        {
+          "key": "use_atr_stop",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        },
+        {
+          "key": "regime_overlay_enabled",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        },
+        {
+          "key": "screener_weinstein_stage2_only",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        }
+      ],
+      "rules": [
+        {
+          "subtype": "enter_market",
+          "ruleset_id": 20,
+          "count": 1,
+          "equal": true,
+          "display_names_equal": false,
+          "expected": [
+            {
+              "name": "enter-buy",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "order_open_price",
+                  "value": 12.0
+                },
+                "a2": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -8.0
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "enter-buy-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "order_open_price",
+                  "value": 12.0
+                },
+                "a2": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -8.0
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        },
+        {
+          "subtype": "open_positions",
+          "ruleset_id": 21,
+          "count": 2,
+          "equal": true,
+          "display_names_equal": true,
+          "expected": [
+            {
+              "name": "goal2020-large_DS_S6top1-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "current_rating_negative"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-large_DS_S6top1-open_positions-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "days_opened",
+                  "operator": ">",
+                  "value": 30.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "goal2020-large_DS_S6top1-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "current_rating_negative"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-large_DS_S6top1-open_positions-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "days_opened",
+                  "operator": ">",
+                  "value": 30.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        }
+      ],
+      "backtest_screener": {
+        "market_cap_min": 20000000000.0,
+        "relative_volume_min": 0.1,
+        "price_drop_pct": 5.0,
+        "price_drop_days": 8,
+        "max_stocks": 30,
+        "weinstein_stage2_only": 1
+      },
+      "live_screener": {
+        "screener_provider": "fmp",
+        "screener_market_cap_min": 20000000000,
+        "screener_market_cap_max": 0,
+        "screener_volume_min": 500000,
+        "screener_volume_max": 0,
+        "screener_float_min": 10000000,
+        "screener_float_max": 0,
+        "screener_price_min": 20.0,
+        "screener_price_max": 0,
+        "screener_relative_volume_min": 0.1,
+        "screener_price_drop_pct": 5.0,
+        "screener_price_drop_days": 8,
+        "screener_max_stocks": 30,
+        "screener_sort_metric": "market_cap",
+        "screener_weinstein_stage2_only": 0,
+        "universe_mode": "broad"
+      },
+      "screener_differences": [
+        {
+          "key": "screener_volume_min",
+          "backtest": "no explicit runtime filter",
+          "live": 500000
+        },
+        {
+          "key": "screener_float_min",
+          "backtest": "no explicit runtime filter",
+          "live": 10000000
+        },
+        {
+          "key": "screener_price_min",
+          "backtest": "no explicit runtime filter",
+          "live": 20.0
+        },
+        {
+          "key": "screener_weinstein_stage2_only",
+          "backtest": 1,
+          "live": 0
+        }
+      ],
+      "capped": {
+        "id": 1407,
+        "status": "completed",
+        "cap": 1000.0,
+        "same_parent_genes": true,
+        "entry_days": {
+          "Monday": 344
+        },
+        "analysis_cadence": "weekly",
+        "entries_below_live_20_dollar_floor": 21,
+        "total_closed_trades": 344,
+        "persisted_run_db": "C:\\Users\\basti\\AppData\\Local\\Temp\\ba2_backtest_dbs\\run_1407.sqlite",
+        "rules_match_live": {
+          "entry": true,
+          "exit": true
+        },
+        "historical_expert_setting_differences": {
+          "risk_per_trade_pct": {
+            "backtest_db": 7.0,
+            "live": 0.5
+          },
+          "atr_risk_budget_pct": {
+            "backtest_db": 0.5,
+            "live": 7.0
+          }
+        },
+        "historical_boolean_runtime": {
+          "earnings_use_sue": true,
+          "target_from_score": false,
+          "use_model_target": false,
+          "use_atr_stop": false,
+          "regime_overlay_enabled": false,
+          "allow_automated_trade_opening": true,
+          "enable_buy": true,
+          "allow_automated_trade_modification": true,
+          "enable_sell": false
+        },
+        "unpersisted_live_defaults": {
+          "m_floor": {
+            "backtest": 0.25,
+            "current_literal_default": 0.25
+          },
+          "hard_riskoff": {
+            "backtest": -0.75,
+            "current_literal_default": -0.75
+          },
+          "macro_gate_min": {
+            "backtest": -0.5,
+            "current_literal_default": -0.5
+          },
+          "w_macro": {
+            "backtest": 0.2,
+            "current_literal_default": 0.2
+          },
+          "k_compress": {
+            "backtest": 0.6,
+            "current_literal_default": 0.6
+          },
+          "veto_cap": {
+            "backtest": 0.0,
+            "current_literal_default": 0.0
+          },
+          "skip_on_missing_section": {
+            "backtest": "skip",
+            "current_literal_default": "skip"
+          },
+          "earnings_drift_window_days": {
+            "backtest": 75,
+            "current_literal_default": 75
+          },
+          "earnings_halflife_days": {
+            "backtest": 25,
+            "current_literal_default": 25
+          },
+          "earnings_scale_pct": {
+            "backtest": 5.0,
+            "current_literal_default": 5.0
+          },
+          "earnings_use_sue": {
+            "backtest": true,
+            "current_literal_default": true
+          },
+          "mom_lookback_days": {
+            "backtest": 252,
+            "current_literal_default": 252
+          },
+          "mom_skip_days": {
+            "backtest": 21,
+            "current_literal_default": 21
+          },
+          "vol_window": {
+            "backtest": 63,
+            "current_literal_default": 63
+          },
+          "sma_trend_period": {
+            "backtest": 200,
+            "current_literal_default": 200
+          },
+          "rsi_period": {
+            "backtest": 14,
+            "current_literal_default": 14
+          },
+          "donchian_period": {
+            "backtest": 20,
+            "current_literal_default": 20
+          },
+          "adx_period": {
+            "backtest": 14,
+            "current_literal_default": 14
+          },
+          "adx_gate": {
+            "backtest": 25.0,
+            "current_literal_default": 25.0
+          },
+          "adx_rsi_boost": {
+            "backtest": 2.0,
+            "current_literal_default": 2.0
+          },
+          "tw_mom": {
+            "backtest": 0.45,
+            "current_literal_default": 0.45
+          },
+          "tw_d200": {
+            "backtest": 0.25,
+            "current_literal_default": 0.25
+          },
+          "tw_rsi": {
+            "backtest": 0.15,
+            "current_literal_default": 0.15
+          },
+          "tw_don": {
+            "backtest": 0.15,
+            "current_literal_default": 0.15
+          },
+          "scale_momvol": {
+            "backtest": 1.5,
+            "current_literal_default": 1.5
+          },
+          "scale_d200": {
+            "backtest": 0.15,
+            "current_literal_default": 0.15
+          },
+          "scale_rsi": {
+            "backtest": 15.0,
+            "current_literal_default": 15.0
+          },
+          "fw_piotroski": {
+            "backtest": 0.25,
+            "current_literal_default": 0.25
+          },
+          "fw_quality": {
+            "backtest": 0.3,
+            "current_literal_default": 0.3
+          },
+          "fw_value": {
+            "backtest": 0.25,
+            "current_literal_default": 0.25
+          },
+          "fw_growth": {
+            "backtest": 0.2,
+            "current_literal_default": 0.2
+          },
+          "z_veto": {
+            "backtest": 1.8,
+            "current_literal_default": 1.8
+          },
+          "z_veto_adjusted": {
+            "backtest": 1.1,
+            "current_literal_default": 1.1
+          },
+          "altman_variant": {
+            "backtest": "auto",
+            "current_literal_default": "auto"
+          },
+          "fscore_disqualify": {
+            "backtest": 0,
+            "current_literal_default": 0
+          },
+          "scale_accel": {
+            "backtest": 0.05,
+            "current_literal_default": 0.05
+          },
+          "fundamentals_max_age_days": {
+            "backtest": 450,
+            "current_literal_default": 450
+          },
+          "analyst_window_days": {
+            "backtest": 90,
+            "current_literal_default": 90
+          },
+          "analyst_recency_halflife_days": {
+            "backtest": 30,
+            "current_literal_default": 30
+          },
+          "aw_grades": {
+            "backtest": 0.5,
+            "current_literal_default": 0.5
+          },
+          "aw_targets": {
+            "backtest": 0.5,
+            "current_literal_default": 0.5
+          },
+          "analyst_target_window_days": {
+            "backtest": 90,
+            "current_literal_default": 90
+          },
+          "analyst_target_scale": {
+            "backtest": 0.2,
+            "current_literal_default": 0.2
+          },
+          "analyst_min_targets": {
+            "backtest": 3,
+            "current_literal_default": 3
+          },
+          "mw_trend_index": {
+            "backtest": 0.43,
+            "current_literal_default": 0.43
+          },
+          "mw_vix": {
+            "backtest": 0.21,
+            "current_literal_default": 0.21
+          },
+          "mw_credit": {
+            "backtest": 0.14,
+            "current_literal_default": 0.14
+          },
+          "mw_yield_curve": {
+            "backtest": 0.14,
+            "current_literal_default": 0.14
+          },
+          "mw_sahm": {
+            "backtest": 0.08,
+            "current_literal_default": 0.08
+          },
+          "vix_calm": {
+            "backtest": 15.0,
+            "current_literal_default": 15.0
+          },
+          "vix_stress": {
+            "backtest": 30.0,
+            "current_literal_default": 30.0
+          },
+          "yc_scale": {
+            "backtest": 0.005,
+            "current_literal_default": 0.005
+          },
+          "index_symbol": {
+            "backtest": "SPY",
+            "current_literal_default": "SPY"
+          },
+          "target_from_score": {
+            "backtest": false,
+            "current_literal_default": false
+          },
+          "min_history_days": {
+            "backtest": 260,
+            "current_literal_default": 260
+          },
+          "use_model_target": {
+            "backtest": false,
+            "current_literal_default": false
+          },
+          "model_target_method": {
+            "backtest": "forward",
+            "current_literal_default": "forward"
+          },
+          "max_expected_profit_percent": {
+            "backtest": 100.0,
+            "current_literal_default": 100.0
+          }
+        }
+      }
+    },
+    {
+      "instance": {
+        "id": 8,
+        "account_id": 1,
+        "expert": "FMPInsiderClusterBuy",
+        "enabled": 1,
+        "alias": "goal2020-mid_ICB_S1top1",
+        "user_description": "Deployed from goal2020-mid_ICB_S1top1 (backtest 1298). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 22,
+        "open_positions_ruleset_id": 23
+      },
+      "source_backtest": 1298,
+      "source_name": "TOP1-scr-mid-FMPInsiderClusterBuy-S1-goal2020-notional",
+      "source_entry_days": {
+        "Thursday": 269
+      },
+      "source_schedule_genes": {
+        "monday": false,
+        "tuesday": false,
+        "wednesday": false,
+        "thursday": true,
+        "friday": false,
+        "saturday": true,
+        "sunday": false
+      },
+      "payload_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "source_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "live_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "live_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "expected_settings": {
+        "sizing_mode": "notional",
+        "lookback_days": 120,
+        "min_insiders": 2,
+        "expected_profit_mode": "model",
+        "max_expected_profit_percent": 40.0,
+        "risk_per_trade_pct": 2.5,
+        "atr_risk_budget_pct": 1.0,
+        "atr_multiplier": 6.0,
+        "atr_period": 14,
+        "min_stop_loss_pct": 13.0,
+        "use_atr_stop": 0,
+        "max_virtual_equity_per_instrument_percent": 15.0,
+        "regime_overlay_enabled": 1,
+        "regime_risk_scale": 1.75,
+        "regime_stop_scale": 2.0,
+        "regime_tp_scale": 1.25,
+        "allow_automated_trade_opening": true,
+        "enable_buy": true,
+        "allow_automated_trade_modification": true,
+        "enable_sell": false,
+        "market_cap_max": 10000000000.0,
+        "screener_market_cap_min": 5000000000.0,
+        "screener_relative_volume_min": 0.6000000000000001,
+        "screener_price_drop_pct": 16.0,
+        "screener_price_drop_days": 18,
+        "screener_max_stocks": 40,
+        "screener_weinstein_stage2_only": 0,
+        "instrument_selection_method": "screener"
+      },
+      "live_runtime_settings": {
+        "allow_automated_trade_modification": true,
+        "allow_automated_trade_opening": true,
+        "atr_multiplier": 6.0,
+        "atr_period": 14,
+        "atr_risk_budget_pct": 1.0,
+        "enable_buy": true,
+        "enable_sell": false,
+        "execution_schedule_enter_market": {
+          "days": {
+            "monday": true,
+            "tuesday": false,
+            "wednesday": false,
+            "thursday": false,
+            "friday": false,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "execution_schedule_open_positions": {
+          "days": {
+            "monday": true,
+            "tuesday": true,
+            "wednesday": true,
+            "thursday": true,
+            "friday": true,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "expected_profit_mode": "model",
+        "instrument_selection_method": "screener",
+        "lookback_days": 120,
+        "market_cap_max": 10000000000.0,
+        "max_expected_profit_percent": 40.0,
+        "max_virtual_equity_per_instrument_percent": 15.0,
+        "min_insiders": 2,
+        "min_stop_loss_pct": 13.0,
+        "regime_overlay_enabled": false,
+        "regime_risk_scale": 1.75,
+        "regime_stop_scale": 2.0,
+        "regime_tp_scale": 1.25,
+        "risk_per_trade_pct": 2.5,
+        "screener_market_cap_min": 5000000000,
+        "screener_max_stocks": 40,
+        "screener_price_drop_days": 18,
+        "screener_price_drop_pct": 16.0,
+        "screener_relative_volume_min": 0.6000000000000001,
+        "screener_weinstein_stage2_only": false,
+        "sizing_mode": "notional",
+        "use_atr_stop": false
+      },
+      "unknown_payload_settings": [
+        "market_cap_max"
+      ],
+      "duplicate_setting_keys": {},
+      "settings_differences": [
+        {
+          "key": "regime_overlay_enabled",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        }
+      ],
+      "rules": [
+        {
+          "subtype": "enter_market",
+          "ruleset_id": 22,
+          "count": 2,
+          "equal": true,
+          "display_names_equal": true,
+          "expected": [
+            {
+              "name": "enter-buy-2",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "medium_term"
+                },
+                "cond_2": {
+                  "event_type": "mediumrisk"
+                },
+                "cond_3": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "expert_target_price",
+                  "value": -6.0
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "enter-buy-3",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "expert_target_price",
+                  "value": 0.0
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "enter-buy-2",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "medium_term"
+                },
+                "cond_2": {
+                  "event_type": "mediumrisk"
+                },
+                "cond_3": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "expert_target_price",
+                  "value": -6.0
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "enter-buy-3",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "expert_target_price",
+                  "value": 0.0
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        },
+        {
+          "subtype": "open_positions",
+          "ruleset_id": 23,
+          "count": 3,
+          "equal": true,
+          "display_names_equal": true,
+          "expected": [
+            {
+              "name": "goal2020-mid_ICB_S1top1-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "days_opened",
+                  "operator": ">",
+                  "value": 210.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-mid_ICB_S1top1-open_positions-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bearish"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-mid_ICB_S1top1-open_positions-2",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "has_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -12.0
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "goal2020-mid_ICB_S1top1-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "days_opened",
+                  "operator": ">",
+                  "value": 210.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-mid_ICB_S1top1-open_positions-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bearish"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-mid_ICB_S1top1-open_positions-2",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "has_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -12.0
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        }
+      ],
+      "backtest_screener": {
+        "market_cap_max": 10000000000.0,
+        "market_cap_min": 5000000000.0,
+        "relative_volume_min": 0.6000000000000001,
+        "price_drop_pct": 16.0,
+        "price_drop_days": 18,
+        "max_stocks": 40,
+        "weinstein_stage2_only": 0
+      },
+      "live_screener": {
+        "screener_provider": "fmp",
+        "screener_market_cap_min": 5000000000,
+        "screener_market_cap_max": 0,
+        "screener_volume_min": 500000,
+        "screener_volume_max": 0,
+        "screener_float_min": 10000000,
+        "screener_float_max": 0,
+        "screener_price_min": 20.0,
+        "screener_price_max": 0,
+        "screener_relative_volume_min": 0.6000000000000001,
+        "screener_price_drop_pct": 16.0,
+        "screener_price_drop_days": 18,
+        "screener_max_stocks": 40,
+        "screener_sort_metric": "market_cap",
+        "screener_weinstein_stage2_only": 0,
+        "universe_mode": "broad"
+      },
+      "screener_differences": [
+        {
+          "key": "screener_market_cap_max",
+          "backtest": 10000000000.0,
+          "live": 0
+        },
+        {
+          "key": "screener_volume_min",
+          "backtest": "no explicit runtime filter",
+          "live": 500000
+        },
+        {
+          "key": "screener_float_min",
+          "backtest": "no explicit runtime filter",
+          "live": 10000000
+        },
+        {
+          "key": "screener_price_min",
+          "backtest": "no explicit runtime filter",
+          "live": 20.0
+        }
+      ],
+      "capped": {
+        "id": 1420,
+        "status": "completed",
+        "cap": 1000.0,
+        "same_parent_genes": true,
+        "entry_days": {
+          "Monday": 224
+        },
+        "analysis_cadence": "weekly",
+        "entries_below_live_20_dollar_floor": 92,
+        "total_closed_trades": 224,
+        "persisted_run_db": "C:\\Users\\basti\\AppData\\Local\\Temp\\ba2_backtest_dbs\\run_1420.sqlite",
+        "rules_match_live": {
+          "entry": true,
+          "exit": true
+        },
+        "historical_expert_setting_differences": {
+          "risk_per_trade_pct": {
+            "backtest_db": 1.0,
+            "live": 2.5
+          },
+          "atr_risk_budget_pct": {
+            "backtest_db": 2.5,
+            "live": 1.0
+          }
+        },
+        "historical_boolean_runtime": {
+          "use_atr_stop": false,
+          "regime_overlay_enabled": false,
+          "allow_automated_trade_opening": true,
+          "enable_buy": true,
+          "allow_automated_trade_modification": true,
+          "enable_sell": false
+        },
+        "unpersisted_live_defaults": {
+          "min_total_value": {
+            "backtest": 200000.0,
+            "current_literal_default": 200000.0
+          },
+          "expected_profit_percent": {
+            "backtest": 10.0,
+            "current_literal_default": 10.0
+          },
+          "model_target_method": {
+            "backtest": "forward",
+            "current_literal_default": "forward"
+          }
+        }
+      }
+    },
+    {
+      "instance": {
+        "id": 9,
+        "account_id": 1,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "alias": "goal2020-small_ED_S2top1",
+        "user_description": "Deployed from goal2020-small_ED_S2top1 (backtest 1363). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 24,
+        "open_positions_ruleset_id": 25
+      },
+      "source_backtest": 1363,
+      "source_name": "TOP1-scr-small-FMPEarningsDrift-S2-goal2020-notional",
+      "source_entry_days": {
+        "Thursday": 52,
+        "Wednesday": 382,
+        "Friday": 37
+      },
+      "source_schedule_genes": {
+        "monday": false,
+        "tuesday": false,
+        "wednesday": true,
+        "thursday": true,
+        "friday": true,
+        "saturday": false,
+        "sunday": false
+      },
+      "payload_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "source_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "live_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "live_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "expected_settings": {
+        "sizing_mode": "notional",
+        "surprise_min_pct": 14.0,
+        "max_days_since_report": 15,
+        "expected_profit_percent": 14.0,
+        "expected_profit_mode": "dynamic",
+        "dynamic_scale": 0.5,
+        "max_expected_profit_percent": 200.0,
+        "risk_per_trade_pct": 1.5,
+        "atr_risk_budget_pct": 10.0,
+        "atr_multiplier": 5.5,
+        "atr_period": 7,
+        "min_stop_loss_pct": 10.0,
+        "use_atr_stop": 1,
+        "max_virtual_equity_per_instrument_percent": 10.0,
+        "regime_overlay_enabled": 1,
+        "regime_risk_scale": 1.0,
+        "regime_stop_scale": 1.5,
+        "regime_tp_scale": 1.0,
+        "allow_automated_trade_opening": true,
+        "enable_buy": true,
+        "allow_automated_trade_modification": true,
+        "enable_sell": false,
+        "market_cap_max": 2000000000.0,
+        "screener_market_cap_min": 800000000.0,
+        "screener_relative_volume_min": 1.6,
+        "screener_price_drop_pct": 0.0,
+        "screener_price_drop_days": 7,
+        "screener_max_stocks": 30,
+        "screener_weinstein_stage2_only": 1,
+        "instrument_selection_method": "screener"
+      },
+      "live_runtime_settings": {
+        "allow_automated_trade_modification": true,
+        "allow_automated_trade_opening": true,
+        "atr_multiplier": 5.5,
+        "atr_period": 7,
+        "atr_risk_budget_pct": 10.0,
+        "dynamic_scale": 0.5,
+        "enable_buy": true,
+        "enable_sell": false,
+        "execution_schedule_enter_market": {
+          "days": {
+            "monday": true,
+            "tuesday": false,
+            "wednesday": false,
+            "thursday": false,
+            "friday": false,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "execution_schedule_open_positions": {
+          "days": {
+            "monday": true,
+            "tuesday": true,
+            "wednesday": true,
+            "thursday": true,
+            "friday": true,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "expected_profit_mode": "dynamic",
+        "expected_profit_percent": 14.0,
+        "instrument_selection_method": "screener",
+        "market_cap_max": 2000000000.0,
+        "max_days_since_report": 15,
+        "max_expected_profit_percent": 200.0,
+        "max_virtual_equity_per_instrument_percent": 10.0,
+        "min_stop_loss_pct": 10.0,
+        "regime_overlay_enabled": false,
+        "regime_risk_scale": 1.0,
+        "regime_stop_scale": 1.5,
+        "regime_tp_scale": 1.0,
+        "risk_per_trade_pct": 1.5,
+        "screener_market_cap_min": 800000000,
+        "screener_max_stocks": 30,
+        "screener_price_drop_days": 7,
+        "screener_price_drop_pct": 0.0,
+        "screener_relative_volume_min": 1.6,
+        "screener_weinstein_stage2_only": false,
+        "sizing_mode": "notional",
+        "surprise_min_pct": 14.0,
+        "use_atr_stop": false
+      },
+      "unknown_payload_settings": [
+        "market_cap_max"
+      ],
+      "duplicate_setting_keys": {},
+      "settings_differences": [
+        {
+          "key": "use_atr_stop",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        },
+        {
+          "key": "regime_overlay_enabled",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        },
+        {
+          "key": "screener_weinstein_stage2_only",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        }
+      ],
+      "rules": [
+        {
+          "subtype": "enter_market",
+          "ruleset_id": 24,
+          "count": 1,
+          "equal": true,
+          "display_names_equal": false,
+          "expected": [
+            {
+              "name": "enter-buy",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "has_no_position"
+                },
+                "cond_2": {
+                  "event_type": "confidence",
+                  "operator": ">",
+                  "value": 45.0
+                },
+                "cond_3": {
+                  "event_type": "days_since_last_close",
+                  "operator": ">",
+                  "value": 20.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "enter-buy-4",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "has_no_position"
+                },
+                "cond_2": {
+                  "event_type": "confidence",
+                  "operator": ">",
+                  "value": 45.0
+                },
+                "cond_3": {
+                  "event_type": "days_since_last_close",
+                  "operator": ">",
+                  "value": 20.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        },
+        {
+          "subtype": "open_positions",
+          "ruleset_id": 25,
+          "count": 4,
+          "equal": true,
+          "display_names_equal": true,
+          "expected": [
+            {
+              "name": "goal2020-small_ED_S2top1-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bearish"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-small_ED_S2top1-open_positions-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "current_rating_negative"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-small_ED_S2top1-open_positions-2",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "profit_loss_percent",
+                  "operator": ">",
+                  "value": 52.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-small_ED_S2top1-open_positions-3",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "has_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -6.0
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "goal2020-small_ED_S2top1-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bearish"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-small_ED_S2top1-open_positions-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "current_rating_negative"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-small_ED_S2top1-open_positions-2",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "profit_loss_percent",
+                  "operator": ">",
+                  "value": 52.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-small_ED_S2top1-open_positions-3",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "has_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -6.0
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        }
+      ],
+      "backtest_screener": {
+        "market_cap_max": 2000000000.0,
+        "market_cap_min": 800000000.0,
+        "relative_volume_min": 1.6,
+        "price_drop_pct": 0.0,
+        "price_drop_days": 7,
+        "max_stocks": 30,
+        "weinstein_stage2_only": 1
+      },
+      "live_screener": {
+        "screener_provider": "fmp",
+        "screener_market_cap_min": 800000000,
+        "screener_market_cap_max": 0,
+        "screener_volume_min": 500000,
+        "screener_volume_max": 0,
+        "screener_float_min": 10000000,
+        "screener_float_max": 0,
+        "screener_price_min": 20.0,
+        "screener_price_max": 0,
+        "screener_relative_volume_min": 1.6,
+        "screener_price_drop_pct": 0.0,
+        "screener_price_drop_days": 7,
+        "screener_max_stocks": 30,
+        "screener_sort_metric": "market_cap",
+        "screener_weinstein_stage2_only": 0,
+        "universe_mode": "broad"
+      },
+      "screener_differences": [
+        {
+          "key": "screener_market_cap_max",
+          "backtest": 2000000000.0,
+          "live": 0
+        },
+        {
+          "key": "screener_volume_min",
+          "backtest": "no explicit runtime filter",
+          "live": 500000
+        },
+        {
+          "key": "screener_float_min",
+          "backtest": "no explicit runtime filter",
+          "live": 10000000
+        },
+        {
+          "key": "screener_price_min",
+          "backtest": "no explicit runtime filter",
+          "live": 20.0
+        },
+        {
+          "key": "screener_weinstein_stage2_only",
+          "backtest": 1,
+          "live": 0
+        }
+      ],
+      "capped": {
+        "id": 1423,
+        "status": "completed",
+        "cap": 1000.0,
+        "same_parent_genes": true,
+        "entry_days": {
+          "Monday": 369
+        },
+        "analysis_cadence": "weekly",
+        "entries_below_live_20_dollar_floor": 183,
+        "total_closed_trades": 369,
+        "persisted_run_db": "C:\\Users\\basti\\AppData\\Local\\Temp\\ba2_backtest_dbs\\run_1423.sqlite",
+        "rules_match_live": {
+          "entry": true,
+          "exit": true
+        },
+        "historical_expert_setting_differences": {
+          "risk_per_trade_pct": {
+            "backtest_db": 10.0,
+            "live": 1.5
+          },
+          "atr_risk_budget_pct": {
+            "backtest_db": 1.5,
+            "live": 10.0
+          }
+        },
+        "historical_boolean_runtime": {
+          "use_atr_stop": false,
+          "regime_overlay_enabled": false,
+          "allow_automated_trade_opening": true,
+          "enable_buy": true,
+          "allow_automated_trade_modification": true,
+          "enable_sell": false
+        },
+        "unpersisted_live_defaults": {
+          "model_target_method": {
+            "backtest": "forward",
+            "current_literal_default": "forward"
+          }
+        }
+      }
+    },
+    {
+      "instance": {
+        "id": 10,
+        "account_id": 1,
+        "expert": "DeterministicScorer",
+        "enabled": 1,
+        "alias": "goal2020-mid_DS_S6top3",
+        "user_description": "Deployed from goal2020-mid_DS_S6top3 (backtest 1173). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 26,
+        "open_positions_ruleset_id": 27
+      },
+      "source_backtest": 1173,
+      "source_name": "TOP3-scr-mid-DeterministicScorer-S6-goal2020-risk_atr-ds",
+      "source_entry_days": {
+        "Tuesday": 33,
+        "Monday": 198
+      },
+      "source_schedule_genes": {
+        "monday": true,
+        "tuesday": true,
+        "wednesday": false,
+        "thursday": false,
+        "friday": false,
+        "saturday": true,
+        "sunday": false
+      },
+      "payload_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "source_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "live_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "live_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "expected_settings": {
+        "sizing_mode": "risk_atr",
+        "w_technical": 0.8,
+        "w_fundamental": 0.2,
+        "w_analyst": 0.4,
+        "w_earnings": 0.2,
+        "macro_mode": "off",
+        "theta_buy": 0.45,
+        "theta_sell": 0.1,
+        "k_stop": 2.5,
+        "k_target": 3.0,
+        "risk_per_trade_pct": 1.75,
+        "atr_risk_budget_pct": 6.0,
+        "atr_multiplier": 3.0,
+        "atr_period": 7,
+        "min_stop_loss_pct": 12.0,
+        "use_atr_stop": 0,
+        "max_virtual_equity_per_instrument_percent": 15.0,
+        "regime_overlay_enabled": 0,
+        "regime_risk_scale": 0.75,
+        "regime_stop_scale": 1.5,
+        "regime_tp_scale": 1.0,
+        "allow_automated_trade_opening": true,
+        "enable_buy": true,
+        "allow_automated_trade_modification": true,
+        "enable_sell": false,
+        "market_cap_max": 10000000000.0,
+        "screener_market_cap_min": 2000000000.0,
+        "screener_relative_volume_min": 1.3,
+        "screener_price_drop_pct": 8.0,
+        "screener_price_drop_days": 10,
+        "screener_max_stocks": 50,
+        "screener_weinstein_stage2_only": 0,
+        "instrument_selection_method": "screener"
+      },
+      "live_runtime_settings": {
+        "allow_automated_trade_modification": true,
+        "allow_automated_trade_opening": true,
+        "atr_multiplier": 3.0,
+        "atr_period": 7,
+        "atr_risk_budget_pct": 6.0,
+        "enable_buy": true,
+        "enable_sell": false,
+        "execution_schedule_enter_market": {
+          "days": {
+            "monday": true,
+            "tuesday": false,
+            "wednesday": false,
+            "thursday": false,
+            "friday": false,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "execution_schedule_open_positions": {
+          "days": {
+            "monday": true,
+            "tuesday": true,
+            "wednesday": true,
+            "thursday": true,
+            "friday": true,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "instrument_selection_method": "screener",
+        "k_stop": 2.5,
+        "k_target": 3.0,
+        "macro_mode": "off",
+        "market_cap_max": 10000000000.0,
+        "max_virtual_equity_per_instrument_percent": 15.0,
+        "min_stop_loss_pct": 12.0,
+        "regime_overlay_enabled": false,
+        "regime_risk_scale": 0.75,
+        "regime_stop_scale": 1.5,
+        "regime_tp_scale": 1.0,
+        "risk_per_trade_pct": 1.75,
+        "screener_market_cap_min": 2000000000,
+        "screener_max_stocks": 50,
+        "screener_price_drop_days": 10,
+        "screener_price_drop_pct": 8.0,
+        "screener_relative_volume_min": 1.3,
+        "screener_weinstein_stage2_only": false,
+        "sizing_mode": "risk_atr",
+        "theta_buy": 0.45,
+        "theta_sell": 0.1,
+        "use_atr_stop": false,
+        "w_analyst": 0.4,
+        "w_earnings": 0.2,
+        "w_fundamental": 0.2,
+        "w_technical": 0.8
+      },
+      "unknown_payload_settings": [
+        "market_cap_max"
+      ],
+      "duplicate_setting_keys": {},
+      "settings_differences": [],
+      "rules": [
+        {
+          "subtype": "enter_market",
+          "ruleset_id": 26,
+          "count": 1,
+          "equal": true,
+          "display_names_equal": false,
+          "expected": [
+            {
+              "name": "enter-buy",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "has_no_position"
+                },
+                "cond_2": {
+                  "event_type": "confidence",
+                  "operator": ">",
+                  "value": 50.0
+                },
+                "cond_3": {
+                  "event_type": "expected_profit_target_percent",
+                  "operator": ">",
+                  "value": 2.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "enter-buy-5",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "has_no_position"
+                },
+                "cond_2": {
+                  "event_type": "confidence",
+                  "operator": ">",
+                  "value": 50.0
+                },
+                "cond_3": {
+                  "event_type": "expected_profit_target_percent",
+                  "operator": ">",
+                  "value": 2.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        },
+        {
+          "subtype": "open_positions",
+          "ruleset_id": 27,
+          "count": 1,
+          "equal": true,
+          "display_names_equal": true,
+          "expected": [
+            {
+              "name": "goal2020-mid_DS_S6top3-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "days_opened",
+                  "operator": ">",
+                  "value": 25.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "goal2020-mid_DS_S6top3-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "days_opened",
+                  "operator": ">",
+                  "value": 25.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        }
+      ],
+      "backtest_screener": {
+        "market_cap_max": 10000000000.0,
+        "market_cap_min": 2000000000.0,
+        "relative_volume_min": 1.3,
+        "price_drop_pct": 8.0,
+        "price_drop_days": 10,
+        "max_stocks": 50,
+        "weinstein_stage2_only": 0
+      },
+      "live_screener": {
+        "screener_provider": "fmp",
+        "screener_market_cap_min": 2000000000,
+        "screener_market_cap_max": 0,
+        "screener_volume_min": 500000,
+        "screener_volume_max": 0,
+        "screener_float_min": 10000000,
+        "screener_float_max": 0,
+        "screener_price_min": 20.0,
+        "screener_price_max": 0,
+        "screener_relative_volume_min": 1.3,
+        "screener_price_drop_pct": 8.0,
+        "screener_price_drop_days": 10,
+        "screener_max_stocks": 50,
+        "screener_sort_metric": "market_cap",
+        "screener_weinstein_stage2_only": 0,
+        "universe_mode": "broad"
+      },
+      "screener_differences": [
+        {
+          "key": "screener_market_cap_max",
+          "backtest": 10000000000.0,
+          "live": 0
+        },
+        {
+          "key": "screener_volume_min",
+          "backtest": "no explicit runtime filter",
+          "live": 500000
+        },
+        {
+          "key": "screener_float_min",
+          "backtest": "no explicit runtime filter",
+          "live": 10000000
+        },
+        {
+          "key": "screener_price_min",
+          "backtest": "no explicit runtime filter",
+          "live": 20.0
+        }
+      ],
+      "capped": {
+        "id": 1409,
+        "status": "completed",
+        "cap": 1000.0,
+        "same_parent_genes": true,
+        "entry_days": {
+          "Monday": 142
+        },
+        "analysis_cadence": "weekly",
+        "entries_below_live_20_dollar_floor": 25,
+        "total_closed_trades": 142,
+        "persisted_run_db": "C:\\Users\\basti\\AppData\\Local\\Temp\\ba2_backtest_dbs\\run_1409.sqlite",
+        "rules_match_live": {
+          "entry": true,
+          "exit": true
+        },
+        "historical_expert_setting_differences": {
+          "risk_per_trade_pct": {
+            "backtest_db": 6.0,
+            "live": 1.75
+          },
+          "atr_risk_budget_pct": {
+            "backtest_db": 1.75,
+            "live": 6.0
+          }
+        },
+        "historical_boolean_runtime": {
+          "earnings_use_sue": true,
+          "target_from_score": false,
+          "use_model_target": false,
+          "use_atr_stop": false,
+          "regime_overlay_enabled": false,
+          "allow_automated_trade_opening": true,
+          "enable_buy": true,
+          "allow_automated_trade_modification": true,
+          "enable_sell": false
+        },
+        "unpersisted_live_defaults": {
+          "m_floor": {
+            "backtest": 0.25,
+            "current_literal_default": 0.25
+          },
+          "hard_riskoff": {
+            "backtest": -0.75,
+            "current_literal_default": -0.75
+          },
+          "macro_gate_min": {
+            "backtest": -0.5,
+            "current_literal_default": -0.5
+          },
+          "w_macro": {
+            "backtest": 0.2,
+            "current_literal_default": 0.2
+          },
+          "k_compress": {
+            "backtest": 0.6,
+            "current_literal_default": 0.6
+          },
+          "veto_cap": {
+            "backtest": 0.0,
+            "current_literal_default": 0.0
+          },
+          "skip_on_missing_section": {
+            "backtest": "skip",
+            "current_literal_default": "skip"
+          },
+          "earnings_drift_window_days": {
+            "backtest": 75,
+            "current_literal_default": 75
+          },
+          "earnings_halflife_days": {
+            "backtest": 25,
+            "current_literal_default": 25
+          },
+          "earnings_scale_pct": {
+            "backtest": 5.0,
+            "current_literal_default": 5.0
+          },
+          "earnings_use_sue": {
+            "backtest": true,
+            "current_literal_default": true
+          },
+          "mom_lookback_days": {
+            "backtest": 252,
+            "current_literal_default": 252
+          },
+          "mom_skip_days": {
+            "backtest": 21,
+            "current_literal_default": 21
+          },
+          "vol_window": {
+            "backtest": 63,
+            "current_literal_default": 63
+          },
+          "sma_trend_period": {
+            "backtest": 200,
+            "current_literal_default": 200
+          },
+          "rsi_period": {
+            "backtest": 14,
+            "current_literal_default": 14
+          },
+          "donchian_period": {
+            "backtest": 20,
+            "current_literal_default": 20
+          },
+          "adx_period": {
+            "backtest": 14,
+            "current_literal_default": 14
+          },
+          "adx_gate": {
+            "backtest": 25.0,
+            "current_literal_default": 25.0
+          },
+          "adx_rsi_boost": {
+            "backtest": 2.0,
+            "current_literal_default": 2.0
+          },
+          "tw_mom": {
+            "backtest": 0.45,
+            "current_literal_default": 0.45
+          },
+          "tw_d200": {
+            "backtest": 0.25,
+            "current_literal_default": 0.25
+          },
+          "tw_rsi": {
+            "backtest": 0.15,
+            "current_literal_default": 0.15
+          },
+          "tw_don": {
+            "backtest": 0.15,
+            "current_literal_default": 0.15
+          },
+          "scale_momvol": {
+            "backtest": 1.5,
+            "current_literal_default": 1.5
+          },
+          "scale_d200": {
+            "backtest": 0.15,
+            "current_literal_default": 0.15
+          },
+          "scale_rsi": {
+            "backtest": 15.0,
+            "current_literal_default": 15.0
+          },
+          "fw_piotroski": {
+            "backtest": 0.25,
+            "current_literal_default": 0.25
+          },
+          "fw_quality": {
+            "backtest": 0.3,
+            "current_literal_default": 0.3
+          },
+          "fw_value": {
+            "backtest": 0.25,
+            "current_literal_default": 0.25
+          },
+          "fw_growth": {
+            "backtest": 0.2,
+            "current_literal_default": 0.2
+          },
+          "z_veto": {
+            "backtest": 1.8,
+            "current_literal_default": 1.8
+          },
+          "z_veto_adjusted": {
+            "backtest": 1.1,
+            "current_literal_default": 1.1
+          },
+          "altman_variant": {
+            "backtest": "auto",
+            "current_literal_default": "auto"
+          },
+          "fscore_disqualify": {
+            "backtest": 0,
+            "current_literal_default": 0
+          },
+          "scale_accel": {
+            "backtest": 0.05,
+            "current_literal_default": 0.05
+          },
+          "fundamentals_max_age_days": {
+            "backtest": 450,
+            "current_literal_default": 450
+          },
+          "analyst_window_days": {
+            "backtest": 90,
+            "current_literal_default": 90
+          },
+          "analyst_recency_halflife_days": {
+            "backtest": 30,
+            "current_literal_default": 30
+          },
+          "aw_grades": {
+            "backtest": 0.5,
+            "current_literal_default": 0.5
+          },
+          "aw_targets": {
+            "backtest": 0.5,
+            "current_literal_default": 0.5
+          },
+          "analyst_target_window_days": {
+            "backtest": 90,
+            "current_literal_default": 90
+          },
+          "analyst_target_scale": {
+            "backtest": 0.2,
+            "current_literal_default": 0.2
+          },
+          "analyst_min_targets": {
+            "backtest": 3,
+            "current_literal_default": 3
+          },
+          "mw_trend_index": {
+            "backtest": 0.43,
+            "current_literal_default": 0.43
+          },
+          "mw_vix": {
+            "backtest": 0.21,
+            "current_literal_default": 0.21
+          },
+          "mw_credit": {
+            "backtest": 0.14,
+            "current_literal_default": 0.14
+          },
+          "mw_yield_curve": {
+            "backtest": 0.14,
+            "current_literal_default": 0.14
+          },
+          "mw_sahm": {
+            "backtest": 0.08,
+            "current_literal_default": 0.08
+          },
+          "vix_calm": {
+            "backtest": 15.0,
+            "current_literal_default": 15.0
+          },
+          "vix_stress": {
+            "backtest": 30.0,
+            "current_literal_default": 30.0
+          },
+          "yc_scale": {
+            "backtest": 0.005,
+            "current_literal_default": 0.005
+          },
+          "index_symbol": {
+            "backtest": "SPY",
+            "current_literal_default": "SPY"
+          },
+          "target_from_score": {
+            "backtest": false,
+            "current_literal_default": false
+          },
+          "min_history_days": {
+            "backtest": 260,
+            "current_literal_default": 260
+          },
+          "use_model_target": {
+            "backtest": false,
+            "current_literal_default": false
+          },
+          "model_target_method": {
+            "backtest": "forward",
+            "current_literal_default": "forward"
+          },
+          "max_expected_profit_percent": {
+            "backtest": 100.0,
+            "current_literal_default": 100.0
+          }
+        }
+      }
+    },
+    {
+      "instance": {
+        "id": 11,
+        "account_id": 1,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "alias": "goal2020-mid_ED_S1top1",
+        "user_description": "Deployed from goal2020-mid_ED_S1top1 (backtest 1088). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 28,
+        "open_positions_ruleset_id": 29
+      },
+      "source_backtest": 1088,
+      "source_name": "TOP1-scr-mid-FMPEarningsDrift-S1-goal2020-riskatr",
+      "source_entry_days": {
+        "Thursday": 220,
+        "Friday": 104,
+        "Tuesday": 238
+      },
+      "source_schedule_genes": {
+        "monday": false,
+        "tuesday": true,
+        "wednesday": false,
+        "thursday": true,
+        "friday": true,
+        "saturday": false,
+        "sunday": true
+      },
+      "payload_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "source_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "live_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "live_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "expected_settings": {
+        "sizing_mode": "risk_atr",
+        "surprise_min_pct": 10.0,
+        "max_days_since_report": 30,
+        "expected_profit_percent": 19.0,
+        "expected_profit_mode": "static",
+        "dynamic_scale": 1.0,
+        "max_expected_profit_percent": 420.0,
+        "risk_per_trade_pct": 2.5,
+        "atr_risk_budget_pct": 8.0,
+        "atr_multiplier": 4.5,
+        "atr_period": 14,
+        "min_stop_loss_pct": 6.0,
+        "use_atr_stop": 1,
+        "max_virtual_equity_per_instrument_percent": 25.0,
+        "regime_overlay_enabled": 1,
+        "regime_risk_scale": 1.0,
+        "regime_stop_scale": 0.75,
+        "regime_tp_scale": 0.5,
+        "allow_automated_trade_opening": true,
+        "enable_buy": true,
+        "allow_automated_trade_modification": true,
+        "enable_sell": false,
+        "market_cap_max": 10000000000.0,
+        "screener_market_cap_min": 5000000000.0,
+        "screener_relative_volume_min": 1.5,
+        "screener_price_drop_pct": 13.0,
+        "screener_price_drop_days": 22,
+        "screener_max_stocks": 20,
+        "screener_weinstein_stage2_only": 0,
+        "instrument_selection_method": "screener"
+      },
+      "live_runtime_settings": {
+        "allow_automated_trade_modification": true,
+        "allow_automated_trade_opening": true,
+        "atr_multiplier": 4.5,
+        "atr_period": 14,
+        "atr_risk_budget_pct": 8.0,
+        "dynamic_scale": 1.0,
+        "enable_buy": true,
+        "enable_sell": false,
+        "execution_schedule_enter_market": {
+          "days": {
+            "monday": true,
+            "tuesday": false,
+            "wednesday": false,
+            "thursday": false,
+            "friday": false,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "execution_schedule_open_positions": {
+          "days": {
+            "monday": true,
+            "tuesday": true,
+            "wednesday": true,
+            "thursday": true,
+            "friday": true,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "expected_profit_mode": "static",
+        "expected_profit_percent": 19.0,
+        "instrument_selection_method": "screener",
+        "market_cap_max": 10000000000.0,
+        "max_days_since_report": 30,
+        "max_expected_profit_percent": 420.0,
+        "max_virtual_equity_per_instrument_percent": 25.0,
+        "min_stop_loss_pct": 6.0,
+        "regime_overlay_enabled": false,
+        "regime_risk_scale": 1.0,
+        "regime_stop_scale": 0.75,
+        "regime_tp_scale": 0.5,
+        "risk_per_trade_pct": 2.5,
+        "screener_market_cap_min": 5000000000,
+        "screener_max_stocks": 20,
+        "screener_price_drop_days": 22,
+        "screener_price_drop_pct": 13.0,
+        "screener_relative_volume_min": 1.5,
+        "screener_weinstein_stage2_only": false,
+        "sizing_mode": "risk_atr",
+        "surprise_min_pct": 10.0,
+        "use_atr_stop": false
+      },
+      "unknown_payload_settings": [
+        "market_cap_max"
+      ],
+      "duplicate_setting_keys": {},
+      "settings_differences": [
+        {
+          "key": "use_atr_stop",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        },
+        {
+          "key": "regime_overlay_enabled",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        }
+      ],
+      "rules": [
+        {
+          "subtype": "enter_market",
+          "ruleset_id": 28,
+          "count": 2,
+          "equal": true,
+          "display_names_equal": false,
+          "expected": [
+            {
+              "name": "enter-buy-2",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "mediumrisk"
+                },
+                "cond_2": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "expert_target_price",
+                  "value": -14.0
+                },
+                "a2": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -16.0
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "enter-buy-3",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "enter-buy-2-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "mediumrisk"
+                },
+                "cond_2": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "expert_target_price",
+                  "value": -14.0
+                },
+                "a2": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -16.0
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "enter-buy-3-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        },
+        {
+          "subtype": "open_positions",
+          "ruleset_id": 29,
+          "count": 2,
+          "equal": true,
+          "display_names_equal": true,
+          "expected": [
+            {
+              "name": "goal2020-mid_ED_S1top1-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "days_opened",
+                  "operator": ">",
+                  "value": 150.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-mid_ED_S1top1-open_positions-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "has_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -14.0
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "goal2020-mid_ED_S1top1-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "days_opened",
+                  "operator": ">",
+                  "value": 150.0
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "close"
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "goal2020-mid_ED_S1top1-open_positions-1",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "has_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -14.0
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        }
+      ],
+      "backtest_screener": {
+        "market_cap_max": 10000000000.0,
+        "market_cap_min": 5000000000.0,
+        "relative_volume_min": 1.5,
+        "price_drop_pct": 13.0,
+        "price_drop_days": 22,
+        "max_stocks": 20,
+        "weinstein_stage2_only": 0
+      },
+      "live_screener": {
+        "screener_provider": "fmp",
+        "screener_market_cap_min": 5000000000,
+        "screener_market_cap_max": 0,
+        "screener_volume_min": 500000,
+        "screener_volume_max": 0,
+        "screener_float_min": 10000000,
+        "screener_float_max": 0,
+        "screener_price_min": 20.0,
+        "screener_price_max": 0,
+        "screener_relative_volume_min": 1.5,
+        "screener_price_drop_pct": 13.0,
+        "screener_price_drop_days": 22,
+        "screener_max_stocks": 20,
+        "screener_sort_metric": "market_cap",
+        "screener_weinstein_stage2_only": 0,
+        "universe_mode": "broad"
+      },
+      "screener_differences": [
+        {
+          "key": "screener_market_cap_max",
+          "backtest": 10000000000.0,
+          "live": 0
+        },
+        {
+          "key": "screener_volume_min",
+          "backtest": "no explicit runtime filter",
+          "live": 500000
+        },
+        {
+          "key": "screener_float_min",
+          "backtest": "no explicit runtime filter",
+          "live": 10000000
+        },
+        {
+          "key": "screener_price_min",
+          "backtest": "no explicit runtime filter",
+          "live": 20.0
+        }
+      ],
+      "capped": {
+        "id": 1406,
+        "status": "completed",
+        "cap": 1000.0,
+        "same_parent_genes": true,
+        "entry_days": {
+          "Monday": 260
+        },
+        "analysis_cadence": "weekly",
+        "entries_below_live_20_dollar_floor": 70,
+        "total_closed_trades": 260,
+        "persisted_run_db": "C:\\Users\\basti\\AppData\\Local\\Temp\\ba2_backtest_dbs\\run_1406.sqlite",
+        "rules_match_live": {
+          "entry": true,
+          "exit": true
+        },
+        "historical_expert_setting_differences": {
+          "risk_per_trade_pct": {
+            "backtest_db": 8.0,
+            "live": 2.5
+          },
+          "atr_risk_budget_pct": {
+            "backtest_db": 2.5,
+            "live": 8.0
+          }
+        },
+        "historical_boolean_runtime": {
+          "use_atr_stop": false,
+          "regime_overlay_enabled": false,
+          "allow_automated_trade_opening": true,
+          "enable_buy": true,
+          "allow_automated_trade_modification": true,
+          "enable_sell": false
+        },
+        "unpersisted_live_defaults": {
+          "model_target_method": {
+            "backtest": "forward",
+            "current_literal_default": "forward"
+          }
+        }
+      }
+    },
+    {
+      "instance": {
+        "id": 12,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "alias": "goal2020-small_RAT_S1top1",
+        "user_description": "Deployed from goal2020-small_RAT_S1top1 (backtest 1330). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 30,
+        "open_positions_ruleset_id": 31
+      },
+      "source_backtest": 1330,
+      "source_name": "TOP1-scr-small-FMPRating-S1-goal2020-notional-from2022",
+      "source_entry_days": {
+        "Monday": 165,
+        "Wednesday": 113,
+        "Thursday": 63,
+        "Friday": 46
+      },
+      "source_schedule_genes": {
+        "monday": true,
+        "tuesday": false,
+        "wednesday": true,
+        "thursday": true,
+        "friday": true,
+        "saturday": false,
+        "sunday": false
+      },
+      "payload_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "source_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ]
+      },
+      "live_entry_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": false,
+          "wednesday": false,
+          "thursday": false,
+          "friday": false,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "live_management_schedule": {
+        "days": {
+          "monday": true,
+          "tuesday": true,
+          "wednesday": true,
+          "thursday": true,
+          "friday": true,
+          "saturday": false,
+          "sunday": false
+        },
+        "times": [
+          "09:30"
+        ],
+        "time_basis": "market"
+      },
+      "expected_settings": {
+        "sizing_mode": "notional",
+        "profit_ratio": 0.8,
+        "min_analysts": 10,
+        "price_target_window_days": 180,
+        "min_price_targets_per_quarter": 0,
+        "max_analyst_age_months": 0,
+        "target_price_type": "median",
+        "risk_per_trade_pct": 1.25,
+        "atr_risk_budget_pct": 9.0,
+        "atr_multiplier": 5.5,
+        "atr_period": 21,
+        "min_stop_loss_pct": 10.0,
+        "use_atr_stop": 1,
+        "max_virtual_equity_per_instrument_percent": 15.0,
+        "regime_overlay_enabled": 1,
+        "regime_risk_scale": 0.75,
+        "regime_stop_scale": 0.75,
+        "regime_tp_scale": 0.75,
+        "allow_automated_trade_opening": true,
+        "enable_buy": true,
+        "allow_automated_trade_modification": true,
+        "enable_sell": false,
+        "market_cap_max": 2000000000.0,
+        "screener_market_cap_min": 600000000.0,
+        "screener_relative_volume_min": 2.2,
+        "screener_price_drop_pct": 4.0,
+        "screener_price_drop_days": 22,
+        "screener_max_stocks": 20,
+        "screener_weinstein_stage2_only": 0,
+        "instrument_selection_method": "screener"
+      },
+      "live_runtime_settings": {
+        "allow_automated_trade_modification": true,
+        "allow_automated_trade_opening": true,
+        "atr_multiplier": 5.5,
+        "atr_period": 21,
+        "atr_risk_budget_pct": 9.0,
+        "enable_buy": true,
+        "enable_sell": false,
+        "execution_schedule_enter_market": {
+          "days": {
+            "monday": true,
+            "tuesday": false,
+            "wednesday": false,
+            "thursday": false,
+            "friday": false,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "execution_schedule_open_positions": {
+          "days": {
+            "monday": true,
+            "tuesday": true,
+            "wednesday": true,
+            "thursday": true,
+            "friday": true,
+            "saturday": false,
+            "sunday": false
+          },
+          "times": [
+            "09:30"
+          ],
+          "time_basis": "market"
+        },
+        "instrument_selection_method": "screener",
+        "market_cap_max": 2000000000.0,
+        "max_analyst_age_months": 0,
+        "max_virtual_equity_per_instrument_percent": 15.0,
+        "min_analysts": 10,
+        "min_price_targets_per_quarter": 0,
+        "min_stop_loss_pct": 10.0,
+        "price_target_window_days": 180,
+        "profit_ratio": 0.8,
+        "regime_overlay_enabled": false,
+        "regime_risk_scale": 0.75,
+        "regime_stop_scale": 0.75,
+        "regime_tp_scale": 0.75,
+        "risk_per_trade_pct": 1.25,
+        "screener_market_cap_min": 600000000,
+        "screener_max_stocks": 20,
+        "screener_price_drop_days": 22,
+        "screener_price_drop_pct": 4.0,
+        "screener_relative_volume_min": 2.2,
+        "screener_weinstein_stage2_only": false,
+        "sizing_mode": "notional",
+        "target_price_type": "median",
+        "use_atr_stop": false
+      },
+      "unknown_payload_settings": [
+        "market_cap_max"
+      ],
+      "duplicate_setting_keys": {},
+      "settings_differences": [
+        {
+          "key": "use_atr_stop",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        },
+        {
+          "key": "regime_overlay_enabled",
+          "payload": 1,
+          "expected_typed": true,
+          "live_runtime": false,
+          "defined": true
+        }
+      ],
+      "rules": [
+        {
+          "subtype": "enter_market",
+          "ruleset_id": 30,
+          "count": 2,
+          "equal": true,
+          "display_names_equal": false,
+          "expected": [
+            {
+              "name": "enter-buy-2",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "confidence",
+                  "operator": ">=",
+                  "value": 80.0
+                },
+                "cond_2": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "expert_target_price",
+                  "value": -14.0
+                },
+                "a2": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -4.0
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "enter-buy-3",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "confidence",
+                  "operator": ">=",
+                  "value": 45.0
+                },
+                "cond_2": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "expert_target_price",
+                  "value": 8.0
+                },
+                "a2": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -18.0
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "enter-buy-2-2",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "confidence",
+                  "operator": ">=",
+                  "value": 80.0
+                },
+                "cond_2": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "expert_target_price",
+                  "value": -14.0
+                },
+                "a2": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -4.0
+                }
+              },
+              "continue_processing": false
+            },
+            {
+              "name": "enter-buy-3-2",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "bullish"
+                },
+                "cond_1": {
+                  "event_type": "confidence",
+                  "operator": ">=",
+                  "value": 45.0
+                },
+                "cond_2": {
+                  "event_type": "has_no_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "buy"
+                },
+                "a1": {
+                  "action_type": "adjust_take_profit",
+                  "reference_value": "expert_target_price",
+                  "value": 8.0
+                },
+                "a2": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -18.0
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        },
+        {
+          "subtype": "open_positions",
+          "ruleset_id": 31,
+          "count": 1,
+          "equal": true,
+          "display_names_equal": true,
+          "expected": [
+            {
+              "name": "goal2020-small_RAT_S1top1-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "has_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -18.0
+                }
+              },
+              "continue_processing": false
+            }
+          ],
+          "live": [
+            {
+              "name": "goal2020-small_RAT_S1top1-open_positions-0",
+              "triggers": {
+                "cond_0": {
+                  "event_type": "has_position"
+                }
+              },
+              "actions": {
+                "a0": {
+                  "action_type": "adjust_stop_loss",
+                  "reference_value": "order_open_price",
+                  "value": -18.0
+                }
+              },
+              "continue_processing": false
+            }
+          ]
+        }
+      ],
+      "backtest_screener": {
+        "market_cap_max": 2000000000.0,
+        "market_cap_min": 600000000.0,
+        "relative_volume_min": 2.2,
+        "price_drop_pct": 4.0,
+        "price_drop_days": 22,
+        "max_stocks": 20,
+        "weinstein_stage2_only": 0
+      },
+      "live_screener": {
+        "screener_provider": "fmp",
+        "screener_market_cap_min": 600000000,
+        "screener_market_cap_max": 0,
+        "screener_volume_min": 500000,
+        "screener_volume_max": 0,
+        "screener_float_min": 10000000,
+        "screener_float_max": 0,
+        "screener_price_min": 20.0,
+        "screener_price_max": 0,
+        "screener_relative_volume_min": 2.2,
+        "screener_price_drop_pct": 4.0,
+        "screener_price_drop_days": 22,
+        "screener_max_stocks": 20,
+        "screener_sort_metric": "market_cap",
+        "screener_weinstein_stage2_only": 0,
+        "universe_mode": "broad"
+      },
+      "screener_differences": [
+        {
+          "key": "screener_market_cap_max",
+          "backtest": 2000000000.0,
+          "live": 0
+        },
+        {
+          "key": "screener_volume_min",
+          "backtest": "no explicit runtime filter",
+          "live": 500000
+        },
+        {
+          "key": "screener_float_min",
+          "backtest": "no explicit runtime filter",
+          "live": 10000000
+        },
+        {
+          "key": "screener_price_min",
+          "backtest": "no explicit runtime filter",
+          "live": 20.0
+        }
+      ],
+      "capped": {
+        "id": 1425,
+        "status": "completed",
+        "cap": 1000.0,
+        "same_parent_genes": true,
+        "entry_days": {
+          "Monday": 185
+        },
+        "analysis_cadence": "weekly",
+        "entries_below_live_20_dollar_floor": 118,
+        "total_closed_trades": 185,
+        "persisted_run_db": "C:\\Users\\basti\\AppData\\Local\\Temp\\ba2_backtest_dbs\\run_1425.sqlite",
+        "rules_match_live": {
+          "entry": true,
+          "exit": true
+        },
+        "historical_expert_setting_differences": {},
+        "historical_boolean_runtime": {
+          "use_atr_stop": false,
+          "regime_overlay_enabled": false,
+          "allow_automated_trade_opening": true,
+          "enable_buy": true,
+          "allow_automated_trade_modification": true,
+          "enable_sell": false
+        },
+        "unpersisted_live_defaults": {}
+      }
+    }
+  ]
+}

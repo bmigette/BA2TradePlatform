@@ -1,0 +1,2436 @@
+{
+  "created_utc": "2026-09-07T06:07:17.371690+00:00",
+  "standalone": {
+    "7": {
+      "instance": {
+        "id": 7,
+        "account_id": 1,
+        "expert": "DeterministicScorer",
+        "enabled": 1,
+        "alias": "goal2020-large_DS_S6top1",
+        "user_description": "Deployed from goal2020-large_DS_S6top1 (backtest 1107). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 20,
+        "open_positions_ruleset_id": 21
+      },
+      "parent_id": 1107,
+      "id": 1407,
+      "name": "OK1000-TOP1-scr-large-DeterministicScorer-S6-goal2020-risk_atr-ds",
+      "start": "2020-01-01 00:00:00.000000",
+      "end": "2025-12-31 00:00:00.000000",
+      "total_pnl_including_end_marks": 1707.601432561178,
+      "closed_pnl": 1683.5877515611778,
+      "open_at_end_marked_pnl": 24.01368099999998,
+      "closed_count": 342,
+      "open_count": 2,
+      "drawdown_pct_cap": -19.69854182080119,
+      "reported_profit_factor": 2.2,
+      "closed_profit_factor": 2.1815870257129917,
+      "closed_win_rate": 62.86549707602339,
+      "reported_win_rate": 63.08,
+      "mean_winner": 14.457863697851161,
+      "median_winner": 14.737634009999997,
+      "mean_loser": -11.219314515565522,
+      "mean_win_loss_ratio": 1.2886583826304647,
+      "top5_closed_winners_pct_gross": 5.241228773000873,
+      "top5_closed_winners_pct_net": 9.676982262963428,
+      "closed_net_without_top5": 1520.6672634611778,
+      "holding_mean_closed_days": 17.237573099415204,
+      "holding_median_closed_days": 16.12847222222222,
+      "holding_p90_closed_days": 31.0,
+      "holding_max_closed_days": 32.0,
+      "open_holding_days": [
+        {
+          "symbol": "MRK",
+          "days": 22.267,
+          "pnl": 13.59
+        },
+        {
+          "symbol": "NVDA",
+          "days": 15.267,
+          "pnl": 10.423
+        }
+      ],
+      "entry_cost_exposure_proxy": 399.4008344288599,
+      "exit_counts": {
+        "take_profit": 145,
+        "stop_loss": 102,
+        "exit": 95,
+        "open_at_end": 2
+      },
+      "closed_yearly_pnl": {
+        "2020": 345.2,
+        "2021": 395.06,
+        "2022": 24.21,
+        "2023": 194.3,
+        "2024": 358.17,
+        "2025": 366.64
+      },
+      "mark_to_market_yearly_pnl": {
+        "2020": 347.42,
+        "2021": 389.78,
+        "2022": 51.25,
+        "2023": 183.9,
+        "2024": 339.69,
+        "2025": 395.56
+      },
+      "largest_closed_winners": [
+        {
+          "symbol": "PLTR",
+          "pnl": 39.213,
+          "days": 0.267
+        },
+        {
+          "symbol": "TSLA",
+          "pnl": 33.048,
+          "days": 0.267
+        },
+        {
+          "symbol": "GE",
+          "pnl": 30.794,
+          "days": 30.267
+        },
+        {
+          "symbol": "AMD",
+          "pnl": 30.245,
+          "days": 7.267
+        },
+        {
+          "symbol": "NVDA",
+          "pnl": 29.62,
+          "days": 8.139
+        }
+      ],
+      "largest_issuer_closed_pnl": {
+        "NVDA": 250.84,
+        "AMAT": 161.21,
+        "PLTR": 155.62,
+        "SHOP": 149.4,
+        "AVGO": 106.1
+      },
+      "settings": {
+        "model:w_technical": 0.6000000000000001,
+        "model:w_fundamental": 0.30000000000000004,
+        "model:w_analyst": 0.0,
+        "model:w_earnings": 0.1,
+        "model:macro_mode": "off",
+        "model:theta_buy": 0.25,
+        "model:theta_sell": 0.30000000000000004,
+        "model:k_stop": 1.5,
+        "model:k_target": 3.0,
+        "model:risk_per_trade_pct": 0.5,
+        "model:atr_risk_budget_pct": 7.0,
+        "model:atr_multiplier": 6.0,
+        "model:atr_period": 21,
+        "model:min_stop_loss_pct": 14.0,
+        "model:use_atr_stop": 1,
+        "model:max_virtual_equity_per_instrument_percent": 25.0,
+        "model:regime_overlay_enabled": 1,
+        "model:regime_risk_scale": 0.75,
+        "model:regime_stop_scale": 1.25,
+        "model:regime_tp_scale": 1.5,
+        "schedule:monday": 1,
+        "schedule:tuesday": 0,
+        "schedule:wednesday": 0,
+        "schedule:thursday": 0,
+        "schedule:friday": 0,
+        "schedule:saturday": 1,
+        "schedule:sunday": 0,
+        "screener:screener_market_cap_min": 20000000000.0,
+        "screener:screener_relative_volume_min": 0.1,
+        "screener:screener_price_drop_pct": 5.0,
+        "screener:screener_price_drop_days": 8,
+        "screener:screener_max_stocks": 30,
+        "screener:screener_weinstein_stage2_only": 1,
+        "expertFixedSettings": {
+          "sizing_mode": "risk_atr"
+        }
+      },
+      "entry_rules": [
+        {
+          "id": "buy",
+          "name": "enter-buy",
+          "conditions": {
+            "id": "root",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "buy-bullish",
+                "field": "bullish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "buy-flat",
+                "field": "has_no_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "buy",
+              "action_type": "buy"
+            },
+            {
+              "id": "entry_tp",
+              "action": "adjust_take_profit",
+              "action_type": "adjust_take_profit",
+              "referenceValue": "order_open_price",
+              "reference_value": "order_open_price",
+              "actionValue": 10.0,
+              "action_value": 12.0,
+              "value": 12.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": 6.0,
+              "action_value_min": 6.0,
+              "actionValueMax": 16.0,
+              "action_value_max": 16.0,
+              "actionValueStep": 1.0,
+              "action_value_step": 1.0,
+              "toggleOptimize": true,
+              "toggle_optimize": true
+            },
+            {
+              "id": "entry_sl",
+              "action": "adjust_stop_loss",
+              "action_type": "adjust_stop_loss",
+              "referenceValue": "order_open_price",
+              "reference_value": "order_open_price",
+              "actionValue": -5.0,
+              "action_value": -8.0,
+              "value": -8.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -10.0,
+              "action_value_min": -10.0,
+              "actionValueMax": -2.0,
+              "action_value_max": -2.0,
+              "actionValueStep": 1.0,
+              "action_value_step": 1.0,
+              "toggleOptimize": true,
+              "toggle_optimize": true
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false
+        }
+      ],
+      "exit_rules": [
+        {
+          "id": "exit_downgrade",
+          "conditions": {
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "xd",
+                "field": "current_rating_negative",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "close",
+              "action_type": "close"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggleOptimize": true,
+          "toggle_optimize": true
+        },
+        {
+          "id": "exit_time",
+          "conditions": {
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "xt",
+                "field": "days_opened",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">",
+                "op": ">",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 30.0,
+                "valueMin": 10.0,
+                "value_min": 10.0,
+                "valueMax": 30.0,
+                "value_max": 30.0,
+                "valueStep": 5.0,
+                "value_step": 5.0
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "close",
+              "action_type": "close"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false
+        }
+      ],
+      "entry_recommendation_profile": {
+        "confidence_min": 25.01928882686819,
+        "confidence_max": 80.54511643767816,
+        "risk_counts": {
+          "MEDIUM": 344
+        },
+        "horizon_counts": {
+          "MEDIUM_TERM": 344
+        }
+      }
+    },
+    "8": {
+      "instance": {
+        "id": 8,
+        "account_id": 1,
+        "expert": "FMPInsiderClusterBuy",
+        "enabled": 1,
+        "alias": "goal2020-mid_ICB_S1top1",
+        "user_description": "Deployed from goal2020-mid_ICB_S1top1 (backtest 1298). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 22,
+        "open_positions_ruleset_id": 23
+      },
+      "parent_id": 1298,
+      "id": 1420,
+      "name": "OK1000-TOP1-scr-mid-FMPInsiderClusterBuy-S1-goal2020-notional",
+      "start": "2020-01-01 00:00:00.000000",
+      "end": "2025-12-31 00:00:00.000000",
+      "total_pnl_including_end_marks": 941.6310683642018,
+      "closed_pnl": 958.2883183642018,
+      "open_at_end_marked_pnl": -16.657249999999998,
+      "closed_count": 221,
+      "open_count": 3,
+      "drawdown_pct_cap": -14.743792215407908,
+      "reported_profit_factor": 2.4,
+      "closed_profit_factor": 2.468023009987258,
+      "closed_win_rate": 77.82805429864254,
+      "reported_win_rate": 77.23,
+      "mean_winner": 9.36664560779069,
+      "median_winner": 3.0676476249999984,
+      "mean_loser": -13.321933187261164,
+      "mean_win_loss_ratio": 0.7030995784266025,
+      "top5_closed_winners_pct_gross": 15.130036070040834,
+      "top5_closed_winners_pct_net": 25.436438603998496,
+      "closed_net_without_top5": 714.5338986142019,
+      "holding_mean_closed_days": 16.336098541980892,
+      "holding_median_closed_days": 2.267361111111111,
+      "holding_p90_closed_days": 49.267361111111114,
+      "holding_max_closed_days": 211.0,
+      "open_holding_days": [
+        {
+          "symbol": "GME",
+          "days": 197.267,
+          "pnl": -10.151
+        },
+        {
+          "symbol": "AAON",
+          "days": 8.267,
+          "pnl": 2.466
+        },
+        {
+          "symbol": "NTSK",
+          "days": 8.267,
+          "pnl": -8.972
+        }
+      ],
+      "entry_cost_exposure_proxy": 181.07570692504905,
+      "exit_counts": {
+        "take_profit": 170,
+        "stop_loss": 49,
+        "exit": 2,
+        "open_at_end": 3
+      },
+      "closed_yearly_pnl": {
+        "2020": 581.12,
+        "2021": 58.07,
+        "2022": 32.98,
+        "2023": 69.06,
+        "2024": 38.48,
+        "2025": 178.58
+      },
+      "mark_to_market_yearly_pnl": {
+        "2020": 595.74,
+        "2021": 43.45,
+        "2022": 31.06,
+        "2023": 92.36,
+        "2024": 21.89,
+        "2025": 157.12
+      },
+      "largest_closed_winners": [
+        {
+          "symbol": "MBLY",
+          "pnl": 55.751,
+          "days": 46.017
+        },
+        {
+          "symbol": "FITB",
+          "pnl": 51.748,
+          "days": 50.267
+        },
+        {
+          "symbol": "FCX",
+          "pnl": 48.325,
+          "days": 22.267
+        },
+        {
+          "symbol": "KEY",
+          "pnl": 47.048,
+          "days": 17.267
+        },
+        {
+          "symbol": "EQT",
+          "pnl": 40.884,
+          "days": 35.021
+        }
+      ],
+      "largest_issuer_closed_pnl": {
+        "ALLY": 101.97,
+        "KEY": 60.24,
+        "FITB": 51.75,
+        "FCX": 48.32,
+        "EQT": 40.88
+      },
+      "settings": {
+        "model:lookback_days": 120,
+        "model:min_insiders": 2,
+        "model:expected_profit_mode": "model",
+        "model:max_expected_profit_percent": 40.0,
+        "model:risk_per_trade_pct": 2.5,
+        "model:atr_risk_budget_pct": 1.0,
+        "model:atr_multiplier": 6.0,
+        "model:atr_period": 14,
+        "model:min_stop_loss_pct": 13.0,
+        "model:use_atr_stop": 0,
+        "model:max_virtual_equity_per_instrument_percent": 15.0,
+        "model:regime_overlay_enabled": 1,
+        "model:regime_risk_scale": 1.75,
+        "model:regime_stop_scale": 2.0,
+        "model:regime_tp_scale": 1.25,
+        "schedule:monday": 0,
+        "schedule:tuesday": 0,
+        "schedule:wednesday": 0,
+        "schedule:thursday": 1,
+        "schedule:friday": 0,
+        "schedule:saturday": 1,
+        "schedule:sunday": 0,
+        "screener:screener_market_cap_min": 5000000000.0,
+        "screener:screener_relative_volume_min": 0.6000000000000001,
+        "screener:screener_price_drop_pct": 16.0,
+        "screener:screener_price_drop_days": 18,
+        "screener:screener_max_stocks": 40,
+        "screener:screener_weinstein_stage2_only": 0,
+        "expertFixedSettings": {
+          "sizing_mode": "notional"
+        }
+      },
+      "entry_rules": [
+        {
+          "id": "buy-2",
+          "name": "enter-buy-2",
+          "conditions": {
+            "id": "u9",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u10",
+                "field": "bullish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "u13",
+                "field": "medium_term",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false,
+                "toggleOptimize": true,
+                "toggle_optimize": true
+              },
+              {
+                "id": "u14",
+                "field": "mediumrisk",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false,
+                "toggleOptimize": true,
+                "toggle_optimize": true
+              },
+              {
+                "id": "u15",
+                "field": "has_no_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "buy",
+              "action_type": "buy"
+            },
+            {
+              "id": "s1_tp_target",
+              "action": "adjust_take_profit",
+              "action_type": "adjust_take_profit",
+              "referenceValue": "expert_target_price",
+              "reference_value": "expert_target_price",
+              "actionValue": -5.0,
+              "action_value": -6.0,
+              "value": -6.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": 10.0,
+              "action_value_max": 10.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0,
+              "toggleOptimize": true,
+              "toggle_optimize": true
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggle_optimize": true
+        },
+        {
+          "id": "buy-3",
+          "name": "enter-buy-3",
+          "conditions": {
+            "id": "u16",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u17",
+                "field": "bullish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "u20",
+                "field": "has_no_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "buy",
+              "action_type": "buy"
+            },
+            {
+              "id": "s1_tp_target",
+              "action": "adjust_take_profit",
+              "action_type": "adjust_take_profit",
+              "referenceValue": "expert_target_price",
+              "reference_value": "expert_target_price",
+              "actionValue": -5.0,
+              "action_value": 0.0,
+              "value": 0.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": 10.0,
+              "action_value_max": 10.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0,
+              "toggleOptimize": true,
+              "toggle_optimize": true
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggle_optimize": true
+        }
+      ],
+      "exit_rules": [
+        {
+          "id": "s1_exit_time",
+          "conditions": {
+            "id": "u21",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u22",
+                "field": "days_opened",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">",
+                "op": ">",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 210.0,
+                "valueMin": 30.0,
+                "value_min": 30.0,
+                "valueMax": 200.0,
+                "value_max": 200.0,
+                "valueStep": 30.0,
+                "value_step": 30.0
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "close",
+              "action_type": "close"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggleOptimize": true,
+          "toggle_optimize": true
+        },
+        {
+          "id": "s1_exit_signal",
+          "conditions": {
+            "id": "u23",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u24",
+                "field": "bearish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "close",
+              "action_type": "close"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggleOptimize": true,
+          "toggle_optimize": true
+        },
+        {
+          "id": "s1_sl_hold",
+          "conditions": {
+            "id": "u25",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u26",
+                "field": "has_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "adjust_stop_loss",
+              "action_type": "adjust_stop_loss",
+              "referenceValue": "order_open_price",
+              "reference_value": "order_open_price",
+              "actionValue": -8.0,
+              "action_value": -12.0,
+              "value": -12.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": -3.0,
+              "action_value_max": -3.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false
+        }
+      ],
+      "entry_recommendation_profile": {
+        "confidence_min": 26.1,
+        "confidence_max": 94.0,
+        "risk_counts": {
+          "MEDIUM": 224
+        },
+        "horizon_counts": {
+          "MEDIUM_TERM": 224
+        }
+      }
+    },
+    "9": {
+      "instance": {
+        "id": 9,
+        "account_id": 1,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "alias": "goal2020-small_ED_S2top1",
+        "user_description": "Deployed from goal2020-small_ED_S2top1 (backtest 1363). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 24,
+        "open_positions_ruleset_id": 25
+      },
+      "parent_id": 1363,
+      "id": 1423,
+      "name": "OK1000-TOP1-scr-small-FMPEarningsDrift-S2-goal2020-notional",
+      "start": "2020-01-01 00:00:00.000000",
+      "end": "2025-12-31 00:00:00.000000",
+      "total_pnl_including_end_marks": 779.9223305554036,
+      "closed_pnl": 675.0404230554037,
+      "open_at_end_marked_pnl": 104.88190750000001,
+      "closed_count": 355,
+      "open_count": 14,
+      "drawdown_pct_cap": -17.385697393438203,
+      "reported_profit_factor": 1.77,
+      "closed_profit_factor": 1.668078148590003,
+      "closed_win_rate": 16.056338028169016,
+      "reported_win_rate": 19.24,
+      "mean_winner": 29.569504744532164,
+      "median_winner": 26.453461,
+      "mean_loser": -3.390675662358824,
+      "mean_win_loss_ratio": 8.720829618944226,
+      "top5_closed_winners_pct_gross": 20.41467071427646,
+      "top5_closed_winners_pct_net": 50.971980150847884,
+      "closed_net_without_top5": 330.95895260540374,
+      "holding_mean_closed_days": 55.495031298904536,
+      "holding_median_closed_days": 15.006944444444445,
+      "holding_p90_closed_days": 150.60555555555558,
+      "holding_max_closed_days": 1045.0,
+      "open_holding_days": [
+        {
+          "symbol": "HMN",
+          "days": 323.267,
+          "pnl": 5.075
+        },
+        {
+          "symbol": "CUBI",
+          "days": 155.267,
+          "pnl": 10.367
+        },
+        {
+          "symbol": "CECO",
+          "days": 148.267,
+          "pnl": 14.792
+        },
+        {
+          "symbol": "AORT",
+          "days": 141.267,
+          "pnl": 5.175
+        },
+        {
+          "symbol": "HE",
+          "days": 141.267,
+          "pnl": 6.863
+        },
+        {
+          "symbol": "IMAX",
+          "days": 64.267,
+          "pnl": 5.233
+        },
+        {
+          "symbol": "NTB",
+          "days": 57.267,
+          "pnl": 4.051
+        },
+        {
+          "symbol": "PRLB",
+          "days": 57.267,
+          "pnl": 2.628
+        },
+        {
+          "symbol": "AUPH",
+          "days": 50.267,
+          "pnl": 4.33
+        },
+        {
+          "symbol": "FIGS",
+          "days": 50.267,
+          "pnl": 17.196
+        },
+        {
+          "symbol": "HROW",
+          "days": 50.267,
+          "pnl": 14.62
+        },
+        {
+          "symbol": "NGVT",
+          "days": 50.267,
+          "pnl": 9.778
+        },
+        {
+          "symbol": "TALO",
+          "days": 50.267,
+          "pnl": 3.856
+        },
+        {
+          "symbol": "WBTN",
+          "days": 43.267,
+          "pnl": 0.918
+        }
+      ],
+      "entry_cost_exposure_proxy": 440.0020005139005,
+      "exit_counts": {
+        "stop_loss": 298,
+        "exit": 57,
+        "open_at_end": 14
+      },
+      "closed_yearly_pnl": {
+        "2020": 37.64,
+        "2021": 216.8,
+        "2022": 54.63,
+        "2023": 11.7,
+        "2024": 219.37,
+        "2025": 134.92
+      },
+      "mark_to_market_yearly_pnl": {
+        "2020": 171.56,
+        "2021": 131.8,
+        "2022": 65.04,
+        "2023": 47.29,
+        "2024": 198.98,
+        "2025": 165.25
+      },
+      "largest_closed_winners": [
+        {
+          "symbol": "CNR",
+          "pnl": 150.08,
+          "days": 1045.0
+        },
+        {
+          "symbol": "LXU",
+          "pnl": 52.768,
+          "days": 39.0
+        },
+        {
+          "symbol": "TIGR",
+          "pnl": 52.118,
+          "days": 84.0
+        },
+        {
+          "symbol": "MTSI",
+          "pnl": 44.644,
+          "days": 88.0
+        },
+        {
+          "symbol": "AMRC",
+          "pnl": 44.471,
+          "days": 52.0
+        }
+      ],
+      "largest_issuer_closed_pnl": {
+        "CNR": 150.08,
+        "MHO": 58.49,
+        "LXU": 52.77,
+        "TIGR": 52.12,
+        "MTSI": 44.64
+      },
+      "settings": {
+        "model:surprise_min_pct": 14.0,
+        "model:max_days_since_report": 15,
+        "model:expected_profit_percent": 14.0,
+        "model:expected_profit_mode": "dynamic",
+        "model:dynamic_scale": 0.5,
+        "model:max_expected_profit_percent": 200.0,
+        "model:risk_per_trade_pct": 1.5,
+        "model:atr_risk_budget_pct": 10.0,
+        "model:atr_multiplier": 5.5,
+        "model:atr_period": 7,
+        "model:min_stop_loss_pct": 10.0,
+        "model:use_atr_stop": 1,
+        "model:max_virtual_equity_per_instrument_percent": 10.0,
+        "model:regime_overlay_enabled": 1,
+        "model:regime_risk_scale": 1.0,
+        "model:regime_stop_scale": 1.5,
+        "model:regime_tp_scale": 1.0,
+        "schedule:monday": 0,
+        "schedule:tuesday": 0,
+        "schedule:wednesday": 1,
+        "schedule:thursday": 1,
+        "schedule:friday": 1,
+        "schedule:saturday": 0,
+        "schedule:sunday": 0,
+        "screener:screener_market_cap_min": 800000000.0,
+        "screener:screener_relative_volume_min": 1.6,
+        "screener:screener_price_drop_pct": 0.0,
+        "screener:screener_price_drop_days": 7,
+        "screener:screener_max_stocks": 30,
+        "screener:screener_weinstein_stage2_only": 1,
+        "expertFixedSettings": {
+          "sizing_mode": "notional"
+        }
+      },
+      "entry_rules": [
+        {
+          "id": "buy",
+          "name": "enter-buy",
+          "conditions": {
+            "id": "root",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "buy-bullish",
+                "field": "bullish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "buy-flat",
+                "field": "has_no_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "gate_confidence",
+                "field": "confidence",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">",
+                "op": ">",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 45.0,
+                "valueMin": 40.0,
+                "value_min": 40.0,
+                "valueMax": 80.0,
+                "value_max": 80.0,
+                "valueStep": 5.0,
+                "value_step": 5.0,
+                "toggleOptimize": true,
+                "toggle_optimize": true
+              },
+              {
+                "id": "gate_days_since_close",
+                "field": "days_since_last_close",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">",
+                "op": ">",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 20.0,
+                "valueMin": 0.0,
+                "value_min": 0.0,
+                "valueMax": 30.0,
+                "value_max": 30.0,
+                "valueStep": 5.0,
+                "value_step": 5.0,
+                "toggleOptimize": true,
+                "toggle_optimize": true
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "buy",
+              "action_type": "buy"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false
+        }
+      ],
+      "exit_rules": [
+        {
+          "id": "exit_bearish",
+          "conditions": {
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "xb",
+                "field": "bearish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "close",
+              "action_type": "close"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggleOptimize": true,
+          "toggle_optimize": true
+        },
+        {
+          "id": "exit_downgrade",
+          "conditions": {
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "xd",
+                "field": "current_rating_negative",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "close",
+              "action_type": "close"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggleOptimize": true,
+          "toggle_optimize": true
+        },
+        {
+          "id": "exit_takeprofit",
+          "conditions": {
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "xtp",
+                "field": "profit_loss_percent",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">",
+                "op": ">",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 52.0,
+                "valueMin": 8.0,
+                "value_min": 8.0,
+                "valueMax": 60.0,
+                "value_max": 60.0,
+                "valueStep": 4.0,
+                "value_step": 4.0
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "close",
+              "action_type": "close"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggleOptimize": true,
+          "toggle_optimize": true
+        },
+        {
+          "id": "exit_stoploss",
+          "conditions": {
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "sl_hold",
+                "field": "has_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "adjust_stop_loss",
+              "action_type": "adjust_stop_loss",
+              "referenceValue": "order_open_price",
+              "reference_value": "order_open_price",
+              "actionValue": -6.0,
+              "action_value": -6.0,
+              "value": -6.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": -3.0,
+              "action_value_max": -3.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false
+        }
+      ],
+      "entry_recommendation_profile": {
+        "confidence_min": 80.0,
+        "confidence_max": 90.0,
+        "risk_counts": {
+          "MEDIUM": 369
+        },
+        "horizon_counts": {
+          "MEDIUM_TERM": 369
+        }
+      }
+    },
+    "10": {
+      "instance": {
+        "id": 10,
+        "account_id": 1,
+        "expert": "DeterministicScorer",
+        "enabled": 1,
+        "alias": "goal2020-mid_DS_S6top3",
+        "user_description": "Deployed from goal2020-mid_DS_S6top3 (backtest 1173). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 26,
+        "open_positions_ruleset_id": 27
+      },
+      "parent_id": 1173,
+      "id": 1409,
+      "name": "OK1000-TOP3-scr-mid-DeterministicScorer-S6-goal2020-risk_atr-ds",
+      "start": "2020-01-01 00:00:00.000000",
+      "end": "2025-12-31 00:00:00.000000",
+      "total_pnl_including_end_marks": 838.6416099929995,
+      "closed_pnl": 838.6416099929995,
+      "open_at_end_marked_pnl": 0.0,
+      "closed_count": 142,
+      "open_count": 0,
+      "drawdown_pct_cap": -13.328130900000257,
+      "reported_profit_factor": 2.56,
+      "closed_profit_factor": 2.564570617868818,
+      "closed_win_rate": 54.929577464788736,
+      "reported_win_rate": 54.93,
+      "mean_winner": 17.62387062480769,
+      "median_winner": 10.636728977499992,
+      "mean_loser": -8.375317167843752,
+      "mean_win_loss_ratio": 2.104263071071851,
+      "top5_closed_winners_pct_gross": 24.941127947271433,
+      "top5_closed_winners_pct_net": 40.882324632432905,
+      "closed_net_without_top5": 495.7854244929996,
+      "holding_mean_closed_days": 24.41798708920188,
+      "holding_median_closed_days": 28.0,
+      "holding_p90_closed_days": 28.0,
+      "holding_max_closed_days": 29.0,
+      "open_holding_days": [],
+      "entry_cost_exposure_proxy": 164.76732940427806,
+      "exit_counts": {
+        "stop_loss": 32,
+        "exit": 110
+      },
+      "closed_yearly_pnl": {
+        "2020": 8.81,
+        "2021": 111.93,
+        "2022": 1.2,
+        "2023": 48.22,
+        "2024": 347.34,
+        "2025": 321.14
+      },
+      "mark_to_market_yearly_pnl": {
+        "2020": 14.48,
+        "2021": 124.28,
+        "2022": -16.83,
+        "2023": 57.84,
+        "2024": 329.6,
+        "2025": 329.26
+      },
+      "largest_closed_winners": [
+        {
+          "symbol": "HIMS",
+          "pnl": 95.231,
+          "days": 28.0
+        },
+        {
+          "symbol": "CRDO",
+          "pnl": 74.453,
+          "days": 28.0
+        },
+        {
+          "symbol": "RKLB",
+          "pnl": 72.729,
+          "days": 28.0
+        },
+        {
+          "symbol": "ASTS",
+          "pnl": 51.029,
+          "days": 28.0
+        },
+        {
+          "symbol": "MNSO",
+          "pnl": 49.414,
+          "days": 28.0
+        }
+      ],
+      "largest_issuer_closed_pnl": {
+        "HIMS": 139.17,
+        "CRDO": 67.59,
+        "HMY": 67.25,
+        "RKLB": 55.37,
+        "APLD": 42.27
+      },
+      "settings": {
+        "model:w_technical": 0.8,
+        "model:w_fundamental": 0.2,
+        "model:w_analyst": 0.4,
+        "model:w_earnings": 0.2,
+        "model:macro_mode": "off",
+        "model:theta_buy": 0.45,
+        "model:theta_sell": 0.1,
+        "model:k_stop": 2.5,
+        "model:k_target": 3.0,
+        "model:risk_per_trade_pct": 1.75,
+        "model:atr_risk_budget_pct": 6.0,
+        "model:atr_multiplier": 3.0,
+        "model:atr_period": 7,
+        "model:min_stop_loss_pct": 12.0,
+        "model:use_atr_stop": 0,
+        "model:max_virtual_equity_per_instrument_percent": 15.0,
+        "model:regime_overlay_enabled": 0,
+        "model:regime_risk_scale": 0.75,
+        "model:regime_stop_scale": 1.5,
+        "model:regime_tp_scale": 1.0,
+        "schedule:monday": 1,
+        "schedule:tuesday": 1,
+        "schedule:wednesday": 0,
+        "schedule:thursday": 0,
+        "schedule:friday": 0,
+        "schedule:saturday": 1,
+        "schedule:sunday": 0,
+        "screener:screener_market_cap_min": 2000000000.0,
+        "screener:screener_relative_volume_min": 1.3,
+        "screener:screener_price_drop_pct": 8.0,
+        "screener:screener_price_drop_days": 10,
+        "screener:screener_max_stocks": 50,
+        "screener:screener_weinstein_stage2_only": 0,
+        "expertFixedSettings": {
+          "sizing_mode": "risk_atr"
+        }
+      },
+      "entry_rules": [
+        {
+          "id": "buy",
+          "name": "enter-buy",
+          "conditions": {
+            "id": "root",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "buy-bullish",
+                "field": "bullish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "buy-flat",
+                "field": "has_no_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "gate_confidence",
+                "field": "confidence",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">",
+                "op": ">",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 50.0,
+                "valueMin": 40.0,
+                "value_min": 40.0,
+                "valueMax": 80.0,
+                "value_max": 50.0,
+                "valueStep": 5.0,
+                "value_step": 5.0,
+                "toggleOptimize": true,
+                "toggle_optimize": true
+              },
+              {
+                "id": "gate_expected_profit",
+                "field": "expected_profit",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">",
+                "op": ">",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 2.0,
+                "valueMin": 0.0,
+                "value_min": 0.0,
+                "valueMax": 15.0,
+                "value_max": 15.0,
+                "valueStep": 1.0,
+                "value_step": 1.0,
+                "toggleOptimize": true,
+                "toggle_optimize": true
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "buy",
+              "action_type": "buy"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false
+        }
+      ],
+      "exit_rules": [
+        {
+          "id": "exit_time",
+          "conditions": {
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "xt",
+                "field": "days_opened",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">",
+                "op": ">",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 25.0,
+                "valueMin": 10.0,
+                "value_min": 10.0,
+                "valueMax": 30.0,
+                "value_max": 30.0,
+                "valueStep": 5.0,
+                "value_step": 5.0
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "close",
+              "action_type": "close"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false
+        }
+      ],
+      "entry_recommendation_profile": {
+        "confidence_min": 50.08207354543838,
+        "confidence_max": 81.68132061178916,
+        "risk_counts": {
+          "MEDIUM": 142
+        },
+        "horizon_counts": {
+          "MEDIUM_TERM": 142
+        }
+      }
+    },
+    "11": {
+      "instance": {
+        "id": 11,
+        "account_id": 1,
+        "expert": "FMPEarningsDrift",
+        "enabled": 1,
+        "alias": "goal2020-mid_ED_S1top1",
+        "user_description": "Deployed from goal2020-mid_ED_S1top1 (backtest 1088). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 28,
+        "open_positions_ruleset_id": 29
+      },
+      "parent_id": 1088,
+      "id": 1406,
+      "name": "OK1000-TOP1-scr-mid-FMPEarningsDrift-S1-goal2020-riskatr",
+      "start": "2020-01-01 00:00:00.000000",
+      "end": "2025-12-31 00:00:00.000000",
+      "total_pnl_including_end_marks": 462.03649983833003,
+      "closed_pnl": 462.03649983833003,
+      "open_at_end_marked_pnl": 0.0,
+      "closed_count": 260,
+      "open_count": 0,
+      "drawdown_pct_cap": -9.998671800000107,
+      "reported_profit_factor": 1.48,
+      "closed_profit_factor": 1.4795016757907997,
+      "closed_win_rate": 70.38461538461539,
+      "reported_win_rate": 70.38,
+      "mean_winner": 7.790234439999981,
+      "median_winner": 5.645913674999998,
+      "mean_loser": -12.513979255606063,
+      "mean_win_loss_ratio": 0.6225225630376588,
+      "top5_closed_winners_pct_gross": 8.950522773359232,
+      "top5_closed_winners_pct_net": 27.616824113386702,
+      "closed_net_without_top5": 334.4366923383302,
+      "holding_mean_closed_days": 2.848410790598291,
+      "holding_median_closed_days": 1.125,
+      "holding_p90_closed_days": 8.04236111111111,
+      "holding_max_closed_days": 51.017361111111114,
+      "open_holding_days": [],
+      "entry_cost_exposure_proxy": 71.47681491800353,
+      "exit_counts": {
+        "stop_loss": 76,
+        "take_profit": 184
+      },
+      "closed_yearly_pnl": {
+        "2020": -14.4,
+        "2021": 34.7,
+        "2022": 62.63,
+        "2023": 80.42,
+        "2024": 227.89,
+        "2025": 70.78
+      },
+      "mark_to_market_yearly_pnl": {
+        "2020": -14.4,
+        "2021": 34.7,
+        "2022": 62.63,
+        "2023": 80.42,
+        "2024": 227.89,
+        "2025": 70.78
+      },
+      "largest_closed_winners": [
+        {
+          "symbol": "TDOC",
+          "pnl": 32.659,
+          "days": 0.267
+        },
+        {
+          "symbol": "GME",
+          "pnl": 30.296,
+          "days": 0.267
+        },
+        {
+          "symbol": "DOCS",
+          "pnl": 22.239,
+          "days": 2.028
+        },
+        {
+          "symbol": "XPO",
+          "pnl": 21.243,
+          "days": 2.267
+        },
+        {
+          "symbol": "OPEN",
+          "pnl": 21.163,
+          "days": 0.267
+        }
+      ],
+      "largest_issuer_closed_pnl": {
+        "DOCS": 70.33,
+        "GME": 55.54,
+        "PSKY": 38.39,
+        "OPEN": 38.21,
+        "ROKU": 34.24
+      },
+      "settings": {
+        "model:surprise_min_pct": 10.0,
+        "model:max_days_since_report": 30,
+        "model:expected_profit_percent": 19.0,
+        "model:expected_profit_mode": "static",
+        "model:dynamic_scale": 1.0,
+        "model:max_expected_profit_percent": 420.0,
+        "model:risk_per_trade_pct": 2.5,
+        "model:atr_risk_budget_pct": 8.0,
+        "model:atr_multiplier": 4.5,
+        "model:atr_period": 14,
+        "model:min_stop_loss_pct": 6.0,
+        "model:use_atr_stop": 1,
+        "model:max_virtual_equity_per_instrument_percent": 25.0,
+        "model:regime_overlay_enabled": 1,
+        "model:regime_risk_scale": 1.0,
+        "model:regime_stop_scale": 0.75,
+        "model:regime_tp_scale": 0.5,
+        "schedule:monday": 0,
+        "schedule:tuesday": 1,
+        "schedule:wednesday": 0,
+        "schedule:thursday": 1,
+        "schedule:friday": 1,
+        "schedule:saturday": 0,
+        "schedule:sunday": 1,
+        "screener:screener_market_cap_min": 5000000000.0,
+        "screener:screener_relative_volume_min": 1.5,
+        "screener:screener_price_drop_pct": 13.0,
+        "screener:screener_price_drop_days": 22,
+        "screener:screener_max_stocks": 20,
+        "screener:screener_weinstein_stage2_only": 0,
+        "expertFixedSettings": {
+          "sizing_mode": "risk_atr"
+        }
+      },
+      "entry_rules": [
+        {
+          "id": "buy-2",
+          "name": "enter-buy-2",
+          "conditions": {
+            "id": "u9",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u10",
+                "field": "bullish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "u14",
+                "field": "mediumrisk",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false,
+                "toggleOptimize": true,
+                "toggle_optimize": true
+              },
+              {
+                "id": "u15",
+                "field": "has_no_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "buy",
+              "action_type": "buy"
+            },
+            {
+              "id": "s1_tp_target",
+              "action": "adjust_take_profit",
+              "action_type": "adjust_take_profit",
+              "referenceValue": "expert_target_price",
+              "reference_value": "expert_target_price",
+              "actionValue": -5.0,
+              "action_value": -14.0,
+              "value": -14.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": 10.0,
+              "action_value_max": 10.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0,
+              "toggleOptimize": true,
+              "toggle_optimize": true
+            },
+            {
+              "id": "s1_sl_entry",
+              "action": "adjust_stop_loss",
+              "action_type": "adjust_stop_loss",
+              "referenceValue": "order_open_price",
+              "reference_value": "order_open_price",
+              "actionValue": -8.0,
+              "action_value": -16.0,
+              "value": -16.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": -3.0,
+              "action_value_max": -3.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0,
+              "toggleOptimize": true,
+              "toggle_optimize": true
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggle_optimize": true
+        },
+        {
+          "id": "buy-3",
+          "name": "enter-buy-3",
+          "conditions": {
+            "id": "u16",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u17",
+                "field": "bullish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "u20",
+                "field": "has_no_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "buy",
+              "action_type": "buy"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggle_optimize": true
+        }
+      ],
+      "exit_rules": [
+        {
+          "id": "s1_exit_time",
+          "conditions": {
+            "id": "u21",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u22",
+                "field": "days_opened",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">",
+                "op": ">",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 150.0,
+                "valueMin": 30.0,
+                "value_min": 30.0,
+                "valueMax": 200.0,
+                "value_max": 200.0,
+                "valueStep": 30.0,
+                "value_step": 30.0
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "close",
+              "action_type": "close"
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggleOptimize": true,
+          "toggle_optimize": true
+        },
+        {
+          "id": "s1_sl_hold",
+          "conditions": {
+            "id": "u25",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u26",
+                "field": "has_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "adjust_stop_loss",
+              "action_type": "adjust_stop_loss",
+              "referenceValue": "order_open_price",
+              "reference_value": "order_open_price",
+              "actionValue": -8.0,
+              "action_value": -14.0,
+              "value": -14.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": -3.0,
+              "action_value_max": -3.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false
+        }
+      ],
+      "entry_recommendation_profile": {
+        "confidence_min": 75.0,
+        "confidence_max": 90.0,
+        "risk_counts": {
+          "MEDIUM": 260
+        },
+        "horizon_counts": {
+          "MEDIUM_TERM": 260
+        }
+      }
+    },
+    "12": {
+      "instance": {
+        "id": 12,
+        "account_id": 1,
+        "expert": "FMPRating",
+        "enabled": 1,
+        "alias": "goal2020-small_RAT_S1top1",
+        "user_description": "Deployed from goal2020-small_RAT_S1top1 (backtest 1330). Created by import_deploy_payload.",
+        "virtual_equity_pct": 60.0,
+        "enter_market_ruleset_id": 30,
+        "open_positions_ruleset_id": 31
+      },
+      "parent_id": 1330,
+      "id": 1425,
+      "name": "OK1000-TOP1-scr-small-FMPRating-S1-goal2020-notional-from2022",
+      "start": "2022-01-01 00:00:00.000000",
+      "end": "2025-12-31 00:00:00.000000",
+      "total_pnl_including_end_marks": 736.5122805349605,
+      "closed_pnl": 522.8524750349604,
+      "open_at_end_marked_pnl": 213.65980549999998,
+      "closed_count": 179,
+      "open_count": 6,
+      "drawdown_pct_cap": -20.82761186400024,
+      "reported_profit_factor": 2.24,
+      "closed_profit_factor": 1.885870467014005,
+      "closed_win_rate": 29.05027932960894,
+      "reported_win_rate": 30.81,
+      "mean_winner": 21.405109828068483,
+      "median_winner": 12.104880062518157,
+      "mean_loser": -4.647348315154337,
+      "mean_win_loss_ratio": 4.605875948284204,
+      "top5_closed_winners_pct_gross": 45.17588504324096,
+      "top5_closed_winners_pct_net": 96.17192422210066,
+      "closed_net_without_top5": 20.01518895096052,
+      "holding_mean_closed_days": 13.362507759155802,
+      "holding_median_closed_days": 2.045138888888889,
+      "holding_p90_closed_days": 39.86666666666672,
+      "holding_max_closed_days": 151.26736111111111,
+      "open_holding_days": [
+        {
+          "symbol": "ARIS",
+          "days": 204.267,
+          "pnl": 131.52
+        },
+        {
+          "symbol": "SNDX",
+          "days": 64.267,
+          "pnl": 64.776
+        },
+        {
+          "symbol": "DV",
+          "days": 50.267,
+          "pnl": 13.214
+        },
+        {
+          "symbol": "VITL",
+          "days": 22.267,
+          "pnl": 5.491
+        },
+        {
+          "symbol": "IQ",
+          "days": 15.267,
+          "pnl": 0.284
+        },
+        {
+          "symbol": "IMNM",
+          "days": 8.267,
+          "pnl": -1.625
+        }
+      ],
+      "entry_cost_exposure_proxy": 179.4617896978265,
+      "exit_counts": {
+        "stop_loss": 127,
+        "take_profit": 52,
+        "open_at_end": 6
+      },
+      "closed_yearly_pnl": {
+        "2022": -68.15,
+        "2023": 195.01,
+        "2024": 233.89,
+        "2025": 162.11
+      },
+      "mark_to_market_yearly_pnl": {
+        "2022": -68.15,
+        "2023": 195.01,
+        "2024": 298.61,
+        "2025": 311.05
+      },
+      "largest_closed_winners": [
+        {
+          "symbol": "CVNA",
+          "pnl": 200.624,
+          "days": 31.09
+        },
+        {
+          "symbol": "MP",
+          "pnl": 96.357,
+          "days": 51.267
+        },
+        {
+          "symbol": "APLD",
+          "pnl": 80.337,
+          "days": 16.042
+        },
+        {
+          "symbol": "MLCO",
+          "pnl": 72.649,
+          "days": 81.003
+        },
+        {
+          "symbol": "MGNI",
+          "pnl": 52.87,
+          "days": 17.267
+        }
+      ],
+      "largest_issuer_closed_pnl": {
+        "CVNA": 200.62,
+        "MP": 96.36,
+        "APLD": 80.34,
+        "MLCO": 72.65,
+        "PHR": 59.99
+      },
+      "settings": {
+        "model:profit_ratio": 0.8,
+        "model:min_analysts": 10,
+        "model:price_target_window_days": 180,
+        "model:min_price_targets_per_quarter": 0,
+        "model:max_analyst_age_months": 0,
+        "model:target_price_type": "median",
+        "model:risk_per_trade_pct": 1.25,
+        "model:atr_risk_budget_pct": 9.0,
+        "model:atr_multiplier": 5.5,
+        "model:atr_period": 21,
+        "model:min_stop_loss_pct": 10.0,
+        "model:use_atr_stop": 1,
+        "model:max_virtual_equity_per_instrument_percent": 15.0,
+        "model:regime_overlay_enabled": 1,
+        "model:regime_risk_scale": 0.75,
+        "model:regime_stop_scale": 0.75,
+        "model:regime_tp_scale": 0.75,
+        "schedule:monday": 1,
+        "schedule:tuesday": 0,
+        "schedule:wednesday": 1,
+        "schedule:thursday": 1,
+        "schedule:friday": 1,
+        "schedule:saturday": 0,
+        "schedule:sunday": 0,
+        "screener:screener_market_cap_min": 600000000.0,
+        "screener:screener_relative_volume_min": 2.2,
+        "screener:screener_price_drop_pct": 4.0,
+        "screener:screener_price_drop_days": 22,
+        "screener:screener_max_stocks": 20,
+        "screener:screener_weinstein_stage2_only": 0,
+        "expertFixedSettings": {
+          "sizing_mode": "notional"
+        }
+      },
+      "entry_rules": [
+        {
+          "id": "buy-2",
+          "name": "enter-buy-2",
+          "conditions": {
+            "id": "u9",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u10",
+                "field": "bullish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "u11",
+                "field": "confidence",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">=",
+                "op": ">=",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 80.0,
+                "valueMin": 35.0,
+                "value_min": 35.0,
+                "valueMax": 85.0,
+                "value_max": 85.0,
+                "valueStep": 5.0,
+                "value_step": 5.0,
+                "toggleOptimize": true,
+                "toggle_optimize": true
+              },
+              {
+                "id": "u15",
+                "field": "has_no_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "buy",
+              "action_type": "buy"
+            },
+            {
+              "id": "s1_tp_target",
+              "action": "adjust_take_profit",
+              "action_type": "adjust_take_profit",
+              "referenceValue": "expert_target_price",
+              "reference_value": "expert_target_price",
+              "actionValue": -5.0,
+              "action_value": -14.0,
+              "value": -14.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": 10.0,
+              "action_value_max": 10.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0,
+              "toggleOptimize": true,
+              "toggle_optimize": true
+            },
+            {
+              "id": "s1_sl_entry",
+              "action": "adjust_stop_loss",
+              "action_type": "adjust_stop_loss",
+              "referenceValue": "order_open_price",
+              "reference_value": "order_open_price",
+              "actionValue": -8.0,
+              "action_value": -4.0,
+              "value": -4.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": -3.0,
+              "action_value_max": -3.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0,
+              "toggleOptimize": true,
+              "toggle_optimize": true
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggle_optimize": true
+        },
+        {
+          "id": "buy-3",
+          "name": "enter-buy-3",
+          "conditions": {
+            "id": "u16",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u17",
+                "field": "bullish",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              },
+              {
+                "id": "u18",
+                "field": "confidence",
+                "fieldType": "numeric",
+                "field_type": "numeric",
+                "comparison": ">=",
+                "op": ">=",
+                "optimizeEnabled": true,
+                "optimize": true,
+                "value": 45.0,
+                "valueMin": 30.0,
+                "value_min": 30.0,
+                "valueMax": 75.0,
+                "value_max": 75.0,
+                "valueStep": 5.0,
+                "value_step": 5.0,
+                "toggleOptimize": true,
+                "toggle_optimize": true
+              },
+              {
+                "id": "u20",
+                "field": "has_no_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "buy",
+              "action_type": "buy"
+            },
+            {
+              "id": "s1_tp_target",
+              "action": "adjust_take_profit",
+              "action_type": "adjust_take_profit",
+              "referenceValue": "expert_target_price",
+              "reference_value": "expert_target_price",
+              "actionValue": -5.0,
+              "action_value": 8.0,
+              "value": 8.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": 10.0,
+              "action_value_max": 10.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0,
+              "toggleOptimize": true,
+              "toggle_optimize": true
+            },
+            {
+              "id": "s1_sl_entry",
+              "action": "adjust_stop_loss",
+              "action_type": "adjust_stop_loss",
+              "referenceValue": "order_open_price",
+              "reference_value": "order_open_price",
+              "actionValue": -8.0,
+              "action_value": -18.0,
+              "value": -18.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": -3.0,
+              "action_value_max": -3.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0,
+              "toggleOptimize": true,
+              "toggle_optimize": true
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false,
+          "toggle_optimize": true
+        }
+      ],
+      "exit_rules": [
+        {
+          "id": "s1_sl_hold",
+          "conditions": {
+            "id": "u25",
+            "operator": "AND",
+            "type": "AND",
+            "conditions": [
+              {
+                "id": "u26",
+                "field": "has_position",
+                "fieldType": "flag",
+                "field_type": "flag",
+                "comparison": "is_true",
+                "op": "is_true",
+                "optimizeEnabled": false,
+                "optimize": false
+              }
+            ]
+          },
+          "actions": [
+            {
+              "action": "adjust_stop_loss",
+              "action_type": "adjust_stop_loss",
+              "referenceValue": "order_open_price",
+              "reference_value": "order_open_price",
+              "actionValue": -8.0,
+              "action_value": -18.0,
+              "value": -18.0,
+              "actionValueOptimize": true,
+              "action_value_optimize": true,
+              "actionValueMin": -20.0,
+              "action_value_min": -20.0,
+              "actionValueMax": -3.0,
+              "action_value_max": -3.0,
+              "actionValueStep": 2.0,
+              "action_value_step": 2.0
+            }
+          ],
+          "continueProcessing": false,
+          "continue_processing": false
+        }
+      ],
+      "entry_recommendation_profile": {
+        "confidence_min": 45.9,
+        "confidence_max": 100.0,
+        "risk_counts": {
+          "MEDIUM": 185
+        },
+        "horizon_counts": {
+          "MEDIUM_TERM": 185
+        }
+      },
+      "rating_branch_closed_results": {
+        "confidence_45_to_80": {
+          "closed_trades": 25,
+          "pnl": 127.10327309481934,
+          "win_rate": 60.0
+        },
+        "confidence_ge_80": {
+          "closed_trades": 154,
+          "pnl": 395.74920194014106,
+          "win_rate": 24.025974025974026
+        }
+      }
+    }
+  },
+  "common_start": "2022-01-03 09:30:00+00:00",
+  "common_end": "2025-12-29 09:30:00+00:00",
+  "common_stats": {
+    "7": {
+      "pnl": 971.975082877956,
+      "drawdown_pct_cap": -19.69854182080119,
+      "correlation_other_five": 0.4196597603062979
+    },
+    "8": {
+      "pnl": 304.75092575576434,
+      "drawdown_pct_cap": -8.351423291646416,
+      "correlation_other_five": 0.3460383892095527
+    },
+    "9": {
+      "pnl": 475.9374304432436,
+      "drawdown_pct_cap": -17.385697393438203,
+      "correlation_other_five": 0.42682603400161073
+    },
+    "10": {
+      "pnl": 699.8373821149229,
+      "drawdown_pct_cap": -11.428000000000281,
+      "correlation_other_five": 0.309633434218326
+    },
+    "11": {
+      "pnl": 441.7272833532109,
+      "drawdown_pct_cap": -9.998671800000107,
+      "correlation_other_five": 0.29870808378702157
+    },
+    "12": {
+      "pnl": 731.442280534853,
+      "drawdown_pct_cap": -20.82761186400024,
+      "correlation_other_five": 0.2958213350895998
+    }
+  },
+  "combinations_independent_6000_cap": {
+    "original_four_plus_cash": {
+      "ids": [
+        7,
+        8,
+        9,
+        10
+      ],
+      "total_pnl": 2452.5008211918866,
+      "dd_dollars": -384.97195368506095,
+      "dd_pct_fixed_6000": -6.416199228084349,
+      "worst_day_pnl": -89.36631408000198,
+      "yearly_pnl": {
+        "2022": 125.11,
+        "2023": 381.38,
+        "2024": 890.17,
+        "2025": 1056.38
+      }
+    },
+    "four_plus_mid_ed_plus_cash": {
+      "ids": [
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "total_pnl": 2894.2281045450977,
+      "dd_dollars": -446.74476781262547,
+      "dd_pct_fixed_6000": -7.445746130210424,
+      "worst_day_pnl": -102.42352264001227,
+      "yearly_pnl": {
+        "2022": 187.75,
+        "2023": 461.8,
+        "2024": 1118.06,
+        "2025": 1127.17
+      }
+    },
+    "four_plus_rating_plus_cash": {
+      "ids": [
+        7,
+        8,
+        9,
+        10,
+        12
+      ],
+      "total_pnl": 3183.9431017267398,
+      "dd_dollars": -474.5700186981303,
+      "dd_pct_fixed_6000": -7.909500311635505,
+      "worst_day_pnl": -104.19631408000271,
+      "yearly_pnl": {
+        "2022": 56.96,
+        "2023": 576.39,
+        "2024": 1188.77,
+        "2025": 1362.37
+      }
+    },
+    "all_six": {
+      "ids": [
+        7,
+        8,
+        9,
+        10,
+        11,
+        12
+      ],
+      "total_pnl": 3625.670385079951,
+      "dd_dollars": -503.13238865262656,
+      "dd_pct_fixed_6000": -8.385539810877109,
+      "worst_day_pnl": -131.89633834001484,
+      "yearly_pnl": {
+        "2022": 119.59,
+        "2023": 656.81,
+        "2024": 1416.67,
+        "2025": 1433.15
+      }
+    }
+  },
+  "daily_pnl_correlations": {
+    "7": {
+      "7": 1.0,
+      "8": 0.2281,
+      "9": 0.3307,
+      "10": 0.2639,
+      "11": 0.2307,
+      "12": 0.1896
+    },
+    "8": {
+      "7": 0.2281,
+      "8": 1.0,
+      "9": 0.2812,
+      "10": 0.1965,
+      "11": 0.2425,
+      "12": 0.1177
+    },
+    "9": {
+      "7": 0.3307,
+      "8": 0.2812,
+      "9": 1.0,
+      "10": 0.1988,
+      "11": 0.1793,
+      "12": 0.2572
+    },
+    "10": {
+      "7": 0.2639,
+      "8": 0.1965,
+      "9": 0.1988,
+      "10": 1.0,
+      "11": 0.111,
+      "12": 0.163
+    },
+    "11": {
+      "7": 0.2307,
+      "8": 0.2425,
+      "9": 0.1793,
+      "10": 0.111,
+      "11": 1.0,
+      "12": 0.1663
+    },
+    "12": {
+      "7": 0.1896,
+      "8": 0.1177,
+      "9": 0.2572,
+      "10": 0.163,
+      "11": 0.1663,
+      "12": 1.0
+    }
+  },
+  "overlap": {
+    "7-8": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "7-9": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "7-10": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "7-11": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "7-12": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "8-9": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "8-10": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "8-11": {
+      "symbols_held_simultaneously": [
+        "ASAN",
+        "BILL",
+        "CROX",
+        "GME",
+        "GTLB",
+        "GWRE",
+        "NTSK",
+        "SOFI",
+        "TWLO"
+      ],
+      "summed_pair_days": 25.59722222222222
+    },
+    "8-12": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "9-10": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "9-11": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "9-12": {
+      "symbols_held_simultaneously": [
+        "ASPN",
+        "CGAU",
+        "HRMY",
+        "IMAX",
+        "PHR",
+        "STNG",
+        "TALO",
+        "VNET",
+        "WBTN"
+      ],
+      "summed_pair_days": 75.60416666666669
+    },
+    "10-11": {
+      "symbols_held_simultaneously": [
+        "CELH",
+        "CROX",
+        "DOCS",
+        "FOUR",
+        "LEVI",
+        "LOAR",
+        "MNSO",
+        "NVT",
+        "VIPS",
+        "XPO"
+      ],
+      "summed_pair_days": 56.36458333333332
+    },
+    "10-12": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    },
+    "11-12": {
+      "symbols_held_simultaneously": [],
+      "summed_pair_days": 0.0
+    }
+  }
+}
