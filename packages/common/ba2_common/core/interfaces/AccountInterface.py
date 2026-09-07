@@ -262,7 +262,21 @@ class AccountInterface(ReadOnlyAccountInterface):
                                     trading_order.transaction_id is not None)
         
         # Handle transaction requirements based on order type
-        self._handle_transaction_requirements(trading_order, is_closing_order=is_closing_order)
+        # A CLOSING order with nothing to attach to skips this entirely. It never opens a
+        # position, so there is no transaction to create and none to validate -- and the
+        # auto-creation below would otherwise record a reducing SELL as OPENING A SHORT.
+        #
+        # DECIDED HERE rather than inside _handle_transaction_requirements, which subclasses
+        # override: adding a parameter to an overridable method breaks every override that
+        # does not know about it, at the call, with a TypeError. This keeps that method's
+        # signature exactly as it was, so no subclass can be broken by the change.
+        if is_closing_order and getattr(trading_order, 'transaction_id', None) is None:
+            logger.debug(
+                f"Closing order for {trading_order.symbol} carries no transaction_id and will "
+                f"not be given one: it reduces a broker position this platform does not track "
+                f"through a transaction (a Transaction links quantity to an expert)")
+        else:
+            self._handle_transaction_requirements(trading_order)
         
         # Sync quantity with the parent order for dependent TP/SL legs.
         #
@@ -523,8 +537,7 @@ class AccountInterface(ReadOnlyAccountInterface):
                 statement = statement.where(TradingOrder.id != exclude_order_id)
             return session.exec(statement).first()
 
-    def _handle_transaction_requirements(self, trading_order: TradingOrder,
-                                         *, is_closing_order: bool = False) -> None:
+    def _handle_transaction_requirements(self, trading_order: TradingOrder) -> None:
         """
         Handle transaction creation/validation requirements based on order type.
         
@@ -545,22 +558,7 @@ class AccountInterface(ReadOnlyAccountInterface):
         has_transaction = (hasattr(trading_order, 'transaction_id') and
                           trading_order.transaction_id is not None)
 
-        # A CLOSING order never opens a position, so it never gets a transaction of its
-        # own. Auto-creation exists for an order that OPENS something (the docstring says
-        # so); applied to a closing order it writes a transaction in the closing
-        # direction -- a SELL that reduces a holding would be recorded as opening a
-        # SHORT, and every downstream reader would then see a short the account does not
-        # have. That is how a plain "sell these shares" instruction, which is exactly what
-        # a manually-traded account's rebalance needs, could not be expressed at all.
-        #
-        # A Transaction links quantity to an EXPERT. A manual holding has no expert, so
-        # requiring one to sell it was the wrong shape for this account type.
-        if is_closing_order and not has_transaction:
-            logger.debug(
-                f"Closing order for {trading_order.symbol} carries no transaction_id and "
-                f"will not be given one: it reduces a broker position this platform does "
-                f"not track through a transaction")
-        elif is_entry_order and not has_transaction:
+        if is_entry_order and not has_transaction:
             # Automatically create Transaction for entry orders without transaction_id
             self._create_transaction_for_order(trading_order)
             logger.info(f"Automatically created transaction {trading_order.transaction_id} for {trading_order.order_type.value} order")
