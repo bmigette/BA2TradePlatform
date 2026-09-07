@@ -28,21 +28,26 @@ echo "=================== goal2020 grid status  $(date) ==================="
 # Match the SCRIPT's own bash (…/bash.exe tools/grid_goal2020.sh …), not an interactive shell
 # that merely mentions the name — otherwise your own grep/editor sessions count as "running".
 #
-# The pattern is '* tools/grid_goal2020.sh*': a LEADING SPACE plus a trailing wildcard.
-#   - the leading space is what excludes a grep/editor, whose command line puts the path AFTER
-#     the pattern or filename (e.g. `grep -n foo tools/grid_goal2020.sh` still matches ' tools/…'
-#     — but its Name is not bash.exe, which is the real discriminator, so the space is belt and
-#     braces for a `bash -c "... tools/grid_goal2020.sh"` one-liner);
-#   - the TRAILING wildcard is required because the runbook documents passthrough arguments
-#     (`bash tools/grid_goal2020.sh --population 60`, `--skip-experts …`). The old pattern
-#     anchored on the path being LAST, so any documented passthrough launch reported
-#     "PARTIAL — wrapper GONE" on a perfectly healthy grid. That false alarm invites a restart
-#     of a multi-day run, which is far more expensive than the noise it was guarding against.
-#   - the `grid_goal2020*.sh` wildcard covers per-matrix wrapper copies (grid_goal2020_matrix3.sh,
-#     2026-08-18): the literal `grid_goal2020.sh` pattern does NOT match them, so a healthy
-#     matrix wrapper reported "PARTIAL — wrapper GONE".
+# THIS CHECK HAS NOW CRIED WOLF FOUR TIMES, so read the shape before touching the pattern. Every
+# false "PARTIAL" has been the same mistake: pinning on the exact SPELLING of a launch that is
+# documented to vary, when `Name -eq 'bash.exe'` was always the real discriminator. And the
+# alarm's own advice — "stop it and relaunch" — would destroy days of a healthy multi-day run,
+# so a false positive here is far more expensive than a missed detection.
+#
+#   1. anchoring on the path being LAST broke every documented passthrough launch
+#      (`bash tools/grid_goal2020.sh --population 60`).
+#   2. the literal `grid_goal2020.sh` missed the per-matrix wrappers (grid_goal2020_matrix3.sh).
+#   3. a LEADING SPACE before `tools/` missed `bash ./tools/grid_goal2020.sh` — the form the
+#      nohup launcher in the runbook actually uses. Seen 2026-09-07: both wrappers alive and
+#      advancing jobs while this printed "wrapper is GONE".
+#
+# So: match the SCRIPT NAME anywhere in the command line of a real bash.exe, and exclude the one
+# thing that genuinely is not the wrapper — a `bash -c "…"` shell that merely MENTIONS the
+# script, which is what a nohup launcher or a tool-call shell looks like. That launcher exits in
+# seconds while the wrapper it spawned runs for days, so counting it is the one way this check
+# can report RUN when nothing is running.
 read -r N_SH N_DRV <<<"$(powershell -NoProfile -Command "
-  \$sh  = @(Get-CimInstance Win32_Process | Where-Object { \$_.Name -eq 'bash.exe' -and \$_.CommandLine -like '* tools/grid_goal2020*.sh*' })
+  \$sh  = @(Get-CimInstance Win32_Process | Where-Object { \$_.Name -eq 'bash.exe' -and \$_.CommandLine -match 'grid_goal2020[^ ]*\.sh' -and \$_.CommandLine -notmatch '\s-c\s' })
   \$drv = @(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -like '*run_screener_capband_matrix*' })
   '{0} {1}' -f \$sh.Count, \$drv.Count" 2>/dev/null)"
 
@@ -132,7 +137,33 @@ rows = list(c.execute(
     "select id,name,status,round(coalesce(best_fitness,0),3) from strategy_optimizations "
     "where name like '%goal2020%' and name not like '%abandoned%' order by id"))
 done = sum(1 for r in rows if r[2] == 'completed')
-print(f"\nOPTS    {len(rows)} row(s), {done} completed   (45 jobs total: 24 risk_atr + 21 notional)")
+
+# FOUR MATRICES, NOT TWO. grid_goal2020.sh gained STRATEGIES_EXTRA=S5,S6,S7 (matrices 3 and 4,
+# a measured +45 jobs), and grid_goal2020_matrix3.sh runs DeterministicScorer and the Senate on
+# its own list. The old footer asserted a flat "45 jobs total" against a count that had long
+# grown past it -- "88 completed (45 jobs total)" is not a progress line, it is noise. Split it
+# the way the wrappers actually divide the work, keyed on the STRATEGY IN THE NAME, which is
+# what the driver builds the name from.
+def bucket(name):
+    if "DeterministicScorer" in name:  return "ds"      # matrix3 wrapper, its own list
+    if name.startswith("sen-"):        return "senate"  # matrix3 wrapper, 3 jobs
+    if any(f"-{s}-" in name for s in ("S5", "S6", "S7")): return "ext"
+    return "base"
+
+banked = {}
+for _id, _name, _status, _f in rows:
+    if _status == "completed":
+        banked.setdefault(bucket(_name), set()).add(_name)
+n = lambda k: len(banked.get(k, ()))
+print()
+print(f"OPTS    {len(rows)} row(s), {done} completed")
+print(f"        base S1-S3   {n('base'):>3}/45   (matrix 1+2: 24 risk_atr + 21 notional)")
+# 42, not 45: FactorRanker carries no strategy in its name (it bypasses classic RM, so S1-S7
+# never enter), which means matrix 3's 3 FactorRanker slots are satisfied by the rows matrix 1
+# already banked and the driver SKIPs them. Counting them as work left to do overstates the
+# remaining wall time by three multi-hour jobs.
+print(f"        ext  S5-S7   {n('ext'):>3}/42   (matrix 3+4, less the 3 shared FactorRanker)")
+print(f"        DeterministicScorer {n('ds')}   Senate {n('senate')}/3   (matrix3 wrapper)")
 for r in rows[-12:]:
     print(f"  {r[0]:<5} {r[2]:<10} fit={r[3]:<9} {r[1]}")
 EOF
