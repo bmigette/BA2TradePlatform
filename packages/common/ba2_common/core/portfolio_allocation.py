@@ -228,10 +228,27 @@ LEVERAGE_NOT_APPLICABLE = "n/a"
 LEVERAGE_VERDICTS = (LEVERAGE_NONE, LEVERAGE_LEVERAGED, LEVERAGE_PENALISED,
                      LEVERAGE_UNKNOWN, LEVERAGE_NOT_APPLICABLE)
 
-#: How far a BP ratio may sit from 1.0 and still be called neutral. Its own
-#: constant and NOT MONEY_EPSILON: this is a dimensionless ratio, and a broker that
-#: publishes a rate to 4dp lands a hair off 1.0 through float division alone.
-LEVERAGE_RATIO_TOLERANCE = 1e-6
+#: How far a BP ratio may sit from 1.0 and still be called neutral. Its own constant
+#: and NOT MONEY_EPSILON: this is a dimensionless ratio, and a broker that publishes
+#: a rate to 4dp lands a hair off 1.0 through float division alone.
+#:
+#: HALF THE DISPLAY STEP, because a badge that contradicts the number beside it is
+#: worse than no badge. The cell renders the ratio as ``x{ratio:.2f}``, so anything
+#: within 0.005 of 1.0 PRINTS as "x1.00"; at the old 1e-6 the colour was decided on
+#: digits the user cannot see. Observed live 2026-09-07: NASA at 0.99953 drew GREEN
+#: "leveraged" and CHPY at 1.00343 drew ORANGE "penalised", both showing x1.00 --
+#: two identical numbers, opposite verdicts, no way to tell why from the screen.
+#:
+#: 0.005 also lands above the FEE DUST that produces most of these. A prechecked row
+#: takes ``bp_factor = impact.bp_cost / estimated_value``, and the broker folds a
+#: fixed fee into that cost (``apply_order_impacts`` says so where it spreads it), so
+#: a perfectly ordinary marginable name comes back a few tenths of a percent over
+#: 1.0. That is a fee, not a margin penalty, and it must not be painted as one.
+#:
+#: It stays far below every real distinction the badge exists for: a leveraged ETF is
+#: 1.5, hard-to-borrow LAZR measured 1.978, non-marginable is 2.0. Nothing the colour
+#: is FOR sits anywhere near half a percent.
+LEVERAGE_RATIO_TOLERANCE = 0.005
 
 # Reason strings attached to AllocationRow.reasons / AllocationPlan.warnings.
 # Pinned here so the UI and the tests agree on the exact text.

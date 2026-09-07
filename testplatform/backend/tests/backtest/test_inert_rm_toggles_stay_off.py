@@ -18,6 +18,10 @@ precisely why the pin is explicit for both rather than relying on the defaults.
 """
 import pytest
 
+# ``ba2test_launcher`` is importable because tests/backtest/conftest.py puts ``testplatform/``
+# on sys.path. It is NOT installed: a bare import here resolved only through a dev box's
+# editable install of ba2test_app, and raised ModuleNotFoundError on CI -- a collection error,
+# which fails the entire tests/backtest step before any test runs.
 import ba2test_launcher as L
 
 

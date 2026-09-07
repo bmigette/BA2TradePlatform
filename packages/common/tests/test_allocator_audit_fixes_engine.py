@@ -400,3 +400,59 @@ class TestThePrecheckMeasuresTheCapitalRequirement:
     def test_the_requirement_cannot_exceed_the_value_it_prices(self):
         row = self._row(margin_requirement=99_999.0)
         assert row["capital_required"] <= row["projected_notional"] + 0.01
+
+
+class TestTheLeverageBadgeAgreesWithTheNumberBesideIt:
+    """A verdict decided on digits the cell does not print, reported 2026-09-07.
+
+    The dry run showed NASA as GREEN "leveraged" and CHPY as ORANGE "penalised" with
+    both cells reading x1.00. The ratios were 0.99953 and 1.00343 and the tolerance
+    was 1e-6, so the colour turned on the fourth decimal of a number rendered to two.
+    Operator: "why nasa bp is 1.0 green and capreq is half projected, while chpy is
+    orange and is 1:1".
+
+    CHPY's excess was not leverage at all: a prechecked row takes its factor from
+    ``impact.bp_cost / estimated_value`` and the broker folds a fixed fee into that
+    cost, so an ordinary marginable name lands a few tenths of a percent over 1.0.
+    """
+
+    def _verdict(self, order_value, bp_cost):
+        row = pa.AllocationRow(symbol="AAA", price=100.0, delta_quantity=+1.0,
+                               side=pa.OrderDirection.BUY, target_quantity=1.0,
+                               estimated_value=order_value, bp_cost=bp_cost,
+                               initial_margin_rate=0.5,
+                               margin_source=pa.MARGIN_SOURCE_PRECHECK)
+        return pa.bp_leverage(row)
+
+    def test_the_two_live_rows_now_read_the_same(self):
+        _, nasa = self._verdict(42.61, 42.59)
+        _, chpy = self._verdict(32.11, 32.22)
+        assert nasa == chpy == pa.LEVERAGE_NONE
+
+    def test_anything_printing_as_x1_00_is_neutral(self):
+        """THE RULE, stated as the display states it: the cell renders x{ratio:.2f},
+        so every ratio that rounds to 1.00 must carry the neutral verdict."""
+        # 99.6 not 99.5: 0.995 renders as "0.99" (round-half-even), so it is NOT one of
+        # the values that prints x1.00 and must not be asserted as one.
+        for cost in (99.6, 99.9, 100.0, 100.1, 100.4):
+            ratio, verdict = self._verdict(100.0, cost)
+            assert f"{ratio:.2f}" == "1.00"
+            assert verdict == pa.LEVERAGE_NONE, f"{cost} prints x1.00 but reads {verdict}"
+
+    def test_a_real_penalty_is_still_caught(self):
+        """The distinctions the badge exists for are 50-100% away, not half a percent:
+        a leveraged ETF at 1.5, hard-to-borrow LAZR measured at 1.978, non-marginable
+        at 2.0."""
+        for cost in (150.0, 197.8, 200.0):
+            assert self._verdict(100.0, cost)[1] == pa.LEVERAGE_PENALISED
+
+    def test_real_leverage_is_still_caught(self):
+        assert self._verdict(100.0, 50.0)[1] == pa.LEVERAGE_LEVERAGED
+
+    def test_an_unrated_row_still_says_nothing_at_all(self):
+        """Unchanged and load-bearing: a wider tolerance must not start VERDICTING
+        rows whose rate the broker never published."""
+        row = pa.AllocationRow(symbol="AAA", price=100.0, delta_quantity=+1.0,
+                               side=pa.OrderDirection.BUY, target_quantity=1.0,
+                               estimated_value=100.0, bp_cost=100.0)
+        assert pa.bp_leverage(row)[1] == pa.LEVERAGE_UNKNOWN
