@@ -163,7 +163,13 @@ print(f"        base S1-S3   {n('base'):>3}/45   (matrix 1+2: 24 risk_atr + 21 n
 # already banked and the driver SKIPs them. Counting them as work left to do overstates the
 # remaining wall time by three multi-hour jobs.
 print(f"        ext  S5-S7   {n('ext'):>3}/42   (matrix 3+4, less the 3 shared FactorRanker)")
-print(f"        DeterministicScorer {n('ds')}   Senate {n('senate')}/3   (matrix3 wrapper)")
+# DENOMINATORS FROM THE WRAPPER'S OWN LOOPS, not from its header comment (which still says
+# "PHASE A ... 14 jobs", left over from when STRATEGIES included S4):
+#   DS      ds_matrix S1-S3 x 3 bands x 2 modes = 18, plus the DS_STRATEGIES_EXTRA S5-S7 pass = 36
+#   Senate  `for MODE in risk_atr notional` x STRATEGIES="S1 S2 S3 S5 S6 S7"                  = 12
+# Senate covers the extended strategies too -- it is not a 3-job phase, and reporting it as one
+# hid ten remaining multi-hour jobs.
+print(f"        DeterministicScorer {n('ds'):>3}/36   Senate {n('senate')}/12   (matrix3 wrapper)")
 for r in rows[-12:]:
     print(f"  {r[0]:<5} {r[2]:<10} fit={r[3]:<9} {r[1]}")
 EOF
