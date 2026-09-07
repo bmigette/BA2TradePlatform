@@ -775,3 +775,39 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         "entry_rules": entry_rules,
         "exit_rules": exit_rules,
     }
+
+
+def schedule_override_from_genes(
+    strategy_params: Optional[Dict[str, Any]],
+    base_override: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """The run_schedule_override a stored genome ACTUALLY ran with, or None if it has no
+    schedule genes.
+
+    ``_build_daily_trial_config`` lets a decoded ``schedule_days`` REPLACE the run-level
+    cadence for that individual, keeping only the run-level ``times``. Anything that
+    reconstructs a genome's config after the fact -- a re-run, an export, a deploy -- has to
+    reproduce that same replacement, or it silently reports/deploys the run-level cadence
+    instead of the days the GA selected. That is exactly how five live instances came to fire
+    on Mondays when their genomes had chosen Thursday, or Tue/Thu/Fri (2026-09-07).
+
+    Mirrors ``decode_params``' repair rule: an all-days-OFF genome gets the first weekday
+    forced back ON, because a config that never scans for entries is dead rather than merely
+    unlucky.
+
+    Returns None when the genome predates the schedule genes, so the caller keeps whatever
+    run-level override it already had.
+    """
+    if not isinstance(strategy_params, dict):
+        return None
+    by_day = {
+        k[len("schedule:"):]: bool(v)
+        for k, v in strategy_params.items()
+        if isinstance(k, str) and k.startswith("schedule:")
+    }
+    if not by_day:
+        return None
+    days = {day: by_day.get(day, False) for day in SCHEDULE_DAYS}
+    if not any(days.values()):
+        days[SCHEDULE_DAYS[0]] = True
+    return {"days": days, "times": (base_override or {}).get("times") or ["09:30"]}

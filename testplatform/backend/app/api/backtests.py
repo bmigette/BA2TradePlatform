@@ -1151,6 +1151,8 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
 
     Pure derivation from the persisted ``strategy_params`` — NO server filesystem writes.
     """
+    from app.services.strategy_param_space import schedule_override_from_genes
+
     sp = backtest.strategy_params or {}
 
     def _pick(*keys):
@@ -1231,7 +1233,17 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                 "commission": acct.get("commission_per_trade"),
                 "slippage": acct.get("slippage_bps"),
                 "enable_short": bool(bt_block.get("enable_short")),
-                "run_schedule_override": bt_block.get("run_schedule_override"),
+                # THE ENTRY CADENCE THIS INDIVIDUAL WAS SCORED ON. The GA searches the entry
+                # weekday per individual (schedule:<day> genes) and _build_daily_trial_config
+                # lets the decoded days REPLACE the run-level override -- so exporting
+                # bt_block's run-level value deploys a cadence the genome never used. Found
+                # live 2026-09-07: five instances firing Mondays for genomes that had chosen
+                # Thursday, Wed/Thu/Fri, Tue/Thu/Fri, Mon/Tue and Mon/Wed/Thu/Fri. Same
+                # overlay shape as the screener genes above.
+                "run_schedule_override": (
+                    schedule_override_from_genes(sp, bt_block.get("run_schedule_override"))
+                    or bt_block.get("run_schedule_override")
+                ),
             }
             interval = bt_block.get("execution_interval")
         else:
@@ -1247,7 +1259,13 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                 "commission": _pick("commission"),
                 "slippage": _pick("slippage"),
                 "enable_short": _pick("enableShort", "enable_short"),
-                "run_schedule_override": _pick("runScheduleOverride", "run_schedule_override"),
+                # Genome days win here too (see the opt-derived branch): a standalone row
+                # cloned from an optimized one still carries the schedule:* genes.
+                "run_schedule_override": (
+                    schedule_override_from_genes(
+                        sp, _pick("runScheduleOverride", "run_schedule_override"))
+                    or _pick("runScheduleOverride", "run_schedule_override")
+                ),
             }
             interval = _pick("executionInterval", "execution_interval")
         # THE ONE TABLE (ba2_common.core.deploy_parity), read here and in

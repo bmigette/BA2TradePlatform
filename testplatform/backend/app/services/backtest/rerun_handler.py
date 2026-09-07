@@ -41,7 +41,19 @@ logger = logging.getLogger(__name__)
 
 # Gene namespaces decode_params accepts (it RAISES on anything else). The stored strategy_params
 # mixes these raw genes with camelCase display keys (buyEntryConditions, ...), so filter first.
-_GENE_PREFIXES = ("model", "screener", "cond", "exit", "entry")
+#
+# "schedule" WAS MISSING HERE until 2026-09-07, and its absence was silent. The GA searches the
+# entry weekday per individual (schedule:<day> genes, _SCHEDULE_DAY_OPT in the launcher) and
+# _build_daily_trial_config lets a decoded ``schedule_days`` REPLACE the run-level cadence. Drop
+# the genes on the way in and ``decoded["schedule_days"]`` is None, so every re-run silently fell
+# back to the run-level override -- Monday-only for the whole goal2020 grid -- while the genome
+# that was actually scored wanted, say, Tue/Thu/Fri. Nothing errored: the run completed and
+# reported numbers for a cadence the GA never chose.
+#
+# This filter is the ONLY thing standing between a stored genome and decode_params, so a gene
+# namespace added to the search must be added here in the same change. Pinned by
+# testplatform/backend/tests/backtest/test_rerun_carries_schedule_genes.py.
+_GENE_PREFIXES = ("model", "screener", "cond", "exit", "entry", "schedule")
 
 # Legacy-row fallbacks: standalone rows created before the run knobs were persisted don't carry a
 # seed / fill model. The re-run uses these so it can still execute (may differ slightly from the
