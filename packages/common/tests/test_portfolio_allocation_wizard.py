@@ -1028,7 +1028,7 @@ def test_can_fill_remaining_symbol_weights_is_the_buttons_enabled_state():
 
 
 def test_can_fill_remaining_symbol_weights_ignores_float_dust_in_the_manual_total():
-    """7.64 + 83.57 + 8.79 is exactly 100 in decimal and 99.99999999999999 in binary,
+    """5.00 + 63.01 + 31.99 is exactly 100 in decimal and 99.99999999999999 in binary,
     so the raw remainder is 1.4e-14 -- positive, and therefore "something left to
     fill" to anything that does not round first.
 
@@ -1036,12 +1036,16 @@ def test_can_fill_remaining_symbol_weights_ignores_float_dust_in_the_manual_tota
     label offers an enabled Fill rest that can only write 0.00 into the empty box:
     a button that does nothing when pressed, which is the exact failure the
     disabled-not-hidden rule exists to avoid. Pinned with a set that genuinely
-    drifts -- 33.33 x 2 + 33.34 sums to 100.0 on the nose and proves nothing.
+    drifts UNDER ``sum`` -- 33.33 x 2 + 33.34 lands on 100.0 on the nose and proves
+    nothing, and so did the original 7.64 / 83.57 / 8.79, which drifts only under a
+    left-to-right add. That one failed on its own premise line rather than on the
+    behaviour it guards: the worst way for a pin to rot, because the guard stops
+    running and says nothing about the thing it was watching.
     """
-    assert sum([7.64, 83.57, 8.79]) != 100.0                       # the premise
+    assert sum([5.0, 63.01, 31.99]) != 100.0                       # the premise
     label = LabelTarget("A", 100.0, [
-        SymbolTarget("AAA", 7.64), SymbolTarget("BBB", 83.57),
-        SymbolTarget("CCC", 8.79), SymbolTarget("DDD", 0.0)])
+        SymbolTarget("AAA", 5.0), SymbolTarget("BBB", 63.01),
+        SymbolTarget("CCC", 31.99), SymbolTarget("DDD", 0.0)])
 
     assert pa.can_fill_remaining_symbol_weights(label) is False
     # And the raw, unrounded remainder really would have said otherwise.
