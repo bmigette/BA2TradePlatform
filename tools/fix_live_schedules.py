@@ -56,12 +56,21 @@ DEPLOYED = [(7, 1107), (8, 1298), (9, 1363), (10, 1173), (11, 1088), (12, 1330)]
 
 
 def _genome_days(sp):
-    """Mirrors decode_params: genes to a full day map, all-off repaired to the first weekday."""
+    """The genome's cadence as LIVE should run it: weekdays only, all-off repaired to Monday.
+
+    WEEKEND GENES ARE NOISE, and must not survive into a live schedule. A daily-clock backtest
+    has no weekend bars, so a saturday/sunday gene is something the GA could never evaluate --
+    it stays ON in perfectly good genomes because nothing ever selected against it. Live has a
+    real scheduler with no market-open guard on the cron (JobManager._parse_schedule builds a
+    plain day_of_week trigger), so copying those bits arms a Saturday 09:30 entry pass into a
+    closed market: behaviour no backtest ever scored. Three of the six deployed genomes carry
+    one (7 and 10 saturday, 11 sunday).
+    """
     by_day = {k[len("schedule:"):]: bool(v) for k, v in sp.items()
               if isinstance(k, str) and k.startswith("schedule:")}
     if not by_day:
         return None
-    days = {d: by_day.get(d, False) for d in DAYS}
+    days = {d: (by_day.get(d, False) and d in DAYS[:5]) for d in DAYS}
     if not any(days.values()):
         days[DAYS[0]] = True
     return days
@@ -126,16 +135,22 @@ def repair_schedules(ns, test) -> int:
             cur = json.loads(cur)
         cur_days = cur.get("days") or {}
 
-        if _trading(cur_days) == _trading(want_days):
+        # Compare ALL SEVEN days, not just the trading ones: a stored saturday=True is
+        # invisible to _trading() but arms a real Saturday cron, so a weekday-only comparison
+        # would report "already ok" and leave the weekend bit in place.
+        if all(bool(cur_days.get(d)) == want_days[d] for d in DAYS):
             print(f"  inst {inst_id}: already {_trading(want_days)} -- ok")
             continue
+        weekend_dropped = [d for d in DAYS[5:] if cur_days.get(d)]
 
         # Keep the instance's own time-of-day and basis: only the DAY selection was optimized
         # (matching _build_daily_trial_config, which keeps the run-level ``times``).
         new = {"days": want_days,
                "times": cur.get("times") or ["09:30"],
                "time_basis": cur.get("time_basis") or "market"}
-        print(f"  inst {inst_id} (bt {bt_id}): {_trading(cur_days)} -> {_trading(want_days)}")
+        note = f"   (dropping inert weekend gene: {weekend_dropped})" if weekend_dropped else ""
+        print(f"  inst {inst_id} (bt {bt_id}): {_trading(cur_days)} -> "
+              f"{_trading(want_days)}{note}")
         changed += 1
         if ns.apply:
             expert.save_settings({"execution_schedule_enter_market": (new, None)})

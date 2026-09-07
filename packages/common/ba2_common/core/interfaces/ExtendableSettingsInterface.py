@@ -5,6 +5,53 @@ from ba2_common.core.db import get_instance, get_db, update_instance, add_instan
 from sqlmodel import select
 import json
 
+
+#: Every spelling a bool-declared setting can arrive or be stored as, mapped to its truth.
+#: Keys are lowercased strings; real bools and 0/1 ints are handled before the lookup.
+_BOOL_WORDS = {
+    "true": True, "false": False,
+    "1": True, "0": False,
+    "yes": True, "no": False,
+    "on": True, "off": False,
+}
+
+
+def coerce_bool(value: Any) -> bool:
+    """A bool-declared setting's value, whatever spelling it arrived in.
+
+    THE DEFECT THIS EXISTS FOR (parity review 2026-09-07). ``save_settings`` stored a bool as
+    ``json.dumps(value)`` with no coercion, so the GA's integer ``1`` was written as the JSON
+    string ``"1"``. The reader tested ``value.lower() == 'true'``, which ``"1"`` is not -- so a
+    gene the optimizer had turned ON came back OFF. Live instances 6-12 held thirteen such rows:
+    ``use_atr_stop``, ``regime_overlay_enabled`` and ``screener_weinstein_stage2_only``
+    silently disabled on strategies selected with them enabled.
+
+    Both ends now go through here, so a value round-trips: 1 is written as ``true`` and reads
+    back True, and a legacy ``"1"`` already in the database reads back True too.
+
+    Raises ValueError on a spelling nothing can mean -- a bool setting holding "maybe" is a bug
+    to surface, not a value to guess at. Silence is what made the original defect survive.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        # Unwrap multiply-escaped JSON ('"\\"true\\""'), which corrupted rows carry.
+        unwrapped = value
+        while (isinstance(unwrapped, str) and len(unwrapped) > 1
+               and unwrapped.startswith('"') and unwrapped.endswith('"')):
+            try:
+                unwrapped = json.loads(unwrapped)
+            except json.JSONDecodeError:
+                break
+        if isinstance(unwrapped, bool):
+            return unwrapped
+        if isinstance(unwrapped, str) and unwrapped.strip().lower() in _BOOL_WORDS:
+            return _BOOL_WORDS[unwrapped.strip().lower()]
+    raise ValueError(f"cannot read {value!r} as a boolean setting value")
+
+
 class ExtendableSettingsInterface(ABC):
     # Hidden variable for builtin settings that all implementations share
     _builtin_settings: Dict[str, Any] = {}
@@ -166,7 +213,10 @@ class ExtendableSettingsInterface(ABC):
                 add_instance(setting, session)
                 
         elif value_type == "bool":
-            json_value = json.dumps(value)
+            # COERCE FIRST. json.dumps(1) is '"1"', which the reader could not recognise as
+            # true -- so an optimizer gene arriving as an int silently disabled itself. Store
+            # the canonical `true`/`false` and the value survives the round trip.
+            json_value = json.dumps(coerce_bool(value))
             if setting:
                 setting.value_json = json_value
                 update_instance(setting, session)
@@ -390,25 +440,17 @@ class ExtendableSettingsInterface(ABC):
                     # JSON and list values are stored as JSON in the database
                     settings[setting.key] = setting.value_json
                 elif value_type == "bool":
-                    # Convert JSON string to bool with robust handling of corrupted values
+                    # Legacy rows written before coerce_bool existed hold '"1"' / '"0"', which
+                    # the old `value.lower() == 'true'` test read as False regardless. Reading
+                    # through the shared coercion recognises them (see coerce_bool's docstring).
                     try:
-                        value = setting.value_json
-                        # Handle corrupted/multiply-escaped JSON values
-                        while isinstance(value, str) and (value.startswith('"') and value.endswith('"')):
-                            try:
-                                value = json.loads(value)
-                            except json.JSONDecodeError:
-                                break
-                        
-                        # Convert to boolean
-                        if isinstance(value, bool):
-                            settings[setting.key] = value
-                        elif isinstance(value, str):
-                            settings[setting.key] = value.lower() == 'true'
-                        else:
-                            settings[setting.key] = bool(value)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse boolean setting '{setting.key}': {e}, defaulting to False")
+                        settings[setting.key] = coerce_bool(setting.value_json)
+                    except ValueError as e:
+                        # A stored spelling nothing can mean. Still defaults to False so one bad
+                        # row cannot take an expert down, but it is now LOUD -- the old handler
+                        # swallowed every '"1"' in the database this way, without a word.
+                        logger.warning(f"Boolean setting '{setting.key}' holds an unreadable "
+                                       f"value ({e}); defaulting to False")
                         settings[setting.key] = False
                 elif value_type == "int":
                     if setting.value_float is not None:

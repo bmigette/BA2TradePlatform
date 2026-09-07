@@ -1241,7 +1241,8 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                 # Thursday, Wed/Thu/Fri, Tue/Thu/Fri, Mon/Tue and Mon/Wed/Thu/Fri. Same
                 # overlay shape as the screener genes above.
                 "run_schedule_override": (
-                    schedule_override_from_genes(sp, bt_block.get("run_schedule_override"))
+                    schedule_override_from_genes(sp, bt_block.get("run_schedule_override"),
+                                                weekdays_only=True)
                     or bt_block.get("run_schedule_override")
                 ),
             }
@@ -1263,7 +1264,8 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                 # cloned from an optimized one still carries the schedule:* genes.
                 "run_schedule_override": (
                     schedule_override_from_genes(
-                        sp, _pick("runScheduleOverride", "run_schedule_override"))
+                        sp, _pick("runScheduleOverride", "run_schedule_override"),
+                        weekdays_only=True)
                     or _pick("runScheduleOverride", "run_schedule_override")
                 ),
             }

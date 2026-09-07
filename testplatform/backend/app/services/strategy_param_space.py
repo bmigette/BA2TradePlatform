@@ -780,6 +780,7 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
 def schedule_override_from_genes(
     strategy_params: Optional[Dict[str, Any]],
     base_override: Optional[Dict[str, Any]] = None,
+    weekdays_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """The run_schedule_override a stored genome ACTUALLY ran with, or None if it has no
     schedule genes.
@@ -795,6 +796,14 @@ def schedule_override_from_genes(
     forced back ON, because a config that never scans for entries is dead rather than merely
     unlucky.
 
+    ``weekdays_only`` translates the genome into the cadence it EFFECTIVELY ran, for callers
+    that drive a real scheduler rather than a bar loop. On a daily clock there are no weekend
+    bars, so a saturday/sunday gene is noise the GA was never able to evaluate -- it stays ON
+    in perfectly good genomes purely because nothing selected against it. A live deploy that
+    copies those bits arms a real Saturday cron and runs an entry pass into a closed market,
+    which is behaviour no backtest ever scored. Deploy paths pass True; anything reproducing a
+    backtest leaves it False so the reconstruction stays bit-for-bit.
+
     Returns None when the genome predates the schedule genes, so the caller keeps whatever
     run-level override it already had.
     """
@@ -808,6 +817,10 @@ def schedule_override_from_genes(
     if not by_day:
         return None
     days = {day: by_day.get(day, False) for day in SCHEDULE_DAYS}
+    if weekdays_only:
+        days = {day: (value and day in SCHEDULE_DAYS[:5]) for day, value in days.items()}
+    # Same repair as decode_params, applied after the weekday filter so an all-weekend genome
+    # deploys as Monday rather than as an instance that never scans at all.
     if not any(days.values()):
         days[SCHEDULE_DAYS[0]] = True
     return {"days": days, "times": (base_override or {}).get("times") or ["09:30"]}
