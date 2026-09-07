@@ -1056,6 +1056,27 @@ def _daily_manage_schedule() -> dict:
     return {"days": days, "times": ["09:30"]}
 
 
+#: Two toggles that NEVER took effect in any run to date, pinned OFF so they still don't.
+#:
+#: Both are bool-declared, and the GA hands its genes over as integers -- which save_settings
+#: stored as the JSON string "1", which the reader did not recognise as true (see
+#: ba2_common.core.interfaces.ExtendableSettingsInterface.coerce_bool). So every historical run,
+#: whatever its genome said, ran with the ATR stop-leg disabled and the regime overlay off.
+#:
+#: Fixing the encoding means these genes would START working -- silently turning the whole grid
+#: into a different experiment, and making new results incomparable with every result on record.
+#: Pinning them here keeps the change to what it should be: a bug fix, not a redesign.
+#:
+#: ``use_atr_stop`` MUST be pinned rather than merely dropped from the search: it DECLARES
+#: default True, so removing it from the space alone would flip it on -- the exact opposite of
+#: the historical behaviour being preserved.
+#:
+#: To test them deliberately, pass them through ``overrides`` (they win over this floor) in a
+#: run named so it cannot be confused with the pinned-off baseline. That is the experiment; this
+#: is the control.
+_INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}
+
+
 def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
     the expert's own universe setting when the spec names one (``universe_setting`` — for an
@@ -1083,6 +1104,8 @@ def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = 
     ``test_no_shipped_expert_spec_selects_a_risk_manager_mode`` pins that.
     """
     settings = dict(spec["fixed_settings"])
+    # HISTORICALLY INERT, PINNED SO THEY STAY THAT WAY. See _INERT_RM_TOGGLES.
+    settings.update(_INERT_RM_TOGGLES)
     if spec.get("universe_setting"):
         settings[spec["universe_setting"]] = ",".join(universe)
     if spec.get("risk_manager_mode"):
@@ -1440,7 +1463,11 @@ _EXPERT_OPT = {
 # and the GA can otherwise only pick one compromise TP%. See
 # docs/plans/2026-08-04-regime-overlay-and-car-drawdown-design.md.
 _REGIME_OPT = {
-    "regime_overlay_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+    # PINNED OFF, not searched -- see _INERT_RM_TOGGLES. Leaving it in the space would let a
+    # decoded gene overwrite the pin, which is the whole thing being prevented. The three
+    # scales below stay in the space: with the overlay off they are inert and drift exactly as
+    # they did in every run on record, so the search space keeps its historical shape.
+    "regime_overlay_enabled": {"optimize": False, "min": 0, "max": 1, "step": 1, "type": "int"},
     "regime_risk_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
     "regime_stop_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
     "regime_tp_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
@@ -1458,7 +1485,8 @@ _RM_OPT = {
     "atr_multiplier": {"optimize": True, "min": 3.0, "max": 6.0, "step": 0.5, "type": "float"},
     "atr_period": {"optimize": True, "min": 7, "max": 28, "step": 7, "type": "int"},
     "min_stop_loss_pct": {"optimize": True, "min": 3.0, "max": 15.0, "step": 1.0, "type": "float"},
-    "use_atr_stop": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+    # PINNED OFF, not searched -- see _INERT_RM_TOGGLES.
+    "use_atr_stop": {"optimize": False, "min": 0, "max": 1, "step": 1, "type": "int"},
     "max_virtual_equity_per_instrument_percent": {"optimize": True, "min": 5.0, "max": 30.0, "step": 5.0, "type": "float"},
     **_REGIME_OPT,
 }
