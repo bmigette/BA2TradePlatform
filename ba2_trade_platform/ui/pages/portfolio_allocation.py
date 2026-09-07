@@ -115,13 +115,12 @@ from ...core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, blocking_messages, build_base_snapshot,
     compute_allocation,
-    compute_base_notional, compute_label_investment, current_value,
-    format_unrealised_pnl, is_blocking_message, unconsumed_income_notice,
-    validate_symbol_weights,
+    cash_dividends_by_symbol, compute_base_notional, compute_label_investment,
+    current_value, format_unrealised_pnl, is_blocking_message,
+    unconsumed_income_notice, validate_symbol_weights,
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
-    get_dividends_by_symbol,
     get_previous_symbol_weights, get_symbol_rows, get_symbol_weights,
     remove_symbols_from_label, replace_managed_labels, save_allocation_targets,
     set_allocation_config, set_managed_label, set_symbol_weight,
@@ -406,13 +405,33 @@ def _load_view_payload(account_id: int, valuation_mode: str,
                                    # row: the ⓘ tooltip is the only consumer and it is
                                    # not worth a lookup per cell.
                                    company_names=get_company_names(symbols),
-                                   # ONE query over the account's income ledger, for
-                                   # the "w/ div" half of the P&L column. A local
-                                   # read, so unlike the yield and 1Y/3Y stats it
-                                   # costs no REST call and needs no background
-                                   # top-up.
-                                   dividends_by_symbol=get_dividends_by_symbol(
-                                       account_id),
+                                   # The "w/ div" half of the P&L column: the
+                                   # broker's FULL dividend history, cash only.
+                                   #
+                                   # NOT the income ledger. get_dividends_by_symbol
+                                   # answers "what cash is waiting to be deployed"
+                                   # and is synced over a rolling
+                                   # INCOME_WINDOW_DAYS=30 window, so it held six
+                                   # weeks of a six-month position and reported a
+                                   # fifth of what the holding had paid
+                                   # (WHEEL_L1_HR, 2026-09-07: 46.98 against ~189).
+                                   # It stays the source for CONSUMPTION, which is
+                                   # the question it is right for.
+                                   #
+                                   # Cash only, via the same helper the growth
+                                   # charts use: a reinvested dividend is already
+                                   # in market value and cost basis, so counting it
+                                   # here would book the money twice.
+                                   #
+                                   # This one costs a REST call, unlike the ledger
+                                   # read it replaces. It is on the same background
+                                   # thread as the rest of this payload, and a
+                                   # broker that will not answer costs the "w/ div"
+                                   # figure, not the page: get_dividends returns []
+                                   # on failure and every row simply has no
+                                   # dividend-adjusted number.
+                                   dividends_by_symbol=cash_dividends_by_symbol(
+                                       account.get_dividends()),
                                    unallocated_pct=unallocated_pct),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,

@@ -143,6 +143,7 @@ __all__ = [
     "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
     "redistribute_label_residuals",
     # per-row leverage, for the dry-run table (W6/W7)
+    "cash_dividends_by_symbol",
     "bp_leverage", "LEVERAGE_VERDICTS", "LEVERAGE_NONE", "LEVERAGE_LEVERAGED",
     "LEVERAGE_PENALISED", "LEVERAGE_UNKNOWN", "LEVERAGE_NOT_APPLICABLE",
     "LEVERAGE_RATIO_TOLERANCE",
@@ -3250,6 +3251,55 @@ def validate_plan_budget(plan: "AllocationPlan") -> Optional[str]:
     if required <= budget + MONEY_EPSILON:
         return None
     return REFUSAL_OVER_BUDGET_FMT.format(required=required, budget=budget)
+
+
+def cash_dividends_by_symbol(dividends: Optional[List[Dict[str, Any]]]) -> Dict[str, float]:
+    """``{SYMBOL: CASH dividend received}`` from the broker's dividend feed. Pure.
+
+    CASH ONLY, and that is the whole point. A REINVESTED (DRIP) dividend never left
+    the position: it became shares. Those shares are already in the position's market
+    value and in its cost basis, so adding the payment to a P&L figure counts the same
+    money twice -- once as the stock it bought and once as income. The growth charts
+    made exactly that mistake until 2026-09-07, drawing total dividends beside a value
+    line that already contained the reinvested ones.
+
+    ``drip_quantity`` is the discriminator, per the ``get_dividends`` contract
+    (``ReadOnlyAccountInterface.get_dividends``): ``None`` on a cash dividend, the
+    share count on a reinvested one.
+
+    ``amount`` is the NET dividend the broker reports -- gross minus tax withheld --
+    which is the money actually kept, and therefore the only figure a P&L column may
+    use. ``gross_amount`` is deliberately not summed here.
+
+    THE OTHER SOURCE, and why this is not it. ``get_dividends_by_symbol`` reads the
+    ``portfolio_income_event`` ledger, which exists to answer "what cash is waiting to
+    be deployed" and is synced over a rolling ``INCOME_WINDOW_DAYS`` window. It is
+    correct for consumption and WRONG for lifetime P&L: on 2026-09-07 it held six
+    weeks of a six-month position and reported a fifth of what the holding had paid.
+    This function takes the broker's full history instead.
+
+    Args:
+        dividends: rows as ``get_dividends()`` returns them. ``None``/empty is an
+            empty result, never an error -- that seam returns ``[]`` on failure.
+
+    Returns:
+        Dict[str, float]: totals keyed by UPPERCASE symbol. A symbol that paid only
+        reinvested dividends is ABSENT rather than 0.0, exactly like one that never
+        paid: neither has cash to show in a P&L column.
+    """
+    out: Dict[str, float] = {}
+    for row in dividends or []:
+        if row.get("drip_quantity"):
+            continue
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            # A payment attributable to nothing would land on whichever holding
+            # sorted first -- the same rule get_dividends_by_symbol applies.
+            continue
+        amount = float(row.get("amount") or 0.0)
+        if amount:
+            out[symbol] = out.get(symbol, 0.0) + amount
+    return out
 
 
 def _row_margin_rate(row: "AllocationRow", plan: "AllocationPlan") -> float:

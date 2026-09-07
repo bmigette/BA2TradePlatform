@@ -456,3 +456,54 @@ class TestTheLeverageBadgeAgreesWithTheNumberBesideIt:
                                side=pa.OrderDirection.BUY, target_quantity=1.0,
                                estimated_value=100.0, bp_cost=100.0)
         assert pa.bp_leverage(row)[1] == pa.LEVERAGE_UNKNOWN
+
+
+class TestCashDividendsBySymbol:
+    """``cash_dividends_by_symbol`` -- the ONE dividend rule, added 2026-09-07.
+
+    Two consumers had two answers. The allocation page summed the
+    ``portfolio_income_event`` ledger, which is synced over a rolling 30-day window
+    and so reported 46.98 for a six-month WHEEL_L1_HR position; the growth charts
+    summed the broker's full history INCLUDING reinvested dividends, which drew
+    ~189 (15.47% of invested) beside a value line that already contained the shares
+    that money bought. Operator: "we need to get it but subtract drip shares" /
+    "the dividends in growth should not be 15".
+
+    Full history, cash only, one function, both callers.
+    """
+
+    def _rows(self):
+        return [
+            {"symbol": "GDXY", "amount": 3.17, "drip_quantity": None},
+            {"symbol": "GDXY", "amount": 2.04, "drip_quantity": None},
+            {"symbol": "GDXY", "amount": 9.99, "drip_quantity": 0.42, "drip_price": 23.8},
+            {"symbol": "chpy", "amount": 1.70, "drip_quantity": None},
+        ]
+
+    def test_reinvested_dividends_are_excluded(self):
+        """THE DEFECT: DRIP is already in market value and cost basis. 3.17 + 2.04,
+        never the 9.99 that turned into shares."""
+        assert pa.cash_dividends_by_symbol(self._rows())["GDXY"] == pytest.approx(5.21)
+
+    def test_symbols_are_uppercased_so_the_two_sources_agree(self):
+        assert "CHPY" in pa.cash_dividends_by_symbol(self._rows())
+
+    def test_a_symbol_that_only_reinvested_is_absent_not_zero(self):
+        """Absent means the same thing it means in ``get_dividends_by_symbol``: there
+        is no cash to show. A 0.00 would read as "measured, and it paid nothing"."""
+        out = pa.cash_dividends_by_symbol(
+            [{"symbol": "AAA", "amount": 5.0, "drip_quantity": 0.1, "drip_price": 50.0}])
+        assert "AAA" not in out
+
+    def test_a_payment_attributable_to_nothing_is_dropped(self):
+        """Same rule the ledger version applies: an unattributed payment would land
+        on whichever holding sorted first."""
+        assert pa.cash_dividends_by_symbol(
+            [{"symbol": "", "amount": 5.0, "drip_quantity": None},
+             {"amount": 5.0, "drip_quantity": None}]) == {}
+
+    def test_a_broker_that_did_not_answer_is_an_empty_result_not_a_crash(self):
+        """``get_dividends`` returns [] on failure, so None/[] is "nothing", and the
+        P&L column simply has no dividend-adjusted figure."""
+        assert pa.cash_dividends_by_symbol(None) == {}
+        assert pa.cash_dividends_by_symbol([]) == {}
