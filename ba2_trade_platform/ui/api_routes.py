@@ -156,3 +156,61 @@ def run_schedule_now(body: RunScheduleRequest):
         "symbol": symbol,
         "subtype": resolved_subtype.value,
     }
+
+
+class ProcessRecommendationsRequest(BaseModel):
+    """Which expert's recent recommendations to push through its enter_market ruleset, and
+    how far back to look. ``lookback_days`` matches the "How many days back" box on the
+    Trade Recommendations card's dialog (default 1, as there)."""
+    expert_instance_id: int
+    lookback_days: int = 1
+
+
+@router.post("/process-recommendations")
+def process_recommendations(body: ProcessRecommendationsRequest):
+    """Run the classic risk-manager pass over an expert's EXISTING recommendations -- the API
+    equivalent of the Trade Recommendations card's "Process Recommendations" button.
+
+    WHY A THIRD ENDPOINT. The pass normally fires by itself when an expert's last analysis
+    task completes. When it does not -- 2026-09-07, a self-deadlock in the trigger left expert
+    10's four actionable recommendations unevaluated until a restart -- the only way to run it
+    afterwards was that UI dialog, which selects the expert from a Quasar dropdown that no
+    script can drive. ``/run-schedule`` is the wrong tool for this case: it re-runs the whole
+    ANALYSIS, minting new recommendations and re-scanning the screener, when the
+    recommendations already exist and merely went unprocessed.
+
+    This makes the SAME call the dialog makes -- ``process_expert_recommendations_after_analysis``
+    with the same lookback semantics -- so the two cannot drift. It runs in FastAPI's worker
+    threadpool (a plain ``def``), exactly as the dialog runs it in an executor: the pass blocks
+    on broker round trips and must not sit on the event loop.
+
+    Every guard the pass itself applies still applies -- HOLDs are skipped, an existing
+    open/waiting transaction for the symbol blocks a duplicate entry, automated trading must be
+    enabled -- so calling this twice is safe; the second call finds nothing left to do.
+    """
+    from ..core.TradeManager import get_trade_manager
+    from ..core.db import get_instance
+    from ..core.models import ExpertInstance
+
+    if body.lookback_days < 1:
+        raise HTTPException(status_code=400,
+                            detail=f"lookback_days must be >= 1, got {body.lookback_days}")
+    if get_instance(ExpertInstance, body.expert_instance_id) is None:
+        raise HTTPException(status_code=404,
+                            detail=f"No expert instance with id {body.expert_instance_id}")
+    try:
+        created = get_trade_manager().process_expert_recommendations_after_analysis(
+            body.expert_instance_id, lookback_days=body.lookback_days) or []
+    except Exception as e:  # noqa: BLE001 -- surface the pass's own error, do not swallow it
+        logger.error(f"process_recommendations: pass failed for expert "
+                     f"{body.expert_instance_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Recommendation processing failed: {e}")
+    order_ids = [o.id for o in created]
+    logger.info(f"process_recommendations: expert={body.expert_instance_id} "
+                f"lookback_days={body.lookback_days} -> {len(order_ids)} order(s) {order_ids}")
+    return {
+        "status": "ok",
+        "expert_instance_id": body.expert_instance_id,
+        "lookback_days": body.lookback_days,
+        "created_orders": order_ids,
+    }
