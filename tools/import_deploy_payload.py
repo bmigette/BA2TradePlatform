@@ -44,7 +44,7 @@ _ba2_db.configure_db(LIVE_DB)
 
 from ba2_common.core.db import add_instance, get_instance, update_instance  # noqa: E402
 from ba2_common.core.deploy_parity import (  # noqa: E402
-    SCREENER_UNIVERSE_SETTING, live_settings_from_universe,
+    SCREENER_UNIVERSE_SETTING, live_settings_from_universe, unmapped_screener_keys,
 )
 from ba2_common.core.models import ExpertInstance  # noqa: E402
 from ba2_common.core.rules_convert import trade_rules_to_live_export  # noqa: E402
@@ -132,9 +132,19 @@ def main() -> int:
         # findings V1 (the six screener:* genes) and V2 (the $100 underlying-price cap every
         # option grid screened on). The exporter has always built it; consuming only
         # ``settings.expert_params`` meant a genome selected on cheap names was deployed onto
-        # whatever universe the live instance happened to have. The live settings exist under
-        # the SAME names, so the whole repair is this mapping.
+        # whatever universe the live instance happened to have. The live settings mostly exist
+        # under the same names -- but NOT all of them: the run-level base settings use the metric
+        # store's unprefixed vocabulary, so live_settings_from_universe canonicalises them onto
+        # the screener_* names StockScreener reads (2026-09-07; see its docstring).
         universe_params = live_settings_from_universe(entry["settings"].get("universe"))
+        # A screener key that reaches live under a name nothing reads is inert, and silence is
+        # how `market_cap_max` survived six deploys with the whole upper bound of the cap band
+        # missing (parity review 2026-09-07). live_settings_from_universe now canonicalises the
+        # known ones; anything left over gets said out loud rather than written and forgotten.
+        stray = unmapped_screener_keys(entry["settings"].get("universe"))
+        if stray:
+            print(f"  WARNING: screener key(s) with no live setting of that name: {stray} -- "
+                  f"they will be stored but NOTHING READS THEM")
         if universe_params:
             # The universe is part of WHAT WAS SCORED, so it wins over the run's base settings
             # for the same reason the forced gates do.

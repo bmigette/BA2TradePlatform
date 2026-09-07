@@ -159,6 +159,24 @@ BACKTEST_FORCED_SETTINGS = (
 #: screener settings sit there inert.
 SCREENER_UNIVERSE_SETTING = "instrument_selection_method"
 
+#: The screener settings MarketExpertInterface declares (get_settings_definitions). Used to
+#: canonicalise a payload's screener block onto the names ``StockScreener`` actually reads --
+#: see live_settings_from_universe. Kept as an explicit tuple rather than imported from the
+#: interface: this module is the deploy CONTRACT, so a name disappearing upstream should show
+#: up as a parity failure here, not silently change what a deploy writes.
+LIVE_SCREENER_SETTINGS = frozenset((
+    "screener_provider",
+    "screener_market_cap_min", "screener_market_cap_max",
+    "screener_volume_min", "screener_volume_max",
+    "screener_dollar_volume_min",
+    "screener_float_min", "screener_float_max",
+    "screener_price_min", "screener_price_max",
+    "screener_relative_volume_min",
+    "screener_price_drop_pct", "screener_price_drop_days",
+    "screener_max_stocks", "screener_sort_metric",
+    "screener_weinstein_stage2_only",
+))
+
 
 def forced_expert_settings(facts: BacktestRunFacts) -> Dict[str, Any]:
     """{live setting: value} for every row that HAS a live analogue.
@@ -188,9 +206,38 @@ def live_settings_from_universe(universe: Optional[Dict[str, Any]]) -> Dict[str,
     A static-universe payload maps to nothing: its symbols are the run's candidate list, not a
     setting, and overwriting a live instance's ``enabled_instruments`` from a backtest's universe
     is a different (and much bigger) decision than carrying the screener config.
+
+    "THE SAME NAMES" WAS ONLY HALF TRUE. The block mixes two vocabularies: the GA's
+    ``screener:*`` genes decode to live names already (``screener_market_cap_min``), but the
+    run-level ``screener_opt.base_settings`` use the metric store's UNPREFIXED names
+    (``market_cap_max``). Copied verbatim, the unprefixed ones land in expertsetting under a key
+    ``StockScreener`` never reads, so the live screener silently keeps its own default. For
+    ``market_cap_max`` that default is 0 = NO CEILING: prod instances 8-12 were deployed with the
+    upper bound of their cap band missing entirely, which is what stops "small" and "mid" from
+    describing a bounded live universe at all (parity review 2026-09-07, P1 #1). Canonicalising
+    the prefix is the whole repair -- the values were always right.
     """
     if not isinstance(universe, dict) or universe.get("mode") != "screener":
         return {}
-    settings = dict(universe.get("screener_settings") or {})
+    settings: Dict[str, Any] = {}
+    for key, value in (universe.get("screener_settings") or {}).items():
+        if key not in LIVE_SCREENER_SETTINGS and f"screener_{key}" in LIVE_SCREENER_SETTINGS:
+            key = f"screener_{key}"
+        settings[key] = value
     settings[SCREENER_UNIVERSE_SETTING] = "screener"
     return settings
+
+
+def unmapped_screener_keys(universe: Optional[Dict[str, Any]]) -> list:
+    """Screener keys that reach live under a name nothing reads -- the caller must SAY so.
+
+    A key that is neither a live screener setting nor one prefix away from being one is
+    carried into expertsetting and then ignored, exactly as ``market_cap_max`` was. Silence is
+    how that survived a deploy; an importer prints this instead.
+    """
+    if not isinstance(universe, dict) or universe.get("mode") != "screener":
+        return []
+    return sorted(
+        k for k in (universe.get("screener_settings") or {})
+        if k not in LIVE_SCREENER_SETTINGS and f"screener_{k}" not in LIVE_SCREENER_SETTINGS
+    )
