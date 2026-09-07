@@ -379,6 +379,13 @@ def test_every_forced_setting_reaches_the_deployed_instance(db, key, expert, rul
     assert {r.live_setting for r in carried} == {
         "allow_automated_trade_opening", "enable_buy",
         "allow_automated_trade_modification", "enable_sell",
+        # ADDED 2026-09-07. Both are pinned OFF for every run (INERT_RM_TOGGLES): a bool gene
+        # arriving as the GA's integer 1 used to be stored as the JSON string "1" and read back
+        # False, so no run on record ever had either feature on. coerce_bool fixed that
+        # encoding, so the values are pinned rather than allowed to switch a whole grid into a
+        # different experiment. They are CARRIED because use_atr_stop declares default True --
+        # a deploy that omitted it would size its stops differently from the run it came from.
+        "use_atr_stop", "regime_overlay_enabled",
     }, ("the forced-settings table changed. ADDING a row is the point of the table -- say so "
         "here. REMOVING one means a setting the backtest engine forces no longer reaches the "
         "deployed instance, which is review finding V3 verbatim.")

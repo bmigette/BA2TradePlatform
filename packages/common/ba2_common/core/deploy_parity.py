@@ -96,10 +96,34 @@ _VALUES = {
     "enable_sell": lambda f: bool(f.enable_short),
     "hold_assigned_stock": lambda f: bool(f.hold_assigned_stock),
     "entry_action": lambda f: f.entry_action,
+    "use_atr_stop": lambda f: False,
+    "regime_overlay_enabled": lambda f: False,
 }
 
 
 BACKTEST_FORCED_SETTINGS = (
+    ForcedSetting(
+        key="use_atr_stop",
+        live_setting="use_atr_stop",
+        source="strategy_param_space.INERT_RM_TOGGLES -> _build_daily_trial_config; "
+               "ba2test_launcher._INERT_RM_TOGGLES for the run-level settings",
+        why="THE INTERFACE DEFAULTS THIS True, and no run on record ever had it on. The GA "
+            "passes genes as integers and the old settings writer stored a bool as the JSON "
+            "string \"1\", which the reader did not read as true -- so every backtest ran with "
+            "the ATR stop-leg disabled whatever its genome claimed. coerce_bool fixed the "
+            "encoding, so the value is now pinned off rather than left to flip a whole grid into "
+            "a different experiment. It MUST travel: a deploy that omits it gets the True "
+            "default and sizes its stops differently from the run it came from.",
+    ),
+    ForcedSetting(
+        key="regime_overlay_enabled",
+        live_setting="regime_overlay_enabled",
+        source="strategy_param_space.INERT_RM_TOGGLES -> _build_daily_trial_config; "
+               "ba2test_launcher._INERT_RM_TOGGLES for the run-level settings",
+        why="same defect and same pin as use_atr_stop. This one declares False, so a deploy that "
+            "omitted it would happen to agree -- carried explicitly anyway, because parity that "
+            "holds by coincidence stops holding the day a default changes.",
+    ),
     ForcedSetting(
         key="allow_automated_trade_opening",
         live_setting="allow_automated_trade_opening",
