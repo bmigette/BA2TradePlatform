@@ -273,13 +273,18 @@ class _FundedEntryAccount(MockAccount):
                          .where(TradingOrder.id == order_id)).first()
         return (got[0], got[1]) if got is not None else None
 
-    def _handle_transaction_requirements(self, trading_order):
+    def _handle_transaction_requirements(self, trading_order, *, is_closing_order=False):
         """THE CVS SHAPE. The Transaction is created and its id stamped on the in-memory
         order; the SEPARATE update_instance that would put that id on the row is the write
         that loses to the lock. The row on disk therefore has no transaction_id at all while a
-        WAITING transaction very much exists."""
+        WAITING transaction very much exists.
+
+        ``is_closing_order`` mirrors the real signature and is forwarded unchanged: a double
+        that overrides a method must accept what its caller passes, or it stops standing in
+        for the thing it is doubling and fails on the call rather than on the behaviour."""
         from ba2_common.core.interfaces.AccountInterface import AccountInterface
-        AccountInterface._handle_transaction_requirements(self, trading_order)
+        AccountInterface._handle_transaction_requirements(
+            self, trading_order, is_closing_order=is_closing_order)
         if trading_order.symbol in self._fail_after_transaction_symbols:
             raise _locked_error()
 

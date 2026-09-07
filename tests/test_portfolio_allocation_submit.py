@@ -1562,23 +1562,38 @@ def test_submit_plan_an_exit_the_equity_planner_cannot_route_is_not_nothing_to_d
     assert "41, 42" in message
 
 
-def test_submit_plan_the_same_exit_without_the_filtered_ids_is_the_OLD_silence():
-    """The BEFORE, pinned. Identical broker shares, identical row, identical empty
-    ``transaction_ids`` -- the ONLY difference is that the filtered-out ids were
-    thrown away instead of carried. That one field is what separated "the account
-    holds 100 shares this run cannot reach" from "nothing to do", and dropping it
-    again brings the silence straight back."""
+def test_submit_plan_the_same_exit_with_NO_transactions_at_all_is_SOLD():
+    """The DISCRIMINATOR, and both halves are loud now.
+
+    Identical broker shares, identical row; the only difference from the test above is
+    that there are no filtered ids either -- nothing is being held back, the platform
+    simply has no record of the holding.
+
+    This used to be the "OLD silence": ACTION_SKIP with the message "nothing to do", the
+    same words a symbol already at its target gets. Since 2026-09-07 it is SOLD instead,
+    as a plain closing order against the shares the broker really holds. A Transaction
+    links quantity to an EXPERT and a manually-traded account has none, so demanding one
+    before selling was the wrong shape -- it left such a holding permanently buy-only.
+
+    The two states must still be TOLD APART: filtered ids mean "unwind these
+    transactions" (unactionable), no ids at all means "we can just sell it"."""
     account = FakeAccount(account_id=702)
     account.positions = [FakePosition("AAPL", 100.0, 15_000.0, 16_000.0)]
+    account.prices = {"AAPL": 160.0}
     plan = AllocationPlan(rows=[_exit_row()], available_buying_power=10_000.0)
-    forgotten = PositionState(symbol="AAPL", quantity=100.0, price=160.0,
+    untracked = PositionState(symbol="AAPL", quantity=100.0, price=160.0,
                               transaction_ids=[], unactionable_transaction_ids=[])
 
-    outcomes = svc.submit_plan(account, plan, {"AAPL": forgotten},
+    outcomes = svc.submit_plan(account, plan, {"AAPL": untracked},
                                run_tag="703", allow_fractional=False)
 
-    assert outcomes[0].status == svc.OUTCOME_SKIPPED
-    assert outcomes[0].message == "nothing to do"
+    assert outcomes[0].action == svc.ACTION_SELL_UNTRACKED
+    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    symbol, side, quantity, _comment = account.submitted[0]
+    assert (symbol, side, quantity) == ("AAPL", OrderDirection.SELL, 100.0)
+    # Submitted as a CLOSING order, which is what stops _handle_transaction_requirements
+    # inventing a transaction -- and a transaction here would record a SHORT.
+    assert account.submit_closing_flags == [True]
 
 
 def test_submit_plan_a_TRIM_of_an_option_only_holding_is_unactionable_too():

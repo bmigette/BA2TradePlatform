@@ -25,7 +25,8 @@ from ..logger import logger
 from .db import InstanceNotFound, add_instance, get_db, get_instance, log_activity
 from .models import ExpertInstance, Transaction, TradingOrder
 from .portfolio_allocation import (
-    ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP, ACTION_UNACTIONABLE,
+    ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SELL_UNTRACKED, ACTION_SKIP,
+    ACTION_UNACTIONABLE,
     ALLOCATION_BASIS_POSITION,
     FRACTIONAL_PATH_WHOLE,
     AllocationPlan, BaseSnapshot, FilledTotals, MarginInfo, OrderFill,
@@ -797,6 +798,10 @@ def _submit_row(account, row, state, *, run_tag: str, allow_fractional: bool,
                               message="; ".join(row.reasons) or "nothing to do")
         if action == ACTION_UNACTIONABLE:
             return _unactionable_row(row, state)
+        if action == ACTION_SELL_UNTRACKED:
+            return _sell_untracked_symbol(account, row, state, run_tag=run_tag,
+                                          allow_fractional=allow_fractional,
+                                          on_order_id=on_order_id)
         if action == ACTION_CLOSE:
             return _note_unacted_legs(
                 _close_symbol(account, row, state, on_order_id=on_order_id), state)
@@ -1109,7 +1114,8 @@ def _adjust_symbol(account, row, state, *, on_order_id=_noop_order_id) -> RowOut
 
 
 def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool,
-                 on_order_id=_noop_order_id) -> RowOutcome:
+                 on_order_id=_noop_order_id, is_closing_order: bool = False,
+                 action: str = ACTION_NEW, max_quantity: Optional[float] = None) -> RowOutcome:
     """Not held, target > 0 -> a brand new MARKET order, with the fractional fallback.
 
     A fractional equity quantity is legal on a MARKET order and on nothing else
@@ -1129,14 +1135,24 @@ def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool,
     and retrying the second one places a second order for the same intent. Under-
     investing is recoverable on the next run; buying the position twice is not.
     """
+    wanted = row.delta_quantity
+    if max_quantity is not None and abs(wanted) > abs(float(max_quantity)):
+        # NEVER OVERSELL. The delta is derived from the same broker read the plan was
+        # built on, so this should not bind -- but "should not" is not a guarantee when
+        # the position can move between the dry run and here, and selling more than is
+        # held opens a SHORT on an account that asked to reduce a long.
+        logger.warning(
+            f"Allocation: clamping {row.symbol} from {wanted:g} to the "
+            f"{float(max_quantity):g} share(s) actually held at the broker")
+        wanted = -abs(float(max_quantity)) if wanted < 0 else abs(float(max_quantity))
     attempts = plan_quantity_attempts(
-        row.delta_quantity,
+        wanted,
         allow_fractional=allow_fractional,
         fractionable=bool(row.fractional),
     )
     if not attempts:
         return RowOutcome(
-            symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_SKIPPED,
+            symbol=row.symbol, action=action, status=OUTCOME_SKIPPED,
             quantity=abs(row.delta_quantity),
             message="below one whole share and fractional is off - nothing submitted",
         )
@@ -1150,7 +1166,7 @@ def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool,
     for index, (path, quantity) in enumerate(attempts):
         last, nothing_was_placed = _submit_new_order(
             account, row, quantity, run_tag=run_tag, path=path,
-            on_order_id=on_order_id)
+            on_order_id=on_order_id, is_closing_order=is_closing_order, action=action)
         for order_id in last.order_ids:
             if order_id not in created:
                 created.append(order_id)
@@ -1183,6 +1199,37 @@ def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool,
             f"retrying at whole shares"
         )
     return last
+
+
+def _sell_untracked_symbol(account, row, state, *, run_tag: str, allow_fractional: bool,
+                           on_order_id=_noop_order_id) -> RowOutcome:
+    """Reduce a broker holding this platform has no transaction for.
+
+    A ``Transaction`` links quantity to an EXPERT. A manually-traded account has none, so
+    a holding that arrived at the broker without passing through this platform -- opened
+    by hand, migrated, delivered by an assignment nobody recorded -- has no transaction,
+    and every managed-exit path (``close_transaction``, ``adjust_quantity_with_tpsl``)
+    needs one. Such a holding could therefore be bought into and never trimmed.
+
+    The plan is the INTENT and the broker position is the TRUTH, so the sale goes out as
+    a plain closing MARKET order against the shares that are actually there. No
+    transaction is invented: ``_handle_transaction_requirements`` declines to auto-create
+    one for a closing order, which is what stops a reducing SELL being recorded as
+    opening a short.
+
+    Clamped to the quantity the BROKER reports, so a plan built a moment earlier can
+    never oversell into a short. Otherwise this is the ordinary new-order machinery --
+    the same fractional fallback, the same rejection classification, the same
+    never-retry-an-ambiguous-failure rule -- because a sale that is unremarkable to the
+    broker deserves no bespoke handling here.
+    """
+    held = abs(float(getattr(state, "quantity", 0.0) or 0.0))
+    logger.info(
+        f"Allocation: {row.symbol} is held at the broker ({held:g}) with no local "
+        f"transaction; selling {abs(row.delta_quantity):g} directly as a closing order")
+    return _open_symbol(account, row, run_tag=run_tag, allow_fractional=allow_fractional,
+                        on_order_id=on_order_id, is_closing_order=True,
+                        action=ACTION_SELL_UNTRACKED, max_quantity=held)
 
 
 def _fresh_comment(order_id: int) -> str:
@@ -1255,7 +1302,9 @@ def _rejection_reason(order, order_id: int, stamped: str) -> str:
 
 
 def _submit_new_order(account, row, quantity: float, *, run_tag: str,
-                      path: str, on_order_id=_noop_order_id) -> Tuple[RowOutcome, bool]:
+                      path: str, on_order_id=_noop_order_id,
+                      is_closing_order: bool = False,
+                      action: str = ACTION_NEW) -> Tuple[RowOutcome, bool]:
     """Persist one TradingOrder and put it through the PUBLIC submit_order seam.
 
     Public, not ``_submit_order_impl``: that is what runs order validation,
@@ -1294,7 +1343,7 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str,
     order_id = add_instance(order, expunge_after_flush=True)
     if not order_id:
         # Nothing was persisted, so nothing was sent: a retry cannot duplicate it.
-        return RowOutcome(symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_FAILED,
+        return RowOutcome(symbol=row.symbol, action=action, status=OUTCOME_FAILED,
                           quantity=quantity, path=path,
                           message="could not persist the TradingOrder"), True
 
@@ -1306,11 +1355,11 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str,
     _record_order_ids(on_order_id, [order_id])
 
     try:
-        result = account.submit_order(order, is_closing_order=False)
+        result = account.submit_order(order, is_closing_order=is_closing_order)
     except Exception as e:
         logger.error(f"Allocation: submit_order raised for {row.symbol} at qty={quantity} "
                      f"({path}): {e}", exc_info=True)
-        return RowOutcome(symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_FAILED,
+        return RowOutcome(symbol=row.symbol, action=action, status=OUTCOME_FAILED,
                           quantity=quantity, path=path, order_ids=[order_id],
                           message=str(e) or e.__class__.__name__), \
             _nothing_was_placed(order_id, None, None)
@@ -1319,7 +1368,7 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str,
     # gate fires, and None on hard failure with the reason on .comment. Inspect
     # .status, never truthiness.
     if result is None:
-        return RowOutcome(symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_FAILED,
+        return RowOutcome(symbol=row.symbol, action=action, status=OUTCOME_FAILED,
                           quantity=quantity, path=path, order_ids=[order_id],
                           message=_rejection_reason(order, order_id, stamped)), \
             _nothing_was_placed(order_id, None, None)
@@ -1327,23 +1376,23 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str,
     status = getattr(result, 'status', None)
     filled = getattr(result, 'filled_qty', None)
     if status == OrderStatus.WASHTRADE_LOCKED:
-        return RowOutcome(symbol=row.symbol, action=ACTION_NEW,
+        return RowOutcome(symbol=row.symbol, action=action,
                           status=OUTCOME_WASHTRADE_LOCKED, quantity=quantity, path=path,
                           order_ids=[order_id],
                           message="wash-trade gate locked this symbol"), False
     if status in _DEAD_ON_ARRIVAL_STATUSES:
         return RowOutcome(
-            symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_FAILED,
+            symbol=row.symbol, action=action, status=OUTCOME_FAILED,
             quantity=quantity, filled_quantity=filled, path=path, order_ids=[order_id],
             message=f"broker returned the order {status.value}: "
                     f"{_rejection_reason(result, order_id, stamped)}"), \
             _nothing_was_placed(order_id, status, filled)
     if status == OrderStatus.PARTIALLY_FILLED:
         return RowOutcome(
-            symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_PARTIAL,
+            symbol=row.symbol, action=action, status=OUTCOME_PARTIAL,
             quantity=quantity, filled_quantity=filled, path=path, order_ids=[order_id],
             message=f"partially filled: {filled} of {quantity}"), False
-    return RowOutcome(symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_SUBMITTED,
+    return RowOutcome(symbol=row.symbol, action=action, status=OUTCOME_SUBMITTED,
                       quantity=quantity, filled_quantity=filled, path=path,
                       order_ids=[order_id]), False
 

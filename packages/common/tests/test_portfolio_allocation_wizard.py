@@ -1342,19 +1342,6 @@ def test_decide_symbol_action_topping_up_a_held_symbol_is_an_adjustment():
     assert decide_symbol_action(row, state) == ACTION_ADJUST
 
 
-def test_decide_symbol_action_a_broker_position_we_do_not_track_is_not_adjustable():
-    """Held at the broker but with no open Transaction of ours: there is nothing
-    to adjust, so a BUY opens a fresh transaction and a SELL is refused rather
-    than trimming a position this platform does not own."""
-    buy = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=5.0,
-                        side=OrderDirection.BUY, target_quantity=15.0)
-    sell = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-5.0,
-                         side=OrderDirection.SELL, target_quantity=5.0)
-    untracked = PositionState(symbol="AAPL", quantity=10.0, transaction_ids=[])
-    assert decide_symbol_action(buy, untracked) == ACTION_NEW
-    assert decide_symbol_action(sell, untracked) == ACTION_SKIP
-
-
 def test_decide_symbol_action_a_suppressed_row_is_skipped_not_closed():
     """The $5 fractional floor zeroes the DELTA and leaves target_quantity at the
     CURRENT holding. A close is decided on the TARGET, so an unsendable trim of a
@@ -1393,18 +1380,6 @@ def test_decide_symbol_action_a_TRIM_of_an_option_only_holding_is_unactionable_t
     state = PositionState(symbol="AAPL", quantity=100.0, transaction_ids=[],
                           unactionable_transaction_ids=[41])
     assert decide_symbol_action(row, state) == ACTION_UNACTIONABLE
-
-
-def test_decide_symbol_action_an_untracked_broker_position_is_still_a_plain_skip():
-    """DISCRIMINATOR for the ``unactionable_transaction_ids`` condition. Shares at
-    the broker with no transactions of ours AT ALL is the pre-existing long-only
-    refusal, not a filtered holding: there is nothing to name and nothing to look
-    at, so it keeps the words it had."""
-    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-100.0,
-                        side=OrderDirection.SELL, target_quantity=0.0)
-    state = PositionState(symbol="AAPL", quantity=100.0, transaction_ids=[],
-                          unactionable_transaction_ids=[])
-    assert decide_symbol_action(row, state) == ACTION_SKIP
 
 
 def test_decide_symbol_action_a_filtered_transaction_with_no_shares_held_is_a_skip():

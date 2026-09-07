@@ -106,7 +106,7 @@ __all__ = [
     # what a plan's target_notional MEANS, and the residual loop's bound (D2)
     "ALLOCATION_BASIS_POSITION", "ALLOCATION_BASIS_BUDGET", "REDISTRIBUTION_MAX_PASSES",
     # reason / warning / error strings
-    "is_untracked_holding", "REASON_UNTRACKED_NO_SELL",
+    "is_untracked_holding", "REASON_UNTRACKED_NO_SELL", "ACTION_SELL_UNTRACKED",
     "REASON_NO_PRICE", "REASON_NOT_MARGINABLE", "REASON_FRACTIONAL",
     "REASON_WHOLE_SHARE_FLOOR", "REASON_FRACTIONAL_UNKNOWN",
     "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
@@ -2443,12 +2443,10 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         # buying it consumed.
         row.bp_cost = row.estimated_value * row.bp_factor if delta > 0 else 0.0
         row.bp_released = row.estimated_value * row.bp_factor if delta < 0 else 0.0
-        # A REDUCTION WITH NO ROUTE TO THE BROKER FREES NOTHING (review PA-05).
-        # The delta is deliberately LEFT ALONE: the operator asked to exit and
-        # deserves to see the size of what could not happen, and submission turns
-        # the flag into a loud ACTION_UNACTIONABLE rather than a silent skip. What
-        # must not survive is the MONEY -- crediting bp_released here is what let
-        # a $1,000 sale that cannot be submitted fund a $1,000 buy that can.
+        # A reduction the CALLER has told us cannot be submitted frees nothing.
+        # Kept for a genuinely unroutable sale; an UNTRACKED broker holding is no
+        # longer one of those -- it is sold directly (ACTION_SELL_UNTRACKED), so
+        # its proceeds are real and must keep funding the plan.
         if delta < 0 and row.symbol in unsellable:
             row.untracked_unsellable = True
             row.reasons.append(REASON_UNTRACKED_NO_SELL)
@@ -3835,6 +3833,11 @@ ACTION_SKIP = "skip"       # nothing to do (or nothing we are willing to do)
 #: does not act on -- so the SELL cannot be routed at all. NOT a skip: see
 #: ``decide_symbol_action``.
 ACTION_UNACTIONABLE = "unactionable"
+#: Held at the broker with no transaction of ours behind it, and being REDUCED.
+#: Submitted as a plain closing order against the broker position -- no transaction
+#: is created for it, because a Transaction links quantity to an expert and a manual
+#: holding has none. See ``decide_symbol_action``.
+ACTION_SELL_UNTRACKED = "sell_untracked"
 
 
 def decide_symbol_action(row: "AllocationRow", state: Optional["PositionState"]) -> str:
@@ -3883,16 +3886,24 @@ def decide_symbol_action(row: "AllocationRow", state: Optional["PositionState"])
             and bool(state.unactionable_transaction_ids)):
         return ACTION_UNACTIONABLE
 
-    # THE UNTRACKED HOLDING the PLANNER identified (review PA-05). Keyed on the
-    # row's flag, never on an inference from ``state``: an empty
+    # A caller-declared unsellable row stays loud: it asked to exit and this run has
+    # no route. Keyed on the row's FLAG, never inferred from ``state`` -- an empty
     # ``transaction_ids`` means "untracked" only when the caller populates ids at
-    # all, which the live service does and a hand-built state does not. A raw
-    # untracked state therefore keeps its pre-existing long-only SKIP -- pinned by
-    # test_decide_symbol_action_an_untracked_broker_position_is_still_a_plain_skip
-    # -- while a row the planner marked gets the loud outcome, because there the
-    # operator really did ask to exit and this run really has no route.
+    # all, which the live service does and a hand-built state does not.
     if row.side == OrderDirection.SELL and row.untracked_unsellable:
         return ACTION_UNACTIONABLE
+
+    # THE UNTRACKED BROKER HOLDING. Shares the broker reports with no transaction
+    # of ours behind them. A Transaction exists to link quantity to an EXPERT, and a
+    # manually-traded account has none -- so requiring one in order to sell was the
+    # wrong shape for this account type, and it is why such a holding could only ever
+    # be bought into and never trimmed.
+    #
+    # The plan is the INTENT and the broker position is the TRUTH: sell it directly,
+    # as a plain closing order against the shares that are actually there. No
+    # transaction is invented for it (that would record a SHORT), and none is needed.
+    if row.side == OrderDirection.SELL and is_untracked_holding(state):
+        return ACTION_SELL_UNTRACKED
 
     return ACTION_NEW if row.side == OrderDirection.BUY else ACTION_SKIP
 
