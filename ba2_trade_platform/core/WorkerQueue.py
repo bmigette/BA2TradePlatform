@@ -1478,7 +1478,11 @@ class WorkerQueue:
         """
         try:
             logger.debug(f"[RISK_MGR_TRIGGER] ===== START _check_and_process_expert_recommendations for expert {expert_instance_id}, use_case={use_case.value} =====")
-            
+
+            # Set INSIDE the lock, acted on OUTSIDE it -- see the release below the
+            # ``with`` block for why that ordering is the whole point.
+            release_parked_exit_pass = False
+
             # Check if there are any pending tasks for this expert
             # Use lock to prevent race condition when multiple jobs complete simultaneously
             with self._risk_manager_lock:
@@ -1657,10 +1661,19 @@ class WorkerQueue:
                                 logger.debug(f"[RISK_MGR_TRIGGER] No orders created by automated processing for expert {expert_instance_id}")
                             if use_case == AnalysisUseCase.ENTER_MARKET:
                                 # Entry orders exist now: this is the backtest's
-                                # `_manage_open_positions`-after-`_run_expert_bar` point. Release
-                                # any OPEN_POSITIONS pass parked behind this entry pass.
-                                self.release_deferred_open_positions(
-                                    expert_instance_id, "entry pass processed")
+                                # `_manage_open_positions`-after-`_run_expert_bar` point. The
+                                # parked OPEN_POSITIONS pass is released AFTER this block drops
+                                # ``_risk_manager_lock`` -- NOT here. ``release_deferred_open_positions``
+                                # takes that same lock, and it is a plain ``threading.Lock``: calling
+                                # it from inside this block is the thread waiting on itself, forever.
+                                # That is exactly what happened on 2026-09-07 15:32:51 (PROD): expert
+                                # 12's pass created 2 orders, called the release, and never logged
+                                # another line; expert 7 and then all 8 of expert 10's completions
+                                # queued behind the held lock, expert 10's 4 actionable
+                                # recommendations were never evaluated, and nothing moved until the
+                                # 21:54 restart. First enter-market pass after e5e37c6a introduced
+                                # the call.
+                                release_parked_exit_pass = True
                             # THE OPTION RUN RECORD. Everything the option risk manager
                             # decided this pass -- every admission and every refused rail --
                             # is written as ONE ``RiskManagerRun`` row with mode="options",
@@ -1692,7 +1705,14 @@ class WorkerQueue:
                 else:
                     logger.debug(f"[RISK_MGR_TRIGGER] Still has pending {use_case.value} tasks for expert {expert_instance_id}, skipping automated processing")
                     logger.debug(f"[RISK_MGR_TRIGGER] ===== END (has pending tasks) =====")
-                
+
+            # OUTSIDE ``_risk_manager_lock`` -- the block above has released it and its
+            # ``finally`` has already dropped this expert from ``_processing_experts``, so the
+            # parking predicate now correctly reads "no entry pass in flight". Releasing while
+            # still holding the lock was a self-deadlock (see the flag's assignment above).
+            if release_parked_exit_pass:
+                self.release_deferred_open_positions(expert_instance_id, "entry pass processed")
+
         except Exception as e:
             logger.error(f"[RISK_MGR_TRIGGER] ✗ Error checking and processing recommendations for expert {expert_instance_id} ({use_case.value}): {e}", exc_info=True)
             logger.debug(f"[RISK_MGR_TRIGGER] ===== END (exception) =====")
