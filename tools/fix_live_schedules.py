@@ -191,10 +191,52 @@ def repair_cap_ceiling(ns, test) -> int:
     return changed
 
 
+#: Live-only screener floors, with the class default each falls back to. The metric store the
+#: backtests screened on applies each of these ONLY when the setting is present, and these runs'
+#: screener_settings carried none of them -- so the backtest had no price, volume or float floor
+#: at all while live silently applied three. 118 of backtest 1425's 185 recorded entries were
+#: below live's $20 floor, i.e. trades the deployed instance could never take.
+#:
+#: Disabling them live (0 = off) makes the live screen the one that was actually measured.
+LIVE_ONLY_FLOORS = {
+    "screener_price_min": 20.0,
+    "screener_volume_min": 500_000,
+    "screener_float_min": 10_000_000,
+}
+
+
+def repair_screener_floors(ns, test) -> int:
+    """Turn off the live-only price/volume/float floors the backtests never applied."""
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import ExpertInstance
+
+    print("--- live-only screener floors ---")
+    changed = 0
+    for inst_id, _bt_id in DEPLOYED:
+        inst = get_instance(ExpertInstance, inst_id)
+        if inst is None:
+            continue
+        expert = _expert_for(inst)
+        if expert is None:
+            continue
+        for key, default in LIVE_ONLY_FLOORS.items():
+            cur = expert.settings.get(key)
+            effective = default if cur is None else float(cur)
+            if effective == 0:
+                continue
+            print(f"  inst {inst_id}: {key} {effective:,.0f} -> 0 (off)")
+            changed += 1
+            if ns.apply:
+                expert.save_settings({key: (0.0, None)})
+    print(f"  {changed} setting(s) {'repaired' if ns.apply else 'would change'}.\n")
+    return changed
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="write the repair (default: dry run)")
-    ap.add_argument("--only", choices=("schedule", "cap"), help="run just one of the two repairs")
+    ap.add_argument("--only", choices=("schedule", "cap", "floors"),
+                    help="run just one of the repairs")
     ns = ap.parse_args()
 
     import sqlite3
@@ -212,6 +254,8 @@ def main() -> int:
         changed += repair_schedules(ns, test)
     if ns.only in (None, "cap"):
         changed += repair_cap_ceiling(ns, test)
+    if ns.only in (None, "floors"):
+        changed += repair_screener_floors(ns, test)
 
     if changed and ns.apply:
         print("Now POST /api/reload (or restart): JobManager rebuilds the cron triggers and "
