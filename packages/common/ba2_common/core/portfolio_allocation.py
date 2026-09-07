@@ -197,6 +197,19 @@ QUANTITY_EPSILON = 1e-9
 #: ledger write, whereas 1e-9 of a share can matter on a fractional grid.
 MONEY_EPSILON = 1e-6
 
+#: The bp_factor a symbol gets when NOTHING is known about its margin treatment.
+#:
+#: 1.0 is neutral on every account shape -- an ordinary marginable stock at Reg-T is
+#: 0.5 x 2 and a cash account is 1.0 x 1, and both land here -- so it holds the
+#: invariant that a buy never consumes MORE buying power than its notional.
+#:
+#: It used to be the ACCOUNT MULTIPLIER (2.0 on a margin account), which by this
+#: module's own table means NON-MARGINABLE: a buying-power penalty of double the
+#: notional, applied to every symbol nobody had measured. On a live TastyTrade
+#: account that was every symbol not already held -- so every first-time buy -- and
+#: the plan then scaled itself down to fit a budget twice its real size.
+NEUTRAL_BP_FACTOR = 1.0
+
 #: The five verdicts ``bp_leverage`` can return, and the ONLY five the dry-run
 #: table knows how to draw. See ``bp_leverage`` for the predicate and the live
 #: numbers behind it; the short version is that the neutral point is 1.0 on every
@@ -869,6 +882,16 @@ class AllocationPlan:
     rows: List[AllocationRow] = field(default_factory=list)
     base_notional: float = 0.0
     available_buying_power: float = 0.0
+    #: The account's Reg-T multiplier (2.0 margin, 1.0 cash), carried as a
+    #: DESCRIPTION of the account -- the same number that seeds ``default_bp_factor``.
+    #:
+    #: NOT a way to recover a row's initial margin rate. It was used exactly that
+    #: way (``rate = bp_factor / margin_multiplier``) until 2026-09-07, and the
+    #: algebra is sound only when ``bp_factor`` came from a real per-symbol rate:
+    #: applied to the neutral 1.0 placeholder it manufactured a confident 0.5 for
+    #: every symbol the broker had never rated, which is every first-time buy on
+    #: TastyTrade. A rate is a broker fact or it is 1.0 -- see ``_row_margin_rate``.
+    margin_multiplier: float = 1.0
     #: What this plan's own SELLS free, summed from ``AllocationRow.bp_released``.
     #: Added to ``available_buying_power`` to make the budget the buys are sized
     #: against. Recomputed by ``filter_plan_rows``, so un-ticking the sell that
@@ -2262,6 +2285,7 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                           available_buying_power=float(available_buying_power),
                           allow_fractional=bool(allow_fractional),
                           valuation_mode=valuation_mode,
+                          margin_multiplier=float(default_bp_factor or 1.0),
                           labels=list(labels or []))
     # THE SINGLE SCALING POINT. The reserve is applied ONCE, here, to produce the
     # money the labels divide; every target below is a share of ``investable``
@@ -2309,7 +2333,7 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         ps = current.get(symbol)
         m = margin.get(symbol)
         row = AllocationRow(symbol=symbol, labels=list(sym_labels[symbol]))
-        row.bp_factor = float(m.bp_factor) if m is not None else float(default_bp_factor)
+        row.bp_factor = float(m.bp_factor) if m is not None else NEUTRAL_BP_FACTOR
         _carry_margin_facts(row, m)
         row.current_quantity = float(ps.quantity) if ps is not None else 0.0
         row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
@@ -2553,7 +2577,7 @@ def compute_label_investment(label: LabelTarget, amount: float,
         ps = current.get(symbol)
         m = margin.get(symbol)
         row = AllocationRow(symbol=symbol, labels=[label.label])
-        row.bp_factor = float(m.bp_factor) if m is not None else float(default_bp_factor)
+        row.bp_factor = float(m.bp_factor) if m is not None else NEUTRAL_BP_FACTOR
         _carry_margin_facts(row, m)
         row.current_quantity = float(ps.quantity) if ps is not None else 0.0
         row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
@@ -2703,6 +2727,28 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
             # -- but the source was left saying "default", so every TastyTrade dry run
             # reported a genuinely measured buying-power cost as unknown (2026-09-05).
             row.margin_source = MARGIN_SOURCE_PRECHECK
+            # THE CAPITAL REQUIREMENT, MEASURED. ``OrderImpact.margin_requirement``
+            # is the broker's own isolated margin requirement for exactly this
+            # order (TastyTrade's ``isolated_order_margin_requirement``), i.e. the
+            # dollars the resulting holding ties up -- the precise number
+            # ``capital_required`` otherwise has to assume. It was collected by the
+            # adapter and then dropped on the floor here until 2026-09-07, so a
+            # first-time buy showed an assumed full-value requirement even on a run
+            # where the broker had just priced it.
+            #
+            # Stored as a RATE, not as the dollar figure, because the row is still
+            # subject to ``_apply_bp_scaling`` below and to later re-sizing: a rate
+            # survives a quantity change, a total does not. The impact was priced
+            # on the pre-scaling quantity, which is what ``estimated_value`` still
+            # holds at this point.
+            #
+            # A non-positive or absent requirement is NOT a measurement of zero:
+            # it leaves the rate None so the row keeps saying "assumed".
+            requirement = getattr(impact, "margin_requirement", None)
+            if requirement is not None and row.estimated_value > MONEY_EPSILON:
+                measured = abs(float(requirement)) / row.estimated_value
+                if measured > 0.0:
+                    row.initial_margin_rate = min(1.0, measured)
             if abs(impact.bp_cost - row.bp_cost) > 0.005:
                 out.warnings.append(WARNING_PRECHECK_DISAGREED_FMT.format(symbol=row.symbol))
                 row.bp_cost = impact.bp_cost
@@ -3189,6 +3235,40 @@ def validate_plan_budget(plan: "AllocationPlan") -> Optional[str]:
     return REFUSAL_OVER_BUDGET_FMT.format(required=required, budget=budget)
 
 
+def _row_margin_rate(row: "AllocationRow", plan: "AllocationPlan") -> float:
+    """The INITIAL MARGIN RATE behind a row's CAPITAL REQUIREMENT. Pure.
+
+    MEASURED, OR 1.0 -- there is no third answer. A rate is a broker fact: it
+    arrives on the ``MarginInfo`` of a symbol the account holds, out of this
+    account's own measured-rate cache, or from the order precheck's isolated
+    margin requirement. When none of those spoke, the requirement is the FULL
+    projected market value. Assuming anything cheaper is inventing leverage the
+    broker never granted, which is the one direction that under-states what a
+    position costs to hold.
+
+    IT USED TO BE DERIVED as ``bp_factor / margin_multiplier``, and that is what
+    made every unrated symbol print a 0.5 rate: the neutral factor is 1.0 and the
+    multiplier is 2.0 on a margin account, so the arithmetic manufactured an
+    ordinary-marginable rate for symbols nobody had rated. The derivation is
+    correct algebra (``bp_factor = rate x multiplier``) applied to a factor that
+    was itself a placeholder, so it turned "unknown" into a confident 50%.
+    ``plan`` is kept in the signature because the capital requirement is a
+    property of the row IN a plan and callers read better for it, not because a
+    plan-level number is allowed back into this answer.
+
+    Clamped to (0, 1]: a rate above 1 would claim a position ties up more capital
+    than it is worth, and a non-positive one is not a rate at all -- both fall
+    back to the full requirement rather than to a quieter wrong number.
+    """
+    rate = row.initial_margin_rate
+    if rate is None:
+        return 1.0
+    rate = float(rate)
+    if rate <= 0.0:
+        return 1.0
+    return min(1.0, rate)
+
+
 def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
     """One display dict per row the user must look at, in plan order.
 
@@ -3302,6 +3382,29 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
             # Already reflects whole-share rounding, the bump and the redistribution:
             # what is displayed is what will be owned.
             "projected_notional": None if projected is None else round(projected, 2),
+            # CAPITAL REQUIRED BY THE RESULTING HOLDING -- a LEVEL, not the trade's
+            # delta. ``projected market value x initial margin rate``: what the
+            # position ties up once this row executes.
+            #
+            # Distinct from ``bp_effect`` beside it, which is what the ORDER consumes
+            # or releases. Both are useful and they answer different questions -- "how
+            # much capital does this position cost me to hold" vs "what does this
+            # trade do to my buying power right now" -- and the two were conflated
+            # under one heading until 2026-09-07.
+            #
+            # The rate is read off ``initial_margin_rate`` and nowhere else: an
+            # unrated symbol requires its FULL projected value, because the only
+            # honest default is no leverage. See ``_row_margin_rate``.
+            "capital_required": (round(projected * _row_margin_rate(row, plan), 2)
+                                 if projected is not None else None),
+            # IS THAT RATE MEASURED, OR ASSUMED? Keyed on the RATE, not on
+            # ``margin_source``: the precheck sets the source to "precheck" for
+            # every accepted buy, including one whose impact carried no isolated
+            # margin requirement, so a source-keyed flag called those measured.
+            # An assumed row is showing 1.0 -- the conservative end, not a
+            # fabricated discount -- and the UI still marks it, because a capital
+            # requirement printed to the cent reads as a measurement either way.
+            "capital_required_estimated": row.initial_margin_rate is None,
             # The SAME projection measured both ways, so cost and value sit side by
             # side instead of the table silently showing whichever one the global
             # toggle happens to select. Equal to each other in an INVEST_LABEL run,
@@ -3328,6 +3431,16 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
             "weight_pct": round(row.target_notional / base * 100.0, 3) if base > 0 else 0.0,
             "projected_weight_pct": (round(projected / base * 100.0, 3)
                                      if base > 0 and projected is not None else 0.0),
+            # WHAT THE ACCOUNT ACTUALLY HOLDS TODAY, as a share of the same base.
+            #
+            # Added 2026-09-07 because the pair above has no "now" in it: BOTH are
+            # forward-looking, so a symbol holding zero shares still showed a
+            # non-zero Weight and read as a holding it did not have. Same
+            # denominator as the other two, deliberately -- three numbers that
+            # divide different things cannot be compared by eye.
+            "current_weight_pct": (round(row.current_quantity * float(row.price or 0.0)
+                                         / base * 100.0, 3)
+                                   if base > 0 and row.price else 0.0),
             "unmet_notional": round(float(row.unmet_notional or 0.0), 2),
             "reasons": ", ".join(row.reasons),
             "fractional": _is_fractional_quantity(row.delta_quantity),

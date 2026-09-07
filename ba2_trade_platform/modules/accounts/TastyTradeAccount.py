@@ -1,3 +1,4 @@
+import json
 import asyncio
 import threading
 from typing import Any, Dict, List, Optional
@@ -22,7 +23,8 @@ from ...core.types import OrderType as CoreOrderType
 from ...core.account_types import (
     AccountSnapshot, CashTransfer, MarginInfo, MarketHours, OrderImpact,
     CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_DIVIDEND, CASH_TRANSFER_WITHDRAWAL,
-    MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION, MARKET_HOURS_SOURCE_BROKER,
+    MARGIN_SOURCE_CACHED, MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
+    MARKET_HOURS_SOURCE_BROKER,
 )
 from ...core.interfaces import AccountInterface
 
@@ -2016,6 +2018,9 @@ class TastyTradeAccount(AccountInterface):
                 f"[Account {self.id}] Margin requirement fetch failed: "
                 f"{self._describe_broker_error(e, 'the margin-requirement fetch')}")
 
+        cached_rates = self._load_margin_rate_cache()
+        learned: Dict[str, float] = {}
+
         result = {}
         for symbol in wanted:
             equity = equities.get(symbol)
@@ -2026,6 +2031,17 @@ class TastyTradeAccount(AccountInterface):
             if symbol in requirement and notional.get(symbol):
                 rate = min(1.0, requirement[symbol] / notional[symbol])
                 source = MARGIN_SOURCE_POSITION
+                learned[symbol] = rate
+            elif symbol in cached_rates:
+                # MEASURED EARLIER, on a day this symbol was held or the broker
+                # answered. TastyTrade publishes a per-symbol requirement only for a
+                # symbol the account HOLDS, so a first-time buy is unmeasurable BY
+                # DEFINITION -- and out of hours even the order preview refuses
+                # ("Opening market orders not allowed when market closed"), which is
+                # when a dry run needs the number most. A rate this account has seen
+                # for this very symbol beats assuming one.
+                rate = float(cached_rates[symbol])
+                source = MARGIN_SOURCE_CACHED
             # TRI-STATE. `is_fractional_quantity_eligible` is `bool | None`
             # (instruments.py:262) and `MarginInfo.fractionable` is Optional[bool] for
             # exactly that reason: None is NOT False. Never coerce, and never report
@@ -2064,7 +2080,24 @@ class TastyTradeAccount(AccountInterface):
                 increment = 1.0
             result[symbol] = MarginInfo(
                 symbol=symbol,
-                bp_factor=(rate * multiplier) if rate is not None else multiplier,
+                # NEUTRAL, not penalised, when nothing is known.
+                #
+                # This used to emit ``multiplier`` (2.0 on a margin account), which by
+                # the engine's own table means "non-marginable" -- a buying-power
+                # PENALTY of double the notional. Every symbol the account does not
+                # already hold got it, so a first-time buy of an ordinary ETF was
+                # charged twice its cost and the whole plan scaled down to fit. On the
+                # live account the two measurable symbols (GRID, URA) both came back at
+                # 0.5 x 2 = 1.0, so 2.0 was contradicted by every observation we had.
+                #
+                # 1.0 is the neutral point on every account shape -- an ordinary
+                # marginable stock at Reg-T (0.5 x 2) and a cash account (1.0 x 1) both
+                # land there -- and it keeps the invariant that a buy never consumes
+                # MORE buying power than its notional. A genuinely non-marginable name
+                # still reports whatever the broker measures once it is held or
+                # prechecked; what is gone is inventing the penalty for a symbol nobody
+                # has measured.
+                bp_factor=(rate * multiplier) if rate is not None else 1.0,
                 # TastyTrade publishes no PER-SYMBOL marginability flag, so this
                 # reports whether the ACCOUNT is a margin account.
                 marginable=is_margin,
@@ -2093,7 +2126,66 @@ class TastyTradeAccount(AccountInterface):
                 maintenance_margin_rate=None,
                 source=source,
             )
+        self._store_margin_rate_cache(learned)
         return result
+
+    #: Where the measured per-symbol initial-margin rates live between runs. An
+    #: account SETTING rather than a new table: it is a handful of floats, it is
+    #: per-account by construction, and it needs no migration to exist.
+    MARGIN_RATE_CACHE_SETTING = "_margin_rate_cache"
+
+    def _load_margin_rate_cache(self) -> Dict[str, float]:
+        """Per-symbol initial-margin rates this account has MEASURED before.
+
+        Read defensively: a corrupt or hand-edited value must degrade to "no cache"
+        rather than take the account's sizing down with it.
+        """
+        try:
+            raw = self.settings.get(self.MARGIN_RATE_CACHE_SETTING)
+            if isinstance(raw, str):
+                raw = json.loads(raw)
+            if not isinstance(raw, dict):
+                return {}
+            out = {}
+            for symbol, value in raw.items():
+                try:
+                    rate = float(value)
+                except (TypeError, ValueError):
+                    continue
+                # A rate outside (0, 1] is not a margin rate. Dropping it is safer than
+                # sizing on it, and it cannot be repaired from here.
+                if 0.0 < rate <= 1.0:
+                    out[str(symbol).strip().upper()] = rate
+            return out
+        except Exception as e:  # noqa: BLE001 - a cache must never break the fetch
+            logger.warning(f"[Account {self.id}] margin-rate cache unreadable ({e}); "
+                           f"continuing without it")
+            return {}
+
+    def _store_margin_rate_cache(self, learned: Dict[str, float]) -> None:
+        """Merge newly MEASURED rates into the cache. Only writes when something changed.
+
+        Measured rates only -- never a fallback or a cached value read back, or the
+        cache would slowly fill with its own assumptions and look like evidence.
+        """
+        if not learned:
+            return
+        try:
+            current = self._load_margin_rate_cache()
+            merged = dict(current)
+            changed = False
+            for symbol, rate in learned.items():
+                symbol = symbol.strip().upper()
+                if abs(current.get(symbol, -1.0) - float(rate)) > 1e-6:
+                    merged[symbol] = float(rate)
+                    changed = True
+            if not changed:
+                return
+            self.save_settings({self.MARGIN_RATE_CACHE_SETTING: (json.dumps(merged), "str")})
+            logger.info(f"[Account {self.id}] margin-rate cache updated for "
+                        f"{len(learned)} symbol(s); {len(merged)} cached in total")
+        except Exception as e:  # noqa: BLE001 - never fail a fetch over a cache write
+            logger.warning(f"[Account {self.id}] could not persist the margin-rate cache: {e}")
 
     # ------------------------------------------------------------------
     # Market hours

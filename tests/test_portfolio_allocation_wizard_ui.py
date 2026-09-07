@@ -2639,8 +2639,10 @@ def test_the_numeric_columns_are_RIGHT_ALIGNED_in_the_header_AND_the_cells(
     headers = {el.text: _classes(el) for el in head.descendants()
                if getattr(el, 'text', None)}
 
-    for numeric in ('Held', 'Cost', 'Value', 'Qty', 'Est. value', 'Target',
-                    'BP effect', 'BP %'):
+    # 'Order value' / 'Target value' since 2026-09-07: both are money and sat side
+    # by side as 'Est. value' and 'Target', which was read as a price more than once.
+    for numeric in ('Held', 'Cost', 'Value', 'Qty', 'Order value', 'Target value',
+                    'Cap req', 'BP effect', 'BP %'):
         assert 'text-right' in headers[numeric], numeric
     # 'Sizing' and 'Outcome' were folded into 'Order' and 'Reasons' (2026-09-05).
     for textual in ('Symbol', 'Side', 'Order', 'Reasons'):
@@ -2658,10 +2660,15 @@ def test_the_header_and_the_cells_cannot_DRIFT_out_of_step():
     wiz = _wiz()
     names = [name for name, _h, _w, _n in wiz.DRY_RUN_COLUMNS]
 
-    # 16 since 2026-09-05: Order and Sizing collapsed into one column (they said
-    # the same word on every trading row) and Outcome was removed, its abnormal
-    # values moving into Reasons in red.
-    assert len(names) == len(set(names)) == 16
+    # 17 since 2026-09-07: 'Cap req' was added beside 'BP effect'. They had been one
+    # column holding the trade's buying-power delta; the capital a POSITION ties up
+    # (projected value x margin rate) is a different number answering a different
+    # question, and one heading could not honestly carry both.
+    #
+    # 16 before that, since 2026-09-05: Order and Sizing collapsed into one column
+    # (they said the same word on every trading row) and Outcome was removed, its
+    # abnormal values moving into Reasons in red.
+    assert len(names) == len(set(names)) == 17
     with pytest.raises(KeyError):
         wiz._col('a-column-the-header-does-not-declare')
 

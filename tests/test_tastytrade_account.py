@@ -1,3 +1,4 @@
+import json
 """Unit tests for TastyTradeAccount against a MOCKED tastytrade SDK (12.0.2).
 
 There is no TastyTrade account in the live database, so nothing here talks to a
@@ -25,7 +26,8 @@ import threading
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, PropertyMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -2709,9 +2711,24 @@ def test_symbol_margin_info_takes_the_magnitude_of_a_debit_signed_requirement():
     assert info["AAPL"].source == MARGIN_SOURCE_POSITION
 
 
-def test_symbol_margin_info_falls_back_to_the_account_multiplier_when_unheld():
-    """Unheld symbols get bp_factor == the account multiplier -- exactly the caller's
-    own conservative fallback, so nothing is over-committed."""
+def test_symbol_margin_info_is_NEUTRAL_not_penalised_when_unheld():
+    """An unmeasurable symbol gets bp_factor 1.0 -- neutral -- not the multiplier.
+
+    CHANGED 2026-09-07. This used to assert 2.0 (``= the account multiplier``) and call
+    it "conservative". By the engine's own table 2.0 means NON-MARGINABLE: a
+    buying-power PENALTY of double the notional, and above 1.0 is explicitly documented
+    as the penalised side. TastyTrade publishes a per-symbol requirement only for a
+    symbol the account HOLDS, so every FIRST-TIME BUY was unmeasurable by definition and
+    every one of them was charged twice its cost -- which then scaled the whole plan down
+    to fit (observed live: ``scaled x0.66``, IBB asked 1.80% of the base and got 1.19%).
+
+    It was also contradicted by the only evidence available: on the live account the two
+    held symbols came back at 0.5 x 2 = 1.0. Assuming the penalty for everything else was
+    not conservative, it was wrong in a direction that quietly under-deploys.
+
+    1.0 is the neutral point on every account shape -- ordinary marginable at Reg-T
+    (0.5 x 2) and a cash account (1.0 x 1) both land there -- and it holds the invariant
+    that a buy never consumes MORE buying power than its notional."""
     from ba2_trade_platform.core.account_types import MARGIN_SOURCE_DEFAULT
 
     acct = _bare_account()
@@ -2723,7 +2740,7 @@ def test_symbol_margin_info_falls_back_to_the_account_multiplier_when_unheld():
     with equity_patch, precision_patch:
         info = acct.get_symbol_margin_info(["MSFT"])
 
-    assert info["MSFT"].bp_factor == 2.0
+    assert info["MSFT"].bp_factor == 1.0
     assert info["MSFT"].initial_margin_rate is None
     assert info["MSFT"].source == MARGIN_SOURCE_DEFAULT
 
@@ -2866,7 +2883,9 @@ def test_symbol_margin_info_still_answers_for_a_genuinely_flat_account():
         info = acct.get_symbol_margin_info(["AAPL"])
 
     assert info["AAPL"].source == MARGIN_SOURCE_DEFAULT
-    assert info["AAPL"].bp_factor == 2.0
+    # NEUTRAL, not the multiplier -- see
+    # test_symbol_margin_info_is_NEUTRAL_not_penalised_when_unheld for why 2.0 was wrong.
+    assert info["AAPL"].bp_factor == 1.0
 
 
 def test_symbol_margin_info_reports_unknown_when_the_precision_table_is_unavailable():
@@ -4306,3 +4325,109 @@ def test_no_tastytrade_order_is_ever_priced_by_dollar_value():
 
     assert "value_effect" not in source
     assert "NOTIONAL_MARKET" not in source
+
+
+# ---------------------------------------------------------------------------
+# The per-symbol margin-rate CACHE. TastyTrade publishes a requirement only for a
+# symbol the account HOLDS, and out of hours even the order preview refuses
+# ("Opening market orders not allowed when market closed") -- which is exactly when
+# a dry run needs the number. A rate this account measured earlier for this very
+# symbol beats assuming one.
+# ---------------------------------------------------------------------------
+
+@contextmanager
+def _margin_cache(acct, stored=None):
+    """Patch the account's read-only ``settings`` property and capture saved settings.
+
+    ``settings`` is a property with no setter (it reads the DB through
+    ExtendableSettingsInterface), so a test cannot assign to it; patching the property
+    on the CLASS is what lets these exercise the real loader and the real writer rather
+    than stubbing them out and testing nothing.
+    """
+    saved = {}
+    payload = {} if stored is None else {acct.MARGIN_RATE_CACHE_SETTING: stored}
+    with patch.object(type(acct), 'settings', new_callable=PropertyMock,
+                      return_value=payload),          patch.object(type(acct), 'save_settings',
+                      side_effect=lambda p: saved.update(p)):
+        yield saved
+
+
+def test_a_measured_rate_is_remembered_for_next_time():
+    """Holding it once is what makes it measurable; the cache is what makes that
+    measurement outlive the position."""
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL")],
+        # 10 shares marked at 155 = 1550 notional; 775 required = a 0.5 rate.
+        report=_margin_report(_margin_entry("AAPL", "775")),
+        precisions=[_precision(value=5)],
+        positions=[_tt_position(symbol="AAPL", quantity="10", mark_price="155")])
+
+    with _margin_cache(acct) as saved, equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    from ba2_trade_platform.core.account_types import MARGIN_SOURCE_POSITION
+
+    assert info["AAPL"].source == MARGIN_SOURCE_POSITION
+    assert acct.MARGIN_RATE_CACHE_SETTING in saved, "the measured rate must be persisted"
+    stored = json.loads(saved[acct.MARGIN_RATE_CACHE_SETTING][0])
+    assert stored["AAPL"] == pytest.approx(0.5)
+
+
+def test_a_cached_rate_is_used_when_the_symbol_is_no_longer_measurable():
+    """THE POINT: the same symbol, now unheld (or the market closed), keeps its real
+    rate instead of dropping to the neutral assumption."""
+    from ba2_trade_platform.core.account_types import MARGIN_SOURCE_CACHED
+
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("MSFT")], report=_margin_report(),
+        precisions=[_precision()], positions=[])
+
+    with _margin_cache(acct, json.dumps({"MSFT": 0.30})), equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["MSFT"])
+
+    assert info["MSFT"].source == MARGIN_SOURCE_CACHED
+    assert info["MSFT"].initial_margin_rate == pytest.approx(0.30)
+    assert info["MSFT"].bp_factor == pytest.approx(0.60)   # 0.30 x 2
+
+
+def test_a_live_measurement_beats_the_cache():
+    """The cache is a fallback, never an override: a rate measurable NOW wins."""
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL")],
+        report=_margin_report(_margin_entry("AAPL", "775")),
+        precisions=[_precision(value=5)],
+        positions=[_tt_position(symbol="AAPL", quantity="10", mark_price="155")])
+
+    with _margin_cache(acct, json.dumps({"AAPL": 0.99})), equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    from ba2_trade_platform.core.account_types import MARGIN_SOURCE_POSITION
+
+    assert info["AAPL"].source == MARGIN_SOURCE_POSITION
+    assert info["AAPL"].initial_margin_rate == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("bad", ['not json', '[]', '{"MSFT": "x"}', '{"MSFT": 0}',
+                                 '{"MSFT": 1.5}', '{"MSFT": -0.2}'])
+def test_an_unusable_cache_degrades_to_no_cache(bad):
+    """A corrupt or out-of-range cache must never take the account's sizing with it.
+    A rate outside (0, 1] is not a margin rate; dropping it beats sizing on it."""
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("MSFT")], report=_margin_report(),
+        precisions=[_precision()], positions=[])
+
+    with _margin_cache(acct, bad), equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["MSFT"])
+
+    from ba2_trade_platform.core.account_types import MARGIN_SOURCE_DEFAULT
+
+    assert info["MSFT"].source == MARGIN_SOURCE_DEFAULT
+    assert info["MSFT"].bp_factor == 1.0

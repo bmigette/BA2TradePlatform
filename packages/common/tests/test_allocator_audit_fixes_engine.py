@@ -190,3 +190,213 @@ class TestThePrecheckedCostSurvivesRounding:
         assert committed <= 200 + pa.MONEY_EPSILON, (
             "either the orders fit the $200 that was available, or they were dropped -- "
             "what must not happen is reporting a fit that the broker priced at $400")
+
+
+class TestTheWeightColumnHasANowInIt:
+    """``current_weight_pct``, added 2026-09-07.
+
+    The dry-run's Weight column showed ``weight_pct -> projected_weight_pct``: the
+    share ASKED for, and the share the plan will ACHIEVE. Both are forward-looking, so
+    a symbol the account holds NOTHING of still opened with a non-zero weight and read
+    as a position it did not have -- which is exactly how it was reported.
+
+    All three divide the same ``base_notional`` on purpose: three percentages with
+    different denominators cannot be compared by eye, which is the whole reason the
+    column exists.
+    """
+
+    def _rows(self):
+        current = {"HELD": PositionState("HELD", quantity=10, cost_basis=800, price=100),
+                   "NEW": PositionState("NEW", price=100)}
+        # HELD is deliberately OFF target (holds 1000, asked 500) -- dry_run_rows
+        # excludes a row already at its target, so an on-target fixture would have
+        # nothing to assert about.
+        plan = _solve(2000, 2000, _labels(("HELD", 25), ("NEW", 75)), current, {})
+        return {r["symbol"]: r for r in pa.dry_run_rows(plan)}
+
+    def test_an_unheld_symbol_reports_zero_percent_NOW(self):
+        """THE DEFECT: this was silently the TARGET share, so it was never 0."""
+        assert self._rows()["NEW"]["current_weight_pct"] == 0.0
+
+    def test_a_held_symbol_reports_what_it_actually_holds(self):
+        """10 shares at 100 = 1000 of a 2000 base = 50%."""
+        assert self._rows()["HELD"]["current_weight_pct"] == pytest.approx(50.0, abs=0.01)
+
+    def test_the_asked_share_is_still_there_and_unchanged(self):
+        """The pair is now NOW -> ASKED; the ask itself must not have moved."""
+        rows = self._rows()
+        assert rows["NEW"]["weight_pct"] > 0
+        assert "projected_weight_pct" in rows["NEW"], "the achieved share moved to the tooltip, not away"
+
+    def test_all_three_shares_divide_the_same_base(self):
+        rows = self._rows()["HELD"]
+        for key in ("current_weight_pct", "weight_pct", "projected_weight_pct"):
+            assert 0.0 <= rows[key] <= 100.0
+
+
+class TestCapitalRequiredIsALevelNotADelta:
+    """``capital_required``, added 2026-09-07.
+
+    The dry run had one buying-power column and it held the TRADE's effect
+    (``order value x factor``). Renaming it "Cap req" made the name wrong: the
+    capital a position ties up is ``projected market value x initial margin rate``,
+    which is a LEVEL and answers a different question. Both now exist.
+    """
+
+    def _plan(self, factor, multiplier=2.0, rate=None):
+        margin = {"AAA": MarginInfo(symbol="AAA", bp_factor=factor, fractionable=False,
+                                    initial_margin_rate=rate)}
+        current = {"AAA": PositionState("AAA", price=100)}
+        return pa.compute_allocation(
+            1000, 10_000, _labels(("AAA", 100)), current, margin,
+            allow_fractional=False, default_bp_factor=multiplier,
+            valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    def _row(self, **kw):
+        return {r["symbol"]: r for r in pa.dry_run_rows(self._plan(**kw))}["AAA"]
+
+    def test_a_marginable_holding_ties_up_its_MEASURED_share_of_its_value(self):
+        """A rate the broker published is the rate that is used -- 10 shares at 100
+        projected = 1000 of stock holding 500 of capital at a measured 0.5."""
+        row = self._row(factor=1.0, rate=0.5)
+        assert row["projected_notional"] == pytest.approx(1000.0)
+        assert row["capital_required"] == pytest.approx(500.0)
+
+    def test_an_unrated_holding_ties_up_the_WHOLE_value(self):
+        """No rate, no leverage. The factor is NOT divided by the account multiplier
+        to manufacture one: that is what printed a confident 0.5 on symbols nobody
+        had rated."""
+        row = self._row(factor=1.0)
+        assert row["capital_required"] == pytest.approx(row["projected_notional"])
+
+    def test_a_cash_account_ties_up_the_whole_value(self):
+        """No leverage anywhere: nothing about multiplier 1 can discount this."""
+        row = self._row(factor=1.0, multiplier=1.0)
+        assert row["capital_required"] == pytest.approx(row["projected_notional"])
+
+    def test_cap_req_is_a_LEVEL_and_bp_effect_is_the_DELTA(self):
+        """The distinction the split exists for: they are different numbers on the
+        same row, and only one of them is about the order."""
+        row = self._row(factor=1.0, rate=0.5)
+        assert row["capital_required"] == pytest.approx(500.0)     # holding the position
+        assert row["bp_effect"] == pytest.approx(-1000.0)          # placing the order
+
+    def test_the_rate_is_clamped_to_a_rate(self):
+        """A rate over 1.0 would claim a position ties up more capital than it is
+        worth."""
+        row = self._row(factor=4.0, rate=2.0)
+        assert row["capital_required"] <= row["projected_notional"] + 0.01
+
+    def test_a_nonsense_rate_falls_back_to_the_full_value(self):
+        """Zero is not a measurement of "free"; it is an unusable rate."""
+        row = self._row(factor=1.0, rate=0.0)
+        assert row["capital_required"] == pytest.approx(row["projected_notional"])
+
+
+class TestAnAssumedCapitalRequirementSaysSo:
+    """``capital_required_estimated``.
+
+    A symbol nobody has rated used to get the neutral factor divided by the account
+    multiplier, which on a 2:1 account manufactured a 0.5 rate out of a placeholder --
+    it ASSUMED the symbol was ordinary marginable, and printed the result to the cent
+    so it read as a measurement. Reported by the operator: "seems capreq assumes a
+    default lever of 2 even if it is unknown", then settled: "we need to assume a 1x by
+    default nothing else".
+
+    So the assumption is now NO LEVERAGE, and it is still flagged: 1x is the
+    conservative end rather than a fabricated discount, but it is an assumption either
+    way and a dry run must not present one as a broker fact.
+    """
+
+    def _row(self, margin):
+        current = {"AAA": PositionState("AAA", price=100)}
+        plan = pa.compute_allocation(
+            1000, 10_000, _labels(("AAA", 100)), current, margin,
+            allow_fractional=False, default_bp_factor=2.0,
+            valuation_mode=pa.VALUATION_MODE_MARKET)
+        return {r["symbol"]: r for r in pa.dry_run_rows(plan)}["AAA"]
+
+    def test_an_unrated_symbol_is_flagged_as_an_estimate(self):
+        row = self._row({})
+        assert row["capital_required_estimated"] is True
+        # Still computed -- a blank column would be less useful, not more honest --
+        # and computed at 1x, the only assumption that cannot understate the cost.
+        assert row["capital_required"] == pytest.approx(row["projected_notional"])
+
+    def test_a_broker_measured_symbol_is_NOT_flagged(self):
+        """The inverse: a real rate must not be dressed up as a guess either."""
+        from ba2_common.core.account_types import MARGIN_SOURCE_POSITION
+
+        margin = {"AAA": MarginInfo(symbol="AAA", bp_factor=1.0718, fractionable=False,
+                                    initial_margin_rate=0.5359,
+                                    source=MARGIN_SOURCE_POSITION)}
+        row = self._row(margin)
+        assert row["capital_required_estimated"] is False
+        assert row["capital_required"] == pytest.approx(1000.0 * 0.5359, abs=0.5)
+
+
+class TestThePrecheckMeasuresTheCapitalRequirement:
+    """The way an unrated symbol STOPS being unrated, added 2026-09-07.
+
+    TastyTrade publishes a per-symbol margin rate only for a symbol the account
+    already holds, so a first-time buy has none and its capital requirement is the
+    conservative 1x assumption. But the order precheck -- the same dry run the
+    wizard already runs on every solve -- returns
+    ``isolated_order_margin_requirement`` for exactly that order: the broker
+    pricing the holding it does not yet rate. The adapter collected it and
+    ``apply_order_impacts`` dropped it, so a market-hours dry run showed an assumed
+    requirement on a row the broker had just measured.
+
+    Operator: "we should be able to test during market open time the missing capreq
+    when clicking dry run button from portfolio page". Market hours is the
+    precondition -- TastyTrade will not price an order out of session -- so this is
+    the mechanism that has to be in place for that test to mean anything.
+    """
+
+    def _plan(self):
+        margin = {"AAA": MarginInfo(symbol="AAA", bp_factor=1.0, fractionable=False)}
+        current = {"AAA": PositionState("AAA", price=100)}
+        return pa.compute_allocation(
+            1000, 10_000, _labels(("AAA", 100)), current, margin,
+            allow_fractional=False, default_bp_factor=2.0,
+            valuation_mode=pa.VALUATION_MODE_MARKET), margin
+
+    def _checked(self, **impact_kw):
+        plan, margin = self._plan()
+        impact = OrderImpact("AAA", change_in_buying_power=-1000.0, **impact_kw)
+        return pa.apply_order_impacts(plan, {"AAA": impact},
+                                      available_buying_power=10_000, margin=margin)
+
+    def _row(self, **impact_kw):
+        return {r["symbol"]: r
+                for r in pa.dry_run_rows(self._checked(**impact_kw))}["AAA"]
+
+    def test_the_brokers_isolated_requirement_becomes_the_capital_required(self):
+        """10 shares at 100 = 1000 of stock the broker says needs 530 of capital."""
+        row = self._row(margin_requirement=530.0)
+        assert row["capital_required"] == pytest.approx(530.0)
+        assert row["capital_required_estimated"] is False
+
+    def test_without_it_the_row_still_says_ASSUMED(self):
+        """THE INVERSE, and the reason the flag is keyed on the rate rather than on
+        margin_source: the precheck marks EVERY accepted buy as prechecked, so a
+        source-keyed flag called an impact carrying no requirement a measurement."""
+        row = self._row()
+        assert row["capital_required_estimated"] is True
+        assert row["capital_required"] == pytest.approx(row["projected_notional"])
+
+    def test_a_zero_requirement_is_not_a_measurement_of_free(self):
+        row = self._row(margin_requirement=0.0)
+        assert row["capital_required_estimated"] is True
+
+    def test_it_is_stored_as_a_RATE_so_it_survives_a_resize(self):
+        """The impact prices the pre-scaling quantity. A dollar figure would be wrong
+        the moment ``_apply_bp_scaling`` cut the row back; a rate stays right."""
+        checked = self._checked(margin_requirement=530.0)
+        row = checked.rows[0]
+        assert row.initial_margin_rate == pytest.approx(0.53)
+        assert row.margin_source == pa.MARGIN_SOURCE_PRECHECK
+
+    def test_the_requirement_cannot_exceed_the_value_it_prices(self):
+        row = self._row(margin_requirement=99_999.0)
+        assert row["capital_required"] <= row["projected_notional"] + 0.01

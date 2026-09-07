@@ -119,14 +119,28 @@ def test_labels_totalling_ninety_percent_leave_ten_percent_undeployed():
     assert plan.total_buy_value == 9_000.0
 
 
-def test_unknown_margin_uses_default_bp_factor():
+def test_unknown_margin_is_NEUTRAL_not_the_account_multiplier():
+    """An unmeasured symbol gets bp_factor 1.0, and the account multiplier is kept
+    only to recover a RATE from a factor.
+
+    CHANGED 2026-09-07. This asserted 2.0 -- the multiplier -- which by this module's
+    own table means NON-MARGINABLE: a buying-power penalty of double the notional,
+    applied to every symbol nobody had measured. Live that was every symbol not
+    already held, so every first-time buy, and the plan then scaled itself down to
+    fit a budget twice its real size (observed: ``scaled x0.66``, orders landing at
+    two-thirds of their target value).
+
+    1.0 is neutral on every account shape and holds the invariant that a buy never
+    consumes MORE buying power than its notional."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                  {"AAA": _pos("AAA", 100.0)}, {},
                                  allow_fractional=False, default_bp_factor=2.0,
                                  valuation_mode=pa.VALUATION_MODE_MARKET)
-    assert plan.rows[0].bp_factor == 2.0
-    assert plan.rows[0].bp_cost == 20_000.0
+    assert plan.rows[0].bp_factor == pa.NEUTRAL_BP_FACTOR == 1.0
+    assert plan.rows[0].bp_cost == 10_000.0
+    # The multiplier is still carried -- it is what turns a factor back into a rate.
+    assert plan.margin_multiplier == 2.0
 
 
 def test_held_symbol_with_no_managed_label_is_absent_from_the_plan():

@@ -32,7 +32,8 @@ CASH_TRANSFER_DIVIDEND = "DIVIDEND"
 MARGIN_SOURCE_PRECHECK = "precheck"    # broker order dry-run (preview_order_impact)
 MARGIN_SOURCE_ASSET = "asset"          # per-asset metadata (Alpaca Asset + multiplier)
 MARGIN_SOURCE_POSITION = "position"    # derived from a held position's requirement
-MARGIN_SOURCE_DEFAULT = "default"      # conservative fallback = account multiplier
+MARGIN_SOURCE_CACHED = "cached"        # a rate this account MEASURED earlier for this symbol
+MARGIN_SOURCE_DEFAULT = "default"      # fallback: assume an ordinary marginable stock (1.0)
 
 # Provenance of a MarketHours answer. PLAIN str (same reasoning as the
 # CASH_TRANSFER_* constants); always use the constant, never a bare literal.

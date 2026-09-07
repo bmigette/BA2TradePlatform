@@ -237,6 +237,17 @@ BP_OVER_BUDGET_NOTE = (
 
 #: Marker on the dry-run table's ``BP effect`` cell.
 MARKER_BP_EFFECT = 'dry-run-bp-effect'
+MARKER_CAPITAL_REQUIRED = 'dry-run-capital-required'
+
+CAP_REQ_TOOLTIP_MEASURED = (
+    "Capital this holding ties up: projected market value x the broker's own initial "
+    "margin rate for this symbol.")
+CAP_REQ_TOOLTIP_ESTIMATED = (
+    "ASSUMED, at NO LEVERAGE: the full projected value. The broker has published no "
+    "margin rate for this symbol -- it only rates one the account already HOLDS, and "
+    "out of hours it will not price an order either. Run this dry run while the market "
+    "is OPEN and the order precheck fills in the real rate, which is lower for an "
+    "ordinary marginable stock.")
 
 #: The ``BP effect`` cell's tooltips. SIGNED is the whole point of the column:
 #: negative is buying power consumed, positive is buying power handed back. The
@@ -535,13 +546,19 @@ DRY_RUN_COLUMNS = (
     # gone: an abnormal sizing outcome is a REASON, and now appears in that column
     # in red beside the reason it caused (2026-09-05).
     ('order', 'Order', 'w-32', False),
-    ('estimated_value', 'Est. value', 'w-24', True),
-    ('target', 'Target', 'w-24', True),
+    # ORDER VALUE, not "Est. value": it is the notional this row TRADES. It was
+    # read as the symbol's price more than once, and it sits next to a TARGET that
+    # is also money, so both now say which money they are.
+    ('estimated_value', 'Order value', 'w-24', True),
+    ('target', 'Target value', 'w-24', True),
     ('projected', 'Projected ({mode})', 'w-32', True),
     ('weight', 'Weight', 'w-32', False),
-    # SIGNED, and no longer called a cost: a sale FREES buying power, and a sell
-    # row reading "BP cost 0.00" said the opposite -- that a sale does nothing to
-    # your buying power at all.
+    # CAPITAL REQUIRED BY THE RESULTING HOLDING: projected market value x initial
+    # margin rate. A LEVEL -- what the position ties up once this row executes.
+    ('capital_required', 'Cap req', 'w-28', True),
+    # WHAT THE TRADE DOES TO BUYING POWER, which is a different question and was
+    # briefly conflated with the one above. SIGNED, and not called a cost: a sale
+    # FREES buying power, and a sell row reading "BP cost 0.00" said the opposite.
     ('bp_effect', 'BP effect', 'w-28', True),
     ('bp_ratio', 'BP ×', 'w-20', True),
     ('bp_pct', 'BP %', 'w-16', True),
@@ -1512,7 +1529,19 @@ class AllocationWizard:
             order_kind, order_class = _order_kind(row)
             _label(order_kind, _col('order', 'text-xs ' + order_class)) \
                 .mark(MARKER_ORDER_KIND)
-            ui.label(f"{row['estimated_value']:,.2f}").classes(_col('estimated_value'))
+            # SIGNED BY DIRECTION: a buy adds that much stock, a sell removes it. The
+            # magnitude alone made a 41.85 SELL and a 41.85 BUY render identically, so
+            # the only thing distinguishing them on a money column was the Side cell
+            # three columns to the left.
+            #
+            # DISPLAY ONLY. ``estimated_value`` stays a magnitude in the row dict: the
+            # buy/sell totals below sum the two sides separately, and the BP-effect
+            # tooltip divides by it to show the ratio -- both would break on a signed
+            # value, and neither is asking "which way did this trade go".
+            _order_value = (-row['estimated_value'] if row['side'] == 'SELL'
+                            else row['estimated_value'])
+            ui.label(f"{_order_value:,.2f}").classes(
+                _col('estimated_value', 'text-green-500' if _order_value < 0 else ''))
             ui.label(f"{row['target_notional']:,.2f}").classes(_col('target'))
             projected = row['projected_notional']
             # The header names the mode this figure is in; the tooltip carries the
@@ -1526,13 +1555,38 @@ class AllocationWizard:
             if row[other] is not None:
                 with projected_label:
                     ui.tooltip(f"{other.replace('_', ' ')}: {row[other]:,.2f}")
-            # ASKED -> ACTUAL. They differ whenever the grid, a bump or the label
-            # redistribution moved this row, and hiding that would be rewriting the
-            # user's weights behind their back.
-            _label(f"{row['weight_pct']:.2f}% → {row['projected_weight_pct']:.2f}%",
-                   _col('weight', 'text-xs '
-                        + ('text-orange-400' if row['redistributed']
-                           else 'text-gray-400')))
+            # NOW -> ASKED. Reads the way a rebalance is actually thought about:
+            # where this symbol sits today, where it is going. It used to read
+            # ASKED -> PROJECTED, which had no "now" in it at all -- so a symbol
+            # holding nothing still opened with a non-zero weight and looked like a
+            # position (reported 2026-09-07).
+            #
+            # The projected share is not lost, it moves to the tooltip: it is the
+            # answer to "did the plan achieve the ask", which is a second question
+            # and not the one the column is for.
+            weight_label = _label(
+                f"{row['current_weight_pct']:.2f}% → {row['weight_pct']:.2f}%",
+                _col('weight', 'text-xs '
+                     + ('text-orange-400' if row['redistributed']
+                        else 'text-gray-400')))
+            with weight_label:
+                ui.tooltip(f"now {row['current_weight_pct']:.2f}% → asked "
+                           f"{row['weight_pct']:.2f}% → this plan achieves "
+                           f"{row['projected_weight_pct']:.2f}%")
+            capital = row['capital_required']
+            # "~" AND DIMMED when the margin rate behind it was assumed rather than
+            # measured. The number is computed to the cent either way, which is
+            # exactly why an unmeasured one needs to say so.
+            estimated = row['capital_required_estimated']
+            capital_cell = _label(
+                '-' if capital is None
+                else (f"~{capital:,.2f}" if estimated else f"{capital:,.2f}"),
+                _col('capital_required', 'text-gray-500' if estimated else '')
+            ).mark(MARKER_CAPITAL_REQUIRED)
+            if capital is not None:
+                with capital_cell:
+                    ui.tooltip(CAP_REQ_TOOLTIP_ESTIMATED if estimated
+                               else CAP_REQ_TOOLTIP_MEASURED)
             self._render_bp_effect(row)
             # Immediately beside BP effect ON PURPOSE: the x IS the explanation of
             # why that figure is not the Est. value, which is the misreading
