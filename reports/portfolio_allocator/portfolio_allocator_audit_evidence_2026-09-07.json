@@ -1,0 +1,132 @@
+{
+  "metadata": {
+    "generated_at_utc": "2026-09-07T11:35:08.883761+00:00",
+    "database": "synthetic in-memory SQLite only",
+    "broker": "FakeAccount only; deliberately accepts submitted orders",
+    "sources_sha256": {
+      "packages/common/ba2_common/core/portfolio_allocation.py": "a6840a83e27fcaad4a422f90278c46159c1603360190580ae30907aa7970f10f",
+      "packages/common/ba2_common/core/portfolio_allocation_store.py": "4e32451fa9c3353d4e832579d18f0d7b79012e44c807bff2bec64125e53ea139",
+      "ba2_trade_platform/core/portfolio_allocation_service.py": "465d4728a0b5f4799e8e979dff045bbe27cf4828fa01c498dd4e3844fe03243f",
+      "ba2_trade_platform/ui/pages/portfolio_allocation.py": "9e2c315950d800aa35b7eef226cfa235070fe2eb6c7e3fbb05256da62ddf0441",
+      "ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py": "06211e91711c5894cdab9f56ba12e8e410c09e6c169b04685cae7ef4031a4493"
+    }
+  },
+  "P1_precheck_rounding_reclaim": {
+    "available_bp": 200,
+    "reported_bp": 200.0,
+    "cost_at_prechecked_rate": 400.0,
+    "orders": [
+      {
+        "symbol": "AAA",
+        "qty": 1.0,
+        "reported_bp": 100.0,
+        "reasons": [
+          "scaled \u00d70.50 to fit buying power",
+          "restored 1 share(s) from the $200.00 the rounding left unspent"
+        ]
+      },
+      {
+        "symbol": "BBB",
+        "qty": 1.0,
+        "reported_bp": 100.0,
+        "reasons": [
+          "scaled \u00d70.50 to fit buying power",
+          "restored 1 share(s) from the $100.00 the rounding left unspent"
+        ]
+      }
+    ]
+  },
+  "design_risk_removed_funding_sell": {
+    "available_bp": 0,
+    "required_bp": 1000.0,
+    "budget_validator": "the selected orders need $1,000.00 of buying power against $0.00 available - the smallest buys will be refused as it runs out",
+    "blocked": false,
+    "orders_sent_to_fake_broker": [
+      {
+        "symbol": "BBB",
+        "quantity": 10.0,
+        "side": "BUY"
+      }
+    ]
+  },
+  "P1_reconcile_during_submission": {
+    "run_finalized_before_first_order": [
+      1
+    ],
+    "filled_buy_value": 1000.0,
+    "income_consumed": 0.0,
+    "income_still_shown_open": 1000.0,
+    "eligible_for_later_reconciliation": 0
+  },
+  "P1_stale_rebalance_two_dialogs": {
+    "reviewed_target_qty": 10,
+    "final_fake_position_qty": 20.0,
+    "initial_cash": 2000,
+    "reviewed_cash_reserve": 1000.0,
+    "cash_after_both_fills": 0.0,
+    "new_position_reads_at_submit": 0,
+    "new_snapshot_reads_at_submit": 0,
+    "run_ids": [
+      1,
+      2
+    ],
+    "orders_sent_to_fake_broker": [
+      {
+        "symbol": "BBB",
+        "quantity": 10.0,
+        "side": "BUY"
+      },
+      {
+        "symbol": "BBB",
+        "quantity": 10.0,
+        "side": "BUY"
+      }
+    ]
+  },
+  "P2_manual_expert_gate_not_rechecked": {
+    "manual_flag": false,
+    "enabled_expert_in_memory_db": true,
+    "page_gate_allows": false,
+    "submission_blocked": false,
+    "setting_reads_at_submission": 0,
+    "orders_sent_to_fake_broker": [
+      {
+        "symbol": "BBB",
+        "quantity": 10.0,
+        "side": "BUY"
+      }
+    ]
+  },
+  "P2_untracked_sell_used_as_funding": {
+    "planned_sell_release": 1000.0,
+    "actual_sell_value": 0.0,
+    "outcomes": [
+      {
+        "symbol": "AAA",
+        "action": "skip",
+        "status": "skipped",
+        "quantity": 0.0,
+        "filled_quantity": null,
+        "path": "",
+        "order_ids": [],
+        "transaction_ids": [],
+        "message": "target 0 - close position"
+      },
+      {
+        "symbol": "BBB",
+        "action": "new",
+        "status": "submitted",
+        "quantity": 10.0,
+        "filled_quantity": 10.0,
+        "path": "whole",
+        "order_ids": [
+          1
+        ],
+        "transaction_ids": [],
+        "message": ""
+      }
+    ],
+    "activity_severity": "success",
+    "remaining_fake_AAA_qty": 10
+  }
+}

@@ -13,6 +13,7 @@ IS a shim (for the pure engine).
 """
 import inspect
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import date as Date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,13 +23,14 @@ from sqlmodel import select
 from ..config import get_app_setting
 from ..logger import logger
 from .db import InstanceNotFound, add_instance, get_db, get_instance, log_activity
-from .models import Transaction, TradingOrder
+from .models import ExpertInstance, Transaction, TradingOrder
 from .portfolio_allocation import (
     ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP, ACTION_UNACTIONABLE,
     ALLOCATION_BASIS_POSITION,
     FRACTIONAL_PATH_WHOLE,
     AllocationPlan, BaseSnapshot, FilledTotals, MarginInfo, OrderFill,
     PositionFetchFailed, PositionState,
+    MONEY_EPSILON, QUANTITY_EPSILON,
     apply_order_impacts, blocking_messages, decide_symbol_action,
     held_no_price_block,
     measure_filled_values, plan_quantity_attempts, signed_position_values,
@@ -406,6 +408,16 @@ UNACTIONABLE_OPTION_HOLDING_FMT = (
     "allocation planner does not act on option transactions, so NOTHING was "
     "submitted and the position is unchanged. Unwind those transaction(s) by "
     "hand, or re-run once they are closed.")
+
+#: The same shape for a holding with NO transaction of any kind behind it -- an
+#: import/reconciliation gap rather than an option one, so the remedy differs and
+#: the sentence must too (review PA-05). Naming "no local transaction" is the
+#: whole point: it is the thing the operator has to go and fix.
+UNACTIONABLE_UNTRACKED_HOLDING_FMT = (
+    "{quantity:g} share(s) of {symbol} are held at the broker with NO local "
+    "transaction behind them, so this platform has no position to close or trim "
+    "and NOTHING was submitted. Its value was NOT counted as funding for the "
+    "buys in this run. Import or reconcile the holding, then re-run.")
 
 #: Appended to a CLOSE or ADJUST row that DID trade, when some of the symbol's
 #: open transactions were filtered out of it. Before the equity filter those
@@ -823,17 +835,33 @@ def _unactionable_row(row, state) -> RowOutcome:
     """
     ids = list(state.unactionable_transaction_ids)
     shares = abs(float(state.quantity))
-    logger.warning(
-        f"Allocation: {row.symbol} is held ({shares}) but every open transaction "
-        f"for it is one the equity planner does not act on "
-        f"(transaction {_txn_id_list(ids)}); NOTHING was submitted for this row"
-    )
+    # TWO shapes reach this outcome and they need different sentences. With ids,
+    # real transactions exist and are held back (options) -- name them, the
+    # operator unwinds those. Without any, the shares are UNTRACKED: there is
+    # nothing to name and the remedy is an import/reconcile, not an unwind.
+    # Formatting the option message with an empty id list would have printed
+    # "transaction []" and pointed the reader at nothing.
+    if ids:
+        logger.warning(
+            f"Allocation: {row.symbol} is held ({shares}) but every open transaction "
+            f"for it is one the equity planner does not act on "
+            f"(transaction {_txn_id_list(ids)}); NOTHING was submitted for this row"
+        )
+        message = UNACTIONABLE_OPTION_HOLDING_FMT.format(
+            quantity=shares, symbol=row.symbol, ids=_txn_id_list(ids))
+    else:
+        logger.warning(
+            f"Allocation: {row.symbol} is held ({shares}) at the broker with no local "
+            f"transaction behind it; NOTHING was submitted for this row and its value "
+            f"funded nothing"
+        )
+        message = UNACTIONABLE_UNTRACKED_HOLDING_FMT.format(
+            quantity=shares, symbol=row.symbol)
     return RowOutcome(
         symbol=row.symbol, action=ACTION_UNACTIONABLE, status=OUTCOME_UNACTIONABLE,
         quantity=shares,
         transaction_ids=ids,
-        message=UNACTIONABLE_OPTION_HOLDING_FMT.format(
-            quantity=shares, symbol=row.symbol, ids=_txn_id_list(ids)),
+        message=message,
     )
 
 
@@ -1700,6 +1728,27 @@ def reconcile_unconsumed_runs(account) -> List[int]:
     """
     from .portfolio_allocation_store import finalise_allocation_run
 
+    # PA-03. A run row is created BEFORE its first order exists, and
+    # ``get_unconsumed_runs`` selects on a NULL income_consumed_at -- so an
+    # actively-submitting run looks exactly like an abandoned one. Another page's
+    # income Refresh could therefore reconcile a run mid-submit: the order list was
+    # empty, empty fills count as settled, and finalisation stamps ONCE. The run
+    # then bought $1,000 and consumed $0 of income, having already left the
+    # reconciliation queue -- unrepairable by any later refresh.
+    #
+    # Taking the SUBMISSION lock is what separates the two states without a schema
+    # change: while a submission holds it, its run is by definition not abandoned.
+    # A run stranded by a process that DIED still reconciles normally, because the
+    # lock died with it -- crash recovery is preserved, which a "never reconcile an
+    # empty run" rule would have broken instead.
+    with _submission_lock(int(account.id)):
+        return _reconcile_unconsumed_runs_locked(account)
+
+
+def _reconcile_unconsumed_runs_locked(account) -> List[int]:
+    """The body of ``reconcile_unconsumed_runs``, under its account lock."""
+    from .portfolio_allocation_store import finalise_allocation_run
+
     # limit=None: EVERY unconsumed run, not the display default of 20. With 25
     # deferred runs the capped query drains the newest 20 and re-reads the same
     # oldest 5 into the window on the next pass, so those 5 never settle and their
@@ -1755,10 +1804,205 @@ def describe_unconsumed_runs(account_id: int) -> Dict[str, Any]:
     return {"run_ids": [run.id for run in runs], "working_order_ids": working}
 
 
+#: One lock per account, so two dialogs cannot interleave between the preflight
+#: re-read and the run row. Without it the checks below are advisory: both
+#: submissions read the same "nothing in flight" world and both proceed.
+#: RE-ENTRANT on purpose. ``run_allocation`` holds this lock and then calls
+#: ``reconcile_unconsumed_runs``, which takes it again; a plain Lock would
+#: deadlock the submission it is protecting.
+_SUBMISSION_LOCKS: Dict[int, threading.RLock] = {}
+_SUBMISSION_LOCKS_GUARD = threading.Lock()
+
+STALE_PLAN_BLOCK_FMT = (
+    "{symbol} now holds {actual:g} share(s); this plan was reviewed against "
+    "{reviewed:g}. The account moved after the review, so the deltas on screen are "
+    "no longer the ones you approved. Refresh and review again.")
+WORKING_ORDERS_BLOCK_FMT = (
+    "{count} order(s) from an earlier allocation run are still working at the "
+    "broker on {symbols}, which this plan also trades. Their fills change what "
+    "these rows should do, so it cannot be submitted until they settle.")
+INELIGIBLE_ACCOUNT_BLOCK_FMT = (
+    "account {account_id} is no longer eligible for portfolio allocation: {why}")
+OVER_BUDGET_BLOCK_FMT = (
+    "the plan needs ${required:,.2f} of buying power against ${available:,.2f} "
+    "available now. Deselect buys or add funds, then review again.")
+
+
+def _submission_lock(account_id: int) -> threading.Lock:
+    with _SUBMISSION_LOCKS_GUARD:
+        lock = _SUBMISSION_LOCKS.get(account_id)
+        if lock is None:
+            lock = threading.RLock()
+            _SUBMISSION_LOCKS[account_id] = lock
+        return lock
+
+
+def _eligibility_block(account) -> Optional[str]:
+    """PA-04. Re-check what the PAGE checked, against the database as it is NOW.
+
+    ``_load_gate`` runs when the page opens. Another tab can enable an expert or
+    clear ``manual_trading_enabled`` while a reviewed plan sits open, and neither
+    ``run_allocation`` nor ``submit_plan`` looked again -- so a dialog opened while
+    the account was manual could still trade it after it became expert-driven.
+    The gate has to hold at the boundary that writes, not only at the one that
+    renders.
+    """
+    try:
+        manual = bool(account.get_setting_with_interface_default(
+            'manual_trading_enabled', log_warning=False))
+    except Exception as e:  # noqa: BLE001 - an unreadable flag is not permission
+        return f"its manual-trading flag could not be read ({e})"
+    if not manual:
+        return "manual trading is switched off"
+    with get_db() as session:
+        names = [(r.alias or r.expert) for r in session.exec(
+            select(ExpertInstance).where(
+                ExpertInstance.account_id == account.id,
+                ExpertInstance.enabled == True,  # noqa: E712 - SQL boolean
+            )
+        ).all()]
+    if names:
+        return f"{len(names)} enabled expert(s) trade it ({', '.join(sorted(names))})"
+    return None
+
+
+def _stale_plan_block(account, plan: AllocationPlan,
+                      current: Dict[str, PositionState]) -> Optional[str]:
+    """PA-01. Refuse a plan whose world has moved since it was reviewed.
+
+    ``run_allocation`` used to submit the deltas exactly as the dry run computed
+    them, without re-reading a single position -- so two dialogs holding the same
+    reviewed plan each sent it, and a reviewed target of 10 shares became 20 with
+    the intended cash reserve spent. Both orders fit the ORIGINAL cash, so a
+    broker buying-power check could not have caught it either.
+
+    Comparing the freshly-read quantity against the one the row was sized from is
+    what makes the second submission impossible: after the first fills, the plan's
+    ``current_quantity`` no longer describes the account.
+
+    Positions are re-read for the ROWS THAT WOULD TRADE only. A symbol the plan
+    leaves alone can drift without changing anything this run does, and blocking
+    on it would make Submit unusable on an account someone else also touches.
+    """
+    symbols = sorted({row.symbol for row in plan.rows
+                      if row.side is not None and row.delta_quantity})
+    if not symbols:
+        return None
+    try:
+        fresh = build_position_states(account, symbols)
+    except PositionFetchFailed as e:
+        # Cannot establish the account moved OR that it did not. Refusing is the
+        # only safe direction: the whole point of this gate is that submitting
+        # blind is what caused the defect.
+        return f"current positions could not be re-read before submitting ({e})"
+    for row in plan.rows:
+        if row.side is None or not row.delta_quantity:
+            continue
+        # Against the SNAPSHOT THE DRY RUN USED, not against row.current_quantity.
+        # ``current`` is the dict the plan was solved from and the one submission
+        # still consumes, so it is the honest definition of "what we reviewed".
+        # row.current_quantity is a derived display field that a caller may not
+        # populate, and reading staleness off it would report drift that never
+        # happened.
+        reviewed_state = current.get(row.symbol)
+        reviewed = float(reviewed_state.quantity or 0.0) if reviewed_state is not None else 0.0
+        state = fresh.get(row.symbol)
+        actual = float(state.quantity or 0.0) if state is not None else 0.0
+        if abs(actual - reviewed) > QUANTITY_EPSILON:
+            return STALE_PLAN_BLOCK_FMT.format(
+                symbol=row.symbol, actual=actual, reviewed=reviewed)
+    return None
+
+
+def _working_orders_block(account_id: int, plan: AllocationPlan) -> Optional[str]:
+    """PA-01, the half a position re-read cannot see.
+
+    Between submitting and filling, an earlier run's orders sit at the broker and
+    the positions still read as they did before it -- so the staleness check above
+    is blind in exactly the window a double-click lands in.
+
+    NARROWED TO THE OVERLAP on purpose. Deferring a run whose orders are still
+    working is the ORDINARY outcome here (decision D3), and ``run_allocation``
+    already reconciles earlier runs as its first act; refusing every rebalance
+    while any order works would break that design and make the feature unusable on
+    an account that trades. What must not happen is re-sending a symbol whose
+    earlier order has not landed yet, so the gate fires only on symbols THIS plan
+    would also trade.
+    """
+    pending = describe_unconsumed_runs(account_id)
+    working = pending.get("working_order_ids") or []
+    if not working:
+        return None
+    planned = {row.symbol for row in plan.rows if row.side is not None and row.delta_quantity}
+    if not planned:
+        return None
+    with get_db() as session:
+        symbols = {o.symbol for o in session.exec(
+            select(TradingOrder).where(TradingOrder.id.in_(working))).all()}
+    overlap = sorted(symbols & planned)
+    if overlap:
+        return WORKING_ORDERS_BLOCK_FMT.format(count=len(overlap), symbols=", ".join(overlap))
+    return None
+
+
+def _budget_block(account, plan: AllocationPlan) -> Optional[str]:
+    """The documented-but-advisory budget check, made binding at submission.
+
+    The engine deliberately lets the BROKER refuse buys as capacity runs out,
+    which is reasonable when the shortfall is a rounding-scale surprise. It is not
+    reasonable when the shortfall is already known: deselecting a funding sell can
+    leave $1,000 of buys against $0, and the validator says so while Submit sends
+    them anyway. Re-measured against buying power read NOW, not at solve time, so
+    a plan that fitted an hour ago is judged on today's account.
+    """
+    required = sum(row.bp_cost or 0.0 for row in plan.rows
+                   if row.side == OrderDirection.BUY and row.delta_quantity)
+    if required <= 0:
+        return None
+    try:
+        snapshot = account.get_account_snapshot()
+    except Exception as e:  # noqa: BLE001 - an unreadable account is not a budget
+        return f"buying power could not be re-read before submitting ({e})"
+    # ``AccountSnapshot.buying_power`` is the broker's own figure, and
+    # ``build_base_snapshot`` maps it straight onto the engine's
+    # ``available_buying_power`` -- so this compares the plan against exactly the
+    # quantity it was solved against, just re-read.
+    available = getattr(snapshot, "buying_power", None)
+    if available is None:
+        return "the broker published no buying power, so the plan cannot be checked against it"
+    if required > float(available) + MONEY_EPSILON:
+        return OVER_BUDGET_BLOCK_FMT.format(required=required, available=float(available))
+    return None
+
+
 def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionState],
                    base: BaseSnapshot, *, mode: str,
                    scope_label: Optional[str] = None) -> Dict[str, Any]:
     """Submit a reviewed plan and record it. The single Submit entry point.
+
+    SERIALISED PER ACCOUNT. The preflight gates inside re-read positions, working
+    orders and buying power; without a lock two dialogs can both pass those reads
+    before either writes a run, and both then submit -- which is review PA-01's
+    reproduction exactly (a reviewed 10 shares became 20, the reserve went to
+    zero). The lock is what turns "we checked" into "we checked and nothing else
+    could act in between". Per account, so one account's rebalance never waits on
+    another's.
+
+    In-process only, and deliberately so: the page, the wizard and every dialog
+    live in one NiceGUI process, which is where the observed collision happens. A
+    second PROCESS submitting for the same account concurrently would still need a
+    durable claim on the run row; the working-orders gate is the backstop that
+    catches it on the next attempt rather than the one that prevents it.
+    """
+    with _submission_lock(int(account.id)):
+        return _run_allocation_locked(account, plan, current, base,
+                                      mode=mode, scope_label=scope_label)
+
+
+def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, PositionState],
+                           base: BaseSnapshot, *, mode: str,
+                           scope_label: Optional[str] = None) -> Dict[str, Any]:
+    """The body of ``run_allocation``, always called under its account lock.
 
     Order of operations:
       0. GATE, three times: on the TARGET TOTALS (decision 3 -- REBALANCE only,
@@ -1854,6 +2098,29 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
         reason = held_no_price_block(base.unpriced_held_symbols)
     if reason is None:
         reason = _market_blocked_reason(fetch_market_hours(account))
+    # THE GATES THAT RE-READ THE WORLD (review PA-01, PA-04 and the advisory
+    # budget). Everything above this line is decided from the plan and the base
+    # captured during the dry run; a reviewed plan can be minutes old, and the
+    # account it describes is shared with other dialogs, other tabs and the
+    # broker itself. These four ask what is true NOW:
+    #
+    #   * is this account still one we may trade at all,
+    #   * has an earlier run left orders working,
+    #   * do the positions still match the ones the deltas were sized from,
+    #   * does the buy side still fit the buying power.
+    #
+    # Ordered cheapest-and-most-actionable first: eligibility is a local read,
+    # working orders a local query, and the two broker re-reads last.
+    if reason is None:
+        why = _eligibility_block(account)
+        if why is not None:
+            reason = INELIGIBLE_ACCOUNT_BLOCK_FMT.format(account_id=account.id, why=why)
+    if reason is None:
+        reason = _working_orders_block(account.id, plan)
+    if reason is None:
+        reason = _stale_plan_block(account, plan, current)
+    if reason is None:
+        reason = _budget_block(account, plan)
     if reason is not None:
         logger.warning(f"Allocation run for account {account.id} BLOCKED: {reason}; "
                        f"nothing was submitted and no run was recorded")

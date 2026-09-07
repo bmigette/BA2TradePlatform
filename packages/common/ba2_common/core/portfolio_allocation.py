@@ -56,7 +56,7 @@ import copy
 import math
 from dataclasses import dataclass, field
 from datetime import datetime as DateTime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from ba2_common.core.account_types import (  # noqa: F401 (re-exported)
     MARGIN_SOURCE_ASSET, MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
@@ -106,6 +106,7 @@ __all__ = [
     # what a plan's target_notional MEANS, and the residual loop's bound (D2)
     "ALLOCATION_BASIS_POSITION", "ALLOCATION_BASIS_BUDGET", "REDISTRIBUTION_MAX_PASSES",
     # reason / warning / error strings
+    "is_untracked_holding", "REASON_UNTRACKED_NO_SELL",
     "REASON_NO_PRICE", "REASON_NOT_MARGINABLE", "REASON_FRACTIONAL",
     "REASON_WHOLE_SHARE_FLOOR", "REASON_FRACTIONAL_UNKNOWN",
     "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
@@ -235,6 +236,20 @@ REASON_WHOLE_SHARE_FLOOR = "rounded down to whole shares"
 REASON_FRACTIONAL_UNKNOWN = "fractionable unknown - whole shares"
 REASON_NEGATIVE_CLAMPED = "negative target clamped to 0"
 REASON_CLOSE_TO_ZERO = "target 0 - close position"
+
+#: A reduction this planner cannot submit, because the shares at the broker have
+#: no local transaction behind them at all (review PA-05, 2026-09-07).
+#:
+#: The engine used to size such a sale normally, credit its proceeds as
+#: ``bp_released`` and let dependent buys spend them -- then submission refused
+#: the sale (there is no transaction to close) and sent the buys anyway. The
+#: refusal is CORRECT and stays; predicting the sale and spending money it was
+#: never going to produce is the defect. Prod account 2 makes this the common
+#: case rather than a corner: 25 broker holdings, zero local orders, so its first
+#: rebalance would have funded its entire buy side from sales that cannot happen.
+REASON_UNTRACKED_NO_SELL = (
+    "held at the broker with no local transaction - cannot be sold, no funding credit"
+)
 
 #: How far ONE tradeable unit may overshoot a target before the bump is refused.
 #: 2.0 == "one share may cost at most 200% of what this symbol was allocated".
@@ -720,6 +735,13 @@ class AllocationRow:
     margin_source: str = MARGIN_SOURCE_DEFAULT
     fractional: bool = False
     skipped: bool = False
+    #: A reduction was wanted here and the planner has NO route to it: the shares
+    #: are at the broker with no local transaction behind them. Distinct from
+    #: ``skipped`` (nothing to do) on purpose -- the operator asked to exit and
+    #: cannot, which is a different sentence and a different run severity. The
+    #: delta is zeroed and the size lands in ``unmet_notional``; see
+    #: ``is_untracked_holding`` and review PA-05.
+    untracked_unsellable: bool = False
     #: The broker precheck's own fee estimate, when one was run and accepted
     #: (``OrderImpact.estimated_fees``). ``None`` means "not prechecked", never
     #: "free" -- no fallback value for a number the broker did not supply.
@@ -1417,6 +1439,27 @@ def _is_fractional_quantity(quantity: float) -> bool:
     return min(part, 1.0 - part) > QUANTITY_EPSILON
 
 
+def is_untracked_holding(state: Optional["PositionState"]) -> bool:
+    """The broker holds shares here and we have NO transaction behind any of them.
+
+    A THIRD meaning for an empty ``transaction_ids``, alongside the two
+    ``PositionState`` already documents. "We hold nothing of ours here" and
+    "everything we hold here is invisible to this planner" are both states the
+    engine can act on; this one is not. There is no transaction to close or trim,
+    so ``decide_symbol_action`` has nowhere to route a sale -- which is correct
+    and deliberate -- and the planner must therefore not PROMISE that sale, nor
+    spend the buying power it would have released.
+
+    Distinguished from the option case by the absence of
+    ``unactionable_transaction_ids``: there, real transactions exist and are
+    merely held back, and the operator is told which ones.
+    """
+    return (state is not None
+            and (state.quantity or 0.0) > 0
+            and not state.transaction_ids
+            and not state.unactionable_transaction_ids)
+
+
 def _suppress_below_min_order(delta: float, margin: Optional[MarginInfo],
                               reasons: List[str],
                               price: Optional[float] = None) -> float:
@@ -2096,8 +2139,24 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                        margin: Dict[str, MarginInfo], *, allow_fractional: bool,
                        default_bp_factor: float,
                        valuation_mode: str,
-                       unallocated_pct: float = 0.0) -> AllocationPlan:
+                       unallocated_pct: float = 0.0,
+                       unsellable_symbols: Optional[Set[str]] = None) -> AllocationPlan:
     """Solve a full REBALANCE: every managed label, buys and sells.
+
+    ``unsellable_symbols`` are symbols whose REDUCTION this caller already knows
+    it cannot submit -- live, a broker holding with no local transaction behind it
+    (see ``is_untracked_holding``). Their sells are still sized and shown, because
+    the operator asked for them and the size is the useful part, but they release
+    NO buying power: predicting proceeds from a sale that is known to be
+    unsubmittable is what let a $1,000 phantom sale fund a $1,000 real buy (review
+    PA-05, 2026-09-07).
+
+    PASSED IN rather than inferred from ``current``, deliberately. An empty
+    ``PositionState.transaction_ids`` means "untracked" only when the caller
+    populates ids at all; the live service always does, a hand-built state does
+    not. Inferring it here would have made every ordinary held position in the
+    shared engine's own vocabulary unsellable. Default ``None`` == today's
+    behaviour exactly.
 
     ``valuation_mode`` is REQUIRED on all three entry points
     (``compute_base_notional``, this, and ``compute_label_investment``) and NONE of
@@ -2245,6 +2304,7 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             per_label[st.symbol] = (per_label.get(st.symbol, 0.0)
                                     + investable * share / 100.0)
 
+    unsellable = set(unsellable_symbols or ())
     for symbol, target_notional in targets.items():
         ps = current.get(symbol)
         m = margin.get(symbol)
@@ -2383,6 +2443,16 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         # buying it consumed.
         row.bp_cost = row.estimated_value * row.bp_factor if delta > 0 else 0.0
         row.bp_released = row.estimated_value * row.bp_factor if delta < 0 else 0.0
+        # A REDUCTION WITH NO ROUTE TO THE BROKER FREES NOTHING (review PA-05).
+        # The delta is deliberately LEFT ALONE: the operator asked to exit and
+        # deserves to see the size of what could not happen, and submission turns
+        # the flag into a loud ACTION_UNACTIONABLE rather than a silent skip. What
+        # must not survive is the MONEY -- crediting bp_released here is what let
+        # a $1,000 sale that cannot be submitted fund a $1,000 buy that can.
+        if delta < 0 and row.symbol in unsellable:
+            row.untracked_unsellable = True
+            row.reasons.append(REASON_UNTRACKED_NO_SELL)
+            row.bp_released = 0.0
         plan.rows.append(row)
 
     # D2, BEFORE the buying-power pass: the label's own arithmetic first, the
@@ -2638,6 +2708,23 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
             if abs(impact.bp_cost - row.bp_cost) > 0.005:
                 out.warnings.append(WARNING_PRECHECK_DISAGREED_FMT.format(symbol=row.symbol))
                 row.bp_cost = impact.bp_cost
+                # RECALIBRATE THE RATE, not just this one total (review PA-02).
+                # bp_cost is a derived number: every later sizing pass recomputes
+                # it as value x bp_factor -- _apply_bp_scaling, the per-row resize
+                # at the end of this function, and _reclaim_rounding_slack. Leaving
+                # bp_factor at the pre-broker estimate meant the broker's answer
+                # survived only until the next pass touched the row, and rounding
+                # recovery then restored an order at HALF its prechecked cost while
+                # reporting the plan as fitting. Two $200-prechecked orders came
+                # back as "$200 required" against $200 available.
+                #
+                # LINEAR, and only as linear as the broker is: a fixed fee inside
+                # the impact is spread across the quantity here. That is still
+                # strictly better than a rate the broker never quoted, and any row
+                # whose FINAL quantity differs from the prechecked one should be
+                # re-previewed rather than trusted to this arithmetic.
+                if row.estimated_value > MONEY_EPSILON:
+                    row.bp_factor = impact.bp_cost / row.estimated_value
     factor = _apply_bp_scaling(out.rows, out.available_buying_power,
                                allow_fractional=out.allow_fractional, margin=margin)
     out.scale_factor = float(plan.scale_factor) * factor
@@ -3794,6 +3881,17 @@ def decide_symbol_action(row: "AllocationRow", state: Optional["PositionState"])
 
     if (row.side == OrderDirection.SELL and at_the_broker
             and bool(state.unactionable_transaction_ids)):
+        return ACTION_UNACTIONABLE
+
+    # THE UNTRACKED HOLDING the PLANNER identified (review PA-05). Keyed on the
+    # row's flag, never on an inference from ``state``: an empty
+    # ``transaction_ids`` means "untracked" only when the caller populates ids at
+    # all, which the live service does and a hand-built state does not. A raw
+    # untracked state therefore keeps its pre-existing long-only SKIP -- pinned by
+    # test_decide_symbol_action_an_untracked_broker_position_is_still_a_plain_skip
+    # -- while a row the planner marked gets the loud outcome, because there the
+    # operator really did ask to exit and this run really has no route.
+    if row.side == OrderDirection.SELL and row.untracked_unsellable:
         return ACTION_UNACTIONABLE
 
     return ACTION_NEW if row.side == OrderDirection.BUY else ACTION_SKIP

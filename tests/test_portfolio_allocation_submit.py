@@ -11,14 +11,14 @@ from sqlmodel import select
 from ba2_trade_platform.core.account_types import (
     CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_DIVIDEND, CASH_TRANSFER_WITHDRAWAL,
     MARKET_HOURS_SOURCE_BROKER, MARKET_HOURS_SOURCE_UNAVAILABLE,
-    CashTransfer, MarginInfo, MarketHours, OrderImpact,
+    AccountSnapshot, CashTransfer, MarginInfo, MarketHours, OrderImpact,
 )
 from ba2_trade_platform.core.db import add_instance, get_db, get_instance, update_instance
 from ba2_trade_platform.core.interfaces.AccountInterface import (
     AccountInterface as _RealAccountInterface,
 )
 from ba2_trade_platform.core.models import (
-    PortfolioAllocationRun, PortfolioIncomeEvent, TradingOrder, Transaction,
+    ExpertInstance, PortfolioAllocationRun, PortfolioIncomeEvent, TradingOrder, Transaction,
 )
 from ba2_trade_platform.core.portfolio_allocation import (
     ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP,
@@ -155,6 +155,34 @@ class FakeAccount:
         self.fills = {}
         self.refresh_calls = []
         self.refresh_raises = None   # set to an Exception to simulate an outage
+
+    #: What the BUDGET gate re-reads at submission. The advisory over-budget check
+    #: is binding now: deselecting a funding sell could leave $1,000 of buys against
+    #: $0 and Submit still sent them, relying on the broker to refuse as capacity
+    #: ran out. Generous by default so these tests exercise submission rather than
+    #: the gate; a test that wants the gate to bite lowers it.
+    available_buying_power = 10_000_000.0
+
+    def get_account_snapshot(self):
+        return AccountSnapshot(buying_power=self.available_buying_power)
+
+    def get_setting_with_interface_default(self, key, log_warning=True):
+        """The eligibility answer the SUBMISSION gate now asks for (review PA-04).
+
+        ``run_allocation`` re-checks ``manual_trading_enabled`` against the database
+        as it is at submission, because the page's gate runs only when the page
+        OPENS and another tab can turn the account expert-driven while a reviewed
+        plan sits there. The double has to be able to answer, or every test here
+        would be exercising the gate's failure branch instead of the submission it
+        means to test.
+
+        Defaults to ELIGIBLE. A test that wants the gate to bite sets
+        ``manual_trading_enabled = False`` on the instance; nothing here asserts
+        the gate by accident.
+        """
+        if key == 'manual_trading_enabled':
+            return getattr(self, 'manual_trading_enabled', True)
+        return None
 
     def get_market_hours(self, *, now=None):
         """Mirrors ReadOnlyAccountInterface.get_market_hours' signature exactly."""
@@ -2431,7 +2459,13 @@ def test_run_allocation_reports_a_ledger_shortfall_without_calling_it_an_error(a
 
 def test_run_allocation_of_a_rebalance_funded_by_its_own_sells_consumes_no_income(activity):
     account = FakeAccount(account_id=50)
-    account.positions = []
+    # The BROKER holds what ``current`` below says we hold. run_allocation now
+    # re-reads positions and refuses a plan whose world has moved since the review
+    # (review PA-01), so a double that claims 5 MSFT in the reviewed snapshot and
+    # nothing at the broker is describing an account that already drifted -- which
+    # is the very thing the gate is there to catch.
+    account.positions = [FakePosition("MSFT", 5.0, 1800.0, 2000.0)]
+    account.prices = {"MSFT": 400.0, "AAPL": 160.0}
     account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0),
                      # None -> each MSFT order fills at its OWN quantity.
                      "MSFT": (OrderStatus.FILLED, None, 400.0)}
@@ -4078,12 +4112,22 @@ def test_measure_run_fills_reports_whether_the_refresh_actually_happened():
 # MINOR: get_unconsumed_runs(limit=20) silently capped the drain AND the panel.
 # ---------------------------------------------------------------------------
 
+#: One symbol per deferred run. ``run_allocation`` now refuses a plan that trades a
+#: symbol an EARLIER run still has working at the broker (review PA-01: an
+#: unfilled order means the positions have not moved yet, so re-sending the same
+#: row double-buys it). Submitting one identical AAPL plan N times was a fixture
+#: shortcut for manufacturing deferred runs; it is also exactly the sequence that
+#: gate exists to stop. These tests are about the DRAIN, not about the symbol, so
+#: each run gets its own and the gate stays honest.
+_DEFER_SYMBOLS = [f"SYM{i:02d}" for i in range(40)]
+
+
 def _defer_runs(account, count: int):
     """``count`` runs, each left unconsumed with one order still working."""
     account.fills = {}
-    return [svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
-                               mode=ALLOCATION_MODE_REBALANCE)["run_id"]
-            for _ in range(count)]
+    return [svc.run_allocation(account, _one_buy_plan(symbol=_DEFER_SYMBOLS[i]), {},
+                               make_base(), mode=ALLOCATION_MODE_REBALANCE)["run_id"]
+            for i in range(count)]
 
 
 def test_one_reconcile_pass_drains_more_than_twenty_deferred_runs(activity):
@@ -4097,7 +4141,7 @@ def test_one_reconcile_pass_drains_more_than_twenty_deferred_runs(activity):
     run_ids = _defer_runs(account, 25)
     assert len(svc.get_unconsumed_runs(116, limit=None)) == 25
 
-    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    account.fills = {sym: (OrderStatus.FILLED, 10.0, 160.0) for sym in _DEFER_SYMBOLS}
     consumed = svc.reconcile_unconsumed_runs(account)
 
     assert sorted(consumed) == sorted(run_ids)
@@ -4395,3 +4439,145 @@ def test_leg_status_combinations():
     # dead leg needs the user's attention.
     assert svc._leg_status(0.0, 1, 1) == svc.OUTCOME_FAILED
     assert svc._leg_status(10.0, 1, 1) == svc.OUTCOME_PARTIAL
+
+
+# ---------------------------------------------------------------------------
+# The 2026-09-07 audit's submission gates: PA-01 (stale plan / double submit),
+# PA-04 (eligibility re-check) and the advisory budget check made binding.
+#
+# The audit's own probe asserts the FAULTY behaviour -- it is evidence the
+# defects were real, not a guard that they stay fixed. These are the guard.
+# ---------------------------------------------------------------------------
+
+def _gate_account(account_id: int, *, holds=None, buying_power=10_000_000.0):
+    account = FakeAccount(account_id=account_id)
+    account.positions = list(holds or [])
+    account.available_buying_power = buying_power
+    account.fills = {}
+    return account
+
+
+class TestAStalePlanCannotBeSubmittedTwice:
+    """PA-01. Two dialogs reviewed the same plan; both used to send it.
+
+    Reproduced: a reviewed target of 10 shares became 20 and a $1,000 reserve went
+    to zero, with ZERO position reads at submission. Both orders fitted the
+    ORIGINAL cash, so a broker buying-power check could not have caught it either.
+    """
+
+    def test_the_first_submission_goes_through(self, activity):
+        account = _gate_account(300)
+        result = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                    mode=ALLOCATION_MODE_REBALANCE)
+        assert result["blocked"] is False
+
+    def test_the_same_plan_is_refused_once_the_account_has_moved(self, activity):
+        """The second dialog's plan was reviewed against 0 shares; the account now
+        holds 10. Its deltas are no longer the ones anyone approved."""
+        account = _gate_account(301)
+        reviewed = {}
+        assert svc.run_allocation(account, _one_buy_plan(), reviewed, make_base(),
+                                  mode=ALLOCATION_MODE_REBALANCE)["blocked"] is False
+        # The first buy FILLED: its order is no longer working (so the
+        # working-orders gate stands down and the staleness gate is the one that
+        # speaks), and the broker now reports the shares.
+        account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+        svc.reconcile_unconsumed_runs(account)
+        account.positions = [FakePosition("AAPL", 10.0, 1600.0, 1600.0)]
+        account.prices = {"AAPL": 160.0}
+        again = svc.run_allocation(account, _one_buy_plan(), reviewed, make_base(),
+                                   mode=ALLOCATION_MODE_REBALANCE)
+        assert again["blocked"] is True
+        assert "reviewed against" in again["blocked_reason"]
+        assert again["run_id"] is None, "a blocked attempt records nothing"
+
+    def test_an_unfilled_earlier_order_also_blocks_the_same_symbol(self, activity):
+        """The window a position re-read cannot see: between submit and fill the
+        positions still read as they did before, so only the working order says so."""
+        account = _gate_account(302)
+        svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                           mode=ALLOCATION_MODE_REBALANCE)
+        again = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                   mode=ALLOCATION_MODE_REBALANCE)
+        assert again["blocked"] is True
+        assert "still working" in again["blocked_reason"]
+
+    def test_a_DIFFERENT_symbol_is_not_held_up(self, activity):
+        """Narrowed to the overlap deliberately. Deferring a run whose orders are
+        still working is the ordinary outcome here, so refusing every rebalance
+        while any order works would break the feature on an account that trades."""
+        account = _gate_account(303)
+        svc.run_allocation(account, _one_buy_plan(symbol="AAPL"), {}, make_base(),
+                           mode=ALLOCATION_MODE_REBALANCE)
+        other = svc.run_allocation(account, _one_buy_plan(symbol="NVDA"), {}, make_base(),
+                                   mode=ALLOCATION_MODE_REBALANCE)
+        assert other["blocked"] is False
+
+
+class TestTheAccountMustStillBeEligible:
+    """PA-04. The page's gate runs when the page OPENS; another tab can change the
+    account while a reviewed plan sits there."""
+
+    def test_manual_trading_switched_off_after_review_blocks_the_submission(self, activity):
+        account = _gate_account(310)
+        account.manual_trading_enabled = False
+        result = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                    mode=ALLOCATION_MODE_REBALANCE)
+        assert result["blocked"] is True
+        assert "manual trading is switched off" in result["blocked_reason"]
+        assert account.submitted == []
+
+    def test_an_expert_enabled_after_review_blocks_the_submission(self, activity):
+        account = _gate_account(311)
+        add_instance(ExpertInstance(account_id=311, expert="FMPRating",
+                                    alias="late-arrival", enabled=True))
+        result = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                    mode=ALLOCATION_MODE_REBALANCE)
+        assert result["blocked"] is True
+        assert "late-arrival" in result["blocked_reason"]
+        assert account.submitted == []
+
+    def test_a_DISABLED_expert_does_not_block(self, activity):
+        """The inverse: the gate is about experts that TRADE the account."""
+        account = _gate_account(312)
+        add_instance(ExpertInstance(account_id=312, expert="FMPRating",
+                                    alias="dormant", enabled=False))
+        assert svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                  mode=ALLOCATION_MODE_REBALANCE)["blocked"] is False
+
+
+class TestAKnownUnfundablePlanIsRefused:
+    """The documented-but-advisory budget check, made binding at submission.
+
+    Deselecting a funding sell could leave $1,000 of buys against $0 while the
+    validator merely warned and Submit sent them, relying on the broker to refuse
+    as capacity ran out. Measured against buying power read NOW, so a plan that
+    fitted an hour ago is judged on today's account.
+    """
+
+    def test_buys_beyond_the_buying_power_are_blocked(self, activity):
+        account = _gate_account(320, buying_power=0.0)
+        result = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                    mode=ALLOCATION_MODE_REBALANCE)
+        assert result["blocked"] is True
+        assert "buying power" in result["blocked_reason"]
+        assert account.submitted == []
+
+    def test_a_plan_that_fits_is_untouched(self, activity):
+        account = _gate_account(321, buying_power=1_600.0)
+        assert svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                  mode=ALLOCATION_MODE_REBALANCE)["blocked"] is False
+
+    def test_a_sell_only_plan_needs_no_buying_power(self, activity):
+        """Nothing is being bought, so an empty account is not a reason to refuse."""
+        account = _gate_account(322, buying_power=0.0,
+                                holds=[FakePosition("MSFT", 5.0, 1800.0, 2000.0)])
+        account.prices = {"MSFT": 400.0}
+        txn_id = make_open_transaction(322, "MSFT", 5.0)
+        sell = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+        sell.target_quantity = 0.0
+        current = {"MSFT": PositionState(symbol="MSFT", quantity=5.0, price=400.0,
+                                         transaction_ids=[txn_id])}
+        result = svc.run_allocation(account, AllocationPlan(rows=[sell]), current,
+                                    make_base(), mode=ALLOCATION_MODE_REBALANCE)
+        assert result["blocked"] is False

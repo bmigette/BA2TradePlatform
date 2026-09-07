@@ -1,0 +1,52 @@
+Portfolio allocator audit verification — 2026-09-07
+
+Runtime:
+C:/Users/basti/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/python.exe
+Python 3.12.14
+Additional installed dependencies read from:
+C:/Users/basti/ba2-venvs/trade/Lib/site-packages
+pytest 9.1.0; SQLModel 0.0.38; SQLAlchemy 2.0.51
+
+Isolation used before importing application code:
+BA2_HOME, DB_FILE and LOG_FOLDER pointed into a newly created ba2_allocator_audit_* temporary directory.
+BA2_FILE_LOGGING=0, BA2_STDOUT_LOGGING=0, PYTEST_DISABLE_PLUGIN_AUTOLOAD=1.
+Repository root and packages/common, packages/providers, packages/experts prepended to sys.path.
+Existing trade site-packages appended to sys.path.
+Common tests use their isolated DB fixture; live tests use their in-memory DB fixtures and fake accounts.
+
+Invocation 1: pytest.main with arguments:
+-q -o addopts=
+packages/common/tests/test_portfolio_allocation.py
+packages/common/tests/test_portfolio_allocation_sell_releases_bp.py
+packages/common/tests/test_portfolio_allocation_redistribution.py
+packages/common/tests/test_portfolio_allocation_bumped_outcome.py
+packages/common/tests/test_portfolio_allocation_validation.py
+packages/common/tests/test_portfolio_allocation_wizard.py
+
+Observed terminal result: 575 passed in 4.52s. Exit code 0.
+
+Invocation 2: pytest.main with arguments:
+-q -o addopts=
+tests/test_portfolio_allocation_submit.py
+tests/test_portfolio_allocation_store.py
+tests/test_portfolio_allocation_store_scoping.py
+tests/test_portfolio_allocation_view.py
+tests/test_portfolio_allocation_dry_run_selection.py
+tests/test_portfolio_allocation_validate_and_retry.py
+tests/test_portfolio_allocation_simulated_base.py
+
+Observed terminal result: 904 passed, 1 warning in 68.32s. Exit code 0.
+Warning: DeprecationWarning from websockets.legacy.__init__; no application test failures.
+The displayed pytest duration excludes interpreter/bootstrap/import latency before pytest execution.
+
+Total: 1479 existing tests passed.
+
+Additional audit reproductions:
+reports/portfolio_allocator/portfolio_allocator_audit_probe.py
+Run with the bundled interpreter and --site-packages pointing at the existing trade environment.
+Observed result: all assertions passed, exit code 0.
+Five defect scenarios plus the explicitly advisory selection-budget scenario reproduced.
+Results and exact source hashes: reports/portfolio_allocator/portfolio_allocator_audit_evidence_2026-09-07.json.
+These assertions encode existing faulty behavior, not the desired behavior after repair.
+
+No real broker adapters instantiated; no real orders submitted; no production database writes.

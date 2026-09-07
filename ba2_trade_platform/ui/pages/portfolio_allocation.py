@@ -114,6 +114,7 @@ from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, blocking_messages, build_base_snapshot,
+    is_untracked_holding,
     compute_allocation,
     compute_base_notional, compute_label_investment, current_value,
     format_unrealised_pnl, is_blocking_message, unconsumed_income_notice,
@@ -625,7 +626,14 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
             base.base_notional, base.available_buying_power, labels, current, margin,
             allow_fractional=allow_fractional,
             default_bp_factor=base.default_bp_factor, valuation_mode=valuation_mode,
-            unallocated_pct=unallocated_pct)
+            unallocated_pct=unallocated_pct,
+            # Holdings this platform cannot sell, named for the solver so their
+            # proceeds never fund a buy (review PA-05). Sound to derive HERE and
+            # not inside the engine: ``build_position_states`` always populates
+            # transaction ids, so an empty pair really does mean "no local record",
+            # whereas a hand-built PositionState may simply not carry them.
+            unsellable_symbols={sym for sym, st in current.items()
+                                if is_untracked_holding(st)})
     # ``margin`` is REQUIRED and is the SAME dict the plan above was solved with:
     # the precheck may re-solve, and a re-solve without it rebuilds a bare
     # MarginInfo per fractional row and rounds on the default 4dp grid, losing
