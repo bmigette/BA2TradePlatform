@@ -824,3 +824,23 @@ def schedule_override_from_genes(
     if not any(days.values()):
         days[SCHEDULE_DAYS[0]] = True
     return {"days": days, "times": (base_override or {}).get("times") or ["09:30"]}
+
+
+#: Settings that never took effect in any run on record, pinned OFF so they still don't.
+#:
+#: Both are bool-declared, and the GA passes genes as integers. The old settings writer stored a
+#: bool as ``json.dumps(value)``, so ON became the JSON string ``"1"`` -- which the reader tested
+#: against ``'true'`` and read as False. Every historical run therefore executed with the ATR
+#: stop-leg disabled and the regime overlay off, whatever its genome said.
+#:
+#: ``coerce_bool`` fixed the encoding, which means those stored genes would START working. That
+#: is right long-term and wrong as a side effect: it would silently make every new result
+#: incomparable with every result on record, and would change what a SAVED backtest reproduces.
+#:
+#: ``use_atr_stop`` must be pinned rather than merely dropped from the search: it declares
+#: ``default: True``, so absence alone would enable it.
+#:
+#: Mirrored by ``ba2test_launcher._INERT_RM_TOGGLES`` (the run-level half, for settings assembled
+#: before any decoding); the two are pinned equal by
+#: testplatform/backend/tests/backtest/test_inert_rm_toggles_stay_off.py.
+INERT_RM_TOGGLES = {"use_atr_stop": False, "regime_overlay_enabled": False}

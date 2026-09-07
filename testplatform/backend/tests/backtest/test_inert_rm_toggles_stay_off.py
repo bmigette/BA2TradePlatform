@@ -90,3 +90,41 @@ def test_an_explicit_override_can_still_turn_them_on():
         overrides={"use_atr_stop": True, "regime_overlay_enabled": True})
     assert settings["use_atr_stop"] is True
     assert settings["regime_overlay_enabled"] is True
+
+
+class TestTheStoredGenomePathIsPinnedToo:
+    """The half that the search-space removal does NOT cover.
+
+    A re-run, a warm start and a deploy all decode the genome ALREADY ON DISK, and
+    `_build_daily_trial_config` merges those decoded `expert_overrides` OVER the run-level
+    settings. Four of the six live deployed genomes carry `model:use_atr_stop: 1`, so without a
+    pin above the overrides, re-running a saved backtest would run a DIFFERENT strategy from the
+    one whose results are recorded on the row -- the exact thing a re-run exists to check.
+    """
+
+    def test_the_two_constants_are_the_same_pin(self):
+        """One is applied to run-level settings (launcher), the other above the decoded genes
+        (trial config). They are hand-kept mirrors, so pin them equal."""
+        from app.services.strategy_param_space import INERT_RM_TOGGLES
+
+        assert INERT_RM_TOGGLES == L._INERT_RM_TOGGLES
+
+    def test_a_decoded_gene_saying_ON_does_not_win(self):
+        from app.services.strategy_optimization_handler import _build_daily_trial_config
+
+        backtest_cfg = {
+            "backtest_id": 1, "name": "t", "start_date": "2024-01-01", "end_date": "2024-02-01",
+            "enabled_instruments": ["AAPL"], "initial_capital": 10000.0, "warmup_days": 0,
+            "seed": 42, "account_settings": {},
+            "experts": [{"class": "FMPRating", "settings": {"sizing_mode": "risk_atr"}}],
+        }
+        decoded = {"expert_overrides": {"use_atr_stop": 1, "regime_overlay_enabled": 1,
+                                        "risk_per_trade_pct": 2.5},
+                   "screener_overrides": {}, "schedule_days": None,
+                   "entry_rules": None, "exit_rules": None}
+        cfg = _build_daily_trial_config(backtest_cfg, decoded, None)
+        settings = cfg["experts"][0]["settings"]
+        assert settings["use_atr_stop"] is False
+        assert settings["regime_overlay_enabled"] is False
+        # The inverse: an ordinary gene must still win over the run-level settings.
+        assert settings["risk_per_trade_pct"] == 2.5

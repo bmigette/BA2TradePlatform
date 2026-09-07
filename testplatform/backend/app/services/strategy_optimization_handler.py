@@ -1828,6 +1828,8 @@ def _build_daily_trial_config(
     below gates the screener-settings wiring further down — it has no tp/sl implications since
     entry TP/SL rides on ``entry_rules`` (Strategy.entry_actions), not a bespoke gene.
     """
+    from app.services.strategy_param_space import INERT_RM_TOGGLES
+
     bypass = _is_bypass_expert(backtest_cfg)
     overrides = dict(decoded.get("expert_overrides") or {})
 
@@ -1896,6 +1898,21 @@ def _build_daily_trial_config(
     # Merge the per-trial overrides into each expert spec's settings (do NOT mutate the
     # run-level backtest_cfg — build fresh spec dicts). The bypass screener settings are layered
     # UNDER the model:* overrides so an explicitly-optimized expert param still wins.
+    #
+    # THE INERT TOGGLES ARE PINNED LAST, above even the genes. use_atr_stop and
+    # regime_overlay_enabled never took effect in any run on record -- the GA passes genes as
+    # integers and the old settings writer stored a bool as the JSON string "1", which the
+    # reader did not read as true. coerce_bool fixed that, which means a STORED genome carrying
+    # `model:use_atr_stop: 1` would now switch the feature on the moment it is decoded.
+    #
+    # Removing the genes from the search space (ba2test_launcher._RM_OPT) covers fresh runs, but
+    # NOT this path: a re-run, a warm start or a deploy decodes the genome that is already on
+    # disk, and `overrides` wins over the run-level settings two lines up. Four of the six live
+    # deployed genomes carry use_atr_stop=1. Without this pin, re-running a saved backtest would
+    # silently produce a DIFFERENT strategy from the one whose results are recorded on the row.
+    #
+    # Applied here because this is the one place every trial config is assembled -- GA, re-run,
+    # robustness variant and deploy alike.
     experts_in = backtest_cfg["experts"]
     experts_out = []
     for spec in experts_in:
@@ -1903,10 +1920,12 @@ def _build_daily_trial_config(
             merged_settings = dict(spec.get("settings") or {})
             merged_settings.update(bypass_screener_settings)
             merged_settings.update(overrides)
+            merged_settings.update(INERT_RM_TOGGLES)
             experts_out.append({"class": spec["class"], "settings": merged_settings})
         else:
             merged_settings = dict(bypass_screener_settings)
             merged_settings.update(overrides)
+            merged_settings.update(INERT_RM_TOGGLES)
             experts_out.append({"class": spec, "settings": merged_settings})
 
     # SCREENER runtime: when the run hoisted a metric store, this individual's EFFECTIVE screener
