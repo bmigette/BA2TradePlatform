@@ -1374,7 +1374,9 @@ def test_solve_plan_hands_the_precheck_the_margin_grid_the_plan_was_solved_on(
                      labels=_alloc_labels(), scope_label=None, amount=0.0,
                      allow_fractional=True, valuation_mode=VALUATION_MODE_COST)
 
-    assert set(seen) == {'available_buying_power', 'margin'}
+    # ``on_progress`` joined them 2026-09-08: the precheck loop is the only countable
+    # part of a solve, so it reports each symbol it previews for the button's bar.
+    assert set(seen) == {'available_buying_power', 'margin', 'on_progress'}
     assert seen['margin']['AAPL'].min_trade_increment == 0.25
 
 
@@ -8243,3 +8245,226 @@ def test_EVERY_price_fetch_on_this_page_asks_for_the_mark():
             assert "'mark'" in call or '"mark"' in call, (
                 f"{where}: {call.strip()!r} must value at the mark, the price the broker's own "
                 f"net liq is struck at")
+
+
+def test_the_review_button_has_a_progress_bar_that_is_hidden_at_rest(monkeypatch,
+                                                                     nicegui_client,
+                                                                     account_id):
+    """Requested 2026-09-08: "when clicking on the review and submit, can we have a small
+    progressbar inside or below the button?"
+
+    Hidden at rest and taking no vertical space, so the toolbar does not jump when it
+    appears. INDETERMINATE on purpose -- the solve's length is set by how many buys need
+    prechecking, and a bar that invented a percentage would be a lie told smoothly.
+    """
+    monkeypatch.setattr(page, 'get_selected_account_id', lambda: account_id)
+    _use_account(monkeypatch, _Account(account_id, {'manual_trading_enabled': True},
+                                       positions=[], prices={}))
+    _run_in_client(nicegui_client, page.content)
+    # The TOOLBAR, not the label area: the button and its bar live above the label rows,
+    # and this is the same setup the other toolbar tests use.
+    bars = _marked(nicegui_client.layout, page.MARKER_REVIEW_PROGRESS)
+    assert len(bars) == 1, "exactly one progress bar, and it belongs to the Review button"
+    bar = bars[0]
+    assert bar.visible is False, "a bar visible at rest says the page is working when it is not"
+    # It STARTS indeterminate and becomes determinate once the precheck reports a
+    # denominator. Before that there is nothing to count -- positions, quotes and
+    # margin are one bulk round trip each -- and a determinate bar at 0 over a
+    # track draws nothing, which is exactly how it came to show no progress at all.
+    assert 'indeterminate' in bar._props
+    # The track and the moving part are coloured in the toolbar's CSS, not by Quasar
+    # palette props: those resolve to theme greens and put three greens on top of
+    # each other on a green button, which is how the bar came to be 'barely
+    # visible'. What is asserted here is that the rule EXISTS -- a colour is a
+    # judgement, its absence is a bug.
+    assert page.TOOLBAR_CLASS, 'the bar is coloured through the toolbar CSS scope'
+    assert bar._props.get("value") == 0.0, "starts empty, not at the last run's fill"
+
+
+def test_the_latch_drives_the_bar_it_was_given():
+    """The bar and the button move TOGETHER, and both are restored in the finally: a bar
+    left running after a failed solve says the page is still working on something it
+    abandoned."""
+    import asyncio
+
+    class _Elem:
+        def __init__(self):
+            self.value = None
+            self.visible = None
+            self.enabled = True
+            self._p = set()
+
+        def set_visibility(self, v):
+            self.visible = v
+
+        def set_enabled(self, v):
+            self.enabled = v
+
+        def set_value(self, v):
+            self.value = v
+
+        def props(self, add=None, remove=None):
+            if add:
+                self._p.add(add)
+            if remove:
+                self._p.discard(remove)
+            return self
+
+    bar, button = _Elem(), _Elem()
+    latch = page.ClickLatch('busy', button=button, progress=bar)
+    seen = {}
+
+    async def _work():
+        seen['during'] = (bar.visible, button.enabled)
+        raise RuntimeError("the solve blew up")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(latch.run(_work))
+
+    assert seen['during'] == (True, False), "shown while running, button disabled"
+    assert bar.visible is False and button.enabled is True, \
+        "a failed run must still release both"
+    assert latch.busy is False
+    # AND NO SPINNER. Quasar's `loading` replaces a button's content -- label, icon
+    # and any child -- so on a button that HOLDS the bar it swallowed it whole and
+    # the button showed a spinner with no progress at all (reported 2026-09-08).
+    assert 'loading' not in button._p
+
+
+def test_the_precheck_reports_every_symbol_it_previews():
+    """The bar is DETERMINATE because this loop is countable.
+
+    Operator, 2026-09-08: "progressbar ugly and does not show real progress. We're
+    iterating on all symbols that could be a progress indicator". Everything else in a
+    solve is bulk -- one positions call, one quote call, one margin call -- while this
+    is one REST round trip per buy, so it is both the slow part and the only part with
+    a denominator.
+    """
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+    from ba2_common.core.portfolio_allocation import AllocationPlan, AllocationRow
+    from ba2_common.core.types import OrderDirection
+
+    rows = [AllocationRow(symbol=s, price=100.0, delta_quantity=1.0,
+                          side=OrderDirection.BUY, target_quantity=1.0)
+            for s in ("AAA", "BBB", "CCC")]
+    plan = AllocationPlan(rows=rows)
+
+    class _Acct:
+        id = 1
+
+        def preview_order_impact(self, order, is_closing_order=False):
+            return None
+
+    seen = []
+    svc.precheck_plan(_Acct(), plan, available_buying_power=10_000.0, margin={},
+                      on_progress=lambda done, total, symbol: seen.append(
+                          (done, total, symbol)))
+
+    assert seen[0] == (0, 3, ''), "an opening report, so the bar starts at 0 of a KNOWN total"
+    assert [s for _d, _t, s in seen[1:]] == ["AAA", "BBB", "CCC"]
+    assert [d for d, _t, _s in seen] == [0, 1, 2, 3]
+    assert all(t == 3 for _d, t, _s in seen), "the denominator never moves mid-run"
+
+
+def test_a_progress_callback_that_raises_cannot_kill_the_solve():
+    """A solve abandoned for a progress bar would be an absurd trade."""
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+    from ba2_common.core.portfolio_allocation import AllocationPlan, AllocationRow
+    from ba2_common.core.types import OrderDirection
+
+    plan = AllocationPlan(rows=[AllocationRow(
+        symbol="AAA", price=100.0, delta_quantity=1.0,
+        side=OrderDirection.BUY, target_quantity=1.0)])
+
+    class _Acct:
+        id = 1
+
+        def preview_order_impact(self, order, is_closing_order=False):
+            return None
+
+    def _boom(*_a):
+        raise RuntimeError("the bar exploded")
+
+    out = svc.precheck_plan(_Acct(), plan, available_buying_power=10_000.0, margin={},
+                            on_progress=_boom)
+    assert out is not None
+
+
+def test_a_latch_with_no_bar_still_gets_the_spinner():
+    """The inverse of the rule above: a button with nothing better to show must keep
+    saying something. The spinner is only wrong where a progress bar has replaced it."""
+    import asyncio
+
+    class _Elem:
+        def __init__(self):
+            self.enabled = True
+            self._p = set()
+
+        def set_enabled(self, v):
+            self.enabled = v
+
+        def props(self, add=None, remove=None):
+            if add:
+                self._p.add(add)
+            if remove:
+                self._p.discard(remove)
+            return self
+
+    button = _Elem()
+    latch = page.ClickLatch('busy', button=button)
+    seen = {}
+
+    async def _work():
+        seen['during'] = set(button._p)
+
+    asyncio.run(latch.run(_work))
+    assert 'loading' in seen['during']
+    assert 'loading' not in button._p, "and removed again afterwards"
+
+
+def test_the_bar_only_goes_determinate_once_there_is_a_denominator():
+    """The two phases, and the switch between them.
+
+    A solve is bulk calls first (positions, quotes, margin -- one round trip each,
+    uncountable) and the per-symbol precheck second. The bar sweeps through the first
+    and shows a real fraction through the second. Getting this wrong is what made it
+    draw NOTHING: a determinate bar sitting at 0 over a transparent track is an
+    invisible rectangle, for the whole slowest part of the run.
+    """
+    class _Bar:
+        def __init__(self):
+            self.value = None
+            self._p = {'indeterminate'}
+
+        def set_value(self, v):
+            self.value = v
+
+        def props(self, add=None, remove=None):
+            if add:
+                self._p.add(add)
+            if remove:
+                self._p.discard(remove)
+            return self
+
+    bar = _Bar()
+    sink = {'done': 0, 'total': 0, 'determinate': False}
+
+    def _paint():
+        if not sink['total']:
+            return
+        if not sink['determinate']:
+            sink['determinate'] = True
+            bar.props(remove='indeterminate')
+        bar.set_value(min(1.0, sink['done'] / sink['total']))
+
+    _paint()
+    assert bar.value is None and 'indeterminate' in bar._p, \
+        "no denominator yet -- it must sweep, not sit at zero"
+
+    sink.update(done=1, total=4)
+    _paint()
+    assert bar.value == 0.25 and 'indeterminate' not in bar._p
+
+    sink.update(done=4)
+    _paint()
+    assert bar.value == 1.0

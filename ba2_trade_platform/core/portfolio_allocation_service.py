@@ -14,6 +14,7 @@ IS a shim (for the pure engine).
 import inspect
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date as Date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -235,7 +236,8 @@ def fetch_margin_info(account, symbols: List[str]) -> Dict[str, MarginInfo]:
 
 
 def precheck_plan(account, plan: AllocationPlan, *, available_buying_power: float,
-                  margin: Optional[Dict[str, MarginInfo]]) -> AllocationPlan:
+                  margin: Optional[Dict[str, MarginInfo]],
+                  on_progress=None) -> AllocationPlan:
     """Re-solve the plan against broker order prechecks, when the broker has them.
 
     Solve once (the caller has already done that), build the candidate BUY
@@ -258,6 +260,15 @@ def precheck_plan(account, plan: AllocationPlan, *, available_buying_power: floa
     legitimate buy). If sells are ever added here they are CLOSES and must pass
     True.
 
+    ``on_progress(done, total, symbol)`` is called after each preview, if given. It
+    is the ONLY honest progress signal this solve has: everything else is bulk (one
+    positions call, one quote call, one margin call) while this is one REST round
+    trip per buy, so it is both the slow part and the countable one. It runs on
+    whatever thread the solve runs on, so a UI caller must only record the numbers
+    here and paint them from its own loop -- never touch an element from inside it.
+    An exception raised by the callback would abandon a solve for a progress bar, so
+    it is called defensively.
+
     ``margin`` is a REQUIRED keyword: pass the same dict the plan was solved
     with (``{}`` when the broker described nothing). Without it the re-solve
     rebuilds a bare ``MarginInfo`` per fractional row and rounds on the default
@@ -272,7 +283,29 @@ def precheck_plan(account, plan: AllocationPlan, *, available_buying_power: floa
         return plan
 
     impacts: Dict[str, Any] = {}
-    for row in plan.buy_rows:
+    buys = list(plan.buy_rows)
+    total = len(buys)
+
+    def _report(done: int, symbol: str) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(done, total, symbol)
+        except Exception as e:  # noqa: BLE001 -- a progress bar may not kill a solve
+            logger.debug(f"Allocation precheck progress callback failed: {e}")
+
+    # SAY WHAT IS ABOUT TO HAPPEN, and how much of it. A preview that SUCCEEDS logs
+    # nothing (only failures do), so a 57-buy precheck produced 23 seconds of total
+    # silence between the margin-cache line and the "returned N impacts" line -- with
+    # no way to tell a slow broker from a hung one. Observed live 2026-09-08 15:33:09
+    # -> 15:33:32.
+    logger.info(f"Allocation precheck: previewing {total} buy(s) with the broker "
+                f"(one round trip each; nothing is ordered)")
+    started = time.monotonic()
+    last_beat = started
+
+    _report(0, '')
+    for index, row in enumerate(buys, start=1):
         candidate = TradingOrder(
             account_id=account.id,
             symbol=row.symbol,
@@ -291,6 +324,18 @@ def precheck_plan(account, plan: AllocationPlan, *, available_buying_power: floa
         # order that FREES buying power, and dropping those loses the headroom.
         if impact is not None:
             impacts[row.symbol] = impact
+        _report(index, row.symbol)
+        # A HEARTBEAT, on the clock rather than every Nth symbol: what the reader needs
+        # to know is that it is still moving, and a symbol count says nothing about that
+        # when one preview can take as long as ten others.
+        now = time.monotonic()
+        if now - last_beat >= PRECHECK_HEARTBEAT_SECONDS:
+            last_beat = now
+            logger.info(f"Allocation precheck: {index}/{total} previewed "
+                        f"({now - started:.0f}s elapsed, last {row.symbol})")
+
+    logger.info(f"Allocation precheck: {total} preview(s) done in "
+                f"{time.monotonic() - started:.1f}s")
 
     if not impacts:
         return plan
@@ -730,7 +775,7 @@ def refresh_symbol_stats(symbols, *, limit: int = STATS_REFRESH_BATCH) -> int:
 
 def submit_plan(account, plan: AllocationPlan, current: Dict[str, PositionState],
                 *, run_tag: str, allow_fractional: bool,
-                on_order_id=_noop_order_id) -> List[RowOutcome]:
+                on_order_id=_noop_order_id, on_outcome=None) -> List[RowOutcome]:
     """Submit a plan: every SELL first, then the BUYs by descending value.
 
     Decision 13 (sells before buys) and the "buying_power shrinks as buys fill"
@@ -762,6 +807,15 @@ def submit_plan(account, plan: AllocationPlan, current: Dict[str, PositionState]
     containment every other per-row failure gets. The dry run can see it coming:
     un-ticking a sell there re-measures the budget through ``filter_plan_rows``.
 
+    ``on_outcome(outcome)`` is called as each row finishes, if given -- BEFORE the
+    run is over and therefore before the return value exists. It is what lets the
+    dry-run dialog mark a row done while the rest are still going, instead of the
+    user watching a closed dialog and a notification. It is called on the thread the
+    submission runs on, so a UI caller must only RECORD here and paint from its own
+    loop; and it is called defensively, because a submission abandoned half way --
+    with orders already at the broker -- for the sake of a status cell would be a
+    far worse bug than a stale cell.
+
     Raises:
         ValueError: when ``allow_fractional`` disagrees with
             ``plan.allow_fractional``. That is the setting the DRY RUN was solved
@@ -785,26 +839,38 @@ def submit_plan(account, plan: AllocationPlan, current: Dict[str, PositionState]
     # SELLS FIRST, and the log shows it: they free the buying power the buys are
     # sized against, so a buy that fails after a sell that did not is a different
     # story from one that failed on its own.
+    def _report(outcome: RowOutcome) -> None:
+        if on_outcome is None:
+            return
+        try:
+            on_outcome(outcome)
+        except Exception as e:  # noqa: BLE001 -- a status cell may not stop a submission
+            logger.debug(f"Allocation outcome callback failed for {outcome.symbol}: {e}")
+
     for row in plan.sell_rows:
         outcome = _submit_row(account, row, current.get(row.symbol),
                               run_tag=run_tag, allow_fractional=allow_fractional,
                               on_order_id=on_order_id)
         log_row_outcome(outcome, run_tag=run_tag)
         outcomes.append(outcome)
+        _report(outcome)
     for row in plan.buy_rows:
         outcome = _submit_row(account, row, current.get(row.symbol),
                               run_tag=run_tag, allow_fractional=allow_fractional,
                               on_order_id=on_order_id)
         log_row_outcome(outcome, run_tag=run_tag)
         outcomes.append(outcome)
+        _report(outcome)
 
     traded = {o.symbol for o in outcomes}
     for row in plan.rows:
         if row.symbol not in traded:
-            outcomes.append(RowOutcome(
+            skipped = RowOutcome(
                 symbol=row.symbol, action=ACTION_SKIP, status=OUTCOME_SKIPPED,
                 message="; ".join(row.reasons) or "no delta",
-            ))
+            )
+            outcomes.append(skipped)
+            _report(skipped)
     return outcomes
 
 
@@ -1422,6 +1488,10 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str,
 
 #: How far back the page syncs and displays the ledger.
 INCOME_WINDOW_DAYS = 30
+
+#: How often the precheck says it is still going. Long enough that a short plan logs
+#: nothing extra, short enough that a stalled broker is obvious rather than inferred.
+PRECHECK_HEARTBEAT_SECONDS = 5.0
 
 
 def _today() -> Date:
@@ -2045,7 +2115,8 @@ def _budget_block(account, plan: AllocationPlan) -> Optional[str]:
 
 def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionState],
                    base: BaseSnapshot, *, mode: str,
-                   scope_label: Optional[str] = None) -> Dict[str, Any]:
+                   scope_label: Optional[str] = None,
+                   on_outcome=None) -> Dict[str, Any]:
     """Submit a reviewed plan and record it. The single Submit entry point.
 
     SERIALISED PER ACCOUNT. The preflight gates inside re-read positions, working
@@ -2064,11 +2135,12 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     """
     with _submission_lock(int(account.id)):
         return _run_allocation_locked(account, plan, current, base,
-                                      mode=mode, scope_label=scope_label)
+                                      mode=mode, scope_label=scope_label,
+                                      on_outcome=on_outcome)
 
 
 def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, PositionState],
-                           base: BaseSnapshot, *, mode: str,
+                           base: BaseSnapshot, *, mode: str, on_outcome=None,
                            scope_label: Optional[str] = None) -> Dict[str, Any]:
     """The body of ``run_allocation``, always called under its account lock.
 
@@ -2243,6 +2315,7 @@ def _run_allocation_locked(account, plan: AllocationPlan, current: Dict[str, Pos
 
     try:
         outcomes = submit_plan(account, plan, current, run_tag=str(run_id),
+                               on_outcome=on_outcome,
                                allow_fractional=bool(plan.allow_fractional),
                                on_order_id=_remember)
     except Exception:

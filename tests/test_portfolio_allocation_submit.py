@@ -2758,7 +2758,8 @@ def test_run_allocation_submits_on_the_plans_own_fractional_setting(activity, mo
     RUN was solved with, and the two disagreeing sends quantities nobody saw."""
     seen = {}
 
-    def _fake_submit(account, plan, current, *, run_tag, allow_fractional, on_order_id):
+    def _fake_submit(account, plan, current, *, run_tag, allow_fractional, on_order_id,
+                     on_outcome=None):
         seen.update(run_tag=run_tag, allow_fractional=allow_fractional)
         return []
 
@@ -4596,3 +4597,45 @@ class TestAKnownUnfundablePlanIsRefused:
         result = svc.run_allocation(account, AllocationPlan(rows=[sell]), current,
                                     make_base(), mode=ALLOCATION_MODE_REBALANCE)
         assert result["blocked"] is False
+
+
+def test_submit_plan_reports_each_row_as_it_lands(monkeypatch):
+    """The seam behind the dry run's live Result column: outcomes arrive DURING the
+    run, not only in the return value. Added 2026-09-08 so the dialog can mark a row
+    done while the rest are still going."""
+    seen = []
+
+    def _fake_row(account, row, state, *, run_tag, allow_fractional, on_order_id):
+        return svc.RowOutcome(symbol=row.symbol, action='new',
+                              status=svc.OUTCOME_SUBMITTED)
+
+    monkeypatch.setattr(svc, "_submit_row", _fake_row)
+    plan = _buy_plan()
+    svc.submit_plan(FakeAccount(account_id=1), plan, {}, run_tag='t',
+                    allow_fractional=plan.allow_fractional,
+                    on_outcome=lambda o: seen.append(o.symbol))
+
+    assert seen, "nothing was reported"
+    assert seen == [o.symbol for o in svc.submit_plan(
+        FakeAccount(account_id=1), plan, {}, run_tag='t',
+        allow_fractional=plan.allow_fractional)], \
+        "the reported order must be the order the outcomes come back in"
+
+
+def test_a_reporting_callback_that_raises_cannot_stop_a_submission(monkeypatch):
+    """Orders are already at the broker by the time this runs. Abandoning the rest of
+    a submission for the sake of a status cell would be far worse than a stale cell."""
+    def _fake_row(account, row, state, *, run_tag, allow_fractional, on_order_id):
+        return svc.RowOutcome(symbol=row.symbol, action='new',
+                              status=svc.OUTCOME_SUBMITTED)
+
+    monkeypatch.setattr(svc, "_submit_row", _fake_row)
+    plan = _buy_plan()
+
+    def _boom(_outcome):
+        raise RuntimeError('the cell exploded')
+
+    outcomes = svc.submit_plan(FakeAccount(account_id=1), plan, {}, run_tag='t',
+                               allow_fractional=plan.allow_fractional,
+                               on_outcome=_boom)
+    assert outcomes, "the run must complete regardless"

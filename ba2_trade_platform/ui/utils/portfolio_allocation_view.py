@@ -4423,3 +4423,99 @@ def working_orders_notice(*, settled: bool,
         return None
     return (WORKING_ORDERS_NOTICE_FMT.format(count=len(working_order_ids or [])),
             "warning")
+
+
+# THE OUTCOME VOCABULARY, spelled out rather than imported. It is defined in
+# ``core.portfolio_allocation_service``, and importing it here drags the DB in
+# (sqlalchemy) -- which this module is deliberately free of, so that the pure suite
+# stays cheap and order-independent
+# (``test_the_view_module_imports_without_nicegui_the_db_or_the_expert_stack``).
+#
+# Two spellings of one vocabulary is exactly the drift this comment should worry
+# about, so it is pinned instead of trusted: ``test_the_result_vocabulary_matches
+# _the_service`` asserts these keys ARE the service's constants, from a test that
+# is free to import both.
+_OUTCOME_SUBMITTED = 'submitted'
+_OUTCOME_PARTIAL = 'partially_filled'
+_OUTCOME_SKIPPED = 'skipped'
+_OUTCOME_FAILED = 'failed'
+_OUTCOME_WASHTRADE_LOCKED = 'washtrade_locked'
+_OUTCOME_UNACTIONABLE = 'unactionable'
+
+# ---------------------------------------------------------------------------
+# SUBMIT RESULTS, shown on the dry-run row itself. The dialog used to close on
+# Submit and hand over to a separate results table, which took away the very
+# table the user had just read -- the quantities, the reasons, the row they were
+# unsure about -- and replaced it with a list of symbols and no context.
+# ---------------------------------------------------------------------------
+
+#: What each outcome status says in the Result cell, and how it is painted.
+#: Short, because the column is w-36 and the row already carries the detail: the
+#: MESSAGE goes in the tooltip, not the cell, so a long broker rejection cannot
+#: push the table sideways.
+SUBMIT_RESULT_TEXT = {
+    _OUTCOME_SUBMITTED: 'sent',
+    _OUTCOME_PARTIAL: 'partial fill',
+    _OUTCOME_FAILED: 'FAILED',
+    _OUTCOME_SKIPPED: 'skipped',
+    _OUTCOME_WASHTRADE_LOCKED: 'wash-trade block',
+    _OUTCOME_UNACTIONABLE: 'needs a human',
+}
+
+#: Green for what went, RED for what did not, grey for what was never going to.
+#: A skipped row is NOT painted red: it is a row that had nothing to do, and
+#: colouring it as a failure would put half a healthy plan in red.
+SUBMIT_RESULT_CLASSES = {
+    _OUTCOME_SUBMITTED: 'text-green-500 font-medium',
+    _OUTCOME_PARTIAL: 'text-orange-400 font-medium',
+    _OUTCOME_FAILED: 'text-red-500 font-medium',
+    _OUTCOME_SKIPPED: 'text-gray-500',
+    _OUTCOME_WASHTRADE_LOCKED: 'text-orange-400 font-medium',
+    _OUTCOME_UNACTIONABLE: 'text-orange-400 font-medium',
+}
+
+#: A status this table has never heard of. Named rather than blanked: an unknown
+#: status is a real outcome the engine produced, and an empty cell beside a row
+#: whose order has gone reads as "nothing happened to it".
+SUBMIT_RESULT_UNKNOWN_CLASSES = 'text-orange-400 font-medium'
+
+SUBMIT_SUMMARY_FMT = 'Run {run_id}: {parts}.'
+SUBMIT_SUMMARY_NOTHING = 'Run {run_id}: nothing was sent.'
+SUBMIT_FAILED_FMT = 'Submission failed: {error}'
+
+
+def submit_result_cell(outcome) -> Tuple[str, str]:
+    """``(text, css)`` for one row's Result cell. Pure.
+
+    Keyed on ``status`` alone. The ACTION (new/close/adjust/sell_untracked) is
+    already visible in the row's Side and Qty, and repeating it here would spend a
+    narrow column restating what is beside it.
+    """
+    status = getattr(outcome, 'status', '') or ''
+    text = SUBMIT_RESULT_TEXT.get(status)
+    if text is None:
+        return status or 'unknown', SUBMIT_RESULT_UNKNOWN_CLASSES
+    return text, SUBMIT_RESULT_CLASSES[status]
+
+
+def submit_summary_line(outcomes, *, run_id) -> str:
+    """One sentence for the whole run: how many of each thing happened. Pure.
+
+    Counted from the outcomes rather than from the plan, because the two can
+    legitimately differ -- a row the broker refused is in both, a row that was
+    never sent is only in the plan.
+
+    Ordered by SEVERITY, not by count: what failed is the first thing the reader
+    needs, even when one row failed and sixty were sent.
+    """
+    counts: Dict[str, int] = {}
+    for outcome in outcomes or []:
+        status = getattr(outcome, 'status', '') or 'unknown'
+        counts[status] = counts.get(status, 0) + 1
+    order = (_OUTCOME_FAILED, _OUTCOME_UNACTIONABLE, _OUTCOME_WASHTRADE_LOCKED,
+             _OUTCOME_PARTIAL, _OUTCOME_SUBMITTED, _OUTCOME_SKIPPED)
+    parts = [f"{counts[s]} {SUBMIT_RESULT_TEXT.get(s, s)}" for s in order if counts.get(s)]
+    parts += [f"{n} {s}" for s, n in sorted(counts.items()) if s not in order]
+    if not parts:
+        return SUBMIT_SUMMARY_NOTHING.format(run_id=run_id)
+    return SUBMIT_SUMMARY_FMT.format(run_id=run_id, parts=', '.join(parts))

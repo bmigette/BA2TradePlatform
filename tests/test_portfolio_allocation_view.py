@@ -5233,3 +5233,74 @@ class TestTheDividendHalfCarriesItsOwnSign:
         head, dividend, tail = view.format_pnl_caption_parts(pnl)
         assert head + (dividend or '') + tail == view.format_pnl_caption(pnl)
         assert head.startswith('P&L ')
+
+
+class TestTheSubmitResultCells:
+    """The dry-run dialog stays open through a submit and each row reports itself.
+
+    Requested 2026-09-08: "when clicking submit, I'd rather keep the popup open and
+    submit button disabled, with a success or error on each line of the table". It
+    used to close the instant Submit was pressed and hand over to a separate results
+    table -- which took away the very table the user had just read (the quantities,
+    the reasons, the row they were unsure about) and replaced it with a list of
+    symbols and no context.
+    """
+
+    @property
+    def view(self):
+        # Imported per-use, as the other late-arriving suites in this file do.
+        from ba2_trade_platform.ui.utils import portfolio_allocation_view
+        return portfolio_allocation_view
+
+    def _outcome(self, status, symbol='AAA'):
+        from types import SimpleNamespace
+        return SimpleNamespace(symbol=symbol, status=status)
+
+    def test_the_result_vocabulary_matches_the_service(self):
+        """THE PIN the module's own comment promises. The view spells these statuses
+        out rather than importing them -- importing the service drags sqlalchemy into
+        a module that must stay cheap -- so two spellings of one vocabulary is exactly
+        the drift worth guarding. This test is free to import both."""
+        view = self.view
+        from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+        assert set(view.SUBMIT_RESULT_TEXT) == {
+            svc.OUTCOME_SUBMITTED, svc.OUTCOME_PARTIAL, svc.OUTCOME_SKIPPED,
+            svc.OUTCOME_FAILED, svc.OUTCOME_WASHTRADE_LOCKED, svc.OUTCOME_UNACTIONABLE,
+        }
+        assert set(view.SUBMIT_RESULT_CLASSES) == set(view.SUBMIT_RESULT_TEXT), \
+            "every status the table names must also have a colour"
+
+    def test_what_went_is_green_and_what_failed_is_red(self):
+        view = self.view
+        text, css = view.submit_result_cell(self._outcome('submitted'))
+        assert text == 'sent' and 'green' in css
+        text, css = view.submit_result_cell(self._outcome('failed'))
+        assert text == 'FAILED' and 'red' in css
+
+    def test_a_skipped_row_is_not_painted_as_a_failure(self):
+        """It had nothing to do. Colouring it red would put half a healthy plan in
+        red and make the rows that DID fail impossible to find."""
+        view = self.view
+        _text, css = view.submit_result_cell(self._outcome('skipped'))
+        assert 'red' not in css and 'green' not in css
+
+    def test_a_status_the_table_has_never_heard_of_is_named_not_blanked(self):
+        """An unknown status is still a real outcome the engine produced. An empty
+        cell beside a row whose order has gone reads as 'nothing happened to it'."""
+        view = self.view
+        text, css = view.submit_result_cell(self._outcome('something_new'))
+        assert text == 'something_new' and css
+
+    def test_the_summary_leads_with_what_failed(self):
+        """Ordered by SEVERITY, not by count: one failure among sixty sends is the
+        first thing the reader needs."""
+        view = self.view
+        outcomes = ([self._outcome('submitted')] * 60) + [self._outcome('failed')]
+        line = view.submit_summary_line(outcomes, run_id=7)
+        assert line.index('FAILED') < line.index('sent')
+        assert '1 FAILED' in line and '60 sent' in line and 'Run 7' in line
+
+    def test_a_run_that_sent_nothing_says_so(self):
+        view = self.view
+        assert 'nothing was sent' in view.submit_summary_line([], run_id=9)
