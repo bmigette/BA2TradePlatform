@@ -154,6 +154,28 @@ def _texts(root):
     return [el._text for el in root.descendants(include_self=True) if el._text]
 
 
+def _marked(root, marker):
+    """Every element carrying *marker* -- how this file finds the header's own
+    elements without depending on where in the layout they sit."""
+    return [el for el in root.descendants(include_self=True)
+            if marker in (el._markers or ())]
+
+
+def _badge(money):
+    """The badge's WHOLE text for *money*, with the BP unreadable.
+
+    A plain ``_Broker`` double implements neither margin accessor, so its BP is
+    DETERMINISTICALLY the dash -- there is nothing approximate to assert here. A
+    substring check against ``''.join(texts)`` would also pass on a badge whose two
+    halves had been drawn as separate labels, or in the wrong order."""
+    return f'{money}{layout.HEADER_BP_PREFIX}{HEADER_BALANCE_UNAVAILABLE_TEXT}'
+
+
+#: The badge with NOTHING cached: both figures unknown, and one exact string.
+BADGE_ALL_UNKNOWN = (f'{HEADER_BALANCE_UNAVAILABLE_TEXT}{layout.HEADER_BP_PREFIX}'
+                     f'{HEADER_BALANCE_UNAVAILABLE_TEXT}')
+
+
 def _timers(root, marker=None):
     """The header's ``ui.timer``s, selected by MARKER.
 
@@ -735,7 +757,7 @@ def test_a_header_whose_scope_lookup_explodes_still_renders_the_page(
 
     texts = _texts(nicegui_client.layout)
     assert 'body' in texts, 'the page content must still be drawn'
-    assert any(HEADER_BALANCE_UNAVAILABLE_TEXT in t for t in texts)
+    assert BADGE_ALL_UNKNOWN in texts
 
 
 def test_a_header_whose_decision_explodes_still_renders_the_page(
@@ -837,9 +859,10 @@ def test_the_refresh_updates_the_label_in_place(nicegui_client, monkeypatch):
     with nicegui_client:
         with layout.layout_render('Test'):
             ui.label('body')
-    # Nothing cached yet: BOTH of the badge's figures are a dash.
-    assert any(HEADER_BALANCE_UNAVAILABLE_TEXT in t
-               for t in _texts(nicegui_client.layout))
+    # Nothing cached yet: BOTH of the badge's figures are a dash, and the badge is
+    # exactly that string. 'a dash somewhere in some text' would also pass on a
+    # badge whose balance rendered fine and whose BP alone was unknown.
+    assert BADGE_ALL_UNKNOWN in _texts(nicegui_client.layout)
 
     once = _first_refresh_timer(nicegui_client.layout)
 
@@ -904,7 +927,7 @@ def test_the_breakdown_lists_every_account_and_a_total(nicegui_client, monkeypat
     assert '$2,200.68' in texts
     assert layout.HEADER_BALANCE_TOTAL_LABEL in texts
     assert texts.count('$3,200.68') == 1      # the Total line
-    assert f'$3,200.68{layout.HEADER_BP_PREFIX}' in ''.join(texts)   # and the badge
+    assert _badge('$3,200.68') in texts       # and the badge
 
 
 def test_the_breakdown_lists_each_account_exactly_once(nicegui_client, monkeypatch):
@@ -917,7 +940,7 @@ def test_the_breakdown_lists_each_account_exactly_once(nicegui_client, monkeypat
     assert texts.count('Tasty (Y)') == 1
     assert texts.count('$1,000.00') == 2      # one per account line, and no more
     assert texts.count('$2,000.00') == 1      # the Total; the badge carries its BP too
-    assert f'$2,000.00{layout.HEADER_BP_PREFIX}' in ''.join(texts)
+    assert _badge('$2,000.00') in texts
 
 
 def test_no_account_is_dropped_from_the_breakdown(nicegui_client, monkeypatch):
@@ -946,7 +969,7 @@ def test_a_single_selected_account_gets_no_breakdown(nicegui_client, monkeypatch
 
     texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, 1)
 
-    assert f'$1,000.00{layout.HEADER_BP_PREFIX}' in ''.join(texts)
+    assert _badge('$1,000.00') in texts
     assert layout.HEADER_BALANCE_TOTAL_LABEL not in texts
     assert '$2,200.68' not in texts
     assert '$3,200.68' not in texts
@@ -967,7 +990,7 @@ def test_the_breakdown_shows_a_genuinely_empty_account_as_zero(nicegui_client, m
         ['$1,000.00', '$0.00']
     # The Alpaca leg and the Total -- the zero leg adds nothing to it.
     assert texts.count('$1,000.00') == 2
-    assert f'$1,000.00{layout.HEADER_BP_PREFIX}' in ''.join(texts)   # and the badge
+    assert _badge('$1,000.00') in texts                              # and the badge
     assert layout.HEADER_BALANCE_PARTIAL_SUFFIX not in ''.join(texts)
 
 
@@ -999,7 +1022,7 @@ def test_the_breakdown_repaints_when_the_refresh_lands(nicegui_client, monkeypat
     texts = _texts(nicegui_client.layout)
     assert '$2,200.68' in texts
     assert texts.count('$3,200.68') == 1                            # the Total line
-    assert f'$3,200.68{layout.HEADER_BP_PREFIX}' in ''.join(texts)  # and the badge
+    assert _badge('$3,200.68') in texts                             # and the badge
     assert texts.count('Tasty (Y)') == 1, 'the repaint must replace the menu, not append'
 
 
@@ -1021,7 +1044,7 @@ def test_a_breakdown_that_explodes_still_renders_the_page(nicegui_client, monkey
     texts = _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
 
     assert 'body' in texts
-    assert f'$3,200.68{layout.HEADER_BP_PREFIX}' in ''.join(texts), \
+    assert _badge('$3,200.68') in texts, \
         'the badge itself must survive the breakdown failing'
     assert any('breakdown' in e for e in errors), errors
 
@@ -1146,14 +1169,26 @@ def test_a_failed_tradable_read_marks_bp_unknown_but_keeps_the_balance(monkeypat
 
 def test_a_broker_double_without_the_margin_accessors_still_reports_its_balance(monkeypatch):
     """Every pre-existing _Broker has no get_tradable_balance at all: the balance must
-    survive and BP reads as unknown, never as zero."""
+    survive and BP reads as unknown, never as zero.
+
+    And the missing accessor is logged as a DEFECT, at ERROR. A broker that cannot
+    say what its multiplier is is an expected unknown and warns; an account CLASS
+    that never implements the accessor was never brought under margin, and filing
+    that beside the benign unknowns is how it stays unnoticed. Never ``caplog``:
+    ``logger.py`` sets ``propagate = False``.
+    """
     clock = Clock()
     _use_brokers(monkeypatch, {1: _Broker(net_liquidation=5.0)})
+    errors = []
+    monkeypatch.setattr(layout.logger, 'error',
+                        lambda msg, *a, **k: errors.append(str(msg)))
     layout.refresh_header_balance_cache([1], utcnow=clock)
 
     view = layout.header_badge_from_cache([(1, 'A')], utcnow=clock)
 
     assert view.text == f'$5.00 / BP {HEADER_BALANCE_UNAVAILABLE_TEXT}'
+    assert any('get_tradable_balance' in e for e in errors), errors
+    assert any('defect' in e for e in errors), errors
 
 
 def test_the_breakdown_lists_the_four_figures_per_account(monkeypatch):
@@ -1182,3 +1217,73 @@ def test_bp_totals_across_accounts_and_marks_partial_like_the_balance(monkeypatc
 
     assert view.text == '$2.00 / BP $2.00 (partial)'
     assert view.partial is False, 'the BALANCE is complete; the BP marker rides in the text'
+
+
+def test_the_badge_tooltip_carries_the_bp_detail_on_its_own_line(nicegui_client,
+                                                                 monkeypatch):
+    """HEADER_BP_DETAIL_FMT opens with a newline ON PURPOSE: the balance and the
+    buying power have independent stories (each can be stale, or partial, on its
+    own), and running them into one paragraph reads as a single claim about a
+    single number.
+
+    A tooltip renders its text as HTML, where a bare newline is only whitespace, so
+    the constant alone does not buy the line break -- the element has to be told to
+    keep it. That instruction is invisible to every text assertion in this file,
+    which is exactly why it gets one of its own."""
+    _use_brokers(monkeypatch, {1: _MarginBroker(net_liquidation=10_000.0,
+                                                tradable=18_000.0,
+                                                option_tradable=10_000.0,
+                                                broker_bp=20_000.0)})
+    refresh_header_balance_cache([1])
+
+    _render_header(monkeypatch, nicegui_client,
+                   [('All', None), ('Alpaca (X)', 1)], 1)
+
+    from nicegui import ui
+    header, = _marked(nicegui_client.layout, layout.HEADER_BALANCE_MARKER)
+    tip, = [el for el in header.descendants() if isinstance(el, ui.tooltip)]
+
+    lead = layout.HEADER_BP_DETAIL_FMT.split('{detail}')[0]   # newline + the label
+    assert lead.startswith('\n'), layout.HEADER_BP_DETAIL_FMT
+    assert lead in tip._text, tip._text
+    assert tip._text.startswith(
+        layout.HEADER_BALANCE_FRESH_DETAIL_FMT.split('{')[0]), tip._text
+    assert 'whitespace-pre-line' in tip._classes, tip._classes
+
+
+def test_the_breakdown_headings_match_the_cell_order(nicegui_client, monkeypatch):
+    """The headings are drawn by one loop and the cells by another, so nothing in
+    the code makes them agree. Swap two headings and every figure sits under the
+    wrong name: a wrong number that LOOKS right, which is the worst kind.
+
+    Four DISTINCT figures per account, so an off-by-one column cannot pass."""
+    _use_brokers(monkeypatch, {
+        1: _MarginBroker(net_liquidation=1_000.0, tradable=2_000.0,
+                         option_tradable=3_000.0, broker_bp=4_000.0),
+        2: _MarginBroker(net_liquidation=10.0, tradable=20.0,
+                         option_tradable=30.0, broker_bp=40.0)})
+    refresh_header_balance_cache([1, 2])
+
+    _render_header(monkeypatch, nicegui_client, TWO_ACCOUNTS, None)
+
+    from nicegui import ui
+    menu, = _marked(nicegui_client.layout, layout.HEADER_BALANCE_BREAKDOWN_MARKER)
+    texts = _texts(menu)
+
+    # The blank cell above the account names has no text, so the four headings
+    # come first, in HEADER_BALANCE_BREAKDOWN_COLUMNS order.
+    assert texts[:4] == list(layout.HEADER_BALANCE_BREAKDOWN_COLUMNS), texts
+    for name, money in (('Alpaca (X)', ['$1,000.00', '$2,000.00', '$3,000.00',
+                                        '$4,000.00']),
+                        ('Tasty (Y)', ['$10.00', '$20.00', '$30.00', '$40.00'])):
+        at = texts.index(name)
+        assert texts[at:at + 5] == [name] + money, texts
+
+    # And the Total is IN THE GRID, in the Balance track. Asked of the elements and
+    # not of the texts, because the texts cannot tell the difference: the empty
+    # filler cells carry no text, so a total drawn under 'Broker BP' -- or in a row
+    # of its own below the grid, which is what it used to be -- reads identically.
+    grid, = [el for el in menu.descendants() if isinstance(el, ui.grid)]
+    tail = [c for c in grid.default_slot.children if isinstance(c, ui.label)][-5:]
+    assert [c._text for c in tail] == [layout.HEADER_BALANCE_TOTAL_LABEL,
+                                       '$1,010.00', '', '', ''], [c._text for c in tail]

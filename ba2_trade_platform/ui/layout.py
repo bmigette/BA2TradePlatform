@@ -335,9 +335,13 @@ def _read_account_figures(account_id: int) -> AccountFigures:
     Imported lazily because ``core.utils``' instance factory pulls the live
     account registry, which must not be a page-import-time dependency.
 
-    ONE ``get_account_snapshot()`` here: the value and the broker's own buying
-    power then describe the SAME broker instant, and TastyTrade (whose snapshot is
-    an uncached REST call) pays for one round trip rather than two.
+    ONE ``get_account_snapshot()`` here, and it covers TWO of the four figures:
+    the value and the broker's own buying power, which therefore describe the SAME
+    broker instant. The two tradable accessors do their OWN reads underneath -- on
+    TastyTrade, uncached, so a refresh can cost up to four more REST calls on top
+    of this snapshot. That is accepted rather than hidden: this runs hourly, in a
+    worker thread, off the event loop. Deriving the tradable figures from the
+    snapshot already in hand is a recorded follow-up, not a thing this does today.
 
     WHY EACH MARGIN FIGURE IS TRIED, AND SWALLOWED, SEPARATELY. A figure that
     cannot be read leaves ONLY that figure unknown; the balance is the headline
@@ -357,6 +361,16 @@ def _read_account_figures(account_id: int) -> AccountFigures:
     def _try(name: str) -> Optional[float]:
         try:
             return float(getattr(account, name)())
+        except AttributeError as e:
+            # NOT an unknown, and so NOT a warning: every account this platform
+            # ships implements both accessors, so an account object that does not
+            # is a class that was never brought under margin -- a defect in the
+            # code, which a WARNING beside the broker's own "no multiplier" would
+            # bury. The header still degrades to a dash; the log says why.
+            logger.error(
+                f"Header balance: account {account_id} ({type(account).__name__}) does "
+                f"not implement {name} -- a defect, not an unknown: {e}", exc_info=True)
+            return None
         except Exception as e:
             # WARNING rather than ERROR: with a broker that publishes no
             # multiplier this is an expected shape of "unknown", and the header
@@ -737,7 +751,11 @@ def _render_account_balance():
     with ui.row().classes('items-center gap-1 mr-4 cursor-pointer').mark(HEADER_BALANCE_MARKER):
         icon = ui.icon('account_balance_wallet', size='xs').classes('text-secondary-custom')
         label = ui.label(view.text).classes('text-xs font-medium')
-        tooltip = ui.tooltip(view.detail)
+        # 'whitespace-pre-line': HEADER_BP_DETAIL_FMT opens with a newline so the
+        # buying power's story is its own line, and q-tooltip renders its text as
+        # HTML, where a bare newline is just whitespace. Without this the two
+        # independent claims run together into one sentence.
+        tooltip = ui.tooltip(view.detail).classes('whitespace-pre-line')
         breakdown = (ui.menu().mark(HEADER_BALANCE_BREAKDOWN_MARKER)
                      if len(accounts) > 1 else None)
     _paint(label, icon, tooltip, view)
@@ -817,24 +835,38 @@ def _paint_breakdown(breakdown, accounts: Sequence[Tuple[int, str]]) -> None:
             # every cell is in the same column track, and four figures per account
             # left to justify-between would zig-zag with the digit count.
             with ui.column().classes('p-3 gap-1 min-w-56'):
-                with ui.grid(columns=5).classes('gap-x-6 gap-y-1 items-center'):
+                # 'auto repeat(4, max-content)', not columns=5: five EQUAL tracks are
+                # sized by the widest cell in the whole grid -- an account name -- so
+                # the money columns came out far wider than their digits and the
+                # figures floated in the middle of them. The name column takes what
+                # it needs; each money column is exactly as wide as its widest figure,
+                # and 'text-right' then lines the digits up on the decimal point.
+                with ui.grid(columns='auto repeat(4, max-content)').classes(
+                        'gap-x-6 gap-y-1 items-center'):
                     # A blank cell over the account names, then the four headings.
                     # Without them the reader has four dollar figures and no way to
                     # tell the stock BP from the broker's.
                     ui.label('')
                     for column in HEADER_BALANCE_BREAKDOWN_COLUMNS:
-                        ui.label(column).classes('text-xs text-secondary-custom font-medium')
+                        ui.label(column).classes(
+                            'text-xs text-secondary-custom font-medium text-right')
                     for label, figures in view.lines:
                         ui.label(label).classes('text-xs text-secondary-custom')
                         for cell in (figures.value, figures.tradable,
                                      figures.option_tradable, figures.broker_bp):
                             ui.label(cell.text).classes(
-                                'text-xs font-medium'
+                                'text-xs font-medium text-right'
                                 + ('' if cell.available else ' text-secondary-custom'))
-                ui.separator()
-                with ui.row().classes('w-full justify-between items-center gap-6'):
+                    # THE TOTAL BELONGS IN THE GRID. It is the one number the reader
+                    # cross-checks against the badge, so it has to sit in the BALANCE
+                    # track: drawn below the grid in its own justify-between row it
+                    # landed under 'Broker BP' and read as a total of that column.
+                    # The three empty cells keep the row five wide.
+                    ui.separator().classes('col-span-5')
                     ui.label(HEADER_BALANCE_TOTAL_LABEL).classes('text-xs font-bold')
-                    ui.label(view.total.text).classes('text-xs font-bold')
+                    ui.label(view.total.text).classes('text-xs font-bold text-right')
+                    for _ in range(3):
+                        ui.label('')
                 # The detail, in the menu rather than only in the hover: it is
                 # where '(partial)' is explained and the excluded account named.
                 ui.label(view.total.detail).classes('text-xs text-secondary-custom')
