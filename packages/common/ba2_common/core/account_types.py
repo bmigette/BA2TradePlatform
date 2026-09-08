@@ -71,12 +71,18 @@ class AccountSnapshot:
     convention). A broker that publishes a positive magnitude instead
     (TastyTrade's ``short-equity-value``) MUST be negated by its adapter, so
     that gross exposure is one formula for every broker.
+
+    ``option_buying_power`` is the broker's derivative buying power; ``None``
+    when the broker publishes none.
     """
     cash: Optional[float] = None
     equity: Optional[float] = None
     net_liquidation: Optional[float] = None
     buying_power: Optional[float] = None
     non_marginable_buying_power: Optional[float] = None
+    #: The broker's OPTION (derivative) buying power. Alpaca `options_buying_power`,
+    #: TastyTrade `derivative_buying_power`. None = not published, never zero.
+    option_buying_power: Optional[float] = None
     margin_multiplier: Optional[float] = None
     is_margin_account: bool = False
     long_market_value: Optional[float] = None

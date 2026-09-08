@@ -197,6 +197,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             buying_power=_first("buying_power", "equity_buying_power", "derivative_buying_power"),
             non_marginable_buying_power=_first("non_marginable_buying_power",
                                                "cash_available_to_withdraw"),
+            option_buying_power=_first("options_buying_power", "derivative_buying_power"),
             margin_multiplier=multiplier,
             is_margin_account=bool(multiplier is not None and multiplier > 1.0),
             long_market_value=_first("long_market_value"),
