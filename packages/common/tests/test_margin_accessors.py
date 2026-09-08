@@ -78,6 +78,15 @@ def test_stock_multiplier_raises_when_broker_publishes_none():
         _Stub(AccountSnapshot()).get_stock_margin_multiplier()
 
 
+@pytest.mark.parametrize("bad", [0.0, -1.0])
+def test_stock_multiplier_raises_on_a_non_positive_value(bad):
+    """0 and negatives are not leverage figures a broker can mean. Returning one would
+    size every margin order to zero (or to a negative) in silence, so they are treated
+    as unpublished and raise alongside None."""
+    with pytest.raises(ValueError, match="account 7"):
+        _Stub(AccountSnapshot(margin_multiplier=bad)).get_stock_margin_multiplier()
+
+
 def test_option_multiplier_defaults_to_one():
     assert _Stub(AccountSnapshot(margin_multiplier=4.0)).get_option_margin_multiplier() == 1.0
 

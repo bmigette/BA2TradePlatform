@@ -269,3 +269,6 @@ def test_stock_margin_multiplier_is_one_the_simulator_is_unlevered():
     acct = BacktestAccount(999, ps, CFG)  # no DB needed: the multiplier is a constant
 
     assert acct.get_stock_margin_multiplier() == 1.0
+    # The override is load-bearing, not decorative: the simulator's snapshot carries no
+    # multiplier at all, so without it this call would raise rather than answer 1.0.
+    assert acct.get_account_snapshot().margin_multiplier is None

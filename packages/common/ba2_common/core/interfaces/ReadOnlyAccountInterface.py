@@ -295,10 +295,12 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         multiplier is a guessed order.
         """
         multiplier = self.get_account_snapshot().margin_multiplier
-        if multiplier is None:
+        # 0 or negative is not a leverage figure a broker can mean; treated as
+        # unpublished so it raises here instead of sizing every order to zero.
+        if multiplier is None or float(multiplier) <= 0:
             raise ValueError(
-                f"account {self.id} ({type(self).__name__}) published no stock margin "
-                f"multiplier; cannot size with margin")
+                f"account {self.id} ({type(self).__name__}) published no usable stock margin "
+                f"multiplier ({multiplier!r}); cannot size with margin")
         return float(multiplier)
 
     def get_option_margin_multiplier(self) -> float:
