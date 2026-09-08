@@ -439,10 +439,29 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             if asset == "stock":
                 # An anomaly worth a WARNING: margin was enabled on an account the broker
                 # will not lend against (a cash account), so the factor scales nothing.
-                logger.warning(
+                #
+                # LATCHED to once per account instance, because this is a STANDING
+                # misconfiguration, not an event: nothing about it changes between calls,
+                # and this path is walked once per order per bar (get_virtual_balance ->
+                # get_tradable_balance), so a backtest configured with margin_enabled=True
+                # on an unlevered account would emit the identical line tens of thousands
+                # of times and bury every other warning in the run. The first occurrence
+                # is the one an operator needs; the rest stay at DEBUG so the condition is
+                # still observable when someone goes looking for it.
+                #
+                # getattr with a default rather than an __init__ attribute: the account
+                # interfaces are subclassed widely (and instantiated bare with
+                # object.__new__ in tests), so an __init__ that every subclass must call
+                # is a fragility this diagnostic does not warrant.
+                message = (
                     f"[Account {self.id}] margin_enabled but the broker reports a non-marginable "
                     f"{asset} account (multiplier {multiplier:g}); tradable {asset} balance stays at "
                     f"the balance ${balance:,.2f}")
+                if getattr(self, "_non_marginable_warned", False):
+                    logger.debug(message)
+                else:
+                    self._non_marginable_warned = True
+                    logger.warning(message)
             else:
                 # NOT an anomaly: 1.0 is the platform's OWN option default -- long options
                 # are cash-settled at every supported broker and no adapter overrides

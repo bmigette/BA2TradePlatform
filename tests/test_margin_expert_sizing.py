@@ -93,3 +93,15 @@ def test_a_tradable_balance_error_yields_none_not_a_number():
 
     account = _Broken(acct_def.id, balance=10_000.0, tradable=None, buying_power=None)
     assert _with_account(account, _Expert(inst.id).get_virtual_balance) is None
+
+
+@pytest.mark.usefixtures("reset_test_db")
+def test_available_balance_is_the_levered_figure_when_the_clamp_does_not_bind():
+    """The counterpart pin: with broker BP above the levered base, the available
+    balance IS the levered figure -- so the clamp test above cannot pass merely
+    because something upstream capped the result back to the plain balance."""
+    acct_def = factories.create_account_definition()
+    inst = factories.create_expert_instance(
+        account_id=acct_def.id, expert="_Expert", virtual_equity_pct=100.0)
+    account = _Account(acct_def.id, balance=10_000.0, tradable=18_000.0, buying_power=20_000.0)
+    assert _with_account(account, _Expert(inst.id).get_available_balance) == 18_000.0

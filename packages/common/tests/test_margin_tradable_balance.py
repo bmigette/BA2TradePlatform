@@ -282,3 +282,21 @@ def test_effective_factor_scales_the_balance_to_the_tradable_balance():
     that SCALES a figure it already holds lands where get_tradable_balance does."""
     acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
     assert 10_000.0 * acct.effective_margin_factor() == acct.get_tradable_balance()
+
+
+def test_non_marginable_warning_is_logged_once_per_account(records):
+    """The condition is a STANDING misconfiguration and this path runs once per order
+    per bar, so only the FIRST occurrence is a WARNING; the rest drop to DEBUG rather
+    than flooding a whole backtest with the identical line."""
+    acct = _Stub(balance=10_000.0,
+                 snapshot=AccountSnapshot(margin_multiplier=1.0, buying_power=4_000.0),
+                 settings=ON)
+    assert acct.get_tradable_balance() == 10_000.0
+    assert acct.get_tradable_balance() == 10_000.0
+
+    warnings = [msg for lvl, msg in records
+                if lvl == logging.WARNING and "non-marginable" in msg]
+    assert len(warnings) == 1
+    debugs = [msg for lvl, msg in records
+              if lvl == logging.DEBUG and "non-marginable" in msg]
+    assert len(debugs) == 1

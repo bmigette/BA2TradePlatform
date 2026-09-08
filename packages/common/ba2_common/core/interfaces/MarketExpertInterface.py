@@ -831,16 +831,21 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         Returns:
             Optional[float]: The virtual balance amount, None if error occurred
         """
+        # Named before the try so the except branch can always name the account the
+        # failure belongs to. Stays None only while the expert instance itself is
+        # still unread -- the one window in which there is no account id to report.
+        account_id = None
         try:
             # Lazy import to avoid circular dependency
             from ba2_common.core.instance_resolver import get_instance_resolver
-            
+
             # Get the expert instance to access virtual_equity_pct
             expert_instance = get_instance(ExpertInstance, self.id)
             if not expert_instance:
                 logger.error(f"Expert instance {self.id} not found")
                 return None
-            
+
+            account_id = expert_instance.account_id
             # Get the account instance for this expert
             account = get_instance_resolver().get_account_instance(expert_instance.account_id)
             if not account:
@@ -872,7 +877,9 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             return virtual_balance
             
         except Exception as e:
-            logger.error(f"Error calculating virtual balance for expert {self.id}: {e}", exc_info=True)
+            logger.error(
+                f"Error calculating virtual balance for expert {self.id} "
+                f"(account {account_id}): {e}", exc_info=True)
             return None
     
     def get_available_balance(self, exclude_transaction_id: Optional[int] = None) -> Optional[float]:
