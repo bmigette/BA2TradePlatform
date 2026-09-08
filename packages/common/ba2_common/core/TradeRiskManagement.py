@@ -254,6 +254,10 @@ class TradeRiskManagement:
                 orders_to_update=orders_to_update,
                 orders_to_delete=orders_to_delete,
                 symbol_prices=symbol_prices,
+                # The same map the sizing core multiplies quantities by, so the record
+                # shows the weight that was actually applied rather than a re-read that
+                # could have changed since.
+                instrument_weights=self._safe_instrument_config(expert),
                 context={
                     "available_balance": total_virtual_balance,
                     "max_per_instrument": max_equity_per_instrument,
@@ -542,10 +546,24 @@ class TradeRiskManagement:
         self.logger.info(f"Filtered {len(filtered_orders)} orders from {len(orders)} based on permissions")
         return filtered_orders
     
+    @staticmethod
+    def _safe_instrument_config(expert) -> dict:
+        """The expert's per-instrument weight map, or ``{}``. Never raises.
+
+        Only ever used to ANNOTATE a run record, so a settings failure must cost the
+        weight column and nothing else -- the sizing pass has already happened by the
+        time this is asked.
+        """
+        try:
+            return expert._get_enabled_instruments_config() or {}
+        except Exception:  # noqa: BLE001 -- observability only
+            return {}
+
     def _record_classic_run(self, *, expert_instance_id, account_id, started_at,
                             pending_orders, dropped_by_permission,
                             orders_with_recommendations, orders_to_update,
-                            orders_to_delete, symbol_prices, context) -> None:
+                            orders_to_delete, symbol_prices, context,
+                            instrument_weights=None) -> None:
         """Turn this pass's drop points into one ``RiskManagerRun``.
 
         Keyed by ORDER ID, not by symbol. Two pending orders can carry the same symbol
@@ -571,6 +589,50 @@ class TradeRiskManagement:
 
             permission_ids = {o.id for o in (dropped_by_permission or [])}
             recommended_ids = {o.id for o, _rec in (orders_with_recommendations or [])}
+
+            # WHAT THE RANKING SAW, per order. The record said which symbols were funded
+            # and why the others were not, and never what the manager DECIDED ON -- so a
+            # symbol refused for being outranked could not be checked against the ones
+            # that outranked it. These are the two numbers that actually allocate:
+            #
+            #   score   compute_order_priority_score(profit%, confidence) -- the sort key
+            #           the funding order is built from. Carried WITH its two inputs, so
+            #           the number can be re-derived rather than trusted.
+            #   weight  the per-instrument weight% from expert settings, which multiplies
+            #           the sized quantity (see the sizing core's "Apply instrument
+            #           weight" step).
+            #
+            # Recorded for REFUSED rows too, and that is the point: the score of a symbol
+            # that lost is the explanation for its refusal.
+            ranking: Dict[int, Dict[str, Any]] = {}
+            for _order, _rec in (orders_with_recommendations or []):
+                profit_pct = getattr(_rec, "expected_profit_percent", None)
+                confidence = getattr(_rec, "confidence", None)
+                ranking[_order.id] = {
+                    "score": round(compute_order_priority_score(profit_pct, confidence), 4),
+                    "confidence": None if confidence is None else float(confidence),
+                    "profit_pct": None if profit_pct is None else float(profit_pct),
+                }
+
+            # PASSED IN, from the caller that already holds the expert. This manager has
+            # no expert of its own -- it is handed one per call -- so reading the setting
+            # here would mean re-fetching the instance purely to annotate a record.
+            weights: Dict[str, float] = {}
+            for _sym, _cfg in (instrument_weights or {}).items():
+                if isinstance(_cfg, dict) and _cfg.get("weight") is not None:
+                    weights[str(_sym).upper()] = float(_cfg["weight"])
+
+            def _alloc(order) -> Dict[str, Any]:
+                """The allocation inputs for one order, omitting what is not known.
+
+                An ABSENT key means "not recorded", which the UI draws as a dash. A 0.0
+                would read as "scored zero", which is a real and different outcome.
+                """
+                out = dict(ranking.get(order.id) or {})
+                weight = weights.get(str(order.symbol).upper())
+                if weight is not None:
+                    out["weight"] = weight
+                return {k: v for k, v in out.items() if v is not None}
             funded_by_id = {o.id: o for o in (orders_to_update or [])}
             unfunded_ids = {o.id for o in (orders_to_delete or [])}
             prices = symbol_prices or {}
@@ -588,7 +650,7 @@ class TradeRiskManagement:
                     decisions.append(decision(
                         symbol, OUTCOME_NO_RECOMMENDATION,
                         "no linked recommendation, so the order could not be ranked "
-                        "against the others", side=side))
+                        "against the others", side=side, **_alloc(order)))
                 elif order.id in funded_by_id:
                     funded = funded_by_id[order.id]
                     raw_qty = funded.quantity
@@ -604,7 +666,7 @@ class TradeRiskManagement:
                             symbol, OUTCOME_FUNDED,
                             "funded, but the order carries no quantity — the size is "
                             "UNMEASURABLE (not zero); repair the order's quantity",
-                            side=side))
+                            side=side, **_alloc(order)))
                         continue
                     qty = float(raw_qty)
                     price = prices.get(symbol)
@@ -616,7 +678,8 @@ class TradeRiskManagement:
                         symbol, OUTCOME_FUNDED,
                         (f"funded at {qty:g}" if cost is None
                          else f"funded at {qty:g} (~{cost:,.2f})"),
-                        quantity=qty, side=side, price=price, cost=cost))
+                        quantity=qty, side=side, price=price, cost=cost,
+                        **_alloc(order)))
                 elif order.id in unfunded_ids:
                     price = prices.get(symbol)
                     # UNMEASURABLE stays unmeasurable: with no price there is no way to
@@ -631,7 +694,7 @@ class TradeRiskManagement:
                         why = ("sized to zero; the remaining budget did not cover one "
                                f"share at {float(price):,.2f}")
                     decisions.append(decision(symbol, OUTCOME_UNFUNDED, why,
-                                              side=side, price=price))
+                                              side=side, price=price, **_alloc(order)))
                 else:
                     # Reached the sizing core and came back neither funded nor deleted --
                     # possible when automated opening is on but the delete pass was
@@ -640,7 +703,7 @@ class TradeRiskManagement:
                     decisions.append(decision(
                         symbol, OUTCOME_UNFUNDED,
                         "not funded by the sizing pass and not queued for deletion",
-                        side=side))
+                        side=side, **_alloc(order)))
 
             record_run(expert_instance_id=expert_instance_id, account_id=account_id,
                        mode=MODE_CLASSIC, decisions=decisions, context=context,

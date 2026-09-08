@@ -922,11 +922,26 @@ class JobMonitoringTab:
             # worked in, so the ranking it applied is still legible.
             refused = [d for d in decisions if d.get('outcome') != 'FUNDED']
             funded = [d for d in decisions if d.get('outcome') == 'FUNDED']
+            def _num(value, fmt: str) -> str:
+                # ABSENT means "not recorded", drawn as a dash. A 0 would read as a
+                # measurement -- "scored zero", "no weight" -- which is a different and
+                # also reachable state.
+                return '-' if value is None else format(value, fmt)
+
             rows = [{
                 'symbol': d.get('symbol', ''),
                 'outcome': d.get('outcome', ''),
                 # '-' not 0: a refused symbol has no quantity at all.
                 'quantity': ('-' if d.get('quantity') is None else f"{d['quantity']:g}"),
+                # THE SIZE IN MONEY, which is what the per-instrument cap in the context
+                # above is denominated in -- so the reader can check a funded row against
+                # the limit it was measured against without doing the multiplication.
+                'size': _num(d.get('cost'), ',.2f'),
+                # WHAT THE RANKING DECIDED ON. The score is the sort key the funding order
+                # was built from, so a refused symbol's score IS its explanation: it
+                # ranked below the ones that took the budget.
+                'score': _num(d.get('score'), '.3f'),
+                'weight': ('-' if d.get('weight') is None else f"{d['weight']:g}%"),
                 'reason': d.get('reason', ''),
             } for d in refused + funded]
 
@@ -937,12 +952,26 @@ class JobMonitoringTab:
                     {'name': 'outcome', 'label': 'Outcome', 'field': 'outcome', 'sortable': True,
                      'align': 'left', 'style': 'width: 200px'},
                     {'name': 'quantity', 'label': 'Qty', 'field': 'quantity',
+                     'align': 'right', 'style': 'width: 70px'},
+                    {'name': 'size', 'label': 'Size', 'field': 'size', 'sortable': True,
+                     'align': 'right', 'style': 'width: 90px'},
+                    {'name': 'score', 'label': 'Score', 'field': 'score', 'sortable': True,
                      'align': 'right', 'style': 'width: 80px'},
+                    {'name': 'weight', 'label': 'Weight', 'field': 'weight',
+                     'align': 'right', 'style': 'width: 70px'},
                     {'name': 'reason', 'label': 'Reason', 'field': 'reason', 'align': 'left'},
                 ],
                 rows=rows,
                 row_key='symbol',
             ).classes('w-full mt-2').props('dense wrap-cells')
+
+            if any(d.get('score') is not None for d in decisions):
+                ui.label(
+                    'Score ranks the funding order: expected profit % weighted by '
+                    'confidence (compute_order_priority_score). Weight is the '
+                    'per-instrument setting the sized quantity is multiplied by. Size is '
+                    'quantity x price, comparable with the per-instrument cap above.'
+                ).classes('text-xs text-gray-500 mt-1')
 
             if not rows:
                 ui.label('This run received no symbols.').classes('text-sm text-gray-500 mt-2')
