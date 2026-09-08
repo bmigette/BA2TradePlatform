@@ -8267,8 +8267,12 @@ def test_the_review_button_has_a_progress_bar_that_is_hidden_at_rest(monkeypatch
     assert len(bars) == 1, "exactly one progress bar, and it belongs to the Review button"
     bar = bars[0]
     assert bar.visible is False, "a bar visible at rest says the page is working when it is not"
-    # DETERMINATE: it is driven by the per-symbol precheck loop, which is countable.
-    assert 'indeterminate' not in bar._props
+    # It STARTS indeterminate and becomes determinate once the precheck reports a
+    # denominator. Before that there is nothing to count -- positions, quotes and
+    # margin are one bulk round trip each -- and a determinate bar at 0 over a
+    # track draws nothing, which is exactly how it came to show no progress at all.
+    assert 'indeterminate' in bar._props
+    assert bar._props.get('track-color'), 'an invisible track is an invisible bar'
     assert bar._props.get("value") == 0.0, "starts empty, not at the last run's fill"
 
 
@@ -8411,3 +8415,51 @@ def test_a_latch_with_no_bar_still_gets_the_spinner():
     asyncio.run(latch.run(_work))
     assert 'loading' in seen['during']
     assert 'loading' not in button._p, "and removed again afterwards"
+
+
+def test_the_bar_only_goes_determinate_once_there_is_a_denominator():
+    """The two phases, and the switch between them.
+
+    A solve is bulk calls first (positions, quotes, margin -- one round trip each,
+    uncountable) and the per-symbol precheck second. The bar sweeps through the first
+    and shows a real fraction through the second. Getting this wrong is what made it
+    draw NOTHING: a determinate bar sitting at 0 over a transparent track is an
+    invisible rectangle, for the whole slowest part of the run.
+    """
+    class _Bar:
+        def __init__(self):
+            self.value = None
+            self._p = {'indeterminate'}
+
+        def set_value(self, v):
+            self.value = v
+
+        def props(self, add=None, remove=None):
+            if add:
+                self._p.add(add)
+            if remove:
+                self._p.discard(remove)
+            return self
+
+    bar = _Bar()
+    sink = {'done': 0, 'total': 0, 'determinate': False}
+
+    def _paint():
+        if not sink['total']:
+            return
+        if not sink['determinate']:
+            sink['determinate'] = True
+            bar.props(remove='indeterminate')
+        bar.set_value(min(1.0, sink['done'] / sink['total']))
+
+    _paint()
+    assert bar.value is None and 'indeterminate' in bar._p, \
+        "no denominator yet -- it must sweep, not sit at zero"
+
+    sink.update(done=1, total=4)
+    _paint()
+    assert bar.value == 0.25 and 'indeterminate' not in bar._p
+
+    sink.update(done=4)
+    _paint()
+    assert bar.value == 1.0

@@ -1210,9 +1210,11 @@ class ClickLatch:
             if self.progress is None:
                 self.button.props('loading')
         if self.progress is not None:
-            # Back to empty first: a bar that opens at last run's 100% reads as
-            # "already finished" for the second or two before the first symbol lands.
+            # Back to empty AND back to sweeping: a bar that opens at the last run's
+            # 100% reads as "already finished", and one left determinate at 0 draws
+            # nothing at all until the first symbol lands.
             self.progress.set_value(0.0)
+            self.progress.props('indeterminate')
             self.progress.set_visibility(True)
         try:
             await factory()
@@ -3814,15 +3816,24 @@ async def content() -> None:
             # The worker thread only RECORDS; this timer paints. A NiceGUI element
             # touched from inside asyncio.to_thread has no client context, so the
             # solve hands over plain numbers and the UI reads them at its own pace.
-            sink = {'done': 0, 'total': 0}
+            sink = {'done': 0, 'total': 0, 'determinate': False}
 
             def _record(done, total, symbol):
                 sink['done'], sink['total'] = done, total
 
             def _paint():
+                # TWO PHASES, and the switch between them is the honest part. Until the
+                # precheck reports there is no denominator -- the bulk positions/quotes/
+                # margin calls are one round trip each and cannot be counted -- so the
+                # bar sweeps. From the first report on it shows the real fraction.
                 bar = review_latch.progress
-                if bar is None or not sink['total']:
+                if bar is None:
                     return
+                if not sink['total']:
+                    return
+                if not sink['determinate']:
+                    sink['determinate'] = True
+                    bar.props(remove='indeterminate')
                 bar.set_value(min(1.0, sink['done'] / sink['total']))
 
             painter = ui.timer(0.2, _paint)
@@ -3872,9 +3883,12 @@ async def content() -> None:
             # takes the bar out of the flow entirely: the button's box is exactly the
             # size it was, and the toolbar cannot move whether the bar shows or not.
             with review_latch.button:
+                # The TRACK is visible on purpose: it is what makes the bar readable
+                # at 0% and it is where the indeterminate sweep is seen. `transparent`
+                # here meant the control drew nothing until it was already half full.
                 review_latch.progress = ui.linear_progress(
                     value=0.0, show_value=False, size='4px') \
-                    .props('rounded color=white track-color=transparent') \
+                    .props('rounded color=white track-color=green-8 indeterminate') \
                     .classes('absolute bottom-0 left-0 w-full z-10') \
                     .mark(MARKER_REVIEW_PROGRESS)
                 review_latch.progress.set_visibility(False)
