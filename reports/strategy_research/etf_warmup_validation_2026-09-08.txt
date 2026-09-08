@@ -1,0 +1,30 @@
+Provider construction validation:
+============================= test session starts =============================
+platform win32 -- Python 3.12.14, pytest-9.1.0, pluggy-1.6.0
+rootdir: C:\Users\basti\Documents\dev\BA2TradePlatform
+configfile: pytest.ini
+collected 3 items
+
+packages\providers\tests\test_fmp_provider_construct.py ...              [100%]
+
+============================== warnings summary ===============================
+packages/providers/tests/test_fmp_provider_construct.py::test_construct_fmp_ohlcv_provider
+  C:\Users/basti/ba2-venvs/trade/Lib/site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 3 passed, 1 warning in 2.61s =========================
+
+Warmup and ETF engine validation:
+.................................                                        [100%]
+============================== warnings summary ===============================
+..\..\..\ba2-venvs\trade\Lib\site-packages\websockets\legacy\__init__.py:6
+  C:\Users/basti/ba2-venvs/trade/Lib/site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+tests/backtest/test_etf_trend.py::test_real_engine_opens_selected_fund_through_shared_rules
+  C:\Users\basti\Documents\dev\BA2TradePlatform\testplatform\backend\app\models\database.py:65: MovedIn20Warning: The ``declarative_base()`` function is now available as sqlalchemy.orm.declarative_base(). (deprecated since: 2.0) (Background on SQLAlchemy 2.0 at: https://sqlalche.me/e/b8d9)
+    Base = declarative_base()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+33 passed, 2 warnings in 7.03s

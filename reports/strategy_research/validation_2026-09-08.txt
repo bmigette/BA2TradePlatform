@@ -1,0 +1,19 @@
+Isolated validation, 2026-09-08; Python 3.12.14
+Files: testplatform/backend/tests/test_research6_driver.py testplatform/backend/tests/backtest/test_etf_trend.py testplatform/backend/tests/test_strategy_optimization_handler.py testplatform/backend/tests/test_strategy_param_space_collect.py testplatform/backend/tests/test_strategy_param_space_decode.py testplatform/backend/tests/backtest/test_parity_golden.py testplatform/backend/tests/backtest/test_traderule_ruleset_through_run_daily_backtest.py testplatform/backend/tests/backtest/test_daily_backtest_handler.py -q -p no:cacheprovider --tb=short
+........................................................................ [ 56%]
+.......................................................                  [100%]
+============================== warnings summary ===============================
+..\..\..\ba2-venvs\trade\Lib\site-packages\websockets\legacy\__init__.py:6
+  C:\Users/basti/ba2-venvs/trade/Lib/site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+testplatform\backend\app\models\database.py:65
+  C:\Users\basti\Documents\dev\BA2TradePlatform\testplatform\backend\app\models\database.py:65: MovedIn20Warning: The ``declarative_base()`` function is now available as sqlalchemy.orm.declarative_base(). (deprecated since: 2.0) (Background on SQLAlchemy 2.0 at: https://sqlalche.me/e/b8d9)
+    Base = declarative_base()
+
+tests/test_strategy_optimization_handler.py::test_handler_completes_remote_only_zero_local_slots
+  C:\Users\basti\Documents\dev\BA2TradePlatform\testplatform\backend\app\services\distributed_eval.py:317: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    row.last_heartbeat = datetime.utcnow()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+127 passed, 3 warnings in 20.25s

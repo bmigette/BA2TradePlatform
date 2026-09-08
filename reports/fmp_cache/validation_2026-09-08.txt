@@ -1,0 +1,22 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.14, pytest-9.1.0, pluggy-1.6.0
+rootdir: C:\Users\basti\Documents\dev\BA2TradePlatform
+configfile: pytest.ini
+collected 47 items
+
+tests\test_ohlcv_cache_asof_coverage.py ......................           [ 46%]
+tests\test_ohlcv_cache_freshness.py .......                              [ 61%]
+tests\test_fmp_common.py ..................                              [100%]
+
+============================== warnings summary ===============================
+..\..\..\ba2-venvs\trade\Lib\site-packages\websockets\legacy\__init__.py:6
+  C:\Users/basti/ba2-venvs/trade/Lib/site-packages\websockets\legacy\__init__.py:6: DeprecationWarning: websockets.legacy is deprecated; see https://websockets.readthedocs.io/en/stable/howto/upgrade.html for upgrade instructions
+    warnings.warn(  # deprecated in 14.0 - 2024-11-09
+
+tests/test_ohlcv_cache_freshness.py::test_pinned_past_end_date_never_refetches
+tests/test_ohlcv_cache_freshness.py::test_pinned_past_end_date_returns_same_rows_as_before_the_fix
+  C:\Users\basti\Documents\dev\BA2TradePlatform\packages\common\ba2_common\core\interfaces\MarketDataProviderInterface.py:633: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+    return end >= datetime.utcnow() - timedelta(hours=1)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================= 47 passed, 3 warnings in 4.16s ========================
