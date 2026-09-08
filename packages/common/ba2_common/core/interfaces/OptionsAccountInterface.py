@@ -2539,18 +2539,31 @@ class OptionsAccountInterface(ABC):
         return self.reserved_option_buying_power_detail().total
 
     def available_option_buying_power(self) -> Optional[float]:
-        """Balance minus reserves, or ``None`` when either is unknown.
+        """Option TRADABLE balance minus reserves, or ``None`` when either is unknown.
 
         ``None``, not ``0.0``. The previous ``self.get_balance() or 0.0`` turned an
         unreadable balance into a real number; it happened to fail closed, but "we could
         not read the balance" and "the balance is zero" are still different facts and
         only one of them is ever true.
+
+        The base is ``get_option_tradable_balance()`` (margin design 2026-09-08):
+        balance x the option leverage, which is 1.0 at every supported broker today, so
+        with margin off or on this equals the plain balance until an adapter reports real
+        option leverage.
         """
         pool = self.reserved_option_buying_power_detail()
         if not pool.is_measurable:
             return None
-        bal = self.get_balance()
-        if bal is None:
+        try:
+            bal = self.get_option_tradable_balance()
+        except Exception as e:
+            # get_option_tradable_balance RAISES on an unknown balance/multiplier where
+            # the old get_balance() returned None; this contract is None-for-unknown (the
+            # gates refuse on None), so the raise is translated here -- and LOGGED, because
+            # an unknown that is merely swallowed is a silent failure.
+            from ba2_common.logger import logger
+            logger.error(f"[Account {self.id}] option tradable balance unavailable: {e}",
+                         exc_info=True)
             return None
         return bal - pool.total
 
