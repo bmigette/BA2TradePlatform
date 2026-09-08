@@ -14,6 +14,26 @@ from ba2_common.core.models import AccountSetting
 from ba2_common.core.interfaces.ExtendableSettingsInterface import ExtendableSettingsInterface
 
 
+#: A margin_factor below 1.0 would let an account deploy LESS than its balance,
+#: which is virtual_equity_pct's job, not this setting's. 1.0 == margin off.
+MARGIN_FACTOR_MIN = 1.0
+
+
+def margin_factor_error(value: Any) -> Optional[str]:
+    """Why ``value`` is not an acceptable ``margin_factor``; ``None`` when it is. Pure.
+
+    Used by the account settings dialog at save time and by the account itself at
+    read time, so the two can never disagree about what is valid.
+    """
+    try:
+        factor = float(value)
+    except (TypeError, ValueError):
+        return f"margin_factor must be a number, got {value!r}"
+    if factor < MARGIN_FACTOR_MIN:
+        return f"margin_factor must be >= {MARGIN_FACTOR_MIN} (1.0 means no leverage), got {factor}"
+    return None
+
+
 class ReadOnlyAccountInterface(ExtendableSettingsInterface):
     """
     Abstract base class for read-only account interfaces.
@@ -52,6 +72,20 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     "default": False,
                     "description": "Manually traded account",
                     "tooltip": "Enable the Portfolio Allocation page for this account. Only for accounts you trade by hand -- the page refuses to run when the account has any enabled expert."
+                },
+                "margin_enabled": {
+                    "type": "bool",
+                    "required": False,
+                    "default": False,
+                    "description": "Margin trading enabled",
+                    "tooltip": "Let this account's experts deploy more than the account balance, up to balance x margin factor, never more than the broker's own buying power. Off = experts size against the plain balance.",
+                },
+                "margin_factor": {
+                    "type": "float",
+                    "required": False,
+                    "default": 1.8,
+                    "description": "Margin factor (max exposure / balance)",
+                    "tooltip": "Ceiling on total exposure as a multiple of balance: 1.8 means a $10k account never holds more than $18k of positions. Capped by the broker's multiplier. Ignored when margin trading is off. Minimum 1.0.",
                 },
             }
 
