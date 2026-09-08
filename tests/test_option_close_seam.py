@@ -171,7 +171,7 @@ class _FakeAccount:
     def get_positions(self):
         return self._positions
 
-    def get_instrument_current_price(self, symbols):
+    def get_instrument_current_price(self, symbols, price_type=None):
         return {s: self._prices[s] for s in symbols if s in self._prices}
 
 
@@ -902,3 +902,59 @@ class TestTwoTrimsOnOneTransactionCannotBothPass:
             "accumulate on this branch")
         assert get_instance(Transaction, txn.id).quantity == 300.0, (
             "...yet the transaction was written down for BOTH trims")
+
+
+class TestAHoldingIsValuedAtTheMarkNotTheBid:
+    """Reported live 2026-09-08: "There's big discrepancy for magy".
+
+    ``build_position_states`` took the price seam's DEFAULT price type, and
+    ``ReadOnlyAccountInterface.get_instrument_current_price`` defaults to ``'bid'``. On a
+    liquid symbol the bid and the mark are a cent apart and nothing showed. MAGY -- a
+    hard-to-borrow covered-call ETF -- quoted bid 16.86 against ask 44.00 with a 42.20 mark:
+    its 4.574 shares valued at 77.12 against the broker's own 193.02 net liq, and the page
+    reported -68.6% on a position the broker had at -21.4%.
+
+    The display was the smaller half. That value is also the position's CURRENT WEIGHT, so a
+    holding sitting on target read as 60% short and the next plan would have BOUGHT more of it.
+    """
+
+    def _account(self, prices):
+        # Imported per-test, the convention this file already follows: the service pulls the
+        # live registry in at import time and the suite keeps that off collection.
+        seen = {}
+
+        class _Acct:
+            id = 1
+
+            def get_positions(self):
+                return [_FakePosition("MAGY", 4.574, 245.48, 77.12)]
+
+            def get_instrument_current_price(self, symbols, price_type=None):
+                seen["price_type"] = price_type
+                return {s: prices[s] for s in symbols if s in prices}
+
+        return _Acct(), seen
+
+    def test_it_asks_for_the_mark(self):
+        from ba2_trade_platform.core import portfolio_allocation_service as svc
+        account, seen = self._account({"MAGY": 42.20})
+        svc.build_position_states(account, ["MAGY"])
+        assert seen["price_type"] == "mark", (
+            "the seam defaults to 'bid', which is what a forced sale would fetch -- not what "
+            "the holding is worth, and not what every weight on the page is computed from")
+
+    def test_the_mark_is_what_lands_on_the_state(self):
+        from ba2_trade_platform.core import portfolio_allocation_service as svc
+        account, _ = self._account({"MAGY": 42.20})
+        states = svc.build_position_states(account, ["MAGY"])
+        assert states["MAGY"].price == 42.20
+        # 4.574 x 42.20 = 193.02, the broker's own net liq for the row.
+        assert abs(states["MAGY"].quantity * states["MAGY"].price - 193.02) < 0.01
+
+    def test_an_unpriced_symbol_is_still_unpriced(self):
+        """Unchanged and load-bearing: asking for a different price type must not invent one.
+        None propagates as "unpriced" and the engine refuses to size on it."""
+        from ba2_trade_platform.core import portfolio_allocation_service as svc
+        account, _ = self._account({})
+        states = svc.build_position_states(account, ["MAGY"])
+        assert states["MAGY"].price is None

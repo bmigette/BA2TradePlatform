@@ -72,7 +72,7 @@ class _Account(MockAccount):
     def get_positions(self):
         return self._positions
 
-    def get_instrument_current_price(self, symbol_or_symbols):
+    def get_instrument_current_price(self, symbol_or_symbols, price_type=None):
         self.quote_requests.append(symbol_or_symbols)
         if isinstance(symbol_or_symbols, list):
             return {s: self._prices.get(s) for s in symbol_or_symbols}

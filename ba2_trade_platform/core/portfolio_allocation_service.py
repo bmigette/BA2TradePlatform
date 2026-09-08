@@ -172,7 +172,26 @@ def build_position_states(account, symbols: List[str]) -> Dict[str, PositionStat
         if symbol in wanted:
             held[symbol] = position
 
-    prices = account.get_instrument_current_price(wanted) if wanted else {}
+    # THE MARK, EXPLICITLY -- the seam's default is 'bid' (ReadOnlyAccountInterface), and
+    # every figure on this page is a VALUATION: market value, P&L, each symbol's weight, and
+    # the target notional every order is sized from. The bid is what a forced sale would
+    # fetch this second, which is a different question and the wrong one here.
+    #
+    # On a liquid symbol the two are a cent apart and nothing showed. On a thin one they are
+    # not: MAGY, a hard-to-borrow covered-call ETF, quoted bid 16.86 against ask 44.00 and a
+    # 42.20 mark on 2026-09-08. Valued at the bid, its 4.574 shares came to 77.12 against the
+    # broker's own 193.02 net liq -- 60% understated -- and the page reported -68.6% on a
+    # position the broker had at -21.4%. Worse than the display: the allocator reads that
+    # value as its current weight, so a position ON target looked 60% short and the plan
+    # would have BOUGHT more of it.
+    #
+    # 'mark' is the broker's consolidated live price -- the one net liq is struck at -- and
+    # it is the only field TastyTrade declares REQUIRED, so it survives the thin/after-hours
+    # case where bid and ask are missing or nonsense. An adapter that does not know the type
+    # degrades to its own default (Alpaca's else-branch returns bid), i.e. exactly today's
+    # behaviour, so this cannot regress a broker that has no mark.
+    prices = (account.get_instrument_current_price(wanted, price_type='mark')
+              if wanted else {})
     if not isinstance(prices, dict):
         prices = {}
     txn_ids, unactionable_ids = _partition_open_transaction_ids(account.id, wanted)
