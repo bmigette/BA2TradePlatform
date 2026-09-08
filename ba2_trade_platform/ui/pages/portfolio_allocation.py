@@ -600,7 +600,7 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
 def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: float,
                 allow_fractional: bool, valuation_mode: str,
                 unallocated_pct: float = 0.0,
-                force_market_refresh: bool = False):
+                force_market_refresh: bool = False, on_progress=None):
     """Solve one dry run against FRESH positions, prices and margin info. Blocking.
 
     Re-reads everything rather than reusing the open dialog's snapshot: Refresh
@@ -661,7 +661,7 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
     # min_trade_increment / min_order_size / min_fractional_notional.
     plan = svc.precheck_plan(account, plan,
                              available_buying_power=base.available_buying_power,
-                             margin=margin)
+                             margin=margin, on_progress=on_progress)
     return base, plan, current, svc.fetch_market_hours(account)
 
 
@@ -843,6 +843,13 @@ MARKER_BAR_ROW = 'pf-bar-row'
 #: only figure on the line whose sign carries a verdict -- so it is the only one
 #: that can be coloured, and NiceGUI colours whole elements.
 MARKER_LABEL_LAST = 'pf-label-last'
+#: The toolbar's own CSS scope, and the height every control in it is pinned to.
+#: 40px because that is what a `dense outlined` Quasar field wants once its
+#: bottom-space reservation is gone -- pinning to the BUTTON's smaller natural height
+#: instead would clip the select's floating label.
+TOOLBAR_CLASS = 'pf-alloc-toolbar'
+TOOLBAR_CONTROL_PX = 40
+
 #: The Review button's own progress bar. Marked so a test can assert it exists, is
 #: hidden at rest, and is the SAME element the latch drives.
 MARKER_REVIEW_PROGRESS = 'pf-review-progress'
@@ -1196,6 +1203,9 @@ class ClickLatch:
             self.button.set_enabled(False)
             self.button.props('loading')
         if self.progress is not None:
+            # Back to empty first: a bar that opens at last run's 100% reads as
+            # "already finished" for the second or two before the first symbol lands.
+            self.progress.set_value(0.0)
             self.progress.set_visibility(True)
         try:
             await factory()
@@ -3409,7 +3419,8 @@ def _market_gate_for(hours):
 
 async def _open_allocation_flow(account_id: int, valuation_mode: str,
                                 refresh, *, mode: str = ALLOCATION_MODE_REBALANCE,
-                                invest_amount: float = 0.0) -> None:
+                                invest_amount: float = 0.0,
+                                on_progress=None) -> None:
     """The Review-and-Submit button: the dry run, then Submit. NO target step any more.
 
     A REBALANCE goes STRAIGHT to the dry run. The three-step dialog it used to open
@@ -3506,7 +3517,8 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                             state['unallocated_pct'])
         try:
             new_base, plan, current, hours = await asyncio.to_thread(
-                _solve_plan, account_id, mode=state['mode'], labels=state['labels'],
+                _solve_plan, account_id, on_progress=on_progress,
+                mode=state['mode'], labels=state['labels'],
                 scope_label=state['scope_label'], amount=state['amount'],
                 allow_fractional=state['allow_fractional'],
                 valuation_mode=valuation_mode,
@@ -3662,7 +3674,24 @@ async def content() -> None:
             _render_gate_blocked(gate)
             return
 
-        toolbar = ui.row().classes('w-full items-center gap-2')
+        # ONE HEIGHT FOR EVERY CONTROL, set in CSS because no combination of props gets
+        # there. A Quasar field and a Quasar button are different components with
+        # different internal padding: `dense` and `hide-bottom-space` narrow the gap and
+        # leave the select a few pixels taller than the buttons, which is exactly the
+        # misalignment that keeps being reported. `items-center` then centres two boxes
+        # of different heights -- correctly, and still looking wrong.
+        #
+        # Scoped to this toolbar (`pf-toolbar`) rather than global: the same fields
+        # elsewhere on the page sit in forms where their natural height is right.
+        ui.add_css(f'''
+            .{TOOLBAR_CLASS} .q-field__control {{ min-height: {TOOLBAR_CONTROL_PX}px;
+                                                  height: {TOOLBAR_CONTROL_PX}px; }}
+            .{TOOLBAR_CLASS} .q-field__marginal {{ height: {TOOLBAR_CONTROL_PX}px; }}
+            .{TOOLBAR_CLASS} .q-field__native {{ padding-top: 0; padding-bottom: 0; }}
+            .{TOOLBAR_CLASS} .q-btn {{ min-height: {TOOLBAR_CONTROL_PX}px;
+                                       height: {TOOLBAR_CONTROL_PX}px; }}
+        ''')
+        toolbar = ui.row().classes(f'w-full items-center gap-2 {TOOLBAR_CLASS}')
         body = ui.column().classes('w-full gap-3')
         try:
             mode_state = {'value': await asyncio.to_thread(_load_valuation_mode, account_id)}
@@ -3760,9 +3789,27 @@ async def content() -> None:
                 ui.notify(SIM_REVIEW_BLOCKED, type='warning', multi_line=True,
                           close_button=True, classes='break-words')
                 return
-            await review_latch.run(
-                lambda: _open_allocation_flow(account_id, mode_state['value'],
-                                              _refresh))
+            # The worker thread only RECORDS; this timer paints. A NiceGUI element
+            # touched from inside asyncio.to_thread has no client context, so the
+            # solve hands over plain numbers and the UI reads them at its own pace.
+            sink = {'done': 0, 'total': 0}
+
+            def _record(done, total, symbol):
+                sink['done'], sink['total'] = done, total
+
+            def _paint():
+                bar = review_latch.progress
+                if bar is None or not sink['total']:
+                    return
+                bar.set_value(min(1.0, sink['done'] / sink['total']))
+
+            painter = ui.timer(0.2, _paint)
+            try:
+                await review_latch.run(
+                    lambda: _open_allocation_flow(account_id, mode_state['value'],
+                                                  _refresh, on_progress=_record))
+            finally:
+                painter.deactivate()
 
         async def _apply_simulation() -> None:
             """Re-render on the simulated base, and lock Review while it is on."""
@@ -3791,20 +3838,22 @@ async def content() -> None:
                 await _apply_simulation()
 
         with toolbar:
-            # The button and its progress bar are ONE column so the bar is exactly as
-            # wide as the button and sits directly under it. ``gap-0`` because a gap
-            # would read as a separate control rather than as this button's own state.
-            with ui.column().classes('gap-0 items-stretch'):
-                review_latch.button = ui.button(
-                    REVIEW_BUTTON_LABEL, icon='fact_check', on_click=_review) \
-                    .props('color=primary') \
-                    .tooltip('Solve the plan against the broker and show it for review. '
-                             'Nothing is ordered until you press Submit in the dry run.')
-                # Indeterminate: see ClickLatch. Hidden until a run starts, and it takes
-                # no vertical space while hidden, so the toolbar does not jump on click.
+            review_latch.button = ui.button(
+                REVIEW_BUTTON_LABEL, icon='fact_check', on_click=_review) \
+                .props('color=primary').classes('relative overflow-hidden') \
+                .tooltip('Solve the plan against the broker and show it for review. '
+                         'Nothing is ordered until you press Submit in the dry run.')
+            # INSIDE the button, absolutely positioned along its bottom edge. It was a
+            # sibling in a column, which made the button+bar unit taller than every
+            # other control and left `items-center` centring THAT -- so the fix for the
+            # misaligned dropdown was itself misaligning the row. Absolute positioning
+            # takes the bar out of the flow entirely: the button's box is exactly the
+            # size it was, and the toolbar cannot move whether the bar shows or not.
+            with review_latch.button:
                 review_latch.progress = ui.linear_progress(
-                    value=0, show_value=False, size='3px') \
-                    .props('indeterminate rounded color=primary') \
+                    value=0.0, show_value=False, size='4px') \
+                    .props('rounded color=white track-color=transparent') \
+                    .classes('absolute bottom-0 left-0 w-full') \
                     .mark(MARKER_REVIEW_PROGRESS)
                 review_latch.progress.set_visibility(False)
             # ``hide-bottom-space`` is what LINES THESE UP. A Quasar field reserves a

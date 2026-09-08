@@ -235,7 +235,8 @@ def fetch_margin_info(account, symbols: List[str]) -> Dict[str, MarginInfo]:
 
 
 def precheck_plan(account, plan: AllocationPlan, *, available_buying_power: float,
-                  margin: Optional[Dict[str, MarginInfo]]) -> AllocationPlan:
+                  margin: Optional[Dict[str, MarginInfo]],
+                  on_progress=None) -> AllocationPlan:
     """Re-solve the plan against broker order prechecks, when the broker has them.
 
     Solve once (the caller has already done that), build the candidate BUY
@@ -258,6 +259,15 @@ def precheck_plan(account, plan: AllocationPlan, *, available_buying_power: floa
     legitimate buy). If sells are ever added here they are CLOSES and must pass
     True.
 
+    ``on_progress(done, total, symbol)`` is called after each preview, if given. It
+    is the ONLY honest progress signal this solve has: everything else is bulk (one
+    positions call, one quote call, one margin call) while this is one REST round
+    trip per buy, so it is both the slow part and the countable one. It runs on
+    whatever thread the solve runs on, so a UI caller must only record the numbers
+    here and paint them from its own loop -- never touch an element from inside it.
+    An exception raised by the callback would abandon a solve for a progress bar, so
+    it is called defensively.
+
     ``margin`` is a REQUIRED keyword: pass the same dict the plan was solved
     with (``{}`` when the broker described nothing). Without it the re-solve
     rebuilds a bare ``MarginInfo`` per fractional row and rounds on the default
@@ -272,7 +282,19 @@ def precheck_plan(account, plan: AllocationPlan, *, available_buying_power: floa
         return plan
 
     impacts: Dict[str, Any] = {}
-    for row in plan.buy_rows:
+    buys = list(plan.buy_rows)
+    total = len(buys)
+
+    def _report(done: int, symbol: str) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(done, total, symbol)
+        except Exception as e:  # noqa: BLE001 -- a progress bar may not kill a solve
+            logger.debug(f"Allocation precheck progress callback failed: {e}")
+
+    _report(0, '')
+    for index, row in enumerate(buys, start=1):
         candidate = TradingOrder(
             account_id=account.id,
             symbol=row.symbol,
@@ -291,6 +313,7 @@ def precheck_plan(account, plan: AllocationPlan, *, available_buying_power: floa
         # order that FREES buying power, and dropping those loses the headroom.
         if impact is not None:
             impacts[row.symbol] = impact
+        _report(index, row.symbol)
 
     if not impacts:
         return plan

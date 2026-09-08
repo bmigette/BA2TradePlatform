@@ -1374,7 +1374,9 @@ def test_solve_plan_hands_the_precheck_the_margin_grid_the_plan_was_solved_on(
                      labels=_alloc_labels(), scope_label=None, amount=0.0,
                      allow_fractional=True, valuation_mode=VALUATION_MODE_COST)
 
-    assert set(seen) == {'available_buying_power', 'margin'}
+    # ``on_progress`` joined them 2026-09-08: the precheck loop is the only countable
+    # part of a solve, so it reports each symbol it previews for the button's bar.
+    assert set(seen) == {'available_buying_power', 'margin', 'on_progress'}
     assert seen['margin']['AAPL'].min_trade_increment == 0.25
 
 
@@ -8265,7 +8267,9 @@ def test_the_review_button_has_a_progress_bar_that_is_hidden_at_rest(monkeypatch
     assert len(bars) == 1, "exactly one progress bar, and it belongs to the Review button"
     bar = bars[0]
     assert bar.visible is False, "a bar visible at rest says the page is working when it is not"
-    assert 'indeterminate' in bar._props
+    # DETERMINATE: it is driven by the per-symbol precheck loop, which is countable.
+    assert 'indeterminate' not in bar._props
+    assert bar._props.get("value") == 0.0, "starts empty, not at the last run's fill"
 
 
 def test_the_latch_drives_the_bar_it_was_given():
@@ -8276,6 +8280,7 @@ def test_the_latch_drives_the_bar_it_was_given():
 
     class _Elem:
         def __init__(self):
+            self.value = None
             self.visible = None
             self.enabled = True
             self._p = set()
@@ -8285,6 +8290,9 @@ def test_the_latch_drives_the_bar_it_was_given():
 
         def set_enabled(self, v):
             self.enabled = v
+
+        def set_value(self, v):
+            self.value = v
 
         def props(self, add=None, remove=None):
             if add:
@@ -8308,3 +8316,62 @@ def test_the_latch_drives_the_bar_it_was_given():
     assert bar.visible is False and button.enabled is True, \
         "a failed run must still release both"
     assert latch.busy is False
+
+
+def test_the_precheck_reports_every_symbol_it_previews():
+    """The bar is DETERMINATE because this loop is countable.
+
+    Operator, 2026-09-08: "progressbar ugly and does not show real progress. We're
+    iterating on all symbols that could be a progress indicator". Everything else in a
+    solve is bulk -- one positions call, one quote call, one margin call -- while this
+    is one REST round trip per buy, so it is both the slow part and the only part with
+    a denominator.
+    """
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+    from ba2_common.core.portfolio_allocation import AllocationPlan, AllocationRow
+    from ba2_common.core.types import OrderDirection
+
+    rows = [AllocationRow(symbol=s, price=100.0, delta_quantity=1.0,
+                          side=OrderDirection.BUY, target_quantity=1.0)
+            for s in ("AAA", "BBB", "CCC")]
+    plan = AllocationPlan(rows=rows)
+
+    class _Acct:
+        id = 1
+
+        def preview_order_impact(self, order, is_closing_order=False):
+            return None
+
+    seen = []
+    svc.precheck_plan(_Acct(), plan, available_buying_power=10_000.0, margin={},
+                      on_progress=lambda done, total, symbol: seen.append(
+                          (done, total, symbol)))
+
+    assert seen[0] == (0, 3, ''), "an opening report, so the bar starts at 0 of a KNOWN total"
+    assert [s for _d, _t, s in seen[1:]] == ["AAA", "BBB", "CCC"]
+    assert [d for d, _t, _s in seen] == [0, 1, 2, 3]
+    assert all(t == 3 for _d, t, _s in seen), "the denominator never moves mid-run"
+
+
+def test_a_progress_callback_that_raises_cannot_kill_the_solve():
+    """A solve abandoned for a progress bar would be an absurd trade."""
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+    from ba2_common.core.portfolio_allocation import AllocationPlan, AllocationRow
+    from ba2_common.core.types import OrderDirection
+
+    plan = AllocationPlan(rows=[AllocationRow(
+        symbol="AAA", price=100.0, delta_quantity=1.0,
+        side=OrderDirection.BUY, target_quantity=1.0)])
+
+    class _Acct:
+        id = 1
+
+        def preview_order_impact(self, order, is_closing_order=False):
+            return None
+
+    def _boom(*_a):
+        raise RuntimeError("the bar exploded")
+
+    out = svc.precheck_plan(_Acct(), plan, available_buying_power=10_000.0, margin={},
+                            on_progress=_boom)
+    assert out is not None
