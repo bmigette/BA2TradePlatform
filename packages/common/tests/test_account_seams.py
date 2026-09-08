@@ -172,6 +172,38 @@ def test_the_plain_buying_power_name_wins_over_the_derivative_one():
     assert snap.buying_power == 9000.0
 
 
+def test_probe_reads_alpaca_name():
+    """option_buying_power under Alpaca's name for it."""
+    snap = _DictAccount(1, {"options_buying_power": "1234.5"}).get_account_snapshot()
+
+    assert snap.option_buying_power == 1234.5
+
+
+def test_probe_reads_tastytrade_name():
+    """... and under TastyTrade's, which is the same field the buying_power chain
+    falls back to -- one name, read into two places on purpose."""
+    snap = _DictAccount(1, {"derivative_buying_power": 99.0}).get_account_snapshot()
+
+    assert snap.option_buying_power == 99.0
+
+
+def test_the_alpaca_options_name_wins_over_the_tastytrade_derivative_one():
+    """No broker publishes both, but the chain has an order and it must be pinned:
+    a silent flip would hand an options-only account the wrong ceiling."""
+    snap = _DictAccount(1, {"options_buying_power": "1234.5",
+                            "derivative_buying_power": "7500"}).get_account_snapshot()
+
+    assert snap.option_buying_power == 1234.5
+
+
+def test_probe_leaves_none_when_broker_publishes_neither():
+    """None means "not published" -- never 0.0, which would read as a real ceiling
+    of zero and refuse every option order."""
+    snap = _DictAccount(1, {"buying_power": 10.0}).get_account_snapshot()
+
+    assert snap.option_buying_power is None
+
+
 def test_pending_transfer_in_is_read_on_the_dict_path_too():
     """Only the attribute path asserted it (as None); an incoming ACH is money
     the allocation page must see."""

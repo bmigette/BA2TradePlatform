@@ -2042,6 +2042,7 @@ def test_account_snapshot_maps_a_margin_account():
     assert snapshot.net_liquidation == 100000.0
     assert snapshot.equity == 100000.0
     assert snapshot.long_market_value == 75000.0
+    assert snapshot.option_buying_power == 25000.0
     assert snapshot.is_margin_account is True
     assert snapshot.margin_multiplier == 2.0
 
