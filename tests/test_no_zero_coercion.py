@@ -361,12 +361,12 @@ def stale_entries(allowlist: dict, live_sites) -> list:
 # who read the site.
 # --------------------------------------------------------------------------- #
 ALLOWLIST: dict = {
-    "ba2_trade_platform/ui/pages/settings.py:3747":
+    "ba2_trade_platform/ui/pages/settings.py:3772":
         "settings import: 100.0 is the documented virtual_equity_pct column default, not a "
         "measurement of anything (was :3852 pre-merge on this branch, :3851 pre-merge on dev "
         "before fetch_info/fetch_missing_info were collapsed onto core.instrument_enrichment; "
         "2026-09-02 dev merge landed dev's collapse, re-numbering this line to :3747)",
-    "ba2_trade_platform/ui/pages/settings.py:3795":
+    "ba2_trade_platform/ui/pages/settings.py:3820":
         "same settings-import default; the comment above the line records why the fallback was "
         "deliberately restored (was :3900 pre-merge on this branch, :3899 on dev; the merge's "
         "AST node for the nested 'general.get(\\'virtual_equity\\', 100.0)' call lands on the "
@@ -383,7 +383,7 @@ ALLOWLIST: dict = {
     "packages/experts/ba2_experts/settings_io.py:210":
         "settings IMPORT default matching the NOT NULL column default; an export of a 0% sleeve "
         "carries the key explicitly, so this only fires on a pre-field export",
-    "packages/common/ba2_common/core/TradeActions.py:1548":
+    "packages/common/ba2_common/core/TradeActions.py:1549":
         "10.0 is the documented default of the max_virtual_equity_per_instrument_percent "
         "SETTING, a configured cap rather than a measurement of anything "
         "(was :1529 before the ARC gate added lines above it; :1532 before the Phase-2a "
@@ -399,7 +399,9 @@ ALLOWLIST: dict = {
         "in ENTRY_CROSS_FULL (+1); :1548 after Task 9 added ONE import line "
         "(``from ba2_common.core.earnings_stamp import ...``, line 37) for the earnings "
         "event-date carry-forward -- 1547 + 1 = 1548, and it is the ONLY line this task "
-        "added above 1547: its other two edits sit at ~2888 and ~2976)",
+        "added above 1547: its other two edits sit at ~2888 and ~2976); :1549 after the "
+        "margin Task 6 wrapped the 'Get total virtual equity' comment just above it onto "
+        "a second line (+1)",
     "testplatform/backend/app/services/backtest/parity_harness.py:223":
         "parity HARNESS synthesising a stub bar; 100.0 is an arbitrary fixture price and the "
         "double 'or 100.0' says so",
@@ -431,7 +433,11 @@ BASELINE: dict = {
     # reader, listed below at the same count), and the service now delegates.
     "ba2_trade_platform/core/portfolio_allocation_service.py": 3,
     "ba2_trade_platform/modules/accounts/AlpacaAccount.py": 11,
-    "ba2_trade_platform/modules/accounts/IBKRAccount.py": 2,
+    # IBKRAccount.py LEFT the register 2026-09-08: both of its coercions lived in
+    # ``get_cash_balance``/``get_buying_power``, two callerless readers that fabricated
+    # 0.0 on error. They were deleted (``get_buying_power`` had also started shadowing
+    # the base contract, which raises rather than inventing a balance), so the file now
+    # measures 0 and drops out -- BASELINE carries no zeroes. Total below drops by 2.
     "ba2_trade_platform/modules/accounts/TastyTradeAccount.py": 5,
     "ba2_trade_platform/ui/pages/marketanalysishistory.py": 1,
     # 17 -> 16: the invested-series accumulator now SKIPS a trade with no qty or
@@ -476,7 +482,7 @@ BASELINE: dict = {
     "testplatform/backend/app/services/backtest_handler.py": 1,
     "testplatform/backend/app/services/strategy_optimization_handler.py": 1,
 }
-BASELINE_TOTAL = 171
+BASELINE_TOTAL = 169
 
 
 # =========================================================================== #

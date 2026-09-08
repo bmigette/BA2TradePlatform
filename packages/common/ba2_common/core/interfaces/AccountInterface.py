@@ -1305,6 +1305,28 @@ class AccountInterface(ReadOnlyAccountInterface):
                 return errors
 
             account_equity = float(account_equity)
+
+            # The cap is a percent of the TRADABLE balance (margin design 2026-09-08):
+            # equity x the account's effective factor. Scaled, not replaced, on purpose --
+            # the backtest account's get_balance() is spendable cash by design while its
+            # snapshot equity is deployed equity, so swapping the denominator would change
+            # every backtest. With margin off this multiplies by 1.0 and reads nothing.
+            # The factor comes from the snapshot ALREADY taken above: multiplier and
+            # equity are then the same broker instant, and TastyTrade (whose snapshot is
+            # an uncached REST call) pays for one round trip here, not two.
+            try:
+                account_equity *= self.effective_margin_factor_from(snapshot)
+            except Exception as e:
+                logger.error(
+                    f"POSITION SIZE VALIDATION CANNOT RUN for {trading_order.symbol}: "
+                    f"account {self.id} margin factor unavailable ({e}). Rejecting the "
+                    f"order rather than treating an unrun risk check as passed.", exc_info=True)
+                errors.append(
+                    f"Cannot validate position size limits: margin factor is unavailable "
+                    f"from {self.__class__.__name__} ({e}). Refusing the order rather than "
+                    f"skipping the check.")
+                return errors
+
             virtual_equity_pct = expert_instance.virtual_equity_pct
             virtual_equity = account_equity * (virtual_equity_pct / 100.0)
             

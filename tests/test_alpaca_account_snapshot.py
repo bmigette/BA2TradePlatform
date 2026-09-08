@@ -378,3 +378,15 @@ def test_a_burst_of_position_size_validations_makes_one_round_trip(monkeypatch):
 
     assert acct.client.get_account.call_count == 1
     assert acct.client.get_account_configurations.call_count == 1
+
+
+def test_alpaca_snapshot_carries_options_buying_power():
+    """Alpaca publishes a separate options_buying_power (a STRING like every
+    other money field); the snapshot must carry it as a float, not drop it."""
+    acct = _bare_account()
+    acct.client.get_account.return_value = _trade_account(options_buying_power="4321.0")
+    acct.client.get_account_configurations.return_value = MagicMock(fractional_trading=True)
+
+    snap = acct.get_account_snapshot()
+
+    assert snap.option_buying_power == 4321.0

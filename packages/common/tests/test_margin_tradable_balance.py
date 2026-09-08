@@ -1,0 +1,327 @@
+"""Tradable balance = balance x min(margin_factor, broker multiplier) with margin on;
+balance with it off. Plus the over-exposure warning threshold.
+
+Worked example the operator gave: balance 10k, broker multiplier 2 (20k gross
+capacity), factor 1.8 (platform deploys at most 18k). Once the broker's REMAINING
+buying power drops under 20k - 18k = 2k, gross exposure has passed the platform's
+own ceiling -- something outside the experts (allocator, manual trade) consumed
+it -- and that is the WARNING.
+
+The log pins use the ``records`` fixture below rather than ``caplog``; see its
+docstring for why caplog cannot work against this package's logger.
+"""
+import logging
+
+import pytest
+
+from ba2_common.core.account_types import AccountSnapshot
+from ba2_common.core.interfaces.ReadOnlyAccountInterface import (
+    ReadOnlyAccountInterface, tradable_balance_for, over_exposure_threshold,
+    effective_factor_for,
+)
+
+
+# ----- pure math -----------------------------------------------------------
+
+def test_margin_off_is_the_balance():
+    assert tradable_balance_for(10_000.0, margin_enabled=False, factor=1.8, multiplier=2.0) == 10_000.0
+
+
+def test_margin_on_is_balance_times_factor():
+    assert tradable_balance_for(10_000.0, margin_enabled=True, factor=1.8, multiplier=2.0) == 18_000.0
+
+
+def test_broker_multiplier_below_factor_wins():
+    assert tradable_balance_for(10_000.0, margin_enabled=True, factor=1.8, multiplier=1.5) == 15_000.0
+
+
+def test_non_marginable_account_is_the_balance():
+    assert tradable_balance_for(10_000.0, margin_enabled=True, factor=1.8, multiplier=1.0) == 10_000.0
+
+
+def test_threshold_is_balance_times_multiplier_minus_factor():
+    # EXACT, not approx: grouped as (gross capacity) - (intended exposure), each term
+    # the same product tradable_balance_for computes. 10_000 * (2.0 - 1.8) is not.
+    assert over_exposure_threshold(10_000.0, multiplier=2.0, factor=1.8) == 2_000.0
+
+
+def test_tradable_balance_equals_balance_times_effective_factor():
+    """ONE expression behind both, so the ceiling and the scaling factor cannot drift."""
+    for factor, multiplier in ((1.8, 2.0), (1.8, 1.5), (1.8, 1.0), (1.0, 4.0)):
+        assert (tradable_balance_for(10_000.0, margin_enabled=True, factor=factor,
+                                     multiplier=multiplier)
+                == 10_000.0 * effective_factor_for(factor, multiplier))
+
+
+def test_threshold_is_negative_when_factor_exceeds_multiplier():
+    # then no remaining-BP figure can ever be below it: the warning cannot fire
+    assert over_exposure_threshold(10_000.0, multiplier=1.5, factor=1.8) < 0
+
+
+# ----- the account methods --------------------------------------------------
+
+class _Stub(ReadOnlyAccountInterface):
+    def __init__(self, *, balance, snapshot, settings):
+        self.id = 3
+        self._balance = balance
+        self._snap = snapshot
+        self._stored = settings
+        self.snapshot_calls = 0
+
+    @property
+    def settings(self):
+        return self._stored
+
+    @classmethod
+    def get_settings_definitions(cls):
+        return {}
+
+    def get_account_snapshot(self):
+        self.snapshot_calls += 1
+        return self._snap
+
+    def get_balance(self):
+        return self._balance
+
+    def get_account_info(self):
+        return {}
+
+    def get_positions(self):
+        return []
+
+    def get_balance_history(self, start_date=None, end_date=None):
+        return []
+
+    # Remaining abstract methods, stubbed exactly as test_margin_accessors._Stub does.
+    def get_orders(self, status=None):
+        return []
+
+    def get_order(self, order_id):
+        return None
+
+    def symbols_exist(self, symbols):
+        return {s: True for s in symbols}
+
+    def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):
+        return None
+
+    def refresh_positions(self):
+        return True
+
+    def refresh_orders(self):
+        return True
+
+    def get_dividends(self, symbol=None, start_date=None, end_date=None):
+        return []
+
+    def get_filled_trades(self, symbol=None, start_date=None, end_date=None):
+        return []
+
+
+@pytest.fixture
+def records(monkeypatch):
+    """``(levelno, message)`` for every line ReadOnlyAccountInterface logs.
+
+    NOT ``caplog``. ``ba2_common``'s logger sets ``propagate = False``
+    (packages/common/ba2_common/logger.py:19) so pytest's ROOT handler never sees a
+    record: every log assertion in this file would pass vacuously against caplog
+    while the operator's log stayed empty -- the exact failure these pins exist to
+    stop. Patching the module-under-test's own ``logger`` is the established idiom
+    here (test_account_seams._capture_errors, test_covered_call_decline_reasons).
+    """
+    import sys
+
+    # sys.modules, not a `from ... import`: the interfaces package re-exports the
+    # CLASS under this name, and the class has no `.logger`.
+    module = sys.modules["ba2_common.core.interfaces.ReadOnlyAccountInterface"]
+    seen = []
+    for name, level in (("debug", logging.DEBUG), ("info", logging.INFO),
+                        ("warning", logging.WARNING), ("error", logging.ERROR)):
+        monkeypatch.setattr(
+            module.logger, name,
+            lambda msg, *a, _lvl=level, **k: seen.append((_lvl, str(msg))))
+    return seen
+
+
+ON = {"margin_enabled": True, "margin_factor": 1.8}
+OFF = {"margin_enabled": False, "margin_factor": 1.8}
+UNSET = {"margin_enabled": None, "margin_factor": None}   # never saved: defaults apply
+LEVERED = AccountSnapshot(margin_multiplier=2.0, buying_power=20_000.0)
+
+
+def test_off_returns_balance_and_never_touches_the_snapshot():
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=OFF)
+    assert acct.get_tradable_balance() == 10_000.0
+    assert acct.get_option_tradable_balance() == 10_000.0
+    assert acct.snapshot_calls == 0
+
+
+def test_on_reads_the_snapshot_exactly_once():
+    """TastyTrade's snapshot is an uncached REST call: one read per tradable balance,
+    so multiplier and buying power come from the SAME broker instant."""
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    acct.get_tradable_balance()
+    assert acct.snapshot_calls == 1
+
+
+def test_unset_settings_read_as_off():
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=UNSET)
+    assert acct.get_tradable_balance() == 10_000.0
+
+
+def test_on_returns_balance_times_factor():
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    assert acct.get_tradable_balance() == 18_000.0
+
+
+def test_on_option_side_uses_the_option_multiplier_default_one():
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    assert acct.get_option_tradable_balance() == 10_000.0
+
+
+def test_string_true_from_the_settings_table_reads_as_on():
+    # the deploy-parity trap: bool settings can come back as "1"/"true"
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings={"margin_enabled": "true", "margin_factor": "1.8"})
+    assert acct.get_tradable_balance() == 18_000.0
+
+
+def test_on_with_cash_account_returns_balance_and_warns(records):
+    acct = _Stub(balance=10_000.0, snapshot=AccountSnapshot(margin_multiplier=1.0, buying_power=4_000.0), settings=ON)
+    assert acct.get_tradable_balance() == 10_000.0
+    assert any(lvl == logging.WARNING and "non-marginable" in msg and "Account 3" in msg
+               for lvl, msg in records)
+
+
+def test_option_default_multiplier_is_a_debug_line_not_a_warning(records):
+    """1.0 is the PLATFORM's own option default (no adapter overrides it), so the
+    ordinary option path must not report a broker anomaly on every single call."""
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    assert acct.get_option_tradable_balance() == 10_000.0
+    assert not any(lvl >= logging.WARNING for lvl, _ in records)
+    hits = [msg for lvl, msg in records
+            if lvl == logging.DEBUG and "cash-settled" in msg]
+    assert len(hits) == 1 and "Account 3" in hits[0]
+
+
+def test_option_side_reads_the_snapshot_exactly_once():
+    """At the default 1.0 option multiplier -- every supported broker today -- NO
+    snapshot is taken at all: the factor is already 1.0, and the snapshot's option
+    buying power feeds nothing but an over-exposure warning ``_effective_factor``
+    returns before reaching. TastyTrade's snapshot is an uncached REST call, so a read
+    whose result nobody looks at is a round trip per option sizing call.
+
+    An adapter that reports real option leverage takes exactly ONE, the same one-read
+    rule as the stock side: multiplier and buying power from the same broker instant.
+    """
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    acct.get_option_tradable_balance()
+    assert acct.snapshot_calls == 0
+
+    class _Levered(_Stub):
+        def get_option_margin_multiplier(self):
+            return 2.0
+
+    levered = _Levered(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    levered.get_option_tradable_balance()
+    assert levered.snapshot_calls == 1
+
+
+def test_on_raises_when_balance_unknown():
+    acct = _Stub(balance=None, snapshot=LEVERED, settings=ON)
+    with pytest.raises(ValueError, match="balance"):
+        acct.get_tradable_balance()
+
+
+def test_on_raises_when_multiplier_unknown():
+    acct = _Stub(balance=10_000.0, snapshot=AccountSnapshot(buying_power=1.0), settings=ON)
+    with pytest.raises(ValueError, match="multiplier"):
+        acct.get_tradable_balance()
+
+
+def test_on_raises_when_buying_power_unknown():
+    acct = _Stub(balance=10_000.0, snapshot=AccountSnapshot(margin_multiplier=2.0), settings=ON)
+    with pytest.raises(ValueError, match="buying power"):
+        acct.get_tradable_balance()
+
+
+def test_on_raises_on_a_bad_factor():
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings={"margin_enabled": True, "margin_factor": 0.5})
+    with pytest.raises(ValueError, match="margin_factor"):
+        acct.get_tradable_balance()
+
+
+def test_over_exposure_warns_below_threshold_and_not_at_it(records):
+    snap_at = AccountSnapshot(margin_multiplier=2.0, buying_power=2_000.0)     # exactly 20k-18k
+    snap_below = AccountSnapshot(margin_multiplier=2.0, buying_power=1_999.0)
+    _Stub(balance=10_000.0, snapshot=snap_at, settings=ON).get_tradable_balance()
+    assert not any("past the margin ceiling" in msg for _, msg in records)
+    records.clear()
+    _Stub(balance=10_000.0, snapshot=snap_below, settings=ON).get_tradable_balance()
+    hits = [msg for lvl, msg in records
+            if lvl == logging.WARNING and "past the margin ceiling" in msg]
+    assert len(hits) == 1 and "1,999.00" in hits[0] and "2,000.00" in hits[0]
+
+
+def test_option_over_exposure_is_skipped_with_a_debug_line_when_option_bp_unknown(records):
+    class _Levered(_Stub):
+        def get_option_margin_multiplier(self):
+            return 2.0
+    acct = _Levered(balance=10_000.0, snapshot=LEVERED, settings=ON)   # option_buying_power None
+    assert acct.get_option_tradable_balance() == 18_000.0
+    assert not any(lvl >= logging.WARNING for lvl, _ in records)
+    assert any(lvl == logging.DEBUG and "option buying power" in msg for lvl, msg in records)
+
+
+# ----- effective_margin_factor ---------------------------------------------
+
+def test_effective_factor_is_one_with_margin_off_and_no_snapshot_read():
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=OFF)
+    assert acct.effective_margin_factor() == 1.0
+    assert acct.snapshot_calls == 0
+
+
+def test_effective_factor_is_min_of_factor_and_multiplier():
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)           # 1.8 vs 2.0
+    assert acct.effective_margin_factor() == 1.8
+    lower = AccountSnapshot(margin_multiplier=1.5, buying_power=15_000.0)   # 1.8 vs 1.5
+    assert _Stub(balance=10_000.0, snapshot=lower, settings=ON).effective_margin_factor() == 1.5
+
+
+def test_effective_factor_is_one_on_a_cash_account():
+    cash = AccountSnapshot(margin_multiplier=1.0, buying_power=10_000.0)
+    assert _Stub(balance=10_000.0, snapshot=cash, settings=ON).effective_margin_factor() == 1.0
+
+
+def test_effective_margin_factor_from_uses_the_given_snapshot_and_reads_none():
+    """A caller that already holds a snapshot hands it over: same factor, no second
+    broker round trip (TastyTrade's snapshot is an uncached REST call), and the
+    multiplier comes from the same instant as the figure being scaled."""
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+
+    assert acct.effective_margin_factor_from(LEVERED) == 1.8
+    assert acct.snapshot_calls == 0
+
+
+def test_effective_factor_scales_the_balance_to_the_tradable_balance():
+    """The account-level pin on the same identity the pure test above makes: a caller
+    that SCALES a figure it already holds lands where get_tradable_balance does."""
+    acct = _Stub(balance=10_000.0, snapshot=LEVERED, settings=ON)
+    assert 10_000.0 * acct.effective_margin_factor() == acct.get_tradable_balance()
+
+
+def test_non_marginable_warning_is_logged_once_per_account(records):
+    """The condition is a STANDING misconfiguration and this path runs once per order
+    per bar, so only the FIRST occurrence is a WARNING; the rest drop to DEBUG rather
+    than flooding a whole backtest with the identical line."""
+    acct = _Stub(balance=10_000.0,
+                 snapshot=AccountSnapshot(margin_multiplier=1.0, buying_power=4_000.0),
+                 settings=ON)
+    assert acct.get_tradable_balance() == 10_000.0
+    assert acct.get_tradable_balance() == 10_000.0
+
+    warnings = [msg for lvl, msg in records
+                if lvl == logging.WARNING and "non-marginable" in msg]
+    assert len(warnings) == 1
+    debugs = [msg for lvl, msg in records
+              if lvl == logging.DEBUG and "non-marginable" in msg]
+    assert len(debugs) == 1

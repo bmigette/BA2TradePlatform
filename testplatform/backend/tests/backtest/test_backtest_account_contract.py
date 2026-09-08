@@ -255,3 +255,24 @@ def test_market_order_fills_and_updates_ledger():
         assert trades[0]["price"] == pytest.approx(expected_fill)
     finally:
         ctx.__exit__(None, None, None)
+
+
+def test_stock_margin_multiplier_is_one_the_simulator_is_unlevered():
+    """The simulator is unlevered and PUBLISHES that on its snapshot, which is where
+    every margin accessor reads it from (an override of the public accessor alone is
+    not consulted by the tradable-balance path)."""
+    from app.services.backtest.backtest_account import BacktestAccount
+    from app.services.backtest.price_source import AsOfPriceSource
+
+    ps = AsOfPriceSource(ohlcv_provider=None)
+    ps.load_bars("AAPL", _AAPL_BARS)
+    ps.set_clock(datetime(2024, 1, 2))
+    acct = BacktestAccount(999, ps, CFG)  # no DB needed: the multiplier is a constant
+
+    assert acct.get_stock_margin_multiplier() == 1.0
+    # ... and it is the SNAPSHOT that says so, so the accessor, the tradable balance and
+    # the allocator's default_bp_factor all read the one published figure.
+    assert acct.get_account_snapshot().margin_multiplier == 1.0
+    # Margin off (the default) leaves backtest behaviour byte-identical: the tradable
+    # balance IS the balance, which on this account is spendable cash by design.
+    assert acct.get_tradable_balance() == acct.get_balance()

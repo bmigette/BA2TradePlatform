@@ -15,6 +15,7 @@ from ..components import LiveTradesTable, LiveTradesTableConfig
 from ..components.MarketAnalysisDetailDialog import MarketAnalysisDetailDialog
 from ..account_filter_context import get_selected_account_id, get_expert_ids_for_account
 from ..utils.perf_logger import PerfLogger
+from ..utils.margin_view import capital_requirement, factors_by_account, value_capreq_text
 
 class LiveTradesTab:
     """Comprehensive transactions management tab with full control over positions."""
@@ -398,6 +399,18 @@ class LiveTradesTab:
             for acc in accounts:
                 account_names[acc.id] = acc.name
 
+        # The EFFECTIVE margin factor per account (1.0 with margin off, no broker read),
+        # once per account per render rather than per row. Scoped to the accounts that
+        # will actually RENDER a requirement -- ``symbols_by_account`` holds only the
+        # accounts with an open position -- so a page of nothing but closed trades costs
+        # no broker call at all. With margin on the read does touch the broker, which is
+        # why it lives here on the async loader path beside the price fetch rather than
+        # in the paint. Deriving the factor from the header's hourly snapshot instead of
+        # reading it per render is a recorded follow-up (see the design doc).
+        factor_by_account: Dict[int, float] = factors_by_account(
+            symbols_by_account.keys(),
+            resolve=lambda acc_id: get_account_instance_from_id(acc_id, session=session))
+
         # Fetch prices in batch for each account
         current_prices = {}
         logger.debug(f"Fetching prices for {len(symbols_by_account)} accounts: {dict(symbols_by_account)}")
@@ -519,7 +532,14 @@ class LiveTradesTab:
                     current_price = current_prices.get(txn.symbol)
                     if current_price:
                         value = txn.quantity * current_price
-                        value_str = f"${value:,.2f}"
+                        # What the position is WORTH, and beside it what it costs the
+                        # account: on margin those differ, and only the second competes
+                        # with every other position for the same balance.
+                        acc_id = txn_to_account.get(txn.id)
+                        factor = factor_by_account.get(acc_id)
+                        capreq = (capital_requirement(value, effective_factor=factor)
+                                  if factor is not None else None)
+                        value_str = value_capreq_text(value, capreq)
                 except Exception as e:
                     logger.debug(f"Could not calculate value for {txn.symbol}: {e}")
 

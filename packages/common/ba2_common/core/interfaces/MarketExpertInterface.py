@@ -7,6 +7,7 @@ from ba2_common.core.models import ExpertSetting, MarketAnalysis, Transaction, E
 from ba2_common.core.types import TransactionStatus, OrderDirection, Recommendation
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.db import get_instance, get_db
+from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.interfaces.ExtendableSettingsInterface import ExtendableSettingsInterface
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 
@@ -822,36 +823,45 @@ class MarketExpertInterface(ExtendableSettingsInterface):
 
     def get_virtual_balance(self) -> Optional[float]:
         """
-        Get the virtual balance for this expert based on account balance and virtual_equity_pct.
-        
-        For example, if account balance is $10,000 and virtual_equity_pct is 10,
-        the virtual balance would be $1,000 (10% of account balance).
+        Get the virtual balance for this expert based on the account's tradable balance
+        and virtual_equity_pct.
+
+        For example, if the account's tradable balance is $10,000 and virtual_equity_pct
+        is 10, the virtual balance would be $1,000 (10% of the tradable balance).
         
         Returns:
             Optional[float]: The virtual balance amount, None if error occurred
         """
+        # Named before the try so the except branch can always name the account the
+        # failure belongs to. Stays None only while the expert instance itself is
+        # still unread -- the one window in which there is no account id to report.
+        account_id = None
         try:
             # Lazy import to avoid circular dependency
             from ba2_common.core.instance_resolver import get_instance_resolver
-            
+
             # Get the expert instance to access virtual_equity_pct
             expert_instance = get_instance(ExpertInstance, self.id)
             if not expert_instance:
                 logger.error(f"Expert instance {self.id} not found")
                 return None
-            
+
+            account_id = expert_instance.account_id
             # Get the account instance for this expert
             account = get_instance_resolver().get_account_instance(expert_instance.account_id)
             if not account:
                 logger.error(f"Account {expert_instance.account_id} not found for expert {self.id}")
                 return None
             
-            # Get account balance
-            account_balance = account.get_balance()
-            if account_balance is None:
-                logger.error(f"Could not get balance for account {expert_instance.account_id}")
-                return None
-            
+            # The TRADABLE balance, not the balance: with margin on this is
+            # balance x min(margin_factor, broker multiplier), so every expert-side
+            # figure downstream (available balance, risk sizing, per-instrument cap)
+            # scales with the account's leverage setting. Raises when the broker
+            # published nothing usable; the except below turns that into None,
+            # which every caller already treats as "cannot size". With margin off
+            # (every backtest) it is get_balance() unchanged.
+            account_balance = account.get_tradable_balance()
+
             # Calculate virtual balance based on virtual_equity_pct.
             #
             # NO ``or 100.0``. The column is ``float = Field(default=100.0)`` -- NOT NULL,
@@ -862,13 +872,23 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             virtual_equity_pct = expert_instance.virtual_equity_pct
             virtual_balance = account_balance * (virtual_equity_pct / 100.0)
             
-            logger.debug(f"Expert {self.id}: Account balance=${account_balance}, "
+            logger.debug(f"Expert {self.id}: Account tradable balance=${account_balance}, "
                         f"Virtual equity %={virtual_equity_pct}, Virtual balance=${virtual_balance}")
             
             return virtual_balance
             
-        except Exception as e:
-            logger.error(f"Error calculating virtual balance for expert {self.id}: {e}", exc_info=True)
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            # WHY ONLY ValueError: that is the NAMED "unknown balance / bad margin factor"
+            # signal ``get_tradable_balance`` raises (``_plain_balance`` / ``_margin_factor``
+            # / the multiplier and buying-power readers). Anything else -- a resolver that
+            # was never wired (``InstanceResolverNotConfigured``), a deleted expert row
+            # (``InstanceNotFound``), a tz/type defect -- is a bug, and absorbing it here
+            # would size every entry this expert makes off a silent None instead of
+            # surfacing it.
+            absorb_if_benign(e, ValueError)
+            logger.error(
+                f"Error calculating virtual balance for expert {self.id} "
+                f"(account {account_id}): {e}", exc_info=True)
             return None
     
     def get_available_balance(self, exclude_transaction_id: Optional[int] = None) -> Optional[float]:

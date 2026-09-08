@@ -1,7 +1,7 @@
 import asyncio
 
 from nicegui import ui
-from typing import Optional, List
+from typing import Any, Dict, Optional, List
 from sqlmodel import select
 
 
@@ -29,6 +29,19 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from ...core.rules_export_import import RulesExportImportUI
 from ...core.rules_documentation import get_event_type_documentation, get_action_type_documentation
 from ..utils.perf_logger import PerfLogger
+
+
+def account_settings_error(dynamic_settings: Dict[str, Any]) -> Optional[str]:
+    """Why this account settings form must not be saved; None when it may. Pure.
+
+    Shares margin_factor_error with the account's own read path, so the dialog can
+    never accept a value the account will later refuse.
+    """
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import margin_factor_error
+    if "margin_factor" in dynamic_settings:
+        return margin_factor_error(dynamic_settings["margin_factor"])
+    return None
+
 
 def _render_reset_default_button(inp, default_value, meta):
     """
@@ -855,6 +868,18 @@ class AccountDefinitionsTab:
             if hasattr(self, 'settings_inputs') and self.settings_inputs:
                 for key, inp in self.settings_inputs.items():
                     dynamic_settings[key] = inp.value
+            # Refused HERE, before a single setting is written: save_account writes the
+            # settings one by one and only then validates, so a value that got past this
+            # point would already be stored. ``ui.number`` hands back None when the field
+            # is cleared, and margin_factor_error(None) is an error message -- so a
+            # cleared factor is refused with a clear message rather than stored as None.
+            # That is intended: the 1.8 default applies only where the key was NEVER
+            # saved, and a stored None is not that.
+            problem = account_settings_error(dynamic_settings)
+            if problem:
+                ui.notify(problem, type='negative')
+                logger.warning(f"Refused to save account settings: {problem}")
+                return
             logger.debug(f'Saving account with provider: {provider}, name: {self.name_input.value}, description: {self.desc_input.value}, dynamic_settings_keys: {list(dynamic_settings.keys())}')
             if account:
                 account.provider = provider

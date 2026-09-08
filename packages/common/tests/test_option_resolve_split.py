@@ -48,6 +48,15 @@ class _Acct:
     def get_balance(self):
         return 100_000.0
 
+    def get_tradable_balance(self):
+        # No margin settings behind this double: what may be deployed IS the balance.
+        return self.get_balance()
+
+    def get_option_tradable_balance(self):
+        # Same, for the OPTION base an option entry sizes from (long options are
+        # cash-settled, so the option multiplier is 1.0 anyway).
+        return self.get_balance()
+
     def submit_option_order(self, **kw):
         self.submitted.append(kw)
         return type("O", (), {"id": len(self.submitted)})()

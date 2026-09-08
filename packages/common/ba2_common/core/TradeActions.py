@@ -1534,7 +1534,8 @@ class IncreaseInstrumentShareAction(TradeAction):
                     data={}
                 )
             
-            # Get total virtual equity (allocated capital, not just free cash)
+            # Get total virtual equity from the tradable balance (allocated
+            # capital, not just free cash)
             virtual_equity = expert.get_virtual_balance()
             if virtual_equity is None or virtual_equity <= 0:
                 return self.create_and_save_action_result(
@@ -1744,7 +1745,8 @@ class DecreaseInstrumentShareAction(TradeAction):
                     data={}
                 )
             
-            # Get total virtual equity (allocated capital, not just free cash)
+            # Get total virtual equity from the tradable balance (allocated
+            # capital, not just free cash)
             virtual_equity = expert.get_virtual_balance()
             if virtual_equity is None or virtual_equity <= 0:
                 return self.create_and_save_action_result(
@@ -2313,8 +2315,21 @@ class _OptionEntryAction(TradeAction):
         return sp, sp
 
     def _virtual_equity(self) -> Optional[float]:
-        """balance * virtual_equity_pct/100 (defaults to balance when unknown)."""
-        balance = self.account.get_balance()
+        """OPTION tradable balance * virtual_equity_pct/100 (the whole option tradable
+        balance when the pct is unknown). Option entries are sized from the option
+        leverage, which is 1.0 at every supported broker today, so with the stock factor
+        at 1.8 this stays at the plain balance -- long options cannot be bought on
+        margin. None when the account cannot answer, never a guess."""
+        try:
+            balance = self.account.get_option_tradable_balance()
+        except Exception as e:  # noqa: BLE001 — narrowed by absorb_if_benign
+            # WHY ONLY ValueError: that is the NAMED "unknown balance / bad margin factor"
+            # signal the tradable-balance path raises. Anything else is a defect, and
+            # absorbing it here would size every option entry off a silent None.
+            absorb_if_benign(e, ValueError)
+            logger.error(f"_virtual_equity: option tradable balance unavailable for "
+                         f"account {self.account.id}: {e}", exc_info=True)
+            return None
         if balance is None:
             return None
         pct = 100.0

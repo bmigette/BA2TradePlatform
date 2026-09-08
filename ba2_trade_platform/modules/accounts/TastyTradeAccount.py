@@ -468,6 +468,7 @@ class TastyTradeAccount(AccountInterface):
             net_liquidation=net_liquidation,
             buying_power=_num("equity_buying_power"),
             non_marginable_buying_power=_num("cash_available_to_withdraw"),
+            option_buying_power=_num("derivative_buying_power"),
             margin_multiplier=2.0 if is_margin else 1.0,
             is_margin_account=is_margin,
             long_market_value=_num("long_equity_value"),

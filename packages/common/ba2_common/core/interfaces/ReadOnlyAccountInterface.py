@@ -1,3 +1,4 @@
+import math
 from abc import abstractmethod
 from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta, date
@@ -11,7 +12,71 @@ from ba2_common.core.account_types import (
 from threading import Lock
 from ba2_common.logger import logger
 from ba2_common.core.models import AccountSetting
-from ba2_common.core.interfaces.ExtendableSettingsInterface import ExtendableSettingsInterface
+from ba2_common.core.interfaces.ExtendableSettingsInterface import (
+    ExtendableSettingsInterface, coerce_bool)
+
+
+#: A margin_factor below 1.0 would let an account deploy LESS than its balance,
+#: which is virtual_equity_pct's job, not this setting's. 1.0 == margin off.
+MARGIN_FACTOR_MIN = 1.0
+
+
+def margin_factor_error(value: Any) -> Optional[str]:
+    """Why ``value`` is not an acceptable ``margin_factor``; ``None`` when it is. Pure.
+
+    Used by the account settings dialog at save time (Task 11) and by the account
+    itself at read time (Task 4), so the two can never disagree about what is valid.
+    """
+    # A bool is float()-able (True == 1.0) and would read as a legal "no leverage"
+    # factor; the settings table has leaked cross-typed values before (see coerce_bool).
+    if isinstance(value, bool):
+        return f"margin_factor must be a number, got {value!r}"
+    try:
+        factor = float(value)
+    except (TypeError, ValueError):
+        return f"margin_factor must be a number, got {value!r}"
+    # NaN compares False against everything, so it would slip past the minimum
+    # and become a NaN tradable balance downstream. Infinity is not a ceiling.
+    if not math.isfinite(factor):
+        return f"margin_factor must be a finite number, got {value!r}"
+    if factor < MARGIN_FACTOR_MIN:
+        return f"margin_factor must be >= {MARGIN_FACTOR_MIN} (1.0 means no leverage), got {factor}"
+    return None
+
+
+def effective_factor_for(factor: float, multiplier: float) -> float:
+    """What one dollar of balance may deploy with margin ON: min(factor, multiplier). Pure.
+
+    ``multiplier <= 1.0`` (a cash account) therefore yields 1.0 -- the broker will not
+    lend, so the factor has nothing to scale. ONE expression, so the ceiling
+    (``tradable_balance_for``) and the scaling factor an existing figure is multiplied
+    by (``ReadOnlyAccountInterface.effective_margin_factor``) can never disagree.
+    """
+    return min(float(factor), max(float(multiplier), 1.0))
+
+
+def tradable_balance_for(balance: float, *, margin_enabled: bool, factor: float,
+                         multiplier: float) -> float:
+    """balance x min(factor, multiplier) with margin on; balance with it off. Pure."""
+    if not margin_enabled:
+        return float(balance)
+    return float(balance) * effective_factor_for(factor, multiplier)
+
+
+def over_exposure_threshold(balance: float, *, multiplier: float, factor: float) -> float:
+    """The remaining-buying-power level below which gross exposure has passed the
+    platform's own ceiling. Pure.
+
+    Gross capacity is balance x multiplier; the platform intends to use
+    balance x factor; what should still be left is the difference. A factor above
+    the multiplier gives a negative threshold, which no remaining BP can be under.
+
+    Grouped as (gross capacity) - (intended exposure) rather than
+    balance x (multiplier - factor): each term is then the same product
+    ``tradable_balance_for`` computes, so the worked example is exact
+    (20000.0 - 18000.0 == 2000.0, where 10_000 * (2.0 - 1.8) is not).
+    """
+    return float(balance) * float(multiplier) - float(balance) * float(factor)
 
 
 class ReadOnlyAccountInterface(ExtendableSettingsInterface):
@@ -52,6 +117,20 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     "default": False,
                     "description": "Manually traded account",
                     "tooltip": "Enable the Portfolio Allocation page for this account. Only for accounts you trade by hand -- the page refuses to run when the account has any enabled expert."
+                },
+                "margin_enabled": {
+                    "type": "bool",
+                    "required": False,
+                    "default": False,
+                    "description": "Margin trading enabled",
+                    "tooltip": "Let this account's experts deploy more than the account balance, up to balance x margin factor, never more than the broker's own buying power. Off = experts size against the plain balance."
+                },
+                "margin_factor": {
+                    "type": "float",
+                    "required": False,
+                    "default": 1.8,
+                    "description": "Margin factor (max exposure / balance)",
+                    "tooltip": "Ceiling on total exposure as a multiple of balance: 1.8 means a $10k account never holds more than $18k of positions. Capped by the broker's multiplier. Ignored when margin trading is off. Minimum 1.0."
                 },
             }
 
@@ -197,6 +276,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             buying_power=_first("buying_power", "equity_buying_power", "derivative_buying_power"),
             non_marginable_buying_power=_first("non_marginable_buying_power",
                                                "cash_available_to_withdraw"),
+            option_buying_power=_first("options_buying_power", "derivative_buying_power"),
             margin_multiplier=multiplier,
             is_margin_account=bool(multiplier is not None and multiplier > 1.0),
             long_market_value=_first("long_market_value"),
@@ -238,6 +318,263 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         fabricated 0.0 is a measured 100% drawdown.
         """
         return self.get_account_snapshot().equity
+
+    # ------------------------------------------------------------------
+    # MARGIN / LEVERAGE.  Design: docs/plans/2026-09-08-margin-trading-design.md
+    # ------------------------------------------------------------------
+    # The two ``_from(snapshot)`` helpers below exist because the tradable-balance
+    # path takes ONE snapshot and derives BOTH figures from it: multiplier and
+    # buying power must describe the same broker instant (they are compared against
+    # each other), and TastyTrade's snapshot is an UNCACHED REST call, so calling
+    # the two public accessors separately would cost three round trips per read.
+    #
+    # CONSEQUENCE FOR OVERRIDERS: an adapter that answers the PUBLIC accessor with a
+    # constant instead of a snapshot field is NOT consulted by the tradable-balance
+    # path -- it would RAISE here on the unpublished figure instead. Loudly, not
+    # silently; an adapter that needs to be heard here publishes the figure on its
+    # snapshot (or overrides these helpers), never the accessor alone. BacktestAccount
+    # used to override the accessor and now publishes multiplier 1.0 in
+    # get_account_info() for exactly this reason.
+    #
+    # The OPTION path is the same shape for the same reason: it reads
+    # ``snapshot.option_buying_power`` off the snapshot it already took, so an adapter
+    # that overrides ``get_option_buying_power()`` without publishing the field is
+    # likewise not consulted. (The option MULTIPLIER is the exception: it is a platform
+    # constant, not a snapshot field, so ``get_option_margin_multiplier()`` IS called.)
+    def _stock_multiplier_from(self, snapshot: AccountSnapshot) -> float:
+        """``get_stock_margin_multiplier``'s body, against a snapshot already taken."""
+        multiplier = snapshot.margin_multiplier
+        # 0 or negative is not a leverage figure a broker can mean; treated as
+        # unpublished so it raises here instead of sizing every order to zero.
+        if multiplier is None or float(multiplier) <= 0:
+            raise ValueError(
+                f"account {self.id} ({type(self).__name__}) published no usable stock margin "
+                f"multiplier ({multiplier!r}); cannot size with margin")
+        return float(multiplier)
+
+    def _buying_power_from(self, snapshot: AccountSnapshot) -> float:
+        """``get_buying_power``'s body, against a snapshot already taken."""
+        bp = snapshot.buying_power
+        if bp is None:
+            raise ValueError(
+                f"account {self.id} ({type(self).__name__}) published no buying power")
+        return float(bp)
+
+    def get_stock_margin_multiplier(self) -> float:
+        """The broker's stock leverage: dollars of buying power per dollar of equity.
+
+        Alpaca publishes it as ``TradeAccount.multiplier``; TastyTrade derives 2.0/1.0
+        from ``margin_or_cash``; the backtest account publishes 1.0. RAISES when the
+        broker published none (IBKR): this number scales position sizes, and a guessed
+        multiplier is a guessed order.
+        """
+        return self._stock_multiplier_from(self.get_account_snapshot())
+
+    def get_option_margin_multiplier(self) -> float:
+        """The broker's OPTION leverage. Base default 1.0: long options are cash-settled
+        at every supported broker. An adapter overrides only with a real broker figure."""
+        return 1.0
+
+    def get_buying_power(self) -> float:
+        """The broker's REMAINING stock buying power. RAISES when unpublished.
+
+        Same reason as the multiplier: this caps what may still be deployed, and a
+        fabricated cap is a fabricated order.
+        """
+        return self._buying_power_from(self.get_account_snapshot())
+
+    def get_option_buying_power(self) -> Optional[float]:
+        """The broker's remaining OPTION buying power, or ``None`` when unpublished.
+
+        ``None`` is allowed here (unlike ``get_buying_power``) because its only
+        consumer is the over-exposure WARNING, which skips itself and says so.
+        """
+        return self.get_account_snapshot().option_buying_power
+
+    def _margin_enabled(self) -> bool:
+        """The per-account leverage switch.
+
+        ``get_setting_with_interface_default`` and NOT ``settings.get(key, default)``:
+        the settings property seeds every declared key to None, so a plain ``.get``
+        default would never apply. ``coerce_bool`` because a bool setting can come back
+        from the table spelled ``"1"`` / ``"true"`` -- the deploy-parity trap that
+        silently disabled thirteen live genes.
+        """
+        return coerce_bool(self.get_setting_with_interface_default(
+            "margin_enabled", log_warning=False))
+
+    def _margin_factor(self) -> float:
+        """The stored exposure ceiling, validated by the SAME function the settings
+        dialog validates with, so reader and writer can never disagree about what is
+        a legal factor. RAISES rather than clamping: a bad stored value is a bug to
+        surface, not a number to guess at."""
+        raw = self.get_setting_with_interface_default("margin_factor", log_warning=False)
+        err = margin_factor_error(raw)
+        if err:
+            raise ValueError(f"account {self.id}: {err}")
+        return float(raw)
+
+    def _plain_balance(self) -> float:
+        """``get_balance()``, refusing the unknown. Margin off, and the margin path's
+        first step, share this: a fabricated balance is a fabricated order size."""
+        balance = self.get_balance()
+        if balance is None:
+            raise ValueError(
+                f"account {self.id} ({type(self).__name__}): balance unavailable")
+        return float(balance)
+
+    def _effective_factor(self, *, asset: str, balance: float, multiplier: float,
+                          remaining_bp: Optional[float]) -> float:
+        """min(margin_factor, broker multiplier) for this asset class, with the
+        non-marginable and over-exposure diagnostics. Margin is known to be ON here.
+
+        Takes the broker figures as ARGUMENTS and never reads the snapshot itself: its
+        caller has already taken exactly one (see ``_stock_multiplier_from``).
+        ``remaining_bp is None`` means the broker published no buying power for this
+        asset class -- its only consumer is the over-exposure warning, which then skips
+        itself and says so.
+        """
+        factor = self._margin_factor()
+        if multiplier <= 1.0:
+            if asset == "stock":
+                # An anomaly worth a WARNING: margin was enabled on an account the broker
+                # will not lend against (a cash account), so the factor scales nothing.
+                #
+                # LATCHED to once per account instance, because this is a STANDING
+                # misconfiguration, not an event: nothing about it changes between calls,
+                # and this path is walked once per order per bar (get_virtual_balance ->
+                # get_tradable_balance), so a backtest configured with margin_enabled=True
+                # on an unlevered account would emit the identical line tens of thousands
+                # of times and bury every other warning in the run. The first occurrence
+                # is the one an operator needs; the rest stay at DEBUG so the condition is
+                # still observable when someone goes looking for it.
+                #
+                # getattr with a default rather than an __init__ attribute: the account
+                # interfaces are subclassed widely (and instantiated bare with
+                # object.__new__ in tests), so an __init__ that every subclass must call
+                # is a fragility this diagnostic does not warrant.
+                message = (
+                    f"[Account {self.id}] margin_enabled but the broker reports a non-marginable "
+                    f"{asset} account (multiplier {multiplier:g}); tradable {asset} balance stays at "
+                    f"the balance ${balance:,.2f}")
+                if getattr(self, "_non_marginable_warned", False):
+                    logger.debug(message)
+                else:
+                    self._non_marginable_warned = True
+                    logger.warning(message)
+            else:
+                # NOT an anomaly: 1.0 is the platform's OWN option default -- long options
+                # are cash-settled at every supported broker and no adapter overrides
+                # get_option_margin_multiplier -- so this is the normal option path, and a
+                # warning here would cry broker anomaly on every single option call.
+                logger.debug(
+                    f"[Account {self.id}] options are cash-settled here (option multiplier "
+                    f"{multiplier:g}); tradable option balance stays at the balance "
+                    f"${balance:,.2f}")
+            return 1.0
+        if remaining_bp is None:
+            logger.debug(f"[Account {self.id}] no {asset} buying power published; "
+                         f"over-exposure check skipped")
+        else:
+            threshold = over_exposure_threshold(balance, multiplier=multiplier, factor=factor)
+            if remaining_bp < threshold:
+                logger.warning(
+                    f"[Account {self.id}] {asset} exposure is past the margin ceiling: remaining "
+                    f"broker buying power ${remaining_bp:,.2f} < ${threshold:,.2f} "
+                    f"(balance ${balance:,.2f} x (multiplier {multiplier:g} - factor {factor:g})). "
+                    f"Something outside the experts (allocator, manual trades) consumed it.")
+        return effective_factor_for(factor, multiplier)
+
+    def _tradable_balance(self, *, asset: str, balance: float, multiplier: float,
+                          remaining_bp: Optional[float]) -> float:
+        """The margin-on branch shared by stock and options: balance x the factor."""
+        return float(balance) * self._effective_factor(
+            asset=asset, balance=balance, multiplier=multiplier, remaining_bp=remaining_bp)
+
+    def effective_margin_factor(self) -> float:
+        """tradable STOCK balance / balance: 1.0 with margin off (no snapshot read),
+        else min(margin_factor, broker stock multiplier), 1.0 on a cash account.
+
+        For callers that must SCALE a figure they already hold rather than replace it:
+        the position-size cap keeps its equity denominator and multiplies by this
+        (so a backtest, where balance is spendable cash by design, stays byte-identical
+        with margin off), and the live-trades page divides a position's value by it to
+        show the capital it actually consumes. Same reads and same diagnostics as
+        ``get_tradable_balance``.
+        """
+        if not self._margin_enabled():
+            return 1.0
+        return self.effective_margin_factor_from(self.get_account_snapshot())
+
+    def effective_margin_factor_from(self, snapshot: AccountSnapshot) -> float:
+        """``effective_margin_factor()`` for a caller that already holds a snapshot, so
+        the multiplier and the figure being scaled come from the SAME broker instant and
+        TastyTrade (uncached snapshot) pays no second round trip. Margin off -> 1.0
+        without reading the snapshot's fields."""
+        if not self._margin_enabled():
+            return 1.0
+        balance = self._plain_balance()
+        return self._effective_factor(asset="stock", balance=balance,
+                                      multiplier=self._stock_multiplier_from(snapshot),
+                                      remaining_bp=self._buying_power_from(snapshot))
+
+    def get_tradable_balance(self) -> float:
+        """What this account's experts may deploy in STOCK, in dollars.
+
+        margin off: ``get_balance()``, and the broker snapshot is not read at all.
+        margin on: balance x min(margin_factor, broker stock multiplier). Remaining
+        broker buying power is NOT subtracted here -- the expert's own
+        ``get_available_balance`` subtracts its positions and clamps to broker BP --
+        it is only read for the over-exposure WARNING.
+
+        ONE snapshot read per call (multiplier and buying power from the same broker
+        instant; TastyTrade's snapshot is an uncached REST call).
+
+        RAISES (never returns a guess) when balance, multiplier or buying power is
+        unknown with margin on, or the stored margin_factor is invalid.
+        """
+        if not self._margin_enabled():
+            return self._plain_balance()
+        # The balance FIRST: an account that cannot say what it holds must refuse
+        # without spending a broker round trip to be told a multiplier it cannot use.
+        balance = self._plain_balance()
+        snapshot = self.get_account_snapshot()
+        return self._tradable_balance(
+            asset="stock", balance=balance,
+            multiplier=self._stock_multiplier_from(snapshot),
+            remaining_bp=self._buying_power_from(snapshot))
+
+    def get_option_tradable_balance(self) -> float:
+        """Same as ``get_tradable_balance`` for OPTIONS, with the option multiplier.
+
+        Three option figures exist and must not be confused: the broker's raw
+        ``get_option_buying_power()`` (may be None), THIS (balance x the option
+        leverage, the base every option sleeve sizes from), and
+        ``OptionsAccountInterface.available_option_buying_power()`` (this minus the
+        platform's option reserve pool). Stock and option tradable balances are
+        views of ONE pot of equity; the split between stock and option experts is
+        governed by their virtual_equity_pct, exactly as before margin existed.
+
+        Option buying power may be unpublished: then the warning is skipped (DEBUG).
+
+        NO SNAPSHOT AT THE 1.0 MULTIPLIER, which is every supported broker today: the
+        option factor is then 1.0 whatever the buying power says, and the only consumer
+        of ``remaining_bp`` is the over-exposure warning that ``_effective_factor``
+        returns before ever reaching. Taking one anyway cost TastyTrade an uncached REST
+        round trip per option sizing call to feed a number nothing read.
+        """
+        if not self._margin_enabled():
+            return self._plain_balance()
+        balance = self._plain_balance()          # before the snapshot; see get_tradable_balance
+        multiplier = self.get_option_margin_multiplier()
+        if multiplier <= 1.0:
+            return self._tradable_balance(
+                asset="option", balance=balance, multiplier=multiplier,
+                remaining_bp=None)
+        snapshot = self.get_account_snapshot()
+        return self._tradable_balance(
+            asset="option", balance=balance, multiplier=multiplier,
+            remaining_bp=snapshot.option_buying_power)
 
     def get_cash_transfers(
         self,

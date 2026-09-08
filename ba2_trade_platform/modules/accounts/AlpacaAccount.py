@@ -2031,6 +2031,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             net_liquidation=equity,
             buying_power=_f('buying_power'),
             non_marginable_buying_power=_f('non_marginable_buying_power'),
+            option_buying_power=_f('options_buying_power'),
             margin_multiplier=multiplier,
             is_margin_account=bool(multiplier is not None and multiplier > 1.0),
             long_market_value=_f('long_market_value'),
